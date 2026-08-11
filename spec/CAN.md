@@ -188,3 +188,24 @@ human park assertion, never a measurement. On exit: re-base all nodes' freshness
 if the flash marker file exists → invalidate homing robot-wide. Bootloader protocol
 (little-endian, ids 0x700/0x701+board, page stream id `(board<<7)|seq`, STM32 CRC-32/MPEG-2)
 stays in vendor tools; an advisory flock guards single-flasher access.
+
+## Implementation findings (P1.A, vendor-verified — codec is authoritative)
+
+1. **Speed conversion carries the dir sign**: `get_joint_speed` negates for
+   `dir == 1` (the formula section above omits it). Both directions flip.
+2. **Sector boundaries**: vendor thresholds are asymmetric (`master − 8192` vs
+   `master + 8191`) and exact-boundary readings fall through unclassified. Codec
+   mirrors the thresholds and resolves boundary readings to the uncorrected
+   sector (shift 0). Invariant: the corrected boot delta is always within ± half
+   a motor revolution.
+3. **`set_home` clears the boot sector shift** — the latched tick is a live
+   accumulated position, not a wrapped boot reading. (The vendor does not clear
+   it, which breaks the `joint_position(endstop) == home_offset` post-condition
+   whenever the shift was nonzero; the post-condition is the contract.)
+4. **Cmd 9 = heartbeat reply** (payload-less), enabled by cmd 30 — added to the
+   command table; decode as `Heartbeat`.
+5. Payload-less replies (cmds 9/10) get **no DLC enforcement** (vendor checks none).
+6. No-gripper tick-timing frame = **RTR ping to the dummy node** (newer vendor
+   handler), not a cmd-61 pack (older util).
+7. A cmd-2 encode with position but no velocity is **refused loudly** (typed
+   error) — the vendor silently dropped it.

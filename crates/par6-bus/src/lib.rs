@@ -12,11 +12,11 @@
 //!   warn/latch classification, kernel link health.
 //! - [`LoopbackBus`]: in-memory reference implementation the contract
 //!   unit tests run against. Not a production backend.
-//! - Spectral/STEPFOC frame codec (future issue): classic CAN 2.0A, 11-bit
+//! - Spectral/STEPFOC frame codec (spectral module): classic CAN 2.0A, 11-bit
 //!   id = (node << 7) | (cmd << 1) | err_bit; big-endian payloads; i24
 //!   position ticks / i24 speed ticks-per-s / i16 current mA with
 //!   DLC-variant position/velocity/current frames.
-//! - SocketCAN backend (future issue): bus bring-up, SO_SNDBUF sizing,
+//! - SocketCAN backend (spectral module): bus bring-up, SO_SNDBUF sizing,
 //!   round-robin telemetry poll + device-info sweep, boot config pacing,
 //!   send errors PROPAGATED (vendor swallowed them — known production bug
 //!   class).
@@ -29,6 +29,7 @@
 
 mod bus;
 mod loopback;
+pub mod spectral;
 mod types;
 
 pub use bus::DriverBus;
