@@ -57,6 +57,8 @@ pub enum ErrorCode {
     SwEstop,
     /// EXEC heartbeat silent ≥0.5 s while samples pending.
     ExecLinkLost,
+    /// EXEC `strict` completion policy timed out while settling.
+    ExecSettleTimeout,
     /// Stream watchdog expired.
     RtiLinkLost,
     /// Loop p99 > 1.05·dt (warning, self-clears).
