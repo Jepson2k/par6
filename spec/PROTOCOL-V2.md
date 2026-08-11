@@ -147,3 +147,32 @@ no-opped). Sim runs on fixed dt, never wall clock (deterministic recordings).
 11. teleport-outside-sim is an error; reset_loop_stats truly unacked; set_tcp_offset
     truly SYSTEM
 12. COMPLETE push per queued command (was: poll completed_index only)
+
+## Frozen decisions (v2.0, contract freeze 1)
+
+Resolved during implementation of `par6-proto`; the crate is authoritative.
+
+1. Tag ranges, class-grouped: MsgType 1–6; CmdType SYSTEM 10–21, QUERY 30–47,
+   FIRE_AND_FORGET 60–66, QUEUED 80–90.
+2. `set_recipe` is SYSTEM (unknown-recipe refusal needs an ack path).
+3. `Frame` is u8 on the wire (WRF=0, TRF=1) — no strings in the envelope.
+4. Idempotency key is wire slot 2: `[tag, req_id, key, ...params]` (QUEUED only).
+5. COMPLETE: `[COMPLETE, 0, index, ok, detail?]`; detail = error 6-tuple, present
+   when ok=false.
+6. The nil convention covers duration/speed/accel, blend radius `r` (nil = no
+   blend), `select_tool.variant_key`, `teleport.tool_positions`, POSE frame.
+   Exactly-one-of duration/speed retained for planned moves.
+7. STATUS decode requires the full 31 v2 elements; longer tails tolerated,
+   shorter rejected (no legacy producers exist).
+8. REACHABLE answers with the enablement triple (parol6's separate ENABLEMENT
+   query merged away).
+9. Activity `state` is the integer ActionState, not a name string.
+10. Error catalog: parol6 codes 10–43 kept; SYS range renumbered and extended
+    (MOTN_SETTLE_TIMEOUT=36, COMM_CHUNK_TIMEOUT=44, COMM_UNKNOWN_RECIPE=45,
+    PROFILE_INVALID=52, SELF_COLLISION=53, NOT_SIMULATOR=54, EXEC_LINK_LOST=55,
+    RTI_LINK_LOST=56, LOOP_CRITICAL=57, JOINT_FAULT=58; PORT_SAVE_FAILED dropped).
+11. A CHUNK payload is the complete inner command datagram, byte-identical to
+    the unchunked encoding.
+12. `tool_action.params` ≤ 16 scalars (float/int/bool/str).
+13. The codec validates shape/ranges only; joint limits, tool names, and recipe
+    names are server-layer checks against config.

@@ -1,0 +1,2498 @@
+{
+  "format": 1,
+  "generator": "cargo run -p par6-proto --bin gen_golden",
+  "proto_version": 2,
+  "vectors": [
+    {
+      "class": "SYSTEM",
+      "cmd": "RESET",
+      "file": "cmd_reset.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_reset",
+      "req_id": 1,
+      "tag": 10,
+      "wire": [
+        10,
+        1
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "ESTOP",
+      "file": "cmd_estop.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_estop",
+      "req_id": 2,
+      "tag": 11,
+      "wire": [
+        11,
+        2
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "STOP",
+      "file": "cmd_stop.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_stop",
+      "req_id": 3,
+      "tag": 12,
+      "wire": [
+        12,
+        3,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "WRITE_IO",
+      "file": "cmd_write_io.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_write_io",
+      "req_id": 4,
+      "tag": 13,
+      "wire": [
+        13,
+        4,
+        3,
+        1
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SIMULATOR",
+      "file": "cmd_simulator.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_simulator",
+      "req_id": 5,
+      "tag": 14,
+      "wire": [
+        14,
+        5,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SELECT_PROFILE",
+      "file": "cmd_select_profile.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_select_profile",
+      "req_id": 6,
+      "tag": 15,
+      "wire": [
+        15,
+        6,
+        "TOPPRA"
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "RESET_STATE",
+      "file": "cmd_reset_state.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_reset_state",
+      "req_id": 7,
+      "tag": 16,
+      "wire": [
+        16,
+        7
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "CONNECT_HARDWARE",
+      "file": "cmd_connect_hardware.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_connect_hardware",
+      "req_id": 8,
+      "tag": 17,
+      "wire": [
+        17,
+        8,
+        "can0"
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_TCP_OFFSET",
+      "file": "cmd_set_tcp_offset.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_tcp_offset",
+      "req_id": 9,
+      "tag": 18,
+      "wire": [
+        18,
+        9,
+        1.5,
+        -2.0,
+        35.5
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_SHAPES",
+      "file": "cmd_set_shapes.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_shapes",
+      "req_id": 10,
+      "tag": 19,
+      "wire": [
+        19,
+        10,
+        [
+          [
+            "box",
+            [
+              400.0,
+              600.0,
+              20.0
+            ],
+            [
+              0.0,
+              0.0,
+              -10.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            true,
+            5.0,
+            "table"
+          ],
+          [
+            "sphere",
+            [
+              50.0
+            ],
+            [
+              120.0,
+              80.0,
+              200.0,
+              0.0,
+              0.0,
+              0.0
+            ],
+            false,
+            null,
+            "camera"
+          ]
+        ]
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_COMPLETION_POLICY",
+      "file": "cmd_set_completion_policy.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_completion_policy",
+      "req_id": 11,
+      "tag": 20,
+      "wire": [
+        20,
+        11,
+        2
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_RECIPE",
+      "file": "cmd_set_recipe.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_recipe",
+      "req_id": 12,
+      "tag": 21,
+      "wire": [
+        21,
+        12,
+        "diagnostics"
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "PING",
+      "file": "cmd_ping.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_ping",
+      "req_id": 20,
+      "tag": 30,
+      "wire": [
+        30,
+        20
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "STATUS",
+      "file": "cmd_status.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_status",
+      "req_id": 21,
+      "tag": 31,
+      "wire": [
+        31,
+        21
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "ANGLES",
+      "file": "cmd_angles.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_angles",
+      "req_id": 22,
+      "tag": 32,
+      "wire": [
+        32,
+        22
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "POSE",
+      "file": "cmd_pose.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_pose",
+      "req_id": 23,
+      "tag": 33,
+      "wire": [
+        33,
+        23,
+        1
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "POSE",
+      "file": "cmd_pose_default_frame.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_pose_default_frame",
+      "req_id": 24,
+      "tag": 33,
+      "wire": [
+        33,
+        24,
+        null
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "IO",
+      "file": "cmd_io.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_io",
+      "req_id": 25,
+      "tag": 34,
+      "wire": [
+        34,
+        25
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "SPEEDS",
+      "file": "cmd_speeds.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_speeds",
+      "req_id": 26,
+      "tag": 35,
+      "wire": [
+        35,
+        26
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "TOOLS",
+      "file": "cmd_tools.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_tools",
+      "req_id": 27,
+      "tag": 36,
+      "wire": [
+        36,
+        27
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "QUEUE",
+      "file": "cmd_queue.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_queue",
+      "req_id": 28,
+      "tag": 37,
+      "wire": [
+        37,
+        28
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "ACTIVITY",
+      "file": "cmd_activity.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_activity",
+      "req_id": 29,
+      "tag": 38,
+      "wire": [
+        38,
+        29
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "LOOP_STATS",
+      "file": "cmd_loop_stats.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_loop_stats",
+      "req_id": 30,
+      "tag": 39,
+      "wire": [
+        39,
+        30
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "PROFILE",
+      "file": "cmd_profile.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_profile",
+      "req_id": 31,
+      "tag": 40,
+      "wire": [
+        40,
+        31
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "REACHABLE",
+      "file": "cmd_reachable.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_reachable",
+      "req_id": 32,
+      "tag": 41,
+      "wire": [
+        41,
+        32
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "ERROR",
+      "file": "cmd_error.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_error",
+      "req_id": 33,
+      "tag": 42,
+      "wire": [
+        42,
+        33
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "TCP_SPEED",
+      "file": "cmd_tcp_speed.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_tcp_speed",
+      "req_id": 34,
+      "tag": 43,
+      "wire": [
+        43,
+        34
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "TCP_OFFSET",
+      "file": "cmd_tcp_offset.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_tcp_offset",
+      "req_id": 35,
+      "tag": 44,
+      "wire": [
+        44,
+        35
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "TOOL_STATUS",
+      "file": "cmd_tool_status.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_tool_status",
+      "req_id": 36,
+      "tag": 45,
+      "wire": [
+        45,
+        36
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "IS_SIMULATOR",
+      "file": "cmd_is_simulator.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_is_simulator",
+      "req_id": 37,
+      "tag": 46,
+      "wire": [
+        46,
+        37
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "SHAPES",
+      "file": "cmd_shapes.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_shapes",
+      "req_id": 38,
+      "tag": 47,
+      "wire": [
+        47,
+        38
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "SERVO_J",
+      "file": "cmd_servo_j.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_servo_j",
+      "req_id": 50,
+      "tag": 60,
+      "wire": [
+        60,
+        50,
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        0.5,
+        null
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "SERVO_J_POSE",
+      "file": "cmd_servo_j_pose.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_servo_j_pose",
+      "req_id": 51,
+      "tag": 61,
+      "wire": [
+        61,
+        51,
+        [
+          250.0,
+          -10.5,
+          180.0,
+          0.0,
+          90.0,
+          179.5
+        ],
+        null,
+        0.25
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "SERVO_L",
+      "file": "cmd_servo_l.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_servo_l",
+      "req_id": 52,
+      "tag": 62,
+      "wire": [
+        62,
+        52,
+        [
+          250.0,
+          -10.5,
+          180.0,
+          0.0,
+          90.0,
+          179.5
+        ],
+        1.0,
+        1.0
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "JOG_J",
+      "file": "cmd_jog_j.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_jog_j",
+      "req_id": 53,
+      "tag": 63,
+      "wire": [
+        63,
+        53,
+        [
+          0.2,
+          -0.2,
+          0.0,
+          0.0,
+          1.0,
+          -1.0
+        ],
+        0.04,
+        0.8
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "JOG_L",
+      "file": "cmd_jog_l.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_jog_l",
+      "req_id": 54,
+      "tag": 64,
+      "wire": [
+        64,
+        54,
+        [
+          0.0,
+          0.0,
+          -0.5,
+          0.0,
+          0.0,
+          0.0
+        ],
+        0.05,
+        1,
+        null
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "TELEPORT",
+      "file": "cmd_teleport.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_teleport",
+      "req_id": 55,
+      "tag": 65,
+      "wire": [
+        65,
+        55,
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        [
+          10.0
+        ]
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "TELEPORT",
+      "file": "cmd_teleport_no_tool.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_teleport_no_tool",
+      "req_id": 56,
+      "tag": 65,
+      "wire": [
+        65,
+        56,
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        null
+      ]
+    },
+    {
+      "class": "FIRE_AND_FORGET",
+      "cmd": "RESET_LOOP_STATS",
+      "file": "cmd_reset_loop_stats.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_reset_loop_stats",
+      "req_id": 57,
+      "tag": 66,
+      "wire": [
+        66,
+        57
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "HOME",
+      "file": "cmd_home.bin",
+      "idempotency_key": 81985529216486895,
+      "kind": "command",
+      "name": "cmd_home",
+      "req_id": 70,
+      "tag": 80,
+      "wire": [
+        80,
+        70,
+        81985529216486895
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_J",
+      "file": "cmd_move_j.bin",
+      "idempotency_key": 101,
+      "kind": "command",
+      "name": "cmd_move_j",
+      "req_id": 71,
+      "tag": 81,
+      "wire": [
+        81,
+        71,
+        101,
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        null,
+        0.5,
+        0.75,
+        null,
+        false
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_J",
+      "file": "cmd_move_j_duration.bin",
+      "idempotency_key": 102,
+      "kind": "command",
+      "name": "cmd_move_j_duration",
+      "req_id": 72,
+      "tag": 81,
+      "wire": [
+        81,
+        72,
+        102,
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        2.5,
+        null,
+        null,
+        null,
+        true
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_J_POSE",
+      "file": "cmd_move_j_pose.bin",
+      "idempotency_key": 103,
+      "kind": "command",
+      "name": "cmd_move_j_pose",
+      "req_id": 73,
+      "tag": 82,
+      "wire": [
+        82,
+        73,
+        103,
+        [
+          250.0,
+          -10.5,
+          180.0,
+          0.0,
+          90.0,
+          179.5
+        ],
+        null,
+        0.9,
+        null,
+        10.0
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_L",
+      "file": "cmd_move_l.bin",
+      "idempotency_key": 104,
+      "kind": "command",
+      "name": "cmd_move_l",
+      "req_id": 74,
+      "tag": 83,
+      "wire": [
+        83,
+        74,
+        104,
+        [
+          250.0,
+          -10.5,
+          180.0,
+          0.0,
+          90.0,
+          179.5
+        ],
+        0,
+        null,
+        0.4,
+        0.5,
+        5.0,
+        true
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_C",
+      "file": "cmd_move_c.bin",
+      "idempotency_key": 105,
+      "kind": "command",
+      "name": "cmd_move_c",
+      "req_id": 75,
+      "tag": 84,
+      "wire": [
+        84,
+        75,
+        105,
+        [
+          200.0,
+          50.0,
+          150.0,
+          0.0,
+          90.0,
+          0.0
+        ],
+        [
+          250.0,
+          -10.5,
+          180.0,
+          0.0,
+          90.0,
+          179.5
+        ],
+        0,
+        3.0,
+        null,
+        null,
+        null
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_S",
+      "file": "cmd_move_s.bin",
+      "idempotency_key": 106,
+      "kind": "command",
+      "name": "cmd_move_s",
+      "req_id": 76,
+      "tag": 85,
+      "wire": [
+        85,
+        76,
+        106,
+        [
+          [
+            250.0,
+            0.0,
+            180.0,
+            0.0,
+            90.0,
+            0.0
+          ],
+          [
+            260.0,
+            10.0,
+            190.0,
+            0.0,
+            90.0,
+            0.0
+          ],
+          [
+            270.0,
+            0.0,
+            200.0,
+            0.0,
+            90.0,
+            0.0
+          ]
+        ],
+        0,
+        null,
+        0.6,
+        null
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "MOVE_P",
+      "file": "cmd_move_p.bin",
+      "idempotency_key": 107,
+      "kind": "command",
+      "name": "cmd_move_p",
+      "req_id": 77,
+      "tag": 86,
+      "wire": [
+        86,
+        77,
+        107,
+        [
+          [
+            250.0,
+            0.0,
+            180.0,
+            0.0,
+            90.0,
+            0.0
+          ],
+          [
+            250.0,
+            100.0,
+            180.0,
+            0.0,
+            90.0,
+            0.0
+          ]
+        ],
+        1,
+        null,
+        0.3,
+        0.4
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "SELECT_TOOL",
+      "file": "cmd_select_tool.bin",
+      "idempotency_key": 108,
+      "kind": "command",
+      "name": "cmd_select_tool",
+      "req_id": 78,
+      "tag": 87,
+      "wire": [
+        87,
+        78,
+        108,
+        "SSG48",
+        "fin_ray"
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "SELECT_TOOL",
+      "file": "cmd_select_tool_default_variant.bin",
+      "idempotency_key": 109,
+      "kind": "command",
+      "name": "cmd_select_tool_default_variant",
+      "req_id": 79,
+      "tag": 87,
+      "wire": [
+        87,
+        79,
+        109,
+        "MSG",
+        null
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "DELAY",
+      "file": "cmd_delay.bin",
+      "idempotency_key": 110,
+      "kind": "command",
+      "name": "cmd_delay",
+      "req_id": 80,
+      "tag": 88,
+      "wire": [
+        88,
+        80,
+        110,
+        0.5
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "CHECKPOINT",
+      "file": "cmd_checkpoint.bin",
+      "idempotency_key": 111,
+      "kind": "command",
+      "name": "cmd_checkpoint",
+      "req_id": 81,
+      "tag": 89,
+      "wire": [
+        89,
+        81,
+        111,
+        "step-1"
+      ]
+    },
+    {
+      "class": "QUEUED",
+      "cmd": "TOOL_ACTION",
+      "file": "cmd_tool_action.bin",
+      "idempotency_key": 112,
+      "kind": "command",
+      "name": "cmd_tool_action",
+      "req_id": 82,
+      "tag": 90,
+      "wire": [
+        90,
+        82,
+        112,
+        "SSG48",
+        "move",
+        [
+          25.5,
+          80,
+          true,
+          "soft"
+        ]
+      ]
+    },
+    {
+      "file": "reply_ok.bin",
+      "kind": "reply",
+      "msg": "OK",
+      "name": "reply_ok",
+      "wire": [
+        1,
+        42
+      ]
+    },
+    {
+      "file": "reply_ok_index.bin",
+      "kind": "reply",
+      "msg": "OK",
+      "name": "reply_ok_index",
+      "wire": [
+        1,
+        43,
+        7
+      ]
+    },
+    {
+      "file": "reply_error.bin",
+      "kind": "reply",
+      "msg": "ERROR",
+      "name": "reply_error",
+      "wire": [
+        2,
+        44,
+        [
+          5,
+          10,
+          "IK: target unreachable",
+          "No valid IK solution exists for the target pose. Target [520.0, 0.0, 130.0] mm.",
+          "Motion command rejected; pipeline halted.",
+          "Verify the target lies inside the workspace, or try a different orientation."
+        ]
+      ]
+    },
+    {
+      "file": "reply_complete_ok.bin",
+      "kind": "reply",
+      "msg": "COMPLETE",
+      "name": "reply_complete_ok",
+      "wire": [
+        5,
+        0,
+        7,
+        true
+      ]
+    },
+    {
+      "file": "reply_complete_error.bin",
+      "kind": "reply",
+      "msg": "COMPLETE",
+      "name": "reply_complete_error",
+      "wire": [
+        5,
+        0,
+        8,
+        false,
+        [
+          8,
+          36,
+          "Settle timeout",
+          "Measured position did not settle on target within the window (max residual 0.02 rad).",
+          "Command completed with error under the strict policy.",
+          "Check for mechanical obstruction, or relax the completion policy."
+        ]
+      ]
+    },
+    {
+      "file": "response_ping.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/PING",
+      "name": "response_ping",
+      "wire": [
+        4,
+        100,
+        [
+          1,
+          true
+        ]
+      ]
+    },
+    {
+      "file": "response_status.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/STATUS",
+      "name": "response_status",
+      "wire": [
+        4,
+        101,
+        [
+          2,
+          [
+            1.0,
+            0.0,
+            0.0,
+            250.5,
+            0.0,
+            1.0,
+            0.0,
+            -10.25,
+            0.0,
+            0.0,
+            1.0,
+            300.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ],
+          [
+            10.0,
+            -20.25,
+            30.5,
+            0.0,
+            45.0,
+            -90.0
+          ],
+          [
+            0.1,
+            -0.2,
+            0.0,
+            0.3,
+            0.0,
+            0.05
+          ],
+          [
+            1,
+            0,
+            1,
+            0,
+            0
+          ],
+          [
+            "SSG48",
+            2,
+            true,
+            false,
+            0,
+            [
+              12.5
+            ],
+            [
+              0.0,
+              3.3
+            ],
+            "fin_ray"
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_angles.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/ANGLES",
+      "name": "response_angles",
+      "wire": [
+        4,
+        102,
+        [
+          3,
+          [
+            10.0,
+            -20.25,
+            30.5,
+            0.0,
+            45.0,
+            -90.0
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_pose.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/POSE",
+      "name": "response_pose",
+      "wire": [
+        4,
+        103,
+        [
+          4,
+          [
+            1.0,
+            0.0,
+            0.0,
+            250.5,
+            0.0,
+            1.0,
+            0.0,
+            -10.25,
+            0.0,
+            0.0,
+            1.0,
+            300.0,
+            0.0,
+            0.0,
+            0.0,
+            1.0
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_io.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/IO",
+      "name": "response_io",
+      "wire": [
+        4,
+        104,
+        [
+          5,
+          [
+            1,
+            1,
+            0,
+            0,
+            0
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_speeds.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/SPEEDS",
+      "name": "response_speeds",
+      "wire": [
+        4,
+        105,
+        [
+          6,
+          [
+            0.0,
+            0.0,
+            0.1,
+            0.0,
+            -0.1,
+            0.0
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_tools.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/TOOLS",
+      "name": "response_tools",
+      "wire": [
+        4,
+        106,
+        [
+          7,
+          "SSG48",
+          [
+            "SSG48",
+            "MSG"
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_queue.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/QUEUE",
+      "name": "response_queue",
+      "wire": [
+        4,
+        107,
+        [
+          8,
+          [
+            "MOVE_J",
+            "DELAY"
+          ],
+          4,
+          3,
+          "pick",
+          2.5
+        ]
+      ]
+    },
+    {
+      "file": "response_activity.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/ACTIVITY",
+      "name": "response_activity",
+      "wire": [
+        4,
+        108,
+        [
+          9,
+          "MOVE_L",
+          1,
+          "DELAY",
+          "pose=[250.0, -10.5, 180.0]"
+        ]
+      ]
+    },
+    {
+      "file": "response_loop_stats.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/LOOP_STATS",
+      "name": "response_loop_stats",
+      "wire": [
+        4,
+        109,
+        [
+          10,
+          250.0,
+          100000,
+          3,
+          0.004,
+          0.0001,
+          0.0038,
+          0.0061,
+          0.0042,
+          0.0044,
+          249.9
+        ]
+      ]
+    },
+    {
+      "file": "response_profile.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/PROFILE",
+      "name": "response_profile",
+      "wire": [
+        4,
+        110,
+        [
+          11,
+          "TOPPRA"
+        ]
+      ]
+    },
+    {
+      "file": "response_reachable.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/REACHABLE",
+      "name": "response_reachable",
+      "wire": [
+        4,
+        111,
+        [
+          12,
+          [
+            1,
+            1,
+            1,
+            1,
+            0,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            1
+          ],
+          [
+            1,
+            1,
+            1,
+            1,
+            1,
+            1,
+            0,
+            0,
+            1,
+            1,
+            1,
+            1
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_error_none.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/ERROR",
+      "name": "response_error_none",
+      "wire": [
+        4,
+        112,
+        [
+          13,
+          null
+        ]
+      ]
+    },
+    {
+      "file": "response_error_active.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/ERROR",
+      "name": "response_error_active",
+      "wire": [
+        4,
+        113,
+        [
+          13,
+          [
+            -1,
+            51,
+            "E-stop active",
+            "The emergency stop is engaged.",
+            "All motion stopped; queue cleared.",
+            "Release the e-stop, then send reset."
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_tcp_speed.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/TCP_SPEED",
+      "name": "response_tcp_speed",
+      "wire": [
+        4,
+        114,
+        [
+          14,
+          12.5
+        ]
+      ]
+    },
+    {
+      "file": "response_tcp_offset.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/TCP_OFFSET",
+      "name": "response_tcp_offset",
+      "wire": [
+        4,
+        115,
+        [
+          15,
+          0.0,
+          0.0,
+          35.5
+        ]
+      ]
+    },
+    {
+      "file": "response_tool_status.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/TOOL_STATUS",
+      "name": "response_tool_status",
+      "wire": [
+        4,
+        116,
+        [
+          16,
+          [
+            "SSG48",
+            2,
+            true,
+            false,
+            0,
+            [
+              12.5
+            ],
+            [
+              0.0,
+              3.3
+            ],
+            "fin_ray"
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_is_simulator.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/IS_SIMULATOR",
+      "name": "response_is_simulator",
+      "wire": [
+        4,
+        117,
+        [
+          17,
+          true
+        ]
+      ]
+    },
+    {
+      "file": "response_shapes.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/SHAPES",
+      "name": "response_shapes",
+      "wire": [
+        4,
+        118,
+        [
+          18,
+          [
+            [
+              "box",
+              [
+                400.0,
+                600.0,
+                20.0
+              ],
+              [
+                0.0,
+                0.0,
+                -10.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              true,
+              5.0,
+              "table"
+            ]
+          ],
+          [
+            [
+              "sphere",
+              [
+                50.0
+              ],
+              [
+                120.0,
+                80.0,
+                200.0,
+                0.0,
+                0.0,
+                0.0
+              ],
+              false,
+              null,
+              "camera"
+            ]
+          ],
+          3
+        ]
+      ]
+    },
+    {
+      "fields": {
+        "accepted_index": 14,
+        "action_current": "MOVE_L",
+        "action_params": "pose=[250.0, -10.5, 180.0]",
+        "action_state": 1,
+        "angles": [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        "cart_en_trf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "cart_en_wrf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "collision_active": true,
+        "collision_pairs": [
+          [
+            "lower_arm",
+            "table"
+          ]
+        ],
+        "completed_index": 11,
+        "controller_id": 12648430,
+        "data_age_ms": 4,
+        "error": [
+          12,
+          53,
+          "Collision predicted",
+          "The planned configuration collides at sample 140 of 500: [lower_arm, table]",
+          "Motion command rejected before dispatch.",
+          "Choose a different target or add intermediate waypoints."
+        ],
+        "executing_index": 12,
+        "homed": true,
+        "io": [
+          1,
+          0,
+          1,
+          1,
+          0
+        ],
+        "joint_en": [
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "last_checkpoint": "approach",
+        "link_ok": 1,
+        "mono_time_ns": 3600000000123,
+        "pose": [
+          1.0,
+          0.0,
+          0.0,
+          250.5,
+          0.0,
+          1.0,
+          0.0,
+          -10.25,
+          0.0,
+          0.0,
+          1.0,
+          300.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "proto_version": 2,
+        "queued_duration": 4.75,
+        "queued_segments": 3,
+        "scene_epoch": 5,
+        "seq": 123456789,
+        "simulator_active": true,
+        "speeds": [
+          0.1,
+          -0.2,
+          0.0,
+          0.3,
+          0.0,
+          0.05
+        ],
+        "tcp_speed": 33.25,
+        "tool_status": [
+          "SSG48",
+          2,
+          true,
+          false,
+          0,
+          [
+            12.5
+          ],
+          [
+            0.0,
+            3.3
+          ],
+          "fin_ray"
+        ]
+      },
+      "file": "status_full.bin",
+      "kind": "status",
+      "name": "status_full",
+      "wire": [
+        3,
+        2,
+        12648430,
+        123456789,
+        3600000000123,
+        1,
+        4,
+        [
+          1.0,
+          0.0,
+          0.0,
+          250.5,
+          0.0,
+          1.0,
+          0.0,
+          -10.25,
+          0.0,
+          0.0,
+          1.0,
+          300.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        [
+          0.1,
+          -0.2,
+          0.0,
+          0.3,
+          0.0,
+          0.05
+        ],
+        [
+          1,
+          0,
+          1,
+          1,
+          0
+        ],
+        "MOVE_L",
+        1,
+        [
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        12,
+        11,
+        "approach",
+        [
+          12,
+          53,
+          "Collision predicted",
+          "The planned configuration collides at sample 140 of 500: [lower_arm, table]",
+          "Motion command rejected before dispatch.",
+          "Choose a different target or add intermediate waypoints."
+        ],
+        3,
+        4.75,
+        "pose=[250.0, -10.5, 180.0]",
+        [
+          "SSG48",
+          2,
+          true,
+          false,
+          0,
+          [
+            12.5
+          ],
+          [
+            0.0,
+            3.3
+          ],
+          "fin_ray"
+        ],
+        33.25,
+        true,
+        true,
+        [
+          [
+            "lower_arm",
+            "table"
+          ]
+        ],
+        5,
+        14,
+        true
+      ]
+    },
+    {
+      "fields": {
+        "accepted_index": -1,
+        "action_current": "",
+        "action_params": "",
+        "action_state": 0,
+        "angles": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "cart_en_trf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "cart_en_wrf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "collision_active": false,
+        "collision_pairs": [],
+        "completed_index": -1,
+        "controller_id": 0,
+        "data_age_ms": 0,
+        "error": null,
+        "executing_index": -1,
+        "homed": false,
+        "io": [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "joint_en": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "last_checkpoint": "",
+        "link_ok": 0,
+        "mono_time_ns": 0,
+        "pose": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "proto_version": 2,
+        "queued_duration": 0.0,
+        "queued_segments": 0,
+        "scene_epoch": 0,
+        "seq": 0,
+        "simulator_active": false,
+        "speeds": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "tcp_speed": 0.0,
+        "tool_status": null
+      },
+      "file": "status_idle.bin",
+      "kind": "status",
+      "name": "status_idle",
+      "wire": [
+        3,
+        2,
+        0,
+        0,
+        0,
+        0,
+        0,
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        [
+          0,
+          0,
+          0,
+          0,
+          0
+        ],
+        "",
+        0,
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        -1,
+        -1,
+        "",
+        null,
+        0,
+        0.0,
+        "",
+        null,
+        0.0,
+        false,
+        false,
+        [],
+        0,
+        -1,
+        false
+      ]
+    },
+    {
+      "fields": {
+        "accepted_index": 14,
+        "action_current": "MOVE_L",
+        "action_params": "pose=[250.0, -10.5, 180.0]",
+        "action_state": 1,
+        "angles": [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        "cart_en_trf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        "cart_en_wrf": [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "collision_active": true,
+        "collision_pairs": [
+          [
+            "lower_arm",
+            "table"
+          ]
+        ],
+        "completed_index": 11,
+        "controller_id": 12648430,
+        "data_age_ms": 4,
+        "error": [
+          12,
+          53,
+          "Collision predicted",
+          "The planned configuration collides at sample 140 of 500: [lower_arm, table]",
+          "Motion command rejected before dispatch.",
+          "Choose a different target or add intermediate waypoints."
+        ],
+        "executing_index": 12,
+        "homed": true,
+        "io": [
+          1,
+          0,
+          1,
+          1,
+          0
+        ],
+        "joint_en": [
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        "last_checkpoint": "approach",
+        "link_ok": 1,
+        "mono_time_ns": 3600000000123,
+        "pose": [
+          1.0,
+          0.0,
+          0.0,
+          250.5,
+          0.0,
+          1.0,
+          0.0,
+          -10.25,
+          0.0,
+          0.0,
+          1.0,
+          300.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        "proto_version": 2,
+        "queued_duration": 4.75,
+        "queued_segments": 3,
+        "scene_epoch": 5,
+        "seq": 123456789,
+        "simulator_active": true,
+        "speeds": [
+          0.1,
+          -0.2,
+          0.0,
+          0.3,
+          0.0,
+          0.05
+        ],
+        "tcp_speed": 33.25,
+        "tool_status": [
+          "SSG48",
+          2,
+          true,
+          false,
+          0,
+          [
+            12.5
+          ],
+          [
+            0.0,
+            3.3
+          ],
+          "fin_ray"
+        ]
+      },
+      "file": "status_longer_tail.bin",
+      "kind": "status",
+      "name": "status_longer_tail",
+      "wire": [
+        3,
+        2,
+        12648430,
+        123456789,
+        3600000000123,
+        1,
+        4,
+        [
+          1.0,
+          0.0,
+          0.0,
+          250.5,
+          0.0,
+          1.0,
+          0.0,
+          -10.25,
+          0.0,
+          0.0,
+          1.0,
+          300.0,
+          0.0,
+          0.0,
+          0.0,
+          1.0
+        ],
+        [
+          10.0,
+          -20.25,
+          30.5,
+          0.0,
+          45.0,
+          -90.0
+        ],
+        [
+          0.1,
+          -0.2,
+          0.0,
+          0.3,
+          0.0,
+          0.05
+        ],
+        [
+          1,
+          0,
+          1,
+          1,
+          0
+        ],
+        "MOVE_L",
+        1,
+        [
+          1,
+          1,
+          1,
+          1,
+          0,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          1
+        ],
+        [
+          1,
+          1,
+          1,
+          1,
+          1,
+          1,
+          0,
+          0,
+          1,
+          1,
+          1,
+          1
+        ],
+        12,
+        11,
+        "approach",
+        [
+          12,
+          53,
+          "Collision predicted",
+          "The planned configuration collides at sample 140 of 500: [lower_arm, table]",
+          "Motion command rejected before dispatch.",
+          "Choose a different target or add intermediate waypoints."
+        ],
+        3,
+        4.75,
+        "pose=[250.0, -10.5, 180.0]",
+        [
+          "SSG48",
+          2,
+          true,
+          false,
+          0,
+          [
+            12.5
+          ],
+          [
+            0.0,
+            3.3
+          ],
+          "fin_ray"
+        ],
+        33.25,
+        true,
+        true,
+        [
+          [
+            "lower_arm",
+            "table"
+          ]
+        ],
+        5,
+        14,
+        true,
+        "future-field",
+        1.25
+      ]
+    },
+    {
+      "assembled_hex": "9855cd012cccc8dc001496cb406f400000000000cb0000000000000000cb4066800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f600000000000cb4000000000000000cb4066a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f800000000000cb4010000000000000cb4066c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fa00000000000cb4018000000000000cb4066e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fc00000000000cb4020000000000000cb4067000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fe00000000000cb4024000000000000cb4067200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070000000000000cb4028000000000000cb4067400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070100000000000cb402c000000000000cb4067600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070200000000000cb4030000000000000cb4067800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070300000000000cb4032000000000000cb4067a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070400000000000cb4034000000000000cb4067c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070500000000000cb4036000000000000cb4067e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070600000000000cb4038000000000000cb4068000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070700000000000cb403a000000000000cb4068200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070800000000000cb403c000000000000cb4068400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070900000000000cb403e000000000000cb4068600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070a00000000000cb4040000000000000cb4068800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070b00000000000cb4041000000000000cb4068a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070c00000000000cb4042000000000000cb4068c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070d00000000000cb4043000000000000cb4068e00000000000cb0000000000000000cb4056800000000000cb000000000000000000c0cb3fe0000000000000c0",
+      "file": "chunk_0.bin",
+      "index": 0,
+      "inner_cmd": "MOVE_S",
+      "kind": "chunk",
+      "name": "chunk_0",
+      "req_id": 300,
+      "total": 3,
+      "transfer_id": 77,
+      "wire": [
+        6,
+        300,
+        77,
+        0,
+        3,
+        {
+          "__bin__": "9855cd012cccc8dc001496cb406f400000000000cb0000000000000000cb4066800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f600000000000cb4000000000000000cb4066a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f800000000000cb4010000000000000cb4066c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fa00000000000cb4018000000000000cb4066e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fc00000000000cb4020000000000000cb4067000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fe00000000000cb4024000000000000cb4067200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070000000000000cb4028000000000000cb4067400000000000cb0000000000"
+        }
+      ]
+    },
+    {
+      "assembled_hex": "9855cd012cccc8dc001496cb406f400000000000cb0000000000000000cb4066800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f600000000000cb4000000000000000cb4066a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f800000000000cb4010000000000000cb4066c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fa00000000000cb4018000000000000cb4066e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fc00000000000cb4020000000000000cb4067000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fe00000000000cb4024000000000000cb4067200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070000000000000cb4028000000000000cb4067400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070100000000000cb402c000000000000cb4067600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070200000000000cb4030000000000000cb4067800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070300000000000cb4032000000000000cb4067a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070400000000000cb4034000000000000cb4067c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070500000000000cb4036000000000000cb4067e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070600000000000cb4038000000000000cb4068000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070700000000000cb403a000000000000cb4068200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070800000000000cb403c000000000000cb4068400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070900000000000cb403e000000000000cb4068600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070a00000000000cb4040000000000000cb4068800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070b00000000000cb4041000000000000cb4068a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070c00000000000cb4042000000000000cb4068c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070d00000000000cb4043000000000000cb4068e00000000000cb0000000000000000cb4056800000000000cb000000000000000000c0cb3fe0000000000000c0",
+      "file": "chunk_1.bin",
+      "index": 1,
+      "inner_cmd": "MOVE_S",
+      "kind": "chunk",
+      "name": "chunk_1",
+      "req_id": 300,
+      "total": 3,
+      "transfer_id": 77,
+      "wire": [
+        6,
+        300,
+        77,
+        1,
+        3,
+        {
+          "__bin__": "000000cb4056800000000000cb000000000000000096cb4070100000000000cb402c000000000000cb4067600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070200000000000cb4030000000000000cb4067800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070300000000000cb4032000000000000cb4067a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070400000000000cb4034000000000000cb4067c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070500000000000cb4036000000000000cb4067e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070600000000000cb4038000000000000cb4068000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070700000000000cb403a000000000000cb406820"
+        }
+      ]
+    },
+    {
+      "assembled_hex": "9855cd012cccc8dc001496cb406f400000000000cb0000000000000000cb4066800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f600000000000cb4000000000000000cb4066a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406f800000000000cb4010000000000000cb4066c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fa00000000000cb4018000000000000cb4066e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fc00000000000cb4020000000000000cb4067000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb406fe00000000000cb4024000000000000cb4067200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070000000000000cb4028000000000000cb4067400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070100000000000cb402c000000000000cb4067600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070200000000000cb4030000000000000cb4067800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070300000000000cb4032000000000000cb4067a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070400000000000cb4034000000000000cb4067c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070500000000000cb4036000000000000cb4067e00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070600000000000cb4038000000000000cb4068000000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070700000000000cb403a000000000000cb4068200000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070800000000000cb403c000000000000cb4068400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070900000000000cb403e000000000000cb4068600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070a00000000000cb4040000000000000cb4068800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070b00000000000cb4041000000000000cb4068a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070c00000000000cb4042000000000000cb4068c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070d00000000000cb4043000000000000cb4068e00000000000cb0000000000000000cb4056800000000000cb000000000000000000c0cb3fe0000000000000c0",
+      "file": "chunk_2.bin",
+      "index": 2,
+      "inner_cmd": "MOVE_S",
+      "kind": "chunk",
+      "name": "chunk_2",
+      "req_id": 300,
+      "total": 3,
+      "transfer_id": 77,
+      "wire": [
+        6,
+        300,
+        77,
+        2,
+        3,
+        {
+          "__bin__": "0000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070800000000000cb403c000000000000cb4068400000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070900000000000cb403e000000000000cb4068600000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070a00000000000cb4040000000000000cb4068800000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070b00000000000cb4041000000000000cb4068a00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070c00000000000cb4042000000000000cb4068c00000000000cb0000000000000000cb4056800000000000cb000000000000000096cb4070d00000000000cb4043000000000000cb4068e00000000000cb0000000000000000cb4056800000000000cb000000000000000000c0cb3fe0000000000000c0"
+        }
+      ]
+    },
+    {
+      "file": "malformed_unknown_tag.bin",
+      "kind": "malformed",
+      "name": "malformed_unknown_tag",
+      "reason": "tag 999 names no command",
+      "target": "command"
+    },
+    {
+      "file": "malformed_short_array.bin",
+      "kind": "malformed",
+      "name": "malformed_short_array",
+      "reason": "envelope has no req_id",
+      "target": "command"
+    },
+    {
+      "file": "malformed_reqid_type.bin",
+      "kind": "malformed",
+      "name": "malformed_reqid_type",
+      "reason": "req_id must be an unsigned int",
+      "target": "command"
+    },
+    {
+      "file": "malformed_reqid_negative.bin",
+      "kind": "malformed",
+      "name": "malformed_reqid_negative",
+      "reason": "req_id must be unsigned",
+      "target": "command"
+    },
+    {
+      "file": "malformed_param_type.bin",
+      "kind": "malformed",
+      "name": "malformed_param_type",
+      "reason": "write_io.port must be an unsigned int",
+      "target": "command"
+    },
+    {
+      "file": "malformed_param_range.bin",
+      "kind": "malformed",
+      "name": "malformed_param_range",
+      "reason": "write_io.port must be 0..=7",
+      "target": "command"
+    },
+    {
+      "file": "malformed_nan_param.bin",
+      "kind": "malformed",
+      "name": "malformed_nan_param",
+      "reason": "floats must be finite",
+      "target": "command"
+    },
+    {
+      "file": "malformed_both_timing.bin",
+      "kind": "malformed",
+      "name": "malformed_both_timing",
+      "reason": "duration and speed are mutually exclusive",
+      "target": "command"
+    },
+    {
+      "file": "malformed_missing_key.bin",
+      "kind": "malformed",
+      "name": "malformed_missing_key",
+      "reason": "queued commands carry an idempotency key",
+      "target": "command"
+    },
+    {
+      "file": "malformed_truncated.bin",
+      "kind": "malformed",
+      "name": "malformed_truncated",
+      "reason": "datagram cut mid-value",
+      "target": "command"
+    },
+    {
+      "file": "malformed_reply_unknown_tag.bin",
+      "kind": "malformed",
+      "name": "malformed_reply_unknown_tag",
+      "reason": "tag 99 names no message",
+      "target": "reply"
+    },
+    {
+      "file": "malformed_complete_reqid.bin",
+      "kind": "malformed",
+      "name": "malformed_complete_reqid",
+      "reason": "COMPLETE pushes use req_id 0",
+      "target": "reply"
+    },
+    {
+      "file": "malformed_status_short.bin",
+      "kind": "malformed",
+      "name": "malformed_status_short",
+      "reason": "v2 status has 31 elements",
+      "target": "status"
+    },
+    {
+      "file": "malformed_status_bad_field.bin",
+      "kind": "malformed",
+      "name": "malformed_status_bad_field",
+      "reason": "pose must be a float array",
+      "target": "status"
+    }
+  ]
+}
