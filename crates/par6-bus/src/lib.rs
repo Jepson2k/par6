@@ -29,6 +29,7 @@
 
 mod bus;
 mod loopback;
+pub mod sim;
 pub mod spectral;
 mod types;
 
