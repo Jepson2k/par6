@@ -82,6 +82,9 @@ fi
 cat > "$FFI_DIR/env.sh" <<EOF
 export PAR6_SHIM_LIB_DIR="$SHIM_PREFIX/lib"
 export PAR6_SHIM_INCLUDE_DIR="$SHIM_PREFIX/include"
+# Runtime loading for binaries whose package did not embed an rpath
+# (link-args don't propagate across cargo packages).
+export LD_LIBRARY_PATH="$SHIM_PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 EOF
 
 echo

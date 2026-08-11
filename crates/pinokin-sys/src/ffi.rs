@@ -62,6 +62,14 @@ extern "C" {
 
     pub fn par6_kin_gravity(h: *mut par6_kin, q: *const f64, out_tau: *mut f64) -> par6_status;
 
+    pub fn par6_kin_aba(
+        h: *mut par6_kin,
+        q: *const f64,
+        v: *const f64,
+        tau: *const f64,
+        out_a: *mut f64,
+    ) -> par6_status;
+
     /// Returns 1 (converged), 0 (iteration budget exhausted) or a negative
     /// `par6_status`. Pass `max_iters <= 0`, `tol <= 0`, `damping < 0` for
     /// the shim defaults (100, 1e-10, 1e-3).

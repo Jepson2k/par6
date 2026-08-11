@@ -148,6 +148,63 @@ fn ik_recovers_fixture_poses_from_perturbed_seeds() {
 }
 
 #[test]
+fn aba_inverts_fixture_gravity_and_probes_symmetric_inverse_inertia() {
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    let tool = ToolParams {
+        transform: fx.tool.transform,
+        mass: fx.tool.mass,
+        com: fx.tool.com,
+        inertia: fx.tool.inertia,
+    };
+    for (cases, tool, label) in [
+        (&fx.cases_flange, None, "flange"),
+        (&fx.cases_tool, Some(&tool), "tool"),
+    ] {
+        let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), tool).unwrap();
+        let nq = model.nq();
+        let zeros = vec![0.0; nq];
+        let mut a = vec![0.0; nq];
+        // ABA must invert the pin-referenced RNEA: applying exactly the
+        // fixture's gravity torque at rest holds the arm still (ddq = 0).
+        for (i, case) in cases.iter().enumerate() {
+            model.aba_into(&case.q, &zeros, &case.tau, &mut a).unwrap();
+            for (k, v) in a.iter().enumerate() {
+                assert!(
+                    v.abs() < 1e-6,
+                    "{label}[case {i}]: ddq[{k}] = {v:e} under gravity-compensating torque"
+                );
+            }
+        }
+        // Unit-torque probes around that equilibrium read out M(q)^-1,
+        // which physics requires to be symmetric positive-diagonal.
+        let case = &cases[0];
+        let mut minv = vec![vec![0.0; nq]; nq];
+        let mut a0 = vec![0.0; nq];
+        model.aba_into(&case.q, &zeros, &case.tau, &mut a0).unwrap();
+        for j in 0..nq {
+            let mut tau = case.tau.clone();
+            tau[j] += 1.0;
+            model.aba_into(&case.q, &zeros, &tau, &mut a).unwrap();
+            for i in 0..nq {
+                minv[i][j] = a[i] - a0[i];
+            }
+        }
+        let scale = minv.iter().flatten().fold(1.0f64, |m, v| m.max(v.abs()));
+        for (i, row) in minv.iter().enumerate() {
+            assert!(row[i] > 0.0, "{label}: M^-1[{i}][{i}] not positive");
+            for (j, v) in row.iter().enumerate().take(i) {
+                assert!(
+                    (v - minv[j][i]).abs() <= 1e-8 * scale,
+                    "{label}: M^-1 asymmetric at ({i},{j}): {v} vs {}",
+                    minv[j][i]
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn create_reports_urdf_and_frame_errors() {
     let root = repo_root();
     let err = Model::from_urdf(&root.join("does-not-exist.urdf"), None, None).unwrap_err();

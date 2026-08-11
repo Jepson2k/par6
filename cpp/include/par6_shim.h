@@ -76,6 +76,12 @@ par6_status par6_kin_jacobian(par6_kin *h, const double *q, double *out_J);
  * tool inertia when given at create. out_tau: nq doubles. */
 par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau);
 
+/* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
+ * the tool inertia when given at create. q/v/tau: nq doubles each;
+ * out_a: nq doubles. Allocation-free after create. */
+par6_status par6_kin_aba(par6_kin *h, const double *q, const double *v,
+                         const double *tau, double *out_a);
+
 /* Seeded damped-least-squares IK.
  * Iterates q += J^T (J J^T + damping^2 I)^-1 e from q_seed toward
  * target_pose16 (row-major 4x4, same frame as par6_kin_fk output).

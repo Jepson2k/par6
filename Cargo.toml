@@ -10,6 +10,9 @@ members = [
     "crates/par6-server",
     "crates/par6d",
 ]
+# pinokin-sys stays a standalone workspace (its ffi build needs the C++
+# toolchain); par6-bus reaches it via an optional path dependency.
+exclude = ["crates/pinokin-sys"]
 
 [workspace.package]
 version = "0.1.0"

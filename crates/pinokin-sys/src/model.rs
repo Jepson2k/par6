@@ -216,6 +216,31 @@ impl Model {
         Ok(out)
     }
 
+    /// Forward dynamics: joint accelerations `ddq = ABA(q, v, tau)`
+    /// (including the tool inertia when given at construction) into `out`.
+    pub fn aba_into(
+        &mut self,
+        q: &[f64],
+        v: &[f64],
+        tau: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), Error> {
+        self.check_len(q, self.nq)?;
+        self.check_len(v, self.nq)?;
+        self.check_len(tau, self.nq)?;
+        self.check_len(out, self.nq)?;
+        let status = unsafe {
+            ffi::par6_kin_aba(
+                self.raw.as_ptr(),
+                q.as_ptr(),
+                v.as_ptr(),
+                tau.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        Self::check_status(status)
+    }
+
     /// Seeded damped-least-squares IK toward `target` (row-major 4x4, same
     /// frame as [`Model::fk`]). Writes the final iterate into `out_q` either
     /// way; returns `Ok(true)` on convergence, `Ok(false)` when the iteration

@@ -4,7 +4,7 @@
 //! Two layers:
 //! - [`ffi`]: raw `extern "C"` declarations mirroring `cpp/include/par6_shim.h`.
 //! - [`Model`]: a minimal safe wrapper (create / fk / jacobian / gravity /
-//!   ik_step) with dimension checking and RAII.
+//!   aba / ik_step) with dimension checking and RAII.
 //!
 //! Everything is gated behind the `ffi` feature (default off) so plain
 //! `cargo check` succeeds without the C++ toolchain. Build the shim with

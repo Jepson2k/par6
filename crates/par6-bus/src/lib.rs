@@ -20,15 +20,17 @@
 //!   round-robin telemetry poll + device-info sweep, boot config pacing,
 //!   send errors PROPAGATED (vendor swallowed them — known production bug
 //!   class).
-//! - Sim backend (future issue, closed loop): virtual Spectral drivers
+//! - Sim backend ([`sim::SimBus`], closed loop): virtual Spectral drivers
 //!   (cascade PID/PD from real config gains, current saturation, kt,
-//!   watchdog) + Pinocchio ABA forward dynamics + friction + endstop
-//!   torques → encoder ticks at fixed dt. Homing stall/current detection
-//!   works for real in CI. Tier 2 (feature `mujoco`): MuJoCo backend on
-//!   the vendor MJCF.
+//!   watchdog) in front of a rate-limited kinematic plant with endstop /
+//!   windup / hall emulation — or, behind feature `sim-dynamics`,
+//!   Pinocchio ABA forward dynamics + friction + endstop torques —
+//!   → encoder ticks at fixed dt. Homing stall/current detection works
+//!   for real in CI.
 
 mod bus;
 mod loopback;
+pub mod sim;
 pub mod spectral;
 mod types;
 
