@@ -9,8 +9,8 @@ repository.workspace = true
 [dependencies]
 par6-proto = { workspace = true }
 par6-config = { workspace = true }
-par6-motion = { workspace = true }
+par6-rt = { workspace = true }
 tokio = { workspace = true }
+serde = { workspace = true }
 rmp-serde = { workspace = true }
-thiserror = { workspace = true }
 log = { workspace = true }
