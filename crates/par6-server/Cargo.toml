@@ -1,0 +1,16 @@
+[package]
+name = "par6-server"
+description = "Command plane: UDP protocol server, gating table, queue, index allocator, status/telemetry broadcast."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+par6-proto = { workspace = true }
+par6-config = { workspace = true }
+par6-motion = { workspace = true }
+tokio = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }
+log = { workspace = true }

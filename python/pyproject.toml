@@ -1,0 +1,30 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "par6"
+version = "0.1.0"
+description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+  "numpy>=2.0,<2.5",
+  "msgspec>=0.18",
+  "ormsgpack>=1.4.0",
+  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.7.0",
+]
+
+[project.optional-dependencies]
+dev = ["ruff", "ty", "pytest", "pytest-asyncio", "pytest-timeout"]
+
+[project.entry-points."waldoctl.robots"]
+par6 = "par6.robot:Robot"
+
+[tool.setuptools.packages.find]
+include = ["par6*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-markers --strict-config -ra --junitxml=test-results.xml"
+timeout = 45

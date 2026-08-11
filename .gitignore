@@ -1,0 +1,7 @@
+/target
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+dist/
+test-results.xml
