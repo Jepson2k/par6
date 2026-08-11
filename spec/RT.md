@@ -163,3 +163,16 @@ commanded, target variants), gravity torque, motor telemetry (temp/voltage/error
 homing status, error latch, loop timing stats (EMA + p50/p90/p99/max + overruns +
 CAN frame age max/min), mode/state/homed, jog/exec/stream live state.
 Vendor invariant to keep: measured-state has exactly ONE writer (the RT thread).
+
+## Implementation findings (P1.D)
+
+- **Jog s-curve lookahead must include current-acceleration reversal terms**:
+  stopping distance `v²/2a + v·a₀/j + a₀³/3j²` with peak velocity `v + a₀²/2j`
+  (reduces to the vendor's `v²/2a + v·a/2j` at a₀=0). Without them a limit trip
+  firing mid-ramp overshoots the soft limit by >1 rad at PAR6 J0 numbers.
+- `Sample`/`SampleMeta` are mirrored in par6-motion (par6-rt depends on
+  par6-motion, so the ring types can't be imported without a cycle); a dev-dep
+  conformance test pins the mirror field-for-field. Candidate cleanup: move the
+  sample types to a leaf crate.
+- Planned-move `tau_ff` is zero until inertial feedforward lands with dynamics;
+  gravity remains RT-side by contract.
