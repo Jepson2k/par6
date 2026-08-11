@@ -1,0 +1,184 @@
+//! Conformance: the C++ shim must reproduce the pip `pin` (Pinocchio Python)
+//! reference numerics on the PAR6 URDF to 1e-9 absolute.
+//!
+//! Fixtures come from `scripts/ffi/gen_fixtures.py`; regenerate with the
+//! pinned `pin` version whenever the sampled set or tool params change.
+#![cfg(feature = "ffi")]
+
+use std::path::PathBuf;
+
+use serde::Deserialize;
+
+use pinokin_sys::{ffi, IkOptions, Model, ToolParams};
+
+const TOL: f64 = 1e-9;
+
+#[derive(Deserialize)]
+struct Fixture {
+    pin_version: String,
+    urdf: String,
+    ee_frame: String,
+    tool: ToolFixture,
+    cases_flange: Vec<Case>,
+    cases_tool: Vec<Case>,
+}
+
+#[derive(Deserialize)]
+struct ToolFixture {
+    transform: [f64; 16],
+    mass: f64,
+    com: [f64; 3],
+    inertia: [f64; 6],
+}
+
+#[derive(Deserialize)]
+struct Case {
+    q: Vec<f64>,
+    fk: Vec<f64>,
+    jac: Vec<f64>,
+    tau: Vec<f64>,
+}
+
+fn repo_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()
+        .unwrap()
+}
+
+fn load_fixture() -> Fixture {
+    let path =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/par6_flange_pin.json");
+    let json = std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("cannot read {path:?}: {e}; run scripts/ffi/gen_fixtures.py"));
+    serde_json::from_str(&json).expect("fixture JSON schema mismatch")
+}
+
+fn assert_close(label: &str, case_idx: usize, got: &[f64], want: &[f64]) {
+    assert_eq!(got.len(), want.len(), "{label}[{case_idx}] length");
+    for (i, (g, w)) in got.iter().zip(want).enumerate() {
+        assert!(
+            (g - w).abs() <= TOL,
+            "{label}[case {case_idx}][{i}]: got {g:.15e}, want {w:.15e}, \
+             diff {:.3e} > {TOL:.0e}",
+            (g - w).abs()
+        );
+    }
+}
+
+fn check_cases(model: &mut Model, cases: &[Case], label: &str) {
+    let nq = model.nq();
+    let mut jac = vec![0.0; 6 * nq];
+    let mut tau = vec![0.0; nq];
+    for (i, case) in cases.iter().enumerate() {
+        let pose = model.fk(&case.q).unwrap();
+        assert_close(&format!("{label}.fk"), i, &pose, &case.fk);
+        model.jacobian_into(&case.q, &mut jac).unwrap();
+        assert_close(&format!("{label}.jac"), i, &jac, &case.jac);
+        model.gravity_into(&case.q, &mut tau).unwrap();
+        assert_close(&format!("{label}.tau"), i, &tau, &case.tau);
+    }
+}
+
+#[test]
+fn matches_pin_reference_on_par6_urdf() {
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    assert!(urdf.exists(), "URDF missing: {urdf:?}");
+
+    // Bare flange model.
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), None)
+        .unwrap_or_else(|e| panic!("create failed (pin fixture v{}): {e}", fx.pin_version));
+    assert_eq!(model.nq(), 6);
+    check_cases(&mut model, &fx.cases_flange, "flange");
+
+    // Same model with the fixture's rigid tool (transform + inertia): fk/jac
+    // shift to the tool frame, gravity picks up the tool per spec/RT.md.
+    let tool = ToolParams {
+        transform: fx.tool.transform,
+        mass: fx.tool.mass,
+        com: fx.tool.com,
+        inertia: fx.tool.inertia,
+    };
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), Some(&tool)).unwrap();
+    check_cases(&mut model, &fx.cases_tool, "tool");
+}
+
+#[test]
+fn ik_recovers_fixture_poses_from_perturbed_seeds() {
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), None).unwrap();
+    let nq = model.nq();
+
+    let mut solved = 0usize;
+    for case in fx.cases_flange.iter().take(8) {
+        let target: [f64; 16] = case.fk.clone().try_into().unwrap();
+        // Perturb the known solution; DLS should walk back to the pose
+        // (possibly via a different q — pose error is what matters).
+        let seed: Vec<f64> = case
+            .q
+            .iter()
+            .enumerate()
+            .map(|(i, v)| v + 0.15 * if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+        let mut q_out = vec![0.0; nq];
+        let opts = IkOptions {
+            max_iters: 200,
+            tol: 1e-16, // |e|^2, so pose error ~1e-8 — tighter than the assert
+            ..IkOptions::default()
+        };
+        let converged = model.ik_step(&seed, &target, &mut q_out, opts).unwrap();
+        if !converged {
+            continue;
+        }
+        solved += 1;
+        let pose = model.fk(&q_out).unwrap();
+        for (g, w) in pose.iter().zip(&target) {
+            assert!(
+                (g - w).abs() < 1e-6,
+                "converged IK pose mismatch: {g} vs {w}"
+            );
+        }
+    }
+    assert!(
+        solved >= 6,
+        "DLS IK should recover most mildly-perturbed poses, solved {solved}/8"
+    );
+}
+
+#[test]
+fn create_reports_urdf_and_frame_errors() {
+    let root = repo_root();
+    let err = Model::from_urdf(&root.join("does-not-exist.urdf"), None, None).unwrap_err();
+    match err {
+        pinokin_sys::Error::Create(msg) => assert!(!msg.is_empty()),
+        other => panic!("expected Create error, got {other:?}"),
+    }
+
+    let fx = load_fixture();
+    let err = Model::from_urdf(&root.join(&fx.urdf), Some("no_such_frame"), None).unwrap_err();
+    match err {
+        pinokin_sys::Error::Create(msg) => {
+            assert!(msg.contains("no_such_frame"), "unhelpful message: {msg}")
+        }
+        other => panic!("expected Create error, got {other:?}"),
+    }
+}
+
+#[test]
+fn toppra_entry_points_are_reserved_not_faked() {
+    // The traj API must refuse to pretend: creation yields no handle and
+    // every status query reports NOT_IMPLEMENTED.
+    unsafe {
+        let h = ffi::par6_traj_create(std::ptr::null(), 0, 0, std::ptr::null(), std::ptr::null());
+        assert!(h.is_null());
+        assert_eq!(ffi::par6_traj_status(h), ffi::PAR6_ERR_NOT_IMPLEMENTED);
+        let mut d = 0.0f64;
+        assert_eq!(
+            ffi::par6_traj_duration(h, &mut d),
+            ffi::PAR6_ERR_NOT_IMPLEMENTED
+        );
+    }
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 1);
+}
