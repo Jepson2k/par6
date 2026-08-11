@@ -1,21 +1,34 @@
 #!/usr/bin/env python3
-"""Generate kinematics/dynamics fixtures for the pinokin-sys conformance test.
+"""Generate kinematics/dynamics fixtures for the Rust FFI conformance tests.
 
-Uses the pip `pin` package (Pinocchio's official Python bindings — the same
-numerics stack the C++ shim links) as the independent reference:
+Two fixture sets, one numerics stack:
 
-    pip install pin==4.1.0
-    python scripts/ffi/gen_fixtures.py
+1. crates/pinokin-sys/tests/fixtures/par6_flange_pin.json — the raw-shim
+   conformance set (flange URDF, bare + synthetic rigid tool), generated
+   with the pip `pin` package (Pinocchio's official Python bindings, the
+   same library the C++ shim links):
 
-Writes JSON to crates/pinokin-sys/tests/fixtures/par6_flange_pin.json:
-fk pose (row-major 4x4), LOCAL_WORLD_ALIGNED jacobian ([linear; angular],
-row-major 6xnq) and gravity torque (RNEA at zero vel/acc) for N sampled
-configurations — once for the bare flange model and once with a rigid tool
-attached (transform + mass/com/inertia), mirroring spec/RT.md's gravity
-requirement (arm + active gripper tool link).
+       pip install pin==4.1.0
+       python scripts/ffi/gen_fixtures.py
 
-The Rust test (cargo test --features ffi) loads the same URDF through the
-C ABI shim and must match to 1e-9 absolute.
+2. tests/golden/kinematics/par6_{flange,msg,ssg48}.json — the par6-kin
+   golden set, one file per PAR6 URDF variant (assets/par6_description).
+   fk / jacobian / tcp-rpy come from `pinokin` (the Python client's
+   kinematics package: Robot.fkine / Robot.jacob0 / se3_rpy); gravity
+   comes from `pin` RNEA at zero vel/acc (pinokin exposes no dynamics).
+   The script asserts pinokin and pin agree on fk/jacobian before writing
+   anything, so the golden numbers are simultaneously the client's and
+   Pinocchio's.
+
+Per case: fk pose (row-major 4x4), LOCAL_WORLD_ALIGNED jacobian
+([linear; angular] rows, row-major, arm columns only), tcp pose
+[x y z, r p y] (intrinsic-XYZ rpy, pinokin.se3_rpy convention) and
+gravity torque for the arm joints, over N sampled arm configurations
+(gripper-variant jaw joints held at zero).
+
+The Rust tests (cargo test --features ffi, in pinokin-sys and par6-kin)
+load the same URDFs through the C ABI shim and must match to 1e-9
+absolute.
 """
 
 import json
@@ -23,6 +36,7 @@ from pathlib import Path
 
 import numpy as np
 import pinocchio as pin
+import pinokin
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 URDF_REL = "assets/par6_description/URDF/par6_flange/urdf/par6_flange.urdf"
@@ -109,6 +123,86 @@ def compute_cases(model: pin.Model, qs: np.ndarray, T_tool) -> list:
     return cases
 
 
+# --- par6-kin golden fixtures: one per URDF variant --------------------------
+
+ARM_NQ = 6
+CROSS_CHECK_TOL = 1e-12  # pinokin and pin wrap the same Pinocchio build
+
+# (fixture name, URDF path relative to assets/par6_description, tcp frame) —
+# must mirror par6-kin's GripperVariant table.
+VARIANTS = [
+    ("par6_flange", "URDF/par6_flange/urdf/par6_flange.urdf", "gripper"),
+    ("par6_msg", "URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf", "tcp"),
+    ("par6_ssg48", "URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf", "tcp"),
+]
+ASSETS_REL = "assets/par6_description"
+GOLDEN_DIR = "tests/golden/kinematics"
+
+
+def golden_cases(urdf_path: Path, ee_frame: str, qs_arm: np.ndarray) -> tuple:
+    """(nq_full, cases): pinokin fk/jac/tcp + pin gravity, cross-checked."""
+    robot = pinokin.Robot(str(urdf_path), ee_frame)
+    model = pin.buildModelFromUrdf(str(urdf_path))
+    data = model.createData()
+    fid = model.getFrameId(ee_frame)
+    nq_full = model.nq
+    assert robot.nq == nq_full
+    v0 = np.zeros(model.nv)
+
+    cases = []
+    for q_arm in qs_arm:
+        q = np.zeros(nq_full)
+        q[:ARM_NQ] = q_arm
+
+        T = np.ascontiguousarray(robot.fkine(q))
+        J_full = np.ascontiguousarray(robot.jacob0(q))
+        rpy = np.zeros(3)
+        pinokin.se3_rpy(T, rpy)
+
+        # pinokin must agree with pin before its numbers become golden.
+        pin.framesForwardKinematics(model, data, q)
+        T_pin = data.oMf[fid].homogeneous
+        J_pin = pin.computeFrameJacobian(model, data, q, fid, pin.LOCAL_WORLD_ALIGNED)
+        assert np.abs(T - T_pin).max() < CROSS_CHECK_TOL, "pinokin/pin fk mismatch"
+        assert np.abs(J_full - J_pin).max() < CROSS_CHECK_TOL, "pinokin/pin jacobian mismatch"
+        if nq_full > ARM_NQ:
+            # Passive jaw joints must not influence the tcp frame.
+            assert np.abs(J_full[:, ARM_NQ:]).max() == 0.0, "jaw columns nonzero"
+
+        tau = pin.rnea(model, data, q, v0, v0)
+        cases.append(
+            {
+                "q": q_arm.tolist(),
+                "fk": T.reshape(-1).tolist(),               # row-major 4x4
+                "tcp": [*T[:3, 3].tolist(), *rpy.tolist()],  # [x y z, r p y]
+                "jac": J_full[:, :ARM_NQ].reshape(-1).tolist(),  # row-major 6x6
+                "tau": tau[:ARM_NQ].tolist(),
+            }
+        )
+    return nq_full, cases
+
+
+def write_golden_fixtures() -> None:
+    rng = np.random.default_rng(SEED)
+    qs_arm = rng.uniform(-np.pi, np.pi, size=(N_CONFIGS, ARM_NQ))
+    out_dir = REPO_ROOT / GOLDEN_DIR
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for name, urdf_rel, ee_frame in VARIANTS:
+        urdf_path = REPO_ROOT / ASSETS_REL / urdf_rel
+        nq_full, cases = golden_cases(urdf_path, ee_frame, qs_arm)
+        fixture = {
+            "pin_version": pin.__version__,
+            "urdf": f"{ASSETS_REL}/{urdf_rel}",
+            "ee_frame": ee_frame,
+            "nq_full": nq_full,
+            "seed": SEED,
+            "cases": cases,
+        }
+        out = out_dir / f"{name}.json"
+        out.write_text(json.dumps(fixture, indent=1) + "\n")
+        print(f"wrote {out} (nq_full={nq_full}, {len(cases)} configs)")
+
+
 def main() -> None:
     urdf_path = REPO_ROOT / URDF_REL
     T_tool = tool_transform()
@@ -133,6 +227,8 @@ def main() -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(fixture, indent=1) + "\n")
     print(f"wrote {out} (pin {pin.__version__}, {N_CONFIGS} configs x 2 models)")
+
+    write_golden_fixtures()
 
 
 if __name__ == "__main__":

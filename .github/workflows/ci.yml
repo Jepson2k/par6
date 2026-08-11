@@ -41,6 +41,40 @@ jobs:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo check --workspace --target aarch64-unknown-linux-gnu
 
+  ffi:
+    name: ffi (pinocchio shim, x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ffi
+      - name: cache pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/env
+            .ffi/shim
+          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build shim (scripts/ffi/setup.sh)
+        run: scripts/ffi/setup.sh
+      - name: clippy (ffi feature)
+        run: |
+          source .ffi/env.sh
+          cargo clippy -p par6-kin --all-targets --features ffi -- -D warnings
+      - name: test par6-kin (golden kinematics fixtures)
+        run: |
+          source .ffi/env.sh
+          cargo test -p par6-kin --features ffi
+      - name: test pinokin-sys (shim conformance)
+        run: |
+          source .ffi/env.sh
+          cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+
   python:
     name: python ${{ matrix.python }}
     runs-on: ubuntu-latest
