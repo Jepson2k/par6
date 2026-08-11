@@ -1,0 +1,62 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    name: rust (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+      - name: fmt
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo fmt --all --check
+      - name: clippy
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: test
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: cargo test --workspace
+      - name: install cross linker
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      - name: cross check (aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+
+  python:
+    name: python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: pip install -e "python[dev]"
+      - name: ruff
+        run: ruff check python/
+      - name: pytest
+        working-directory: python
+        run: pytest

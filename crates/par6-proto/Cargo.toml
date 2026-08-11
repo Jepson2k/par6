@@ -1,0 +1,12 @@
+[package]
+name = "par6-proto"
+description = "Protocol v2: command/reply/status codec, enums, error catalog. Single source of truth; python mirror is generated."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+rmp-serde = { workspace = true }
+thiserror = { workspace = true }

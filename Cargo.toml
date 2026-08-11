@@ -1,0 +1,47 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/par6-proto",
+    "crates/par6-config",
+    "crates/par6-kin",
+    "crates/par6-motion",
+    "crates/par6-bus",
+    "crates/par6-rt",
+    "crates/par6-server",
+    "crates/par6d",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/Jepson2k/par6"
+rust-version = "1.85"
+
+[workspace.dependencies]
+par6-proto = { path = "crates/par6-proto" }
+par6-config = { path = "crates/par6-config" }
+par6-kin = { path = "crates/par6-kin" }
+par6-motion = { path = "crates/par6-motion" }
+par6-bus = { path = "crates/par6-bus" }
+par6-rt = { path = "crates/par6-rt" }
+par6-server = { path = "crates/par6-server" }
+
+serde = { version = "1", features = ["derive"] }
+rmp-serde = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
+socketcan = "3.6"
+thread-priority = "3"
+rsruckig = "3"
+toml = "0.8"
+thiserror = "2"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+
+[profile.release.package.par6d]
+debug = true

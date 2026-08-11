@@ -1,0 +1,16 @@
+[package]
+name = "par6d"
+description = "The runtime binary: config load, thread spawn/wiring. `par6d --sim` runs anywhere, including CI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+par6-config = { workspace = true }
+par6-bus = { workspace = true }
+par6-rt = { workspace = true }
+par6-server = { workspace = true }
+tokio = { workspace = true }
+env_logger = { workspace = true }
+log = { workspace = true }

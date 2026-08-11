@@ -1,0 +1,7 @@
+The contents of assets/par6_description/ are copied from
+https://github.com/Source-Robotics/PAR6-Collaborative-Robot-Arm
+("PAR6 Description" directory), Copyright Source Robotics,
+licensed under the Apache License, Version 2.0.
+
+Copied unmodified. Contains: URDF models (flange / MSG gripper / SSG48
+gripper variants), MJCF (MuJoCo) models and scene, and STL meshes.
