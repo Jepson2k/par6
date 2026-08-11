@@ -1,5 +1,5 @@
-/* par6_shim — C ABI over Pinocchio (kinematics/dynamics) for the par6 Rust
- * runtime and, later, toppra-cpp (trajectory parameterization).
+/* par6_shim — C ABI over Pinocchio (kinematics/dynamics) and toppra-cpp
+ * (time-optimal path parameterization) for the par6 Rust runtime.
  *
  * Conventions:
  *   - Poses are 4x4 homogeneous transforms, row-major, 16 doubles.
@@ -8,7 +8,9 @@
  *   - Joint vectors are nq doubles (PAR6: nq == 6, revolute only).
  *   - All par6_kin_* calls after par6_kin_create are allocation-free:
  *     pinocchio::Data and every workspace buffer live in the handle.
- *   - Handles are NOT thread-safe: one handle per thread.
+ *   - par6_kin handles are NOT thread-safe: one handle per thread.
+ *     par6_traj handles are immutable after create; concurrent
+ *     par6_traj_sample / par6_traj_duration calls on one handle are safe.
  */
 #ifndef PAR6_SHIM_H
 #define PAR6_SHIM_H
@@ -23,11 +25,10 @@ typedef struct par6_kin par6_kin;
 
 typedef enum par6_status {
     PAR6_OK = 0,
-    PAR6_ERR_INVALID_ARG = -1,   /* NULL pointer, bad dimensions */
+    PAR6_ERR_INVALID_ARG = -1,   /* NULL pointer, bad dimensions, NaN input */
     PAR6_ERR_URDF = -2,          /* URDF load/parse failure */
     PAR6_ERR_FRAME = -3,         /* named frame not found in model */
     PAR6_ERR_EXCEPTION = -4,     /* unexpected C++ exception */
-    PAR6_ERR_NOT_IMPLEMENTED = -100,
 } par6_status;
 
 /* Optional tool attached rigidly to the end-effector frame.
@@ -98,27 +99,64 @@ int32_t par6_kin_ik_step(par6_kin *h,
                          double tol,
                          double damping);
 
-/* --- toppra-cpp path parameterization: reserved, NOT implemented. ---
- * conda-forge ships no C++ toppra (only the pure-python `toppra-python`),
- * so these entry points exist for ABI stability and return
- * PAR6_ERR_NOT_IMPLEMENTED unconditionally. See cpp/README.md. */
+/* --- toppra-cpp time-optimal path parameterization (par6_traj_*) ----------
+ *
+ * Implemented over toppra-cpp (github.com/hungpham2511/toppra, MIT) with its
+ * bundled Seidel LP solver — see cpp/README.md for the source pin.
+ *
+ * Planner-side API: par6_traj_create heap-allocates freely while solving.
+ * The finished handle is immutable and par6_traj_sample writes into caller
+ * buffers without allocating, so a handle built on the planner may be
+ * sampled from the RT tick (create/destroy stay off it).
+ */
 
 typedef struct par6_traj par6_traj;
 
-/* Would parameterize a joint-space path under velocity/acceleration limits.
- * Returns NULL; writes PAR6_ERR_NOT_IMPLEMENTED semantics via par6_traj_status. */
+/* Time-optimal rest-to-rest parameterization of a joint-space path (TOPPRA).
+ * The waypoints are interpolated with a natural cubic spline over a unit
+ * path parameter, then re-timed to be as fast as the symmetric limits allow:
+ * |qd| <= vel_limit and |qdd| <= acc_limit componentwise along the whole
+ * trajectory, with zero start and end joint velocity.
+ *
+ *   waypoints     n_waypoints x nq doubles, row-major (waypoint-major).
+ *   n_waypoints   number of waypoints, >= 2.
+ *   nq            joints per waypoint, >= 1.
+ *   vel_limit     nq doubles, finite and > 0 [rad/s].
+ *   acc_limit     nq doubles, finite and > 0 [rad/s^2].
+ *   n_gridpoints  path-parameter discretization: <= 0 selects an automatic
+ *                 grid (recommended); otherwise >= 2 gridpoints.
+ *   err_buf       optional (may be NULL): receives a NUL-terminated error
+ *                 message of at most err_len bytes on failure.
+ *
+ * Rejected with NULL + message: NULL pointers, n_waypoints < 2, nq < 1,
+ * n_gridpoints == 1, NaN/inf in waypoints or limits, zero/negative limits,
+ * zero total displacement, and paths the solver cannot parameterize.
+ * Returns NULL on failure. */
 par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq,
-                            const double *vel_limit, const double *acc_limit);
+                            const double *vel_limit, const double *acc_limit,
+                            int32_t n_gridpoints,
+                            char *err_buf, int32_t err_len);
+
 void par6_traj_destroy(par6_traj *h);
-par6_status par6_traj_status(const par6_traj *h);
+
+/* Number of joints (== nq at create); 0 for a NULL handle. */
+int32_t par6_traj_nq(const par6_traj *h);
+
+/* Total trajectory duration in seconds (finite, > 0). */
 par6_status par6_traj_duration(const par6_traj *h, double *out_seconds);
+
+/* Sample joint position/velocity/acceleration at time t into caller buffers
+ * (nq doubles each; all required). Finite t outside [0, duration] clamps to
+ * the nearer endpoint; NaN t is PAR6_ERR_INVALID_ARG. Allocation-free. */
 par6_status par6_traj_sample(const par6_traj *h, double t,
                              double *out_q, double *out_qd, double *out_qdd);
 
-/* ABI version of this header/library pair. Bump on any breaking change. */
+/* ABI version of this header/library pair. Bump on any breaking change.
+ * v2: par6_traj_* implemented over toppra-cpp — create takes n_gridpoints
+ *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 1
+#define PAR6_SHIM_ABI_VERSION 2
 
 #ifdef __cplusplus
 } /* extern "C" */

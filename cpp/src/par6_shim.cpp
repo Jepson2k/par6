@@ -1,4 +1,5 @@
 #include "par6_shim.h"
+#include "shim_err.hpp"
 
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/model.hpp>
@@ -26,11 +27,7 @@ using Mat6x = Eigen::Matrix<double, 6, Eigen::Dynamic>;
 using Vec6 = Eigen::Matrix<double, 6, 1>;
 using Mat6 = Eigen::Matrix<double, 6, 6>;
 
-void write_err(char *err_buf, int32_t err_len, const char *msg) {
-    if (err_buf != nullptr && err_len > 0) {
-        std::snprintf(err_buf, static_cast<size_t>(err_len), "%s", msg);
-    }
-}
+using par6_shim_detail::write_err;
 
 } // namespace
 
@@ -291,27 +288,7 @@ int32_t par6_kin_ik_step(par6_kin *h,
     }
 }
 
-/* --- toppra stubs: no C++ toppra on conda-forge; see cpp/README.md. --- */
-
-par6_traj *par6_traj_create(const double *, int32_t, int32_t, const double *,
-                            const double *) {
-    return nullptr;
-}
-
-void par6_traj_destroy(par6_traj *) {}
-
-par6_status par6_traj_status(const par6_traj *) {
-    return PAR6_ERR_NOT_IMPLEMENTED;
-}
-
-par6_status par6_traj_duration(const par6_traj *, double *) {
-    return PAR6_ERR_NOT_IMPLEMENTED;
-}
-
-par6_status par6_traj_sample(const par6_traj *, double, double *, double *,
-                             double *) {
-    return PAR6_ERR_NOT_IMPLEMENTED;
-}
+/* par6_traj_* live in par6_traj.cpp (toppra-cpp). */
 
 int32_t par6_shim_abi_version(void) { return PAR6_SHIM_ABI_VERSION; }
 

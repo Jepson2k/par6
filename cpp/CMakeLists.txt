@@ -8,8 +8,9 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(pinocchio REQUIRED)
+find_package(toppra REQUIRED)
 
-set(PAR6_SHIM_SOURCES src/par6_shim.cpp)
+set(PAR6_SHIM_SOURCES src/par6_shim.cpp src/par6_traj.cpp)
 
 # Shared library — what pinokin-sys links by default (Pinocchio itself is
 # only distributed as shared libs on conda-forge).
@@ -30,7 +31,8 @@ foreach(tgt par6_shim par6_shim_static)
   # (The pinocchio::pinocchio umbrella drags in collision/casadi/extra.)
   target_link_libraries(${tgt} PUBLIC
     pinocchio::pinocchio_default
-    pinocchio::pinocchio_parsers)
+    pinocchio::pinocchio_parsers
+    toppra::toppra)
   target_compile_options(${tgt} PRIVATE -Wall -Wextra)
 endforeach()
 

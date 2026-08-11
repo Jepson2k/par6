@@ -9,7 +9,7 @@ use std::path::PathBuf;
 
 use serde::Deserialize;
 
-use pinokin_sys::{ffi, IkOptions, Model, ToolParams};
+use pinokin_sys::{IkOptions, Model, ToolParams};
 
 const TOL: f64 = 1e-9;
 
@@ -221,21 +221,4 @@ fn create_reports_urdf_and_frame_errors() {
         }
         other => panic!("expected Create error, got {other:?}"),
     }
-}
-
-#[test]
-fn toppra_entry_points_are_reserved_not_faked() {
-    // The traj API must refuse to pretend: creation yields no handle and
-    // every status query reports NOT_IMPLEMENTED.
-    unsafe {
-        let h = ffi::par6_traj_create(std::ptr::null(), 0, 0, std::ptr::null(), std::ptr::null());
-        assert!(h.is_null());
-        assert_eq!(ffi::par6_traj_status(h), ffi::PAR6_ERR_NOT_IMPLEMENTED);
-        let mut d = 0.0f64;
-        assert_eq!(
-            ffi::par6_traj_duration(h, &mut d),
-            ffi::PAR6_ERR_NOT_IMPLEMENTED
-        );
-    }
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 1);
 }

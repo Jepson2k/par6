@@ -14,8 +14,9 @@ pub struct par6_kin {
     _private: [u8; 0],
 }
 
-/// Opaque trajectory handle (`struct par6_traj`) — toppra entry points are
-/// reserved and currently return [`PAR6_ERR_NOT_IMPLEMENTED`].
+/// Opaque trajectory handle (`struct par6_traj`) — a TOPPRA-parameterized
+/// joint-space trajectory. Immutable after create: concurrent
+/// [`par6_traj_sample`] / [`par6_traj_duration`] calls are safe.
 #[repr(C)]
 pub struct par6_traj {
     _private: [u8; 0],
@@ -28,7 +29,6 @@ pub const PAR6_ERR_INVALID_ARG: par6_status = -1;
 pub const PAR6_ERR_URDF: par6_status = -2;
 pub const PAR6_ERR_FRAME: par6_status = -3;
 pub const PAR6_ERR_EXCEPTION: par6_status = -4;
-pub const PAR6_ERR_NOT_IMPLEMENTED: par6_status = -100;
 
 /// Mirror of `par6_tool_params`: rigid tool attached to the ee frame.
 /// `transform` is T_ee_tool row-major; `com` in ee-frame coordinates;
@@ -83,17 +83,28 @@ extern "C" {
         damping: f64,
     ) -> i32;
 
-    // toppra-cpp: reserved, return NOT_IMPLEMENTED (see cpp/README.md)
+    /// Time-optimal rest-to-rest parameterization of a joint-space path
+    /// (TOPPRA over toppra-cpp): natural cubic spline through `waypoints`
+    /// (`n_waypoints` x `nq`, row-major), re-timed under symmetric
+    /// `vel_limit` / `acc_limit` (`nq` each, finite and > 0).
+    /// `n_gridpoints <= 0` selects the automatic grid; otherwise >= 2.
+    /// Returns NULL on failure with a message in `err_buf`.
     pub fn par6_traj_create(
         waypoints: *const f64,
         n_waypoints: i32,
         nq: i32,
         vel_limit: *const f64,
         acc_limit: *const f64,
+        n_gridpoints: i32,
+        err_buf: *mut c_char,
+        err_len: i32,
     ) -> *mut par6_traj;
     pub fn par6_traj_destroy(h: *mut par6_traj);
-    pub fn par6_traj_status(h: *const par6_traj) -> par6_status;
+    pub fn par6_traj_nq(h: *const par6_traj) -> i32;
     pub fn par6_traj_duration(h: *const par6_traj, out_seconds: *mut f64) -> par6_status;
+    /// Samples q/qd/qdd (`nq` doubles each, all required) at time `t`;
+    /// finite `t` outside `[0, duration]` clamps to the nearer endpoint,
+    /// NaN `t` is `PAR6_ERR_INVALID_ARG`. Allocation-free.
     pub fn par6_traj_sample(
         h: *const par6_traj,
         t: f64,

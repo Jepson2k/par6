@@ -1,10 +1,13 @@
-//! FFI bindings to `par6_shim` — the C-ABI shim over Pinocchio shared by
-//! `par6-kin` (and, once wired, toppra-cpp for `par6-motion`).
+//! FFI bindings to `par6_shim` — the C-ABI shim over Pinocchio
+//! (kinematics/dynamics, consumed by `par6-kin`) and toppra-cpp
+//! (time-optimal path parameterization, for `par6-motion`).
 //!
 //! Two layers:
 //! - [`ffi`]: raw `extern "C"` declarations mirroring `cpp/include/par6_shim.h`.
-//! - [`Model`]: a minimal safe wrapper (create / fk / jacobian / gravity /
-//!   aba / ik_step) with dimension checking and RAII.
+//! - [`Model`] / [`Trajectory`]: minimal safe wrappers with dimension
+//!   checking and RAII. [`Model`] covers create / fk / jacobian / gravity /
+//!   aba / ik_step; [`Trajectory`] covers TOPPRA parameterize / duration /
+//!   allocation-free sampling.
 //!
 //! Everything is gated behind the `ffi` feature (default off) so plain
 //! `cargo check` succeeds without the C++ toolchain. Build the shim with
@@ -28,4 +31,10 @@ pub mod ffi;
 mod model;
 
 #[cfg(feature = "ffi")]
+mod traj;
+
+#[cfg(feature = "ffi")]
 pub use model::{Error, IkOptions, Model, ToolParams};
+
+#[cfg(feature = "ffi")]
+pub use traj::Trajectory;

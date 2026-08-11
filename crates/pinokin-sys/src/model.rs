@@ -9,7 +9,8 @@ use crate::ffi;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {
-    /// Model construction failed; carries the shim's error message.
+    /// Handle construction (`par6_kin_create` / `par6_traj_create`) failed;
+    /// carries the shim's error message.
     Create(String),
     /// A slice had the wrong length for this model's `nq`.
     Dimension { expected: usize, got: usize },
@@ -22,7 +23,7 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Error::Create(msg) => write!(f, "par6_kin_create failed: {msg}"),
+            Error::Create(msg) => write!(f, "shim handle create failed: {msg}"),
             Error::Dimension { expected, got } => {
                 write!(f, "dimension mismatch: expected {expected}, got {got}")
             }

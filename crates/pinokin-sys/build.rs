@@ -68,12 +68,12 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=par6_shim");
         }
         "static" => {
-            // Static shim archive: Pinocchio (shared-only on conda-forge) and
-            // the C++ runtime must be linked explicitly.
+            // Static shim archive: Pinocchio and toppra (shared-only in the
+            // .ffi env) and the C++ runtime must be linked explicitly.
             let dep_dir = env::var("PAR6_SHIM_DEP_LIB_DIR").unwrap_or_else(|_| {
                 panic!(
                     "PAR6_SHIM_LINK=static requires PAR6_SHIM_DEP_LIB_DIR \
-                     (the Pinocchio lib directory, e.g. <repo>/.ffi/env/lib)."
+                     (the Pinocchio/toppra lib directory, e.g. <repo>/.ffi/env/lib)."
                 )
             });
             println!("cargo:rustc-link-lib=static=par6_shim");
@@ -81,6 +81,7 @@ fn main() {
             println!("cargo:rustc-link-arg=-Wl,-rpath,{dep_dir}");
             println!("cargo:rustc-link-lib=dylib=pinocchio_default");
             println!("cargo:rustc-link-lib=dylib=pinocchio_parsers");
+            println!("cargo:rustc-link-lib=dylib=toppra");
             println!("cargo:rustc-link-lib=dylib=stdc++");
         }
         _ => unreachable!(),

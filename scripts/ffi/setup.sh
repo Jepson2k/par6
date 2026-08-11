@@ -2,8 +2,10 @@
 # Reproducible C++ FFI toolchain bootstrap for par6:
 #   1. installs micromamba into a local prefix (no system changes)
 #   2. creates a conda-forge env with Pinocchio + toolchain (pinned)
-#   3. builds + installs cpp/ (the par6_shim C-ABI library) against it
-#   4. prints/persists the env vars pinokin-sys's build.rs consumes
+#   3. builds + installs toppra-cpp (pinned commit; no conda-forge package)
+#      from source into the same env prefix
+#   4. builds + installs cpp/ (the par6_shim C-ABI library) against both
+#   5. prints/persists the env vars pinokin-sys's build.rs consumes
 #
 # Everything lands under $PAR6_FFI_DIR (default: <repo>/.ffi, self-gitignored).
 # Idempotent: re-running skips completed steps; FORCE=1 rebuilds the shim.
@@ -20,6 +22,10 @@ FFI_DIR="${PAR6_FFI_DIR:-$ROOT/.ffi}"
 # Pinned package set. pin (pip) and pinocchio (conda-forge) versions must
 # match so scripts/ffi/gen_fixtures.py validates against identical numerics.
 PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
+# toppra-cpp source pin (v0.6.9 release commit). MIT; built with the bundled
+# Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
+TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
+TOPPRA_COMMIT="${PAR6_TOPPRA_COMMIT:-142456f3282c92c93ab97749a24856661924d989}"
 CONDA_SPECS=(
   "pinocchio=${PINOCCHIO_VERSION}"
   "eigen"      # constrained by pinocchio's build (5.0.x as of 2026-08)
@@ -60,7 +66,42 @@ else
   echo ">>> env exists: $ENV_DIR (delete it to force re-create)"
 fi
 
-# --- 3. build + install the shim ---------------------------------------------
+# --- 3. toppra-cpp from source into the env prefix ---------------------------
+# No conda-forge C++ toppra exists (only pure-python `toppra-python`), so the
+# pinned commit is built here. Installing into $ENV_DIR keeps a single dep
+# lib dir (the shim's rpath) and lands inside the CI cache paths.
+# Delete $ENV_DIR/lib/libtoppra.so to force a rebuild (e.g. after a pin bump).
+TOPPRA_SRC="$FFI_DIR/src/toppra"
+TOPPRA_BUILD="$FFI_DIR/build-toppra"
+if [[ ! -e "$ENV_DIR/lib/libtoppra.so" ]]; then
+  if [[ "$(git -C "$TOPPRA_SRC" rev-parse HEAD 2>/dev/null)" != "$TOPPRA_COMMIT" ]]; then
+    echo ">>> fetching toppra @ $TOPPRA_COMMIT"
+    rm -rf "$TOPPRA_SRC"
+    mkdir -p "$TOPPRA_SRC"
+    git -C "$TOPPRA_SRC" init -q
+    git -C "$TOPPRA_SRC" remote add origin "$TOPPRA_REPO"
+    git -C "$TOPPRA_SRC" fetch -q --depth 1 origin "$TOPPRA_COMMIT"
+    git -C "$TOPPRA_SRC" checkout -q --detach FETCH_HEAD
+  fi
+  echo ">>> building toppra-cpp"
+  "$MAMBA" run -p "$ENV_DIR" cmake -G Ninja -S "$TOPPRA_SRC/cpp" -B "$TOPPRA_BUILD" \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_PREFIX_PATH="$ENV_DIR" \
+    -DCMAKE_INSTALL_PREFIX="$ENV_DIR" \
+    -DCMAKE_INSTALL_RPATH="$ENV_DIR/lib" \
+    -DBUILD_TESTING=OFF \
+    -DPYTHON_BINDINGS=OFF \
+    -DBUILD_WITH_PINOCCHIO=OFF \
+    -DBUILD_WITH_qpOASES=OFF \
+    -DBUILD_WITH_GLPK=OFF \
+    -DTOPPRA_WARN_ON=OFF
+  "$MAMBA" run -p "$ENV_DIR" cmake --build "$TOPPRA_BUILD"
+  "$MAMBA" run -p "$ENV_DIR" cmake --install "$TOPPRA_BUILD"
+else
+  echo ">>> toppra exists: $ENV_DIR/lib/libtoppra.so (delete it to rebuild)"
+fi
+
+# --- 4. build + install the shim ---------------------------------------------
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
 fi
@@ -78,7 +119,7 @@ else
   echo ">>> shim exists: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
 
-# --- 4. env vars for pinokin-sys ---------------------------------------------
+# --- 5. env vars for pinokin-sys ---------------------------------------------
 cat > "$FFI_DIR/env.sh" <<EOF
 export PAR6_SHIM_LIB_DIR="$SHIM_PREFIX/lib"
 export PAR6_SHIM_INCLUDE_DIR="$SHIM_PREFIX/include"
