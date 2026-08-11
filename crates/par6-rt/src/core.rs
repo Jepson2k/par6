@@ -413,6 +413,40 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
+    /// Simulator/teleport path: re-base joint `joint`'s wire conversion
+    /// so encoder reading `motor_ticks` maps to `joint_rad`, and seed the
+    /// measured mirrors at that value. Stale wire readings from before
+    /// the re-reference are dropped so they are never re-interpreted
+    /// under the new mapping. `par6d` calls this after re-seeding the sim
+    /// plant; on hardware, references are owned by the homing FSM.
+    pub fn set_joint_reference(&mut self, joint: usize, motor_ticks: i32, joint_rad: f64) {
+        if joint >= MAX_JOINTS {
+            return;
+        }
+        self.conv[joint].set_home(motor_ticks, joint_rad);
+        self.sector_done[joint] = true;
+        let node = &mut self.bus_state.nodes[usize::from(self.node_of[joint])];
+        node.position_ticks = None;
+        node.speed_ticks_s = None;
+        self.q[joint] = joint_rad;
+        self.qd[joint] = 0.0;
+        self.q_filt[joint] = joint_rad;
+        self.qd_filt[joint] = 0.0;
+    }
+
+    /// Replace the EXEC completion policy (takes effect at the next
+    /// command boundary) — the `set_completion_policy` follow-through
+    /// from the command plane.
+    pub fn set_settle_policy(&mut self, policy: Box<dyn SettlePolicy>) {
+        self.exec.set_policy(policy);
+    }
+
+    /// Reset the loop timing statistics (the `reset_loop_stats`
+    /// follow-through); the warmup gate re-arms.
+    pub fn reset_loop_stats(&mut self) {
+        self.timing.reset();
+    }
+
     /// One tick of the core. `period_s` is the measured loop period (the
     /// virtual-tick tests feed the nominal `dt`); `overrun` marks a
     /// missed deadline as measured by the caller.

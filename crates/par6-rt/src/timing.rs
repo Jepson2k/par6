@@ -134,6 +134,18 @@ impl LoopTiming {
     pub fn stats(&self) -> LoopStats {
         self.stats
     }
+
+    /// Discard all statistics and re-enter the warmup gate (the
+    /// `reset_loop_stats` command). Allocation-free: the window keeps its
+    /// capacity.
+    pub fn reset(&mut self) {
+        self.window.clear();
+        self.next = 0;
+        self.filled = false;
+        self.ticks = 0;
+        self.critical_streak = 0;
+        self.stats = LoopStats::default();
+    }
 }
 
 #[cfg(test)]
