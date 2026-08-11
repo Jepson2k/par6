@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=64"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -13,6 +13,24 @@ dependencies = [
   "msgspec>=0.18",
   "ormsgpack>=1.4.0",
   "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.7.0",
+  # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
+  # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-macosx_15_0_arm64.whl ; python_version == '3.11' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-macosx_15_0_arm64.whl ; python_version == '3.12' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-macosx_15_0_arm64.whl ; python_version == '3.13' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-macosx_15_0_arm64.whl ; python_version == '3.14' and platform_system == 'Darwin' and platform_machine == 'arm64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-win_amd64.whl ; python_version == '3.11' and platform_system == 'Windows' and platform_machine == 'AMD64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-win_amd64.whl ; python_version == '3.12' and platform_system == 'Windows' and platform_machine == 'AMD64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-win_amd64.whl ; python_version == '3.13' and platform_system == 'Windows' and platform_machine == 'AMD64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-win_amd64.whl ; python_version == '3.14' and platform_system == 'Windows' and platform_machine == 'AMD64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-manylinux_2_39_x86_64.whl ; python_version == '3.11' and platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-manylinux_2_39_x86_64.whl ; python_version == '3.12' and platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-manylinux_2_39_x86_64.whl ; python_version == '3.13' and platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-manylinux_2_39_x86_64.whl ; python_version == '3.14' and platform_system == 'Linux' and platform_machine == 'x86_64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-manylinux_2_39_aarch64.whl ; python_version == '3.11' and platform_system == 'Linux' and platform_machine == 'aarch64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-manylinux_2_39_aarch64.whl ; python_version == '3.12' and platform_system == 'Linux' and platform_machine == 'aarch64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-manylinux_2_39_aarch64.whl ; python_version == '3.13' and platform_system == 'Linux' and platform_machine == 'aarch64'",
+  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-manylinux_2_39_aarch64.whl ; python_version == '3.14' and platform_system == 'Linux' and platform_machine == 'aarch64'",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +41,11 @@ par6 = "par6.robot:Robot"
 
 [tool.setuptools.packages.find]
 include = ["par6*"]
+
+[tool.setuptools.package-data]
+# Runtime config + URDF trees mirrored from the repo root by
+# scripts/sync_pkg_data.py (freshness-guarded in tests/test_robot.py).
+par6 = ["_data/**/*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

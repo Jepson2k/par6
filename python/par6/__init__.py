@@ -1,12 +1,16 @@
 """par6 — waldoctl backend for the PAR6 arm, client of the par6d Rust runtime.
 
-Public surface: :class:`AsyncRobotClient` (async UDP client),
-:class:`RobotClient` (sync facade), :class:`RobotError`, and the protocol v2
-wire layer re-exported from :mod:`par6.protocol`.  The ``Robot`` factory
-lands with workstream P1.H.
+Public surface: :class:`Robot` (the waldoctl backend entry point),
+:class:`AsyncRobotClient` (async UDP client), :class:`RobotClient` (sync
+facade), :class:`RobotError`, and the protocol v2 wire layer re-exported
+from :mod:`par6.protocol`.
 """
 
 from importlib.metadata import PackageNotFoundError, version
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .robot import Robot
 
 from .client import (
     AsyncRobotClient,
@@ -39,7 +43,19 @@ try:
 except PackageNotFoundError:  # running from a source tree
     __version__ = "0.0.0.dev0"
 
+
+def __getattr__(name: str) -> object:
+    # Lazy: Robot pulls in pinokin/numba, which pure protocol users of this
+    # package never need at import time.
+    if name == "Robot":
+        from .robot import Robot
+
+        return Robot
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
 __all__ = [
+    "Robot",
     # client
     "AsyncRobotClient",
     "RobotClient",
