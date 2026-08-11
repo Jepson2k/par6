@@ -77,8 +77,11 @@ measured joint position at the endstop equals `home_offset`.
 
 **Gripper-dependent offsets:** each joint has a fallback `home_offset` and a
 `home_offset_gripper_dependent` flag; the ACTIVE gripper's config may override the
-offset for flagged joints (PAR6: J4 index-4 homes against the gripper's lower arm —
-fallback −2.717 rad, MSG-small-150 override −2.070 rad). Swapping grippers changes an
+offset for flagged joints. PAR6 per the vendor XML (verified against
+`robots/PAR6.xml` + gripper files): index 3 is gripper-dependent with fallback
+−2.717 rad and no gripper overrides it (fallback applies); index 4 is
+gripper-dependent with fallback 0.0 and every gripper overrides it
+(MSG-small-150 −2.070, SSG48 −2.120, Flange −2.258). Swapping grippers changes an
 ARM joint's home reference — config must make this dependency explicit.
 
 ## Current limits around homing
