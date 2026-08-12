@@ -1,26 +1,31 @@
 """The offline dry-run client, checked against the runtime it predicts.
 
 The offline-only tests assert properties the runtime enforces (limits, path
-geometry, the refusals ``par6d`` answers with).  The e2e test closes the loop:
-the same command is planned offline and queued on a live ``par6d --sim``, and
-the prediction has to match what the runtime actually executed — a dry run
-that only agrees with itself proves nothing.
+geometry, blend semantics, the refusals ``par6d`` answers with).  The e2e
+tests close the loop: the same commands are planned offline and queued on a
+live ``par6d --sim``, and the prediction has to match what the runtime
+actually executed — its own commanded joint stream, read back off the
+telemetry port — because a dry run that only agrees with itself proves
+nothing.
 """
 
 from __future__ import annotations
 
+import asyncio
 import math
+import socket
 import time
 
 import numpy as np
+import ormsgpack
 import pytest
-from live_daemon import LiveDaemon, requires_par6d
+from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
 
 from par6 import config as _cfg
 from par6 import motion as _motion
 from par6.client import RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import CompletionPolicy, ErrorCode
+from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.robot import Robot
 
 try:
@@ -35,6 +40,64 @@ pytestmark = pytest.mark.skipif(
 
 def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
+
+
+def _offset(pose: np.ndarray, delta: tuple[float, float, float]) -> np.ndarray:
+    """*pose* (mm + degrees) moved by *delta* mm, orientation untouched."""
+    out = np.asarray(pose, dtype=np.float64).copy()
+    out[:3] += delta
+    return out
+
+
+def _closest(points: np.ndarray, target: np.ndarray) -> float:
+    """Closest approach of a sampled path to *target* [mm], measured against
+    the path itself — a path passes through a point even when no sample lands
+    exactly on it."""
+    a, b = points[:-1], points[1:]
+    d = b - a
+    length2 = np.einsum("ij,ij->i", d, d)
+    t = np.clip(
+        np.einsum("ij,ij->i", target - a, d) / np.where(length2 > 0.0, length2, 1.0),
+        0.0,
+        1.0,
+    )
+    return float(np.linalg.norm(target - (a + t[:, None] * d), axis=1).min())
+
+
+def _polyline_gap(points: np.ndarray, corners: list[np.ndarray]) -> float:
+    """How far *points* strays from the polyline through *corners* [mm]."""
+    polyline = np.stack(corners)
+    return max(_closest(polyline, p) for p in points)
+
+
+def _length(points: np.ndarray) -> float:
+    return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
+
+
+def _tcp_speeds(result) -> np.ndarray:
+    """TCP speed at every sample of a previewed motion [mm/s]."""
+    points = result.tcp_poses[:, :3] * 1000.0
+    return np.linalg.norm(np.diff(points, axis=0), axis=1) / (
+        result.duration / len(points)
+    )
+
+
+def _ramp(speeds: np.ndarray) -> int:
+    """Samples to ignore at each end: every motion starts and ends at rest."""
+    return max(len(speeds) // 10, 1)
+
+
+def _circle_through(
+    p1: np.ndarray, p2: np.ndarray, p3: np.ndarray
+) -> tuple[np.ndarray, float]:
+    """Centre and radius of the circle through three points — derived here,
+    independently of the client, so the arc is checked against geometry
+    rather than against itself."""
+    a, b = p2 - p1, p3 - p1
+    aa, bb, ab = a @ a, b @ b, a @ b
+    det = aa * bb - ab * ab
+    centre = p1 + a * (bb * (aa - ab)) / (2.0 * det) + b * (aa * (bb - ab)) / (2.0 * det)
+    return centre, float(np.linalg.norm(centre - p1))
 
 
 @pytest.fixture(scope="module")
@@ -123,13 +186,159 @@ class TestCartesianMotion:
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
+    def test_curved_moves_preview_the_shape_they_trace(self, dry_run) -> None:
+        """``move_c`` must preview the arc through its via point, ``move_s`` the
+        spline through every waypoint, and ``move_p`` the same waypoints with
+        the corners rounded away — each ending on the last pose it was given."""
+        dry_run.teleport(park_deg())
+        base = np.asarray(dry_run.pose())
+        via, end = _offset(base, (30.0, 0.0, 25.0)), _offset(base, (60.0, 0.0, 0.0))
+
+        curve = dry_run.move_c(via.tolist(), end.tolist(), speed=0.4)
+        assert curve.error is None
+        points = curve.tcp_poses[:, :3] * 1000.0
+        centre, radius = _circle_through(base[:3], via[:3], end[:3])
+        off_circle = np.abs(np.linalg.norm(points - centre, axis=1) - radius)
+        assert off_circle.max() < 0.5, f"arc leaves its circle by {off_circle.max():.3f} mm"
+        assert _closest(points, via[:3]) < 1.0, "the arc missed its via point"
+        assert np.allclose(points[-1], end[:3], atol=0.5)
+
+        dry_run.teleport(park_deg())
+        waypoints = [
+            _offset(base, delta).tolist()
+            for delta in ((20.0, 0.0, 25.0), (40.0, 0.0, -15.0), (60.0, 0.0, 25.0))
+        ]
+        curved = dry_run.move_s(waypoints, speed=0.4)
+        assert curved.error is None
+        spline = curved.tcp_poses[:, :3] * 1000.0
+        for w in waypoints:
+            assert _closest(spline, np.asarray(w[:3])) < 1.0, f"spline missed {w[:3]}"
+        # A spline is not the polyline it interpolates: it bows off the chords.
+        assert _polyline_gap(spline, [base[:3]] + [np.asarray(w[:3]) for w in waypoints]) > 2.0
+
+        dry_run.teleport(park_deg())
+        process = dry_run.move_p(waypoints, speed=0.4)
+        assert process.error is None
+        swept = process.tcp_poses[:, :3] * 1000.0
+        # Auto-blended corners: the interior waypoints are rounded off (the
+        # path passes near them, not through them), the ends are kept, and
+        # cutting the corners makes the path shorter than the polyline.
+        for w in waypoints[:-1]:
+            miss = _closest(swept, np.asarray(w[:3]))
+            assert 0.5 < miss < 25.0, f"corner {w[:3]} missed by {miss:.2f} mm"
+        assert np.allclose(swept[-1], waypoints[-1][:3], atol=0.5)
+        assert _length(swept) < _length(
+            np.stack([base[:3]] + [np.asarray(w[:3]) for w in waypoints])
+        )
+
+    def test_blend_radius_folds_the_queue_into_one_motion(self, dry_run) -> None:
+        """A move with ``r`` is held for the move behind it, exactly as the
+        runtime's queue holds it: the two become ONE motion with a rounded
+        corner that the arm never stops in, and it is the move that closes the
+        chain (or ``flush()``) that reports it."""
+        dry_run.teleport(park_deg())
+        base = np.asarray(dry_run.pose())
+        corner, finish = _offset(base, (50.0, 0.0, 0.0)), _offset(base, (50.0, 0.0, 40.0))
+
+        sharp = [
+            dry_run.move_l(corner.tolist(), speed=0.4),
+            dry_run.move_l(finish.tolist(), speed=0.4),
+        ]
+        assert all(r is not None for r in sharp)
+        stopped = np.vstack([r.tcp_poses[:, :3] for r in sharp]) * 1000.0
+
+        dry_run.teleport(park_deg())
+        held = dry_run.move_l(corner.tolist(), speed=0.4, r=15.0)
+        assert held is None, "a move that rounds a corner has no motion of its own"
+        blended = dry_run.move_l(finish.tolist(), speed=0.4)
+        assert blended is not None and blended.error is None
+        assert dry_run.flush() == [], "the chain was already closed"
+        rounded = blended.tcp_poses[:, :3] * 1000.0
+
+        miss = _closest(rounded, corner[:3])
+        assert 1.0 < miss < 15.0, f"corner rounded by {miss:.2f} mm, radius was 15 mm"
+        assert _closest(stopped, corner[:3]) < 0.5, "the sharp pair must reach the corner"
+        assert np.allclose(rounded[-1], finish[:3], atol=0.5)
+        assert _length(rounded) < _length(stopped) - 1.0
+        # One motion, so the TCP sweeps through the corner instead of coming
+        # to rest in it — which is exactly what the sharp pair does.  Compared
+        # away from the start and stop ramps every motion has.
+        blended_speeds = _tcp_speeds(blended)
+        sharp_speeds = [_tcp_speeds(r) for r in sharp]
+        edge = _ramp(blended_speeds)
+        cruising = blended_speeds[edge:-edge].min()
+        at_the_corner = min(
+            sharp_speeds[0][_ramp(sharp_speeds[0]) :].min(),
+            sharp_speeds[1][: -_ramp(sharp_speeds[1])].min(),
+        )
+        assert cruising > 0.1 * blended_speeds.max(), (
+            f"the blended motion crawled to {cruising:.2f} mm/s mid-path"
+        )
+        assert at_the_corner < 0.01 * max(s.max() for s in sharp_speeds), (
+            "the un-blended pair is supposed to stop at the corner"
+        )
+        assert np.allclose(dry_run.angles(), np.degrees(blended.end_joints_rad))
+
+        # A chain the program never closes is planned by flush(), which is
+        # where the runtime's blend hold expires.
+        dry_run.teleport(park_deg())
+        assert dry_run.move_l(corner.tolist(), speed=0.4, r=15.0) is None
+        trailing = dry_run.flush()
+        assert len(trailing) == 1 and trailing[0].error is None
+        assert np.allclose(trailing[0].tcp_poses[-1, :3] * 1000.0, corner[:3], atol=0.5)
+
+    def test_blended_joint_moves_run_as_one_motion(self, dry_run) -> None:
+        """Joint moves blend too: the corner zone is sized from the TCP distance
+        the radius names, and the chain runs as one motion that never stops at
+        the interior target — so it is quicker than the same moves run apart."""
+        dry_run.teleport(park_deg())
+        first = list(dry_run.angles())
+        first[0] += 20.0
+        second = list(first)
+        second[1] -= 15.0
+
+        apart = [dry_run.move_j(first, speed=0.5), dry_run.move_j(second, speed=0.5)]
+        assert all(r is not None for r in apart)
+        separate = sum(r.duration for r in apart)
+
+        dry_run.teleport(park_deg())
+        assert dry_run.move_j(first, speed=0.5, r=25.0) is None
+        chain = dry_run.move_j(second, speed=0.5)
+        assert chain is not None and chain.error is None
+        assert chain.duration < separate
+        np.testing.assert_allclose(
+            np.degrees(chain.end_joints_rad), second, atol=1e-6
+        )
+        # The corner is rounded in joint space: the chain passes close by the
+        # interior target without ever reaching it.
+        interior = np.abs(np.degrees(chain.joint_trajectory_rad) - first).max(axis=1)
+        assert 0.1 < interior.min() < 5.0, (
+            f"the chain came within {interior.min():.3f} deg of the interior target"
+        )
+
     def test_refuses_what_the_runtime_refuses(self, dry_run) -> None:
         """Parameters and commands ``par6d`` rejects must be rejected here with
         the same code, so a preview never promises motion the arm will refuse."""
         dry_run.teleport(park_deg())
-        with pytest.raises(RobotError) as blend:
-            dry_run.move_l(dry_run.pose(), r=5.0)
-        assert blend.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        # An arc ends where its end pose is: par6d rounds corners between
+        # straight moves and between joint moves, but has no arc-to-successor
+        # blend, so a radius on move_c is refused rather than ignored.
+        with pytest.raises(RobotError) as arc_blend:
+            dry_run.move_c(dry_run.pose(), dry_run.pose(), r=5.0)
+        assert arc_blend.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        # Geometry the runtime cannot turn into a path is a validation error,
+        # never silently straightened into a line.
+        base = np.asarray(dry_run.pose())
+        with pytest.raises(RobotError) as collinear:
+            dry_run.move_c(
+                _offset(base, (20.0, 0.0, 0.0)).tolist(),
+                _offset(base, (40.0, 0.0, 0.0)).tolist(),
+            )
+        assert collinear.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        with pytest.raises(RobotError) as empty:
+            dry_run.move_s([])
+        assert empty.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as tool:
             dry_run.select_tool("SSG48")
@@ -138,11 +347,6 @@ class TestCartesianMotion:
         with pytest.raises(RobotError) as profile:
             dry_run.select_profile("BANG_BANG")
         assert profile.value.code == ErrorCode.SYS_PROFILE_INVALID
-
-        curved = dry_run.move_c([0.0] * 6, [0.0] * 6)
-        assert curved.error is not None
-        assert curved.error.code == ErrorCode.MOTN_SETUP_FAILED
-        assert curved.tcp_poses.shape[0] == 0
 
         far = list(dry_run.angles())
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
@@ -270,6 +474,259 @@ async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
                 slow_predicted - fast_predicted, abs=1.0
             ), f"execution windows {observed} do not track the prediction"
     finally:
+        daemon.stop()
+
+
+#: An open posture the shapes below fit in: extended, clear of the collision
+#: gate the runtime enforces, and away from the wrist singularity the seeded
+#: IK chain cannot be driven through.
+_OPEN_POSE_DEG = [90.0, -30.0, 240.0, 0.0, -50.0, 180.0]
+
+#: The shapes the comparison traces, as millimetre offsets from wherever the
+#: arm is standing.
+_ARC = ((25.0, 0.0, 20.0), (50.0, 0.0, 0.0))
+_CURVE = ((20.0, 0.0, 20.0), (40.0, 0.0, -15.0), (60.0, 0.0, 20.0))
+_CHAIN = ((35.0, 0.0, 0.0), (35.0, 0.0, 30.0))
+_CHAIN_R_MM = 15.0
+_CASE_SPEED = 0.4
+
+#: How far the runtime's own commanded path may sit from the previewed one
+#: [mm].  Both describe the same trajectory, so the only budget needed is the
+#: chord error of comparing the runtime's coarse-tick samples against the
+#: preview's dense ones — a geometry, sampling or corner-rounding difference
+#: is orders of magnitude larger than this.
+_PATH_GAP_MM = 2.0
+
+
+class _CommandStream:
+    """The joint stream the runtime commands, read off its telemetry port.
+
+    ``set_recipe("commanded")`` makes ``par6d`` publish one msgpack frame per
+    telemetry tick — ``[recipe, seq, mono_ns, tick, measured, commanded, …]``
+    (``crates/par6-server/src/telemetry.rs``) — and the commanded positions
+    are the planner's own output, which is what an offline plan has to
+    reproduce.  The MEASURED positions are the sim plant's response to that
+    stream and carry its tracking lag, so they answer a different question.
+    """
+
+    #: Frame index of the commanded positions: 3 header elements, then the
+    #: ``commanded`` recipe's fields (tick, measured, commanded, …).
+    _COMMANDED = 5
+
+    def __init__(self, port: int) -> None:
+        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
+        self._sock.bind(("127.0.0.1", port))
+        self._sock.setblocking(False)
+
+    def drain(self) -> list[list[float]]:
+        """Every frame waiting on the socket, oldest first."""
+        frames = []
+        while True:
+            try:
+                frames.append(ormsgpack.unpackb(self._sock.recv(65535)))
+            except BlockingIOError:
+                return frames
+
+    def executed(self) -> np.ndarray:
+        """The commanded joint path since the last drain, ``(N, 6)`` radians.
+
+        One row per RT tick (the telemetry loop runs faster and repeats a
+        tick), with the idle frames the RT publishes as NaN dropped.
+
+        The stream is trimmed to the motion's own samples.  The tick that
+        starts it is dropped with them: between two commands the RT holds the
+        last value it commanded, and the sim's plant settles a little short of
+        it, so the first sample of a new plan steps back to where the arm
+        measured — which is the point the plan starts FROM, not a sample of
+        it.  The preview's trajectory starts one tick in for the same reason.
+        """
+        by_tick = {}
+        for frame in self.drain():
+            commanded = np.asarray(frame[self._COMMANDED][:NUM_JOINTS], dtype=np.float64)
+            if np.all(np.isfinite(commanded)):
+                by_tick[frame[3]] = commanded
+        path = np.stack([by_tick[tick] for tick in sorted(by_tick)])
+        moving = np.flatnonzero(np.abs(np.diff(path, axis=0)).max(axis=1) > 1e-12)
+        assert moving.size > 1, "the runtime commanded no motion"
+        return path[moving[0] + 1 : moving[-1] + 2]
+
+    def close(self) -> None:
+        self._sock.close()
+
+
+def _shape_from(pose: list[float], deltas) -> list[list[float]]:
+    """The shape's waypoints, anchored on *pose* and holding its orientation.
+
+    Each side anchors on the pose IT reports, so the comparison is of the
+    motion, not of two TCP frames: a pure-translation shape with a held
+    orientation moves the whole arm the same way whatever point on the tool
+    the frame is measured at.
+    """
+    base = np.asarray(pose, dtype=np.float64)
+    return [_offset(base, delta).tolist() for delta in deltas]
+
+
+def _preview_case(preview, case: str) -> list:
+    """Plan one case offline; returns every result the preview produced."""
+    if case == "arc":
+        via, end = _shape_from(preview.pose(), _ARC)
+        return [preview.move_c(via, end, speed=_CASE_SPEED)]
+    if case == "spline":
+        return [preview.move_s(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)]
+    if case == "process":
+        return [preview.move_p(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)]
+    corner, finish = _shape_from(preview.pose(), _CHAIN)
+    held = preview.move_l(corner, speed=_CASE_SPEED, r=_CHAIN_R_MM)
+    assert held is None, "a blended move must be held for the one behind it"
+    return [preview.move_l(finish, speed=_CASE_SPEED)]
+
+
+async def _queue_case(client, case: str) -> list[int]:
+    """Queue one case on the runtime; returns the command indexes."""
+    pose = await client.pose()
+    assert pose is not None
+    if case == "arc":
+        via, end = _shape_from(pose, _ARC)
+        return [await client.move_c(via, end, speed=_CASE_SPEED)]
+    if case == "spline":
+        return [await client.move_s(_shape_from(pose, _CURVE), speed=_CASE_SPEED)]
+    if case == "process":
+        return [await client.move_p(_shape_from(pose, _CURVE), speed=_CASE_SPEED)]
+    corner, finish = _shape_from(pose, _CHAIN)
+    return [
+        await client.move_l(corner, speed=_CASE_SPEED, r=_CHAIN_R_MM),
+        await client.move_l(finish, speed=_CASE_SPEED),
+    ]
+
+
+async def _run_case(client, case: str) -> tuple[list[int], list[float]]:
+    """Queue one case on the runtime and wait it out.
+
+    Returns the command indexes and when each of them completed, in seconds
+    after the first was queued — the window a client observes, which is the
+    plan's execution plus dispatch.
+    """
+    started = time.monotonic()
+    indexes = await _queue_case(client, case)
+    assert all(index >= 0 for index in indexes)
+    waits = [
+        asyncio.create_task(client.wait_command(index, timeout=90.0))
+        for index in indexes
+    ]
+    finished = []
+    for wait in waits:
+        assert await wait is True
+        finished.append(time.monotonic() - started)
+    return indexes, finished
+
+
+@pytest.mark.e2e
+@requires_par6d
+@pytest.mark.timeout(600)
+async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
+    """Every curved and blended move must preview the motion par6d runs.
+
+    An arc, a spline, a process move and a blended pair of straight moves are
+    each planned offline and queued on a live ``par6d --sim``, and the
+    runtime's OWN commanded joint stream is read back off its telemetry port.
+    A preview whose geometry, sampling, corner rounding or timing differed
+    from the runtime's would trace a different path or fill a different number
+    of ticks with it.
+
+    Both sides anchor their shape on the pose they themselves report and hold
+    that orientation, so the two describe the same rigid motion whatever point
+    on the tool each measures it at, and both paths are compared through the
+    same kinematics.
+
+    The blended pair also pins the completion semantics: two commands, ONE
+    motion, both completing at the same instant, with the high-water mark
+    ending on the last of them.
+    """
+    daemon = LiveDaemon.start(tmp_path)
+    robot = Robot()
+    stream = _CommandStream(daemon.telemetry_port)
+    try:
+        async with daemon.client() as client:
+            assert await client.wait_status(lambda s: s.link_ok == 1, timeout=20.0)
+            assert await client.reset() == 1
+            assert await client.set_completion_policy(CompletionPolicy.COMMANDED) == 1
+            assert await client.set_recipe("commanded") == 1
+
+            for case in ("arc", "spline", "process", "chain"):
+                # Both sides plan from the configuration the arm is measured
+                # in, so the shapes are anchored on the same place.
+                await _teleport_to(client, _OPEN_POSE_DEG)
+                assert await client.wait_status(
+                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
+                    timeout=20.0,
+                )
+                live_start = await client.angles()
+                assert live_start is not None
+                preview = Robot().create_dry_run_client(initial_joints_deg=live_start)
+                results = _preview_case(preview, case)
+                assert all(r is not None and r.error is None for r in results), (
+                    f"{case}: the preview refused it: "
+                    f"{[r.error for r in results if r is not None]}"
+                )
+                anchor = robot.fk_batch(np.radians([live_start]))[:, :3] * 1000.0
+                predicted = np.vstack(
+                    [anchor, np.vstack([r.tcp_poses[:, :3] for r in results]) * 1000.0]
+                )
+                predicted_duration = sum(r.duration for r in results)
+
+                stream.drain()
+                indexes, finished = await _run_case(client, case)
+                commanded = stream.executed()
+                executed = np.vstack(
+                    [anchor, robot.fk_batch(commanded)[:, :3] * 1000.0]
+                )
+
+                # The shape has to be a shape: a straight line between the
+                # same endpoints would sit far outside the gap budget, so the
+                # comparison below has teeth.
+                bow = max(
+                    _closest(np.stack([predicted[0], predicted[-1]]), p)
+                    for p in predicted
+                )
+                assert bow > 5 * _PATH_GAP_MM, f"{case}: previewed path is nearly straight"
+
+                gap = max(
+                    max(_closest(predicted, p) for p in executed),
+                    max(_closest(executed, p) for p in predicted),
+                )
+                assert gap < _PATH_GAP_MM, (
+                    f"{case}: the runtime commanded a path {gap:.2f} mm off the "
+                    "previewed one"
+                )
+                assert np.allclose(executed[-1], predicted[-1], atol=1.0), (
+                    f"{case}: the runtime finished at {executed[-1]}, preview "
+                    f"predicted {predicted[-1]}"
+                )
+                # The runtime fills whole RT ticks with the motion the preview
+                # timed, so the two agree to within its tick.
+                ticks = commanded.shape[0]
+                assert abs(ticks * TICK_DT_S - predicted_duration) <= 2 * TICK_DT_S, (
+                    f"{case}: the runtime executed {ticks * TICK_DT_S:.3f}s of "
+                    f"motion, preview predicted {predicted_duration:.3f}s"
+                )
+                assert (
+                    predicted_duration - 0.5 <= finished[-1] <= predicted_duration + 1.5
+                ), (
+                    f"{case}: runtime took {finished[-1]:.3f}s end to end, preview "
+                    f"predicted {predicted_duration:.3f}s"
+                )
+                if case == "chain":
+                    assert len(results) == 1, "the chain is one motion, not two"
+                    assert finished[1] - finished[0] < 0.3, (
+                        "a blended motion completes every command it consumed at "
+                        f"the same instant, not {finished[1] - finished[0]:.3f}s apart"
+                    )
+                    assert await client.wait_status(
+                        lambda s: s.completed_index == indexes[-1], timeout=5.0
+                    ), "the high-water mark must end on the last command consumed"
+    finally:
+        stream.close()
         daemon.stop()
 
 

@@ -20,6 +20,10 @@ tick sampling — so a prediction and the motion the runtime executes agree:
 - **Jog**: a port of ``par6_motion::jog``'s ``JogEngine`` — per-tick velocity
   ramp (trapezoid or s-curve), jerk-aware soft-limit lookahead with direction
   blocking, and target integration.
+- **Cartesian geometry**: a port of ``par6_motion::cart`` — the line, arc,
+  spline and rounded-polyline shapes every cartesian move traces, at the
+  runtime's own sampling pitch, plus the ABB zone rule its corner blending
+  and ``move_p``'s automatic corners are built on.
 
 Timing convention, from the runtime: a plan is a stream of one sample per tick
 starting one tick after motion begins, so its duration is ``len(samples) * dt``.
@@ -42,14 +46,25 @@ PROFILES: tuple[str, ...] = ("RUCKIG", "TRAPEZOID", "TOPPRA")
 #: Default profile a fresh runtime plans with (``planner.rs::DEFAULT_PROFILE``).
 DEFAULT_PROFILE = "RUCKIG"
 
-# Cartesian-segment discretization and validation, from
-# ``crates/par6d/src/planner.rs`` (``MOVE_L_*``, ``NULL_MOVE_RAD``).
-MOVE_L_STEP_M = 0.005
-MOVE_L_STEP_RAD = 0.05
+# Cartesian discretization and validation, from ``crates/par6d/src/planner.rs``
+# (``CART_*``, ``MOVE_L_*``, ``NULL_MOVE_RAD``, ``WAYPOINT_SNAP_M``,
+# ``MOVE_P_AUTO_BLEND_FRAC``).
+CART_STEP_M = 0.005
+CART_STEP_RAD = 0.05
 MOVE_L_MAX_STEPS = 400
+CART_PATH_MAX_STEPS = 3000
 MOVE_L_NULL_M = 1e-6
 MOVE_L_MAX_JOINT_STEP_RAD = 0.35
 NULL_MOVE_RAD = 1e-9
+WAYPOINT_SNAP_M = 5e-3
+MOVE_P_AUTO_BLEND_FRAC = 0.25
+
+#: Longest chain of blended moves one motion can cover, from
+#: ``par6-server``'s ``blend_lookahead`` (and parol6's
+#: ``PAROL6_MAX_BLEND_LOOKAHEAD``): the planner never sees more of the
+#: queue than this at once, so a longer run of blended moves is executed
+#: as several motions.
+BLEND_LOOKAHEAD = 100
 
 #: Displacements below this count as "joint does not move" (``plan.rs``).
 _ZERO_DELTA = 1e-12
@@ -328,8 +343,31 @@ def plan_toppra_path(
 
 
 # ---------------------------------------------------------------------------
-# Cartesian segments
+# Cartesian path geometry
 # ---------------------------------------------------------------------------
+#
+# A port of ``crates/par6-motion/src/cart.rs``: the shapes a queued
+# cartesian move traces before any of it becomes joint waypoints.  Poses
+# are 4x4 homogeneous transforms (translation in metres); position follows
+# the shape and orientation is a shortest-arc quaternion slerp along it,
+# the way parol6 (``motion/geometry.py``) separates the two.
+#
+# The runtime's two documented divergences from parol6 are carried over as
+# they stand: ``move_p`` sizes its own corner radii, and the spline uses
+# chord-length knots with natural end conditions rather than uniform knots
+# with not-a-knot ends.
+
+#: Rotation angle below which two orientations count as equal (slerp
+#: degenerates) \[rad\].
+_ANGLE_EPS = 1e-9
+
+#: Below this a length is zero for geometry purposes \[m\].
+_LEN_EPS = 1e-9
+
+#: How close ``move_c``'s end point must be to its start point to mean
+#: "sweep the whole circle" \[m\] — parol6's threshold
+#: (``motion/geometry.py``, ``compute_circle_from_3_points``).
+_FULL_CIRCLE_M = 1e-3
 
 
 def _quat_from_matrix(T: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -366,20 +404,83 @@ def _quat_to_matrix(q: NDArray[np.float64], out: NDArray[np.float64]) -> None:
     ]
 
 
-class CartSegment:
-    """Straight Cartesian segment: position lerp, orientation slerp.
+def _quat_angle(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
+    """Angle of the relative rotation between two unit quaternions \\[rad\\]."""
+    return 2.0 * math.acos(float(np.clip(abs(a @ b), -1.0, 1.0)))
 
-    Port of ``crates/par6d/src/kin.rs``'s ``CartSegment``.
+
+def _quat_slerp(
+    a: NDArray[np.float64], b: NDArray[np.float64], t: float
+) -> NDArray[np.float64]:
+    """Shortest-arc slerp between unit quaternions."""
+    dot = float(a @ b)
+    if dot < 0.0:
+        b = -b
+        dot = -dot
+    theta = math.acos(min(max(dot, -1.0), 1.0))
+    if theta < _ANGLE_EPS:  # nearly parallel: nlerp is exact to first order
+        q = a + t * (b - a)
+        return q / np.linalg.norm(q)
+    sin_theta = math.sin(theta)
+    return (math.sin((1.0 - t) * theta) * a + math.sin(t * theta) * b) / sin_theta
+
+
+def _pose_of(q: NDArray[np.float64], p: NDArray[np.float64]) -> NDArray[np.float64]:
+    """A pose from an orientation quaternion and a translation \\[m\\]."""
+    T = np.eye(4, dtype=np.float64)
+    _quat_to_matrix(q, T)
+    T[:3, 3] = p
+    return T
+
+
+@dataclass(frozen=True)
+class CartSampling:
+    """How finely a cartesian shape becomes IK waypoints.
+
+    One waypoint per ``step_m`` of translation or ``step_rad`` of rotation,
+    whichever asks for more, with ``max_points`` bounding the whole path.
     """
 
+    step_m: float
+    step_rad: float
+    max_points: int
+
+    def intervals(self, len_m: float, angle_rad: float) -> int:
+        """Intervals a piece of this much translation and rotation wants."""
+        return max(
+            math.ceil(len_m / self.step_m), math.ceil(angle_rad / self.step_rad), 1
+        )
+
+
+def line_sampling() -> CartSampling:
+    """Sampling of a single straight ``move_l`` (``planner.rs``)."""
+    return CartSampling(CART_STEP_M, CART_STEP_RAD, MOVE_L_MAX_STEPS + 1)
+
+
+def path_sampling() -> CartSampling:
+    """Sampling of a multi-segment path — arc, spline, process move, chain."""
+    return CartSampling(CART_STEP_M, CART_STEP_RAD, CART_PATH_MAX_STEPS)
+
+
+def _fit_budget(counts: list[int], max_points: int) -> None:
+    """Scale per-piece interval counts down so the path fits the budget."""
+    total = sum(counts)
+    budget = max(max_points, len(counts) + 1)
+    if total < budget:
+        return
+    factor = (budget - 1) / total
+    for i, c in enumerate(counts):
+        counts[i] = max(int(round(c * factor)), 1)
+
+
+class LineSegment:
+    """Straight Cartesian segment: position lerp, orientation slerp."""
+
     def __init__(self, start: NDArray[np.float64], end: NDArray[np.float64]) -> None:
-        self.p0 = start[:3, 3].copy()
-        self.p1 = end[:3, 3].copy()
+        self.p0 = np.asarray(start[:3, 3], dtype=np.float64).copy()
+        self.p1 = np.asarray(end[:3, 3], dtype=np.float64).copy()
         self.q0 = _quat_from_matrix(start)
-        q1 = _quat_from_matrix(end)
-        if float(self.q0 @ q1) < 0.0:  # shortest arc
-            q1 = -q1
-        self.q1 = q1
+        self.q1 = _quat_from_matrix(end)
 
     @property
     def length_m(self) -> float:
@@ -387,37 +488,430 @@ class CartSegment:
 
     @property
     def angle_rad(self) -> float:
-        dot = float(np.clip(abs(self.q0 @ self.q1), -1.0, 1.0))
-        return 2.0 * math.acos(dot)
+        return _quat_angle(self.q0, self.q1)
 
     def sample(self, t: float) -> NDArray[np.float64]:
-        dot = float(np.clip(self.q0 @ self.q1, -1.0, 1.0))
-        if dot > 0.9995:
-            q = self.q0 + t * (self.q1 - self.q0)
-            q /= np.linalg.norm(q)
-        else:
-            theta = math.acos(dot)
-            sin_theta = math.sin(theta)
-            q = (
-                math.sin((1.0 - t) * theta) * self.q0 + math.sin(t * theta) * self.q1
-            ) / sin_theta
-        T = np.eye(4, dtype=np.float64)
-        _quat_to_matrix(q, T)
-        T[:3, 3] = self.p0 + t * (self.p1 - self.p0)
-        return T
+        """Pose at normalized position *t* in [0, 1]."""
+        return _pose_of(
+            _quat_slerp(self.q0, self.q1, t), self.p0 + t * (self.p1 - self.p0)
+        )
 
-    def steps(self) -> int:
-        """Waypoint count the runtime discretizes this segment into."""
-        return int(
-            min(
-                max(
-                    math.ceil(self.length_m / MOVE_L_STEP_M),
-                    math.ceil(self.angle_rad / MOVE_L_STEP_RAD),
-                    2,
-                ),
-                MOVE_L_MAX_STEPS,
+
+def line(
+    start: NDArray[np.float64], end: NDArray[np.float64], s: CartSampling
+) -> list[NDArray[np.float64]]:
+    """Waypoints along a straight segment, *start* first and *end* last."""
+    seg = LineSegment(start, end)
+    n = min(s.intervals(seg.length_m, seg.angle_rad), max(s.max_points - 1, 1))
+    return [seg.sample(k / n) for k in range(n + 1)]
+
+
+@dataclass(frozen=True)
+class Circle:
+    """A circle in 3-D: centre, radius \\[m\\] and unit plane normal."""
+
+    center: NDArray[np.float64]
+    radius: float
+    normal: NDArray[np.float64]
+
+
+def circle_through(
+    p1: NDArray[np.float64], p2: NDArray[np.float64], p3: NDArray[np.float64]
+) -> Circle:
+    """The circle through three points, as ``move_c`` derives it.
+
+    An end point that coincides with the start (within :data:`_FULL_CIRCLE_M`)
+    means a FULL circle, which two points do not determine a plane for: the
+    circle is the one with ``p1``-``p2`` as its diameter, in the plane parol6
+    picks (normal = ``d x ref``, ``ref`` = z unless ``d`` is nearly parallel
+    to it).  Collinear or coincident points have no circle and are refused —
+    never silently straightened into a line.
+    """
+    a = p2 - p1
+    b = p3 - p1
+    if float(np.linalg.norm(b)) < _FULL_CIRCLE_M:
+        a_len = float(np.linalg.norm(a))
+        if a_len < _LEN_EPS:
+            raise PlanningError(
+                "the start, via and end points of an arc are all the same point"
+            )
+        d = a / a_len
+        reference = (
+            np.array([0.0, 0.0, 1.0]) if abs(d[2]) < 0.9 else np.array([1.0, 0.0, 0.0])
+        )
+        n = np.cross(d, reference)
+        return Circle(
+            center=p1 + 0.5 * a,
+            radius=a_len / 2.0,
+            normal=n / float(np.linalg.norm(n)),
+        )
+    n = np.cross(a, b)
+    n_len = float(np.linalg.norm(n))
+    if n_len < _LEN_EPS * _LEN_EPS:
+        raise PlanningError(
+            "the start, via and end points of an arc are collinear; "
+            "they define no circle"
+        )
+    # Circumcentre C = p1 + s*a + t*b from the perpendicular bisectors:
+    # (C-p1).a = |a|^2/2 and (C-p1).b = |b|^2/2.
+    aa, bb, ab = float(a @ a), float(b @ b), float(a @ b)
+    det = aa * bb - ab * ab
+    if abs(det) < _LEN_EPS * _LEN_EPS:
+        raise PlanningError(
+            "the start, via and end points of an arc are degenerate; "
+            "no circle centre exists"
+        )
+    s = (bb * aa - ab * bb) / (2.0 * det)
+    t = (aa * bb - ab * aa) / (2.0 * det)
+    center = p1 + s * a + t * b
+    return Circle(
+        center=center,
+        radius=float(np.linalg.norm(center - p1)),
+        normal=n / n_len,
+    )
+
+
+def _rotate_about(
+    v: NDArray[np.float64], k: NDArray[np.float64], angle: float
+) -> NDArray[np.float64]:
+    """Rotate *v* about the unit axis *k* by *angle* (Rodrigues)."""
+    c, s = math.cos(angle), math.sin(angle)
+    return v * c + np.cross(k, v) * s + k * (float(k @ v) * (1.0 - c))
+
+
+def arc(
+    start: NDArray[np.float64],
+    via: NDArray[np.float64],
+    end: NDArray[np.float64],
+    s: CartSampling,
+) -> list[NDArray[np.float64]]:
+    """Waypoints along the circular arc from *start* through *via* to *end*.
+
+    The sweep direction is the one that passes through the via point: when
+    the short way round does not contain it, the complement is taken.
+    Orientation slerps from the start pose to the end pose across the whole
+    sweep.
+    """
+    p_start, p_via, p_end = start[:3, 3], via[:3, 3], end[:3, 3]
+    circle = circle_through(p_start, p_via, p_end)
+    r1 = p_start - circle.center
+    r2 = p_end - circle.center
+    n1, n2 = float(np.linalg.norm(r1)), float(np.linalg.norm(r2))
+    if n1 < _LEN_EPS or n2 < _LEN_EPS:
+        raise PlanningError("the arc has no radius")
+    u1, u2 = r1 / n1, r2 / n2
+    sweep = math.acos(float(np.clip(u1 @ u2, -1.0, 1.0)))
+    if sweep < 1e-6 and float(np.linalg.norm(r1 - r2)) < _FULL_CIRCLE_M:
+        # Start and end coincide: the whole circle, not a zero-length arc.
+        sweep = 2.0 * math.pi
+    elif float(np.cross(u1, u2) @ circle.normal) < 0.0:
+        sweep = 2.0 * math.pi - sweep
+
+    q0, q1 = _quat_from_matrix(start), _quat_from_matrix(end)
+    n = min(
+        s.intervals(circle.radius * sweep, _quat_angle(q0, q1)),
+        max(s.max_points - 1, 1),
+    )
+    out = []
+    for k in range(n + 1):
+        t = k / n
+        out.append(
+            _pose_of(
+                _quat_slerp(q0, q1, t),
+                circle.center + _rotate_about(r1, circle.normal, t * sweep),
             )
         )
+    return out
+
+
+def _natural_spline_second_derivatives(
+    x: NDArray[np.float64], y: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Second derivatives of the natural cubic spline through ``(x, y)``
+    (Thomas algorithm on the tridiagonal moment system)."""
+    n = len(x)
+    m = np.zeros(n, dtype=np.float64)
+    if n < 3:
+        return m
+    c = np.zeros(n, dtype=np.float64)
+    d = np.zeros(n, dtype=np.float64)
+    for i in range(1, n - 1):
+        h0, h1 = x[i] - x[i - 1], x[i + 1] - x[i]
+        b = 2.0 * (h0 + h1)
+        rhs = 6.0 * ((y[i + 1] - y[i]) / h1 - (y[i] - y[i - 1]) / h0)
+        denom = b - h0 * c[i - 1]
+        c[i] = h1 / denom
+        d[i] = (rhs - h0 * d[i - 1]) / denom
+    for i in range(n - 2, 0, -1):
+        m[i] = d[i] - c[i] * m[i + 1]
+    return m
+
+
+def spline(
+    waypoints: list[NDArray[np.float64]], s: CartSampling
+) -> list[NDArray[np.float64]]:
+    """Waypoints along a cubic spline through *waypoints*.
+
+    Position is a natural cubic spline per axis over chord-length knots;
+    orientation is a piecewise slerp on the same knots.  Both choices are
+    the runtime's deliberate divergences from parol6's uniform-knot,
+    not-a-knot scipy spline (``motion/geometry.py``,
+    ``SplineMotion.generate_spline``): chord length keeps the curve from
+    overshooting between unevenly spaced waypoints, and natural ends cannot
+    swing wide of the first and last segments — the arm starts and ends this
+    path at rest, so the end curvature carries no information.
+    """
+    n = len(waypoints)
+    if n < 2:
+        raise PlanningError(f"a spline needs at least 2 waypoints, got {n}")
+    if n == 2:
+        return line(waypoints[0], waypoints[1], s)
+    points = np.stack([np.asarray(w[:3, 3], dtype=np.float64) for w in waypoints])
+    quats = [_quat_from_matrix(w) for w in waypoints]
+
+    # Chord-length knots; coincident neighbours would give a zero interval
+    # and a singular system, so they carry a floor.
+    knots = np.zeros(n, dtype=np.float64)
+    for i in range(1, n):
+        knots[i] = knots[i - 1] + max(
+            float(np.linalg.norm(points[i] - points[i - 1])), _LEN_EPS
+        )
+    total = float(knots[-1])
+    if total < _LEN_EPS:
+        raise PlanningError("every spline waypoint is the same point")
+
+    second = np.stack(
+        [_natural_spline_second_derivatives(knots, points[:, axis]) for axis in range(3)]
+    )
+
+    # The spline is longer than its polyline, never shorter, so the polyline
+    # length is a floor on the density and the budget is the ceiling.
+    turn = sum(_quat_angle(quats[i - 1], quats[i]) for i in range(1, n))
+    steps = min(s.intervals(total, turn), max(s.max_points, 2) - 1)
+
+    out = []
+    seg = 0
+    for k in range(steps + 1):
+        u = total * k / steps
+        while seg + 2 < n and u > knots[seg + 1]:
+            seg += 1
+        h = knots[seg + 1] - knots[seg]
+        local = u - knots[seg]
+        t = min(max(local / h, 0.0), 1.0)
+        a, b = local, h - local
+        p = (b * points[seg] + a * points[seg + 1]) / h + (
+            (b**3 - h * h * b) * second[:, seg] + (a**3 - h * h * a) * second[:, seg + 1]
+        ) / (6.0 * h)
+        out.append(_pose_of(_quat_slerp(quats[seg], quats[seg + 1], t), p))
+    return out
+
+
+@dataclass
+class Trim:
+    """The fraction of a segment each of its ends loses to a corner zone."""
+
+    entry: float = 0.0
+    exit: float = 0.0
+
+
+def corner_trims(
+    seg_lengths: list[float], radii: list[float]
+) -> tuple[list[Trim], list[float]]:
+    """Clamp corner radii against the segments they round.
+
+    ``seg_lengths`` has one entry per segment, ``radii`` one per INTERIOR
+    waypoint.  The ABB zone rule, ported from parol6 (``motion/geometry.py``,
+    ``build_composite_cartesian_path``): a radius never eats more than half of
+    either adjacent segment, and two zones sharing a segment are scaled down
+    together until they fit inside it.
+
+    Returns the per-segment trims and the clamped radii \\[m\\].
+    """
+    if not seg_lengths or len(radii) + 1 != len(seg_lengths):
+        raise PlanningError(
+            f"{len(seg_lengths)} segments take {max(len(seg_lengths) - 1, 0)} "
+            f"corner radii, got {len(radii)}"
+        )
+    clamped = [
+        min(max(r, 0.0), seg_lengths[i] / 2.0, seg_lengths[i + 1] / 2.0)
+        for i, r in enumerate(radii)
+    ]
+    for i in range(len(clamped) - 1):
+        total = clamped[i] + clamped[i + 1]
+        length = seg_lengths[i + 1]
+        if total > length and total > 0.0:
+            factor = length / total
+            clamped[i] *= factor
+            clamped[i + 1] *= factor
+    trims = [Trim() for _ in seg_lengths]
+    for i, r in enumerate(clamped):
+        if r <= 0.0:
+            continue
+        if seg_lengths[i] > _LEN_EPS:
+            trims[i].exit = r / seg_lengths[i]
+        if seg_lengths[i + 1] > _LEN_EPS:
+            trims[i + 1].entry = r / seg_lengths[i + 1]
+    return trims, clamped
+
+
+def _push_distinct(
+    out: list[NDArray[np.float64]], pose: NDArray[np.float64]
+) -> None:
+    """Append *pose* unless it repeats the previous one (piece junctions are
+    shared points, and a duplicate waypoint is a zero-length path step)."""
+    if out:
+        last = out[-1]
+        if (
+            float(np.linalg.norm(pose[:3, 3] - last[:3, 3])) < _LEN_EPS
+            and _quat_angle(_quat_from_matrix(pose), _quat_from_matrix(last))
+            < _ANGLE_EPS
+        ):
+            return
+    out.append(pose)
+
+
+def blended_polyline(
+    waypoints: list[NDArray[np.float64]], radii: list[float], s: CartSampling
+) -> list[NDArray[np.float64]]:
+    """Waypoints along a polyline whose interior corners are rounded by
+    quadratic Bézier zones of the given radii \\[m\\].
+
+    ``radii`` has one entry per interior waypoint, and ``0`` there means
+    "stop at this corner" (the path still passes exactly through it).  Each
+    rounded corner is tangent to the incoming segment where the zone starts
+    and to the outgoing one where it ends, so the arm never has to come to
+    rest to change direction.
+    """
+    n = len(waypoints)
+    if n < 2:
+        raise PlanningError(f"a path needs at least 2 waypoints, got {n}")
+    if n == 2:
+        return line(waypoints[0], waypoints[1], s)
+    segments = [LineSegment(waypoints[i], waypoints[i + 1]) for i in range(n - 1)]
+    lengths = [seg.length_m for seg in segments]
+    trims, clamped = corner_trims(lengths, radii)
+
+    # Two passes: size every piece first so the density budget is spread over
+    # the whole path, then emit.
+    pieces: list[tuple[str, int, float, float]] = []
+    counts: list[int] = []
+    for i in range(n - 1):
+        a, b = trims[i].entry, 1.0 - trims[i].exit
+        if b > a + 1e-12:
+            counts.append(
+                s.intervals((b - a) * lengths[i], (b - a) * segments[i].angle_rad)
+            )
+            pieces.append(("line", i, a, b))
+        if i + 1 < n - 1 and clamped[i] > 0.0:
+            # The corner's control polygon is 2r long; its arc is shorter.
+            entry = segments[i].sample(1.0 - trims[i].exit)
+            exit_ = segments[i + 1].sample(trims[i + 1].entry)
+            counts.append(
+                s.intervals(2.0 * clamped[i], LineSegment(entry, exit_).angle_rad)
+            )
+            pieces.append(("corner", i, 0.0, 0.0))
+    if not pieces:
+        raise PlanningError("the path has no length")
+    _fit_budget(counts, s.max_points)
+
+    out: list[NDArray[np.float64]] = []
+    for (kind, i, a, b), steps in zip(pieces, counts):
+        if kind == "line":
+            seg = segments[i]
+            for k in range(steps + 1):
+                _push_distinct(out, seg.sample(a + (b - a) * k / steps))
+        else:
+            entry = segments[i].sample(1.0 - trims[i].exit)
+            exit_ = segments[i + 1].sample(trims[i + 1].entry)
+            corner = waypoints[i + 1][:3, 3]
+            pe, px = entry[:3, 3], exit_[:3, 3]
+            qe, qx = _quat_from_matrix(entry), _quat_from_matrix(exit_)
+            for k in range(steps + 1):
+                t = k / steps
+                omt = 1.0 - t
+                p = omt * omt * pe + 2.0 * omt * t * corner + t * t * px
+                _push_distinct(out, _pose_of(_quat_slerp(qe, qx, t), p))
+    return out
+
+
+def blended_polyline_joint(
+    waypoints: NDArray[np.float64],
+    fracs: list[tuple[float, float]],
+    step_rad: float,
+    max_points: int,
+) -> NDArray[np.float64]:
+    """Joint-space counterpart of :func:`blended_polyline`.
+
+    ``fracs`` carries, per interior waypoint, the fraction of the incoming and
+    of the outgoing segment its corner zone consumes — a joint segment has no
+    length in millimetres, so the caller turns a corner radius into those
+    fractions with FK (parol6 does the same in ``commands/joint_commands.py``,
+    ``do_setup_with_blend``).  ``step_rad`` is the sampling pitch: one
+    waypoint per that much motion on the fastest-moving joint.
+    """
+    n = len(waypoints)
+    if n < 2:
+        raise PlanningError(f"a path needs at least 2 waypoints, got {n}")
+    if len(fracs) + 2 != n:
+        raise PlanningError(
+            f"{n} waypoints take {n - 2} corner zones, got {len(fracs)}"
+        )
+
+    def span(a: NDArray[np.float64], b: NDArray[np.float64]) -> float:
+        return float(np.abs(b - a).max())
+
+    exit_frac = [0.0] * (n - 1)
+    entry_frac = [0.0] * (n - 1)
+    for i, (before, after) in enumerate(fracs):
+        exit_frac[i] = min(max(before, 0.0), 0.5)
+        entry_frac[i + 1] = min(max(after, 0.0), 0.5)
+
+    def interval(motion: float) -> int:
+        return max(math.ceil(motion / step_rad), 1)
+
+    pieces: list[tuple[str, int, float, float]] = []
+    counts: list[int] = []
+    for i in range(n - 1):
+        a, b = entry_frac[i], 1.0 - exit_frac[i]
+        if b > a + 1e-12:
+            counts.append(interval((b - a) * span(waypoints[i], waypoints[i + 1])))
+            pieces.append(("line", i, a, b))
+        if i + 1 < n - 1 and exit_frac[i] > 0.0:
+            e = waypoints[i] + (1.0 - exit_frac[i]) * (waypoints[i + 1] - waypoints[i])
+            x = waypoints[i + 1] + entry_frac[i + 1] * (
+                waypoints[i + 2] - waypoints[i + 1]
+            )
+            counts.append(
+                interval(span(e, waypoints[i + 1]) + span(waypoints[i + 1], x))
+            )
+            pieces.append(("corner", i, 0.0, 0.0))
+    if not pieces:
+        raise PlanningError("the path has no length")
+    _fit_budget(counts, max_points)
+
+    out: list[NDArray[np.float64]] = []
+
+    def push(q: NDArray[np.float64]) -> None:
+        if out and span(out[-1], q) < 1e-12:
+            return
+        out.append(q)
+
+    for (kind, i, a, b), steps in zip(pieces, counts):
+        if kind == "line":
+            for k in range(steps + 1):
+                t = a + (b - a) * k / steps
+                push(waypoints[i] + t * (waypoints[i + 1] - waypoints[i]))
+        else:
+            e = waypoints[i] + (1.0 - exit_frac[i]) * (waypoints[i + 1] - waypoints[i])
+            x = waypoints[i + 1] + entry_frac[i + 1] * (
+                waypoints[i + 2] - waypoints[i + 1]
+            )
+            w = waypoints[i + 1]
+            for k in range(steps + 1):
+                t = k / steps
+                omt = 1.0 - t
+                push(omt * omt * e + 2.0 * omt * t * w + t * t * x)
+    return np.stack(out)
 
 
 # ---------------------------------------------------------------------------
@@ -527,11 +1021,23 @@ class JogEngine:
 __all__ = [
     "DEFAULT_PROFILE",
     "PROFILES",
-    "CartSegment",
+    "CartSampling",
+    "Circle",
     "JogEngine",
+    "LineSegment",
     "MotionLimits",
     "PlanningError",
+    "Trim",
+    "arc",
+    "blended_polyline",
+    "blended_polyline_joint",
+    "circle_through",
+    "corner_trims",
+    "line",
+    "line_sampling",
+    "path_sampling",
     "plan_joint_move",
     "plan_toppra_path",
+    "spline",
     "tick_dt_s",
 ]
