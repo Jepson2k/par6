@@ -34,7 +34,11 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-dev = ["ruff", "ty", "pytest", "pytest-asyncio", "pytest-timeout"]
+# ruff is pinned: it was unpinned and unconfigured, so CI installed whatever
+# was newest and linted against that version's default rule set while devs ran
+# an older one — every push was red on rules the code had never been checked
+# against. The pin and the explicit `select` below are what make the two agree.
+dev = ["ruff==0.15.8", "ty", "pytest", "pytest-asyncio", "pytest-timeout"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"
@@ -46,6 +50,14 @@ include = ["par6*"]
 # Runtime config + URDF trees mirrored from the repo root by
 # scripts/sync_pkg_data.py (freshness-guarded in tests/test_robot.py).
 par6 = ["_data/**/*"]
+
+[tool.ruff]
+target-version = "py311"
+
+[tool.ruff.lint]
+# Explicit, not inherited: ruff's defaults change between releases, and an
+# inherited set silently re-lints the whole package on every upgrade.
+select = ["E4", "E7", "E9", "F", "I"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

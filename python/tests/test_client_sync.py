@@ -11,11 +11,11 @@ import functools
 import threading
 
 import pytest
+from protocol_peer import ANGLES, ScriptedRuntime, start_peer
 
 from par6.client import RobotClient
 from par6.protocol import wire
 from par6.protocol.constants import CmdType, MsgType
-from protocol_peer import ANGLES, ScriptedRuntime, start_peer
 
 
 @pytest.fixture

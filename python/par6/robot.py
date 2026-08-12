@@ -23,7 +23,8 @@ from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from pinokin import Damping, IKSolver, Robot as PinokinRobot, se3_from_rpy, so3_rpy
+from pinokin import Damping, IKSolver, se3_from_rpy, so3_rpy
+from pinokin import Robot as PinokinRobot
 from waldoctl import (
     CartesianKinodynamicLimits,
     ChannelDescriptor,
@@ -31,12 +32,14 @@ from waldoctl import (
     JointsSpec,
     LinearMotion,
     MeshRole,
-    Robot as _RobotABC,
-    ToolSpec,
     ToolsCollection,
+    ToolSpec,
     ToolStatus,
     ToolType,
     resolve_variant_tcp,
+)
+from waldoctl import (
+    Robot as _RobotABC,
 )
 from waldoctl.results import IKResult
 

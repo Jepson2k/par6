@@ -16,6 +16,7 @@ import pytest
 
 from par6.protocol import wire
 from par6.protocol.constants import (
+    COMMAND_CLASS,
     STATUS_LEN,
     ActionState,
     CmdType,
@@ -23,7 +24,6 @@ from par6.protocol.constants import (
     MsgType,
     QueryType,
     ToolState,
-    COMMAND_CLASS,
 )
 
 GOLDEN_DIR = Path(__file__).resolve().parents[2] / "tests" / "golden" / "protocol"

@@ -44,12 +44,16 @@ from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
     ActionState as WActionState,
+)
+from waldoctl.status import (
     ActivityResult,
     PingResult,
     ToolResult,
 )
-from waldoctl.tools import ToolSpec, ToolState as WToolState, ToolStatus
-from waldoctl.types import Axis, Frame as WFrame
+from waldoctl.tools import ToolSpec, ToolStatus
+from waldoctl.tools import ToolState as WToolState
+from waldoctl.types import Axis
+from waldoctl.types import Frame as WFrame
 
 from ..protocol.constants import (
     NUM_JOINTS,

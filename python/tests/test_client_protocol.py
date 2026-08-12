@@ -13,13 +13,6 @@ import math
 
 import numpy as np
 import pytest
-from waldoctl.shapes import Box
-from waldoctl.status import ActionState as WActionState
-from waldoctl.tools import GripperTool, GripperType, ToolState as WToolState
-
-from par6.client import AsyncRobotClient, RobotError
-from par6.protocol import wire
-from par6.protocol.constants import CmdType, Frame, MsgType, QueryType
 from protocol_peer import (
     ANGLES,
     IO,
@@ -27,6 +20,14 @@ from protocol_peer import (
     error_tuple,
     start_peer,
 )
+from waldoctl.shapes import Box
+from waldoctl.status import ActionState as WActionState
+from waldoctl.tools import GripperTool, GripperType
+from waldoctl.tools import ToolState as WToolState
+
+from par6.client import AsyncRobotClient, RobotError
+from par6.protocol import wire
+from par6.protocol.constants import CmdType, Frame, MsgType, QueryType
 
 
 @pytest.fixture
