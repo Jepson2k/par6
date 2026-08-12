@@ -109,3 +109,32 @@ jobs:
       - name: pytest
         working-directory: python
         run: pytest
+
+  # End-to-end: the real python client against a real `par6d --sim` process
+  # over real UDP. Needs the binary, so it builds par6d here and points
+  # PAR6D_BIN at it; without that the same tests skip themselves (which is
+  # what happens in the `python` job above).
+  e2e:
+    name: e2e (python client <-> par6d --sim)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: e2e
+      # Release, not debug: the sim runs in wall-clock time and an
+      # unoptimized RT loop misses its deadlines and latches LOOP_CRITICAL.
+      - name: build par6d
+        run: cargo build -p par6d --release
+      - name: install python client
+        run: pip install -e "python[dev]"
+      - name: pytest -m e2e
+        working-directory: python
+        env:
+          PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
+        run: pytest -m e2e

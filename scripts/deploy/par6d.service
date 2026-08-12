@@ -1,0 +1,60 @@
+[Unit]
+Description=PAR6 runtime daemon (par6d)
+Documentation=https://github.com/Jepson2k/par6
+After=network.target
+# par6d brings the CAN link up itself when it is down (needs CAP_NET_ADMIN),
+# so the device is not a hard dependency — but do not race the driver.
+After=sys-subsystem-net-devices-can0.device
+# Crash-loop guard: five failed starts inside a minute stops the retries.
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=exec
+ExecStart=/usr/local/bin/par6d
+WorkingDirectory=/var/lib/par6
+StateDirectory=par6
+
+# Config discovery: par6d reads PAR6_CONFIG before falling back to
+# ./config/PAR6.toml and <exe>/../../config/PAR6.toml. Pin it explicitly.
+Environment=PAR6_CONFIG=/etc/par6/PAR6.toml
+# Only consumed by builds with the `ffi` feature (kinematics stack).
+Environment=PAR6_ASSETS=/usr/share/par6/par6_description
+Environment=RUST_LOG=info
+
+User=par6
+Group=par6
+# CAP_SYS_NICE: the RT thread requests SCHED_FIFO 99 (spec/RT.md). Setup
+# failure is logged DEGRADED and is not fatal, so a box without the
+# capability still runs — badly.
+# CAP_NET_ADMIN: bring can0 up at the configured bitrate when it is down.
+AmbientCapabilities=CAP_SYS_NICE CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_ADMIN
+LimitRTPRIO=99
+NoNewPrivileges=yes
+
+# par6d pins its own RT thread to CPU 3; do NOT constrain the process
+# affinity here or that pin (and the tokio command plane) fight over cores.
+
+Restart=always
+RestartSec=2
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=par6d
+
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=no
+ProtectControlGroups=yes
+ProtectKernelModules=yes
+RestrictSUIDSGID=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_CAN for the bus, AF_NETLINK for the link bring-up, AF_INET/6 for the
+# protocol-v2 command/status/telemetry planes.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_CAN
+
+[Install]
+WantedBy=multi-user.target
