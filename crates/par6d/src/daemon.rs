@@ -153,6 +153,7 @@ impl Daemon {
             bridge: kin_bridge,
             housekeeping: kin_hk,
             collision,
+            tool_offset,
             assets_dir,
         } = load_kin_stack(opts, &config_path, robot)?;
 
@@ -256,8 +257,11 @@ impl Daemon {
             handles.heartbeat.clone(),
             plan_r,
             &bundle,
-            kin_planner,
-            collision,
+            crate::planner::PlannerKin {
+                kin: kin_planner,
+                collision,
+                tool_offset,
+            },
         )?;
         #[cfg(not(feature = "ffi"))]
         let planner = Par6Planner::new(
@@ -509,6 +513,8 @@ struct KinStack {
     bridge: crate::kin::CartKin,
     housekeeping: crate::kin::CartKin,
     collision: par6_kin::Collision,
+    /// The one TCP-offset cell all of the above read.
+    tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
 }
 
@@ -528,7 +534,9 @@ fn load_kin_stack(
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
 ) -> Result<KinStack, DaemonError> {
-    use crate::kin::{load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity};
+    use crate::kin::{
+        load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity, ToolOffset,
+    };
     let assets_dir =
         resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
     let variant = variant_for(&robot.robot.active_gripper);
@@ -559,15 +567,19 @@ fn load_kin_stack(
                 assets_dir.display()
             ))
         })?;
+    // Gravity is the only model that does not carry it: the offset is a
+    // massless point, not a load.
+    let tool_offset = ToolOffset::new();
     Ok(KinStack {
-        fk: KinFk::new(load()?),
+        fk: KinFk::new(load()?, tool_offset.clone()),
         gravity: KinGravity::new(
             load_kin(&assets_dir, gravity_variant).map_err(DaemonError::Kinematics)?,
         ),
-        planner: CartKin::new(load()?),
-        bridge: CartKin::new(load()?),
-        housekeeping: CartKin::new(load()?),
+        planner: CartKin::new(load()?, tool_offset.clone()),
+        bridge: CartKin::new(load()?, tool_offset.clone()),
+        housekeeping: CartKin::new(load()?, tool_offset.clone()),
         collision,
+        tool_offset,
         assets_dir,
     })
 }

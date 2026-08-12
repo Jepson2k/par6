@@ -35,7 +35,7 @@ use par6_config::ConfigBundle;
 use par6_kin::NQ;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
-use par6_proto::{make_error, Command, ErrorCode, WireError, UNATTRIBUTED};
+use par6_proto::{make_error, Command, ErrorCode, WireError, EN_SLOTS, UNATTRIBUTED};
 use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
     SnapshotReader, SpecSettle, StateSnapshot, MAX_JOINTS,
@@ -179,6 +179,16 @@ struct InFlight {
     kind: InFlightKind,
 }
 
+/// The planner's kinematics kit (feature `ffi`): its own model instance,
+/// the enforced collision world, and the shared TCP-offset cell it
+/// publishes into.
+#[cfg(feature = "ffi")]
+pub(crate) struct PlannerKin {
+    pub(crate) kin: crate::kin::CartKin,
+    pub(crate) collision: par6_kin::Collision,
+    pub(crate) tool_offset: crate::kin::ToolOffset,
+}
+
 /// The `Planner` implementation `par6d` hands to the server.
 pub(crate) struct Par6Planner {
     link: CoreLink,
@@ -222,6 +232,12 @@ pub(crate) struct Par6Planner {
     /// to the server by the next [`Planner::poll`].
     #[cfg(feature = "ffi")]
     invalidated: Option<CommandOutcome>,
+    /// The commanded TCP offset, shared with the bridge's and
+    /// housekeeping's models and with the RT FK hook.
+    #[cfg(feature = "ffi")]
+    tool_offset: crate::kin::ToolOffset,
+    /// Rate/change gate for the cartesian enablement probe.
+    probe: EnablementProbe,
     /// Link pairs that touch in the robot's own configured park pose, and
     /// are therefore not collisions.
     ///
@@ -245,12 +261,15 @@ impl Par6Planner {
         heartbeat: ExecHeartbeat,
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
-        #[cfg(feature = "ffi")] kin: crate::kin::CartKin,
-        #[cfg(feature = "ffi")] collision: par6_kin::Collision,
+        #[cfg(feature = "ffi")] models: PlannerKin,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
         #[cfg(feature = "ffi")]
-        let mut collision = collision;
+        let PlannerKin {
+            kin,
+            mut collision,
+            tool_offset,
+        } = models;
         #[cfg(feature = "ffi")]
         let resting_pairs = park_contacts(&mut collision, &bundle.robot.robot.park_pose_rad);
         let dt = bundle.robot.robot.tick_dt_s;
@@ -274,7 +293,17 @@ impl Par6Planner {
             tool_grace_ticks: ticks(TOOL_COMMAND_GRACE_S).max(2),
             tool_cal_min_ticks: ticks(TOOL_CALIBRATE_MIN_WAIT_S),
             inflight: None,
-            enablement: Enablement::default(),
+            // Nothing measured yet, and the wire has no "unknown": claim
+            // no freedom until the first probe runs (the next poll).
+            enablement: NO_FREEDOM,
+            probe: EnablementProbe::new(
+                Duration::from_secs_f64(
+                    1.0 / f64::from(bundle.robot.protocol.status_rate_hz.max(1)),
+                )
+                .max(EN_MIN_PERIOD),
+            ),
+            #[cfg(feature = "ffi")]
+            tool_offset,
             #[cfg(feature = "ffi")]
             kin,
             #[cfg(feature = "ffi")]
@@ -986,19 +1015,252 @@ impl Par6Planner {
         }
     }
 
+    /// Recompute the enablement flags for STATUS and the REACHABLE query.
+    ///
+    /// Rate- and change-gated ([`EnablementProbe`]): the cartesian half
+    /// costs 24 seeded IK solves and a collision check per solution, which
+    /// belongs nowhere near the RT thread and not on every 500 Hz planner
+    /// poll either — and a configuration that has not moved cannot have
+    /// changed its answer.
     fn update_enablement(&mut self, snap: &StateSnapshot) {
-        // Direction freedom against the soft window, POSITIVE slot first
-        // (`[j1+, j1−, …]`) — the order the waldoctl frontend unpacks and
-        // parol6 publishes; filling the pair the other way round greys
-        // out the opposite jog button. Cartesian flags stay at their
-        // permissive default: there is no workspace model to bound them
-        // against yet (follow-up).
-        let mut en = Enablement::default();
-        for j in 0..MAX_JOINTS {
-            en.joint_en[2 * j] = u8::from(snap.q[j] < self.exec_limits.soft_max[j]);
-            en.joint_en[2 * j + 1] = u8::from(snap.q[j] > self.exec_limits.soft_min[j]);
+        if !self.probe.due(&snap.q) {
+            return;
         }
+        // POSITIVE slot first (`[j1+, j1−, …]`) — the order the waldoctl
+        // frontend unpacks and parol6 publishes; filling the pair the
+        // other way round greys out the opposite jog button. The margin
+        // is parol6's: a joint a fraction of a degree from its stop has
+        // no usable freedom left, so the button greys before the jog is
+        // refused.
+        let mut en = NO_FREEDOM;
+        for j in 0..MAX_JOINTS {
+            en.joint_en[2 * j] =
+                u8::from(snap.q[j] + EN_JOINT_DELTA_RAD <= self.exec_limits.soft_max[j]);
+            en.joint_en[2 * j + 1] =
+                u8::from(snap.q[j] - EN_JOINT_DELTA_RAD >= self.exec_limits.soft_min[j]);
+        }
+        #[cfg(feature = "ffi")]
+        self.probe_directions(snap, &mut en);
         self.enablement = en;
+    }
+
+    /// Fill the cartesian slots, and withdraw joint directions the
+    /// collision world blocks.
+    ///
+    /// Per parol6's IK worker: each of the twelve directions gets a
+    /// [`EN_STEP_M`] / [`EN_STEP_RAD`] delta transform applied `dT·T`
+    /// (world frame) or `T·dT` (tool frame), and the slot is whether
+    /// seeded IK at the measured `q` reaches it. A solution outside the
+    /// EXEC soft window does not count — that is where par6 refuses the
+    /// motion — and neither does one the collision world rejects.
+    #[cfg(feature = "ffi")]
+    fn probe_directions(&mut self, snap: &StateSnapshot, en: &mut Enablement) {
+        let started = Instant::now();
+        let mut q = [0.0; NQ];
+        q.copy_from_slice(&snap.q[..NQ]);
+        let pose = match self.kin.fk(&q) {
+            Ok(p) => p,
+            Err(e) => {
+                log::warn!("enablement: FK failed at the measured pose ({e}); no freedom reported");
+                return;
+            }
+        };
+        let baseline = match self.baseline_pairs(&q) {
+            Ok(b) => b,
+            Err(e) => {
+                log::warn!("enablement: collision baseline failed ({e}); no freedom reported");
+                return;
+            }
+        };
+
+        for wrf in [true, false] {
+            let mut slots = [0u8; EN_SLOTS];
+            for (slot, out) in slots.iter_mut().enumerate() {
+                let axis = slot / 2;
+                let step = if axis < 3 { EN_STEP_M } else { EN_STEP_RAD };
+                let d = crate::kin::axis_delta(axis, if slot % 2 == 0 { step } else { -step });
+                let target = if wrf {
+                    crate::kin::mat_mul(&d, &pose)
+                } else {
+                    crate::kin::mat_mul(&pose, &d)
+                };
+                *out = u8::from(self.direction_free(&q, &target, &baseline));
+            }
+            if wrf {
+                en.cart_en_wrf = slots;
+            } else {
+                en.cart_en_trf = slots;
+            }
+        }
+
+        // A joint direction whose small step drives into the world is not
+        // free either, whatever the limits say.
+        for j in 0..NQ {
+            for (slot, sign) in [(2 * j, 1.0), (2 * j + 1, -1.0)] {
+                if en.joint_en[slot] == 0 {
+                    continue;
+                }
+                let mut step = q;
+                step[j] = (q[j] + sign * EN_JOINT_STEP_RAD)
+                    .clamp(self.exec_limits.soft_min[j], self.exec_limits.soft_max[j]);
+                en.joint_en[slot] = u8::from(self.adds_no_collision(&step, &baseline));
+            }
+        }
+        // Trace, not debug: this fires on a timer whenever the arm is
+        // moving, and a per-probe line at debug drowns the log the
+        // one-per-move collision-gate timing lives in.
+        log::trace!(
+            "enablement probe: {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+    }
+
+    /// The colliding pairs the arm is ALREADY in — the ones a probed
+    /// direction may keep without being blocked for them. Same escape rule
+    /// as the planner's collision gate: a direction may not CREATE a
+    /// collision, it may leave one.
+    #[cfg(feature = "ffi")]
+    fn baseline_pairs(
+        &mut self,
+        q: &[f64; NQ],
+    ) -> Result<Vec<(String, String)>, par6_kin::KinError> {
+        let world = &self.world_names;
+        let col = &mut self.collision;
+        let mut pairs: Vec<(String, String)> = col
+            .check(q, false)?
+            .pairs()
+            .map(|(a, b)| (display_name(a, world), display_name(b, world)))
+            .collect();
+        pairs.extend(self.resting_pairs.iter().cloned());
+        Ok(pairs)
+    }
+
+    /// Whether a small step to `target` is reachable, inside the soft
+    /// window, and clear of the collision world.
+    #[cfg(feature = "ffi")]
+    fn direction_free(
+        &mut self,
+        seed: &[f64; NQ],
+        target: &par6_kin::Pose,
+        baseline: &[(String, String)],
+    ) -> bool {
+        let solved = match self.kin.ik_within(seed, target, EN_IK_ITERS) {
+            crate::kin::IkResult::Solved(q) => q,
+            crate::kin::IkResult::Unreachable => return false,
+            crate::kin::IkResult::Failed(e) => {
+                log::warn!("enablement: IK call failed ({e})");
+                return false;
+            }
+        };
+        let inside = (0..NQ).all(|j| {
+            solved[j] >= self.exec_limits.soft_min[j] && solved[j] <= self.exec_limits.soft_max[j]
+        });
+        inside && self.adds_no_collision(&solved, baseline)
+    }
+
+    /// Whether `q` collides in no pair the arm is not already in.
+    #[cfg(feature = "ffi")]
+    fn adds_no_collision(&mut self, q: &[f64; NQ], baseline: &[(String, String)]) -> bool {
+        let world = &self.world_names;
+        let col = &mut self.collision;
+        match col.check(q, false) {
+            Ok(report) => report.pairs().all(|(a, b)| {
+                let (a, b) = (display_name_ref(a, world), display_name_ref(b, world));
+                baseline.iter().any(|(x, y)| x == a && y == b)
+            }),
+            Err(e) => {
+                log::warn!("enablement: collision check failed ({e})");
+                false
+            }
+        }
+    }
+}
+
+/// Nothing is known to be free — the state the flags start in and fall
+/// back to. The wire slots are 0/1 with no "unknown" spelling, and 1
+/// means "you may move that way", so an unmeasured direction reports 0.
+const NO_FREEDOM: Enablement = Enablement {
+    joint_en: [0; EN_SLOTS],
+    cart_en_wrf: [0; EN_SLOTS],
+    cart_en_trf: [0; EN_SLOTS],
+};
+
+/// Translation probe step for cartesian enablement \[m\] (parol6: 0.5 mm).
+#[cfg(feature = "ffi")]
+const EN_STEP_M: f64 = 0.0005;
+/// Rotation probe step for cartesian enablement \[rad\] (parol6: 0.5°).
+#[cfg(feature = "ffi")]
+const EN_STEP_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
+/// Iteration budget for one probe solve (parol6's solver runs 20 per
+/// attempt). A 0.5 mm / 0.5° step off the measured configuration
+/// converges in a handful of iterations when it converges at all, so the
+/// full planning budget would be spent only on the directions that have
+/// no answer — which is exactly where the probe must stay cheap.
+#[cfg(feature = "ffi")]
+const EN_IK_ITERS: i32 = 20;
+/// Joint probe step for the collision half of the joint gate \[rad\]
+/// (parol6: 2°) — big enough that a step actually enters what it is about
+/// to enter, and clamped into the soft window so a pose past the stop
+/// cannot grey a button the jog could still use.
+#[cfg(feature = "ffi")]
+const EN_JOINT_STEP_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
+/// Floor on the enablement probe's period.
+///
+/// parol6 recomputes enablement at the status cadence, but it does so in a
+/// separate process; par6 computes it on the command-plane task, between
+/// feeding the EXEC link heartbeat and filling the RT sample ring.
+/// Measured on the sim rig, one probe costs ~6 ms typically and up to
+/// ~50 ms where most directions have no IK solution — at a 50 Hz status
+/// rate that is most of the task's budget, so the probe is capped here
+/// instead. It still refreshes far faster than an operator can act on a
+/// jog button, and it only runs at all while the arm is moving.
+const EN_MIN_PERIOD: Duration = Duration::from_millis(100);
+/// Margin a joint must still have inside its soft window to count as free
+/// \[rad\] (parol6: 0.2° against `qlim`).
+const EN_JOINT_DELTA_RAD: f64 = 0.2 * std::f64::consts::PI / 180.0;
+
+/// Rate/change gate for [`Par6Planner::update_enablement`].
+///
+/// parol6 recomputes enablement at the status cadence and skips
+/// submission entirely while the measured configuration is unchanged. par6
+/// keeps the change gate — a still arm's answer cannot change on its own,
+/// so a still arm pays nothing — and floors the period at
+/// [`EN_MIN_PERIOD`], because par6 runs the probe on the command-plane
+/// task rather than in a separate process.
+struct EnablementProbe {
+    period: Duration,
+    due_at: Option<Instant>,
+    last_q: Option<[f64; MAX_JOINTS]>,
+}
+
+impl EnablementProbe {
+    fn new(period: Duration) -> Self {
+        Self {
+            period,
+            due_at: None,
+            last_q: None,
+        }
+    }
+
+    fn due(&mut self, q: &[f64; MAX_JOINTS]) -> bool {
+        let now = Instant::now();
+        if self.due_at.is_some_and(|t| now < t) || self.last_q == Some(*q) {
+            return false;
+        }
+        self.last_q = Some(*q);
+        self.due_at = Some(now + self.period);
+        true
+    }
+
+    /// Something other than the configuration changed what the answer
+    /// would be (the collision world, the TCP the probe measures from):
+    /// recompute at the next poll even though the arm has not moved.
+    /// Only the cartesian half has such inputs, so only `ffi` builds
+    /// have a reason to call it.
+    #[cfg(feature = "ffi")]
+    fn invalidate(&mut self) {
+        self.due_at = None;
+        self.last_q = None;
     }
 }
 
@@ -1069,12 +1331,13 @@ impl Planner for Par6Planner {
 
     fn poll(&mut self) -> Option<CommandOutcome> {
         let snap = self.snapshots.latest();
-        self.update_enablement(&snap);
-        #[cfg(feature = "ffi")]
-        if let Some(out) = self.invalidated.take() {
-            return Some(out);
-        }
-        self.inflight.as_ref()?;
+        // While a planned trajectory is running, this task's budget belongs
+        // to the EXEC link watchdog and the sample ring, both fed from
+        // here — so the enablement probe, the one expensive thing on this
+        // loop, stands down for the duration. Nothing is lost: a client
+        // cannot jog through a running move (a streamable cancels the
+        // queue), and the configuration the move ends in is a change, so
+        // the probe runs the moment it finishes.
         if matches!(
             self.inflight,
             Some(InFlight {
@@ -1084,6 +1347,12 @@ impl Planner for Par6Planner {
         ) {
             self.heartbeat.feed();
             self.pump_ring();
+        } else {
+            self.update_enablement(&snap);
+        }
+        #[cfg(feature = "ffi")]
+        if let Some(out) = self.invalidated.take() {
+            return Some(out);
         }
         // `verdict` reads planner-wide constants, so the in-flight
         // command is taken out of `self` for the call and put back.
@@ -1140,10 +1409,21 @@ impl Planner for Par6Planner {
                 ctx.profile
             ),
         }
-        // tool / tcp_offset are stored and reported by the server; the
-        // planner will consume them once TCP-offset retargeting lands
-        // (follow-up). Cartesian targets currently resolve at the URDF's
-        // TCP frame.
+        // The offset composes AFTER the variant's own TCP frame, which
+        // the URDF already carries — so publishing the commanded
+        // translation is the whole application. The cell is shared with
+        // the bridge's and housekeeping's models and with the RT FK hook,
+        // so planning, streaming and the reported pose all resolve at the
+        // same point; `TCP_OFFSET` still reads back the COMMANDED value,
+        // which the server owns.
+        #[cfg(feature = "ffi")]
+        {
+            let mm = ctx.tcp_offset_mm;
+            self.tool_offset
+                .set([mm[0] / 1000.0, mm[1] / 1000.0, mm[2] / 1000.0]);
+            // The workspace the enablement probe measured is the old TCP's.
+            self.probe.invalidate();
+        }
     }
 
     #[cfg(feature = "ffi")]
@@ -1189,6 +1469,8 @@ impl Planner for Par6Planner {
             .map(|s| s.name.clone())
             .collect();
         self.world_names = self.layer_names.concat();
+        // The measured freedom was measured against the previous world.
+        self.probe.invalidate();
         // Committed motion is not exempt from a world it now violates.
         self.revalidate_inflight();
         Ok(Some(epoch))
@@ -1254,17 +1536,26 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
 /// name the client gave it, robot geometry drops the per-link geometry
 /// index the model appends (`upper_arm_0` -> `upper_arm`) so pairs name
 /// URDF links, not solver-internal identifiers.
+///
+/// Borrows out of the model's own name table — the enablement probe
+/// compares tens of pairs per probed configuration and must not allocate
+/// to do it.
 #[cfg(feature = "ffi")]
-fn display_name(geom: &str, world_names: &[String]) -> String {
+fn display_name_ref<'a>(geom: &'a str, world_names: &[String]) -> &'a str {
     if world_names.iter().any(|n| n == geom) {
-        return geom.to_owned();
+        return geom;
     }
     match geom.rsplit_once('_') {
-        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
-            link.to_owned()
-        }
-        _ => geom.to_owned(),
+        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => link,
+        _ => geom,
     }
+}
+
+/// [`display_name_ref`], owned — for the pair lists that outlive the
+/// report they came from (error payloads, the STATUS latch).
+#[cfg(feature = "ffi")]
+fn display_name(geom: &str, world_names: &[String]) -> String {
+    display_name_ref(geom, world_names).to_owned()
 }
 
 /// Link pairs already in contact at the robot's configured park pose.

@@ -18,7 +18,9 @@ use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use par6_proto::command::{JogL, MoveJ, MoveJPose, MoveL, SetShapes, Shape, Teleport};
+use par6_proto::command::{
+    JogL, MoveJ, MoveJPose, MoveL, SetShapes, SetTcpOffset, Shape, Teleport,
+};
 use par6_proto::{
     decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, QueryResult, Reply,
     Status, WireError, NUM_JOINTS,
@@ -1035,6 +1037,301 @@ fn collision_world_is_enforced_over_protocol_v2() {
     assert!(
         ok,
         "a move to the configured park pose must not be refused: {detail:?}"
+    );
+
+    rig.shutdown();
+}
+
+// ---- TCP offset -------------------------------------------------------------
+
+/// Length of the commanded TCP offset \[mm\] — a tool standing this far
+/// off the gripper's own TCP, the case `set_tcp_offset` exists for.
+const TOOL_OFFSET_MM: f64 = 100.0;
+/// World displacement of the commanded target from the start pose \[mm\].
+/// The travel `cartesian_surface_over_protocol_v2` already proves the arm
+/// covers from [`CART_START_DEG`], so both runs below land well inside the
+/// workspace; the offset points along the same ray.
+const OFFSET_TARGET_MM: [f64; 3] = [120.0, 60.0, 120.0];
+/// Settle time for the cartesian moves below \[s\].
+const OFFSET_MOVE_S: f64 = 8.0;
+
+fn move_j_pose(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
+    Command::MoveJPose(MoveJPose {
+        key,
+        pose,
+        duration: Some(duration_s),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+    })
+}
+
+fn set_tcp_offset(x: f64, y: f64, z: f64) -> Command {
+    Command::SetTcpOffset(SetTcpOffset { x, y, z })
+}
+
+fn tcp_offset_readback(c: &mut Client) -> [f64; 3] {
+    match c.query(&Command::TcpOffset) {
+        QueryResult::TcpOffset { x, y, z } => [x, y, z],
+        other => panic!("unexpected TCP_OFFSET result {other:?}"),
+    }
+}
+
+/// Settled TCP position after motion stops.
+fn settled_tcp(rig: &Rig, what: &str) -> Status {
+    rig.drain_status();
+    rig.wait_status(what, |s| s.speeds.iter().all(|v| v.abs() < 0.05))
+}
+
+/// `set_tcp_offset` retargets the whole cartesian surface, not just the
+/// readback.
+///
+/// The offset composes AFTER the URDF variant's own TCP frame and in the
+/// TOOL-LOCAL frame — `T_flange→TCP = T_tool · T_offset`, the composition
+/// the Python client already applies for preview FK/IK. The commanded
+/// translation here is `Rᵀ·v`, so it is neither the world displacement it
+/// must produce nor axis-aligned in any frame: a runtime that read it as
+/// a world offset, or dropped it, lands somewhere else. With it set:
+///
+/// - STATUS reports the offset point, immediately, without the arm moving,
+///   and it sits exactly `v` from the flange;
+/// - the same commanded `move_j_pose` target puts THAT point on the
+///   target, which parks the flange 100 mm from where the identical
+///   command parks it with no offset;
+/// - the `TCP_OFFSET` query still answers the COMMANDED translation, not
+///   the composed transform.
+///
+/// Before the offset reached the models this failed on the first bound
+/// already: STATUS kept reporting the flange, and the two `move_j_pose`
+/// runs parked the arm in the same configuration.
+#[test]
+fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
+    let rig = Rig::boot("tcpoffset", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    rig.drain_status();
+    let flange = rig.wait_status("start pose", |_| true);
+    let p_flange = tcp_mm(&flange);
+
+    // The world displacement the offset must produce, and the tool-local
+    // translation that produces it: `d = Rᵀ·v` off the start orientation.
+    let norm = (OFFSET_TARGET_MM[0] * OFFSET_TARGET_MM[0]
+        + OFFSET_TARGET_MM[1] * OFFSET_TARGET_MM[1]
+        + OFFSET_TARGET_MM[2] * OFFSET_TARGET_MM[2])
+        .sqrt();
+    let v: [f64; 3] = std::array::from_fn(|i| TOOL_OFFSET_MM * OFFSET_TARGET_MM[i] / norm);
+    let d: [f64; 3] = std::array::from_fn(|j| (0..3).map(|i| flange.pose[4 * i + j] * v[i]).sum());
+
+    // --- The reported point moves; the arm does not.
+    c.ok(&set_tcp_offset(d[0], d[1], d[2]));
+    rig.drain_status();
+    let offset = rig.wait_status("STATUS follows the offset TCP", |s| {
+        distance(tcp_mm(s), p_flange) > 1.0
+    });
+    let p_tcp = tcp_mm(&offset);
+    for k in 0..3 {
+        let want = p_flange[k] + v[k];
+        assert!(
+            (p_tcp[k] - want).abs() < 0.5,
+            "the tool-local offset {d:?} must displace the reported TCP by {v:?}: \
+             axis {k} is {}, expected {want} ({p_flange:?} -> {p_tcp:?})",
+            p_tcp[k]
+        );
+    }
+    assert!(
+        angles_close(&offset.angles, &flange.angles, 0.1),
+        "setting a TCP offset must not move the arm: {:?} -> {:?}",
+        flange.angles,
+        offset.angles
+    );
+    // A pure translation in the tool frame: the orientation block is
+    // untouched, so only the point the runtime resolves at has changed.
+    for k in [0, 1, 2, 4, 5, 6, 8, 9, 10] {
+        assert!(
+            (offset.pose[k] - flange.pose[k]).abs() < 1e-6,
+            "the offset rotated the reported pose at element {k}"
+        );
+    }
+    let readback = tcp_offset_readback(&mut c);
+    for k in 0..3 {
+        assert!(
+            (readback[k] - d[k]).abs() < 1e-9,
+            "TCP_OFFSET answers the commanded translation {d:?}, not the composed \
+             transform: got {readback:?}"
+        );
+    }
+
+    // --- The same commanded target, with and without the offset. Both
+    // runs park the flange along the travel
+    // `cartesian_surface_over_protocol_v2` already proves is clear, a full
+    // TOOL_OFFSET_MM apart from each other.
+    let target: [f64; 3] = std::array::from_fn(|k| p_flange[k] + OFFSET_TARGET_MM[k]);
+    let wire_target = wire_pose_at(&flange.pose, target);
+
+    let i = c.ok_index(&move_j_pose(2001, wire_target, OFFSET_MOVE_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "move_j_pose with a TCP offset must complete, got {detail:?}"
+    );
+    let landed = settled_tcp(&rig, "settled with the offset");
+    let reached = tcp_mm(&landed);
+    assert!(
+        distance(reached, target) < 10.0,
+        "STATUS must report the OFFSET point on the commanded target: \
+         {reached:?} vs {target:?}"
+    );
+
+    // Where the flange actually ended up: same configuration, offset off.
+    c.ok(&set_tcp_offset(0.0, 0.0, 0.0));
+    rig.drain_status();
+    let f_with = tcp_mm(&rig.wait_status("flange of the offset run", |s| {
+        distance(tcp_mm(s), reached) > 1.0
+    }));
+
+    rig.drain_status();
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let i = c.ok_index(&move_j_pose(2002, wire_target, OFFSET_MOVE_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "move_j_pose without an offset must complete, got {detail:?}"
+    );
+    let plain = settled_tcp(&rig, "settled without the offset");
+    let f_without = tcp_mm(&plain);
+    assert!(
+        distance(f_without, target) < 10.0,
+        "without an offset the FLANGE lands on the target: {f_without:?} vs {target:?}"
+    );
+
+    let moved = distance(f_with, f_without);
+    assert!(
+        moved > 80.0,
+        "the offset must land the flange somewhere else for the same commanded \
+         target: {f_with:?} vs {f_without:?} ({moved:.1} mm apart, expected \
+         about {TOOL_OFFSET_MM})"
+    );
+    let joint_delta = landed
+        .angles
+        .iter()
+        .zip(plain.angles.iter())
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        joint_delta > 2.0,
+        "the two runs parked in the same configuration ({joint_delta:.3} deg apart): \
+         the offset never reached the planner's IK"
+    );
+
+    rig.shutdown();
+}
+
+// ---- cartesian enablement ---------------------------------------------------
+
+/// A configuration at the edge of the reachable workspace: the arm is
+/// stretched out along −x holding the wrist fixed, so a step further out
+/// has no IK solution while a step back in does. Measured, not assumed —
+/// the test drives a real 20 mm `move_l` each way and the runtime agrees
+/// with the flags.
+const BOUNDARY_DEG: [f64; NUM_JOINTS] = [0.0, -100.0, 285.0, 0.0, -30.0, 180.0];
+/// World-frame enablement slots, positive direction first.
+const X_POS: usize = 0;
+const X_NEG: usize = 1;
+
+fn move_l_to(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
+    Command::MoveL(MoveL {
+        key,
+        pose,
+        frame: Frame::Wrf,
+        duration: Some(duration_s),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    })
+}
+
+/// The cartesian enablement flags describe the real workspace.
+///
+/// Parked against the outer edge of its reach, the arm may still move
+/// inward and may not move further out — and STATUS says exactly that,
+/// per direction, in both frames. The flags are then corroborated against
+/// what the runtime actually does with the same two directions: the
+/// blocked one is an `IK_TARGET_UNREACHABLE` refusal, the free one runs to
+/// COMPLETE.
+///
+/// Before the probe landed, an `ffi` runtime published
+/// `Enablement::default()` — all twelve directions free, in both frames,
+/// in every pose — so the blocked direction read 1 and a frontend offered
+/// a jog button for a motion the runtime would refuse.
+#[test]
+fn cartesian_enablement_measures_the_real_workspace() {
+    let rig = Rig::boot("enablement", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    enable_and_teleport(&rig, &mut c, BOUNDARY_DEG);
+    rig.drain_status();
+    let s = rig.wait_status("parked at the edge of reach", |s| {
+        angles_close(&s.angles, &BOUNDARY_DEG, 0.5)
+    });
+    let edge = tcp_mm(&s);
+    assert!(
+        edge[0] < -400.0,
+        "the boundary pose must reach out along -x, got {edge:?}"
+    );
+    assert_eq!(
+        (s.cart_en_wrf[X_POS], s.cart_en_wrf[X_NEG]),
+        (1, 0),
+        "at the edge of reach the arm may move in (+x) and not out (-x); \
+         world-frame flags were {:?}",
+        s.cart_en_wrf
+    );
+    assert!(
+        s.cart_en_trf.contains(&0),
+        "the tool-frame flags are a real measurement too, not a default: {:?}",
+        s.cart_en_trf
+    );
+    // The REACHABLE query answers from the same measurement.
+    match c.query(&Command::Reachable) {
+        QueryResult::Reachable { cart_en_wrf, .. } => assert_eq!(
+            (cart_en_wrf[X_POS], cart_en_wrf[X_NEG]),
+            (1, 0),
+            "REACHABLE disagrees with STATUS: {cart_en_wrf:?}"
+        ),
+        other => panic!("unexpected REACHABLE result {other:?}"),
+    }
+
+    // Corroboration: the runtime really does refuse the direction it
+    // greyed, and really does run the one it kept.
+    let inward = wire_pose_at(&s.pose, [edge[0] + 20.0, edge[1], edge[2]]);
+    let i = c.ok_index(&move_l_to(3001, inward, 3.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "the direction reported free must actually run, got {detail:?}"
+    );
+
+    enable_and_teleport(&rig, &mut c, BOUNDARY_DEG);
+    let outward = wire_pose_at(&s.pose, [edge[0] - 20.0, edge[1], edge[2]]);
+    let i = c.ok_index(&move_l_to(3002, outward, 3.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        !ok,
+        "the direction reported blocked must actually be refused"
+    );
+    // Either IK verdict says the same thing — the line leaves the
+    // reachable workspace; which one depends on whether the endpoint or
+    // an interior sample loses convergence first.
+    let code = detail.expect("a failed COMPLETE carries the error").code;
+    assert!(
+        code == ErrorCode::IkTargetUnreachable as u16 || code == ErrorCode::IkPartialPath as u16,
+        "the blocked direction must be blocked for the reason the flag claims, \
+         got error code {code}"
     );
 
     rig.shutdown();

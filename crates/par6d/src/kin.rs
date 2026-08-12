@@ -17,8 +17,15 @@
 //!   the SAME convention, extracted here from the FK matrix (NOT via
 //!   `Kin::tcp`, whose rpy is the intrinsic-XYZ pinokin convention and
 //!   would round-trip to a wrong STATUS matrix).
+//!
+//! The commanded TCP offset lives on this boundary too — see
+//! [`ToolOffset`]: one shared cell, read by every FK/IK consumer, so the
+//! pose STATUS reports and the pose a cartesian target resolves at are
+//! the same point.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, Pose, NQ};
 use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
@@ -76,6 +83,82 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
             assets_dir.display()
         )
     })
+}
+
+// ----------------------------------------------------------- tool offset
+
+/// The commanded TCP offset, shared by every FK/IK consumer.
+///
+/// `T_flange→TCP = T_tool(variant) · T_offset`: the URDF variant already
+/// carries `T_tool` (FK/IK resolve at its `tcp` frame), so the commanded
+/// offset is a pure translation in the TOOL-LOCAL frame composed AFTER
+/// it — it never replaces the variant's own TCP. Same composition as the
+/// Python client's `set_active_tool`, so client-side preview FK/IK and
+/// the runtime resolve at the same point.
+///
+/// One cell with many readers rather than a copy per consumer: the
+/// planner, the bridge, housekeeping and the RT FK hook all clone this
+/// handle, so a single `set` reaches all of them and they cannot
+/// disagree about where the TCP is. Writes come from the command plane
+/// only (one writer), reads happen on the RT thread — hence the seqlock:
+/// the reader never blocks a writer and never observes a half-written
+/// offset, and with writes only on `set_tcp_offset` / tool selection the
+/// retry loop effectively never spins.
+#[derive(Clone)]
+pub(crate) struct ToolOffset {
+    cell: Arc<OffsetCell>,
+}
+
+struct OffsetCell {
+    /// Even = settled, odd = a write is in progress.
+    version: AtomicU64,
+    xyz_m: [AtomicU64; 3],
+}
+
+impl ToolOffset {
+    pub(crate) fn new() -> Self {
+        Self {
+            cell: Arc::new(OffsetCell {
+                version: AtomicU64::new(0),
+                xyz_m: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+            }),
+        }
+    }
+
+    /// Publish the tool-local offset \[m\]. Command plane only.
+    pub(crate) fn set(&self, xyz_m: [f64; 3]) {
+        let v = self.cell.version.load(Ordering::Relaxed);
+        self.cell
+            .version
+            .store(v.wrapping_add(1), Ordering::Release);
+        for (slot, value) in self.cell.xyz_m.iter().zip(xyz_m) {
+            slot.store(value.to_bits(), Ordering::Release);
+        }
+        self.cell
+            .version
+            .store(v.wrapping_add(2), Ordering::Release);
+    }
+
+    /// The published offset \[m\].
+    pub(crate) fn get(&self) -> [f64; 3] {
+        loop {
+            let before = self.cell.version.load(Ordering::Acquire);
+            let mut out = [0.0; 3];
+            for (o, slot) in out.iter_mut().zip(self.cell.xyz_m.iter()) {
+                *o = f64::from_bits(slot.load(Ordering::Acquire));
+            }
+            if before.is_multiple_of(2) && self.cell.version.load(Ordering::Acquire) == before {
+                return out;
+            }
+        }
+    }
+}
+
+/// `m ← m · T(d)` — walk `d` along the pose's own axes.
+fn translate_local(m: &mut Pose, d: [f64; 3]) {
+    m[3] += m[0] * d[0] + m[1] * d[1] + m[2] * d[2];
+    m[7] += m[4] * d[0] + m[5] * d[1] + m[6] * d[2];
+    m[11] += m[8] * d[0] + m[9] * d[1] + m[10] * d[2];
 }
 
 // ------------------------------------------------------------- pose math
@@ -257,6 +340,26 @@ impl CartSegment {
     }
 }
 
+/// A one-axis delta transform: `axis` 0..=2 translates along x/y/z by
+/// `amount` \[m\], 3..=5 rotates about x/y/z by `amount` \[rad\].
+pub(crate) fn axis_delta(axis: usize, amount: f64) -> Pose {
+    let mut m = [0.0; 16];
+    for i in 0..4 {
+        m[5 * i] = 1.0;
+    }
+    if axis < 3 {
+        m[4 * axis + 3] = amount;
+    } else {
+        let (s, c) = amount.sin_cos();
+        let (u, v) = ((axis - 3 + 1) % 3, (axis - 3 + 2) % 3);
+        m[5 * u] = c;
+        m[4 * u + v] = -s;
+        m[4 * v + u] = s;
+        m[5 * v] = c;
+    }
+    m
+}
+
 /// 4x4 product `a · b` (homogeneous transforms).
 pub(crate) fn mat_mul(a: &Pose, b: &Pose) -> Pose {
     let mut out = [0.0; 16];
@@ -281,13 +384,15 @@ pub(crate) fn mat_mul(a: &Pose, b: &Pose) -> Pose {
 pub(crate) struct KinFk {
     kin: Kin,
     scratch: Pose,
+    offset: ToolOffset,
 }
 
 impl KinFk {
-    pub(crate) fn new(kin: Kin) -> Self {
+    pub(crate) fn new(kin: Kin, offset: ToolOffset) -> Self {
         Self {
             kin,
             scratch: [0.0; 16],
+            offset,
         }
     }
 }
@@ -295,7 +400,10 @@ impl KinFk {
 impl ForwardKin for KinFk {
     fn tcp(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; 6]) {
         match self.kin.fk(q, &mut self.scratch) {
-            Ok(()) => *out = matrix_to_xyzrpy(&self.scratch),
+            Ok(()) => {
+                translate_local(&mut self.scratch, self.offset.get());
+                *out = matrix_to_xyzrpy(&self.scratch);
+            }
             Err(_) => out.fill(f64::NAN),
         }
     }
@@ -347,21 +455,31 @@ pub(crate) enum IkResult {
 pub(crate) struct CartKin {
     kin: Kin,
     jac: [f64; 6 * NQ],
+    offset: ToolOffset,
 }
 
 /// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
 const DLS_LAMBDA: f64 = 0.05;
 
 impl CartKin {
-    pub(crate) fn new(kin: Kin) -> Self {
+    pub(crate) fn new(kin: Kin, offset: ToolOffset) -> Self {
         Self {
             kin,
             jac: [0.0; 6 * NQ],
+            offset,
         }
     }
 
-    /// FK matrix at `q`, or a one-line error.
+    /// FK matrix at `q` — at the OFFSET TCP, the point the client
+    /// commands and STATUS reports — or a one-line error.
     pub(crate) fn fk(&mut self, q: &[f64; NQ]) -> Result<Pose, String> {
+        let mut pose = self.fk_model(q)?;
+        translate_local(&mut pose, self.offset.get());
+        Ok(pose)
+    }
+
+    /// FK matrix at the URDF's own TCP frame, offset NOT applied.
+    fn fk_model(&mut self, q: &[f64; NQ]) -> Result<Pose, String> {
         let mut pose = [0.0; 16];
         self.kin
             .fk(q, &mut pose)
@@ -369,10 +487,34 @@ impl CartKin {
         Ok(pose)
     }
 
-    /// Seeded damped-least-squares IK toward `target`.
+    /// Seeded damped-least-squares IK toward `target`, which is where the
+    /// OFFSET TCP must land: the solver works at the URDF's TCP frame, so
+    /// the target is walked back along its own axes by the offset first.
     pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
+        self.ik_within(seed, target, IkOptions::default().max_iters)
+    }
+
+    /// [`CartKin::ik`] under a caller-chosen iteration budget.
+    ///
+    /// A budget only pays for itself where the answer is a yes/no about a
+    /// step small enough to converge in a handful of iterations: the full
+    /// budget is then spent only on targets that have no solution, and
+    /// spending it is the whole cost.
+    pub(crate) fn ik_within(
+        &mut self,
+        seed: &[f64; NQ],
+        target: &Pose,
+        max_iters: i32,
+    ) -> IkResult {
+        let d = self.offset.get();
+        let mut target = *target;
+        translate_local(&mut target, [-d[0], -d[1], -d[2]]);
         let mut out = [0.0; NQ];
-        match self.kin.ik(seed, target, &mut out, IkOptions::default()) {
+        let opts = IkOptions {
+            max_iters,
+            ..IkOptions::default()
+        };
+        match self.kin.ik(seed, &target, &mut out, opts) {
             Ok(IkOutcome::Converged) => IkResult::Solved(out),
             Ok(IkOutcome::MaxIters) => IkResult::Unreachable,
             Err(e) => IkResult::Failed(e.to_string()),
@@ -383,10 +525,38 @@ impl CartKin {
     /// (`[vx vy vz (m/s), wx wy wz (rad/s)]`, LOCAL_WORLD_ALIGNED) at
     /// configuration `q`, via damped least squares — bounded near
     /// singularities instead of exploding.
+    ///
+    /// The twist is the OFFSET TCP's, so with an offset set the jacobian's
+    /// linear rows are moved to that point (`v_tcp = v_model + ω × r`,
+    /// `r = R·d`) — otherwise a pure rotation jog would pivot the arm
+    /// about the flange while FK reported the offset point moving.
     pub(crate) fn twist_to_qd(&mut self, q: &[f64; NQ], v: &[f64; 6]) -> Result<[f64; NQ], String> {
+        let d = self.offset.get();
+        let r = if d == [0.0; 3] {
+            [0.0; 3]
+        } else {
+            let m = self.fk_model(q)?;
+            [
+                m[0] * d[0] + m[1] * d[1] + m[2] * d[2],
+                m[4] * d[0] + m[5] * d[1] + m[6] * d[2],
+                m[8] * d[0] + m[9] * d[1] + m[10] * d[2],
+            ]
+        };
         self.kin
             .jacobian(q, &mut self.jac)
             .map_err(|e| format!("jacobian failed: {e}"))?;
+        if r != [0.0; 3] {
+            for k in 0..NQ {
+                let w = [
+                    self.jac[3 * NQ + k],
+                    self.jac[4 * NQ + k],
+                    self.jac[5 * NQ + k],
+                ];
+                self.jac[k] += w[1] * r[2] - w[2] * r[1];
+                self.jac[NQ + k] += w[2] * r[0] - w[0] * r[2];
+                self.jac[2 * NQ + k] += w[0] * r[1] - w[1] * r[0];
+            }
+        }
         let j = &self.jac;
         // A = J·Jᵀ + λ²I (6x6 symmetric), then qd = Jᵀ·A⁻¹·v.
         let mut a = [[0.0f64; 6]; 6];

@@ -973,5 +973,22 @@ fn joint_enablement_slots_are_positive_direction_first() {
         "J1 sits inside its soft window: both directions stay free"
     );
 
+    // The window is reported with parol6's margin, not as a bare
+    // inequality: a joint a tenth of a degree short of its soft stop has
+    // no usable freedom left, and a frontend that offers the button gets
+    // a jog refused the moment it is pressed.
+    let mut at_max = park_deg();
+    at_max[0] = soft_max - 0.1;
+    teleport_home(&rig, &mut c, at_max);
+    let s = rig.wait_status("J0 parked 0.1 deg short of its upper soft limit", |s| {
+        (s.angles[0] - at_max[0]).abs() < 0.02
+    });
+    assert_eq!(
+        (s.joint_en[0], s.joint_en[1]),
+        (0, 1),
+        "0.1 deg of travel is not freedom; slots were {:?}",
+        &s.joint_en[..2]
+    );
+
     rig.shutdown();
 }
