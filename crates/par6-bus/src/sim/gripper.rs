@@ -136,6 +136,21 @@ impl GripperSim {
         self.driver.feed_watchdog();
     }
 
+    /// Re-seed the jaw at `closed` (0 = fully open, 1 = fully closed) —
+    /// the gripper half of the simulator's teleport. The in-progress
+    /// firmware command follows the jaw, so a standing "go to position"
+    /// does not drag it back off the teleported pose.
+    pub fn teleport(&mut self, closed: f64) {
+        self.pos_byte = (closed.clamp(0.0, 1.0) * 255.0).round();
+        self.joint
+            .reseed((1.0 - self.pos_byte / 255.0) * self.stroke_ticks);
+        self.cmd.position = self.pos_byte as u8;
+        self.calibration_ticks_left = 0;
+        self.moving = false;
+        self.pressing = false;
+        self.detection = ObjectDetection::ReachedNoObject;
+    }
+
     /// One fixed step of whichever controller owns the jaw.
     pub fn step(&mut self, dt: f64) {
         match self.ctrl {

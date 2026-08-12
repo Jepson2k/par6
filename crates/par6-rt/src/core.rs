@@ -562,6 +562,11 @@ impl<B: DriverBus> RtCore<B> {
                     self.gripper_cmd = GripperCommand::Firmware(fw);
                 }
             }
+            RtCommand::GripperCalibrate => {
+                if self.has_can_gripper {
+                    self.gripper_cmd = GripperCommand::Calibrate;
+                }
+            }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
         }
     }
@@ -1039,6 +1044,11 @@ impl<B: DriverBus> RtCore<B> {
         }
         if let Err(e) = self.bus.send_gripper(&self.gripper_cmd) {
             log::warn!("gripper TX failed: {e}");
+        }
+        if self.gripper_cmd == GripperCommand::Calibrate {
+            // cmd 62 goes out once; the empty poll then carries the
+            // sweep (a repeated cmd 62 would restart it every tick).
+            self.gripper_cmd = GripperCommand::FirmwarePoll;
         }
         let _ = self.bus.poll_step();
     }

@@ -76,8 +76,21 @@ pub struct ServerConfig {
     /// Whether the simulator backend is active at startup.
     pub simulator: bool,
     /// Tool registry keys (`select_tool` / `tool_action` validation and
-    /// the TOOLS query).
+    /// the TOOLS query). Matched case-insensitively on the wire.
     pub tools: Vec<String>,
+    /// The tool the runtime is actually fitted with — active from startup
+    /// (and after `reset_state`), and the only key `select_tool` accepts:
+    /// swapping a tool changes the kinematic model, which is a restart.
+    /// Empty = no tool.
+    pub fitted_tool: String,
+    /// Controllable degrees of freedom of the fitted tool. 0 = passive:
+    /// `tool_action` and `teleport`'s `tool_positions` are refused.
+    pub tool_dof: usize,
+    /// Whether this runtime has kinematics. `false` refuses the cartesian
+    /// STREAMING commands (`servo_j_pose` / `servo_l` / `jog_l`), which
+    /// would otherwise be dropped without a word — a fire-and-forget
+    /// command the runtime cannot execute must still say so.
+    pub cartesian: bool,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -112,6 +125,9 @@ impl Default for ServerConfig {
             poll_interval: Duration::from_millis(2),
             simulator: false,
             tools: Vec::new(),
+            fitted_tool: String::new(),
+            tool_dof: 0,
+            cartesian: true,
             profiles: vec!["default".to_owned()],
             initial_profile: "default".to_owned(),
             installation_shapes: Vec::new(),

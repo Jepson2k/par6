@@ -1,7 +1,7 @@
 //! Planned-move trajectory generation: a queued program of joint-space
 //! moves compiled into a tick-rate [`Sample`] stream for the EXEC ring.
 //!
-//! Two profiles today (see [`ProfileKind`] for the TOPPRA slot):
+//! Two profiles ([`ProfileKind`]):
 //!
 //! - **Trapezoid**: accel–cruise–decel run on the normalized path
 //!   coordinate `s`, which synchronizes all joints on the slowest one
@@ -30,13 +30,9 @@ use crate::{MotionError, MotionLimits, Sample, SampleMeta, NUM_JOINTS};
 /// Displacements below this count as "joint does not move" \[rad\].
 const ZERO_DELTA: f64 = 1e-12;
 
-/// Profile registry for planned moves.
-///
-/// A `Toppra` variant slots in here when the C++ toppra shim lands (the
-/// FFI entry points `par6_traj_*` are stubbed NOT_IMPLEMENTED until
-/// conda-forge ships C++ toppra); it will consume arbitrary
-/// [`PathSampler`] geometry — cartesian paths included — with
-/// curvature-aware constraint handling.
+/// Profile registry for the moves THIS crate compiles. TOPPRA is not
+/// here: it re-times a finished path through the C++ shim and is driven
+/// by `par6d`'s planner (see the crate docs).
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ProfileKind {

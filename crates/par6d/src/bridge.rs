@@ -60,6 +60,26 @@ const JOG_L_LINEAR_MAX_M_S: f64 = 0.08;
 #[cfg(feature = "ffi")]
 const JOG_L_ANGULAR_MAX_RAD_S: f64 = 0.6;
 
+/// A firmware "go to position" gripper frame from wire units: `closed`
+/// and `speed` are fractions in \[0, 1\] (0 = fully open / slowest byte,
+/// 1 = fully closed / fastest), `current_ma` the press-force limit.
+pub(crate) fn gripper_move_command(
+    closed: f64,
+    speed: f64,
+    current_ma: f64,
+) -> par6_bus::FirmwareGripperCommand {
+    let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round() as u8;
+    par6_bus::FirmwareGripperCommand {
+        position: byte(closed),
+        speed: byte(speed),
+        current_ma: current_ma.clamp(0.0, f64::from(i16::MAX)).round() as i16,
+        activate: true,
+        action: true,
+        estop: false,
+        release_dir: false,
+    }
+}
+
 /// Both channels into the RT thread, bundled (cloneable).
 #[derive(Clone)]
 pub(crate) struct CoreLink {
@@ -199,8 +219,9 @@ impl RtCommands for RtBridge {
     fn stream(&mut self, cmd: &Command) {
         match cmd {
             Command::JogJ(p) => {
-                // The RT jog engine drives one joint at a time; collapse
-                // to the dominant axis (UIs send single-axis jogs).
+                // Single-axis by contract: the server refuses a jog with
+                // more than one non-zero speed, because the RT jog engine
+                // ramps one joint at a time (spec/RT.md, Jog).
                 let (joint, pct) = p
                     .speeds
                     .iter()
@@ -208,9 +229,6 @@ impl RtCommands for RtBridge {
                     .enumerate()
                     .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
                     .expect("NUM_JOINTS > 0");
-                if p.speeds.iter().filter(|s| **s != 0.0).count() > 1 {
-                    log::debug!("multi-axis jog_j collapsed to joint {joint}");
-                }
                 let mut sh = self.shared.lock().unwrap();
                 if !matches!(
                     sh.stream,
@@ -350,8 +368,10 @@ impl RtCommands for RtBridge {
             }
             #[cfg(not(feature = "ffi"))]
             Command::JogL(_) | Command::ServoJPose(_) | Command::ServoL(_) => {
-                log::warn!(
-                    "{:?} requires kinematics (par6d built without feature `ffi`); ignored",
+                // The server refuses cartesian commands when it is told
+                // the runtime has no kinematics; this is defense in depth.
+                log::error!(
+                    "{:?} reached a par6d built without feature `ffi`; dropped",
                     cmd.tag()
                 );
             }
@@ -398,8 +418,21 @@ impl RtCommands for RtBridge {
             log::error!("teleport outside simulator mode reached the bridge; dropped");
             return;
         }
-        if tool_positions.is_some() {
-            log::warn!("teleport tool_positions are not supported by the sim backend; ignored");
+        // The tool DOF is re-seeded like a joint: the jaw jumps, and the
+        // standing firmware frame is re-aimed at where it landed so the
+        // onboard controller holds it there instead of driving back to
+        // the previous target. The server validates count and range.
+        let tool_closed = tool_positions.and_then(|p| p.first().copied());
+        if let Some(closed) = tool_closed {
+            let hold_ma = self
+                .bundle
+                .active_gripper()
+                .and_then(|g| g.driver.as_ref())
+                .map(|d| d.ilim_ma)
+                .unwrap_or(0.0);
+            self.link.send(RtCommand::Gripper(gripper_move_command(
+                closed, 1.0, hold_ma,
+            )));
         }
         let bundle = self.bundle.clone();
         let mut q = [0.0; MAX_JOINTS];
@@ -418,6 +451,11 @@ impl RtCommands for RtBridge {
             if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
                 log::error!("teleport: sim re-seed failed: {e}");
                 return;
+            }
+            if let Some(closed) = tool_closed {
+                if let Err(e) = bus.teleport_gripper(closed) {
+                    log::error!("teleport: sim tool re-seed failed: {e}");
+                }
             }
             for (i, joint) in robot.joints.iter().enumerate() {
                 // The re-seeded sim reports the wrapped boot reading

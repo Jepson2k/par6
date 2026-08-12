@@ -75,6 +75,11 @@ pub enum RtCommand {
     /// Firmware gripper command for the per-tick gripper slot; replaces
     /// the standing gripper frame until the next one.
     Gripper(FirmwareGripperCommand),
+    /// Run the gripper's firmware calibration sequence (CAN cmd 62). The
+    /// frame goes out ONCE and the standing gripper frame then falls back
+    /// to the DLC-0 empty poll, which feeds the driver watchdog for the
+    /// whole sweep without overwriting it (spec/CAN.md, Gripper).
+    GripperCalibrate,
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),

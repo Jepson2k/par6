@@ -1,16 +1,23 @@
 //! Queued-command execution: `par6-motion` behind the server's
 //! [`Planner`] trait.
 //!
-//! `move_j` is planned with [`ProgramBuilder`] (Ruckig profile, EXEC
-//! limits) from the latest measured pose, converted sample-for-sample
-//! into the RT ring format, and fed into the SPSC ring under
-//! backpressure. Completion is observed through the RT snapshot: the
+//! `move_j` is planned from the latest measured pose under the selected
+//! [`Profile`] (EXEC limits), converted sample-for-sample into the RT
+//! ring format, and fed into the SPSC ring under backpressure —
+//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID, the TOPPRA path parameterizer
+//! for TOPPRA. Completion is observed through the RT snapshot: the
 //! EXEC playback publishes a high-water `completed_index` over the
 //! per-command ring indexes this planner allocates, and the settle
 //! policy (commanded/settled/strict) runs RT-side — so a `poll()`
 //! outcome means the arm actually finished, not merely that samples
 //! were emitted. `home` runs the real homing FSM via a mode request and
 //! watches the snapshot; `delay` counts RT ticks.
+//!
+//! `tool_action` drives the fitted CAN gripper: `move` puts a firmware
+//! "go to position" frame on the RT gripper slot, `calibrate` runs the
+//! cmd-62 sweep, and both finish on what the gripper's own cmd-60 reply
+//! says (travel finished / object detected / calibrated), never on a
+//! timer alone.
 //!
 //! With feature `ffi` the cartesian surface is live: `move_j_pose` runs
 //! seeded IK on the target pose and rides the `move_j` pipeline;
@@ -22,8 +29,10 @@
 
 use std::time::{Duration, Instant};
 
+use par6_bus::ObjectDetection;
 use par6_config::ConfigBundle;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
+use par6_proto::command::ToolParam;
 use par6_proto::{make_error, Command, ErrorCode, WireError, UNATTRIBUTED};
 use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
@@ -31,11 +40,25 @@ use par6_rt::{
 };
 use par6_server::{CommandOutcome, Enablement, PlanContext, Planner};
 
-use crate::bridge::CoreLink;
+use crate::bridge::{gripper_move_command, CoreLink};
 
 /// How long a started command may wait for its RT mode to engage before
 /// the planner declares the start failed.
 const MODE_GRACE: Duration = Duration::from_secs(2);
+/// Settling time before a gripper reply is trusted as the answer to the
+/// command just sent \[s\]: the RT loop consumes one command per tick and
+/// the reply arrives a frame later.
+const TOOL_COMMAND_GRACE_S: f64 = 0.05;
+/// How long a gripper move may run before the planner fails it.
+const TOOL_MOVE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Gripper firmware calibrate timeout (vendor: 10 s).
+const TOOL_CALIBRATE_TIMEOUT: Duration = Duration::from_secs(12);
+/// Minimum calibration wait \[s\] — the `calibrated` bit can still be set
+/// from the previous run (same rule as the homing FSM).
+const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
+/// Joint displacement below which a move has no path to time \[rad\].
+#[cfg(feature = "ffi")]
+const NULL_MOVE_RAD: f64 = 1e-9;
 
 /// `move_l` cartesian sampling pitch: one IK waypoint per this much
 /// translation \[m\] …
@@ -57,7 +80,73 @@ const MOVE_L_NULL_M: f64 = 1e-6;
 #[cfg(feature = "ffi")]
 const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 
+/// The planned-move profiles this planner really implements, in the
+/// upper-case spelling clients use on the wire. The server refuses any
+/// name outside [`profile_names`], so a stored profile is always one of
+/// these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum Profile {
+    /// Jerk-limited point-to-point (rsruckig).
+    #[default]
+    Ruckig,
+    /// Trapezoid on the path coordinate; no jerk limiting.
+    Trapezoid,
+    /// Time-optimal path parameterization (toppra-cpp): the velocity and
+    /// acceleration limits bind, nothing else.
+    #[cfg(feature = "ffi")]
+    Toppra,
+}
+
+impl Profile {
+    fn from_name(name: &str) -> Option<Self> {
+        match name {
+            "RUCKIG" => Some(Self::Ruckig),
+            "TRAPEZOID" => Some(Self::Trapezoid),
+            #[cfg(feature = "ffi")]
+            "TOPPRA" => Some(Self::Toppra),
+            _ => None,
+        }
+    }
+}
+
+/// The profile registry the command plane advertises and validates
+/// `select_profile` against. TOPPRA rides the C++ shim, so a build
+/// without feature `ffi` must not offer it.
+pub(crate) fn profile_names() -> Vec<String> {
+    #[cfg_attr(not(feature = "ffi"), allow(unused_mut))]
+    let mut names = vec!["RUCKIG".to_owned(), "TRAPEZOID".to_owned()];
+    #[cfg(feature = "ffi")]
+    names.push("TOPPRA".to_owned());
+    names
+}
+
+/// Name of the profile a fresh runtime plans with.
+pub(crate) const DEFAULT_PROFILE: &str = "RUCKIG";
+
+/// What the planner needs to know about the fitted CAN gripper.
+struct ToolSpec {
+    /// Current limit \[mA\] — the ceiling for a `move` action.
+    ilim_ma: f64,
+}
+
+/// A gripper action in flight, and what finishing looks like.
+enum ToolWait {
+    /// Jaw travel: done when the firmware stops reporting motion and
+    /// reports why it stopped (target reached, or an object detected).
+    Move,
+    /// Firmware calibration sweep: done when the `calibrated` bit is set,
+    /// no earlier than the minimum wait.
+    Calibrate,
+}
+
 enum InFlightKind {
+    Tool {
+        wait: ToolWait,
+        /// RT tick the command was queued on; replies older than the
+        /// grace still describe the PREVIOUS command.
+        start_tick: u64,
+        timeout: Duration,
+    },
     Exec {
         ring_index: u32,
         samples: Vec<RingSample>,
@@ -90,6 +179,10 @@ pub(crate) struct Par6Planner {
     ticks_per_s: f64,
     next_ring_index: u32,
     policy: par6_proto::CompletionPolicy,
+    profile: Profile,
+    tool: Option<ToolSpec>,
+    tool_grace_ticks: u64,
+    tool_cal_min_ticks: u64,
     inflight: Option<InFlight>,
     enablement: Enablement,
     #[cfg(feature = "ffi")]
@@ -107,6 +200,11 @@ impl Par6Planner {
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
         let dt = bundle.robot.robot.tick_dt_s;
+        let ticks = |s: f64| (s / dt).round() as u64;
+        let tool = bundle
+            .active_gripper()
+            .and_then(|g| g.driver.as_ref())
+            .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
         Ok(Self {
             link,
             producer,
@@ -117,6 +215,10 @@ impl Par6Planner {
             ticks_per_s: 1.0 / dt,
             next_ring_index: 1,
             policy: par6_proto::CompletionPolicy::Settled,
+            profile: Profile::default(),
+            tool,
+            tool_grace_ticks: ticks(TOOL_COMMAND_GRACE_S).max(2),
+            tool_cal_min_ticks: ticks(TOOL_CALIBRATE_MIN_WAIT_S),
             inflight: None,
             enablement: Enablement::default(),
             #[cfg(feature = "ffi")]
@@ -165,7 +267,7 @@ impl Par6Planner {
     }
 
     /// Plan a joint-space move from the measured pose in `snap` to
-    /// `target` \[rad\] with the Ruckig EXEC profile and start it.
+    /// `target` \[rad\] under the SELECTED profile and start it.
     fn start_joint_move(
         &mut self,
         snap: &StateSnapshot,
@@ -175,6 +277,32 @@ impl Par6Planner {
         accel: Option<f64>,
     ) -> Result<InFlightKind, WireError> {
         let start = snap.q;
+        let kind = match self.profile {
+            Profile::Ruckig => ProfileKind::Ruckig,
+            Profile::Trapezoid => ProfileKind::Trapezoid,
+            // TOPPRA times the straight joint-space path instead of
+            // shaping a point-to-point profile: same waypoints, a
+            // different (time-optimal) parameterization.
+            #[cfg(feature = "ffi")]
+            Profile::Toppra => {
+                self.exec_limits
+                    .require_inside_soft(&target)
+                    .map_err(planning_error)?;
+                // toppra needs a path to time; identical waypoints have none.
+                if start
+                    .iter()
+                    .zip(target.iter())
+                    .all(|(a, b)| (a - b).abs() < NULL_MOVE_RAD)
+                {
+                    return Ok(InFlightKind::Instant);
+                }
+                let mut waypoints = Vec::with_capacity(2 * MAX_JOINTS);
+                waypoints.extend_from_slice(&start);
+                waypoints.extend_from_slice(&target);
+                let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
+                return Ok(self.start_exec(samples, snap.mode == Mode::Exec));
+            }
+        };
         let mut limits = self.exec_limits;
         if let Some(accel) = accel {
             for a in limits.acceleration.iter_mut() {
@@ -186,7 +314,7 @@ impl Par6Planner {
             .move_j(
                 target,
                 MoveParams {
-                    profile: ProfileKind::Ruckig,
+                    profile: kind,
                     speed_fraction: speed.unwrap_or(1.0),
                     min_duration_s: duration,
                     blend_with_next: false,
@@ -208,6 +336,133 @@ impl Par6Planner {
         Ok(self.start_exec(samples, snap.mode == Mode::Exec))
     }
 
+    /// TOPPRA-time a joint waypoint list and sample it at tick dt.
+    /// A requested `min_duration` is a minimum: TOPPRA's optimum bounds
+    /// how fast the path can be driven, a longer request time-scales the
+    /// whole trajectory (velocities scale with it, so limits still hold).
+    #[cfg(feature = "ffi")]
+    fn toppra_samples(
+        &self,
+        waypoints: &[f64],
+        speed: Option<f64>,
+        accel: Option<f64>,
+        min_duration: Option<f64>,
+    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
+        let speed_frac = speed.unwrap_or(1.0);
+        let accel_frac = accel.unwrap_or(1.0);
+        let vel: Vec<f64> = self
+            .exec_limits
+            .velocity
+            .iter()
+            .map(|v| v * speed_frac)
+            .collect();
+        let acc: Vec<f64> = self
+            .exec_limits
+            .acceleration
+            .iter()
+            .map(|a| a * accel_frac)
+            .collect();
+        let traj = pinokin_sys::Trajectory::parameterize(waypoints, MAX_JOINTS, &vel, &acc, None)
+            .map_err(|e| {
+            make_error(
+                ErrorCode::TrajNoSteps,
+                UNATTRIBUTED,
+                &[("detail", &e.to_string())],
+            )
+        })?;
+        let t_path = traj.duration();
+        if !t_path.is_finite() || t_path <= 0.0 {
+            return Err(make_error(
+                ErrorCode::TrajNoSteps,
+                UNATTRIBUTED,
+                &[("detail", &format!("TOPPRA produced duration {t_path}"))],
+            ));
+        }
+        let t_eff = t_path.max(min_duration.unwrap_or(0.0));
+        let scale = t_path / t_eff;
+        let n = ((t_eff / self.dt).ceil() as usize).max(1);
+        let mut samples = Vec::with_capacity(n);
+        let (mut q, mut qd, mut qdd) = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        for k in 1..=n {
+            let t = ((k as f64) * self.dt).min(t_eff) * scale;
+            traj.sample_into(t, &mut q, &mut qd, &mut qdd)
+                .map_err(|e| {
+                    make_error(
+                        ErrorCode::MotnSetupFailed,
+                        UNATTRIBUTED,
+                        &[("detail", &format!("trajectory sampling failed: {e}"))],
+                    )
+                })?;
+            let mut qqd = [0.0; 2 * MAX_JOINTS];
+            qqd[..MAX_JOINTS].copy_from_slice(&q);
+            for (out, v) in qqd[MAX_JOINTS..].iter_mut().zip(qd.iter()) {
+                *out = v * scale;
+            }
+            samples.push(qqd);
+        }
+        Ok(samples)
+    }
+
+    /// Start a gripper action: validate the verb and its parameters, put
+    /// the firmware command on the RT gripper slot, and wait for the
+    /// cmd-60 reply to say it finished.
+    fn start_tool_action(
+        &mut self,
+        snap: &StateSnapshot,
+        cmd: &par6_proto::command::ToolAction,
+    ) -> Result<InFlightKind, WireError> {
+        let invalid = |detail: String| {
+            make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[("detail", &detail)],
+            )
+        };
+        let Some(tool) = &self.tool else {
+            return Err(invalid(format!(
+                "tool '{}' has no driver: it takes no actions",
+                cmd.tool_key
+            )));
+        };
+        let (wait, timeout) = match cmd.action.as_str() {
+            "move" => {
+                let [position, speed, current] = scalars(&cmd.params)
+                    .ok_or_else(|| invalid("move takes [position, speed, current_ma]".into()))?;
+                for (what, v, hi) in [
+                    ("position", position, 1.0),
+                    ("speed", speed, 1.0),
+                    ("current", current, tool.ilim_ma),
+                ] {
+                    if !v.is_finite() || v < 0.0 || v > hi {
+                        return Err(invalid(format!("{what} = {v} is outside [0, {hi}]")));
+                    }
+                }
+                self.link.send(RtCommand::Gripper(gripper_move_command(
+                    position, speed, current,
+                )));
+                (ToolWait::Move, TOOL_MOVE_TIMEOUT)
+            }
+            "calibrate" => {
+                if !cmd.params.is_empty() {
+                    return Err(invalid("calibrate takes no parameters".into()));
+                }
+                self.link.send(RtCommand::GripperCalibrate);
+                (ToolWait::Calibrate, TOOL_CALIBRATE_TIMEOUT)
+            }
+            other => {
+                return Err(invalid(format!(
+                    "tool '{}' has no action '{other}' (move | calibrate)",
+                    cmd.tool_key
+                )));
+            }
+        };
+        Ok(InFlightKind::Tool {
+            wait,
+            start_tick: snap.tick,
+            timeout,
+        })
+    }
+
     fn start_move_j(
         &mut self,
         cmd: &par6_proto::command::MoveJ,
@@ -217,9 +472,6 @@ impl Par6Planner {
         for (i, t) in target.iter_mut().enumerate() {
             let a = cmd.angles[i].to_radians();
             *t = if cmd.rel { snap.q[i] + a } else { a };
-        }
-        if cmd.blend_radius.is_some() {
-            log::debug!("move_j blend_radius ignored: cross-command blending is a follow-up");
         }
         self.start_joint_move(&snap, target, cmd.duration, cmd.speed, cmd.accel)
     }
@@ -254,9 +506,6 @@ impl Par6Planner {
                 ));
             }
         };
-        if cmd.blend_radius.is_some() {
-            log::debug!("move_j_pose blend_radius ignored: cross-command blending is a follow-up");
-        }
         self.start_joint_move(&snap, target, cmd.duration, cmd.speed, cmd.accel)
     }
 
@@ -294,9 +543,6 @@ impl Par6Planner {
             // tool frame.
             (Frame::Trf, _) => crate::kin::mat_mul(&start_pose, &wire),
         };
-        if cmd.blend_radius.is_some() {
-            log::debug!("move_l blend_radius ignored: cross-command blending is a follow-up");
-        }
 
         let seg = CartSegment::new(&start_pose, &target_pose);
         let (len, ang) = (seg.length_m(), seg.angle_rad());
@@ -378,61 +624,7 @@ impl Par6Planner {
             seed = q;
         }
 
-        let speed_frac = cmd.speed.unwrap_or(1.0);
-        let accel_frac = cmd.accel.unwrap_or(1.0);
-        let vel: Vec<f64> = self
-            .exec_limits
-            .velocity
-            .iter()
-            .map(|v| v * speed_frac)
-            .collect();
-        let acc: Vec<f64> = self
-            .exec_limits
-            .acceleration
-            .iter()
-            .map(|a| a * accel_frac)
-            .collect();
-        let traj = pinokin_sys::Trajectory::parameterize(&waypoints, MAX_JOINTS, &vel, &acc, None)
-            .map_err(|e| {
-                make_error(
-                    ErrorCode::TrajNoSteps,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                )
-            })?;
-        let t_path = traj.duration();
-        if !t_path.is_finite() || t_path <= 0.0 {
-            return Err(make_error(
-                ErrorCode::TrajNoSteps,
-                UNATTRIBUTED,
-                &[("detail", &format!("TOPPRA produced duration {t_path}"))],
-            ));
-        }
-        // A requested duration is a minimum: TOPPRA's optimum bounds how
-        // fast the line can be driven, a longer request time-scales the
-        // whole trajectory (velocities scale with it, so limits still hold).
-        let t_eff = t_path.max(cmd.duration.unwrap_or(0.0));
-        let scale = t_path / t_eff;
-        let n = ((t_eff / self.dt).ceil() as usize).max(1);
-        let mut samples = Vec::with_capacity(n);
-        let (mut q, mut qd, mut qdd) = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
-        for k in 1..=n {
-            let t = ((k as f64) * self.dt).min(t_eff) * scale;
-            traj.sample_into(t, &mut q, &mut qd, &mut qdd)
-                .map_err(|e| {
-                    make_error(
-                        ErrorCode::MotnSetupFailed,
-                        UNATTRIBUTED,
-                        &[("detail", &format!("trajectory sampling failed: {e}"))],
-                    )
-                })?;
-            let mut qqd = [0.0; 2 * MAX_JOINTS];
-            qqd[..MAX_JOINTS].copy_from_slice(&q);
-            for (out, v) in qqd[MAX_JOINTS..].iter_mut().zip(qd.iter()) {
-                *out = v * scale;
-            }
-            samples.push(qqd);
-        }
+        let samples = self.toppra_samples(&waypoints, cmd.speed, cmd.accel, cmd.duration)?;
         Ok(self.start_exec(samples, snap.mode == Mode::Exec))
     }
 
@@ -462,12 +654,73 @@ impl Par6Planner {
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
 
+    /// Poll-time verdict for a gripper action, read off the cmd-60 reply
+    /// in the snapshot. Replies from before the command reached the bus
+    /// describe the previous action, so nothing counts until the grace.
+    fn tool_verdict(
+        wait: &ToolWait,
+        start_tick: u64,
+        grace_ticks: u64,
+        cal_min_ticks: u64,
+        snap: &StateSnapshot,
+    ) -> Option<Result<(), WireError>> {
+        let elapsed = snap.tick.saturating_sub(start_tick);
+        if elapsed < grace_ticks {
+            return None;
+        }
+        let reply = snap.gripper.reply?;
+        let fault = i32::from(reply.temperature_error)
+            | (i32::from(reply.timeout_error) << 1)
+            | (i32::from(reply.estop_error) << 2)
+            | (i32::from(snap.gripper.live_error_bit) << 3);
+        if fault != 0 {
+            return Some(Err(make_error(
+                ErrorCode::MotnToolFault,
+                UNATTRIBUTED,
+                &[("fault_code", &fault.to_string())],
+            )));
+        }
+        match wait {
+            ToolWait::Move => (!reply.action_status
+                && reply.object_detection != ObjectDetection::Moving)
+                .then_some(Ok(())),
+            ToolWait::Calibrate => (elapsed >= cal_min_ticks && reply.calibrated).then_some(Ok(())),
+        }
+    }
+
     /// Poll-time verdict for the in-flight command; `None` = keep going.
-    fn verdict(fl: &mut InFlight, snap: &StateSnapshot) -> Option<Result<(), WireError>> {
+    fn verdict(&self, fl: &mut InFlight, snap: &StateSnapshot) -> Option<Result<(), WireError>> {
         if snap.error_active {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
+            InFlightKind::Tool {
+                wait,
+                start_tick,
+                timeout,
+            } => {
+                let verdict = Self::tool_verdict(
+                    wait,
+                    *start_tick,
+                    self.tool_grace_ticks,
+                    self.tool_cal_min_ticks,
+                    snap,
+                );
+                match verdict {
+                    None if fl.started.elapsed() > *timeout => {
+                        let state = match wait {
+                            ToolWait::Move => "move",
+                            ToolWait::Calibrate => "calibrate",
+                        };
+                        Some(Err(make_error(
+                            ErrorCode::MotnToolTimeout,
+                            UNATTRIBUTED,
+                            &[("state", state)],
+                        )))
+                    }
+                    other => other,
+                }
+            }
             InFlightKind::Exec {
                 ring_index,
                 seen_exec,
@@ -549,15 +802,9 @@ impl Planner for Par6Planner {
                 }
             }
             Command::Checkpoint(_) | Command::SelectTool(_) => InFlightKind::Instant,
-            Command::ToolAction(_) => {
-                return Err(make_error(
-                    ErrorCode::MotnSetupFailed,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "tool_action is not wired to the gripper yet (par6d follow-up)",
-                    )],
-                ));
+            Command::ToolAction(p) => {
+                let snap = self.snapshots.latest();
+                self.start_tool_action(&snap, p)?
             }
             #[cfg(feature = "ffi")]
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
@@ -618,9 +865,13 @@ impl Planner for Par6Planner {
             self.heartbeat.feed();
             self.pump_ring();
         }
-        let fl = self.inflight.as_mut()?;
+        // `verdict` reads planner-wide constants, so the in-flight
+        // command is taken out of `self` for the call and put back.
+        let mut fl = self.inflight.take()?;
         let index = fl.server_index;
-        match Self::verdict(fl, &snap) {
+        let verdict = self.verdict(&mut fl, &snap);
+        self.inflight = Some(fl);
+        match verdict {
             None => None,
             Some(Ok(())) => {
                 self.inflight = None;
@@ -660,8 +911,17 @@ impl Planner for Par6Planner {
                 core.set_settle_policy(Box::new(SpecSettle::new(rt_policy, dt)));
             }));
         }
-        // profile / tool / tcp_offset / shapes are stored and reported by
-        // the server; the planner will consume them once TCP-offset
+        match Profile::from_name(ctx.profile) {
+            Some(p) => self.profile = p,
+            // The server validates against `profile_names()` before it
+            // gets here, so this can only be a wiring mistake.
+            None => log::error!(
+                "unknown motion profile '{}'; keeping the current one",
+                ctx.profile
+            ),
+        }
+        // tool / tcp_offset / shapes are stored and reported by the
+        // server; the planner will consume them once TCP-offset
         // retargeting and collision checking land (follow-up). Cartesian
         // targets currently resolve at the URDF's TCP frame.
     }
@@ -669,6 +929,23 @@ impl Planner for Par6Planner {
     fn enablement(&self) -> Enablement {
         self.enablement
     }
+}
+
+/// Exactly `N` numeric tool parameters (the wire allows int or float for
+/// any of them); `None` if the count or a type does not match.
+fn scalars<const N: usize>(params: &[ToolParam]) -> Option<[f64; N]> {
+    if params.len() != N {
+        return None;
+    }
+    let mut out = [0.0; N];
+    for (slot, p) in out.iter_mut().zip(params) {
+        *slot = match p {
+            ToolParam::Float(v) => *v,
+            ToolParam::Int(v) => *v as f64,
+            ToolParam::Bool(_) | ToolParam::Str(_) => return None,
+        };
+    }
+    Some(out)
 }
 
 fn planning_error(e: MotionError) -> WireError {

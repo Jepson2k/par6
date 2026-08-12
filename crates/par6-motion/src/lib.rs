@@ -17,16 +17,16 @@
 //! - [`StreamingExecutor`]: rsruckig online target tracker for
 //!   servo-style streaming targets, stepped at tick rate.
 //!
-//! # TOPPRA slot
+//! # TOPPRA
 //!
-//! Time-optimal path parameterization (move_l / move_s / move_p under
-//! joint constraints, curvature-aware) belongs to C++ toppra behind the
-//! shared FFI shim — its entry points (`par6_traj_*`) are stubbed
-//! NOT_IMPLEMENTED until conda-forge ships C++ toppra, so nothing here
-//! calls them yet. When the shim lands, a `Toppra` variant slots into
-//! [`ProfileKind`]: it consumes [`PathSampler`] geometry (which the
-//! trapezoid profile already exercises), produces the same tick-rate
-//! sample streams, and needs no changes to the ring metadata contract.
+//! Time-optimal path parameterization lives in C++ toppra behind the
+//! shared FFI shim (`par6_traj_*`, safe wrapper `pinokin_sys::Trajectory`)
+//! and is driven by `par6d`'s planner, which owns the geometry it times:
+//! cartesian `move_l` waypoint chains, and joint-space paths under the
+//! TOPPRA motion profile. It is deliberately NOT a [`ProfileKind`] —
+//! that keeps this crate free of the FFI dependency — and both paths
+//! produce the same tick-rate sample streams under the same ring
+//! metadata contract.
 //!
 //! Generation is planner-side and may allocate; only [`JogEngine::tick`],
 //! [`CompletionMonitor::tick`], and [`StreamingExecutor::step`] are meant

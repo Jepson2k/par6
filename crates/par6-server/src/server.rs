@@ -9,6 +9,10 @@
 //!   a post-reset wait.
 //! - Gating rejections always answer with ERROR (echoed `req_id`),
 //!   including FIRE_AND_FORGET commands whose success stays unacked.
+//! - A parameter this runtime cannot honour is REFUSED the same way
+//!   (`validate_supported`), never dropped: a command that half-executes
+//!   moves the arm somewhere the client did not ask for, and the client
+//!   has no way to find out.
 //! - Cancellation (stop/estop/reset/simulator toggle/stream preemption)
 //!   drops commands WITHOUT a COMPLETE push; clients observe it through
 //!   the status stream (queue emptied, `executing_index` = −1, and for
@@ -103,10 +107,9 @@ struct Pending {
 enum PostEffect {
     None,
     Checkpoint(String),
-    SelectTool {
-        tool: String,
-        variant: Option<String>,
-    },
+    /// `select_tool` can only ever name the fitted tool (validated at
+    /// accept time), so the variant is the part that actually changes.
+    SelectVariant(Option<String>),
 }
 
 struct Executing {
@@ -213,6 +216,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             profile: cfg.initial_profile.clone(),
             recipe: cfg.initial_recipe.clone(),
             simulator: cfg.simulator,
+            tool: cfg.fitted_tool.clone(),
             cfg,
             runtime,
             socket,
@@ -232,7 +236,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             action_state: ActionState::Idle,
             estop_latched: false,
             active_stream: None,
-            tool: String::new(),
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
             shapes: Vec::new(),
@@ -444,16 +447,25 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 })
             }
             C::SelectProfile(p) => {
-                if self.cfg.profiles.iter().any(|x| x == &p.profile) {
-                    self.profile = p.profile.clone();
-                    self.sync_planner();
-                    Ok(())
-                } else {
-                    Err(make_error(
+                // Matched case-insensitively, stored in the registry's
+                // spelling — the planner keys its behaviour off that.
+                let known = self
+                    .cfg
+                    .profiles
+                    .iter()
+                    .find(|x| x.eq_ignore_ascii_case(&p.profile))
+                    .cloned();
+                match known {
+                    Some(name) => {
+                        self.profile = name;
+                        self.sync_planner();
+                        Ok(())
+                    }
+                    None => Err(make_error(
                         ErrorCode::SysProfileInvalid,
                         UNATTRIBUTED,
                         &[("detail", &p.profile)],
-                    ))
+                    )),
                 }
             }
             C::ResetState => {
@@ -461,7 +473,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.standing_error = None;
                 self.action_state = ActionState::Idle;
                 self.last_checkpoint.clear();
-                self.tool.clear();
+                self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
                 self.shapes.clear();
@@ -520,7 +532,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.runtime.rt.reset_loop_stats();
             return;
         }
-        if let Some(error) = self.check_gate(tag) {
+        if let Some(error) = self
+            .check_gate(tag)
+            .or_else(|| self.validate_supported(&cmd))
+        {
             // Rejection gets a real ERROR even though success is unacked.
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
@@ -582,7 +597,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if let Some(error) = self.validate_registries(&cmd) {
+        if let Some(error) = self
+            .validate_registries(&cmd)
+            .or_else(|| self.validate_supported(&cmd))
+        {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -638,23 +656,111 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     }
 
     /// Server-layer name checks the codec deliberately leaves to config.
+    /// Tool keys are matched case-insensitively: the registry spells them
+    /// as the config does, clients as their own tool tables do.
     fn validate_registries(&self, cmd: &Command) -> Option<WireError> {
-        let unknown_tool = |name: &str| {
-            make_error(
+        let name = match cmd {
+            Command::SelectTool(p) => &p.tool_name,
+            Command::ToolAction(p) => &p.tool_key,
+            _ => return None,
+        };
+        let detail = if !self
+            .cfg
+            .tools
+            .iter()
+            .any(|t| t.eq_ignore_ascii_case(name.as_str()))
+        {
+            format!(
+                "unknown tool '{name}'; this runtime knows {:?}",
+                self.cfg.tools
+            )
+        } else if !self.cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+            // Selecting a tool swaps the kinematic and gravity models,
+            // which are built at startup from the configured tool.
+            format!(
+                "tool '{name}' is not fitted; this runtime is running '{}' \
+                 (change robot.active_gripper and restart par6d)",
+                self.cfg.fitted_tool
+            )
+        } else {
+            return None;
+        };
+        Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[("detail", &detail)],
+        ))
+    }
+
+    /// Parameters the runtime cannot honour. Refusing them is the whole
+    /// point: a silently dropped parameter makes the arm do something
+    /// other than what the client asked for, with no way to tell.
+    fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
+        let refuse = |detail: String| {
+            Some(make_error(
                 ErrorCode::CommValidationError,
                 UNATTRIBUTED,
-                &[("detail", &format!("unknown tool '{name}'"))],
-            )
+                &[("detail", &detail)],
+            ))
         };
-        match cmd {
-            Command::SelectTool(p) if !self.cfg.tools.iter().any(|t| t == &p.tool_name) => {
-                Some(unknown_tool(&p.tool_name))
+        // Blending needs the NEXT queued move at planning time; par6d
+        // plans and runs exactly one queued command at a time, and no
+        // profile takes a corner radius.
+        let blend = |r: Option<f64>| {
+            r.map(|r| {
+                format!(
+                    "blend radius {r} mm is not supported: queued moves run one at \
+                     a time and stop at every waypoint; send r = nil"
+                )
+            })
+        };
+        let unsupported = match cmd {
+            Command::MoveJ(p) => blend(p.blend_radius),
+            Command::MoveJPose(p) => blend(p.blend_radius),
+            Command::MoveL(p) => blend(p.blend_radius),
+            Command::MoveC(p) => blend(p.blend_radius),
+            // The RT jog engine ramps ONE joint at a time (spec/RT.md,
+            // Jog): direction-block latching is keyed on the commanded
+            // joint. Collapsing to the dominant axis would move the arm
+            // somewhere the client did not ask for.
+            Command::JogJ(p) => {
+                let axes = p.speeds.iter().filter(|s| **s != 0.0).count();
+                (axes > 1).then(|| {
+                    format!("jog_j drives one joint at a time; {axes} axes were commanded")
+                })
             }
-            Command::ToolAction(p) if !self.cfg.tools.iter().any(|t| t == &p.tool_key) => {
-                Some(unknown_tool(&p.tool_key))
+            Command::Teleport(p) => match p.tool_positions.as_deref() {
+                None => None,
+                Some(_) if self.cfg.tool_dof == 0 => Some(format!(
+                    "tool '{}' has no controllable position",
+                    self.cfg.fitted_tool
+                )),
+                Some(pos) if pos.len() != self.cfg.tool_dof => Some(format!(
+                    "tool '{}' has {} position(s), {} given",
+                    self.cfg.fitted_tool,
+                    self.cfg.tool_dof,
+                    pos.len()
+                )),
+                Some(pos) => pos
+                    .iter()
+                    .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
+            },
+            // A passive tool (no driver) has nothing to actuate.
+            Command::ToolAction(p) if self.cfg.tool_dof == 0 => Some(format!(
+                "tool '{}' is passive: it has no actions",
+                p.tool_key
+            )),
+            // Cartesian streamables need IK every tick; a runtime without
+            // kinematics can only drop them.
+            Command::ServoJPose(_) | Command::ServoL(_) | Command::JogL(_)
+                if !self.cfg.cartesian =>
+            {
+                Some("this runtime has no kinematics: cartesian commands are unavailable".into())
             }
             _ => None,
-        }
+        };
+        unsupported.and_then(refuse)
     }
 
     // ---- queue engine ------------------------------------------------------
@@ -706,8 +812,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     match ex.effect {
                         PostEffect::None => {}
                         PostEffect::Checkpoint(label) => self.last_checkpoint = label,
-                        PostEffect::SelectTool { tool, variant } => {
-                            self.tool = tool;
+                        PostEffect::SelectVariant(variant) => {
                             self.tool_variant = variant;
                             self.sync_planner();
                         }
@@ -908,7 +1013,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     r.activated && od == 1,
                     od == 1 || od == 2,
                     fault_code,
-                    vec![f64::from(r.position)],
+                    // Wire units for a tool DOF are 0 (open) … 1 (closed);
+                    // the firmware reports a 0..255 jaw byte.
+                    vec![f64::from(r.position) / 255.0],
                     vec![f64::from(r.current_ma)],
                 )
             }
@@ -1145,10 +1252,7 @@ fn identity_pose() -> [f64; POSE_ELEMS] {
 fn post_effect(cmd: &Command) -> PostEffect {
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
-        Command::SelectTool(p) => PostEffect::SelectTool {
-            tool: p.tool_name.clone(),
-            variant: p.variant_key.clone(),
-        },
+        Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
         _ => PostEffect::None,
     }
 }

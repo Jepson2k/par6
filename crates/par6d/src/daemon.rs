@@ -467,6 +467,14 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     cfg.rt_tick_rate_hz = robot.tick_rate_hz();
     cfg.simulator = opts.sim;
     cfg.tools = bundle.grippers.iter().map(|g| g.name.clone()).collect();
+    // The fitted tool is the one the kinematics, gravity model and bus
+    // were built around at startup; a passive tool (no CAN driver) has no
+    // controllable DOF.
+    cfg.fitted_tool = robot.robot.active_gripper.clone();
+    cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
+    cfg.cartesian = cfg!(feature = "ffi");
+    cfg.profiles = crate::planner::profile_names();
+    cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();
     if let Some(ip) = opts.bind {
         cfg.bind.set_ip(ip);
     }

@@ -66,7 +66,10 @@ impl MotionLimits {
     }
 
     /// Error unless `q` lies inside the soft window on every joint.
-    pub(crate) fn require_inside_soft(&self, q: &[f64; NUM_JOINTS]) -> Result<(), MotionError> {
+    /// [`ProgramBuilder`](crate::ProgramBuilder) applies this to every
+    /// queued move; planners that time a path themselves apply it to
+    /// their own targets.
+    pub fn require_inside_soft(&self, q: &[f64; NUM_JOINTS]) -> Result<(), MotionError> {
         for (j, &v) in q.iter().enumerate() {
             if !(v >= self.soft_min[j] && v <= self.soft_max[j]) {
                 return Err(MotionError::TargetOutsideSoftLimits {

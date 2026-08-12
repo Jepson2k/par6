@@ -290,6 +290,26 @@ impl SimBus {
         }
     }
 
+    /// Re-seed the jaw at `closed` (0 = fully open, 1 = fully closed) —
+    /// the tool half of [`teleport_joint_rad`](Self::teleport_joint_rad),
+    /// with the same re-seed (not reboot) semantics. Fails when no CAN
+    /// gripper is fitted.
+    pub fn teleport_gripper(&mut self, closed: f64) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if !closed.is_finite() {
+            return Err(BusError::InvalidCommand {
+                reason: "tool position must be finite",
+            });
+        }
+        let Some(g) = &mut self.gripper else {
+            return Err(BusError::InvalidCommand {
+                reason: "no CAN gripper is fitted",
+            });
+        };
+        g.teleport(closed);
+        Ok(())
+    }
+
     /// Put (or remove) an object between the jaws: closing jams at this
     /// position byte (`None` = free travel).
     pub fn set_gripper_object_closing(&mut self, at: Option<u8>) {
