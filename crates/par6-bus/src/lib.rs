@@ -16,10 +16,11 @@
 //!   id = (node << 7) | (cmd << 1) | err_bit; big-endian payloads; i24
 //!   position ticks / i24 speed ticks-per-s / i16 current mA with
 //!   DLC-variant position/velocity/current frames.
-//! - SocketCAN backend (spectral module): bus bring-up, SO_SNDBUF sizing,
-//!   round-robin telemetry poll + device-info sweep, boot config pacing,
-//!   send errors PROPAGATED (vendor swallowed them — known production bug
-//!   class).
+//! - SocketCAN backend ([`hw::SocketCanBus`]): bus bring-up, SO_SNDBUF
+//!   sizing, non-blocking RX drain then TX inside one tick, round-robin
+//!   telemetry poll + device-info sweep, paced boot config load, kernel
+//!   link health sampled off the RT thread, send errors PROPAGATED
+//!   (vendor swallowed them — known production bug class).
 //! - Sim backend ([`sim::SimBus`], closed loop): virtual Spectral drivers
 //!   (cascade PID/PD from real config gains, current saturation, kt,
 //!   watchdog) in front of a rate-limited kinematic plant with endstop /
@@ -30,13 +31,17 @@
 //!   bits) — → encoder ticks at fixed dt. Homing stall/current detection
 //!   works for real in CI.
 
+mod backend;
 mod bus;
+pub mod hw;
 mod loopback;
 pub mod sim;
 pub mod spectral;
 mod types;
 
+pub use backend::RuntimeBus;
 pub use bus::DriverBus;
+pub use hw::{OpenError, SocketCanBus};
 pub use loopback::{LoopbackBus, Reply, TxRecord};
 pub use types::{
     BusError, BusState, DeviceInfo, ErrorFlags, FirmwareGripperCommand, Freshness, GripperCommand,
