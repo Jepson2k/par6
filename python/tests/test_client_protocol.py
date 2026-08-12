@@ -15,7 +15,9 @@ import numpy as np
 import pytest
 from protocol_peer import (
     ANGLES,
+    IDENTITY_POSE,
     IO,
+    SPEEDS,
     ScriptedRuntime,
     error_tuple,
     start_peer,
@@ -696,3 +698,60 @@ async def test_wait_ready_polls_until_reachable(
     peer.drop_replies[CmdType.PING] = 2  # first ping attempt (incl. retry) fails
     assert await client.wait_ready(timeout=5.0, interval=0.05) is True
     assert len(peer.of(CmdType.PING)) >= 3
+
+
+# ---------------------------------------------------------------------------
+# Tools
+# ---------------------------------------------------------------------------
+
+
+async def test_config_cased_tool_keys_round_trip_through_a_bare_client(
+    client: AsyncRobotClient, peer: ScriptedRuntime
+):
+    """The runtime spells tool keys the way the gripper config does; every
+    consumer indexes them the way ``waldoctl.ToolSpec`` does (upper).  A key
+    off the wire — from TOOLS, from a STATUS frame, from TOOL_STATUS — must
+    therefore index ``Robot.tools`` and the client's own bound tools, and a
+    bare client (a user script's, built with no tool specs) must be able to
+    act on the selected tool."""
+    from par6.robot import Robot
+
+    config_key = "MSG_small_motor_150mm_rail"
+    peer.handlers[CmdType.TOOLS] = lambda cmd, req_id, params: wire.encode_wire(
+        [int(MsgType.RESPONSE), req_id, [int(QueryType.TOOLS), config_key, [config_key, "Flange"]]]
+    )
+    wire_tool_status = [config_key, 2, True, False, 0, [0.5], [120.0], ""]
+    peer.handlers[CmdType.TOOL_STATUS] = lambda cmd, req_id, params: wire.encode_wire(
+        [int(MsgType.RESPONSE), req_id, [int(QueryType.TOOL_STATUS), wire_tool_status]]
+    )
+    peer.handlers[CmdType.STATUS] = lambda cmd, req_id, params: wire.encode_wire(
+        [
+            int(MsgType.RESPONSE),
+            req_id,
+            [int(QueryType.STATUS), IDENTITY_POSE, ANGLES, SPEEDS, IO, wire_tool_status],
+        ]
+    )
+
+    robot = Robot()
+    reported = await client.tools()
+    assert reported is not None
+    assert robot.tools[reported.tool].display_name == config_key
+    assert all(key in robot.tools for key in reported.available)
+
+    status_addr = await _status_addr(client)
+    peer.send_status(status_addr, seq=1, tool_status=wire_tool_status)
+    assert await client.wait_status(lambda s: s.tool_status_present, timeout=2.0)
+    broadcast_key = client._shared_status.tool_status.key
+    assert robot.tools[broadcast_key] is robot.tools[reported.tool]
+
+    queried = await client.status()
+    assert queried is not None and queried.tool_status is not None
+    assert robot.tools[queried.tool_status.key] is robot.tools[reported.tool]
+
+    # A bare client binds the packaged tools, so a user script can drive the
+    # selected tool without going through the Robot factory.
+    assert await client.select_tool(reported.tool) >= 0
+    assert client.tool.key == broadcast_key
+    await client.tool.close()
+    actions = peer.of(CmdType.TOOL_ACTION)
+    assert [(p[1], p[2]) for _, _, p in actions] == [(broadcast_key, "move")]

@@ -55,6 +55,7 @@ from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
+from ..config import canonical_tool_key
 from ..protocol.constants import (
     NUM_JOINTS,
     CmdType,
@@ -144,7 +145,7 @@ def _wire_tool_status(raw: Sequence | None) -> ToolStatus | None:
         return None
     key, state, engaged, part_detected, fault_code, positions, channels, variant = raw
     return ToolStatus(
-        key=key,
+        key=canonical_tool_key(key),
         variant_key=variant,
         state=WToolState(state),
         engaged=engaged,
@@ -378,8 +379,17 @@ class AsyncRobotClient(_RobotClientABC):
         self._active_tool_key: str | None = None
         self._active_variant_key = ""
         self._bound_tools: dict[str, ToolSpec] = {}
-        if tool_specs is not None:
-            self.bind_tools(tool_specs)
+        if tool_specs is None:
+            # A bare client (what a user script constructs) binds the packaged
+            # tools itself, so ``rbt.select_tool(...); rbt.tool.close()`` works
+            # without going through the Robot factory. Imported here: par6.tools
+            # reaches back into the package, which is mid-import at class
+            # definition time. The factory passes its own composed set, which
+            # additionally carries plugin tools.
+            from par6.tools import build_tools
+
+            tool_specs = build_tools().available
+        self.bind_tools(tool_specs)
 
     # ------------------------------------------------------------------
     # Configuration / lifecycle
@@ -546,6 +556,11 @@ class AsyncRobotClient(_RobotClientABC):
             return
         if not decode_status_bin_into(data, self._shared_status):
             return
+        # The wire carries the config spelling of the tool key; every consumer
+        # (and ``waldoctl.ToolSpec``, which upper-cases what it is given)
+        # indexes tools by the canonical one.
+        tool_status = self._shared_status.tool_status
+        tool_status.key = canonical_tool_key(tool_status.key)
         seq = self._shared_status.seq
         last = self._last_status_seq
         if last is not None and seq > last + 1:
@@ -1378,7 +1393,7 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.select_tool("PNEUMATIC")
         """
-        key = tool_name.strip().upper()
+        key = canonical_tool_key(tool_name)
         index = await self._queued(
             CmdType.SELECT_TOOL, [key, variant_key if variant_key else None]
         )
@@ -1430,7 +1445,7 @@ class AsyncRobotClient(_RobotClientABC):
         """
         index = await self._queued(
             CmdType.TOOL_ACTION,
-            [tool_key.strip().upper(), action.strip().lower(), list(params or [])],
+            [canonical_tool_key(tool_key), action.strip().lower(), list(params or [])],
         )
         if wait and index >= 0:
             await self.wait_command(index, timeout=timeout)
@@ -1555,7 +1570,10 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._query(CmdType.TOOLS)
         if result is None:
             return None
-        return ToolResult(tool=result[1], available=result[2])
+        return ToolResult(
+            tool=canonical_tool_key(result[1]),
+            available=[canonical_tool_key(k) for k in result[2]],
+        )
 
     async def activity(self) -> ActivityResult | None:
         """What the robot is currently doing.

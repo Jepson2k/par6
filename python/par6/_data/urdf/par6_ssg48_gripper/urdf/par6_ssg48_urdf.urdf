@@ -26,7 +26,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/base_link.STL" />
+          filename="package://par6/meshes/base_link.STL" />
       </geometry>
       <material
         name="">
@@ -40,7 +40,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/base_link.STL" />
+          filename="package://par6/meshes/base_link.STL" />
       </geometry>
     </collision>
   </link>
@@ -66,7 +66,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/shoulder.STL" />
+          filename="package://par6/meshes/shoulder.STL" />
       </geometry>
       <material
         name="">
@@ -80,7 +80,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/shoulder.STL" />
+          filename="package://par6/meshes/shoulder.STL" />
       </geometry>
     </collision>
   </link>
@@ -124,7 +124,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/upper_arm.STL" />
+          filename="package://par6/meshes/upper_arm.STL" />
       </geometry>
       <material
         name="">
@@ -138,7 +138,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/upper_arm.STL" />
+          filename="package://par6/meshes/upper_arm.STL" />
       </geometry>
     </collision>
   </link>
@@ -182,7 +182,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/elbow.STL" />
+          filename="package://par6/meshes/elbow.STL" />
       </geometry>
       <material
         name="">
@@ -196,7 +196,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/elbow.STL" />
+          filename="package://par6/meshes/elbow.STL" />
       </geometry>
     </collision>
   </link>
@@ -240,7 +240,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/lower_arm.STL" />
+          filename="package://par6/meshes/lower_arm.STL" />
       </geometry>
       <material
         name="">
@@ -254,7 +254,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/lower_arm.STL" />
+          filename="package://par6/meshes/lower_arm.STL" />
       </geometry>
     </collision>
   </link>
@@ -298,7 +298,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/wrist.STL" />
+          filename="package://par6/meshes/wrist.STL" />
       </geometry>
       <material
         name="">
@@ -312,7 +312,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/wrist.STL" />
+          filename="package://par6/meshes/wrist.STL" />
       </geometry>
     </collision>
   </link>
@@ -356,7 +356,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/gripper.STL" />
+          filename="package://par6/meshes/gripper.STL" />
       </geometry>
       <material
         name="">
@@ -370,7 +370,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/gripper.STL" />
+          filename="package://par6/meshes/gripper.STL" />
       </geometry>
     </collision>
   </link>
@@ -414,7 +414,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/jaw1.STL" />
+          filename="package://par6/meshes/jaw1.STL" />
       </geometry>
       <material
         name="">
@@ -428,13 +428,13 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/jaw1.STL" />
+          filename="package://par6/meshes/jaw1.STL" />
       </geometry>
     </collision>
   </link>
   <joint
     name="jaw1_JOINT"
-    type="prismatic">
+    type="fixed">
     <origin
       xyz="0 0 -0.11745"
       rpy="-3.1416 0 -3.1416" />
@@ -472,7 +472,7 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/jaw2.STL" />
+          filename="package://par6/meshes/jaw2.STL" />
       </geometry>
       <material
         name="">
@@ -486,12 +486,12 @@
         rpy="0 0 0" />
       <geometry>
         <mesh
-          filename="package://par6_ssg48_gripper/meshes/jaw2.STL" />
+          filename="package://par6/meshes/jaw2.STL" />
       </geometry>
     </collision>
   </link>
   <joint
-    name="jaw2_JOINT" type="prismatic">
+    name="jaw2_JOINT" type="fixed">
     <mimic joint="jaw1_JOINT" multiplier="-1" offset="0"/>
     <origin
       xyz="0 0 -0.11745"

@@ -18,14 +18,15 @@ from pathlib import Path
 
 import numpy as np
 from waldoctl import (
-    CartesianKinodynamicLimits,
     HomePosition,
     JointLimits,
     JointsSpec,
     KinodynamicLimits,
-    LinearAngularLimits,
     PositionLimits,
 )
+
+#: Runtime floor on the jog ramp time \[s\] (``par6_motion::jog::MIN_ACCEL_TIME_S``).
+MIN_JOG_ACCEL_TIME_S = 0.05
 
 
 def data_root() -> Path:
@@ -124,6 +125,23 @@ def soft_limits_rad(config: dict | None = None) -> np.ndarray:
     )
 
 
+#: Readout labels for the six axes, positionally matched to the config's
+#: ``joint1``..``joint6``.  The config and the URDF both carry structural ids
+#: (``joint1`` / ``shoulder_JOINT``), which is what an operator readout must
+#: not show.  PAR6 is the PAROL6 kinematic topology — the packaged URDF chain
+#: is ``base_link -> shoulder -> upper_arm -> elbow -> lower_arm -> wrist ->
+#: gripper`` — so the axes carry the same functional names parol6 gives them
+#: (``parol6/robot.py:401``).
+JOINT_DISPLAY_NAMES: tuple[str, ...] = (
+    "Base",
+    "Shoulder",
+    "Elbow",
+    "Wrist 1",
+    "Wrist 2",
+    "Wrist 3",
+)
+
+
 def build_joints_spec() -> JointsSpec:
     """waldoctl :class:`JointsSpec` from the packaged runtime config.
 
@@ -136,9 +154,14 @@ def build_joints_spec() -> JointsSpec:
     joints = config["joints"]
     rad = soft_limits_rad(config)
     home_rad = np.array(config["robot"]["park_pose_rad"], dtype=np.float64)
+    if len(joints) != len(JOINT_DISPLAY_NAMES):
+        raise RuntimeError(
+            f"config has {len(joints)} joints, "
+            f"{len(JOINT_DISPLAY_NAMES)} display names are defined"
+        )
     return JointsSpec(
         count=len(joints),
-        names=tuple(j["name"] for j in joints),
+        names=JOINT_DISPLAY_NAMES,
         limits=JointLimits(
             position=PositionLimits(deg=np.degrees(rad), rad=rad),
             hard=KinodynamicLimits(
@@ -159,17 +182,58 @@ def build_joints_spec() -> JointsSpec:
     )
 
 
+def homing_ready_pose_rad() -> np.ndarray:
+    """Where the configured homing sequence leaves the arm \\[rad\\].
+
+    The runtime answers HOME by running its full referencing sequence, so the
+    pose it ends at is decided by that sequence's ``move_to`` steps (the last
+    one commanded per joint), not by ``[robot].park_pose_rad``.
+    """
+    final: dict[int, float] = {}
+    for step in load_robot_config()["homing"]["sequence"]:
+        for move in step.get("move_to", []):
+            final[int(move["joint"])] = float(move["position_rad"])
+    joints = range(len(load_robot_config()["joints"]))
+    missing = [j for j in joints if j not in final]
+    if missing:
+        raise RuntimeError(f"homing sequence leaves joints {missing} unplaced")
+    return np.array([final[j] for j in joints], dtype=np.float64)
+
+
+def jog_ramp_acceleration() -> np.ndarray:
+    """Per-joint acceleration the RT jog ramp actually uses \\[rad/s^2\\].
+
+    Mirrors ``JogEngine::tick`` (``crates/par6-motion/src/jog.rs``):
+    ``a = min(v_jog / accel_time_s, a_jog)``, with the runtime's
+    ``MIN_ACCEL_TIME_S`` floor applied to the configured ramp time.
+    """
+    config = load_robot_config()
+    jog = config.get("jog", {})
+    accel_time_s = max(float(jog.get("accel_time_s", MIN_JOG_ACCEL_TIME_S)), MIN_JOG_ACCEL_TIME_S)
+    resolved = [resolve_mode_limits(j["limits"], "jog") for j in config["joints"]]
+    return np.array(
+        [min(vel / accel_time_s, acc) for vel, acc, _ in resolved], dtype=np.float64
+    )
+
+
 # ---------------------------------------------------------------------------
-# Cartesian jog caps
+# Tools
 # ---------------------------------------------------------------------------
 
-# The runtime config carries only joint-space limits; Cartesian jog is bounded
-# client-side (WC jog UI scaling) until the runtime grows enforced Cartesian
-# limits.  Magnitudes sized for a desktop 6-axis arm of PAR6's reach.
-CARTESIAN_JOG_LIMITS = CartesianKinodynamicLimits(
-    velocity=LinearAngularLimits(linear=0.16, angular=1.4),
-    acceleration=LinearAngularLimits(linear=0.55, angular=4.8),
-)
+
+def canonical_tool_key(name: str) -> str:
+    """The one spelling of a tool key this package uses everywhere.
+
+    ``waldoctl.ToolSpec`` upper-cases every key it is given, and the runtime
+    matches ``SELECT_TOOL`` / ``TOOL_ACTION`` keys case-insensitively, so the
+    upper form is the only spelling that round-trips through both.
+    """
+    return name.strip().upper()
+
+
+def fitted_tool_key() -> str:
+    """Canonical key of the gripper the runtime is configured with."""
+    return canonical_tool_key(load_robot_config()["robot"]["active_gripper"])
 
 
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@ kinematics; clients are the protocol-v2 UDP clients from
 from __future__ import annotations
 
 import logging
+import math
 import os
 import random
 import shutil
@@ -18,7 +19,6 @@ import subprocess
 import tempfile
 import time
 import xml.etree.ElementTree as ET
-from collections.abc import Callable
 from dataclasses import dataclass
 from typing import IO, Any, Literal
 
@@ -28,15 +28,9 @@ from pinokin import Damping, IKSolver, se3_from_rpy, so3_rpy
 from pinokin import Robot as PinokinRobot
 from waldoctl import (
     CartesianKinodynamicLimits,
-    ChannelDescriptor,
-    ElectricGripperTool,
     JointsSpec,
-    LinearMotion,
-    MeshRole,
+    LinearAngularLimits,
     ToolsCollection,
-    ToolSpec,
-    ToolStatus,
-    ToolType,
     resolve_variant_tcp,
 )
 from waldoctl import (
@@ -46,9 +40,11 @@ from waldoctl.results import IKResult
 
 from par6 import config as _cfg
 from par6.client.async_client import AsyncRobotClient
+from par6.client.dry_run_client import DryRunRobotClient
 from par6.client.sync_client import RobotClient as SyncRobotClient
 from par6.protocol.constants import CmdType, MsgType
 from par6.protocol.wire import ProtocolError, decode_reply, encode_command
+from par6.tools import build_tools
 
 logger = logging.getLogger(__name__)
 
@@ -142,128 +138,6 @@ class _Par6dManager:
 
 
 # ===========================================================================
-# Concrete tools (client-bound via bind_tools' _execute/_get_status hooks)
-# ===========================================================================
-
-
-class _ClientBound:
-    """Dispatch hooks the client's ``bind_tools`` fills in on shallow copies.
-
-    ``_execute`` maps to ``client.tool_action`` and ``_get_status`` to the
-    client's tool-status query; unbound specs (as exposed on ``robot.tools``)
-    raise so misuse is loud.
-    """
-
-    _execute: Callable[..., Any] | None = None
-    _get_status: Callable[..., Any] | None = None
-    key: str  # provided by ToolSpec in concrete subclasses
-
-    async def _cmd(
-        self, action: str, params: list[Any] | None = None, **kwargs: object
-    ) -> int:
-        if self._execute is None:
-            raise RuntimeError("Tool not bound to a client. Access via client.tool.")
-        return await self._execute(self.key, action, params or [], **kwargs)
-
-    async def status(self) -> ToolStatus:
-        if self._get_status is None:
-            raise RuntimeError("Tool not bound to a client. Access via client.tool.")
-        return await self._get_status()
-
-
-class _PassiveTool(_ClientBound, ToolSpec):
-    """Passive tool (bare flange): TCP + visuals only, no actions."""
-
-
-class _ElectricGripper(_ClientBound, ElectricGripperTool):
-    """Electric gripper driving the runtime's ``tool_action`` verbs.
-
-    ``move`` takes ``[position 0..1, speed 0..1, current mA]``; ``calibrate``
-    runs the driver's homing/activation sequence.
-    """
-
-    def __init__(self, **kwargs: Any) -> None:
-        kwargs.setdefault("action_r_labels", ("Calibrate", "Calibrate"))
-        kwargs.setdefault("action_r_icons", ("build", "build"))
-        super().__init__(**kwargs)
-
-    async def set_position(self, position: float, **kwargs: float | int) -> int:
-        speed = float(kwargs.get("speed", 0.5))
-        current = int(kwargs.get("current", self.current_range[1]))
-        return await self._cmd("move", [float(position), speed, current])
-
-    async def calibrate(self, **kwargs: object) -> int:
-        return await self._cmd("calibrate")
-
-    async def action_r(self, engaged: bool) -> None:
-        await self.calibrate()
-
-    async def open(self, **kwargs: float | int) -> int:
-        return await self.set_position(0.0, **kwargs)
-
-    async def close(self, **kwargs: float | int) -> int:
-        return await self.set_position(1.0, **kwargs)
-
-    @property
-    def adjust_step(self) -> int:
-        """Current step: ~10% of range, rounded to the nearest 10 mA."""
-        lo, hi = self.current_range
-        return max(10, round((hi - lo) / 10 / 10) * 10)
-
-    @property
-    def adjust_labels(self) -> tuple[str, str]:
-        return ("Less current", "More current")
-
-    @property
-    def adjust_icons(self) -> tuple[str, str]:
-        return ("remove", "add")
-
-    @property
-    def channel_descriptors(self) -> tuple[ChannelDescriptor, ...]:
-        return (
-            ChannelDescriptor(
-                name="Current", unit="mA", max=float(self.current_range[1])
-            ),
-        )
-
-
-def _build_tools(grippers: dict[str, dict]) -> ToolsCollection:
-    """Typed tool specs from the gripper TOMLs (flange first, as default)."""
-    tools: list[ToolSpec] = []
-    for key in sorted(grippers, key=lambda k: (k != "FLANGE", k)):
-        cfg = grippers[key]
-        origin, rpy = _cfg.tool_tcp(cfg["kinematics"])
-        common = dict(
-            key=key,
-            display_name=cfg["name"],
-            tcp_origin=origin,
-            tcp_rpy=rpy,
-        )
-        driver = cfg.get("driver")
-        if driver is None:
-            tools.append(_PassiveTool(tool_type=ToolType.NONE, **common))
-            continue
-        stroke_m = driver["stroke_mm"] / 1000.0
-        tools.append(
-            _ElectricGripper(
-                position_range=(0.0, 1.0),
-                speed_range=(0.0, 1.0),
-                current_range=(0, int(driver["ilim_ma"])),
-                motions=(
-                    LinearMotion(
-                        role=MeshRole.JAW,
-                        axis=(0.0, 1.0, 0.0),
-                        travel_m=stroke_m / 2.0,
-                        symmetric=True,
-                    ),
-                ),
-                **common,
-            )
-        )
-    return ToolsCollection(tuple(tools), default_key="FLANGE")
-
-
-# ===========================================================================
 # Kinematic model
 # ===========================================================================
 
@@ -295,6 +169,61 @@ def _load_kinematic_model(
             f"URDF {urdf_file!r} has {i} revolute joints, config has {soft_rad.shape[0]}"
         )
     return PinokinRobot.from_urdf_string(ET.tostring(root, encoding="unicode"))
+
+
+def _sample_cartesian_limit(
+    model: PinokinRobot,
+    soft_rad: NDArray[np.float64],
+    home_rad: NDArray[np.float64],
+    joint_limit: NDArray[np.float64],
+    samples: int,
+    seed: int,
+    spread_deg: float = 30.0,
+) -> tuple[float, float]:
+    """Median TCP rate a per-joint limit buys, as ``(linear, angular)``.
+
+    Samples joint configurations around the park pose, and at each one solves
+    the Jacobian pseudoinverse for the joint rates that move the TCP along one
+    Cartesian axis alone, then takes the largest scaling of those rates that
+    stays inside *joint_limit*.  Ill-conditioned configurations and directions
+    that cannot be isolated (a linear axis that drags rotation with it, or the
+    reverse) are dropped.  Deterministic: *seed* fixes the sample set.
+
+    This is the derivation parol6 runs offline to produce its ``LIMITS.cart``
+    constants (``parol6/PAROL6_ROBOT.py:603-676``); par6 runs it against its
+    own model and config instead of carrying the numbers.
+    """
+    rng = np.random.default_rng(seed)
+    spread_rad = math.radians(spread_deg)
+    linear: list[float] = []
+    angular: list[float] = []
+    desired = np.zeros(6, dtype=np.float64)
+    for _ in range(samples):
+        q = np.clip(
+            home_rad + rng.normal(0.0, spread_rad, home_rad.shape[0]),
+            soft_rad[:, 0],
+            soft_rad[:, 1],
+        )
+        J = model.jacob0(q)
+        if np.linalg.cond(J) > 1e6:
+            continue
+        J_pinv = np.linalg.pinv(J)
+        for axis in range(6):
+            desired[:] = 0.0
+            desired[axis] = 1.0
+            q_dot = J_pinv @ desired
+            coupled = J[3:, :] @ q_dot if axis < 3 else J[:3, :] @ q_dot
+            if np.linalg.norm(coupled) > 0.01:
+                continue
+            rate = float(np.min(joint_limit / (np.abs(q_dot) + 1e-10)))
+            if rate > 0.001:
+                (linear if axis < 3 else angular).append(rate)
+    if not linear or not angular:
+        raise RuntimeError(
+            "Cartesian limit sampling found no isolable axis; "
+            "the kinematic model or the joint limits are degenerate"
+        )
+    return float(np.median(linear)), float(np.median(angular))
 
 
 @dataclass
@@ -336,8 +265,9 @@ class Robot(_RobotABC):
         self._config = _cfg.load_robot_config()
         self._grippers = _cfg.load_gripper_configs()
         self._joints = _cfg.build_joints_spec()
-        self._tools = _build_tools(self._grippers)
+        self._tools = build_tools()
         self._soft_rad = _cfg.soft_limits_rad(self._config)
+        self._cartesian_limits: CartesianKinodynamicLimits | None = None
 
         self._pinokin = _load_kinematic_model(
             str(_cfg.urdf_path("FLANGE")),
@@ -359,8 +289,12 @@ class Robot(_RobotABC):
         self._rpy_buf = np.zeros(3, dtype=np.float64)
         self._T_target_buf = np.zeros((4, 4), dtype=np.float64)
 
-        self._active_tool_key = "FLANGE"
-        self.set_active_tool("FLANGE")
+        # The runtime is built around one fitted gripper and refuses
+        # SELECT_TOOL for any other, so the fitted tool — not the bare
+        # flange — is what a display should start on (and which URDF tree
+        # :attr:`urdf_path` should hand a 3-D view before the first STATUS).
+        self._active_tool_key = self._tools.default.key
+        self.set_active_tool(self._active_tool_key)
 
     # -- Identity -----------------------------------------------------------
 
@@ -381,7 +315,34 @@ class Robot(_RobotABC):
 
     @property
     def cartesian_limits(self) -> CartesianKinodynamicLimits:
-        return _cfg.CARTESIAN_JOG_LIMITS
+        """Cartesian velocity/acceleration reachable at 100% jog.
+
+        Derived on first use from the config's JOG-mode joint limits through
+        this robot's own Jacobian (see :func:`_sample_cartesian_limit`), not
+        stored anywhere: the runtime enforces joint-space limits only, so the
+        Cartesian envelope is a consequence of them and the arm's geometry.
+        """
+        if self._cartesian_limits is None:
+            self._cartesian_limits = self._derive_cartesian_limits()
+        return self._cartesian_limits
+
+    def _derive_cartesian_limits(self) -> CartesianKinodynamicLimits:
+        jog = self._joints.limits.jog
+        vel_lin, vel_ang = _sample_cartesian_limit(
+            self._pinokin, self._soft_rad, self._joints.home.rad, jog.velocity, 500, 42
+        )
+        acc_lin, acc_ang = _sample_cartesian_limit(
+            self._pinokin,
+            self._soft_rad,
+            self._joints.home.rad,
+            _cfg.jog_ramp_acceleration(),
+            200,
+            43,
+        )
+        return CartesianKinodynamicLimits(
+            velocity=LinearAngularLimits(linear=vel_lin, angular=vel_ang),
+            acceleration=LinearAngularLimits(linear=acc_lin, angular=acc_ang),
+        )
 
     # -- Unit preferences ---------------------------------------------------
 
@@ -472,7 +433,7 @@ class Robot(_RobotABC):
         ``tcp_origin``/``tcp_rpy`` with variant overrides.  The 3-D view's
         :attr:`urdf_path`/:attr:`mesh_dir` follow the selected tree.
         """
-        key = tool_key.strip().upper()
+        key = _cfg.canonical_tool_key(tool_key)
         gripper = self._grippers.get(key)
         if gripper is not None:
             origin, rpy = _cfg.tool_tcp(gripper["kinematics"])
@@ -491,6 +452,8 @@ class Robot(_RobotABC):
         else:
             self._pinokin.set_tool_transform(T_tool)
         self._active_tool_key = key
+        # The Cartesian envelope is a property of the Jacobian AT THE TCP.
+        self._cartesian_limits = None
 
     def _plugin_tool_tcp(
         self, tool_key: str, variant_key: str | None
@@ -558,6 +521,15 @@ class Robot(_RobotABC):
         if len(q_rad) != self._soft_rad.shape[0]:
             return False
         return self._limit_violations(np.asarray(q_rad, dtype=np.float64)) is None
+
+    def jacobian(self, q_rad: NDArray[np.float64]) -> NDArray[np.float64]:
+        """World-frame Jacobian at the active tool's TCP, ``(6, num_joints)``.
+
+        Maps joint rates to a TCP twist ``[vx, vy, vz, wx, wy, wz]``; its
+        pseudo-inverse is what turns a Cartesian jog twist into joint rates,
+        the same way the runtime's ``step_cart_jog`` does.
+        """
+        return self._pinokin.jacob0(np.asarray(q_rad, dtype=np.float64))
 
     def fk_batch(self, joint_path_rad: NDArray[np.float64]) -> NDArray[np.float64]:
         transforms = self._pinokin.batch_fk(
@@ -665,6 +637,14 @@ class Robot(_RobotABC):
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
         return SyncRobotClient(tool_specs=self.tools.available, **kwargs)
+
+    def create_dry_run_client(self, **kwargs: Any) -> DryRunRobotClient:
+        """Offline preview client — the command stream without a runtime.
+
+        Keyword args: ``initial_joints_deg`` (defaults to home),
+        ``initial_homed``, ``max_snapshot_points``.
+        """
+        return DryRunRobotClient(**kwargs)
 
 
 __all__ = ["Par6IKResult", "Robot"]

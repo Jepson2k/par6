@@ -12,6 +12,12 @@ dependencies = [
   "numpy>=2.0,<2.5",
   "msgspec>=0.18",
   "ormsgpack>=1.4.0",
+  # The offline dry-run client plans with the algorithms the runtime plans
+  # with: ruckig is the reference implementation of the jerk-limited OTG
+  # par6-motion drives through rsruckig, and toppra is the library the C++
+  # shim (cpp/src/par6_traj.cpp) parameterizes paths with.
+  "ruckig>=0.12.2",
+  "toppra>=0.6.3",
   "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.7.0",
   # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
   # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)

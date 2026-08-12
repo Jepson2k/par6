@@ -54,6 +54,27 @@ requires_par6d = pytest.mark.skipif(
 )
 
 
+def repo_assets_dir() -> Path | None:
+    """The repo's ``assets/par6_description`` tree, if this is a checkout.
+
+    A ``par6d`` built with the ``ffi`` feature loads its kinematics and
+    collision models from that tree and looks for it next to the config file —
+    and every config these tests hand it lives in a tmp dir, so it has to be
+    named explicitly for the same tests to serve both build flavors.
+    """
+    assets = Path(__file__).resolve().parents[2] / "assets" / "par6_description"
+    return assets if assets.is_dir() else None
+
+
+def daemon_env() -> dict[str, str]:
+    """Environment for the daemon under test."""
+    env = dict(os.environ)
+    assets = repo_assets_dir()
+    if "PAR6_ASSETS" not in env and assets is not None:
+        env["PAR6_ASSETS"] = str(assets)
+    return env
+
+
 def free_udp_port() -> int:
     """A currently-free loopback UDP port (bind, read, release)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
@@ -120,6 +141,7 @@ class LiveDaemon:
             stdout=subprocess.PIPE,
             stderr=log,
             text=True,
+            env=daemon_env(),
         )
         try:
             command_port = cls._read_ready_port(process, log_path)

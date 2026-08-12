@@ -18,7 +18,13 @@ import time
 
 import numpy as np
 import pytest
-from live_daemon import LiveDaemon, free_udp_port, requires_par6d, sim_config
+from live_daemon import (
+    LiveDaemon,
+    free_udp_port,
+    repo_assets_dir,
+    requires_par6d,
+    sim_config,
+)
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -328,6 +334,11 @@ def test_robot_backend_attaches_to_a_running_runtime_then_spawns_its_own(
 
     # -- spawn one of its own --------------------------------------------
     port = free_udp_port()
+    assets = repo_assets_dir()
+    if assets is not None:
+        # The spawned runtime's config lives in a tmp dir; an ffi build looks
+        # for its kinematics assets next to the config unless told otherwise.
+        monkeypatch.setenv("PAR6_ASSETS", str(assets))
     monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "spawned")))
     monkeypatch.setenv("PAR6_BIND", "127.0.0.1")
     monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
@@ -387,3 +398,43 @@ async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
             pass
         else:
             assert "TOPPRA" in advertised
+
+
+@pytest.mark.timeout(120)
+async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
+    """The tool the client advertises must be the tool the runtime has.
+
+    ``Robot.tools`` is what a UI renders before any STATUS arrives, and every
+    consumer indexes it with the key the wire reports — so the runtime's TOOLS
+    answer, its STATUS ``tool_status`` and its accepted ``select_tool`` all
+    have to name the same entry of that collection, and the collection's
+    default has to be the tool the runtime is actually fitted with.
+    """
+    robot = Robot()
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        reported = await client.tools()
+        assert reported is not None
+
+        fitted = robot.tools[reported.tool]
+        assert fitted is robot.tools.default, (
+            f"the runtime is fitted with {reported.tool}, but the client "
+            f"defaults to {robot.tools.default.key}"
+        )
+        for key in reported.available:
+            assert key in robot.tools, f"{key} is not in {[t.key for t in robot.tools.available]}"
+
+        assert await client.wait_status(lambda s: s.tool_status_present, timeout=STEP_BUDGET_S)
+        broadcast = await client.wait_status(lambda s: True, timeout=STEP_BUDGET_S)
+        assert broadcast
+        streamed_key = client._shared_status.tool_status.key
+        assert robot.tools[streamed_key] is fitted
+
+        # The runtime accepts the key it reported, and the bound tool of a
+        # client built without any specs is that same tool.  Queued commands
+        # are gated on ENABLED, so the controller is reset first.
+        async def select():
+            assert await client.select_tool(reported.tool) >= 0
+
+        assert await enable(client, select) is None
+        assert client.tool.key == fitted.key
