@@ -7,17 +7,21 @@
 //!   golden kinematics fixture's FK matrix for a known q,
 //! - `move_l` runs the cartesian pipeline (segment → seeded IK → TOPPRA
 //!   → ring) to COMPLETE, and the measured TCP stays on the line,
-//! - an out-of-workspace pose is a real IK error reply, never a no-op.
+//! - an out-of-workspace pose is a real IK error reply, never a no-op,
+//! - the collision world is enforced: a planned move through a keep-out
+//!   is refused before dispatch, STATUS reports the live verdict, and a
+//!   malformed shape set changes neither the epoch nor the enforced
+//!   world.
 #![cfg(feature = "ffi")]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use par6_proto::command::{JogL, MoveJPose, MoveL, Teleport};
+use par6_proto::command::{JogL, MoveJ, MoveJPose, MoveL, SetShapes, Shape, Teleport};
 use par6_proto::{
-    decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, Reply, Status,
-    WireError, NUM_JOINTS,
+    decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, QueryResult, Reply,
+    Status, WireError, NUM_JOINTS,
 };
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -127,6 +131,23 @@ impl Rig {
         }
     }
 
+    /// Drop the STATUS frames the socket has already buffered.
+    ///
+    /// The broadcast runs at 50 Hz whatever the test is doing, so by the
+    /// time a multi-second move ends there is a queue of history waiting:
+    /// a stale frame can satisfy a wait for a condition that has not
+    /// happened yet. Draining first makes the next frame a live one.
+    fn drain_status(&self) {
+        self.status_rx
+            .set_nonblocking(true)
+            .expect("nonblocking status socket");
+        let mut buf = [0u8; 65535];
+        while self.status_rx.recv_from(&mut buf).is_ok() {}
+        self.status_rx
+            .set_nonblocking(false)
+            .expect("blocking status socket");
+    }
+
     /// Collect every STATUS arriving in `window`.
     fn collect_status(&self, window: Duration) -> Vec<Status> {
         let until = Instant::now() + window;
@@ -220,6 +241,20 @@ impl Client {
         match self.request(cmd) {
             Reply::Ok { .. } => {}
             other => panic!("expected OK, got {other:?}"),
+        }
+    }
+
+    fn query(&mut self, cmd: &Command) -> QueryResult {
+        match self.request(cmd) {
+            Reply::Response { result, .. } => result,
+            other => panic!("expected RESPONSE, got {other:?}"),
+        }
+    }
+
+    fn expect_error(&mut self, cmd: &Command) -> WireError {
+        match self.request(cmd) {
+            Reply::Error { error, .. } => error,
+            other => panic!("expected ERROR, got {other:?}"),
         }
     }
 
@@ -383,11 +418,18 @@ fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
 }
 
 /// A well-conditioned start posture for cartesian moves: away from the
-/// wrist-aligned park singularity, comfortably inside every soft window.
-const CART_START_DEG: [f64; NUM_JOINTS] = [0.0, -70.0, 150.0, 20.0, 45.0, 180.0];
+/// wrist-aligned park singularity, comfortably inside every soft window,
+/// and extended clear of the arm's own collision meshes. The posture this
+/// test used before enforcement landed had the arm wrapped down onto its
+/// own base (TCP 76 mm BELOW the base plane, six link pairs in contact),
+/// where the collision gate rightly refuses a move that tightens the fold
+/// further.
+const CART_START_DEG: [f64; NUM_JOINTS] = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0];
 /// Cartesian move duration \[s\]. Long enough that the sim's cascade
-/// tracking lag stays small next to the path tolerances.
-const MOVE_S: f64 = 6.0;
+/// tracking lag stays small next to the path tolerances: the lag is
+/// proportional to speed, and the line below is held to 8 mm over a
+/// 180 mm move.
+const MOVE_S: f64 = 15.0;
 
 // ---- tests -----------------------------------------------------------------
 
@@ -441,7 +483,11 @@ fn cartesian_surface_over_protocol_v2() {
     enable_and_teleport(&rig, &mut c, CART_START_DEG);
     let s = rig.wait_status("start pose", |_| true);
     let start = tcp_mm(&s);
-    let target = [start[0] + 80.0, start[1], start[2] + 40.0];
+    // Out of the arm's plane in all three axes: the joint-space route to
+    // the same pose then bows tens of millimetres off the line, which is
+    // what makes the collinearity bound below a measurement instead of a
+    // truism.
+    let target = [start[0] + 120.0, start[1] + 60.0, start[2] + 120.0];
     let wire_target = wire_pose_at(&s.pose, target);
     let move_l = Command::MoveL(MoveL {
         key: 1001,
@@ -666,6 +712,330 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
             );
         }
     }
+
+    rig.shutdown();
+}
+
+// ---- collision enforcement -------------------------------------------------
+
+/// Start of the base sweep the keep-out tests drive: the arm extended
+/// (its own meshes clear of each other, unlike the folded park pose),
+/// rotated back around J0 so the sweep's midpoint sits in open workspace
+/// where a keep-out can be parked.
+const SWEEP_START_DEG: [f64; NUM_JOINTS] = [-40.0, -15.0, 365.0, 0.0, 0.0, 180.0];
+/// J0 travel of the sweep \[deg\]; its midpoint is where the box goes.
+const SWEEP_DEG: f64 = 80.0;
+/// Sweep duration \[s\].
+const SWEEP_S: f64 = 3.0;
+/// Keep-out edge length \[m\]. Wide enough that the gripper cannot slip
+/// past it between two checked configurations, small enough that the
+/// sweep's endpoints stay well clear.
+const KEEPOUT_M: f64 = 0.1;
+
+fn with_j0(base: [f64; NUM_JOINTS], delta_deg: f64) -> [f64; NUM_JOINTS] {
+    let mut a = base;
+    a[0] += delta_deg;
+    a
+}
+
+fn move_j(key: u64, angles_deg: [f64; NUM_JOINTS], duration_s: f64) -> Command {
+    Command::MoveJ(MoveJ {
+        key,
+        angles: angles_deg,
+        duration: Some(duration_s),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    })
+}
+
+/// An axis-aligned cube keep-out centred on a TCP position read from
+/// STATUS. Shapes are metres/radians on the wire (what waldoctl sends);
+/// STATUS translations are mm.
+fn keepout_at(name: &str, tcp_mm: [f64; 3]) -> Shape {
+    Shape {
+        kind: "box".to_owned(),
+        params: vec![KEEPOUT_M, KEEPOUT_M, KEEPOUT_M],
+        pose: vec![
+            tcp_mm[0] / 1000.0,
+            tcp_mm[1] / 1000.0,
+            tcp_mm[2] / 1000.0,
+            0.0,
+            0.0,
+            0.0,
+        ],
+        collision: true,
+        margin: None,
+        name: name.to_owned(),
+    }
+}
+
+fn set_shapes(shapes: Vec<Shape>) -> Command {
+    Command::SetShapes(SetShapes { shapes })
+}
+
+/// The applied collision world as the SHAPES query reports it.
+fn shapes_readback(c: &mut Client) -> (Vec<Shape>, u64) {
+    match c.query(&Command::Shapes) {
+        QueryResult::Shapes { program, epoch, .. } => (program, epoch),
+        other => panic!("unexpected SHAPES result {other:?}"),
+    }
+}
+
+/// The configured park pose in wire units — where every program ends.
+fn park_deg() -> [f64; NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let mut a = [0.0; NUM_JOINTS];
+    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
+        *out = rad.to_degrees();
+    }
+    a
+}
+
+fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> bool {
+    a.iter()
+        .zip(b.iter())
+        .all(|(x, y)| (x - y).abs() <= tol_deg)
+}
+
+/// Collision enforcement end to end, over the real protocol against the
+/// real coal world:
+///
+/// - a `move_j` whose ENDPOINTS are both clear but whose interior sweeps
+///   the gripper through a keep-out is refused before a sample reaches
+///   the RT ring, with `SYS_SELF_COLLISION` and the colliding pair in the
+///   payload — and the arm does not move;
+/// - the same move runs to COMPLETE once the box is gone;
+/// - STATUS carries that verdict (`collision_active` / `collision_pairs`)
+///   until a motion is accepted, in the URDF's reporting vocabulary;
+/// - a malformed shape refuses the WHOLE set: the epoch does not move,
+///   the readback does not change, and the previous world stays
+///   ENFORCED (not merely echoed);
+/// - a keep-out dropped onto a RUNNING move stops it;
+/// - the same move runs once the box is gone, and `reset_state` clears
+///   the program layer.
+#[test]
+fn collision_world_is_enforced_over_protocol_v2() {
+    let rig = Rig::boot("collision", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+
+    // Where the gripper passes halfway through the sweep: the keep-out
+    // goes there, so both endpoints stay clear and only the interior of
+    // the move is blocked.
+    enable_and_teleport(&rig, &mut c, mid_deg);
+    let mid_tcp =
+        tcp_mm(&rig.wait_status("midpoint pose", |s| angles_close(&s.angles, &mid_deg, 0.5)));
+
+    // Baseline: with an empty world the sweep runs to COMPLETE.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7001, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the sweep must run with an empty world, got {detail:?}");
+
+    // The keep-out, straddling the middle of that same sweep.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let keepout = keepout_at("keepout", mid_tcp);
+    c.ok(&set_shapes(vec![keepout.clone()]));
+    let (program, epoch) = shapes_readback(&mut c);
+    assert_eq!(program, vec![keepout.clone()]);
+    assert!(epoch > 0, "an applied world must carry a non-zero epoch");
+
+    // Both endpoints are clear — proven by STATUS at each of them — so
+    // only checking the interior of the path can catch this move.
+    rig.drain_status();
+    let s = rig.wait_status("start of the sweep is clear", |s| {
+        angles_close(&s.angles, &SWEEP_START_DEG, 0.5)
+    });
+    assert!(
+        !s.collision_active,
+        "the sweep start must be outside the keep-out: {:?}",
+        s.collision_pairs
+    );
+    let i = c.ok_index(&move_j(7002, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a move sweeping through the keep-out must be refused");
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(
+        e.code,
+        ErrorCode::SysSelfCollision as u16,
+        "the refusal must be SYS_SELF_COLLISION, got {e:?}"
+    );
+    assert!(
+        e.cause.contains("keepout"),
+        "the error payload must name the colliding pair: {e:?}"
+    );
+    rig.drain_status();
+    let s = rig.wait_status("pose after the refusal", |s| {
+        s.action_state != par6_proto::ActionState::Executing
+    });
+    assert!(
+        angles_close(&s.angles, &SWEEP_START_DEG, 1.0),
+        "a refused move must not drive the arm: {:?}",
+        s.angles
+    );
+
+    // STATUS carries the verdict of the refusal: the pairs the blocked
+    // move would have collided in, in the URDF's reporting vocabulary
+    // (link names and the client's own shape names, never the solver's
+    // per-link geometry identifiers).
+    rig.drain_status();
+    let s = rig.wait_status("the refusal reaches STATUS", |s| s.collision_active);
+    let pair = s
+        .collision_pairs
+        .iter()
+        .find(|(a, b)| a == "keepout" || b == "keepout")
+        .unwrap_or_else(|| {
+            panic!(
+                "collision_pairs must name the keep-out: {:?}",
+                s.collision_pairs
+            )
+        });
+    let link = if pair.0 == "keepout" {
+        &pair.1
+    } else {
+        &pair.0
+    };
+    assert!(
+        !link.ends_with("_0"),
+        "the pair must name a URDF link, not a solver geometry id: {link}"
+    );
+
+    // A malformed set is refused WHOLE. Every flavour of malformed: a
+    // kind waldoctl does not define, an arity that does not match the
+    // kind, a dimension coal cannot build, and a name already taken.
+    let mut unknown_kind = keepout.clone();
+    unknown_kind.kind = "pyramid".to_owned();
+    unknown_kind.name = "bad".to_owned();
+    let mut short_params = keepout.clone();
+    short_params.params = vec![KEEPOUT_M, KEEPOUT_M];
+    short_params.name = "bad".to_owned();
+    let mut negative = keepout.clone();
+    negative.kind = "sphere".to_owned();
+    negative.params = vec![-1.0];
+    negative.name = "bad".to_owned();
+    let duplicate = keepout.clone();
+    for (label, bad) in [
+        ("unknown kind", unknown_kind),
+        ("wrong arity", short_params),
+        ("negative radius", negative),
+        ("duplicate name", duplicate),
+    ] {
+        let err = c.expect_error(&set_shapes(vec![keepout.clone(), bad]));
+        assert_eq!(
+            err.code,
+            ErrorCode::CommValidationError as u16,
+            "a {label} shape must be refused, got {err:?}"
+        );
+        let (program, refused_epoch) = shapes_readback(&mut c);
+        assert_eq!(
+            refused_epoch, epoch,
+            "a refused world must not advance scene_epoch ({label})"
+        );
+        assert_eq!(
+            program,
+            vec![keepout.clone()],
+            "a refused set must not change the readback ({label})"
+        );
+    }
+    // …and the previous world is still ENFORCED, not merely echoed: the
+    // same move is still refused.
+    let i = c.ok_index(&move_j(7003, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a refused SET_SHAPES dropped the enforced keep-out");
+    assert_eq!(
+        detail.expect("a failed COMPLETE carries the error").code,
+        ErrorCode::SysSelfCollision as u16
+    );
+
+    // A world change does not spare motion already committed: drop the
+    // keep-out onto the path of a move that is already running and it
+    // stops, instead of being enforced only from the next command on.
+    c.ok(&set_shapes(Vec::new()));
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7004, end_deg, SWEEP_S));
+    rig.drain_status();
+    rig.wait_status("the sweep is under way but short of the keep-out", |s| {
+        s.executing_index == i as i64
+            && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+            && s.angles[0] < -10.0
+    });
+    c.ok(&set_shapes(vec![keepout.clone()]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a keep-out dropped on a running move must stop it");
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(
+        e.code,
+        ErrorCode::SysSelfCollision as u16,
+        "the invalidated move must report SYS_SELF_COLLISION, got {e:?}"
+    );
+    rig.drain_status();
+    let s = rig.wait_status("the arm stops", |s| s.speeds.iter().all(|v| v.abs() < 0.05));
+    assert!(
+        s.angles[0] < mid_deg[0],
+        "the arm drove into the keep-out it was stopped for: {:?}",
+        s.angles
+    );
+
+    // Removing the keep-out advances the epoch and lets the very same
+    // move through — and accepting it clears the latched verdict.
+    c.ok(&set_shapes(Vec::new()));
+    let (program, cleared_epoch) = shapes_readback(&mut c);
+    assert!(program.is_empty());
+    assert!(
+        cleared_epoch > epoch,
+        "clearing the world must advance the epoch: {cleared_epoch} vs {epoch}"
+    );
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7005, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "the sweep must run once the keep-out is removed, got {detail:?}"
+    );
+    rig.drain_status();
+    let s = rig.wait_status("a clean move clears the verdict", |_| true);
+    assert!(
+        !s.collision_active && s.collision_pairs.is_empty(),
+        "the refusal's pairs outlived the motion that caused them: {:?}",
+        s.collision_pairs
+    );
+
+    // reset_state clears the program layer: the readback empties and the
+    // keep-out stops being enforced.
+    c.ok(&set_shapes(vec![keepout]));
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7006, end_deg, SWEEP_S));
+    assert!(!c.wait_complete(i).0, "the keep-out must be back in force");
+    c.ok(&Command::ResetState);
+    let (program, _) = shapes_readback(&mut c);
+    assert!(
+        program.is_empty(),
+        "reset_state must clear the program readback: {program:?}"
+    );
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7007, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "reset_state must stop enforcing the program layer, got {detail:?}"
+    );
+
+    // The arm must be able to return to its OWN park pose. PAR6 parks
+    // folded, forearm back and resting against the base, which the vendor
+    // collision meshes report as contact; if that counted as a collision
+    // the last step of every program would be refused.
+    let i = c.ok_index(&move_j(7008, park_deg(), SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a move to the configured park pose must not be refused: {detail:?}"
+    );
 
     rig.shutdown();
 }

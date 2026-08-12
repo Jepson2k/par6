@@ -9,15 +9,17 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use par6_proto::command::{JogJ, JogL, MoveJ, MoveS, SetRecipe, Simulator, Stop, Teleport};
+use par6_proto::command::{
+    JogJ, JogL, MoveJ, MoveS, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport, WriteIo,
+};
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
     CmdType, Command, ErrorCode, Frame, QueryResult, Reply, WireError, UNATTRIBUTED,
 };
 use par6_rt::{snapshot_channel, ArmState, SnapshotWriter, StateSnapshot};
 use par6_server::{
-    spawn, CommandOutcome, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle,
-    ServerConfig, ServerHandle, StatusTransport,
+    spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, RtCommands,
+    RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -96,6 +98,13 @@ struct PlannerState {
     fail_next_start: Option<WireError>,
     cancels: usize,
     enablement: Enablement,
+    /// Every accepted layer replacement, in order.
+    layers: Vec<(ShapeLayer, Vec<Shape>)>,
+    /// Epoch of the applied world, moved only by an accepted replacement
+    /// (`par6-kin`'s `Collision::set_layer` contract).
+    epoch: u64,
+    fail_next_shapes: Option<WireError>,
+    collision: Option<CollisionState>,
 }
 
 #[derive(Clone)]
@@ -117,6 +126,25 @@ impl Planner for TestPlanner {
         self.0.lock().unwrap().cancels += 1;
     }
     fn sync(&mut self, _ctx: PlanContext<'_>) {}
+    fn set_shapes(
+        &mut self,
+        layer: ShapeLayer,
+        shapes: &[Shape],
+    ) -> Result<Option<u64>, WireError> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(e) = s.fail_next_shapes.take() {
+            return Err(e);
+        }
+        s.layers.push((layer, shapes.to_vec()));
+        s.epoch += 1;
+        Ok(Some(s.epoch))
+    }
+    fn collision(&mut self) -> Option<CollisionState> {
+        self.0.lock().unwrap().collision.clone()
+    }
+    fn clear_collision(&mut self) {
+        self.0.lock().unwrap().collision = Some(CollisionState::default());
+    }
     fn enablement(&self) -> Enablement {
         self.0.lock().unwrap().enablement
     }
@@ -961,4 +989,373 @@ async fn telemetry_recipes_refusal_and_stream() {
     let (_, seq2, ns2, _, _) = recv_telemetry(&h.telemetry_rx).await;
     assert!(seq2 > seq1, "telemetry seq must increase");
     assert!(ns2 >= ns1);
+}
+
+fn wire_shape(name: &str, kind: &str) -> Shape {
+    Shape {
+        kind: kind.to_owned(),
+        params: vec![0.2, 0.2, 0.2],
+        pose: vec![0.3, 0.0, 0.1, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: name.to_owned(),
+    }
+}
+
+/// The collision-world seam the server owns: which layer goes to the
+/// planner when, whose epoch STATUS reports, and what a refusal leaves
+/// behind.
+///
+/// - the configured installation keep-outs are pushed ONCE, at startup,
+///   and neither `set_shapes` nor `reset_state` ever touches that layer
+///   again — a program cannot clear the deployment's keep-outs;
+/// - `set_shapes` replaces the program layer and adopts the epoch of the
+///   world the planner actually applied, instead of counting its own;
+/// - a refused set changes nothing: not the enforced world, not the
+///   SHAPES readback, not the epoch — so a client that sees the epoch
+///   move knows its shapes are the ones being enforced;
+/// - `reset_state` clears the program layer only;
+/// - STATUS carries the planner's verdict rather than a hardcoded false.
+#[tokio::test]
+async fn shape_layers_epoch_adoption_and_collision_status() {
+    let install = wire_shape("cage", "box");
+    let mut h = start(|cfg| cfg.installation_shapes = vec![install.clone()]).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    // Startup: installation only, and STATUS reports the applied epoch.
+    assert_eq!(
+        h.planner.lock().unwrap().layers,
+        vec![(ShapeLayer::Installation, vec![install.clone()])],
+        "installation keep-outs are pushed once, at startup"
+    );
+    let epoch_after_install = 1;
+
+    let program = vec![wire_shape("table", "box"), wire_shape("post", "cylinder")];
+    match c
+        .request(&Command::SetShapes(SetShapes {
+            shapes: program.clone(),
+        }))
+        .await
+    {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    assert_eq!(
+        h.planner.lock().unwrap().layers.last(),
+        Some(&(ShapeLayer::Program, program.clone())),
+        "set_shapes replaces the program layer"
+    );
+    match c.query(&Command::Shapes).await {
+        QueryResult::Shapes {
+            installation,
+            program: p,
+            epoch,
+        } => {
+            assert_eq!(installation, vec![install.clone()]);
+            assert_eq!(p, program);
+            assert_eq!(
+                epoch,
+                epoch_after_install + 1,
+                "the reported epoch is the applied world's"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // A refused set: the world, the readback and the epoch all stand.
+    h.planner.lock().unwrap().fail_next_shapes = Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", "shape \"bad\": unknown kind \"pyramid\"")],
+    ));
+    let err = c
+        .expect_error(&Command::SetShapes(SetShapes {
+            shapes: vec![wire_shape("bad", "pyramid")],
+        }))
+        .await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    let applied = h.planner.lock().unwrap().layers.clone();
+    assert_eq!(
+        applied.last(),
+        Some(&(ShapeLayer::Program, program.clone())),
+        "a refused set must not reach the collision world"
+    );
+    match c.query(&Command::Shapes).await {
+        QueryResult::Shapes {
+            program: p, epoch, ..
+        } => {
+            assert_eq!(p, program, "a refused set must not change the readback");
+            assert_eq!(
+                epoch,
+                epoch_after_install + 1,
+                "a refused world must not advance scene_epoch"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // reset_state clears the PROGRAM layer only.
+    match c.request(&Command::ResetState).await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    let applied = h.planner.lock().unwrap().layers.clone();
+    assert_eq!(
+        applied.last(),
+        Some(&(ShapeLayer::Program, Vec::new())),
+        "reset_state clears the program layer"
+    );
+    assert_eq!(
+        applied
+            .iter()
+            .filter(|(l, _)| *l == ShapeLayer::Installation)
+            .count(),
+        1,
+        "installation shapes are never re-pushed or cleared: {applied:?}"
+    );
+    match c.query(&Command::Shapes).await {
+        QueryResult::Shapes {
+            installation,
+            program: p,
+            ..
+        } => {
+            assert!(p.is_empty(), "reset_state clears the program readback");
+            assert_eq!(
+                installation,
+                vec![install],
+                "reset_state keeps the installation keep-outs"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // STATUS reports what the planner says, not a hardcoded false.
+    let s = recv_status(&h.status_rx).await;
+    assert!(!s.collision_active);
+    assert!(s.collision_pairs.is_empty());
+    h.planner.lock().unwrap().collision = Some(CollisionState {
+        active: true,
+        pairs: vec![("forearm_0".to_owned(), "cage".to_owned())],
+    });
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.collision_active {
+            assert_eq!(
+                s.collision_pairs,
+                vec![("forearm_0".to_owned(), "cage".to_owned())]
+            );
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the planner's collision verdict never reached STATUS"
+        );
+    }
+}
+
+/// A configured installation keep-out the runtime cannot apply is a
+/// startup failure: coming up with an unenforceable world would silently
+/// under-enforce, and no client is connected yet to be told.
+#[tokio::test]
+async fn unappliable_installation_shapes_fail_startup() {
+    let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let cfg = ServerConfig {
+        bind: "127.0.0.1:0".parse().unwrap(),
+        status_transport: StatusTransport::Unicast,
+        status_dest_host: "127.0.0.1".parse().unwrap(),
+        status_port: status_rx.local_addr().unwrap().port(),
+        telemetry_port: telemetry_rx.local_addr().unwrap().port(),
+        installation_shapes: vec![wire_shape("bad", "pyramid")],
+        ..ServerConfig::default()
+    };
+    let (_writer, snapshots) = snapshot_channel::<StateSnapshot>();
+    let planner = Arc::new(Mutex::new(PlannerState {
+        fail_next_shapes: Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[("detail", "shape \"bad\": unknown kind \"pyramid\"")],
+        )),
+        ..PlannerState::default()
+    }));
+    let started = spawn(
+        cfg,
+        RuntimeHandle {
+            planner: TestPlanner(planner.clone()),
+            rt: TestRt(Arc::new(Mutex::new(RtLog::default()))),
+            snapshots,
+        },
+    )
+    .await;
+    let err = match started {
+        Err(e) => e,
+        Ok(_) => panic!("a refused installation layer must fail startup"),
+    };
+    assert!(
+        err.to_string().contains("pyramid"),
+        "the startup error names the offending shape: {err}"
+    );
+}
+
+/// `write_io` is refused rather than acked into a fabricated readback.
+///
+/// Nothing in this runtime drives a digital output, so the only honest
+/// answers are an ERROR for the command and an un-asserted level for the
+/// two output slots — whichever port a client picks (the shipped Python
+/// client sends the STATUS slot index, 2, for its logical output 0; the
+/// wire's own numbering starts at 0).
+#[tokio::test]
+async fn write_io_is_refused_and_never_reported_as_a_driven_output() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    for port in [0u8, 2] {
+        let err = c
+            .expect_error(&Command::WriteIo(WriteIo { port, value: 1 }))
+            .await;
+        assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+        assert!(
+            err.cause.contains("digital output"),
+            "the refusal says why: {}",
+            err.cause
+        );
+    }
+
+    match c.query(&Command::Io).await {
+        QueryResult::Io { io } => {
+            assert_eq!(io[2..4], [0, 0], "no output was driven, none is reported");
+            assert_eq!(io[4], 1, "the e-stop slot is the one backed by a real line");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let status = recv_status(&h.status_rx).await;
+    assert_eq!(status.io[2..4], [0, 0], "STATUS agrees with the IO query");
+
+    assert!(
+        !h.rt_events()
+            .iter()
+            .any(|e| matches!(e, RtEvent::WriteIo(..))),
+        "a refused command reaches no backend: {:?}",
+        h.rt_events()
+    );
+}
+
+/// Cartesian freedom is reported only where a model backs it.
+///
+/// A runtime built without kinematics refuses every Cartesian command, so
+/// claiming freedom in all twelve Cartesian directions is the one thing it
+/// knows to be false — and the wire slot has no "unknown" to report
+/// instead. Joint flags, which the planner really computes, pass through
+/// either way, and so do the Cartesian ones once kinematics exist.
+#[tokio::test]
+async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
+    let joints = [1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0, 1];
+    let mut h = start(|cfg| cfg.cartesian = false).await;
+    h.planner.lock().unwrap().enablement.joint_en = joints;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    // The premise: this runtime cannot execute a Cartesian command.
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+
+    match c.query(&Command::Reachable).await {
+        QueryResult::Reachable {
+            joint_en,
+            cart_en_wrf,
+            cart_en_trf,
+        } => {
+            assert_eq!(
+                joint_en, joints,
+                "the joint model is real and passes through"
+            );
+            assert_eq!(cart_en_wrf, [0; 12], "no world-frame freedom is claimed");
+            assert_eq!(cart_en_trf, [0; 12], "no tool-frame freedom is claimed");
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    let status = recv_status(&h.status_rx).await;
+    assert_eq!(status.cart_en_wrf, [0; 12], "STATUS agrees with REACHABLE");
+    assert_eq!(status.cart_en_trf, [0; 12]);
+    assert_eq!(status.joint_en, joints);
+
+    // With kinematics the planner's verdict is what goes on the wire —
+    // the narrowing is conditional, not a blanket zero.
+    let wrf = [1, 1, 0, 1, 1, 1, 1, 1, 1, 1, 1, 0];
+    let trf = [0, 1, 1, 1, 1, 1, 1, 0, 1, 1, 1, 1];
+    let mut h = start(|cfg| cfg.cartesian = true).await;
+    {
+        let mut p = h.planner.lock().unwrap();
+        p.enablement.cart_en_wrf = wrf;
+        p.enablement.cart_en_trf = trf;
+    }
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    match c.query(&Command::Reachable).await {
+        QueryResult::Reachable {
+            cart_en_wrf,
+            cart_en_trf,
+            ..
+        } => {
+            assert_eq!(cart_en_wrf, wrf);
+            assert_eq!(cart_en_trf, trf);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+}
+
+/// Selecting a tool variant drops the TCP offset.
+///
+/// The offset is measured in the tool's own frame, so it means nothing once
+/// a different variant moves that frame — the client API says a tool change
+/// resets it, and the runtime has to make that true. Re-selecting the same
+/// variant is not a change and leaves it alone.
+#[tokio::test]
+async fn selecting_a_different_variant_clears_the_tcp_offset() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let select = |key: u64, variant: Option<&str>| {
+        Command::SelectTool(par6_proto::command::SelectTool {
+            key,
+            tool_name: "GRIPPER".to_owned(),
+            variant_key: variant.map(str::to_owned),
+        })
+    };
+    let offset = |x: f64, y: f64, z: f64| {
+        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { x, y, z })
+    };
+    async fn read_offset(c: &mut Client) -> [f64; 3] {
+        match c.query(&Command::TcpOffset).await {
+            QueryResult::TcpOffset { x, y, z } => [x, y, z],
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    let i1 = c.ok_index(&select(701, Some("fin_ray"))).await;
+    h.complete_ok(i1);
+    c.wait_complete(i1).await;
+    c.request(&offset(0.0, 0.0, -190.0)).await;
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
+
+    // Same variant again: nothing about the tool frame moved.
+    let i2 = c.ok_index(&select(702, Some("fin_ray"))).await;
+    h.complete_ok(i2);
+    c.wait_complete(i2).await;
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
+
+    // A different variant moves the TCP the offset was measured from.
+    let i3 = c.ok_index(&select(703, Some("wide_jaw"))).await;
+    h.complete_ok(i3);
+    c.wait_complete(i3).await;
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
 }

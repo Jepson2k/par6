@@ -37,7 +37,7 @@ use par6_proto::{
     command_class, decode_chunk, decode_command, encode_reply, make_error, peek_tag, ActionState,
     CmdType, Command, CommandClass, CompletionPolicy, DecodeError, ErrorCode, LoopStatsResult,
     MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState, ToolStatusWire,
-    WireError, IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
+    WireError, EN_SLOTS, IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
 };
 use par6_rt::{ArmState, Mode, StateSnapshot};
 use tokio::net::UdpSocket;
@@ -47,7 +47,9 @@ use tokio::time::MissedTickBehavior;
 use crate::config::ServerConfig;
 use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
-use crate::runtime::{PlanContext, Planner, RtCommands, RuntimeHandle};
+use crate::runtime::{
+    CollisionState, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle, ShapeLayer,
+};
 use crate::telemetry;
 
 /// Cap on the `action_params` summary string.
@@ -89,7 +91,12 @@ where
     let link = BroadcastLink::open(&cfg).await?;
     let shutdown = Arc::new(Notify::new());
     let stop = shutdown.clone();
-    let core = Core::new(cfg, runtime, socket, link);
+    let mut core = Core::new(cfg, runtime, socket, link);
+    // A configured keep-out the runtime cannot apply is a startup
+    // failure: coming up anyway would enforce a world the operator did
+    // not configure, and nobody is listening yet to be told.
+    core.install_shapes()
+        .map_err(|e| std::io::Error::other(format!("installation shapes refused: {}", e.cause)))?;
     let task = tokio::spawn(core.run(stop));
     Ok(ServerHandle {
         addr,
@@ -182,10 +189,10 @@ struct Core<P: Planner, R: RtCommands> {
     tcp_offset_mm: [f64; 3],
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
+    collision: CollisionState,
     completion_policy: CompletionPolicy,
     recipe: Option<String>,
     simulator: bool,
-    io_out: [u8; 2],
 
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
@@ -240,8 +247,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tcp_offset_mm: [0.0; 3],
             shapes: Vec::new(),
             scene_epoch: 0,
+            collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
-            io_out: [0; 2],
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
@@ -382,6 +389,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     async fn on_status(&mut self) {
         self.refresh_snapshot();
         self.update_tcp_speed();
+        self.update_collision();
         let status = self.build_status();
         self.status_seq += 1;
         let bytes = self.encoder.encode(&status);
@@ -433,13 +441,23 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
                 Ok(())
             }
-            C::WriteIo(p) => {
-                self.runtime.rt.write_io(p.port, p.value);
-                if usize::from(p.port) < self.io_out.len() {
-                    self.io_out[usize::from(p.port)] = p.value;
-                }
-                Ok(())
-            }
+            // Nothing in this runtime can drive a digital output: the bus
+            // protocol has no output frame (`spec/CAN.md`) and the RT core
+            // owns one GPIO line, the e-stop INPUT. Acking the command and
+            // echoing the commanded level back in STATUS showed an
+            // operator an output state the arm never produced.
+            C::WriteIo(p) => Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "write_io is unavailable: this runtime drives no digital outputs, \
+                         so port {} cannot be set",
+                        p.port
+                    ),
+                )],
+            )),
             C::Simulator(p) => {
                 self.cancel_all_motion();
                 self.runtime.rt.set_simulator(p.on).map(|()| {
@@ -476,14 +494,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
-                self.shapes.clear();
-                self.scene_epoch += 1;
                 self.completion_policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
                 self.recipe = self.cfg.initial_recipe.clone();
                 self.runtime.rt.reset_state();
                 self.sync_planner();
-                Ok(())
+                // The program layer only: installation keep-outs are the
+                // deployment's, not the program's, and survive.
+                self.apply_program_shapes(Vec::new())
             }
             C::ConnectHardware(p) => self.runtime.rt.connect_hardware(&p.port),
             C::SetTcpOffset(p) => {
@@ -491,12 +509,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.sync_planner();
                 Ok(())
             }
-            C::SetShapes(p) => {
-                self.shapes = p.shapes.clone();
-                self.scene_epoch += 1;
-                self.sync_planner();
-                Ok(())
-            }
+            C::SetShapes(p) => self.apply_program_shapes(p.shapes.clone()),
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -551,7 +564,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
-            self.clear_standing_error();
+            self.on_motion_accepted();
             return;
         }
         debug_assert!(is_stream(tag));
@@ -573,7 +586,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.stream(&cmd);
             }
         }
-        self.clear_standing_error();
+        self.on_motion_accepted();
     }
 
     async fn on_queued(&mut self, req_id: u32, cmd: Command, addr: SocketAddr) {
@@ -613,7 +626,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.next_index += 1;
         self.dedup.insert(key, index);
         self.accepted_index = index as i64;
-        self.clear_standing_error();
+        self.on_motion_accepted();
         if self.active_stream.take().is_some() {
             // A planned move cancels streaming.
             self.runtime.rt.cancel_stream();
@@ -813,6 +826,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                         PostEffect::None => {}
                         PostEffect::Checkpoint(label) => self.last_checkpoint = label,
                         PostEffect::SelectVariant(variant) => {
+                            // A variant carries its own TCP frame, so an
+                            // offset measured against the old one describes
+                            // nothing once it changes — a real change clears
+                            // it, a re-selection of the same variant leaves
+                            // it alone (the client API documents the reset,
+                            // and it is what the parol6 runtime does).
+                            if variant != self.tool_variant {
+                                self.tcp_offset_mm = [0.0; 3];
+                            }
                             self.tool_variant = variant;
                             self.sync_planner();
                         }
@@ -868,10 +890,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.pending.clear();
     }
 
-    fn clear_standing_error(&mut self) {
+    /// A motion command was accepted: the previous attempt's verdicts stop
+    /// being the current state of the world. The standing error clears,
+    /// and so does the latched collision report — its pairs described the
+    /// configuration a superseded motion was blocked at.
+    fn on_motion_accepted(&mut self) {
         if self.standing_error.take().is_some() && self.action_state == ActionState::Error {
             self.action_state = ActionState::Idle;
         }
+        self.runtime.planner.clear_collision();
+        self.collision = CollisionState::default();
     }
 
     fn drain_backlog(&self) {
@@ -915,10 +943,56 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
-            shapes: &self.shapes,
             completion_policy: self.completion_policy,
         };
         self.runtime.planner.sync(ctx);
+    }
+
+    /// Push the configured installation keep-outs into the planner's
+    /// collision world. Called once, before the server task starts.
+    fn install_shapes(&mut self) -> Result<(), WireError> {
+        if self.cfg.installation_shapes.is_empty() {
+            return Ok(());
+        }
+        let shapes = self.cfg.installation_shapes.clone();
+        if let Some(epoch) = self
+            .runtime
+            .planner
+            .set_shapes(ShapeLayer::Installation, &shapes)?
+        {
+            self.scene_epoch = epoch;
+        }
+        Ok(())
+    }
+
+    /// Replace the program layer: the planner enforces it, the server
+    /// stores the copy the SHAPES query reads back, and the epoch of the
+    /// APPLIED world becomes the reported one. A refusal changes
+    /// nothing — neither the enforced world, nor the readback, nor the
+    /// epoch — so a client that sees the epoch move knows the shapes it
+    /// sent are the shapes being enforced.
+    fn apply_program_shapes(&mut self, shapes: Vec<par6_proto::Shape>) -> Result<(), WireError> {
+        match self
+            .runtime
+            .planner
+            .set_shapes(ShapeLayer::Program, &shapes)?
+        {
+            Some(epoch) => self.scene_epoch = epoch,
+            // No collision world to adopt an epoch from: the server's own
+            // counter still has to move, or a readback cannot be tied to
+            // the world it describes.
+            None => self.scene_epoch += 1,
+        }
+        self.shapes = shapes;
+        Ok(())
+    }
+
+    /// Refresh the STATUS collision fields from the planner's verdict at
+    /// the arm's measured configuration.
+    fn update_collision(&mut self) {
+        if let Some(state) = self.runtime.planner.collision() {
+            self.collision = state;
+        }
     }
 
     fn update_tcp_speed(&mut self) {
@@ -948,14 +1022,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 .any(|e| matches!(e.code, RtErr::Estop | RtErr::SwEstop))
     }
 
+    /// The `[in1, in2, out1, out2, estop]` slots. Only the e-stop slot is
+    /// backed by a real line; the runtime neither reads the two inputs nor
+    /// drives the two outputs, and the wire type (`u8` per slot) has no way
+    /// to say "unknown" — so they report the un-asserted level rather than
+    /// a level the arm was never observed at.
     fn io(&self) -> [u8; IO_SLOTS] {
-        [
-            0,
-            0,
-            self.io_out[0],
-            self.io_out[1],
-            u8::from(!self.estop_pressed()),
-        ]
+        [0, 0, 0, 0, u8::from(!self.estop_pressed())]
     }
 
     fn angles_deg(&self) -> [f64; NUM_JOINTS] {
@@ -1037,8 +1110,23 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.pending.iter().map(|p| duration_estimate(&p.cmd)).sum()
     }
 
+    /// Enablement as clients see it. The planner owns the model; a runtime
+    /// built without kinematics has none to own for the Cartesian axes, and
+    /// it already refuses every Cartesian command — so it reports no
+    /// Cartesian freedom instead of full freedom. The wire slots are 0/1
+    /// with no "unknown" spelling, and 1 means "you may move that way",
+    /// which is the one thing such a runtime knows to be false.
+    fn enablement(&self) -> Enablement {
+        let mut en = self.runtime.planner.enablement();
+        if !self.cfg.cartesian {
+            en.cart_en_wrf = [0; EN_SLOTS];
+            en.cart_en_trf = [0; EN_SLOTS];
+        }
+        en
+    }
+
     fn build_status(&self) -> Status {
-        let en = self.runtime.planner.enablement();
+        let en = self.enablement();
         let (action_current, action_state, action_params) = self.action_fields();
         Status {
             proto_version: PROTO_VERSION,
@@ -1066,8 +1154,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tool_status: self.build_tool_status(),
             tcp_speed: self.tcp_speed,
             simulator_active: self.simulator,
-            collision_active: false,
-            collision_pairs: Vec::new(),
+            collision_active: self.collision.active,
+            collision_pairs: self.collision.pairs.clone(),
             scene_epoch: self.scene_epoch,
             accepted_index: self.accepted_index,
             homed: self.snap.homed,
@@ -1155,7 +1243,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 profile: self.profile.clone(),
             },
             C::Reachable => {
-                let en = self.runtime.planner.enablement();
+                let en = self.enablement();
                 QueryResult::Reachable {
                     joint_en: en.joint_en,
                     cart_en_wrf: en.cart_en_wrf,

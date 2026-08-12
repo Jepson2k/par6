@@ -31,6 +31,8 @@ use std::time::{Duration, Instant};
 
 use par6_bus::ObjectDetection;
 use par6_config::ConfigBundle;
+#[cfg(feature = "ffi")]
+use par6_kin::NQ;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
 use par6_proto::{make_error, Command, ErrorCode, WireError, UNATTRIBUTED};
@@ -38,7 +40,7 @@ use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
     SnapshotReader, SpecSettle, StateSnapshot, MAX_JOINTS,
 };
-use par6_server::{CommandOutcome, Enablement, PlanContext, Planner};
+use par6_server::{CollisionState, CommandOutcome, Enablement, PlanContext, Planner, ShapeLayer};
 
 use crate::bridge::{gripper_move_command, CoreLink};
 
@@ -79,6 +81,15 @@ const MOVE_L_NULL_M: f64 = 1e-6;
 /// IK branch and the "straight line" would whip the arm.
 #[cfg(feature = "ffi")]
 const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
+
+/// Joint-space pitch of the collision gate \[rad\]: consecutive checked
+/// configurations along a planned path never differ by more than this on
+/// any joint. At PAR6's ~0.45 m reach a 0.02 rad shoulder step sweeps the
+/// wrist under 10 mm, so a keep-out thicker than that cannot be tunneled
+/// through; the cost is bounded by the path's joint-space length rather
+/// than by the sample count (a 90° single-joint move costs ~79 checks).
+#[cfg(feature = "ffi")]
+const COLLISION_STEP_RAD: f64 = 0.02;
 
 /// The planned-move profiles this planner really implements, in the
 /// upper-case spelling clients use on the wire. The server refuses any
@@ -187,6 +198,44 @@ pub(crate) struct Par6Planner {
     enablement: Enablement,
     #[cfg(feature = "ffi")]
     kin: crate::kin::CartKin,
+    /// The enforced collision world. Planner-side by construction: coal's
+    /// C++ narrow phase allocates on deep interpenetration, so no check
+    /// may ever run on the RT thread.
+    #[cfg(feature = "ffi")]
+    collision: par6_kin::Collision,
+    /// Names of the applied world shapes, both layers: the reporting
+    /// vocabulary keeps them verbatim while robot geometry is reduced to
+    /// its link name.
+    #[cfg(feature = "ffi")]
+    world_names: Vec<String>,
+    /// The two layers' name lists, so replacing one rebuilds
+    /// [`Par6Planner::world_names`] without disturbing the other.
+    #[cfg(feature = "ffi")]
+    layer_names: [Vec<String>; 2],
+    /// The pairs the last refused motion would have collided at — the
+    /// `collision_active` / `collision_pairs` STATUS fields. Latched, not
+    /// sampled: it describes the configuration a move was blocked AT, and
+    /// the server drops it when it accepts the next motion command.
+    #[cfg(feature = "ffi")]
+    collision_latch: CollisionState,
+    /// Outcome of a command a world change invalidated mid-flight, handed
+    /// to the server by the next [`Planner::poll`].
+    #[cfg(feature = "ffi")]
+    invalidated: Option<CommandOutcome>,
+    /// Link pairs that touch in the robot's own configured park pose, and
+    /// are therefore not collisions.
+    ///
+    /// The vendor collision meshes are coarse and `par6-kin` excludes only
+    /// structurally-neighbouring pairs, so PAR6's park pose — forearm
+    /// folded back, resting against the base — reports contact between
+    /// links that legitimately rest against each other there. Without this
+    /// the runtime would refuse every move that returns to its own park
+    /// pose. It is the MoveIt rule (`default_collisions`: pairs colliding
+    /// in the default pose are disabled) derived from the one pose the
+    /// config declares valid; parol6 gets the same effect from a bundled
+    /// SRDF, which `par6-kin` has no support for yet.
+    #[cfg(feature = "ffi")]
+    resting_pairs: Vec<(String, String)>,
 }
 
 impl Par6Planner {
@@ -197,8 +246,13 @@ impl Par6Planner {
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
         #[cfg(feature = "ffi")] kin: crate::kin::CartKin,
+        #[cfg(feature = "ffi")] collision: par6_kin::Collision,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
+        #[cfg(feature = "ffi")]
+        let mut collision = collision;
+        #[cfg(feature = "ffi")]
+        let resting_pairs = park_contacts(&mut collision, &bundle.robot.robot.park_pose_rad);
         let dt = bundle.robot.robot.tick_dt_s;
         let ticks = |s: f64| (s / dt).round() as u64;
         let tool = bundle
@@ -223,12 +277,171 @@ impl Par6Planner {
             enablement: Enablement::default(),
             #[cfg(feature = "ffi")]
             kin,
+            #[cfg(feature = "ffi")]
+            collision,
+            #[cfg(feature = "ffi")]
+            world_names: Vec::new(),
+            #[cfg(feature = "ffi")]
+            layer_names: [Vec::new(), Vec::new()],
+            #[cfg(feature = "ffi")]
+            collision_latch: CollisionState::default(),
+            #[cfg(feature = "ffi")]
+            invalidated: None,
+            #[cfg(feature = "ffi")]
+            resting_pairs,
         })
+    }
+
+    /// Refuse a planned path that would drive the arm into the collision
+    /// world, before a single sample reaches the RT ring.
+    ///
+    /// `from` is the sample the arm will start at, so a world change can
+    /// re-gate the REMAINDER of a running trajectory with the same rule.
+    ///
+    /// The path is walked at [`COLLISION_STEP_RAD`] joint-space pitch —
+    /// the endpoints of a move are usually clear while its interior is
+    /// not, and the samples ARE the trajectory the arm will run, so this
+    /// gates what actually happens rather than a straight line between
+    /// the two endpoints.
+    ///
+    /// Normally any collision along the path refuses the move. The
+    /// exception is a path that STARTS in collision — the arm parked in
+    /// its configured park pose (which folds the forearm back onto the
+    /// upper arm and rests it against the base, so the vendor collision
+    /// meshes touch), or a keep-out dropped on top of it. Refusing
+    /// outright would trap the arm, so a move that adds no colliding
+    /// pair the arm is not already in is allowed: a move may not CREATE
+    /// a collision, it may leave one.
+    ///
+    /// Streaming (`jog_*` / `servo_*`) is not gated: the jog/servo ramp
+    /// is integrated on the RT thread, where a coal check cannot go.
+    #[cfg(feature = "ffi")]
+    fn gate_collisions(
+        &mut self,
+        samples: &[[f64; 2 * MAX_JOINTS]],
+        from: usize,
+    ) -> Result<(), WireError> {
+        let started = Instant::now();
+        let q_now = self.snapshots.latest().q;
+        // Disjoint field borrows: the name tables are read while the
+        // collision model is being driven.
+        let world = &self.world_names;
+        let col = &mut self.collision;
+        let named = |report: &par6_kin::CollisionReport<'_>| -> Vec<(String, String)> {
+            report
+                .pairs()
+                .map(|(a, b)| (display_name(a, world), display_name(b, world)))
+                .collect()
+        };
+        let mut baseline = named(&col.check(&q_now, false).map_err(collision_error)?);
+        baseline.extend(self.resting_pairs.iter().cloned());
+
+        let total = samples.len();
+        let mut checked = 0usize;
+        let mut last: Option<[f64; NQ]> = None;
+        for (k, sample) in samples.iter().enumerate().skip(from) {
+            let mut q = [0.0; NQ];
+            q.copy_from_slice(&sample[..NQ]);
+            let coarse = last.is_some_and(|prev| {
+                q.iter()
+                    .zip(prev.iter())
+                    .all(|(a, b)| (a - b).abs() <= COLLISION_STEP_RAD)
+            });
+            // The last sample is where the arm comes to rest, so it is
+            // checked however close it sits to its predecessor.
+            if coarse && k + 1 != total {
+                continue;
+            }
+            last = Some(q);
+            checked += 1;
+            let report = col.check(&q, false).map_err(collision_error)?;
+            let offending: Vec<(String, String)> = named(&report)
+                .into_iter()
+                .filter(|p| !baseline.contains(p))
+                .collect();
+            if !offending.is_empty() {
+                let pairs = format_pairs(&offending);
+                log::info!("collision gate: rejected sample {k}/{total}: {pairs}");
+                self.collision_latch = CollisionState {
+                    active: true,
+                    pairs: offending,
+                };
+                return Err(make_error(
+                    ErrorCode::SysSelfCollision,
+                    UNATTRIBUTED,
+                    &[
+                        ("sample", &k.to_string()),
+                        ("total", &total.to_string()),
+                        ("pairs", &pairs),
+                    ],
+                ));
+            }
+        }
+        log::debug!(
+            "collision gate: {checked} checks over samples {from}..{total} in {:.2} ms",
+            started.elapsed().as_secs_f64() * 1e3
+        );
+        Ok(())
+    }
+
+    /// Re-gate the in-flight trajectory against a world that just
+    /// changed, halting it where the new world makes its remainder
+    /// illegal — a keep-out dropped onto a moving arm stops the move
+    /// instead of being enforced only for the NEXT one.
+    ///
+    /// The remainder starts at the planned sample closest to where the
+    /// arm actually is: the part already driven cannot be un-driven, and
+    /// gating it would fail a move over a keep-out placed behind it.
+    #[cfg(feature = "ffi")]
+    fn revalidate_inflight(&mut self) {
+        let Some(InFlight {
+            server_index,
+            kind: InFlightKind::Exec { samples, .. },
+            ..
+        }) = &self.inflight
+        else {
+            return;
+        };
+        let index = *server_index;
+        let q = self.snapshots.latest().q;
+        let nearest = samples
+            .iter()
+            .enumerate()
+            .min_by(|(_, a), (_, b)| joint_distance(&a.q, &q).total_cmp(&joint_distance(&b.q, &q)))
+            .map_or(0, |(i, _)| i);
+        let planned: Vec<[f64; 2 * MAX_JOINTS]> = samples
+            .iter()
+            .map(|s| {
+                let mut qqd = [0.0; 2 * MAX_JOINTS];
+                qqd[..MAX_JOINTS].copy_from_slice(&s.q);
+                qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
+                qqd
+            })
+            .collect();
+        if let Err(error) = self.gate_collisions(&planned, nearest) {
+            log::warn!(
+                "command {index} invalidated by a world change: {}",
+                error.cause
+            );
+            self.discard_planned();
+            self.invalidated = Some(CommandOutcome {
+                index,
+                error: Some(error),
+            });
+        }
     }
 
     /// Wrap fully-timed tick-dt samples as the next EXEC in-flight
     /// command: allocate a ring index, stamp the metadata, request EXEC.
-    fn start_exec(&mut self, samples: Vec<[f64; 2 * MAX_JOINTS]>, seen_exec: bool) -> InFlightKind {
+    /// The collision gate runs first: nothing is queued, and no mode
+    /// change is requested, for a path that would collide.
+    fn start_exec(
+        &mut self,
+        samples: Vec<[f64; 2 * MAX_JOINTS]>,
+        seen_exec: bool,
+    ) -> Result<InFlightKind, WireError> {
+        #[cfg(feature = "ffi")]
+        self.gate_collisions(&samples, 0)?;
         // A fresh fill generation: a flush already queued for an earlier
         // command can no longer reach these samples, however far behind
         // the RT command queue is running.
@@ -258,12 +471,12 @@ impl Par6Planner {
             .collect();
         self.link.send(RtCommand::SetMode(Mode::Exec));
         self.heartbeat.feed();
-        InFlightKind::Exec {
+        Ok(InFlightKind::Exec {
             ring_index,
             samples,
             cursor: 0,
             seen_exec,
-        }
+        })
     }
 
     /// Plan a joint-space move from the measured pose in `snap` to
@@ -300,7 +513,7 @@ impl Par6Planner {
                 waypoints.extend_from_slice(&start);
                 waypoints.extend_from_slice(&target);
                 let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
-                return Ok(self.start_exec(samples, snap.mode == Mode::Exec));
+                return self.start_exec(samples, snap.mode == Mode::Exec);
             }
         };
         let mut limits = self.exec_limits;
@@ -333,7 +546,7 @@ impl Par6Planner {
                 qqd
             })
             .collect();
-        Ok(self.start_exec(samples, snap.mode == Mode::Exec))
+        self.start_exec(samples, snap.mode == Mode::Exec)
     }
 
     /// TOPPRA-time a joint waypoint list and sample it at tick dt.
@@ -625,7 +838,7 @@ impl Par6Planner {
         }
 
         let samples = self.toppra_samples(&waypoints, cmd.speed, cmd.accel, cmd.duration)?;
-        Ok(self.start_exec(samples, snap.mode == Mode::Exec))
+        self.start_exec(samples, snap.mode == Mode::Exec)
     }
 
     /// Feed pending samples into the ring, up to its free capacity.
@@ -774,13 +987,16 @@ impl Par6Planner {
     }
 
     fn update_enablement(&mut self, snap: &StateSnapshot) {
-        // Direction freedom against the soft window. Cartesian flags
-        // stay at their permissive default: there is no workspace model
-        // to bound them against yet (follow-up).
+        // Direction freedom against the soft window, POSITIVE slot first
+        // (`[j1+, j1−, …]`) — the order the waldoctl frontend unpacks and
+        // parol6 publishes; filling the pair the other way round greys
+        // out the opposite jog button. Cartesian flags stay at their
+        // permissive default: there is no workspace model to bound them
+        // against yet (follow-up).
         let mut en = Enablement::default();
         for j in 0..MAX_JOINTS {
-            en.joint_en[2 * j] = u8::from(snap.q[j] > self.exec_limits.soft_min[j]);
-            en.joint_en[2 * j + 1] = u8::from(snap.q[j] < self.exec_limits.soft_max[j]);
+            en.joint_en[2 * j] = u8::from(snap.q[j] < self.exec_limits.soft_max[j]);
+            en.joint_en[2 * j + 1] = u8::from(snap.q[j] > self.exec_limits.soft_min[j]);
         }
         self.enablement = en;
     }
@@ -854,6 +1070,10 @@ impl Planner for Par6Planner {
     fn poll(&mut self) -> Option<CommandOutcome> {
         let snap = self.snapshots.latest();
         self.update_enablement(&snap);
+        #[cfg(feature = "ffi")]
+        if let Some(out) = self.invalidated.take() {
+            return Some(out);
+        }
         self.inflight.as_ref()?;
         if matches!(
             self.inflight,
@@ -920,15 +1140,195 @@ impl Planner for Par6Planner {
                 ctx.profile
             ),
         }
-        // tool / tcp_offset / shapes are stored and reported by the
-        // server; the planner will consume them once TCP-offset
-        // retargeting and collision checking land (follow-up). Cartesian
-        // targets currently resolve at the URDF's TCP frame.
+        // tool / tcp_offset are stored and reported by the server; the
+        // planner will consume them once TCP-offset retargeting lands
+        // (follow-up). Cartesian targets currently resolve at the URDF's
+        // TCP frame.
     }
+
+    #[cfg(feature = "ffi")]
+    fn set_shapes(
+        &mut self,
+        layer: ShapeLayer,
+        shapes: &[par6_proto::Shape],
+    ) -> Result<Option<u64>, WireError> {
+        let refuse = |detail: String| {
+            make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[("detail", &detail)],
+            )
+        };
+        // Convert everything BEFORE touching the world: a set with one
+        // bad shape in it is refused whole, so a client can never end up
+        // enforcing the half of its keep-outs that happened to parse.
+        let converted = shapes
+            .iter()
+            .map(par6_kin::Shape::from_proto)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| refuse(e.to_string()))?;
+        // Names are the reporting vocabulary: a duplicate would make a
+        // colliding-pair report ambiguous about which shape it means
+        // (and shadow one shape in a frontend's highlight mapping).
+        if let Some(dup) = first_duplicate(&converted) {
+            return Err(refuse(format!("duplicate shape name {dup:?}")));
+        }
+        let (slot, kin_layer) = match layer {
+            ShapeLayer::Installation => (0, par6_kin::Layer::Installation),
+            ShapeLayer::Program => (1, par6_kin::Layer::Program),
+        };
+        // The epoch is the collision world's, not a parallel counter:
+        // `set_layer` moves it only for a world it actually applied.
+        let epoch = self
+            .collision
+            .set_layer(kin_layer, &converted)
+            .map_err(collision_error)?;
+        self.layer_names[slot] = converted
+            .iter()
+            .filter(|s| s.collision)
+            .map(|s| s.name.clone())
+            .collect();
+        self.world_names = self.layer_names.concat();
+        // Committed motion is not exempt from a world it now violates.
+        self.revalidate_inflight();
+        Ok(Some(epoch))
+    }
+
+    #[cfg(not(feature = "ffi"))]
+    fn set_shapes(
+        &mut self,
+        _layer: ShapeLayer,
+        _shapes: &[par6_proto::Shape],
+    ) -> Result<Option<u64>, WireError> {
+        // No kinematics, no collision world: the server stores and echoes
+        // the shapes, and STATUS keeps reporting nothing enforced.
+        Ok(None)
+    }
+
+    #[cfg(feature = "ffi")]
+    fn collision(&mut self) -> Option<CollisionState> {
+        Some(self.collision_latch.clone())
+    }
+
+    #[cfg(not(feature = "ffi"))]
+    fn collision(&mut self) -> Option<CollisionState> {
+        None
+    }
+
+    #[cfg(feature = "ffi")]
+    fn clear_collision(&mut self) {
+        self.collision_latch = CollisionState::default();
+    }
+
+    #[cfg(not(feature = "ffi"))]
+    fn clear_collision(&mut self) {}
 
     fn enablement(&self) -> Enablement {
         self.enablement
     }
+}
+
+/// Cap on the pairs spelled out in an error payload; a report can carry
+/// up to `par6_kin::MAX_REPORTED_PAIRS` of them and the first few are the
+/// actionable ones.
+#[cfg(feature = "ffi")]
+const MAX_REPORTED_PAIRS: usize = 4;
+
+/// Format colliding pairs the way the v2 error catalog's `{pairs}` slot
+/// and the golden status fixture spell them: `[a, b], [c, d]`.
+#[cfg(feature = "ffi")]
+fn format_pairs(pairs: &[(String, String)]) -> String {
+    let mut out = pairs
+        .iter()
+        .take(MAX_REPORTED_PAIRS)
+        .map(|(a, b)| format!("[{a}, {b}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if pairs.len() > MAX_REPORTED_PAIRS {
+        out.push_str(&format!(" (+{} more)", pairs.len() - MAX_REPORTED_PAIRS));
+    }
+    out
+}
+
+/// The reporting name of one colliding geometry: a world shape keeps the
+/// name the client gave it, robot geometry drops the per-link geometry
+/// index the model appends (`upper_arm_0` -> `upper_arm`) so pairs name
+/// URDF links, not solver-internal identifiers.
+#[cfg(feature = "ffi")]
+fn display_name(geom: &str, world_names: &[String]) -> String {
+    if world_names.iter().any(|n| n == geom) {
+        return geom.to_owned();
+    }
+    match geom.rsplit_once('_') {
+        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
+            link.to_owned()
+        }
+        _ => geom.to_owned(),
+    }
+}
+
+/// Link pairs already in contact at the robot's configured park pose.
+///
+/// A pose the configuration declares the arm rests in cannot be a
+/// collision; the pairs it reports are the coarseness of the vendor
+/// collision meshes showing through, and enforcing them would refuse
+/// every move that returns to park.
+#[cfg(feature = "ffi")]
+fn park_contacts(collision: &mut par6_kin::Collision, park_rad: &[f64]) -> Vec<(String, String)> {
+    let mut park = [0.0; NQ];
+    for (slot, q) in park.iter_mut().zip(park_rad.iter()) {
+        *slot = *q;
+    }
+    let pairs = match collision.check(&park, false) {
+        Ok(report) => report
+            .pairs()
+            .map(|(a, b)| (display_name(a, &[]), display_name(b, &[])))
+            .collect::<Vec<_>>(),
+        Err(e) => {
+            log::warn!("cannot survey the park pose for resting contacts: {e}");
+            Vec::new()
+        }
+    };
+    if !pairs.is_empty() {
+        log::info!(
+            "collision: {} link pair(s) rest in contact at the park pose and are not \
+             enforced: {}",
+            pairs.len(),
+            format_pairs(&pairs)
+        );
+    }
+    pairs
+}
+
+/// The first name two shapes in one layer share, if any.
+#[cfg(feature = "ffi")]
+fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
+    shapes.iter().enumerate().find_map(|(i, s)| {
+        shapes[..i]
+            .iter()
+            .any(|prev| prev.name == s.name)
+            .then_some(s.name.as_str())
+    })
+}
+
+/// Max-norm joint distance \[rad\] between two configurations.
+#[cfg(feature = "ffi")]
+fn joint_distance(a: &[f64; MAX_JOINTS], b: &[f64; MAX_JOINTS]) -> f64 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// A collision-world call the shim refused: a malformed shape (negative
+/// radius, zero-length plane normal) or a broken model.
+#[cfg(feature = "ffi")]
+fn collision_error(e: par6_kin::KinError) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", &format!("collision world: {e}"))],
+    )
 }
 
 /// Exactly `N` numeric tool parameters (the wire allows int or float for

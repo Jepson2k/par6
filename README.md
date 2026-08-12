@@ -27,12 +27,12 @@ Kinematics/dynamics run on **Pinocchio via a C-ABI shim** shared with the Python
 |---|---|
 | `crates/par6-proto` | protocol v2 codec — **single source of truth**; python constants are generated |
 | `crates/par6-config` | robot/gripper/homing TOML config |
-| `crates/par6-kin` | Pinocchio FFI: fk / jacobian / gravity / ik (coal collision later) |
+| `crates/par6-kin` | Pinocchio FFI: fk / jacobian / gravity / ik, coal collision world (self-pairs + installation/program keep-out layers) |
 | `crates/par6-motion` | TOPPRA + rsruckig + trapezoid, jog ramps, completion policies |
 | `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + sim backends |
 | `crates/par6-rt` | RT tick loop, mode dispatch, homing FSM, error latching, e-stop |
-| `crates/par6-server` | UDP command plane, status/telemetry broadcast |
-| `crates/par6d` | the runtime binary |
+| `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
+| `crates/par6d` | the runtime binary; plan-time collision gate (feature `ffi`) |
 | `python/` | the `par6` pip package (waldoctl backend) |
 | `spec/` | behavioral specs extracted from the vendor stack — the coordination contract |
 | `tests/golden/` | cross-language golden vectors (Rust ↔ Python conformance) |

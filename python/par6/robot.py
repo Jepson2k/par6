@@ -424,7 +424,19 @@ class Robot(_RobotABC):
 
     @property
     def motion_profiles(self) -> tuple[str, ...]:
-        return ("RUCKIG", "TRAPEZOID")
+        """Profile names ``par6d`` plans queued moves with.
+
+        ``RUCKIG`` (the runtime's startup default) is jerk-limited
+        point-to-point, ``TRAPEZOID`` drops the jerk limit, and ``TOPPRA``
+        time-optimally parameterizes the path.  TOPPRA runs through the
+        C++ shim, so only a ``par6d`` built with its ``ffi`` feature
+        registers it; on a build without one ``select_profile("TOPPRA")``
+        answers ``SYS_PROFILE_INVALID`` and the active profile is
+        unchanged.  The protocol has no query that enumerates the
+        registry, so this list cannot narrow itself to the runtime it is
+        talking to.
+        """
+        return ("RUCKIG", "TRAPEZOID", "TOPPRA")
 
     # -- Backend injection --------------------------------------------------
 

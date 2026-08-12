@@ -347,3 +347,43 @@ def test_robot_backend_attaches_to_a_running_runtime_then_spawns_its_own(
     while robot.is_available(port=port) and time.monotonic() < deadline:
         time.sleep(0.1)
     assert robot.is_available(port=port) is False, "Robot.stop() must reap what it spawned"
+
+
+@pytest.mark.timeout(120)
+async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
+    daemon: LiveDaemon,
+):
+    """``Robot.motion_profiles`` must name the runtime's real registry.
+
+    Every advertised profile is driven through ``select_profile`` and read
+    back from the PROFILE query, so the list cannot drift from what the
+    command plane accepts; a name outside it is refused, so the list is not
+    vacuously true.  TOPPRA is registered only by a ``par6d`` built with
+    the C++ shim — whichever build is under test, the advertisement and the
+    runtime have to agree about it.
+    """
+    advertised = Robot().motion_profiles
+    async with daemon.client() as client:
+        with pytest.raises(RobotError) as unknown:
+            await client.select_profile("BANG_BANG")
+        assert unknown.value.code == ErrorCode.SYS_PROFILE_INVALID
+
+        for name in advertised:
+            try:
+                await client.select_profile(name)
+            except RobotError as e:
+                assert e.code == ErrorCode.SYS_PROFILE_INVALID
+                assert name == "TOPPRA", f"{name} must be plannable on every build"
+                # Documented consequence of a build without the shim: the
+                # refusal leaves the previous profile running.
+                continue
+            assert await client.profile() == name
+
+        # The reverse direction: a runtime that plans with TOPPRA must not
+        # be talking to a client that hides it.
+        try:
+            await client.select_profile("TOPPRA")
+        except RobotError:
+            pass
+        else:
+            assert "TOPPRA" in advertised

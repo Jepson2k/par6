@@ -29,9 +29,19 @@ pub struct CommandOutcome {
 /// Per-joint / per-axis enablement flags (freedom before hitting limits),
 /// computed by the motion layer: it owns kinematics and the limit model.
 ///
-/// Slot layout matches the wire: `[j1−, j1+, …, j6−, j6+]` for joints and
-/// `[x−, x+, y−, y+, z−, z+, rx−, …]` per Cartesian frame; 1 = motion
-/// allowed in that direction.
+/// Slot layout matches the wire, POSITIVE DIRECTION FIRST:
+/// `[j1+, j1−, …, j6+, j6−]` for joints and
+/// `[x+, x−, y+, y−, z+, z−, rx+, rx−, ry+, ry−, rz+, rz−]` per Cartesian
+/// frame; 1 = motion allowed in that direction. The order is the one the
+/// waldoctl frontend unpacks (`can_jog_pos[i] = slot[2i]`) and the one the
+/// parol6 runtime publishes — a backend that fills the pairs the other way
+/// round greys out the opposite button.
+///
+/// The wire slots are 0/1 — there is no "unknown" — and clients gate jog
+/// controls on them, so an implementation sets 1 only for a direction its
+/// model says is free. The server narrows what it gets before it goes out:
+/// a runtime configured without kinematics reports no Cartesian freedom,
+/// whatever the planner claims.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Enablement {
     /// Per-joint direction flags.
@@ -53,9 +63,13 @@ impl Default for Enablement {
 }
 
 /// Planning context the server pushes to the planner whenever one of its
-/// pieces changes (profile / tool / TCP offset / shapes / completion
-/// policy). The planner needs it to plan correctly; the server remains
-/// the owner of the authoritative copy it reports in queries and STATUS.
+/// pieces changes (profile / tool / TCP offset / completion policy). The
+/// planner needs it to plan correctly; the server remains the owner of
+/// the authoritative copy it reports in queries and STATUS.
+///
+/// Collision shapes do NOT ride here: applying them can fail, and a
+/// refusal has to reach the client, so they go through
+/// [`Planner::set_shapes`] instead.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PlanContext<'a> {
     /// Active motion profile name.
@@ -66,10 +80,38 @@ pub struct PlanContext<'a> {
     pub tool_variant: Option<&'a str>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
-    /// Program-layer collision shapes (wire units).
-    pub shapes: &'a [Shape],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
+}
+
+/// Which replaceable layer of the collision world a shape set belongs to.
+///
+/// The layers are independent: `SET_SHAPES` and `reset_state` replace the
+/// [`ShapeLayer::Program`] layer only, so the installation keep-outs a
+/// deployment is configured with can never be cleared from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ShapeLayer {
+    /// Persistent keep-outs from the runtime's configuration, pushed once
+    /// at startup.
+    Installation,
+    /// The last applied `SET_SHAPES` set (last-write-wins).
+    Program,
+}
+
+/// The collision verdict STATUS carries: `collision_active` and, when it
+/// is, the colliding geometry pairs by name.
+///
+/// It describes the configuration a motion was BLOCKED AT — the pairs the
+/// refused move would have collided in — not a sample of wherever the arm
+/// happens to be standing. That is what a client can act on and
+/// highlight, and it is why an arm resting in a park pose whose own links
+/// touch does not raise a permanent alarm.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CollisionState {
+    /// Whether a motion was blocked by collision.
+    pub active: bool,
+    /// The colliding pairs; empty unless `active`.
+    pub pairs: Vec<(String, String)>,
 }
 
 /// Executes queued commands: plans them, feeds the RT sample ring, and
@@ -92,9 +134,34 @@ pub trait Planner: Send {
     fn cancel(&mut self);
 
     /// The planning context changed (profile / tool / TCP offset /
-    /// shapes / completion policy). Also called once at server startup
-    /// with the initial context.
+    /// completion policy). Also called once at server startup with the
+    /// initial context.
     fn sync(&mut self, ctx: PlanContext<'_>);
+
+    /// Replace one collision-world layer (wire units: metres and radians),
+    /// returning the `scene_epoch` of the world now applied.
+    ///
+    /// `Ok(None)` = this runtime enforces no collision world (a build
+    /// without kinematics); the server keeps its own epoch counter and
+    /// STATUS keeps reporting no collision. `Err` refuses the shape set
+    /// WHOLE: the previously applied world stays enforced and its epoch
+    /// does not move, so a malformed shape can never leave a half-built
+    /// keep-out world in place.
+    fn set_shapes(&mut self, layer: ShapeLayer, shapes: &[Shape])
+        -> Result<Option<u64>, WireError>;
+
+    /// The latched collision verdict for the STATUS broadcast: the pairs
+    /// the last blocked motion would have collided in. `None` = this
+    /// runtime enforces no collision world.
+    ///
+    /// Called at the status cadence, so it is a read of what the gate
+    /// already decided — never a fresh check.
+    fn collision(&mut self) -> Option<CollisionState>;
+
+    /// Drop the latched collision verdict. The server calls this when it
+    /// accepts a motion command, so a refusal's pairs never outlive the
+    /// motion that produced them.
+    fn clear_collision(&mut self);
 
     /// Current enablement flags for the REACHABLE query and the STATUS
     /// broadcast.

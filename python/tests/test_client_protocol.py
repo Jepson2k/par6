@@ -650,6 +650,19 @@ async def test_bound_tool_actions_go_through_tool_action(
     assert tool_status is not None
     assert tool_status.key == "SSG48" and tool_status.variant_key == "fin_ray"
 
+    # A refused selection (the runtime is fitted with a different tool)
+    # must not become the client's active tool — the next tool_action
+    # would otherwise be addressed to hardware that is not on the arm.
+    def reject(cmd, req_id, params):
+        return wire.encode_wire([int(MsgType.ERROR), req_id, error_tuple(-1, code=43)])
+
+    peer.handlers[CmdType.SELECT_TOOL] = reject
+    with pytest.raises(RobotError) as excinfo:
+        await client.select_tool("not_fitted")
+    assert excinfo.value.code == 43
+    assert await client.tool.set_position(0.5) >= 0
+    assert peer.of(CmdType.TOOL_ACTION)[-1][2][1] == "GRIP"
+
 
 # ---------------------------------------------------------------------------
 # Multicast fallback ladder (bad group → unicast) and wait_ready

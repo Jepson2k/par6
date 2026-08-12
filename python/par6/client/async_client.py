@@ -1379,11 +1379,16 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.select_tool("PNEUMATIC")
         """
         key = tool_name.strip().upper()
-        self._active_tool_key = key
-        self._active_variant_key = variant_key
-        return await self._queued(
+        index = await self._queued(
             CmdType.SELECT_TOOL, [key, variant_key if variant_key else None]
         )
+        # Only a tool the runtime accepted is the active one: a refused
+        # selection (the runtime is fitted with a different tool) would
+        # otherwise leave ``client.tool`` and the tool_action key pointing
+        # at hardware that is not on the arm.
+        self._active_tool_key = key
+        self._active_variant_key = variant_key
+        return index
 
     async def checkpoint(self, label: str) -> int:
         """Insert a checkpoint marker in the command queue.

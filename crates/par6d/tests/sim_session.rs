@@ -929,3 +929,49 @@ fn tool_actions_profiles_and_unsupported_parameters() {
 
     rig.shutdown();
 }
+
+/// The enablement pair is POSITIVE slot first: `[j1+, j1−, …]`.
+///
+/// Parked past a joint's upper soft limit, the positive slot must read 0
+/// and the negative slot 1. Nothing on the wire pins the order, so a
+/// backend that fills the pair the other way round quietly greys out the
+/// opposite jog button in a frontend that unpacks it as
+/// `can_jog_pos[i] = slot[2i]` (which is what waldoctl and parol6 do).
+#[test]
+fn joint_enablement_slots_are_positive_direction_first() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+
+    // Between J0's soft and hard windows: teleport clamps to the hard
+    // window, so the arm really lands outside the soft one.
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let (soft_max, hard_max) = (
+        cfg.joints[0].limits.soft_max_rad.to_degrees(),
+        cfg.joints[0].limits.hard_max_rad.to_degrees(),
+    );
+    assert!(hard_max > soft_max, "the config must leave a soft margin");
+    let mut past_max = park_deg();
+    past_max[0] = 0.5 * (soft_max + hard_max);
+    teleport_home(&rig, &mut c, past_max);
+
+    let s = rig.wait_status("J0 parked past its upper soft limit", |s| {
+        (s.angles[0] - past_max[0]).abs() < 1.0
+    });
+    assert_eq!(
+        (s.joint_en[0], s.joint_en[1]),
+        (0, 1),
+        "past the upper soft limit J0 may only move negative; slots were {:?}",
+        &s.joint_en[..2]
+    );
+    // A joint inside its window keeps both directions.
+    assert_eq!(
+        (s.joint_en[2], s.joint_en[3]),
+        (1, 1),
+        "J1 sits inside its soft window: both directions stay free"
+    );
+
+    rig.shutdown();
+}

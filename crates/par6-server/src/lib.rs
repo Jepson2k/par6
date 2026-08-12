@@ -35,6 +35,9 @@ pub mod telemetry;
 
 pub use config::{ServerConfig, StatusTransport};
 pub use gating::{gate, Gate};
-pub use runtime::{CommandOutcome, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle};
+pub use runtime::{
+    CollisionState, CommandOutcome, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle,
+    ShapeLayer,
+};
 pub use server::{spawn, ServerHandle};
 pub use telemetry::{TelemetryField, TelemetryRecipe};

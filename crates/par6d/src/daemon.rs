@@ -152,6 +152,7 @@ impl Daemon {
             planner: kin_planner,
             bridge: kin_bridge,
             housekeeping: kin_hk,
+            collision,
             assets_dir,
         } = load_kin_stack(opts, &config_path, robot)?;
 
@@ -256,6 +257,7 @@ impl Daemon {
             plan_r,
             &bundle,
             kin_planner,
+            collision,
         )?;
         #[cfg(not(feature = "ffi"))]
         let planner = Par6Planner::new(
@@ -506,8 +508,17 @@ struct KinStack {
     planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
     housekeeping: crate::kin::CartKin,
+    collision: par6_kin::Collision,
     assets_dir: std::path::PathBuf,
 }
+
+/// Standoff \[m\] every collision pair is checked with: geometry within
+/// this distance counts as colliding, so the arm keeps a near-miss buffer
+/// from itself and from keep-outs that absorbs model and calibration
+/// error. The value parol6 runs the same arm with; a shape that wants a
+/// wider berth carries its own `margin`.
+#[cfg(feature = "ffi")]
+const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
@@ -536,6 +547,18 @@ fn load_kin_stack(
     } else {
         variant
     };
+    // The collision world models the same body the planner plans for,
+    // tool included — a keep-out the gripper enters is a collision even
+    // when the flange clears it. Loaded once: the vendor collision meshes
+    // cost hundreds of milliseconds to read.
+    let collision = par6_kin::Collision::load(&assets_dir, variant, COLLISION_CLEARANCE_M)
+        .map_err(|e| {
+            DaemonError::Kinematics(format!(
+                "cannot load collision model {} from {}: {e}",
+                variant.urdf_relpath(),
+                assets_dir.display()
+            ))
+        })?;
     Ok(KinStack {
         fk: KinFk::new(load()?),
         gravity: KinGravity::new(
@@ -544,6 +567,7 @@ fn load_kin_stack(
         planner: CartKin::new(load()?),
         bridge: CartKin::new(load()?),
         housekeeping: CartKin::new(load()?),
+        collision,
         assets_dir,
     })
 }
