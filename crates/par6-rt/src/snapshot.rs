@@ -143,11 +143,23 @@ mod tests {
         type Payload = [u64; 32];
         const ITERS: u64 = 50_000;
         let (mut w, mut r) = snapshot_channel::<Payload>();
-        let writer = std::thread::spawn(move || {
-            for i in 1..=ITERS {
-                w.publish(&[i; 32]);
-            }
-        });
+        // The reader must actually race the writer rather than pick up a
+        // finished sequence in one read: the writer holds after the first
+        // publish until the reader has taken it, which forces at least two
+        // distinct observations however the host schedules the two threads.
+        let first_seen = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let first_seen = first_seen.clone();
+            std::thread::spawn(move || {
+                w.publish(&[1; 32]);
+                while !first_seen.load(Ordering::Acquire) {
+                    std::thread::yield_now();
+                }
+                for i in 2..=ITERS {
+                    w.publish(&[i; 32]);
+                }
+            })
+        };
         let mut last = 0u64;
         let mut saw_new = 0u64;
         while last < ITERS {
@@ -156,9 +168,9 @@ mod tests {
             assert!(v[0] >= last, "snapshots must be monotonic");
             if v[0] > last {
                 saw_new += 1;
-            }
-            last = last.max(v[0]);
-            if last == 0 {
+                last = v[0];
+                first_seen.store(true, Ordering::Release);
+            } else {
                 std::thread::yield_now();
             }
         }

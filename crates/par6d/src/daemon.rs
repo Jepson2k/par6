@@ -25,7 +25,7 @@ use std::time::Duration;
 
 use par6_bus::sim::SimBus;
 use par6_bus::{RuntimeBus, SocketCanBus};
-use par6_config::{ConfigBundle, ConfigError, LimitMode};
+use par6_config::{ConfigBundle, ConfigError, LimitMode, TimingConfig};
 use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
 #[cfg(not(feature = "ffi"))]
 use par6_rt::NoFk;
@@ -110,14 +110,23 @@ impl Daemon {
     pub fn start(opts: &Options) -> Result<Self, DaemonError> {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
-        let bundle = Arc::new(ConfigBundle::load(&config_path)?);
+        let mut loaded = ConfigBundle::load(&config_path)?;
+        loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
+        let bundle = Arc::new(loaded);
         let robot = &bundle.robot;
+        let bands = robot.loop_timing();
         log::info!(
             "loaded {} ({} joints, tick {} Hz) from {}",
             robot.robot.name,
             robot.joints.len(),
             robot.tick_rate_hz(),
             config_path.display()
+        );
+        log::info!(
+            "loop bands: degraded > {:.2}x dt, critical > {:.2}x dt sustained {} s",
+            bands.degraded_factor,
+            bands.critical_factor,
+            bands.critical_sustain_s
         );
 
         if opts.sim_dynamics && !opts.sim {
@@ -435,6 +444,23 @@ fn tee_loop(
     }
 }
 
+/// The loop-period bands the RT core runs under.
+///
+/// The simulator paces itself off the wall clock on whatever host it is
+/// given, where the vendor bands (sized for a dedicated PREEMPT_RT box)
+/// turn ordinary scheduler starvation into a latched `LOOP_CRITICAL` that
+/// no robot fault caused. `--sim` therefore falls back to the wider
+/// [`TimingConfig::SIM`] bands — but only as a default: a config that
+/// declares `[timing]` always wins, on hardware and in sim alike, so the
+/// guard can still be tightened for a deliberate test.
+fn resolve_loop_bands(sim: bool, declared: Option<TimingConfig>) -> TimingConfig {
+    match declared {
+        Some(t) => t,
+        None if sim => TimingConfig::SIM,
+        None => TimingConfig::default(),
+    }
+}
+
 fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     let robot = &bundle.robot;
     let mut cfg = ServerConfig::from_protocol(&robot.protocol);
@@ -521,4 +547,28 @@ fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, Daemo
     log::info!("bus backend: SocketCAN on '{}'", cfg.interface);
     SocketCanBus::open(cfg)
         .map_err(|e| DaemonError::Hardware(format!("{e} — run with --sim for the simulator")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `--sim` supplies the relaxed bands only where the config is silent;
+    /// a declared section is authoritative in both directions.
+    #[test]
+    fn sim_relaxes_the_loop_bands_but_never_overrides_a_declared_section() {
+        assert_eq!(resolve_loop_bands(false, None), TimingConfig::default());
+        assert_eq!(resolve_loop_bands(true, None), TimingConfig::SIM);
+        assert!(TimingConfig::SIM.critical_factor > TimingConfig::default().critical_factor);
+
+        // A config asking for a tight guard keeps it under --sim, so a
+        // test can still prove the critical latch fires on the simulator.
+        let tight = TimingConfig {
+            degraded_factor: 1.01,
+            critical_factor: 1.02,
+            critical_sustain_s: 0.1,
+        };
+        assert_eq!(resolve_loop_bands(true, Some(tight)), tight);
+        assert_eq!(resolve_loop_bands(false, Some(tight)), tight);
+    }
 }

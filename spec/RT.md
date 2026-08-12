@@ -15,6 +15,12 @@ deviations from the vendor design.
 - Degradation: fed by rolling p99 of loop period (500-sample ring, recompute every 50
   ticks, warmup ~850 ticks). `p99 > 1.05·dt` → `LOOP_DEGRADED` (warning, self-clears);
   `p99 > 1.10·dt` sustained 1.0 s → `LOOP_CRITICAL` (hard latch → DISABLED+ACTIVE_ERROR).
+  **[OURS]** those three numbers are the DEFAULTS of config `[timing]`
+  (`degraded_factor`/`critical_factor`/`critical_sustain_s`), not constants — hardware
+  runs the vendor values, and `par6d --sim` widens them (a wall-clock simulator on a
+  shared host cannot hold the deadline). Ring size, recompute interval and warmup stay
+  constants; note a sustain shorter than the recompute interval latches on the first
+  bad percentile.
 - Vendor scheduling: SCHED_FIFO prio 99, pinned core 3; setup failure is logged
   DEGRADED but non-fatal. Keep that stance.
 

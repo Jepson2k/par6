@@ -34,7 +34,7 @@ pub use homing::{
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
     KtFetchConfig, KtSource, LimitMode, ModeLimits, ProtocolConfig, ResolvedLimits, RobotConfig,
-    RobotSection, ScanConfig, StreamDefaults, WatchdogAction,
+    RobotSection, ScanConfig, StreamDefaults, TimingConfig, WatchdogAction,
 };
 
 use std::path::Path;
@@ -325,5 +325,55 @@ mod tests {
         let text = std::fs::read_to_string(&path).unwrap();
         let text = text.replacen("tick_dt_s", "tick_dt_sec", 1);
         assert!(RobotConfig::from_toml_str(&text).is_err());
+    }
+
+    #[test]
+    fn loop_bands_default_to_the_vendor_values_and_reject_unusable_ones() {
+        let text = std::fs::read_to_string(config_dir().join("PAR6.toml")).unwrap();
+
+        // A config that says nothing about timing runs the vendor bands,
+        // so hardware behavior does not depend on this section existing.
+        let stock = RobotConfig::from_toml_str(&text).unwrap();
+        let bands = stock.loop_timing();
+        assert_eq!(bands.degraded_factor, 1.05);
+        assert_eq!(bands.critical_factor, 1.10);
+        assert_eq!(bands.critical_sustain_s, 1.0);
+
+        // A declared section is what the runtime then uses.
+        let declared = RobotConfig::from_toml_str(&format!(
+            "{text}\n[timing]\ndegraded_factor = 1.5\n\
+             critical_factor = 4.0\ncritical_sustain_s = 5.0\n"
+        ))
+        .expect("declared timing section must load");
+        assert_eq!(declared.loop_timing(), TimingConfig::SIM);
+        // …and survives a serialize/reparse round-trip.
+        let back = RobotConfig::from_toml_str(&toml::to_string(&declared).unwrap()).unwrap();
+        assert_eq!(back, declared);
+
+        // Bands that would fire on a loop meeting its deadline, an
+        // inverted pair, or a non-finite/zero sustain are refused by name.
+        for (section, field) in [
+            ("degraded_factor = 1.0", "timing.degraded_factor"),
+            ("critical_factor = 0.9", "timing.critical_factor"),
+            ("degraded_factor = nan", "timing.degraded_factor"),
+            ("critical_factor = inf", "timing.critical_factor"),
+            (
+                "degraded_factor = 2.0\ncritical_factor = 1.5",
+                "timing.critical_factor",
+            ),
+            ("critical_sustain_s = 0.0", "timing.critical_sustain_s"),
+            ("critical_sustain_s = -1.0", "timing.critical_sustain_s"),
+        ] {
+            let err = RobotConfig::from_toml_str(&format!("{text}\n[timing]\n{section}\n"))
+                .expect_err(&format!("`{section}` must be refused"))
+                .to_string();
+            assert!(err.contains(field), "{section}: {err}");
+        }
+
+        // Typos in the section are caught, not silently defaulted.
+        assert!(RobotConfig::from_toml_str(&format!(
+            "{text}\n[timing]\ncritical_factor_x = 4.0\n"
+        ))
+        .is_err());
     }
 }

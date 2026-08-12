@@ -4,13 +4,21 @@
 //! Fed one measured loop period per tick; keeps a rolling window whose
 //! percentiles are recomputed periodically. Bands are one-sided (the
 //! vendor loop can only run SLOW; with absolute deadlines an early wake
-//! is absorbed by the next `clock_nanosleep`): `p99 > 1.05·dt` is a
-//! self-clearing `LOOP_DEGRADED` warning, `p99 > 1.10·dt` sustained for
-//! 1.0 s is the `LOOP_CRITICAL` hard latch. Nothing is evaluated during
-//! the warmup, so boot jitter cannot latch a false critical.
+//! is absorbed by the next `clock_nanosleep`): `p99 > degraded·dt` is a
+//! self-clearing `LOOP_DEGRADED` warning, `p99 > critical·dt` sustained
+//! for the configured interval is the `LOOP_CRITICAL` hard latch. The
+//! three band parameters come from [`TimingConfig`] and default to the
+//! vendor values. Nothing is evaluated during the warmup, so boot jitter
+//! cannot latch a false critical.
+//!
+//! The sustain is a floor, not a resolution: `p99` only moves every
+//! [`RECOMPUTE_EVERY`] ticks, so a sustain shorter than that interval
+//! latches on the first bad percentile.
 //!
 //! Everything is preallocated at construction; [`LoopTiming::record`] is
 //! allocation-free.
+
+use par6_config::TimingConfig;
 
 use crate::state::LoopStats;
 
@@ -21,12 +29,6 @@ const RECOMPUTE_EVERY: u64 = 50;
 /// Ticks before the bands are evaluated at all (vendor constant; covers
 /// filling the window plus scheduler settling at boot).
 const WARMUP_TICKS: u64 = 850;
-/// `p99 > DEGRADED_FACTOR · dt` = warning band.
-const DEGRADED_FACTOR: f64 = 1.05;
-/// `p99 > CRITICAL_FACTOR · dt` sustained = hard band.
-const CRITICAL_FACTOR: f64 = 1.10;
-/// How long the critical band must hold before latching \[s\].
-const CRITICAL_SUSTAIN_S: f64 = 1.0;
 /// EMA smoothing factor for the published mean period.
 const EMA_ALPHA: f64 = 0.05;
 
@@ -45,7 +47,8 @@ pub enum LoopHealth {
 /// Loop-period tracker. One instance per RT core, fed once per tick.
 #[derive(Debug)]
 pub struct LoopTiming {
-    dt: f64,
+    degraded_period_s: f64,
+    critical_period_s: f64,
     window: Vec<f64>,
     scratch: Vec<f64>,
     next: usize,
@@ -57,17 +60,19 @@ pub struct LoopTiming {
 }
 
 impl LoopTiming {
-    /// Tracker for tick period `dt` \[s\]. Allocates its buffers here.
-    pub fn new(dt: f64) -> Self {
+    /// Tracker for tick period `dt` \[s\] with the config's degradation
+    /// bands. Allocates its buffers here.
+    pub fn new(dt: f64, bands: TimingConfig) -> Self {
         Self {
-            dt,
+            degraded_period_s: bands.degraded_factor * dt,
+            critical_period_s: bands.critical_factor * dt,
             window: Vec::with_capacity(WINDOW),
             scratch: vec![0.0; WINDOW],
             next: 0,
             filled: false,
             ticks: 0,
             critical_streak: 0,
-            critical_sustain_ticks: ((CRITICAL_SUSTAIN_S / dt).round() as u32).max(1),
+            critical_sustain_ticks: ((bands.critical_sustain_s / dt).round() as u32).max(1),
             stats: LoopStats::default(),
         }
     }
@@ -100,14 +105,14 @@ impl LoopTiming {
             self.critical_streak = 0;
             return LoopHealth::Ok;
         }
-        if self.stats.p99_s > CRITICAL_FACTOR * self.dt {
+        if self.stats.p99_s > self.critical_period_s {
             self.critical_streak = self.critical_streak.saturating_add(1);
         } else {
             self.critical_streak = 0;
         }
         if self.critical_streak >= self.critical_sustain_ticks {
             LoopHealth::Critical
-        } else if self.stats.p99_s > DEGRADED_FACTOR * self.dt {
+        } else if self.stats.p99_s > self.degraded_period_s {
             LoopHealth::Degraded
         } else {
             LoopHealth::Ok
@@ -152,10 +157,60 @@ impl LoopTiming {
 mod tests {
     use super::*;
 
+    /// Run `ticks` periods from `period` through a fresh tracker and
+    /// report whether it ever reached each band.
+    fn run(dt: f64, bands: TimingConfig, ticks: u64, period: impl Fn(u64) -> f64) -> (bool, bool) {
+        let mut t = LoopTiming::new(dt, bands);
+        let (mut degraded, mut critical) = (false, false);
+        for i in 0..ticks {
+            match t.record(period(i), false) {
+                LoopHealth::Critical => critical = true,
+                LoopHealth::Degraded => degraded = true,
+                LoopHealth::Ok => {}
+            }
+        }
+        (degraded, critical)
+    }
+
+    /// The CI-flake trace: a wall-clock sim at a 50 ms tick on a shared
+    /// host, where a small fraction of ticks wake very late. p99 is the
+    /// 495th of 500 samples, so ~1.6% late ticks put it at the outlier
+    /// value — 2.8·dt, far above the vendor 1.10·dt hard band but nowhere
+    /// near a loop that is actually failing to run.
+    #[test]
+    fn sim_bands_ride_out_host_jitter_that_latches_the_vendor_bands() {
+        let dt = 0.05;
+        let jitter = |i: u64| if i.is_multiple_of(60) { dt * 2.8 } else { dt };
+        // Long enough to clear warmup and then hold the trace for several
+        // multiples of the sim sustain window.
+        let ticks = WARMUP_TICKS + 10 * (TimingConfig::SIM.critical_sustain_s / dt) as u64;
+
+        let (_, vendor_critical) = run(dt, TimingConfig::default(), ticks, jitter);
+        assert!(
+            vendor_critical,
+            "the vendor bands are what makes this trace latch"
+        );
+
+        let (sim_degraded, sim_critical) = run(dt, TimingConfig::SIM, ticks, jitter);
+        assert!(
+            !sim_critical,
+            "host jitter must not disable the controller under the sim bands"
+        );
+        assert!(
+            sim_degraded,
+            "the jitter must still be reported as degradation"
+        );
+
+        // A loop genuinely running an order of magnitude slow is still
+        // caught — the sim bands widen the guard, they do not remove it.
+        let (_, runaway_critical) = run(dt, TimingConfig::SIM, ticks, |_| dt * 10.0);
+        assert!(runaway_critical, "a runaway loop must still hard-latch");
+    }
+
     #[test]
     fn bands_need_warmup_then_degrade_then_latch_critical() {
         let dt = 0.004;
-        let mut t = LoopTiming::new(dt);
+        let mut t = LoopTiming::new(dt, TimingConfig::default());
         // Slow periods from the very first tick: warmup must still gate.
         for _ in 0..(WARMUP_TICKS - 1) {
             assert_eq!(t.record(dt * 1.2, false), LoopHealth::Ok, "warmup gates");
@@ -170,7 +225,7 @@ mod tests {
         assert!(verdicts.contains(&LoopHealth::Critical), "sustained latch");
         // Degraded band: periods slightly high (7% over) — degraded but
         // never critical.
-        let mut t = LoopTiming::new(dt);
+        let mut t = LoopTiming::new(dt, TimingConfig::default());
         let mut saw_degraded = false;
         for _ in 0..(WARMUP_TICKS + 3 * sustain) {
             match t.record(dt * 1.07, false) {

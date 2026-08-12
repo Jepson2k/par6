@@ -407,6 +407,56 @@ impl Default for StreamDefaults {
     }
 }
 
+/// Loop-period degradation bands (spec/RT.md "Rate & timing").
+///
+/// The p99 of the measured loop period is compared against multiples of
+/// the tick period: above `degraded_factor · dt` the runtime raises the
+/// self-clearing `LOOP_DEGRADED` warning, and above `critical_factor ·
+/// dt` held for `critical_sustain_s` it hard-latches `LOOP_CRITICAL`
+/// (controller DISABLED).
+///
+/// Defaults are the vendor values, sized for a dedicated PREEMPT_RT host.
+/// A host that cannot hold the tick deadline — a wall-clock simulator on
+/// a shared CI runner — needs wider bands, or host jitter latches a
+/// critical that no robot fault caused.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct TimingConfig {
+    /// Warning band as a multiple of the tick period.
+    pub degraded_factor: f64,
+    /// Hard band as a multiple of the tick period.
+    pub critical_factor: f64,
+    /// How long the hard band must hold before latching \[s\].
+    pub critical_sustain_s: f64,
+}
+
+impl Default for TimingConfig {
+    fn default() -> Self {
+        Self {
+            degraded_factor: 1.05,
+            critical_factor: 1.10,
+            critical_sustain_s: 1.0,
+        }
+    }
+}
+
+impl TimingConfig {
+    /// Bands for a wall-clock simulator sharing its host with everything
+    /// else on the box (CI runners, dev containers).
+    ///
+    /// Wide enough that ordinary scheduler starvation only raises the
+    /// self-clearing warning, tight enough that a loop actually running
+    /// several times slower than its period, continuously, still latches.
+    /// The sustain also has to outlast the runtime's percentile recompute
+    /// interval — a sustain shorter than one recompute reduces to "one
+    /// bad percentile latches".
+    pub const SIM: Self = Self {
+        degraded_factor: 1.5,
+        critical_factor: 4.0,
+        critical_sustain_s: 5.0,
+    };
+}
+
 /// Root of a robot TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -427,6 +477,11 @@ pub struct RobotConfig {
     /// Streaming mode policy defaults.
     #[serde(default)]
     pub stream: StreamDefaults,
+    /// Loop-period degradation bands. Omitted = the vendor bands, so a
+    /// config that says nothing keeps hardware behavior; `par6d --sim`
+    /// fills this in with [`TimingConfig::SIM`] when it is absent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timing: Option<TimingConfig>,
 }
 
 impl RobotConfig {
@@ -462,6 +517,12 @@ impl RobotConfig {
         (seconds / self.robot.tick_dt_s).round() as u32
     }
 
+    /// The loop-period bands this config runs under, applying the
+    /// fall-back-to-vendor rule.
+    pub fn loop_timing(&self) -> TimingConfig {
+        self.timing.unwrap_or_default()
+    }
+
     /// Validate the whole tree; every error names its field.
     pub fn validate(&self) -> Result<(), ConfigError> {
         let r = &self.robot;
@@ -493,6 +554,7 @@ impl RobotConfig {
         self.validate_bus()?;
         self.validate_protocol()?;
         self.validate_defaults()?;
+        self.validate_timing()?;
         Ok(())
     }
 
@@ -722,6 +784,35 @@ impl RobotConfig {
                 "stream.success_warn",
                 "need 0 <= success_bad <= success_warn <= 1",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_timing(&self) -> Result<(), ConfigError> {
+        let Some(t) = self.timing else {
+            return Ok(());
+        };
+        // A band at or below the nominal period fires on a loop that is
+        // meeting its deadline, so both factors must clear 1.0.
+        for (v, name) in [
+            (t.degraded_factor, "timing.degraded_factor"),
+            (t.critical_factor, "timing.critical_factor"),
+        ] {
+            if !is_positive(v - 1.0) || !v.is_finite() {
+                return Err(invalid(
+                    name,
+                    "must be > 1.0 (a multiple of the tick period)",
+                ));
+            }
+        }
+        if t.critical_factor < t.degraded_factor {
+            return Err(invalid(
+                "timing.critical_factor",
+                "must be >= timing.degraded_factor",
+            ));
+        }
+        if !is_positive(t.critical_sustain_s) || !t.critical_sustain_s.is_finite() {
+            return Err(invalid("timing.critical_sustain_s", "must be > 0"));
         }
         Ok(())
     }

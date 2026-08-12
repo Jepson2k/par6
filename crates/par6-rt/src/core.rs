@@ -323,7 +323,7 @@ impl<B: DriverBus> RtCore<B> {
             fk: hooks.fk,
             homing: HomingSystem::new(bundle),
             errors: ErrorManager::new(dt),
-            timing: LoopTiming::new(dt),
+            timing: LoopTiming::new(dt, robot.loop_timing()),
             mode: Mode::Booting,
             state: ArmState::Disabled,
             homed: false,
