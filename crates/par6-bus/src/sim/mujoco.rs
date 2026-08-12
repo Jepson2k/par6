@@ -285,6 +285,21 @@ impl MujocoPlant {
         }
     }
 
+    /// Place the arm at `q0` \[rad\] at rest (teleport): only the arm's
+    /// generalized state moves — the jaws, the graspable objects and
+    /// every contact in the scene carry on, which reloading the scene
+    /// would throw away. The boot inertia probe is kept (re-probing
+    /// needs `mj_resetData`, which would reset exactly that state).
+    pub fn reseed(&mut self, q0: &[f64]) {
+        self.qpos[..self.n].copy_from_slice(q0);
+        self.qvel[..self.n].fill(0.0);
+        self.qfrc[..self.n].fill(0.0);
+        unsafe {
+            ffi::mj_setState(self.model, self.data, self.qpos.as_ptr(), ffi::STATE_QPOS);
+            ffi::mj_setState(self.model, self.data, self.qvel.as_ptr(), ffi::STATE_QVEL);
+        }
+    }
+
     /// Measured motor state of arm joint `j` (position ticks, speed
     /// ticks/s).
     pub fn motor_state(&self, j: usize, map: &JointMap) -> (f64, f64) {

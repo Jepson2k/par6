@@ -127,6 +127,10 @@ impl Par6Planner {
     /// Wrap fully-timed tick-dt samples as the next EXEC in-flight
     /// command: allocate a ring index, stamp the metadata, request EXEC.
     fn start_exec(&mut self, samples: Vec<[f64; 2 * MAX_JOINTS]>, seen_exec: bool) -> InFlightKind {
+        // A fresh fill generation: a flush already queued for an earlier
+        // command can no longer reach these samples, however far behind
+        // the RT command queue is running.
+        self.producer.begin_generation();
         let ring_index = self.next_ring_index;
         self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         let n = samples.len();
@@ -450,6 +454,10 @@ impl Par6Planner {
 
     fn discard_planned(&mut self) {
         self.inflight = None;
+        // Mark BEFORE queueing the flush: the mark rides the ring, so it
+        // is pinned to what is queued now and cannot swallow the fill of
+        // whatever the client sends next.
+        self.producer.flush_marker().mark();
         self.link.send(RtCommand::ExecFlush);
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
@@ -631,11 +639,9 @@ impl Planner for Par6Planner {
     fn cancel(&mut self) {
         // Only an in-flight command can own samples in the ring: one
         // that completed drained it, one already discarded flushed it.
-        // A flush sent with nothing in flight is not idempotent — it
-        // rides the RT command queue (one command per tick) while
-        // samples ride the SPSC ring (immediate), so it can overtake
-        // the NEXT command's samples and silently erase them, leaving
-        // EXEC holding forever with no COMPLETE.
+        // The flush is generation-bounded, so a stray one can no longer
+        // erase the next command's samples, but sending it with nothing
+        // in flight would still cost an RT command slot for nothing.
         if self.inflight.is_some() {
             self.discard_planned();
         }

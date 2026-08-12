@@ -28,7 +28,9 @@ const STOP_ZETA: f64 = 1.2;
 const VISC_RATE: f64 = 8.0;
 /// Coulomb friction \[Nm\], smoothed near zero velocity.
 const COULOMB_NM: f64 = 0.1;
-/// Velocity scale of the Coulomb smoothing \[rad/s\].
+/// Narrowest velocity scale of the Coulomb smoothing \[rad/s\]; joints
+/// too light to integrate that slope explicitly get a wider one (see
+/// [`DynamicsPlant::coulomb_eps`]).
 const COULOMB_EPS: f64 = 0.01;
 /// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
 /// shorted-phase brake of an idled driver.
@@ -45,6 +47,7 @@ pub(crate) struct DynamicsPlant {
     inertia: Vec<f64>,
     k_stop: Vec<f64>,
     c_stop: Vec<f64>,
+    coulomb_eps: Vec<f64>,
 }
 
 impl DynamicsPlant {
@@ -61,27 +64,8 @@ impl DynamicsPlant {
             model.nq()
         );
         let q = q0.to_vec();
-        let mut tau = vec![0.0; n];
-        let mut a0 = vec![0.0; n];
-        let mut a1 = vec![0.0; n];
-        let zeros = vec![0.0; n];
-        model
-            .aba_into(&q, &zeros, &tau, &mut a0)
-            .expect("ABA probe (zero torque)");
         let mut inertia = vec![0.0; n];
-        for j in 0..n {
-            tau[j] = 1.0;
-            model
-                .aba_into(&q, &zeros, &tau, &mut a1)
-                .expect("ABA probe (unit torque)");
-            tau[j] = 0.0;
-            let inv_m = a1[j] - a0[j];
-            assert!(
-                inv_m > 0.0,
-                "ABA inertia probe returned non-positive apparent inertia for joint {j}"
-            );
-            inertia[j] = 1.0 / inv_m;
-        }
+        probe_inertia(&mut model, &q, &mut inertia);
         let k_stop: Vec<f64> = inertia
             .iter()
             .map(|i| i * STOP_OMEGA * STOP_OMEGA)
@@ -96,9 +80,41 @@ impl DynamicsPlant {
             v: vec![0.0; n],
             tau: vec![0.0; n],
             a: vec![0.0; n],
+            coulomb_eps: vec![COULOMB_EPS; n],
             inertia,
             k_stop,
             c_stop,
+        }
+    }
+
+    /// Smoothed Coulomb friction enters the torque vector explicitly, so
+    /// its near-zero slope `COULOMB_NM/eps` acts as a damper of rate
+    /// `COULOMB_NM/(eps·inertia)`: the substep only integrates that
+    /// stably while `rate·h ≤ 1`. The wrist joints are one to three
+    /// orders of magnitude lighter than the shoulder, so at the shared
+    /// `COULOMB_EPS` their friction oscillates instead of damping and a
+    /// perfectly gravity-compensated wrist drifts degrees per second.
+    /// Widening the smoothing band for the light joints keeps the
+    /// friction MAGNITUDE (`COULOMB_NM`) and only softens the regularized
+    /// `sign()` — the same per-joint inertia scaling the endstop gains
+    /// already use.
+    fn coulomb_eps(inertia: f64, h: f64) -> f64 {
+        COULOMB_EPS.max(COULOMB_NM * h / inertia)
+    }
+
+    /// Place the arm at `q0` \[rad\] at rest (teleport): the model, its
+    /// data and the contact gains stay live — only the state moves. The
+    /// apparent-inertia probe is re-run at the new pose, so the endstop
+    /// and friction scaling match the configuration the arm is now in.
+    pub fn reseed(&mut self, q0: &[f64]) {
+        self.q.copy_from_slice(q0);
+        self.v.fill(0.0);
+        self.a.fill(0.0);
+        self.tau.fill(0.0);
+        probe_inertia(&mut self.model, &self.q, &mut self.inertia);
+        for j in 0..self.inertia.len() {
+            self.k_stop[j] = self.inertia[j] * STOP_OMEGA * STOP_OMEGA;
+            self.c_stop[j] = 2.0 * STOP_ZETA * self.inertia[j] * STOP_OMEGA;
         }
     }
 
@@ -114,13 +130,16 @@ impl DynamicsPlant {
     /// accelerations over `SUBSTEPS` semi-implicit Euler substeps.
     pub fn step(&mut self, dt: f64, cmds: &[PlantCmd], loads_ma: &[f64], maps: &[JointMap]) {
         let h = dt / f64::from(SUBSTEPS);
+        for (eps, inertia) in self.coulomb_eps.iter_mut().zip(&self.inertia) {
+            *eps = Self::coulomb_eps(*inertia, h);
+        }
         for _ in 0..SUBSTEPS {
             for j in 0..self.q.len() {
                 let map = &maps[j];
                 let drive_nm = (cmds[j].current_ma - loads_ma[j]) / map.factor_ma_per_nm;
                 let mut t = drive_nm
                     - VISC_RATE * self.inertia[j] * self.v[j]
-                    - COULOMB_NM * (self.v[j] / COULOMB_EPS).tanh();
+                    - COULOMB_NM * (self.v[j] / self.coulomb_eps[j]).tanh();
                 if cmds[j].idle {
                     t -= IDLE_RATE * self.inertia[j] * self.v[j];
                 }
@@ -145,5 +164,32 @@ impl DynamicsPlant {
                 self.q[j] += self.v[j] * h;
             }
         }
+    }
+}
+
+/// Apparent joint inertias at `q`: the unit-torque ABA response against
+/// the zero-torque baseline. Panics on a non-positive result — that is a
+/// broken model, not a runtime condition.
+fn probe_inertia(model: &mut Model, q: &[f64], out: &mut [f64]) {
+    let n = q.len();
+    let zeros = vec![0.0; n];
+    let mut tau = vec![0.0; n];
+    let mut a0 = vec![0.0; n];
+    let mut a1 = vec![0.0; n];
+    model
+        .aba_into(q, &zeros, &tau, &mut a0)
+        .expect("ABA probe (zero torque)");
+    for j in 0..n {
+        tau[j] = 1.0;
+        model
+            .aba_into(q, &zeros, &tau, &mut a1)
+            .expect("ABA probe (unit torque)");
+        tau[j] = 0.0;
+        let inv_m = a1[j] - a0[j];
+        assert!(
+            inv_m > 0.0,
+            "ABA inertia probe returned non-positive apparent inertia for joint {j}"
+        );
+        out[j] = 1.0 / inv_m;
     }
 }

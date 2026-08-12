@@ -221,6 +221,44 @@ impl SimBus {
         self.initial_q = Some(q0.to_vec());
     }
 
+    /// Teleport the simulated arm to `q` \[rad\] (one entry per joint,
+    /// clamped inside the hard limits) after boot: the plant state moves
+    /// and the reported-position wrap re-bases onto the new pose, while
+    /// the drivers, the gripper and the link state carry on.
+    ///
+    /// This is a re-seed, not a reboot. Re-running
+    /// [`DriverBus::boot_configure`] would place the arm too, but it
+    /// rebuilds the whole bus around it — fresh virtual drivers (their
+    /// latched mode, limits and loop state gone), a fresh gripper front
+    /// end (calibration gone) and, for the plants that own a scene, a
+    /// fresh model with every object back at its spawn.
+    pub fn teleport_joint_rad(&mut self, q: &[f64]) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if q.len() != self.maps.len() {
+            return Err(BusError::InvalidCommand {
+                reason: "teleport pose length != joint count",
+            });
+        }
+        let mut clamped = [0.0; MAX_NODES];
+        for (j, map) in self.maps.iter_mut().enumerate() {
+            clamped[j] = q[j].clamp(map.hard_lo_rad, map.hard_hi_rad);
+            map.reseed(clamped[j]);
+        }
+        let q = &clamped[..self.maps.len()];
+        match &mut self.plant {
+            ArmPlant::Kinematic(joints) => {
+                for (j, joint) in joints.iter_mut().enumerate() {
+                    joint.reseed(f64::from(self.maps[j].conv.motor_ticks(q[j])));
+                }
+            }
+            #[cfg(feature = "sim-dynamics")]
+            ArmPlant::Dynamics(d) => d.reseed(q),
+            #[cfg(feature = "sim-mujoco")]
+            ArmPlant::Mujoco(p) => p.reseed(q),
+        }
+        Ok(())
+    }
+
     /// Move a hall sensor: joint `joint`'s trigger band becomes
     /// `center_rad ± half_width_rad` (defaults come from the homing
     /// config: hall-strategy joints trigger at their `home_offset_rad`).

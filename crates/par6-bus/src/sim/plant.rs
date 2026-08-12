@@ -120,6 +120,16 @@ impl KinJoint {
         };
     }
 
+    /// Place the joint at rest at `pos0` \[ticks\], off any endstop
+    /// (teleport re-seed — the gains and bounds are unchanged).
+    pub fn reseed(&mut self, pos0: f64) {
+        self.pos = pos0;
+        self.vel = 0.0;
+        self.reported_vel = 0.0;
+        self.seat = Seat::Free;
+        self.excess = 0.0;
+    }
+
     /// Seated at `bound`; `into_sign` is the drive sign that presses into
     /// the stop. Windup follows the into-current first-order; enough
     /// away-current breaks the seat.
@@ -161,16 +171,8 @@ pub(crate) struct JointMap {
         allow(dead_code)
     )]
     pub factor_ma_per_nm: f64,
-    /// Hard limits \[rad\] (dynamics-plant endstops).
-    #[cfg_attr(
-        not(any(feature = "sim-dynamics", feature = "sim-mujoco")),
-        allow(dead_code)
-    )]
+    /// Hard limits \[rad\] (dynamics-plant endstops, teleport clamp).
     pub hard_lo_rad: f64,
-    #[cfg_attr(
-        not(any(feature = "sim-dynamics", feature = "sim-mujoco")),
-        allow(dead_code)
-    )]
     pub hard_hi_rad: f64,
     /// Motor ticks per joint radian (unsigned magnitude).
     pub tpr: f64,
@@ -179,10 +181,6 @@ pub(crate) struct JointMap {
         allow(dead_code)
     )]
     pub gear_ratio: f64,
-    #[cfg_attr(
-        not(any(feature = "sim-dynamics", feature = "sim-mujoco")),
-        allow(dead_code)
-    )]
     pub encoder_max_counts: i32,
 }
 
@@ -213,6 +211,16 @@ impl JointMap {
             gear_ratio: j.gear_ratio,
             encoder_max_counts,
         }
+    }
+
+    /// Re-base the reported-position wrap onto a new true pose
+    /// (teleport): the next reported position reads exactly as a boot
+    /// reading at `q0_rad` would, which is the contract the RT's
+    /// re-reference call relies on.
+    pub fn reseed(&mut self, q0_rad: f64) {
+        let true0 = self.conv.motor_ticks(q0_rad);
+        let wrapped0 = true0.rem_euclid(self.encoder_max_counts);
+        self.report_offset = f64::from(wrapped0 - true0);
     }
 
     /// True motor position → reported encoder position \[ticks\].

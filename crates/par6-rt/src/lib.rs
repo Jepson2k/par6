@@ -34,7 +34,8 @@
 //! - [`hooks`]: the small per-tick trait seams `par6d` wires the motion
 //!   stack onto (jog, streaming, completion, commands, FK, flash marker).
 //! - [`ring`]: the planner→RT SPSC sample ring ([`Sample`],
-//!   [`sample_ring`], `samples_remaining` backpressure).
+//!   [`sample_ring`], `samples_remaining` backpressure,
+//!   generation-bounded flushes via [`FlushMarker`]).
 //! - [`snapshot`]: the single-writer snapshot channel
 //!   ([`snapshot_channel`], triple buffer, wait-free, tear-free).
 //! - [`state`]: [`StateSnapshot`] and its component types (modes, error
@@ -63,7 +64,7 @@ pub use hooks::{
     CommandSource, CompletionPolicy, FlashMarker, ForwardKin, JogEngine, NoCommands, NoFk,
     RtCommand, SettlePolicy, SharedFlashMarker, SpecSettle, StreamTracker,
 };
-pub use ring::{sample_ring, Sample, SampleConsumer, SampleMeta, SampleProducer};
+pub use ring::{sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer};
 pub use rt::RunOptions;
 pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{

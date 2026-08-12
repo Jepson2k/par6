@@ -160,6 +160,8 @@ impl Daemon {
         let shutdown = Arc::new(AtomicBool::new(false));
         let rt_break = Arc::new(AtomicBool::new(false));
         let (producer, consumer) = sample_ring(RING_CAPACITY);
+        // The bridge's `halt` flushes the same ring the planner fills.
+        let flush_marker = producer.flush_marker();
         let (gpio, _estop_line) = SharedLineGpio::new(true);
         let (flash, _flash_flag) = SharedFlashMarker::new();
 
@@ -261,6 +263,7 @@ impl Daemon {
             link.clone(),
             stream_input.clone(),
             shared.clone(),
+            flush_marker,
             bundle.clone(),
             opts.sim,
             crate::bridge::CartStream {
@@ -275,6 +278,7 @@ impl Daemon {
             link.clone(),
             stream_input.clone(),
             shared.clone(),
+            flush_marker,
             bundle.clone(),
             opts.sim,
         );

@@ -591,3 +591,61 @@ fn hardware_mode_and_bad_config_fail_with_clear_errors() {
         "names the missing path: {err}"
     );
 }
+
+/// Issue #15 regression: a `stop` immediately followed by a queued move.
+/// The stop's EXEC flush rides the RT command queue (one command per
+/// tick) while the new move's samples ride the SPSC ring (immediate), so
+/// an unbounded flush lands AFTER those samples and erases them — EXEC
+/// then holds forever and the move never completes. The move must run to
+/// COMPLETE and the arm must actually be at the target.
+#[test]
+fn stop_then_move_completes_without_losing_samples() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let park = park_deg();
+    let deadline = Instant::now() + BUDGET;
+    'teleport: loop {
+        c.send(&teleport(park));
+        let window = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < window {
+            if let Some(s) = rig.recv_status() {
+                if s.homed && angles_close(&s.angles, &park, 1.0) {
+                    break 'teleport;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "teleport did not take effect within budget"
+        );
+    }
+
+    // A long move to stop in the middle of, then — back to back with the
+    // stop — a fresh short move.
+    let i_long = c.ok_index(&move_j(3001, with_j0(park, 40.0), 6.0));
+    rig.wait_status("the long move is executing", |s| {
+        s.executing_index == i_long as i64
+    });
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    let target = with_j0(park, 10.0);
+    let i_next = c.ok_index(&move_j(3002, target, 0.5));
+    let (ok, detail) = c.wait_complete(i_next);
+    assert!(
+        ok,
+        "the move queued right after a stop must complete, got {detail:?}"
+    );
+    let s = rig.wait_status("completed_index reaches the move", |s| {
+        s.completed_index >= i_next as i64
+    });
+    assert!(
+        (s.angles[0] - target[0]).abs() < 6.0,
+        "the move after the stop never drove J0 to the target: {:?}",
+        s.angles
+    );
+    assert!(!c.saw_complete(i_long), "the stopped move pushed COMPLETE");
+
+    rig.shutdown();
+}

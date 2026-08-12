@@ -1071,6 +1071,96 @@ fn identical_streams_are_bit_identical() {
     }
 }
 
+/// Teleport (the sim's fast homing) re-seeds the arm mid-session: the
+/// plant lands at the commanded configuration — reported exactly as a
+/// boot reading there would be — while the bus AROUND it keeps running.
+/// Placing the arm by re-running `boot_configure` lands it too, but
+/// rebuilds the drivers (limits pushed at runtime revert to config) and
+/// the gripper front end (calibration gone) around it.
+#[test]
+fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
+    let robot = par6();
+    let gripper = msg_gripper();
+    let mut rig = Rig::boot(&robot, Some(&gripper), None);
+    let cmds = rig.idle_cmds();
+
+    // State the bus is carrying when the teleport arrives: a calibrated
+    // gripper, and a current limit pushed onto J0 at runtime (what the
+    // homing sequence does before an approach).
+    rig.step(&cmds, &GripperCommand::Calibrate);
+    for _ in 0..u64::from(robot.ticks(10.0)) {
+        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        if rig.state.gripper.reply.is_some_and(|r| r.calibrated) {
+            break;
+        }
+    }
+    assert!(
+        rig.state.gripper.reply.unwrap().calibrated,
+        "the gripper must be calibrated before the teleport"
+    );
+    let j0 = &robot.joints[0];
+    let pushed_ilim_ma = 250.0f64;
+    assert!(
+        pushed_ilim_ma < j0.ilim_ma,
+        "the pushed limit must be lower"
+    );
+    rig.bus
+        .send_limits(
+            j0.node_id,
+            j0.velocity_limit_ticks_s as f32,
+            pushed_ilim_ma as f32,
+            2,
+        )
+        .expect("send_limits");
+
+    // Teleport: every joint a few degrees off its calibration pose.
+    let mut target = calibration_pose(&robot);
+    for (q, j) in target.iter_mut().zip(&robot.joints) {
+        *q = (*q + 0.2).clamp(j.limits.hard_min_rad, j.limits.hard_max_rad);
+    }
+    rig.bus.teleport_joint_rad(&target).expect("teleport");
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+
+    for (j, jc) in robot.joints.iter().enumerate() {
+        let conv = JointConversion::from_config(jc);
+        let want = conv
+            .motor_ticks(target[j])
+            .rem_euclid(1i32 << jc.encoder_bits);
+        let got = rig.state.nodes[usize::from(jc.node_id)]
+            .position_ticks
+            .expect("position after teleport");
+        assert!(
+            (got - want).abs() <= 2,
+            "joint {j} reported {got} ticks after a teleport to {want}"
+        );
+    }
+
+    // The bus around the plant is untouched: the gripper is still
+    // calibrated, and J0 still saturates at the limit pushed before the
+    // teleport instead of the config ceiling.
+    assert!(
+        rig.state.gripper.reply.unwrap().calibrated,
+        "the teleport reset the gripper front end"
+    );
+    let mut drive = rig.idle_cmds();
+    drive[0] = JointCommand::current((j0.ilim_ma as i32) as i16);
+    for _ in 0..10 {
+        rig.step(&drive, &GripperCommand::FirmwarePoll);
+    }
+    let cur = f64::from(
+        rig.state.nodes[usize::from(j0.node_id)]
+            .current_ma
+            .expect("current reply"),
+    );
+    assert!(
+        (cur - pushed_ilim_ma).abs() < 1.0,
+        "J0 drove {cur} mA: the teleport reverted the runtime current limit \
+         (pushed {pushed_ilim_ma} mA, config ceiling {} mA)",
+        j0.ilim_ma
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Dynamics plant (feature sim-dynamics): same DriverBus surface, torque-
 // level physics. Gated: needs the C++ shim from scripts/ffi/setup.sh.
@@ -1079,6 +1169,7 @@ fn identical_streams_are_bit_identical() {
 #[cfg(feature = "sim-dynamics")]
 mod dynamics {
     use super::*;
+    use par6_bus::spectral::convert::{torque_to_ma_factor, trunc_to_wire};
 
     fn urdf() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -1171,6 +1262,83 @@ mod dynamics {
             "dynamics stall current peaked at {peak_cur} mA (limit {} mA)",
             h.current_ma
         );
+    }
+
+    /// Every joint held by its own gravity torque stays put — the wrist
+    /// included. The drive is the REAL controller path: G(q) from the
+    /// same model the plant integrates, through the config
+    /// torque↔current factor, truncated to whole mA like the RT's
+    /// commit, sent as cmd-2 current frames. The light wrist joints are
+    /// the ones this can fail on: their smoothed Coulomb friction is a
+    /// stiff explicit damper next to their inertia, and at the shared
+    /// smoothing width they oscillate instead of damping and the joint
+    /// drifts degrees per second under perfect compensation.
+    #[test]
+    fn gravity_compensated_joints_hold_including_the_wrist() {
+        /// Hold tolerance \[deg\] over the watch window.
+        const HOLD_TOL_DEG: f64 = 1.0;
+        let robot = par6();
+        let q0: Vec<f64> = [0.0f64, -70.0, 150.0, 20.0, 45.0, 180.0]
+            .iter()
+            .map(|d| d.to_radians())
+            .collect();
+        let mut rig = boot(&robot, Some(&q0));
+        let conv: Vec<JointConversion> = robot
+            .joints
+            .iter()
+            .map(JointConversion::from_config)
+            .collect();
+        let factor: Vec<f64> = robot
+            .joints
+            .iter()
+            .map(|j| torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir))
+            .collect();
+        let mut model = pinokin_sys::Model::from_urdf(&urdf(), None, None).expect("model");
+
+        let n = robot.joints.len();
+        let mut q = q0.clone();
+        let mut g = vec![0.0; n];
+        let mut cmds = rig.idle_cmds();
+        let mut offset = vec![0i32; n];
+        let mut seeded = false;
+        let mut drift_deg = vec![0.0f64; n];
+        for _ in 0..u64::from(robot.ticks(4.0)) {
+            // Measured pose off the real reply frames (the sim reports a
+            // wrapped boot reading, so the first one fixes the offset the
+            // RT would install as its home reference).
+            let mut have = true;
+            for (j, jc) in robot.joints.iter().enumerate() {
+                match rig.state.nodes[usize::from(jc.node_id)].position_ticks {
+                    Some(t) => {
+                        if !seeded {
+                            offset[j] = t - conv[j].motor_ticks(q0[j]);
+                        }
+                        q[j] = conv[j].joint_rad(t - offset[j]);
+                    }
+                    None => have = false,
+                }
+            }
+            seeded |= have;
+            model.gravity_into(&q, &mut g).expect("G(q)");
+            for j in 0..n {
+                cmds[j] = JointCommand::current(trunc_to_wire(g[j] * factor[j]) as i16);
+            }
+            rig.step(&cmds, &GripperCommand::NoGripper);
+            if seeded {
+                for j in 0..n {
+                    drift_deg[j] = drift_deg[j].max((q[j] - q0[j]).abs().to_degrees());
+                }
+            }
+        }
+        assert!(seeded, "no measured pose ever arrived");
+        for j in 0..n {
+            assert!(
+                drift_deg[j] < HOLD_TOL_DEG,
+                "joint {j} drifted {:.2}° under its own gravity torque \
+                 (all joints: {drift_deg:?})",
+                drift_deg[j]
+            );
+        }
     }
 
     #[test]

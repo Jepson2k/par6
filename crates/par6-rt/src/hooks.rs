@@ -64,7 +64,13 @@ pub enum RtCommand {
     JogRelease,
     /// Pause/resume EXEC playback (pause holds in place, ring untouched).
     ExecSetPaused(bool),
-    /// Discard everything queued in the EXEC ring (stop/flush — NOT pause).
+    /// Discard the EXEC ring samples the planner marked for discard
+    /// (stop/flush — NOT pause). The bound rides the ring itself
+    /// ([`FlushMarker::mark`](crate::FlushMarker::mark)), because this
+    /// command is consumed one per tick while samples arrive at once:
+    /// an unbounded flush would erase the samples of whatever was
+    /// queued behind the stop. Marking is the sender's job — an
+    /// unmarked flush discards nothing.
     ExecFlush,
     /// Firmware gripper command for the per-tick gripper slot; replaces
     /// the standing gripper frame until the next one.

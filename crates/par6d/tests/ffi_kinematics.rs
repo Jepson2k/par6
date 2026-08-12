@@ -603,34 +603,26 @@ fn cartesian_surface_over_protocol_v2() {
 
 /// The gravity hook does physical work. On the torque-level plant
 /// (`--sim-dynamics`) an IDLE arm is held by nothing but the G(q)
-/// feedforward: the shoulder and elbow, which carry essentially the
-/// whole weight of the arm, stay where the sim placed them. With the
-/// `ZeroGravity` placeholder the same rig collapses — measured here,
-/// the shoulder is 69° down and the elbow 108° over inside one second,
-/// both against their endstops by the second — so this bound cannot
-/// pass without the hook.
+/// feedforward: every loaded joint, wrist included, stays where the sim
+/// placed it. With the `ZeroGravity` placeholder the same rig collapses
+/// — measured here, the shoulder is 69° down and the elbow 108° over
+/// inside one second, both against their endstops by the second — so
+/// this bound cannot pass without the hook.
 #[test]
 fn gravity_hook_holds_the_arm_on_the_torque_plant() {
-    /// Hold tolerance \[deg\] for the load-bearing joints.
+    /// Hold tolerance \[deg\] for every joint.
     const HOLD_TOL: f64 = 2.5;
-    /// Shoulder and elbow. The wrist joints are not asserted: their
-    /// gravity load is a small residual that the sim driver's
-    /// torque↔current path does not reproduce faithfully (J3 keeps
-    /// creeping even perfectly compensated), which says nothing about
-    /// the hook under test.
-    const LOADED: [usize; 2] = [1, 2];
+    /// Every joint with a gravity load: the shoulder and elbow carry
+    /// essentially the whole arm, the wrist joints carry a residual
+    /// small enough that only a faithful torque↔current path holds
+    /// them (J0 is on the vertical axis and carries nothing).
+    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
 
     let rig = Rig::boot("gravity", true);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
-    // Enable, let the RT clear sequence settle, then enable again right
-    // before the teleport: re-seeding the plant reboots the sim drivers,
-    // and only the retry window a fresh reset opens brings them back up
-    // enabled — otherwise the arm is limp and just falls.
     let placed = CART_START_DEG;
-    c.ok(&Command::Reset);
-    rig.collect_status(Duration::from_secs(2));
     c.ok(&Command::Reset);
     enable_and_teleport(&rig, &mut c, placed);
 

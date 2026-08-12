@@ -14,6 +14,18 @@
 //! / [`SampleConsumer::samples_remaining`] is the planner's deadline
 //! signal (vendor prefetch target: 750 samples = 3 s at 4 ms).
 //!
+//! Flushes are GENERATION-BOUNDED. Samples reach the RT immediately over
+//! this ring, while the flush that discards them rides the RT command
+//! queue (one command per tick), so an unbounded flush issued for one
+//! command can land after the NEXT command's samples and erase them —
+//! EXEC then holds forever with no completion. Every fill the planner
+//! starts gets a generation ([`SampleProducer::begin_generation`]) that
+//! is stamped on its samples; a stop marks the generation it means to
+//! discard ([`FlushMarker::mark`]) and the RT drops only samples at or
+//! below that mark ([`SampleConsumer::clear_marked`]). The bound travels
+//! on the ring — the same channel as the samples — so it can never
+//! overtake them.
+//!
 //! Lock-free single-producer/single-consumer over std atomics (no
 //! crossbeam): wrapping u64 head/tail counters, fixed capacity allocated
 //! once at construction — both halves are allocation-free afterwards, so
@@ -65,12 +77,24 @@ impl Default for Sample {
     }
 }
 
+/// A queued sample plus the fill generation it was pushed under.
+struct Slot {
+    sample: Sample,
+    generation: u64,
+}
+
 struct RingShared {
-    buf: Box<[UnsafeCell<Sample>]>,
+    buf: Box<[UnsafeCell<Slot>]>,
     /// Total samples ever popped (consumer-owned write).
     head: AtomicU64,
     /// Total samples ever pushed (producer-owned write).
     tail: AtomicU64,
+    /// Generation stamped on pushes right now (producer-owned write).
+    fill_generation: AtomicU64,
+    /// Newest generation marked for discard; `clear_marked` drops
+    /// samples at or below it. Monotonic (`fetch_max`), so concurrent
+    /// or repeated marks never shrink the bound.
+    flush_generation: AtomicU64,
 }
 
 // SAFETY: SPSC discipline — the producer only writes slots in
@@ -99,17 +123,35 @@ pub struct SampleConsumer {
     ring: Arc<RingShared>,
 }
 
+/// The flush bound's sender: marks the samples queued so far for
+/// discard, so a stop can be issued from a command plane that does not
+/// own the producer. `Clone`/`Send`/`Sync` — marks are monotonic, so
+/// several holders can mark concurrently without erasing a newer fill.
+#[derive(Clone)]
+pub struct FlushMarker {
+    ring: Arc<RingShared>,
+}
+
 /// Create a ring with room for `capacity` samples (panics on 0).
 /// The single allocation happens here.
 pub fn sample_ring(capacity: usize) -> (SampleProducer, SampleConsumer) {
     assert!(capacity > 0, "sample ring capacity must be nonzero");
-    let buf: Box<[UnsafeCell<Sample>]> = (0..capacity)
-        .map(|_| UnsafeCell::new(Sample::default()))
+    let buf: Box<[UnsafeCell<Slot>]> = (0..capacity)
+        .map(|_| {
+            UnsafeCell::new(Slot {
+                sample: Sample::default(),
+                generation: 0,
+            })
+        })
         .collect();
     let ring = Arc::new(RingShared {
         buf,
         head: AtomicU64::new(0),
         tail: AtomicU64::new(0),
+        // Generation 0 is never stamped on a sample, so an unmarked
+        // flush discards nothing.
+        fill_generation: AtomicU64::new(1),
+        flush_generation: AtomicU64::new(0),
     });
     (
         SampleProducer { ring: ring.clone() },
@@ -128,11 +170,34 @@ impl SampleProducer {
             return false;
         }
         let idx = (tail as usize) % ring.buf.len();
+        let generation = ring.fill_generation.load(Ordering::Relaxed);
         // SAFETY: this slot is outside [head, tail) so the consumer does
         // not read it until the Release store below publishes it.
-        unsafe { *ring.buf[idx].get() = *sample };
+        unsafe {
+            *ring.buf[idx].get() = Slot {
+                sample: *sample,
+                generation,
+            }
+        };
         ring.tail.store(tail + 1, Ordering::Release);
         true
+    }
+
+    /// Open a new fill generation for the samples pushed from here on
+    /// (call once per queued command, before its first
+    /// [`try_push`](Self::try_push)); returns the new generation. A
+    /// flush marked before this call can no longer reach those samples.
+    pub fn begin_generation(&mut self) -> u64 {
+        let next = self.ring.fill_generation.load(Ordering::Relaxed) + 1;
+        self.ring.fill_generation.store(next, Ordering::Release);
+        next
+    }
+
+    /// A handle that can mark this ring's queued samples for discard.
+    pub fn flush_marker(&self) -> FlushMarker {
+        FlushMarker {
+            ring: self.ring.clone(),
+        }
     }
 
     /// Free slots available for pushing right now.
@@ -164,7 +229,7 @@ impl SampleConsumer {
         let idx = (head as usize) % ring.buf.len();
         // SAFETY: head < tail so the producer has published this slot and
         // will not rewrite it until `head` advances past it (Release).
-        let sample = unsafe { *ring.buf[idx].get() };
+        let sample = unsafe { (*ring.buf[idx].get()).sample };
         ring.head.store(head + 1, Ordering::Release);
         Some(sample)
     }
@@ -180,7 +245,7 @@ impl SampleConsumer {
         }
         let idx = (head as usize) % ring.buf.len();
         // SAFETY: as in `pop`; head does not advance so the slot stays ours.
-        Some(unsafe { *ring.buf[idx].get() })
+        Some(unsafe { (*ring.buf[idx].get()).sample })
     }
 
     /// Samples currently queued.
@@ -198,9 +263,47 @@ impl SampleConsumer {
         (tail - head) as usize
     }
 
+    /// Discard the queued samples whose fill generation is at or below
+    /// the newest [`FlushMarker::mark`] — the RT-side half of a
+    /// generation-bounded stop. Samples pushed under a later generation
+    /// (the command queued right after the stop) survive. Returns the
+    /// discard count; allocation-free, so it is safe on the tick path.
+    pub fn clear_marked(&mut self) -> usize {
+        let ring = &*self.ring;
+        let bound = ring.flush_generation.load(Ordering::Acquire);
+        let tail = ring.tail.load(Ordering::Acquire);
+        let start = ring.head.load(Ordering::Relaxed);
+        let mut head = start;
+        while head < tail {
+            let idx = (head as usize) % ring.buf.len();
+            // SAFETY: head < tail, so the producer has published this
+            // slot and will not rewrite it before `head` passes it.
+            if unsafe { (*ring.buf[idx].get()).generation } > bound {
+                break;
+            }
+            head += 1;
+        }
+        ring.head.store(head, Ordering::Release);
+        (head - start) as usize
+    }
+
     /// Total capacity.
     pub fn capacity(&self) -> usize {
         self.ring.buf.len()
+    }
+}
+
+impl FlushMarker {
+    /// Mark everything queued right now for discard: the next
+    /// [`SampleConsumer::clear_marked`] drops samples up to the fill
+    /// generation in flight at this instant, and nothing pushed under a
+    /// later generation. Returns the marked generation.
+    pub fn mark(&self) -> u64 {
+        let generation = self.ring.fill_generation.load(Ordering::Acquire);
+        self.ring
+            .flush_generation
+            .fetch_max(generation, Ordering::AcqRel);
+        generation
     }
 }
 
@@ -270,6 +373,43 @@ mod tests {
         assert_eq!(rx.clear(), 3);
         assert_eq!(rx.pop(), None);
         assert_eq!(tx.free_slots(), 4);
+    }
+
+    /// A flush marked for one command must not reach the samples of the
+    /// command queued after it (issue #15): the mark is taken against
+    /// the fill generation in flight, and the next fill outruns it.
+    #[test]
+    fn a_marked_flush_stops_at_the_next_generation() {
+        let (mut tx, mut rx) = sample_ring(16);
+        let marker = tx.flush_marker();
+
+        // An unmarked flush is a no-op — no stop was ever issued.
+        tx.begin_generation();
+        for i in 0..4 {
+            assert!(tx.try_push(&sample(i)));
+        }
+        assert_eq!(rx.clear_marked(), 0, "nothing marked, nothing discarded");
+        assert_eq!(rx.samples_remaining(), 4);
+
+        // Stop: mark, then the next command fills the ring before the RT
+        // gets around to the flush.
+        marker.mark();
+        tx.begin_generation();
+        for i in 10..14 {
+            assert!(tx.try_push(&sample(i)));
+        }
+        assert_eq!(rx.clear_marked(), 4, "only the stopped command's samples");
+        for i in 10..14 {
+            assert_eq!(rx.pop().expect("survivor").q[0], i as f64);
+        }
+        assert_eq!(rx.pop(), None);
+
+        // The same mark does not reach a later fill on a repeat flush
+        // (the stop path queues more than one).
+        tx.begin_generation();
+        assert!(tx.try_push(&sample(20)));
+        assert_eq!(rx.clear_marked(), 0);
+        assert_eq!(rx.pop().expect("survivor").q[0], 20.0);
     }
 
     #[test]

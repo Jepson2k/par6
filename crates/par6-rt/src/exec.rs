@@ -78,13 +78,15 @@ impl ExecPlayback {
         self.paused = paused;
     }
 
-    /// Discard everything queued (stop/flush path — NOT pause).
-    /// Returns the number of discarded samples.
+    /// Discard the samples marked for discard (stop/flush path — NOT
+    /// pause): everything up to the marked fill generation, so a
+    /// command queued right after the stop keeps its samples even when
+    /// its fill beat this flush to the RT. Returns the discard count.
     pub fn flush(&mut self) -> usize {
         self.owe_boundary = None;
         self.last_meta = None;
         self.settling = false;
-        self.consumer.clear()
+        self.consumer.clear_marked()
     }
 
     /// Replace the completion policy (takes effect at the next boundary).

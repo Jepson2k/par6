@@ -231,9 +231,19 @@ fn pause_holds_in_place_with_the_ring_untouched() {
         "playback resumed"
     );
 
-    // Flush (stop path) discards the queue — unlike pause.
+    // Flush (stop path) discards the queue — unlike pause. The bound
+    // rides the ring: an unmarked flush leaves the backlog alone (the
+    // tick still plays its own sample), a marked one drops all of it.
+    let queued = rig.snap().exec.samples_remaining;
+    assert!(queued > 1, "backlog needed to tell the two apart");
+    rig.cmd(RtCommand::ExecFlush); // one tick: the command, and one sample played
+    assert_eq!(
+        rig.snap().exec.samples_remaining,
+        queued - 1,
+        "an unmarked flush must not discard the backlog"
+    );
+    rig.producer.flush_marker().mark();
     rig.cmd(RtCommand::ExecFlush);
-    rig.tick();
     assert_eq!(rig.snap().exec.samples_remaining, 0);
 }
 

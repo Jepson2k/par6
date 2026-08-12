@@ -22,11 +22,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use par6_bus::{DriverBus, RuntimeBus};
+use par6_bus::RuntimeBus;
 use par6_config::ConfigBundle;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
-    ArmState, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput, MAX_JOINTS,
+    ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput,
+    MAX_JOINTS,
 };
 use par6_server::RtCommands;
 
@@ -150,6 +151,8 @@ pub(crate) struct RtBridge {
     link: CoreLink,
     stream_input: Arc<Mutex<StreamInput>>,
     shared: Arc<Mutex<SharedState>>,
+    /// Bound for the EXEC flushes `halt` queues (see [`RtBridge::halt`]).
+    flush: FlushMarker,
     bundle: Arc<ConfigBundle>,
     sim: bool,
     #[cfg(feature = "ffi")]
@@ -161,6 +164,7 @@ impl RtBridge {
         link: CoreLink,
         stream_input: Arc<Mutex<StreamInput>>,
         shared: Arc<Mutex<SharedState>>,
+        flush: FlushMarker,
         bundle: Arc<ConfigBundle>,
         sim: bool,
         #[cfg(feature = "ffi")] cart: CartStream,
@@ -169,6 +173,7 @@ impl RtBridge {
             link,
             stream_input,
             shared,
+            flush,
             bundle,
             sim,
             #[cfg(feature = "ffi")]
@@ -362,6 +367,11 @@ impl RtCommands for RtBridge {
     fn halt(&mut self) {
         self.shared.lock().unwrap().stream = None;
         self.link.send(RtCommand::JogRelease);
+        // Marked before it is queued, so the flush is pinned to the
+        // samples in the ring right now: a move accepted while this
+        // stop is still working its way through the RT command queue
+        // keeps its own fill.
+        self.flush.mark();
         self.link.send(RtCommand::ExecFlush);
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
@@ -399,13 +409,13 @@ impl RtCommands for RtBridge {
         }
         self.link.op(Box::new(move |core| {
             let robot = &bundle.robot;
-            let gripper = bundle.active_gripper().filter(|g| g.driver.is_some());
             let Some(bus) = core.bus_mut().sim_mut() else {
                 log::error!("teleport reached a hardware bus; dropped");
                 return;
             };
-            bus.set_initial_joint_rad(&q);
-            if let Err(e) = bus.boot_configure(robot, gripper, 1) {
+            // Re-seed, not a bus reboot: the drivers keep running, so the
+            // arm is still held the tick after it lands.
+            if let Err(e) = bus.teleport_joint_rad(&q[..robot.joints.len()]) {
                 log::error!("teleport: sim re-seed failed: {e}");
                 return;
             }
