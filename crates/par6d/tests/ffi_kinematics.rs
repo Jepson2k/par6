@@ -19,7 +19,7 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogL, MoveJ, MoveJPose, MoveL, SetShapes, SetTcpOffset, Shape, Teleport,
+    JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetShapes, SetTcpOffset, Shape, Teleport,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, QueryResult, Reply,
@@ -1332,6 +1332,588 @@ fn cartesian_enablement_measures_the_real_workspace() {
         code == ErrorCode::IkTargetUnreachable as u16 || code == ErrorCode::IkPartialPath as u16,
         "the blocked direction must be blocked for the reason the flag claims, \
          got error code {code}"
+    );
+
+    rig.shutdown();
+}
+
+// ---- curved and blended moves ----------------------------------------------
+
+/// Start posture for the curved and blended moves: the same kind of
+/// well-conditioned pose as [`CART_START_DEG`], chosen (by sweeping the
+/// IK + soft-window envelope) for room around it — a 120 mm arc and two
+/// 120 mm legs fit inside every joint's soft window from here, which
+/// they do not from [`CART_START_DEG`], where the elbow is 15° from its
+/// soft stop.
+const CURVE_START_DEG: [f64; NUM_JOINTS] = [0.0, -70.0, 260.0, 0.0, -20.0, 180.0];
+/// Duration of the spline move \[s\]. Slower than [`MOVE_S`] because the
+/// sim's tracking lag is proportional to speed AND to path curvature,
+/// and a wave has far more of the second than a straight line does.
+const SPLINE_S: f64 = 25.0;
+
+/// Speed of the TCP \[mm/s\] over a sliding window of STATUS frames,
+/// paired with the position at the middle of each window.
+///
+/// Measured from the broadcast itself (pose delta over the header's
+/// monotonic clock) rather than read out of `STATUS.tcp_speed`, so the
+/// numbers below stand on the same evidence a client has. The window
+/// spans [`SPEED_WINDOW`] frames because the status rate and the RT tick
+/// rate are the same here: consecutive frames sometimes carry the same
+/// snapshot, and a frame pair that straddles one would read as a
+/// standstill.
+fn tcp_speeds(path: &[Status]) -> Vec<([f64; 3], f64)> {
+    path.windows(SPEED_WINDOW)
+        .filter_map(|w| {
+            let (first, last) = (&w[0], &w[SPEED_WINDOW - 1]);
+            let dt = last.mono_time_ns.checked_sub(first.mono_time_ns)? as f64 * 1e-9;
+            (dt > 0.0).then(|| {
+                (
+                    tcp_mm(&w[SPEED_WINDOW / 2]),
+                    distance(tcp_mm(first), tcp_mm(last)) / dt,
+                )
+            })
+        })
+        .collect()
+}
+
+/// STATUS frames per speed measurement (~0.1 s at the 50 Hz broadcast).
+const SPEED_WINDOW: usize = 5;
+
+/// Teleport to the curved-move start posture and return the pose the arm
+/// actually came to rest in.
+///
+/// The wait is on the ANGLES, not just on the broadcast: `teleport`
+/// confirms within a degree, and a degree of J1 is centimetres of TCP —
+/// enough to move every target derived from this pose by more than the
+/// path tolerances below.
+fn curve_start(rig: &Rig, c: &mut Client) -> Status {
+    enable_and_teleport(rig, c, CURVE_START_DEG);
+    rig.drain_status();
+    rig.wait_status("the arm at rest in the curved-move start posture", |s| {
+        s.angles
+            .iter()
+            .zip(CURVE_START_DEG.iter())
+            .all(|(a, b)| (a - b).abs() < 0.02)
+            && s.speeds.iter().all(|v| v.abs() < 0.01)
+    })
+}
+
+/// The slowest the TCP ever got while it was within `radius_mm` of
+/// `corner`, and the mean speed over the whole move.
+fn corner_and_mean_speed(path: &[Status], corner: [f64; 3], radius_mm: f64) -> (f64, f64) {
+    let speeds = tcp_speeds(path);
+    let moving: Vec<f64> = speeds
+        .iter()
+        .map(|(_, v)| *v)
+        .filter(|v| *v > 0.5)
+        .collect();
+    let mean = if moving.is_empty() {
+        0.0
+    } else {
+        moving.iter().sum::<f64>() / moving.len() as f64
+    };
+    let at_corner = speeds
+        .iter()
+        .filter(|(p, _)| distance(*p, corner) < radius_mm)
+        .map(|(_, v)| *v)
+        .fold(f64::INFINITY, f64::min);
+    (at_corner, mean)
+}
+
+/// Closest the measured TCP path came to `p` \[mm\], measured against the
+/// path (its frame-to-frame segments), not just the sampled points.
+fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
+    path.windows(2)
+        .map(|w| distance_to_segment(p, w[0], w[1]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Arc, spline and process moves trace the geometry they name.
+///
+/// All three were `MOTN_SETUP_FAILED "arc/spline/process moves are not
+/// implemented yet"` before this landed, so completion alone would be a
+/// result — but completion is not the claim. The claims are geometric
+/// and are measured off the STATUS broadcast:
+///
+/// - `move_c` puts every point of the path on the circle through
+///   start / via / end, in that circle's plane, and passes through the
+///   via point — while bowing far off the straight chord a `move_l`
+///   would have taken;
+/// - `move_s` passes through every waypoint it was given, and curves
+///   between them (a polyline through the same waypoints would not);
+/// - `move_p` rounds its interior corner instead of stopping in it: the
+///   path stays inside the auto-blend zone and the TCP is still moving
+///   when it goes through.
+#[test]
+fn curved_moves_trace_their_geometry() {
+    let rig = Rig::boot("curved", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    // --- move_c: a half circle of radius R in the world XZ plane,
+    // from the start pose, up over the top, and down to +2R in x.
+    const R: f64 = 60.0;
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let center = [start[0] + R, start[1], start[2]];
+    let via = [center[0], center[1], center[2] - R];
+    let end = [center[0] + R, center[1], center[2]];
+    let i = c.ok_index(&Command::MoveC(MoveC {
+        key: 4001,
+        via: wire_pose_at(&s.pose, via),
+        end: wire_pose_at(&s.pose, end),
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+    }));
+    let arc: Vec<[f64; 3]> = rig
+        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_c must complete ok, got {detail:?}");
+
+    let moving: Vec<[f64; 3]> = arc
+        .iter()
+        .copied()
+        .filter(|p| distance(*p, start) > 3.0)
+        .collect();
+    assert!(
+        moving.len() > 50,
+        "expected a sampled arc, got {} moving samples",
+        moving.len()
+    );
+    let radial = moving
+        .iter()
+        .map(|p| (distance(*p, center) - R).abs())
+        .fold(0.0f64, f64::max);
+    let out_of_plane = moving
+        .iter()
+        .map(|p| (p[1] - center[1]).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        radial < 8.0,
+        "move_c left its circle by {radial:.2} mm (radius {R} mm about {center:?})"
+    );
+    assert!(
+        out_of_plane < 8.0,
+        "move_c left the arc plane by {out_of_plane:.2} mm"
+    );
+    let via_miss = path_misses(&arc, via);
+    assert!(
+        via_miss < 8.0,
+        "move_c missed its via point by {via_miss:.2} mm"
+    );
+    let chord_dev = moving
+        .iter()
+        .map(|p| distance_to_segment(*p, start, end))
+        .fold(0.0f64, f64::max);
+    assert!(
+        chord_dev > R / 2.0,
+        "move_c hugged the straight chord ({chord_dev:.2} mm off it): that is a move_l, not an arc"
+    );
+    // Where the arm comes to rest, within the rig's own steady-state
+    // tracking error — the same ~10 mm the joint-space cartesian move
+    // above is held to.
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_c")), end);
+    assert!(
+        end_miss < 15.0,
+        "move_c ended {end_miss:.1} mm off its end pose"
+    );
+
+    // --- move_s: a wave through four waypoints.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let waypoints: Vec<[f64; 3]> = [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
+        .iter()
+        .map(|d| [start[0] + d[0], start[1] + d[1], start[2] + d[2]])
+        .collect();
+    let i = c.ok_index(&Command::MoveS(MoveS {
+        key: 4002,
+        waypoints: waypoints
+            .iter()
+            .map(|p| wire_pose_at(&s.pose, *p))
+            .collect(),
+        frame: Frame::Wrf,
+        duration: Some(SPLINE_S),
+        speed: None,
+        accel: None,
+    }));
+    let spline: Vec<[f64; 3]> = rig
+        .collect_status(Duration::from_secs_f64(SPLINE_S + 1.0))
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_s must complete ok, got {detail:?}");
+    // The spline geometry itself passes within 0.1 mm of every
+    // waypoint (`par6-motion`'s own tests measure that); what is
+    // measured here is the arm ON it, so the bound is the sim's
+    // tracking lag at a curvature peak. It is meaningful because the
+    // straight line joining the same endpoints misses these waypoints
+    // by more than twice as much — asserted right below.
+    let last = *waypoints.last().expect("waypoints");
+    for (k, w) in waypoints.iter().enumerate() {
+        let miss = path_misses(&spline, *w);
+        assert!(
+            miss < 12.0,
+            "move_s missed waypoint {k} ({w:?}) by {miss:.2} mm"
+        );
+        // The bound above is only worth something because the straight
+        // route between the same endpoints comes nowhere near these
+        // waypoints.
+        if k + 1 < waypoints.len() {
+            let straight = distance_to_segment(*w, start, last);
+            assert!(
+                straight > 25.0,
+                "waypoint {k} sits {straight:.1} mm off the straight route: \
+                 passing near it proves nothing"
+            );
+        }
+    }
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_s")), last);
+    assert!(
+        end_miss < 15.0,
+        "move_s ended {end_miss:.1} mm off its last waypoint"
+    );
+    // A spline is not a polyline: between the second and third waypoints
+    // it leaves the chord that joins them.
+    let bow = spline
+        .iter()
+        .filter(|p| {
+            let t = progress_along(**p, waypoints[0], waypoints[1]);
+            (0.1..0.9).contains(&t)
+        })
+        .map(|p| distance_to_segment(*p, waypoints[0], waypoints[1]))
+        .fold(0.0f64, f64::max);
+    assert!(
+        bow > 3.0,
+        "move_s ran straight between its waypoints ({bow:.2} mm of bow)"
+    );
+
+    // --- move_p: a right-angle corner, auto-blended.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + 100.0, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let i = c.ok_index(&Command::MoveP(MoveP {
+        key: 4003,
+        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+    }));
+    let process = rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_p must complete ok, got {detail:?}");
+    let points: Vec<[f64; 3]> = process.iter().map(tcp_mm).collect();
+    // 25 mm of auto-blend on 100 mm segments, so the corner is cut by
+    // something under that and by more than the tracking error.
+    let corner_miss = path_misses(&points, corner);
+    assert!(
+        (2.0..25.0).contains(&corner_miss),
+        "move_p's corner was not rounded into its blend zone: closest approach {corner_miss:.2} mm"
+    );
+    let (at_corner, mean) = corner_and_mean_speed(&process, corner, 30.0);
+    assert!(
+        at_corner > 0.25 * mean,
+        "move_p slowed to {at_corner:.2} mm/s at the corner against a mean of {mean:.2} mm/s: \
+         a blend that stops is not a blend"
+    );
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_p")), finish);
+    assert!(
+        end_miss < 15.0,
+        "move_p ended {end_miss:.1} mm off its last waypoint"
+    );
+
+    rig.shutdown();
+}
+
+/// A blend radius on a queued `move_l` really rounds the corner into the
+/// NEXT queued `move_l` — measured against the same corner run without
+/// one.
+///
+/// Before this landed the runtime refused any non-nil `r` outright
+/// (`COMM_VALIDATION_ERROR`), because it started exactly one queued
+/// command at a time. The claim now is a comparison, not a completion:
+/// with `r = 0` the arm stops dead in the corner and passes through it;
+/// with `r = 25` it cuts the corner, never stops, and gets there sooner.
+/// Both commands still report their own COMPLETE, and the high-water
+/// `completed_index` ends on the second of them.
+#[test]
+fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
+    const BLEND_MM: f64 = 60.0;
+    const LEG_MM: f64 = 150.0;
+    /// Duration of each leg \[s\]. Slow, for the same reason the other
+    /// cartesian measurements here are: the rig's tracking error scales
+    /// with speed and the corner geometry is what is being measured.
+    const LEG_S: f64 = 8.0;
+
+    let rig = Rig::boot("blend", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    // Two legs meeting at a right angle: +x, then +z.
+    let leg = |s: &Status, key: u64, r: Option<f64>| -> (Command, [f64; 3], [f64; 3]) {
+        let start = tcp_mm(s);
+        let corner = [start[0] + LEG_MM, start[1], start[2]];
+        let finish = [corner[0], corner[1], corner[2] - LEG_MM];
+        (
+            Command::MoveL(MoveL {
+                key,
+                pose: wire_pose_at(&s.pose, corner),
+                frame: Frame::Wrf,
+                duration: Some(LEG_S),
+                speed: None,
+                accel: None,
+                blend_radius: r,
+                rel: false,
+            }),
+            corner,
+            finish,
+        )
+    };
+    let second = |s: &Status, key: u64, finish: [f64; 3]| {
+        Command::MoveL(MoveL {
+            key,
+            pose: wire_pose_at(&s.pose, finish),
+            frame: Frame::Wrf,
+            duration: Some(LEG_S),
+            speed: None,
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        })
+    };
+
+    // --- control: the same corner with no blend radius.
+    let s = curve_start(&rig, &mut c);
+    let (first, corner, finish) = leg(&s, 5001, None);
+    let started = Instant::now();
+    let i1 = c.ok_index(&first);
+    let i2 = c.ok_index(&second(&s, 5002, finish));
+    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let (ok, detail) = c.wait_complete(i1);
+    assert!(
+        ok,
+        "the unblended first leg must complete ok, got {detail:?}"
+    );
+    let (ok, detail) = c.wait_complete(i2);
+    assert!(
+        ok,
+        "the unblended second leg must complete ok, got {detail:?}"
+    );
+    let sharp_time = started.elapsed().as_secs_f64();
+    let sharp_points: Vec<[f64; 3]> = sharp.iter().map(tcp_mm).collect();
+    let sharp_miss = path_misses(&sharp_points, corner);
+    let (sharp_corner_speed, sharp_mean) = corner_and_mean_speed(&sharp, corner, 20.0);
+    assert!(
+        sharp_miss < 16.0,
+        "without a blend radius the arm must go INTO the corner, missed by {sharp_miss:.2} mm \
+         (the rig's own stopping error is about 10 mm)"
+    );
+    assert!(
+        sharp_corner_speed < 1.0,
+        "without a blend radius the arm must STOP in the corner, \
+         slowest it got was {sharp_corner_speed:.2} mm/s"
+    );
+
+    // --- the same corner, blended.
+    let s = curve_start(&rig, &mut c);
+    let (first, corner, finish) = leg(&s, 5003, Some(BLEND_MM));
+    let started = Instant::now();
+    let i1 = c.ok_index(&first);
+    let i2 = c.ok_index(&second(&s, 5004, finish));
+    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let (ok, detail) = c.wait_complete(i1);
+    assert!(ok, "the blended first leg must complete ok, got {detail:?}");
+    let (ok, detail) = c.wait_complete(i2);
+    assert!(
+        ok,
+        "the blended second leg must complete ok, got {detail:?}"
+    );
+    let blend_time = started.elapsed().as_secs_f64();
+    let blended_points: Vec<[f64; 3]> = blended.iter().map(tcp_mm).collect();
+
+    // The corner is rounded: cut by more than the tracking error, and
+    // by no more than the radius that was asked for.
+    // Measured against the SAME corner driven without a radius, so the
+    // rig's stopping error cancels out of the comparison: the geometry
+    // cuts this corner by 0.35 r (21 mm here), the rest is tracking.
+    let blend_miss = path_misses(&blended_points, corner);
+    assert!(
+        blend_miss > sharp_miss + 6.0,
+        "r = {BLEND_MM} mm cut the corner by {blend_miss:.2} mm and the same corner without \
+         a radius by {sharp_miss:.2} mm: that is not a rounded corner"
+    );
+    assert!(
+        blend_miss < BLEND_MM,
+        "the rounded corner strayed {blend_miss:.2} mm from the waypoint, further than the \
+         {BLEND_MM} mm zone that was asked for"
+    );
+    // And it is a fly-by, not a stop-and-go.
+    let (blend_corner_speed, blend_mean) = corner_and_mean_speed(&blended, corner, 40.0);
+    assert!(
+        blend_corner_speed > 0.3 * blend_mean && blend_corner_speed > 5.0,
+        "the blended corner slowed to {blend_corner_speed:.2} mm/s against a mean of \
+         {blend_mean:.2} mm/s (unblended: {sharp_corner_speed:.2} of {sharp_mean:.2}) — \
+         a blend that stops is not a blend"
+    );
+    assert!(
+        blend_time < sharp_time,
+        "the blended corner took {blend_time:.2} s and the sharp one {sharp_time:.2} s: \
+         not stopping is supposed to be faster"
+    );
+    let end_miss = distance(
+        tcp_mm(&settled_tcp(&rig, "settled after the blended chain")),
+        finish,
+    );
+    assert!(
+        end_miss < 15.0,
+        "the blended chain ended {end_miss:.1} mm off its last target"
+    );
+    // Completion-index semantics for a blended pair: both indexes are
+    // completed, and the high-water mark is the LAST of them.
+    let s = rig.wait_status("completed index reaches the blended pair", |s| {
+        s.completed_index >= i2 as i64
+    });
+    assert_eq!(
+        s.executing_index, -1,
+        "nothing may still be executing once both blended commands completed"
+    );
+
+    rig.shutdown();
+}
+
+/// A blend radius on a queued `move_j` rounds the corner between two
+/// JOINT moves, and is measured where a joint move lives: in joint
+/// space.
+///
+/// Without a radius the arm has to arrive at the intermediate
+/// configuration exactly — that is what "the move completed" means — and
+/// then set off again. With one, the runtime plans both moves as a
+/// single joint path whose corner is a Bézier zone sized from the TCP
+/// distance the radius describes, so the intermediate configuration is
+/// passed BY, not landed on, and the arm never comes to rest in it.
+#[test]
+fn a_blend_radius_rounds_a_joint_chain_too() {
+    const BLEND_MM: f64 = 30.0;
+    const LEG_S: f64 = 4.0;
+
+    let rig = Rig::boot("jointblend", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let mut corner_deg = CURVE_START_DEG;
+    corner_deg[0] += 15.0;
+    let mut finish_deg = corner_deg;
+    finish_deg[1] -= 12.0;
+    let move_j = |key: u64, angles: [f64; NUM_JOINTS], r: Option<f64>| {
+        Command::MoveJ(MoveJ {
+            key,
+            angles,
+            duration: Some(LEG_S),
+            speed: None,
+            accel: None,
+            blend_radius: r,
+            rel: false,
+        })
+    };
+    /// Largest per-joint distance from `q` to the corner configuration.
+    fn from_corner(s: &Status, corner: [f64; NUM_JOINTS]) -> f64 {
+        s.angles
+            .iter()
+            .zip(corner.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f64, f64::max)
+    }
+
+    // --- control: the same two moves, no radius. The arm lands on the
+    // intermediate configuration and stops there.
+    curve_start(&rig, &mut c);
+    let i1 = c.ok_index(&move_j(6001, corner_deg, None));
+    let i2 = c.ok_index(&move_j(6002, finish_deg, None));
+    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    for i in [i1, i2] {
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "the unblended joint legs must complete ok, got {detail:?}"
+        );
+    }
+    let sharp_miss = sharp
+        .iter()
+        .map(|s| from_corner(s, corner_deg))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        sharp_miss < 1.5,
+        "without a radius the arm must reach the intermediate configuration, \
+         closest it got was {sharp_miss:.2}° (the rig's own stopping error is a few tenths)"
+    );
+
+    // --- the same pair, blended.
+    curve_start(&rig, &mut c);
+    let i1 = c.ok_index(&move_j(6003, corner_deg, Some(BLEND_MM)));
+    let i2 = c.ok_index(&move_j(6004, finish_deg, None));
+    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    for i in [i1, i2] {
+        let (ok, detail) = c.wait_complete(i);
+        assert!(
+            ok,
+            "the blended joint legs must complete ok, got {detail:?}"
+        );
+    }
+    let blend_miss = blended
+        .iter()
+        .map(|s| from_corner(s, corner_deg))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        blend_miss > sharp_miss + 0.5,
+        "r = {BLEND_MM} mm passed within {blend_miss:.2}° of the intermediate configuration \
+         and the unblended pair within {sharp_miss:.2}°: the corner was not rounded"
+    );
+
+    // And it never stopped there: between leaving the start and reaching
+    // the end, the joints keep moving.
+    let mid: Vec<&Status> = blended
+        .iter()
+        .filter(|s| from_corner(s, corner_deg) < 4.0)
+        .collect();
+    assert!(
+        mid.len() > 5,
+        "expected the corner region to be sampled, got {} frames",
+        mid.len()
+    );
+    let slowest = mid
+        .iter()
+        .map(|s| s.speeds.iter().fold(0.0f64, |m, v| m.max(v.abs())))
+        .fold(f64::INFINITY, f64::min);
+    assert!(
+        slowest > 0.02,
+        "the blended joint corner slowed to {slowest:.4} rad/s: a blend that stops is not a blend"
+    );
+    rig.wait_status(
+        "the blended joint chain reports both commands complete",
+        |s| s.completed_index >= i2 as i64,
+    );
+    // Where it came to rest, within the rig's own stopping error (the
+    // unblended pair above lands no closer).
+    let settled = settled_tcp(&rig, "the blended joint chain at rest");
+    assert!(
+        settled
+            .angles
+            .iter()
+            .zip(finish_deg.iter())
+            .all(|(a, b)| (a - b).abs() < 2.0),
+        "the blended chain ended at {:?}, not at {finish_deg:?}",
+        settled.angles
     );
 
     rig.shutdown();

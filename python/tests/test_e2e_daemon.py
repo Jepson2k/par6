@@ -455,16 +455,23 @@ async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
     """A ``servo_j`` stream at this rig's tick rate must drive the arm and
     leave the controller usable — the path no e2e covered.
 
-    The RT streaming watchdog is derived from config SECONDS
-    (``stream.command_timeout_s / tick_dt_s``), and at a tick period this
-    long it rounded down to a single tick.  The watchdog is read in the
-    tick's error phase but fed in its later dispatch phase, so even a
-    stream landing a setpoint on every tick showed one tick of age at
-    every check: ``RTI_LINK_LOST`` latched one tick into every stream, the
-    arm never moved, and the controller stayed DISABLED for the rest of
-    the session — refusing every command while the client was told
-    nothing.  All three halves are asserted here: the motion, the clean
-    error surface, and a session that still works afterwards.
+    Two defects lived here.  The RT streaming watchdog is derived from
+    config SECONDS (``stream.command_timeout_s / tick_dt_s``), and at a
+    tick period this long it rounded down to a single tick; read in the
+    tick's error phase but fed in its later dispatch phase, even a stream
+    landing a setpoint on every tick showed one tick of age at every
+    check, so ``RTI_LINK_LOST`` latched one tick in and the controller
+    stayed DISABLED for the rest of the session.  Separately the stream
+    adapter forwarded the OTG's *terminal* velocity, which is 0 whenever
+    the minimum-time move to the current target finishes inside one tick
+    — and the driver treats commanded velocity as a cap, so the position
+    channel advanced against a zero-velocity cap and the arm did not move.
+
+    The stream below is the shape that exposes the second defect: a
+    target nudged a little further every cycle, the way a UI slider or a
+    teleoperation source emits one, so each setpoint is reachable within
+    a tick.  All of it is asserted here: the tracking, the clean error
+    surface, and a session that still works afterwards.
     """
     park = park_deg()
     async with daemon.client() as client:
@@ -472,19 +479,24 @@ async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
         await teleport_to(client, park)
         start = (await client.angles())[0]
 
-        # A UI's streaming cadence (20 Hz) toward a target well outside
-        # one tick's travel, so the arm has to move to follow it.
+        # A UI's streaming cadence (20 Hz), stepping the target by a
+        # fraction of a degree per cycle — each one inside a single tick's
+        # travel, so nothing but the commanded velocity keeps the arm
+        # moving.
+        step_deg = 0.25
+        cycles = 160
         target = list(park)
-        target[0] = park[0] + 20.0
-        for _ in range(40):
+        for _ in range(cycles):
+            target[0] += step_deg
             await client.servo_j(target)
             await asyncio.sleep(0.05)
 
         landed = await client.angles()
         assert landed is not None
-        assert landed[0] > start + 2.0, (
-            f"the servo stream never drove J0 ({start:.3f} -> {landed[0]:.3f} deg); "
-            f"daemon log:\n{daemon.log()}"
+        commanded = cycles * step_deg
+        assert landed[0] > start + 0.5 * commanded, (
+            f"the servo stream never drove J0 ({start:.3f} -> {landed[0]:.3f} deg, "
+            f"{commanded:.3f} deg of target stepped); daemon log:\n{daemon.log()}"
         )
         assert await client.error() is None, (
             f"streaming must not latch an RT error; daemon log:\n{daemon.log()}"

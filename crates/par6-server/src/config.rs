@@ -73,6 +73,20 @@ pub struct ServerConfig {
     /// Cadence of the internal housekeeping tick (planner outcome
     /// polling, queue pumping, chunk expiry).
     pub poll_interval: Duration,
+    /// How many queued commands the planner may see ahead of the one it
+    /// is about to start, so it can blend them into a single motion.
+    /// 1 = no lookahead: every move runs alone and stops at its target.
+    pub blend_lookahead: usize,
+    /// How long a move whose blend radius is positive waits at the head
+    /// of the queue for the successor it is meant to blend into.
+    ///
+    /// A corner cannot be rounded before both of its segments are known,
+    /// so the first move of a chain has to be held briefly. It costs
+    /// nothing once a program is streaming commands — the successor is
+    /// then already queued behind a move that is still running — and it
+    /// bounds how long a blended move can sit still if the successor
+    /// never comes.
+    pub blend_hold: Duration,
     /// Whether the simulator backend is active at startup.
     pub simulator: bool,
     /// Tool registry keys (`select_tool` / `tool_action` validation and
@@ -130,6 +144,12 @@ impl Default for ServerConfig {
             dedup_window: 256,
             chunk_timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(2),
+            // parol6's blend buffer holds up to PAROL6_MAX_BLEND_LOOKAHEAD
+            // (100) commands and flushes after 100 ms of queue silence
+            // (`server/motion_planner.py`); the same numbers here mean a
+            // program written against parol6 blends the same way.
+            blend_lookahead: 100,
+            blend_hold: Duration::from_millis(100),
             simulator: false,
             tools: Vec::new(),
             fitted_tool: String::new(),

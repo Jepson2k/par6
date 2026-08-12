@@ -8,11 +8,15 @@
 #   # on the box itself, from an unpacked bundle:
 #   sudo scripts/deploy/install.sh --local --bundle /tmp/par6-deploy-<ts>
 #
+#   # just build the bundle (what CI checks; no ssh, no box):
+#   scripts/deploy/install.sh --stage-only /tmp/bundle
+#
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
+#   /usr/local/lib/par6/*.so          the Pinocchio shim + its runtime closure
 #   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
-#   /usr/share/par6/par6_description  URDF/meshes (only used by `ffi` builds)
+#   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
 #   /etc/systemd/system/par6d.service the unit
 #
 # RESTARTING par6d STOPS THE ROBOT. The service is restarted unless
@@ -25,12 +29,17 @@ TARGET_TRIPLE="aarch64-unknown-linux-gnu"
 
 HOST=""
 BUNDLE=""
+STAGE_ONLY=""
 LOCAL=0
 RESTART=1
 FORCE_CONFIG=0
 BINARY="$ROOT/target/$TARGET_TRIPLE/release/par6d"
 CONFIG_DIR="$ROOT/config"
 ASSETS_DIR="$ROOT/assets/par6_description"
+# The staged shim + dependency closure scripts/ffi/setup.sh --target aarch64
+# produced. par6d is linked with an rpath pointing at $LIBS_DEST, so these
+# have to arrive with the binary or it will not start.
+RUNTIME_LIBS="${PAR6_RUNTIME_LIB_SRC:-}"
 UNIT="$ROOT/scripts/deploy/par6d.service"
 
 STAGE_DIR=""
@@ -38,6 +47,7 @@ SERVICE_USER="par6"
 BIN_DEST="/usr/local/bin/par6d"
 ETC_DEST="/etc/par6"
 ASSETS_DEST="/usr/share/par6/par6_description"
+LIBS_DEST="/usr/local/lib/par6"
 UNIT_DEST="/etc/systemd/system/par6d.service"
 
 die() { echo "install: $*" >&2; exit 1; }
@@ -55,7 +65,9 @@ while [ $# -gt 0 ]; do
     --binary) BINARY="${2:?--binary needs a path}"; shift 2;;
     --config) CONFIG_DIR="${2:?--config needs a directory}"; shift 2;;
     --assets) ASSETS_DIR="${2:?--assets needs a directory}"; shift 2;;
+    --runtime-libs) RUNTIME_LIBS="${2:?--runtime-libs needs a directory}"; shift 2;;
     --bundle) BUNDLE="${2:?--bundle needs a directory}"; shift 2;;
+    --stage-only) STAGE_ONLY="${2:?--stage-only needs a directory}"; shift 2;;
     --local) LOCAL=1; shift;;
     --no-restart) RESTART=0; shift;;
     --force-config) FORCE_CONFIG=1; shift;;
@@ -72,6 +84,10 @@ install_local() {
   [ -d "$bundle" ] || die "bundle directory not found: $bundle"
   [ -f "$bundle/par6d" ] || die "no par6d binary in $bundle"
   [ -f "$bundle/par6d.service" ] || die "no unit file in $bundle"
+  [ -d "$bundle/lib" ] || die "no lib/ in $bundle — this bundle was staged without the
+  Pinocchio shim, and par6d does not run without it. Rebuild with:
+    scripts/ffi/setup.sh --target aarch64 && source .ffi/env-aarch64.sh
+    scripts/deploy/build-aarch64.sh"
 
   if command -v file >/dev/null && [ "$(uname -m)" = "aarch64" ]; then
     file -b "$bundle/par6d" | grep -q "ARM aarch64" \
@@ -88,6 +104,14 @@ install_local() {
     systemctl stop par6d
   fi
 
+  # Before the binary: par6d's rpath points here and it will not even
+  # answer --help until the shim and its closure are in place. Replaced
+  # wholesale so a shrinking closure does not leave stale sonames behind.
+  install -d -m 0755 "$LIBS_DEST"
+  rm -f "$LIBS_DEST"/*.so*
+  install -m 0644 "$bundle"/lib/*.so* "$LIBS_DEST/"
+  say "installed $(ls "$LIBS_DEST" | wc -l) libraries into $LIBS_DEST"
+
   # Staged then renamed: a rename works even while the old binary is
   # running (a plain overwrite would hit ETXTBSY under --no-restart).
   install -D -m 0755 "$bundle/par6d" "$BIN_DEST.new"
@@ -96,8 +120,9 @@ install_local() {
   if ! "$BIN_DEST.new" --help >/dev/null 2>&1; then
     rm -f "$BIN_DEST.new"
     die "the bundled binary does not run on this host
-  (wrong architecture, or the box's glibc is older than the cross toolchain's —
-   see scripts/deploy/README.md)"
+  (wrong architecture, a glibc older than the cross toolchain's, or a runtime
+   library missing from $LIBS_DEST — run \`ldd $BIN_DEST.new\` and see
+   scripts/deploy/README.md)"
   fi
   mv -f "$BIN_DEST.new" "$BIN_DEST"
   say "installed $BIN_DEST"
@@ -109,12 +134,13 @@ install_local() {
     install_config "$gripper" "$ETC_DEST/grippers/$(basename "$gripper")"
   done
 
-  if [ -d "$bundle/par6_description" ]; then
-    install -d -m 0755 "$(dirname "$ASSETS_DEST")"
-    rm -rf "$ASSETS_DEST"
-    cp -a "$bundle/par6_description" "$ASSETS_DEST"
-    say "installed $ASSETS_DEST"
-  fi
+  # Not optional: the runtime loads its kinematics and collision models
+  # from this tree at boot and refuses to start without them.
+  [ -d "$bundle/par6_description" ] || die "no par6_description/ in $bundle"
+  install -d -m 0755 "$(dirname "$ASSETS_DEST")"
+  rm -rf "$ASSETS_DEST"
+  cp -a "$bundle/par6_description" "$ASSETS_DEST"
+  say "installed $ASSETS_DEST"
 
   install -D -m 0644 "$bundle/par6d.service" "$UNIT_DEST"
   systemctl daemon-reload
@@ -155,17 +181,21 @@ stage_bundle() {
   build it first: scripts/deploy/build-aarch64.sh"
   [ -f "$CONFIG_DIR/PAR6.toml" ] || die "no PAR6.toml under $CONFIG_DIR"
   [ -d "$CONFIG_DIR/grippers" ] || die "no grippers/ under $CONFIG_DIR"
+  [ -n "$RUNTIME_LIBS" ] || die "no runtime library directory
+  (set PAR6_RUNTIME_LIB_SRC by sourcing .ffi/env-aarch64.sh, or pass
+   --runtime-libs DIR)"
+  [ -e "$RUNTIME_LIBS/libpar6_shim.so" ] \
+    || die "no libpar6_shim.so under $RUNTIME_LIBS"
+  [ -d "$ASSETS_DIR" ] || die "no assets tree at $ASSETS_DIR"
   mkdir -p "$dir/config/grippers"
   cp "$BINARY" "$dir/par6d"
   cp "$UNIT" "$dir/par6d.service"
   cp "$SELF" "$dir/install.sh"
   cp "$CONFIG_DIR/PAR6.toml" "$dir/config/PAR6.toml"
   cp "$CONFIG_DIR"/grippers/*.toml "$dir/config/grippers/"
-  if [ -d "$ASSETS_DIR" ]; then
-    cp -a "$ASSETS_DIR" "$dir/par6_description"
-  else
-    say "no assets tree at $ASSETS_DIR — skipping (only 'ffi' builds need it)"
-  fi
+  mkdir -p "$dir/lib"
+  cp "$RUNTIME_LIBS"/*.so* "$dir/lib/"
+  cp -a "$ASSETS_DIR" "$dir/par6_description"
 }
 
 install_remote() {
@@ -194,7 +224,11 @@ install_remote() {
     sudo bash '$remote_dir/install.sh' $flags"
 }
 
-if [ "$LOCAL" -eq 1 ]; then
+if [ -n "$STAGE_ONLY" ]; then
+  mkdir -p "$STAGE_ONLY"
+  stage_bundle "$STAGE_ONLY"
+  say "staged bundle in $STAGE_ONLY ($(du -sh "$STAGE_ONLY" | cut -f1))"
+elif [ "$LOCAL" -eq 1 ]; then
   [ -n "$BUNDLE" ] || die "--local needs --bundle DIR"
   install_local "$BUNDLE"
 elif [ -n "$HOST" ]; then

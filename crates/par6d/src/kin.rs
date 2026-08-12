@@ -163,10 +163,6 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 
 // ------------------------------------------------------------- pose math
 
-/// Rotation-angle threshold below which two orientations count as equal
-/// (slerp degenerates) \[rad\].
-const ANGLE_EPS: f64 = 1e-9;
-
 /// `[x y z (m), roll pitch yaw (rad)]` from a row-major 4x4, rpy in the
 /// URDF fixed-axis convention `R = Rz·Ry·Rx` (gimbal lock folds yaw
 /// into roll, matching the Python client's decode).
@@ -213,131 +209,6 @@ pub(crate) fn wire_pose_to_matrix(pose_mm_deg: &[f64; 6]) -> Pose {
         0.0,
         1.0,
     ]
-}
-
-/// Unit quaternion `[w, x, y, z]` from the rotation block of `m`
-/// (Shepperd's method: pick the largest diagonal pivot for stability).
-fn matrix_to_quat(m: &Pose) -> [f64; 4] {
-    let (r00, r01, r02) = (m[0], m[1], m[2]);
-    let (r10, r11, r12) = (m[4], m[5], m[6]);
-    let (r20, r21, r22) = (m[8], m[9], m[10]);
-    let trace = r00 + r11 + r22;
-    let q = if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        [s / 4.0, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s]
-    } else if r00 >= r11 && r00 >= r22 {
-        let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
-        [(r21 - r12) / s, s / 4.0, (r01 + r10) / s, (r02 + r20) / s]
-    } else if r11 >= r22 {
-        let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
-        [(r02 - r20) / s, (r01 + r10) / s, s / 4.0, (r12 + r21) / s]
-    } else {
-        let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
-        [(r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, s / 4.0]
-    };
-    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
-}
-
-fn quat_to_rotation(q: &[f64; 4], m: &mut Pose) {
-    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
-    m[0] = 1.0 - 2.0 * (y * y + z * z);
-    m[1] = 2.0 * (x * y - w * z);
-    m[2] = 2.0 * (x * z + w * y);
-    m[4] = 2.0 * (x * y + w * z);
-    m[5] = 1.0 - 2.0 * (x * x + z * z);
-    m[6] = 2.0 * (y * z - w * x);
-    m[8] = 2.0 * (x * z - w * y);
-    m[9] = 2.0 * (y * z + w * x);
-    m[10] = 1.0 - 2.0 * (x * x + y * y);
-}
-
-/// Angle of the relative rotation between two unit quaternions \[rad\].
-fn quat_angle(a: &[f64; 4], b: &[f64; 4]) -> f64 {
-    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).abs();
-    2.0 * dot.clamp(-1.0, 1.0).acos()
-}
-
-/// Shortest-arc slerp between unit quaternions.
-fn quat_slerp(a: &[f64; 4], b: &[f64; 4], t: f64) -> [f64; 4] {
-    let mut b = *b;
-    let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-    if dot < 0.0 {
-        for v in &mut b {
-            *v = -*v;
-        }
-        dot = -dot;
-    }
-    let dot = dot.clamp(-1.0, 1.0);
-    let theta = dot.acos();
-    if theta < ANGLE_EPS {
-        // Nearly parallel: nlerp is exact to first order.
-        let mut out = [0.0; 4];
-        for i in 0..4 {
-            out[i] = a[i] + t * (b[i] - a[i]);
-        }
-        let n = out.iter().map(|v| v * v).sum::<f64>().sqrt();
-        for v in &mut out {
-            *v /= n;
-        }
-        return out;
-    }
-    let sin_theta = theta.sin();
-    let (wa, wb) = (
-        ((1.0 - t) * theta).sin() / sin_theta,
-        (t * theta).sin() / sin_theta,
-    );
-    [
-        wa * a[0] + wb * b[0],
-        wa * a[1] + wb * b[1],
-        wa * a[2] + wb * b[2],
-        wa * a[3] + wb * b[3],
-    ]
-}
-
-/// A straight cartesian segment: position lerp + orientation slerp.
-pub(crate) struct CartSegment {
-    p0: [f64; 3],
-    p1: [f64; 3],
-    q0: [f64; 4],
-    q1: [f64; 4],
-}
-
-impl CartSegment {
-    pub(crate) fn new(start: &Pose, end: &Pose) -> Self {
-        Self {
-            p0: [start[3], start[7], start[11]],
-            p1: [end[3], end[7], end[11]],
-            q0: matrix_to_quat(start),
-            q1: matrix_to_quat(end),
-        }
-    }
-
-    /// Translation length \[m\].
-    pub(crate) fn length_m(&self) -> f64 {
-        let d = [
-            self.p1[0] - self.p0[0],
-            self.p1[1] - self.p0[1],
-            self.p1[2] - self.p0[2],
-        ];
-        (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-    }
-
-    /// Rotation angle between the endpoint orientations \[rad\].
-    pub(crate) fn angle_rad(&self) -> f64 {
-        quat_angle(&self.q0, &self.q1)
-    }
-
-    /// Pose at normalized arc position `t` in \[0, 1\].
-    pub(crate) fn sample(&self, t: f64) -> Pose {
-        let mut m = [0.0; 16];
-        m[15] = 1.0;
-        quat_to_rotation(&quat_slerp(&self.q0, &self.q1, t), &mut m);
-        m[3] = self.p0[0] + t * (self.p1[0] - self.p0[0]);
-        m[7] = self.p0[1] + t * (self.p1[1] - self.p0[1]);
-        m[11] = self.p0[2] + t * (self.p1[2] - self.p0[2]);
-        m
-    }
 }
 
 /// A one-axis delta transform: `axis` 0..=2 translates along x/y/z by
@@ -643,11 +514,14 @@ mod tests {
         }
     }
 
+    /// The wire pose convention and `par6-motion`'s segment geometry
+    /// meet here: a segment built from two wire poses interpolates in
+    /// the rpy convention this module decodes with.
     #[test]
     fn cart_segment_interpolates_endpoints_and_midpoint_rotation() {
         let start = wire_pose_to_matrix(&[100.0, 0.0, 200.0, 0.0, 0.0, 0.0]);
         let end = wire_pose_to_matrix(&[200.0, 50.0, 200.0, 0.0, 0.0, 90.0]);
-        let seg = CartSegment::new(&start, &end);
+        let seg = par6_motion::cart::LineSegment::new(&start, &end);
         assert!((seg.length_m() - (0.1f64.powi(2) + 0.05f64.powi(2)).sqrt()).abs() < 1e-12);
         assert!((seg.angle_rad() - std::f64::consts::FRAC_PI_2).abs() < 1e-9);
         let mid = seg.sample(0.5);

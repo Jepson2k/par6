@@ -4,6 +4,12 @@
 //! boot in-process for a protocol workflow; one spawns the actual binary
 //! to prove the CLI/ready-line/signal path. All waiting is
 //! deadline-bounded polling — no blind sleeps stand in for conditions.
+//!
+//! Feature `ffi` gated because every test here boots a runtime, and a
+//! par6d built without kinematics refuses to boot (`no_kinematics.rs`
+//! covers that). `ffi` is the shipped configuration; these tests
+//! exercise the protocol plane of exactly the binary that deploys.
+#![cfg(feature = "ffi")]
 
 use std::io::BufRead;
 use std::net::{SocketAddr, UdpSocket};
@@ -12,12 +18,12 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, Stop, Teleport, ToolAction,
+    JogJ, MoveC, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, Stop, Teleport, ToolAction,
     ToolParam,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_command, ActionState, Command, CompletionPolicy, ErrorCode,
-    QueryResult, Reply, Status, ToolState, WireError, NUM_JOINTS,
+    Frame, QueryResult, Reply, Status, ToolState, WireError, NUM_JOINTS,
 };
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -748,14 +754,19 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     teleport_home(&rig, &mut c, park);
 
     // ---- parameters that cannot be honoured are refused, never ignored.
-    let err = c.expect_error(&Command::MoveJ(MoveJ {
+    // A corner radius on an ARC is one of them: par6d rounds corners
+    // between straight cartesian moves and between joint moves, but an
+    // arc ends at its end pose, and a radius that quietly did nothing
+    // would be the silent alteration this surface exists to prevent.
+    let err = c.expect_error(&Command::MoveC(MoveC {
         key: 5001,
-        angles: with_j0(park, 5.0),
+        via: [0.0; 6],
+        end: [0.0; 6],
+        frame: Frame::Wrf,
         duration: Some(0.5),
         speed: None,
         accel: None,
         blend_radius: Some(5.0),
-        rel: false,
     }));
     assert_eq!(
         err.code,
@@ -813,23 +824,6 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "a refused teleport must leave the arm where it was, not clamp it: {:?}",
         s.angles
     );
-    // A build without kinematics cannot execute a cartesian stream, so it
-    // says so instead of dropping the datagram.
-    #[cfg(not(feature = "ffi"))]
-    {
-        let err = c.expect_error(&Command::JogL(par6_proto::command::JogL {
-            velocities: [0.0, 0.0, 0.05, 0.0, 0.0, 0.0],
-            duration: 0.2,
-            frame: par6_proto::Frame::Wrf,
-            accel: None,
-        }));
-        assert_eq!(
-            err.code,
-            ErrorCode::CommValidationError as u16,
-            "a cartesian stream without kinematics must be refused, got {err:?}"
-        );
-    }
-
     // ---- the profile registry is real: unknown names are refused, the
     // advertised ones are selectable, and the choice reaches the planner
     // (jerk-limited ruckig cannot beat the unlimited-jerk trapezoid over
@@ -849,15 +843,12 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "the selected profile did not change the trajectory: \
          TRAPEZOID {trapezoid:?} vs RUCKIG {ruckig:?}"
     );
-    #[cfg(feature = "ffi")]
-    {
-        let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
-        assert!(
-            toppra < ruckig,
-            "TOPPRA (time-optimal, no jerk limit) must not be slower than \
-             jerk-limited RUCKIG: {toppra:?} vs {ruckig:?}"
-        );
-    }
+    let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
+    assert!(
+        toppra < ruckig,
+        "TOPPRA (time-optimal, no jerk limit) must not be slower than \
+         jerk-limited RUCKIG: {toppra:?} vs {ruckig:?}"
+    );
 
     // ---- tools. The fitted tool reports from boot — a client does not
     // have to ask for the tool the runtime is physically wearing — and

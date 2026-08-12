@@ -19,13 +19,36 @@
 //! says (travel finished / object detected / calibrated), never on a
 //! timer alone.
 //!
-//! With feature `ffi` the cartesian surface is live: `move_j_pose` runs
-//! seeded IK on the target pose and rides the `move_j` pipeline;
-//! `move_l` samples the straight cartesian segment (position lerp +
-//! orientation slerp), solves seeded IK per sample, times the joint
-//! waypoints with TOPPRA ([`pinokin_sys::Trajectory`]) and streams the
-//! timed trajectory into the ring at tick dt. Any IK or timing failure
-//! is a command error — there is no silent joint-space fallback.
+//! With feature `ffi` the cartesian surface is live. `move_j_pose` runs
+//! seeded IK on the target pose and rides the `move_j` pipeline; every
+//! other cartesian move rides ONE pipeline
+//! ([`Par6Planner::start_cart_path`]): `par6-motion`'s [`cart`] geometry
+//! produces the pose list, seeded IK turns each pose into a joint
+//! waypoint (guarded against soft-window exits and IK branch flips),
+//! TOPPRA ([`pinokin_sys::Trajectory`]) times the waypoint chain, and
+//! the timed trajectory streams into the ring at tick dt. The geometry
+//! is all that differs between them:
+//!
+//! - `move_l` — one straight segment (position lerp + orientation slerp).
+//! - `move_c` — the arc through the via point, on the circle the three
+//!   poses define; a repeated start point means the whole circle.
+//! - `move_s` — a cubic spline through the waypoints.
+//! - `move_p` — the waypoints as straight segments with every interior
+//!   corner rounded, so the TCP sweeps the path without stopping.
+//!
+//! Any IK or timing failure is a command error — there is no silent
+//! joint-space fallback and no second timing path.
+//!
+//! **Blending.** A queued move whose blend radius is positive is planned
+//! together with the moves QUEUED BEHIND IT (the server hands them over
+//! as lookahead): a chain of `move_l`s becomes one cartesian path with
+//! Bézier corners, a chain of `move_j` / `move_j_pose` becomes one joint
+//! path with the corner zones sized from the TCP distance the radius
+//! names. One motion covers the whole chain, so the arm never comes to
+//! rest at an interior waypoint, and the commands it consumed all
+//! complete when it does.
+//!
+//! [`cart`]: par6_motion::cart
 
 use std::time::{Duration, Instant};
 
@@ -33,6 +56,8 @@ use par6_bus::ObjectDetection;
 use par6_config::ConfigBundle;
 #[cfg(feature = "ffi")]
 use par6_kin::NQ;
+#[cfg(feature = "ffi")]
+use par6_motion::cart::Pose;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
 use par6_proto::{make_error, Command, ErrorCode, WireError, EN_SLOTS, UNATTRIBUTED};
@@ -40,7 +65,9 @@ use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
     SnapshotReader, SpecSettle, StateSnapshot, MAX_JOINTS,
 };
-use par6_server::{CollisionState, CommandOutcome, Enablement, PlanContext, Planner, ShapeLayer};
+use par6_server::{
+    CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand, ShapeLayer,
+};
 
 use crate::bridge::{gripper_move_command, CoreLink};
 
@@ -62,25 +89,56 @@ const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
 #[cfg(feature = "ffi")]
 const NULL_MOVE_RAD: f64 = 1e-9;
 
-/// `move_l` cartesian sampling pitch: one IK waypoint per this much
-/// translation \[m\] …
+/// Cartesian sampling pitch: one IK waypoint per this much translation
+/// \[m\] …
 #[cfg(feature = "ffi")]
-const MOVE_L_STEP_M: f64 = 0.005;
+const CART_STEP_M: f64 = 0.005;
 /// … or per this much rotation \[rad\], whichever yields more waypoints.
 #[cfg(feature = "ffi")]
-const MOVE_L_STEP_RAD: f64 = 0.05;
+const CART_STEP_RAD: f64 = 0.05;
 /// Waypoint-count ceiling for one `move_l` (bounds planning cost).
 #[cfg(feature = "ffi")]
 const MOVE_L_MAX_STEPS: usize = 400;
-/// Below this much translation AND rotation a `move_l` is already at
-/// its target.
+/// Waypoint-count ceiling for a multi-segment cartesian path — an arc, a
+/// spline, a process move, or a blended chain of straight moves. Higher
+/// than a single `move_l`'s because the path is that much longer; the
+/// sampler spreads the budget over the whole path rather than sampling
+/// each piece as if it were alone.
+#[cfg(feature = "ffi")]
+const CART_PATH_MAX_STEPS: usize = 3000;
+/// Below this much translation AND rotation a cartesian move is already
+/// at its target.
 #[cfg(feature = "ffi")]
 const MOVE_L_NULL_M: f64 = 1e-6;
-/// Largest joint change allowed between consecutive `move_l` IK
+/// Largest joint change allowed between consecutive cartesian IK
 /// waypoints \[rad\]; a bigger jump means the solver hopped to another
-/// IK branch and the "straight line" would whip the arm.
+/// IK branch and the commanded path would whip the arm.
 #[cfg(feature = "ffi")]
 const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
+/// How far a waypoint list's first pose may sit from where the arm
+/// actually is before the current pose is PREPENDED to the path instead
+/// of replacing that first waypoint \[m\].
+///
+/// parol6's rule (`commands/curved_commands.py`, `MoveSCommand` /
+/// `MovePCommand`): a client that starts its waypoint list at the pose
+/// it believes the arm is at means the path to begin there, and the
+/// small FK/IK discrepancy must not become a spurious first segment; a
+/// list that starts somewhere else means the arm to travel there first.
+#[cfg(feature = "ffi")]
+const WAYPOINT_SNAP_M: f64 = 5e-3;
+/// Corner radius `move_p` rounds its interior waypoints with, as a
+/// fraction of the shorter adjacent segment.
+///
+/// `move_p` is the one move whose corners are blended without the client
+/// naming a radius — "process move — constant TCP speed, auto-blended
+/// corners" is what `par6-proto` and the client API both promise — so
+/// the radius has to come from the path itself. A quarter of the shorter
+/// neighbour keeps half the segment straight on both sides of every
+/// corner, which is the same shape as the zone clamp
+/// ([`par6_motion::cart::corner_trims`]) applied to the largest radius a
+/// corner could take.
+#[cfg(feature = "ffi")]
+const MOVE_P_AUTO_BLEND_FRAC: f64 = 0.25;
 
 /// Joint-space pitch of the collision gate \[rad\]: consecutive checked
 /// configurations along a planned path never differ by more than this on
@@ -751,89 +809,88 @@ impl Par6Planner {
         self.start_joint_move(&snap, target, cmd.duration, cmd.speed, cmd.accel)
     }
 
-    /// MOVE_L: straight cartesian segment → seeded IK waypoints → TOPPRA
-    /// timing → ring samples at tick dt. Every failure (IK, branch flip,
-    /// soft limits, timing) errors the command; nothing falls back to a
-    /// joint-space move.
+    /// The TCP pose the arm is standing at — where every cartesian move
+    /// starts from.
     #[cfg(feature = "ffi")]
-    fn start_move_l(
+    fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
+        self.kin
+            .fk(q)
+            .map_err(|e| make_error(ErrorCode::MotnSetupFailed, UNATTRIBUTED, &[("detail", &e)]))
+    }
+
+    /// Seeded IK on one pose, with the cartesian failure vocabulary.
+    #[cfg(feature = "ffi")]
+    fn ik_pose(&mut self, seed: &[f64; NQ], pose: &Pose) -> Result<[f64; NQ], WireError> {
+        use crate::kin::IkResult;
+        match self.kin.ik(seed, pose) {
+            IkResult::Solved(q) => Ok(q),
+            IkResult::Unreachable => Err(make_error(
+                ErrorCode::IkTargetUnreachable,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "The solver did not converge from the current configuration.",
+                )],
+            )),
+            IkResult::Failed(e) => Err(make_error(
+                ErrorCode::MotnSetupFailed,
+                UNATTRIBUTED,
+                &[("detail", &e)],
+            )),
+        }
+    }
+
+    /// The shared cartesian pipeline every cartesian move rides:
+    /// pose list → seeded IK per pose → TOPPRA timing → ring samples at
+    /// tick dt. Every failure (IK, branch flip, soft limits, timing) is
+    /// a command error; nothing falls back to a joint-space move, and no
+    /// second timing path exists.
+    ///
+    /// `poses[0]` is where the arm already is, so it contributes the
+    /// measured configuration rather than an IK solution.
+    #[cfg(feature = "ffi")]
+    fn start_cart_path(
         &mut self,
-        cmd: &par6_proto::command::MoveL,
+        snap: &StateSnapshot,
+        poses: &[Pose],
+        speed: Option<f64>,
+        accel: Option<f64>,
+        duration: Option<f64>,
     ) -> Result<InFlightKind, WireError> {
-        use crate::kin::{wire_pose_to_matrix, CartSegment, IkResult};
-        use par6_proto::Frame;
+        use par6_motion::cart::LineSegment;
 
-        let snap = self.snapshots.latest();
         let start_q = snap.q;
-        let start_pose = self
-            .kin
-            .fk(&start_q)
-            .map_err(|e| make_error(ErrorCode::MotnSetupFailed, UNATTRIBUTED, &[("detail", &e)]))?;
-        let wire = wire_pose_to_matrix(&cmd.pose);
-        let target_pose = match (cmd.frame, cmd.rel) {
-            (Frame::Wrf, false) => wire,
-            // World-frame delta: translation adds, rotation applies
-            // about the world axes.
-            (Frame::Wrf, true) => {
-                let mut t = crate::kin::mat_mul(&wire, &start_pose);
-                t[3] = start_pose[3] + wire[3];
-                t[7] = start_pose[7] + wire[7];
-                t[11] = start_pose[11] + wire[11];
-                t
-            }
-            // A tool-frame pose is inherently relative to the current
-            // tool frame.
-            (Frame::Trf, _) => crate::kin::mat_mul(&start_pose, &wire),
+        let Some(target_pose) = poses.last() else {
+            return Ok(InFlightKind::Instant);
         };
-
-        let seg = CartSegment::new(&start_pose, &target_pose);
-        let (len, ang) = (seg.length_m(), seg.angle_rad());
-        if len < MOVE_L_NULL_M && ang < MOVE_L_NULL_M {
+        let moved = poses.windows(2).any(|w| {
+            let seg = LineSegment::new(&w[0], &w[1]);
+            seg.length_m() >= MOVE_L_NULL_M || seg.angle_rad() >= MOVE_L_NULL_M
+        });
+        if !moved {
             return Ok(InFlightKind::Instant);
         }
-        let steps = ((len / MOVE_L_STEP_M).ceil() as usize)
-            .max((ang / MOVE_L_STEP_RAD).ceil() as usize)
-            .clamp(2, MOVE_L_MAX_STEPS);
 
         // The endpoint decides reachable-at-all before the path decides
-        // reachable-along-the-line.
-        match self.kin.ik(&start_q, &target_pose) {
-            IkResult::Solved(_) => {}
-            IkResult::Unreachable => {
-                return Err(make_error(
-                    ErrorCode::IkTargetUnreachable,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "The solver did not converge from the current configuration.",
-                    )],
-                ));
-            }
-            IkResult::Failed(e) => {
-                return Err(make_error(
-                    ErrorCode::MotnSetupFailed,
-                    UNATTRIBUTED,
-                    &[("detail", &e)],
-                ));
-            }
-        }
+        // reachable-along-the-way.
+        self.ik_pose(&start_q, target_pose)?;
 
-        let total = steps + 1;
+        let total = poses.len();
         let mut waypoints = Vec::with_capacity(total * MAX_JOINTS);
         waypoints.extend_from_slice(&start_q);
         let mut seed = start_q;
-        for k in 1..=steps {
-            let pose = seg.sample(k as f64 / steps as f64);
-            let q = match self.kin.ik(&seed, &pose) {
-                IkResult::Solved(q) => q,
-                IkResult::Unreachable => {
-                    return Err(make_error(
-                        ErrorCode::IkPartialPath,
-                        UNATTRIBUTED,
-                        &[("valid", &k.to_string()), ("total", &total.to_string())],
-                    ));
-                }
-                IkResult::Failed(e) => {
+        for (k, pose) in poses.iter().enumerate().skip(1) {
+            let partial = || {
+                make_error(
+                    ErrorCode::IkPartialPath,
+                    UNATTRIBUTED,
+                    &[("valid", &k.to_string()), ("total", &total.to_string())],
+                )
+            };
+            let q = match self.kin.ik(&seed, pose) {
+                crate::kin::IkResult::Solved(q) => q,
+                crate::kin::IkResult::Unreachable => return Err(partial()),
+                crate::kin::IkResult::Failed(e) => {
                     return Err(make_error(
                         ErrorCode::MotnSetupFailed,
                         UNATTRIBUTED,
@@ -849,25 +906,367 @@ impl Par6Planner {
                         &[(
                             "detail",
                             &format!(
-                                "the line leaves joint {j}'s soft window at sample {k}/{total}"
+                                "the path leaves joint {j}'s soft window at sample {k}/{total}"
                             ),
                         )],
                     ));
                 }
                 if (q[j] - seed[j]).abs() > MOVE_L_MAX_JOINT_STEP_RAD {
-                    return Err(make_error(
-                        ErrorCode::IkPartialPath,
-                        UNATTRIBUTED,
-                        &[("valid", &k.to_string()), ("total", &total.to_string())],
-                    ));
+                    return Err(partial());
                 }
             }
             waypoints.extend_from_slice(&q);
             seed = q;
         }
 
-        let samples = self.toppra_samples(&waypoints, cmd.speed, cmd.accel, cmd.duration)?;
+        let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
         self.start_exec(samples, snap.mode == Mode::Exec)
+    }
+
+    /// MOVE_L: one straight cartesian segment.
+    #[cfg(feature = "ffi")]
+    fn start_move_l(
+        &mut self,
+        cmd: &par6_proto::command::MoveL,
+    ) -> Result<InFlightKind, WireError> {
+        let snap = self.snapshots.latest();
+        let start_pose = self.current_pose(&snap.q)?;
+        let target = target_pose(&start_pose, &cmd.pose, cmd.frame, cmd.rel);
+        let poses = par6_motion::cart::line(&start_pose, &target, line_sampling());
+        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+    }
+
+    /// MOVE_C: circular arc through the via pose to the end pose, with
+    /// the circle derived from the three points.
+    #[cfg(feature = "ffi")]
+    fn start_move_c(
+        &mut self,
+        cmd: &par6_proto::command::MoveC,
+    ) -> Result<InFlightKind, WireError> {
+        let snap = self.snapshots.latest();
+        let start_pose = self.current_pose(&snap.q)?;
+        let via = target_pose(&start_pose, &cmd.via, cmd.frame, false);
+        let end = target_pose(&start_pose, &cmd.end, cmd.frame, false);
+        let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling())
+            .map_err(planning_error)?;
+        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+    }
+
+    /// MOVE_S: cubic spline through the waypoint list.
+    #[cfg(feature = "ffi")]
+    fn start_move_s(
+        &mut self,
+        cmd: &par6_proto::command::MoveS,
+    ) -> Result<InFlightKind, WireError> {
+        let snap = self.snapshots.latest();
+        let start_pose = self.current_pose(&snap.q)?;
+        let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame);
+        let poses =
+            par6_motion::cart::spline(&waypoints, path_sampling()).map_err(planning_error)?;
+        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+    }
+
+    /// MOVE_P: process move — the waypoint list as straight segments
+    /// with every interior corner rounded, so the TCP sweeps the path
+    /// without stopping at a single waypoint.
+    #[cfg(feature = "ffi")]
+    fn start_move_p(
+        &mut self,
+        cmd: &par6_proto::command::MoveP,
+    ) -> Result<InFlightKind, WireError> {
+        use par6_motion::cart::LineSegment;
+        let snap = self.snapshots.latest();
+        let start_pose = self.current_pose(&snap.q)?;
+        let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame);
+        let lengths: Vec<f64> = waypoints
+            .windows(2)
+            .map(|w| LineSegment::new(&w[0], &w[1]).length_m())
+            .collect();
+        let radii: Vec<f64> = lengths
+            .windows(2)
+            .map(|w| MOVE_P_AUTO_BLEND_FRAC * w[0].min(w[1]))
+            .collect();
+        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
+            .map_err(planning_error)?;
+        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+    }
+
+    /// A chain of `move_l`s linked by blend radii, planned as ONE
+    /// cartesian path whose interior corners are rounded.
+    ///
+    /// Each move's target resolves against its PREDECESSOR's target, not
+    /// against the live pose: a relative or tool-frame move in the
+    /// middle of a chain means "from where the move before it ends",
+    /// which is where the arm will be (parol6 does the same in
+    /// `commands/cartesian_commands.py`, `do_setup_with_blend`).
+    ///
+    /// The chain runs under the slowest speed and acceleration fraction
+    /// in it; durations add up when every move carries one, and are
+    /// dropped when they are mixed with speed-parameterised moves —
+    /// there is no meaningful total otherwise.
+    #[cfg(feature = "ffi")]
+    fn start_move_l_chain(
+        &mut self,
+        chain: &[&par6_proto::command::MoveL],
+    ) -> Result<InFlightKind, WireError> {
+        use par6_motion::cart::LineSegment;
+
+        let snap = self.snapshots.latest();
+        let start_pose = self.current_pose(&snap.q)?;
+        let mut waypoints = Vec::with_capacity(chain.len() + 1);
+        waypoints.push(start_pose);
+        for cmd in chain {
+            let previous = *waypoints.last().expect("seeded with the start pose");
+            waypoints.push(target_pose(&previous, &cmd.pose, cmd.frame, cmd.rel));
+        }
+        let radii: Vec<f64> = chain[..chain.len() - 1]
+            .iter()
+            .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
+            .collect();
+        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
+            .map_err(planning_error)?;
+
+        let speed = chain
+            .iter()
+            .filter_map(|c| c.speed)
+            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
+        let accel = chain
+            .iter()
+            .filter_map(|c| c.accel)
+            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
+        let duration = chain
+            .iter()
+            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
+            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+        log::debug!(
+            "blended cartesian chain: {} moves, {} poses, {:.1} mm of path",
+            chain.len(),
+            poses.len(),
+            poses
+                .windows(2)
+                .map(|w| LineSegment::new(&w[0], &w[1]).length_m())
+                .sum::<f64>()
+                * 1e3
+        );
+        self.start_cart_path(&snap, &poses, speed, accel, duration)
+    }
+
+    /// A chain of joint-space moves (`move_j` / `move_j_pose`) linked by
+    /// blend radii, planned as ONE joint path whose interior corners are
+    /// rounded.
+    ///
+    /// The radius is a CARTESIAN quantity and a joint segment has no
+    /// length in millimetres, so each corner's zone is sized by the TCP
+    /// distance between the waypoints it joins — FK at the waypoints
+    /// turns `r` into the fraction of each adjacent joint segment the
+    /// zone eats. Same conversion as parol6
+    /// (`commands/joint_commands.py`, `do_setup_with_blend`).
+    #[cfg(feature = "ffi")]
+    fn start_joint_chain(&mut self, chain: &[JointTarget<'_>]) -> Result<InFlightKind, WireError> {
+        let snap = self.snapshots.latest();
+        let mut waypoints: Vec<[f64; NQ]> = Vec::with_capacity(chain.len() + 1);
+        waypoints.push(snap.q);
+        for target in chain {
+            let previous = *waypoints.last().expect("seeded with the measured pose");
+            let q = match target.goal {
+                JointGoal::Angles { angles, rel } => {
+                    let mut q = [0.0; NQ];
+                    for (j, out) in q.iter_mut().enumerate() {
+                        let a = angles[j].to_radians();
+                        *out = if rel { previous[j] + a } else { a };
+                    }
+                    q
+                }
+                JointGoal::Pose(pose) => {
+                    let m = crate::kin::wire_pose_to_matrix(pose);
+                    self.ik_pose(&previous, &m)?
+                }
+            };
+            self.exec_limits
+                .require_inside_soft(&q)
+                .map_err(planning_error)?;
+            waypoints.push(q);
+        }
+
+        let mut tcp = Vec::with_capacity(waypoints.len());
+        for q in &waypoints {
+            let pose = self.current_pose(q)?;
+            tcp.push(par6_motion::cart::translation(&pose));
+        }
+        let distance = |a: [f64; 3], b: [f64; 3]| {
+            ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        };
+        let fracs: Vec<(f64, f64)> = (1..waypoints.len() - 1)
+            .map(|i| {
+                let r = chain[i - 1].blend_radius.unwrap_or(0.0).max(0.0) / 1000.0;
+                let before = distance(tcp[i - 1], tcp[i]);
+                let after = distance(tcp[i], tcp[i + 1]);
+                (
+                    if before > 1e-9 { r / before } else { 0.0 },
+                    if after > 1e-9 { r / after } else { 0.0 },
+                )
+            })
+            .collect();
+
+        let path = par6_motion::cart::blended_polyline_joint(
+            &waypoints,
+            &fracs,
+            CART_STEP_RAD,
+            CART_PATH_MAX_STEPS,
+        )
+        .map_err(planning_error)?;
+        let mut flat = Vec::with_capacity(path.len() * MAX_JOINTS);
+        for q in &path {
+            flat.extend_from_slice(q);
+        }
+        let speed = chain
+            .iter()
+            .filter_map(|c| c.speed)
+            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
+        let accel = chain
+            .iter()
+            .filter_map(|c| c.accel)
+            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
+        let duration = chain
+            .iter()
+            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
+            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+        let samples = self.toppra_samples(&flat, speed, accel, duration)?;
+        self.start_exec(samples, snap.mode == Mode::Exec)
+    }
+
+    /// Plan `cmd`, looking at the queue standing behind it (`rest`, in
+    /// order) for moves it can blend with. Returns what is now in flight
+    /// and how many commands it covers — 1 unless a blend chain formed.
+    fn plan(
+        &mut self,
+        cmd: &Command,
+        rest: &[QueuedCommand<'_>],
+    ) -> Result<(InFlightKind, usize), WireError> {
+        // Rounding a corner means re-planning both of its segments as
+        // one path, which takes IK and TOPPRA: without kinematics
+        // nothing blends, and the command plane has already refused the
+        // radius that would have asked for it.
+        #[cfg(not(feature = "ffi"))]
+        let _ = rest;
+        #[cfg(feature = "ffi")]
+        if let Some(consumed) = self.blend_chain_len(cmd, rest) {
+            let kind = match cmd {
+                Command::MoveL(head) => {
+                    let mut chain = vec![head];
+                    chain.extend(rest[..consumed].iter().map(|q| match q.cmd {
+                        Command::MoveL(p) => p,
+                        _ => unreachable!("the chain only accepts move_l"),
+                    }));
+                    self.start_move_l_chain(&chain)?
+                }
+                _ => {
+                    let mut chain = vec![JointTarget::of(cmd).expect("a joint move")];
+                    chain.extend(
+                        rest[..consumed]
+                            .iter()
+                            .map(|q| JointTarget::of(q.cmd).expect("a joint move")),
+                    );
+                    self.start_joint_chain(&chain)?
+                }
+            };
+            return Ok((kind, consumed + 1));
+        }
+        let kind = match cmd {
+            Command::MoveJ(p) => self.start_move_j(p)?,
+            Command::Home(_) => {
+                self.link.send(RtCommand::SetMode(Mode::Homing));
+                InFlightKind::Home { seen_homing: false }
+            }
+            Command::Delay(p) => {
+                let snap = self.snapshots.latest();
+                let ticks = (p.seconds * self.ticks_per_s).round().max(1.0) as u64;
+                InFlightKind::Delay {
+                    target_tick: snap.tick + ticks,
+                }
+            }
+            Command::Checkpoint(_) | Command::SelectTool(_) => InFlightKind::Instant,
+            Command::ToolAction(p) => {
+                let snap = self.snapshots.latest();
+                self.start_tool_action(&snap, p)?
+            }
+            #[cfg(feature = "ffi")]
+            Command::MoveJPose(p) => self.start_move_j_pose(p)?,
+            #[cfg(feature = "ffi")]
+            Command::MoveL(p) => self.start_move_l(p)?,
+            #[cfg(feature = "ffi")]
+            Command::MoveC(p) => self.start_move_c(p)?,
+            #[cfg(feature = "ffi")]
+            Command::MoveS(p) => self.start_move_s(p)?,
+            #[cfg(feature = "ffi")]
+            Command::MoveP(p) => self.start_move_p(p)?,
+            #[cfg(not(feature = "ffi"))]
+            Command::MoveJPose(_)
+            | Command::MoveL(_)
+            | Command::MoveC(_)
+            | Command::MoveS(_)
+            | Command::MoveP(_) => {
+                return Err(make_error(
+                    ErrorCode::MotnSetupFailed,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        "cartesian planning needs a par6d build with feature `ffi`",
+                    )],
+                ));
+            }
+            other => {
+                return Err(make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        &format!("{:?} is not a queued command", other.tag()),
+                    )],
+                ));
+            }
+        };
+        Ok((kind, 1))
+    }
+
+    /// How many of the commands behind `cmd` blend into it, or `None`
+    /// when `cmd` does not start a chain.
+    ///
+    /// A chain grows while the move already in it asks for a rounded
+    /// corner (positive blend radius) AND the next queued command is a
+    /// move of the SAME family — straight cartesian moves round corners
+    /// against straight cartesian moves, joint moves against joint
+    /// moves. Anything else (an arc, a delay, a tool action, a move with
+    /// no radius) ends the chain: the arm stops at that target, which is
+    /// exactly what "no blend radius" asks for.
+    ///
+    /// A positive radius on the LAST move of a chain has nothing to
+    /// round — there is no following segment — so that move stops at its
+    /// target like any other. That is also what a lone blended move
+    /// does after the server's blend hold expires.
+    #[cfg(feature = "ffi")]
+    fn blend_chain_len(&self, cmd: &Command, rest: &[QueuedCommand<'_>]) -> Option<usize> {
+        let cartesian = matches!(cmd, Command::MoveL(_));
+        let same_family = |c: &Command| {
+            if cartesian {
+                matches!(c, Command::MoveL(_))
+            } else {
+                matches!(c, Command::MoveJ(_) | Command::MoveJPose(_))
+            }
+        };
+        if !cartesian && JointTarget::of(cmd).is_none() {
+            return None;
+        }
+        let mut previous = cmd;
+        let mut n = 0usize;
+        while par6_server::blend_radius_mm(previous).is_some_and(|r| r > 0.0) {
+            let Some(next) = rest.get(n).filter(|q| same_family(q.cmd)) else {
+                break;
+            };
+            previous = next.cmd;
+            n += 1;
+        }
+        (n > 0).then_some(n)
     }
 
     /// Feed pending samples into the ring, up to its free capacity.
@@ -1176,6 +1575,134 @@ impl Par6Planner {
     }
 }
 
+/// Sampling of a single straight `move_l`.
+#[cfg(feature = "ffi")]
+fn line_sampling() -> par6_motion::cart::CartSampling {
+    par6_motion::cart::CartSampling {
+        step_m: CART_STEP_M,
+        step_rad: CART_STEP_RAD,
+        max_points: MOVE_L_MAX_STEPS + 1,
+    }
+}
+
+/// Sampling of a multi-segment cartesian path (arc, spline, process
+/// move, blended chain): the same pitch, a budget sized for the longer
+/// path.
+#[cfg(feature = "ffi")]
+fn path_sampling() -> par6_motion::cart::CartSampling {
+    par6_motion::cart::CartSampling {
+        step_m: CART_STEP_M,
+        step_rad: CART_STEP_RAD,
+        max_points: CART_PATH_MAX_STEPS,
+    }
+}
+
+/// Where a cartesian move's wire pose puts the TCP, resolved against the
+/// pose the move starts from.
+#[cfg(feature = "ffi")]
+fn target_pose(start: &Pose, wire_pose: &[f64; 6], frame: par6_proto::Frame, rel: bool) -> Pose {
+    use par6_proto::Frame;
+    let wire = crate::kin::wire_pose_to_matrix(wire_pose);
+    match (frame, rel) {
+        (Frame::Wrf, false) => wire,
+        // World-frame delta: translation adds, rotation applies about
+        // the world axes.
+        (Frame::Wrf, true) => {
+            let mut t = crate::kin::mat_mul(&wire, start);
+            t[3] = start[3] + wire[3];
+            t[7] = start[7] + wire[7];
+            t[11] = start[11] + wire[11];
+            t
+        }
+        // A tool-frame pose is inherently relative to the tool frame the
+        // move starts in.
+        (Frame::Trf, _) => crate::kin::mat_mul(start, &wire),
+    }
+}
+
+/// A waypoint list as poses, starting at where the arm is.
+///
+/// TRF waypoints are all resolved against the STARTING tool frame — the
+/// list describes one shape in one frame, not a chain of successive
+/// tool-relative hops (parol6's `_transform_waypoints_trf_to_wrf`).
+///
+/// The first waypoint is replaced by the measured pose when it is within
+/// [`WAYPOINT_SNAP_M`] of it, and the measured pose is prepended
+/// otherwise: a client that starts its list where it believes the arm is
+/// gets its shape, not that shape plus a millimetre-long lead-in
+/// segment.
+#[cfg(feature = "ffi")]
+fn waypoint_poses(start: &Pose, waypoints: &[[f64; 6]], frame: par6_proto::Frame) -> Vec<Pose> {
+    use par6_motion::cart::translation;
+    let mut poses = Vec::with_capacity(waypoints.len() + 1);
+    poses.push(*start);
+    let mut wire = waypoints
+        .iter()
+        .map(|w| target_pose(start, w, frame, false))
+        .peekable();
+    if let Some(first) = wire.peek() {
+        let (a, b) = (translation(first), translation(start));
+        let far = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+            > WAYPOINT_SNAP_M;
+        if !far {
+            wire.next();
+        }
+    }
+    poses.extend(wire);
+    poses
+}
+
+/// One move of a joint-space blend chain: where it goes, and the
+/// parameters the chain has to reconcile.
+#[cfg(feature = "ffi")]
+struct JointTarget<'a> {
+    goal: JointGoal<'a>,
+    blend_radius: Option<f64>,
+    speed: Option<f64>,
+    accel: Option<f64>,
+    duration: Option<f64>,
+}
+
+#[cfg(feature = "ffi")]
+#[derive(Clone, Copy)]
+enum JointGoal<'a> {
+    /// `move_j`: joint angles \[deg\], absolute or relative to where the
+    /// preceding move ends.
+    Angles {
+        angles: &'a [f64; MAX_JOINTS],
+        rel: bool,
+    },
+    /// `move_j_pose`: a cartesian target reached by IK, travelled in
+    /// joint space.
+    Pose(&'a [f64; 6]),
+}
+
+#[cfg(feature = "ffi")]
+impl<'a> JointTarget<'a> {
+    fn of(cmd: &'a Command) -> Option<Self> {
+        match cmd {
+            Command::MoveJ(p) => Some(Self {
+                goal: JointGoal::Angles {
+                    angles: &p.angles,
+                    rel: p.rel,
+                },
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
+            Command::MoveJPose(p) => Some(Self {
+                goal: JointGoal::Pose(&p.pose),
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
+            _ => None,
+        }
+    }
+}
+
 /// Nothing is known to be free — the state the flags start in and fall
 /// back to. The wire slots are 0/1 with no "unknown" spelling, and 1
 /// means "you may move that way", so an unmeasured direction reports 0.
@@ -1265,68 +1792,22 @@ impl EnablementProbe {
 }
 
 impl Planner for Par6Planner {
-    fn start(&mut self, index: u64, cmd: &Command) -> Result<(), WireError> {
-        let kind = match cmd {
-            Command::MoveJ(p) => self.start_move_j(p)?,
-            Command::Home(_) => {
-                self.link.send(RtCommand::SetMode(Mode::Homing));
-                InFlightKind::Home { seen_homing: false }
-            }
-            Command::Delay(p) => {
-                let snap = self.snapshots.latest();
-                let ticks = (p.seconds * self.ticks_per_s).round().max(1.0) as u64;
-                InFlightKind::Delay {
-                    target_tick: snap.tick + ticks,
-                }
-            }
-            Command::Checkpoint(_) | Command::SelectTool(_) => InFlightKind::Instant,
-            Command::ToolAction(p) => {
-                let snap = self.snapshots.latest();
-                self.start_tool_action(&snap, p)?
-            }
-            #[cfg(feature = "ffi")]
-            Command::MoveJPose(p) => self.start_move_j_pose(p)?,
-            #[cfg(feature = "ffi")]
-            Command::MoveL(p) => self.start_move_l(p)?,
-            #[cfg(not(feature = "ffi"))]
-            Command::MoveJPose(_) | Command::MoveL(_) => {
-                return Err(make_error(
-                    ErrorCode::MotnSetupFailed,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "cartesian planning needs a par6d build with feature `ffi`",
-                    )],
-                ));
-            }
-            Command::MoveC(_) | Command::MoveS(_) | Command::MoveP(_) => {
-                return Err(make_error(
-                    ErrorCode::MotnSetupFailed,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "arc/spline/process moves are not implemented yet (par6d follow-up)",
-                    )],
-                ));
-            }
-            other => {
-                return Err(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        &format!("{:?} is not a queued command", other.tag()),
-                    )],
-                ));
-            }
+    fn start(&mut self, batch: &[QueuedCommand<'_>]) -> Result<usize, WireError> {
+        let Some(head) = batch.first() else {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[("detail", "the planner was started with an empty batch")],
+            ));
         };
+        let (kind, consumed) = self.plan(head.cmd, &batch[1..])?;
         self.inflight = Some(InFlight {
-            server_index: index,
+            server_index: head.index,
             started: Instant::now(),
             kind,
         });
         self.pump_ring();
-        Ok(())
+        Ok(consumed)
     }
 
     fn poll(&mut self) -> Option<CommandOutcome> {

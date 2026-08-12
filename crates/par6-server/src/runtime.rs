@@ -114,15 +114,56 @@ pub struct CollisionState {
     pub pairs: Vec<(String, String)>,
 }
 
+/// One queued command offered to [`Planner::start`], with the index the
+/// server allocated for it.
+#[derive(Debug, Clone, Copy)]
+pub struct QueuedCommand<'a> {
+    /// Wire command index (the one the client was acked with).
+    pub index: u64,
+    /// The decoded command.
+    pub cmd: &'a par6_proto::Command,
+}
+
+/// The blend radius \[mm\] a queued command carries, if its type has one
+/// and the client set it. `None` and `Some(0.0)` both mean "stop at the
+/// target"; only a positive radius asks for a rounded corner.
+///
+/// One rule for the server (which decides how long to hold a move open
+/// for its successor) and for the planner (which decides how far a blend
+/// chain reaches), so the two cannot disagree about what blends.
+pub fn blend_radius_mm(cmd: &par6_proto::Command) -> Option<f64> {
+    use par6_proto::Command as C;
+    match cmd {
+        C::MoveJ(p) => p.blend_radius,
+        C::MoveJPose(p) => p.blend_radius,
+        C::MoveL(p) => p.blend_radius,
+        C::MoveC(p) => p.blend_radius,
+        _ => None,
+    }
+}
+
 /// Executes queued commands: plans them, feeds the RT sample ring, and
-/// reports completion. Exactly one command is in flight at a time — the
+/// reports completion. Exactly one MOTION is in flight at a time — the
 /// server serializes the queue and calls [`Planner::start`] only after
-/// the previous command's outcome arrived (or was cancelled).
+/// the previous outcome arrived (or was cancelled) — but one motion may
+/// cover SEVERAL queued commands when they blend into one another.
 pub trait Planner: Send {
-    /// Begin executing queued command `index` (wire units). `Err` means
-    /// the command never started; the server latches the error, clears
-    /// the pending queue, and pushes `COMPLETE(ok=false)`.
-    fn start(&mut self, index: u64, cmd: &par6_proto::Command) -> Result<(), WireError>;
+    /// Begin executing `batch[0]` (wire units). The rest of `batch` is
+    /// the queue standing behind it, in order, offered for blending: an
+    /// implementation may fold as many of those as it can honour into
+    /// the same motion.
+    ///
+    /// Returns how many commands from the front of `batch` the started
+    /// motion covers — at least 1, never more than `batch.len()`. The
+    /// server removes exactly that many from its queue and completes all
+    /// of them together when [`Planner::poll`] reports the outcome for
+    /// `batch[0].index`; a blended-away command has no outcome of its
+    /// own.
+    ///
+    /// `Err` means nothing started; the server latches the error against
+    /// `batch[0].index`, clears the pending queue, and pushes
+    /// `COMPLETE(ok=false)`.
+    fn start(&mut self, batch: &[QueuedCommand<'_>]) -> Result<usize, WireError>;
 
     /// Poll the outcome of the in-flight command; `None` while it is
     /// still running. Outcomes for cancelled indexes are ignored by the

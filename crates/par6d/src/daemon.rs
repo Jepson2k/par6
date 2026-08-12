@@ -47,6 +47,18 @@ const RING_CAPACITY: usize = 4096;
 /// Grace period for the server task to exit after the shutdown notify.
 const SERVER_GRACE: Duration = Duration::from_millis(100);
 
+/// Why a par6d compiled without feature `ffi` does not boot. Kinematics
+/// is load-bearing for the advertised surface, and its absence is
+/// invisible from the client side, so it is a startup failure rather
+/// than a degraded mode.
+const NO_FFI_REFUSAL: &str = "this par6d was built without feature `ffi`, so it has no \
+     kinematics: the TCP pose broadcast would read NaN, `move_l` / `move_j_pose` / `servo_l` / \
+     `servo_j_pose` / `jog_l` would all be refused, the TOPPRA profile the registry advertises \
+     would be unavailable, and the collision world would be empty while `set_shapes` still \
+     reported success. Refusing to start rather than serve that. Build the runtime with \
+     `--features ffi` (scripts/ffi/setup.sh, then `source .ffi/env.sh`); \
+     see scripts/deploy/README.md for the aarch64 control box.";
+
 /// Startup failure. Every variant renders as a one-line, actionable
 /// message — a missing CAN interface or config file must never panic.
 #[derive(Debug, thiserror::Error)]
@@ -107,7 +119,21 @@ impl Daemon {
     /// Boot the full runtime: load config, build the RT core over the
     /// selected bus backend, wire the planner and bridge, and spawn the
     /// command plane.
+    ///
+    /// Refuses to boot a binary built without feature `ffi`: that build
+    /// has no kinematics at all, and every one of its degradations is
+    /// silent to a client (NaN TCP pose, zero cartesian freedom, an
+    /// empty collision world that still answers `set_shapes` with
+    /// success). Kinematics is not an optional part of the runtime's
+    /// advertised surface, so the build that lacks it does not run.
     pub fn start(opts: &Options) -> Result<Self, DaemonError> {
+        if !cfg!(feature = "ffi") {
+            return Err(DaemonError::Kinematics(NO_FFI_REFUSAL.into()));
+        }
+        Self::start_inner(opts)
+    }
+
+    fn start_inner(opts: &Options) -> Result<Self, DaemonError> {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
@@ -168,6 +194,7 @@ impl Daemon {
         let jog = MotionJog::new(JogEngine::new(robot)?);
         let stream = MotionStream::new(
             StreamingExecutor::new(dt, &stream_limits)?,
+            dt,
             stream_limits.soft_min,
             stream_limits.soft_max,
         );

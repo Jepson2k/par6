@@ -8,7 +8,9 @@
 //!   dedup (retries re-ack the ORIGINAL index), per-command COMPLETE
 //!   pushes, streaming preemption (same-type in-place, type-change
 //!   cancel+drain, planned move cancels streaming), stop/estop/reset
-//!   cancel scopes, and chunked bulk reassembly with
+//!   cancel scopes, blend lookahead (a move with a corner radius is held
+//!   briefly for the successor it rounds into, and the planner is
+//!   offered the whole runnable chain), and chunked bulk reassembly with
 //!   `COMM_CHUNK_TIMEOUT` expiry.
 //! - [`link`]: the status/telemetry broadcast transport ladder —
 //!   multicast with a startup reachability probe, permanent unicast
@@ -42,8 +44,8 @@ pub use config::{ServerConfig, StatusTransport};
 pub use faults::{gripper_fault_code, rt_standing_error};
 pub use gating::{gate, Gate};
 pub use runtime::{
-    CollisionState, CommandOutcome, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle,
-    ShapeLayer,
+    blend_radius_mm, CollisionState, CommandOutcome, Enablement, PlanContext, Planner,
+    QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
 pub use server::{spawn, ServerHandle};
 pub use telemetry::{TelemetryField, TelemetryRecipe};

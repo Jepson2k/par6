@@ -10,6 +10,10 @@
 //! - [`PathSampler`] is the geometry seam for cartesian paths: the
 //!   planner will implement it over IK-solved waypoints from `par6-kin`;
 //!   joint-space moves run through it today via [`JointLinePath`].
+//! - [`cart`] is the cartesian geometry the queued moves trace before
+//!   IK: straight segments (`move_l`), three-point arcs (`move_c`),
+//!   cubic splines (`move_s`), and polylines whose corners are rounded
+//!   by Bézier blend zones (`move_p`, and blend-radius chains).
 //! - [`JogEngine`]: per-joint velocity ramps (trapezoid / s-curve) with
 //!   jerk-aware soft-limit lookahead and direction-block latching.
 //! - [`CompletionMonitor`]: commanded / settled / strict completion
@@ -32,6 +36,7 @@
 //! [`CompletionMonitor::tick`], and [`StreamingExecutor::step`] are meant
 //! for the RT thread.
 
+pub mod cart;
 mod completion;
 mod error;
 mod jog;

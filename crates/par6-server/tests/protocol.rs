@@ -21,8 +21,8 @@ use par6_rt::{
     StateSnapshot,
 };
 use par6_server::{
-    spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, RtCommands,
-    RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
+    spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
+    RtCommands, RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -120,6 +120,11 @@ impl RtCommands for TestRt {
 #[derive(Default)]
 struct PlannerState {
     started: Vec<(u64, Command)>,
+    /// Every batch the server offered to `start`, as the indexes in it.
+    batches: Vec<Vec<u64>>,
+    /// How many commands of each offered batch this planner reports it
+    /// folded into one motion. 0 = the default (one command at a time).
+    consume: usize,
     outcomes: VecDeque<CommandOutcome>,
     fail_next_start: Option<WireError>,
     cancels: usize,
@@ -137,13 +142,15 @@ struct PlannerState {
 struct TestPlanner(Arc<Mutex<PlannerState>>);
 
 impl Planner for TestPlanner {
-    fn start(&mut self, index: u64, cmd: &Command) -> Result<(), WireError> {
+    fn start(&mut self, batch: &[QueuedCommand<'_>]) -> Result<usize, WireError> {
         let mut s = self.0.lock().unwrap();
+        s.batches.push(batch.iter().map(|q| q.index).collect());
         if let Some(e) = s.fail_next_start.take() {
             return Err(e);
         }
-        s.started.push((index, cmd.clone()));
-        Ok(())
+        let head = batch.first().expect("the server never starts nothing");
+        s.started.push((head.index, head.cmd.clone()));
+        Ok(s.consume.clamp(1, batch.len()))
     }
     fn poll(&mut self) -> Option<CommandOutcome> {
         self.0.lock().unwrap().outcomes.pop_front()
@@ -1502,4 +1509,134 @@ async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_clie
         other => panic!("unexpected {other:?}"),
     }
     c.ok_index(&move_j(702)).await;
+}
+
+/// Blend lookahead: a move that asks to round a corner is held at the
+/// head of the queue until its successor is there to round it INTO, the
+/// planner is offered both, and the pair it folds into one motion
+/// completes together.
+///
+/// The queue engine used to hand the planner exactly one command at a
+/// time, so a corner radius had nowhere to reach and was refused at
+/// accept time. What is asserted here is the contract that replaced it,
+/// including the completion-index semantics `spec/PROTOCOL-V2.md`
+/// prescribes for blended-away commands: one COMPLETE per queued
+/// command, all of them at the end of the motion that carried them, and
+/// a high-water `completed_index` on the LAST of them.
+#[tokio::test]
+async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
+    let mut h = start(|cfg| {
+        cfg.blend_hold = Duration::from_millis(150);
+        cfg.blend_lookahead = 4;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    // This planner double folds two commands into every motion.
+    h.planner.lock().unwrap().consume = 2;
+
+    // A move that wants to blend is NOT started on its own: there is no
+    // corner until the next move arrives.
+    let i1 = c.ok_index(&move_j_blended(201, Some(15.0))).await;
+    tokio::time::sleep(Duration::from_millis(40)).await;
+    assert!(
+        h.planner.lock().unwrap().started.is_empty(),
+        "a blended move must wait for the successor it is meant to blend into"
+    );
+
+    // Its successor arrives, and the pair starts as one batch.
+    let i2 = c.ok_index(&move_j_blended(202, None)).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let seen = {
+            let s = h.planner.lock().unwrap();
+            s.batches
+                .last()
+                .map(|batch| (batch.clone(), s.started.len()))
+        };
+        if let Some((batch, started)) = seen {
+            assert_eq!(
+                batch,
+                vec![i1, i2],
+                "the planner must see the whole runnable chain, not just its head"
+            );
+            assert_eq!(started, 1, "one motion covers both commands");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chain never started"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Nothing completes until the motion does — and then both do.
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            queue,
+            executing_index,
+            completed_index,
+            ..
+        } => {
+            assert!(queue.is_empty(), "both commands left the pending queue");
+            assert_eq!(executing_index, i1 as i64);
+            assert_eq!(completed_index, -1);
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+    h.complete_ok(i1);
+    let (ok, _) = c.wait_complete(i1).await;
+    assert!(ok);
+    let (ok, _) = c.wait_complete(i2).await;
+    assert!(ok, "the blended-away command reports its own COMPLETE");
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            executing_index,
+            completed_index,
+            ..
+        } => {
+            assert_eq!(executing_index, -1);
+            assert_eq!(
+                completed_index, i2 as i64,
+                "the high-water completed index is the LAST command of the blend"
+            );
+        }
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // The hold is bounded: a blended move with no successor coming runs
+    // on its own rather than sitting in the queue forever.
+    let i3 = c.ok_index(&move_j_blended(203, Some(15.0))).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let ran = {
+            let s = h.planner.lock().unwrap();
+            s.started.iter().any(|(i, _)| *i == i3)
+        };
+        if ran {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a blended move whose successor never came must still run"
+        );
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    h.complete_ok(i3);
+    let (ok, _) = c.wait_complete(i3).await;
+    assert!(ok);
+
+    h.server.shutdown();
+}
+
+fn move_j_blended(key: u64, r: Option<f64>) -> Command {
+    Command::MoveJ(MoveJ {
+        key,
+        angles: [10.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        duration: Some(0.5),
+        speed: None,
+        accel: None,
+        blend_radius: r,
+        rel: false,
+    })
 }

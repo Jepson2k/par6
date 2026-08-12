@@ -49,7 +49,8 @@ use crate::faults::{gripper_fault_code, rt_standing_error};
 use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
 use crate::runtime::{
-    CollisionState, Enablement, PlanContext, Planner, RtCommands, RuntimeHandle, ShapeLayer,
+    blend_radius_mm, CollisionState, Enablement, PlanContext, Planner, QueuedCommand, RtCommands,
+    RuntimeHandle, ShapeLayer,
 };
 use crate::telemetry;
 
@@ -131,6 +132,15 @@ struct Executing {
     name: &'static str,
     params: String,
     effect: PostEffect,
+    /// Commands the planner blended into this motion, in queue order
+    /// (motion commands only — a blend chain never reaches past one).
+    /// They finish when it finishes: each gets its own COMPLETE push and
+    /// the high-water `completed_index` jumps to the last of them, which
+    /// is what `spec/PROTOCOL-V2.md` prescribes for blended-away
+    /// commands. There is no earlier honest moment to call one of them
+    /// done — the arm never stops at their targets, and their samples
+    /// are interleaved with the head's in one trajectory.
+    blended: Vec<(u64, SocketAddr)>,
 }
 
 /// Idempotency dedup window: last N keys → original index.
@@ -181,6 +191,9 @@ struct Core<P: Planner, R: RtCommands> {
     dedup: Dedup,
     pending: VecDeque<Pending>,
     executing: Option<Executing>,
+    /// Deadline the head of the queue is being held to, while it waits
+    /// for the successor its blend radius asks to round a corner into.
+    blend_hold: Option<Instant>,
     accepted_index: i64,
     completed_index: i64,
     last_checkpoint: String,
@@ -246,6 +259,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             next_index: 1,
             pending: VecDeque::new(),
             executing: None,
+            blend_hold: None,
             accepted_index: -1,
             completed_index: -1,
             last_checkpoint: String::new(),
@@ -449,6 +463,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.cancel_active_motion();
                 if p.clear_queue {
                     self.pending.clear();
+                    self.blend_hold = None;
                 }
                 Ok(())
             }
@@ -798,14 +813,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 &[("detail", &detail)],
             ))
         };
-        // Blending needs the NEXT queued move at planning time; par6d
-        // plans and runs exactly one queued command at a time, and no
-        // profile takes a corner radius.
+        // A corner is rounded by re-planning both of its segments as one
+        // path, which needs kinematics (IK along the rounded corner, and
+        // TOPPRA to time it). A runtime without them can only stop at
+        // every waypoint, and saying so beats doing it silently.
         let blend = |r: Option<f64>| {
-            r.map(|r| {
+            r.filter(|r| *r > 0.0 && !self.cfg.cartesian).map(|r| {
                 format!(
-                    "blend radius {r} mm is not supported: queued moves run one at \
-                     a time and stop at every waypoint; send r = nil"
+                    "blend radius {r} mm needs kinematics: this runtime has none, \
+                     so every move stops at its target; send r = nil"
                 )
             })
         };
@@ -813,7 +829,17 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             Command::MoveJ(p) => blend(p.blend_radius),
             Command::MoveJPose(p) => blend(p.blend_radius),
             Command::MoveL(p) => blend(p.blend_radius),
-            Command::MoveC(p) => blend(p.blend_radius),
+            // An arc ends where its `end` pose is: par6d rounds corners
+            // between straight segments and between joint moves, but has
+            // no arc-to-successor blend, and a radius that quietly did
+            // nothing would be the silent alteration this function
+            // exists to prevent.
+            Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
+                format!(
+                    "blend radius {r} mm is not supported on move_c: an arc stops at \
+                     its end pose; send r = nil"
+                )
+            }),
             // The RT jog engine ramps ONE joint at a time (spec/RT.md,
             // Jog): direction-block latching is keyed on the commanded
             // joint. Collapsing to the dominant axis would move the arm
@@ -874,12 +900,48 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             {
                 break;
             }
-            let Some(pc) = self.pending.pop_front() else {
+            if self.pending.is_empty() {
+                self.blend_hold = None;
                 break;
+            }
+            if self.holding_for_blend() {
+                break;
+            }
+            self.blend_hold = None;
+            // Disjoint field borrows: the queue is read to build the
+            // lookahead while the planner is driven.
+            let batch: Vec<QueuedCommand<'_>> = self
+                .pending
+                .iter()
+                .take(self.cfg.blend_lookahead.max(1))
+                .map(|p| QueuedCommand {
+                    index: p.index,
+                    cmd: &p.cmd,
+                })
+                .collect();
+            let started = self.runtime.planner.start(&batch);
+            let taken = match started {
+                Ok(n) => n.clamp(1, batch.len()),
+                Err(_) => 1,
             };
-            let name = cmd_name(pc.cmd.tag());
-            match self.runtime.planner.start(pc.index, &pc.cmd) {
-                Ok(()) => {
+            drop(batch);
+            let pc = self.pending.pop_front().expect("checked non-empty");
+            let blended: Vec<(u64, SocketAddr)> = (1..taken)
+                .map(|_| {
+                    let p = self.pending.pop_front().expect("planner took what it saw");
+                    (p.index, p.addr)
+                })
+                .collect();
+            match started {
+                Ok(_) => {
+                    let name = cmd_name(pc.cmd.tag());
+                    if !blended.is_empty() {
+                        log::debug!(
+                            "command {} blends {} following command(s) into one motion",
+                            pc.index,
+                            blended.len()
+                        );
+                    }
                     self.action_state = ActionState::Executing;
                     self.executing = Some(Executing {
                         index: pc.index,
@@ -887,6 +949,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                         name,
                         params: params_summary(&pc.cmd),
                         effect: post_effect(&pc.cmd),
+                        blended,
                     });
                 }
                 Err(e) => {
@@ -895,6 +958,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
         }
+    }
+
+    /// Whether the head of the queue is a blended move still waiting for
+    /// the successor it is supposed to round a corner into.
+    ///
+    /// The wait is on the LAST queued command: while it asks to blend
+    /// into something that has not been queued yet, the chain the
+    /// planner would build is still growing, and starting now would cost
+    /// the corner. It ends when a command that stops at its target
+    /// arrives, when the lookahead is full, or when the hold expires.
+    fn holding_for_blend(&mut self) -> bool {
+        let wants_more = self.pending.len() < self.cfg.blend_lookahead
+            && self
+                .pending
+                .back()
+                .and_then(|p| blend_radius_mm(&p.cmd))
+                .is_some_and(|r| r > 0.0);
+        if !wants_more {
+            return false;
+        }
+        let deadline = *self
+            .blend_hold
+            .get_or_insert_with(|| Instant::now() + self.cfg.blend_hold);
+        Instant::now() < deadline
     }
 
     async fn collect_outcomes(&mut self) {
@@ -928,8 +1015,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                         }
                     }
                     self.push_complete(ex.addr, ex.index, None).await;
+                    // Blended-away commands finished in the same motion:
+                    // each is completed in queue order, and the
+                    // high-water mark ends on the last of them.
+                    for (index, addr) in ex.blended {
+                        self.completed_index = self.completed_index.max(index as i64);
+                        self.push_complete(addr, index, None).await;
+                    }
                 }
                 Some(e) => {
+                    // The whole blended motion failed. The error is
+                    // attributed to the command that started it, and the
+                    // ones folded into it are dropped exactly like the
+                    // pending queue behind them.
                     self.fail_command(ex.index, ex.addr, e).await;
                 }
             }
@@ -945,6 +1043,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.standing_error = Some(e.clone());
         self.action_state = ActionState::Error;
         self.pending.clear();
+        self.blend_hold = None;
         self.push_complete(addr, index, Some(e)).await;
     }
 
@@ -965,6 +1064,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     fn cancel_all_motion(&mut self) {
         self.cancel_active_motion();
         self.pending.clear();
+        self.blend_hold = None;
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
@@ -976,6 +1076,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.action_state = ActionState::Idle;
         }
         self.pending.clear();
+        self.blend_hold = None;
     }
 
     /// A motion command was accepted: the previous attempt's verdicts stop

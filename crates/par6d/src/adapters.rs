@@ -67,21 +67,25 @@ impl RtJogEngine for MotionJog {
 /// way in and out.
 pub struct MotionStream {
     executor: StreamingExecutor,
+    dt: f64,
     soft_min: [f64; MAX_JOINTS],
     soft_max: [f64; MAX_JOINTS],
     hold_q: [f64; MAX_JOINTS],
 }
 
 impl MotionStream {
-    /// Wrap a configured streaming executor; `soft_min`/`soft_max` are
-    /// the per-joint soft position limits \[rad\].
+    /// Wrap a configured streaming executor running at tick period `dt`
+    /// \[s\]; `soft_min`/`soft_max` are the per-joint soft position
+    /// limits \[rad\].
     pub fn new(
         executor: StreamingExecutor,
+        dt: f64,
         soft_min: [f64; MAX_JOINTS],
         soft_max: [f64; MAX_JOINTS],
     ) -> Self {
         Self {
             executor,
+            dt,
             soft_min,
             soft_max,
             hold_q: [0.0; MAX_JOINTS],
@@ -114,8 +118,24 @@ impl StreamTracker for MotionStream {
             Ok(StreamStep { q, qd, .. }) => {
                 *q_out = q;
                 self.clamp(q_out);
+                // The velocity channel of a cmd-2 position frame is a
+                // CAP the driver clamps its own position-loop output to
+                // (spec/CAN.md), not a setpoint. The OTG reports the
+                // velocity it ends the tick AT, which is zero on every
+                // tick that lands on the current target — so forwarding
+                // it caps a still-advancing position channel at a
+                // standstill. Command the larger of the two: the OTG's
+                // own profile velocity, or the rate the position channel
+                // is advancing at this tick.
+                for j in 0..MAX_JOINTS {
+                    let advance = (q_out[j] - self.hold_q[j]) / self.dt;
+                    qd_out[j] = if advance.abs() > qd[j].abs() {
+                        advance
+                    } else {
+                        qd[j]
+                    };
+                }
                 self.hold_q = *q_out;
-                *qd_out = qd;
             }
             Err(e) => {
                 // Hold in place rather than emit garbage; the RT loop
@@ -125,5 +145,80 @@ impl StreamTracker for MotionStream {
                 qd_out.fill(0.0);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use par6_config::LimitMode;
+    use par6_motion::MotionLimits;
+    use std::path::PathBuf;
+
+    fn stream_limits() -> MotionLimits {
+        let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let cfg = par6_config::RobotConfig::load(&path).expect("PAR6 config");
+        MotionLimits::from_config(&cfg, LimitMode::Stream).expect("stream limits")
+    }
+
+    /// A servo source nudging its target a little further every cycle —
+    /// the shape a UI slider or a teleoperation feed emits — must be
+    /// commanded a velocity that covers the setpoint's advance.
+    ///
+    /// The wire velocity is a cap, so a commanded velocity below the rate
+    /// the position channel advances at throttles the arm to a standstill
+    /// while the position channel keeps moving: the failure reports
+    /// nothing anywhere. Ruckig's terminal velocity is exactly 0 on every
+    /// tick whose minimum-time move lands on the target, which is every
+    /// tick of a stream whose steps are reachable within one.
+    #[test]
+    fn stepped_stream_targets_are_commanded_a_velocity_that_covers_their_advance() {
+        let limits = stream_limits();
+        let dt = 0.05;
+        let mut stream = MotionStream::new(
+            par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
+            dt,
+            limits.soft_min,
+            limits.soft_max,
+        );
+
+        let start = [0.0; MAX_JOINTS];
+        stream.activate(&start);
+
+        let step_rad = 0.25_f64.to_radians();
+        let mut target = start;
+        let mut q = [0.0; MAX_JOINTS];
+        let mut qd = [0.0; MAX_JOINTS];
+        let mut ticks_advancing = 0usize;
+
+        for _ in 0..160 {
+            let previous = q[0];
+            target[0] += step_rad;
+            stream.set_target(&target);
+            stream.step(&mut q, &mut qd);
+            let advance = (q[0] - previous) / dt;
+            if advance.abs() > 0.0 {
+                ticks_advancing += 1;
+                assert!(
+                    qd[0].abs() + 1e-12 >= advance.abs(),
+                    "commanded velocity {:.6} rad/s caps a position channel \
+                     advancing at {:.6} rad/s",
+                    qd[0],
+                    advance,
+                );
+            }
+        }
+
+        assert!(
+            ticks_advancing > 150,
+            "the position channel should track the stepped target on \
+             essentially every tick, advanced on {ticks_advancing}/160"
+        );
+        assert!(
+            q[0] > 0.9 * target[0],
+            "the tracker fell behind the stepped target: {:.4} of {:.4} rad",
+            q[0],
+            target[0]
+        );
     }
 }
