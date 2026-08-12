@@ -14,9 +14,12 @@ use par6_proto::command::{
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
-    CmdType, Command, ErrorCode, Frame, QueryResult, Reply, WireError, UNATTRIBUTED,
+    ActionState, CmdType, Command, ErrorCode, Frame, QueryResult, Reply, WireError, UNATTRIBUTED,
 };
-use par6_rt::{snapshot_channel, ArmState, SnapshotWriter, StateSnapshot};
+use par6_rt::{
+    snapshot_channel, ArmState, ErrorCode as RtCode, ErrorEntry, Mode, SnapshotWriter,
+    StateSnapshot,
+};
 use par6_server::{
     spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, RtCommands,
     RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
@@ -45,6 +48,12 @@ enum RtEvent {
 #[derive(Default)]
 struct RtLog {
     events: Vec<RtEvent>,
+    /// What the RT answers the NEXT enable request with. `None` = it came
+    /// up ENABLED; `Some` = it refused, the way the real core does while
+    /// the e-stop line is engaged or a hard error is latched.
+    enable_verdict: Option<WireError>,
+    /// The pending answer, collected exactly once by the server.
+    enable_outcome: Option<Result<(), WireError>>,
 }
 
 #[derive(Clone)]
@@ -68,6 +77,23 @@ impl RtCommands for TestRt {
     }
     fn set_enabled(&mut self, enabled: bool) {
         self.push(RtEvent::SetEnabled(enabled));
+        let mut log = self.0.lock().unwrap();
+        if enabled {
+            log.enable_outcome = Some(match log.enable_verdict.clone() {
+                None => Ok(()),
+                Some(e) => Err(e),
+            });
+        } else if log.enable_outcome.take().is_some() {
+            // A disable supersedes an enable nobody has collected yet.
+            log.enable_outcome = Some(Err(make_error(
+                ErrorCode::SysEstopActive,
+                UNATTRIBUTED,
+                &[],
+            )));
+        }
+    }
+    fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.0.lock().unwrap().enable_outcome.take()
     }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
@@ -1358,4 +1384,122 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     h.complete_ok(i3);
     c.wait_complete(i3).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
+}
+
+/// Gaps 2 + 3, together: the controller comes up ready to accept motion,
+/// `reset` reports what the RT actually did with the enable, and a hard
+/// error the RT latched on its own reaches the client.
+///
+/// Measured against the runtime before this landed: par6d booted DISABLED
+/// and refused every queued command with `SYS_CONTROLLER_DISABLED` until
+/// someone sent `reset` — which no frontend does at startup; `reset`
+/// answered OK whether or not the RT accepted the enable; and with a hard
+/// RT latch standing the client was told `error() -> None`,
+/// `activity() -> IDLE`, `action_state = IDLE` while every command was
+/// being refused. An arm that is bricked and says it is idle is the one
+/// state an operator cannot diagnose.
+#[tokio::test]
+async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_client() {
+    let mut h = start(|_| {}).await;
+    let mut c = Client::new(&h).await;
+
+    // ---- boot: leaving BOOTING enables the controller, unasked.
+    h.publish(|s| s.mode = Mode::Idle);
+    let ev = h
+        .wait_rt(|ev| ev.contains(&RtEvent::SetEnabled(true)))
+        .await;
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, RtEvent::SetEnabled(_)))
+            .count(),
+        1,
+        "exactly one enable, and no client asked for it: {ev:?}"
+    );
+    // Motion is accepted straight away — no client had to press Reset.
+    let i = c.ok_index(&move_j(700)).await;
+    h.complete_ok(i);
+    assert!(c.wait_complete(i).await.0);
+
+    // ---- a hard error the RT latched on its own: no command earned it,
+    // so nothing in the command plane knows about it but the snapshot.
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.state = ArmState::Disabled;
+        s.errors.insert(ErrorEntry {
+            code: RtCode::RtiLinkLost,
+            joint: None,
+        });
+        s.error_active = true;
+    });
+
+    let err = c.expect_error(&move_j(701)).await;
+    assert_eq!(err.code, ErrorCode::SysControllerDisabled as u16);
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => assert_eq!(
+            e.code,
+            ErrorCode::SysRtiLinkLost as u16,
+            "the ERROR query must name the latch, got {e:?}"
+        ),
+        other => panic!("a latched RT error must reach the ERROR query, got {other:?}"),
+    }
+    match c.query(&Command::Activity).await {
+        QueryResult::Activity { state, .. } => assert_eq!(
+            state,
+            ActionState::Error,
+            "activity must not read IDLE while the arm is latched"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::SysRtiLinkLost as u16)
+            && s.action_state == ActionState::Error
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "STATUS never carried the latched RT error; last: {:?}",
+            s.error
+        );
+    }
+
+    // ---- reset while the RT still refuses: the refusal is the answer.
+    h.rt.lock().unwrap().enable_verdict = Some(make_error(
+        ErrorCode::SysControllerDisabled,
+        UNATTRIBUTED,
+        &[("detail", "still latched")],
+    ));
+    match c.request(&Command::Reset).await {
+        Reply::Error { error, .. } => assert_eq!(
+            error.code,
+            ErrorCode::SysControllerDisabled as u16,
+            "a refused enable must not be reported as a successful reset"
+        ),
+        other => panic!("expected the RT's refusal, got {other:?}"),
+    }
+    // The refusal did not paper over the latch either.
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysRtiLinkLost as u16)
+        }
+        other => panic!("the latch outlives a failed reset, got {other:?}"),
+    }
+
+    // ---- reset once the RT really enables: OK, and the error is gone
+    // because the LATCH is gone, not because the reset cleared a field.
+    h.rt.lock().unwrap().enable_verdict = None;
+    h.publish(|s| s.mode = Mode::Idle);
+    match c.request(&Command::Reset).await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("expected a confirmed reset, got {other:?}"),
+    }
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error } => assert!(error.is_none(), "{error:?}"),
+        other => panic!("unexpected {other:?}"),
+    }
+    c.ok_index(&move_j(702)).await;
 }

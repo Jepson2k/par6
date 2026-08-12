@@ -37,18 +37,13 @@ pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 
 /// Servo streams self-terminate after this much client silence (the RT
 /// stream watchdog is fed by housekeeping keep-alives until then).
-const SERVO_GRACE: Duration = Duration::from_millis(250);
+pub(crate) const SERVO_GRACE: Duration = Duration::from_millis(250);
 /// How long the enable retry keeps trying after `reset` (covers the RT
 /// clear-sequence settle window with margin, even on a loaded host).
 const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// Spacing between enable retries (a few RT ticks at any supported
 /// rate, so retries never saturate the one-command-per-tick budget).
 const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
-/// Extra RT ticks on top of the clear-settle countdown before an
-/// ENABLED snapshot is trusted as the OUTCOME of this enable request —
-/// covers commands already queued ahead of ours (an e-stop still in
-/// flight must not read as "already enabled").
-const ENABLE_TRUST_SLACK_TICKS: u64 = 16;
 /// Housekeeping loop period.
 const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
 /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities` fraction
@@ -149,11 +144,27 @@ struct ActiveStream {
     cart: Option<CartJogState>,
 }
 
+/// An enable request in flight, retried by housekeeping until the RT
+/// answers it or the window closes.
+struct EnableRequest {
+    /// When to give up and report the controller still DISABLED.
+    deadline: Instant,
+    /// When the last `Enable` went out (retry spacing).
+    last_sent: Option<Instant>,
+    /// The core's `enable_seq` sampled just BEFORE that send. The first
+    /// snapshot whose `enable_seq` is past it has processed an Enable
+    /// belonging to this request, so its `state` is the request's answer
+    /// — not a leftover reading from before it.
+    sent_at_seq: Option<u64>,
+}
+
 /// State shared between the bridge (server task) and housekeeping.
 #[derive(Default)]
 pub(crate) struct SharedState {
     stream: Option<ActiveStream>,
-    enable_deadline: Option<Instant>,
+    enable: Option<EnableRequest>,
+    /// Resolved enable outcome, waiting to be collected by the server.
+    enable_outcome: Option<Result<(), WireError>>,
 }
 
 /// The bridge's kinematics kit (feature `ffi`): its own model instance
@@ -401,14 +412,33 @@ impl RtCommands for RtBridge {
         if enabled {
             // Clear the soft e-stop flag and run the RT clear sequence;
             // Enable only succeeds after the clear settle window, so
-            // housekeeping retries it until the snapshot reads ENABLED.
+            // housekeeping retries it until the core answers.
             self.link.send(RtCommand::SetSoftEstop(false));
             self.link.send(RtCommand::ClearErrors);
-            sh.enable_deadline = Some(Instant::now() + ENABLE_RETRY_WINDOW);
+            // A verdict nobody collected belongs to the request it came
+            // from; this one gets its own answer, never an inherited one.
+            sh.enable_outcome = None;
+            sh.enable = Some(EnableRequest {
+                deadline: Instant::now() + ENABLE_RETRY_WINDOW,
+                last_sent: None,
+                sent_at_seq: None,
+            });
         } else {
             self.link.send(RtCommand::SetSoftEstop(true));
-            sh.enable_deadline = None;
+            if sh.enable.take().is_some() {
+                // An enable that an e-stop overtook did not happen, and
+                // whoever is waiting on it must be told so.
+                sh.enable_outcome = Some(Err(make_error(
+                    ErrorCode::SysEstopActive,
+                    UNATTRIBUTED,
+                    &[],
+                )));
+            }
         }
+    }
+
+    fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.shared.lock().unwrap().enable_outcome.take()
     }
 
     fn teleport(&mut self, angles_deg: &[f64; NUM_JOINTS], tool_positions: Option<&[f64]>) {
@@ -435,10 +465,12 @@ impl RtCommands for RtBridge {
             )));
         }
         let bundle = self.bundle.clone();
+        // Taken as given: the server refuses any angle outside the joint's
+        // hard window before it reaches here, so the arm lands exactly
+        // where the client asked or the command never runs.
         let mut q = [0.0; MAX_JOINTS];
-        for (i, (out, deg)) in q.iter_mut().zip(angles_deg.iter()).enumerate() {
-            let l = &bundle.robot.joints[i].limits;
-            *out = deg.to_radians().clamp(l.hard_min_rad, l.hard_max_rad);
+        for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+            *out = deg.to_radians();
         }
         self.link.op(Box::new(move |core| {
             let robot = &bundle.robot;
@@ -519,25 +551,15 @@ impl RtCommands for RtBridge {
 
 /// Timed follow-throughs that the datagram-driven bridge cannot run
 /// itself: jog duration watchdog, servo keep-alive + silence timeout,
-/// and the post-`reset` enable retry. `tick_dt_s` sizes the enable
-/// trust window in RT ticks (all time constants are config seconds).
+/// and the enable retry that resolves a `reset` into a real answer.
 pub(crate) fn housekeeping_loop(
     link: CoreLink,
     stream_input: Arc<Mutex<StreamInput>>,
     shared: Arc<Mutex<SharedState>>,
     mut snapshots: SnapshotReader<StateSnapshot>,
-    tick_dt_s: f64,
     shutdown: Arc<AtomicBool>,
     #[cfg(feature = "ffi")] mut kin: crate::kin::CartKin,
 ) {
-    // ENABLED may only be trusted as the outcome of THIS request once
-    // the RT has had time to drain the queue ahead of it and run the
-    // clear-settle countdown; before that it can be the stale pre-e-stop
-    // state (the reset usually races the e-stop through the queue).
-    let trust_delay_ticks =
-        (par6_rt::errors::CLEAR_SETTLE_S / tick_dt_s).ceil() as u64 + ENABLE_TRUST_SLACK_TICKS;
-    let mut window: Option<(Instant, u64)> = None; // (deadline, trust_after_tick)
-    let mut last_enable: Option<Instant> = None;
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
@@ -581,28 +603,35 @@ pub(crate) fn housekeeping_loop(
                 }
                 _ => {}
             }
-            match sh.enable_deadline {
-                Some(deadline) => {
-                    if window.map(|(d, _)| d) != Some(deadline) {
-                        window = Some((deadline, snap.tick + trust_delay_ticks));
-                        last_enable = None;
-                    }
-                    let (_, trust_after) = window.expect("set above");
-                    if snap.state == ArmState::Enabled && snap.tick >= trust_after {
-                        sh.enable_deadline = None;
-                        window = None;
-                    } else if now >= deadline {
-                        sh.enable_deadline = None;
-                        window = None;
-                        log::warn!("enable retry window expired; controller still DISABLED");
-                    } else if last_enable
-                        .is_none_or(|t| now.duration_since(t) >= ENABLE_RETRY_PERIOD)
-                    {
-                        link.send(RtCommand::Enable);
-                        last_enable = Some(now);
-                    }
+            if let Some(req) = &mut sh.enable {
+                // `enable_seq` counts every Enable the core PROCESSED,
+                // granted or refused, so a reading past our baseline
+                // makes the `state` in the same snapshot this request's
+                // answer rather than whatever an earlier one left behind.
+                let answered = req.sent_at_seq.is_some_and(|s| snap.enable_seq > s);
+                if answered && snap.state == ArmState::Enabled {
+                    sh.enable = None;
+                    sh.enable_outcome = Some(Ok(()));
+                } else if now >= req.deadline {
+                    log::warn!("enable retry window expired; controller still DISABLED");
+                    sh.enable = None;
+                    sh.enable_outcome = Some(Err(make_error(
+                        ErrorCode::SysControllerDisabled,
+                        UNATTRIBUTED,
+                        &[(
+                            "detail",
+                            "The RT core refused to enable: the e-stop line is engaged \
+                             or a hard error is latched.",
+                        )],
+                    )));
+                } else if req
+                    .last_sent
+                    .is_none_or(|t| now.duration_since(t) >= ENABLE_RETRY_PERIOD)
+                {
+                    req.sent_at_seq = Some(snap.enable_seq);
+                    req.last_sent = Some(now);
+                    link.send(RtCommand::Enable);
                 }
-                None => window = None,
             }
         }
         std::thread::sleep(HOUSEKEEPING_PERIOD);

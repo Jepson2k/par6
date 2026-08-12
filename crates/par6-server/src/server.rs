@@ -45,6 +45,7 @@ use tokio::sync::Notify;
 use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
+use crate::faults::{gripper_fault_code, rt_standing_error};
 use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
 use crate::runtime::{
@@ -54,6 +55,11 @@ use crate::telemetry;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
+
+/// How many un-answered `reset` requests may pile up while the RT is
+/// still deciding. A client that keeps re-sending past this is not
+/// waiting for an answer, and the queue must stay bounded.
+const MAX_RESET_WAITERS: usize = 16;
 
 /// Handle to a running server. Dropping it aborts the task.
 pub struct ServerHandle {
@@ -182,6 +188,10 @@ struct Core<P: Planner, R: RtCommands> {
     action_state: ActionState,
     estop_latched: bool,
     active_stream: Option<CmdType>,
+    /// Clients whose `reset` is still waiting for the RT's answer.
+    reset_waiters: Vec<(u32, SocketAddr)>,
+    /// Whether the boot-time enable has been requested yet.
+    booted: bool,
 
     profile: String,
     tool: String,
@@ -243,6 +253,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             action_state: ActionState::Idle,
             estop_latched: false,
             active_stream: None,
+            reset_waiters: Vec::new(),
+            booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
             shapes: Vec::new(),
@@ -381,6 +393,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.request_boot_enable();
+        self.settle_enable().await;
         self.expire_chunks().await;
         self.collect_outcomes().await;
         self.pump().await;
@@ -418,14 +432,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn on_system(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
         use Command as C;
+        if matches!(cmd, C::Reset) {
+            self.on_reset(req_id, addr).await;
+            return;
+        }
         let result: Result<(), WireError> = match cmd {
-            C::Reset => {
-                self.estop_latched = false;
-                self.standing_error = None;
-                self.action_state = ActionState::Idle;
-                self.runtime.rt.set_enabled(true);
-                Ok(())
-            }
             C::Estop => {
                 self.cancel_all_motion();
                 self.estop_latched = true;
@@ -537,6 +548,77 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             Err(error) => Reply::Error { req_id, error },
         };
         self.reply(addr, &reply).await;
+    }
+
+    /// `reset` asks the RT to enable; only the RT can say whether it did.
+    /// The reply therefore waits for [`RtCommands::take_enable_outcome`]
+    /// — reporting OK on the strength of having sent the request is
+    /// exactly the "success without confirmation" the waldoctl client
+    /// contract forbids, and it is what let a `reset()` answer 1 while
+    /// the very next command was still refused as DISABLED.
+    async fn on_reset(&mut self, req_id: u32, addr: SocketAddr) {
+        if self.reset_waiters.len() >= MAX_RESET_WAITERS {
+            let error = make_error(ErrorCode::CommQueueFull, UNATTRIBUTED, &[]);
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        self.estop_latched = false;
+        self.standing_error = None;
+        self.action_state = ActionState::Idle;
+        self.runtime.rt.set_enabled(true);
+        self.reset_waiters.push((req_id, addr));
+    }
+
+    /// Hand the RT's enable verdict to whoever is waiting on it.
+    async fn settle_enable(&mut self) {
+        let Some(outcome) = self.runtime.rt.take_enable_outcome() else {
+            return;
+        };
+        if self.reset_waiters.is_empty() {
+            // The boot-time enable: nobody asked, so nobody is answered.
+            // A refusal is not lost — it comes from an RT latch, and that
+            // latch is what STATUS and the ERROR query now report.
+            if let Err(e) = &outcome {
+                log::warn!("startup enable refused: {e}");
+            }
+            return;
+        }
+        for (req_id, addr) in std::mem::take(&mut self.reset_waiters) {
+            let reply = match &outcome {
+                Ok(()) => Reply::Ok {
+                    req_id,
+                    index: None,
+                },
+                Err(error) => Reply::Error {
+                    req_id,
+                    error: error.clone(),
+                },
+            };
+            self.reply(addr, &reply).await;
+        }
+    }
+
+    /// Come up ready to accept motion, the way parol6's controller does
+    /// (`server/state.py`, `enabled = True`): its `enabled` flag is a
+    /// PROTECTIVE-STOP latch, and nothing is latched on a clean boot.
+    /// par6's `ArmState` means the same thing — motors stay energized and
+    /// holding either way (`spec/RT.md`, IDLE law) — so booting DISABLED
+    /// only meant that nothing moved until a client sent `reset`, which
+    /// no frontend does at startup.
+    ///
+    /// It is safe because the enable runs through the identical gate a
+    /// client `reset` does: the RT refuses it while the e-stop line is
+    /// engaged or any hard error is latched, and every motion MODE
+    /// additionally requires a home reference that only an explicit
+    /// `home` can grant. Deferred until the core leaves BOOTING so a
+    /// command can never be accepted for a mode the core cannot enter.
+    fn request_boot_enable(&mut self) {
+        if self.booted || self.snap.mode == Mode::Booting {
+            return;
+        }
+        self.booted = true;
+        log::info!("RT core out of BOOTING: enabling the controller");
+        self.runtime.rt.set_enabled(true);
     }
 
     async fn on_faf(&mut self, req_id: u32, cmd: Command, addr: SocketAddr) {
@@ -742,23 +824,29 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     format!("jog_j drives one joint at a time; {axes} axes were commanded")
                 })
             }
-            Command::Teleport(p) => match p.tool_positions.as_deref() {
-                None => None,
-                Some(_) if self.cfg.tool_dof == 0 => Some(format!(
-                    "tool '{}' has no controllable position",
-                    self.cfg.fitted_tool
-                )),
-                Some(pos) if pos.len() != self.cfg.tool_dof => Some(format!(
-                    "tool '{}' has {} position(s), {} given",
-                    self.cfg.fitted_tool,
-                    self.cfg.tool_dof,
-                    pos.len()
-                )),
-                Some(pos) => pos
-                    .iter()
-                    .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-                    .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
-            },
+            // A pose the runtime cannot place the arm at is refused, not
+            // clamped: clamping landed the arm tens of degrees from where
+            // the client asked and answered success, which is the silent
+            // alteration this whole function exists to prevent.
+            Command::Teleport(p) => {
+                teleport_angle_fault(&p.angles, &self.cfg).or(match p.tool_positions.as_deref() {
+                    None => None,
+                    Some(_) if self.cfg.tool_dof == 0 => Some(format!(
+                        "tool '{}' has no controllable position",
+                        self.cfg.fitted_tool
+                    )),
+                    Some(pos) if pos.len() != self.cfg.tool_dof => Some(format!(
+                        "tool '{}' has {} position(s), {} given",
+                        self.cfg.fitted_tool,
+                        self.cfg.tool_dof,
+                        pos.len()
+                    )),
+                    Some(pos) => pos
+                        .iter()
+                        .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                        .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
+                })
+            }
             // A passive tool (no driver) has nothing to actuate.
             Command::ToolAction(p) if self.cfg.tool_dof == 0 => Some(format!(
                 "tool '{}' is passive: it has no actions",
@@ -1046,6 +1134,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
+    /// The standing error as a client sees it: the one attributed to a
+    /// queued command if there is one, otherwise whatever the RT has
+    /// latched on its own. The RT latch is DERIVED, never stored — it
+    /// stops being reported exactly when the RT stops latching it, so
+    /// accepting a new motion command cannot clear an error the arm is
+    /// still bricked by.
+    fn effective_error(&self) -> Option<WireError> {
+        self.standing_error
+            .clone()
+            .or_else(|| rt_standing_error(&self.snap))
+    }
+
     fn action_fields(&self) -> (String, ActionState, String) {
         if let Some(ex) = &self.executing {
             (
@@ -1055,6 +1155,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             )
         } else if let Some(name) = self.stream_shown() {
             (name.to_owned(), ActionState::Executing, String::new())
+        } else if self.effective_error().is_some() {
+            // Nothing is running and an error stands: the action state is
+            // the error, whether a command earned it or the RT latched it.
+            (String::new(), ActionState::Error, String::new())
         } else {
             (String::new(), self.action_state, String::new())
         }
@@ -1067,10 +1171,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let g = &self.snap.gripper;
         let (state, engaged, part_detected, fault_code, positions, channels) = match g.reply {
             Some(r) => {
-                let fault_code = i32::from(r.temperature_error)
-                    | (i32::from(r.timeout_error) << 1)
-                    | (i32::from(r.estop_error) << 2)
-                    | (i32::from(g.live_error_bit) << 3);
+                let fault_code = gripper_fault_code(&self.snap);
                 let od = r.object_detection as u8;
                 let state = if fault_code != 0 {
                     ToolState::Error
@@ -1147,7 +1248,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             executing_index: self.executing.as_ref().map_or(-1, |e| e.index as i64),
             completed_index: self.completed_index,
             last_checkpoint: self.last_checkpoint.clone(),
-            error: self.standing_error.clone(),
+            error: self.effective_error(),
             queued_segments: self.pending.len() as u32,
             queued_duration: self.queued_duration(),
             action_params,
@@ -1251,7 +1352,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::Error => QueryResult::Error {
-                error: self.standing_error.clone(),
+                error: self.effective_error(),
             },
             C::TcpSpeed => QueryResult::TcpSpeed {
                 speed: self.tcp_speed,
@@ -1326,6 +1427,28 @@ fn pose_matrix_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
         0.0,
         1.0,
     ]
+}
+
+/// The first `teleport` angle the runtime cannot honour, described in
+/// the terms a client can act on: which joint, what it asked for, and
+/// the window it has. `None` = every angle is placeable.
+fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Option<String> {
+    // Finiteness belongs to the codec (`par6-proto` rejects NaN/inf at
+    // decode), so only the travel window is left to check here.
+    for (i, (&a, &(lo, hi))) in angles
+        .iter()
+        .zip(cfg.joint_hard_limits_deg.iter())
+        .enumerate()
+    {
+        if a < lo || a > hi {
+            return Some(format!(
+                "angles[{i}] = {a:.3} deg is outside joint {i}'s travel \
+                 [{lo:.3}, {hi:.3}] deg; teleport places the arm exactly \
+                 where it is told or not at all"
+            ));
+        }
+    }
+    None
 }
 
 fn identity_pose() -> [f64; POSE_ELEMS] {

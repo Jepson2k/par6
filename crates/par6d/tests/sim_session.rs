@@ -790,6 +790,29 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         ErrorCode::CommValidationError as u16,
         "an out-of-range tool position must be refused, got {err:?}"
     );
+    // …and so is an ANGLE outside the joint's travel. It used to be
+    // clamped into range with an OK reply, which landed the arm tens of
+    // degrees from the request and told the client it had arrived.
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let mut past_hard = park;
+    past_hard[2] = cfg.joints[2].limits.hard_max_rad.to_degrees() + 10.0;
+    let err = c.expect_error(&teleport(past_hard));
+    assert_eq!(
+        err.code,
+        ErrorCode::CommValidationError as u16,
+        "an unreachable teleport angle must be refused, got {err:?}"
+    );
+    assert!(
+        err.cause.contains("angles[2]"),
+        "the refusal must name the joint that could not be placed: {}",
+        err.cause
+    );
+    let s = rig.wait_status("a refused teleport moved nothing", |_| true);
+    assert!(
+        (s.angles[2] - park[2]).abs() < 1.0,
+        "a refused teleport must leave the arm where it was, not clamp it: {:?}",
+        s.angles
+    );
     // A build without kinematics cannot execute a cartesian stream, so it
     // says so instead of dropping the datagram.
     #[cfg(not(feature = "ffi"))]
@@ -957,16 +980,14 @@ fn joint_enablement_slots_are_positive_direction_first() {
     past_max[0] = 0.5 * (soft_max + hard_max);
     teleport_home(&rig, &mut c, past_max);
 
-    let s = rig.wait_status("J0 parked past its upper soft limit", |s| {
-        (s.angles[0] - past_max[0]).abs() < 1.0
+    // The enablement probe runs at the status cadence, so the frame that
+    // first carries a new pose may still carry the previous answer: poll
+    // for the settled one rather than reading the first arrival.
+    let s = rig.wait_status("past the upper soft limit J0 may only move negative", |s| {
+        (s.angles[0] - past_max[0]).abs() < 1.0 && (s.joint_en[0], s.joint_en[1]) == (0, 1)
     });
-    assert_eq!(
-        (s.joint_en[0], s.joint_en[1]),
-        (0, 1),
-        "past the upper soft limit J0 may only move negative; slots were {:?}",
-        &s.joint_en[..2]
-    );
-    // A joint inside its window keeps both directions.
+    // A joint inside its window keeps both directions — asserted on that
+    // same frame, so it is this pose's answer and not a stale one.
     assert_eq!(
         (s.joint_en[2], s.joint_en[3]),
         (1, 1),
@@ -980,14 +1001,13 @@ fn joint_enablement_slots_are_positive_direction_first() {
     let mut at_max = park_deg();
     at_max[0] = soft_max - 0.1;
     teleport_home(&rig, &mut c, at_max);
-    let s = rig.wait_status("J0 parked 0.1 deg short of its upper soft limit", |s| {
-        (s.angles[0] - at_max[0]).abs() < 0.02
+    let s = rig.wait_status("0.1 deg of travel is not freedom", |s| {
+        (s.angles[0] - at_max[0]).abs() < 0.02 && (s.joint_en[0], s.joint_en[1]) == (0, 1)
     });
     assert_eq!(
-        (s.joint_en[0], s.joint_en[1]),
-        (0, 1),
-        "0.1 deg of travel is not freedom; slots were {:?}",
-        &s.joint_en[..2]
+        (s.joint_en[2], s.joint_en[3]),
+        (1, 1),
+        "only J0 is at its stop; J1 keeps both directions"
     );
 
     rig.shutdown();

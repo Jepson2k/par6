@@ -1649,37 +1649,16 @@ fn planning_error(e: MotionError) -> WireError {
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
 }
 
-/// Map the RT error latch to the closest wire error.
+/// The RT error latch as the failure of the command that was in flight.
+/// One mapping serves this path and the standing error the command plane
+/// reports, so a fault cannot read one way when it kills a command and
+/// another way in STATUS.
 fn rt_error(snap: &StateSnapshot) -> WireError {
-    use par6_rt::ErrorCode as Rt;
-    let errs = snap.errors.as_slice();
-    let has = |c: Rt| errs.iter().any(|e| e.code == c);
-    if has(Rt::ExecSettleTimeout) {
-        make_error(
-            ErrorCode::MotnSettleTimeout,
-            UNATTRIBUTED,
-            &[("residual", "unknown")],
-        )
-    } else if has(Rt::Estop) || has(Rt::SwEstop) {
-        make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[])
-    } else if has(Rt::ExecLinkLost) {
-        make_error(ErrorCode::SysExecLinkLost, UNATTRIBUTED, &[])
-    } else if has(Rt::LoopCritical) {
-        make_error(ErrorCode::SysLoopCritical, UNATTRIBUTED, &[])
-    } else if let Some(e) = errs.iter().find(|e| e.joint.is_some()) {
-        make_error(
-            ErrorCode::SysJointFault,
-            UNATTRIBUTED,
-            &[
-                ("joint", &format!("{}", e.joint.unwrap_or(0))),
-                ("kind", &format!("{:?}", e.code)),
-            ],
-        )
-    } else {
+    par6_server::rt_standing_error(snap).unwrap_or_else(|| {
         make_error(
             ErrorCode::MotnTickFailed,
             UNATTRIBUTED,
             &[("detail", "the RT core latched a hard error")],
         )
-    }
+    })
 }

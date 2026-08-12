@@ -344,6 +344,15 @@ pub struct StateSnapshot {
     pub mode: Mode,
     /// Enabled/disabled.
     pub state: ArmState,
+    /// Number of enable requests the core has PROCESSED, granted or
+    /// refused. The command plane cannot read an enable's outcome off
+    /// `state` alone — an ENABLED reading may be left over from an
+    /// earlier request, and a DISABLED one may simply predate this
+    /// request reaching the tick loop. A counter that moves exactly once
+    /// per processed request makes `state` in the same snapshot the
+    /// answer to a specific request, so `reset` can report what the RT
+    /// actually did instead of what it was asked to do.
+    pub enable_seq: u64,
     /// Whether the home references are valid.
     pub homed: bool,
     /// Measured joint positions \[rad\].
@@ -403,6 +412,7 @@ impl Default for StateSnapshot {
             tick: 0,
             mode: Mode::default(),
             state: ArmState::default(),
+            enable_seq: 0,
             homed: false,
             q: [0.0; MAX_JOINTS],
             qd: [0.0; MAX_JOINTS],

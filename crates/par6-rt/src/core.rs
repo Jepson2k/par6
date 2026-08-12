@@ -206,6 +206,7 @@ pub struct RtCore<B: DriverBus> {
     // State-machine variables (spec/RT.md: mode, state, homed, errors).
     mode: Mode,
     state: ArmState,
+    enable_seq: u64,
     homed: bool,
     soft_estop: bool,
     hw_estop: bool,
@@ -326,6 +327,7 @@ impl<B: DriverBus> RtCore<B> {
             timing: LoopTiming::new(dt, robot.loop_timing()),
             mode: Mode::Booting,
             state: ArmState::Disabled,
+            enable_seq: 0,
             homed: false,
             soft_estop: false,
             hw_estop: false,
@@ -359,7 +361,17 @@ impl<B: DriverBus> RtCore<B> {
             stream_rx,
             stream_sent: stream_sent.clone(),
             stream_last_rx_tick: 0,
-            stream_timeout_ticks: robot.ticks(robot.stream.command_timeout_s).max(1),
+            // The watchdog is READ in phase 7 and FED in phase 8 (the
+            // setpoint intake), so even a stream that lands a fresh
+            // target on every single tick always shows one tick of age
+            // at the check. A one-tick window is therefore unsatisfiable
+            // — it latches RTI_LINK_LOST on the second tick of every
+            // stream, however fast the client is — and two ticks is the
+            // smallest window a live stream can meet. Tick rates where
+            // `round(command_timeout_s / dt) >= 2` keep the configured
+            // window exactly; only rates whose tick period approaches
+            // the window itself are raised.
+            stream_timeout_ticks: robot.ticks(robot.stream.command_timeout_s).max(2),
             stream_window_ticks: robot.ticks(robot.stream.success_window_s).max(1),
             stream_window_pos: 0,
             stream_window_applied: 0,
@@ -528,7 +540,16 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::Enable => {
-                if self.estop_condition() || self.errors.any_hard() {
+                // Counted whether granted or refused: the counter is what
+                // ties the published `state` to THIS request.
+                self.enable_seq += 1;
+                if self.mode == Mode::Booting {
+                    // ENABLED before the bus selfcheck lets the command
+                    // plane accept motion the transition table then
+                    // refuses — every working mode is unreachable from
+                    // BOOTING, so the command dies at setup instead.
+                    log::warn!("enable refused: the core is still BOOTING");
+                } else if self.estop_condition() || self.errors.any_hard() {
                     log::warn!("enable refused: e-stop or errors active");
                 } else {
                     self.state = ArmState::Enabled;
@@ -1082,6 +1103,7 @@ impl<B: DriverBus> RtCore<B> {
         s.tick = self.tick;
         s.mode = self.mode;
         s.state = self.state;
+        s.enable_seq = self.enable_seq;
         s.homed = self.homed;
         s.q = self.q;
         s.qd = self.qd;

@@ -315,3 +315,55 @@ fn degradation_bands_warn_then_hard_latch_from_injected_periods() {
     assert!(!rig.snap().error_active);
     assert_eq!(rig.snap().mode, Mode::Idle);
 }
+
+/// The stream watchdog must be SATISFIABLE by a live stream at every
+/// supported tick rate, and must still fire when the stream really stops.
+///
+/// `stream.command_timeout_s` (0.040 s) converts to `round(s / dt)` ticks.
+/// At the tick period the repo's own e2e rig runs (50 ms) that rounds to
+/// ONE tick — and the watchdog is READ in the error phase while the
+/// setpoint intake that feeds it runs in the later dispatch phase, so
+/// even a stream that lands a fresh target on every single tick shows one
+/// tick of age at every check. A one-tick window is therefore
+/// unsatisfiable: the RT latched RTI_LINK_LOST on the second tick of
+/// every stream, dropped to ACTIVE_ERROR and disabled the controller,
+/// however fast the client streamed.
+#[test]
+fn stream_watchdog_survives_a_fed_stream_and_still_fires_on_a_silent_one() {
+    let dt = 0.05;
+    let mut rig = Rig::at_tick_dt(dt);
+    rig.ready();
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    assert_eq!(rig.snap().mode, Mode::Stream, "stream mode must be entered");
+
+    // A client streaming a fresh setpoint every tick — the best a client
+    // can possibly do — must never trip the watchdog.
+    let mut target = rig.pose;
+    for _ in 0..20 {
+        target[0] += 0.0005;
+        rig.handles.stream.send(&target);
+        rig.tick();
+    }
+    let s = rig.snap();
+    assert!(
+        !has_error(&mut rig, ErrorCode::RtiLinkLost, None),
+        "a stream fed every tick must not latch RTI_LINK_LOST at dt={dt}"
+    );
+    assert_eq!(s.mode, Mode::Stream, "the session must still be streaming");
+    assert_eq!(
+        s.state,
+        ArmState::Enabled,
+        "the controller must stay enabled"
+    );
+
+    // …and the watchdog is still a watchdog: silence latches, disables and
+    // drops the session into ACTIVE_ERROR.
+    rig.tick_n(4);
+    let s = rig.snap();
+    assert!(
+        has_error(&mut rig, ErrorCode::RtiLinkLost, None),
+        "a silent stream must latch RTI_LINK_LOST"
+    );
+    assert_eq!(s.state, ArmState::Disabled);
+    assert_eq!(s.mode, Mode::ActiveError);
+}

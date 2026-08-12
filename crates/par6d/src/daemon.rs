@@ -112,6 +112,8 @@ impl Daemon {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
+        loaded.robot.stream.command_timeout_s =
+            resolve_stream_timeout(opts.sim, loaded.robot.stream.command_timeout_s);
         let bundle = Arc::new(loaded);
         let robot = &bundle.robot;
         let bands = robot.loop_timing();
@@ -127,6 +129,10 @@ impl Daemon {
             bands.degraded_factor,
             bands.critical_factor,
             bands.critical_sustain_s
+        );
+        log::info!(
+            "streaming watchdog: {:.3} s of client silence",
+            robot.stream.command_timeout_s
         );
 
         if opts.sim_dynamics && !opts.sim {
@@ -352,9 +358,9 @@ impl Daemon {
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         #[cfg(feature = "ffi")]
-                        housekeeping_loop(link, stream_input, shared, hk_r, dt, shutdown, kin_hk);
+                        housekeeping_loop(link, stream_input, shared, hk_r, shutdown, kin_hk);
                         #[cfg(not(feature = "ffi"))]
-                        housekeeping_loop(link, stream_input, shared, hk_r, dt, shutdown);
+                        housekeeping_loop(link, stream_input, shared, hk_r, shutdown);
                     })?,
             );
         }
@@ -467,6 +473,27 @@ fn resolve_loop_bands(sim: bool, declared: Option<TimingConfig>) -> TimingConfig
     }
 }
 
+/// The streaming watchdog window this runtime runs under \[s\].
+///
+/// The watchdog stops a real arm when the PC streaming to it goes quiet,
+/// and the configured 40 ms is right for an arm whose RT thread owns an
+/// isolated core. Under `--sim` the same loop paces itself off the wall
+/// clock on whatever host it is given, and the keep-alive feeding the
+/// watchdog is an ordinary thread: one scheduler hiccup then latches
+/// `RTI_LINK_LOST` that no client fault caused, and takes the controller
+/// DISABLED with it. The sim floor is sized past the bridge's own servo
+/// grace period, so the property [`crate::bridge`] states — housekeeping
+/// ends a silent stream before the RT watchdog fires — actually holds
+/// there. A config asking for a LONGER window always wins, in sim and on
+/// hardware alike.
+fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
+    if sim {
+        declared.max(2.0 * crate::bridge::SERVO_GRACE.as_secs_f64())
+    } else {
+        declared
+    }
+}
+
 fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     let robot = &bundle.robot;
     let mut cfg = ServerConfig::from_protocol(&robot.protocol);
@@ -479,6 +506,15 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     cfg.fitted_tool = robot.robot.active_gripper.clone();
     cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
     cfg.cartesian = cfg!(feature = "ffi");
+    // The window `teleport` may place a joint in. Refusing outside it is
+    // the server's job: the bridge is fire-and-forget and has no reply
+    // channel to refuse on.
+    for (slot, joint) in cfg.joint_hard_limits_deg.iter_mut().zip(&robot.joints) {
+        *slot = (
+            joint.limits.hard_min_rad.to_degrees(),
+            joint.limits.hard_max_rad.to_degrees(),
+        );
+    }
     cfg.profiles = crate::planner::profile_names();
     cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();
     if let Some(ip) = opts.bind {

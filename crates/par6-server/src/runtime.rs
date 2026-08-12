@@ -185,7 +185,25 @@ pub trait RtCommands: Send {
     fn halt(&mut self);
 
     /// Enable (`reset`) or disable (`estop` latch) motion.
+    ///
+    /// Enabling is a REQUEST, not a fact: the RT core refuses it while
+    /// the e-stop is engaged or a hard error is latched, and it takes
+    /// several ticks to answer. Implementations start the request here
+    /// and publish its outcome through
+    /// [`take_enable_outcome`](RtCommands::take_enable_outcome).
+    /// Disabling is immediate, and cancels any outstanding enable.
     fn set_enabled(&mut self, enabled: bool);
+
+    /// Take the outcome of the last `set_enabled(true)` request, once the
+    /// RT has actually answered it: `Some(Ok(()))` when the core came up
+    /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`
+    /// while the request is still outstanding or there is none.
+    ///
+    /// The server holds the `reset` reply until this resolves — waldoctl
+    /// forbids reporting success for something the backend could not
+    /// confirm, and "the enable was queued" is not "the arm will move".
+    /// Each outcome is delivered exactly once.
+    fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>>;
 
     /// Instantly set joint angles (degrees) and optionally tool joint
     /// positions. Only called in simulator mode — the server gates

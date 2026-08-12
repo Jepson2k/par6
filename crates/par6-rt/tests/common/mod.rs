@@ -24,6 +24,16 @@ pub fn bundle() -> ConfigBundle {
     ConfigBundle::load(&path).expect("PAR6 config bundle")
 }
 
+/// The PAR6 bundle re-ticked to `dt` seconds. Every RT time constant is
+/// declared in config SECONDS and converted with `round(s / dt)`, so the
+/// tick rate is the single knob that moves every derived tick count at
+/// once — which is what makes a rate-dependent rounding bug reachable.
+pub fn bundle_at(dt: f64) -> ConfigBundle {
+    let mut b = bundle();
+    b.robot.robot.tick_dt_s = dt;
+    b
+}
+
 /// Constant-torque gravity model — the one-line oracle feeding the
 /// IDLE-hold and feedforward law tests.
 pub struct ConstGravity(pub [f64; MAX_JOINTS]);
@@ -77,12 +87,30 @@ impl Rig {
         Self::build(CompletionPolicy::Settled, Box::new(ZeroGravity), false)
     }
 
+    /// The rig at an arbitrary tick period (rate-dependent timing tests).
+    pub fn at_tick_dt(dt: f64) -> Self {
+        Self::build_bundle(
+            bundle_at(dt),
+            CompletionPolicy::Settled,
+            Box::new(ZeroGravity),
+            true,
+        )
+    }
+
     pub fn build(
         policy: CompletionPolicy,
         gravity: Box<dyn GravityModel>,
         line_high: bool,
     ) -> Self {
-        let bundle = bundle();
+        Self::build_bundle(bundle(), policy, gravity, line_high)
+    }
+
+    pub fn build_bundle(
+        bundle: ConfigBundle,
+        policy: CompletionPolicy,
+        gravity: Box<dyn GravityModel>,
+        line_high: bool,
+    ) -> Self {
         let robot = &bundle.robot;
         let dt = robot.robot.tick_dt_s;
         let (tx, rx) = mpsc::channel();

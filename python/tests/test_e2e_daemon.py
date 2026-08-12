@@ -159,9 +159,17 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         )
 
         # -- planned motion is gated before homing -----------------------
+        # The runtime enables itself as soon as the RT core clears BOOTING
+        # (~0.5 s at this rig's tick), so a move sent in that window is
+        # refused as DISABLED and after it as un-homed. Either way it is
+        # refused; which gate catches it is a race, so both are accepted
+        # and the un-homed gate is proven deterministically just below.
         with pytest.raises(RobotError) as booted:
             await client.move_j(park, duration=1.5)
-        assert booted.value.code == ErrorCode.SYS_CONTROLLER_DISABLED
+        assert booted.value.code in (
+            ErrorCode.SYS_CONTROLLER_DISABLED,
+            ErrorCode.MOTN_NOT_HOMED,
+        )
 
         async def unhomed_move():
             await client.move_j(park, duration=1.5)
@@ -438,3 +446,54 @@ async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
 
         assert await enable(client, select) is None
         assert client.tool.key == fitted.key
+
+
+@pytest.mark.timeout(240)
+async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
+    daemon: LiveDaemon,
+):
+    """A ``servo_j`` stream at this rig's tick rate must drive the arm and
+    leave the controller usable — the path no e2e covered.
+
+    The RT streaming watchdog is derived from config SECONDS
+    (``stream.command_timeout_s / tick_dt_s``), and at a tick period this
+    long it rounded down to a single tick.  The watchdog is read in the
+    tick's error phase but fed in its later dispatch phase, so even a
+    stream landing a setpoint on every tick showed one tick of age at
+    every check: ``RTI_LINK_LOST`` latched one tick into every stream, the
+    arm never moved, and the controller stayed DISABLED for the rest of
+    the session — refusing every command while the client was told
+    nothing.  All three halves are asserted here: the motion, the clean
+    error surface, and a session that still works afterwards.
+    """
+    park = park_deg()
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await teleport_to(client, park)
+        start = (await client.angles())[0]
+
+        # A UI's streaming cadence (20 Hz) toward a target well outside
+        # one tick's travel, so the arm has to move to follow it.
+        target = list(park)
+        target[0] = park[0] + 20.0
+        for _ in range(40):
+            await client.servo_j(target)
+            await asyncio.sleep(0.05)
+
+        landed = await client.angles()
+        assert landed is not None
+        assert landed[0] > start + 2.0, (
+            f"the servo stream never drove J0 ({start:.3f} -> {landed[0]:.3f} deg); "
+            f"daemon log:\n{daemon.log()}"
+        )
+        assert await client.error() is None, (
+            f"streaming must not latch an RT error; daemon log:\n{daemon.log()}"
+        )
+        assert "RtiLinkLost" not in daemon.log()
+
+        # The controller survived the stream: a queued move runs to
+        # completion instead of being refused as DISABLED.
+        index = await client.move_j(park, duration=1.5)
+        assert await client.wait_command(index, timeout=STEP_BUDGET_S) is True, (
+            f"the stream left the controller unusable; daemon log:\n{daemon.log()}"
+        )
