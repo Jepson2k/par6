@@ -2,7 +2,7 @@
 //!
 //! Threads owned by one [`Daemon`]:
 //!
-//! 1. **RT thread** — `RtCore<SimBus>::run()` (absolute-deadline pacing;
+//! 1. **RT thread** — `RtCore<RuntimeBus>::run()` (absolute-deadline pacing;
 //!    SCHED_FIFO/pinning skipped in sim mode). Between `run()` sessions
 //!    it applies queued [`CoreOp`](crate::bridge) closures (teleport
 //!    re-seed, settle-policy swap, loop-stats reset).
@@ -24,12 +24,15 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use par6_bus::sim::SimBus;
+use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::{ConfigBundle, ConfigError, LimitMode};
 use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
+#[cfg(not(feature = "ffi"))]
+use par6_rt::NoFk;
 use par6_rt::{
-    sample_ring, snapshot_channel, CompletionPolicy, NoFk, RtCore, RtHooks, RunOptions,
-    SharedFlashMarker, SharedLineGpio, SnapshotReader, SnapshotWriter, SpecSettle, StateSnapshot,
-    ZeroGravity,
+    sample_ring, snapshot_channel, CompletionPolicy, ForwardKin, GravityModel, RtCore, RtHooks,
+    RunOptions, SharedFlashMarker, SharedLineGpio, SnapshotReader, SnapshotWriter, SpecSettle,
+    StateSnapshot, ZeroGravity,
 };
 use par6_server::{ServerConfig, ServerHandle};
 
@@ -57,6 +60,10 @@ pub enum DaemonError {
     /// Hardware mode is unavailable (missing interface or backend).
     #[error("{0}")]
     Hardware(String),
+    /// The kinematics stack could not start (missing assets tree, URDF
+    /// load failure, or a build without feature `ffi`).
+    #[error("kinematics: {0}")]
+    Kinematics(String),
     /// The RT core could not be constructed.
     #[error("RT core: {0}")]
     Core(#[from] par6_rt::CoreError),
@@ -113,9 +120,31 @@ impl Daemon {
             config_path.display()
         );
 
-        if !opts.sim {
-            return Err(hardware_unavailable(&robot.bus.interface));
+        if opts.sim_dynamics && !opts.sim {
+            return Err(DaemonError::Hardware(
+                "--sim-dynamics is a simulator plant; add --sim or drop it".into(),
+            ));
         }
+        #[cfg(not(feature = "ffi"))]
+        if opts.sim_dynamics {
+            return Err(DaemonError::Kinematics(
+                "--sim-dynamics needs a par6d build with feature `ffi`".into(),
+            ));
+        }
+        #[cfg(not(feature = "ffi"))]
+        if opts.assets.is_some() {
+            log::warn!("--assets has no effect: this par6d was built without feature `ffi`");
+        }
+
+        #[cfg(feature = "ffi")]
+        let KinStack {
+            fk: kin_fk,
+            gravity: kin_gravity,
+            planner: kin_planner,
+            bridge: kin_bridge,
+            housekeeping: kin_hk,
+            assets_dir,
+        } = load_kin_stack(opts, &config_path, robot)?;
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
@@ -134,29 +163,90 @@ impl Daemon {
         let (gpio, _estop_line) = SharedLineGpio::new(true);
         let (flash, _flash_flag) = SharedFlashMarker::new();
 
-        // Gravity and TCP FK run the built-in defaults: ZeroGravity and
-        // NoFk (all-NaN TCP pose). Follow-up: adapt the pinokin gravity
-        // model and par6-kin FK here once the kinematics workstream
-        // lands its adapter — do NOT wire pinokin from this crate yet.
+        // Gravity and TCP FK: Kin-backed (G(q) + real TCP pose) with
+        // feature `ffi`, the built-in defaults (ZeroGravity, NoFk =
+        // all-NaN TCP pose) otherwise.
+        //
+        // G(q) is a feedforward that cancels the arm's OWN weight, so it
+        // belongs only where that weight exists: the torque-level plant
+        // (and, later, hardware). The kinematic plant integrates
+        // commanded current directly and models no gravity, so feeding
+        // it G(q) would accelerate an IDLE arm off its pose.
+        #[cfg(feature = "ffi")]
+        let gravity_hook: Box<dyn GravityModel> = if opts.sim && !opts.sim_dynamics {
+            Box::new(ZeroGravity)
+        } else {
+            Box::new(kin_gravity)
+        };
+        #[cfg(feature = "ffi")]
+        let fk_hook: Box<dyn ForwardKin> = Box::new(kin_fk);
+        #[cfg(not(feature = "ffi"))]
+        let (gravity_hook, fk_hook): (Box<dyn GravityModel>, Box<dyn ForwardKin>) =
+            (Box::new(ZeroGravity), Box::new(NoFk));
         let hooks = RtHooks {
-            gravity: Box::new(ZeroGravity),
+            gravity: gravity_hook,
             jog: Box::new(jog),
             stream: Box::new(stream),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
             estop: Box::new(gpio),
             flash: Box::new(flash),
             commands: Box::new(cmds_rx),
-            fk: Box::new(NoFk),
+            fk: fk_hook,
             samples: consumer,
         };
-        let (core, handles) = RtCore::new(&bundle, SimBus::new(), hooks)?;
+        #[cfg(feature = "ffi")]
+        let sim_bus = if opts.sim_dynamics {
+            // The torque-level plant models the ARM (its URDF must carry
+            // exactly the configured joint count, so the bare-flange
+            // model is the only fit); the active tool's mass rides the
+            // gravity model, not the plant.
+            let urdf = assets_dir.join(par6_kin::GripperVariant::Flange.urdf_relpath());
+            if !urdf.is_file() {
+                return Err(DaemonError::Kinematics(format!(
+                    "sim-dynamics URDF missing: {}",
+                    urdf.display()
+                )));
+            }
+            log::info!("sim plant: torque-level dynamics ({})", urdf.display());
+            SimBus::with_dynamics(urdf)
+        } else {
+            SimBus::new()
+        };
+        #[cfg(not(feature = "ffi"))]
+        let sim_bus = SimBus::new();
+        let bus = if opts.sim {
+            RuntimeBus::from(sim_bus)
+        } else {
+            RuntimeBus::from(open_hardware_bus(&robot.bus)?)
+        };
+        let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
 
         // The RT snapshot channel is single-reader; the tee fans it out.
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
         let (plan_w, plan_r) = snapshot_channel::<StateSnapshot>();
         let (hk_w, hk_r) = snapshot_channel::<StateSnapshot>();
+        // The bridge only needs its own tap with feature `ffi` (seeding
+        // cartesian streams from the measured pose).
+        #[cfg_attr(not(feature = "ffi"), allow(unused_mut))]
+        let mut tee_writers = vec![srv_w, plan_w, hk_w];
+        #[cfg(feature = "ffi")]
+        let bridge_snapshots = {
+            let (br_w, br_r) = snapshot_channel::<StateSnapshot>();
+            tee_writers.push(br_w);
+            br_r
+        };
 
         let link = CoreLink::new(cmds_tx, ops_tx, rt_break.clone());
+        #[cfg(feature = "ffi")]
+        let planner = Par6Planner::new(
+            link.clone(),
+            producer,
+            handles.heartbeat.clone(),
+            plan_r,
+            &bundle,
+            kin_planner,
+        )?;
+        #[cfg(not(feature = "ffi"))]
         let planner = Par6Planner::new(
             link.clone(),
             producer,
@@ -166,6 +256,21 @@ impl Daemon {
         )?;
         let stream_input = Arc::new(Mutex::new(handles.stream));
         let shared = Arc::new(Mutex::new(SharedState::default()));
+        #[cfg(feature = "ffi")]
+        let bridge = RtBridge::new(
+            link.clone(),
+            stream_input.clone(),
+            shared.clone(),
+            bundle.clone(),
+            opts.sim,
+            crate::bridge::CartStream {
+                kin: kin_bridge,
+                snapshots: bridge_snapshots,
+                soft_min: stream_limits.soft_min,
+                soft_max: stream_limits.soft_max,
+            },
+        );
+        #[cfg(not(feature = "ffi"))]
         let bridge = RtBridge::new(
             link.clone(),
             stream_input.clone(),
@@ -189,12 +294,19 @@ impl Daemon {
             },
         ))?;
         let command_addr = server.addr;
-        log::info!("command plane on {command_addr} (sim backend)");
+        let backend = if opts.sim { "sim" } else { "SocketCAN" };
+        log::info!("command plane on {command_addr} ({backend} backend)");
 
-        let run_opts = RunOptions {
+        let run_opts = if opts.sim {
             // Sim runs unprivileged and in CI: no pinning, no SCHED_FIFO.
-            cpu: None,
-            fifo_priority: None,
+            RunOptions {
+                cpu: None,
+                fifo_priority: None,
+            }
+        } else {
+            // Hardware: SCHED_FIFO on the isolated core (spec/RT.md
+            // scheduling; setup failure is logged DEGRADED, not fatal).
+            RunOptions::default()
         };
         let mut threads = Vec::new();
         {
@@ -211,7 +323,7 @@ impl Daemon {
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-tee".into())
-                    .spawn(move || tee_loop(rt_reader, vec![srv_w, plan_w, hk_w], shutdown))?,
+                    .spawn(move || tee_loop(rt_reader, tee_writers, shutdown))?,
             );
         }
         {
@@ -220,7 +332,10 @@ impl Daemon {
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
-                        housekeeping_loop(link, stream_input, shared, hk_r, dt, shutdown)
+                        #[cfg(feature = "ffi")]
+                        housekeeping_loop(link, stream_input, shared, hk_r, dt, shutdown, kin_hk);
+                        #[cfg(not(feature = "ffi"))]
+                        housekeeping_loop(link, stream_input, shared, hk_r, dt, shutdown);
                     })?,
             );
         }
@@ -274,7 +389,7 @@ impl Drop for Daemon {
 /// The RT thread body: `run()` until an op or shutdown breaks the loop,
 /// apply pending ops with `&mut RtCore`, repeat.
 fn rt_loop(
-    mut core: RtCore<SimBus>,
+    mut core: RtCore<RuntimeBus>,
     ops: mpsc::Receiver<CoreOp>,
     rt_break: Arc<AtomicBool>,
     shutdown: Arc<AtomicBool>,
@@ -343,18 +458,63 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     cfg
 }
 
-/// Hardware mode diagnosis: distinguish "no such interface" from "the
-/// backend is missing" so the operator knows which problem to fix.
-fn hardware_unavailable(iface: &str) -> DaemonError {
-    use socketcan::Socket;
-    match socketcan::CanSocket::open(iface) {
-        Ok(_) => DaemonError::Hardware(format!(
-            "CAN interface '{iface}' is present, but the SocketCAN DriverBus backend \
-             has not landed in par6-bus yet; run with --sim"
-        )),
-        Err(e) => DaemonError::Hardware(format!(
-            "CAN interface '{iface}' is not available ({e}); hardware mode needs a \
-             configured SocketCAN interface — run with --sim for the simulator"
-        )),
-    }
+/// The kinematics models loaded at startup (feature `ffi`): one
+/// [`par6_kin::Kin`] per consumer — pinocchio's `Data` is mutated by
+/// every call, so instances are never shared across threads.
+#[cfg(feature = "ffi")]
+struct KinStack {
+    fk: crate::kin::KinFk,
+    gravity: crate::kin::KinGravity,
+    planner: crate::kin::CartKin,
+    bridge: crate::kin::CartKin,
+    housekeeping: crate::kin::CartKin,
+    assets_dir: std::path::PathBuf,
+}
+
+/// Resolve the assets tree and load every model instance. Any failure
+/// (missing tree, bad URDF) is a clean startup error.
+#[cfg(feature = "ffi")]
+fn load_kin_stack(
+    opts: &Options,
+    config_path: &std::path::Path,
+    robot: &par6_config::RobotConfig,
+) -> Result<KinStack, DaemonError> {
+    use crate::kin::{load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity};
+    let assets_dir =
+        resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
+    let variant = variant_for(&robot.robot.active_gripper);
+    log::info!(
+        "kinematics: {} from {}",
+        variant.urdf_relpath(),
+        assets_dir.display()
+    );
+    let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
+    // G(q) must describe the body that actually swings: the torque-level
+    // sim plant is built from the arm-only URDF (the gripper variants
+    // carry jaw joints the plant cannot take), so compensating a tool it
+    // is not carrying would push an IDLE arm upward.
+    let gravity_variant = if opts.sim_dynamics {
+        par6_kin::GripperVariant::Flange
+    } else {
+        variant
+    };
+    Ok(KinStack {
+        fk: KinFk::new(load()?),
+        gravity: KinGravity::new(
+            load_kin(&assets_dir, gravity_variant).map_err(DaemonError::Kinematics)?,
+        ),
+        planner: CartKin::new(load()?),
+        bridge: CartKin::new(load()?),
+        housekeeping: CartKin::new(load()?),
+        assets_dir,
+    })
+}
+
+/// Open the hardware bus, turning the backend's bring-up diagnosis into a
+/// clean startup error (the operator needs to know which problem to fix:
+/// missing interface, no `CAP_NET_ADMIN`, wrong bitrate).
+fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, DaemonError> {
+    log::info!("bus backend: SocketCAN on '{}'", cfg.interface);
+    SocketCanBus::open(cfg)
+        .map_err(|e| DaemonError::Hardware(format!("{e} — run with --sim for the simulator")))
 }

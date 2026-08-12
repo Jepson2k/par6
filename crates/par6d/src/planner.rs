@@ -11,6 +11,14 @@
 //! outcome means the arm actually finished, not merely that samples
 //! were emitted. `home` runs the real homing FSM via a mode request and
 //! watches the snapshot; `delay` counts RT ticks.
+//!
+//! With feature `ffi` the cartesian surface is live: `move_j_pose` runs
+//! seeded IK on the target pose and rides the `move_j` pipeline;
+//! `move_l` samples the straight cartesian segment (position lerp +
+//! orientation slerp), solves seeded IK per sample, times the joint
+//! waypoints with TOPPRA ([`pinokin_sys::Trajectory`]) and streams the
+//! timed trajectory into the ring at tick dt. Any IK or timing failure
+//! is a command error — there is no silent joint-space fallback.
 
 use std::time::{Duration, Instant};
 
@@ -28,6 +36,26 @@ use crate::bridge::CoreLink;
 /// How long a started command may wait for its RT mode to engage before
 /// the planner declares the start failed.
 const MODE_GRACE: Duration = Duration::from_secs(2);
+
+/// `move_l` cartesian sampling pitch: one IK waypoint per this much
+/// translation \[m\] …
+#[cfg(feature = "ffi")]
+const MOVE_L_STEP_M: f64 = 0.005;
+/// … or per this much rotation \[rad\], whichever yields more waypoints.
+#[cfg(feature = "ffi")]
+const MOVE_L_STEP_RAD: f64 = 0.05;
+/// Waypoint-count ceiling for one `move_l` (bounds planning cost).
+#[cfg(feature = "ffi")]
+const MOVE_L_MAX_STEPS: usize = 400;
+/// Below this much translation AND rotation a `move_l` is already at
+/// its target.
+#[cfg(feature = "ffi")]
+const MOVE_L_NULL_M: f64 = 1e-6;
+/// Largest joint change allowed between consecutive `move_l` IK
+/// waypoints \[rad\]; a bigger jump means the solver hopped to another
+/// IK branch and the "straight line" would whip the arm.
+#[cfg(feature = "ffi")]
+const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 
 enum InFlightKind {
     Exec {
@@ -64,6 +92,8 @@ pub(crate) struct Par6Planner {
     policy: par6_proto::CompletionPolicy,
     inflight: Option<InFlight>,
     enablement: Enablement,
+    #[cfg(feature = "ffi")]
+    kin: crate::kin::CartKin,
 }
 
 impl Par6Planner {
@@ -73,6 +103,7 @@ impl Par6Planner {
         heartbeat: ExecHeartbeat,
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
+        #[cfg(feature = "ffi")] kin: crate::kin::CartKin,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
         let dt = bundle.robot.robot.tick_dt_s;
@@ -88,28 +119,63 @@ impl Par6Planner {
             policy: par6_proto::CompletionPolicy::Settled,
             inflight: None,
             enablement: Enablement::default(),
+            #[cfg(feature = "ffi")]
+            kin,
         })
     }
 
-    fn start_move_j(
-        &mut self,
-        cmd: &par6_proto::command::MoveJ,
-    ) -> Result<InFlightKind, WireError> {
-        let snap = self.snapshots.latest();
-        let start = snap.q;
-        let mut target = [0.0; MAX_JOINTS];
-        for (i, t) in target.iter_mut().enumerate() {
-            let a = cmd.angles[i].to_radians();
-            *t = if cmd.rel { start[i] + a } else { a };
+    /// Wrap fully-timed tick-dt samples as the next EXEC in-flight
+    /// command: allocate a ring index, stamp the metadata, request EXEC.
+    fn start_exec(&mut self, samples: Vec<[f64; 2 * MAX_JOINTS]>, seen_exec: bool) -> InFlightKind {
+        let ring_index = self.next_ring_index;
+        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
+        let n = samples.len();
+        let samples: Vec<RingSample> = samples
+            .into_iter()
+            .enumerate()
+            .map(|(k, qqd)| {
+                let mut s = RingSample {
+                    q: [0.0; MAX_JOINTS],
+                    qd: [0.0; MAX_JOINTS],
+                    tau_ff: [0.0; MAX_JOINTS],
+                    meta: SampleMeta {
+                        command_index: ring_index,
+                        checkpoint_id: ring_index,
+                        blend_continues: false,
+                        is_last: k + 1 == n,
+                    },
+                };
+                s.q.copy_from_slice(&qqd[..MAX_JOINTS]);
+                s.qd.copy_from_slice(&qqd[MAX_JOINTS..]);
+                s
+            })
+            .collect();
+        self.link.send(RtCommand::SetMode(Mode::Exec));
+        self.heartbeat.feed();
+        InFlightKind::Exec {
+            ring_index,
+            samples,
+            cursor: 0,
+            seen_exec,
         }
+    }
+
+    /// Plan a joint-space move from the measured pose in `snap` to
+    /// `target` \[rad\] with the Ruckig EXEC profile and start it.
+    fn start_joint_move(
+        &mut self,
+        snap: &StateSnapshot,
+        target: [f64; MAX_JOINTS],
+        duration: Option<f64>,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> Result<InFlightKind, WireError> {
+        let start = snap.q;
         let mut limits = self.exec_limits;
-        if let Some(accel) = cmd.accel {
+        if let Some(accel) = accel {
             for a in limits.acceleration.iter_mut() {
                 *a *= accel;
             }
-        }
-        if cmd.blend_radius.is_some() {
-            log::debug!("move_j blend_radius ignored: cross-command blending is a follow-up");
         }
         let mut builder = ProgramBuilder::new(start, limits, self.dt).map_err(planning_error)?;
         builder
@@ -117,42 +183,253 @@ impl Par6Planner {
                 target,
                 MoveParams {
                     profile: ProfileKind::Ruckig,
-                    speed_fraction: cmd.speed.unwrap_or(1.0),
-                    min_duration_s: cmd.duration,
+                    speed_fraction: speed.unwrap_or(1.0),
+                    min_duration_s: duration,
                     blend_with_next: false,
                     checkpoint_id: None,
                 },
             )
             .map_err(planning_error)?;
         let plan = builder.plan().map_err(planning_error)?;
-
-        let ring_index = self.next_ring_index;
-        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
-        let n = plan.len();
-        let samples: Vec<RingSample> = plan
+        let samples = plan
             .samples()
             .iter()
-            .enumerate()
-            .map(|(k, s)| RingSample {
-                q: s.q,
-                qd: s.qd,
-                tau_ff: s.tau_ff,
-                meta: SampleMeta {
-                    command_index: ring_index,
-                    checkpoint_id: ring_index,
-                    blend_continues: false,
-                    is_last: k + 1 == n,
-                },
+            .map(|s| {
+                let mut qqd = [0.0; 2 * MAX_JOINTS];
+                qqd[..MAX_JOINTS].copy_from_slice(&s.q);
+                qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
+                qqd
             })
             .collect();
-        self.link.send(RtCommand::SetMode(Mode::Exec));
-        self.heartbeat.feed();
-        Ok(InFlightKind::Exec {
-            ring_index,
-            samples,
-            cursor: 0,
-            seen_exec: snap.mode == Mode::Exec,
-        })
+        Ok(self.start_exec(samples, snap.mode == Mode::Exec))
+    }
+
+    fn start_move_j(
+        &mut self,
+        cmd: &par6_proto::command::MoveJ,
+    ) -> Result<InFlightKind, WireError> {
+        let snap = self.snapshots.latest();
+        let mut target = [0.0; MAX_JOINTS];
+        for (i, t) in target.iter_mut().enumerate() {
+            let a = cmd.angles[i].to_radians();
+            *t = if cmd.rel { snap.q[i] + a } else { a };
+        }
+        if cmd.blend_radius.is_some() {
+            log::debug!("move_j blend_radius ignored: cross-command blending is a follow-up");
+        }
+        self.start_joint_move(&snap, target, cmd.duration, cmd.speed, cmd.accel)
+    }
+
+    /// MOVE_J_POSE: seeded IK on the target pose, then the joint-move
+    /// pipeline. IK failure is a command error, never a silent no-op.
+    #[cfg(feature = "ffi")]
+    fn start_move_j_pose(
+        &mut self,
+        cmd: &par6_proto::command::MoveJPose,
+    ) -> Result<InFlightKind, WireError> {
+        use crate::kin::{wire_pose_to_matrix, IkResult};
+        let snap = self.snapshots.latest();
+        let target_pose = wire_pose_to_matrix(&cmd.pose);
+        let target = match self.kin.ik(&snap.q, &target_pose) {
+            IkResult::Solved(q) => q,
+            IkResult::Unreachable => {
+                return Err(make_error(
+                    ErrorCode::IkTargetUnreachable,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        "The solver did not converge from the current configuration.",
+                    )],
+                ));
+            }
+            IkResult::Failed(e) => {
+                return Err(make_error(
+                    ErrorCode::MotnSetupFailed,
+                    UNATTRIBUTED,
+                    &[("detail", &e)],
+                ));
+            }
+        };
+        if cmd.blend_radius.is_some() {
+            log::debug!("move_j_pose blend_radius ignored: cross-command blending is a follow-up");
+        }
+        self.start_joint_move(&snap, target, cmd.duration, cmd.speed, cmd.accel)
+    }
+
+    /// MOVE_L: straight cartesian segment → seeded IK waypoints → TOPPRA
+    /// timing → ring samples at tick dt. Every failure (IK, branch flip,
+    /// soft limits, timing) errors the command; nothing falls back to a
+    /// joint-space move.
+    #[cfg(feature = "ffi")]
+    fn start_move_l(
+        &mut self,
+        cmd: &par6_proto::command::MoveL,
+    ) -> Result<InFlightKind, WireError> {
+        use crate::kin::{wire_pose_to_matrix, CartSegment, IkResult};
+        use par6_proto::Frame;
+
+        let snap = self.snapshots.latest();
+        let start_q = snap.q;
+        let start_pose = self
+            .kin
+            .fk(&start_q)
+            .map_err(|e| make_error(ErrorCode::MotnSetupFailed, UNATTRIBUTED, &[("detail", &e)]))?;
+        let wire = wire_pose_to_matrix(&cmd.pose);
+        let target_pose = match (cmd.frame, cmd.rel) {
+            (Frame::Wrf, false) => wire,
+            // World-frame delta: translation adds, rotation applies
+            // about the world axes.
+            (Frame::Wrf, true) => {
+                let mut t = crate::kin::mat_mul(&wire, &start_pose);
+                t[3] = start_pose[3] + wire[3];
+                t[7] = start_pose[7] + wire[7];
+                t[11] = start_pose[11] + wire[11];
+                t
+            }
+            // A tool-frame pose is inherently relative to the current
+            // tool frame.
+            (Frame::Trf, _) => crate::kin::mat_mul(&start_pose, &wire),
+        };
+        if cmd.blend_radius.is_some() {
+            log::debug!("move_l blend_radius ignored: cross-command blending is a follow-up");
+        }
+
+        let seg = CartSegment::new(&start_pose, &target_pose);
+        let (len, ang) = (seg.length_m(), seg.angle_rad());
+        if len < MOVE_L_NULL_M && ang < MOVE_L_NULL_M {
+            return Ok(InFlightKind::Instant);
+        }
+        let steps = ((len / MOVE_L_STEP_M).ceil() as usize)
+            .max((ang / MOVE_L_STEP_RAD).ceil() as usize)
+            .clamp(2, MOVE_L_MAX_STEPS);
+
+        // The endpoint decides reachable-at-all before the path decides
+        // reachable-along-the-line.
+        match self.kin.ik(&start_q, &target_pose) {
+            IkResult::Solved(_) => {}
+            IkResult::Unreachable => {
+                return Err(make_error(
+                    ErrorCode::IkTargetUnreachable,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        "The solver did not converge from the current configuration.",
+                    )],
+                ));
+            }
+            IkResult::Failed(e) => {
+                return Err(make_error(
+                    ErrorCode::MotnSetupFailed,
+                    UNATTRIBUTED,
+                    &[("detail", &e)],
+                ));
+            }
+        }
+
+        let total = steps + 1;
+        let mut waypoints = Vec::with_capacity(total * MAX_JOINTS);
+        waypoints.extend_from_slice(&start_q);
+        let mut seed = start_q;
+        for k in 1..=steps {
+            let pose = seg.sample(k as f64 / steps as f64);
+            let q = match self.kin.ik(&seed, &pose) {
+                IkResult::Solved(q) => q,
+                IkResult::Unreachable => {
+                    return Err(make_error(
+                        ErrorCode::IkPartialPath,
+                        UNATTRIBUTED,
+                        &[("valid", &k.to_string()), ("total", &total.to_string())],
+                    ));
+                }
+                IkResult::Failed(e) => {
+                    return Err(make_error(
+                        ErrorCode::MotnSetupFailed,
+                        UNATTRIBUTED,
+                        &[("detail", &e)],
+                    ));
+                }
+            };
+            for j in 0..MAX_JOINTS {
+                if q[j] < self.exec_limits.soft_min[j] || q[j] > self.exec_limits.soft_max[j] {
+                    return Err(make_error(
+                        ErrorCode::CommValidationError,
+                        UNATTRIBUTED,
+                        &[(
+                            "detail",
+                            &format!(
+                                "the line leaves joint {j}'s soft window at sample {k}/{total}"
+                            ),
+                        )],
+                    ));
+                }
+                if (q[j] - seed[j]).abs() > MOVE_L_MAX_JOINT_STEP_RAD {
+                    return Err(make_error(
+                        ErrorCode::IkPartialPath,
+                        UNATTRIBUTED,
+                        &[("valid", &k.to_string()), ("total", &total.to_string())],
+                    ));
+                }
+            }
+            waypoints.extend_from_slice(&q);
+            seed = q;
+        }
+
+        let speed_frac = cmd.speed.unwrap_or(1.0);
+        let accel_frac = cmd.accel.unwrap_or(1.0);
+        let vel: Vec<f64> = self
+            .exec_limits
+            .velocity
+            .iter()
+            .map(|v| v * speed_frac)
+            .collect();
+        let acc: Vec<f64> = self
+            .exec_limits
+            .acceleration
+            .iter()
+            .map(|a| a * accel_frac)
+            .collect();
+        let traj = pinokin_sys::Trajectory::parameterize(&waypoints, MAX_JOINTS, &vel, &acc, None)
+            .map_err(|e| {
+                make_error(
+                    ErrorCode::TrajNoSteps,
+                    UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                )
+            })?;
+        let t_path = traj.duration();
+        if !t_path.is_finite() || t_path <= 0.0 {
+            return Err(make_error(
+                ErrorCode::TrajNoSteps,
+                UNATTRIBUTED,
+                &[("detail", &format!("TOPPRA produced duration {t_path}"))],
+            ));
+        }
+        // A requested duration is a minimum: TOPPRA's optimum bounds how
+        // fast the line can be driven, a longer request time-scales the
+        // whole trajectory (velocities scale with it, so limits still hold).
+        let t_eff = t_path.max(cmd.duration.unwrap_or(0.0));
+        let scale = t_path / t_eff;
+        let n = ((t_eff / self.dt).ceil() as usize).max(1);
+        let mut samples = Vec::with_capacity(n);
+        let (mut q, mut qd, mut qdd) = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        for k in 1..=n {
+            let t = ((k as f64) * self.dt).min(t_eff) * scale;
+            traj.sample_into(t, &mut q, &mut qd, &mut qdd)
+                .map_err(|e| {
+                    make_error(
+                        ErrorCode::MotnSetupFailed,
+                        UNATTRIBUTED,
+                        &[("detail", &format!("trajectory sampling failed: {e}"))],
+                    )
+                })?;
+            let mut qqd = [0.0; 2 * MAX_JOINTS];
+            qqd[..MAX_JOINTS].copy_from_slice(&q);
+            for (out, v) in qqd[MAX_JOINTS..].iter_mut().zip(qd.iter()) {
+                *out = v * scale;
+            }
+            samples.push(qqd);
+        }
+        Ok(self.start_exec(samples, snap.mode == Mode::Exec))
     }
 
     /// Feed pending samples into the ring, up to its free capacity.
@@ -237,8 +514,8 @@ impl Par6Planner {
 
     fn update_enablement(&mut self, snap: &StateSnapshot) {
         // Direction freedom against the soft window. Cartesian flags
-        // stay at their permissive default until the par6-kin FK/IK
-        // adapter lands (follow-up).
+        // stay at their permissive default: there is no workspace model
+        // to bound them against yet (follow-up).
         let mut en = Enablement::default();
         for j in 0..MAX_JOINTS {
             en.joint_en[2 * j] = u8::from(snap.q[j] > self.exec_limits.soft_min[j]);
@@ -274,17 +551,28 @@ impl Planner for Par6Planner {
                     )],
                 ));
             }
-            Command::MoveJPose(_)
-            | Command::MoveL(_)
-            | Command::MoveC(_)
-            | Command::MoveS(_)
-            | Command::MoveP(_) => {
+            #[cfg(feature = "ffi")]
+            Command::MoveJPose(p) => self.start_move_j_pose(p)?,
+            #[cfg(feature = "ffi")]
+            Command::MoveL(p) => self.start_move_l(p)?,
+            #[cfg(not(feature = "ffi"))]
+            Command::MoveJPose(_) | Command::MoveL(_) => {
                 return Err(make_error(
                     ErrorCode::MotnSetupFailed,
                     UNATTRIBUTED,
                     &[(
                         "detail",
-                        "cartesian planning requires the par6-kin IK adapter (follow-up)",
+                        "cartesian planning needs a par6d build with feature `ffi`",
+                    )],
+                ));
+            }
+            Command::MoveC(_) | Command::MoveS(_) | Command::MoveP(_) => {
+                return Err(make_error(
+                    ErrorCode::MotnSetupFailed,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        "arc/spline/process moves are not implemented yet (par6d follow-up)",
                     )],
                 ));
             }
@@ -341,11 +629,15 @@ impl Planner for Par6Planner {
     }
 
     fn cancel(&mut self) {
+        // Only an in-flight command can own samples in the ring: one
+        // that completed drained it, one already discarded flushed it.
+        // A flush sent with nothing in flight is not idempotent — it
+        // rides the RT command queue (one command per tick) while
+        // samples ride the SPSC ring (immediate), so it can overtake
+        // the NEXT command's samples and silently erase them, leaving
+        // EXEC holding forever with no COMPLETE.
         if self.inflight.is_some() {
             self.discard_planned();
-        } else {
-            // Idempotent: still flush anything queued in the ring.
-            self.link.send(RtCommand::ExecFlush);
         }
     }
 
@@ -363,8 +655,9 @@ impl Planner for Par6Planner {
             }));
         }
         // profile / tool / tcp_offset / shapes are stored and reported by
-        // the server; the planner will consume them once cartesian
-        // planning and collision checking land with par6-kin (follow-up).
+        // the server; the planner will consume them once TCP-offset
+        // retargeting and collision checking land (follow-up). Cartesian
+        // targets currently resolve at the URDF's TCP frame.
     }
 
     fn enablement(&self) -> Enablement {

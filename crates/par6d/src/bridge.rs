@@ -22,8 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use par6_bus::sim::SimBus;
-use par6_bus::DriverBus;
+use par6_bus::{DriverBus, RuntimeBus};
 use par6_config::ConfigBundle;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
@@ -33,7 +32,7 @@ use par6_server::RtCommands;
 
 /// A closure applied to the core on the RT thread, between `run()`
 /// sessions.
-pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<SimBus>) + Send>;
+pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 
 /// Servo streams self-terminate after this much client silence (the RT
 /// stream watchdog is fed by housekeeping keep-alives until then).
@@ -51,6 +50,14 @@ const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
 const ENABLE_TRUST_SLACK_TICKS: u64 = 16;
 /// Housekeeping loop period.
 const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+/// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities` fraction
+/// of ±1 maps to this; conservative — the RT stream limiter still owns
+/// the joint-space envelope).
+#[cfg(feature = "ffi")]
+const JOG_L_LINEAR_MAX_M_S: f64 = 0.08;
+/// Full-scale `jog_l` angular TCP speed \[rad/s\].
+#[cfg(feature = "ffi")]
+const JOG_L_ANGULAR_MAX_RAD_S: f64 = 0.6;
 
 /// Both channels into the RT thread, bundled (cloneable).
 #[derive(Clone)]
@@ -94,12 +101,31 @@ impl CoreLink {
 enum StreamKind {
     Jog,
     Servo,
+    /// Cartesian velocity jog (`jog_l`): housekeeping integrates the
+    /// twist through the jacobian and streams the joint targets.
+    #[cfg(feature = "ffi")]
+    CartJog,
+}
+
+/// Live state of a cartesian jog, advanced by housekeeping each period.
+#[cfg(feature = "ffi")]
+struct CartJogState {
+    /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
+    /// commanded frame's axes.
+    twist: [f64; 6],
+    frame: par6_proto::Frame,
+    /// Integrated joint target \[rad\] (the stream setpoint source).
+    q: [f64; MAX_JOINTS],
+    soft_min: [f64; MAX_JOINTS],
+    soft_max: [f64; MAX_JOINTS],
 }
 
 struct ActiveStream {
     kind: StreamKind,
     deadline: Instant,
     servo_target: Option<[f64; MAX_JOINTS]>,
+    #[cfg(feature = "ffi")]
+    cart: Option<CartJogState>,
 }
 
 /// State shared between the bridge (server task) and housekeeping.
@@ -109,6 +135,16 @@ pub(crate) struct SharedState {
     enable_deadline: Option<Instant>,
 }
 
+/// The bridge's kinematics kit (feature `ffi`): its own model instance
+/// plus the snapshot reader that seeds IK from the measured pose.
+#[cfg(feature = "ffi")]
+pub(crate) struct CartStream {
+    pub(crate) kin: crate::kin::CartKin,
+    pub(crate) snapshots: SnapshotReader<StateSnapshot>,
+    pub(crate) soft_min: [f64; MAX_JOINTS],
+    pub(crate) soft_max: [f64; MAX_JOINTS],
+}
+
 /// The `RtCommands` implementation `par6d` hands to the server.
 pub(crate) struct RtBridge {
     link: CoreLink,
@@ -116,6 +152,8 @@ pub(crate) struct RtBridge {
     shared: Arc<Mutex<SharedState>>,
     bundle: Arc<ConfigBundle>,
     sim: bool,
+    #[cfg(feature = "ffi")]
+    cart: CartStream,
 }
 
 impl RtBridge {
@@ -125,6 +163,7 @@ impl RtBridge {
         shared: Arc<Mutex<SharedState>>,
         bundle: Arc<ConfigBundle>,
         sim: bool,
+        #[cfg(feature = "ffi")] cart: CartStream,
     ) -> Self {
         Self {
             link,
@@ -132,6 +171,8 @@ impl RtBridge {
             shared,
             bundle,
             sim,
+            #[cfg(feature = "ffi")]
+            cart,
         }
     }
 
@@ -187,6 +228,8 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Jog,
                     deadline: Instant::now() + Duration::from_secs_f64(p.duration),
                     servo_target: None,
+                    #[cfg(feature = "ffi")]
+                    cart: None,
                 });
             }
             Command::ServoJ(p) => {
@@ -209,13 +252,101 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
                     servo_target: Some(target),
+                    #[cfg(feature = "ffi")]
+                    cart: None,
                 });
             }
+            // Cartesian position streams: seeded IK, then the exact
+            // servo_j path. An unreachable target drops the datagram
+            // (fire-and-forget has no reply channel) — the arm must not
+            // move on a pose the solver cannot reach.
+            #[cfg(feature = "ffi")]
+            Command::ServoJPose(par6_proto::command::ServoJPose { pose, .. })
+            | Command::ServoL(par6_proto::command::ServoL { pose, .. }) => {
+                let mut sh = self.shared.lock().unwrap();
+                let seed = match &sh.stream {
+                    Some(ActiveStream {
+                        kind: StreamKind::Servo,
+                        servo_target: Some(t),
+                        ..
+                    }) => *t,
+                    _ => self.cart.snapshots.latest().q,
+                };
+                let target_pose = crate::kin::wire_pose_to_matrix(pose);
+                let mut target = match self.cart.kin.ik(&seed, &target_pose) {
+                    crate::kin::IkResult::Solved(q) => q,
+                    crate::kin::IkResult::Unreachable => {
+                        log::warn!("{:?}: target pose unreachable; dropped", cmd.tag());
+                        return;
+                    }
+                    crate::kin::IkResult::Failed(e) => {
+                        log::warn!("{:?}: IK failed ({e}); dropped", cmd.tag());
+                        return;
+                    }
+                };
+                for (j, v) in target.iter_mut().enumerate() {
+                    *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
+                }
+                if !matches!(
+                    sh.stream,
+                    Some(ActiveStream {
+                        kind: StreamKind::Servo,
+                        ..
+                    })
+                ) {
+                    self.enter_stream_mode(Mode::Stream);
+                }
+                self.stream_input.lock().unwrap().send(&target);
+                sh.stream = Some(ActiveStream {
+                    kind: StreamKind::Servo,
+                    deadline: Instant::now() + SERVO_GRACE,
+                    servo_target: Some(target),
+                    cart: None,
+                });
+            }
+            // Cartesian velocity jog: housekeeping steps the twist
+            // through the jacobian each period until the watchdog
+            // duration elapses.
+            #[cfg(feature = "ffi")]
+            Command::JogL(p) => {
+                let mut sh = self.shared.lock().unwrap();
+                let q = match &sh.stream {
+                    Some(ActiveStream {
+                        kind: StreamKind::CartJog,
+                        cart: Some(state),
+                        ..
+                    }) => state.q,
+                    _ => {
+                        self.enter_stream_mode(Mode::Stream);
+                        self.cart.snapshots.latest().q
+                    }
+                };
+                let mut twist = [0.0; 6];
+                for (i, (out, frac)) in twist.iter_mut().zip(p.velocities.iter()).enumerate() {
+                    let full = if i < 3 {
+                        JOG_L_LINEAR_MAX_M_S
+                    } else {
+                        JOG_L_ANGULAR_MAX_RAD_S
+                    };
+                    *out = frac * full;
+                }
+                sh.stream = Some(ActiveStream {
+                    kind: StreamKind::CartJog,
+                    deadline: Instant::now() + Duration::from_secs_f64(p.duration),
+                    servo_target: None,
+                    cart: Some(CartJogState {
+                        twist,
+                        frame: p.frame,
+                        q,
+                        soft_min: self.cart.soft_min,
+                        soft_max: self.cart.soft_max,
+                    }),
+                });
+            }
+            #[cfg(not(feature = "ffi"))]
             Command::JogL(_) | Command::ServoJPose(_) | Command::ServoL(_) => {
-                // Cartesian streaming needs IK; the par6-kin adapter is a
-                // follow-up owned by the kinematics workstream.
                 log::warn!(
-                    "{:?} requires kinematics (par6-kin adapter not wired yet); ignored",
+                    "{:?} requires kinematics (par6d built without feature `ffi`); ignored",
                     cmd.tag()
                 );
             }
@@ -269,7 +400,10 @@ impl RtCommands for RtBridge {
         self.link.op(Box::new(move |core| {
             let robot = &bundle.robot;
             let gripper = bundle.active_gripper().filter(|g| g.driver.is_some());
-            let bus = core.bus_mut();
+            let Some(bus) = core.bus_mut().sim_mut() else {
+                log::error!("teleport reached a hardware bus; dropped");
+                return;
+            };
             bus.set_initial_joint_rad(&q);
             if let Err(e) = bus.boot_configure(robot, gripper, 1) {
                 log::error!("teleport: sim re-seed failed: {e}");
@@ -315,7 +449,10 @@ impl RtCommands for RtBridge {
             UNATTRIBUTED,
             &[(
                 "detail",
-                &format!("hardware bus '{port}' unavailable: the SocketCAN DriverBus backend has not landed"),
+                &format!(
+                    "cannot switch to hardware bus '{port}' while running; \
+                     restart par6d without --sim to open the configured interface"
+                ),
             )],
         ))
     }
@@ -343,6 +480,7 @@ pub(crate) fn housekeeping_loop(
     mut snapshots: SnapshotReader<StateSnapshot>,
     tick_dt_s: f64,
     shutdown: Arc<AtomicBool>,
+    #[cfg(feature = "ffi")] mut kin: crate::kin::CartKin,
 ) {
     // ENABLED may only be trusted as the outcome of THIS request once
     // the RT has had time to drain the queue ahead of it and run the
@@ -357,7 +495,7 @@ pub(crate) fn housekeeping_loop(
         let snap = snapshots.latest();
         {
             let mut sh = shared.lock().unwrap();
-            match &sh.stream {
+            match &mut sh.stream {
                 Some(a) if now >= a.deadline => {
                     match a.kind {
                         StreamKind::Jog => {
@@ -365,6 +503,8 @@ pub(crate) fn housekeeping_loop(
                             link.send(RtCommand::JogRelease);
                         }
                         StreamKind::Servo => log::debug!("servo stream went silent; stopping"),
+                        #[cfg(feature = "ffi")]
+                        StreamKind::CartJog => log::debug!("jog_l duration elapsed; stopping"),
                     }
                     link.send(RtCommand::SetMode(Mode::Idle));
                     sh.stream = None;
@@ -374,6 +514,21 @@ pub(crate) fn housekeeping_loop(
                     // datagrams (its timeout is shorter than the grace).
                     if let Some(t) = a.servo_target {
                         stream_input.lock().unwrap().send(&t);
+                    }
+                }
+                #[cfg(feature = "ffi")]
+                Some(a) if a.kind == StreamKind::CartJog => {
+                    if let Some(state) = &mut a.cart {
+                        match step_cart_jog(&mut kin, state, HOUSEKEEPING_PERIOD.as_secs_f64()) {
+                            Ok(target) => stream_input.lock().unwrap().send(&target),
+                            Err(e) => {
+                                // Hold in place rather than integrate on a
+                                // failed solve; the stream watchdog still
+                                // needs feeding.
+                                log::warn!("jog_l step failed ({e}); holding");
+                                stream_input.lock().unwrap().send(&state.q);
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -404,4 +559,34 @@ pub(crate) fn housekeeping_loop(
         }
         std::thread::sleep(HOUSEKEEPING_PERIOD);
     }
+}
+
+/// One cartesian-jog integration step: resolve the twist into world
+/// axes, solve joint velocities through the damped jacobian, integrate
+/// the joint target and clamp it inside the soft window.
+#[cfg(feature = "ffi")]
+fn step_cart_jog(
+    kin: &mut crate::kin::CartKin,
+    state: &mut CartJogState,
+    dt_s: f64,
+) -> Result<[f64; MAX_JOINTS], String> {
+    let mut v = state.twist;
+    if state.frame == par6_proto::Frame::Trf {
+        let pose = kin.fk(&state.q)?;
+        let rot = |vec: [f64; 3]| {
+            [
+                pose[0] * vec[0] + pose[1] * vec[1] + pose[2] * vec[2],
+                pose[4] * vec[0] + pose[5] * vec[1] + pose[6] * vec[2],
+                pose[8] * vec[0] + pose[9] * vec[1] + pose[10] * vec[2],
+            ]
+        };
+        let lin = rot([v[0], v[1], v[2]]);
+        let ang = rot([v[3], v[4], v[5]]);
+        v = [lin[0], lin[1], lin[2], ang[0], ang[1], ang[2]];
+    }
+    let qd = kin.twist_to_qd(&state.q, &v)?;
+    for (j, q) in state.q.iter_mut().enumerate() {
+        *q = (*q + qd[j] * dt_s).clamp(state.soft_min[j], state.soft_max[j]);
+    }
+    Ok(state.q)
 }

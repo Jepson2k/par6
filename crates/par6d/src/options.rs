@@ -17,15 +17,22 @@ USAGE:
     par6d [--sim] [OPTIONS]
 
 MODES:
-    (default)                  Hardware mode: requires the configured SocketCAN
-                               interface. NOTE: the SocketCAN DriverBus backend
-                               has not landed yet, so hardware mode currently
-                               reports a startup error.
+    (default)                  Hardware mode: the SocketCAN backend on the
+                               configured interface (brought up at the config
+                               bitrate when it is down — needs CAP_NET_ADMIN).
     --sim                      Closed-loop simulator backend (runs anywhere).
 
 OPTIONS:
     --config <PATH>            Robot TOML (default: $PAR6_CONFIG, then
                                ./config/PAR6.toml, then <exe>/../../config/PAR6.toml)
+    --assets <DIR>             assets/par6_description tree with the PAR6 URDFs
+                               (default: $PAR6_ASSETS, then the tree next to the
+                               config directory). Used by the kinematics stack;
+                               requires a build with feature `ffi`.
+    --sim-dynamics             With --sim: torque-level physics plant (Pinocchio
+                               forward dynamics) instead of the kinematic plant.
+                               Requires a build with feature `ffi`.
+                               [env: PAR6_SIM_DYNAMICS=1]
     --port <PORT>              Command UDP port; 0 = ephemeral. The bound port is
                                printed on stdout as `PAR6D_READY command_port=...`.
                                [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
@@ -45,6 +52,11 @@ pub struct Options {
     pub sim: bool,
     /// Explicit robot TOML path (`--config` / `PAR6_CONFIG`).
     pub config: Option<PathBuf>,
+    /// Explicit `assets/par6_description` tree (`--assets` / `PAR6_ASSETS`).
+    pub assets: Option<PathBuf>,
+    /// Run the sim on the torque-level dynamics plant (`--sim-dynamics` /
+    /// `PAR6_SIM_DYNAMICS`); requires feature `ffi`.
+    pub sim_dynamics: bool,
     /// Command UDP port override (0 = ephemeral).
     pub command_port: Option<u16>,
     /// Command-socket bind address override.
@@ -71,6 +83,8 @@ impl Options {
             match arg.as_str() {
                 "--sim" => o.sim = true,
                 "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
+                "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
+                "--sim-dynamics" => o.sim_dynamics = true,
                 "--port" | "--command-port" => {
                     o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
                 }
@@ -99,6 +113,16 @@ impl Options {
         if self.config.is_none() {
             if let Some(v) = env_var("PAR6_CONFIG") {
                 self.config = Some(PathBuf::from(v));
+            }
+        }
+        if self.assets.is_none() {
+            if let Some(v) = env_var("PAR6_ASSETS") {
+                self.assets = Some(PathBuf::from(v));
+            }
+        }
+        if !self.sim_dynamics {
+            if let Some(v) = env_var("PAR6_SIM_DYNAMICS") {
+                self.sim_dynamics = v == "1" || v.eq_ignore_ascii_case("true");
             }
         }
         if self.command_port.is_none() {

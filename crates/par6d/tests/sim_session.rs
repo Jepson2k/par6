@@ -121,7 +121,13 @@ impl Rig {
             status_port: Some(status_rx.local_addr().unwrap().port()),
             telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
             status_transport: Some(StatusTransport::Unicast),
-            help: false,
+            // The test config lives in a temp dir, so the kinematics
+            // stack (feature `ffi`) cannot find the assets tree beside
+            // it; ignored by builds without the feature.
+            assets: Some(
+                PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description"),
+            ),
+            ..Options::default()
         };
         Rig {
             daemon: Some(Daemon::start(&opts).expect("daemon boots in sim mode")),

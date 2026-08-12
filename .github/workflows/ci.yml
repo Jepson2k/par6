@@ -81,6 +81,14 @@ jobs:
           source .ffi/env.sh
           cargo clippy -p par6-bus --all-targets --features sim-mujoco -- -D warnings
           cargo test -p par6-bus --features sim-mujoco
+      # The runtime's kinematics wiring (Kin-backed gravity/FK hooks, the
+      # cartesian planner surface) lives behind `ffi`, so the workspace
+      # clippy/test jobs never build it either.
+      - name: test par6d (kinematics-backed runtime)
+        run: |
+          source .ffi/env.sh
+          cargo clippy -p par6d --all-targets --features ffi -- -D warnings
+          cargo test -p par6d --features ffi
 
   python:
     name: python ${{ matrix.python }}

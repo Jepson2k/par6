@@ -4,7 +4,7 @@
 //!
 //! ```text
 //!             UDP protocol v2                 CoreOp closures + RtCommand mpsc
-//! client ◀──▶ par6-server task ── Planner ──▶ RT thread: RtCore<SimBus>.run()
+//! client ◀──▶ par6-server task ── Planner ──▶ RT thread: RtCore<RuntimeBus>.run()
 //!                    │            RtBridge ─▶   │  (SPSC sample ring, latest-wins
 //!                    │                          │   stream slot, 1 cmd per tick)
 //!                    ◀── snapshot tee thread ◀──┘  (triple-buffer fan-out)
@@ -29,6 +29,8 @@
 mod adapters;
 mod bridge;
 pub mod daemon;
+#[cfg(feature = "ffi")]
+mod kin;
 pub mod options;
 mod planner;
 

@@ -6,6 +6,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[features]
+# Real kinematics/dynamics through the Pinocchio C-ABI shim: Kin-backed
+# gravity + TCP FK hooks, the cartesian planner surface (move_j_pose /
+# move_l / cartesian streamables), and the torque-level sim plant behind
+# `--sim-dynamics`. Off by default so plain builds need no C++ toolchain;
+# run scripts/ffi/setup.sh, `source .ffi/env.sh`, then build with
+# `--features ffi`.
+ffi = [
+    "dep:par6-kin",
+    "par6-kin?/ffi",
+    "dep:pinokin-sys",
+    "par6-bus/sim-dynamics",
+]
+
 [dependencies]
 par6-config = { workspace = true }
 par6-proto = { workspace = true }
@@ -13,6 +27,8 @@ par6-motion = { workspace = true }
 par6-bus = { workspace = true }
 par6-rt = { workspace = true }
 par6-server = { workspace = true }
+par6-kin = { workspace = true, optional = true }
+pinokin-sys = { path = "../pinokin-sys", features = ["ffi"], optional = true }
 tokio = { workspace = true }
 socketcan = { workspace = true }
 thiserror = { workspace = true }
@@ -25,3 +41,5 @@ par6-proto = { workspace = true }
 par6-config = { workspace = true }
 env_logger = { workspace = true }
 libc = "0.2"
+serde = { workspace = true }
+serde_json = "1"
