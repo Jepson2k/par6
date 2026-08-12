@@ -74,6 +74,13 @@ jobs:
         run: |
           source .ffi/env.sh
           cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+      # sim-mujoco is off by default, so the workspace clippy/test jobs never
+      # see this code; libmujoco comes from the same .ffi env as the shim.
+      - name: test par6-bus (sim-mujoco contact plant)
+        run: |
+          source .ffi/env.sh
+          cargo clippy -p par6-bus --all-targets --features sim-mujoco -- -D warnings
+          cargo test -p par6-bus --features sim-mujoco
 
   python:
     name: python ${{ matrix.python }}

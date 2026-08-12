@@ -26,6 +26,11 @@ PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
 TOPPRA_COMMIT="${PAR6_TOPPRA_COMMIT:-142456f3282c92c93ab97749a24856661924d989}"
+# libmujoco (par6-bus feature `sim-mujoco`). Pinned: the hand-rolled FFI
+# declarations in crates/par6-bus/src/sim/mujoco.rs are written against this
+# version's C API. `libmujoco` is the C library alone (the `mujoco`
+# conda-forge package is a metapackage that would drag in python bindings).
+MUJOCO_VERSION="${PAR6_MUJOCO_VERSION:-3.10.0}"
 CONDA_SPECS=(
   "pinocchio=${PINOCCHIO_VERSION}"
   "eigen"      # constrained by pinocchio's build (5.0.x as of 2026-08)
@@ -101,6 +106,17 @@ else
   echo ">>> toppra exists: $ENV_DIR/lib/libtoppra.so (delete it to rebuild)"
 fi
 
+# --- 3b. libmujoco into the same env prefix ----------------------------------
+# Additive to the pinocchio/toppra env; delete $ENV_DIR/lib/libmujoco.so (or
+# bump the pin) to force a re-install.
+if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
+  echo ">>> installing libmujoco=${MUJOCO_VERSION}"
+  "$MAMBA" install -y -p "$ENV_DIR" -c conda-forge --override-channels \
+    "libmujoco=${MUJOCO_VERSION}"
+else
+  echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
+fi
+
 # --- 4. build + install the shim ---------------------------------------------
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
@@ -119,13 +135,16 @@ else
   echo ">>> shim exists: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
 
-# --- 5. env vars for pinokin-sys ---------------------------------------------
+# --- 5. env vars for pinokin-sys / par6-bus ----------------------------------
 cat > "$FFI_DIR/env.sh" <<EOF
 export PAR6_SHIM_LIB_DIR="$SHIM_PREFIX/lib"
 export PAR6_SHIM_INCLUDE_DIR="$SHIM_PREFIX/include"
+# libmujoco lives in the env prefix (par6-bus feature sim-mujoco).
+export PAR6_MUJOCO_LIB_DIR="$ENV_DIR/lib"
 # Runtime loading for binaries whose package did not embed an rpath
-# (link-args don't propagate across cargo packages).
-export LD_LIBRARY_PATH="$SHIM_PREFIX/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
+# (link-args don't propagate across cargo packages). Covers the shim AND
+# libmujoco + its conda deps.
+export LD_LIBRARY_PATH="$SHIM_PREFIX/lib:$ENV_DIR/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}"
 EOF
 
 echo

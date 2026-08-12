@@ -14,8 +14,9 @@ use crate::types::{FirmwareGripperCommand, NodeId, ObjectDetection};
 use super::driver::{ReplyKind, VirtualDriver};
 use super::plant::KinJoint;
 
-/// Firmware jaw speed \[position bytes per second per speed-byte unit\].
-const BYTES_PER_S_PER_SPEED_UNIT: f64 = 4.0;
+/// Firmware jaw speed \[position bytes per second per speed-byte unit\]
+/// (the MuJoCo plant's jaw approach uses the same rate).
+pub(crate) const BYTES_PER_S_PER_SPEED_UNIT: f64 = 4.0;
 /// Firmware calibration sweep duration \[s\] (vendor waits ≥2 s, times
 /// out at 10 s).
 const CALIBRATION_S: f64 = 1.5;

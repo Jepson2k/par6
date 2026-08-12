@@ -20,7 +20,12 @@
 //!   commands, and hall-sensor emulation at configured trigger positions;
 //! - feature `sim-dynamics`: torque-level dynamics through Pinocchio ABA
 //!   ([`dynamics::DynamicsPlant`]) — motor torques + gravity + friction +
-//!   endstop spring-dampers, semi-implicit Euler integration.
+//!   endstop spring-dampers, semi-implicit Euler integration;
+//! - feature `sim-mujoco`: contact-level dynamics through MuJoCo
+//!   ([`mujoco::MujocoPlant`]) — the same torque drive integrated in a
+//!   full scene (floor, graspable objects), with physical jaw
+//!   obstructions fed back into the gripper front end so contact grasps
+//!   surface through the real cmd-60 detection bits.
 //!
 //! Encoder output goes through the real spectral conversions: positions
 //! report from the 14-bit-wrapped boot reading (sector semantics) and
@@ -33,12 +38,14 @@ mod driver;
 #[cfg(feature = "sim-dynamics")]
 mod dynamics;
 mod gripper;
+#[cfg(feature = "sim-mujoco")]
+mod mujoco;
 mod plant;
 
 pub use driver::FaultKind;
 
 use std::collections::VecDeque;
-#[cfg(feature = "sim-dynamics")]
+#[cfg(any(feature = "sim-dynamics", feature = "sim-mujoco"))]
 use std::path::PathBuf;
 
 use par6_config::{Gains, GripperConfig, KtSource, RobotConfig, WatchdogAction};
@@ -83,6 +90,8 @@ enum ArmPlant {
     Kinematic(Vec<KinJoint>),
     #[cfg(feature = "sim-dynamics")]
     Dynamics(dynamics::DynamicsPlant),
+    #[cfg(feature = "sim-mujoco")]
+    Mujoco(mujoco::MujocoPlant),
 }
 
 /// The closed-loop sim bus. Construct, optionally set hooks
@@ -124,6 +133,12 @@ pub struct SimBus {
     initial_q: Option<Vec<f64>>,
     #[cfg(feature = "sim-dynamics")]
     urdf: Option<PathBuf>,
+    #[cfg(feature = "sim-mujoco")]
+    mjcf_scene: Option<PathBuf>,
+    /// Mirror of the gripper front end's latched firmware command, used
+    /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
+    #[cfg(feature = "sim-mujoco")]
+    mj_jaw_cmd: Option<FirmwareGripperCommand>,
 }
 
 impl SimBus {
@@ -164,6 +179,10 @@ impl SimBus {
             initial_q: None,
             #[cfg(feature = "sim-dynamics")]
             urdf: None,
+            #[cfg(feature = "sim-mujoco")]
+            mjcf_scene: None,
+            #[cfg(feature = "sim-mujoco")]
+            mj_jaw_cmd: None,
         }
     }
 
@@ -175,6 +194,22 @@ impl SimBus {
     pub fn with_dynamics(urdf: impl Into<PathBuf>) -> Self {
         let mut bus = Self::new();
         bus.urdf = Some(urdf.into());
+        bus
+    }
+
+    /// A sim bus whose arm plant is the MuJoCo scene at `scene` (arm +
+    /// gripper jaws + graspable objects, see
+    /// `sim-assets/PAR6_MSG_scene.xml`), built at
+    /// [`DriverBus::boot_configure`] time. With this plant the gripper's
+    /// object positions are owned by the scene physics —
+    /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)
+    /// values are overwritten every tick. Panics at boot if the scene
+    /// cannot be loaded or its joint layout does not match the robot
+    /// config.
+    #[cfg(feature = "sim-mujoco")]
+    pub fn with_mujoco(scene: impl Into<PathBuf>) -> Self {
+        let mut bus = Self::new();
+        bus.mjcf_scene = Some(scene.into());
         bus
     }
 
@@ -285,7 +320,28 @@ impl SimBus {
             ArmPlant::Kinematic(joints) => (joints[j].pos, joints[j].reported_vel),
             #[cfg(feature = "sim-dynamics")]
             ArmPlant::Dynamics(d) => d.motor_state(j, &self.maps[j]),
+            #[cfg(feature = "sim-mujoco")]
+            ArmPlant::Mujoco(p) => p.motor_state(j, &self.maps[j]),
         }
+    }
+
+    /// How the MuJoCo scene's jaw DOF should be driven this tick: run the
+    /// plant's own approach for an actionable latched firmware command,
+    /// otherwise follow the front end's reported jaw byte.
+    #[cfg(feature = "sim-mujoco")]
+    fn mj_jaw_drive(&self) -> Option<mujoco::JawDrive> {
+        let g = self.gripper.as_ref()?;
+        Some(match self.mj_jaw_cmd {
+            Some(c) if c.activate && c.action && !c.estop && !g.driver.watchdog_fired() => {
+                mujoco::JawDrive::Active {
+                    target_byte: f64::from(c.position),
+                    rate_bytes_s: f64::from(c.speed).max(1.0) * gripper::BYTES_PER_S_PER_SPEED_UNIT,
+                }
+            }
+            _ => mujoco::JawDrive::Track {
+                byte: f64::from(g.firmware_reply().0),
+            },
+        })
     }
 
     /// One fixed-dt physics step: drivers close their loops on the
@@ -300,6 +356,8 @@ impl SimBus {
             let (p, v) = self.motor_state(j);
             self.cmd_buf[j] = self.drivers[j].control_step(p + self.maps[j].report_offset, v);
         }
+        #[cfg(feature = "sim-mujoco")]
+        let jaw_drive = self.mj_jaw_drive();
         match &mut self.plant {
             ArmPlant::Kinematic(joints) => {
                 for (j, joint) in joints.iter_mut().enumerate() {
@@ -308,6 +366,15 @@ impl SimBus {
             }
             #[cfg(feature = "sim-dynamics")]
             ArmPlant::Dynamics(d) => d.step(dt, &self.cmd_buf, &self.loads_ma, &self.maps),
+            #[cfg(feature = "sim-mujoco")]
+            ArmPlant::Mujoco(p) => {
+                p.step(dt, &self.cmd_buf, &self.loads_ma, &self.maps, jaw_drive);
+                // The scene owns the object positions: whatever physically
+                // jammed the jaws becomes the front end's obstruction.
+                if let Some(g) = &mut self.gripper {
+                    (g.object_close_at, g.object_open_at) = p.jaw_obstruction();
+                }
+            }
         }
         if let Some(g) = &mut self.gripper {
             g.step(dt);
@@ -505,7 +572,7 @@ impl SimBus {
             match (cmd, d.len()) {
                 (CommandId::GripperDataPack, 5) => {
                     let bits = unfold_bits_msb_first(d[4]);
-                    g.on_firmware_command(FirmwareGripperCommand {
+                    let fcmd = FirmwareGripperCommand {
                         position: d[0],
                         speed: d[1],
                         current_ma: unpack_i16([d[2], d[3]]),
@@ -513,7 +580,12 @@ impl SimBus {
                         action: bits[1],
                         estop: bits[2],
                         release_dir: bits[3],
-                    });
+                    };
+                    #[cfg(feature = "sim-mujoco")]
+                    {
+                        self.mj_jaw_cmd = Some(fcmd);
+                    }
+                    g.on_firmware_command(fcmd);
                     None
                 }
                 (CommandId::GripperDataPack, 0) => {
@@ -521,12 +593,22 @@ impl SimBus {
                     None
                 }
                 (CommandId::GripperCalibrate, 0) => {
+                    // The calibration sweep replaces the latched command.
+                    #[cfg(feature = "sim-mujoco")]
+                    {
+                        self.mj_jaw_cmd = None;
+                    }
                     g.on_calibrate();
                     None
                 }
                 _ => Some(g.on_motor_frame(cmd, d)),
             }
         };
+        // A handled motor-mode frame hands the jaw to the motor loop.
+        #[cfg(feature = "sim-mujoco")]
+        if matches!(motor_reply, Some(r) if r != ReplyKind::None) {
+            self.mj_jaw_cmd = None;
+        }
         match motor_reply {
             None => self.enqueue_gripper_reply(),
             Some(ReplyKind::Motion) => {
@@ -906,16 +988,11 @@ impl DriverBus for SimBus {
             })
             .collect();
 
-        self.plant = {
-            #[cfg(feature = "sim-dynamics")]
-            if let Some(urdf) = &self.urdf {
-                ArmPlant::Dynamics(dynamics::DynamicsPlant::new(urdf, &self.maps, &q0))
-            } else {
-                ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, &q0, self.dt))
-            }
-            #[cfg(not(feature = "sim-dynamics"))]
-            ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, &q0, self.dt))
-        };
+        self.plant = self.make_arm_plant(robot, &q0);
+        #[cfg(feature = "sim-mujoco")]
+        {
+            self.mj_jaw_cmd = None;
+        }
 
         let has_can_gripper = gripper.is_some_and(|g| g.driver.is_some());
         self.gripper = if has_can_gripper {
@@ -1053,6 +1130,18 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
+    fn make_arm_plant(&self, robot: &RobotConfig, q0: &[f64]) -> ArmPlant {
+        #[cfg(feature = "sim-mujoco")]
+        if let Some(scene) = &self.mjcf_scene {
+            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(scene, &self.maps, q0));
+        }
+        #[cfg(feature = "sim-dynamics")]
+        if let Some(urdf) = &self.urdf {
+            return ArmPlant::Dynamics(dynamics::DynamicsPlant::new(urdf, &self.maps, q0));
+        }
+        ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, q0, self.dt))
+    }
+
     fn kinematic_joints(
         robot: &RobotConfig,
         maps: &[JointMap],

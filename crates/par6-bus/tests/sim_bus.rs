@@ -1197,3 +1197,222 @@ mod dynamics {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// MuJoCo plant (feature sim-mujoco): same DriverBus surface, contact-level
+// physics in a full scene (floor + graspable object). Gated: needs
+// libmujoco from scripts/ffi/setup.sh.
+// ---------------------------------------------------------------------------
+
+#[cfg(feature = "sim-mujoco")]
+mod mujoco {
+    use super::*;
+
+    /// Reach-down pose over the scene's grasp object (config frame).
+    const GRASP_POSE: [f64; 6] = [0.0, -1.0, 4.2, 0.0, 1.8, 0.0];
+
+    fn scene() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sim-assets/PAR6_MSG_scene.xml")
+    }
+
+    fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Rig {
+        let mut bus = SimBus::with_mujoco(scene());
+        if let Some(q) = q0 {
+            bus.set_initial_joint_rad(q);
+        }
+        bus.boot_configure(robot, gripper, robot.bus.boot_config_repeats)
+            .expect("boot_configure (mujoco)");
+        Rig {
+            bus,
+            state: BusState::new(),
+            tick: 0,
+            joints: robot.joints.len(),
+        }
+    }
+
+    /// Idle drivers + gravity: the arm sags, so reported positions drift
+    /// — MuJoCo physics is live behind the same DriverBus surface.
+    #[test]
+    fn mujoco_gravity_sags_idle_arm() {
+        let robot = par6();
+        let mut q0 = calibration_pose(&robot);
+        q0[1] = -1.5; // shoulder off vertical → nonzero gravity torque
+        let mut rig = boot(&robot, None, Some(&q0));
+        let cmds: Vec<JointCommand> = vec![JointCommand::default(); rig.joints];
+        let mut first = None;
+        for _ in 0..u64::from(robot.ticks(0.5)) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+            rig.bus.queue_poll_override(
+                PollAction::Poll {
+                    node: 1,
+                    kind: PollKind::Encoder,
+                },
+                1,
+            );
+            if first.is_none() {
+                first = rig.state.nodes[1].position_ticks;
+            }
+        }
+        let first = first.expect("no shoulder position");
+        let last = rig.state.nodes[1].position_ticks.unwrap();
+        assert!(
+            (last - first).abs() > 200,
+            "idle arm did not sag under gravity ({first} → {last})"
+        );
+    }
+
+    /// The endstop stall signatures HOMING.md requires hold on the MuJoCo
+    /// plant too (J0: vertical axis, gravity-neutral).
+    #[test]
+    fn mujoco_endstop_stall_signatures() {
+        let robot = par6();
+        let dt = robot.robot.tick_dt_s;
+        let j = 0usize;
+        let jc = &robot.joints[j];
+        let h = &robot.homing.joints[j];
+        let mut q0 = calibration_pose(&robot);
+        q0[j] = jc.limits.hard_max_rad - 0.08; // short approach to the stop
+        let mut rig = boot(&robot, None, Some(&q0));
+        rig.bus
+            .send_limits(
+                jc.node_id,
+                jc.velocity_limit_ticks_s as f32,
+                h.current_ma as f32,
+                4,
+            )
+            .unwrap();
+        let sign = if h.direction == 1 { -1.0 } else { 1.0 };
+        let drive = JointCommand::velocity((sign * h.speed_ticks_s) as i32, 0);
+        let mut cmds = rig.idle_cmds();
+        let (_, _, peak_cur) = run_stall_approach(
+            &mut rig,
+            &mut cmds,
+            &GripperCommand::NoGripper,
+            Some(j),
+            usize::from(jc.node_id),
+            drive,
+            h.speed_ticks_s,
+            h.current_ma,
+            u64::from(robot.ticks(h.timeout_s)),
+            dt,
+        );
+        assert!(
+            f64::from(peak_cur) >= 0.9 * h.current_ma,
+            "mujoco stall current peaked at {peak_cur} mA (limit {} mA)",
+            h.current_ma
+        );
+    }
+
+    fn close_cmd(position: u8) -> GripperCommand {
+        GripperCommand::Firmware(FirmwareGripperCommand {
+            position,
+            speed: 150,
+            current_ma: 600,
+            activate: true,
+            action: true,
+            estop: false,
+            release_dir: false,
+        })
+    }
+
+    /// Read the boot wire positions (one velocity-0 tick produces motion
+    /// replies), then return position-hold commands for them.
+    fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
+        let zero: Vec<JointCommand> = vec![JointCommand::velocity(0, 0); rig.joints];
+        rig.step(&zero, &GripperCommand::FirmwarePoll);
+        rig.step(&zero, &GripperCommand::FirmwarePoll);
+        robot
+            .joints
+            .iter()
+            .map(|jc| {
+                let pos = rig.state.nodes[usize::from(jc.node_id)]
+                    .position_ticks
+                    .expect("boot position");
+                JointCommand::position(pos, 20000, 0)
+            })
+            .collect()
+    }
+
+    /// The grasp scenario end to end through the REAL status path:
+    /// closing on the scene's free object jams the jaws mid-travel and
+    /// the cmd-60 reply reports DetectedClosing at the commanded pressing
+    /// current; opening away reports ReachedNoObject. No MuJoCo state is
+    /// inspected — only decoded bus replies.
+    #[test]
+    fn mujoco_grasp_detected_through_status_bits() {
+        let robot = par6();
+        let gripper = msg_gripper();
+        let mut rig = boot(&robot, Some(&gripper), Some(&GRASP_POSE));
+        let cmds = hold_commands(&mut rig, &robot);
+
+        // Close on the object (per-tick replay, homing-style).
+        for _ in 0..u64::from(robot.ticks(2.0)) {
+            rig.step(&cmds, &close_cmd(252));
+        }
+        let r = rig.state.gripper.reply.expect("no gripper reply");
+        assert_eq!(
+            r.object_detection,
+            ObjectDetection::DetectedClosing,
+            "no object detected while closing (reply {r:?})"
+        );
+        assert!(
+            !r.action_status,
+            "still reported moving while pressing the object"
+        );
+        assert!(
+            r.position > 100 && r.position < 240,
+            "jam position byte {} not in mid-travel — jaws passed through or \
+             never reached the object",
+            r.position
+        );
+        assert_eq!(r.current_ma, 600, "pressing current is the commanded limit");
+        // Pressing is stable: the jam position holds under continued replay.
+        let jam = r.position;
+        for _ in 0..u64::from(robot.ticks(0.5)) {
+            rig.step(&cmds, &close_cmd(252));
+        }
+        let r = rig.state.gripper.reply.unwrap();
+        assert_eq!(r.object_detection, ObjectDetection::DetectedClosing);
+        assert!(
+            (i16::from(r.position) - i16::from(jam)).abs() <= 2,
+            "jam position drifted while pressing ({jam} → {})",
+            r.position
+        );
+
+        // Open away from the object: free travel completes, no detection.
+        for _ in 0..u64::from(robot.ticks(2.0)) {
+            rig.step(&cmds, &close_cmd(20));
+        }
+        let r = rig.state.gripper.reply.unwrap();
+        assert_eq!(r.position, 20, "open move did not complete");
+        assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
+    }
+
+    /// Identical tick/command streams — including a contact grasp — must
+    /// produce bit-identical state streams.
+    #[test]
+    fn mujoco_streams_are_bit_identical() {
+        fn run() -> Vec<BusState> {
+            let robot = par6();
+            let gripper = msg_gripper();
+            let mut rig = boot(&robot, Some(&gripper), Some(&GRASP_POSE));
+            let cmds = hold_commands(&mut rig, &robot);
+            let mut states = Vec::new();
+            for t in 1..=300u64 {
+                let g = if t < 20 {
+                    GripperCommand::FirmwarePoll
+                } else {
+                    close_cmd(252)
+                };
+                rig.step(&cmds, &g);
+                states.push(rig.state.clone());
+            }
+            states
+        }
+        let a = run();
+        let b = run();
+        for (t, (sa, sb)) in a.iter().zip(&b).enumerate() {
+            assert!(sa == sb, "mujoco streams diverge at tick {}", t + 1);
+        }
+    }
+}

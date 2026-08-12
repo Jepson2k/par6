@@ -12,6 +12,10 @@ repository.workspace = true
 # `source .ffi/env.sh` before building. Without it the sim backend uses
 # the pure-Rust kinematic plant and needs no C++ toolchain.
 sim-dynamics = ["dep:pinokin-sys"]
+# MuJoCo-backed sim plant (contacts, grasp scenarios) for the sim backend.
+# Requires libmujoco: scripts/ffi/setup.sh installs it into .ffi/env, then
+# `source .ffi/env.sh` before building (exports PAR6_MUJOCO_LIB_DIR).
+sim-mujoco = []
 
 [dependencies]
 par6-config = { workspace = true }
