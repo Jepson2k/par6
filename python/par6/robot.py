@@ -15,11 +15,12 @@ import random
 import shutil
 import socket
 import subprocess
+import tempfile
 import time
 import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any, Literal
+from typing import IO, Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -92,6 +93,7 @@ class _Par6dManager:
 
     def __init__(self) -> None:
         self._proc: subprocess.Popen | None = None
+        self._log: IO[bytes] | None = None
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -100,10 +102,24 @@ class _Par6dManager:
         if self.is_running():
             return
         binary = _find_par6d()
+        # Never inherit the parent's stdout/stderr: par6d logs continuously,
+        # and if it inherits a pipe nobody drains (pytest capture, a GUI that
+        # captures subprocess output) it blocks on write once the buffer
+        # fills — the runtime then stops answering PING and looks hung. A
+        # file has no such backpressure and keeps the log for diagnosis.
+        log = tempfile.NamedTemporaryFile(prefix="par6d-", suffix=".log", delete=False)
         try:
-            self._proc = subprocess.Popen([binary, "--sim"])
+            self._proc = subprocess.Popen(
+                [binary, "--sim"],
+                stdin=subprocess.DEVNULL,
+                stdout=log,
+                stderr=subprocess.STDOUT,
+            )
         except OSError as e:
+            log.close()
             raise RuntimeError(f"failed to start {binary!r}: {e}") from e
+        self._log = log
+        logger.debug("par6d --sim logging to %s", log.name)
 
     def stop(self, timeout: float = 2.0) -> None:
         if self._proc is None:
@@ -120,6 +136,9 @@ class _Par6dManager:
                 except subprocess.TimeoutExpired:
                     logger.error("par6d did not exit after SIGKILL")
         self._proc = None
+        if self._log is not None:
+            self._log.close()
+            self._log = None
 
 
 # ===========================================================================
@@ -249,7 +268,9 @@ def _build_tools(grippers: dict[str, dict]) -> ToolsCollection:
 # ===========================================================================
 
 
-def _load_kinematic_model(urdf_file: str, soft_rad: NDArray[np.float64], velocity: NDArray[np.float64]) -> PinokinRobot:
+def _load_kinematic_model(
+    urdf_file: str, soft_rad: NDArray[np.float64], velocity: NDArray[np.float64]
+) -> PinokinRobot:
     """Pinokin model of the flange URDF with config limits injected.
 
     The SolidWorks export writes ``lower="0" upper="0"`` on every joint, so
@@ -370,15 +391,18 @@ class Robot(_RobotABC):
 
     # -- Capability flags ---------------------------------------------------
 
+    # Must stay consistent with the STATUS io layout
+    # (`IO_SLOTS = [in1, in2, out1, out2, estop]`): consumers size their IO
+    # buffers as inputs + outputs + 1 and write decoded frames straight into
+    # them, so a count that disagrees with the wire breaks every status frame.
+
     @property
     def digital_outputs(self) -> int:
-        """The RCB control board exposes three isolated outputs."""
-        return 3
+        return 2
 
     @property
     def digital_inputs(self) -> int:
-        """The RCB control board exposes three isolated inputs."""
-        return 3
+        return 2
 
     # -- Visualization ------------------------------------------------------
 
