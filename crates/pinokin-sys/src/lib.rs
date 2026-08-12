@@ -4,10 +4,12 @@
 //!
 //! Two layers:
 //! - [`ffi`]: raw `extern "C"` declarations mirroring `cpp/include/par6_shim.h`.
-//! - [`Model`] / [`Trajectory`]: minimal safe wrappers with dimension
-//!   checking and RAII. [`Model`] covers create / fk / jacobian / gravity /
-//!   aba / ik_step; [`Trajectory`] covers TOPPRA parameterize / duration /
-//!   allocation-free sampling.
+//! - [`Model`] / [`Trajectory`] / [`CollisionModel`]: minimal safe wrappers
+//!   with dimension checking and RAII. [`Model`] covers create / fk /
+//!   jacobian / gravity / aba / ik_step; [`Trajectory`] covers TOPPRA
+//!   parameterize / duration / allocation-free sampling;
+//!   [`CollisionModel`] covers the coal geometry world — installation and
+//!   program shape layers, in-collision verdict and colliding pairs.
 //!
 //! Everything is gated behind the `ffi` feature (default off) so plain
 //! `cargo check` succeeds without the C++ toolchain. Build the shim with
@@ -34,7 +36,13 @@ mod model;
 mod traj;
 
 #[cfg(feature = "ffi")]
+mod collision;
+
+#[cfg(feature = "ffi")]
 pub use model::{Error, IkOptions, Model, ToolParams};
 
 #[cfg(feature = "ffi")]
 pub use traj::Trajectory;
+
+#[cfg(feature = "ffi")]
+pub use collision::{CollisionModel, Layer, ShapeDesc};

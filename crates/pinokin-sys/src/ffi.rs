@@ -22,6 +22,14 @@ pub struct par6_traj {
     _private: [u8; 0],
 }
 
+/// Opaque collision handle (`struct par6_col`) — a Pinocchio geometry model
+/// over the URDF's `<collision>` meshes plus the two replaceable world
+/// shape layers. Not thread-safe: one handle per thread.
+#[repr(C)]
+pub struct par6_col {
+    _private: [u8; 0],
+}
+
 /// `par6_status` values.
 pub type par6_status = i32;
 pub const PAR6_OK: par6_status = 0;
@@ -41,6 +49,34 @@ pub struct par6_tool_params {
     pub mass: f64,
     pub com: [f64; 3],
     pub inertia: [f64; 6],
+}
+
+/// `par6_shape_kind` values — the coal primitives waldoctl's `Shape`
+/// subclasses map onto.
+pub type par6_shape_kind = i32;
+pub const PAR6_SHAPE_BOX: par6_shape_kind = 0;
+pub const PAR6_SHAPE_SPHERE: par6_shape_kind = 1;
+pub const PAR6_SHAPE_CYLINDER: par6_shape_kind = 2;
+pub const PAR6_SHAPE_CAPSULE: par6_shape_kind = 3;
+pub const PAR6_SHAPE_CONE: par6_shape_kind = 4;
+pub const PAR6_SHAPE_ELLIPSOID: par6_shape_kind = 5;
+pub const PAR6_SHAPE_PLANE: par6_shape_kind = 6;
+
+/// Capacity of [`par6_shape::params`] (`PAR6_SHAPE_MAX_PARAMS`).
+pub const PAR6_SHAPE_MAX_PARAMS: usize = 4;
+
+/// Mirror of `par6_shape`: one world collision shape. `params` holds the
+/// coal constructor arguments for `kind` (only the first `n_params` are
+/// read); `pose` is `[x, y, z, rx, ry, rz]` in metres/radians with
+/// `R = Rx·Ry·Rz`; `margin < 0` selects the model's default clearance.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct par6_shape {
+    pub kind: par6_shape_kind,
+    pub n_params: i32,
+    pub params: [f64; PAR6_SHAPE_MAX_PARAMS],
+    pub pose: [f64; 6],
+    pub margin: f64,
 }
 
 extern "C" {
@@ -112,6 +148,55 @@ extern "C" {
         out_qd: *mut f64,
         out_qdd: *mut f64,
     ) -> par6_status;
+
+    /// Build the collision model from `urdf_path`'s `<collision>` meshes.
+    /// `package_dir` (may be NULL) resolves `package://…` mesh URIs;
+    /// `clearance` is the default standoff in metres. NULL on failure with
+    /// a message in `err_buf`. Loads meshes eagerly — slow.
+    pub fn par6_col_create(
+        urdf_path: *const c_char,
+        package_dir: *const c_char,
+        clearance: f64,
+        err_buf: *mut c_char,
+        err_len: i32,
+    ) -> *mut par6_col;
+    pub fn par6_col_destroy(h: *mut par6_col);
+    pub fn par6_col_nq(h: *const par6_col) -> i32;
+    /// Robot-link geometry objects; the world layers start at this index.
+    pub fn par6_col_robot_geom_count(h: *const par6_col) -> i32;
+    /// Robot links plus both world layers.
+    pub fn par6_col_geom_count(h: *const par6_col) -> i32;
+    pub fn par6_col_pair_count(h: *const par6_col) -> i32;
+    /// Copies geometry `idx`'s NUL-terminated name into `buf`; a too-small
+    /// buffer or out-of-range index is `PAR6_ERR_INVALID_ARG`.
+    pub fn par6_col_geom_name(
+        h: *const par6_col,
+        idx: i32,
+        buf: *mut c_char,
+        buf_len: i32,
+    ) -> par6_status;
+    /// Replaces world layer `layer` (0 = installation, 1 = program)
+    /// wholesale; the other layer is untouched. Malformed shapes leave the
+    /// previous world in place. Allocates — not for the query path.
+    pub fn par6_col_set_layer(
+        h: *mut par6_col,
+        layer: i32,
+        shapes: *const par6_shape,
+        n_shapes: i32,
+        err_buf: *mut c_char,
+        err_len: i32,
+    ) -> par6_status;
+    /// Returns 1 (in collision), 0 (clear) or a negative `par6_status`.
+    /// Colliding geometry-index couples land in `out_pairs` (capacity
+    /// `2 * max_pairs`), the count in `out_n_pairs`.
+    pub fn par6_col_check(
+        h: *mut par6_col,
+        q: *const f64,
+        stop_at_first: i32,
+        out_pairs: *mut i32,
+        max_pairs: i32,
+        out_n_pairs: *mut i32,
+    ) -> i32;
 
     pub fn par6_shim_abi_version() -> i32;
 }

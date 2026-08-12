@@ -8,9 +8,10 @@ if(NOT CMAKE_BUILD_TYPE)
 endif()
 
 find_package(pinocchio REQUIRED)
+find_package(coal REQUIRED)
 find_package(toppra REQUIRED)
 
-set(PAR6_SHIM_SOURCES src/par6_shim.cpp src/par6_traj.cpp)
+set(PAR6_SHIM_SOURCES src/par6_shim.cpp src/par6_traj.cpp src/par6_col.cpp)
 
 # Shared library — what pinokin-sys links by default (Pinocchio itself is
 # only distributed as shared libs on conda-forge).
@@ -27,11 +28,14 @@ foreach(tgt par6_shim par6_shim_static)
   target_include_directories(${tgt} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
-  # Minimal Pinocchio targets: instantiated algorithms + URDF parser.
-  # (The pinocchio::pinocchio umbrella drags in collision/casadi/extra.)
+  # Minimal Pinocchio targets: instantiated algorithms, URDF parser and the
+  # coal-backed collision algorithms. (The pinocchio::pinocchio umbrella
+  # would also drag in casadi/extra, which nothing here uses.)
   target_link_libraries(${tgt} PUBLIC
     pinocchio::pinocchio_default
     pinocchio::pinocchio_parsers
+    pinocchio::pinocchio_collision
+    coal::coal
     toppra::toppra)
   target_compile_options(${tgt} PRIVATE -Wall -Wextra)
 endforeach()

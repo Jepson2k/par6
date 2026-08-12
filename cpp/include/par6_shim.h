@@ -1,5 +1,6 @@
-/* par6_shim — C ABI over Pinocchio (kinematics/dynamics) and toppra-cpp
- * (time-optimal path parameterization) for the par6 Rust runtime.
+/* par6_shim — C ABI over Pinocchio (kinematics/dynamics), coal/hpp-fcl
+ * (collision) and toppra-cpp (time-optimal path parameterization) for the
+ * par6 Rust runtime.
  *
  * Conventions:
  *   - Poses are 4x4 homogeneous transforms, row-major, 16 doubles.
@@ -11,6 +12,7 @@
  *   - par6_kin handles are NOT thread-safe: one handle per thread.
  *     par6_traj handles are immutable after create; concurrent
  *     par6_traj_sample / par6_traj_duration calls on one handle are safe.
+ *     par6_col handles are NOT thread-safe: one handle per thread.
  */
 #ifndef PAR6_SHIM_H
 #define PAR6_SHIM_H
@@ -152,11 +154,156 @@ par6_status par6_traj_duration(const par6_traj *h, double *out_seconds);
 par6_status par6_traj_sample(const par6_traj *h, double t,
                              double *out_q, double *out_qd, double *out_qdd);
 
+/* --- coal/hpp-fcl collision (par6_col_*) ---------------------------------
+ *
+ * A par6_col handle owns a second Pinocchio model of the same URDF plus the
+ * geometry model built from its <collision> meshes, and answers "is this
+ * configuration in collision, and which geometry pairs?".
+ *
+ * Layers. The world (non-robot) geometry is held in two independently
+ * replaceable layers, mirroring the waldoctl shape-world contract:
+ *   layer 0 = INSTALLATION — persistent keep-outs from robot config,
+ *   layer 1 = PROGRAM      — the last-applied SET_SHAPES set.
+ * Each par6_col_set_layer call REPLACES that layer wholesale
+ * (last-write-wins) and leaves the other layer untouched.
+ *
+ * Geometry indexing. Geometry objects are laid out as
+ *   [0, robot_geom_count)     robot links (fixed at create)
+ *   [robot_geom_count, ...)   installation layer, in the order given
+ *   [..., geom_count)         program layer, in the order given
+ * so world-shape indices SHIFT whenever a layer is replaced. Re-read
+ * par6_col_geom_count / par6_col_geom_name after every par6_col_set_layer.
+ *
+ * Collision pairs. Every robot link pair is checked except pairs sharing a
+ * parent joint and pairs whose parent joints are adjacent in the kinematic
+ * tree (a link always touches its neighbours). Every world shape is checked
+ * against every robot link; world shapes are never checked against each
+ * other (two overlapping keep-outs are not a robot collision).
+ *
+ * Units. Metres and radians throughout — the units waldoctl's Shape carries
+ * and the client puts on the wire verbatim.
+ *
+ * par6_col_check is planner-side, not RT-side: it writes only into caller
+ * buffers and the handle's preallocated pinocchio/coal workspace, but coal's
+ * mesh narrow phase allocates internally on deep interpenetration.
+ *
+ * Cost. Against the PAR6 vendor collision meshes a check costs ~17 us
+ * (flange) to ~180 us (gripper variants) with bounded world shapes.
+ * PAR6_SHAPE_PLANE is the exception: a half-space has no bounding volume,
+ * so coal cannot prune it against a link's mesh BVH and scans every
+ * triangle — ~35 ms per check, whether or not it touches anything, and the
+ * same in the Python client's coal build. Model floors and walls as large
+ * boxes (a 4x4x2 m slab measures ~25 us) unless an exact half-space is
+ * genuinely required.
+ */
+
+typedef struct par6_col par6_col;
+
+/* Shape kinds, mirroring waldoctl's Shape subclasses one-for-one. `params`
+ * are the coal constructor arguments in field order:
+ *   BOX        3: full side lengths x, y, z [m]
+ *   SPHERE     1: radius [m]
+ *   CYLINDER   2: radius, length [m]
+ *   CAPSULE    2: radius, length [m]  (length excludes the end caps)
+ *   CONE       2: radius, length [m]
+ *   ELLIPSOID  3: radius_x, radius_y, radius_z [m]
+ *   PLANE      4: nx, ny, nz, offset — half-space solid where n.x <= offset
+ */
+typedef enum par6_shape_kind {
+    PAR6_SHAPE_BOX = 0,
+    PAR6_SHAPE_SPHERE = 1,
+    PAR6_SHAPE_CYLINDER = 2,
+    PAR6_SHAPE_CAPSULE = 3,
+    PAR6_SHAPE_CONE = 4,
+    PAR6_SHAPE_ELLIPSOID = 5,
+    PAR6_SHAPE_PLANE = 6,
+} par6_shape_kind;
+
+/* Capacity of par6_shape::params — the widest kind (PLANE) takes 4. */
+#define PAR6_SHAPE_MAX_PARAMS 4
+
+/* One world shape. Only the first n_params entries of `params` are read. */
+typedef struct par6_shape {
+    /* A par6_shape_kind value. */
+    int32_t kind;
+    /* Entries of `params` that carry meaning for this kind. */
+    int32_t n_params;
+    /* Kind-specific coal constructor params, see par6_shape_kind. */
+    double params[PAR6_SHAPE_MAX_PARAMS];
+    /* World placement [x, y, z, rx, ry, rz], metres and radians. Rotation is
+     * R = Rx(rx) * Ry(ry) * Rz(rz) — the intrinsic-XYZ convention the
+     * tcp/pose readback uses. */
+    double pose[6];
+    /* Standoff distance [m] at which pairs against this shape report a
+     * collision; negative selects the handle's default clearance. */
+    double margin;
+} par6_shape;
+
+/* Build a collision model from a URDF file and its <collision> meshes.
+ *   urdf_path    the same URDF par6_kin_create loads.
+ *   package_dir  directory that `package://<name>/...` mesh URIs resolve
+ *                against; NULL or "" passes no search path.
+ *   clearance    default standoff [m] applied to every pair; finite, >= 0.
+ *   err_buf      optional: NUL-terminated message of at most err_len bytes.
+ * Meshes are loaded eagerly, so this is slow (hundreds of ms for the PAR6
+ * vendor meshes). Returns NULL on failure. */
+par6_col *par6_col_create(const char *urdf_path,
+                          const char *package_dir,
+                          double clearance,
+                          char *err_buf, int32_t err_len);
+
+void par6_col_destroy(par6_col *h);
+
+/* Position variables of the underlying model; 0 for a NULL handle. */
+int32_t par6_col_nq(const par6_col *h);
+
+/* Robot-link geometry objects (fixed at create); 0 for a NULL handle. */
+int32_t par6_col_robot_geom_count(const par6_col *h);
+
+/* All geometry objects, robot links plus both world layers; 0 for NULL. */
+int32_t par6_col_geom_count(const par6_col *h);
+
+/* Active collision pairs in the current world; 0 for a NULL handle. */
+int32_t par6_col_pair_count(const par6_col *h);
+
+/* Copy geometry object `idx`'s name into `buf` as a NUL-terminated string.
+ * PAR6_ERR_INVALID_ARG for a NULL handle/buffer, an out-of-range index, or
+ * a buffer too small for the name and its terminator. */
+par6_status par6_col_geom_name(const par6_col *h, int32_t idx,
+                               char *buf, int32_t buf_len);
+
+/* Replace world layer `layer` (0 = installation, 1 = program) with
+ * `n_shapes` shapes; n_shapes == 0 clears the layer. The other layer and the
+ * robot geometry are untouched. Rejected with a message: NULL handle,
+ * unknown layer, NULL shapes with n_shapes > 0, negative n_shapes, unknown
+ * kind, wrong n_params for the kind, non-finite or non-positive dimensions,
+ * non-finite pose or margin, zero plane normal. On failure the previous
+ * world is left in place. Allocates; call it off the query path. */
+par6_status par6_col_set_layer(par6_col *h, int32_t layer,
+                               const par6_shape *shapes, int32_t n_shapes,
+                               char *err_buf, int32_t err_len);
+
+/* Test configuration `q` (nq doubles) against the current world.
+ *
+ * Writes at most `max_pairs` colliding pairs into `out_pairs` as consecutive
+ * geometry-index couples (2 * max_pairs int32 of capacity) and the number
+ * actually written into `out_n_pairs`; pass out_pairs = NULL / max_pairs = 0
+ * to test without collecting pairs. Non-zero `stop_at_first` returns as soon
+ * as one pair collides, so at most one pair is reported.
+ *
+ * Returns 1 (in collision), 0 (clear) or a negative par6_status. Non-finite
+ * entries in `q` are PAR6_ERR_INVALID_ARG, never a fabricated verdict. */
+int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
+                       int32_t *out_pairs, int32_t max_pairs,
+                       int32_t *out_n_pairs);
+
 /* ABI version of this header/library pair. Bump on any breaking change.
  * v2: par6_traj_* implemented over toppra-cpp — create takes n_gridpoints
- *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added. */
+ *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added.
+ * v3: par6_col_* added — coal/hpp-fcl collision over the same URDF, with
+ *     the installation/program world layers waldoctl defines. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 2
+#define PAR6_SHIM_ABI_VERSION 3
 
 #ifdef __cplusplus
 } /* extern "C" */

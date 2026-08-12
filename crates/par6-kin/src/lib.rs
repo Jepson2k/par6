@@ -13,8 +13,11 @@
 //! toolchain. Build the shim with `scripts/ffi/setup.sh`, then
 //! `source .ffi/env.sh` and add `--features ffi`.
 //!
-//! Follow-up: coal/hpp-fcl collision through the same shim (shape world,
-//! plan-time trajectory checks) — see the collision section of the README.
+//! Collision ([`Collision`], same `ffi` feature) runs coal/hpp-fcl over the
+//! same URDF: self-collision plus the installation/program keep-out layers
+//! waldoctl defines, reporting `collision_active`, the colliding pairs and
+//! the `scene_epoch` of the applied world. It is planner-side (tens of µs to
+//! a few ms per configuration), not RT-tick-side.
 
 /// Arm degrees of freedom. Gripper-variant URDFs carry extra passive jaw
 /// joints internally; the public API is always sized to the arm.
@@ -64,4 +67,16 @@ impl GripperVariant {
 mod kin;
 
 #[cfg(feature = "ffi")]
+mod collision;
+
+#[cfg(feature = "ffi")]
+mod shapes;
+
+#[cfg(feature = "ffi")]
 pub use kin::{IkOptions, IkOutcome, Kin, KinError, Pose};
+
+#[cfg(feature = "ffi")]
+pub use collision::{Collision, CollisionReport, Layer, MAX_REPORTED_PAIRS};
+
+#[cfg(feature = "ffi")]
+pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

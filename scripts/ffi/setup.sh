@@ -35,6 +35,11 @@ CONDA_SPECS=(
   "pinocchio=${PINOCCHIO_VERSION}"
   "eigen"      # constrained by pinocchio's build (5.0.x as of 2026-08)
   "urdfdom"    # constrained by pinocchio's build (6.0.x as of 2026-08)
+  # coal (hpp-fcl) backs par6_col_* and already arrives as a pinocchio
+  # dependency; naming it keeps the shim's link line honest and makes a
+  # future pinocchio build that drops collision support fail here instead
+  # of at cmake time. Version is left to pinocchio's constraint (3.0.x).
+  "coal"
   "cmake"
   "ninja"
   "cxx-compiler"  # hermetic toolchain — host compiler stays out of the ABI
@@ -70,6 +75,17 @@ if [[ ! -e "$ENV_DIR/lib/libpinocchio_default.so" ]]; then
 else
   echo ">>> env exists: $ENV_DIR (delete it to force re-create)"
 fi
+
+# cpp/src/par6_col.cpp links coal and pinocchio's collision module; both come
+# with the pinocchio package, so a missing one means an env built before coal
+# was required (or a pinocchio build without collision support).
+for lib in libcoal.so libpinocchio_collision.so; do
+  if [[ ! -e "$ENV_DIR/lib/$lib" ]]; then
+    echo "$ENV_DIR/lib/$lib is missing — the collision shim cannot link." >&2
+    echo "Delete $ENV_DIR and re-run to rebuild the env." >&2
+    exit 1
+  fi
+done
 
 # --- 3. toppra-cpp from source into the env prefix ---------------------------
 # No conda-forge C++ toppra exists (only pure-python `toppra-python`), so the

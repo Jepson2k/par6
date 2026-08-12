@@ -1,0 +1,348 @@
+//! Safe collision world over the `par6_col` C ABI (Pinocchio + coal).
+//!
+//! One [`Collision`] per thread (the underlying `pinocchio::GeometryData`
+//! is mutated by every check). Everything the query path touches — the
+//! full-model configuration buffer, the colliding-pair index buffer, the
+//! geometry name table — is preallocated when a layer is applied, so
+//! [`Collision::check`] performs no Rust-side allocation and the planner
+//! can call it per waypoint.
+//!
+//! This is a **planner-side** API, not an RT-tick one: coal's mesh narrow
+//! phase allocates internally when links deeply interpenetrate, and a
+//! single check costs tens of microseconds to a few milliseconds depending
+//! on how close the arm is to contact.
+//!
+//! Measured per-waypoint cost against the vendor collision meshes
+//! (`tests/golden_collision.rs::per_waypoint_check_cost_is_reported`
+//! reprints these on every run): self-collision only, 17 µs for the flange
+//! and 180 µs for the gripper variants; with a box keep-out, 28 µs / 224 µs;
+//! with a per-shape margin, which costs coal its early exit, ~300 µs / 730 µs.
+//! A [`ShapeKind::Plane`] keep-out is the outlier at ~35 ms — see its docs.
+//!
+//! [`ShapeKind::Plane`]: crate::ShapeKind::Plane
+
+use std::path::Path;
+
+use crate::shapes::Shape;
+use crate::{GripperVariant, KinError, NQ};
+
+/// Which replaceable world layer a shape set belongs to.
+///
+/// The layers are independent: replacing one leaves the other in place.
+/// [`Layer::Installation`] is the backend's persistent keep-out set from
+/// robot config — `SET_SHAPES` cannot change it; [`Layer::Program`] is the
+/// last-applied `SET_SHAPES` set (last-write-wins, survives program end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// Persistent keep-outs from robot config.
+    Installation,
+    /// Program shapes, replaced wholesale by `SET_SHAPES`.
+    Program,
+}
+
+impl Layer {
+    fn as_sys(self) -> pinokin_sys::Layer {
+        match self {
+            Layer::Installation => pinokin_sys::Layer::Installation,
+            Layer::Program => pinokin_sys::Layer::Program,
+        }
+    }
+}
+
+/// Upper bound on colliding pairs reported by one [`Collision::check`].
+///
+/// Sized so the buffer is preallocated once: a report longer than this is
+/// truncated (the verdict stays correct — `collision_active` is still true,
+/// and the wire carries a bounded pair list either way).
+pub const MAX_REPORTED_PAIRS: usize = 64;
+
+/// A configuration's collision verdict.
+///
+/// Borrowed from the [`Collision`] that produced it, so reading the pair
+/// names costs nothing: they are slices of the preallocated name table.
+#[derive(Debug)]
+pub struct CollisionReport<'a> {
+    active: bool,
+    pairs: &'a [(usize, usize)],
+    names: &'a [String],
+}
+
+impl CollisionReport<'_> {
+    /// Whether any pair collided — the `collision_active` status field.
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    /// Colliding geometry pairs by name — the `collision_pairs` status
+    /// field. Robot links use their URDF geometry names (`upper_arm_0`);
+    /// world shapes use the [`Shape::name`] they were applied with.
+    pub fn pairs(&self) -> impl Iterator<Item = (&str, &str)> + '_ {
+        self.pairs
+            .iter()
+            .map(|&(a, b)| (self.names[a].as_str(), self.names[b].as_str()))
+    }
+
+    /// Number of reported pairs (capped at [`MAX_REPORTED_PAIRS`]).
+    pub fn pair_count(&self) -> usize {
+        self.pairs.len()
+    }
+}
+
+/// The collision world for one PAR6 variant: robot links from the URDF's
+/// `<collision>` meshes plus the installation and program shape layers.
+///
+/// Self-collision pairs cover every link pair except structurally-touching
+/// neighbours (same parent joint, or parent/child in the kinematic tree).
+/// Every world shape is checked against every robot link; world shapes are
+/// never checked against each other.
+pub struct Collision {
+    model: pinokin_sys::CollisionModel,
+    nq_full: usize,
+    scene_epoch: u64,
+    clearance: f64,
+
+    // Preallocated: the query path only writes into these.
+    q_full: Vec<f64>,
+    raw_pairs: Vec<i32>,
+    pairs: Vec<(usize, usize)>,
+    names: Vec<String>,
+
+    // Applied layers, kept so a layer replacement can rebuild the name
+    // table without re-reading the shim's synthetic world-geometry names.
+    layer_names: [Vec<String>; 2],
+    robot_geoms: usize,
+}
+
+impl std::fmt::Debug for Collision {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Collision")
+            .field("nq_full", &self.nq_full)
+            .field("scene_epoch", &self.scene_epoch)
+            .field("clearance", &self.clearance)
+            .field("geoms", &self.names.len())
+            .field("pairs", &self.model.pair_count())
+            .finish()
+    }
+}
+
+impl Collision {
+    /// Load `variant`'s collision geometry from the `assets/par6_description`
+    /// tree at `assets_dir`. `clearance` is the default standoff in metres
+    /// applied to every pair (0.0 = touching counts as colliding).
+    ///
+    /// Loads the vendor collision meshes eagerly — hundreds of milliseconds.
+    /// Build one at startup and keep it.
+    pub fn load(
+        assets_dir: &Path,
+        variant: GripperVariant,
+        clearance: f64,
+    ) -> Result<Self, KinError> {
+        Self::from_urdf(
+            &assets_dir.join(variant.urdf_relpath()),
+            Some(&assets_dir.join("URDF")),
+            clearance,
+        )
+    }
+
+    /// Load an arbitrary URDF's `<collision>` geometry. `package_dir`
+    /// resolves `package://…` mesh URIs.
+    pub fn from_urdf(
+        urdf: &Path,
+        package_dir: Option<&Path>,
+        clearance: f64,
+    ) -> Result<Self, KinError> {
+        let model =
+            pinokin_sys::CollisionModel::from_urdf(urdf, package_dir, clearance).map_err(|e| {
+                match e {
+                    pinokin_sys::Error::Create(msg) => KinError::Load(msg),
+                    other => KinError::Ffi(other),
+                }
+            })?;
+        let nq_full = model.nq();
+        if nq_full < NQ {
+            return Err(KinError::ArmJoints { got: nq_full });
+        }
+        let robot_geoms = model.robot_geom_count();
+        let mut this = Collision {
+            model,
+            nq_full,
+            scene_epoch: 0,
+            clearance,
+            q_full: vec![0.0; nq_full],
+            raw_pairs: vec![0; 2 * MAX_REPORTED_PAIRS],
+            pairs: Vec::with_capacity(MAX_REPORTED_PAIRS),
+            names: Vec::new(),
+            layer_names: [Vec::new(), Vec::new()],
+            robot_geoms,
+        };
+        this.rebuild_names()?;
+        Ok(this)
+    }
+
+    /// Total position variables in the loaded URDF (arm + passive jaws).
+    pub fn nq_full(&self) -> usize {
+        self.nq_full
+    }
+
+    /// Default standoff \[m\] applied to pairs without a shape override.
+    pub fn clearance(&self) -> f64 {
+        self.clearance
+    }
+
+    /// Epoch of the applied collision world — the `scene_epoch` status
+    /// field. Starts at 0 and increments on every accepted layer
+    /// replacement, so a readback can be tied to the world it describes.
+    pub fn scene_epoch(&self) -> u64 {
+        self.scene_epoch
+    }
+
+    /// Active collision pairs in the current world (robot self-pairs plus
+    /// world-shape pairs).
+    pub fn pair_count(&self) -> usize {
+        self.model.pair_count()
+    }
+
+    /// Replace `layer` with `shapes`, returning the new [`scene_epoch`].
+    ///
+    /// Shapes with `collision == false` are visual-only markers and are
+    /// left out of the collision world (they still belong in the `SHAPES`
+    /// readback — that is the server's copy, not this one). The other layer
+    /// is untouched.
+    ///
+    /// On rejection the previous world stays applied and the epoch does not
+    /// move, so a bad `SET_SHAPES` can never leave a half-built keep-out
+    /// world enforced.
+    ///
+    /// Allocates; call it when the world changes, not per waypoint.
+    ///
+    /// [`scene_epoch`]: Collision::scene_epoch
+    pub fn set_layer(&mut self, layer: Layer, shapes: &[Shape]) -> Result<u64, KinError> {
+        let descs: Vec<pinokin_sys::ShapeDesc> = shapes
+            .iter()
+            .filter(|s| s.collision)
+            .map(|s| pinokin_sys::ShapeDesc {
+                kind: kind_to_sys(s.kind),
+                params: s.params,
+                n_params: s.kind.n_params(),
+                pose: s.pose,
+                margin: s.margin,
+            })
+            .collect();
+
+        self.model
+            .set_layer(layer.as_sys(), &descs)
+            .map_err(|e| match e {
+                pinokin_sys::Error::Create(msg) => KinError::Load(msg),
+                other => KinError::Ffi(other),
+            })?;
+
+        let slot = match layer {
+            Layer::Installation => 0,
+            Layer::Program => 1,
+        };
+        self.layer_names[slot] = shapes
+            .iter()
+            .filter(|s| s.collision)
+            .map(|s| s.name.clone())
+            .collect();
+        self.rebuild_names()?;
+        self.scene_epoch += 1;
+        Ok(self.scene_epoch)
+    }
+
+    /// Test arm configuration `q` against the applied world.
+    ///
+    /// Passive gripper jaw joints are held at zero (jaws closed), matching
+    /// [`Kin`]'s convention. `stop_at_first` answers the boolean gate
+    /// cheaply — it reports at most one pair.
+    ///
+    /// Rust-side allocation-free; see the module docs for the C++ side.
+    ///
+    /// [`Kin`]: crate::Kin
+    pub fn check(
+        &mut self,
+        q: &[f64; NQ],
+        stop_at_first: bool,
+    ) -> Result<CollisionReport<'_>, KinError> {
+        self.q_full[..NQ].copy_from_slice(q);
+        let (active, n) =
+            self.model
+                .check_into(&self.q_full, stop_at_first, &mut self.raw_pairs)?;
+        self.pairs.clear();
+        for i in 0..n {
+            self.pairs.push((
+                self.raw_pairs[2 * i] as usize,
+                self.raw_pairs[2 * i + 1] as usize,
+            ));
+        }
+        Ok(CollisionReport {
+            active,
+            pairs: &self.pairs,
+            names: &self.names,
+        })
+    }
+
+    /// Whether the straight joint-space segment `from → to` stays clear,
+    /// sampled at `steps` interior points plus both endpoints.
+    ///
+    /// Returns the first colliding sample's index (`0` = `from`,
+    /// `steps + 1` = `to`), or `None` when the whole segment is clear. The
+    /// planner uses this per motion segment; the cost is `steps + 2` checks.
+    pub fn check_segment(
+        &mut self,
+        from: &[f64; NQ],
+        to: &[f64; NQ],
+        steps: usize,
+    ) -> Result<Option<usize>, KinError> {
+        let n = steps + 1;
+        let mut q = [0.0; NQ];
+        for i in 0..=n {
+            let t = i as f64 / n as f64;
+            for j in 0..NQ {
+                q[j] = from[j] + t * (to[j] - from[j]);
+            }
+            if self.check(&q, true)?.active() {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Refresh the geometry name table after the world changed.
+    fn rebuild_names(&mut self) -> Result<(), KinError> {
+        let total = self.model.geom_count();
+        self.names.clear();
+        self.names.reserve(total);
+        for idx in 0..self.robot_geoms {
+            self.names.push(self.model.geom_name(idx)?);
+        }
+        for slot in 0..2 {
+            for name in &self.layer_names[slot] {
+                self.names.push(name.clone());
+            }
+        }
+        // The shim's documented layout is [robot…, installation…, program…];
+        // a mismatch would silently mislabel colliding pairs, so it is
+        // checked in release builds too.
+        assert_eq!(
+            self.names.len(),
+            total,
+            "shim geometry layout drift: {} names for {total} geometries",
+            self.names.len()
+        );
+        Ok(())
+    }
+}
+
+fn kind_to_sys(kind: crate::shapes::ShapeKind) -> i32 {
+    use crate::shapes::ShapeKind as K;
+    match kind {
+        K::Box => pinokin_sys::ffi::PAR6_SHAPE_BOX,
+        K::Sphere => pinokin_sys::ffi::PAR6_SHAPE_SPHERE,
+        K::Cylinder => pinokin_sys::ffi::PAR6_SHAPE_CYLINDER,
+        K::Capsule => pinokin_sys::ffi::PAR6_SHAPE_CAPSULE,
+        K::Cone => pinokin_sys::ffi::PAR6_SHAPE_CONE,
+        K::Ellipsoid => pinokin_sys::ffi::PAR6_SHAPE_ELLIPSOID,
+        K::Plane => pinokin_sys::ffi::PAR6_SHAPE_PLANE,
+    }
+}

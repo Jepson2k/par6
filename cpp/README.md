@@ -1,10 +1,16 @@
-# par6_shim — C++ FFI layer (Pinocchio + toppra-cpp)
+# par6_shim — C++ FFI layer (Pinocchio + coal + toppra-cpp)
 
 One C-ABI shim toolchain for the C++ dependencies of the Rust runtime:
 
 - **Pinocchio** (kinematics/dynamics) — `par6_kin_*` (create/destroy, fk,
   jacobian, gravity, aba, DLS ik_step), consumed by `crates/pinokin-sys`
   and, on top of that, `par6-kin`.
+- **coal / hpp-fcl** (collision) — `par6_col_*` (create/destroy, set_layer,
+  check, geometry introspection) over `pinocchio::GeometryModel` built from
+  the URDF's `<collision>` meshes. coal ships **with** the conda-forge
+  pinocchio package (`libcoal`, plus `pinocchio::pinocchio_collision`), so
+  `scripts/ffi/setup.sh` needs no new package — only the CMake
+  `find_package(coal)` and the two extra link targets.
 - **toppra-cpp** (time-optimal path parameterization, the backend for
   `par6-motion`'s planned moves) — `par6_traj_*` (create/destroy, nq,
   duration, sample). conda-forge ships no C++ toppra (only `toppra-python`,
@@ -27,6 +33,7 @@ FK/Jacobian/tool conventions mirror.
 cpp/include/par6_shim.h    the frozen C ABI (PAR6_SHIM_ABI_VERSION)
 cpp/src/par6_shim.cpp      par6_kin_* implementation (pinocchio)
 cpp/src/par6_traj.cpp      par6_traj_* implementation (toppra-cpp)
+cpp/src/par6_col.cpp       par6_col_* implementation (pinocchio + coal)
 cpp/src/shim_err.hpp       shared err_buf helper
 cpp/CMakeLists.txt         builds libpar6_shim.so + libpar6_shim.a
 crates/pinokin-sys/        raw decls + safe Model/Trajectory wrappers + tests
@@ -78,6 +85,19 @@ dependency lib dir (`.ffi/env/lib`) — also what the CI cache covers.
   call concurrently / from the RT tick. Finite out-of-range sample times
   clamp to the endpoints; NaN inputs and degenerate paths are explicit
   errors, never crashes.
+- `par6_col_create` builds a second Pinocchio model plus the geometry model
+  from the URDF's `<collision>` meshes (eager mesh load, ~0.5 s). The world
+  is two independently replaceable layers — installation (config keep-outs)
+  and program (`SET_SHAPES`) — laid out as
+  `[robot… , installation… , program…]`, so world geometry indices shift on
+  every `par6_col_set_layer`; robot indices never do. Self-collision pairs
+  are all link pairs minus same-joint and parent/child-adjacent ones (the
+  same set `pinokin.CollisionChecker` produces client-side); each world
+  shape pairs against every robot link, never against another world shape.
+  Shape units are **metres and radians** (`R = Rx·Ry·Rz`) — waldoctl's units,
+  which the Python client puts on the wire unconverted. `par6_col_check`
+  writes only into caller buffers and the handle's workspace, but coal's
+  mesh narrow phase allocates internally: planner-side, not RT-side.
 - Exceptions never cross the boundary; failures come back as `par6_status`
   (or as NULL + `err_buf` message from the create calls).
 
@@ -88,7 +108,7 @@ dependency lib dir (`.ffi/env/lib`) — also what the CI cache covers.
 | `PAR6_SHIM_LIB_DIR` | required with `--features ffi`; dir containing `libpar6_shim.{so,a}` |
 | `PAR6_SHIM_INCLUDE_DIR` | optional; sanity-checked (`par6_shim.h`), reserved for a future bindgen step |
 | `PAR6_SHIM_LINK` | `dylib` (default) or `static` |
-| `PAR6_SHIM_DEP_LIB_DIR` | required for `static`: Pinocchio/toppra lib dir (`.ffi/env/lib`) |
+| `PAR6_SHIM_DEP_LIB_DIR` | required for `static`: Pinocchio/coal/toppra lib dir (`.ffi/env/lib`) |
 
 Without the `ffi` feature the crate is an empty stub — plain `cargo check`
 / `cargo test` need no C++ toolchain, which is why the crate is standalone
@@ -97,7 +117,8 @@ and **not** a member of the root workspace.
 `dylib` mode links `libpar6_shim.so`, whose install rpath points at the
 conda env's `lib/`, and adds an rpath to `PAR6_SHIM_LIB_DIR` — tests run
 without `LD_LIBRARY_PATH`. `static` mode links `libpar6_shim.a` plus
-Pinocchio (`pinocchio_default`, `pinocchio_parsers`), `toppra` and
+Pinocchio (`pinocchio_default`, `pinocchio_parsers`,
+`pinocchio_collision`), `coal`, `toppra` and
 `libstdc++` dynamically; Pinocchio has no static conda-forge builds and
 the toppra build here is shared-only to match.
 
@@ -112,6 +133,31 @@ Rust tests load the same URDF through the shim and must match to **1e-9
 absolute**; IK is checked by re-reaching fixture poses from perturbed seeds.
 Regenerate fixtures whenever the pinned Pinocchio version, sample set, or
 tool parameters change.
+
+The collision API is validated on two levels. `crates/par6-kin/tests/
+golden_collision.rs` is cross-stack conformance: verdicts and colliding-pair
+sets for every variant, self-collision and both keep-out layers, against
+fixtures generated from `pinokin.CollisionChecker` (the client's own
+Pinocchio+coal stack) by `crates/par6-kin/tests/golden/collision/
+gen_collision_fixtures.py`. `crates/pinokin-sys/tests/collision.rs` covers
+the C boundary itself: NULL/out-of-range arguments, the geometry-index
+layout across layer replacement, pair-buffer truncation, and the promise
+that a rejected layer leaves the previous world enforced.
+
+**Mesh cost.** `assets/` ships only the vendor's full-resolution
+SolidWorks-export STLs — the same mesh serves `<visual>` and `<collision>`
+(shoulder ≈ 51 k triangles, upper_arm ≈ 31 k), and there is no simplified
+set anywhere in the stack: the Python client loads exactly these. Measured
+per-waypoint check cost on a straight joint-space sweep: 17 µs (flange) /
+180 µs (gripper variants) for self-collision, 28 µs / 224 µs with a box
+keep-out, ~300 µs / 730 µs once a per-shape margin removes coal's early
+exit. Blanket convex hulls were measured (~31 µs mean, hulls built in 27 ms)
+and **rejected**: the SSG48's interleaved jaw hulls overlap at the closed
+position, so the home pose reports a permanent false collision. The one
+pathological case is `PAR6_SHAPE_PLANE`: an unbounded half-space has no
+bounding volume to prune with, so coal scans every triangle — ~35 ms per
+check regardless of contact, reproducible in the client's coal build. Model
+floors and walls as large boxes (4×4×2 m slab: ~25 µs).
 
 The traj API is validated in `crates/pinokin-sys/tests/traj.rs` against the
 time-optimality requirement itself: dense sampling stays within the limits

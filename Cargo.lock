@@ -386,6 +386,7 @@ dependencies = [
 name = "par6-kin"
 version = "0.1.0"
 dependencies = [
+ "par6-proto",
  "pinokin-sys",
  "serde",
  "serde_json",
