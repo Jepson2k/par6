@@ -1,10 +1,11 @@
 """Unified PAR6 robot — waldoctl ``Robot`` backend for the par6d runtime.
 
 Identity and limits come from the packaged runtime config (see
-:mod:`par6.config`); FK/IK run on the packaged flange URDF via pinokin with
-the end-effector applied as a tool transform from the gripper TOML
-kinematics; clients are the protocol-v2 UDP clients from
-:mod:`par6.client` with the config-built tool specs bound.
+:mod:`par6.config`); FK/IK run through pinokin on the packaged URDF tree of
+the active tool, resolved at that tree's own TCP frame — the same file and
+the same frame ``par6d`` resolves at, so preview and runtime cannot
+disagree about where the tool is; clients are the protocol-v2 UDP clients
+from :mod:`par6.client` with the config-built tool specs bound.
 """
 
 from __future__ import annotations
@@ -145,7 +146,13 @@ class _Par6dManager:
 def _load_kinematic_model(
     urdf_file: str, soft_rad: NDArray[np.float64], velocity: NDArray[np.float64]
 ) -> PinokinRobot:
-    """Pinokin model of the flange URDF with config limits injected.
+    """Pinokin model of a packaged URDF tree, resolved at its TCP frame.
+
+    Every gripper tree carries its TCP as a fixed link off the flange, and
+    that link is the frame the runtime resolves FK/IK/Jacobian at
+    (``par6_kin::GripperVariant::tcp_frame``); the bare flange tree has no
+    such link and its last link is the tool point, which is what both sides
+    fall back to.
 
     The SolidWorks export writes ``lower="0" upper="0"`` on every joint, so
     the config's soft position limits (and velocity ceilings) are patched in
@@ -168,7 +175,13 @@ def _load_kinematic_model(
         raise RuntimeError(
             f"URDF {urdf_file!r} has {i} revolute joints, config has {soft_rad.shape[0]}"
         )
-    return PinokinRobot.from_urdf_string(ET.tostring(root, encoding="unicode"))
+    model = PinokinRobot.from_urdf_string(ET.tostring(root, encoding="unicode"))
+    # Named, not inferred: the end of the chain is the TCP only by an
+    # accident of link ordering, and a tree that gained a link after it
+    # would silently move the whole cartesian surface.
+    if any(link.get("name") == _cfg.TCP_LINK for link in root.iter("link")):
+        model.set_ee_frame(_cfg.TCP_LINK)
+    return model
 
 
 def _sample_cartesian_limit(
@@ -269,22 +282,18 @@ class Robot(_RobotABC):
         self._soft_rad = _cfg.soft_limits_rad(self._config)
         self._cartesian_limits: CartesianKinodynamicLimits | None = None
 
-        self._pinokin = _load_kinematic_model(
-            str(_cfg.urdf_path("FLANGE")),
-            self._soft_rad,
-            self._joints.limits.hard.velocity,
-        )
-        self._solver = IKSolver(
-            self._pinokin,
-            damping=Damping.Sugihara,
-            tol=1e-12,
-            lm_lambda=0.0,
-            max_iter=20,
-            max_restarts=10,
-        )
+        # One model per packaged URDF tree, built on first use and kept:
+        # a tool change is a display action, and re-parsing a tree (and
+        # rebuilding its solver) on every one would stall the UI.
+        self._models: dict[str, PinokinRobot] = {}
+        self._solvers: dict[str, IKSolver] = {}
+        # Both bound by the set_active_tool call below, which every tool
+        # change goes through — there is no "no tool selected" state.
+        self._pinokin: PinokinRobot
+        self._solver: IKSolver
 
         # Pre-allocated FK/IK buffers (Eigen-compatible column-major pose).
-        self._q_buf = np.zeros(self._pinokin.nq, dtype=np.float64)
+        self._q_buf = np.zeros(self._joints.count, dtype=np.float64)
         self._T_buf = np.asfortranarray(np.zeros((4, 4), dtype=np.float64))
         self._rpy_buf = np.zeros(3, dtype=np.float64)
         self._T_target_buf = np.zeros((4, 4), dtype=np.float64)
@@ -420,27 +429,51 @@ class Robot(_RobotABC):
         self._q_buf[:n] = q_rad[:n]
         self._q_buf[n:] = 0.0
 
+    def _model_for(self, tool_key: str) -> tuple[PinokinRobot, IKSolver]:
+        """The model + solver for *tool_key*'s URDF tree, built once."""
+        path = str(_cfg.urdf_path(tool_key))
+        model = self._models.get(path)
+        if model is None:
+            model = _load_kinematic_model(
+                path, self._soft_rad, self._joints.limits.hard.velocity
+            )
+            self._models[path] = model
+            self._solvers[path] = IKSolver(
+                model,
+                damping=Damping.Sugihara,
+                tol=1e-12,
+                lm_lambda=0.0,
+                max_iter=20,
+                max_restarts=10,
+            )
+        return model, self._solvers[path]
+
     def set_active_tool(
         self,
         tool_key: str,
         tcp_offset_m: tuple[float, float, float] | None = None,
         variant_key: str | None = None,
     ) -> None:
-        """Apply a tool transform to the local FK/IK model.
+        """Point the local FK/IK model at a tool's TCP.
 
-        Native tools take their DH tool link from the gripper TOML; plugin
-        tools (composed via ``waldoctl.tools``) fall back to their spec's
-        ``tcp_origin``/``tcp_rpy`` with variant overrides.  The 3-D view's
-        :attr:`urdf_path`/:attr:`mesh_dir` follow the selected tree.
+        A native tool's TCP is not modeled here at all: it is the ``tcp``
+        link of that tool's URDF tree, so selecting one selects the tree
+        the runtime is fitted with and FK resolves where ``par6d``'s does.
+        Plugin tools (composed via ``waldoctl.tools``, described by no
+        packaged tree) hang off the bare flange by their spec's
+        ``tcp_origin``/``tcp_rpy`` with variant overrides.  ``tcp_offset_m``
+        composes after either, in the tool-local frame — the same
+        composition the runtime applies to ``set_tcp_offset``.  The 3-D
+        view's :attr:`urdf_path`/:attr:`mesh_dir` follow the same tree.
         """
         key = _cfg.canonical_tool_key(tool_key)
-        gripper = self._grippers.get(key)
-        if gripper is not None:
-            origin, rpy = _cfg.tool_tcp(gripper["kinematics"])
-        else:
+        model, solver = self._model_for(key)
+
+        T_tool = np.eye(4, dtype=np.float64)
+        if key not in self._grippers:
             origin, rpy = self._plugin_tool_tcp(key, variant_key)
-        T_tool = np.zeros((4, 4), dtype=np.float64)
-        se3_from_rpy(origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool)
+            T_tool = np.zeros((4, 4), dtype=np.float64)
+            se3_from_rpy(origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool)
 
         if tcp_offset_m is not None and any(v != 0 for v in tcp_offset_m):
             T_offset = np.eye(4)
@@ -448,9 +481,13 @@ class Robot(_RobotABC):
             T_tool = T_tool @ T_offset
 
         if np.allclose(T_tool, np.eye(4)):
-            self._pinokin.clear_tool_transform()
+            model.clear_tool_transform()
         else:
-            self._pinokin.set_tool_transform(T_tool)
+            model.set_tool_transform(T_tool)
+        self._pinokin = model
+        self._solver = solver
+        if self._q_buf.shape[0] != model.nq:
+            self._q_buf = np.zeros(model.nq, dtype=np.float64)
         self._active_tool_key = key
         # The Cartesian envelope is a property of the Jacobian AT THE TCP.
         self._cartesian_limits = None

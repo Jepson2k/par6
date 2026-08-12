@@ -5,13 +5,14 @@ Reads the runtime's own config files (``config/PAR6.toml`` and
 ``scripts/sync_pkg_data.py``) so the Python surface exposes exactly the
 values the Rust runtime enforces, with no hand-duplicated numbers.
 
-Everything here is pure data (tomllib + numpy + waldoctl dataclasses); the
-pinokin-backed kinematics live in :mod:`par6.robot`.
+Everything here is pure data (tomllib, the URDF trees' own XML, numpy and
+waldoctl dataclasses); the pinokin-backed kinematics live in :mod:`par6.robot`.
 """
 
 from __future__ import annotations
 
 import tomllib
+import xml.etree.ElementTree as ET
 from functools import cache
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -240,15 +241,78 @@ def fitted_tool_key() -> str:
 # Tool kinematics
 # ---------------------------------------------------------------------------
 
+#: Link the URDF trees give the tool center point (see :func:`flange_to_tcp`).
+TCP_LINK = "tcp"
 
-def tool_tcp(kinematics: dict) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
-    """Flange->TCP as ``(origin_m, rpy_rad)`` from a gripper TOML kinematics block.
 
-    The vendor models the end-effector as one DH link after joint 6:
-    ``Tz(d) @ Tx(a) @ Rx(alpha)`` — translation ``(a, 0, d)`` then a roll of
-    ``alpha`` about the tool x-axis.
-    """
-    return (
-        (kinematics["a_m"], 0.0, kinematics["d_m"]),
-        (kinematics["alpha_rad"], 0.0, 0.0),
+def _rotation(rpy: str | None) -> np.ndarray:
+    """URDF ``rpy`` attribute as a rotation matrix (fixed axes, ``Rz·Ry·Rx``)."""
+    if rpy is None:
+        return np.eye(3)
+    r, p, y = (float(v) for v in rpy.split())
+    cr, sr, cp, sp, cy, sy = (
+        np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
     )
+    return (
+        np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+        @ np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+        @ np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    )
+
+
+def _rpy_xyz(R: np.ndarray) -> tuple[float, float, float]:
+    """Rotation matrix as intrinsic-XYZ rpy — ``R = Rx(r)·Ry(p)·Rz(y)``.
+
+    The convention ``pinokin.se3_from_rpy`` re-encodes, which is what every
+    consumer of a ``ToolSpec``'s ``tcp_rpy`` feeds it back through; the URDF's
+    own ``rpy`` attribute is the other order and must not be handed over raw.
+    """
+    pitch = float(np.arcsin(np.clip(R[0, 2], -1.0, 1.0)))
+    if abs(R[0, 2]) < 1.0 - 1e-12:
+        return float(np.arctan2(-R[1, 2], R[2, 2])), pitch, float(np.arctan2(-R[0, 1], R[0, 0]))
+    return float(np.arctan2(R[2, 1], R[1, 1])), pitch, 0.0
+
+
+@cache
+def flange_to_tcp(tool_key: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+    """Flange->TCP of *tool_key*'s URDF tree as ``(origin_m, rpy_rad)``.
+
+    The ONE definition of a native tool's tool center point: the ``tcp`` link
+    the tree itself carries, reached from the flange over its fixed joints.
+    ``par6d`` resolves FK/IK/Jacobian at that same link of that same tree
+    (``par6_kin::GripperVariant::tcp_frame``), and :mod:`par6.robot` loads the
+    tree whole — so nothing here can drift from what the runtime does.  A tree
+    without a ``tcp`` link (the bare flange) has its last link as the tool
+    point, and this is identity.
+
+    NOT taken from the gripper TOML's ``[kinematics]`` block: ``d_m`` /
+    ``a_m`` / ``alpha_rad`` there are the vendor's DH row for the tool link,
+    stated in the vendor's DH frame 6 — the URDF's ``gripper`` frame turned by
+    Rz(pi) — and landing on the gripper's JAW MOUNT, not its TCP.  Both
+    variants confirm that frame exactly: ``Rz(pi)*T(a,0,d)*Rx(alpha)``
+    reproduces the jaw joint's origin and rpy as the URDF states them.
+    Composing that row straight onto the flange, as this module used to,
+    mirrors x by ``a`` and rolls the frame by ``alpha`` — the 28.35 mm and
+    180 degrees the runtime and the client disagreed by (issue #20).
+    """
+    root = ET.parse(urdf_path(tool_key)).getroot()
+    fixed: dict[str, ET.Element] = {}
+    for joint in root.iter("joint"):
+        if joint.get("type") == "fixed":
+            child = joint.find("child")
+            if child is not None:
+                fixed[str(child.get("link"))] = joint
+    R = np.eye(3)
+    t = np.zeros(3)
+    link = TCP_LINK
+    while link in fixed:
+        origin = fixed[link].find("origin")
+        xyz = np.zeros(3) if origin is None else np.array(
+            [float(v) for v in str(origin.get("xyz", "0 0 0")).split()]
+        )
+        R_j = _rotation(None if origin is None else origin.get("rpy"))
+        t = xyz + R_j @ t
+        R = R_j @ R
+        parent = fixed[link].find("parent")
+        link = "" if parent is None else str(parent.get("link"))
+    return (float(t[0]), float(t[1]), float(t[2])), _rpy_xyz(R)

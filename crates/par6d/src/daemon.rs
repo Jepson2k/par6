@@ -598,7 +598,8 @@ fn load_kin_stack(
     robot: &par6_config::RobotConfig,
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{
-        load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity, ToolOffset,
+        load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity, SoftWindow,
+        ToolOffset,
     };
     let assets_dir =
         resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
@@ -633,14 +634,15 @@ fn load_kin_stack(
     // Gravity is the only model that does not carry it: the offset is a
     // massless point, not a load.
     let tool_offset = ToolOffset::new();
+    let window = SoftWindow::from_config(robot);
     Ok(KinStack {
         fk: KinFk::new(load()?, tool_offset.clone()),
         gravity: KinGravity::new(
             load_kin(&assets_dir, gravity_variant).map_err(DaemonError::Kinematics)?,
         ),
-        planner: CartKin::new(load()?, tool_offset.clone()),
-        bridge: CartKin::new(load()?, tool_offset.clone()),
-        housekeeping: CartKin::new(load()?, tool_offset.clone()),
+        planner: CartKin::new(load()?, tool_offset.clone(), window),
+        bridge: CartKin::new(load()?, tool_offset.clone(), window),
+        housekeeping: CartKin::new(load()?, tool_offset.clone(), window),
         collision,
         tool_offset,
         assets_dir,

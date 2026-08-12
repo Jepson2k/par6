@@ -9,12 +9,14 @@ tests instead of failing, so a checkout without a Rust build stays green.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import queue
 import shutil
 import socket
 import subprocess
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -82,12 +84,14 @@ def free_udp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def sim_config(dest: Path) -> Path:
+def sim_config(dest: Path, active_gripper: str | None = None) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
     Sourced from ``par6/_data`` (the same tree the client reads), so the
     daemon under test runs the joints, limits and homing sequence the
-    Python package advertises.
+    Python package advertises.  *active_gripper* fits the daemon with a
+    different tool than the packaged config names — the runtime picks its
+    URDF variant, its gravity model and its TCP frame from that one key.
     """
     src = _cfg.data_root() / "config"
     dest.mkdir(parents=True, exist_ok=True)
@@ -98,6 +102,14 @@ def sim_config(dest: Path) -> Path:
     )
     if patched == text:
         raise RuntimeError("PAR6.toml patch points (tick_dt_s / status_rate_hz) missing")
+    if active_gripper is not None:
+        fitted = _cfg.load_robot_config()["robot"]["active_gripper"]
+        swapped = patched.replace(
+            f'active_gripper = "{fitted}"', f'active_gripper = "{active_gripper}"'
+        )
+        if swapped == patched and active_gripper != fitted:
+            raise RuntimeError("PAR6.toml patch point (active_gripper) missing")
+        patched = swapped
     out = dest / "PAR6.toml"
     out.write_text(patched)
     for gripper in sorted((src / "grippers").glob("*.toml")):
@@ -117,11 +129,11 @@ class LiveDaemon:
     log_path: Path
 
     @classmethod
-    def start(cls, workdir: Path) -> "LiveDaemon":
+    def start(cls, workdir: Path, active_gripper: str | None = None) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
-        config = sim_config(workdir / "config")
+        config = sim_config(workdir / "config", active_gripper)
         status_port = free_udp_port()
         telemetry_port = free_udp_port()
         log_path = workdir / "par6d.log"
@@ -213,3 +225,28 @@ class LiveDaemon:
             status_unicast_host="127.0.0.1",
             **kwargs,
         )
+
+
+async def settle_at(
+    client: AsyncRobotClient, angles_deg: list[float], budget_s: float = 20.0
+) -> None:
+    """Reset the controller and leave the sim arm standing at *angles_deg*.
+
+    Teleport is unacked and gated on ENABLED, and the RT clear sequence
+    settles over several ticks, so both are re-sent until the broadcast
+    shows the arm there — the same loop a UI runs. Raises when the arm
+    never arrives within *budget_s*.
+    """
+    deadline = time.monotonic() + budget_s
+    await client.reset()
+    while time.monotonic() < deadline:
+        await client.teleport(angles_deg)
+        arrived = await client.wait_status(
+            lambda s: s.homed
+            and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg)),
+            timeout=0.5,
+        )
+        if arrived:
+            return
+        await asyncio.sleep(0.05)
+    raise AssertionError(f"the sim arm never reached {angles_deg}")

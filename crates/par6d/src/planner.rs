@@ -113,6 +113,15 @@ const MOVE_L_NULL_M: f64 = 1e-6;
 /// Largest joint change allowed between consecutive cartesian IK
 /// waypoints \[rad\]; a bigger jump means the solver hopped to another
 /// IK branch and the commanded path would whip the arm.
+///
+/// Measured against the wrap-normalized solution — [`CartKin::ik_within`]
+/// picks the 2π branch nearest the seed, and the seed here is the
+/// previous waypoint. A whole turn on one joint is the same
+/// configuration and must not read as a branch flip; the postures that
+/// genuinely are one still do, because wrapping only ever moves a
+/// solution closer to the seed.
+///
+/// [`CartKin::ik_within`]: crate::kin::CartKin::ik_within
 #[cfg(feature = "ffi")]
 const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 /// How far a waypoint list's first pose may sit from where the arm

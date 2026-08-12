@@ -63,6 +63,10 @@ impl GripperVariant {
     }
 }
 
+mod wrap;
+
+pub use wrap::wrap_to_window;
+
 #[cfg(feature = "ffi")]
 mod kin;
 

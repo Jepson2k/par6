@@ -4,6 +4,10 @@ Kinematics tests drive the real pinokin model on the packaged URDF; they
 skip cleanly when pinokin (a binary wheel) is not installed.  The freshness
 guard compares the packaged ``par6/_data`` copies against the repo-root
 sources, mirroring the generated ``protocol/constants.py`` pattern.
+
+The tool frame is checked against a live ``par6d --sim`` rather than against
+another model of itself — client and runtime agreeing about where the TCP is
+is the property the whole tool-frame design exists to hold (issue #20).
 """
 
 from __future__ import annotations
@@ -14,12 +18,14 @@ import re
 import subprocess
 import sys
 import venv
+import xml.etree.ElementTree as ET
 from collections.abc import Callable
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pytest
+from live_daemon import LiveDaemon, requires_par6d, settle_at
 
 from par6.config import load_gripper_configs, urdf_path
 
@@ -50,6 +56,67 @@ def robot() -> Robot:
 def _sample_q(rng: np.random.Generator, robot: Robot, margin: float = 0.15) -> np.ndarray:
     lim = robot.joints.limits.position.rad
     return np.array([rng.uniform(lo + margin, hi - margin) for lo, hi in lim])
+
+
+# --- URDF readers, written out rather than imported from par6.config: these
+# tests are what says the packaged trees mean what the package thinks they
+# mean, so they may not lean on the package's own reader to say it. ---------
+
+
+def _urdf_root(tool_key: str) -> ET.Element:
+    return ET.parse(urdf_path(tool_key)).getroot()
+
+
+def _has_link(tool_key: str, name: str) -> bool:
+    return any(link.get("name") == name for link in _urdf_root(tool_key).iter("link"))
+
+
+def _urdf_transform(element: ET.Element | None) -> np.ndarray:
+    """A URDF ``<origin>`` as a 4x4 — fixed-axis rpy, ``R = Rz·Ry·Rx``."""
+    T = np.eye(4)
+    if element is None:
+        return T
+    r, p, y = (float(v) for v in str(element.get("rpy", "0 0 0")).split())
+    cr, sr, cp, sp, cy, sy = (
+        np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+    )
+    T[:3, :3] = (
+        np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
+        @ np.array([[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]])
+        @ np.array([[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]])
+    )
+    T[:3, 3] = [float(v) for v in str(element.get("xyz", "0 0 0")).split()]
+    return T
+
+
+def _joint_transform(tool_key: str, joint_name: str) -> np.ndarray:
+    """The named joint's placement in its parent link's frame."""
+    joint = next(
+        j for j in _urdf_root(tool_key).iter("joint") if j.get("name") == joint_name
+    )
+    return _urdf_transform(joint.find("origin"))
+
+
+#: Configurations the client and the runtime are compared at.  The first is
+#: the one issue #20 measured; the rest spread the wrist and elbow around so
+#: an agreement that only holds where the tool axis lines up with the flange
+#: axis cannot pass.  All inside every hard window, so the sim's teleport
+#: clamp does not move them.
+AGREEMENT_POSES_DEG = [
+    [0.0, -90.0, 180.0, 0.0, 0.0, 180.0],
+    [30.0, -60.0, 200.0, -25.0, 40.0, 120.0],
+    [-45.0, -120.0, 250.0, 60.0, -50.0, 300.0],
+]
+
+
+def _link_transform(tool_key: str, link_name: str) -> np.ndarray:
+    """The named link's placement in its parent link's frame."""
+    joint = next(
+        j
+        for j in _urdf_root(tool_key).iter("joint")
+        if (child := j.find("child")) is not None and child.get("link") == link_name
+    )
+    return _urdf_transform(joint.find("origin"))
 
 
 @needs_pinokin
@@ -102,32 +169,136 @@ class TestKinematics:
 
 @needs_pinokin
 class TestToolTransforms:
-    def test_active_tool_moves_tcp_per_gripper_toml(self, robot: Robot) -> None:
-        """fk() must return the TCP of the active tool: flange frame composed
-        with the DH tool link (d, a, alpha) from that gripper's TOML."""
-        grippers = load_gripper_configs()
-        bare = pinokin.Robot(str(urdf_path("FLANGE")))  # no tool transform
+    def test_active_tool_selects_the_urdf_tree_that_defines_its_tcp(
+        self, robot: Robot
+    ) -> None:
+        """The TCP a tool advertises and the TCP its model resolves at are the
+        ``tcp`` link of that tool's URDF tree — one definition, not two.
+
+        A tool frame written down twice drifts: issue #20 had the client
+        composing the gripper TOML's DH row onto the flange, landing 28.35 mm
+        and 180° from the ``tcp`` link the runtime resolves at.  ``fk()`` must
+        now sit exactly on that link, and ``ToolSpec.tcp_origin`` (what a
+        consumer places a gizmo from) must name the same point.
+        """
         rng = np.random.default_rng(7)
         lim = robot.joints.limits.position.rad
         q = np.array([rng.uniform(lo, hi) for lo, hi in lim])
-        T6 = bare.fkine(q)
         out = np.zeros(6)
         for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
-            kin = grippers[key]["kinematics"]
-            # DH tool link Tz(d)·Tx(a)·Rx(alpha): TCP sits at (a, 0, d) in
-            # the flange frame.
-            expected = T6[:3, 3] + T6[:3, :3] @ np.array([kin["a_m"], 0.0, kin["d_m"]])
+            tree = pinokin.Robot(str(urdf_path(key)))
+            # Both frames off the SAME tree: the trees are separate CAD
+            # exports and their arm chains are written to different
+            # precisions, so a cross-tree comparison drifts by microns for
+            # reasons that have nothing to do with the tool.
+            tree.set_ee_frame("gripper")
+            flange = tree.fkine(q)
+            tree.set_ee_frame("tcp" if _has_link(key, "tcp") else "gripper")
+            expected = tree.fkine(q)
             robot.set_active_tool(key)
-            tcp = robot.fk(q, out)[:3]
-            assert np.allclose(tcp, expected, atol=1e-9), key
-        # SSG48 sits 60.35 mm further out along the flange axis than the bare
-        # flange plate (d: -0.11745 vs -0.0571 in the TOMLs).
+            assert np.allclose(robot.fk(q, out)[:3], expected[:3, 3], atol=1e-9), key
+            spec_tcp = flange[:3, 3] + flange[:3, :3] @ np.array(
+                robot.tools[key].tcp_origin
+            )
+            assert np.allclose(expected[:3, 3], spec_tcp, atol=1e-9), key
+        # Each gripper reaches past the bare flange by what its own tree
+        # says: 140 mm (MSG) and 160 mm (SSG48).  Cross-tree, so held to the
+        # micron the trees' differing chain precision costs, not to 1e-9.
         robot.set_active_tool("FLANGE")
         p_flange = robot.fk(q, out)[:3].copy()
-        robot.set_active_tool("SSG48")
-        p_ssg = robot.fk(q, out)[:3].copy()
-        assert np.linalg.norm(p_ssg - p_flange) == pytest.approx(0.06035, abs=1e-9)
+        for key, reach in (("MSG_SMALL_MOTOR_150MM_RAIL", 0.14), ("SSG48", 0.16)):
+            robot.set_active_tool(key)
+            p_tool = robot.fk(q, out)[:3].copy()
+            assert np.linalg.norm(p_tool - p_flange) == pytest.approx(reach, abs=1e-5)
         robot.set_active_tool("FLANGE")
+
+    def test_gripper_toml_dh_row_describes_the_jaw_mount_not_the_tcp(self) -> None:
+        """Why the gripper TOML's ``[kinematics]`` d/a/alpha is not a TCP.
+
+        It is the vendor's DH row for the tool link, stated in the vendor's DH
+        frame 6 — the URDF ``gripper`` frame turned by Rz(pi) — and it lands
+        on the gripper's jaw mount.  Read in that frame it reproduces the jaw
+        joint each tree declares, origin and orientation, which is what
+        identifies it; read as a flange->TCP transform (what this package used
+        to do) it names a point 28.35 mm and 180° off the tree's ``tcp`` link.
+        This is the evidence the URDF is the authoritative frame, so it is
+        checked rather than remembered.
+        """
+        rz_pi = np.eye(4)
+        rz_pi[:3, :3] = np.diag([-1.0, -1.0, 1.0])
+        grippers = load_gripper_configs()
+        for key, jaw in (("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"), ("SSG48", "jaw1_JOINT")):
+            kin = grippers[key]["kinematics"]
+            dh = np.zeros((4, 4))
+            pinokin.se3_from_rpy(
+                kin["a_m"], 0.0, kin["d_m"], kin["alpha_rad"], 0.0, 0.0, dh
+            )
+            assert np.allclose(rz_pi @ dh, _joint_transform(key, jaw), atol=1e-4), key
+            tcp = _link_transform(key, "tcp")[:3, 3]
+            assert np.linalg.norm(dh[:3, 3] - tcp) > 0.005, key
+
+    @requires_par6d
+    @pytest.mark.e2e
+    @pytest.mark.timeout(180)
+    # Both gripper variants. Not the bare flange: the shipped homing
+    # sequence references the fitted gripper's driver, so a runtime
+    # configured with `Flange` refuses to start on its own config.
+    @pytest.mark.parametrize("fitted_gripper", ["MSG_small_motor_150mm_rail", "SSG48"])
+    async def test_tcp_agrees_with_a_live_daemon(
+        self, tmp_path: Path, fitted_gripper: str
+    ) -> None:
+        """The client's TCP and the runtime's TCP are the same point.
+
+        This is the property issue #20 was the absence of, and the only one
+        that decides whether a ``move_l`` preview draws where the arm goes:
+        Waldo Commander reads the pose from the runtime and the preview from
+        this backend, so a frame the two model separately is a frame that
+        drifts.  Checked at several configurations against a real
+        ``par6d --sim`` fitted with each gripper in turn — the daemon's URDF
+        variant follows ``[robot].active_gripper``, so each run exercises a
+        different tool tree on both sides.
+
+        Both position and orientation, each side decoded in its own
+        documented convention: STATUS carries the pose as a matrix, while
+        :meth:`Robot.fk` reports intrinsic-XYZ rpy (pinokin's), so comparing
+        the reconstructed matrices is what catches a frame that is rotated
+        rather than merely displaced — the 180° half of the original bug.
+        """
+        from par6.robot import Robot as Par6Robot
+
+        client_robot = Par6Robot()
+        client_robot.set_active_tool(fitted_gripper)
+        live = LiveDaemon.start(tmp_path, active_gripper=fitted_gripper)
+        try:
+            async with live.client() as client:
+                assert await client.wait_status(lambda s: s.link_ok == 1, timeout=30.0)
+                for angles_deg in AGREEMENT_POSES_DEG:
+                    await settle_at(client, angles_deg)
+                    # One STATUS frame: the joint angles and the pose the
+                    # runtime derived from them, measured at one instant.
+                    status = await client.status()
+                    assert status is not None, "the runtime answered no STATUS"
+                    T_runtime = np.array(status.pose, dtype=np.float64).reshape(4, 4)
+
+                    out = np.zeros(6)
+                    pose = client_robot.fk(np.radians(status.angles), out)
+                    T_client = np.zeros((4, 4))
+                    pinokin.se3_from_rpy(*pose, T_client)
+
+                    assert np.allclose(
+                        T_client[:3, 3] * 1000.0, T_runtime[:3, 3], atol=1e-3
+                    ), (
+                        f"{fitted_gripper} at {angles_deg}: client TCP "
+                        f"{T_client[:3, 3] * 1000.0} mm vs runtime {T_runtime[:3, 3]} mm"
+                    )
+                    assert np.allclose(
+                        T_client[:3, :3], T_runtime[:3, :3], atol=1e-6
+                    ), (
+                        f"{fitted_gripper} at {angles_deg}: client and runtime "
+                        f"disagree about the tool orientation\n{T_client}\n{T_runtime}"
+                    )
+        finally:
+            live.stop()
 
     def test_tcp_offset_composes_in_tool_frame(self, robot: Robot) -> None:
         q = robot.joints.home.rad.copy()
@@ -173,8 +344,12 @@ class TestToolTransforms:
             assert with_tool.velocity.angular < flange.velocity.angular, (
                 f"{key}: the angular envelope must tighten at a TCP further out"
             )
+            # Equal, to the precision the trees are written at: each tool is
+            # its own CAD export and their arm chains carry different
+            # rounding, which moves the sampled median by a few parts per
+            # hundred thousand.
             assert with_tool.velocity.linear == pytest.approx(
-                flange.velocity.linear, rel=1e-9
+                flange.velocity.linear, rel=1e-3
             )
         robot.set_active_tool("FLANGE")
 

@@ -1918,3 +1918,123 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
 
     rig.shutdown();
 }
+
+/// The configured soft window, in radians, per joint.
+fn soft_window_rad() -> [(f64, f64); NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let mut out = [(0.0, 0.0); NUM_JOINTS];
+    for (slot, joint) in out.iter_mut().zip(cfg.joints.iter()) {
+        *slot = (joint.limits.soft_min_rad, joint.limits.soft_max_rad);
+    }
+    out
+}
+
+fn to_deg(rad: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
+    rad.map(f64::to_degrees)
+}
+
+/// A posture the seeded solve reaches only by turning: from the park
+/// pose, DLS converges on this configuration with J1 and J4 each a full
+/// revolution out (`+2π` / `−2π`), which is the same arm and a pair of
+/// numbers the soft-limit check rejects.
+const TURNED_POSTURE_RAD: [f64; NUM_JOINTS] = [
+    1.151_079_285_338_248,
+    -2.149_645_469_653_074,
+    3.980_431_385_749_838,
+    0.623_123_050_584_976,
+    1.021_342_994_420_38,
+    0.990_794_316_439_534,
+];
+
+/// J5 held past its SOFT window (1.9 rad) but inside its hard one: a
+/// posture the arm can be teleported into and whose pose no turn of any
+/// joint brings back in range.
+const BEYOND_SOFT_J5_RAD: f64 = 1.9;
+
+/// A converged IK solution is judged as a configuration, not as a turn
+/// count.
+///
+/// Damped least squares integrates joint increments without bound, so a
+/// solve routinely lands on `q + 2πk`: the same arm posture, carried by
+/// a number the soft-limit check refuses verbatim — measured on this
+/// rig as `move target for joint 3 (5.366112773926797 rad) is outside
+/// soft limits [-2.6147335, 2.5547335]`, for a solution 0.917 rad
+/// inside that window.
+///
+/// Both halves are the fix: the turned solution has to run and land on
+/// the commanded pose, and a target that is out of range at every turn
+/// count has to stay refused — wrapping is branch selection, never a
+/// way past the limits.
+#[test]
+fn ik_solutions_are_wrapped_into_their_soft_window() {
+    let rig = Rig::boot("ikwrap", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let soft = soft_window_rad();
+    let park = park_deg();
+
+    // The pose of the turned posture, as the runtime itself reports it.
+    let turned_deg = to_deg(TURNED_POSTURE_RAD);
+    enable_and_teleport(&rig, &mut c, turned_deg);
+    rig.drain_status();
+    let at_posture = rig.wait_status("parked at the turned posture", |s| {
+        angles_close(&s.angles, &turned_deg, 0.5)
+    });
+    let target = wire_pose_at(&at_posture.pose, tcp_mm(&at_posture));
+
+    // Commanded from the park pose, the seeded solve turns J1 and J4 a
+    // revolution past their windows to reach it.
+    enable_and_teleport(&rig, &mut c, park);
+    let i = c.ok_index(&move_j_pose(9101, target, 8.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a solution that is inside every soft window after wrapping must run: {detail:?}"
+    );
+    let settled = settled_tcp(&rig, "the wrapped solution at rest");
+    assert!(
+        distance(tcp_mm(&settled), [target[0], target[1], target[2]]) < 5.0,
+        "the wrapped solution must land on the commanded pose: {:?} vs {target:?}",
+        tcp_mm(&settled)
+    );
+    for (j, angle_deg) in settled.angles.iter().enumerate() {
+        let rad = angle_deg.to_radians();
+        assert!(
+            rad >= soft[j].0 - 1e-6 && rad <= soft[j].1 + 1e-6,
+            "the arm parked outside joint {j}'s soft window: {rad} rad in {:?}",
+            soft[j]
+        );
+    }
+
+    // Out of range at every turn count: J5 beyond its soft window, which
+    // the wrist flip mirrors to the far side of the same window.
+    let mut beyond_deg = park;
+    beyond_deg[4] = BEYOND_SOFT_J5_RAD.to_degrees();
+    enable_and_teleport(&rig, &mut c, beyond_deg);
+    rig.drain_status();
+    let at_beyond = rig.wait_status("parked past J5's soft window", |s| {
+        angles_close(&s.angles, &beyond_deg, 0.5)
+    });
+    let refused_target = wire_pose_at(&at_beyond.pose, tcp_mm(&at_beyond));
+
+    enable_and_teleport(&rig, &mut c, park);
+    let before = tcp_mm(&rig.wait_status("pose before the out-of-range target", |_| true));
+    let i = c.ok_index(&move_j_pose(9102, refused_target, 8.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a target outside the soft window must stay refused");
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(
+        e.code,
+        ErrorCode::CommValidationError as u16,
+        "the refusal must name the soft-limit violation, got {e:?}"
+    );
+    let after = tcp_mm(&rig.wait_status("pose after the out-of-range target", |_| true));
+    assert!(
+        distance(before, after) < 1.0,
+        "a refused target moved the arm: {before:?} -> {after:?}"
+    );
+
+    rig.shutdown();
+}

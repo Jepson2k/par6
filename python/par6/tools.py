@@ -143,7 +143,9 @@ def build_tools() -> ToolsCollection:
     tools: list[ToolSpec] = []
     for key in sorted(grippers, key=lambda k: (k != flange, k)):
         cfg = grippers[key]
-        origin, rpy = _cfg.tool_tcp(cfg["kinematics"])
+        # From the tool's URDF tree, never from the TOML's DH row — see
+        # :func:`par6.config.flange_to_tcp`.
+        origin, rpy = _cfg.flange_to_tcp(key)
         common = dict(
             key=key,
             display_name=cfg["name"],

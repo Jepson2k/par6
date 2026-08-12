@@ -320,6 +320,37 @@ pub(crate) enum IkResult {
     Failed(String),
 }
 
+/// The per-joint soft position window solved configurations are
+/// normalized into.
+///
+/// Not a limit check — the planner still runs its own, and this window
+/// is the same one it checks against. It is the frame of reference for
+/// choosing WHICH 2π branch of a solution to report, so that check
+/// judges the configuration the solver found rather than the number of
+/// turns it integrated getting there.
+#[derive(Clone, Copy)]
+pub(crate) struct SoftWindow {
+    min: [f64; NQ],
+    max: [f64; NQ],
+}
+
+impl SoftWindow {
+    /// The configured soft limits. Joints the config does not describe
+    /// (a robot dimensioned smaller than [`NQ`]) get an unbounded
+    /// window, which leaves their solutions untouched.
+    pub(crate) fn from_config(robot: &par6_config::RobotConfig) -> Self {
+        let mut window = SoftWindow {
+            min: [f64::NEG_INFINITY; NQ],
+            max: [f64::INFINITY; NQ],
+        };
+        for (j, joint) in robot.joints.iter().take(NQ).enumerate() {
+            window.min[j] = joint.limits.soft_min_rad;
+            window.max[j] = joint.limits.soft_max_rad;
+        }
+        window
+    }
+}
+
 /// A [`Kin`] plus the small solver surface the planner, bridge and
 /// housekeeping use (FK matrix, seeded IK, damped-least-squares
 /// jacobian velocity solve).
@@ -327,17 +358,19 @@ pub(crate) struct CartKin {
     kin: Kin,
     jac: [f64; 6 * NQ],
     offset: ToolOffset,
+    window: SoftWindow,
 }
 
 /// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
 const DLS_LAMBDA: f64 = 0.05;
 
 impl CartKin {
-    pub(crate) fn new(kin: Kin, offset: ToolOffset) -> Self {
+    pub(crate) fn new(kin: Kin, offset: ToolOffset, window: SoftWindow) -> Self {
         Self {
             kin,
             jac: [0.0; 6 * NQ],
             offset,
+            window,
         }
     }
 
@@ -361,6 +394,8 @@ impl CartKin {
     /// Seeded damped-least-squares IK toward `target`, which is where the
     /// OFFSET TCP must land: the solver works at the URDF's TCP frame, so
     /// the target is walked back along its own axes by the offset first.
+    ///
+    /// A solution comes back wrap-normalized — see [`CartKin::ik_within`].
     pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
         self.ik_within(seed, target, IkOptions::default().max_iters)
     }
@@ -371,6 +406,15 @@ impl CartKin {
     /// step small enough to converge in a handful of iterations: the full
     /// budget is then spent only on targets that have no solution, and
     /// spending it is the whole cost.
+    ///
+    /// Every solved joint is normalized onto the 2π branch its soft
+    /// window admits, nearest the seed
+    /// ([`par6_kin::wrap_to_window`]) — the DLS iterate itself carries
+    /// however many turns the walk accumulated, and a limit check on
+    /// that raw number refuses reachable targets. Nearest-the-seed is
+    /// what keeps this in step with the callers' branch-flip guards:
+    /// wrapping never moves a solution further from the seed, so a
+    /// solution that is still far from it really is another posture.
     pub(crate) fn ik_within(
         &mut self,
         seed: &[f64; NQ],
@@ -386,7 +430,17 @@ impl CartKin {
             ..IkOptions::default()
         };
         match self.kin.ik(seed, &target, &mut out, opts) {
-            Ok(IkOutcome::Converged) => IkResult::Solved(out),
+            Ok(IkOutcome::Converged) => {
+                for (j, q) in out.iter_mut().enumerate() {
+                    *q = par6_kin::wrap_to_window(
+                        *q,
+                        seed[j],
+                        self.window.min[j],
+                        self.window.max[j],
+                    );
+                }
+                IkResult::Solved(out)
+            }
             Ok(IkOutcome::MaxIters) => IkResult::Unreachable,
             Err(e) => IkResult::Failed(e.to_string()),
         }
