@@ -385,14 +385,21 @@ fn shipped_250hz_configuration_holds_a_full_session() {
     );
 
     // -- the loop's own account -------------------------------------------
+    // Hold the session until the loop has genuinely covered thousands of
+    // ticks: how many the phases above leave behind depends on how fast
+    // their wait conditions resolve on the host, so the floor is enforced
+    // by waiting, not by luck.
     let deadline = Instant::now() + BUDGET;
     let stats = loop {
         match c.query(&Command::LoopStats) {
-            QueryResult::LoopStats(ls) if ls.p99_period_s > 0.0 => break ls,
+            QueryResult::LoopStats(ls) if ls.p99_period_s > 0.0 && ls.loop_count > 2500 => {
+                break ls;
+            }
             QueryResult::LoopStats(_) => {}
             other => panic!("unexpected loop_stats result {other:?}"),
         }
         assert!(Instant::now() < deadline, "loop stats never populated");
+        std::thread::sleep(Duration::from_millis(50));
     };
     println!(
         "shipped-tick soak: target {} Hz, {} ticks, {} overruns, mean {:.6} s, \
