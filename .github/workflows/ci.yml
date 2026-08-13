@@ -165,13 +165,19 @@ jobs:
       - name: install python client
         run: pip install -e "python[dev]"
       - name: pytest -m e2e
-        working-directory: python
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
-          # par6d embeds an rpath to the shim, but its Pinocchio/coal
-          # dependencies live in the conda env prefix.
-          LD_LIBRARY_PATH: ${{ github.workspace }}/.ffi/env/lib
-        run: pytest -m e2e
+        # Sourced, not hand-listed: par6d embeds no rpath at all (cargo
+        # link-args do not propagate across packages), so it needs the
+        # shim's own directory as well as the conda prefix its Pinocchio
+        # and coal live in. env.sh is what setup.sh generates and what
+        # every other job here uses; a second hand-maintained copy of the
+        # list is what silently dropped .ffi/shim/lib and left every e2e
+        # test erroring on a missing libpar6_shim.so.
+        run: |
+          source .ffi/env.sh
+          cd python
+          pytest -m e2e
 
   # The artifact that actually deploys: par6d cross-built for the control
   # box WITH kinematics, plus the shim and the runtime closure that ship
