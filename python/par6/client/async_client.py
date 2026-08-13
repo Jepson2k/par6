@@ -1645,6 +1645,37 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._query(CmdType.TCP_SPEED)
         return result[1] if result is not None else None
 
+    async def is_estop_pressed(self) -> bool:
+        """Whether the e-stop is engaged.
+
+        Category: Query
+
+        Example:
+            pressed = rbt.is_estop_pressed()
+        """
+        io_status = await self.io()
+        if io_status is None or len(io_status) < 5:
+            return False
+        # The e-stop slot carries the LINE, which reads low while pressed.
+        return io_status[4] == 0
+
+    async def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
+        """Whether every joint is below *threshold_speed* (rad/s).
+
+        Polls the live joint speeds.  Prefer ``wait_command()`` to wait
+        for a specific command and ``wait_motion()`` to wait for a
+        settle; this is for diagnostics and manual stop logic.
+
+        Category: Query
+
+        Example:
+            stopped = rbt.is_robot_stopped()
+        """
+        speeds = await self.joint_speeds()
+        if not speeds:
+            return False
+        return max(abs(s) for s in speeds) < threshold_speed
+
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
 

@@ -14,14 +14,15 @@ import logging
 import math
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
-import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from typing import IO, Any, Literal
+from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
@@ -85,38 +86,108 @@ def _find_par6d() -> str:
     return found
 
 
-class _Par6dManager:
-    """Owns an optional local ``par6d --sim`` subprocess."""
+#: One ``env_logger`` line as ``par6d`` writes it to stderr:
+#: ``[2026-08-12T18:34:22Z INFO  par6d::daemon] loaded PAR6 …``.
+_LOG_LINE_RE = re.compile(
+    r"^\[(?P<ts>[^\s\]]+)\s+(?P<level>TRACE|DEBUG|INFO|WARN|ERROR)\s+"
+    r"(?P<target>[^\s\]]+)\]\s?(?P<message>.*)$"
+)
 
-    def __init__(self) -> None:
+#: Rust log levels → :mod:`logging` levels. Rust's TRACE is finer than
+#: anything :mod:`logging` names, and DEBUG is the nearest level a Python
+#: handler can be configured for.
+_RUST_LEVELS = {
+    "TRACE": logging.DEBUG,
+    "DEBUG": logging.DEBUG,
+    "INFO": logging.INFO,
+    "WARN": logging.WARNING,
+    "ERROR": logging.ERROR,
+}
+
+#: Logger every forwarded runtime line lands under, so one
+#: ``logging.getLogger("par6d")`` configures the whole runtime.
+_RUNTIME_LOGGER = "par6d"
+
+
+def _runtime_logger(target: str) -> str:
+    """The :mod:`logging` logger name for a Rust log target."""
+    name = target.replace("::", ".")
+    if name == _RUNTIME_LOGGER or name.startswith(f"{_RUNTIME_LOGGER}."):
+        return name
+    return f"{_RUNTIME_LOGGER}.{name}"
+
+
+class _Par6dManager:
+    """Owns an optional local ``par6d --sim`` subprocess.
+
+    The runtime's stdout/stderr is drained by a reader thread and
+    forwarded into :mod:`logging` — never inherited and never left to a
+    pipe nobody reads.  par6d logs continuously, and a pipe that fills up
+    (pytest capture, a GUI capturing subprocess output) blocks the
+    runtime on write: it stops answering PING and looks hung.
+    """
+
+    def __init__(self, normalize_logs: bool = False) -> None:
         self._proc: subprocess.Popen | None = None
-        self._log: IO[bytes] | None = None
+        self._reader: threading.Thread | None = None
+        self._stop_reader = threading.Event()
+        self.normalize_logs = normalize_logs
 
     def is_running(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
 
-    def start_sim(self) -> None:
+    def start_sim(self, host: str, port: int) -> None:
         if self.is_running():
             return
         binary = _find_par6d()
-        # Never inherit the parent's stdout/stderr: par6d logs continuously,
-        # and if it inherits a pipe nobody drains (pytest capture, a GUI that
-        # captures subprocess output) it blocks on write once the buffer
-        # fills — the runtime then stops answering PING and looks hung. A
-        # file has no such backpressure and keeps the log for diagnosis.
-        log = tempfile.NamedTemporaryFile(prefix="par6d-", suffix=".log", delete=False)
         try:
             self._proc = subprocess.Popen(
-                [binary, "--sim"],
+                [binary, "--sim", "--bind", host, "--port", str(port)],
                 stdin=subprocess.DEVNULL,
-                stdout=log,
+                stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
             )
         except OSError as e:
-            log.close()
             raise RuntimeError(f"failed to start {binary!r}: {e}") from e
-        self._log = log
-        logger.debug("par6d --sim logging to %s", log.name)
+        self._stop_reader.clear()
+        self._reader = threading.Thread(
+            target=self._forward_output,
+            args=(self._proc,),
+            name="par6d-log-reader",
+            daemon=True,
+        )
+        self._reader.start()
+
+    def _forward_output(self, proc: subprocess.Popen) -> None:
+        """Read the runtime's output line by line into :mod:`logging`."""
+        stream = proc.stdout
+        if stream is None:
+            return
+        runtime = logging.getLogger(_RUNTIME_LOGGER)
+        try:
+            for raw in iter(stream.readline, ""):
+                if self._stop_reader.is_set():
+                    break
+                line = raw.rstrip("\r\n")
+                if not line:
+                    continue
+                match = _LOG_LINE_RE.match(line) if self.normalize_logs else None
+                if match is None:
+                    # A line the runtime did not format (the PAR6D_READY
+                    # handshake, a panic, anything on the raw stream) —
+                    # forwarded verbatim rather than dropped.
+                    runtime.log(
+                        logging.ERROR if _is_panic(line) else logging.INFO, line
+                    )
+                    continue
+                logging.getLogger(_runtime_logger(match["target"])).log(
+                    _RUST_LEVELS.get(match["level"], logging.INFO), match["message"]
+                )
+        except (OSError, ValueError) as e:
+            # ValueError: the stream was closed under the reader by stop().
+            runtime.debug("par6d log reader stopped: %s", e)
 
     def stop(self, timeout: float = 2.0) -> None:
         if self._proc is None:
@@ -132,10 +203,20 @@ class _Par6dManager:
                     self._proc.wait(timeout=timeout)
                 except subprocess.TimeoutExpired:
                     logger.error("par6d did not exit after SIGKILL")
+        self._stop_reader.set()
+        if self._reader is not None:
+            # The dead process closes the pipe, so the reader's blocking
+            # readline returns on its own.
+            self._reader.join(timeout=timeout)
+            self._reader = None
+        if self._proc.stdout is not None:
+            self._proc.stdout.close()
         self._proc = None
-        if self._log is not None:
-            self._log.close()
-            self._log = None
+
+
+def _is_panic(line: str) -> bool:
+    """Whether an unformatted runtime line is a crash report."""
+    return line.startswith("thread '") or "panicked at" in line
 
 
 # ===========================================================================
@@ -268,12 +349,13 @@ class Robot(_RobotABC):
         host: str | None = None,
         port: int | None = None,
         timeout: float = 10.0,
+        normalize_logs: bool = False,
     ) -> None:
         self._host = host or os.environ.get("PAR6_HOST", "127.0.0.1")
         env_port = os.environ.get("PAR6_COMMAND_PORT")
         self._port = port if port is not None else int(env_port) if env_port else 6001
         self._timeout = timeout
-        self._manager = _Par6dManager()
+        self._manager = _Par6dManager(normalize_logs=normalize_logs)
 
         self._config = _cfg.load_robot_config()
         self._grippers = _cfg.load_gripper_configs()
@@ -599,28 +681,46 @@ class Robot(_RobotABC):
     # -- Lifecycle ----------------------------------------------------------
 
     def start(self, **kwargs: Any) -> None:
-        """Attach to a reachable par6d, or spawn ``par6d --sim`` and await it.
+        """Spawn ``par6d --sim`` at the target address and await it.
 
         Keyword args override constructor defaults: ``host``, ``port``,
-        ``timeout``.  A runtime already answering PING at the target is
-        reused as-is; otherwise a local simulated runtime is spawned (binary
-        resolved via ``PAR6D_BIN``, then PATH) and polled until it answers.
-        Raises ``RuntimeError`` when the target is remote and unreachable,
-        when no binary can be found, or when the spawned runtime dies or
-        never becomes ready.
+        ``timeout``.  Starting claims EXCLUSIVE ownership of the target:
+        a runtime already answering PING there is a hard failure, not a
+        silent attach — the caller asked to own a runtime and would
+        otherwise be handed one it cannot configure or stop.  To use a
+        runtime somebody else started, check :meth:`is_available` and go
+        straight to the client factories.
+
+        The binary is resolved via ``PAR6D_BIN``, then PATH, and polled
+        until it answers.  Raises ``RuntimeError`` when the target is
+        already served, when it is remote (a local ``--sim`` cannot serve
+        one), when a ``com_port`` is named, when no binary can be found,
+        or when the spawned runtime dies or never becomes ready.
         """
         host: str = kwargs.get("host", self._host)
         port: int = kwargs.get("port", self._port)
         timeout: float = kwargs.get("timeout", self._timeout)
+        com_port: str | None = kwargs.get("com_port")
 
+        if com_port:
+            raise RuntimeError(
+                f"com_port={com_port!r} cannot be honoured: par6d reaches the "
+                "arm over SocketCAN, and the interface it uses is named by "
+                "[bus].interface in the robot TOML (PAR6_CONFIG), not by a "
+                "serial device"
+            )
         if _ping_runtime(host, port, timeout=min(timeout, 2.0)):
-            return
+            raise RuntimeError(
+                f"a par6d runtime is already running at {host}:{port}; "
+                "start() takes exclusive ownership — use is_available() and "
+                "the client factories to attach to it instead"
+            )
         if host not in ("127.0.0.1", "localhost", "::1"):
             raise RuntimeError(
                 f"par6d runtime not reachable at {host}:{port} "
                 "(a local --sim cannot serve a remote target)"
             )
-        self._manager.start_sim()
+        self._manager.start_sim(host, port)
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             if _ping_runtime(host, port, timeout=0.2):

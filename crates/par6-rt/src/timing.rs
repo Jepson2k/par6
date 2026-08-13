@@ -130,8 +130,15 @@ impl LoopTiming {
         };
         self.stats.p50_s = rank(0.50);
         self.stats.p90_s = rank(0.90);
+        self.stats.p95_s = rank(0.95);
         self.stats.p99_s = rank(0.99);
+        self.stats.min_s = s[0];
         self.stats.max_s = s[n - 1];
+        // Dispersion over the same window the percentiles come from,
+        // as the population sigma the vendor's Welford pass computes.
+        let mean = s.iter().sum::<f64>() / n as f64;
+        let var = s.iter().map(|v| (v - mean) * (v - mean)).sum::<f64>() / n as f64;
+        self.stats.std_s = var.sqrt();
     }
 
     /// Current statistics for the snapshot (frame ages are filled by the
@@ -205,6 +212,51 @@ mod tests {
         // caught — the sim bands widen the guard, they do not remove it.
         let (_, runaway_critical) = run(dt, TimingConfig::SIM, ticks, |_| dt * 10.0);
         assert!(runaway_critical, "a runaway loop must still hard-latch");
+    }
+
+    /// Every statistic the LOOP_STATS query publishes comes off this
+    /// window — `std`, `min` and `p95` included. They were reported as
+    /// 0.0, which is indistinguishable from a loop that never ran.
+    #[test]
+    fn the_window_yields_min_std_and_p95_not_zeros() {
+        let dt = 0.004;
+        let mut t = LoopTiming::new(dt, TimingConfig::default());
+        // A window with known order statistics: 100 periods spread
+        // evenly over [dt, 2·dt], fed until the window holds only these.
+        let n = 100;
+        let period = |i: u64| dt * (1.0 + (i % n) as f64 / n as f64);
+        for i in 0..(WINDOW as u64 + RECOMPUTE_EVERY) {
+            t.record(period(i), false);
+        }
+        let s = t.stats();
+        assert!(
+            (s.min_s - dt).abs() < 1e-12,
+            "the fastest tick in the window is dt, got {}",
+            s.min_s
+        );
+        assert!(
+            (s.max_s - dt * 1.99).abs() < 1e-12,
+            "the slowest is just under 2·dt, got {}",
+            s.max_s
+        );
+        assert!(
+            s.min_s < s.p50_s && s.p50_s < s.p95_s && s.p95_s < s.p99_s && s.p99_s <= s.max_s,
+            "the percentiles must be ordered and distinct: {s:?}"
+        );
+        // Uniform over [dt, 2·dt): sigma = span / sqrt(12).
+        let expected = dt / 12f64.sqrt();
+        assert!(
+            (s.std_s - expected).abs() < 0.02 * expected,
+            "std must measure the window's spread ({expected}), got {}",
+            s.std_s
+        );
+        // A perfectly steady loop has no spread at all.
+        for _ in 0..(WINDOW as u64 + RECOMPUTE_EVERY) {
+            t.record(dt, false);
+        }
+        let s = t.stats();
+        assert!(s.std_s < 1e-15, "a steady loop has no spread: {}", s.std_s);
+        assert_eq!((s.min_s, s.p95_s, s.max_s), (dt, dt, dt));
     }
 
     #[test]

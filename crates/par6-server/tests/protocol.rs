@@ -136,6 +136,10 @@ struct PlannerState {
     epoch: u64,
     fail_next_shapes: Option<WireError>,
     collision: Option<CollisionState>,
+    /// How many times the server asked for a queue estimate.
+    estimates: usize,
+    /// Seconds the in-flight motion reports it has left.
+    inflight_duration: f64,
 }
 
 #[derive(Clone)]
@@ -180,6 +184,26 @@ impl Planner for TestPlanner {
     }
     fn enablement(&self) -> Enablement {
         self.0.lock().unwrap().enablement
+    }
+    /// Times what it is told — an explicit `duration=` on a move, a
+    /// delay's seconds — and nothing else, which is the floor the trait
+    /// asks for. Counts its calls: the server must not re-estimate
+    /// (i.e. re-plan) a queue that has not changed.
+    fn queued_duration(&mut self, pending: &[QueuedCommand<'_>]) -> f64 {
+        let mut s = self.0.lock().unwrap();
+        s.estimates += 1;
+        pending
+            .iter()
+            .map(|q| match q.cmd {
+                Command::MoveJ(p) => p.duration.unwrap_or(0.0),
+                Command::MoveS(p) => p.duration.unwrap_or(0.0),
+                Command::Delay(p) => p.seconds,
+                _ => 0.0,
+            })
+            .sum()
+    }
+    fn inflight_duration(&self, _snap: &StateSnapshot) -> f64 {
+        self.0.lock().unwrap().inflight_duration
     }
 }
 
@@ -1639,4 +1663,70 @@ fn move_j_blended(key: u64, r: Option<f64>) -> Command {
         blend_radius: r,
         rel: false,
     })
+}
+
+/// The queue ETA on the wire is the motion in flight plus the queue
+/// standing behind it, and it is re-estimated only when the queue
+/// actually changes — estimating means planning, which must not run at
+/// the status cadence.
+#[tokio::test]
+async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    h.planner.lock().unwrap().inflight_duration = 2.0;
+    let mut c = Client::new(&h).await;
+
+    // Nothing queued: the ETA is whatever is still running.
+    let idle = match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            queued_duration, ..
+        } => queued_duration,
+        other => panic!("unexpected queue result {other:?}"),
+    };
+    assert!((idle - 2.0).abs() < 1e-9, "in-flight only, got {idle}");
+
+    // Three moves: the first starts (leaving the planner's in-flight
+    // duration to describe it), two stay pending at 0.5 s each.
+    for key in 1..=3u64 {
+        c.ok_index(&move_j(key)).await;
+    }
+    let queued = match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            queued_duration,
+            queue,
+            ..
+        } => {
+            assert_eq!(queue.len(), 2, "one move started, two are pending");
+            queued_duration
+        }
+        other => panic!("unexpected queue result {other:?}"),
+    };
+    assert!(
+        (queued - 3.0).abs() < 1e-9,
+        "2 s in flight + 2 × 0.5 s queued, got {queued}"
+    );
+
+    // The STATUS broadcast carries the same number...
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.queued_segments == 2 {
+            assert!((s.queued_duration - 3.0).abs() < 1e-9);
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no status frame with the queued moves"
+        );
+    }
+    // ... without asking the planner to re-plan for every frame.
+    let before = h.planner.lock().unwrap().estimates;
+    for _ in 0..3 {
+        recv_status(&h.status_rx).await;
+    }
+    assert_eq!(
+        h.planner.lock().unwrap().estimates,
+        before,
+        "an unchanged queue must not be re-estimated"
+    );
 }

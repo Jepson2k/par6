@@ -78,6 +78,31 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
     a.iter().zip(b).all(|(x, y)| (x - y).abs() <= tol_deg)
 }
 
+fn max_deg_error(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+/// Where the configured homing sequence leaves the arm: its `move_to`
+/// steps replayed in order, last write per joint. Derived from the same
+/// config the runtime executes, never a transcribed constant.
+fn ready_pose_deg() -> [f64; NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let mut a = [f64::NAN; NUM_JOINTS];
+    for step in &cfg.homing.sequence {
+        for m in &step.move_to {
+            a[usize::from(m.joint)] = m.position_rad.to_degrees();
+        }
+    }
+    assert!(
+        a.iter().all(|v| v.is_finite()),
+        "the homing sequence must place every joint"
+    );
+    a
+}
+
 fn move_j(key: u64, angles_deg: [f64; NUM_JOINTS], duration_s: f64) -> Command {
     Command::MoveJ(MoveJ {
         key,
@@ -1002,4 +1027,285 @@ fn joint_enablement_slots_are_positive_direction_first() {
     );
 
     rig.shutdown();
+}
+
+/// Gap 14: `home` on an arm that is already referenced is a planned
+/// return to the configured park pose, not another full referencing
+/// seek (parol6 `server/motion_planner.py:239-241` routes `HomeCmd` to
+/// a `MoveJCmd(HOME_ANGLES_DEG, HOME_RETURN_SPEED_FRAC)` when
+/// `Homed_in[:6].all()`).
+///
+/// The shipped PAR6 sequence takes ~60 s and leaves the arm on the ready
+/// pose its `move_to` steps command, so a re-seek satisfies neither
+/// half of this: the return has to finish inside the test budget AND
+/// leave the arm where `Robot.joints.home` says home is.
+#[test]
+fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    // Referenced (teleport applies the home references) but standing
+    // away from the park pose on every joint the ready pose differs on.
+    let park = park_deg();
+    let ready = ready_pose_deg();
+    let mut away = park;
+    for (a, r) in away.iter_mut().zip(ready.iter()) {
+        *a += 0.25 * (r - *a);
+    }
+    teleport_home(&rig, &mut c, away);
+
+    let started = Instant::now();
+    let index = c.ok_index(&Command::Home(par6_proto::command::Home { key: 7401 }));
+    let (ok, detail) = c.wait_complete(index);
+    let elapsed = started.elapsed();
+    assert!(ok, "home on a referenced arm must complete, got {detail:?}");
+    assert!(
+        elapsed < Duration::from_secs(15),
+        "an already-referenced home must not re-run the seek (took {elapsed:?})"
+    );
+
+    let s = rig.wait_status("the return move is reported complete", |s| {
+        s.completed_index >= index as i64
+    });
+    // The rig's 50 Hz tick turns the return's 0.5 speed fraction into a
+    // near-step for the sim's cascade, which lands short of any fast
+    // target (`full_sim_session_over_protocol_v2` measures the same
+    // lag) — so the assertion is that home drove the arm to its home
+    // pose and nowhere near where a referencing seek would have left it.
+    assert!(
+        max_deg_error(&s.angles, &park) < max_deg_error(&s.angles, &ready),
+        "home must return to the park pose {park:?}, not the referencing \
+         sequence's ready pose {ready:?}; got {:?}",
+        s.angles
+    );
+    assert!(
+        max_deg_error(&s.angles, &park) < 0.5 * max_deg_error(&away, &park),
+        "home must close most of the distance to the park pose: from \
+         {away:?} it reached {:?} (home is {park:?})",
+        s.angles
+    );
+    // A referencing seek drops `homed` on its way through; a planned
+    // return never does.
+    assert!(s.homed, "the return move must not drop the home reference");
+
+    rig.shutdown();
+}
+
+/// Gap 24: the queue ETA covers moves parameterised by SPEED, which is
+/// how nearly every client queues them — `duration=` is the exception.
+/// parol6 accumulates the planned duration of every buffered segment
+/// (`server/segment_player.py:94,257`), so its ETA is real; a runtime
+/// that only counted an explicit `duration=` reported 0 for a queue
+/// full of work.
+///
+/// The ETA is PLANNED time, so the plan is what it is checked against:
+/// the same travel at half the speed takes proportionally longer, a
+/// second queued move adds its own time, and neither may exceed the
+/// wall-clock the moves really take (which also carries the settle the
+/// plan does not describe). Every move is RELATIVE, so each one covers
+/// the same travel wherever the sim's tracking lag left the arm.
+#[test]
+fn queue_eta_counts_speed_parameterised_moves() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+
+    let sweep = |key: u64, deg: f64, speed: f64| {
+        Command::MoveJ(MoveJ {
+            key,
+            angles: [deg, 0.0, 0.0, 0.0, 0.0, 0.0],
+            duration: None,
+            speed: Some(speed),
+            accel: None,
+            blend_radius: None,
+            rel: true,
+        })
+    };
+
+    // One move in flight: the ETA is that move's planned duration.
+    let index = c.ok_index(&sweep(7411, 20.0, 0.10));
+    let started = Instant::now();
+    let fast = queued_duration(&mut c);
+    let (ok, detail) = c.wait_complete(index);
+    assert!(ok, "the move must complete, got {detail:?}");
+    let wall = started.elapsed().as_secs_f64();
+    assert!(
+        fast > 0.5,
+        "a 20 deg move at a tenth of full speed is real work, ETA said {fast}"
+    );
+    assert!(
+        fast <= wall,
+        "planned time ({fast:.2} s) cannot exceed the time the move really \
+         took ({wall:.2} s)"
+    );
+
+    // Drained queue: nothing left to wait for.
+    let idle = rig.wait_status("queue drains", |s| {
+        s.queued_segments == 0 && s.executing_index == -1
+    });
+    assert!(
+        idle.queued_duration < 0.5,
+        "an empty queue has no ETA, got {}",
+        idle.queued_duration
+    );
+
+    // The same travel at half the speed takes proportionally longer —
+    // up to twice as long, less the ramps, which the acceleration limit
+    // fixes independently of the speed fraction.
+    let index = c.ok_index(&sweep(7412, -20.0, 0.05));
+    let slow = queued_duration(&mut c);
+    let ratio = slow / fast;
+    assert!(
+        (1.4..=2.05).contains(&ratio),
+        "halving the speed must nearly double the ETA \
+         ({fast:.2} s -> {slow:.2} s)"
+    );
+    assert!(c.wait_complete(index).0);
+
+    // A second queued move counts too: the ETA covers the whole queue,
+    // not just the motion in flight.
+    let a = c.ok_index(&sweep(7413, 20.0, 0.05));
+    let b = c.ok_index(&sweep(7414, -20.0, 0.05));
+    let two = queued_duration(&mut c);
+    let ratio = two / slow;
+    assert!(
+        (1.8..2.2).contains(&ratio),
+        "a second identical move must double the ETA ({slow:.2} s -> {two:.2} s)"
+    );
+    assert!(c.wait_complete(a).0 && c.wait_complete(b).0);
+
+    rig.shutdown();
+}
+
+/// The QUEUE query's `queued_duration`.
+fn queued_duration(c: &mut Client) -> f64 {
+    match c.query(&Command::Queue) {
+        QueryResult::Queue {
+            queued_duration, ..
+        } => queued_duration,
+        other => panic!("unexpected queue result {other:?}"),
+    }
+}
+
+/// Gap 25: LOOP_STATS publishes ten numbers and every one of them has
+/// to come from the loop. `std`, `min` and `p95` were hardcoded 0.0
+/// while the same rolling window already produced p50/p90/p99/max —
+/// three of ten metrics that could not be told apart from a stopped
+/// loop.
+#[test]
+fn loop_stats_reports_the_whole_window_not_three_zeros() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+
+    // The percentiles are recomputed on a periodic tick boundary; poll
+    // until the window has been summarised at least once.
+    let deadline = Instant::now() + BUDGET;
+    let stats = loop {
+        match c.query(&Command::LoopStats) {
+            QueryResult::LoopStats(ls) if ls.max_period_s > 0.0 => break ls,
+            QueryResult::LoopStats(_) => {}
+            other => panic!("unexpected loop_stats result {other:?}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the loop never published its window"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+
+    assert!(
+        stats.min_period_s > 0.0,
+        "a running loop has a real fastest tick, got {stats:?}"
+    );
+    assert!(
+        stats.p95_period_s > 0.0,
+        "a running loop has a real p95, got {stats:?}"
+    );
+    assert!(
+        stats.std_period_s > 0.0,
+        "a wall-clock loop has real jitter, got {stats:?}"
+    );
+    assert!(
+        stats.min_period_s <= stats.p95_period_s
+            && stats.p95_period_s <= stats.p99_period_s
+            && stats.p99_period_s <= stats.max_period_s,
+        "the window statistics must be ordered: {stats:?}"
+    );
+
+    rig.shutdown();
+}
+
+/// Gap 26: `pose(frame="TRF")` is the WORLD expressed in the tool frame
+/// — parol6 returns `inv(T_fk)` (`commands/query_commands.py:71-78`).
+/// Answering the identity is definitionally true and carries no
+/// information at all.
+#[test]
+fn pose_in_the_tool_frame_is_the_world_in_tool_transform() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    // Off the park pose, so neither matrix is near-identity by accident.
+    teleport_home(&rig, &mut c, with_j0(park_deg(), 30.0));
+
+    let pose = |c: &mut Client, frame: Option<Frame>| -> [f64; 16] {
+        match c.query(&Command::Pose(par6_proto::command::PoseQuery { frame })) {
+            QueryResult::Pose { pose } => pose,
+            other => panic!("unexpected pose result {other:?}"),
+        }
+    };
+    let wrf = pose(&mut c, Some(Frame::Wrf));
+    let trf = pose(&mut c, Some(Frame::Trf));
+
+    assert!(
+        wrf.iter().all(|v| v.is_finite()) && trf.iter().all(|v| v.is_finite()),
+        "both frames must answer with a real pose: wrf {wrf:?} trf {trf:?}"
+    );
+    assert!(
+        !is_identity(&trf),
+        "the tool frame's answer must not be the identity: {trf:?}"
+    );
+    // The two describe the same transform in opposite directions, so
+    // composing them (in metres — the wire carries mm translations)
+    // must land on the identity.
+    let product = mat_mul(&to_metres(&trf), &to_metres(&wrf));
+    assert!(
+        is_identity(&product),
+        "TRF must be the inverse of WRF; their product is {product:?}"
+    );
+
+    rig.shutdown();
+}
+
+/// Row-major 4x4 with the translation converted mm → m.
+fn to_metres(m: &[f64; 16]) -> [f64; 16] {
+    let mut out = *m;
+    for row in 0..3 {
+        out[row * 4 + 3] /= 1000.0;
+    }
+    out
+}
+
+fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
+    let mut out = [0.0; 16];
+    for r in 0..4 {
+        for col in 0..4 {
+            out[r * 4 + col] = (0..4).map(|k| a[r * 4 + k] * b[k * 4 + col]).sum();
+        }
+    }
+    out
+}
+
+fn is_identity(m: &[f64; 16]) -> bool {
+    (0..4).all(|r| {
+        (0..4).all(|c| {
+            let want = if r == c { 1.0 } else { 0.0 };
+            (m[r * 4 + c] - want).abs() < 1e-6
+        })
+    })
 }

@@ -88,6 +88,9 @@ const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
 /// Joint displacement below which a move has no path to time \[rad\].
 #[cfg(feature = "ffi")]
 const NULL_MOVE_RAD: f64 = 1e-9;
+/// Speed fraction the return-to-home move runs at when the arm is
+/// already referenced (vendor `HOME_RETURN_SPEED_FRAC`).
+const HOME_RETURN_SPEED_FRAC: f64 = 0.5;
 
 /// Cartesian sampling pitch: one IK waypoint per this much translation
 /// \[m\] …
@@ -263,6 +266,9 @@ pub(crate) struct Par6Planner {
     heartbeat: ExecHeartbeat,
     snapshots: SnapshotReader<StateSnapshot>,
     exec_limits: MotionLimits,
+    /// The configured home pose \[rad\] — where a HOME on an already
+    /// referenced arm returns to.
+    home_pose_rad: [f64; MAX_JOINTS],
     dt: f64,
     ticks_per_s: f64,
     next_ring_index: u32,
@@ -345,12 +351,20 @@ impl Par6Planner {
             .active_gripper()
             .and_then(|g| g.driver.as_ref())
             .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
+        let mut home_pose_rad = [0.0; MAX_JOINTS];
+        for (out, rad) in home_pose_rad
+            .iter_mut()
+            .zip(bundle.robot.robot.park_pose_rad.iter())
+        {
+            *out = *rad;
+        }
         Ok(Self {
             link,
             producer,
             heartbeat,
             snapshots,
             exec_limits,
+            home_pose_rad,
             dt,
             ticks_per_s: 1.0 / dt,
             next_ring_index: 1,
@@ -585,7 +599,27 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
     ) -> Result<InFlightKind, WireError> {
-        let start = snap.q;
+        let samples = self.joint_move_samples(&snap.q, &target, duration, speed, accel)?;
+        if samples.is_empty() {
+            return Ok(InFlightKind::Instant);
+        }
+        self.start_exec(samples, snap.mode == Mode::Exec)
+    }
+
+    /// The tick-rate samples a joint-space move from `start` to `target`
+    /// \[rad\] compiles to under the SELECTED profile. Empty = the move
+    /// has no path to run (start and target are the same configuration).
+    ///
+    /// Planning without starting is also how a queued move is TIMED for
+    /// the queue ETA, so this stays free of side effects.
+    fn joint_move_samples(
+        &self,
+        start: &[f64; MAX_JOINTS],
+        target: &[f64; MAX_JOINTS],
+        duration: Option<f64>,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid => ProfileKind::Trapezoid,
@@ -595,7 +629,7 @@ impl Par6Planner {
             #[cfg(feature = "ffi")]
             Profile::Toppra => {
                 self.exec_limits
-                    .require_inside_soft(&target)
+                    .require_inside_soft(target)
                     .map_err(planning_error)?;
                 // toppra needs a path to time; identical waypoints have none.
                 if start
@@ -603,13 +637,12 @@ impl Par6Planner {
                     .zip(target.iter())
                     .all(|(a, b)| (a - b).abs() < NULL_MOVE_RAD)
                 {
-                    return Ok(InFlightKind::Instant);
+                    return Ok(Vec::new());
                 }
                 let mut waypoints = Vec::with_capacity(2 * MAX_JOINTS);
-                waypoints.extend_from_slice(&start);
-                waypoints.extend_from_slice(&target);
-                let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
-                return self.start_exec(samples, snap.mode == Mode::Exec);
+                waypoints.extend_from_slice(start);
+                waypoints.extend_from_slice(target);
+                return self.toppra_samples(&waypoints, speed, accel, duration);
             }
         };
         let mut limits = self.exec_limits;
@@ -618,10 +651,10 @@ impl Par6Planner {
                 *a *= accel;
             }
         }
-        let mut builder = ProgramBuilder::new(start, limits, self.dt).map_err(planning_error)?;
+        let mut builder = ProgramBuilder::new(*start, limits, self.dt).map_err(planning_error)?;
         builder
             .move_j(
-                target,
+                *target,
                 MoveParams {
                     profile: kind,
                     speed_fraction: speed.unwrap_or(1.0),
@@ -632,7 +665,7 @@ impl Par6Planner {
             )
             .map_err(planning_error)?;
         let plan = builder.plan().map_err(planning_error)?;
-        let samples = plan
+        Ok(plan
             .samples()
             .iter()
             .map(|s| {
@@ -641,8 +674,7 @@ impl Par6Planner {
                 qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
                 qqd
             })
-            .collect();
-        self.start_exec(samples, snap.mode == Mode::Exec)
+            .collect())
     }
 
     /// TOPPRA-time a joint waypoint list and sample it at tick dt.
@@ -1184,8 +1216,26 @@ impl Par6Planner {
         let kind = match cmd {
             Command::MoveJ(p) => self.start_move_j(p)?,
             Command::Home(_) => {
-                self.link.send(RtCommand::SetMode(Mode::Homing));
-                InFlightKind::Home { seen_homing: false }
+                let snap = self.snapshots.latest();
+                if snap.homed {
+                    // An arm that already holds its references does not
+                    // need them re-established: HOME is a normal planned
+                    // return to the configured home pose, which is what
+                    // makes a Home button press cost seconds instead of
+                    // a full referencing seek (parol6 routes an
+                    // already-referenced `HomeCmd` to exactly this move,
+                    // `server/motion_planner.py:239-241`).
+                    self.start_joint_move(
+                        &snap,
+                        self.home_pose_rad,
+                        None,
+                        Some(HOME_RETURN_SPEED_FRAC),
+                        None,
+                    )?
+                } else {
+                    self.link.send(RtCommand::SetMode(Mode::Homing));
+                    InFlightKind::Home { seen_homing: false }
+                }
             }
             Command::Delay(p) => {
                 let snap = self.snapshots.latest();
@@ -1997,6 +2047,91 @@ impl Planner for Par6Planner {
 
     fn enablement(&self) -> Enablement {
         self.enablement
+    }
+
+    fn queued_duration(&mut self, pending: &[QueuedCommand<'_>]) -> f64 {
+        let snap = self.snapshots.latest();
+        // Where the queue will start from: the end of the motion in
+        // flight when there is one, the measured pose otherwise.
+        let mut from = match &self.inflight {
+            Some(InFlight {
+                kind: InFlightKind::Exec { samples, .. },
+                ..
+            }) => samples.last().map_or(snap.q, |s| s.q),
+            _ => snap.q,
+        };
+        let mut total = 0.0;
+        for queued in pending {
+            match queued.cmd {
+                Command::Delay(p) => total += p.seconds,
+                Command::MoveJ(p) => {
+                    let mut target = [0.0; MAX_JOINTS];
+                    for (i, t) in target.iter_mut().enumerate() {
+                        let a = p.angles[i].to_radians();
+                        *t = if p.rel { from[i] + a } else { a };
+                    }
+                    // The real plan under the selected profile: a move
+                    // this planner cannot compile is one it will refuse
+                    // when it starts, and an unplannable move has no
+                    // honest duration to report.
+                    if let Ok(samples) =
+                        self.joint_move_samples(&from, &target, p.duration, p.speed, p.accel)
+                    {
+                        total += samples.len() as f64 * self.dt;
+                    }
+                    from = target;
+                }
+                // Cartesian targets are poses: timing one means IK over
+                // its whole waypoint chain, which is the planning the
+                // move itself will do. Only an explicitly requested
+                // duration is known ahead of that.
+                Command::MoveJPose(p) => total += p.duration.unwrap_or(0.0),
+                Command::MoveL(p) => total += p.duration.unwrap_or(0.0),
+                Command::MoveC(p) => total += p.duration.unwrap_or(0.0),
+                Command::MoveS(p) => total += p.duration.unwrap_or(0.0),
+                Command::MoveP(p) => total += p.duration.unwrap_or(0.0),
+                // Homing, gripper actions and the instant commands run
+                // against hardware that answers when it answers.
+                _ => {}
+            }
+        }
+        total
+    }
+
+    fn inflight_duration(&self, snap: &StateSnapshot) -> f64 {
+        match &self.inflight {
+            Some(InFlight {
+                kind:
+                    InFlightKind::Exec {
+                        ring_index,
+                        samples,
+                        cursor,
+                        ..
+                    },
+                ..
+            }) => {
+                // Until the RT is seen PLAYING this trajectory, none of
+                // it has been consumed — the snapshot describing the
+                // ring predates the samples going in, and reading its
+                // `samples_remaining` would report a whole move as no
+                // work left.
+                let ticks = if snap.exec.active_command_index == *ring_index {
+                    // The tail this planner has not fed the ring yet (it
+                    // feeds under backpressure, so a long trajectory is
+                    // only ever partly in the ring), plus what the ring
+                    // still holds.
+                    samples.len().saturating_sub(*cursor) as u64 + snap.exec.samples_remaining
+                } else {
+                    samples.len() as u64
+                };
+                ticks as f64 * self.dt
+            }
+            Some(InFlight {
+                kind: InFlightKind::Delay { target_tick },
+                ..
+            }) => target_tick.saturating_sub(snap.tick) as f64 * self.dt,
+            _ => 0.0,
+        }
     }
 }
 

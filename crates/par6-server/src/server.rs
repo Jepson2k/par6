@@ -217,6 +217,11 @@ struct Core<P: Planner, R: RtCommands> {
     recipe: Option<String>,
     simulator: bool,
 
+    /// Planner estimate of the pending queue, and the `(front, len)` of
+    /// the queue it describes.
+    queue_estimate: f64,
+    queue_estimate_for: (u64, usize),
+
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
@@ -275,6 +280,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
+            queue_estimate: 0.0,
+            queue_estimate_for: (0, 0),
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
@@ -418,6 +425,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.refresh_snapshot();
         self.update_tcp_speed();
         self.update_collision();
+        self.refresh_queue_estimate();
         let status = self.build_status();
         self.status_seq += 1;
         let bytes = self.encoder.encode(&status);
@@ -440,6 +448,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        self.refresh_queue_estimate();
         let result = self.query_result(cmd);
         self.reply(addr, &Reply::Response { req_id, result }).await;
     }
@@ -1308,8 +1317,36 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         })
     }
 
+    /// The queue ETA a client reads: what the motion in flight has left
+    /// to run plus the planner's estimate of everything still queued.
     fn queued_duration(&self) -> f64 {
-        self.pending.iter().map(|p| duration_estimate(&p.cmd)).sum()
+        self.runtime.planner.inflight_duration(&self.snap) + self.queue_estimate
+    }
+
+    /// Re-estimate the pending queue when its contents changed.
+    ///
+    /// Estimating means planning, so it must not run at the status
+    /// cadence. Queue indices are allocated in order and commands only
+    /// ever leave from the front, so the pending queue is a contiguous
+    /// index range and `(front, len)` names it exactly.
+    fn refresh_queue_estimate(&mut self) {
+        let key = (
+            self.pending.front().map_or(0, |p| p.index),
+            self.pending.len(),
+        );
+        if key == self.queue_estimate_for {
+            return;
+        }
+        let batch: Vec<QueuedCommand<'_>> = self
+            .pending
+            .iter()
+            .map(|p| QueuedCommand {
+                index: p.index,
+                cmd: &p.cmd,
+            })
+            .collect();
+        self.queue_estimate = self.runtime.planner.queued_duration(&batch);
+        self.queue_estimate_for = key;
     }
 
     /// Enablement as clients see it. The planner owns the model; a runtime
@@ -1382,9 +1419,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             },
             C::Pose(q) => QueryResult::Pose {
                 pose: match q.frame {
-                    // The TCP pose expressed in its own tool frame is the
-                    // identity by definition.
-                    Some(par6_proto::Frame::Trf) => identity_pose(),
+                    // The WORLD expressed in the tool frame — the tool
+                    // pose read the other way round. (The TCP in its own
+                    // frame is the identity, which is true of every arm
+                    // in every configuration and tells a client nothing.)
+                    Some(par6_proto::Frame::Trf) => world_in_tool_mm(&self.snap.tcp),
                     _ => pose_matrix_mm(&self.snap.tcp),
                 },
             },
@@ -1422,17 +1461,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             }
             C::LoopStats => {
                 let ls = &self.snap.loop_stats;
-                // The RT snapshot supplies EMA / p50 / p90 / p99 / max;
-                // stats it does not carry (std, min, p95) report 0.0.
+                // Every published number comes off the RT's rolling
+                // window, except the mean: that one is the EMA the RT
+                // updates every tick, which tracks the live loop rather
+                // than the window's last summary.
                 QueryResult::LoopStats(LoopStatsResult {
                     target_hz: self.cfg.rt_tick_rate_hz,
                     loop_count: self.snap.tick,
                     overrun_count: u64::from(ls.overruns),
                     mean_period_s: ls.period_ema_s,
-                    std_period_s: 0.0,
-                    min_period_s: 0.0,
+                    std_period_s: ls.std_s,
+                    min_period_s: ls.min_s,
                     max_period_s: ls.max_s,
-                    p95_period_s: 0.0,
+                    p95_period_s: ls.p95_s,
                     p99_period_s: ls.p99_s,
                     mean_hz: if ls.period_ema_s > 0.0 {
                         1.0 / ls.period_ema_s
@@ -1530,6 +1571,28 @@ fn pose_matrix_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     ]
 }
 
+/// The world origin expressed in the tool frame: the inverse of
+/// [`pose_matrix_mm`]'s transform, translation in mm.
+///
+/// Inverting a rigid transform is `Rᵀ` and `−Rᵀ·t`; the inversion runs in
+/// metres and the result is scaled back to mm, so it composes with the
+/// WRF matrix exactly (parol6 inverts the SE(3) and scales after, same
+/// order).
+fn world_in_tool_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
+    let m = pose_matrix_mm(tcp);
+    let t_m = [tcp[0], tcp[1], tcp[2]];
+    let mut out = [0.0; POSE_ELEMS];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r * 4 + c] = m[c * 4 + r];
+        }
+        let t = -(0..3).map(|k| m[k * 4 + r] * t_m[k]).sum::<f64>();
+        out[r * 4 + 3] = t * 1000.0;
+    }
+    out[15] = 1.0;
+    out
+}
+
 /// The first `teleport` angle the runtime cannot honour, described in
 /// the terms a client can act on: which joint, what it asked for, and
 /// the window it has. `None` = every angle is placeable.
@@ -1550,15 +1613,6 @@ fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Optio
         }
     }
     None
-}
-
-fn identity_pose() -> [f64; POSE_ELEMS] {
-    let mut m = [0.0; POSE_ELEMS];
-    m[0] = 1.0;
-    m[5] = 1.0;
-    m[10] = 1.0;
-    m[15] = 1.0;
-    m
 }
 
 fn post_effect(cmd: &Command) -> PostEffect {
@@ -1584,20 +1638,6 @@ fn params_summary(cmd: &Command) -> String {
 /// Explicitly specified time a queued command will take; speed-based
 /// moves contribute 0 (the planner learns their duration only after
 /// parameterization).
-fn duration_estimate(cmd: &Command) -> f64 {
-    use Command as C;
-    match cmd {
-        C::MoveJ(p) => p.duration.unwrap_or(0.0),
-        C::MoveJPose(p) => p.duration.unwrap_or(0.0),
-        C::MoveL(p) => p.duration.unwrap_or(0.0),
-        C::MoveC(p) => p.duration.unwrap_or(0.0),
-        C::MoveS(p) => p.duration.unwrap_or(0.0),
-        C::MoveP(p) => p.duration.unwrap_or(0.0),
-        C::Delay(p) => p.seconds,
-        _ => 0.0,
-    }
-}
-
 /// Wire name of a command (STATUS `action_current`, QUEUE listing).
 fn cmd_name(tag: CmdType) -> &'static str {
     use CmdType as T;

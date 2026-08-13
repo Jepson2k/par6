@@ -207,6 +207,26 @@ pub trait Planner: Send {
     /// Current enablement flags for the REACHABLE query and the STATUS
     /// broadcast.
     fn enablement(&self) -> Enablement;
+
+    /// Seconds of work the NOT-YET-STARTED `pending` commands represent,
+    /// in queue order, as the planner's own timing model sees it.
+    ///
+    /// Planning is not free, so the server calls this only when the
+    /// queue changes and caches the answer; an implementation times what
+    /// its model can time and contributes NOTHING for a command it
+    /// cannot time without executing it. The reported total therefore
+    /// means "queued seconds that are known" — never a guess, and never
+    /// to be read as "the queue is nearly done" when it is small.
+    fn queued_duration(&mut self, pending: &[QueuedCommand<'_>]) -> f64;
+
+    /// Seconds of motion the command IN FLIGHT still has to run, given
+    /// the RT snapshot the server is reporting from. 0 when nothing is
+    /// in flight, or when the running command has no duration model
+    /// (homing, a gripper action).
+    ///
+    /// Read at the status cadence, so it must be arithmetic on state the
+    /// planner already holds — never a re-plan.
+    fn inflight_duration(&self, snap: &StateSnapshot) -> f64;
 }
 
 /// Immediate command effects forwarded to the RT core. All methods are

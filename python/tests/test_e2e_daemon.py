@@ -13,6 +13,7 @@ Skipped, not failed, when no ``par6d`` binary is reachable — see
 from __future__ import annotations
 
 import asyncio
+import logging
 import math
 import time
 
@@ -315,18 +316,31 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
 
 
 @pytest.mark.timeout(240)
-def test_robot_backend_attaches_to_a_running_runtime_then_spawns_its_own(
-    daemon: LiveDaemon, monkeypatch, tmp_path
+def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
+    daemon: LiveDaemon, monkeypatch, tmp_path, caplog
 ):
-    """``Robot.start()``'s reachable-or-spawn contract against the real
-    binary: a runtime already answering PING is adopted (and outlives the
-    Robot), and with nothing listening a local ``par6d --sim`` is spawned,
-    served through the sync client, and torn down with the Robot."""
+    """``Robot.start()`` against the real binary.
+
+    Waldo Commander calls it under ``EXCLUSIVE_START``, whose contract is
+    *fail hard when something is already running* — parol6 raises
+    ``"Server already running at …"`` (``parol6/robot.py:908-909``); a
+    silent attach hands the caller a runtime it does not own.  A client
+    that only wants to attach has ``is_available`` plus the client
+    factories, which is the path asserted here first.
+
+    ``com_port`` names a serial device; par6d drives a CAN bus, so the
+    request is refused rather than dropped on the floor.
+
+    Everything the spawned runtime logs reaches ``logging`` with its
+    level and target preserved (parol6 ``robot.py:189-227``); the log
+    used to go to an unnamed temp file nobody reads.
+    """
     robot = Robot(host="127.0.0.1", port=daemon.command_port, timeout=STEP_BUDGET_S)
 
-    # -- adopt the running runtime ---------------------------------------
+    # -- attaching is is_available + a client, never start() -------------
     assert robot.is_available() is True
-    robot.start()
+    with pytest.raises(RuntimeError, match="already"):
+        robot.start()
     with robot.create_sync_client(
         status_transport="UNICAST",
         status_port=daemon.status_port,
@@ -338,7 +352,7 @@ def test_robot_backend_attaches_to_a_running_runtime_then_spawns_its_own(
         assert angles is not None and len(angles) == 6
         assert client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
     robot.stop()
-    assert robot.is_available() is True, "an adopted runtime must outlive the Robot"
+    assert robot.is_available() is True, "a runtime it never started must survive"
 
     # -- spawn one of its own --------------------------------------------
     port = free_udp_port()
@@ -348,24 +362,59 @@ def test_robot_backend_attaches_to_a_running_runtime_then_spawns_its_own(
         # for its kinematics assets next to the config unless told otherwise.
         monkeypatch.setenv("PAR6_ASSETS", str(assets))
     monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "spawned")))
-    monkeypatch.setenv("PAR6_BIND", "127.0.0.1")
     monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
     monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
     monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
     monkeypatch.setenv("PAR6_TELEMETRY_PORT", str(free_udp_port()))
-    monkeypatch.setenv("PAR6_COMMAND_PORT", str(port))
 
-    assert robot.is_available(port=port) is False
+    logs = Robot(host="127.0.0.1", port=port, normalize_logs=True)
+    assert logs.is_available() is False
+    with pytest.raises(RuntimeError, match="com_port"):
+        logs.start(com_port="/dev/ttyACM0")
+
     try:
-        robot.start(port=port, timeout=60.0)
-        assert robot.is_available(port=port) is True
+        with caplog.at_level(logging.DEBUG, logger="par6d"):
+            logs.start(timeout=60.0)
+            assert logs.is_available() is True
+            forwarded = _await_records(caplog, "par6d", STEP_BUDGET_S)
     finally:
-        robot.stop()
+        logs.stop()
+
+    assert forwarded, "the spawned runtime's log never reached logging"
+    assert any(r.levelno == logging.INFO for r in forwarded), (
+        f"levels must survive normalization: {[r.levelname for r in forwarded]}"
+    )
+    assert any("command plane on" in r.getMessage() for r in forwarded), (
+        f"the runtime's own boot lines must arrive: "
+        f"{[r.getMessage() for r in forwarded][:10]}"
+    )
+    assert not any(r.getMessage().startswith("[20") for r in forwarded), (
+        "normalized records carry the message, not the raw env_logger prefix"
+    )
+    assert any(r.name.startswith("par6d.") for r in forwarded), (
+        f"the runtime's target must become the logger name: "
+        f"{sorted({r.name for r in forwarded})}"
+    )
 
     deadline = time.monotonic() + STEP_BUDGET_S
-    while robot.is_available(port=port) and time.monotonic() < deadline:
+    while logs.is_available() and time.monotonic() < deadline:
         time.sleep(0.1)
-    assert robot.is_available(port=port) is False, "Robot.stop() must reap what it spawned"
+    assert logs.is_available() is False, "Robot.stop() must reap what it spawned"
+
+
+def _await_records(caplog, logger_name: str, budget_s: float) -> list:
+    """Records logged under *logger_name*, polled until some arrive.
+
+    The forwarder is a reader thread, so the records a just-started
+    runtime has already written may not have been processed yet.
+    """
+    deadline = time.monotonic() + budget_s
+    while time.monotonic() < deadline:
+        found = [r for r in caplog.records if r.name.startswith(logger_name)]
+        if found:
+            return found
+        time.sleep(0.05)
+    return []
 
 
 @pytest.mark.timeout(120)
@@ -509,3 +558,64 @@ async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
         assert await client.wait_command(index, timeout=STEP_BUDGET_S) is True, (
             f"the stream left the controller unusable; daemon log:\n{daemon.log()}"
         )
+
+
+@pytest.mark.timeout(120)
+async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
+    daemon: LiveDaemon,
+):
+    """``is_estop_pressed`` / ``is_robot_stopped`` — the two palette
+    entries parol6 has and par6 did not (``async_client.py:1135,1148``).
+
+    Both read live telemetry rather than a cached status, so the e-stop
+    predicate has to follow a real ``estop()`` latch and the motion
+    predicate has to tell a moving arm from a parked one.
+    """
+    park = park_deg()
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await teleport_to(client, park)
+
+        assert await client.is_estop_pressed() is False
+        assert await client.is_robot_stopped() is True
+
+        # A long move: while it runs the arm is not stopped.
+        target = list(park)
+        target[0] += 20.0
+
+        async def start_move():
+            assert await client.move_j(target, duration=6.0) >= 0
+
+        assert await enable(client, start_move) is None
+        assert await client.wait_status(
+            lambda s: abs(s.speeds[0]) > 0.05, timeout=STEP_BUDGET_S
+        ), "the move never moved the arm"
+        assert await client.is_robot_stopped() is False
+
+        await client.estop()
+        assert await client.wait_status(
+            lambda s: s.io[4] == 0, timeout=STEP_BUDGET_S
+        ), "the e-stop never reached the I/O surface"
+        assert await client.is_estop_pressed() is True
+
+        # The latch and the arm are two different facts, and they do not
+        # become true in the same tick: SAFETY_STOP commands 0 Nm
+        # (crates/par6-rt/src/dispatch.rs:94) while the arm is still
+        # carrying a move, so the e-stop is visible on the I/O surface
+        # before the joints read zero. `is_robot_stopped` reports the
+        # arm, not the latch, and asserting it straight off the latch is
+        # a race — it has to be waited for.
+        #
+        # Note what this does NOT establish: on hardware, 0 Nm means a
+        # torque-held arm sags under gravity, where parol6's steppers
+        # hold. The default sim plant does not model that (the arm here
+        # halts within 0.01deg of where the latch caught it), so no CI
+        # tier currently exercises e-stop sag. Tracked as issue #22.
+        assert await client.wait_status(
+            lambda s: max(abs(v) for v in s.speeds) < 0.01, timeout=STEP_BUDGET_S
+        ), "the arm never came to rest under the e-stop latch"
+        assert await client.is_robot_stopped() is True
+
+        assert await client.reset() == 1
+        assert await client.wait_status(lambda s: s.io[4] == 1, timeout=STEP_BUDGET_S)
+        assert await client.is_estop_pressed() is False

@@ -508,6 +508,14 @@ class RobotClient:
         """TCP linear velocity in mm/s."""
         return _run(self._inner.tcp_speed())
 
+    def is_estop_pressed(self) -> bool:
+        """Whether the e-stop is engaged."""
+        return _run(self._inner.is_estop_pressed())
+
+    def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
+        """Whether every joint is below *threshold_speed* (rad/s)."""
+        return _run(self._inner.is_robot_stopped(threshold_speed))
+
     def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z]."""
         return _run(self._inner.tcp_offset())

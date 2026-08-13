@@ -257,10 +257,16 @@ impl Default for HomingStatus {
 pub struct LoopStats {
     /// EMA of the loop period \[s\].
     pub period_ema_s: f64,
+    /// Standard deviation of the loop period across the window \[s\].
+    pub std_s: f64,
+    /// Min loop period in the window \[s\].
+    pub min_s: f64,
     /// p50 of the loop period \[s\].
     pub p50_s: f64,
     /// p90 of the loop period \[s\].
     pub p90_s: f64,
+    /// p95 of the loop period \[s\].
+    pub p95_s: f64,
     /// p99 of the loop period \[s\] — feeds the degradation bands.
     pub p99_s: f64,
     /// Max loop period in the window \[s\].
