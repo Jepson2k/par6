@@ -126,11 +126,12 @@ jobs:
   # The SocketCAN backend is the only bus that will ever touch the arm,
   # and its vcan suite skips itself wherever no vcan interface exists —
   # which used to be everywhere, CI included. GitHub's ubuntu runners
-  # allow sudo and ship the vcan module, so this job creates the
-  # interface and runs the suite for real. PAR6_REQUIRE_VCAN=1 turns the
-  # developer-default skip into a hard failure: if interface creation
-  # ever breaks, the job goes red instead of silently degrading to a
-  # no-op.
+  # allow sudo, and the vcan module lives in linux-modules-extra (not in
+  # the base image), so this job installs that package for the running
+  # kernel, creates the interface, and runs the suite for real.
+  # PAR6_REQUIRE_VCAN=1 turns the developer-default skip into a hard
+  # failure: if interface creation ever breaks, the job goes red instead
+  # of silently degrading to a no-op.
   socketcan:
     name: socketcan (vcan)
     runs-on: ubuntu-latest
@@ -143,6 +144,8 @@ jobs:
           key: socketcan
       - name: create vcan0
         run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
           sudo modprobe vcan
           sudo ip link add dev vcan0 type vcan
           sudo ip link set vcan0 up
