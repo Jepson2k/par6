@@ -89,6 +89,42 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
     })
 }
 
+/// The G(q) model for a runtime whose arm carries the configured tool
+/// (hardware, and the kinematic simulator's published-only gravity):
+/// the arm-only URDF chain plus the ACTIVE gripper's `[kinematics]`
+/// inertials, attached through [`Kin::dh_tool_params`].
+///
+/// Reconciliation rule: every mass has exactly one source. Arm links
+/// come from the URDF; everything distal of the wrist comes from the
+/// gripper config (the vendor semantics — the tool REPLACES the sixth
+/// link, so even the bare flange plate is a config entry). The gripper
+/// variants' URDF tool links are deliberately not part of this chain,
+/// which is what makes `[kinematics] mass_kg` the knob that tunes
+/// gravity compensation instead of a parsed-and-ignored field.
+pub(crate) fn load_gravity_kin(
+    assets_dir: &Path,
+    gripper: Option<&par6_config::GripperConfig>,
+) -> Result<Kin, String> {
+    let tool = gripper.map(|g| {
+        let k = &g.kinematics;
+        Kin::dh_tool_params(
+            k.d_m,
+            k.a_m,
+            k.alpha_rad,
+            k.mass_kg,
+            k.com_m,
+            k.inertia_kg_m2,
+        )
+    });
+    Kin::load_arm(assets_dir, tool.as_ref()).map_err(|e| {
+        format!(
+            "cannot load gravity model {} from {}: {e}",
+            Kin::ARM_URDF_RELPATH,
+            assets_dir.display()
+        )
+    })
+}
+
 // ----------------------------------------------------------- tool offset
 
 /// The commanded TCP offset, shared by every FK/IK consumer.

@@ -286,6 +286,21 @@ impl VirtualDriver {
         }
     }
 
+    /// Discard motion-transient controller state (teleport re-seed).
+    ///
+    /// The velocity-loop integral is charge accumulated against the
+    /// plant's PREVIOUS motion — after a jog-release brake it holds
+    /// hundreds of mA. A teleport puts the plant at rest somewhere else;
+    /// letting the stale integral discharge there shoves the arm off the
+    /// teleported pose (about a thousand ticks after a fast jog) and
+    /// rings, violating the teleport contract that the arm lands exactly
+    /// where the client asked. Mode and config survive; only the
+    /// transient is dropped.
+    pub fn reset_motion_transients(&mut self) {
+        self.integral_ma = 0.0;
+        self.cur_out_ma = 0.0;
+    }
+
     /// Reset the command-silence counter (a valid data frame arrived).
     /// The firmware gripper uses this for cmd 61/62 frames, whose payloads
     /// the gripper model parses itself.

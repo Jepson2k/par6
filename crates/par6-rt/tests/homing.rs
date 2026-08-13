@@ -1,8 +1,12 @@
 //! Homing: the full PAR6 sequence driven closed-loop against the sim bus
 //! (spec/HOMING.md "Sim requirements"), the mid-homing hard-error abort,
 //! the home reference the hall FSM latches against the sim's own sensor,
-//! and the failure signatures (two-pass mismatch, position-never-valid)
-//! from scripted NodeState evolutions at the HomingSystem seam.
+//! the failure signatures (two-pass mismatch, position-never-valid,
+//! approach timeout), the stall false-positive guards (startup inrush,
+//! current-window duty), and the release phase's sign/duration/sample
+//! contract — the scripted cases at the HomingSystem seam. The latched
+//! reference itself is checked against plant ground truth in
+//! homing_reference.rs.
 
 mod common;
 
@@ -115,9 +119,13 @@ fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
         );
     }
 
-    // The ready pose reached through the HOMED references — J3's offset
-    // is the config fallback, J4's comes from the ACTIVE gripper (MSG),
-    // so a wrong gripper-dependent offset would miss these targets.
+    // Closed-loop tracking check only: the move_to targets and `s.q`
+    // both convert through the JointConversion that set_home re-based
+    // moments earlier, so this holds for essentially ANY latched
+    // reference — it proves the sequence completes and the position
+    // loops track, not that the reference is right. The reference is
+    // checked against the sim plant's ground truth in
+    // homing_reference.rs.
     let want = [1.57, -1.85, 2.85, 0.0, -0.5, std::f64::consts::PI];
     for (i, (got, want)) in s.q.iter().zip(&want).enumerate() {
         assert!(
@@ -428,6 +436,372 @@ fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
     assert!(
         (latched - stop as i64).abs() <= 50,
         "home reference latched at {latched}, endstop at {stop}"
+    );
+}
+
+// ------------------------------------------------------------------
+// Stall false-positive guards (G4): the startup guard and the 60 %
+// current-window duty requirement, scripted at the HomingSystem seam.
+// ------------------------------------------------------------------
+
+/// Spin-up inrush: real drivers draw saturated current at velocity-mode
+/// start while the rotor has not yet moved — a displacement plateau AND
+/// high current, the full stall signature. The 0.15 s startup guard is
+/// what keeps that from latching the home reference at the start pose.
+/// Without the guard this run latches pass 1 at the boot pose, pass 2
+/// hits the real endstop 5000 ticks away, and the two-pass check FAILS
+/// the sequence — so `Complete` binds the guard.
+#[test]
+fn spinup_inrush_does_not_false_latch_a_stall() {
+    let bundle = single_joint_bundle(0);
+    let jh = &bundle.robot.homing.joints[0];
+    let eff = bundle
+        .effective_home_offset(0)
+        .unwrap_or(jh.home_offset_rad);
+    let mut h = HomingHarness::new(&bundle);
+    let n0 = usize::from(bundle.robot.joints[0].node_id);
+
+    // ~0.14 s of saturated current with the rotor parked (inrush), then
+    // normal travel at 80 % tracking and 100 mA to the endstop.
+    let inrush_ticks = (0.14 / h.dt).round() as u32;
+    const TRACKING: f64 = 0.8;
+    let master = bundle.robot.joints[0].sector_master_position_ticks;
+    let mut pos = f64::from(master);
+    let stop = pos + 5000.0;
+    h.state.nodes[n0].position_ticks = Some(master);
+    h.state.nodes[n0].current_ma = Some(0);
+
+    let mut outcome = SeqStatus::Running;
+    let mut drive_ticks = 0u32;
+    let mut pos_at_first_hit: Option<f64> = None;
+    for t in 1..20_000u64 {
+        let status = h.tick(t);
+        let v = h.cmds[0].vel.unwrap_or(0);
+        if v > 0 {
+            drive_ticks += 1;
+        } else if drive_ticks > 0 && pos_at_first_hit.is_none() {
+            // First non-approach command after driving = the pass-1 hit.
+            pos_at_first_hit = Some(pos);
+        }
+        let spinning_up = v > 0 && drive_ticks <= inrush_ticks;
+        if !spinning_up {
+            pos = (pos + f64::from(v) * TRACKING * h.dt).min(stop);
+        }
+        let seated = pos >= stop - 0.5 && v > 0;
+        h.state.nodes[n0].position_ticks = Some(pos as i32);
+        h.state.nodes[n0].speed_ticks_s = Some(v);
+        h.state.nodes[n0].current_ma = Some(if seated || spinning_up {
+            jh.current_ma as i16
+        } else {
+            100
+        });
+        match status {
+            SeqStatus::Running => {}
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+
+    assert_eq!(
+        outcome,
+        SeqStatus::Complete,
+        "an inrush-latched pass 1 would fail the two-pass check"
+    );
+    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
+    assert!(
+        pos_at_first_hit.expect("pass 1 must hit") >= stop - 200.0,
+        "pass 1 hit at {} — the endstop is {stop}, the inrush plateau was {master}",
+        pos_at_first_hit.unwrap()
+    );
+    let latched = i64::from(h.conv[0].motor_ticks(eff));
+    assert!(
+        (latched - stop as i64).abs() <= 50,
+        "home reference latched at {latched}, endstop at {stop}"
+    );
+}
+
+/// A jammed joint whose current is above threshold only 40 % of the time
+/// (an oscillating load) must not read as a stall: the detector demands
+/// ≥ 60 % of the window above `0.70 · homing_current`. The same jam under
+/// 100 % duty must latch promptly — same displacement plateau, so the
+/// duty cycle is the only variable.
+#[test]
+fn a_forty_percent_current_duty_is_not_a_stall() {
+    let bundle = single_joint_bundle(0);
+    let jh = &bundle.robot.homing.joints[0];
+    let eff = bundle
+        .effective_home_offset(0)
+        .unwrap_or(jh.home_offset_rad);
+    let mut h = HomingHarness::new(&bundle);
+    let n0 = usize::from(bundle.robot.joints[0].node_id);
+
+    let duty_ticks = 250u32;
+    let master = bundle.robot.joints[0].sector_master_position_ticks;
+    let mut pos = f64::from(master);
+    let stop = pos + 3000.0;
+    h.state.nodes[n0].position_ticks = Some(master);
+    h.state.nodes[n0].current_ma = Some(0);
+
+    let mut outcome = SeqStatus::Running;
+    let mut jam_ticks = 0u32; // ticks seated during pass 1
+    let mut full_duty_from: Option<u64> = None;
+    let mut first_hit_tick: Option<u64> = None;
+    let mut drive_seen = false;
+    for t in 1..20_000u64 {
+        let status = h.tick(t);
+        let v = h.cmds[0].vel.unwrap_or(0);
+        if v > 0 {
+            drive_seen = true;
+        } else if drive_seen && first_hit_tick.is_none() {
+            first_hit_tick = Some(t);
+        }
+        pos = (pos + f64::from(v) * h.dt).clamp(f64::from(master) - 4000.0, stop);
+        let seated = pos >= stop - 0.5 && v > 0;
+        let cur = if seated && first_hit_tick.is_none() && jam_ticks < duty_ticks {
+            // Pass-1 jam, phase B: 2-on / 3-off — 40 % of the window.
+            jam_ticks += 1;
+            if jam_ticks == duty_ticks {
+                full_duty_from = Some(t + 1);
+            }
+            if jam_ticks % 5 < 2 {
+                jh.current_ma as i16
+            } else {
+                0
+            }
+        } else if seated {
+            jh.current_ma as i16
+        } else {
+            100
+        };
+        h.state.nodes[n0].position_ticks = Some(pos as i32);
+        h.state.nodes[n0].speed_ticks_s = Some(v);
+        h.state.nodes[n0].current_ma = Some(cur);
+
+        // Through the whole 40 %-duty window the approach must persist.
+        if jam_ticks > 0 && jam_ticks <= duty_ticks && first_hit_tick.is_none() {
+            assert_eq!(status, SeqStatus::Running);
+            assert_eq!(
+                h.cmds[0].vel,
+                Some(jh.speed_ticks_s as i32),
+                "tick {t}: 40 % duty latched a stall {jam_ticks} jam ticks in"
+            );
+        }
+        match status {
+            SeqStatus::Running => {}
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+
+    let full_from = full_duty_from.expect("the jam must reach the duty window");
+    let hit = first_hit_tick.expect("100 % duty must latch");
+    assert!(
+        hit >= full_from,
+        "stall latched at tick {hit}, before full duty began at {full_from}"
+    );
+    assert!(
+        hit <= full_from + 60,
+        "100 % duty should latch within a detection window (hit {hit}, full duty from {full_from})"
+    );
+    assert_eq!(outcome, SeqStatus::Complete);
+    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
+    let latched = i64::from(h.conv[0].motor_ticks(eff));
+    assert!(
+        (latched - stop as i64).abs() <= 50,
+        "home reference latched at {latched}, endstop at {stop}"
+    );
+}
+
+// ------------------------------------------------------------------
+// Approach timeout (G7): the only guard against a joint driving forever.
+// ------------------------------------------------------------------
+
+/// A free-running joint (detached endstop: normal travel, low current,
+/// nothing ever stalls) must fail at exactly `round(timeout_s / dt)`
+/// approach ticks — not before — with the joint marked Failed and the
+/// full node config (normal current limits included) resent. Run at two
+/// tick rates so the seconds→ticks conversion is pinned, not an
+/// accident of the shipped dt.
+#[test]
+fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
+    for dt in [0.004, 0.01] {
+        let mut bundle = single_joint_bundle(0);
+        bundle.robot.robot.tick_dt_s = dt;
+        let timeout_ticks = (bundle.robot.homing.joints[0].timeout_s / dt).round() as u64;
+        let mut h = HomingHarness::new(&bundle);
+        let n0 = usize::from(bundle.robot.joints[0].node_id);
+
+        let master = bundle.robot.joints[0].sector_master_position_ticks;
+        let mut pos = f64::from(master);
+        h.state.nodes[n0].position_ticks = Some(master);
+        h.state.nodes[n0].current_ma = Some(0);
+
+        let mut first_drive: Option<u64> = None;
+        let mut failed_at: Option<u64> = None;
+        for t in 1..=timeout_ticks + 10 {
+            let status = h.tick(t);
+            let v = h.cmds[0].vel.unwrap_or(0);
+            if v > 0 && first_drive.is_none() {
+                first_drive = Some(t);
+            }
+            // Perfect free travel, telemetry current well below threshold.
+            pos += f64::from(v) * dt;
+            h.state.nodes[n0].position_ticks = Some(pos as i32);
+            h.state.nodes[n0].speed_ticks_s = Some(v);
+            h.state.nodes[n0].current_ma = Some(50);
+            match status {
+                SeqStatus::Running => {}
+                SeqStatus::Failed => {
+                    failed_at = Some(t);
+                    break;
+                }
+                other => panic!("dt {dt}: unexpected status {other:?} at tick {t}"),
+            }
+        }
+
+        let first_drive = first_drive.expect("the approach must drive");
+        let failed_at = failed_at.unwrap_or_else(|| panic!("dt {dt}: timeout never fired"));
+        // elapsed == timeout is still within budget; the tick after is
+        // the failure — exactly `round(timeout_s / dt)` driven ticks.
+        // 13.0 is the shipped J0 timeout (config/PAR6.toml), spelled out
+        // so the conversion is pinned against the config seconds.
+        assert_eq!(timeout_ticks, (13.0f64 / dt).round() as u64, "dt {dt}");
+        assert_eq!(
+            failed_at - first_drive,
+            timeout_ticks,
+            "dt {dt}: timeout fired after the wrong number of approach ticks"
+        );
+        assert_eq!(h.sys.statuses()[0], HomingJointStatus::Failed, "dt {dt}");
+        assert!(!h.sys.active(), "dt {dt}: sequence stopped");
+        assert!(
+            h.config_passes() > MAX_JOINTS,
+            "dt {dt}: failure must resend every node's stored config (got {})",
+            h.config_passes()
+        );
+    }
+}
+
+// ------------------------------------------------------------------
+// Release phase (G8): current sign, duration, and the sample tick.
+// ------------------------------------------------------------------
+
+/// Scripted release-phase plant for J1: seat against the endstop through
+/// both passes, then apply sign-sensitive release physics — positive
+/// current moves the motor positive (away from the low stop, relaxing
+/// the wound gearbox), negative current presses further in. Returns
+/// (release frames sent, position exposed at each release tick, latched
+/// reference, outcome).
+fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqStatus) {
+    let jh = &bundle.robot.homing.joints[1];
+    let eff = bundle
+        .effective_home_offset(1)
+        .unwrap_or(jh.home_offset_rad);
+    let mut h = HomingHarness::new(bundle);
+    let n1 = usize::from(bundle.robot.joints[1].node_id);
+
+    const TRACKING: f64 = 0.8;
+    /// Windup relax/wind rate under release current \[ticks per tick\].
+    const RELEASE_STEP: f64 = 3.0;
+    let master = bundle.robot.joints[1].sector_master_position_ticks;
+    let mut pos = f64::from(master);
+    let stop = pos - 3000.0; // J1 approaches with negative motor speed
+    h.state.nodes[n1].position_ticks = Some(master);
+    h.state.nodes[n1].current_ma = Some(0);
+
+    let mut release_cmds: Vec<i16> = Vec::new();
+    let mut release_seen: Vec<i32> = Vec::new();
+    let mut outcome = SeqStatus::Running;
+    for t in 1..30_000u64 {
+        let exposed = h.state.nodes[n1].position_ticks.unwrap();
+        let status = h.tick(t);
+        let cmd = h.cmds[1];
+        if cmd.pos.is_none() && cmd.vel.is_none() {
+            // Current-only frame (cmd 2 DLC 2) — the release drive.
+            let c = cmd.cur_ma.expect("current-only frame carries current");
+            release_cmds.push(c);
+            release_seen.push(exposed);
+            // Sign-sensitive plant: the current's sign decides whether
+            // the gearbox relaxes (away from the stop) or winds tighter.
+            pos += RELEASE_STEP * f64::from(c.signum());
+        } else {
+            let v = cmd.vel.unwrap_or(0);
+            pos = (pos + f64::from(v) * TRACKING * h.dt).max(stop);
+            let seated = pos <= stop + 0.5 && v < 0;
+            h.state.nodes[n1].current_ma = Some(if seated { -(jh.current_ma as i16) } else { 100 });
+            h.state.nodes[n1].speed_ticks_s = Some(v);
+        }
+        h.state.nodes[n1].position_ticks = Some(pos as i32);
+        match status {
+            SeqStatus::Running => {}
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+    let latched = i64::from(h.conv[1].motor_ticks(eff));
+    (release_cmds, release_seen, latched, outcome)
+}
+
+#[test]
+fn release_commands_the_config_sign_and_duration_and_samples_at_eighty_percent() {
+    let bundle = single_joint_bundle(1);
+    let r = bundle.robot.homing.joints[1]
+        .release
+        .expect("J1 ships a release plan");
+    let dt = bundle.robot.robot.tick_dt_s;
+    let dur_ticks = (r.duration_s / dt).round().max(1.0) as usize;
+    let sample_tick = ((dur_ticks as f64 * r.sample_pct).round() as usize).clamp(1, dur_ticks);
+
+    let (cmds, seen, latched, outcome) = run_release_scenario(&bundle);
+    assert_eq!(outcome, SeqStatus::Complete);
+    // Exactly `duration_s` worth of current-only frames, every one with
+    // the CONFIG sign (+150 mA for J1: away from the stop).
+    assert_eq!(cmds.len(), dur_ticks, "release runs for round(duration/dt)");
+    assert!(
+        cmds.iter().all(|&c| c == r.current_ma as i16),
+        "every release frame carries the config current verbatim: {cmds:?}"
+    );
+    // The reference is the position the joint had relaxed to at the
+    // sample tick — the scripted plant moves a distinct 3 ticks per
+    // release tick, so the latched value identifies the tick exactly.
+    assert_eq!(
+        latched,
+        i64::from(seen[sample_tick - 1]),
+        "reference sampled at round(dur · sample_pct) = tick {sample_tick}"
+    );
+    // And it is the RELAXED position: well away from the seated stop in
+    // the releasing direction.
+    let stop = i64::from(bundle.robot.joints[1].sector_master_position_ticks) - 3000;
+    assert!(
+        latched - stop >= 500,
+        "latched {latched} must sit relaxed above the stop {stop}"
+    );
+
+    // Inverting the config sign must move the reference the other way —
+    // the plant winds tighter instead of relaxing, and the relaxed-side
+    // assertion above would reject it. This pins that the test (and the
+    // FSM) are sign-sensitive, not |current|-sensitive.
+    let mut inverted = single_joint_bundle(1);
+    let rel = inverted.robot.homing.joints[1]
+        .release
+        .as_mut()
+        .expect("J1 ships a release plan");
+    rel.current_ma = -rel.current_ma;
+    let (inv_cmds, _, inv_latched, inv_outcome) = run_release_scenario(&inverted);
+    assert_eq!(inv_outcome, SeqStatus::Complete);
+    assert!(
+        inv_cmds.iter().all(|&c| c == -(r.current_ma as i16)),
+        "the FSM forwards the inverted sign verbatim"
+    );
+    assert!(
+        inv_latched - stop <= -400,
+        "inverted release must latch WOUND-IN ({inv_latched} vs stop {stop}) — \
+         the relaxed-side assertion would fail on it"
     );
 }
 

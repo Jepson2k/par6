@@ -2,7 +2,7 @@
 //! statistics, and the [`StateSnapshot`] the RT thread publishes every
 //! tick (spec/RT.md "Status snapshot").
 
-use par6_bus::{GripperState, NodeState};
+use par6_bus::{GripperState, LinkHealth, NodeState};
 
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -277,6 +277,11 @@ pub struct LoopStats {
     pub can_frame_age_max_ticks: u64,
     /// Min CAN frame age seen in the last drain \[ticks\].
     pub can_frame_age_min_ticks: u64,
+    /// Bus TX sends (joint + gripper slots) the backend refused with an
+    /// error, as observed by the tick loop, since boot.
+    pub bus_tx_failures: u32,
+    /// Bus RX drains the backend refused with an error, since boot.
+    pub bus_rx_failures: u32,
 }
 
 /// EXEC-mode live state.
@@ -404,6 +409,9 @@ pub struct StateSnapshot {
     pub error_active: bool,
     /// Loop timing statistics.
     pub loop_stats: LoopStats,
+    /// Motor-bus link health as the backend reports it (kernel link
+    /// state and counters on hardware; per-backend counters elsewhere).
+    pub link: LinkHealth,
     /// EXEC live state.
     pub exec: ExecStatus,
     /// Jog live state.
@@ -441,6 +449,7 @@ impl Default for StateSnapshot {
             errors: ErrorList::new(),
             error_active: false,
             loop_stats: LoopStats::default(),
+            link: LinkHealth::default(),
             exec: ExecStatus::default(),
             jog: JogStatus::default(),
             stream: StreamStatus::default(),

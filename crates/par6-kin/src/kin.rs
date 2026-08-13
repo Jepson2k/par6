@@ -90,6 +90,66 @@ impl std::fmt::Debug for Kin {
 }
 
 impl Kin {
+    /// The arm-only gravity chain: the flange URDF with a massless tool
+    /// stub on the wrist, so the active tool's inertials can be attached
+    /// from the gripper config ([`Kin::dh_tool_params`]) without
+    /// double-counting a URDF tool link. Relative to the
+    /// `assets/par6_description` tree.
+    pub const ARM_URDF_RELPATH: &'static str = "URDF/par6_flange/urdf/par6_arm.urdf";
+
+    /// The vendor gripper configs describe the tool as one extra DH link
+    /// hanging off the wrist (`Rz(q6)·Tz(d)·Tx(a)·Rx(alpha)`), with its
+    /// mass/COM/inertia in that DH tool frame. The URDF's `gripper` frame
+    /// IS the vendor's post-`Rz(q6)` frame (verified numerically against
+    /// the vendor DH chain when the gravity reference fixture was
+    /// generated), so the fixed frame between them is exactly
+    /// `Tz(d)·Tx(a)·Rx(alpha)` and the conversion into end-effector-frame
+    /// [`pinokin_sys::ToolParams`] coordinates is a rotation by
+    /// `Rx(alpha)` plus the `(a, 0, d)` offset.
+    ///
+    /// `inertia_kg_m2` uses the config/vendor order
+    /// `[Ixx, Iyy, Izz, Ixy, Iyz, Ixz]` (about the COM, DH tool axes).
+    /// The returned `transform` is identity: the tool is attached for its
+    /// INERTIAL contribution only — the gravity model never resolves
+    /// poses at the tool, and shifting fk/ik would silently move the
+    /// model's TCP.
+    pub fn dh_tool_params(
+        d_m: f64,
+        a_m: f64,
+        alpha_rad: f64,
+        mass_kg: f64,
+        com_m: [f64; 3],
+        inertia_kg_m2: [f64; 6],
+    ) -> pinokin_sys::ToolParams {
+        let (s, c) = alpha_rad.sin_cos();
+        // R = Rx(alpha); v' = R·v.
+        let rot = |v: [f64; 3]| [v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]];
+        let com = {
+            let r = rot(com_m);
+            [r[0] + a_m, r[1], r[2] + d_m]
+        };
+        // I' = R·I·Rᵀ via rotating rows then columns.
+        let [ixx, iyy, izz, ixy, iyz, ixz] = inertia_kg_m2;
+        let rows = [
+            rot([ixx, ixy, ixz]),
+            rot([ixy, iyy, iyz]),
+            rot([ixz, iyz, izz]),
+        ];
+        let col = |k: usize| rot([rows[0][k], rows[1][k], rows[2][k]]);
+        let (c0, c1, c2) = (col(0), col(1), col(2));
+        pinokin_sys::ToolParams {
+            transform: [
+                1.0, 0.0, 0.0, 0.0, //
+                0.0, 1.0, 0.0, 0.0, //
+                0.0, 0.0, 1.0, 0.0, //
+                0.0, 0.0, 0.0, 1.0,
+            ],
+            mass: mass_kg,
+            com,
+            // ToolParams order: (Ixx, Ixy, Iyy, Ixz, Iyz, Izz).
+            inertia: [c0[0], c1[0], c1[1], c2[0], c2[1], c2[2]],
+        }
+    }
     /// Load `variant`'s URDF from the `assets/par6_description` tree at
     /// `assets_dir`, resolving FK at the variant's TCP frame.
     pub fn load(assets_dir: &Path, variant: GripperVariant) -> Result<Self, KinError> {
@@ -99,11 +159,38 @@ impl Kin {
         )
     }
 
+    /// Load the arm-only gravity chain ([`Kin::ARM_URDF_RELPATH`]) and
+    /// attach `tool` — the active tool's inertials from the gripper
+    /// config, via [`Kin::dh_tool_params`]. This is the G(q) model par6d
+    /// runs outside the
+    /// torque-level simulator: arm links from the URDF, tool from config,
+    /// each mass with exactly one source.
+    pub fn load_arm(
+        assets_dir: &Path,
+        tool: Option<&pinokin_sys::ToolParams>,
+    ) -> Result<Self, KinError> {
+        Self::from_urdf_with_tool(
+            &assets_dir.join(Self::ARM_URDF_RELPATH),
+            Some("gripper"),
+            tool,
+        )
+    }
+
     /// Load an arbitrary URDF whose first [`NQ`] position variables are the
     /// arm joints (true for every PAR6 variant). `ee_frame = None` selects
     /// the model's last frame.
     pub fn from_urdf(urdf: &Path, ee_frame: Option<&str>) -> Result<Self, KinError> {
-        let model = pinokin_sys::Model::from_urdf(urdf, ee_frame, None).map_err(|e| match e {
+        Self::from_urdf_with_tool(urdf, ee_frame, None)
+    }
+
+    /// [`Kin::from_urdf`] with an optional rigid tool whose inertials load
+    /// gravity (see [`pinokin_sys::ToolParams`]).
+    pub fn from_urdf_with_tool(
+        urdf: &Path,
+        ee_frame: Option<&str>,
+        tool: Option<&pinokin_sys::ToolParams>,
+    ) -> Result<Self, KinError> {
+        let model = pinokin_sys::Model::from_urdf(urdf, ee_frame, tool).map_err(|e| match e {
             pinokin_sys::Error::Create(msg) => KinError::Load(msg),
             other => KinError::Ffi(other),
         })?;

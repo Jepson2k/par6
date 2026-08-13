@@ -366,6 +366,12 @@ two_pass_max_diff_ticks = 1500
 home_offset_rad = -2.717
 home_offset_gripper_dependent = true
 
+# J4's release current (+1500 below) shares the sign of its approach
+# drive (direction = 0), unlike J1/J2 whose releases oppose the approach
+# and relax the gearbox. Vendor-verbatim (robots/PAR6.xml), so it ships
+# as-is — but it means the release presses toward the stop in any plant
+# that reads the sign literally. Verify the real behavior at HIL
+# bring-up (CODE-REVIEW.md §5.3) before trusting J4's home windup.
 [[homing.joints]] # J4 — gripper-dependent; every shipped gripper overrides it
 strategy = "stall"
 speed_ticks_s = 13500.0
@@ -516,3 +522,30 @@ lowpass_cutoff_hz = 0.0
 success_window_s = 0.4 # 100 ticks @ 250 Hz
 success_warn = 0.95
 success_bad = 0.9
+
+# ============================================= installation keep-outs (issue #19)
+# Standing collision restrictions of THIS installation — cage walls, the
+# table, fixtures — enforced from boot in the planner's collision gate AND
+# the streaming (jog/servo) gate. The wire's `set_shapes` replaces the
+# PROGRAM layer only, so nothing a client sends can remove these; the
+# SHAPES query reads them back as the `installation` list.
+#
+# Units are metres and radians. `pose` is [x, y, z, rx, ry, rz] with
+# extrinsic-XYZ rotation (angles about fixed world axes, R = Rz*Ry*Rx) —
+# the waldoctl Shape.pose convention, NOT the TCP-pose readback one.
+# `kind` is one of: box, sphere, cylinder, capsule, cone, ellipsoid,
+# plane (prefer a box over a plane: an unbounded half-space costs the
+# checker ~1000x per query). `params` are the primitive's constructor
+# arguments in waldoctl field order (box: [x, y, z] full side lengths).
+# Optional: `collision = false` (visual-only marker), `margin` (extra
+# standoff in metres on top of the runtime's 5 mm clearance).
+#
+# Every entry is validated at startup through the same path a client
+# `set_shapes` runs — a malformed shape refuses boot, naming the shape.
+#
+# Example (a table surface 10 cm below the robot base origin):
+# [[installation_shapes]]
+# name = "table"
+# kind = "box"
+# params = [0.8, 0.8, 0.02]
+# pose = [0.3, 0.0, -0.11, 0.0, 0.0, 0.0]

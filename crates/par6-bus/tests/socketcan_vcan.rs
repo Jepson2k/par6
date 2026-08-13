@@ -11,9 +11,12 @@
 //! sudo modprobe vcan && sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up
 //! ```
 //!
-//! Every test SKIPS cleanly when the interface is absent — CI containers
-//! usually cannot create netlink interfaces, so this file is developer /
-//! bring-up coverage, not a CI gate.
+//! Every test SKIPS cleanly when the interface is absent, so a developer
+//! checkout without vcan stays green. Set `PAR6_REQUIRE_VCAN=1` to turn
+//! absence into a hard failure instead — the `socketcan (vcan)` CI job
+//! sets it after creating vcan0, so the job can never silently degrade
+//! to a no-op. Run with `--test-threads=1` when the interface exists:
+//! every test observes the same wire and asserts exact frame sequences.
 //!
 //! There is no simulated driver here on purpose: a fake that answered
 //! frames would be re-implementing the protocol. RX comes from the
@@ -26,7 +29,7 @@ use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use par6_bus::spectral::{pack_can_id, CommandId};
+use par6_bus::spectral::{pack_can_id, pack_f32, CommandId};
 use par6_bus::{
     BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, PollKind, SocketCanBus,
 };
@@ -90,6 +93,15 @@ macro_rules! require_vcan {
         match vcan() {
             Some(name) => name,
             None => {
+                // PAR6_REQUIRE_VCAN=1 is the CI job's setting: there the
+                // interface is supposed to exist, so its absence means the
+                // job is broken and must fail loudly, never no-op green.
+                assert!(
+                    std::env::var("PAR6_REQUIRE_VCAN").map_or(true, |v| v != "1"),
+                    "PAR6_REQUIRE_VCAN=1 but no vcan interface is up \
+                     (`sudo modprobe vcan && sudo ip link add dev vcan0 type vcan \
+                     && sudo ip link set vcan0 up`)"
+                );
                 eprintln!(
                     "skipping: no vcan interface (set PAR6_VCAN_IFACE, or \
                      `sudo ip link add dev vcan0 type vcan && sudo ip link set vcan0 up`)"
@@ -317,10 +329,20 @@ fn boot_scan_and_kt_fetch_reach_the_first_bus_state() {
             .collect::<std::collections::BTreeSet<_>>(),
         (0..16u8).collect::<std::collections::BTreeSet<_>>()
     );
+    // The queued reply is drained during the ladder's FIRST wait window
+    // (node 0's), so by the time the fetch reaches node 5 it is already
+    // answered — an answered node is never asked. The silent nodes are
+    // where the RTRs go.
     assert!(
         seen.iter()
+            .any(|s| s.cmd == CommandId::RespondKt.raw() && s.rtr),
+        "kt is fetched with RTRs to cmd 33"
+    );
+    assert!(
+        !seen
+            .iter()
             .any(|s| s.node == 5 && s.cmd == CommandId::RespondKt.raw() && s.rtr),
-        "kt is fetched with an RTR to cmd 33"
+        "a node whose kt is already known must not be re-asked"
     );
     assert_eq!(
         bus.connected_nodes() & (1 << 5),
@@ -465,6 +487,167 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     for j in &robot.joints {
         assert_eq!(bus.freshness(j.node_id), Freshness::Lost);
     }
+}
+
+/// How many cmd-33 (kt) RTR asks `seen` carries, per node id.
+fn kt_asks(seen: &[Seen]) -> [usize; 16] {
+    let mut n = [0usize; 16];
+    for s in seen {
+        if s.cmd == CommandId::RespondKt.raw() && s.rtr {
+            n[usize::from(s.node)] += 1;
+        }
+    }
+    n
+}
+
+/// Every configured node, joints then gripper — the order and population
+/// the boot kt fetch walks.
+fn configured_nodes(robot: &RobotConfig) -> Vec<NodeId> {
+    robot
+        .joints
+        .iter()
+        .map(|j| j.node_id)
+        .chain(std::iter::once(robot.bus.gripper_node))
+        .collect()
+}
+
+/// Boot kt fetch, failure shape 1: NO node answers (spec/CAN.md boot
+/// step 3 — config is the fallback for a driver that does not answer).
+///
+/// The retry ladder must actually go out on the wire — every configured
+/// node asked retries×rounds times, each unanswered ask waiting out its
+/// reply timeout — boot must still terminate, and the first drained state
+/// must publish kt UNKNOWN for every node. `None` is the provenance
+/// `RtCore::adopt_driver_kt` keys its per-joint config fallback off
+/// (that adoption, and the fallback torque factor it builds, are asserted
+/// at the RT layer in par6-rt's core_modes suite).
+#[test]
+fn kt_fetch_with_no_replies_exhausts_the_ladder_and_publishes_unknown() {
+    let iface = require_vcan!();
+    let (mut robot, gripper) = configs(&iface);
+    robot.robot.kt_source = KtSource::Auto;
+    robot.bus.scan.rounds = 0;
+    robot.bus.kt_fetch.timeout_s = 0.02;
+    robot.bus.kt_fetch.retries = 2;
+    robot.bus.kt_fetch.rounds = 2;
+    let wire = Wire::open(&iface);
+    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
+    let _ = wire.drain();
+
+    let started = Instant::now();
+    bus.boot_configure(&robot, Some(&gripper), 0)
+        .expect("a bus with no drivers answering must still boot");
+    let elapsed = started.elapsed();
+
+    let nodes = configured_nodes(&robot);
+    let asks = kt_asks(&wire.drain());
+    let per_node = usize::from(robot.bus.kt_fetch.retries) * usize::from(robot.bus.kt_fetch.rounds);
+    for n in &nodes {
+        assert_eq!(
+            asks[usize::from(*n)],
+            per_node,
+            "node {n}: the full retry ladder must reach the wire"
+        );
+    }
+    // Each unanswered ask waits out its reply timeout: the ladder is a
+    // real wall-clock budget, not a burst — and it is bounded.
+    let floor = Duration::from_secs_f64(robot.bus.kt_fetch.timeout_s)
+        .mul_f64((per_node * nodes.len()) as f64 * 0.9);
+    assert!(
+        elapsed >= floor,
+        "ladder finished in {elapsed:?}, under its {floor:?} wait budget"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the no-reply ladder must stay bounded, took {elapsed:?}"
+    );
+
+    let mut state = BusState::new();
+    bus.begin_tick(0);
+    bus.drain_rx(&mut state).expect("drain");
+    for n in &nodes {
+        assert_eq!(
+            state.nodes[usize::from(*n)].kt_nm_a,
+            None,
+            "node {n}: no reply must publish UNKNOWN, never a default"
+        );
+    }
+}
+
+/// Boot kt fetch, failure shapes 2 and 3: a node that answers GARBAGE,
+/// and a reply that arrives after the fetch window is over.
+///
+/// The bus is the provenance transport, not the policy. It must publish
+/// exactly what each driver said — a non-positive kt included — and stop
+/// asking any node that answered; the adopt-or-reject policy (a
+/// non-finite or non-positive reply is REJECTED and the config factor
+/// stays in effect) is `RtCore::adopt_driver_kt` in par6-rt. Likewise
+/// "an answer after the timeout is not applied": the transport keeps
+/// publishing kt whenever the frame lands, so the snapshot provenance
+/// stays truthful, while the torque factor is rebuilt exactly once at
+/// the RT core's boot resolve tick and never re-adopted afterwards.
+#[test]
+fn kt_fetch_garbage_and_late_replies_are_provenance_not_re_asks() {
+    let iface = require_vcan!();
+    let (mut robot, gripper) = configs(&iface);
+    robot.robot.kt_source = KtSource::Auto;
+    robot.bus.scan.rounds = 0;
+    robot.bus.kt_fetch.timeout_s = 0.02;
+    robot.bus.kt_fetch.retries = 2;
+    robot.bus.kt_fetch.rounds = 2;
+    let wire = Wire::open(&iface);
+    let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
+    let _ = wire.drain();
+
+    // Queued before boot, so both replies land in the ladder's first wait
+    // window: the golden kt for node 5, and a garbage (negative) kt for
+    // node 1 — the out-of-family shape a mis-flashed driver produces.
+    let (kt_id, kt_data) = golden("rx_cmd33_kt");
+    wire.send(kt_id, &kt_data);
+    wire.send(pack_can_id(1, CommandId::RespondKt, false), &pack_f32(-0.5));
+
+    bus.boot_configure(&robot, Some(&gripper), 0)
+        .expect("boot_configure");
+
+    let asks = kt_asks(&wire.drain());
+    let per_node = usize::from(robot.bus.kt_fetch.retries) * usize::from(robot.bus.kt_fetch.rounds);
+    assert_eq!(asks[5], 0, "an answered node is never asked again");
+    assert_eq!(
+        asks[1], 0,
+        "even a garbage answer ends the asking — rejection is the RT \
+         core's job, re-asking would just re-fetch the same garbage"
+    );
+    for n in configured_nodes(&robot) {
+        if n != 1 && n != 5 {
+            assert_eq!(
+                asks[usize::from(n)],
+                per_node,
+                "node {n}: silent ⇒ full ladder"
+            );
+        }
+    }
+
+    // The first drain publishes the verbatim answers next to the silence.
+    let mut state = BusState::new();
+    bus.begin_tick(0);
+    bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(state.nodes[5].kt_nm_a, Some(0.151));
+    assert_eq!(
+        state.nodes[1].kt_nm_a,
+        Some(-0.5),
+        "garbage is published as said, so the RT layer can see and reject it"
+    );
+    assert_eq!(state.nodes[0].kt_nm_a, None);
+
+    // Shape 3: an answer arriving after the whole fetch window. The
+    // transport still decodes and publishes it on the next tick drain —
+    // late kt is telemetry provenance; only the RT core's one-shot boot
+    // resolution decides what the torque factor was built from.
+    wire.send(pack_can_id(0, CommandId::RespondKt, false), &pack_f32(0.2));
+    std::thread::sleep(Duration::from_millis(2));
+    bus.begin_tick(1);
+    bus.drain_rx(&mut state).expect("drain");
+    assert_eq!(state.nodes[0].kt_nm_a, Some(0.2));
 }
 
 /// The RT tick path allocates NOTHING after init (CLAUDE.md Rust rules),

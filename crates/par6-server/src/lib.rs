@@ -26,9 +26,10 @@
 //!   and [`RtCommands`] (immediate effects) — plus the
 //!   [`RuntimeHandle`] bundle that also carries the RT snapshot reader.
 //!
-//! STATUS broadcasts ALWAYS go out, even with a dead RT core:
-//! `link_ok` / `data_age_ms` report snapshot staleness instead of the
-//! server going silent.
+//! STATUS broadcasts ALWAYS go out, even with a dead RT core or a
+//! silent motor bus: `link_ok` / `data_age_ms` report motor-bus
+//! freshness (the youngest node's `data_age_ticks`, aged by the
+//! snapshot's wall age) instead of the server going silent.
 
 #![warn(missing_docs)]
 

@@ -31,6 +31,8 @@ use par6_rt::{
     MAX_JOINTS,
 };
 use par6_server::RtCommands;
+#[cfg(feature = "ffi")]
+use par6_server::{CollisionState, ShapeLayer};
 
 /// A closure applied to the core on the RT thread, between `run()`
 /// sessions.
@@ -74,6 +76,34 @@ const JOG_L_LINEAR_MAX_M_S: f64 = 0.08;
 #[cfg(feature = "ffi")]
 const JOG_L_ANGULAR_MAX_RAD_S: f64 = 0.6;
 
+/// Velocity-scaled streaming lookahead horizon \[s\]: a jog is refused or
+/// stopped when the configuration this far ahead AT THE COMMANDED
+/// VELOCITY would collide, so faster jogs stop further from contact.
+/// parol6 runs the same horizon (`COLLISION_JOG_LOOKAHEAD_S`) on its
+/// server-side jog integrator; par6's integrator ramps on the RT thread,
+/// so the projection here uses the commanded target velocity — an upper
+/// bound on the ramping integrator's, which errs on the stopping side.
+#[cfg(feature = "ffi")]
+const STREAM_LOOKAHEAD_S: f64 = 0.15;
+/// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
+/// counts as "no deeper" (absorbs signed-distance jitter between two
+/// nearby configurations; parol6's escape tolerance). Used by the
+/// planner's per-sample check against the START depth, matching
+/// parol6's `guard_joint_path`.
+#[cfg(feature = "ffi")]
+pub(crate) const ESCAPE_TOL_M: f64 = 1e-4;
+/// The streaming gate's escape-depth tolerance \[m\]. parol6 applies
+/// [`ESCAPE_TOL_M`] per integrator step (~10 ms of travel); par6's gate
+/// compares across the whole [`STREAM_LOOKAHEAD_S`] projection in one
+/// step, so the same per-step slack scales with the horizon — otherwise
+/// an escaping arc whose link transiently dips ~1 mm deeper inside the
+/// window is refused, and the arm is trapped in the keep-out the rule
+/// exists to let it leave. Sustained grinding is still caught: the
+/// housekeeping re-check advances `current` every period, so a deepening
+/// beyond this slack cannot accumulate unrefused.
+#[cfg(feature = "ffi")]
+const STREAM_ESCAPE_TOL_M: f64 = 1.5e-3;
+
 /// A firmware "go to position" gripper frame from wire units: `closed`
 /// and `speed` are fractions in \[0, 1\] (0 = fully open / slowest byte,
 /// 1 = fully closed / fastest), `current_ma` the press-force limit.
@@ -92,6 +122,259 @@ pub(crate) fn gripper_move_command(
         estop: false,
         release_dir: false,
     }
+}
+
+/// The streaming collision gate: the collision world as enforced against
+/// `jog_j` / `jog_l` / `servo_*` setpoints.
+///
+/// The RT thread integrates the jog/servo ramp, and a coal check cannot
+/// run there — so the gate runs on the two places that CAN see the
+/// stream: the bridge (admission, one check per accepted datagram) and
+/// housekeeping (a re-check every period while a stream is live, which
+/// is the moving-jog analogue of parol6 re-checking every controller
+/// tick). It holds its OWN model instance (pinocchio's `GeometryData` is
+/// mutated by every query), mirrored layer-for-layer with the planner's
+/// world by [`RtCommands::set_shapes`].
+///
+/// The verdict rule is parol6's `collision_blocked`: approaching, a
+/// motion is blocked when its lookahead configuration collides; already
+/// colliding (a keep-out placed over the arm), it is blocked when it
+/// contacts anything NEW or goes DEEPER (`min_distance` comparison) —
+/// escaping stays allowed, because streaming is the only way OUT of a
+/// keep-out the arm is already inside. Contacts the arm rests in at its
+/// configured park pose are not collisions, same as the planner's rule.
+#[cfg(feature = "ffi")]
+pub(crate) struct StreamGate {
+    collision: par6_kin::Collision,
+    /// Link pairs in contact at the configured park pose (reporting
+    /// names) — the coarse vendor meshes touching where the arm rests.
+    resting: Vec<(String, String)>,
+    /// Applied world-shape names per layer (reporting vocabulary).
+    layer_names: [Vec<String>; 2],
+    world_names: Vec<String>,
+    /// Per-joint JOG-mode velocity limits \[rad/s\] — what a `speeds`
+    /// fraction of ±1 commands, and therefore what the lookahead
+    /// projects with.
+    jog_vel: [f64; MAX_JOINTS],
+    soft_min: [f64; MAX_JOINTS],
+    soft_max: [f64; MAX_JOINTS],
+    /// The pairs the last refused or stopped stream would have collided
+    /// in — the streaming half of the STATUS `collision_active` fields.
+    latch: CollisionState,
+}
+
+#[cfg(feature = "ffi")]
+impl StreamGate {
+    pub(crate) fn new(
+        mut collision: par6_kin::Collision,
+        park_pose_rad: &[f64],
+        jog_limits: &par6_motion::MotionLimits,
+    ) -> Self {
+        let mut park = [0.0; par6_kin::NQ];
+        for (slot, q) in park.iter_mut().zip(park_pose_rad.iter()) {
+            *slot = *q;
+        }
+        // Same rule as the planner's park-contact survey: a pose the
+        // config declares the arm rests in cannot be a collision.
+        let resting: Vec<(String, String)> = match collision.check(&park, false) {
+            Ok(report) => report
+                .pairs()
+                .map(|(a, b)| (trim_geom(a).to_owned(), trim_geom(b).to_owned()))
+                .collect(),
+            Err(e) => {
+                log::warn!("stream gate: cannot survey the park pose ({e}); no resting exemption");
+                Vec::new()
+            }
+        };
+        Self {
+            collision,
+            resting,
+            layer_names: [Vec::new(), Vec::new()],
+            world_names: Vec::new(),
+            jog_vel: jog_limits.velocity,
+            soft_min: jog_limits.soft_min,
+            soft_max: jog_limits.soft_max,
+            latch: CollisionState::default(),
+        }
+    }
+
+    /// Mirror one layer of the planner-accepted world. The conversion is
+    /// the identical `Shape::from_proto` path the planner ran, so on a
+    /// set the server hands over it cannot disagree.
+    fn set_layer(
+        &mut self,
+        layer: ShapeLayer,
+        shapes: &[par6_proto::Shape],
+    ) -> Result<(), WireError> {
+        let converted = shapes
+            .iter()
+            .map(par6_kin::Shape::from_proto)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| {
+                make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                )
+            })?;
+        let (slot, kin_layer) = match layer {
+            ShapeLayer::Installation => (0, par6_kin::Layer::Installation),
+            ShapeLayer::Program => (1, par6_kin::Layer::Program),
+        };
+        self.collision
+            .set_layer(kin_layer, &converted)
+            .map_err(|e| {
+                make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[("detail", &format!("stream gate collision world: {e}"))],
+                )
+            })?;
+        self.layer_names[slot] = converted
+            .iter()
+            .filter(|s| s.collision)
+            .map(|s| s.name.clone())
+            .collect();
+        self.world_names = self.layer_names.concat();
+        Ok(())
+    }
+
+    /// The reporting name of one colliding geometry: world shapes keep
+    /// the name they were applied with, robot geometry drops the model's
+    /// per-link geometry suffix (`upper_arm_0` → `upper_arm`).
+    fn display(&self, geom: &str) -> String {
+        if self.world_names.iter().any(|n| n == geom) {
+            return geom.to_owned();
+        }
+        trim_geom(geom).to_owned()
+    }
+
+    /// Colliding pairs at `q` that are NOT park-pose resting contacts.
+    fn offending(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Vec<(String, String)>, WireError> {
+        let mut nq = [0.0; par6_kin::NQ];
+        nq.copy_from_slice(&q[..par6_kin::NQ]);
+        let report = self.collision.check(&nq, false).map_err(gate_error)?;
+        let raw: Vec<(String, String)> = report
+            .pairs()
+            .map(|(a, b)| (a.to_owned(), b.to_owned()))
+            .collect();
+        Ok(raw
+            .into_iter()
+            .map(|(a, b)| (self.display(&a), self.display(&b)))
+            .filter(|p| !self.resting.contains(p))
+            .collect())
+    }
+
+    fn min_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
+        let mut nq = [0.0; par6_kin::NQ];
+        nq.copy_from_slice(&q[..par6_kin::NQ]);
+        self.collision.min_distance(&nq).map_err(gate_error)
+    }
+
+    /// Whether streaming from `current` toward `target` must stop, and
+    /// the pairs to report if so.
+    ///
+    /// parol6's `collision_blocked` rule. Approaching: blocked when the
+    /// target configuration collides. Already colliding: blocked when
+    /// the target contacts a pair the arm is not already in, or when the
+    /// deepest penetration grows (`min_distance` drops by more than
+    /// [`ESCAPE_TOL_M`]) — a pair-set check alone cannot tell an
+    /// escaping move from one grinding deeper through the same pair, and
+    /// the depth check alone cannot tell an improving start-collision
+    /// from a new shallower one, so both run.
+    fn blocked(
+        &mut self,
+        current: &[f64; MAX_JOINTS],
+        target: &[f64; MAX_JOINTS],
+    ) -> Result<Option<Vec<(String, String)>>, WireError> {
+        let cur = self.offending(current)?;
+        let tgt = self.offending(target)?;
+        if cur.is_empty() {
+            return Ok((!tgt.is_empty()).then_some(tgt));
+        }
+        let new: Vec<(String, String)> = tgt.iter().filter(|p| !cur.contains(p)).cloned().collect();
+        if !new.is_empty() {
+            return Ok(Some(new));
+        }
+        // The depth half runs only when the standing collision involves a
+        // WORLD shape — the keep-out case escape exists for. A marginal
+        // arm-arm mesh contact (coarse meshes flickering near the park
+        // set) must not put two full-model `min_distance` scans (tens of
+        // ms each) into every 4 ms housekeeping period; arm-arm remains
+        // guarded by the pair half above.
+        let world_pair = cur
+            .iter()
+            .any(|p| self.world_names.contains(&p.0) || self.world_names.contains(&p.1));
+        if world_pair
+            && self.min_distance(target)? < self.min_distance(current)? - STREAM_ESCAPE_TOL_M
+        {
+            return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
+        }
+        Ok(None)
+    }
+
+    /// Epoch of the applied collision world (the model's `scene_epoch`);
+    /// moves only on an accepted layer replacement.
+    fn epoch(&self) -> u64 {
+        self.collision.scene_epoch()
+    }
+
+    /// Where a `jog_j` on `joint` at `signed_pct` will be one lookahead
+    /// horizon from `q`, clamped into the soft window so a pose at the
+    /// stop cannot phantom-trip the gate.
+    fn jog_lookahead(
+        &self,
+        q: &[f64; MAX_JOINTS],
+        joint: usize,
+        signed_pct: f64,
+    ) -> [f64; MAX_JOINTS] {
+        let mut la = *q;
+        la[joint] = (la[joint] + signed_pct * self.jog_vel[joint] * STREAM_LOOKAHEAD_S)
+            .clamp(self.soft_min[joint], self.soft_max[joint]);
+        la
+    }
+
+    /// Latch `pairs` as the streaming collision verdict and build the
+    /// refusal the client reads. One checked configuration, so the error
+    /// template's path slots read `0` of `1`.
+    fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
+        let rendered = pairs
+            .iter()
+            .take(4)
+            .map(|(a, b)| format!("[{a}, {b}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.latch = CollisionState {
+            active: true,
+            pairs,
+        };
+        make_error(
+            ErrorCode::SysSelfCollision,
+            UNATTRIBUTED,
+            &[("sample", "0"), ("total", "1"), ("pairs", &rendered)],
+        )
+    }
+}
+
+/// Robot geometry names carry the model's per-link geometry index
+/// (`upper_arm_0`); reports name URDF links.
+#[cfg(feature = "ffi")]
+fn trim_geom(geom: &str) -> &str {
+    match geom.rsplit_once('_') {
+        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => link,
+        _ => geom,
+    }
+}
+
+/// A collision-world query the shim refused (a broken model, never a
+/// well-formed configuration).
+#[cfg(feature = "ffi")]
+fn gate_error(e: par6_kin::KinError) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", &format!("stream gate collision world: {e}"))],
+    )
 }
 
 /// Both channels into the RT thread, bundled (cloneable).
@@ -159,6 +442,19 @@ struct ActiveStream {
     kind: StreamKind,
     deadline: Instant,
     servo_target: Option<[f64; MAX_JOINTS]>,
+    /// The live `jog_j` command `(joint, signed speed fraction)`; `None`
+    /// once the button released. What housekeeping's periodic collision
+    /// re-check projects the lookahead from (feature `ffi` — a build
+    /// without kinematics has no gate to read it).
+    #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+    jog: Option<(usize, f64)>,
+    /// `scene_epoch` of the collision world a held SERVO target was last
+    /// checked against. A held target cannot move, so it only needs
+    /// re-testing when the WORLD does — this is what housekeeping's
+    /// re-check keys on, so the steady state costs no collision queries
+    /// (and a pathological Plane keep-out cannot starve the keep-alive).
+    #[cfg_attr(not(feature = "ffi"), allow(dead_code))]
+    world_epoch: u64,
     #[cfg(feature = "ffi")]
     cart: Option<CartJogState>,
 }
@@ -186,14 +482,16 @@ pub(crate) struct SharedState {
     enable_outcome: Option<Result<(), WireError>>,
 }
 
-/// The bridge's kinematics kit (feature `ffi`): its own model instance
-/// plus the snapshot reader that seeds IK from the measured pose.
+/// The bridge's kinematics kit (feature `ffi`): its own model instance,
+/// the snapshot reader that seeds IK from the measured pose, and the
+/// streaming collision gate it shares with housekeeping.
 #[cfg(feature = "ffi")]
 pub(crate) struct CartStream {
     pub(crate) kin: crate::kin::CartKin,
     pub(crate) snapshots: SnapshotReader<StateSnapshot>,
     pub(crate) soft_min: [f64; MAX_JOINTS],
     pub(crate) soft_max: [f64; MAX_JOINTS],
+    pub(crate) gate: Arc<Mutex<StreamGate>>,
 }
 
 /// The `RtCommands` implementation `par6d` hands to the server.
@@ -246,7 +544,7 @@ impl RtBridge {
 }
 
 impl RtCommands for RtBridge {
-    fn stream(&mut self, cmd: &Command) {
+    fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
         match cmd {
             Command::JogJ(p) => {
                 // Single-axis by contract: the server refuses a jog with
@@ -260,6 +558,20 @@ impl RtCommands for RtBridge {
                     .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
                     .expect("NUM_JOINTS > 0");
                 let mut sh = self.shared.lock().unwrap();
+                // Admission gate: where this jog will be one lookahead
+                // horizon ahead must not collide (or, from inside a
+                // keep-out, must not deepen it). The commanded velocity
+                // bounds the RT integrator's ramp from above, so a jog
+                // this projection clears cannot outrun it.
+                #[cfg(feature = "ffi")]
+                if pct != 0.0 {
+                    let q = self.cart.snapshots.latest().q;
+                    let mut gate = self.cart.gate.lock().unwrap();
+                    let la = gate.jog_lookahead(&q, joint, pct);
+                    if let Some(pairs) = gate.blocked(&q, &la)? {
+                        return Err(gate.refuse(pairs));
+                    }
+                }
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -281,6 +593,8 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Jog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
+                    jog: (pct != 0.0).then_some((joint, pct)),
+                    world_epoch: 0,
                     #[cfg(feature = "ffi")]
                     cart: None,
                 });
@@ -291,6 +605,21 @@ impl RtCommands for RtBridge {
                     *t = a.to_radians();
                 }
                 let mut sh = self.shared.lock().unwrap();
+                // Servo targets are explicit configurations, so the gate
+                // checks the target itself — each datagram is its own
+                // admission check, which is the streaming cadence parol6
+                // gates at.
+                #[cfg(feature = "ffi")]
+                let world_epoch = {
+                    let q = self.cart.snapshots.latest().q;
+                    let mut gate = self.cart.gate.lock().unwrap();
+                    if let Some(pairs) = gate.blocked(&q, &target)? {
+                        return Err(gate.refuse(pairs));
+                    }
+                    gate.epoch()
+                };
+                #[cfg(not(feature = "ffi"))]
+                let world_epoch = 0;
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -305,6 +634,8 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
                     servo_target: Some(target),
+                    jog: None,
+                    world_epoch,
                     #[cfg(feature = "ffi")]
                     cart: None,
                 });
@@ -330,16 +661,24 @@ impl RtCommands for RtBridge {
                     crate::kin::IkResult::Solved(q) => q,
                     crate::kin::IkResult::Unreachable => {
                         log::warn!("{:?}: target pose unreachable; dropped", cmd.tag());
-                        return;
+                        return Ok(());
                     }
                     crate::kin::IkResult::Failed(e) => {
                         log::warn!("{:?}: IK failed ({e}); dropped", cmd.tag());
-                        return;
+                        return Ok(());
                     }
                 };
                 for (j, v) in target.iter_mut().enumerate() {
                     *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
                 }
+                let world_epoch = {
+                    let q = self.cart.snapshots.latest().q;
+                    let mut gate = self.cart.gate.lock().unwrap();
+                    if let Some(pairs) = gate.blocked(&q, &target)? {
+                        return Err(gate.refuse(pairs));
+                    }
+                    gate.epoch()
+                };
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -354,6 +693,8 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
                     servo_target: Some(target),
+                    jog: None,
+                    world_epoch,
                     cart: None,
                 });
             }
@@ -369,10 +710,7 @@ impl RtCommands for RtBridge {
                         cart: Some(state),
                         ..
                     }) => state.q,
-                    _ => {
-                        self.enter_stream_mode(Mode::Stream);
-                        self.cart.snapshots.latest().q
-                    }
+                    _ => self.cart.snapshots.latest().q,
                 };
                 let mut twist = [0.0; 6];
                 for (i, (out, frac)) in twist.iter_mut().zip(p.velocities.iter()).enumerate() {
@@ -383,10 +721,40 @@ impl RtCommands for RtBridge {
                     };
                     *out = frac * full;
                 }
+                // Admission gate on the projected lookahead. A twist the
+                // jacobian cannot resolve is admitted — housekeeping
+                // holds in place on every failed solve, so nothing
+                // unchecked ever streams.
+                let mut probe = CartJogState {
+                    twist,
+                    frame: p.frame,
+                    q,
+                    soft_min: self.cart.soft_min,
+                    soft_max: self.cart.soft_max,
+                };
+                if let Ok((la, _)) =
+                    step_cart_jog(&mut self.cart.kin, &mut probe, STREAM_LOOKAHEAD_S)
+                {
+                    let mut gate = self.cart.gate.lock().unwrap();
+                    if let Some(pairs) = gate.blocked(&q, &la)? {
+                        return Err(gate.refuse(pairs));
+                    }
+                }
+                if !matches!(
+                    sh.stream,
+                    Some(ActiveStream {
+                        kind: StreamKind::CartJog,
+                        ..
+                    })
+                ) {
+                    self.enter_stream_mode(Mode::Stream);
+                }
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::CartJog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
+                    jog: None,
+                    world_epoch: 0,
                     cart: Some(CartJogState {
                         twist,
                         frame: p.frame,
@@ -407,6 +775,7 @@ impl RtCommands for RtBridge {
             }
             other => log::warn!("unexpected stream command {:?}", other.tag()),
         }
+        Ok(())
     }
 
     fn cancel_stream(&mut self) {
@@ -566,6 +935,25 @@ impl RtCommands for RtBridge {
     fn reset_loop_stats(&mut self) {
         self.link.op(Box::new(|core| core.reset_loop_stats()));
     }
+
+    #[cfg(feature = "ffi")]
+    fn set_shapes(
+        &mut self,
+        layer: ShapeLayer,
+        shapes: &[par6_proto::Shape],
+    ) -> Result<(), WireError> {
+        self.cart.gate.lock().unwrap().set_layer(layer, shapes)
+    }
+
+    #[cfg(feature = "ffi")]
+    fn collision(&mut self) -> Option<CollisionState> {
+        Some(self.cart.gate.lock().unwrap().latch.clone())
+    }
+
+    #[cfg(feature = "ffi")]
+    fn clear_collision(&mut self) {
+        self.cart.gate.lock().unwrap().latch = CollisionState::default();
+    }
 }
 
 /// Timed follow-throughs that the datagram-driven bridge cannot run
@@ -578,7 +966,22 @@ pub(crate) fn housekeeping_loop(
     mut snapshots: SnapshotReader<StateSnapshot>,
     shutdown: Arc<AtomicBool>,
     #[cfg(feature = "ffi")] mut kin: crate::kin::CartKin,
+    #[cfg(feature = "ffi")] gate: Arc<Mutex<StreamGate>>,
 ) {
+    // Stops the live stream because its next step is collision-blocked:
+    // latch the verdict for STATUS and put the RT back to IDLE. The
+    // abrupt stop is deliberate — the alternative is driving on toward
+    // contact (parol6 halts its joint jog on the same prediction).
+    #[cfg(feature = "ffi")]
+    let collision_stop = |link: &CoreLink,
+                          gate: &Arc<Mutex<StreamGate>>,
+                          what: &str,
+                          pairs: Vec<(String, String)>| {
+        log::warn!("{what}: collision predicted; stopping the stream");
+        gate.lock().unwrap().refuse(pairs);
+        link.send(RtCommand::JogRelease);
+        link.send(RtCommand::SetMode(Mode::Idle));
+    };
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
@@ -598,7 +1001,72 @@ pub(crate) fn housekeeping_loop(
                     link.send(RtCommand::SetMode(Mode::Idle));
                     sh.stream = None;
                 }
+                // The moving-jog re-check: the admission gate saw the
+                // configuration the jog STARTED at, and the arm has
+                // moved since. Every period the lookahead is projected
+                // from the measured pose and re-tested — against the
+                // world as it is NOW, so a keep-out dropped onto a
+                // running jog stops it too.
+                #[cfg(feature = "ffi")]
+                Some(a) if a.kind == StreamKind::Jog && a.jog.is_some() => {
+                    let (joint, pct) = a.jog.expect("guarded");
+                    let mut g = gate.lock().unwrap();
+                    let la = g.jog_lookahead(&snap.q, joint, pct);
+                    match g.blocked(&snap.q, &la) {
+                        Ok(None) => {}
+                        Ok(Some(pairs)) => {
+                            drop(g);
+                            collision_stop(&link, &gate, "jog_j", pairs);
+                            sh.stream = None;
+                        }
+                        Err(e) => {
+                            // A world the gate cannot query gates
+                            // nothing it can prove; stop rather than
+                            // stream unchecked.
+                            drop(g);
+                            log::error!("jog_j gate check failed: {}", e.cause);
+                            link.send(RtCommand::JogRelease);
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                            sh.stream = None;
+                        }
+                    }
+                }
                 Some(a) if a.kind == StreamKind::Servo => {
+                    // A held servo target was admitted against the world
+                    // of its datagram, and a held target cannot move —
+                    // so it is re-tested exactly when the WORLD changes
+                    // (the analogue of the planner's in-flight
+                    // revalidation), never per period: the steady state
+                    // costs no collision queries, which is what keeps a
+                    // pathological Plane keep-out from starving the
+                    // keep-alive below past the RT stream watchdog.
+                    #[cfg(feature = "ffi")]
+                    if let Some(t) = a.servo_target {
+                        let epoch = gate.lock().unwrap().epoch();
+                        if epoch != a.world_epoch {
+                            a.world_epoch = epoch;
+                            let verdict = gate.lock().unwrap().blocked(&snap.q, &t);
+                            match verdict {
+                                Ok(None) => {}
+                                Ok(Some(pairs)) => {
+                                    collision_stop(&link, &gate, "servo", pairs);
+                                    sh.stream = None;
+                                    continue;
+                                }
+                                Err(e) => {
+                                    // A world the gate cannot query gates
+                                    // nothing it can prove; stop (without
+                                    // a collision verdict — this is a
+                                    // model failure) rather than stream
+                                    // unchecked.
+                                    log::error!("servo gate check failed: {}", e.cause);
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Keep the RT stream watchdog fed between client
                     // datagrams (its timeout is shorter than the grace).
                     if let Some(t) = a.servo_target {
@@ -608,8 +1076,35 @@ pub(crate) fn housekeeping_loop(
                 #[cfg(feature = "ffi")]
                 Some(a) if a.kind == StreamKind::CartJog => {
                     if let Some(state) = &mut a.cart {
+                        let before = state.q;
                         match step_cart_jog(&mut kin, state, HOUSEKEEPING_PERIOD.as_secs_f64()) {
-                            Ok(target) => stream_input.lock().unwrap().send(&target),
+                            Ok((target, qd)) => {
+                                // The velocity-scaled horizon, projected
+                                // past the step just integrated.
+                                let mut la = target;
+                                for (j, v) in la.iter_mut().enumerate() {
+                                    *v = (*v + qd[j] * STREAM_LOOKAHEAD_S)
+                                        .clamp(state.soft_min[j], state.soft_max[j]);
+                                }
+                                let verdict = gate.lock().unwrap().blocked(&before, &la);
+                                match verdict {
+                                    Ok(None) => stream_input.lock().unwrap().send(&target),
+                                    Ok(Some(pairs)) => {
+                                        collision_stop(&link, &gate, "jog_l", pairs);
+                                        sh.stream = None;
+                                        continue;
+                                    }
+                                    Err(e) => {
+                                        // Stop without a collision verdict:
+                                        // this is a model failure, not a
+                                        // predicted contact.
+                                        log::error!("jog_l gate check failed: {}", e.cause);
+                                        link.send(RtCommand::SetMode(Mode::Idle));
+                                        sh.stream = None;
+                                        continue;
+                                    }
+                                }
+                            }
                             Err(e) => {
                                 // Hold in place rather than integrate on a
                                 // failed solve; the stream watchdog still
@@ -659,13 +1154,15 @@ pub(crate) fn housekeeping_loop(
 
 /// One cartesian-jog integration step: resolve the twist into world
 /// axes, solve joint velocities through the damped jacobian, integrate
-/// the joint target and clamp it inside the soft window.
+/// the joint target and clamp it inside the soft window. Returns the
+/// integrated target and the joint velocity it moved at — what the
+/// collision gate projects its lookahead with.
 #[cfg(feature = "ffi")]
 fn step_cart_jog(
     kin: &mut crate::kin::CartKin,
     state: &mut CartJogState,
     dt_s: f64,
-) -> Result<[f64; MAX_JOINTS], String> {
+) -> Result<([f64; MAX_JOINTS], [f64; MAX_JOINTS]), String> {
     let mut v = state.twist;
     if state.frame == par6_proto::Frame::Trf {
         let pose = kin.fk(&state.q)?;
@@ -684,7 +1181,7 @@ fn step_cart_jog(
     for (j, q) in state.q.iter_mut().enumerate() {
         *q = (*q + qd[j] * dt_s).clamp(state.soft_min[j], state.soft_max[j]);
     }
-    Ok(state.q)
+    Ok((state.q, qd))
 }
 
 #[cfg(test)]

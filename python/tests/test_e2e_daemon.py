@@ -24,8 +24,10 @@ from live_daemon import (
     free_udp_port,
     repo_assets_dir,
     requires_par6d,
+    settle_at,
     sim_config,
 )
+from waldoctl.shapes import Box
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -621,6 +623,86 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert await client.is_estop_pressed() is False
 
 
+@pytest.mark.timeout(180)
+async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
+    daemon: LiveDaemon,
+):
+    """``jog_j`` into a soft limit through the real protocol, with the sim's
+    closed-loop driver supplying genuine tracking lag.
+
+    The jog engine's lookahead runs on its own integrated target while the
+    hard clamp -- and the operator -- see the MEASURED pose, so the
+    question that matters at the boundary is whether the arm the STATUS
+    broadcast reports comes to rest short of the configured soft limit and
+    stays there while the button is still held.  The direction block is
+    asserted behaviorally, within one jog session: continued same-direction
+    jogging advances nothing, and the opposite direction clears it and
+    moves away.  (The RT's per-direction blocked mask is snapshot-only and
+    never carried by STATUS, so the latch has no wire bit to read; the
+    mask itself is pinned at the RT layer in ``core_modes.rs``.)
+    """
+    cfg = _cfg.load_robot_config()
+    limit_deg = math.degrees(cfg["joints"][0]["limits"]["soft_max_rad"])
+    park = park_deg()
+    start = list(park)
+    start[0] = limit_deg - 40.0
+
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await teleport_to(client, start)
+
+        # A UI-style jog stream toward the limit at half speed.  Every
+        # STATUS frame seen on the way goes into the trace, so a transient
+        # excursion past the limit cannot hide between assertions.  The
+        # 0.4 s watchdog never expires between 0.1 s-spaced sends, so the
+        # whole stream is ONE jog session and the block latch stays live.
+        trace: list[float] = []
+
+        def track(s) -> bool:
+            trace.append(float(s.angles[0]))
+            return False
+
+        for _ in range(20):
+            await client.jog_j(0, 0.5, duration=0.4)
+            await client.wait_status(track, timeout=0.1)
+
+        rest = (await client.angles())[0]
+        assert rest > start[0] + 10.0, (
+            f"the jog never moved: {start[0]:.2f} -> {rest:.2f} deg"
+        )
+        assert rest < limit_deg - 1.0, (
+            f"the measured angle must rest short of the soft limit: "
+            f"{rest:.2f} vs {limit_deg:.2f} deg"
+        )
+
+        # Still pressing the same direction: the latched block must hold
+        # the measured pose exactly where it stopped.
+        for _ in range(10):
+            await client.jog_j(0, 0.5, duration=0.4)
+            await client.wait_status(track, timeout=0.1)
+        held = (await client.angles())[0]
+        assert abs(held - rest) < 0.5, (
+            f"blocked direction advanced under the held button: "
+            f"{rest:.2f} -> {held:.2f} deg"
+        )
+        assert max(trace) < limit_deg - 1.0, (
+            f"the measured angle came within 1 deg of the soft limit in "
+            f"flight: max {max(trace):.2f} vs {limit_deg:.2f}"
+        )
+
+        # Let the watchdog self-terminate, then jog the opposite way: the
+        # block clears and the arm moves off the limit.
+        assert await client.wait_status(
+            lambda s: abs(s.speeds[0]) < 0.05, timeout=STEP_BUDGET_S
+        ), "the jog watchdog never self-terminated"
+        for _ in range(8):
+            await client.jog_j(0, -0.3, duration=0.4)
+            await asyncio.sleep(0.1)
+        assert await client.wait_status(
+            lambda s: s.angles[0] < rest - 2.0, timeout=STEP_BUDGET_S
+        ), "the opposite direction must clear the block and move away"
+
+
 #: A posture whose TCP orientation has three substantial rotation
 #: components (~170 / 11 / 165 deg) — the only kind of pose that can tell
 #: the two readings of `[rx, ry, rz]` apart. It is the same
@@ -690,4 +772,101 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: Li
         )
         assert max_deg_error(replayed[:3], taught[:3]) < 5.0, (
             f"replaying the taught pose moved the TCP: {taught[:3]} -> {replayed[:3]}"
+        )
+
+
+#: The extended sweep posture the Rust collision tests drive: the arm
+#: stretched out (its own meshes clear of each other), rotated back
+#: around J0 so the mid-sweep TCP sits in open workspace where a keep-out
+#: can be parked.
+SWEEP_START_DEG = [-40.0, -15.0, 365.0, 0.0, 0.0, 180.0]
+
+
+@pytest.mark.timeout(180)
+async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
+    """Streaming motion is gated by the collision world (issue #19).
+
+    A UI-style jog stream toward a keep-out must never carry the arm into
+    it: the runtime's velocity-scaled lookahead either refuses the jog
+    outright or stops the stream short, and either way the verdict reaches
+    the STATUS broadcast as ``collision_active`` with the keep-out named.
+    From INSIDE the keep-out (dropped over the arm), the outward jog must
+    still run -- streaming is the only way out, and refusing it would trap
+    the arm.  Everything here drives a real ``par6d --sim`` over real UDP
+    with the real client; the keep-out is placed from a pose read off the
+    live broadcast, never a transcribed constant.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+
+        # Park the keep-out on the TCP position at mid-sweep.
+        mid = list(SWEEP_START_DEG)
+        mid[0] += 40.0
+        await settle_at(client, mid)
+        pose = await client.pose()
+        assert pose is not None
+        if not all(math.isfinite(v) for v in pose[:3]):
+            pytest.skip("runtime built without kinematics: STATUS carries no pose")
+        center_m = [v / 1000.0 for v in pose[:3]]
+        radius_m = math.hypot(center_m[0], center_m[1])
+        assert await client.set_shapes(
+            [
+                Box(
+                    name="keepout",
+                    x=0.1,
+                    y=0.1,
+                    z=0.1,
+                    pose=(center_m[0], center_m[1], center_m[2], 0.0, 0.0, 0.0),
+                )
+            ]
+        )
+
+        # Two box widths short of the box centre along the J0 arc, then a
+        # UI-style jog stream toward it.  Every frame seen on the way goes
+        # into the trace, so an excursion into the box cannot hide between
+        # assertions.
+        start = list(mid)
+        start[0] -= math.degrees(0.2 / radius_m)
+        await teleport_to(client, start)
+        trace: list[float] = []
+
+        def blocked_and_latched(s) -> bool:
+            trace.append(float(s.angles[0]))
+            return bool(s.collision_active) and any(
+                "keepout" in name for pair in s.collision_pairs for name in pair
+            )
+
+        blocked = False
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and not blocked:
+            await client.jog_j(0, 0.5, duration=0.4)
+            blocked = await client.wait_status(blocked_and_latched, timeout=0.1)
+        assert blocked, (
+            "the jog toward the keep-out was never blocked: the stream gate "
+            "let the arm drive at the box"
+        )
+        assert await client.wait_status(
+            lambda s: abs(s.speeds[0]) < 0.05, timeout=STEP_BUDGET_S
+        ), "the blocked jog never came to rest"
+        rest = (await client.angles())[0]
+        assert rest < mid[0] - 5.0, (
+            f"the blocked jog stopped at {rest:.2f} deg -- inside the keep-out "
+            f"centred at {mid[0]:.2f}"
+        )
+        assert max(trace) < mid[0] - 5.0, (
+            f"the arm entered the keep-out in flight: max {max(trace):.2f} deg"
+        )
+
+        # A keep-out dropped over the arm: the outward jog still runs.
+        await settle_at(client, mid)
+        escaped = False
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and not escaped:
+            await client.jog_j(0, -0.3, duration=0.4)
+            escaped = await client.wait_status(
+                lambda s: s.angles[0] < mid[0] - 3.0, timeout=0.1
+            )
+        assert escaped, (
+            "the escaping jog out of the keep-out never moved the arm: the "
+            "gate is refusing the only way out"
         )

@@ -42,8 +42,14 @@ Push messages use req_id 0.
 - **QUERY** — RESPONSE, never OK: ping, status, angles, pose, io, speeds, tools, queue,
   activity, loop_stats, profile, reachable, error, tcp_speed, tcp_offset, tool_status,
   is_simulator, shapes.
-- **FIRE_AND_FORGET** — no reply: servo_j, servo_j_pose, servo_l, jog_j, jog_l, teleport,
-  reset_loop_stats.
+- **FIRE_AND_FORGET** — success is never acked: servo_j, servo_j_pose, servo_l, jog_j,
+  jog_l, teleport, reset_loop_stats. A REJECTION (gating or validation) is answered with
+  a real ERROR (echoed `req_id`) — and, because no caller awaits that datagram, the
+  runtime also latches the refusal as the standing error while its pipeline is idle
+  (nothing executing/pending/streaming, no attributed or RT-latched error standing), so
+  it reaches STATUS and the ERROR query. The next ACCEPTED motion command clears it,
+  like every standing error. A refusal arriving over live motion answers ERROR only —
+  it must not fail the running program's completion waits through the stale-error rule.
 - **QUEUED** — ack carries the command index; a COMPLETE push follows when it finishes:
   home, move_j, move_j_pose, move_l, move_c, move_s, move_p, select_tool, delay,
   checkpoint, tool_action.
@@ -116,6 +122,14 @@ Header (new in v2): `[STATUS_tag, proto_version u8, controller_id u32, seq u64,
 mono_time_ns u64, link_ok u8, data_age_ms u16]` — always broadcast, even when the bus
 link is down (parol6 went silent when stale; clients couldn't tell dead from quiet).
 
+`link_ok` / `data_age_ms` measure the **motor bus**, not the runtime's internal snapshot
+plumbing: `data_age_ms` is the age of the freshest node frame the RT has seen (plus the
+snapshot's own age, so a dead RT thread degrades it too), saturating at `0xFFFF` when no
+node has ever answered — the bus analogue of parol6's `first_frame_received`. `link_ok`
+is `data_age_ms` within the configured staleness window. The PING query's
+`hardware_connected` is `link_ok AND NOT simulator`. The RT publishing its snapshot
+every tick must never read as a healthy link over a silent bus.
+
 Body (parol6 field set, kept): pose (f64[16] row-major 4×4, mm — decompose to rpy with
 the intrinsic-XYZ convention above), angles f64[N] deg,
 speeds f64[N] rad/s, io u8[5] [in1,in2,out1,out2,estop], action_current str,
@@ -154,7 +168,48 @@ MTU-sized (parol6 truncated silently at 1024 bytes → undiagnosable decode erro
 `simulator(bool)` switches the bus backend live (state re-seeded); `is_simulator()`
 query. `teleport(angles_deg, tool_positions?)` is fire-and-forget, streamable-class
 (preempts streams); **rejected with a real error outside sim mode** (parol6 silently
-no-opped). Sim runs on fixed dt, never wall clock (deterministic recordings).
+no-opped), and the refusal latches as the standing error like every rejected
+fire-and-forget (see the ack taxonomy above). Sim runs on fixed dt, never wall clock
+(deterministic recordings).
+
+## Collision enforcement
+
+Two shape layers make up the collision world, both enforced identically and read back
+by the SHAPES query:
+
+- **installation** — persistent keep-outs from the runtime's own configuration
+  (`[[installation_shapes]]` in the robot TOML: cage walls, the table, fixtures),
+  applied once at startup. A malformed entry refuses BOOT through the same validation
+  a `set_shapes` runs. Nothing on the wire changes this layer — `set_shapes` and
+  `reset_state` replace the program layer only. parol6 keeps them in robot config
+  with the same rule.
+- **program** — the last applied `set_shapes` set (last-write-wins). A set with any
+  malformed shape is refused WHOLE: the previously applied world stays enforced and
+  `scene_epoch` does not move.
+
+Enforcement covers every way the arm moves:
+
+- **Planned motion** — the trajectory's own samples are walked before anything
+  reaches the RT ring; a colliding sample refuses the command with
+  `SYS_SELF_COLLISION` (pairs named in the payload). A world change re-gates the
+  remainder of the motion in flight.
+- **Streaming motion (jog_j / jog_l / servo_\*)** — parol6 gates these inside its
+  server-side integrator; par6 integrates the ramp on the RT thread, where a coal
+  check cannot run, so the gate sits on what CAN see the stream: each accepted
+  datagram (admission) and a periodic re-check while the stream is live. Jogs are
+  tested at a velocity-scaled lookahead — the configuration 0.15 s ahead at the
+  COMMANDED velocity, an upper bound on the RT ramp (parol6's
+  `COLLISION_JOG_LOOKAHEAD_S`) — so faster jogs stop further from contact; servo
+  targets are explicit configurations, tested as such on every datagram. A blocked
+  admission answers ERROR (`SYS_SELF_COLLISION`) and latches like any refused
+  fire-and-forget; a block detected mid-stream stops the stream (RT back to IDLE)
+  and latches `collision_active` / `collision_pairs` in STATUS.
+- **Start-in-collision escape rule** (both gates): a motion that BEGINS in collision
+  — the park pose's own resting contacts excepted — is permitted only while it adds
+  no new colliding pair AND goes no deeper (the minimum signed distance may not drop
+  by more than a 0.1 mm tolerance). Escaping a keep-out dropped over the arm stays
+  possible; grinding deeper through the same pair is refused. Same rule as parol6's
+  `collision_blocked` / `guard_joint_path`.
 
 ## v2 change log vs parol6 (rationale in the wart audit)
 

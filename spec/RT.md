@@ -87,10 +87,18 @@ conversion → record → single send per joint per tick.
 | RTI stream | limited | limited/ff | limited + G(q) | see Streaming |
 | HOMING / FLASHING | SELF_MANAGED | | | homing sends per-joint; flashing sends nothing |
 
-Gravity: G(q) only — RNEA at zero vel/accel over the arm + active gripper tool link
-(masses/COM/inertia from config). Computed every tick, published always; applied as
-current feedforward (`mA = Nm · sign·1000/(gear·eff·kt)`, factor precomputed once) only
-when homed ∧ enabled ∧ mode allows ∧ comp enabled. External estimation downstream:
+Gravity: G(q) only — RNEA at zero vel/accel over the arm-only URDF chain (link
+inertials transcribed from the vendor dynamics table; pinned to it by
+`par6-kin/tests/gravity_reference.rs`) plus the ACTIVE gripper's `[kinematics]`
+mass/COM/inertia from config, attached as a rigid tool on the wrist joint
+(`Kin::dh_tool_params`). One source per mass: arm from URDF, tool from config — the
+gripper variants' URDF tool links do not feed gravity. Two mode exceptions:
+`--sim-dynamics` models exactly the body the torque-level plant swings (the flange
+variant URDF, no config tool), and plain `--sim` computes/publishes the real G(q) but
+disables the comp feedforward at boot (the kinematic plant models no gravity to
+cancel). Computed every tick, published always; applied as current feedforward
+(`mA = Nm · sign·1000/(gear·eff·kt)`, factor precomputed once) only when
+homed ∧ enabled ∧ mode allows ∧ comp enabled. External estimation downstream:
 `τ_ext = τ_filtered - G(q)`, `F_ext = solve(Jᵀ, τ_ext)` (pinv near singularity).
 
 ## Jog

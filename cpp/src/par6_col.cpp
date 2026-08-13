@@ -7,6 +7,7 @@
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/algorithm/geometry.hpp>
 #include <pinocchio/collision/collision.hpp>
+#include <pinocchio/collision/distance.hpp>
 
 #include <coal/shape/geometric_shapes.h>
 
@@ -15,6 +16,7 @@
 #include <cmath>
 #include <cstring>
 #include <exception>
+#include <limits>
 #include <memory>
 #include <new>
 #include <string>
@@ -426,6 +428,39 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
             *out_n_pairs = written;
         }
         return 1;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+par6_status par6_col_distance(par6_col *h, const double *q,
+                              double *out_distance) {
+    if (h == nullptr || q == nullptr || out_distance == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    for (Eigen::Index i = 0; i < h->model.nq; ++i) {
+        if (!std::isfinite(q[i])) {
+            return PAR6_ERR_INVALID_ARG;
+        }
+    }
+
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        pinocchio::computeDistances(h->model, h->data, h->geom, h->geom_data,
+                                    h->q);
+        /* coal's per-pair result is signed: separation when apart,
+         * -(penetration depth) when overlapping. The minimum over every
+         * active pair is what the escape-depth rule compares, and +inf when
+         * there are no pairs at all. Margins never enter — this is raw
+         * geometry, unlike par6_col_check's margin-shifted verdict. */
+        double best = std::numeric_limits<double>::infinity();
+        for (const coal::DistanceResult &r : h->geom_data.distanceResults) {
+            if (r.min_distance < best) {
+                best = r.min_distance;
+            }
+        }
+        *out_distance = best;
+        return PAR6_OK;
     } catch (const std::exception &) {
         return PAR6_ERR_EXCEPTION;
     }

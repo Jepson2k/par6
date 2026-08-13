@@ -52,7 +52,13 @@ pub struct ArmJointHomeOffset {
 }
 
 /// DH tool link + dynamics appended to the arm's kinematic chain while
-/// this tool is fitted. Feeds gravity compensation and TCP kinematics.
+/// this tool is fitted (vendor semantics: the tool REPLACES the sixth
+/// link, bare flange included). `d_m`/`a_m`/`alpha_rad` locate the tool
+/// frame off the wrist and `mass_kg`/`com_m`/`inertia_kg_m2` feed the
+/// gravity model through `par6_kin::Kin::dh_tool_params` — this config
+/// is the ONLY mass source for everything distal of the wrist (the URDF
+/// variants' tool links do not load gravity). The TCP frame itself comes
+/// from the variant URDF, not from these DH numbers.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ToolKinematics {

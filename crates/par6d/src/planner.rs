@@ -69,6 +69,8 @@ use par6_server::{
     CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
+#[cfg(feature = "ffi")]
+use crate::bridge::ESCAPE_TOL_M;
 use crate::bridge::{gripper_move_command, CoreLink};
 
 /// How long a started command may wait for its RT mode to engage before
@@ -423,8 +425,17 @@ impl Par6Planner {
     /// pair the arm is not already in is allowed: a move may not CREATE
     /// a collision, it may leave one.
     ///
-    /// Streaming (`jog_*` / `servo_*`) is not gated: the jog/servo ramp
-    /// is integrated on the RT thread, where a coal check cannot go.
+    /// Leaving one is bounded by depth: from a start in (non-resting)
+    /// collision, a sample whose pair set stays inside the baseline is
+    /// still refused when its deepest penetration exceeds the start's
+    /// (`min_distance` drops below the start value by more than
+    /// [`ESCAPE_TOL_M`]) — the pair half alone cannot tell an escaping
+    /// path from one grinding deeper through the same pair.
+    ///
+    /// Streaming (`jog_*` / `servo_*`) is gated separately at datagram
+    /// admission in the bridge's `StreamGate`, which applies the same
+    /// two-halves rule: the jog/servo ramp is integrated on the RT
+    /// thread, where a coal check cannot go.
     #[cfg(feature = "ffi")]
     fn gate_collisions(
         &mut self,
@@ -443,7 +454,25 @@ impl Par6Planner {
                 .map(|(a, b)| (display_name(a, world), display_name(b, world)))
                 .collect()
         };
-        let mut baseline = named(&col.check(&q_now, false).map_err(collision_error)?);
+        let start_pairs = named(&col.check(&q_now, false).map_err(collision_error)?);
+        // The depth half of the escape rule engages only when the start
+        // penetrates a WORLD shape (a keep-out dropped over the arm) —
+        // the case escape exists for. Not for arm-arm contact: the park
+        // resting pairs penetrate permanently, near-park poses flicker
+        // marginal mesh-coarseness contacts in and out of that set, and
+        // engaging on those would run a full-model `min_distance`
+        // (tens of ms) on every checked sample of every ordinary plan.
+        // An arm-arm start collision is still guarded by the pair half —
+        // the move may not contact anything new.
+        let start_depth = if start_pairs
+            .iter()
+            .any(|p| world.contains(&p.0) || world.contains(&p.1))
+        {
+            Some(col.min_distance(&q_now).map_err(collision_error)?)
+        } else {
+            None
+        };
+        let mut baseline = start_pairs;
         baseline.extend(self.resting_pairs.iter().cloned());
 
         let total = samples.len();
@@ -464,10 +493,11 @@ impl Par6Planner {
             }
             last = Some(q);
             checked += 1;
-            let report = col.check(&q, false).map_err(collision_error)?;
-            let offending: Vec<(String, String)> = named(&report)
-                .into_iter()
+            let touching = named(&col.check(&q, false).map_err(collision_error)?);
+            let offending: Vec<(String, String)> = touching
+                .iter()
                 .filter(|p| !baseline.contains(p))
+                .cloned()
                 .collect();
             if !offending.is_empty() {
                 let pairs = format_pairs(&offending);
@@ -485,6 +515,29 @@ impl Par6Planner {
                         ("pairs", &pairs),
                     ],
                 ));
+            }
+            if let Some(d0) = start_depth {
+                let depth = col.min_distance(&q).map_err(collision_error)?;
+                if depth < d0 - ESCAPE_TOL_M {
+                    let pairs = format_pairs(&touching);
+                    log::info!(
+                        "collision gate: rejected sample {k}/{total}: \
+                         penetration deepens ({depth:.4} m < start {d0:.4} m): {pairs}"
+                    );
+                    self.collision_latch = CollisionState {
+                        active: true,
+                        pairs: touching,
+                    };
+                    return Err(make_error(
+                        ErrorCode::SysSelfCollision,
+                        UNATTRIBUTED,
+                        &[
+                            ("sample", &k.to_string()),
+                            ("total", &total.to_string()),
+                            ("pairs", &pairs),
+                        ],
+                    ));
+                }
             }
         }
         log::debug!(

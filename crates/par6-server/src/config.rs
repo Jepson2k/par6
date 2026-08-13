@@ -62,7 +62,9 @@ pub struct ServerConfig {
     pub probe_timeout: Duration,
     /// RT tick rate \[Hz\] (loop-stats reporting).
     pub rt_tick_rate_hz: f64,
-    /// Snapshot age beyond which STATUS reports `link_ok = 0`.
+    /// Motor-bus freshness window: STATUS reports `link_ok = 0` when no
+    /// node's data (per-node `data_age_ticks`, aged by the snapshot's
+    /// wall age) is younger than this.
     pub link_stale: Duration,
     /// Pending-queue capacity; enqueueing beyond it is `COMM_QUEUE_FULL`.
     pub queue_capacity: usize,
@@ -118,6 +120,9 @@ pub struct ServerConfig {
     pub joint_hard_limits_deg: [(f64, f64); NUM_JOINTS],
     /// Installation-layer collision shapes (persistent keep-outs,
     /// reported by the SHAPES query alongside the program layer).
+    /// `par6d` fills this from the robot TOML's `[[installation_shapes]]`
+    /// array; the server pushes it into both collision gates at spawn and
+    /// refuses to start on a shape the world cannot apply.
     pub installation_shapes: Vec<Shape>,
 }
 

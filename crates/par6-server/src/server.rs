@@ -8,7 +8,10 @@
 //!   `reset_state` — so a stale pre-reset status frame can never satisfy
 //!   a post-reset wait.
 //! - Gating rejections always answer with ERROR (echoed `req_id`),
-//!   including FIRE_AND_FORGET commands whose success stays unacked.
+//!   including FIRE_AND_FORGET commands whose success stays unacked. A
+//!   refused fire-and-forget additionally latches as the standing error
+//!   while the pipeline is idle, so the refusal reaches STATUS and the
+//!   ERROR query — no caller awaits the reply datagram itself.
 //! - A parameter this runtime cannot honour is REFUSED the same way
 //!   (`validate_supported`), never dropped: a command that half-executes
 //!   moves the arm somewhere the client did not ask for, and the client
@@ -605,7 +608,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// the very next command was still refused as DISABLED.
     async fn on_reset(&mut self, req_id: u32, addr: SocketAddr) {
         if self.reset_waiters.len() >= MAX_RESET_WAITERS {
-            let error = make_error(ErrorCode::CommQueueFull, UNATTRIBUTED, &[]);
+            // Same code as a full motion queue, so the `{detail}` slot is
+            // what tells an operator retrying `reset` on a latched arm
+            // apart from one flooding moves — without it the template
+            // pointed at an empty motion queue.
+            let error = make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "Too many reset requests are already awaiting the \
+                     controller's verdict; stop retrying until the \
+                     outstanding reset is answered.",
+                )],
+            );
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -678,7 +694,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             .check_gate(tag)
             .or_else(|| self.validate_supported(&cmd))
         {
-            // Rejection gets a real ERROR even though success is unacked.
+            // Rejection gets a real ERROR even though success is unacked —
+            // and, when nothing else stands, it latches as the standing
+            // error: no caller awaits a fire-and-forget reply, so the
+            // datagram alone leaves `error()` = None over an arm that
+            // silently refuses to move (issue #23).
+            self.latch_faf_refusal(&error);
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -697,11 +718,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             return;
         }
         debug_assert!(is_stream(tag));
-        match self.active_stream {
+        let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
                 // index, no cancel, no drain.
-                self.runtime.rt.stream(&cmd);
+                let outcome = self.runtime.rt.stream(&cmd);
+                if outcome.is_err() {
+                    // A refused update stops the stream it was updating:
+                    // the client asked for a direction the gate blocks,
+                    // and letting the PREVIOUS setpoint keep driving
+                    // would carry the arm on while the refusal is read.
+                    self.active_stream = None;
+                    self.runtime.rt.cancel_stream();
+                }
+                outcome
             }
             _ => {
                 if let Some(superseded) = self.active_stream.take() {
@@ -711,11 +741,25 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.drain_stream_backlog(superseded);
                 }
                 self.cancel_planned();
-                self.active_stream = Some(tag);
-                self.runtime.rt.stream(&cmd);
+                let outcome = self.runtime.rt.stream(&cmd);
+                if outcome.is_ok() {
+                    self.active_stream = Some(tag);
+                }
+                outcome
+            }
+        };
+        match outcome {
+            Ok(()) => self.on_motion_accepted(),
+            Err(error) => {
+                // A refused streamable is a refused fire-and-forget:
+                // ERROR to the sender, latched while nothing truer
+                // stands. The gate's own collision latch (if the refusal
+                // was a collision) reaches STATUS through
+                // `update_collision`.
+                self.latch_faf_refusal(&error);
+                self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
-        self.on_motion_accepted();
     }
 
     async fn on_queued(&mut self, req_id: u32, cmd: Command, addr: SocketAddr) {
@@ -747,7 +791,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             return;
         }
         if self.pending.len() >= self.cfg.queue_capacity {
-            let error = make_error(ErrorCode::CommQueueFull, UNATTRIBUTED, &[]);
+            let error = make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "The motion queue is full; wait for queued motions to \
+                     finish before enqueueing more.",
+                )],
+            );
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -1111,6 +1163,36 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.blend_hold = None;
     }
 
+    /// A refused fire-and-forget command answered its sender with ERROR,
+    /// but nothing awaits that datagram — so the refusal is ALSO latched
+    /// as the standing error, reaching STATUS, `activity` and the ERROR
+    /// query, the way parol6 surfaces pipeline failures through
+    /// `state.error`. Without this, an idle arm refusing every jog or
+    /// teleport reads healthy while nothing moves.
+    ///
+    /// Latched only while the pipeline is idle and nothing truer stands:
+    /// - an ATTRIBUTED standing error (a queued command's failure) and
+    ///   the RT's own latch describe the arm and outrank a refusal;
+    /// - with motion in flight (executing / pending / streaming) a stray
+    ///   refusal must not fail the running program's `wait_command`
+    ///   through the stale-error ordering rule — the ERROR reply alone
+    ///   serves there.
+    ///
+    /// Cleared like every standing error: by the next ACCEPTED motion
+    /// command ([`Self::on_motion_accepted`]) or by `reset`/`reset_state`.
+    fn latch_faf_refusal(&mut self, error: &WireError) {
+        let busy =
+            self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        let attributed = self
+            .standing_error
+            .as_ref()
+            .is_some_and(|e| e.command_index != UNATTRIBUTED);
+        if busy || attributed || rt_standing_error(&self.snap).is_some() {
+            return;
+        }
+        self.standing_error = Some(error.clone());
+    }
+
     /// A motion command was accepted: the previous attempt's verdicts stop
     /// being the current state of the world. The standing error clears,
     /// and so does the latched collision report — its pairs described the
@@ -1120,6 +1202,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.action_state = ActionState::Idle;
         }
         self.runtime.planner.clear_collision();
+        self.runtime.rt.clear_collision();
         self.collision = CollisionState::default();
     }
 
@@ -1172,13 +1255,40 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
+    /// Age of the freshest MOTOR-BUS data \[ms, saturating\]: the youngest
+    /// node age the RT snapshot carries (ticks → ms) plus the wall age of
+    /// the snapshot itself. `u16::MAX` = no node has ever answered — the
+    /// bus analogue of parol6's `first_frame_received == false`, so a
+    /// runtime that has never heard a driver cannot report a healthy link.
+    ///
+    /// The RT publishes a snapshot every tick whether or not the bus
+    /// spoke, so the snapshot's own wall age alone reads fresh over a
+    /// silent bus; the per-node `data_age_ticks` in the same snapshot is
+    /// the signal the wire doc actually promises ("motor bus link",
+    /// `par6-proto/src/status.rs`). The snapshot wall age still
+    /// contributes so a dead RT thread degrades the reading too.
     fn data_age_ms(&self) -> u16 {
-        match self.last_fresh {
-            Some(t) => t.elapsed().as_millis().min(u128::from(u16::MAX)) as u16,
-            None => u16::MAX,
+        let Some(fresh) = self.last_fresh else {
+            return u16::MAX;
+        };
+        let bus_ticks = self
+            .snap
+            .nodes
+            .iter()
+            .map(|n| n.data_age_ticks)
+            .min()
+            .unwrap_or(u64::MAX);
+        if bus_ticks == u64::MAX {
+            return u16::MAX;
         }
+        let tick_ms = 1000.0 / self.cfg.rt_tick_rate_hz.max(1.0);
+        let bus_ms = (bus_ticks as f64 * tick_ms).min(f64::from(u16::MAX)) as u128;
+        (bus_ms + fresh.elapsed().as_millis()).min(u128::from(u16::MAX)) as u16
     }
 
+    /// Whether the motor bus is live: some node answered within the
+    /// staleness window. Feeds STATUS `link_ok` and (with `!simulator`)
+    /// the PING query's `hardware_connected`.
     fn link_ok(&self) -> bool {
         u128::from(self.data_age_ms()) <= self.cfg.link_stale.as_millis()
     }
@@ -1212,6 +1322,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         {
             self.scene_epoch = epoch;
         }
+        // The streaming gate enforces the same world the planner does.
+        self.runtime
+            .rt
+            .set_shapes(ShapeLayer::Installation, &shapes)?;
         Ok(())
     }
 
@@ -1233,14 +1347,31 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // the world it describes.
             None => self.scene_epoch += 1,
         }
+        // Mirror into the streaming gate. The planner accepted this set,
+        // and the gate converts through the identical path, so a refusal
+        // here is a wiring defect — surfaced, because a jog gated against
+        // a STALE world is worse than a loud error.
+        self.runtime.rt.set_shapes(ShapeLayer::Program, &shapes)?;
         self.shapes = shapes;
         Ok(())
     }
 
-    /// Refresh the STATUS collision fields from the planner's verdict at
-    /// the arm's measured configuration.
+    /// Refresh the STATUS collision fields from the latched verdicts.
+    ///
+    /// Two gates latch one: the planner's (a refused or invalidated
+    /// planned move) and the streaming gate's (a refused or stopped
+    /// jog/servo). At most one motion pipeline is active at a time and
+    /// accepting a motion clears both, so they never disagree — the
+    /// merge simply reports whichever is active.
     fn update_collision(&mut self) {
+        let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.collision() {
+            self.collision = if state.active {
+                state
+            } else {
+                stream.unwrap_or(state)
+            };
+        } else if let Some(state) = stream {
             self.collision = state;
         }
     }

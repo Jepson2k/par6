@@ -22,10 +22,13 @@ const SUBSTEPS: u32 = 4;
 const STOP_OMEGA: f64 = 50.0;
 /// Endstop contact damping ratio.
 const STOP_ZETA: f64 = 1.2;
-/// Joint viscous friction as a rate \[1/s\], scaled by apparent inertia —
-/// matches the kinematic plant's damping so the config gains behave the
-/// same on both plants.
-const VISC_RATE: f64 = 8.0;
+/// Joint viscous friction as a rate \[1/s\], scaled by apparent inertia:
+/// the torque `−rate·I·v` cancels the inertia through ABA, so `rate` is
+/// the same velocity-decay rate as the kinematic plant's `VISC` and must
+/// EQUAL it (plant.rs derives 2.0 against the homing stall-current
+/// threshold: J2 steady approach drag ≈ 56 mA vs the 175 mA
+/// current-ratio limit; 8.0 would put it at ~225 mA and false-fire).
+const VISC_RATE: f64 = 2.0;
 /// Coulomb friction \[Nm\], smoothed near zero velocity.
 const COULOMB_NM: f64 = 0.1;
 /// Narrowest velocity scale of the Coulomb smoothing \[rad/s\]; joints

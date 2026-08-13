@@ -30,6 +30,14 @@ trailing global `post_moves`. Pre/post/move_to timeouts **warn and continue**
 (arm: cmd 2 with vel 0/cur 0; gripper: replay of last gripper_move or the DLC-0 empty
 poll) — otherwise the freshness detector latches CAN_LOST on idle joints.
 
+**`idle` pre-move** (distinct from the keep-alive above): the joint is dropped to
+firmware Idle — cmd 12 (DLC 0) on the first two ticks (the driver never replies to
+cmd 12, so it is repeated once), then cmd-28 RTR encoder polls for the remainder of
+the duration. The polls keep position feedback and the freshness detector alive
+without re-arming the control loop, so the joint hangs limp for the whole window
+(vendor `Send_Idle` → `Send_Respond_Encoder_data`). A cmd-2 vel-0 frame would instead
+hold the joint actively and preserve any wound-up velocity integral.
+
 ## Per-joint FSM
 
 Phases: homing → [pre_clear] → dwell → backoff → pause → homing(pass 2) → [release] →

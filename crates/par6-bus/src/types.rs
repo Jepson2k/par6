@@ -35,6 +35,17 @@ pub enum Pack {
         /// Trigger-value byte sent with the speed (vendor homing uses 2).
         trigger_value: u8,
     },
+    /// Firmware Idle (CAN cmd 12, DLC 0): the driver drops its control
+    /// loop entirely — no drive, phases limp — until the next motion
+    /// frame re-arms it. All channels must be `None`; the driver never
+    /// replies to cmd 12, so a sender that needs feedback must follow
+    /// with [`Pack::EncoderPoll`].
+    Idle,
+    /// Encoder telemetry request (CAN cmd 28, RTR): keeps position/speed
+    /// feedback and the freshness detector alive on a joint that has been
+    /// dropped to firmware Idle without re-arming its control loop. All
+    /// channels must be `None`.
+    EncoderPoll,
 }
 
 /// Per-joint setpoint for one tick.
@@ -96,9 +107,34 @@ impl JointCommand {
     }
 
     /// Active idle: velocity 0, current 0 (keeps the driver watchdog fed
-    /// and the freshness detector alive without moving).
+    /// and the freshness detector alive without moving). The driver's
+    /// control loop stays armed — for a genuinely limp joint use
+    /// [`drop_to_idle`](Self::drop_to_idle).
     pub fn idle() -> Self {
         Self::velocity(0, 0)
+    }
+
+    /// Firmware Idle frame (cmd 12, DLC 0): the driver goes limp. It
+    /// sends no reply, so follow with [`encoder_poll`](Self::encoder_poll)
+    /// to keep feedback and freshness alive for the idled joint.
+    pub fn drop_to_idle() -> Self {
+        Self {
+            pos: None,
+            vel: None,
+            cur_ma: None,
+            pack: Pack::Idle,
+        }
+    }
+
+    /// Encoder telemetry request (cmd 28, RTR): position/speed feedback
+    /// without re-arming an idled driver.
+    pub fn encoder_poll() -> Self {
+        Self {
+            pos: None,
+            vel: None,
+            cur_ma: None,
+            pack: Pack::EncoderPoll,
+        }
     }
 
     /// Impedance PD frame (cmd 4, DLC 8) with current feedforward.

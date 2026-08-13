@@ -103,8 +103,9 @@ pub enum GripperHomeMode {
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum PreMove {
-    /// Hold a joint actively idle (vel 0 / cur 0) for a duration —
-    /// keeps its freshness alive while other joints home.
+    /// Drop a joint to firmware idle (cmd 12 — limp, no active hold)
+    /// for a duration, polling its encoder to keep freshness alive
+    /// while other joints home.
     Idle {
         /// Arm joint index.
         joint: u8,

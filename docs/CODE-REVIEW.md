@@ -12,6 +12,21 @@ deduplicated to **22 distinct defects**. Severities below are the post-skeptic o
 Constants and semantics are ported; the implementations are independent. Every reference
 citation in this document is behavioural, not textual.
 
+> **Status (2026-08-13).** Two remediation waves have landed since this review was
+> written. The first (`9838348`) fixed C1–C3, H1–H8 and M1–M6. The second closed the
+> §5.1 theatre items, the §5.2 gaps G1 and G3–G13 (G2's vcan job now runs in CI; only
+> real `PF_CAN` hardware remains outside CI), the §4 lows L1–L5, and repo issues #19
+> (collision gating for jog/servo, escape-depth rule, installation shapes) and #23
+> (fire-and-forget refusals now latch as the standing error). Integration testing of
+> the second wave surfaced and fixed two defects this document missed: a sim-driver
+> velocity-integral that survived teleport re-seeds (displacing the arm ~0.03 rad off
+> every post-jog teleport), and a coal fidelity limit — mesh-pair penetration depth is
+> nearly flat in true depth — now documented in issue #25. It also surfaced **one new
+> blocking finding: issue #24** — the config's vendor-theta angle space and the URDF's
+> q space differ by per-joint sign/offset (`theta = S·q + O`), self-consistent in sim
+> but wrong against the physical arm. **Issue #24 joins §5.3 as a hardware-bring-up
+> blocker.** The §5.3 HIL checklist itself remains open and hardware-bound.
+
 ---
 
 ## 1. Verdict

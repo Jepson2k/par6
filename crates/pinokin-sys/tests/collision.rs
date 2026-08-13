@@ -42,8 +42,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v4() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 4);
+fn abi_version_is_v5() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 5);
 }
 
 #[test]
@@ -220,6 +220,18 @@ fn null_and_out_of_range_arguments_are_rejected() {
     let mut pairs = [0i32; 8];
     assert!(matches!(
         col.check_into(&[0.0; 5], false, &mut pairs),
+        Err(Error::Dimension { .. })
+    ));
+
+    // par6_col_distance: a NULL handle and a Rust-side dimension mismatch
+    // are both refused, never answered.
+    let mut d = f64::NAN;
+    assert_eq!(
+        unsafe { ffi::par6_col_distance(std::ptr::null_mut(), [0.0; 6].as_ptr(), &mut d) },
+        ffi::PAR6_ERR_INVALID_ARG
+    );
+    assert!(matches!(
+        col.min_distance(&[0.0; 5]),
         Err(Error::Dimension { .. })
     ));
 }

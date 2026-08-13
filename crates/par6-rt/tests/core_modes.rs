@@ -117,6 +117,19 @@ fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
             kt_nm_a: driver_kt,
         },
     );
+    // J3's (index 2) driver answers 10x out of family — a corrupt reply
+    // or a mis-flashed driver. The answer is recorded in the snapshot
+    // but NOT adopted: the config factor keeps governing, which the
+    // shared torque expectation below proves (an adopted 10x kt would
+    // miss it by 10x).
+    let family_kt = (robot.joints[2].kt_nm_a * 10.0) as f32;
+    rig.core.bus_mut().inject(
+        false,
+        Reply::Kt {
+            node: rig.node_of[2],
+            kt_nm_a: family_kt,
+        },
+    );
     rig.boot_to_idle();
 
     rig.core.set_homed(true);
@@ -138,6 +151,11 @@ fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
     let s = rig.snap();
     assert_eq!(s.nodes[0].kt_nm_a, Some(driver_kt));
     assert_eq!(s.nodes[1].kt_nm_a, None, "silent driver ⇒ config fallback");
+    assert_eq!(
+        s.nodes[2].kt_nm_a,
+        Some(family_kt),
+        "an out-of-family answer is recorded (provenance) even though rejected"
+    );
 
     // The measured mA → Nm direction reads through the same factor.
     rig.auto_inject = false;

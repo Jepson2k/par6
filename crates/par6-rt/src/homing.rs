@@ -84,6 +84,10 @@ const CAL_MIN_WAIT_S: f64 = 2.0;
 const LIMIT_REPEATS: u8 = 4;
 /// HALL pack trigger value (vendor homing constant).
 const HALL_TRIGGER_VALUE: u8 = 2;
+/// Idle pre-move: cmd-12 sends before switching to encoder polls. The
+/// driver never replies to cmd 12, so it is sent twice to survive a lost
+/// frame (vendor `Send_Idle` cadence).
+const IDLE_CMD_REPEATS: u32 = 2;
 /// Encoder counts (14-bit) used for the gripper `ticks_per_meter`.
 const GRIPPER_ENCODER_COUNTS: f64 = 16384.0;
 
@@ -897,7 +901,15 @@ impl HomingSystem {
         m.elapsed += 1;
         match m.spec {
             PreMove::Idle { joint, .. } => {
-                cmds[usize::from(joint)] = JointCommand::idle();
+                // Firmware idle, not the vel-0 keep-alive: the joint hangs
+                // limp for the duration so its drivetrain unloads while a
+                // neighbour homes. Encoder polls keep feedback and the
+                // freshness detector alive without re-arming the loop.
+                cmds[usize::from(joint)] = if m.elapsed <= IDLE_CMD_REPEATS {
+                    JointCommand::drop_to_idle()
+                } else {
+                    JointCommand::encoder_poll()
+                };
                 if m.elapsed >= m.dur_ticks {
                     m.done = true;
                 }

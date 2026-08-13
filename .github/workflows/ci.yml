@@ -95,6 +95,15 @@ jobs:
           source .ffi/env.sh
           cargo clippy -p par6-bus --all-targets --features sim-mujoco -- -D warnings
           cargo test -p par6-bus --features sim-mujoco
+      # sim-dynamics (Pinocchio ABA torque-level plant) is the other
+      # optional sim tier; it builds against the same shim as sim-mujoco
+      # but had no CI job at all, so its code only ever compiled on a
+      # developer box that happened to enable it.
+      - name: test par6-bus (sim-dynamics torque plant)
+        run: |
+          source .ffi/env.sh
+          cargo clippy -p par6-bus --all-targets --features sim-dynamics -- -D warnings
+          cargo test -p par6-bus --features sim-dynamics
       # `ffi` is the shipped configuration, so this is where par6d's whole
       # protocol-plane suite runs (sim_session.rs is gated on the feature —
       # a par6d without kinematics does not boot, so there is no runtime for
@@ -104,6 +113,46 @@ jobs:
           source .ffi/env.sh
           cargo clippy -p par6d --all-targets --features ffi -- -D warnings
           cargo test -p par6d --features ffi
+      # The shipped 250 Hz configuration, end to end: every other harness
+      # patches tick_dt_s up for CI headroom, so this soak is the one place
+      # the unpatched 0.004 runs before it meets the arm. Release because
+      # an unoptimized RT loop cannot hold a 4 ms period anywhere (the test
+      # skips itself in debug builds for the same reason).
+      - name: shipped 250 Hz soak (par6d, release)
+        run: |
+          source .ffi/env.sh
+          cargo test -p par6d --release --features ffi --test shipped_tick -- --nocapture
+
+  # The SocketCAN backend is the only bus that will ever touch the arm,
+  # and its vcan suite skips itself wherever no vcan interface exists —
+  # which used to be everywhere, CI included. GitHub's ubuntu runners
+  # allow sudo and ship the vcan module, so this job creates the
+  # interface and runs the suite for real. PAR6_REQUIRE_VCAN=1 turns the
+  # developer-default skip into a hard failure: if interface creation
+  # ever breaks, the job goes red instead of silently degrading to a
+  # no-op.
+  socketcan:
+    name: socketcan (vcan)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: socketcan
+      - name: create vcan0
+        run: |
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set vcan0 up
+      # Single-threaded: every test in the binary opens observer sockets on
+      # the same vcan0 and asserts exact frame sequences, so concurrent
+      # tests would see each other's traffic.
+      - name: test par6-bus against vcan0
+        env:
+          PAR6_REQUIRE_VCAN: '1'
+        run: cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
 
   python:
     name: python ${{ matrix.python }}

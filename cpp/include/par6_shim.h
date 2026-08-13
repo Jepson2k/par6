@@ -158,7 +158,8 @@ par6_status par6_traj_sample(const par6_traj *h, double t,
  *
  * A par6_col handle owns a second Pinocchio model of the same URDF plus the
  * geometry model built from its <collision> meshes, and answers "is this
- * configuration in collision, and which geometry pairs?".
+ * configuration in collision, and which geometry pairs?" (par6_col_check)
+ * and "how far is the nearest pair from contact?" (par6_col_distance).
  *
  * Layers. The world (non-robot) geometry is held in two independently
  * replaceable layers, mirroring the waldoctl shape-world contract:
@@ -298,6 +299,26 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
                        int32_t *out_pairs, int32_t max_pairs,
                        int32_t *out_n_pairs);
 
+/* Minimum signed distance over every active pair at configuration `q`
+ * (nq doubles), written into `out_distance`.
+ *
+ * Sign convention (the one parol6's escape-depth rule compares):
+ *   > 0   the closest pair's separation [m] — larger is safer;
+ *   < 0   the deepest pair's penetration depth [m] — more negative is
+ *         deeper, so "goes no deeper" is `d_after >= d_before - tol`;
+ *   +inf  no active pairs (nothing to be close to).
+ *
+ * This is raw geometry: margins and the handle's clearance shift
+ * par6_col_check's verdict, never this value, so with a positive clearance
+ * a configuration can be "in collision" at a positive distance.
+ *
+ * Runs coal's distance query on every pair with no early exit, so it costs
+ * more than par6_col_check — planner-side only, and the PAR6_SHAPE_PLANE
+ * cost note above applies here too. Non-finite entries in `q` are
+ * PAR6_ERR_INVALID_ARG, never a fabricated value. */
+par6_status par6_col_distance(par6_col *h, const double *q,
+                              double *out_distance);
+
 /* ABI version of this header/library pair. Bump on any breaking change.
  * v2: par6_traj_* implemented over toppra-cpp — create takes n_gridpoints
  *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added.
@@ -306,9 +327,12 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
  * v4: par6_shape::pose reads as extrinsic-XYZ (R = Rz*Ry*Rx), the
  *     waldoctl Shape.pose contract. Layout is unchanged, so a stale v3
  *     library links and silently places multi-axis-tilted keep-outs in a
- *     different orientation — which is what the version is here to catch. */
+ *     different orientation — which is what the version is here to catch.
+ * v5: par6_col_distance added (minimum signed distance over active pairs,
+ *     the escape-depth half of the start-in-collision rule). Purely
+ *     additive; a stale v4 library merely fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 4
+#define PAR6_SHIM_ABI_VERSION 5
 
 #ifdef __cplusplus
 } /* extern "C" */

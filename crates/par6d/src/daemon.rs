@@ -27,13 +27,13 @@ use par6_bus::sim::SimBus;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::{ConfigBundle, ConfigError, LimitMode, TimingConfig};
 use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
-#[cfg(not(feature = "ffi"))]
-use par6_rt::NoFk;
 use par6_rt::{
     sample_ring, snapshot_channel, CompletionPolicy, EstopGpio, FlashMarker, ForwardKin,
     GravityModel, RtCore, RtHooks, RunOptions, SharedLineGpio, SnapshotReader, SnapshotWriter,
-    SpecSettle, StateSnapshot, ZeroGravity,
+    SpecSettle, StateSnapshot,
 };
+#[cfg(not(feature = "ffi"))]
+use par6_rt::{NoFk, ZeroGravity};
 use par6_server::{ServerConfig, ServerHandle};
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -185,12 +185,15 @@ impl Daemon {
             bridge: kin_bridge,
             housekeeping: kin_hk,
             collision,
+            gate_collision,
             tool_offset,
             assets_dir,
-        } = load_kin_stack(opts, &config_path, robot)?;
+        } = load_kin_stack(opts, &config_path, robot, bundle.active_gripper())?;
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        #[cfg(feature = "ffi")]
+        let jog_limits = MotionLimits::from_config(robot, LimitMode::Jog)?;
         let jog = MotionJog::new(JogEngine::new(robot)?);
         let stream = MotionStream::new(
             StreamingExecutor::new(dt, &stream_limits)?,
@@ -241,17 +244,23 @@ impl Daemon {
         // feature `ffi`, the built-in defaults (ZeroGravity, NoFk =
         // all-NaN TCP pose) otherwise.
         //
-        // G(q) is a feedforward that cancels the arm's OWN weight, so it
-        // belongs only where that weight exists: the torque-level plant
-        // (and, later, hardware). The kinematic plant integrates
-        // commanded current directly and models no gravity, so feeding
-        // it G(q) would accelerate an IDLE arm off its pose.
+        // The real gravity model always runs, so `gravity_torque_nm`
+        // publishes the arm's true G(q) in every mode. APPLYING it as a
+        // feedforward is a different matter: it cancels weight that must
+        // actually exist in the plant, which is true on hardware and on
+        // the torque-level plant, and false on the kinematic plant (it
+        // integrates commanded current and models no gravity, so an
+        // applied G(q) would accelerate an IDLE arm off its pose). Plain
+        // `--sim` therefore disables the comp feedforward at boot —
+        // publish-only. Nothing can re-enable it: `SetGravityComp` has
+        // no client-facing sender.
         #[cfg(feature = "ffi")]
-        let gravity_hook: Box<dyn GravityModel> = if opts.sim && !opts.sim_dynamics {
-            Box::new(ZeroGravity)
-        } else {
-            Box::new(kin_gravity)
-        };
+        let gravity_hook: Box<dyn GravityModel> = Box::new(kin_gravity);
+        if opts.sim && !opts.sim_dynamics {
+            cmds_tx
+                .send(par6_rt::RtCommand::SetGravityComp(false))
+                .expect("receiver outlives startup");
+        }
         #[cfg(feature = "ffi")]
         let fk_hook: Box<dyn ForwardKin> = Box::new(kin_fk);
         #[cfg(not(feature = "ffi"))]
@@ -309,6 +318,16 @@ impl Daemon {
         )?;
         let stream_input = Arc::new(Mutex::new(handles.stream));
         let shared = Arc::new(Mutex::new(SharedState::default()));
+        // The streaming collision gate holds its own model instance
+        // (pinocchio's GeometryData is mutated by every query, so the
+        // planner's cannot be shared) and is itself shared between the
+        // bridge's admission check and housekeeping's periodic re-check.
+        #[cfg(feature = "ffi")]
+        let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
+            gate_collision,
+            &robot.robot.park_pose_rad,
+            &jog_limits,
+        )));
         #[cfg(feature = "ffi")]
         let bridge = RtBridge::new(
             link.clone(),
@@ -322,6 +341,7 @@ impl Daemon {
                 snapshots: bridge_snapshots,
                 soft_min: stream_limits.soft_min,
                 soft_max: stream_limits.soft_max,
+                gate: stream_gate.clone(),
             },
         );
         #[cfg(not(feature = "ffi"))]
@@ -388,7 +408,15 @@ impl Daemon {
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         #[cfg(feature = "ffi")]
-                        housekeeping_loop(link, stream_input, shared, hk_r, shutdown, kin_hk);
+                        housekeeping_loop(
+                            link,
+                            stream_input,
+                            shared,
+                            hk_r,
+                            shutdown,
+                            kin_hk,
+                            stream_gate,
+                        );
                         #[cfg(not(feature = "ffi"))]
                         housekeeping_loop(link, stream_input, shared, hk_r, shutdown);
                     })?,
@@ -547,6 +575,23 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     }
     cfg.profiles = crate::planner::profile_names();
     cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();
+    // The configured installation keep-outs, as wire shapes. The server
+    // pushes them through the planner's `Shape::from_proto` path at
+    // spawn, so a malformed entry (unknown kind, wrong arity, negative
+    // dimension, duplicate name) is a startup failure that names the
+    // shape — never a keep-out that silently isn't there.
+    cfg.installation_shapes = bundle
+        .installation_shapes
+        .iter()
+        .map(|s| par6_proto::Shape {
+            kind: s.kind.clone(),
+            params: s.params.clone(),
+            pose: s.pose.to_vec(),
+            collision: s.collision,
+            margin: s.margin,
+            name: s.name.clone(),
+        })
+        .collect();
     if let Some(ip) = opts.bind {
         cfg.bind.set_ip(ip);
     }
@@ -579,6 +624,10 @@ struct KinStack {
     bridge: crate::kin::CartKin,
     housekeeping: crate::kin::CartKin,
     collision: par6_kin::Collision,
+    /// The streaming gate's own collision world (pinocchio `Data` is
+    /// mutated by every query, so the planner's instance cannot be
+    /// shared across threads).
+    gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
     tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
@@ -599,6 +648,7 @@ fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
+    active_gripper: Option<&par6_config::GripperConfig>,
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{
         load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity, SoftWindow,
@@ -613,40 +663,47 @@ fn load_kin_stack(
         assets_dir.display()
     );
     let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
-    // G(q) must describe the body that actually swings: the torque-level
-    // sim plant is built from the arm-only URDF (the gripper variants
-    // carry jaw joints the plant cannot take), so compensating a tool it
-    // is not carrying would push an IDLE arm upward.
-    let gravity_variant = if opts.sim_dynamics {
-        par6_kin::GripperVariant::Flange
+    // G(q) must describe the body that actually swings. Under
+    // `--sim-dynamics` that body is the plant's own URDF (the flange
+    // variant — the gripper variants carry jaw joints the plant cannot
+    // take), so compensating a tool the plant is not carrying would push
+    // an IDLE arm upward. Everywhere else it is the real arm: the
+    // arm-only chain plus the ACTIVE gripper's inertials from config
+    // (see `kin::load_gravity_kin` for the one-source-per-mass rule).
+    let gravity_kin = if opts.sim_dynamics {
+        load_kin(&assets_dir, par6_kin::GripperVariant::Flange).map_err(DaemonError::Kinematics)?
     } else {
-        variant
+        crate::kin::load_gravity_kin(&assets_dir, active_gripper)
+            .map_err(DaemonError::Kinematics)?
     };
     // The collision world models the same body the planner plans for,
     // tool included — a keep-out the gripper enters is a collision even
-    // when the flange clears it. Loaded once: the vendor collision meshes
-    // cost hundreds of milliseconds to read.
-    let collision = par6_kin::Collision::load(&assets_dir, variant, COLLISION_CLEARANCE_M)
-        .map_err(|e| {
+    // when the flange clears it. Two instances, one per consumer thread
+    // (planner and the streaming gate), each loaded once at startup: the
+    // vendor collision meshes cost hundreds of milliseconds to read.
+    let load_collision = || {
+        par6_kin::Collision::load(&assets_dir, variant, COLLISION_CLEARANCE_M).map_err(|e| {
             DaemonError::Kinematics(format!(
                 "cannot load collision model {} from {}: {e}",
                 variant.urdf_relpath(),
                 assets_dir.display()
             ))
-        })?;
+        })
+    };
+    let collision = load_collision()?;
+    let gate_collision = load_collision()?;
     // Gravity is the only model that does not carry it: the offset is a
     // massless point, not a load.
     let tool_offset = ToolOffset::new();
     let window = SoftWindow::from_config(robot);
     Ok(KinStack {
         fk: KinFk::new(load()?, tool_offset.clone()),
-        gravity: KinGravity::new(
-            load_kin(&assets_dir, gravity_variant).map_err(DaemonError::Kinematics)?,
-        ),
+        gravity: KinGravity::new(gravity_kin),
         planner: CartKin::new(load()?, tool_offset.clone(), window),
         bridge: CartKin::new(load()?, tool_offset.clone(), window),
         housekeeping: CartKin::new(load()?, tool_offset.clone(), window),
         collision,
+        gate_collision,
         tool_offset,
         assets_dir,
     })

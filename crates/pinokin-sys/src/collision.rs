@@ -232,6 +232,34 @@ impl CollisionModel {
             s => Err(Error::Status(s)),
         }
     }
+
+    /// Minimum signed distance over every active pair at configuration `q`
+    /// (`nq` entries): positive is the closest pair's separation in metres,
+    /// negative the deepest pair's penetration depth (more negative =
+    /// deeper), `+inf` when there are no active pairs.
+    ///
+    /// Raw geometry: per-shape margins and the model's clearance shift
+    /// [`check_into`]'s verdict, never this value. Runs coal's distance
+    /// query on every pair with no early exit, so it costs more than a
+    /// check. Non-finite entries in `q` are an error, never a fabricated
+    /// value.
+    ///
+    /// [`check_into`]: CollisionModel::check_into
+    pub fn min_distance(&mut self, q: &[f64]) -> Result<f64, Error> {
+        if q.len() != self.nq {
+            return Err(Error::Dimension {
+                expected: self.nq,
+                got: q.len(),
+            });
+        }
+        let mut distance = f64::NAN;
+        let status =
+            unsafe { ffi::par6_col_distance(self.raw.as_ptr(), q.as_ptr(), &mut distance) };
+        if status != ffi::PAR6_OK {
+            return Err(Error::Status(status));
+        }
+        Ok(distance)
+    }
 }
 
 impl Drop for CollisionModel {

@@ -297,6 +297,19 @@ pub struct RtCore<B: DriverBus> {
     timing: LoopTiming,
     bus_faults: BusFaultLogs,
 
+    // Bus-failure accounting: the backend PROPAGATES send/drain errors
+    // (spec/CAN.md stance) and the tick loop counts every one into the
+    // published loop stats. Consecutive-failure streaks drive the
+    // disconnect latch below.
+    bus_tx_failures: u32,
+    bus_rx_failures: u32,
+    tx_fail_streak: u32,
+    gripper_tx_fail_streak: u32,
+    /// Consecutive failed ticks after which a TX streak latches the
+    /// per-node disconnect errors — the freshness lost window, so an
+    /// outbound-dead link disables on the same clock as a silent one.
+    tx_fault_latch_ticks: u32,
+
     // State-machine variables (spec/RT.md: mode, state, homed, errors).
     mode: Mode,
     state: ArmState,
@@ -431,6 +444,11 @@ impl<B: DriverBus> RtCore<B> {
             errors: ErrorManager::new(dt),
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
+            bus_tx_failures: 0,
+            bus_rx_failures: 0,
+            tx_fail_streak: 0,
+            gripper_tx_fail_streak: 0,
+            tx_fault_latch_ticks: robot.ticks(robot.bus.lost_s).max(1),
             mode: Mode::Booting,
             state: ArmState::Disabled,
             enable_seq: 0,
@@ -645,16 +663,35 @@ impl<B: DriverBus> RtCore<B> {
     /// gone out on the config factor. `nodes[i].kt_nm_a` rides the
     /// snapshot, so `Some` vs `None` is the per-joint provenance.
     ///
-    /// A non-positive or non-finite reply is REJECTED, not adopted: the
-    /// factor divides by kt, so garbage here scales every commanded
-    /// torque, every gravity feedforward and every reported `tau`.
+    /// A non-positive, non-finite, or out-of-family reply is REJECTED,
+    /// not adopted: the factor divides by kt, so garbage here scales
+    /// every commanded torque, every gravity feedforward and every
+    /// reported `tau`. "Out of family" means more than
+    /// [`KT_FAMILY_FACTOR`]× from the config value in either direction —
+    /// a real driver's calibration differs from the config by percent,
+    /// not by multiples, and a multiple-off answer is a corrupt reply or
+    /// a mis-flashed driver, either of which the config value serves
+    /// better than adopting.
     fn adopt_driver_kt(&mut self) {
+        const KT_FAMILY_FACTOR: f64 = 3.0;
         for i in 0..MAX_JOINTS {
             let cal = self.torque_cal[i];
             let kt = self.bus_state.nodes[usize::from(self.node_of[i])]
                 .kt_nm_a
                 .map(f64::from)
-                .filter(|kt| kt.is_finite() && *kt > 0.0);
+                .filter(|kt| kt.is_finite() && *kt > 0.0)
+                .filter(|kt| {
+                    let in_family = *kt <= cal.kt_nm_a * KT_FAMILY_FACTOR
+                        && *kt >= cal.kt_nm_a / KT_FAMILY_FACTOR;
+                    if !in_family {
+                        log::warn!(
+                            "J{i}: driver kt {kt} Nm/A rejected (config {} Nm/A; \
+                             outside the {KT_FAMILY_FACTOR}x family band)",
+                            cal.kt_nm_a
+                        );
+                    }
+                    in_family
+                });
             match kt {
                 Some(kt) => {
                     self.torque_ma_factor[i] = cal.factor(kt);
@@ -885,6 +922,7 @@ impl<B: DriverBus> RtCore<B> {
         match self.bus.drain_rx(&mut self.bus_state) {
             Ok(_) => self.bus_faults.rx.healthy(),
             Err(e) => {
+                self.bus_rx_failures = self.bus_rx_failures.saturating_add(1);
                 if let Some(n) = self.bus_faults.rx.admit(self.tick) {
                     log::warn!("bus RX drain failed: {e} (+{n} suppressed)");
                 }
@@ -949,6 +987,24 @@ impl<B: DriverBus> RtCore<B> {
         }
 
         if !self.bus.is_silent() {
+            // A sustained TX-failure streak is a disconnect: the arm has
+            // stopped receiving commands even if RX freshness still reads
+            // green (e.g. a full TX queue while polls trickle through).
+            // Latched on the freshness lost window via the per-node
+            // disconnect keys. Home references stay valid — the encoders
+            // were never lost; if RX actually goes silent too, the
+            // freshness path below invalidates homing as usual.
+            if self.tx_fail_streak >= self.tx_fault_latch_ticks {
+                for i in 0..MAX_JOINTS {
+                    self.errors.latch(ErrorCode::CanLost, Some(i as u8));
+                }
+                if self.has_can_gripper {
+                    self.errors.latch(ErrorCode::CanLost, Some(GRIPPER_ERR_IDX));
+                }
+            }
+            if self.has_can_gripper && self.gripper_tx_fail_streak >= self.tx_fault_latch_ticks {
+                self.errors.latch(ErrorCode::CanLost, Some(GRIPPER_ERR_IDX));
+            }
             // Freshness: stale warns (self-clears), lost latches; any
             // disconnect while homed invalidates homing.
             for i in 0..MAX_JOINTS {
@@ -1221,8 +1277,13 @@ impl<B: DriverBus> RtCore<B> {
     /// (see [`FaultLog`]).
     fn send_joints(&mut self) {
         match self.bus.send_joint_commands(&self.cmds) {
-            Ok(()) => self.bus_faults.joint_tx.healthy(),
+            Ok(()) => {
+                self.bus_faults.joint_tx.healthy();
+                self.tx_fail_streak = 0;
+            }
             Err(e) => {
+                self.bus_tx_failures = self.bus_tx_failures.saturating_add(1);
+                self.tx_fail_streak = self.tx_fail_streak.saturating_add(1);
                 if let Some(n) = self.bus_faults.joint_tx.admit(self.tick) {
                     log::warn!("joint TX failed: {e} (+{n} suppressed)");
                 }
@@ -1233,8 +1294,13 @@ impl<B: DriverBus> RtCore<B> {
     /// The tick's gripper-slot send, with its failure log throttled.
     fn send_gripper(&mut self, cmd: GripperCommand) {
         match self.bus.send_gripper(&cmd) {
-            Ok(()) => self.bus_faults.gripper_tx.healthy(),
+            Ok(()) => {
+                self.bus_faults.gripper_tx.healthy();
+                self.gripper_tx_fail_streak = 0;
+            }
             Err(e) => {
+                self.bus_tx_failures = self.bus_tx_failures.saturating_add(1);
+                self.gripper_tx_fail_streak = self.gripper_tx_fail_streak.saturating_add(1);
                 if let Some(n) = self.bus_faults.gripper_tx.admit(self.tick) {
                     log::warn!("gripper TX failed: {e} (+{n} suppressed)");
                 }
@@ -1299,6 +1365,9 @@ impl<B: DriverBus> RtCore<B> {
         s.loop_stats = self.timing.stats();
         s.loop_stats.can_frame_age_max_ticks = self.bus_state.frame_age_max_ticks;
         s.loop_stats.can_frame_age_min_ticks = self.bus_state.frame_age_min_ticks;
+        s.loop_stats.bus_tx_failures = self.bus_tx_failures;
+        s.loop_stats.bus_rx_failures = self.bus_rx_failures;
+        s.link = self.bus.link_health();
         s.exec = self.exec.status();
         s.jog = JogStatus {
             active: self.jog_active,

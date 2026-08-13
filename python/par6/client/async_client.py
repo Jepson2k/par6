@@ -567,7 +567,10 @@ class AsyncRobotClient(_RobotClientABC):
         gets one refusal per datagram and the operator needs to read the
         reason, not scroll past it.  Returning it to the caller is a
         wider change than a log line: ``jog_j`` returns before the reply
-        could exist.
+        could exist.  The authoritative surface is the runtime's standing
+        error — a refused fire-and-forget latches there (issue #23), so
+        :meth:`error` and the STATUS broadcast carry the reason; this log
+        line is corroboration, not the delivery path.
         """
         try:
             err = RobotError.from_wire(payload)
@@ -1191,7 +1194,12 @@ class AsyncRobotClient(_RobotClientABC):
         not a watchdog.  Long traverses are :meth:`move_j`'s job.
 
         Single joint: ``jog_j(0, 0.5, 1.0)``
-        Multi joint:  ``jog_j(joints=[0, 1], speeds=[0.5, -0.3], duration=1.0)``
+
+        The ``joints=``/``speeds=`` form exists for waldoctl parity, but
+        the PAR6 runtime drives ONE joint at a time: a request with more
+        than one non-zero speed is refused with a validation error, which
+        surfaces through :meth:`error` and the STATUS broadcast (the send
+        itself still returns 1 — fire-and-forget success is unacked).
 
         Category: Jog
 

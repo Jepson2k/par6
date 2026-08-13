@@ -237,7 +237,16 @@ pub trait RtCommands: Send {
     /// `servo_l` / `jog_j` / `jog_l`, wire units). Called both to start
     /// a stream and to update the active one in place — the RT session
     /// watchdog owns termination.
-    fn stream(&mut self, cmd: &par6_proto::Command);
+    ///
+    /// `Err` REFUSES the setpoint: nothing was forwarded, and the server
+    /// answers the datagram with the error (and latches it as the
+    /// standing error like any refused fire-and-forget). This is where
+    /// the streaming collision gate lives — parol6 gates jog/servo
+    /// against its collision world too (`collision_blocked` plus a
+    /// velocity-scaled lookahead), and a jog the world blocks must be a
+    /// spoken refusal, never a silent drop. Implementations without a
+    /// collision world simply always return `Ok`.
+    fn stream(&mut self, cmd: &par6_proto::Command) -> Result<(), WireError>;
 
     /// Stop the active streaming session (hold in place). Idempotent.
     fn cancel_stream(&mut self);
@@ -287,6 +296,31 @@ pub trait RtCommands: Send {
 
     /// Reset loop timing statistics (truly unacked fire-and-forget).
     fn reset_loop_stats(&mut self);
+
+    /// Mirror one collision-world layer into the RT side's own gate
+    /// model (wire units, the same set just applied to the planner).
+    ///
+    /// The planner's [`Planner::set_shapes`] is the authoritative apply
+    /// — it validates, owns the epoch, and refuses first — so this is
+    /// called only with a set the planner accepted, and conversion is
+    /// the same deterministic path. The default is a no-op for runtimes
+    /// whose streaming gate has no collision world.
+    fn set_shapes(&mut self, _layer: ShapeLayer, _shapes: &[Shape]) -> Result<(), WireError> {
+        Ok(())
+    }
+
+    /// The streaming gate's latched collision verdict — the pairs a
+    /// refused or stopped jog/servo would have collided in. `None` =
+    /// this runtime gates no streams. Merged into STATUS alongside the
+    /// planner's verdict; read at the status cadence, never a fresh
+    /// check.
+    fn collision(&mut self) -> Option<CollisionState> {
+        None
+    }
+
+    /// Drop the streaming gate's latched verdict (the next accepted
+    /// motion command supersedes it, exactly like the planner's).
+    fn clear_collision(&mut self) {}
 }
 
 /// Everything the server needs from the rest of `par6d`, bundled.
@@ -295,7 +329,9 @@ pub struct RuntimeHandle<P: Planner, R: RtCommands> {
     pub planner: P,
     /// Immediate effects.
     pub rt: R,
-    /// Reader half of the RT snapshot channel; feeds queries, STATUS
-    /// (including `link_ok` / `data_age_ms` freshness) and telemetry.
+    /// Reader half of the RT snapshot channel; feeds queries, STATUS and
+    /// telemetry. `link_ok` / `data_age_ms` derive from the per-node
+    /// `data_age_ticks` it carries (motor-bus freshness), aged further by
+    /// the snapshot's own wall age.
     pub snapshots: SnapshotReader<StateSnapshot>,
 }

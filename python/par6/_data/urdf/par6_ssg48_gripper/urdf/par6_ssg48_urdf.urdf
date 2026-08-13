@@ -47,18 +47,19 @@
   <link
     name="shoulder">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 1) -->
       <origin
-        xyz="0.0065681 0.029094 0.099551"
+        xyz="0.00551 0.01797 0.10726"
         rpy="0 0 0" />
       <mass
-        value="1.993" />
+        value="1.99314" />
       <inertia
-        ixx="0.0010066"
-        ixy="-6.2658E-05"
-        ixz="-5.9491E-05"
-        iyy="0.00054695"
-        iyz="-0.00013311"
-        izz="0.0011908" />
+        ixx="0.01274598834"
+        ixy="-0.00247889785"
+        ixz="-5.666903e-05"
+        iyy="0.0025494801"
+        iyz="0.00026984318"
+        izz="0.01351975443" />
     </inertial>
     <visual>
       <origin
@@ -105,18 +106,19 @@
   <link
     name="upper_arm">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 2) -->
       <origin
-        xyz="-0.0085493 -0.071342 0.041639"
+        xyz="-0.01108 -0.07715 0.01588"
         rpy="0 0 0" />
       <mass
-        value="1.332" />
+        value="1.33224" />
       <inertia
-        ixx="0.001614"
-        ixy="-2.3762E-05"
-        ixz="-1.2377E-05"
-        iyy="0.0002833"
-        iyz="-0.00013464"
-        izz="0.0016392" />
+        ixx="0.00644795378"
+        ixy="-9.078224e-05"
+        ixz="0.00025671953"
+        iyy="0.00322195371"
+        iyz="-0.00029855195"
+        izz="0.00382431687" />
     </inertial>
     <visual>
       <origin
@@ -163,18 +165,19 @@
   <link
     name="elbow">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 3) -->
       <origin
-        xyz="0.015551 -0.019113 -0.0015332"
+        xyz="0.00958 -0.02219 -0.00374"
         rpy="0 0 0" />
       <mass
-        value="0.681" />
+        value="0.68511" />
       <inertia
-        ixx="0.00057828"
-        ixy="0.00011651"
-        ixz="-1.1996E-05"
-        iyy="0.00056701"
-        iyz="1.5581E-05"
-        izz="0.00081586" />
+        ixx="0.00061022164"
+        ixy="-6.122538e-05"
+        ixz="2.528564e-05"
+        iyy="0.00077646955"
+        iyz="-5.698924e-05"
+        izz="0.00085682016" />
     </inertial>
     <visual>
       <origin
@@ -221,18 +224,19 @@
   <link
     name="lower_arm">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 4) -->
       <origin
-        xyz="0.00052734 -0.010166 -0.092593"
+        xyz="-9e-05 -0.01713 -0.11143"
         rpy="0 0 0" />
       <mass
-        value="0.579" />
+        value="0.57956" />
       <inertia
-        ixx="0.00038381"
-        ixy="-5.7178E-06"
-        ixz="-1.1344E-06"
-        iyy="0.00032461"
-        iyz="-6.4819E-05"
-        izz="0.00025249" />
+        ixx="0.00117046561"
+        ixy="1.2438e-07"
+        ixz="-1.08145e-06"
+        iyy="0.00104058689"
+        iyz="0.00028745228"
+        izz="0.00035842503" />
     </inertial>
     <visual>
       <origin
@@ -279,18 +283,19 @@
   <link
     name="wrist">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 5) -->
       <origin
-        xyz="-1.5461E-06 -0.0031485 0.00019393"
+        xyz="0 -0.00355 -0.00024"
         rpy="0 0 0" />
       <mass
-        value="0.523" />
+        value="0.52381" />
       <inertia
-        ixx="0.00018083"
-        ixy="-4.6339E-10"
-        ixz="-6.7928E-09"
-        iyy="0.00010621"
-        iyz="2.8796E-06"
-        izz="0.0001756" />
+        ixx="0.00041379107"
+        ixy="3.557e-08"
+        ixz="2.613e-08"
+        iyy="0.00018259111"
+        iyz="9.4593e-07"
+        izz="0.00040956068" />
     </inertial>
     <visual>
       <origin

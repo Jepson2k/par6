@@ -282,6 +282,33 @@ impl Collision {
         })
     }
 
+    /// Minimum signed distance over every active pair at `q` in metres —
+    /// the escape-depth half of the start-in-collision rule: a move that
+    /// begins in collision is permitted only when it adds no new colliding
+    /// pair *and* goes no deeper, i.e.
+    /// `min_distance(q_next) >= min_distance(q_start) - tol`.
+    ///
+    /// Sign convention (parol6's `min_distance` semantics): positive is the
+    /// closest pair's separation, negative the deepest pair's penetration
+    /// depth (more negative = deeper), `+inf` when the world has no active
+    /// pairs. Raw geometry — per-shape margins and the model [`clearance`]
+    /// shift [`check`]'s verdict, never this value, so with a positive
+    /// clearance a configuration can be "in collision" at a positive
+    /// distance.
+    ///
+    /// Passive gripper jaw joints are held at zero, matching [`check`].
+    /// Costs more than a check (coal's distance query runs on every pair,
+    /// no early exit), and the [`ShapeKind::Plane`] cost note applies here
+    /// too — planner-side only.
+    ///
+    /// [`check`]: Collision::check
+    /// [`clearance`]: Collision::clearance
+    /// [`ShapeKind::Plane`]: crate::ShapeKind::Plane
+    pub fn min_distance(&mut self, q: &[f64; NQ]) -> Result<f64, KinError> {
+        self.q_full[..NQ].copy_from_slice(q);
+        Ok(self.model.min_distance(&self.q_full)?)
+    }
+
     /// Whether the straight joint-space segment `from → to` stays clear,
     /// sampled at `steps` interior points plus both endpoints.
     ///

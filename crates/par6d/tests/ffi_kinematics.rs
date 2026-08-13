@@ -1,8 +1,11 @@
 //! Kinematics-backed runtime (feature `ffi`), driven end-to-end through
 //! the real protocol-v2 encoding over UDP against `par6d --sim`:
 //!
-//! - the gravity hook does physical work: on the torque-level sim plant
+//! - the gravity hook is wired end to end: on the torque-level sim plant
 //!   an IDLE arm holds its pose only while G(q) is fed forward,
+//! - the gravity model reads the gripper CONFIG: changing the active
+//!   tool's `[kinematics] mass_kg` changes the published gravity
+//!   torques,
 //! - the FK hook publishes the true TCP pose: STATUS reproduces the
 //!   golden kinematics fixture's FK matrix for a known q,
 //! - `move_l` runs the cartesian pipeline (segment → seeded IK → TOPPRA
@@ -19,7 +22,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetShapes, SetTcpOffset, Shape, Teleport,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetRecipe, SetShapes, SetTcpOffset,
+    Shape, Stop, Teleport,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, QueryResult, Reply,
@@ -67,6 +71,26 @@ fn test_config(tag: &str) -> PathBuf {
     dst
 }
 
+/// [`test_config`] with the active (MSG) gripper's `[kinematics] mass_kg`
+/// replaced — the knob the gravity-wiring test turns.
+fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
+    let dst = test_config(tag);
+    let toml = dst
+        .parent()
+        .unwrap()
+        .join("grippers/MSG_small_motor_150mm_rail.toml");
+    let text = std::fs::read_to_string(&toml).expect("gripper toml");
+    // contains(), not assert_ne on the output: the baseline call passes
+    // the default 0.37, whose patch is a no-op by construction.
+    assert!(
+        text.contains("mass_kg = 0.37"),
+        "mass_kg patch point must exist"
+    );
+    let patched = text.replace("mass_kg = 0.37", &format!("mass_kg = {mass_kg}"));
+    std::fs::write(&toml, patched).expect("write gripper toml");
+    dst
+}
+
 // ---- in-process rig --------------------------------------------------------
 
 struct Rig {
@@ -77,6 +101,10 @@ struct Rig {
 
 impl Rig {
     fn boot(tag: &str, sim_dynamics: bool) -> Rig {
+        Self::boot_config(test_config(tag), sim_dynamics)
+    }
+
+    fn boot_config(config: PathBuf, sim_dynamics: bool) -> Rig {
         let _ = env_logger::builder().is_test(true).try_init();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
@@ -86,7 +114,7 @@ impl Rig {
         let opts = Options {
             sim: true,
             sim_dynamics,
-            config: Some(test_config(tag)),
+            config: Some(config),
             assets: Some(assets_dir()),
             command_port: Some(0),
             bind: Some("127.0.0.1".parse().unwrap()),
@@ -692,13 +720,21 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
-/// The gravity hook does physical work. On the torque-level plant
-/// (`--sim-dynamics`) an IDLE arm is held by nothing but the G(q)
-/// feedforward: every loaded joint, wrist included, stays where the sim
-/// placed it. With the `ZeroGravity` placeholder the same rig collapses
-/// — measured here, the shoulder is 69° down and the elbow 108° over
-/// inside one second, both against their endstops by the second — so
-/// this bound cannot pass without the hook.
+/// The gravity hook is wired, signed right, and survives the Nm→mA→Nm
+/// round trip. On the torque-level plant (`--sim-dynamics`) an IDLE arm
+/// is held by nothing but the G(q) feedforward: every loaded joint,
+/// wrist included, stays where the sim placed it. With the `ZeroGravity`
+/// placeholder the same rig collapses — measured here, the shoulder is
+/// 69° down and the elbow 108° over inside one second — so this bound
+/// cannot pass without the hook.
+///
+/// What this does NOT establish is physical truth: the plant is built
+/// from the same URDF the gravity model reads, so it measures internal
+/// consistency and would pass unchanged with every link mass halved.
+/// The external half of the claim lives in
+/// `par6-kin/tests/gravity_reference.rs`, which pins G(q) on these URDFs
+/// to the VENDOR's dynamics table, independent of any URDF — the pair
+/// together is the whole statement.
 #[test]
 fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     /// Hold tolerance \[deg\] for every joint.
@@ -759,6 +795,189 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     }
 
     rig.shutdown();
+}
+
+// ---- gravity reads the gripper config --------------------------------------
+
+/// Just enough msgpack to read a telemetry packet: arrays, strings,
+/// unsigned ints and floats — the only markers `rmp_serde` emits for the
+/// `[recipe, seq, mono_ns, ...values]` shape. Written out here rather
+/// than pulling in a decoder dependency; unknown markers panic, which in
+/// a test is the right failure.
+mod mp {
+    pub enum Val {
+        Str(String),
+        U64(u64),
+        F64(f64),
+        Arr(Vec<Val>),
+    }
+
+    pub fn read(b: &[u8], i: &mut usize) -> Val {
+        let m = b[*i];
+        *i += 1;
+        match m {
+            0x00..=0x7f => Val::U64(u64::from(m)),
+            0xa0..=0xbf => read_str(b, i, usize::from(m & 0x1f)),
+            0xd9 => {
+                let n = usize::from(b[*i]);
+                *i += 1;
+                read_str(b, i, n)
+            }
+            0xcc => {
+                let v = u64::from(b[*i]);
+                *i += 1;
+                Val::U64(v)
+            }
+            0xcd => Val::U64(u64::from(u16::from_be_bytes(take(b, i)))),
+            0xce => Val::U64(u64::from(u32::from_be_bytes(take(b, i)))),
+            0xcf => Val::U64(u64::from_be_bytes(take(b, i))),
+            0xca => Val::F64(f64::from(f32::from_be_bytes(take(b, i)))),
+            0xcb => Val::F64(f64::from_be_bytes(take(b, i))),
+            0x90..=0x9f => read_arr(b, i, usize::from(m & 0x0f)),
+            0xdc => {
+                let n = usize::from(u16::from_be_bytes(take(b, i)));
+                read_arr(b, i, n)
+            }
+            other => panic!("unexpected msgpack marker {other:#04x} at byte {}", *i - 1),
+        }
+    }
+
+    fn take<const N: usize>(b: &[u8], i: &mut usize) -> [u8; N] {
+        let out: [u8; N] = b[*i..*i + N].try_into().unwrap();
+        *i += N;
+        out
+    }
+
+    fn read_str(b: &[u8], i: &mut usize, n: usize) -> Val {
+        let s = String::from_utf8(b[*i..*i + n].to_vec()).expect("utf8 msgpack str");
+        *i += n;
+        Val::Str(s)
+    }
+
+    fn read_arr(b: &[u8], i: &mut usize, n: usize) -> Val {
+        Val::Arr((0..n).map(|_| read(b, i)).collect())
+    }
+}
+
+/// `GravityTorques` [Nm] out of one `full`-recipe telemetry packet:
+/// `[recipe, seq, mono_ns, ...fields]` with gravity at field 12 of the
+/// `full` field order.
+fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
+    let mut i = 0;
+    let mp::Val::Arr(elems) = mp::read(pkt, &mut i) else {
+        return None;
+    };
+    match elems.first() {
+        Some(mp::Val::Str(name)) if name == "full" => {}
+        _ => return None,
+    }
+    match elems.get(3 + 12) {
+        Some(mp::Val::Arr(vals)) => Some(
+            vals.iter()
+                .map(|v| match v {
+                    mp::Val::F64(x) => *x,
+                    mp::Val::U64(x) => *x as f64,
+                    _ => f64::NAN,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
+/// The gravity model reads the gripper CONFIG, not just the URDF.
+///
+/// Boot plain `--sim` twice; the only difference is the active gripper's
+/// `[kinematics] mass_kg` (0.37 kg stock vs 2.37 kg — a tool two kilos
+/// heavier). At the same teleported posture the published GravityTorques
+/// telemetry must shift by the extra tool weight: about 6.7 Nm at the
+/// shoulder and 0.3 Nm at the wrist pitch for these numbers.
+///
+/// Failing before the wiring landed, twice over: par6d built its gravity
+/// model with `tool: None`, so `mass_kg` was parsed, validated and read
+/// by nothing — the spec's "masses/COM/inertia from config" was false —
+/// and plain `--sim` installed `ZeroGravity`, so the same field
+/// published all-zero torques no matter the model. (The feedforward is
+/// still never APPLIED on the kinematic plant: comp is disabled at boot,
+/// publish-only.)
+#[test]
+fn gripper_config_mass_changes_published_gravity_torque() {
+    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], Vec<f64>) {
+        let rig = Rig::boot_config(test_config_with_tool_mass(tag, mass_kg), false);
+        let mut c = Client::new(rig.addr());
+        rig.wait_status("link_ok", |s| s.link_ok == 1);
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, CART_START_DEG);
+        let at = rig.wait_status("at the probe posture", |s| {
+            angles_close(&s.angles, &CART_START_DEG, 0.1)
+        });
+        // No telemetry flows until a recipe is selected, so every packet
+        // that arrives below is from this posture.
+        c.ok(&Command::SetRecipe(SetRecipe {
+            name: "full".into(),
+        }));
+        rig._telemetry_rx
+            .set_read_timeout(Some(READ_TIMEOUT))
+            .expect("telemetry timeout");
+        let deadline = Instant::now() + BUDGET;
+        let mut buf = [0u8; 65535];
+        let g = loop {
+            match rig._telemetry_rx.recv_from(&mut buf) {
+                Ok((n, _)) => {
+                    if let Some(g) = gravity_from_telemetry(&buf[..n]) {
+                        break g;
+                    }
+                }
+                Err(e) if is_timeout(&e) => {}
+                Err(e) => panic!("telemetry recv failed: {e}"),
+            }
+            assert!(
+                Instant::now() < deadline,
+                "no decodable full-recipe telemetry packet within budget"
+            );
+        };
+        rig.shutdown();
+        (at.angles, g)
+    }
+
+    let (q_stock, g_stock) = published_gravity("grav-stock", 0.37);
+    let (q_heavy, g_heavy) = published_gravity("grav-heavy", 2.37);
+    assert!(
+        angles_close(&q_stock, &q_heavy, 0.2),
+        "the two runs must be compared at the same posture: {q_stock:?} vs {q_heavy:?}"
+    );
+
+    // Plain --sim publishes the real model, not placeholder zeros: the
+    // shoulder carries most of the arm at this posture.
+    assert!(
+        g_stock[1].abs() > 2.0,
+        "published shoulder gravity torque is {:.3} Nm — the kinematic-sim \
+         runtime is publishing a placeholder, not G(q)",
+        g_stock[1]
+    );
+    // The config knob reaches the published torque, at the joints the
+    // extra tool mass actually loads.
+    let d_shoulder = (g_heavy[1] - g_stock[1]).abs();
+    let d_wrist = (g_heavy[4] - g_stock[4]).abs();
+    assert!(
+        d_shoulder > 3.0,
+        "2 kg more tool mass moved the shoulder gravity torque by only \
+         {d_shoulder:.3} Nm (expected ~6.7): [kinematics] mass_kg does not \
+         reach the gravity model"
+    );
+    assert!(
+        d_wrist > 0.1,
+        "2 kg more tool mass moved the wrist gravity torque by only \
+         {d_wrist:.3} Nm (expected ~0.3): the tool attaches to the wrong link \
+         or not at all"
+    );
+    // And J0 stays gravity-free: its axis is vertical, so a value here
+    // means the tool was attached in the wrong frame.
+    assert!(
+        g_heavy[0].abs() < 1e-6,
+        "J0 is on the vertical axis and must carry no gravity torque, got {:.6}",
+        g_heavy[0]
+    );
 }
 
 // ---- collision enforcement -------------------------------------------------
@@ -1083,6 +1302,296 @@ fn collision_world_is_enforced_over_protocol_v2() {
     );
 
     rig.shutdown();
+}
+
+// ---- streaming collision gate ----------------------------------------------
+
+fn jog_j(joint: usize, signed_pct: f64, duration_s: f64) -> Command {
+    let mut speeds = [0.0; NUM_JOINTS];
+    speeds[joint] = signed_pct;
+    Command::JogJ(JogJ {
+        speeds,
+        duration: duration_s,
+        accel: None,
+    })
+}
+
+/// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
+/// loads — where a keep-out has to go to sit on the swept path.
+fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
+    let mut kin =
+        par6_kin::Kin::load(&assets_dir(), par6_kin::GripperVariant::Msg).expect("kin model");
+    let mut q = [0.0; NUM_JOINTS];
+    for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+        *out = deg.to_radians();
+    }
+    let mut pose = [0.0; 16];
+    kin.fk(&q, &mut pose).expect("fk");
+    [pose[3], pose[7], pose[11]]
+}
+
+/// The configured JOG-mode velocity limit of J0 \[rad/s\] — what a jog
+/// `speeds` fraction commands, and what the gate's lookahead projects.
+fn j0_jog_velocity() -> f64 {
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    cfg.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Jog)
+        .velocity_rad_s
+}
+
+/// Streaming motion is gated by the same collision world as planned
+/// motion (issue #19 gap 1 + gap 2), over the real protocol against the
+/// real coal world and the real RT jog engine:
+///
+/// - a jog TOWARD a keep-out stops short of it: the gate's velocity-
+///   scaled lookahead predicts the contact, the stream is stopped, and
+///   STATUS latches `collision_active` with the keep-out named — the arm
+///   never reaches the box;
+/// - from INSIDE the keep-out (dropped over the arm), a jog moving
+///   OUTWARD is permitted — the arm demonstrably escapes;
+/// - from a SHALLOW penetration, a jog driving DEEPER is refused with a
+///   real `SYS_SELF_COLLISION` ERROR reply (the escape-depth rule: same
+///   pairs, deeper penetration — the pair-set check alone cannot catch
+///   it), while the outward jog from the same spot runs.
+#[test]
+fn streaming_is_gated_by_the_collision_world() {
+    let rig = Rig::boot("streamgate", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
+    let mid_m = tcp_at_m(mid_deg);
+    // The J0 arc the TCP travels on: converts arc metres to J0 radians.
+    let radius_m = (mid_m[0].powi(2) + mid_m[1].powi(2)).sqrt();
+    let deg_per_m = 1.0_f64.to_degrees() / radius_m;
+    let v0 = j0_jog_velocity();
+
+    let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
+    c.ok(&set_shapes(vec![keepout.clone()]));
+
+    // --- a jog toward the keep-out stops short of it.
+    // Start with the TCP two box widths from the box centre, jog toward
+    // it at half speed, and let the periodic re-check catch the approach.
+    let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
+    enable_and_teleport(&rig, &mut c, start_deg);
+    rig.drain_status();
+    c.send(&jog_j(0, 0.5, 10.0));
+    let s = rig.wait_status("the jog is blocked and latched", |s| s.collision_active);
+    assert!(
+        s.collision_pairs
+            .iter()
+            .any(|(a, b)| a == "keepout" || b == "keepout"),
+        "the latched pairs must name the keep-out: {:?}",
+        s.collision_pairs
+    );
+    rig.drain_status();
+    let s = rig.wait_status("the blocked jog comes to rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    assert!(
+        s.angles[0] < mid_deg[0] - 5.0,
+        "the jog drove to the keep-out it was stopped for: j0 = {} deg toward {}",
+        s.angles[0],
+        mid_deg[0]
+    );
+
+    // --- from inside the keep-out, an escaping jog is permitted.
+    // Teleport into the box (a keep-out dropped over the arm) and jog
+    // back out: refusing this would trap the arm, which is exactly what
+    // the escape rule exists to prevent.
+    enable_and_teleport(&rig, &mut c, mid_deg);
+    rig.drain_status();
+    c.send(&jog_j(0, -0.3, 5.0));
+    rig.wait_status("the escaping jog moves the arm out", |s| {
+        s.angles[0] < mid_deg[0] - 3.0
+    });
+
+    // --- from a shallow penetration, driving deeper is refused.
+    // The TCP sits inside the box near its face; a slow jog toward the
+    // centre goes DEEPER through the same colliding pair, and only the
+    // min-distance half of the escape rule can see that.
+    // Stop the still-running escape jog and let it decelerate to rest
+    // BEFORE teleporting: its 5 s duration outlives the wait above, and
+    // the release ramp of a live jog would drag the freshly teleported
+    // pose back out of the box — the gate would then be right to ACCEPT
+    // the inward jog.
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    rig.drain_status();
+    rig.wait_status("the stopped escape jog comes to rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    let shallow_deg = with_j0(mid_deg, -0.8 * (KEEPOUT_M / 2.0) * deg_per_m);
+    enable_and_teleport(&rig, &mut c, shallow_deg);
+    rig.drain_status();
+    let s = rig.wait_status("the arm rests at the shallow spot", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05) && (s.angles[0] - shallow_deg[0]).abs() < 1.0
+    });
+    assert!(s.homed, "teleport must leave the arm referenced");
+    // A speed whose lookahead lands AT the box centre. coal's penetration
+    // depth for a mesh-vs-box pair is a local contact-patch estimate,
+    // nearly flat in the true depth (measured on this rig: ~5 mm of
+    // reported deepening across the full 40 mm face-to-centre travel),
+    // so a gentle probe's deepening drowns in the gate's jitter
+    // tolerance — the centre is where the measured drop is unambiguous.
+    // The refusal still cannot be excused as "the far side is shallower
+    // again": the centre is the depth extremum, not past it.
+    let pct = (0.8 * (KEEPOUT_M / 2.0) / radius_m / (v0 * 0.15)).clamp(0.01, 1.0);
+    let err = c.expect_error(&jog_j(0, pct, 5.0));
+    assert_eq!(
+        err.code,
+        ErrorCode::SysSelfCollision as u16,
+        "a deeper-penetrating jog must be refused: {err:?}"
+    );
+    assert!(
+        err.cause.contains("keepout"),
+        "the refusal must name the colliding pair: {err:?}"
+    );
+    // The same spot still allows the OUTWARD jog: the refusal above is
+    // the direction's, not the position's.
+    rig.drain_status();
+    c.send(&jog_j(0, -0.3, 5.0));
+    rig.wait_status("the outward jog from the shallow spot runs", |s| {
+        s.angles[0] < shallow_deg[0] - 3.0
+    });
+
+    rig.shutdown();
+}
+
+// ---- installation keep-outs ------------------------------------------------
+
+/// `[[installation_shapes]]` in the robot TOML is a real producer for the
+/// installation layer (issue #19 gap 3): the configured keep-out arrives
+/// in the ENFORCED collision world at boot (a planned move through it is
+/// refused, not merely echoed), the SHAPES query reads it back on the
+/// `installation` list, and neither `set_shapes` nor `reset_state` can
+/// remove it. A malformed entry refuses BOOT with the shape named.
+#[test]
+fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
+    let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+    let mid_m = tcp_at_m(mid_deg);
+
+    let config = test_config("install-shapes");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
+             params = [{KEEPOUT_M}, {KEEPOUT_M}, {KEEPOUT_M}]\n\
+             pose = [{}, {}, {}, 0.0, 0.0, 0.0]\n",
+            std::fs::read_to_string(&config).expect("test config"),
+            mid_m[0],
+            mid_m[1],
+            mid_m[2],
+        ),
+    )
+    .expect("write config");
+    let rig = Rig::boot_config(config, false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    // The SHAPES query reads the configured keep-out back on the
+    // installation list, program layer empty.
+    match c.query(&Command::Shapes) {
+        QueryResult::Shapes {
+            installation,
+            program,
+            ..
+        } => {
+            assert_eq!(program, Vec::<Shape>::new());
+            assert_eq!(installation.len(), 1, "{installation:?}");
+            assert_eq!(installation[0].name, "cage");
+            assert_eq!(installation[0].kind, "box");
+            assert_eq!(installation[0].params, vec![KEEPOUT_M; 3]);
+        }
+        other => panic!("unexpected SHAPES result {other:?}"),
+    }
+
+    // ENFORCED, not just echoed: the sweep through it is refused with
+    // the cage named, from boot, with no set_shapes ever sent.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7101, end_deg, SWEEP_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "a configured keep-out must be enforced at boot");
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(e.code, ErrorCode::SysSelfCollision as u16, "{e:?}");
+    assert!(e.cause.contains("cage"), "{e:?}");
+
+    // The streaming gate got the same layer: a jog toward the cage is
+    // blocked and latched too. The refused move's own latch is cleared
+    // first (teleport = an accepted motion), so the collision_active
+    // frame waited on below can only be the JOG gate's.
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    rig.drain_status();
+    rig.wait_status("the refused move's verdict is cleared", |s| {
+        !s.collision_active
+    });
+    c.send(&jog_j(0, 0.5, 10.0));
+    let s = rig.wait_status("the jog toward the cage is blocked", |s| s.collision_active);
+    assert!(
+        s.collision_pairs
+            .iter()
+            .any(|(a, b)| a == "cage" || b == "cage"),
+        "{:?}",
+        s.collision_pairs
+    );
+
+    // Nothing on the wire removes it: an empty set_shapes and a full
+    // reset_state both leave the cage standing and enforced.
+    c.ok(&set_shapes(Vec::new()));
+    c.ok(&Command::ResetState);
+    match c.query(&Command::Shapes) {
+        QueryResult::Shapes { installation, .. } => {
+            assert_eq!(installation.len(), 1, "{installation:?}");
+            assert_eq!(installation[0].name, "cage");
+        }
+        other => panic!("unexpected SHAPES result {other:?}"),
+    }
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(7102, end_deg, SWEEP_S));
+    let (ok, _) = c.wait_complete(i);
+    assert!(
+        !ok,
+        "set_shapes/reset_state must not be able to clear the installation layer"
+    );
+
+    rig.shutdown();
+}
+
+/// A malformed `[[installation_shapes]]` entry is a startup refusal that
+/// names the shape — the alternative is a daemon that comes up with a
+/// keep-out silently missing from the world the operator configured.
+#[test]
+fn a_malformed_installation_shape_refuses_boot_by_name() {
+    let config = test_config("install-bad");
+    std::fs::write(
+        &config,
+        format!(
+            "{}\n[[installation_shapes]]\nname = \"wall\"\nkind = \"pyramid\"\n\
+             params = [0.5, 0.5, 0.5]\npose = [0.4, 0.0, 0.3, 0.0, 0.0, 0.0]\n",
+            std::fs::read_to_string(&config).expect("test config"),
+        ),
+    )
+    .expect("write config");
+    let opts = Options {
+        sim: true,
+        config: Some(config),
+        assets: Some(assets_dir()),
+        command_port: Some(0),
+        bind: Some("127.0.0.1".parse().unwrap()),
+        status_host: Some("127.0.0.1".parse().unwrap()),
+        status_transport: Some(StatusTransport::Unicast),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts)
+        .err()
+        .expect("a malformed keep-out must refuse boot")
+        .to_string();
+    assert!(err.contains("installation"), "{err}");
+    assert!(err.contains("wall"), "{err}");
+    assert!(err.contains("pyramid"), "{err}");
 }
 
 // ---- TCP offset -------------------------------------------------------------

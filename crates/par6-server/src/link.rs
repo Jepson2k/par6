@@ -132,32 +132,82 @@ async fn probe(sock: &UdpSocket, cfg: &ServerConfig) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
-    /// Drive the failover counter through error/success sequences and
-    /// assert the "3 consecutive, then permanently unicast" contract.
+    /// A real send error through the real path: destination port 0 is
+    /// rejected by the kernel (EINVAL) before any routing, in unicast
+    /// and multicast mode alike — so `send()` runs its own error arm.
+    async fn failing_send(link: &mut BroadcastLink) {
+        link.send(0, b"probe").await;
+    }
+
+    /// `send()` itself resets the consecutive-error counter on success —
+    /// driven through real sends on the socket the link binds, so the
+    /// reset asserted here is the code's, not the test's.
+    #[tokio::test]
+    async fn a_successful_send_resets_the_consecutive_error_counter() {
+        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
+        let port = rx.local_addr().expect("addr").port();
+        let cfg = ServerConfig {
+            status_transport: StatusTransport::Unicast,
+            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..ServerConfig::default()
+        };
+        let mut link = BroadcastLink::open(&cfg).await.expect("bind");
+
+        failing_send(&mut link).await;
+        failing_send(&mut link).await;
+        assert_eq!(link.errors, 2, "real send errors must count");
+
+        link.send(port, b"delivered").await;
+        let mut buf = [0u8; 32];
+        let (n, _) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+            .await
+            .expect("delivery within budget")
+            .expect("recv");
+        assert_eq!(&buf[..n], b"delivered", "the send really went out");
+        assert_eq!(link.errors, 0, "a successful send resets the counter");
+    }
+
+    /// Three consecutive real send errors fail over to unicast, and the
+    /// failover is permanent: later sends succeed FOR REAL — delivered to
+    /// the unicast destination and resetting the error counter — and the
+    /// link still never returns to multicast.
     #[tokio::test]
     async fn three_consecutive_send_errors_fail_over_permanently() {
+        let rx = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("rx");
+        let port = rx.local_addr().expect("addr").port();
         let cfg = ServerConfig {
             status_transport: StatusTransport::Multicast,
+            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             ..ServerConfig::default()
         };
         let mut link = BroadcastLink::open(&cfg).await.expect("bind");
         assert!(!link.unicast);
-        let err = || std::io::Error::new(std::io::ErrorKind::NetworkUnreachable, "no route");
 
-        // Two errors then a success: counter resets, still multicast.
-        link.note_send_failure(&err());
-        link.note_send_failure(&err());
-        link.errors = 0; // what a successful send() does
-        link.note_send_failure(&err());
-        assert!(!link.unicast, "non-consecutive errors must not fail over");
+        failing_send(&mut link).await;
+        failing_send(&mut link).await;
+        assert!(!link.unicast, "two errors must not fail over");
+        failing_send(&mut link).await;
+        assert!(link.unicast, "the third consecutive error fails over");
 
-        link.note_send_failure(&err());
-        link.note_send_failure(&err());
-        assert!(link.unicast, "third consecutive error fails over");
-
-        // Permanent: further successes never switch back.
-        link.errors = 0;
-        assert!(link.unicast);
+        // Permanent: successful sends now go to the unicast destination
+        // (proven by delivery), reset the counter through send()'s own
+        // arm, and never switch the transport back.
+        for _ in 0..2 {
+            link.send(port, b"status").await;
+            let mut buf = [0u8; 32];
+            let (n, from) = tokio::time::timeout(Duration::from_secs(2), rx.recv_from(&mut buf))
+                .await
+                .expect("unicast delivery within budget")
+                .expect("recv");
+            assert_eq!(&buf[..n], b"status");
+            assert_eq!(from.ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            assert_eq!(link.errors, 0);
+            assert!(
+                link.unicast,
+                "successes must never switch back to multicast"
+            );
+        }
     }
 }

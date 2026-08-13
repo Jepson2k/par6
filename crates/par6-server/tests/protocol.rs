@@ -48,12 +48,20 @@ enum RtEvent {
 #[derive(Default)]
 struct RtLog {
     events: Vec<RtEvent>,
+    /// What the RT answers the NEXT streaming setpoint with. `None` = it
+    /// is forwarded; `Some` = refused, the way the real bridge refuses a
+    /// jog its collision gate blocks.
+    stream_verdict: Option<WireError>,
     /// What the RT answers the NEXT enable request with. `None` = it came
     /// up ENABLED; `Some` = it refused, the way the real core does while
     /// the e-stop line is engaged or a hard error is latched.
     enable_verdict: Option<WireError>,
     /// The pending answer, collected exactly once by the server.
     enable_outcome: Option<Result<(), WireError>>,
+    /// While true the RT is "still deciding": `take_enable_outcome`
+    /// answers `None`, the way the real core does for several ticks —
+    /// which is what lets `reset` waiters pile up.
+    hold_enable_outcome: bool,
 }
 
 #[derive(Clone)]
@@ -66,8 +74,12 @@ impl TestRt {
 }
 
 impl RtCommands for TestRt {
-    fn stream(&mut self, cmd: &Command) {
+    fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
+        if let Some(e) = self.0.lock().unwrap().stream_verdict.take() {
+            return Err(e);
+        }
         self.push(RtEvent::Stream(cmd.tag()));
+        Ok(())
     }
     fn cancel_stream(&mut self) {
         self.push(RtEvent::CancelStream);
@@ -93,7 +105,11 @@ impl RtCommands for TestRt {
         }
     }
     fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>> {
-        self.0.lock().unwrap().enable_outcome.take()
+        let mut log = self.0.lock().unwrap();
+        if log.hold_enable_outcome {
+            return None;
+        }
+        log.enable_outcome.take()
     }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
@@ -263,9 +279,11 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
 }
 
 impl Harness {
-    /// Publish a fresh snapshot (enabled + homed unless overridden).
-    /// The server re-reads the snapshot channel on every datagram, so a
-    /// command sent after this sees the new state.
+    /// Publish a fresh snapshot (enabled + homed + a live motor bus
+    /// unless overridden — the default `NodeState` means "never heard",
+    /// which reads as a dead link). The server re-reads the snapshot
+    /// channel on every datagram, so a command sent after this sees the
+    /// new state.
     fn publish(&mut self, f: impl FnOnce(&mut StateSnapshot)) {
         self.tick += 1;
         let mut s = StateSnapshot {
@@ -274,6 +292,9 @@ impl Harness {
             homed: true,
             ..StateSnapshot::default()
         };
+        for node in &mut s.nodes {
+            node.data_age_ticks = 0;
+        }
         f(&mut s);
         self.writer.publish(&s);
     }
@@ -673,6 +694,49 @@ async fn queue_full_rejects_with_comm_queue_full() {
     c.ok_index(&move_j(203)).await;
     let err = c.expect_error(&move_j(204)).await;
     assert_eq!(err.code, ErrorCode::CommQueueFull as u16);
+    assert!(
+        err.cause.contains("motion queue"),
+        "the refusal must name the MOTION queue: {}",
+        err.cause
+    );
+}
+
+/// A `reset` refused for the waiter cap shares COMM_QUEUE_FULL with the
+/// motion queue, so its detail must name the RESET pile-up — pointing a
+/// retrying operator at the outstanding reset, not at an empty motion
+/// queue. The held waiters are all answered once the RT decides.
+#[tokio::test]
+async fn reset_waiter_overflow_names_itself_in_the_refusal() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    h.rt.lock().unwrap().hold_enable_outcome = true;
+    let mut c = Client::new(&h).await;
+
+    // 16 resets pile up unanswered while the RT is "still deciding".
+    for _ in 0..16 {
+        c.send(&Command::Reset).await;
+    }
+    let err = c.expect_error(&Command::Reset).await;
+    assert_eq!(err.code, ErrorCode::CommQueueFull as u16);
+    assert!(
+        err.cause.contains("reset"),
+        "the refusal must name the reset pile-up: {}",
+        err.cause
+    );
+    assert!(
+        !err.cause.contains("motion queue"),
+        "the refusal must not point at the motion queue: {}",
+        err.cause
+    );
+
+    // The RT decides: every held waiter gets the verdict.
+    h.rt.lock().unwrap().hold_enable_outcome = false;
+    for _ in 0..16 {
+        match c.recv().await {
+            Reply::Ok { index: None, .. } => {}
+            other => panic!("held reset waiters must be answered, got {other:?}"),
+        }
+    }
 }
 
 /// The gating table over the wire: un-homed, disabled, e-stop latch and
@@ -1135,6 +1199,265 @@ async fn status_broadcast_content_and_staleness() {
         stale.data_age_ms
     );
     assert!(stale.seq > s2.seq, "broadcast never went silent");
+}
+
+/// `link_ok` / `data_age_ms` / PING `hardware_connected` mean the MOTOR
+/// BUS, not the RT snapshot channel: the RT publishes a snapshot every
+/// tick whether or not any driver answered, so a silent bus behind a
+/// healthy RT must read link-down — while STATUS keeps flowing.
+///
+/// (parol6's `hardware_connected` requires `first_frame_received` for the
+/// same reason: a connected transport that has never produced a frame is
+/// not a connected robot.)
+#[tokio::test]
+async fn silent_motor_bus_reads_link_down_while_status_keeps_flowing() {
+    let mut h = start(|_| {}).await;
+    let mut c = Client::new(&h).await;
+
+    // Boot: the RT is alive and publishing, but no node has ever answered.
+    h.publish(|s| {
+        for node in &mut s.nodes {
+            node.data_age_ticks = u64::MAX;
+        }
+    });
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let dead = loop {
+        let s = recv_status(&h.status_rx).await;
+        // Skip any frame that predates the publish (no snapshot yet also
+        // reads link-down, so wait for the saturated age specifically).
+        if s.data_age_ms == u16::MAX {
+            break s;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "never-seen bus never read as saturated data_age"
+        );
+    };
+    assert_eq!(dead.link_ok, 0, "a bus that never spoke is not a link");
+    match c.query(&Command::Ping).await {
+        QueryResult::Ping { hardware_connected } => {
+            assert!(!hardware_connected, "no frame ever arrived from a driver")
+        }
+        other => panic!("expected PING result, got {other:?}"),
+    }
+
+    // The bus comes up: fresh node data flips the link healthy. (Each
+    // iteration re-publishes so the snapshot's own wall age never decides
+    // the outcome on a slow runner.)
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        h.publish(|_| {});
+        let s = recv_status(&h.status_rx).await;
+        if s.link_ok == 1 {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "fresh bus data never read as link_ok"
+        );
+    }
+    h.publish(|_| {});
+    match c.query(&Command::Ping).await {
+        QueryResult::Ping { hardware_connected } => assert!(hardware_connected),
+        other => panic!("expected PING result, got {other:?}"),
+    }
+
+    // Mid-session silence: the RT keeps publishing every tick (each
+    // publish here is younger than `link_stale`), only the node ages
+    // grow — 100 ticks at the default 250 Hz is 400 ms against the
+    // harness's 100 ms staleness window. Before the fix this read
+    // link_ok = 1 forever, because only the snapshot's wall age was
+    // measured.
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    let silent = loop {
+        h.publish(|s| {
+            for node in &mut s.nodes {
+                node.data_age_ticks = 100;
+            }
+        });
+        let s = recv_status(&h.status_rx).await;
+        // The target frame carries the BUS age (100 ticks @ 250 Hz =
+        // 400 ms), not merely a snapshot that aged in the rx backlog.
+        if s.link_ok == 0 && s.data_age_ms >= 400 && s.data_age_ms != u16::MAX {
+            break s;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "a silent bus behind a live RT still read link_ok = 1 \
+             (or data_age never carried the bus age)"
+        );
+    };
+    assert!(silent.seq > dead.seq, "STATUS must keep flowing throughout");
+    h.publish(|s| {
+        for node in &mut s.nodes {
+            node.data_age_ticks = 100;
+        }
+    });
+    match c.query(&Command::Ping).await {
+        QueryResult::Ping { hardware_connected } => {
+            assert!(
+                !hardware_connected,
+                "a silent bus is not connected hardware"
+            )
+        }
+        other => panic!("expected PING result, got {other:?}"),
+    }
+}
+
+/// A refused fire-and-forget command must surface where a caller can see
+/// it: the refusal latches as the standing error (STATUS + the ERROR
+/// query), because nothing awaits the ERROR reply datagram itself
+/// (issue #23). The next ACCEPTED motion command clears it, and a
+/// refusal never latches over a running program.
+#[tokio::test]
+async fn refused_fire_and_forget_latches_the_standing_error_until_motion_is_accepted() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    // Teleport outside sim mode: refused with a real ERROR reply...
+    let err = c
+        .expect_error(&Command::Teleport(Teleport {
+            angles: [0.0; 6],
+            tool_positions: None,
+        }))
+        .await;
+    assert_eq!(err.code, ErrorCode::SysNotSimulator as u16);
+
+    // ...and the refusal stands where a client that never awaited the
+    // reply looks: the ERROR query and the broadcast.
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysNotSimulator as u16)
+        }
+        other => panic!("the refusal must stand in the ERROR query, got {other:?}"),
+    }
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.error
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::SysNotSimulator as u16)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the refusal never reached the STATUS broadcast"
+        );
+    }
+
+    // An accepted stream clears it, like every standing error.
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error: None } => break,
+            QueryResult::Error { error: Some(_) } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "acceptance must clear the refusal latch"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("expected ERROR result, got {other:?}"),
+        }
+    }
+
+    // While a stream is live, a stray refusal answers ERROR but does NOT
+    // latch — it must not poison the running session's error surface.
+    let err = c
+        .expect_error(&Command::Teleport(Teleport {
+            angles: [0.0; 6],
+            tool_positions: None,
+        }))
+        .await;
+    assert_eq!(err.code, ErrorCode::SysNotSimulator as u16);
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: None } => {}
+        other => panic!("a refusal over live motion must not latch, got {other:?}"),
+    }
+}
+
+/// A streaming setpoint the RUNTIME refuses (the bridge's collision gate
+/// blocking a jog, issue #19) is a spoken refusal, not a silent drop:
+/// the sender gets the runtime's ERROR, no stream session starts, and
+/// the refusal latches as the standing error. A refusal of an in-place
+/// UPDATE stops the stream it was updating — the previous setpoint must
+/// not keep driving the arm while the client reads why its correction
+/// was refused.
+#[tokio::test]
+async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let collision = || {
+        make_error(
+            ErrorCode::SysSelfCollision,
+            UNATTRIBUTED,
+            &[("sample", "0"), ("total", "1"), ("pairs", "[j3, keepout]")],
+        )
+    };
+
+    // Refused at admission: the ERROR reaches the sender, nothing was
+    // forwarded to the RT, and the refusal stands in the ERROR query.
+    h.rt.lock().unwrap().stream_verdict = Some(collision());
+    let err = c.expect_error(&jog_j()).await;
+    assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
+    assert!(err.cause.contains("keepout"), "{err:?}");
+    assert!(
+        !h.rt_events().contains(&RtEvent::Stream(CmdType::JogJ)),
+        "a refused setpoint must not reach the RT: {:?}",
+        h.rt_events()
+    );
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysSelfCollision as u16)
+        }
+        other => panic!("the refusal must stand in the ERROR query, got {other:?}"),
+    }
+
+    // The next ACCEPTED jog starts a session normally and clears the
+    // latch — a refusal is a verdict about one setpoint, not a lockout.
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error: None } => break,
+            QueryResult::Error { error: Some(_) } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "acceptance must clear the refusal latch"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("expected ERROR result, got {other:?}"),
+        }
+    }
+
+    // A refused UPDATE of the live session cancels it: the arm stops
+    // instead of continuing on the setpoint the client just replaced.
+    let before = h.rt_events();
+    assert!(
+        !before.contains(&RtEvent::CancelStream),
+        "premise: the session is live and uncancelled: {before:?}"
+    );
+    h.rt.lock().unwrap().stream_verdict = Some(collision());
+    let err = c.expect_error(&jog_j()).await;
+    assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
+    h.wait_rt(|ev| ev.contains(&RtEvent::CancelStream)).await;
+    // The session really ended: the next same-type jog is a fresh start,
+    // which the double sees as a new Stream event after the cancel.
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| {
+        let cancel = ev.iter().position(|e| *e == RtEvent::CancelStream);
+        cancel.is_some_and(|i| ev[i..].contains(&RtEvent::Stream(CmdType::JogJ)))
+    })
+    .await;
 }
 
 /// Telemetry: unknown recipes are refused with COMM_UNKNOWN_RECIPE;

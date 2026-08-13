@@ -223,9 +223,9 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
         },
         E::CommQueueFull => ErrorTemplate {
             title: "Command queue full",
-            cause: "The motion queue is at capacity.",
+            cause: "A server queue is at capacity. {detail}",
             effect: "Command rejected.",
-            remedy: "Wait for queued motions to finish before enqueueing more.",
+            remedy: "Wait for the named queue to drain, then retry.",
         },
         E::CommUnknownCommand => ErrorTemplate {
             title: "Unknown command",
@@ -296,8 +296,8 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
         E::SysRtiLinkLost => ErrorTemplate {
             title: "Streaming link lost",
             cause: "No streaming packet arrived within the watchdog window.",
-            effect: "Streaming session stopped; robot held.",
-            remedy: "Check the client connection and stream rate, then reclaim the session.",
+            effect: "Streaming stopped; controller DISABLED; error latched.",
+            remedy: "Check the client connection and stream rate, then send reset.",
         },
         E::SysLoopCritical => ErrorTemplate {
             title: "Control loop critical",

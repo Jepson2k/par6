@@ -25,6 +25,16 @@ bugs, `can_hardware.py:150-158`). Keep the SO_SNDBUF raise as backstop. Read ker
 state (bus-off/error-passive/restarts) via netlink at ~1 Hz off the RT thread — auto-restart
 (100 ms) lands between the freshness thresholds, so bus-off is otherwise invisible.
 
+The RT loop acts on the propagated errors, never just logs them: every refused
+send/drain is counted into the published loop stats (`bus_tx_failures` /
+`bus_rx_failures`), the backend's `LinkHealth` rides every snapshot, and a TX-failure
+streak spanning the freshness lost window (`lost_s`) latches every node's disconnect
+error (⇒ DISABLED / ACTIVE_ERROR) — an outbound-dead link means the arm is not
+receiving commands even while RX freshness reads green, so it disables on the same
+clock as a silent one. Home references survive a TX-only latch (the encoders were
+never lost); an actually-silent bus still invalidates homing through the freshness
+path.
+
 ## Arbitration ID (11-bit)
 
 ```

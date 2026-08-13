@@ -39,6 +39,8 @@ pub use robot::{
 
 use std::path::Path;
 
+use serde::{Deserialize, Serialize};
+
 /// Error produced by loading or validating configuration.
 ///
 /// Every validation failure names the offending field with its full TOML
@@ -88,6 +90,56 @@ pub(crate) fn read_to_string(path: &Path) -> Result<String, ConfigError> {
     })
 }
 
+/// One installation-layer keep-out shape, as declared in the robot TOML's
+/// `[[installation_shapes]]` array.
+///
+/// These are the standing restrictions of THIS robot's installation —
+/// cage walls, the table, fixtures — enforced from boot in both the
+/// planner's collision gate and the streaming (jog/servo) gate. The
+/// protocol's `set_shapes` replaces the PROGRAM layer only, so nothing on
+/// the wire can remove them (parol6 keeps them in robot config with the
+/// same rule). The `SHAPES` query reads them back as the `installation`
+/// list.
+///
+/// Fields mirror the waldoctl `Shape` wire contract exactly — this
+/// section is parsed as schema only, and every VALUE is validated at
+/// daemon startup through the same `Shape::from_proto` + world-apply path
+/// a `set_shapes` runs, so a malformed entry (unknown kind, wrong param
+/// arity, negative dimension, duplicate name) refuses startup with a
+/// message naming the shape.
+///
+/// **Units are metres and radians.** `pose` is `[x, y, z, rx, ry, rz]`
+/// with extrinsic-XYZ rotation (each angle about a fixed world axis,
+/// `R = Rz·Ry·Rx`) — the `Shape.pose` convention every waldoctl
+/// implementation shares, NOT the TCP-pose readback convention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ShapeConfig {
+    /// Display name — what colliding-pair reports and the frontend's
+    /// highlight mapping name this shape by. Unique within the layer.
+    pub name: String,
+    /// Primitive kind: `box`, `sphere`, `cylinder`, `capsule`, `cone`,
+    /// `ellipsoid`, or `plane` (prefer a box over a plane — an unbounded
+    /// half-space costs the checker ~1000x per query).
+    pub kind: String,
+    /// The primitive's constructor parameters \[m\], in waldoctl field
+    /// order (e.g. box: `[x, y, z]` full side lengths; sphere:
+    /// `[radius]`).
+    pub params: Vec<f64>,
+    /// World placement `[x, y, z, rx, ry, rz]` \[m, rad\].
+    pub pose: [f64; 6],
+    /// `false` = visual-only marker (drawn by frontends, not enforced).
+    #[serde(default = "collision_default")]
+    pub collision: bool,
+    /// Extra standoff \[m\] on top of the runtime's default clearance.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub margin: Option<f64>,
+}
+
+fn collision_default() -> bool {
+    true
+}
+
 /// A robot plus every gripper config found beside it, cross-validated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ConfigBundle {
@@ -96,6 +148,10 @@ pub struct ConfigBundle {
     /// All gripper configurations from `<robot dir>/grippers/*.toml`,
     /// sorted by file name.
     pub grippers: Vec<GripperConfig>,
+    /// Installation-layer keep-out shapes from the robot TOML's
+    /// `[[installation_shapes]]` array (empty when the section is
+    /// absent).
+    pub installation_shapes: Vec<ShapeConfig>,
 }
 
 impl ConfigBundle {
@@ -103,7 +159,7 @@ impl ConfigBundle {
     /// directory, drop the sequence steps the active tool cannot run,
     /// then cross-validate.
     pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
-        let robot = RobotConfig::load(robot_toml)?;
+        let (robot, installation_shapes) = load_robot_with_shapes(robot_toml)?;
         let dir = robot_toml
             .parent()
             .map(|p| p.join("grippers"))
@@ -121,7 +177,11 @@ impl ConfigBundle {
             .iter()
             .map(|p| GripperConfig::load(p))
             .collect::<Result<Vec<_>, _>>()?;
-        let mut bundle = Self { robot, grippers };
+        let mut bundle = Self {
+            robot,
+            grippers,
+            installation_shapes,
+        };
         bundle.drop_gripper_homing_without_a_gripper();
         bundle.validate()?;
         Ok(bundle)
@@ -210,6 +270,16 @@ impl ConfigBundle {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        for (i, s) in self.installation_shapes.iter().enumerate() {
+            for (what, values) in [("params", s.params.as_slice()), ("pose", s.pose.as_slice())] {
+                if let Some(v) = values.iter().find(|v| !v.is_finite()) {
+                    return Err(invalid(
+                        format!("installation_shapes[{i}].{what}"),
+                        format!("shape `{}`: {v} is not a finite number", s.name),
+                    ));
+                }
+            }
+        }
         let Some(active) = self.active_gripper() else {
             return Err(invalid(
                 "robot.active_gripper",
@@ -240,6 +310,45 @@ impl ConfigBundle {
         }
         Ok(())
     }
+}
+
+/// Parse the robot TOML, splitting the `[[installation_shapes]]` array
+/// off before the strict `RobotConfig` schema sees the text.
+///
+/// The shapes ride in the robot file (the parol6 arrangement: keep-outs
+/// are installation config, next to the other installation limits), but
+/// they are a server-layer vocabulary, not a robot parameter — so
+/// `RobotConfig` keeps its own schema and its `deny_unknown_fields` typo
+/// protection, and the split hands it exactly the document minus this one
+/// key. A file without the key takes the plain [`RobotConfig::load`]
+/// path, byte for byte.
+fn load_robot_with_shapes(path: &Path) -> Result<(RobotConfig, Vec<ShapeConfig>), ConfigError> {
+    let text = read_to_string(path)?;
+    let parse_err = |source: toml::de::Error| ConfigError::Parse {
+        path: path.display().to_string(),
+        source: Box::new(source),
+    };
+    let mut table: toml::Table = toml::from_str(&text).map_err(parse_err)?;
+    let Some(value) = table.remove("installation_shapes") else {
+        return Ok((RobotConfig::load(path)?, Vec::new()));
+    };
+    let shapes: Vec<ShapeConfig> = value.try_into().map_err(parse_err)?;
+    let rest = toml::to_string(&table).map_err(|e| {
+        invalid(
+            "installation_shapes",
+            format!("cannot re-serialize the remaining config: {e}"),
+        )
+    })?;
+    let robot = RobotConfig::from_toml_str(&rest).map_err(|e| match e {
+        // Re-attach the real path: the round-trip through a string names
+        // `<string>` otherwise, which is useless in a startup error.
+        ConfigError::Parse { source, .. } => ConfigError::Parse {
+            path: path.display().to_string(),
+            source,
+        },
+        other => other,
+    })?;
+    Ok((robot, shapes))
 }
 
 #[cfg(test)]
@@ -485,6 +594,106 @@ mod tests {
         // refused, not the tool selection.
         let ok = TempConfig::new(select_tool("SSG48"));
         ConfigBundle::load(&ok.robot()).expect("SSG48 with its [homing] section must load");
+    }
+
+    /// `[[installation_shapes]]` rides in the robot TOML and comes out of
+    /// `ConfigBundle::load` as typed shapes, without costing `RobotConfig`
+    /// its strict schema: the same file's robot half still validates, and
+    /// a file WITHOUT the section still loads to an empty list.
+    #[test]
+    fn installation_shapes_load_from_the_robot_toml() {
+        let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
+        assert!(
+            stock.installation_shapes.is_empty(),
+            "the shipped config declares no keep-outs"
+        );
+
+        let with_shapes = TempConfig::new(|file, text| {
+            if file == "PAR6.toml" {
+                format!(
+                    "{text}\n[[installation_shapes]]\n\
+                     name = \"table\"\nkind = \"box\"\n\
+                     params = [0.8, 0.8, 0.02]\n\
+                     pose = [0.3, 0.0, -0.11, 0.0, 0.0, 0.0]\n\
+                     \n[[installation_shapes]]\n\
+                     name = \"marker\"\nkind = \"sphere\"\nparams = [0.05]\n\
+                     pose = [0.0, 0.4, 0.2, 0.0, 0.0, 0.0]\n\
+                     collision = false\nmargin = 0.01\n"
+                )
+            } else {
+                text.to_owned()
+            }
+        });
+        let bundle = ConfigBundle::load(&with_shapes.robot()).expect("shapes must load");
+        assert_eq!(
+            bundle.installation_shapes,
+            vec![
+                ShapeConfig {
+                    name: "table".into(),
+                    kind: "box".into(),
+                    params: vec![0.8, 0.8, 0.02],
+                    pose: [0.3, 0.0, -0.11, 0.0, 0.0, 0.0],
+                    collision: true,
+                    margin: None,
+                },
+                ShapeConfig {
+                    name: "marker".into(),
+                    kind: "sphere".into(),
+                    params: vec![0.05],
+                    pose: [0.0, 0.4, 0.2, 0.0, 0.0, 0.0],
+                    collision: false,
+                    margin: Some(0.01),
+                },
+            ]
+        );
+        // The robot half of the same file went through its normal
+        // parse-and-validate path.
+        assert_eq!(bundle.robot, stock.robot);
+    }
+
+    /// Malformed `[[installation_shapes]]` entries fail the LOAD with a
+    /// message pointing at the problem — a keep-out that does not parse
+    /// must never become a keep-out that silently is not there.
+    #[test]
+    fn malformed_installation_shapes_are_refused_by_name() {
+        let load_with = |entry: &str| {
+            let cfg = TempConfig::new(|file, text| {
+                if file == "PAR6.toml" {
+                    format!("{text}\n[[installation_shapes]]\n{entry}\n")
+                } else {
+                    text.to_owned()
+                }
+            });
+            ConfigBundle::load(&cfg.robot())
+        };
+
+        // A pose that is not [x, y, z, rx, ry, rz].
+        let err = load_with(
+            "name = \"wall\"\nkind = \"box\"\nparams = [1.0, 0.02, 1.0]\n\
+             pose = [0.4, 0.0, 0.3]",
+        )
+        .expect_err("a 3-element pose must be refused")
+        .to_string();
+        assert!(err.to_lowercase().contains("length 6"), "{err}");
+
+        // A typo'd key inside a shape entry (schema protection).
+        let err = load_with(
+            "name = \"wall\"\nkind = \"box\"\nparams = [1.0, 0.02, 1.0]\n\
+             pose = [0.4, 0.0, 0.3, 0.0, 0.0, 0.0]\nmargins = 0.01",
+        )
+        .expect_err("an unknown shape key must be refused")
+        .to_string();
+        assert!(err.contains("margins"), "{err}");
+
+        // A non-finite dimension, named by field and shape.
+        let err = load_with(
+            "name = \"wall\"\nkind = \"box\"\nparams = [1.0, nan, 1.0]\n\
+             pose = [0.4, 0.0, 0.3, 0.0, 0.0, 0.0]",
+        )
+        .expect_err("a NaN dimension must be refused")
+        .to_string();
+        assert!(err.contains("installation_shapes[0].params"), "{err}");
+        assert!(err.contains("wall"), "{err}");
     }
 
     #[test]

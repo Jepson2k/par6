@@ -197,6 +197,16 @@ extern "C" {
         max_pairs: i32,
         out_n_pairs: *mut i32,
     ) -> i32;
+    /// Minimum signed distance over every active pair at `q`, written into
+    /// `out_distance`: positive = closest pair's separation \[m\], negative
+    /// = deepest penetration depth \[m\], +inf with no active pairs.
+    /// Margins/clearance never shift it (raw geometry, unlike
+    /// [`par6_col_check`]'s margin-shifted verdict).
+    pub fn par6_col_distance(
+        h: *mut par6_col,
+        q: *const f64,
+        out_distance: *mut f64,
+    ) -> par6_status;
 
     pub fn par6_shim_abi_version() -> i32;
 }

@@ -308,6 +308,8 @@ pub enum EncodeError {
 ///   (vendor defaults).
 /// - [`Pack::Hall`] (cmd 31): DLC 4, i24 speed (`vel`, `None` → 0) + the
 ///   trigger byte; `pos`/`cur_ma` are not part of the frame.
+/// - [`Pack::Idle`] (cmd 12): DLC-0 data frame, no channels.
+/// - [`Pack::EncoderPoll`] (cmd 28): RTR request, no channels.
 pub fn encode_joint_command(
     node: NodeId,
     command: &JointCommand,
@@ -354,6 +356,8 @@ pub fn encode_joint_command(
             p[3] = trigger_value;
             CanFrame::data_frame(id, &p)
         }
+        Pack::Idle => encode_idle(node),
+        Pack::EncoderPoll => CanFrame::rtr_frame(pack_can_id(node, CommandId::EncoderData, false)),
     };
     Ok(Some(frame))
 }
@@ -1011,6 +1015,19 @@ mod tests {
             assert_eq!(f.dlc, dlc);
             assert_eq!(unpack_can_id(f.id).1, 2);
         }
+        // Firmware idle: cmd 12, DLC 0, a DATA frame (not RTR) — the
+        // driver drops its loop and sends no reply.
+        let f = encode_joint_command(3, &JointCommand::drop_to_idle())
+            .unwrap()
+            .unwrap();
+        assert!(!f.rtr);
+        assert_eq!((f.dlc, unpack_can_id(f.id)), (0, (3, 12, false)));
+        // Encoder poll: cmd 28 as an RTR request.
+        let f = encode_joint_command(3, &JointCommand::encoder_poll())
+            .unwrap()
+            .unwrap();
+        assert!(f.rtr);
+        assert_eq!((f.dlc, unpack_can_id(f.id)), (0, (3, 28, false)));
     }
 
     #[test]

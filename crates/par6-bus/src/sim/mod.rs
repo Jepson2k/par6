@@ -236,6 +236,7 @@ impl SimBus {
         for (j, map) in self.maps.iter_mut().enumerate() {
             clamped[j] = q[j].clamp(map.hard_lo_rad, map.hard_hi_rad);
             map.reseed(clamped[j]);
+            self.drivers[j].reset_motion_transients();
         }
         let q = &clamped[..self.maps.len()];
         match &mut self.plant {
@@ -321,6 +322,17 @@ impl SimBus {
     /// Frames dropped because the RX queue was full.
     pub fn dropped_rx_frames(&self) -> u64 {
         self.dropped_rx
+    }
+
+    /// Ground truth: the plant's true joint angles \[rad\], one per arm
+    /// joint, straight from the physics state through the boot-frame
+    /// conversion — no `report_offset`, no runtime re-referencing. This
+    /// is the oracle the runtime's homed frame is tested against; nothing
+    /// on the wire can reach it.
+    pub fn true_joint_rad(&self) -> Vec<f64> {
+        (0..self.drivers.len())
+            .map(|j| self.maps[j].joint_rad(self.motor_state(j).0))
+            .collect()
     }
 
     /// Deliver a raw host→driver frame exactly as if the RT side had
@@ -570,6 +582,28 @@ impl SimBus {
             }
         };
         self.enqueue(frame);
+    }
+
+    /// Deliver one host→driver frame — a DATA frame to the node's
+    /// command parser, an RTR request to the telemetry responder (the
+    /// joint slot carries RTR encoder polls while a driver is idled).
+    fn deliver_frame(&mut self, frame: &CanFrame) {
+        if !frame.rtr {
+            self.deliver_data(frame);
+            return;
+        }
+        let (node, raw_cmd, _) = unpack_can_id(frame.id);
+        let kind = match CommandId::from_raw(raw_cmd) {
+            Some(CommandId::EncoderData) => PollKind::Encoder,
+            Some(CommandId::Temperature) => PollKind::Temperature,
+            Some(CommandId::Voltage) => PollKind::Voltage,
+            Some(CommandId::StateOfErrors) => PollKind::Errors,
+            Some(CommandId::DeviceInfo) => PollKind::DeviceInfo,
+            Some(CommandId::RespondKt) => PollKind::Kt,
+            Some(CommandId::Ping) => PollKind::Ping,
+            _ => return,
+        };
+        self.deliver_rtr(node, kind);
     }
 
     /// Deliver one host→driver DATA frame to its node and enqueue
@@ -877,7 +911,7 @@ impl DriverBus for SimBus {
                 }
             })?;
             if let Some(f) = frame {
-                self.deliver_data(&f);
+                self.deliver_frame(&f);
             }
         }
         Ok(())
@@ -892,11 +926,9 @@ impl DriverBus for SimBus {
         let Some(f) = frame else {
             return Ok(());
         };
-        if f.rtr {
-            // NoGripper: RTR ping to the timing dummy — nothing answers.
-            return Ok(());
-        }
-        self.deliver_data(&f);
+        // NoGripper's RTR ping targets the driverless timing dummy, so it
+        // goes unanswered like on the real bus.
+        self.deliver_frame(&f);
         Ok(())
     }
 

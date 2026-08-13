@@ -47,18 +47,19 @@
   <link
     name="shoulder">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 1) -->
       <origin
-        xyz="0.00656811939880825 0.0290935389673309 0.099551347543145"
+        xyz="0.00551 0.01797 0.10726"
         rpy="0 0 0" />
       <mass
-        value="0.620900499130961" />
+        value="1.99314" />
       <inertia
-        ixx="0.00100663738746705"
-        ixy="-6.26580888440262E-05"
-        ixz="-5.94906456216177E-05"
-        iyy="0.000546947368013689"
-        iyz="-0.000133114961306643"
-        izz="0.00119083362934585" />
+        ixx="0.01274598834"
+        ixy="-0.00247889785"
+        ixz="-5.666903e-05"
+        iyy="0.0025494801"
+        iyz="0.00026984318"
+        izz="0.01351975443" />
     </inertial>
     <visual>
       <origin
@@ -105,18 +106,19 @@
   <link
     name="upper_arm">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 2) -->
       <origin
-        xyz="-0.00854934366236779 -0.0713421424494267 0.0416391335881903"
+        xyz="-0.01108 -0.07715 0.01588"
         rpy="0 0 0" />
       <mass
-        value="0.564255649327409" />
+        value="1.33224" />
       <inertia
-        ixx="0.00161401505877108"
-        ixy="-2.3762413487102E-05"
-        ixz="-1.23771305810395E-05"
-        iyy="0.000283296701166046"
-        iyz="-0.000134635985563592"
-        izz="0.00163917151493148" />
+        ixx="0.00644795378"
+        ixy="-9.078224e-05"
+        ixz="0.00025671953"
+        iyy="0.00322195371"
+        iyz="-0.00029855195"
+        izz="0.00382431687" />
     </inertial>
     <visual>
       <origin
@@ -163,18 +165,19 @@
   <link
     name="elbow">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 3) -->
       <origin
-        xyz="0.0155509885239591 -0.0191127686426609 -0.00153322577917109"
+        xyz="0.00958 -0.02219 -0.00374"
         rpy="0 0 0" />
       <mass
-        value="0.550970997806043" />
+        value="0.68511" />
       <inertia
-        ixx="0.00057827573271994"
-        ixy="0.000116505232322314"
-        ixz="-1.19955293256511E-05"
-        iyy="0.000567011676944701"
-        iyz="1.55814255036018E-05"
-        izz="0.000815862001506842" />
+        ixx="0.00061022164"
+        ixy="-6.122538e-05"
+        ixz="2.528564e-05"
+        iyy="0.00077646955"
+        iyz="-5.698924e-05"
+        izz="0.00085682016" />
     </inertial>
     <visual>
       <origin
@@ -221,18 +224,19 @@
   <link
     name="lower_arm">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 4) -->
       <origin
-        xyz="0.000527335454629185 -0.0101658497051326 -0.0925926618710919"
+        xyz="-9e-05 -0.01713 -0.11143"
         rpy="0 0 0" />
       <mass
-        value="0.382768168076152" />
+        value="0.57956" />
       <inertia
-        ixx="0.000383809752758758"
-        ixy="-5.71777005742458E-06"
-        ixz="-1.13435862343122E-06"
-        iyy="0.000324613577491975"
-        iyz="-6.4819470273156E-05"
-        izz="0.000252488975982478" />
+        ixx="0.00117046561"
+        ixy="1.2438e-07"
+        ixz="-1.08145e-06"
+        iyy="0.00104058689"
+        iyz="0.00028745228"
+        izz="0.00035842503" />
     </inertial>
     <visual>
       <origin
@@ -279,18 +283,19 @@
   <link
     name="wrist">
     <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 5) -->
       <origin
-        xyz="-1.54606600299978E-06 -0.00314847566621398 0.000193929742576537"
+        xyz="0 -0.00355 -0.00024"
         rpy="0 0 0" />
       <mass
-        value="0.230864625594321" />
+        value="0.52381" />
       <inertia
-        ixx="0.000180829695434151"
-        ixy="-4.63392548736093E-10"
-        ixz="-6.79284338617228E-09"
-        iyy="0.000106212288444716"
-        iyz="2.87958450952461E-06"
-        izz="0.000175598200731164" />
+        ixx="0.00041379107"
+        ixy="3.557e-08"
+        ixz="2.613e-08"
+        iyy="0.00018259111"
+        iyz="9.4593e-07"
+        izz="0.00040956068" />
     </inertial>
     <visual>
       <origin
