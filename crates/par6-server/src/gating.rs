@@ -1,8 +1,8 @@
 //! The declarative gating table: what state a command requires before it
 //! is accepted. Derived from [`command_class`] (SYSTEM and QUERY commands
-//! always apply) plus the per-command requirements from the spec:
-//! planned moves need a homed robot, `teleport` is simulator-only, and
-//! every motion-class command needs an ENABLED controller.
+//! always apply) plus the per-command requirements from the spec: motion
+//! needs a homed robot, `teleport` is simulator-only, and every
+//! motion-class command needs an ENABLED controller.
 //!
 //! Rejections always answer with a structured ERROR carrying the echoed
 //! `req_id` — including FIRE_AND_FORGET commands, whose SUCCESS stays
@@ -16,8 +16,13 @@ use par6_proto::{command_class, CmdType, CommandClass};
 pub struct Gate {
     /// Controller must be ENABLED (and the e-stop latch clear).
     pub needs_enabled: bool,
-    /// Robot must be homed (planned motion only; jogging stays available
-    /// un-homed).
+    /// Robot must be homed. Every motion MODE the RT can enter needs a
+    /// home reference: `RtCore::request_mode` refuses `Jog`, `Stream`
+    /// and `Exec` without one, following the vendor's `REQUIRES_HOMED`
+    /// set — so streaming setpoints are gated here exactly like planned
+    /// moves. `parol6` leaves jogging available un-homed, which is why
+    /// this table once did too; par6's RT does not, and the two sides
+    /// disagreeing is what makes a jog vanish with nothing said.
     pub needs_homed: bool,
     /// Simulator backend must be active.
     pub needs_simulator: bool,
@@ -34,7 +39,17 @@ pub fn gate(cmd: CmdType) -> Gate {
         ..Gate::default()
     };
     match cmd {
-        C::MoveJ | C::MoveJPose | C::MoveL | C::MoveC | C::MoveS | C::MoveP => {
+        C::MoveJ
+        | C::MoveJPose
+        | C::MoveL
+        | C::MoveC
+        | C::MoveS
+        | C::MoveP
+        | C::ServoJ
+        | C::ServoJPose
+        | C::ServoL
+        | C::JogJ
+        | C::JogL => {
             g.needs_homed = true;
         }
         C::Teleport => g.needs_simulator = true,

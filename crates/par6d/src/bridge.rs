@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use par6_bus::RuntimeBus;
 use par6_config::ConfigBundle;
+use par6_proto::command::MAX_JOG_DURATION_S;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
     ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput,
@@ -46,6 +47,24 @@ const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
 /// Housekeeping loop period.
 const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+
+/// Watchdog deadline for a jog carrying `duration_s` seconds.
+///
+/// The codec already bounds `duration` to [`MAX_JOG_DURATION_S`], but
+/// this is the arithmetic that takes the process down if that bound is
+/// ever wrong — `Duration::from_secs_f64` panics above ~1.8e19 s, and it
+/// runs here with the shared-state lock held, in a build compiled
+/// `panic = "abort"`. So it clamps rather than trusts: nothing reachable
+/// from the wire may abort the daemon.
+fn jog_deadline(duration_s: f64) -> Instant {
+    let bounded = duration_s.clamp(0.0, MAX_JOG_DURATION_S);
+    // `clamp` propagates NaN, and the deadline is what STOPS the jog, so
+    // an unusable duration expires it at once instead of arming an
+    // undefined watchdog.
+    let bounded = if bounded.is_nan() { 0.0 } else { bounded };
+    Instant::now() + Duration::from_secs_f64(bounded)
+}
+
 /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities` fraction
 /// of ±1 maps to this; conservative — the RT stream limiter still owns
 /// the joint-space envelope).
@@ -260,7 +279,7 @@ impl RtCommands for RtBridge {
                 }
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Jog,
-                    deadline: Instant::now() + Duration::from_secs_f64(p.duration),
+                    deadline: jog_deadline(p.duration),
                     servo_target: None,
                     #[cfg(feature = "ffi")]
                     cart: None,
@@ -366,7 +385,7 @@ impl RtCommands for RtBridge {
                 }
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::CartJog,
-                    deadline: Instant::now() + Duration::from_secs_f64(p.duration),
+                    deadline: jog_deadline(p.duration),
                     servo_target: None,
                     cart: Some(CartJogState {
                         twist,
@@ -666,4 +685,42 @@ fn step_cart_jog(
         *q = (*q + qd[j] * dt_s).clamp(state.soft_min[j], state.soft_max[j]);
     }
     Ok(state.q)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The jog watchdog deadline is what STOPS a jog, and it is computed
+    /// from a wire float with `Duration`/`Instant` arithmetic that panics
+    /// near f64's range — in a build compiled `panic = "abort"`, under
+    /// the shared-state lock. The codec refuses these values; this is the
+    /// second wall, so no reachable `duration` can either abort the
+    /// daemon or arm a watchdog that outlives the shift.
+    #[test]
+    fn no_wire_duration_can_produce_an_unusable_jog_deadline() {
+        let ceiling = Duration::from_secs_f64(MAX_JOG_DURATION_S);
+        for hostile in [1e30, 1e19, f64::MAX, f64::INFINITY, f64::NAN, -1.0] {
+            // `jog_deadline` reads its own `Instant::now()`, so the
+            // ceiling has to be measured from an instant at or after
+            // that read — bracketing the call is what makes the bound
+            // exact rather than off by the clock tick between them.
+            let before = Instant::now();
+            let deadline = jog_deadline(hostile);
+            let after = Instant::now();
+            assert!(
+                deadline <= after + ceiling,
+                "duration {hostile} armed the watchdog past the ceiling"
+            );
+            assert!(
+                deadline >= before,
+                "duration {hostile} armed it in the past"
+            );
+        }
+        // A duration a UI actually streams is honoured, not clamped away.
+        let before = Instant::now();
+        let deadline = jog_deadline(0.1);
+        assert!(deadline >= before + Duration::from_millis(100));
+        assert!(deadline < before + Duration::from_millis(200));
+    }
 }

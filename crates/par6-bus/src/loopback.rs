@@ -14,6 +14,7 @@ use std::collections::VecDeque;
 use par6_config::{GripperConfig, RobotConfig};
 
 use crate::bus::DriverBus;
+use crate::hw::sched::FreshnessClock;
 use crate::types::{
     BusError, BusState, DeviceInfo, ErrorFlags, Freshness, GripperCommand, GripperReply, HallState,
     JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
@@ -151,12 +152,8 @@ pub struct LoopbackBus {
     joint_nodes: Vec<NodeId>,
     gripper_node: NodeId,
     timing_dummy_node: NodeId,
-    stale_warn_ticks: u64,
-    lost_ticks: u64,
     rx_cap: usize,
-    last_rx_tick: [Option<u64>; MAX_NODES],
-    lost_latched: [bool; MAX_NODES],
-    last_gripper_rx_tick: Option<u64>,
+    fresh: FreshnessClock,
     connected: u16,
     rx_queue: VecDeque<Injected>,
     /// Everything transmitted, as `(tick, record)` — the test oracle.
@@ -177,12 +174,8 @@ impl LoopbackBus {
             joint_nodes: Vec::new(),
             gripper_node: 0,
             timing_dummy_node: 0,
-            stale_warn_ticks: u64::MAX,
-            lost_ticks: u64::MAX,
             rx_cap: 32,
-            last_rx_tick: [None; MAX_NODES],
-            lost_latched: [false; MAX_NODES],
-            last_gripper_rx_tick: None,
+            fresh: FreshnessClock::default(),
             connected: 0,
             rx_queue: VecDeque::new(),
             tx_log: Vec::new(),
@@ -280,13 +273,7 @@ impl DriverBus for LoopbackBus {
         self.tick = tick;
         self.joints_sent_this_tick = false;
         if !self.silent {
-            for n in 0..MAX_NODES {
-                if let Some(last) = self.last_rx_tick[n] {
-                    if tick.saturating_sub(last) >= self.lost_ticks {
-                        self.lost_latched[n] = true;
-                    }
-                }
-            }
+            self.fresh.latch_lost(tick);
         }
     }
 
@@ -317,15 +304,11 @@ impl DriverBus for LoopbackBus {
             age_min = age_min.min(age);
             age_max = age_max.max(age);
             let node = frame.reply.node(self.gripper_node);
-            let n = usize::from(node);
-            if let Some(last) = self.last_rx_tick[n] {
-                if self.tick.saturating_sub(last) >= self.stale_warn_ticks {
-                    state.reconnected_mask |= 1 << n;
-                }
+            if self.fresh.mark(node, self.tick) {
+                state.reconnected_mask |= 1 << usize::from(node);
             }
-            self.last_rx_tick[n] = Some(self.tick);
             if matches!(frame.reply, Reply::Gripper { .. }) {
-                self.last_gripper_rx_tick = Some(self.tick);
+                self.fresh.mark_gripper(self.tick);
             }
             Self::apply(&frame.reply, frame.err_bit, state, self.gripper_node);
         }
@@ -336,15 +319,9 @@ impl DriverBus for LoopbackBus {
         }
         // Refresh every node's data age against the current tick.
         for n in 0..MAX_NODES {
-            state.nodes[n].data_age_ticks = match self.last_rx_tick[n] {
-                Some(last) => self.tick.saturating_sub(last),
-                None => u64::MAX,
-            };
+            state.nodes[n].data_age_ticks = self.fresh.age(n as NodeId, self.tick);
         }
-        state.gripper.data_age_ticks = match self.last_gripper_rx_tick {
-            Some(last) => self.tick.saturating_sub(last),
-            None => u64::MAX,
-        };
+        state.gripper.data_age_ticks = self.fresh.gripper_age(self.tick);
         Ok(count)
     }
 
@@ -427,8 +404,10 @@ impl DriverBus for LoopbackBus {
         self.joint_nodes = robot.joints.iter().map(|j| j.node_id).collect();
         self.gripper_node = robot.bus.gripper_node;
         self.timing_dummy_node = robot.bus.timing_dummy_node;
-        self.stale_warn_ticks = u64::from(robot.ticks(robot.bus.stale_warn_s));
-        self.lost_ticks = u64::from(robot.ticks(robot.bus.lost_s));
+        self.fresh.configure(
+            u64::from(robot.ticks(robot.bus.stale_warn_s)),
+            u64::from(robot.ticks(robot.bus.lost_s)),
+        );
         self.rx_cap = robot.bus.rx_frames_per_tick_cap as usize;
         self.connected = self
             .joint_nodes
@@ -500,35 +479,15 @@ impl DriverBus for LoopbackBus {
     }
 
     fn freshness(&self, node: NodeId) -> Freshness {
-        let n = usize::from(node);
-        if self.lost_latched[n] {
-            return Freshness::Lost;
-        }
-        match self.last_rx_tick[n] {
-            None => Freshness::Unknown,
-            Some(last) => {
-                let age = self.tick.saturating_sub(last);
-                if age >= self.lost_ticks {
-                    Freshness::Lost
-                } else if age >= self.stale_warn_ticks {
-                    Freshness::Stale
-                } else {
-                    Freshness::Fresh
-                }
-            }
-        }
+        self.fresh.classify(node, self.tick)
     }
 
     fn clear_lost_latch(&mut self, node: NodeId) {
-        let n = usize::from(node);
-        self.lost_latched[n] = false;
-        self.last_rx_tick[n] = None;
+        self.fresh.clear_latch(node, self.tick);
     }
 
     fn rebase_freshness(&mut self) {
-        self.last_rx_tick = [None; MAX_NODES];
-        self.lost_latched = [false; MAX_NODES];
-        self.last_gripper_rx_tick = None;
+        self.fresh.rebase(self.tick);
     }
 
     fn connected_nodes(&self) -> u16 {
@@ -720,9 +679,17 @@ mod tests {
             "reconnect edge still reported"
         );
         assert_eq!(bus.freshness(0), Freshness::Lost);
-        // ...only the user clear path does.
+        // ...only the user clear path does, and it re-arms the clock at
+        // "seen now" so a node that stays silent re-latches on its own.
         bus.clear_lost_latch(0);
-        assert_eq!(bus.freshness(0), Freshness::Unknown);
+        assert_eq!(bus.freshness(0), Freshness::Fresh);
+        bus.begin_tick(1 + stale + 2 * lost);
+        assert_eq!(
+            bus.freshness(0),
+            Freshness::Lost,
+            "a still-silent node re-latches after the clear"
+        );
+        bus.clear_lost_latch(0);
         bus.inject(
             false,
             Reply::Motion {
@@ -805,7 +772,7 @@ mod tests {
 
     #[test]
     fn silent_mode_is_bus_silent_and_discards_rx() {
-        let (mut bus, _) = configured_bus();
+        let (mut bus, robot) = configured_bus();
         bus.tx_log.clear();
         bus.begin_tick(1);
         bus.set_silent(true);
@@ -840,7 +807,14 @@ mod tests {
         bus.set_silent(false);
         bus.rebase_freshness();
         for n in 0..6 {
-            assert_eq!(bus.freshness(n), Freshness::Unknown);
+            assert_eq!(bus.freshness(n), Freshness::Fresh);
+        }
+        // "Seen now", not "never seen": a driver that did not survive the
+        // flash still latches after the normal lost window.
+        let lost = u64::from(robot.ticks(robot.bus.lost_s));
+        bus.begin_tick(1 + lost);
+        for n in 0..6 {
+            assert_eq!(bus.freshness(n), Freshness::Lost);
         }
     }
 

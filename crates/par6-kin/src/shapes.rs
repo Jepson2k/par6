@@ -92,7 +92,9 @@ pub struct Shape {
     /// The primitive's constructor params; `kind.n_params()` are used.
     pub params: [f64; MAX_SHAPE_PARAMS],
     /// World placement `[x, y, z, rx, ry, rz]` (m, rad),
-    /// `R = Rx(rx)·Ry(ry)·Rz(rz)`.
+    /// `R = Rz(rz)·Ry(ry)·Rx(rx)` — waldoctl's `Shape.pose` is
+    /// extrinsic-XYZ, each angle about a fixed world axis, and NOT the
+    /// convention the TCP pose readback uses.
     pub pose: [f64; 6],
     /// `false` = visual-only marker, excluded from the collision world.
     pub collision: bool,

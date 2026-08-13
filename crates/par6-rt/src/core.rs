@@ -33,7 +33,7 @@ use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
 };
-use par6_config::{ConfigBundle, ControlMode};
+use par6_config::{ConfigBundle, ControlMode, KtSource};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
@@ -67,6 +67,95 @@ const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 const MEAS_FILTER_ALPHA: f64 = 0.2;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
+/// Minimum spacing between two bus-fault log lines from the RT thread
+/// \[s\] (see [`FaultLog`]).
+const BUS_FAULT_LOG_PERIOD_S: f64 = 1.0;
+
+/// Rate limiter for one RT-thread failure log site: the first failure
+/// after a healthy tick is logged, then at most one line per
+/// [`BUS_FAULT_LOG_PERIOD_S`] until the site succeeds again.
+///
+/// A bus failure is permanent while the link is down (`send`/`recv` map
+/// ENETDOWN/ENOBUFS straight to `LinkDown`/`TxQueueFull`) and the tick
+/// keeps commanding through `ACTIVE_ERROR`, so an ungated `warn!` takes
+/// the logger's writer lock and issues a `write(2)` on EVERY tick of a
+/// SCHED_FIFO 99 thread. Under systemd that fd is a pipe to journald: a
+/// stalled reader then blocks the tick loop instead of degrading it, and
+/// even when it does not, the per-tick syscall pushes p99 into the
+/// critical band and latches `LOOP_CRITICAL` against the wrong subsystem.
+#[derive(Debug)]
+struct FaultLog {
+    period_ticks: u64,
+    /// Tick of the last emitted line; `None` while the site is healthy.
+    last: Option<u64>,
+    suppressed: u32,
+}
+
+impl FaultLog {
+    fn new(period_ticks: u64) -> Self {
+        Self {
+            period_ticks,
+            last: None,
+            suppressed: 0,
+        }
+    }
+
+    /// Whether this failure may be logged now, and how many failures were
+    /// suppressed since the previous line.
+    fn admit(&mut self, tick: u64) -> Option<u32> {
+        match self.last {
+            Some(last) if tick.saturating_sub(last) < self.period_ticks => {
+                self.suppressed = self.suppressed.saturating_add(1);
+                None
+            }
+            _ => {
+                self.last = Some(tick);
+                Some(std::mem::take(&mut self.suppressed))
+            }
+        }
+    }
+
+    /// The site succeeded: the next failure is a fresh edge.
+    fn healthy(&mut self) {
+        self.last = None;
+        self.suppressed = 0;
+    }
+}
+
+/// The three bus-failure log sites on the tick path, throttled
+/// independently so a permanent TX fault cannot hide a new RX one.
+#[derive(Debug)]
+struct BusFaultLogs {
+    rx: FaultLog,
+    joint_tx: FaultLog,
+    gripper_tx: FaultLog,
+}
+
+impl BusFaultLogs {
+    fn new(period_ticks: u64) -> Self {
+        Self {
+            rx: FaultLog::new(period_ticks),
+            joint_tx: FaultLog::new(period_ticks),
+            gripper_tx: FaultLog::new(period_ticks),
+        }
+    }
+}
+
+/// Per-joint torque-scale inputs, kept so the boot kt resolution can
+/// rebuild [`RtCore::torque_ma_factor`] around a driver-reported kt.
+#[derive(Debug, Clone, Copy)]
+struct TorqueCal {
+    gear_ratio: f64,
+    gear_efficiency: f64,
+    kt_nm_a: f64,
+    dir: u8,
+}
+
+impl TorqueCal {
+    fn factor(&self, kt_nm_a: f64) -> f64 {
+        torque_to_ma_factor(self.gear_ratio, self.gear_efficiency, kt_nm_a, self.dir)
+    }
+}
 
 /// Why a mode request was refused (logged; requests are fire-and-forget).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -183,6 +272,10 @@ pub struct RtCore<B: DriverBus> {
     conv: [JointConversion; MAX_JOINTS],
     sector_done: [bool; MAX_JOINTS],
     torque_ma_factor: [f64; MAX_JOINTS],
+    torque_cal: [TorqueCal; MAX_JOINTS],
+    /// `kt_source = "auto"`: adopt the drivers' own kt at the boot
+    /// one-shot, before anything can be enabled.
+    kt_auto: bool,
     node_of: [NodeId; MAX_JOINTS],
     gripper_node: NodeId,
     has_can_gripper: bool,
@@ -202,6 +295,7 @@ pub struct RtCore<B: DriverBus> {
     homing: HomingSystem,
     errors: ErrorManager,
     timing: LoopTiming,
+    bus_faults: BusFaultLogs,
 
     // State-machine variables (spec/RT.md: mode, state, homed, errors).
     mode: Mode,
@@ -285,10 +379,19 @@ impl<B: DriverBus> RtCore<B> {
 
         let conv: [JointConversion; MAX_JOINTS] =
             std::array::from_fn(|i| JointConversion::from_config(&robot.joints[i]));
-        let torque_ma_factor: [f64; MAX_JOINTS] = std::array::from_fn(|i| {
+        let torque_cal: [TorqueCal; MAX_JOINTS] = std::array::from_fn(|i| {
             let j = &robot.joints[i];
-            torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir)
+            TorqueCal {
+                gear_ratio: j.gear_ratio,
+                gear_efficiency: j.gear_efficiency,
+                kt_nm_a: j.kt_nm_a,
+                dir: j.dir,
+            }
         });
+        // Config kt until the boot one-shot resolves the drivers' own
+        // (`kt_source = "auto"`), which happens while still BOOTING.
+        let torque_ma_factor: [f64; MAX_JOINTS] =
+            std::array::from_fn(|i| torque_cal[i].factor(torque_cal[i].kt_nm_a));
         let (writer, snapshots) = snapshot_channel::<StateSnapshot>();
         let (stream_tx, stream_rx) = snapshot_channel::<[f64; MAX_JOINTS]>();
         let heartbeat = Arc::new(AtomicBool::new(false));
@@ -307,6 +410,8 @@ impl<B: DriverBus> RtCore<B> {
             conv,
             sector_done: [false; MAX_JOINTS],
             torque_ma_factor,
+            torque_cal,
+            kt_auto: robot.robot.kt_source == KtSource::Auto,
             node_of: std::array::from_fn(|i| robot.joints[i].node_id),
             gripper_node: robot.bus.gripper_node,
             has_can_gripper,
@@ -325,6 +430,7 @@ impl<B: DriverBus> RtCore<B> {
             homing: HomingSystem::new(bundle),
             errors: ErrorManager::new(dt),
             timing: LoopTiming::new(dt, robot.loop_timing()),
+            bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
             mode: Mode::Booting,
             state: ArmState::Disabled,
             enable_seq: 0,
@@ -512,6 +618,9 @@ impl<B: DriverBus> RtCore<B> {
             if self.has_can_gripper && connected & (1 << u16::from(self.gripper_node)) == 0 {
                 self.errors.latch(ErrorCode::CanLost, Some(GRIPPER_ERR_IDX));
             }
+            if self.kt_auto {
+                self.adopt_driver_kt();
+            }
             if self.mode == Mode::Booting {
                 let _ = self.request_mode(Mode::Idle);
             }
@@ -522,6 +631,39 @@ impl<B: DriverBus> RtCore<B> {
             }
             if self.has_can_gripper {
                 let _ = self.bus.resend_node_config(self.gripper_node, 1);
+            }
+        }
+    }
+
+    /// Rebuild the torque scale around the drivers' own torque constants
+    /// (`kt_source = "auto"`, spec/CAN.md boot step 3): the fetched value
+    /// governs, config is the fallback for a driver that did not answer.
+    ///
+    /// Boot one-shot, by which tick the backend's boot replies have been
+    /// published through `drain_rx`. It runs while the core is still
+    /// BOOTING — enable is refused there — so no torque command can have
+    /// gone out on the config factor. `nodes[i].kt_nm_a` rides the
+    /// snapshot, so `Some` vs `None` is the per-joint provenance.
+    ///
+    /// A non-positive or non-finite reply is REJECTED, not adopted: the
+    /// factor divides by kt, so garbage here scales every commanded
+    /// torque, every gravity feedforward and every reported `tau`.
+    fn adopt_driver_kt(&mut self) {
+        for i in 0..MAX_JOINTS {
+            let cal = self.torque_cal[i];
+            let kt = self.bus_state.nodes[usize::from(self.node_of[i])]
+                .kt_nm_a
+                .map(f64::from)
+                .filter(|kt| kt.is_finite() && *kt > 0.0);
+            match kt {
+                Some(kt) => {
+                    self.torque_ma_factor[i] = cal.factor(kt);
+                    log::info!("J{i}: kt {kt} Nm/A (driver)");
+                }
+                None => log::warn!(
+                    "J{i}: kt {} Nm/A (config; no usable driver reply)",
+                    cal.kt_nm_a
+                ),
             }
         }
     }
@@ -730,14 +872,23 @@ impl<B: DriverBus> RtCore<B> {
             node.error_flags = None;
         }
         self.not_homed_refused = false;
+        // Subsystem flags that `check_errors` re-asserts every tick have
+        // to go with the latch, or the clear is undone before the settle
+        // countdown even finishes.
+        self.homing.clear_faults();
         self.errors.begin_clear();
     }
 
     // ------------------------------------------------------------ state
 
     fn drain_and_derive(&mut self) {
-        if let Err(e) = self.bus.drain_rx(&mut self.bus_state) {
-            log::warn!("bus RX drain failed: {e}");
+        match self.bus.drain_rx(&mut self.bus_state) {
+            Ok(_) => self.bus_faults.rx.healthy(),
+            Err(e) => {
+                if let Some(n) = self.bus_faults.rx.admit(self.tick) {
+                    log::warn!("bus RX drain failed: {e} (+{n} suppressed)");
+                }
+            }
         }
         for i in 0..MAX_JOINTS {
             let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
@@ -947,18 +1098,14 @@ impl<B: DriverBus> RtCore<B> {
             // joints) and the gripper slot.
             let status = self.homing.tick(
                 &mut self.bus,
-                &self.bus_state,
+                &mut self.bus_state,
                 &mut self.conv,
                 &mut self.cmds,
                 &mut self.homing_gcmd,
             );
             self.mirror = CommandMirror::default();
-            if let Err(e) = self.bus.send_joint_commands(&self.cmds) {
-                log::warn!("joint TX failed: {e}");
-            }
-            if let Err(e) = self.bus.send_gripper(&self.homing_gcmd) {
-                log::warn!("gripper TX failed: {e}");
-            }
+            self.send_joints();
+            self.send_gripper(self.homing_gcmd);
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Complete => {
@@ -1060,18 +1207,39 @@ impl<B: DriverBus> RtCore<B> {
             &mut self.cmds,
             &mut self.mirror,
         );
-        if let Err(e) = self.bus.send_joint_commands(&self.cmds) {
-            log::warn!("joint TX failed: {e}");
-        }
-        if let Err(e) = self.bus.send_gripper(&self.gripper_cmd) {
-            log::warn!("gripper TX failed: {e}");
-        }
+        self.send_joints();
+        self.send_gripper(self.gripper_cmd);
         if self.gripper_cmd == GripperCommand::Calibrate {
             // cmd 62 goes out once; the empty poll then carries the
             // sweep (a repeated cmd 62 would restart it every tick).
             self.gripper_cmd = GripperCommand::FirmwarePoll;
         }
         let _ = self.bus.poll_step();
+    }
+
+    /// The tick's single per-joint send, with its failure log throttled
+    /// (see [`FaultLog`]).
+    fn send_joints(&mut self) {
+        match self.bus.send_joint_commands(&self.cmds) {
+            Ok(()) => self.bus_faults.joint_tx.healthy(),
+            Err(e) => {
+                if let Some(n) = self.bus_faults.joint_tx.admit(self.tick) {
+                    log::warn!("joint TX failed: {e} (+{n} suppressed)");
+                }
+            }
+        }
+    }
+
+    /// The tick's gripper-slot send, with its failure log throttled.
+    fn send_gripper(&mut self, cmd: GripperCommand) {
+        match self.bus.send_gripper(&cmd) {
+            Ok(()) => self.bus_faults.gripper_tx.healthy(),
+            Err(e) => {
+                if let Some(n) = self.bus_faults.gripper_tx.admit(self.tick) {
+                    log::warn!("gripper TX failed: {e} (+{n} suppressed)");
+                }
+            }
+        }
     }
 
     fn stream_window(&mut self, applied: bool) {

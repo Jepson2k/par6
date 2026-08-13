@@ -513,6 +513,12 @@ class Circle:
     center: NDArray[np.float64]
     radius: float
     normal: NDArray[np.float64]
+    full_circle: bool = False
+    """The end point came back to the start, so the client meant one whole
+    lap.  :func:`arc` takes the sweep from this rather than re-deriving it
+    from the endpoints: the two differ by the arm's settle error, which
+    subtends a fraction of a degree and would otherwise replace the commanded
+    circle with a nudge of that size."""
 
 
 def circle_through(
@@ -544,6 +550,7 @@ def circle_through(
             center=p1 + 0.5 * a,
             radius=a_len / 2.0,
             normal=n / float(np.linalg.norm(n)),
+            full_circle=True,
         )
     n = np.cross(a, b)
     n_len = float(np.linalg.norm(n))
@@ -568,6 +575,7 @@ def circle_through(
         center=center,
         radius=float(np.linalg.norm(center - p1)),
         normal=n / n_len,
+        full_circle=False,
     )
 
 
@@ -588,9 +596,10 @@ def arc(
     """Waypoints along the circular arc from *start* through *via* to *end*.
 
     The sweep direction is the one that passes through the via point: when
-    the short way round does not contain it, the complement is taken.
-    Orientation slerps from the start pose to the end pose across the whole
-    sweep.
+    the short way round does not contain it, the complement is taken.  A
+    :attr:`Circle.full_circle` sweeps the lap the client asked for instead,
+    whatever the endpoints subtend.  Orientation slerps from the start pose
+    to the end pose across the whole sweep.
     """
     p_start, p_via, p_end = start[:3, 3], via[:3, 3], end[:3, 3]
     circle = circle_through(p_start, p_via, p_end)
@@ -601,8 +610,7 @@ def arc(
         raise PlanningError("the arc has no radius")
     u1, u2 = r1 / n1, r2 / n2
     sweep = math.acos(float(np.clip(u1 @ u2, -1.0, 1.0)))
-    if sweep < 1e-6 and float(np.linalg.norm(r1 - r2)) < _FULL_CIRCLE_M:
-        # Start and end coincide: the whole circle, not a zero-length arc.
+    if circle.full_circle:
         sweep = 2.0 * math.pi
     elif float(np.cross(u1, u2) @ circle.normal) < 0.0:
         sweep = 2.0 * math.pi - sweep
@@ -876,7 +884,15 @@ def blended_polyline_joint(
         if b > a + 1e-12:
             counts.append(interval((b - a) * span(waypoints[i], waypoints[i + 1])))
             pieces.append(("line", i, a, b))
-        if i + 1 < n - 1 and exit_frac[i] > 0.0:
+        # Either trim on its own leaves a gap the corner has to fill: the
+        # caller sizes the two from independent TCP distances, so a corner
+        # whose incoming (or outgoing) segment does not move the TCP — a
+        # wrist roll, a repeated target — arrives with one of them zeroed.
+        # The Bézier degenerates to the corner itself on the zeroed end,
+        # which is exactly the piece the trim removed.  parol6 guards on
+        # both the same way (``motion/geometry.py``,
+        # ``build_composite_joint_path``).
+        if i + 1 < n - 1 and (exit_frac[i] > 0.0 or entry_frac[i + 1] > 0.0):
             e = waypoints[i] + (1.0 - exit_frac[i]) * (waypoints[i + 1] - waypoints[i])
             x = waypoints[i + 1] + entry_frac[i + 1] * (
                 waypoints[i + 2] - waypoints[i + 1]

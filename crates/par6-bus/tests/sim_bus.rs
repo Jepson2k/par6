@@ -742,6 +742,11 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
     rig.step(&cmds, &GripperCommand::NoGripper);
 
     // kt fetch (kt_source = auto) answered at boot; scan saw all joints.
+    // This proves the cmd-33 round trip reaches `BusState`, nothing more:
+    // `VirtualDriver` is seeded from the same config kt, so the value is
+    // equal by construction. Whether the RT ADOPTS a driver kt that
+    // differs from config is `core_modes.rs`'s job — the sim cannot pose
+    // that question.
     assert_eq!(rig.bus.connected_nodes(), 0b0011_1111);
     for (i, joint) in robot.joints.iter().enumerate() {
         let n = usize::from(joint.node_id);

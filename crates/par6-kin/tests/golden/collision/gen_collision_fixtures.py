@@ -54,7 +54,15 @@ KIND_PARAMS = {
 
 
 def rpy_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
-    """R = Rx(rx) @ Ry(ry) @ Rz(rz) — waldoctl's pose convention."""
+    """R = Rz(rz) @ Ry(ry) @ Rx(rx) — waldoctl's ``Shape.pose`` convention.
+
+    Extrinsic XYZ: every angle turns about a fixed world axis, x first.
+    Deliberately NOT pinokin's ``se3_from_rpy`` (Rx·Ry·Rz), which is the
+    convention for a TCP pose, not for a shape placement — the other two
+    implementations of this contract (parol6's ``_pose_to_matrix`` and the
+    frontend's renderer) both place shapes the extrinsic way, and a
+    multi-axis tilt is where the two orders part company.
+    """
 
     def rot(axis: int, a: float) -> np.ndarray:
         c, s = math.cos(a), math.sin(a)
@@ -66,7 +74,7 @@ def rpy_matrix(rx: float, ry: float, rz: float) -> np.ndarray:
         m[j, i] = s
         return m
 
-    return rot(0, rx) @ rot(1, ry) @ rot(2, rz)
+    return rot(2, rz) @ rot(1, ry) @ rot(0, rx)
 
 
 def pose_matrix(pose: list[float]) -> np.ndarray:
@@ -204,8 +212,10 @@ def build(variant: str, relpath: str, ee_frame: str) -> dict:
             "configs": ["reach_out"],
         },
         {
-            # A rotated capsule proves the RPY convention travels: laid on
-            # its side across the reach_out TCP by Ry(pi/2).
+            # A rotated capsule proves a rotation travels at all: laid on
+            # its side across the reach_out TCP by Ry(pi/2).  One axis, so
+            # both RPY orders agree on it — which is what the tilted bar
+            # below is for.
             "name": "rotated_capsule",
             "installation": [],
             "program": [
@@ -214,6 +224,24 @@ def build(variant: str, relpath: str, ee_frame: str) -> dict:
                     "capsule",
                     [0.03, 0.30],
                     [*tcp, 0.0, math.pi / 2, 0.0],
+                )
+            ],
+            "configs": ["home", "reach_out"],
+        },
+        {
+            # Two axes at once, which is the only way to tell the RPY
+            # orders apart: Rz(90)Rx(90) lays this bar along +X, across the
+            # upper arm, where the intrinsic order would lay it along -Y
+            # and clear of the whole robot.  The verdict below is therefore
+            # the convention itself, not a recording of one implementation.
+            "name": "tilted_bar",
+            "installation": [],
+            "program": [
+                shape(
+                    "bar",
+                    "box",
+                    [0.03, 0.03, 0.70],
+                    [0.35, 0.0, 0.15, math.pi / 2, 0.0, math.pi / 2],
                 )
             ],
             "configs": ["home", "reach_out"],

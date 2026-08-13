@@ -81,6 +81,9 @@ _FRAMES: dict[str, Frame] = {"WRF": Frame.WRF, "TRF": Frame.TRF}
 
 _COMPLETIONS_KEPT = 1024
 
+# How often one error code may be logged for a reply nobody awaits.
+_UNCLAIMED_ERROR_PERIOD_S = 1.0
+
 
 def _env_str(name: str, default: str) -> str:
     return os.environ.get(name, default)
@@ -123,20 +126,24 @@ def _blend(r: float | None) -> float | None:
 def _matrix_to_pose(m: Sequence[float]) -> list[float]:
     """Flattened row-major 4x4 (translation in mm) -> [x, y, z, rx, ry, rz] deg.
 
-    RPY convention: R = Rz(yaw) @ Ry(pitch) @ Rx(roll) (URDF fixed-axis rpy).
+    RPY convention: R = Rx(rx) @ Ry(ry) @ Rz(rz) (intrinsic XYZ), the
+    decomposition ``pinokin.so3_rpy`` performs -- so a pose read here is the
+    pose :meth:`par6.robot.Robot.fk` reports, the pose :meth:`move_l` re-encodes
+    and the pose a frontend decoding the STATUS matrix itself sees
+    (``spec/PROTOCOL-V2.md``).
     """
     x, y, z = m[3], m[7], m[11]
-    r00, r10 = m[0], m[4]
-    r11, r12 = m[5], m[6]
-    r20, r21, r22 = m[8], m[9], m[10]
-    sy = math.hypot(r00, r10)
-    if sy > 1e-9:
-        roll = math.atan2(r21, r22)
-        yaw = math.atan2(r10, r00)
-    else:  # gimbal lock (pitch = +/-90 deg): fold everything into roll
-        roll = math.atan2(-r12, r11)
+    r00, r01, r02 = m[0], m[1], m[2]
+    r10, r11, r12 = m[4], m[5], m[6]
+    r22 = m[10]
+    cp = math.hypot(r12, r22)
+    if cp > 1e-9:
+        roll = math.atan2(-r12, r22)
+        yaw = math.atan2(-r01, r00)
+    else:  # gimbal lock (ry = +/-90 deg): only roll -/+ yaw is observable
+        roll = math.atan2(math.copysign(1.0, r02) * r10, r11)
         yaw = 0.0
-    pitch = math.atan2(-r20, sy)
+    pitch = math.atan2(r02, cp)
     return [x, y, z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
 
 
@@ -357,6 +364,8 @@ class AsyncRobotClient(_RobotClientABC):
 
         # req_id correlation: one future per in-flight request.
         self._pending: dict[int, asyncio.Future[tuple[MsgType, Any]]] = {}
+        # Last time each error code was logged for a reply nobody awaits.
+        self._unclaimed_errors: dict[int, float] = {}
         self._req_id = random.randrange(1, 1 << 32)
         self._transfer_id = random.randrange(0, 1 << 32)
 
@@ -540,8 +549,37 @@ class AsyncRobotClient(_RobotClientABC):
             self._record_complete(index, ok, detail)
             return
         fut = self._pending.get(req_id)
-        if fut is not None and not fut.done():
+        if fut is None:
+            if msg_type is MsgType.ERROR:
+                self._log_unclaimed_error(payload)
+            return
+        if not fut.done():
             fut.set_result((msg_type, payload))
+
+    def _log_unclaimed_error(self, payload: Sequence) -> None:
+        """An ERROR no caller is waiting on — a rejected fire-and-forget
+        command, whose SUCCESS is unacked but whose REJECTION is a real
+        ERROR (``spec/PROTOCOL-V2.md``), or a reply that arrived after
+        its request timed out.  Dropping these silently is how a gated
+        jog becomes a button that does nothing.
+
+        Throttled per error code, because a UI streaming jogs at 20-50 Hz
+        gets one refusal per datagram and the operator needs to read the
+        reason, not scroll past it.  Returning it to the caller is a
+        wider change than a log line: ``jog_j`` returns before the reply
+        could exist.
+        """
+        try:
+            err = RobotError.from_wire(payload)
+        except (TypeError, ValueError):
+            logger.debug("ignoring malformed unclaimed ERROR payload")
+            return
+        now = time.monotonic()
+        last = self._unclaimed_errors.get(err.code)
+        if last is not None and now - last < _UNCLAIMED_ERROR_PERIOD_S:
+            return
+        self._unclaimed_errors[err.code] = now
+        logger.warning("runtime reported an error nothing is waiting on: %s", err)
 
     def _record_complete(self, index: int, ok: bool, detail: tuple | None) -> None:
         self._completions[index] = (ok, detail)
@@ -1149,6 +1187,8 @@ class AsyncRobotClient(_RobotClientABC):
     ) -> int:
         """Joint velocity jog (fire-and-forget).  *duration* is the
         self-terminating watchdog — UIs stream fresh jogs at 20-50 Hz.
+        The runtime refuses a duration above 60 s: a watchdog that long is
+        not a watchdog.  Long traverses are :meth:`move_j`'s job.
 
         Single joint: ``jog_j(0, 0.5, 1.0)``
         Multi joint:  ``jog_j(joints=[0, 1], speeds=[0.5, -0.3], duration=1.0)``
@@ -1182,6 +1222,7 @@ class AsyncRobotClient(_RobotClientABC):
         accel: float = 1.0,
     ) -> int:
         """Cartesian velocity jog (fire-and-forget), duration-watchdogged.
+        Same 60 s ceiling on *duration* as :meth:`jog_j`.
 
         Single axis: ``jog_l("WRF", "X", 0.5, 1.0)``
         Multi axis:  ``jog_l("WRF", axes=["X", "Y"], speeds_list=[0.5, -0.3])``

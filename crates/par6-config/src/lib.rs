@@ -100,8 +100,8 @@ pub struct ConfigBundle {
 
 impl ConfigBundle {
     /// Load `robot_toml` plus every `grippers/*.toml` in the same
-    /// directory, then cross-validate (active gripper exists; gripper
-    /// homing steps in the sequence have a CAN gripper to run on).
+    /// directory, drop the sequence steps the active tool cannot run,
+    /// then cross-validate.
     pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
         let robot = RobotConfig::load(robot_toml)?;
         let dir = robot_toml
@@ -121,7 +121,8 @@ impl ConfigBundle {
             .iter()
             .map(|p| GripperConfig::load(p))
             .collect::<Result<Vec<_>, _>>()?;
-        let bundle = Self { robot, grippers };
+        let mut bundle = Self { robot, grippers };
+        bundle.drop_gripper_homing_without_a_gripper();
         bundle.validate()?;
         Ok(bundle)
     }
@@ -154,6 +155,60 @@ impl ConfigBundle {
         Some(jh.home_offset_rad)
     }
 
+    /// Strip the gripper work out of the homing sequence when the active
+    /// tool has no CAN driver to run it on.
+    ///
+    /// The sequence in `PAR6.toml` is written for the shipped gripper and
+    /// is shared by every tool, so selecting the bare flange (vendor
+    /// `Flange.xml`, `CAN_gripper = 0`) leaves steps addressing a node
+    /// that is not on the bus. Refusing the bundle instead would make the
+    /// safest possible first power-on — arm bare, nothing on the flange —
+    /// the one configuration that cannot boot, and would force the
+    /// operator to hand-edit the shared sequence this file exists to stop
+    /// them transcribing. The vendor resolves it the same way, skipping
+    /// both gripper homing modes with a warning
+    /// (`rcb-runtime/robotics/homing.py`).
+    ///
+    /// A home group left with no joints and no gripper is a no-op step
+    /// the FSM walks straight through, so the surrounding sequence and
+    /// its arm-joint references are untouched.
+    fn drop_gripper_homing_without_a_gripper(&mut self) {
+        if self.active_gripper().is_none_or(|g| g.driver.is_some()) {
+            return;
+        }
+        let tool = self.robot.robot.active_gripper.clone();
+        let strip = |where_: String, moves: &mut Vec<PreMove>| {
+            let before = moves.len();
+            moves.retain(|m| !matches!(m, PreMove::GripperMove { .. }));
+            if moves.len() < before {
+                log::warn!(
+                    "{where_}: skipping {} gripper move(s) — tool `{tool}` has no CAN driver",
+                    before - moves.len()
+                );
+            }
+        };
+        for (i, step) in self.robot.homing.sequence.iter_mut().enumerate() {
+            if let Some(mode) = step.home.as_mut().and_then(|h| h.gripper.take()) {
+                log::warn!(
+                    "homing.sequence[{i}]: skipping {mode:?} gripper homing — \
+                     tool `{tool}` has no CAN driver"
+                );
+            }
+            strip(
+                format!("homing.sequence[{i}].pre_moves"),
+                &mut step.pre_moves,
+            );
+            strip(
+                format!("homing.sequence[{i}].post_moves"),
+                &mut step.post_moves,
+            );
+        }
+        strip(
+            "homing.post_moves".into(),
+            &mut self.robot.homing.post_moves,
+        );
+    }
+
     fn validate(&self) -> Result<(), ConfigError> {
         let Some(active) = self.active_gripper() else {
             return Err(invalid(
@@ -164,26 +219,21 @@ impl ConfigBundle {
                 ),
             ));
         };
-        let sequence_homes_gripper = self
-            .robot
-            .homing
-            .sequence
-            .iter()
-            .any(|s| s.home.as_ref().is_some_and(|h| h.gripper.is_some()));
-        if sequence_homes_gripper && active.driver.is_none() {
+        // Motor-mode gripper homing runs the joint FSM against the
+        // gripper's own `[homing]` parameters; without them the step
+        // would report Done on the tick it started and the jaws would
+        // never be referenced. A tool WITHOUT a driver never gets here —
+        // its gripper steps were dropped above.
+        let motor_homed = self.robot.homing.sequence.iter().any(|s| {
+            s.home
+                .as_ref()
+                .is_some_and(|h| h.gripper == Some(GripperHomeMode::Motor))
+        });
+        if motor_homed && active.homing.is_none() {
             return Err(invalid(
                 "homing.sequence",
                 format!(
-                    "sequence homes the gripper but active gripper `{}` has no [driver] section",
-                    active.name
-                ),
-            ));
-        }
-        if sequence_homes_gripper && active.homing.is_none() {
-            return Err(invalid(
-                "homing.sequence",
-                format!(
-                    "sequence homes the gripper but active gripper `{}` has no [homing] section",
+                    "sequence homes the gripper motor but gripper `{}` has no [homing] section",
                     active.name
                 ),
             ));
@@ -199,6 +249,79 @@ mod tests {
 
     fn config_dir() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config")
+    }
+
+    /// A throwaway copy of `config/` a test may rewrite.
+    /// [`ConfigBundle::load`] reads `grippers/` relative to the robot
+    /// file, so selecting a different tool means moving the whole tree.
+    struct TempConfig(PathBuf);
+
+    impl TempConfig {
+        /// Copy the shipped tree, then apply `edit` to each file's text
+        /// (keyed by file name; `PAR6.toml` for the robot).
+        fn new(edit: impl Fn(&str, &str) -> String) -> Self {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static N: AtomicU32 = AtomicU32::new(0);
+            let root = std::env::temp_dir().join(format!(
+                "par6-config-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Ordering::Relaxed)
+            ));
+            let grippers = root.join("grippers");
+            std::fs::create_dir_all(&grippers).expect("temp config dir");
+            let src = config_dir();
+            let mut files = vec![src.join("PAR6.toml")];
+            files.extend(
+                std::fs::read_dir(src.join("grippers"))
+                    .expect("grippers dir")
+                    .map(|e| e.expect("dir entry").path()),
+            );
+            for path in files {
+                let name = path.file_name().unwrap().to_str().unwrap().to_owned();
+                let text = edit(&name, &std::fs::read_to_string(&path).expect("read config"));
+                let dest = if name == "PAR6.toml" {
+                    root.join(&name)
+                } else {
+                    grippers.join(&name)
+                };
+                std::fs::write(dest, text).expect("write config");
+            }
+            Self(root)
+        }
+
+        fn robot(&self) -> PathBuf {
+            self.0.join("PAR6.toml")
+        }
+    }
+
+    impl Drop for TempConfig {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn select_tool(name: &str) -> impl Fn(&str, &str) -> String + '_ {
+        move |file, text| {
+            if file == "PAR6.toml" {
+                text.replace(
+                    "active_gripper = \"MSG_small_motor_150mm_rail\"",
+                    &format!("active_gripper = \"{name}\""),
+                )
+            } else {
+                text.to_owned()
+            }
+        }
+    }
+
+    /// Drop one `[section]` and everything up to the next table header.
+    fn without_section(text: &str, section: &str) -> String {
+        let start = text.find(section).expect("section present");
+        let tail = &text[start + section.len()..];
+        let end = tail
+            .find("\n[")
+            .map(|i| start + section.len() + i + 1)
+            .unwrap_or(text.len());
+        format!("{}{}", &text[..start], &text[end..])
     }
 
     #[test]
@@ -269,6 +392,99 @@ mod tests {
         let text = toml::to_string(active).expect("serialize gripper");
         let back = GripperConfig::from_toml_str(&text).expect("reparse gripper");
         assert_eq!(*active, back);
+    }
+
+    /// The bare flange is a supported tool, and the shared sequence is
+    /// what adapts to it: selecting `Flange` (no `[driver]`, vendor
+    /// `CAN_gripper = 0`) must load, and must leave the runtime a
+    /// sequence with nothing addressed to a gripper node that is not on
+    /// the bus — otherwise the firmware-calibrate step runs into its
+    /// 10 s timeout and fails the whole homing run.
+    #[test]
+    fn the_bare_flange_loads_and_takes_the_gripper_out_of_the_sequence() {
+        let flanged = TempConfig::new(select_tool("Flange"));
+
+        // The premise: the shipped sequence does home the gripper.
+        let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
+        let stock_modes: Vec<_> = stock
+            .robot
+            .homing
+            .sequence
+            .iter()
+            .filter_map(|s| s.home.as_ref().and_then(|h| h.gripper))
+            .collect();
+        assert_eq!(
+            stock_modes,
+            vec![GripperHomeMode::Firmware, GripperHomeMode::Motor],
+            "the shipped sequence must still exercise both gripper modes"
+        );
+
+        let bundle = ConfigBundle::load(&flanged.robot()).expect("the bare flange must load");
+        assert_eq!(
+            bundle.active_gripper().map(|g| g.name.as_str()),
+            Some("Flange")
+        );
+        assert!(
+            bundle
+                .robot
+                .homing
+                .sequence
+                .iter()
+                .all(|s| s.home.as_ref().is_none_or(|h| h.gripper.is_none())),
+            "no step may home a gripper that has no driver"
+        );
+        assert!(
+            bundle
+                .robot
+                .homing
+                .sequence
+                .iter()
+                .flat_map(|s| s.pre_moves.iter().chain(s.post_moves.iter()))
+                .chain(bundle.robot.homing.post_moves.iter())
+                .all(|m| !matches!(m, PreMove::GripperMove { .. })),
+            "no move may command a gripper that has no driver"
+        );
+
+        // The arm's own homing work survives intact — this drops the
+        // gripper, not the sequence.
+        let arm_steps: Vec<Vec<u8>> = bundle
+            .robot
+            .homing
+            .sequence
+            .iter()
+            .filter_map(|s| s.home.as_ref())
+            .map(|h| h.joints.clone())
+            .filter(|j| !j.is_empty())
+            .collect();
+        assert_eq!(arm_steps, vec![vec![0], vec![1, 2], vec![3, 5], vec![4]]);
+        // ...and the flange's own J4 offset is what the runtime homes to.
+        assert_eq!(bundle.effective_home_offset(4), Some(-2.258));
+    }
+
+    /// A gripper that IS on the bus but has no `[homing]` parameters
+    /// cannot be motor-homed: the FSM would report Done on the tick it
+    /// started and the jaws would never touch their endstop.
+    #[test]
+    fn a_can_gripper_without_homing_params_is_still_refused() {
+        let select = select_tool("SSG48");
+        let broken = TempConfig::new(|file, text| {
+            let text = select(file, text);
+            if file == "SSG48.toml" {
+                without_section(&text, "[homing]")
+            } else {
+                text
+            }
+        });
+        let err = ConfigBundle::load(&broken.robot())
+            .expect_err("motor homing without [homing] must be refused")
+            .to_string();
+        assert!(err.contains("homing.sequence"), "{err}");
+        assert!(err.contains("SSG48"), "{err}");
+
+        // Intact, the same tool loads: it is the missing section that is
+        // refused, not the tool selection.
+        let ok = TempConfig::new(select_tool("SSG48"));
+        ConfigBundle::load(&ok.robot()).expect("SSG48 with its [homing] section must load");
     }
 
     #[test]

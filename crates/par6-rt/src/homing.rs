@@ -15,12 +15,14 @@
 //!   move_to timeouts warn and continue; home-phase failures FAIL the
 //!   sequence.
 //! - the per-joint FSM: approach (stall = windowed displacement plateau
-//!   AND current-ratio window, both required; hall = trigger/edge with the
-//!   pre-clear guard) → dwell → backoff → pause → second pass at the
-//!   rehome speed → optional release (current-only, latch at the sample
-//!   percentage) → settle (position-never-valid = FAILURE, two-pass
-//!   mismatch = FAILURE, then the home reference is applied and normal
-//!   limits restored) → optional post-move.
+//!   AND current-ratio window, both required; hall = trigger/edge with
+//!   the pre-clear guard, on cmd-32 bits dropped at every approach entry
+//!   so only a reply this approach asked for can be a hit) → dwell →
+//!   backoff → pause → second pass at the rehome speed → optional release
+//!   (current-only, latch at the sample percentage) → settle
+//!   (position-never-valid = FAILURE, two-pass mismatch = FAILURE, then
+//!   the home reference is applied and normal limits restored) →
+//!   optional post-move.
 //!
 //! Current limits: entry swaps every involved node to its homing current
 //! (Limits frames ×4 — the runtime keeps the full config reload for exit,
@@ -66,7 +68,10 @@ const REHOME_SPEED_FACTOR: f64 = 0.3;
 const CURRENT_RATIO: f64 = 0.70;
 /// Fraction of the detection window that must be above threshold.
 const CURRENT_WINDOW_FRACTION: f64 = 0.6;
-/// Stall displacement threshold: `max(10, |speed| · 0.08 · 0.25)` ticks.
+/// Stall displacement threshold: `max(10, |speed| · 0.08 · 0.25)` ticks,
+/// against the speed COMMANDED this tick (pass 2 runs at
+/// `REHOME_SPEED_FACTOR`, so a fixed pass-1 threshold would call a joint
+/// still travelling at 83 % of the commanded speed stalled).
 const STALL_DISP_FACTOR: f64 = 0.08 * 0.25;
 /// In-position tolerance for position moves \[ticks\].
 const POS_TOL_TICKS: i64 = 50;
@@ -113,7 +118,6 @@ struct HomerParams {
     max_diff_ticks: i64,
     release: Option<ReleasePlan>,
     post: Option<PostPlan>,
-    stall_disp_ticks: i64,
     stall_needed: u32,
     startup_guard: u32,
     cur_window: u32,
@@ -178,7 +182,6 @@ impl HomerParams {
                 position_rad: p.position_rad,
                 speed: p.speed_ticks_s,
             }),
-            stall_disp_ticks: (jh.speed_ticks_s.abs() * STALL_DISP_FACTOR).max(10.0) as i64,
             stall_needed: ticks(DETECT_WINDOW_S).max(5),
             startup_guard: ticks(STARTUP_GUARD_S),
             cur_window,
@@ -282,11 +285,14 @@ impl Homer {
         !matches!(self.phase, HPhase::Finished | HPhase::Failed)
     }
 
-    fn detect_stall(&mut self, p: &HomerParams, node: &NodeState) -> bool {
+    /// `speed` is the signed speed commanded THIS tick — the threshold
+    /// tracks it, so pass 2 is judged against pass-2 travel.
+    fn detect_stall(&mut self, p: &HomerParams, node: &NodeState, speed: f64) -> bool {
+        let disp_ticks = (speed.abs() * STALL_DISP_FACTOR).max(10.0) as i64;
         // Windowed displacement plateau; the window resets on movement.
         let stalled = if let Some(pos) = node.position_ticks {
             match self.ref_pos {
-                Some(r) if (i64::from(pos) - i64::from(r)).abs() < p.stall_disp_ticks => {
+                Some(r) if (i64::from(pos) - i64::from(r)).abs() < disp_ticks => {
                     self.still += 1;
                     self.still >= p.stall_needed
                 }
@@ -324,14 +330,29 @@ impl Homer {
     }
 
     /// One FSM tick. Returns the wire command for this joint and at most
-    /// one event.
-    fn tick(&mut self, p: &HomerParams, node: &NodeState) -> (JointCommand, Option<HomerEvent>) {
+    /// one event. Takes the node state mutably: entering an approach
+    /// drops the node's cached cmd-32 bits (see below).
+    fn tick(
+        &mut self,
+        p: &HomerParams,
+        node: &mut NodeState,
+    ) -> (JointCommand, Option<HomerEvent>) {
         match self.phase {
             HPhase::Approach => {
                 self.elapsed += 1;
                 if self.elapsed > p.timeout_ticks {
                     self.phase = HPhase::Failed;
                     return (JointCommand::idle(), Some(HomerEvent::Failed));
+                }
+                if self.elapsed == 1 {
+                    // `hall` is written only by a cmd-32 reply and nothing
+                    // else ever invalidates it, so a hit cached from an
+                    // earlier approach — the pre-clear trigger, or the
+                    // previous home() in this process — would read as a
+                    // hit on tick 1 and latch the reference wherever the
+                    // joint happens to be. Only a reply solicited by THIS
+                    // approach is evidence; `None` stays "no reply yet".
+                    node.hall = None;
                 }
                 let speed = if self.pass == 2 {
                     p.speed * REHOME_SPEED_FACTOR
@@ -341,7 +362,7 @@ impl Homer {
                 let (cmd, hit) = match p.strategy {
                     HomingStrategy::Stall => (
                         JointCommand::velocity(trunc_to_wire(speed), 0),
-                        self.detect_stall(p, node),
+                        self.detect_stall(p, node, speed),
                     ),
                     HomingStrategy::Hall => (
                         JointCommand::hall(trunc_to_wire(speed), HALL_TRIGGER_VALUE),
@@ -405,7 +426,10 @@ impl Homer {
                     if rehome_after {
                         self.phase = HPhase::Pause;
                     } else {
-                        // Pre-clear return path: restart pass 1.
+                        // Pre-clear return path: restart pass 1. The
+                        // trigger that sent us here is dropped by the
+                        // approach entry, not here — no cmd-32 reply can
+                        // arrive during a velocity backoff anyway.
                         self.phase = HPhase::Approach;
                         self.reset_detectors();
                     }
@@ -730,6 +754,15 @@ impl HomingSystem {
         self.cal_failed
     }
 
+    /// Drop the latched calibration failure (the user clear sequence).
+    /// Without this the flag outlives the clear, `check_errors` re-latches
+    /// `GRIPPER_CALIBRATION_FAILED` on the next tick, and the hard-error
+    /// gate refuses the HOMING entry that is the only other way to clear
+    /// it — a restart-only lockout on a transient.
+    pub fn clear_faults(&mut self) {
+        self.cal_failed = false;
+    }
+
     /// Gripper motor-homing results: `(endstop_ticks, ticks_per_meter)`.
     pub fn gripper_reference(&self) -> (Option<i32>, Option<f64>) {
         (self.endstop_ticks, self.ticks_per_meter)
@@ -949,12 +982,14 @@ impl HomingSystem {
 
     /// One HOMING tick: fill the full per-joint command array (idle
     /// frames on every non-active joint) and the gripper slot; drive the
-    /// sequence. Needs `&mut conv` to apply home references.
+    /// sequence. Needs `&mut conv` to apply home references, and `&mut
+    /// state` to invalidate cached endstop-detector replies (cmd 32) that
+    /// a new approach must not read as its own.
     #[allow(clippy::too_many_arguments)]
     pub fn tick<B: DriverBus>(
         &mut self,
         bus: &mut B,
-        state: &BusState,
+        state: &mut BusState,
         conv: &mut [JointConversion; MAX_JOINTS],
         cmds: &mut [JointCommand; MAX_JOINTS],
         gcmd: &mut GripperCommand,
@@ -1171,7 +1206,7 @@ impl HomingSystem {
     fn tick_home<B: DriverBus>(
         &mut self,
         bus: &mut B,
-        state: &BusState,
+        state: &mut BusState,
         conv: &mut [JointConversion; MAX_JOINTS],
         cmds: &mut [JointCommand; MAX_JOINTS],
         gcmd: &mut GripperCommand,
@@ -1183,7 +1218,7 @@ impl HomingSystem {
                 continue;
             }
             let p = &self.params[j];
-            let node = &state.nodes[usize::from(p.node)];
+            let node = &mut state.nodes[usize::from(p.node)];
             let (cmd, event) = self.homers[j].tick(p, node);
             cmds[j] = cmd;
             match event {
@@ -1208,7 +1243,7 @@ impl HomingSystem {
             Some(GripperHomeMode::Motor) => {
                 if self.homers[GRIPPER_SLOT].running() {
                     if let Some(gp) = &self.gripper_params {
-                        let node = &state.nodes[usize::from(gp.node)];
+                        let node = &mut state.nodes[usize::from(gp.node)];
                         let (cmd, event) = self.homers[GRIPPER_SLOT].tick(gp, node);
                         *gcmd = GripperCommand::Motor(cmd);
                         match event {

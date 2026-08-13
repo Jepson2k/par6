@@ -425,14 +425,20 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     std::thread::sleep(Duration::from_millis(2));
     bus.drain_rx(&mut state).expect("drain");
     assert_eq!(bus.freshness(motion_node), Freshness::Lost);
+    // The clear drops the latch and re-arms the clock at "seen now": a
+    // node that is still off the bus re-latches on its own rather than
+    // going permanently un-reportable.
     bus.clear_lost_latch(motion_node);
-    assert_eq!(bus.freshness(motion_node), Freshness::Unknown);
+    assert_eq!(bus.freshness(motion_node), Freshness::Fresh);
+    bus.begin_tick(2 + stale + 2 * lost);
+    assert_eq!(bus.freshness(motion_node), Freshness::Lost);
+    bus.clear_lost_latch(motion_node);
 
     // FLASHING: bus-silent. Nothing may be transmitted, and RX is drained
     // but never decoded (bootloader page frames alias application ids).
     let _ = wire.drain();
     bus.set_silent(true);
-    bus.begin_tick(3 + stale + lost);
+    bus.begin_tick(3 + stale + 2 * lost);
     assert!(bus.send_joint_commands(&joints).is_err());
     assert!(bus.send_gripper(&GripperCommand::FirmwarePoll).is_err());
     bus.poll_step().expect("polls are suppressed, not an error");
@@ -451,7 +457,13 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     bus.set_silent(false);
     bus.rebase_freshness();
     for j in &robot.joints {
-        assert_eq!(bus.freshness(j.node_id), Freshness::Unknown);
+        assert_eq!(bus.freshness(j.node_id), Freshness::Fresh);
+    }
+    // Re-base stamps "seen now", not "never seen", so a driver that did
+    // not come back from the flash still latches after the lost window.
+    bus.begin_tick(3 + stale + 3 * lost);
+    for j in &robot.joints {
+        assert_eq!(bus.freshness(j.node_id), Freshness::Lost);
     }
 }
 

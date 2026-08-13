@@ -262,6 +262,85 @@ fn freshness_stale_warns_lost_latches_and_invalidates_homing() {
     );
 }
 
+/// Clearing errors on a node that is STILL off the bus must not silence
+/// it: the joint has to re-latch on its own, and when the cable is
+/// re-seated the node must still get its stored config back.
+///
+/// The bus-side clear used to zero the observation clock rather than the
+/// latch. `None` is absorbing there — only an incoming frame leaves it —
+/// so pressing "clear errors" before fixing the cable made the joint
+/// permanently un-reportable: `error_active` false, empty error list,
+/// `Enable` granted and HOMING reachable with a joint off the bus, for
+/// the life of the process. The boot selfcheck that would have caught it
+/// is a one-shot at tick 8. The same erasure also cost the returning node
+/// its stale→fresh edge, so a driver that rebooted ran on firmware
+/// defaults — wrong Ilim, wrong gains — while the RT commanded it.
+#[test]
+fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
+    let mut rig = Rig::new();
+    rig.ready();
+    let lost_ticks = 50u32; // bus.lost_s = 0.2 s at 250 Hz (config)
+    let settle_ticks = 45u32; // > round(0.152 / 0.004) = 38
+
+    // J3's connector works loose: the node goes silent and latches.
+    rig.skip_nodes = 1 << 3;
+    rig.tick_n(lost_ticks + 2);
+    assert!(has_error(&mut rig, ErrorCode::CanLost, Some(3)));
+    assert!(!rig.snap().homed, "a disconnect while homed un-homes");
+
+    // The operator presses "clear errors" — the obvious response to a red
+    // banner — WITHOUT fixing the cable. The wipe lands...
+    rig.cmd(RtCommand::ClearErrors);
+    rig.tick_n(settle_ticks);
+    assert!(!rig.snap().error_active, "the clear wipes the latch");
+
+    // ...and then the still-silent joint must come back on its own within
+    // the lost window. The health surface may not go quiet on a joint
+    // that is off the bus.
+    rig.tick_n(lost_ticks);
+    let s = rig.snap();
+    assert!(
+        has_error(&mut rig, ErrorCode::CanLost, Some(3)),
+        "a node that is still silent must re-latch"
+    );
+    assert!(s.error_active);
+    assert_eq!(s.mode, Mode::ActiveError);
+
+    // Which is what keeps the arm off the wall: enable and HOMING stay
+    // refused while a joint is off the bus (HOMING is not behind the
+    // homed gate, so this latch is the only thing holding it).
+    rig.cmd(RtCommand::Enable);
+    rig.cmd(RtCommand::SetMode(Mode::Homing));
+    let s = rig.snap();
+    assert_eq!(s.state, ArmState::Disabled, "enable refused");
+    assert_ne!(s.mode, Mode::Homing, "homing refused");
+
+    // The operator clears again and re-seats the cable: the node's return
+    // is a stale→fresh edge, so its stored config goes back out before
+    // the RT commands it.
+    rig.cmd(RtCommand::ClearErrors);
+    rig.tick_n(settle_ticks);
+    rig.clear_tx();
+    rig.skip_nodes = 0;
+    rig.tick_n(3);
+    let passes = rig
+        .core
+        .bus_mut()
+        .tx_log
+        .iter()
+        .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
+        .count();
+    assert!(
+        passes >= 1,
+        "a node returning after a clear must get its config resent"
+    );
+    rig.tick_n(lost_ticks + 2);
+    assert!(
+        !has_error(&mut rig, ErrorCode::CanLost, Some(3)),
+        "a node that is back does not re-latch"
+    );
+}
+
 #[test]
 fn degradation_bands_warn_then_hard_latch_from_injected_periods() {
     let dt = 0.004;

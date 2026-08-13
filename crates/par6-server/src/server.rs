@@ -62,6 +62,12 @@ const MAX_PARAMS_LEN: usize = 100;
 /// waiting for an answer, and the queue must stay bounded.
 const MAX_RESET_WAITERS: usize = 16;
 
+/// How many datagrams one stream preemption may lift off the socket.
+/// Two clients streaming at 50 Hz put a handful in the queue; the cap is
+/// what stops a flooding peer from keeping the server inside the drain
+/// instead of back in its event loop.
+const DRAIN_LIMIT: usize = 64;
+
 /// Handle to a running server. Dropping it aborts the task.
 pub struct ServerHandle {
     /// Bound command-socket address (useful with an ephemeral bind).
@@ -201,6 +207,12 @@ struct Core<P: Planner, R: RtCommands> {
     action_state: ActionState,
     estop_latched: bool,
     active_stream: Option<CmdType>,
+    /// Datagrams a preemption drain took off the socket without being
+    /// entitled to discard them; dispatched by the run loop, in order.
+    deferred: VecDeque<(Vec<u8>, SocketAddr)>,
+    /// Scratch buffer for that drain (full datagram size — a short one
+    /// would truncate whatever it rescued).
+    drainbuf: Vec<u8>,
     /// Clients whose `reset` is still waiting for the RT's answer.
     reset_waiters: Vec<(u32, SocketAddr)>,
     /// Whether the boot-time enable has been requested yet.
@@ -272,6 +284,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             action_state: ActionState::Idle,
             estop_latched: false,
             active_stream: None,
+            deferred: VecDeque::new(),
+            drainbuf: vec![0u8; 65535],
             reset_waiters: Vec::new(),
             booted: false,
             tool_variant: None,
@@ -315,7 +329,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 _ = shutdown.notified() => Event::Shutdown,
             };
             match ev {
-                Event::Datagram(n, addr) => self.on_datagram(&rxbuf[..n], addr).await,
+                Event::Datagram(n, addr) => {
+                    self.on_datagram(&rxbuf[..n], addr).await;
+                    // A stream preemption may have lifted other clients'
+                    // traffic off the socket to get at the stale
+                    // setpoints behind it. Those datagrams are dispatched
+                    // here, in arrival order, before the next event.
+                    while let Some((data, from)) = self.deferred.pop_front() {
+                        self.on_datagram(&data, from).await;
+                    }
+                }
                 Event::Poll => self.on_poll().await,
                 Event::Status => self.on_status().await,
                 Event::Telemetry => self.on_telemetry().await,
@@ -662,9 +685,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if let Command::Teleport(p) = &cmd {
             // Streamable-class: preempts the active stream and planned
             // motion, but is not itself a continuing stream.
-            if self.active_stream.take().is_some() {
+            if let Some(superseded) = self.active_stream.take() {
                 self.runtime.rt.cancel_stream();
-                self.drain_backlog();
+                self.drain_stream_backlog(superseded);
             }
             self.cancel_planned();
             self.runtime
@@ -681,11 +704,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.stream(&cmd);
             }
             _ => {
-                if self.active_stream.take().is_some() {
+                if let Some(superseded) = self.active_stream.take() {
                     // Type change: cancel and flush the stale backlog of
                     // the previous stream before starting fresh.
                     self.runtime.rt.cancel_stream();
-                    self.drain_backlog();
+                    self.drain_stream_backlog(superseded);
                 }
                 self.cancel_planned();
                 self.active_stream = Some(tag);
@@ -1100,14 +1123,43 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.collision = CollisionState::default();
     }
 
-    fn drain_backlog(&self) {
-        let mut buf = [0u8; 2048];
-        let mut n = 0usize;
-        while self.socket.try_recv_from(&mut buf).is_ok() {
-            n += 1;
+    /// Preemption drain: pull the datagrams already queued behind the
+    /// streamable that just preempted `superseded`, and discard the ones
+    /// belonging to that stream — they are setpoints the client has
+    /// itself replaced, and replaying them would flip the active stream
+    /// type straight back.
+    ///
+    /// Everything else is put on [`Self::deferred`] and dispatched
+    /// normally. This socket is the ONE command socket: every client and
+    /// every command class arrives on it, so a blind drain also destroys
+    /// a buffered `estop` — with no reply, no effect, and a `_system`
+    /// send that does not retry. Preemption discards only what it is
+    /// entitled to discard (`spec/PROTOCOL-V2.md`: "cancels the active
+    /// streamable, drains the socket backlog" — the previous stream's
+    /// backlog).
+    ///
+    /// Bounded per call: what stays in the kernel queue is read by the
+    /// normal event loop on the next turn, so a peer that streams faster
+    /// than the server drains cannot hold it in here.
+    fn drain_stream_backlog(&mut self, superseded: CmdType) {
+        let (mut dropped, mut kept) = (0usize, 0usize);
+        for _ in 0..DRAIN_LIMIT {
+            let Ok((n, from)) = self.socket.try_recv_from(&mut self.drainbuf) else {
+                break;
+            };
+            let data = &self.drainbuf[..n];
+            if peek_tag(data).is_ok_and(|t| CmdType::from_wire(t) == Some(superseded)) {
+                dropped += 1;
+                continue;
+            }
+            self.deferred.push_back((data.to_vec(), from));
+            kept += 1;
         }
-        if n > 0 {
-            log::debug!("stream type change: drained {n} backlogged datagrams");
+        if dropped > 0 || kept > 0 {
+            log::debug!(
+                "stream preemption: dropped {dropped} stale {superseded:?}, \
+                 deferred {kept} other datagram(s)"
+            );
         }
     }
 
@@ -1545,24 +1597,26 @@ fn rate_period(hz: u32) -> std::time::Duration {
 }
 
 /// 4×4 row-major pose matrix (translation in mm) from the snapshot's
-/// `[x, y, z (m), roll, pitch, yaw (rad)]` TCP, with R = Rz·Ry·Rx.
+/// `[x, y, z (m), roll, pitch, yaw (rad)]` TCP, with `R = Rx·Ry·Rz` —
+/// the wire's intrinsic-XYZ rotation convention (`spec/PROTOCOL-V2.md`),
+/// the exact composition the runtime's rpy extraction inverts.
 fn pose_matrix_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     let (x, y, z) = (tcp[0] * 1000.0, tcp[1] * 1000.0, tcp[2] * 1000.0);
     let (sr, cr) = tcp[3].sin_cos();
     let (sp, cp) = tcp[4].sin_cos();
     let (sy, cy) = tcp[5].sin_cos();
     [
-        cy * cp,
-        cy * sp * sr - sy * cr,
-        cy * sp * cr + sy * sr,
+        cp * cy,
+        -cp * sy,
+        sp,
         x,
-        sy * cp,
-        sy * sp * sr + cy * cr,
-        sy * sp * cr - cy * sr,
+        sr * sp * cy + cr * sy,
+        cr * cy - sr * sp * sy,
+        -sr * cp,
         y,
-        -sp,
-        cp * sr,
-        cp * cr,
+        sr * sy - cr * sp * cy,
+        cr * sp * sy + sr * cy,
+        cr * cp,
         z,
         0.0,
         0.0,

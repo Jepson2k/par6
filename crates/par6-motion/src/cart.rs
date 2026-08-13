@@ -276,6 +276,12 @@ pub struct Circle {
     pub radius: f64,
     /// Unit normal of the plane the circle lies in.
     pub normal: [f64; 3],
+    /// The end point came back to the start, so the client meant one whole
+    /// lap. [`arc`] takes the sweep from this rather than re-deriving it
+    /// from the endpoints: the two differ by the arm's settle error, which
+    /// subtends a fraction of a degree and would otherwise replace the
+    /// commanded circle with a nudge of that size.
+    pub full_circle: bool,
 }
 
 /// The circle through three points, as `move_c` derives it from
@@ -313,6 +319,7 @@ pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle
             center: add(p1, scale(a, 0.5)),
             radius: a_len / 2.0,
             normal: scale(n, 1.0 / norm(n)),
+            full_circle: true,
         });
     }
     let n = cross(a, b);
@@ -344,6 +351,7 @@ pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle
         center,
         radius: norm(sub(center, p1)),
         normal: scale(n, 1.0 / n_len),
+        full_circle: false,
     })
 }
 
@@ -353,7 +361,8 @@ pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle
 /// plane normal is oriented by `(via-start) × (end-start)`, so the
 /// counter-clockwise sweep about it is the one containing the via — and
 /// when the short way round does NOT contain it, the complement
-/// (`2π - θ`) is taken instead.
+/// (`2π - θ`) is taken instead. A [`Circle::full_circle`] sweeps the lap
+/// the client asked for instead, whatever the endpoints subtend.
 ///
 /// Orientation slerps from the start pose to the end pose across the
 /// whole sweep; `end`'s own orientation is what the arm finishes in.
@@ -376,9 +385,7 @@ pub fn arc(
     }
     let (u1, u2) = (scale(r1, 1.0 / n1), scale(r2, 1.0 / n2));
     let mut sweep = dot(u1, u2).clamp(-1.0, 1.0).acos();
-    // Start and end coincide: the client asked for the whole circle, not
-    // for a zero-length arc.
-    if sweep < 1e-6 && norm(sub(r1, r2)) < FULL_CIRCLE_M {
+    if circle.full_circle {
         sweep = std::f64::consts::TAU;
     } else if dot(cross(u1, u2), circle.normal) < 0.0 {
         sweep = std::f64::consts::TAU - sweep;
@@ -769,7 +776,15 @@ pub fn blended_polyline_joint<const N: usize>(
             counts.push(interval((b - a) * span(&waypoints[i], &waypoints[i + 1])));
             pieces.push(Piece::Line { i, a, b });
         }
-        if i + 1 < n - 1 && exit[i] > 0.0 {
+        // Either trim on its own leaves a gap the corner has to fill: the
+        // caller sizes the two from independent TCP distances, so a corner
+        // whose incoming (or outgoing) segment does not move the TCP —
+        // a wrist roll, a repeated target — arrives with one of them
+        // zeroed. The Bézier degenerates to the corner itself on the
+        // zeroed end, which is exactly the piece the trim removed.
+        // parol6 guards on both the same way (`motion/geometry.py`,
+        // `build_composite_joint_path`).
+        if i + 1 < n - 1 && (exit[i] > 0.0 || entry[i + 1] > 0.0) {
             let e = lerp(&waypoints[i], &waypoints[i + 1], 1.0 - exit[i]);
             let x = lerp(&waypoints[i + 1], &waypoints[i + 2], entry[i + 1]);
             counts.push(interval(
@@ -946,6 +961,41 @@ mod tests {
     }
 
     #[test]
+    fn a_full_circle_survives_an_end_that_missed_the_start() {
+        // move_c's end pose comes from FK of the MEASURED joints, so it
+        // lands a settle error away from the start the client asked to
+        // come back to — either side of it. Both must still be one lap.
+        let r = 0.05;
+        let at = |deg: f64| {
+            let a: f64 = deg.to_radians();
+            pose(r * a.cos(), 0.4, 0.25 + r * a.sin(), 0.0, 0.0, 0.0)
+        };
+        let start = at(0.0);
+        let circumference = std::f64::consts::TAU * r;
+        for miss in [0.0, 3e-4, -3e-4] {
+            let mut end = start;
+            end[11] += miss;
+            let path = arc(&start, &at(180.0), &end, sampling()).expect("full circle");
+            let length: f64 = path
+                .windows(2)
+                .map(|w| norm(sub(translation(&w[1]), translation(&w[0]))))
+                .sum();
+            assert!(
+                (length - circumference).abs() < 0.01 * circumference,
+                "a {:.1} mm miss swept {length} m of a {circumference} m circle",
+                miss * 1000.0
+            );
+            for deg in [90.0, 180.0, 270.0] {
+                assert!(
+                    closest(&path, translation(&at(deg))) < 2e-3,
+                    "the circle missed {deg}° after a {:.1} mm miss",
+                    miss * 1000.0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn collinear_arc_points_are_refused() {
         let a = pose(0.1, 0.2, 0.3, 0.0, 0.0, 0.0);
         let b = pose(0.2, 0.2, 0.3, 0.0, 0.0, 0.0);
@@ -1099,6 +1149,45 @@ mod tests {
             path.iter()
                 .any(|q| q[0] > 0.75 && q[0] < 1.0 && q[1] > 1e-6),
             "the corner was traversed one joint at a time"
+        );
+    }
+
+    #[test]
+    fn a_corner_with_one_trim_zeroed_is_still_sampled() {
+        // The caller sizes the two trims from independent TCP distances, so
+        // a wrist-roll leg (the TCP sits on J6's axis and does not move)
+        // arrives with the incoming trim zeroed and the outgoing one live.
+        let step = 0.05;
+        let wps = [
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.0, 0.0, 0.8],
+            [0.524, 0.0, 0.0, 0.0, 0.0, 0.8],
+        ];
+        let path = blended_polyline_joint(&wps, &[(0.0, 0.5)], step, 4000).expect("path");
+        let biggest = path
+            .windows(2)
+            .map(|w| (0..6).fold(0.0f64, |m, j| m.max((w[1][j] - w[0][j]).abs())))
+            .fold(0.0f64, f64::max);
+        // The corner's Bézier parameter is not arc length, so its own
+        // samples are uneven — but never by the multiple a dropped corner
+        // costs, which hands TOPPRA one interval as long as the trim.
+        assert!(
+            biggest < 2.0 * step,
+            "the path steps {biggest} rad at a {step} rad pitch"
+        );
+        // The trim removed the head of the outgoing segment; something has
+        // to cover it, or the arm is told nothing between the corner and
+        // half way to the target.
+        let head = 0.5 * wps[2][0];
+        assert!(
+            path.iter().any(|q| q[0] > 1e-9 && q[0] < head - 1e-9),
+            "nothing was sampled inside the corner's outgoing zone"
+        );
+        let same = |q: &[f64; 6], w: &[f64; 6]| (0..6).all(|j| (q[j] - w[j]).abs() < 1e-12);
+        assert!(
+            same(path.first().expect("non-empty"), &wps[0])
+                && same(path.last().expect("non-empty"), &wps[2]),
+            "the chain must still start and finish on its own waypoints"
         );
     }
 

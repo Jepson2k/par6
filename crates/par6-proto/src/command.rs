@@ -11,6 +11,11 @@
 //! - Units at the wire are mm and degrees; `speed`/`accel` are fractions of
 //!   the configured maxima in `(0, 1]`; jog speeds are signed fractions in
 //!   `[-1, 1]`; durations are seconds.
+//! - A TCP pose `[x, y, z, rx, ry, rz]` rotates intrinsic XYZ,
+//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (`spec/PROTOCOL-V2.md`). A collision
+//!   [`Shape`]'s pose is the other way round — waldoctl's `Shape.pose`
+//!   contract is extrinsic XYZ, `R = Rz·Ry·Rx`, so that the shape the
+//!   frontend draws is the shape the checker enforces.
 //! - All floats must be finite; NaN/inf are rejected at decode.
 //! - The codec validates shape and ranges only. Joint limits, tool names and
 //!   recipe names are configuration, validated in the server layer (the codec
@@ -19,6 +24,45 @@
 use crate::enums::{CmdType, CompletionPolicy, Frame};
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, NUM_JOINTS};
+
+/// Longest duration any command may carry \[s\].
+///
+/// Every duration ends up in `Duration::from_secs_f64`, which PANICS above
+/// ~1.8e19 s, and in `Instant + Duration`, which panics above ~9.2e18 s —
+/// so an unbounded duration on the wire is a reachable abort of the whole
+/// runtime. An hour is past anything a queued dwell or a timed move needs
+/// and far below the arithmetic cliff.
+pub const MAX_DURATION_S: f64 = 3600.0;
+
+/// Longest duration a `jog_*` watchdog may be armed for \[s\].
+///
+/// The duration IS the watchdog: it is what stops the jog when the client
+/// streaming it goes away, and UIs refresh it at 20–50 Hz (par6's own
+/// client defaults to 0.1 s). A minute is two orders of magnitude above
+/// that and still short enough that one datagram cannot leave the arm
+/// jogging until it hits a soft limit — which is the whole reason jog
+/// carries a duration. Long traverses are `move_j`'s job.
+pub const MAX_JOG_DURATION_S: f64 = 60.0;
+
+/// Largest waypoint list a `move_s` / `move_p` may carry.
+///
+/// The reassembler admits [`crate::MAX_TRANSFER_BYTES`] (4 MiB), which is
+/// ~73 k float64 waypoints — minutes of planner work, and tens of MB of
+/// allocation, out of one transfer. 10 k waypoints is ~540 kB on the
+/// wire, well inside that budget and longer than any path a 250 Hz arm is
+/// asked to spline through.
+pub const MAX_WAYPOINTS: usize = 10_000;
+
+/// Largest collision-shape list a `set_shapes` may carry. The world these
+/// populate is installation keep-outs plus a program's own fixtures —
+/// tens, not thousands — and every one is checked against every link on
+/// every gate call.
+pub const MAX_SHAPES: usize = 256;
+
+/// Longest bare float vector any command may carry. The widest real user
+/// is a `plane` shape's four params; `teleport.tool_positions` and
+/// `tool_action.params` are capped at 16 by [`Command::validate`].
+const MAX_VEC_ELEMS: usize = 16;
 
 /// One workspace collision shape (mirrors waldoctl `Shape.to_wire()`).
 ///
@@ -535,6 +579,11 @@ impl Command {
                 finite("set_tcp_offset.z", p.z)
             }
             C::SetShapes(p) => {
+                check(
+                    p.shapes.len() <= MAX_SHAPES,
+                    "set_shapes.shapes",
+                    &format!("at most {MAX_SHAPES} shapes"),
+                )?;
                 for s in &p.shapes {
                     str_len("shape.kind", &s.kind, 1, 32)?;
                     str_len("shape.name", &s.name, 0, 128)?;
@@ -565,12 +614,12 @@ impl Command {
             }
             C::JogJ(p) => {
                 signed_fracs("jog_j.speeds", &p.speeds)?;
-                duration("jog_j.duration", p.duration)?;
+                bounded_duration("jog_j.duration", p.duration, MAX_JOG_DURATION_S)?;
                 opt_frac("jog_j.accel", p.accel)
             }
             C::JogL(p) => {
                 signed_fracs("jog_l.velocities", &p.velocities)?;
-                duration("jog_l.duration", p.duration)?;
+                bounded_duration("jog_l.duration", p.duration, MAX_JOG_DURATION_S)?;
                 opt_frac("jog_l.accel", p.accel)
             }
             C::Teleport(p) => {
@@ -690,8 +739,16 @@ fn signed_fracs(what: &'static str, vs: &[f64]) -> Result<(), DecodeError> {
 }
 
 fn duration(what: &'static str, v: f64) -> Result<(), DecodeError> {
+    bounded_duration(what, v, MAX_DURATION_S)
+}
+
+fn bounded_duration(what: &'static str, v: f64, max: f64) -> Result<(), DecodeError> {
     finite(what, v)?;
-    check(v > 0.0, what, "must be > 0")
+    check(
+        v > 0.0 && v <= max,
+        what,
+        &format!("must be in (0, {max}] seconds"),
+    )
 }
 
 fn blend(what: &'static str, v: Option<f64>) -> Result<(), DecodeError> {
@@ -739,6 +796,11 @@ fn str_len(what: &'static str, s: &str, min: usize, max: usize) -> Result<(), De
 
 fn waypoints(what: &'static str, wps: &[[f64; 6]]) -> Result<(), DecodeError> {
     check(wps.len() >= 2, what, "requires at least 2 waypoints")?;
+    check(
+        wps.len() <= MAX_WAYPOINTS,
+        what,
+        &format!("at most {MAX_WAYPOINTS} waypoints"),
+    )?;
     for wp in wps {
         finite_all(what, wp)?;
     }
@@ -1027,8 +1089,19 @@ fn r_fixed6(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 6], DecodeEr
     Ok(out)
 }
 
-fn r_vec_f64(r: &mut Reader<'_>) -> Result<Vec<f64>, DecodeError> {
+/// Read a length header and refuse it before anything is reserved on its
+/// word. `array_len` accepts msgpack's 0xDD form up to 4 294 967 295 with
+/// no cross-check against the bytes actually present, so a nine-byte
+/// datagram can otherwise ask the allocator for hundreds of gigabytes and
+/// abort the process on `handle_alloc_error`.
+fn r_len(r: &mut Reader<'_>, what: &'static str, max: usize) -> Result<usize, DecodeError> {
     let n = r.array_len()?;
+    check(n <= max, what, &format!("at most {max} elements"))?;
+    Ok(n)
+}
+
+fn r_vec_f64(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<f64>, DecodeError> {
+    let n = r_len(r, what, MAX_VEC_ELEMS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(r.f64()?);
@@ -1044,8 +1117,8 @@ fn r_frame(r: &mut Reader<'_>) -> Result<Frame, DecodeError> {
     })
 }
 
-fn r_waypoints(r: &mut Reader<'_>) -> Result<Vec<[f64; 6]>, DecodeError> {
-    let n = r.array_len()?;
+fn r_waypoints(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<[f64; 6]>, DecodeError> {
+    let n = r_len(r, what, MAX_WAYPOINTS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(r_fixed6(r, "waypoint")?);
@@ -1064,8 +1137,8 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     }
     Ok(Shape {
         kind: r.str()?.to_owned(),
-        params: r_vec_f64(r)?,
-        pose: r_vec_f64(r)?,
+        params: r_vec_f64(r, "shape.params")?,
+        pose: r_vec_f64(r, "shape.pose")?,
         collision: r.bool()?,
         margin: r.opt_f64()?,
         name: r.str()?.to_owned(),
@@ -1149,7 +1222,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             z: r.f64()?,
         }),
         T::SetShapes => {
-            let n = r.array_len()?;
+            let n = r_len(&mut r, "set_shapes.shapes", MAX_SHAPES)?;
             let mut shapes = Vec::with_capacity(n);
             for _ in 0..n {
                 shapes.push(r_shape(&mut r)?);
@@ -1225,7 +1298,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
                 r.nil()?;
                 None
             } else {
-                Some(r_vec_f64(&mut r)?)
+                Some(r_vec_f64(&mut r, "teleport.tool_positions")?)
             },
         }),
         T::ResetLoopStats => Command::ResetLoopStats,
@@ -1269,7 +1342,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         }),
         T::MoveS => Command::MoveS(MoveS {
             key: r.uint()?,
-            waypoints: r_waypoints(&mut r)?,
+            waypoints: r_waypoints(&mut r, "move_s.waypoints")?,
             frame: r_frame(&mut r)?,
             duration: r.opt_f64()?,
             speed: r.opt_f64()?,
@@ -1277,7 +1350,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         }),
         T::MoveP => Command::MoveP(MoveP {
             key: r.uint()?,
-            waypoints: r_waypoints(&mut r)?,
+            waypoints: r_waypoints(&mut r, "move_p.waypoints")?,
             frame: r_frame(&mut r)?,
             duration: r.opt_f64()?,
             speed: r.opt_f64()?,
@@ -1305,7 +1378,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             let key = r.uint()?;
             let tool_key = r.str()?.to_owned();
             let action = r.str()?.to_owned();
-            let n = r.array_len()?;
+            let n = r_len(&mut r, "tool_action.params", MAX_VEC_ELEMS)?;
             let mut params = Vec::with_capacity(n);
             for _ in 0..n {
                 params.push(r_tool_param(&mut r)?);

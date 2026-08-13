@@ -59,10 +59,33 @@ Fixes vs parol6: `reset_loop_stats` is fire-and-forget in BOTH the table and dis
   streaming; system commands always apply).
 - Units at the wire: mm and degrees (waldoctl convention); the runtime converts to SI
   internally. Cartesian frames: WRF | TRF.
+- **TCP pose rotation: intrinsic XYZ, `R = Rx(rx)·Ry(ry)·Rz(rz)`.** Binding wherever the
+  six numbers `[x, y, z, rx, ry, rz]` appear — move_l / move_j_pose / move_c / move_s /
+  move_p / servo_l / servo_j_pose targets, the POSE query, and any decomposition of the
+  STATUS pose matrix. Same convention as `pinokin.se3_from_rpy` / `so3_rpy` (scipy's
+  `Rotation.from_euler('XYZ')`), which is what waldoctl's `Robot.fk`/`ik` contract, parol6
+  and the frontend's readout all use. It is NOT the URDF `rpy` attribute's fixed-axis order
+  `Rz·Ry·Rx`: the two readings of the same three numbers agree only when at most one of
+  them is non-zero, and the everyday tool-down pose `[…, 180, 0, rz]` read the wrong way
+  round comes back with `rz` negated — a taught pose and its replay `2·rz` apart.
+  Collision geometry is the one exception: `set_shapes` poses carry waldoctl's
+  `Shape.pose` contract, which is extrinsic XYZ (`R = Rz·Ry·Rx`) so that what the frontend
+  draws is what the checker enforces. Two contracts, deliberately different; neither
+  convention travels into the other's messages.
 - Jog carries a DURATION (self-terminating watchdog); UIs stream fresh jogs at ~20–50 Hz.
+  It is bounded (60 s) — an unbounded duration is not a watchdog, and one datagram must
+  never be able to jog until a soft limit stops it. Every other duration is bounded too
+  (1 h): they all become `Duration`/`Instant` arithmetic, which panics near f64's range.
 - Streaming preemption: an incoming streamable of the SAME type updates the active
-  command in place (no new index); a DIFFERENT type cancels the active streamable,
-  drains the socket backlog, and starts fresh; a planned move cancels any streamable.
+  command in place (no new index); a DIFFERENT type cancels the active streamable and
+  starts fresh; a planned move cancels any streamable.
+- Preemption drains **only the preempted stream's own backlog**. Its setpoints are stale
+  by construction — the client has replaced them — but the command socket is shared by
+  every client and every command class, so anything else already queued behind them
+  (SYSTEM `estop`/`stop`/`reset_state`, queries, queued moves, chunks, another client's
+  stream) is dispatched normally, in arrival order. A blind drain of the socket is a
+  silent `estop` loss: it gets no reply, has no effect, and the client's SYSTEM send does
+  not retry.
 - Queued commands carry an **idempotency key** (client uuid64). The runtime keeps a
   dedup window (last N keys → index); a retried enqueue re-acks the ORIGINAL index
   instead of double-queueing. This makes at-most-once → effectively-once under retry.
@@ -93,7 +116,8 @@ Header (new in v2): `[STATUS_tag, proto_version u8, controller_id u32, seq u64,
 mono_time_ns u64, link_ok u8, data_age_ms u16]` — always broadcast, even when the bus
 link is down (parol6 went silent when stale; clients couldn't tell dead from quiet).
 
-Body (parol6 field set, kept): pose (f64[16] row-major 4×4, mm), angles f64[N] deg,
+Body (parol6 field set, kept): pose (f64[16] row-major 4×4, mm — decompose to rpy with
+the intrinsic-XYZ convention above), angles f64[N] deg,
 speeds f64[N] rad/s, io u8[5] [in1,in2,out1,out2,estop], action_current str,
 action_state u8 {IDLE,EXECUTING,ERROR}, joint_en u8[12], cart_en_wrf u8[12],
 cart_en_trf u8[12], executing_index i64, completed_index i64, last_checkpoint str,

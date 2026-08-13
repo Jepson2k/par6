@@ -231,8 +231,9 @@ typedef struct par6_shape {
     /* Kind-specific coal constructor params, see par6_shape_kind. */
     double params[PAR6_SHAPE_MAX_PARAMS];
     /* World placement [x, y, z, rx, ry, rz], metres and radians. Rotation is
-     * R = Rx(rx) * Ry(ry) * Rz(rz) — the intrinsic-XYZ convention the
-     * tcp/pose readback uses. */
+     * R = Rz(rz) * Ry(ry) * Rx(rx) — waldoctl's Shape.pose is extrinsic-XYZ
+     * (each angle about a fixed world axis, x first), which is NOT the
+     * convention the tcp/pose readback uses. */
     double pose[6];
     /* Standoff distance [m] at which pairs against this shape report a
      * collision; negative selects the handle's default clearance. */
@@ -301,9 +302,13 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
  * v2: par6_traj_* implemented over toppra-cpp — create takes n_gridpoints
  *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added.
  * v3: par6_col_* added — coal/hpp-fcl collision over the same URDF, with
- *     the installation/program world layers waldoctl defines. */
+ *     the installation/program world layers waldoctl defines.
+ * v4: par6_shape::pose reads as extrinsic-XYZ (R = Rz*Ry*Rx), the
+ *     waldoctl Shape.pose contract. Layout is unchanged, so a stale v3
+ *     library links and silently places multi-axis-tilted keep-outs in a
+ *     different orientation — which is what the version is here to catch. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 3
+#define PAR6_SHIM_ABI_VERSION 4
 
 #ifdef __cplusplus
 } /* extern "C" */

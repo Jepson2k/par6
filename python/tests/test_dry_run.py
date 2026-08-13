@@ -316,6 +316,42 @@ class TestCartesianMotion:
             f"the chain came within {interior.min():.3f} deg of the interior target"
         )
 
+    def test_a_wrist_roll_corner_stays_inside_the_commanded_envelope(
+        self, dry_run
+    ) -> None:
+        """A blended chain must never drive a joint past the waypoints it was
+        given.  The corner zone is sized from two independent TCP distances
+        and a wrist roll moves no TCP at all — the TCP sits on J6's axis — so
+        this chain's incoming fraction comes out zero while its outgoing one
+        trims half the segment.  Anything that leaves that trimmed head
+        unsampled hands TOPPRA a single interval as long as the trim, and its
+        spline swings outside the envelope.  The runtime's own geometry
+        carries the same guard (``crates/par6-motion/src/cart.rs``,
+        ``blended_polyline_joint``)."""
+        dry_run.teleport(park_deg())
+        start = list(dry_run.angles())
+        roll = list(start)
+        roll[5] += 35.0
+        swing = list(roll)
+        swing[0] += 30.0
+
+        assert dry_run.move_j(roll, speed=0.5, r=25.0) is None
+        chain = dry_run.move_j(swing, speed=0.5)
+        assert chain is not None and chain.error is None
+
+        corners = np.radians(np.stack([start, roll, swing]))
+        low, high = corners.min(axis=0), corners.max(axis=0)
+        traj = chain.joint_trajectory_rad
+        excursion = max(
+            float((low - traj.min(axis=0)).max()),
+            float((traj.max(axis=0) - high).max()),
+        )
+        # Rounding a corner cuts inside the waypoints, never outside them;
+        # what is left is the timing spline's own bow through them.
+        assert excursion < 0.01, (
+            f"the chain left the commanded envelope by {np.degrees(excursion):.2f} deg"
+        )
+
     def test_refuses_what_the_runtime_refuses(self, dry_run) -> None:
         """Parameters and commands ``par6d`` rejects must be rejected here with
         the same code, so a preview never promises motion the arm will refuse."""
@@ -485,6 +521,11 @@ _OPEN_POSE_DEG = [90.0, -30.0, 240.0, 0.0, -50.0, 180.0]
 #: The shapes the comparison traces, as millimetre offsets from wherever the
 #: arm is standing.
 _ARC = ((25.0, 0.0, 20.0), (50.0, 0.0, 0.0))
+#: A full circle: the via is diametrically opposite and the end comes back to
+#: the start — a fraction of a millimetre off it, which is what a client that
+#: hands its own measured pose back as the end actually sends.  Both sides
+#: must read that as one lap and not as the nudge between the two points.
+_CIRCLE = ((50.0, 0.0, 0.0), (0.0, 0.3, 0.0))
 _CURVE = ((20.0, 0.0, 20.0), (40.0, 0.0, -15.0), (60.0, 0.0, 20.0))
 _CHAIN = ((35.0, 0.0, 0.0), (35.0, 0.0, 30.0))
 _CHAIN_R_MM = 15.0
@@ -569,8 +610,8 @@ def _shape_from(pose: list[float], deltas) -> list[list[float]]:
 
 def _preview_case(preview, case: str) -> list:
     """Plan one case offline; returns every result the preview produced."""
-    if case == "arc":
-        via, end = _shape_from(preview.pose(), _ARC)
+    if case in ("arc", "circle"):
+        via, end = _shape_from(preview.pose(), _ARC if case == "arc" else _CIRCLE)
         return [preview.move_c(via, end, speed=_CASE_SPEED)]
     if case == "spline":
         return [preview.move_s(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)]
@@ -586,8 +627,8 @@ async def _queue_case(client, case: str) -> list[int]:
     """Queue one case on the runtime; returns the command indexes."""
     pose = await client.pose()
     assert pose is not None
-    if case == "arc":
-        via, end = _shape_from(pose, _ARC)
+    if case in ("arc", "circle"):
+        via, end = _shape_from(pose, _ARC if case == "arc" else _CIRCLE)
         return [await client.move_c(via, end, speed=_CASE_SPEED)]
     if case == "spline":
         return [await client.move_s(_shape_from(pose, _CURVE), speed=_CASE_SPEED)]
@@ -627,12 +668,12 @@ async def _run_case(client, case: str) -> tuple[list[int], list[float]]:
 async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
     """Every curved and blended move must preview the motion par6d runs.
 
-    An arc, a spline, a process move and a blended pair of straight moves are
-    each planned offline and queued on a live ``par6d --sim``, and the
-    runtime's OWN commanded joint stream is read back off its telemetry port.
-    A preview whose geometry, sampling, corner rounding or timing differed
-    from the runtime's would trace a different path or fill a different number
-    of ticks with it.
+    An arc, a full circle, a spline, a process move and a blended pair of
+    straight moves are each planned offline and queued on a live
+    ``par6d --sim``, and the runtime's OWN commanded joint stream is read back
+    off its telemetry port.  A preview whose geometry, sampling, corner
+    rounding or timing differed from the runtime's would trace a different
+    path or fill a different number of ticks with it.
 
     Both sides anchor their shape on the pose they themselves report and hold
     that orientation, so the two describe the same rigid motion whatever point
@@ -653,7 +694,7 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
             assert await client.set_completion_policy(CompletionPolicy.COMMANDED) == 1
             assert await client.set_recipe("commanded") == 1
 
-            for case in ("arc", "spline", "process", "chain"):
+            for case in ("arc", "circle", "spline", "process", "chain"):
                 # Both sides plan from the configuration the arm is measured
                 # in, so the shapes are anchored on the same place.
                 await _teleport_to(client, _OPEN_POSE_DEG)

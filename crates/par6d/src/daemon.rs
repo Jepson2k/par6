@@ -30,9 +30,9 @@ use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
 #[cfg(not(feature = "ffi"))]
 use par6_rt::NoFk;
 use par6_rt::{
-    sample_ring, snapshot_channel, CompletionPolicy, ForwardKin, GravityModel, RtCore, RtHooks,
-    RunOptions, SharedFlashMarker, SharedLineGpio, SnapshotReader, SnapshotWriter, SpecSettle,
-    StateSnapshot, ZeroGravity,
+    sample_ring, snapshot_channel, CompletionPolicy, EstopGpio, FlashMarker, ForwardKin,
+    GravityModel, RtCore, RtHooks, RunOptions, SharedLineGpio, SnapshotReader, SnapshotWriter,
+    SpecSettle, StateSnapshot, ZeroGravity,
 };
 use par6_server::{ServerConfig, ServerHandle};
 
@@ -206,8 +206,36 @@ impl Daemon {
         let (producer, consumer) = sample_ring(RING_CAPACITY);
         // The bridge's `halt` flushes the same ring the planner fills.
         let flush_marker = producer.flush_marker();
-        let (gpio, _estop_line) = SharedLineGpio::new(true);
-        let (flash, _flash_flag) = SharedFlashMarker::new();
+
+        // Hardware prerequisites, in the order an operator fixes them:
+        // the CAN interface, then the e-stop line. Both are startup
+        // refusals — nothing has been spawned yet.
+        #[cfg(feature = "ffi")]
+        let sim_bus = if opts.sim_dynamics {
+            // The torque-level plant models the ARM (its URDF must carry
+            // exactly the configured joint count, so the bare-flange
+            // model is the only fit); the active tool's mass rides the
+            // gravity model, not the plant.
+            let urdf = assets_dir.join(par6_kin::GripperVariant::Flange.urdf_relpath());
+            if !urdf.is_file() {
+                return Err(DaemonError::Kinematics(format!(
+                    "sim-dynamics URDF missing: {}",
+                    urdf.display()
+                )));
+            }
+            log::info!("sim plant: torque-level dynamics ({})", urdf.display());
+            SimBus::with_dynamics(urdf)
+        } else {
+            SimBus::new()
+        };
+        #[cfg(not(feature = "ffi"))]
+        let sim_bus = SimBus::new();
+        let bus = if opts.sim {
+            RuntimeBus::from(sim_bus)
+        } else {
+            RuntimeBus::from(open_hardware_bus(&robot.bus)?)
+        };
+        let estop = estop_source(opts)?;
 
         // Gravity and TCP FK: Kin-backed (G(q) + real TCP pose) with
         // feature `ffi`, the built-in defaults (ZeroGravity, NoFk =
@@ -234,36 +262,11 @@ impl Daemon {
             jog: Box::new(jog),
             stream: Box::new(stream),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
-            estop: Box::new(gpio),
-            flash: Box::new(flash),
+            estop,
+            flash: flash_marker(),
             commands: Box::new(cmds_rx),
             fk: fk_hook,
             samples: consumer,
-        };
-        #[cfg(feature = "ffi")]
-        let sim_bus = if opts.sim_dynamics {
-            // The torque-level plant models the ARM (its URDF must carry
-            // exactly the configured joint count, so the bare-flange
-            // model is the only fit); the active tool's mass rides the
-            // gravity model, not the plant.
-            let urdf = assets_dir.join(par6_kin::GripperVariant::Flange.urdf_relpath());
-            if !urdf.is_file() {
-                return Err(DaemonError::Kinematics(format!(
-                    "sim-dynamics URDF missing: {}",
-                    urdf.display()
-                )));
-            }
-            log::info!("sim plant: torque-level dynamics ({})", urdf.display());
-            SimBus::with_dynamics(urdf)
-        } else {
-            SimBus::new()
-        };
-        #[cfg(not(feature = "ffi"))]
-        let sim_bus = SimBus::new();
-        let bus = if opts.sim {
-            RuntimeBus::from(sim_bus)
-        } else {
-            RuntimeBus::from(open_hardware_bus(&robot.bus)?)
         };
         let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
 
@@ -649,6 +652,52 @@ fn load_kin_stack(
     })
 }
 
+/// The e-stop input this runtime reads once per tick.
+///
+/// Hardware gets the control box's physical ESTOP_1 line and refuses to
+/// start without it. There is no degraded mode here: an always-released
+/// stub is indistinguishable from a working line in every field the
+/// runtime publishes — the ESTOP latch, the mode, the state and
+/// `io()[4]` all read exactly as they do with an intact chain — so a
+/// par6d that cannot read the button must not present as one that can.
+///
+/// `--sim` has no button. Its line sits released for the session and a
+/// simulated stop goes through the software e-stop instead, which is a
+/// separate key (`SW_ESTOP`) with the same reaction.
+fn estop_source(opts: &Options) -> Result<Box<dyn EstopGpio>, DaemonError> {
+    if opts.sim {
+        let (gpio, _released) = SharedLineGpio::new(true);
+        return Ok(Box::new(gpio));
+    }
+    par6_rt::gpio::open_estop1().map_err(|e| {
+        DaemonError::Hardware(format!(
+            "{e} — the physical e-stop must be readable before the arm moves; \
+             run with --sim for the simulator"
+        ))
+    })
+}
+
+/// Whether firmware was flashed during a FLASHING window, consulted once
+/// on the way out of it.
+///
+/// A flash reboots the driver and the encoder is absolute only within one
+/// motor revolution, so the flashed joint's home reference dies with it:
+/// the vendor consumes a marker file its flasher writes and clears homing
+/// robot-wide. par6 ships no flasher — `spec/CAN.md` leaves the bootloader
+/// protocol to the vendor tools — so nothing here can tell a flash from a
+/// scan, and the only answer that is never unrecoverable is "yes". Every
+/// FLASHING exit therefore costs a re-home; a marker-writing flasher is
+/// what would buy the scan-only case back.
+fn flash_marker() -> Box<dyn FlashMarker> {
+    struct AssumeFlashed;
+    impl FlashMarker for AssumeFlashed {
+        fn flashed(&mut self) -> bool {
+            true
+        }
+    }
+    Box::new(AssumeFlashed)
+}
+
 /// Open the hardware bus, turning the backend's bring-up diagnosis into a
 /// clean startup error (the operator needs to know which problem to fix:
 /// missing interface, no `CAP_NET_ADMIN`, wrong bitrate).
@@ -679,5 +728,60 @@ mod tests {
         };
         assert_eq!(resolve_loop_bands(true, Some(tight)), tight);
         assert_eq!(resolve_loop_bands(false, Some(tight)), tight);
+    }
+
+    /// Hardware mode reads a physical line or does not start; `--sim`
+    /// never wants one.
+    ///
+    /// The RT core's debounce → latch → `ACTIVE_ERROR` path is covered
+    /// thoroughly elsewhere, over a shared-flag line the tests flip
+    /// themselves — which says nothing about whether the shipped runtime
+    /// reads anything at all, and that question has no answer from
+    /// outside: an unread line publishes the same latch, the same mode
+    /// and the same `io()[4]` as an intact chain. So the check has to sit
+    /// here, at the selection, and the falling-back-to-a-stub branch has
+    /// to not exist. Pressing the actual button is HIL step 2.
+    #[test]
+    fn hardware_needs_a_real_estop_line_and_sim_never_asks_for_one() {
+        // A chip that cannot be one, so the outcome is the same on a bare
+        // CI container and on the control box. No other test in this
+        // binary reads the variable.
+        std::env::set_var("PAR6_GPIO_CHIP", "/dev/par6-no-such-gpiochip");
+
+        let gpio = estop_source(&Options {
+            sim: true,
+            ..Default::default()
+        })
+        .expect("sim has no button and must not need a chardev");
+        let mut monitor = par6_rt::EstopMonitor::new(gpio);
+        for _ in 0..(par6_rt::DEBOUNCE_READS * 2) {
+            assert!(!monitor.pressed(), "the simulated line reads released");
+        }
+
+        let refusal = estop_source(&Options {
+            sim: false,
+            ..Default::default()
+        });
+        std::env::remove_var("PAR6_GPIO_CHIP");
+        let Err(DaemonError::Hardware(msg)) = refusal else {
+            panic!("hardware mode must refuse an unreadable ESTOP_1");
+        };
+        assert!(msg.contains("ESTOP_1"), "the refusal names the line: {msg}");
+    }
+
+    /// Every FLASHING exit invalidates homing.
+    ///
+    /// The wiring this pins was a dropped write handle: a marker nothing
+    /// could ever set answered "no flash happened" for the life of the
+    /// process, so `RtCore::leave_mode` kept a home reference that the
+    /// driver reboot had already destroyed.
+    #[test]
+    fn the_flash_marker_reports_a_flash_on_every_flashing_exit() {
+        let mut marker = flash_marker();
+        assert!(marker.flashed(), "par6d cannot tell a flash from a scan");
+        assert!(
+            marker.flashed(),
+            "consulted once per window — a second window must invalidate too"
+        );
     }
 }

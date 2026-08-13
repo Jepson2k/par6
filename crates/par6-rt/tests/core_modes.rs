@@ -6,7 +6,8 @@ mod common;
 
 use common::{ConstGravity, Rig};
 use par6_bus::spectral::{torque_to_ma_factor, trunc_to_wire};
-use par6_bus::{JointCommand, Pack, TxRecord};
+use par6_bus::{JointCommand, Pack, Reply, TxRecord};
+use par6_config::KtSource;
 use par6_rt::{Mode, RtCommand, MAX_JOINTS};
 
 fn assert_zero_velocity(frames: &[JointCommand], ctx: &str) {
@@ -76,6 +77,87 @@ fn idle_gravity_hold_is_torque_only_and_gated() {
     assert_zero_velocity(&rig.last_joints(), "IDLE grav-off");
     // ... and still published.
     assert_eq!(rig.snap().gravity_torque_nm, g);
+}
+
+/// `kt_source = "auto"` means the DRIVER's torque constant governs and
+/// config is only the fallback for a node that does not answer the boot
+/// cmd-33 fetch (spec/CAN.md boot step 3) — the shipped `PAR6.toml` asks
+/// for it on every hardware boot.
+///
+/// The fetched value used to be logged as authoritative and then thrown
+/// away: the torque scale was built once from config and never rebuilt.
+/// Both directions hang off that one factor, and IDLE hold is
+/// torque-only with no position or velocity term, so a driver flashed
+/// with kt 0.20 against a config 0.28 delivered 71 % of the intended
+/// hold current with nothing closing around it — while the reported
+/// torque read 1.4x high, i.e. in the reassuring direction.
+#[test]
+fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
+    let g = [0.5, -1.2, 0.8, 0.05, -0.02, 0.01];
+    let mut rig = Rig::with_gravity(Box::new(ConstGravity(g)));
+    let robot = &common::bundle().robot;
+    assert_eq!(
+        robot.robot.kt_source,
+        KtSource::Auto,
+        "the shipped config fetches kt from the drivers"
+    );
+
+    // J1's driver answers with a kt well away from the config value —
+    // exactly the mismatch `auto` exists for. J2's driver never answers.
+    let driver_kt = 0.20f32;
+    assert!(
+        (f64::from(driver_kt) - robot.joints[0].kt_nm_a).abs() > 0.05,
+        "the injected kt must actually differ from config"
+    );
+    let node = rig.node_of[0];
+    rig.core.bus_mut().inject(
+        false,
+        Reply::Kt {
+            node,
+            kt_nm_a: driver_kt,
+        },
+    );
+    rig.boot_to_idle();
+
+    rig.core.set_homed(true);
+    rig.cmd(RtCommand::Enable);
+    rig.tick();
+    let expect: [i16; MAX_JOINTS] = std::array::from_fn(|i| {
+        let j = &robot.joints[i];
+        let kt = if i == 0 {
+            f64::from(driver_kt)
+        } else {
+            j.kt_nm_a
+        };
+        let f = torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, kt, j.dir);
+        trunc_to_wire(g[i] * f) as i16
+    });
+    assert_torque_only(&rig.last_joints(), &expect, "IDLE hold on the resolved kt");
+
+    // Provenance rides the snapshot: Some = this joint's driver answered.
+    let s = rig.snap();
+    assert_eq!(s.nodes[0].kt_nm_a, Some(driver_kt));
+    assert_eq!(s.nodes[1].kt_nm_a, None, "silent driver ⇒ config fallback");
+
+    // The measured mA → Nm direction reads through the same factor.
+    rig.auto_inject = false;
+    let ticks = rig.conv[0].motor_ticks(rig.pose[0]);
+    rig.core.bus_mut().inject(
+        false,
+        Reply::Motion {
+            node,
+            position_ticks: ticks,
+            speed_ticks_s: 0,
+            current_ma: 500,
+        },
+    );
+    rig.tick();
+    let j = &robot.joints[0];
+    let f = torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, f64::from(driver_kt), j.dir);
+    assert!(
+        (rig.snap().tau[0] - 500.0 / f).abs() < 1e-9,
+        "reported torque must use the adopted kt"
+    );
 }
 
 #[test]

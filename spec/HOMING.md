@@ -39,13 +39,22 @@ settle → [post_move] → done | failed.
 
 - *Hall joints* (`has_hall_sensor=1`): drive with the HALL pack (cmd 31, speed +
   trigger_value 2); hit when HALL_trigger==0 or edge bit set; position latched AT
-  trigger. Hall joints skip two-pass (the digital edge is the reference). Pre-clear
-  guard: a trigger within 0.5 s of start means "started on the sensor" → back off
-  `backoff_s`, reset, re-approach.
+  trigger. The cmd-32 bits are the only endstop evidence there is and nothing on the
+  RX path invalidates them, so **every approach entry drops the node's cached
+  reading**: "no reply yet" is not a hit, and a reply an earlier approach asked for
+  says nothing about this one. Hall joints skip two-pass (the digital edge is the
+  reference). Pre-clear guard: a trigger within 0.5 s of start means "started on the
+  sensor" → back off `backoff_s`, reset, re-approach. The backoff is a cmd-2 frame,
+  so no cmd-32 reply lands for its whole duration: without the drop at the
+  re-approach entry the stale trigger latches the reference at the backoff point
+  (~8° on J5), and a second `home()` in one process latches at the parked pose.
 - *Stall joints*: drive velocity-mode (cmd 2 DLC 5, signed homing speed, cur 0).
   Two conditions gated together (current primary, stall secondary):
   - windowed stall: displacement from a reference stays below
-    `max(10, |speed|·0.08·0.25)` ticks; window resets on movement; stalled at
+    `max(10, |speed|·0.08·0.25)` ticks, computed each tick from the speed
+    COMMANDED that tick — pass 2 runs at `rehome_speed_factor × speed`, and a
+    threshold frozen at the pass-1 value accepts a joint still travelling at 83 %
+    of the pass-2 speed as stalled; window resets on movement; stalled at
     `round(0.08/dt)` consecutive ticks (min 5);
   - current ratio: after a 0.15 s startup guard, ticks with current above
     `0.70 · homing_current_ma`; fires at `round(0.08/dt)` ticks (min 2) with ≥60%
@@ -106,7 +115,7 @@ if fully closed at power-on) and latch `endstop_ticks`.
 | approach exceeds `homing_timeout_s` | joint FAIL → sequence failed |
 | two-pass diff > `two_pass_max_diff` | FAIL at settle, limits restored |
 | position never valid at settle | **FAIL** (vendor: silent-uncalibrated hazard — fixed) |
-| gripper calibrate timeout | failed |
+| gripper calibrate timeout | failed; the hard key it raises clears with the user clear sequence (HOMING entry is gated on no-hard-errors, so a sticky flag makes a transient restart-only) |
 | pre/post/move_to timeout | warn + continue |
 | any hard error during HOMING | abort, clear homed, zero statuses, restore config |
 

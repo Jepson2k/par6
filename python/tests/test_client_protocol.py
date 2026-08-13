@@ -13,6 +13,7 @@ import math
 
 import numpy as np
 import pytest
+from pinokin import se3_from_rpy
 from protocol_peer import (
     ANGLES,
     IDENTITY_POSE,
@@ -562,16 +563,18 @@ async def test_query_surface_parses_wire_payloads(
 async def test_pose_converts_matrix_to_xyz_rpy_degrees(
     client: AsyncRobotClient, peer: ScriptedRuntime
 ):
-    roll, pitch, yaw = math.radians(30.0), math.radians(-40.0), math.radians(55.0)
-    cr, sr = math.cos(roll), math.sin(roll)
-    cp, sp = math.cos(pitch), math.sin(pitch)
-    cy, sy = math.cos(yaw), math.sin(yaw)
-    rz = np.array([[cy, -sy, 0], [sy, cy, 0], [0, 0, 1]])
-    ry = np.array([[cp, 0, sp], [0, 1, 0], [-sp, 0, cp]])
-    rx = np.array([[1, 0, 0], [0, cr, -sr], [0, 0 + sr, cr]])
-    mat = np.eye(4)
-    mat[:3, :3] = rz @ ry @ rx
-    mat[:3, 3] = [120.0, -45.5, 310.0]
+    """The STATUS/POSE matrix decodes in the wire's intrinsic-XYZ convention.
+
+    The oracle is ``pinokin.se3_from_rpy`` — the composition ``Robot.ik``
+    re-encodes a target with and the frontend's readout decodes with, so a
+    pose read here is a pose that can be handed straight back to ``move_l``.
+    Read in the URDF fixed-axis order instead, the same nine matrix entries
+    name a different orientation for every pose with more than one non-zero
+    rotation component, and the everyday tool-down pose comes back with its
+    wrist angle negated.
+    """
+    mat = np.zeros((4, 4))
+    se3_from_rpy(120.0, -45.5, 310.0, *np.radians([30.0, -40.0, 55.0]), mat)
 
     peer.handlers[CmdType.POSE] = lambda cmd, req_id, params: wire.encode_wire(
         [int(MsgType.RESPONSE), req_id, [int(QueryType.POSE), mat.flatten().tolist()]]
@@ -581,6 +584,20 @@ async def test_pose_converts_matrix_to_xyz_rpy_degrees(
     assert pose is not None
     assert pose[:3] == pytest.approx([120.0, -45.5, 310.0])
     assert pose[3:] == pytest.approx([30.0, -40.0, 55.0])
+
+    for rz_deg in (10.0, 90.0):
+        down = np.zeros((4, 4))
+        se3_from_rpy(0.0, 0.0, 0.0, math.pi, 0.0, math.radians(rz_deg), down)
+        peer.handlers[CmdType.POSE] = lambda cmd, req_id, params, m=down: wire.encode_wire(
+            [int(MsgType.RESPONSE), req_id, [int(QueryType.POSE), m.flatten().tolist()]]
+        )
+        tool_down = await client.pose()
+        assert tool_down is not None
+        assert abs(tool_down[3]) == pytest.approx(180.0)
+        assert tool_down[4] == pytest.approx(0.0, abs=1e-9)
+        assert tool_down[5] == pytest.approx(rz_deg), (
+            f"tool-down wrist angle came back as {tool_down[5]}, not {rz_deg}"
+        )
 
 
 async def test_motion_timing_maps_to_exactly_one_of_duration_speed(

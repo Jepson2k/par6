@@ -406,17 +406,33 @@ fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
 }
 
 /// Wire pose `[x y z mm, rx ry rz deg]` from a STATUS pose matrix
-/// (row-major 4x4, mm, `R = Rz·Ry·Rx`) with the translation replaced.
+/// (row-major 4x4, mm) with the translation replaced.
+///
+/// Decoded the way a client decodes it — `pinokin.so3_rpy`, the wire's
+/// intrinsic-XYZ convention (`spec/PROTOCOL-V2.md`), written out here
+/// rather than borrowed from the runtime so the two halves of the
+/// round trip cannot agree on the wrong thing.
 fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
-    let (r00, r10, r20, r21, r22) = (pose[0], pose[4], pose[8], pose[9], pose[10]);
+    let (r00, r01, r02) = (pose[0], pose[1], pose[2]);
+    let (r12, r22) = (pose[6], pose[10]);
+    let cp = r12.hypot(r22);
     [
         xyz_mm[0],
         xyz_mm[1],
         xyz_mm[2],
-        r21.atan2(r22).to_degrees(),
-        (-r20).atan2(r00.hypot(r10)).to_degrees(),
-        r10.atan2(r00).to_degrees(),
+        (-r12).atan2(r22).to_degrees(),
+        r02.atan2(cp).to_degrees(),
+        (-r01).atan2(r00).to_degrees(),
     ]
+}
+
+/// Largest absolute difference between the rotation blocks of two STATUS
+/// pose matrices — the orientation held (or not) across a move.
+fn rotation_drift(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+    (0..12)
+        .filter(|i| i % 4 != 3)
+        .map(|i| (a[i] - b[i]).abs())
+        .fold(0.0f64, f64::max)
 }
 
 /// A well-conditioned start posture for cartesian moves: away from the
@@ -536,6 +552,24 @@ fn cartesian_surface_over_protocol_v2() {
         "move_l covered only {:.0}% of the segment",
         reach * 100.0
     );
+    // The commanded target carries the start orientation, decoded out of
+    // STATUS the way a client decodes it and handed straight back, so the
+    // arm has to finish pointing where it started: a runtime that
+    // rebuilds those three numbers in the other order (`Rz·Ry·Rx`, the
+    // URDF `rpy` reading) turns the wrist 36.7° at this posture on its
+    // way to a target the operator never asked for. The 0.1 bound is ~6°
+    // of rotation-block error — room for the cascade's settle lag, an
+    // order of magnitude under the 0.56 the swapped order costs.
+    let landed = settled_tcp(&rig, "the pose move_l finished at");
+    let rot_drift = rotation_drift(&s.pose, &landed.pose);
+    assert!(
+        rot_drift < 0.1,
+        "move_l changed the orientation it was told to hold (rotation \
+         block off by {rot_drift:.3}): commanded {wire_target:?}, started \
+         {:?}, finished {:?}",
+        s.pose,
+        landed.pose
+    );
 
     // --- move_j_pose: same target through IK + the joint-space profile.
     // Its TCP path bows far off the line — which is what makes the
@@ -571,6 +605,15 @@ fn cartesian_surface_over_protocol_v2() {
     assert!(
         miss < 15.0,
         "move_j_pose IK target missed by {miss:.1} mm (reached {reached:?}, target {target:?})"
+    );
+    // The seeded-IK entry point reads the target's rotation through the
+    // same decode as move_l's, so it holds the orientation too.
+    let after = settled_tcp(&rig, "settled after move_j_pose");
+    let rot_drift = rotation_drift(&s.pose, &after.pose);
+    assert!(
+        rot_drift < 0.1,
+        "move_j_pose solved for a different orientation than it was given \
+         (rotation block off by {rot_drift:.3})"
     );
 
     // --- jog_l: cartesian velocity streaming through the jacobian.

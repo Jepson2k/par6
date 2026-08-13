@@ -32,7 +32,9 @@
 //! them — a documented production bug class).
 
 mod link;
-mod sched;
+/// The freshness clock in here is shared by every backend; the rest is
+/// SocketCAN-only (see the module doc).
+pub(crate) mod sched;
 
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime};
@@ -745,11 +747,11 @@ impl DriverBus for SocketCanBus {
     }
 
     fn clear_lost_latch(&mut self, node: NodeId) {
-        self.fresh.clear_latch(node);
+        self.fresh.clear_latch(node, self.tick);
     }
 
     fn rebase_freshness(&mut self) {
-        self.fresh.rebase();
+        self.fresh.rebase(self.tick);
     }
 
     fn connected_nodes(&self) -> u16 {

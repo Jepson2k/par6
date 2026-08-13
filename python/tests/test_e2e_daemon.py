@@ -619,3 +619,75 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert await client.reset() == 1
         assert await client.wait_status(lambda s: s.io[4] == 1, timeout=STEP_BUDGET_S)
         assert await client.is_estop_pressed() is False
+
+
+#: A posture whose TCP orientation has three substantial rotation
+#: components (~170 / 11 / 165 deg) — the only kind of pose that can tell
+#: the two readings of `[rx, ry, rz]` apart. It is the same
+#: well-conditioned start posture the Rust cartesian e2e test uses:
+#: inside every soft window and clear of the arm's own meshes.
+TILTED_POSTURE_DEG = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0]
+
+
+@pytest.mark.timeout(180)
+async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: LiveDaemon):
+    """A pose read off the wire, sent straight back, must not move the arm.
+
+    This is the teach-and-replay path: Waldo Commander decodes the STATUS
+    pose matrix with pinokin, shows those scalars, and its motion recorder
+    emits them verbatim as a ``move_l``/``move_j`` target.  So the six
+    numbers have to mean the same rotation in all three places -- the
+    client's decode, ``Robot.fk``'s decode, and the runtime's re-encode.
+    Read one of them in the URDF fixed-axis order (``Rz*Ry*Rx``) and this
+    posture's replay lands 36.7 deg from where it was taught; a tool-down
+    pose lands with its wrist angle negated.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+
+        async def unhomed_move():
+            await client.move_j(TILTED_POSTURE_DEG, duration=1.5)
+
+        await enable(client, unhomed_move)
+        await teleport_to(client, TILTED_POSTURE_DEG)
+
+        taught = await client.pose()
+        assert taught is not None
+        if not all(math.isfinite(v) for v in taught):
+            pytest.skip("runtime built without kinematics: STATUS carries no pose")
+        angles = await client.angles()
+        assert angles is not None
+
+        # The pose the waldoctl backend computes for the same
+        # configuration, decomposed by pinokin -- the decode the frontend
+        # readout uses, and an oracle that shares no code with the runtime.
+        expected = np.zeros(6)
+        Robot().fk(np.radians(angles), expected)
+        position_error_mm = float(
+            np.max(np.abs(np.asarray(taught[:3]) - expected[:3] * 1000.0))
+        )
+        assert position_error_mm < 2.0, (
+            f"the reported TCP position disagrees with Robot.fk by "
+            f"{position_error_mm:.2f} mm: {taught[:3]} vs {expected[:3] * 1000.0}"
+        )
+        assert max_deg_error(taught[3:], np.degrees(expected[3:])) < 0.5, (
+            f"the reported TCP rotation disagrees with Robot.fk: {taught[3:]} vs "
+            f"{np.degrees(expected[3:])} -- the client and the kinematics backend "
+            f"are decomposing the same matrix in different conventions"
+        )
+
+        # Replay it. The arm is already in this pose, so a runtime that
+        # reads the numbers the way they were written has a null move to
+        # run; one that reads them the other way round swings the wrist to
+        # an orientation nobody commanded (or fails the solve outright).
+        index = await client.move_j(pose=taught)
+        assert index >= 0
+        assert await client.wait_command(index, timeout=STEP_BUDGET_S) is True
+        replayed = await client.pose()
+        assert replayed is not None
+        assert max_deg_error(replayed[3:], taught[3:]) < 1.0, (
+            f"replaying the taught pose turned the tool: {taught[3:]} -> {replayed[3:]}"
+        )
+        assert max_deg_error(replayed[:3], taught[:3]) < 5.0, (
+            f"replaying the taught pose moved the TCP: {taught[:3]} -> {replayed[:3]}"
+        )

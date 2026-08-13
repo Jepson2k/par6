@@ -51,6 +51,7 @@ use std::path::PathBuf;
 use par6_config::{Gains, GripperConfig, KtSource, RobotConfig, WatchdogAction};
 
 use crate::bus::DriverBus;
+use crate::hw::sched::FreshnessClock;
 use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
     encode_pd_gains, encode_position_gains, encode_velocity_gains, encode_voltage_limit,
@@ -107,12 +108,8 @@ pub struct SimBus {
     node_to_joint: [Option<usize>; MAX_NODES],
     gripper_node: NodeId,
     timing_dummy_node: NodeId,
-    stale_warn_ticks: u64,
-    lost_ticks: u64,
     rx_cap: usize,
-    last_rx_tick: [Option<u64>; MAX_NODES],
-    lost_latched: [bool; MAX_NODES],
-    last_gripper_rx_tick: Option<u64>,
+    fresh: FreshnessClock,
     connected: u16,
     drivers: Vec<VirtualDriver>,
     gripper: Option<GripperSim>,
@@ -153,12 +150,8 @@ impl SimBus {
             node_to_joint: [None; MAX_NODES],
             gripper_node: 0,
             timing_dummy_node: 0,
-            stale_warn_ticks: u64::MAX,
-            lost_ticks: u64::MAX,
             rx_cap: 32,
-            last_rx_tick: [None; MAX_NODES],
-            lost_latched: [false; MAX_NODES],
-            last_gripper_rx_tick: None,
+            fresh: FreshnessClock::default(),
             connected: 0,
             drivers: Vec::new(),
             gripper: None,
@@ -803,13 +796,7 @@ impl DriverBus for SimBus {
         self.tick = tick;
         self.joints_sent_this_tick = false;
         if !self.silent {
-            for n in 0..MAX_NODES {
-                if let Some(last) = self.last_rx_tick[n] {
-                    if tick.saturating_sub(last) >= self.lost_ticks {
-                        self.lost_latched[n] = true;
-                    }
-                }
-            }
+            self.fresh.latch_lost(tick);
         }
     }
 
@@ -849,15 +836,12 @@ impl DriverBus for SimBus {
             };
             let n = usize::from(node);
             state.nodes[n].live_error_bit = err_bit;
-            if let Some(last) = self.last_rx_tick[n] {
-                if self.tick.saturating_sub(last) >= self.stale_warn_ticks {
-                    state.reconnected_mask |= 1 << n;
-                }
+            if self.fresh.mark(node, self.tick) {
+                state.reconnected_mask |= 1 << n;
             }
-            self.last_rx_tick[n] = Some(self.tick);
             let (_, raw_cmd, _) = unpack_can_id(frame.id);
             if raw_cmd == CommandId::RespondGripperData.raw() {
-                self.last_gripper_rx_tick = Some(self.tick);
+                self.fresh.mark_gripper(self.tick);
             }
         }
         state.frames_last_drain = count as u32;
@@ -866,15 +850,9 @@ impl DriverBus for SimBus {
             state.frame_age_max_ticks = age_max;
         }
         for n in 0..MAX_NODES {
-            state.nodes[n].data_age_ticks = match self.last_rx_tick[n] {
-                Some(last) => self.tick.saturating_sub(last),
-                None => u64::MAX,
-            };
+            state.nodes[n].data_age_ticks = self.fresh.age(n as NodeId, self.tick);
         }
-        state.gripper.data_age_ticks = match self.last_gripper_rx_tick {
-            Some(last) => self.tick.saturating_sub(last),
-            None => u64::MAX,
-        };
+        state.gripper.data_age_ticks = self.fresh.gripper_age(self.tick);
         Ok(count)
     }
 
@@ -988,8 +966,10 @@ impl DriverBus for SimBus {
         }
         self.gripper_node = robot.bus.gripper_node;
         self.timing_dummy_node = robot.bus.timing_dummy_node;
-        self.stale_warn_ticks = u64::from(robot.ticks(robot.bus.stale_warn_s));
-        self.lost_ticks = u64::from(robot.ticks(robot.bus.lost_s));
+        self.fresh.configure(
+            u64::from(robot.ticks(robot.bus.stale_warn_s)),
+            u64::from(robot.ticks(robot.bus.lost_s)),
+        );
         self.rx_cap = robot.bus.rx_frames_per_tick_cap as usize;
         self.rx = VecDeque::with_capacity(RX_QUEUE_CAP);
 
@@ -1147,35 +1127,15 @@ impl DriverBus for SimBus {
     }
 
     fn freshness(&self, node: NodeId) -> Freshness {
-        let n = usize::from(node);
-        if self.lost_latched[n] {
-            return Freshness::Lost;
-        }
-        match self.last_rx_tick[n] {
-            None => Freshness::Unknown,
-            Some(last) => {
-                let age = self.tick.saturating_sub(last);
-                if age >= self.lost_ticks {
-                    Freshness::Lost
-                } else if age >= self.stale_warn_ticks {
-                    Freshness::Stale
-                } else {
-                    Freshness::Fresh
-                }
-            }
-        }
+        self.fresh.classify(node, self.tick)
     }
 
     fn clear_lost_latch(&mut self, node: NodeId) {
-        let n = usize::from(node);
-        self.lost_latched[n] = false;
-        self.last_rx_tick[n] = None;
+        self.fresh.clear_latch(node, self.tick);
     }
 
     fn rebase_freshness(&mut self) {
-        self.last_rx_tick = [None; MAX_NODES];
-        self.lost_latched = [false; MAX_NODES];
-        self.last_gripper_rx_tick = None;
+        self.fresh.rebase(self.tick);
     }
 
     fn connected_nodes(&self) -> u16 {

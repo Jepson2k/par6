@@ -1,5 +1,6 @@
 //! Homing: the full PAR6 sequence driven closed-loop against the sim bus
 //! (spec/HOMING.md "Sim requirements"), the mid-homing hard-error abort,
+//! the home reference the hall FSM latches against the sim's own sensor,
 //! and the failure signatures (two-pass mismatch, position-never-valid)
 //! from scripted NodeState evolutions at the HomingSystem seam.
 
@@ -9,16 +10,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
-use par6_bus::spectral::JointConversion;
+use par6_bus::spectral::{trunc_to_wire, JointConversion};
 use par6_bus::{
-    BusState, DriverBus, GripperCommand, HallState, JointCommand, LoopbackBus, Pack, TxRecord,
+    BusState, DriverBus, GripperCommand, GripperReply, HallState, JointCommand, LoopbackBus, Pack,
+    Reply, TxRecord,
 };
-use par6_config::{ConfigBundle, HomeGroup, SequenceStep};
+use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, SequenceStep};
 use par6_rt::homing::{HomingSystem, SeqStatus};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
-    sample_ring, ArmState, CompletionPolicy, HomingJointStatus, Mode, NoFk, RtCommand, RtCore,
-    RtHandles, RtHooks, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, Mode, NoFk, RtCommand,
+    RtCore, RtHandles, RtHooks, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity,
+    MAX_JOINTS,
 };
 
 /// An RtCore over the closed-loop sim bus. J5's hall band is moved onto
@@ -212,7 +215,7 @@ impl HomingHarness {
         self.bus.begin_tick(t);
         self.sys.tick(
             &mut self.bus,
-            &self.state,
+            &mut self.state,
             &mut self.conv,
             &mut self.cmds,
             &mut self.gcmd,
@@ -364,4 +367,326 @@ fn hall_position_never_valid_at_settle_is_a_failure() {
         "never-valid position must FAIL, not silently mark done"
     );
     assert_eq!(h.sys.statuses()[5], HomingJointStatus::Failed);
+}
+
+#[test]
+fn a_joint_still_travelling_on_pass_two_is_not_a_stall() {
+    let bundle = single_joint_bundle(0);
+    let jh = &bundle.robot.homing.joints[0];
+    let eff = bundle
+        .effective_home_offset(0)
+        .unwrap_or(jh.home_offset_rad);
+    let mut h = HomingHarness::new(&bundle);
+    let n0 = usize::from(bundle.robot.joints[0].node_id);
+
+    // A loaded J0: it draws its homing current the whole time it is
+    // driven (real drivers do at velocity-mode start), and free travel
+    // runs at 80 % of the commanded speed. Only the endstop stops it.
+    const TRACKING: f64 = 0.8;
+    let master = bundle.robot.joints[0].sector_master_position_ticks;
+    let mut pos = f64::from(master);
+    let stop = pos + 3000.0;
+    h.state.nodes[n0].position_ticks = Some(master);
+    h.state.nodes[n0].current_ma = Some(0);
+
+    let mut outcome = SeqStatus::Running;
+    let mut pass2_ticks = 0u32;
+    for t in 1..12_000u64 {
+        let status = h.tick(t);
+        let v = h.cmds[0].vel.unwrap_or(0);
+        // Pass 2 is the only phase commanding the reduced approach speed.
+        if v > 0 && f64::from(v) < jh.speed_ticks_s * 0.9 {
+            pass2_ticks += 1;
+        }
+        pos = (pos + f64::from(v) * TRACKING * h.dt).min(stop);
+        h.state.nodes[n0].position_ticks = Some(pos as i32);
+        h.state.nodes[n0].speed_ticks_s = Some(v);
+        h.state.nodes[n0].current_ma = Some(if v != 0 { jh.current_ma as i16 } else { 0 });
+        match status {
+            SeqStatus::Running => {}
+            other => {
+                outcome = other;
+                break;
+            }
+        }
+    }
+
+    assert_eq!(outcome, SeqStatus::Complete, "the genuine stall completes");
+    assert_eq!(h.sys.statuses()[0], HomingJointStatus::Done);
+    // Pass 2 re-covers the backoff distance at the rehome speed factor
+    // (the tracking factor scales both legs, so it cancels). A gate still
+    // sized for pass 1 calls this travel a stall a quarter of the way in.
+    let rehome_speed_factor = 0.3;
+    let expected = jh.backoff_s / (rehome_speed_factor * h.dt);
+    assert!(
+        f64::from(pass2_ticks) > 0.8 * expected,
+        "pass 2 must travel the backoff distance before it counts as stalled \
+         ({pass2_ticks} ticks, expected about {expected:.0})"
+    );
+    // The reference is the endstop, not wherever a false stall fired.
+    let latched = i64::from(h.conv[0].motor_ticks(eff));
+    assert!(
+        (latched - stop as i64).abs() <= 50,
+        "home reference latched at {latched}, endstop at {stop}"
+    );
+}
+
+// ------------------------------------------------------------------
+// Cached-reply regressions, driven against the closed-loop sim bus so
+// the hall bits come from its own sensor emulation and cmd-32 replies.
+// ------------------------------------------------------------------
+
+/// The homing subsystem in the RT tick order — drain → FSM → send — over
+/// the sim bus, plus a way to drive one joint outside the sequence.
+struct SimHomingHarness {
+    sys: HomingSystem,
+    bus: SimBus,
+    state: BusState,
+    conv: [JointConversion; MAX_JOINTS],
+    cmds: [JointCommand; MAX_JOINTS],
+    gcmd: GripperCommand,
+    t: u64,
+}
+
+impl SimHomingHarness {
+    /// Boots the sim at `q0` with joint `joint`'s hall band at
+    /// `center ± half` \[rad\].
+    fn new(
+        bundle: &ConfigBundle,
+        q0: &[f64; MAX_JOINTS],
+        joint: usize,
+        center: f64,
+        half: f64,
+    ) -> Self {
+        let mut bus = SimBus::new();
+        bus.set_initial_joint_rad(q0);
+        bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+            .expect("sim boot");
+        bus.set_hall_trigger(joint, center, half);
+        Self {
+            sys: HomingSystem::new(bundle),
+            bus,
+            state: BusState::new(),
+            conv: std::array::from_fn(|i| JointConversion::from_config(&bundle.robot.joints[i])),
+            cmds: [JointCommand::idle(); MAX_JOINTS],
+            gcmd: GripperCommand::FirmwarePoll,
+            t: 0,
+        }
+    }
+
+    fn drain(&mut self) {
+        self.t += 1;
+        self.bus.begin_tick(self.t);
+        self.bus.drain_rx(&mut self.state).expect("drain");
+    }
+
+    fn send(&mut self) {
+        self.bus.send_joint_commands(&self.cmds).expect("joint TX");
+        self.bus.send_gripper(&self.gcmd).expect("gripper TX");
+    }
+
+    fn tick(&mut self) -> SeqStatus {
+        self.drain();
+        let status = self.sys.tick(
+            &mut self.bus,
+            &mut self.state,
+            &mut self.conv,
+            &mut self.cmds,
+            &mut self.gcmd,
+        );
+        self.send();
+        status
+    }
+
+    /// Run the sequence to its terminal status.
+    fn run(&mut self, budget: u32) -> SeqStatus {
+        for _ in 0..budget {
+            match self.tick() {
+                SeqStatus::Running => {}
+                other => return other,
+            }
+        }
+        panic!("the sequence did not finish within {budget} ticks");
+    }
+
+    /// One tick outside the sequence driving `joint` with `cmd` — the
+    /// test's own motion source; every other joint keeps its keep-alive.
+    fn drive(&mut self, joint: usize, cmd: JointCommand) {
+        self.drain();
+        self.cmds = [JointCommand::idle(); MAX_JOINTS];
+        self.cmds[joint] = cmd;
+        self.send();
+    }
+
+    /// Where the sim's hall sensor physically is, in wire ticks: drive
+    /// the joint along the approach direction with the HALL pack until
+    /// the driver answers in-band, and take the position it latched AT
+    /// the trigger. The cached reading goes first, for the same reason
+    /// the FSM drops its own: it predates the question.
+    fn sensor_ticks(&mut self, joint: usize, node: usize, speed: f64) -> i32 {
+        self.state.nodes[node].hall = None;
+        for _ in 0..4000 {
+            self.drive(joint, JointCommand::hall(trunc_to_wire(speed), 2));
+            if let Some(hall) = self.state.nodes[node].hall {
+                if !hall.trigger {
+                    return self.state.nodes[node]
+                        .position_ticks
+                        .expect("a hall reply carries a position");
+                }
+            }
+        }
+        panic!("the sim's hall sensor was never reached");
+    }
+}
+
+#[test]
+fn hall_homing_latches_at_the_sensor_not_on_a_cached_trigger() {
+    let bundle = single_joint_bundle(5);
+    let jh = &bundle.robot.homing.joints[5];
+    let eff = bundle
+        .effective_home_offset(5)
+        .unwrap_or(jh.home_offset_rad);
+    let n5 = usize::from(bundle.robot.joints[5].node_id);
+    let q0: [f64; MAX_JOINTS] =
+        std::array::from_fn(|i| bundle.robot.joints[i].sector_home_offset_rad);
+
+    // (a) J5 boots ON its sensor — the case the pre-clear guard exists
+    // for. The trigger it fires on tick 1 must not survive the backoff.
+    let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], 0.02);
+    h.sys.start(&mut h.bus);
+    assert_eq!(h.run(6000), SeqStatus::Complete, "first home completes");
+
+    let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
+    let sensor_rad = h.conv[5].joint_rad(sensor);
+    assert!(
+        (sensor_rad - eff).abs() < 0.01,
+        "the sensor must read as the home offset: {sensor_rad} vs {eff}"
+    );
+    let first_ref = i64::from(h.conv[5].motor_ticks(eff));
+
+    // (b) A second home() in the same process, the normal bring-up case:
+    // the reply from run 1 is still the node's `hall` while the joint is
+    // parked well clear of the sensor.
+    for _ in 0..250 {
+        h.drive(
+            5,
+            JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
+        );
+    }
+    assert!(
+        matches!(h.state.nodes[n5].hall, Some(hall) if !hall.trigger),
+        "the parked joint still carries run 1's trigger"
+    );
+    h.sys.start(&mut h.bus);
+    assert_eq!(h.run(6000), SeqStatus::Complete, "second home completes");
+
+    let second_ref = i64::from(h.conv[5].motor_ticks(eff));
+    assert!(
+        // One approach tick of travel is 48 ticks; the cached-hit failure
+        // is the whole park distance, ~12 000.
+        (second_ref - first_ref).abs() <= 150,
+        "both homes must reference the same sensor: {first_ref} then {second_ref}"
+    );
+}
+
+// ------------------------------------------------------------------
+// Gripper calibration failure: recoverable without a restart.
+// ------------------------------------------------------------------
+
+/// A bundle whose whole sequence is the firmware gripper calibration.
+fn gripper_cal_bundle() -> ConfigBundle {
+    let mut bundle = common::bundle();
+    bundle.robot.homing.sequence = vec![SequenceStep {
+        pre_moves: vec![],
+        home: Some(HomeGroup {
+            joints: vec![],
+            gripper: Some(GripperHomeMode::Firmware),
+        }),
+        move_to: vec![],
+        post_moves: vec![],
+    }];
+    bundle.robot.homing.post_moves = vec![];
+    bundle
+}
+
+/// A live bus whose gripper never reports `calibrated` — jaws jammed,
+/// gripper unpowered, or the wrong node id on a first bring-up.
+fn tick_uncalibrated(rig: &mut common::Rig, n: u32) {
+    for _ in 0..n {
+        for i in 0..MAX_JOINTS {
+            let node = rig.node_of[i];
+            let position_ticks = rig.conv[i].motor_ticks(rig.pose[i]);
+            rig.core.bus_mut().inject(
+                false,
+                Reply::Motion {
+                    node,
+                    position_ticks,
+                    speed_ticks_s: 0,
+                    current_ma: 0,
+                },
+            );
+        }
+        rig.core.bus_mut().inject(
+            false,
+            Reply::Gripper {
+                reply: GripperReply {
+                    calibrated: false,
+                    ..GripperReply::default()
+                },
+            },
+        );
+        rig.tick();
+    }
+}
+
+#[test]
+fn a_gripper_calibration_timeout_clears_without_a_restart() {
+    let mut rig = common::Rig::build_bundle(
+        gripper_cal_bundle(),
+        CompletionPolicy::Settled,
+        Box::new(ZeroGravity),
+        true,
+    );
+    rig.auto_inject = false;
+    tick_uncalibrated(&mut rig, 10);
+    assert_eq!(rig.snap().mode, Mode::Idle, "boot one-shot reaches IDLE");
+    rig.send(RtCommand::Enable);
+    tick_uncalibrated(&mut rig, 1);
+    rig.send(RtCommand::SetMode(Mode::Homing));
+    tick_uncalibrated(&mut rig, 1);
+    assert_eq!(rig.snap().mode, Mode::Homing);
+
+    // cmd 62 goes out, the calibrated bit never comes back: after the
+    // 10 s calibrate timeout (spec/HOMING.md) the sequence fails and the
+    // hard key latches on the next error pass.
+    let timeout_ticks = (10.0 / rig.dt).round() as u32;
+    tick_uncalibrated(&mut rig, timeout_ticks + 40);
+    let s = rig.snap();
+    assert_eq!(s.mode, Mode::ActiveError, "the calibration failure reacts");
+    assert!(!s.homed);
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::GripperCalibrationFailed),
+        "the operator gets a key naming the failure"
+    );
+
+    // Clear Errors must actually clear it — the flag behind the key is
+    // re-read every tick, and the key it re-latches gates the HOMING
+    // entry that is the only other way to reset the flag.
+    rig.send(RtCommand::ClearErrors);
+    tick_uncalibrated(&mut rig, 80);
+    let s = rig.snap();
+    assert!(!s.error_active, "the latch stays wiped after the settle");
+    assert_eq!(s.mode, Mode::Idle, "ACTIVE_ERROR auto-recovers");
+
+    // ... and the runtime is homable again, not restart-only.
+    rig.send(RtCommand::Enable);
+    tick_uncalibrated(&mut rig, 1);
+    rig.send(RtCommand::SetMode(Mode::Homing));
+    tick_uncalibrated(&mut rig, 1);
+    let s = rig.snap();
+    assert_eq!(s.state, ArmState::Enabled, "enable is granted again");
+    assert_eq!(s.mode, Mode::Homing, "homing can be retried after a clear");
 }

@@ -449,14 +449,16 @@ impl SettlePolicy for SpecSettle {
 
 /// Flash-marker hook consulted ONCE on FLASHING exit: firmware was
 /// actually written during the maintenance window, so homing must be
-/// invalidated robot-wide. `par6d` wires this to the flasher's marker
-/// file; tests use [`SharedFlashMarker`].
+/// invalidated robot-wide. `par6d` answers yes unconditionally — it ships
+/// no flasher that could leave a marker to read, and a missed
+/// invalidation is unrecoverable while a spurious one costs a re-home.
+/// Tests use [`SharedFlashMarker`] to drive both answers.
 pub trait FlashMarker: Send {
     /// Whether a flash happened since FLASHING was entered.
     fn flashed(&mut self) -> bool;
 }
 
-/// Shared-flag marker for tests and the sim runtime.
+/// Shared-flag marker for tests.
 #[derive(Debug, Clone)]
 pub struct SharedFlashMarker {
     flag: std::sync::Arc<std::sync::atomic::AtomicBool>,

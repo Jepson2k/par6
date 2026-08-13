@@ -7,10 +7,18 @@ license.workspace = true
 repository.workspace = true
 
 [features]
+default = ["gpio"]
 # Gravity via the Pinocchio FFI shim (pinokin-sys). Off by default so plain
 # builds need no C++ toolchain; the zero-torque and test gravity models are
 # always available.
 ffi = ["dep:pinokin-sys"]
+# The control box's physical ESTOP_1 line, through the Linux GPIO character
+# device. ON by default: a hardware runtime that cannot read the button
+# refuses to start, so shipping this off would ship an arm that never
+# reacts to an e-stop. The dependency is Linux-only and pure Rust (it
+# cross-compiles to aarch64 with no C toolchain), so a non-Linux host still
+# builds with the feature nominally on and refuses hardware mode at startup.
+gpio = ["dep:gpiocdev"]
 
 [dependencies]
 par6-config = { workspace = true }
@@ -20,3 +28,7 @@ thread-priority = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }
 libc = "0.2"
+
+# Pure-Rust GPIO character device (uAPI v2), no C libgpiod to cross-compile.
+[target.'cfg(target_os = "linux")'.dependencies]
+gpiocdev = { version = "0.8", optional = true }

@@ -57,12 +57,17 @@ const char *kind_name(int32_t kind) {
     }
 }
 
-/* R = Rx(rx) * Ry(ry) * Rz(rz) — the intrinsic-XYZ convention the pose
- * readback (par6_kin fk -> tcp rpy) and waldoctl's Shape.pose share. */
+/* R = Rz(rz) * Ry(ry) * Rx(rx) — waldoctl's Shape.pose is extrinsic-XYZ:
+ * each angle turns about a FIXED world axis, x first. This is a different
+ * contract from the tcp pose readback, and deliberately so: the other two
+ * implementations of it — parol6's _pose_to_matrix and the frontend's
+ * renderer (nicegui rotation_matrix_from_euler, order 'XYZ' = Rz*Ry*Rx) —
+ * place shapes this way, so a keep-out is enforced in the orientation it
+ * was drawn in. A multi-axis tilt is where the two orders diverge. */
 Eigen::Matrix3d rpy_to_rotation(double rx, double ry, double rz) {
-    return (Eigen::AngleAxisd(rx, Eigen::Vector3d::UnitX()) *
+    return (Eigen::AngleAxisd(rz, Eigen::Vector3d::UnitZ()) *
             Eigen::AngleAxisd(ry, Eigen::Vector3d::UnitY()) *
-            Eigen::AngleAxisd(rz, Eigen::Vector3d::UnitZ()))
+            Eigen::AngleAxisd(rx, Eigen::Vector3d::UnitX()))
         .toRotationMatrix();
 }
 

@@ -10,13 +10,17 @@
 //! Pose conventions on this boundary:
 //!
 //! - Wire poses are `[x, y, z (mm), rx, ry, rz (deg)]` with
-//!   `R = Rz(rz)·Ry(ry)·Rx(rx)` (URDF fixed-axis rpy) — the convention
-//!   the Python client documents and the server's STATUS matrix
-//!   reconstruction assumes.
+//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ — `pinokin.se3_from_rpy`,
+//!   `scipy` `'XYZ'`), stated in `spec/PROTOCOL-V2.md`. This is the
+//!   convention `par6.robot.Robot`'s FK/IK, the dry-run client and the
+//!   frontend's STATUS-matrix decode all read the same six numbers in.
+//!   It is NOT the URDF `rpy` attribute's fixed-axis order, which
+//!   composes the same three numbers the other way round.
 //! - The RT snapshot's `tcp` is `[x y z (m), roll pitch yaw (rad)]` in
-//!   the SAME convention, extracted here from the FK matrix (NOT via
-//!   `Kin::tcp`, whose rpy is the intrinsic-XYZ pinokin convention and
-//!   would round-trip to a wrong STATUS matrix).
+//!   the SAME convention, extracted here from the FK matrix so the
+//!   server's STATUS matrix reconstruction reproduces the true pose.
+//!   (Not `Kin::tcp`: same convention, but its decode drops the wrist
+//!   angle of an exactly gimbal-locked matrix where this one keeps it.)
 //!
 //! The commanded TCP offset lives on this boundary too — see
 //! [`ToolOffset`]: one shared cell, read by every FK/IK consumer, so the
@@ -164,24 +168,32 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 // ------------------------------------------------------------- pose math
 
 /// `[x y z (m), roll pitch yaw (rad)]` from a row-major 4x4, rpy in the
-/// URDF fixed-axis convention `R = Rz·Ry·Rx` (gimbal lock folds yaw
-/// into roll, matching the Python client's decode).
+/// wire's intrinsic-XYZ convention `R = Rx·Ry·Rz` — the decomposition
+/// `pinokin.so3_rpy` performs, and the exact inverse of
+/// [`wire_pose_to_matrix`].
+///
+/// At gimbal lock only `roll ∓ yaw` is observable, and this decode folds
+/// it into roll rather than reading both off a column of zeros: the
+/// server rebuilds the STATUS matrix from what comes out of here, and
+/// `atan2(±0, ±0)` on an exactly degenerate matrix answers 0 or ±π by
+/// sign bit — either way a rotation the arm is not in.
 pub(crate) fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
-    let (r00, r10) = (m[0], m[4]);
-    let (r11, r12) = (m[5], m[6]);
-    let (r20, r21, r22) = (m[8], m[9], m[10]);
-    let sy = r00.hypot(r10);
-    let (roll, yaw) = if sy > 1e-9 {
-        (r21.atan2(r22), r10.atan2(r00))
+    let (r00, r01, r02) = (m[0], m[1], m[2]);
+    let (r10, r11, r12) = (m[4], m[5], m[6]);
+    let r22 = m[10];
+    let cp = r12.hypot(r22);
+    let (roll, yaw) = if cp > 1e-9 {
+        ((-r12).atan2(r22), (-r01).atan2(r00))
     } else {
-        ((-r12).atan2(r11), 0.0)
+        ((r02.signum() * r10).atan2(r11), 0.0)
     };
-    let pitch = (-r20).atan2(sy);
+    let pitch = r02.atan2(cp);
     [m[3], m[7], m[11], roll, pitch, yaw]
 }
 
 /// Row-major 4x4 from a wire pose `[x y z (mm), rx ry rz (deg)]`,
-/// `R = Rz·Ry·Rx`.
+/// `R = Rx(rx)·Ry(ry)·Rz(rz)` — `pinokin.se3_from_rpy` in the units the
+/// wire speaks.
 pub(crate) fn wire_pose_to_matrix(pose_mm_deg: &[f64; 6]) -> Pose {
     let (x, y, z) = (
         pose_mm_deg[0] / 1000.0,
@@ -192,17 +204,17 @@ pub(crate) fn wire_pose_to_matrix(pose_mm_deg: &[f64; 6]) -> Pose {
     let (sp, cp) = pose_mm_deg[4].to_radians().sin_cos();
     let (sy, cy) = pose_mm_deg[5].to_radians().sin_cos();
     [
-        cy * cp,
-        cy * sp * sr - sy * cr,
-        cy * sp * cr + sy * sr,
+        cp * cy,
+        -cp * sy,
+        sp,
         x,
-        sy * cp,
-        sy * sp * sr + cy * cr,
-        sy * sp * cr - cy * sr,
+        sr * sp * cy + cr * sy,
+        cr * cy - sr * sp * sy,
+        -sr * cp,
         y,
-        -sp,
-        cp * sr,
-        cp * cr,
+        sr * sy - cr * sp * cy,
+        cr * sp * sy + sr * cy,
+        cr * cp,
         z,
         0.0,
         0.0,
@@ -543,6 +555,102 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `R = Rx(rx)·Ry(ry)·Rz(rz)` built from the module's own axis
+    /// rotations — the wire convention stated the long way round, and an
+    /// oracle no ordering mistake inside [`wire_pose_to_matrix`] can
+    /// share.
+    fn intrinsic_xyz(rx_deg: f64, ry_deg: f64, rz_deg: f64) -> Pose {
+        let rx = axis_delta(3, rx_deg.to_radians());
+        let ry = axis_delta(4, ry_deg.to_radians());
+        let rz = axis_delta(5, rz_deg.to_radians());
+        mat_mul(&mat_mul(&rx, &ry), &rz)
+    }
+
+    /// The wire's rotation convention, against an independent product of
+    /// axis rotations. Reading the same three numbers the other way
+    /// round (`Rz·Ry·Rx`, the URDF `rpy` order) is a different
+    /// orientation for every pose with more than one non-zero component
+    /// — 36.7° at the posture the cartesian e2e test starts from.
+    #[test]
+    fn wire_rotation_is_intrinsic_xyz() {
+        for (rx, ry, rz) in [
+            (10.0, -20.0, 130.0),
+            (30.6, 33.25, 13.32),
+            (-170.0, 45.0, -5.0),
+        ] {
+            let built = wire_pose_to_matrix(&[120.0, -45.0, 300.0, rx, ry, rz]);
+            let want = intrinsic_xyz(rx, ry, rz);
+            for (i, (a, b)) in built.iter().zip(want.iter()).enumerate().take(11) {
+                if i % 4 != 3 {
+                    assert!(
+                        (a - b).abs() < 1e-12,
+                        "({rx}, {ry}, {rz}) elem {i}: {a} vs Rx·Ry·Rz {b}"
+                    );
+                }
+            }
+            let back = matrix_to_xyzrpy(&want);
+            let got = [
+                back[3].to_degrees(),
+                back[4].to_degrees(),
+                back[5].to_degrees(),
+            ];
+            for (a, b) in got.iter().zip([rx, ry, rz].iter()) {
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "decode gave {got:?}, want [{rx}, {ry}, {rz}]"
+                );
+            }
+        }
+    }
+
+    /// The everyday tool-down pose: pointing the tool at the table and
+    /// spinning the wrist. Under the fixed-axis reading of the same
+    /// three numbers the wrist angle comes back NEGATED — the taught
+    /// pose and the replayed pose are `2·rz` apart, and the arm enters
+    /// the fixture rotated.
+    #[test]
+    fn tool_down_wrist_angle_keeps_its_sign() {
+        for rz in [10.0, 30.0, 90.0] {
+            let down = intrinsic_xyz(180.0, 0.0, rz);
+            let back = matrix_to_xyzrpy(&down);
+            assert!(
+                (back[5].to_degrees() - rz).abs() < 1e-9,
+                "tool-down rz={rz} decoded as {}",
+                back[5].to_degrees()
+            );
+            assert!((back[3].to_degrees().abs() - 180.0).abs() < 1e-9);
+            assert!(back[4].abs() < 1e-9);
+        }
+    }
+
+    /// A pose whose pitch sits exactly on gimbal lock still names the
+    /// orientation it is in: roll and yaw are no longer separable, so
+    /// the pair the decode picks has to rebuild the same matrix.
+    #[test]
+    fn gimbal_locked_pose_round_trips_to_the_same_orientation() {
+        for (pitch, rx, rz) in [(90.0, 40.0, 25.0), (-90.0, -15.0, 100.0)] {
+            let locked = intrinsic_xyz(rx, pitch, rz);
+            let back = matrix_to_xyzrpy(&locked);
+            let again = wire_pose_to_matrix(&[
+                0.0,
+                0.0,
+                0.0,
+                back[3].to_degrees(),
+                back[4].to_degrees(),
+                back[5].to_degrees(),
+            ]);
+            for (i, (a, b)) in locked.iter().zip(again.iter()).enumerate().take(11) {
+                if i % 4 != 3 {
+                    assert!(
+                        (a - b).abs() < 1e-9,
+                        "pitch {pitch} elem {i}: {a} vs {b} (decoded {:?})",
+                        &back[3..]
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn wire_pose_round_trips_through_matrix() {

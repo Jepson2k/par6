@@ -5,6 +5,11 @@
 //! Nothing here touches a file descriptor, so the schedulers that decide
 //! WHAT goes on the wire are exercised directly by unit tests, while the
 //! hardware module only has to get the transport right.
+//!
+//! [`FreshnessClock`] is the exception to "SocketCAN backend": data age
+//! and its warn/latch/re-arm rules are bus health semantics, not
+//! transport, so [`crate::sim::SimBus`] and [`crate::LoopbackBus`] run
+//! the same clock rather than each carrying a copy of it.
 
 use par6_config::{Gains, WatchdogAction};
 
@@ -103,8 +108,14 @@ impl PollScheduler {
 
 /// Per-node data-age clock (spec/CAN.md freshness layer 1): stale is a
 /// self-clearing warning, lost LATCHES until the user clear path.
+///
+/// `None` means "never seen", which only [`configure`](Self::configure)
+/// produces: it is an absorbing state ([`latch_lost`](Self::latch_lost)
+/// skips it and [`classify`](Self::classify) maps it to
+/// [`Freshness::Unknown`]), so nothing that means "forget the fault" may
+/// ever write it — see [`clear_latch`](Self::clear_latch).
 #[derive(Debug)]
-pub(super) struct FreshnessClock {
+pub(crate) struct FreshnessClock {
     stale_warn_ticks: u64,
     lost_ticks: u64,
     last_rx_tick: [Option<u64>; MAX_NODES],
@@ -126,16 +137,20 @@ impl Default for FreshnessClock {
 
 impl FreshnessClock {
     /// Install the thresholds (config seconds converted to ticks by the
-    /// caller) and forget every observation.
-    pub(super) fn configure(&mut self, stale_warn_ticks: u64, lost_ticks: u64) {
+    /// caller) and forget every observation. Boot is the one moment where
+    /// "never seen" is the truth — the bus scan and the RT boot selfcheck
+    /// are what catch a node that never appears at all.
+    pub(crate) fn configure(&mut self, stale_warn_ticks: u64, lost_ticks: u64) {
         self.stale_warn_ticks = stale_warn_ticks;
         self.lost_ticks = lost_ticks;
-        self.rebase();
+        self.last_rx_tick = [None; MAX_NODES];
+        self.lost_latched = [false; MAX_NODES];
+        self.last_gripper_rx_tick = None;
     }
 
     /// Latch every node whose age has reached the lost threshold. Called
     /// once per tick, before the drain.
-    pub(super) fn latch_lost(&mut self, tick: u64) {
+    pub(crate) fn latch_lost(&mut self, tick: u64) {
         for n in 0..MAX_NODES {
             if let Some(last) = self.last_rx_tick[n] {
                 if tick.saturating_sub(last) >= self.lost_ticks {
@@ -147,7 +162,7 @@ impl FreshnessClock {
 
     /// Record a frame from `node`. Returns `true` when it is a
     /// stale→fresh edge (the reconnect signal that re-sends config).
-    pub(super) fn mark(&mut self, node: NodeId, tick: u64) -> bool {
+    pub(crate) fn mark(&mut self, node: NodeId, tick: u64) -> bool {
         let n = usize::from(node);
         let reconnected = self.last_rx_tick[n]
             .is_some_and(|last| tick.saturating_sub(last) >= self.stale_warn_ticks);
@@ -157,12 +172,12 @@ impl FreshnessClock {
 
     /// Record a firmware-gripper reply (cmd 60), which ages separately
     /// from the node's other traffic.
-    pub(super) fn mark_gripper(&mut self, tick: u64) {
+    pub(crate) fn mark_gripper(&mut self, tick: u64) {
         self.last_gripper_rx_tick = Some(tick);
     }
 
     /// Ticks since `node`'s last frame; `u64::MAX` = never seen.
-    pub(super) fn age(&self, node: NodeId, tick: u64) -> u64 {
+    pub(crate) fn age(&self, node: NodeId, tick: u64) -> u64 {
         match self.last_rx_tick[usize::from(node)] {
             Some(last) => tick.saturating_sub(last),
             None => u64::MAX,
@@ -170,7 +185,7 @@ impl FreshnessClock {
     }
 
     /// Ticks since the last firmware-gripper reply.
-    pub(super) fn gripper_age(&self, tick: u64) -> u64 {
+    pub(crate) fn gripper_age(&self, tick: u64) -> u64 {
         match self.last_gripper_rx_tick {
             Some(last) => tick.saturating_sub(last),
             None => u64::MAX,
@@ -178,7 +193,7 @@ impl FreshnessClock {
     }
 
     /// Freshness classification of one node at `tick`.
-    pub(super) fn classify(&self, node: NodeId, tick: u64) -> Freshness {
+    pub(crate) fn classify(&self, node: NodeId, tick: u64) -> Freshness {
         let n = usize::from(node);
         if self.lost_latched[n] {
             return Freshness::Lost;
@@ -198,18 +213,29 @@ impl FreshnessClock {
         }
     }
 
-    /// User clear-errors path for one node.
-    pub(super) fn clear_latch(&mut self, node: NodeId) {
+    /// User clear-errors path for one node: drop the latch and stamp the
+    /// node SEEN NOW.
+    ///
+    /// "Forget" must mean "seen now", never "never seen". Zeroing the
+    /// observation would make a node that never speaks again permanently
+    /// un-reportable and would cost it the stale→fresh edge that resends
+    /// its stored config; stamping the current tick re-arms both — a
+    /// still-silent node re-latches `lost_ticks` later on its own, and one
+    /// that comes back is a reconnect.
+    pub(crate) fn clear_latch(&mut self, node: NodeId, tick: u64) {
         let n = usize::from(node);
         self.lost_latched[n] = false;
-        self.last_rx_tick[n] = None;
+        self.last_rx_tick[n] = Some(tick);
     }
 
-    /// Forget every observation (FLASHING exit).
-    pub(super) fn rebase(&mut self) {
-        self.last_rx_tick = [None; MAX_NODES];
+    /// Stamp every node SEEN NOW and drop every latch (FLASHING exit):
+    /// the deliberately silent window must not read as a mass disconnect,
+    /// while a node that did not survive the flash still latches
+    /// `lost_ticks` later.
+    pub(crate) fn rebase(&mut self, tick: u64) {
+        self.last_rx_tick = [Some(tick); MAX_NODES];
         self.lost_latched = [false; MAX_NODES];
-        self.last_gripper_rx_tick = None;
+        self.last_gripper_rx_tick = Some(tick);
     }
 }
 
@@ -468,8 +494,8 @@ mod tests {
         f.mark(0, t);
         assert_eq!(f.classify(0, t), Freshness::Lost, "lost is latched");
         // Only the user clear path resets it.
-        f.clear_latch(0);
-        assert_eq!(f.classify(0, t), Freshness::Unknown);
+        f.clear_latch(0, t);
+        assert_eq!(f.classify(0, t), Freshness::Fresh);
         f.mark(0, t);
         assert_eq!(f.classify(0, t), Freshness::Fresh);
 
@@ -477,15 +503,72 @@ mod tests {
         f.latch_lost(t + 10 * lost);
         assert_eq!(f.classify(3, t + 10 * lost), Freshness::Unknown);
 
-        // Re-base (FLASHING exit) forgets everything, latch included.
+        // The gripper reply ages on its own clock.
+        assert_eq!(f.gripper_age(t), u64::MAX, "never seen");
+        f.mark_gripper(t);
+        assert_eq!(f.gripper_age(t + 4), 4);
+
+        // Re-base (FLASHING exit) drops the latch and stamps SEEN NOW.
         f.mark(1, t);
         f.latch_lost(t + lost);
         assert_eq!(f.classify(1, t + lost), Freshness::Lost);
-        f.rebase();
-        assert_eq!(f.classify(1, t + lost), Freshness::Unknown);
-        assert_eq!(f.gripper_age(t), u64::MAX);
-        f.mark_gripper(t);
-        assert_eq!(f.gripper_age(t + 4), 4);
+        f.rebase(t + lost);
+        assert_eq!(f.classify(1, t + lost), Freshness::Fresh);
+    }
+
+    /// Clearing a latch is "seen now", never "never seen": a node that is
+    /// still off the bus must re-latch on its own, and one that comes back
+    /// must still produce the stale→fresh edge that resends its config.
+    ///
+    /// Zeroing the observation instead is absorbing — `latch_lost` skips
+    /// `None` and only `mark` leaves it — so the clear would make a dead
+    /// node permanently un-reportable AND silently deny it its config
+    /// resend, leaving it on firmware defaults while the RT commands it.
+    /// The same applies to the FLASHING-exit re-base.
+    #[test]
+    fn clearing_a_latch_re_arms_the_lost_threshold_and_the_reconnect_edge() {
+        let (stale, lost) = (10u64, 50u64);
+        let mut f = FreshnessClock::default();
+        f.configure(stale, lost);
+        f.mark(2, 1);
+
+        // Node 2 goes silent and latches; the user clears it without
+        // fixing the cable.
+        let latched_at = 1 + lost;
+        f.latch_lost(latched_at);
+        assert_eq!(f.classify(2, latched_at), Freshness::Lost);
+        f.clear_latch(2, latched_at);
+
+        // Still silent: stale again after the warn window, and LOST again
+        // after the lost window — the health surface cannot go quiet on a
+        // joint that is off the bus.
+        f.latch_lost(latched_at + lost - 1);
+        assert_eq!(f.classify(2, latched_at + stale), Freshness::Stale);
+        assert_eq!(
+            f.classify(2, latched_at + lost - 1),
+            Freshness::Stale,
+            "one tick short of the window is still only a warning"
+        );
+        f.latch_lost(latched_at + lost);
+        assert_eq!(f.classify(2, latched_at + lost), Freshness::Lost);
+
+        // The cable is re-seated after a second clear: the node's return
+        // is a stale→fresh edge, so its stored config goes back out.
+        let cleared_at = latched_at + lost;
+        f.clear_latch(2, cleared_at);
+        assert!(
+            f.mark(2, cleared_at + stale),
+            "a node returning after a clear is a reconnect"
+        );
+
+        // FLASHING exit: same rule, robot-wide.
+        f.rebase(cleared_at);
+        f.latch_lost(cleared_at + lost);
+        assert_eq!(
+            f.classify(0, cleared_at + lost),
+            Freshness::Lost,
+            "a node that did not survive the flash still latches"
+        );
     }
 
     /// The boot load is batched BY MESSAGE TYPE with a pace between

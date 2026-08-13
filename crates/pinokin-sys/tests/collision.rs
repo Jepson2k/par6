@@ -42,8 +42,55 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v3() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 3);
+fn abi_version_is_v4() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 4);
+}
+
+#[test]
+fn a_tilted_shape_is_placed_the_way_waldoctl_draws_it() {
+    // waldoctl's Shape.pose is extrinsic-XYZ (R = Rz·Ry·Rx), which is what
+    // parol6's _pose_to_matrix and the frontend's renderer place shapes
+    // with. Under the intrinsic reading the same triple points the bar
+    // somewhere else entirely, so the keep-out an operator drew across the
+    // arm becomes one the arm walks straight through.
+    let bar = |rx: f64, ry: f64, rz: f64| ShapeDesc {
+        kind: ffi::PAR6_SHAPE_BOX,
+        params: [0.03, 0.03, 0.7, 0.0],
+        n_params: 3,
+        // Long side on local z, laid across the arm's +X reach.
+        pose: [0.35, 0.0, 0.15, rx, ry, rz],
+        margin: None,
+    };
+    let quarter = std::f64::consts::FRAC_PI_2;
+    let verdict = |col: &mut CollisionModel, shape: ShapeDesc| {
+        col.set_layer(Layer::Program, &[shape]).unwrap();
+        let mut buf = [0i32; 64];
+        let (active, n) = col.check_into(&[0.0; 6], false, &mut buf).unwrap();
+        let mut names: Vec<String> = buf[..2 * n]
+            .iter()
+            .map(|&i| col.geom_name(i as usize).unwrap())
+            .collect();
+        names.sort();
+        (active, names)
+    };
+    let mut col = load();
+
+    // Single-axis references: both orders agree on these, so they are the
+    // two placements the tilted triple has to choose between.
+    let along_x = verdict(&mut col, bar(0.0, quarter, 0.0));
+    let along_y = verdict(&mut col, bar(quarter, 0.0, 0.0));
+    assert!(
+        along_x.0 && !along_y.0,
+        "the case stopped discriminating: +X {along_x:?}, -Y {along_y:?}"
+    );
+
+    // Rz(90°)·Ry(0)·Rx(90°) lays the bar along +X; the intrinsic order
+    // lays the same triple along -Y.
+    let tilted = verdict(&mut col, bar(quarter, 0.0, quarter));
+    assert_eq!(
+        tilted, along_x,
+        "the tilted keep-out was enforced somewhere else"
+    );
 }
 
 #[test]

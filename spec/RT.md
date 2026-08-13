@@ -23,6 +23,12 @@ deviations from the vendor design.
   bad percentile.
 - Vendor scheduling: SCHED_FIFO prio 99, pinned core 3; setup failure is logged
   DEGRADED but non-fatal. Keep that stance.
+- **[OURS]** Nothing on the tick path may log unthrottled. A bus fault is permanent while
+  the link is down and the tick keeps commanding through ACTIVE_ERROR, so a per-tick
+  `warn!` is ~750 records/s of writer lock + `write(2)` on a prio-99 thread — under
+  systemd that fd is a pipe to journald, and a stalled reader blocks the loop instead of
+  degrading it. Each bus failure site (RX drain, joint TX, gripper TX) is rate limited to
+  one line per second with a suppressed-since count, re-arming on the first success.
 
 ## Tick phase order
 
@@ -39,8 +45,15 @@ The state pipeline order (motor arrays → joint/TCP derivation → history appe
 finite differences) is load-bearing either way.
 
 - At most ONE external command consumed per tick.
-- Boot one-shots: tick 8 = bus scan + selfcheck then request IDLE (exit BOOTING);
-  vendor re-sends full config at ticks 50/150/300 (workaround — we may drop after HIL).
+- Boot one-shots: tick 8 = bus scan + selfcheck, kt resolution, then request IDLE (exit
+  BOOTING); vendor re-sends full config at ticks 50/150/300 (workaround — we may drop
+  after HIL).
+- **kt resolution** (`robot.kt_source = auto`): the boot cmd-33 fetch lands in
+  `BusState.nodes[n].kt_nm_a` with the first drain; at the tick-8 one-shot the RT rebuilds
+  `torque_ma_factor[i]` around the DRIVER's value, falling back to config per joint for a
+  node that did not answer or answered non-finite/≤0. It happens while still BOOTING, so
+  no enable and no torque command can have used the config factor. Per-joint provenance is
+  `nodes[i].kt_nm_a` in the snapshot: `Some` = read off that driver.
 
 ## State machine
 
@@ -135,9 +148,18 @@ NOT_HOMED, LOOP_DEGRADED. Everything else LATCHES until user clear.
 - **Live-bit gating**: per-type motor flags (from the ~84 ms round-robin poll) are only
   trusted while that node's live fault bit (CAN-id err_bit) is set — fixes the
   "clear needs two presses" race. Unknown (-1) does NOT suppress.
-- Clear sequence: cmd 1 ×3 to each faulted node (+ gripper), zero stale entries, settle
-  countdown ~152 ms (sized to outlast the poll cycle), then wipe latch; anything real
-  re-latches next poll.
+- Clear sequence: cmd 1 ×3 to each faulted node (+ gripper), zero stale entries, drop the
+  subsystem flags a hard key is re-asserted from every tick (homing's gripper-calibration
+  failure — left set, the key comes back after the wipe and blocks the HOMING entry that
+  is its only other reset), settle countdown ~152 ms (sized to outlast the poll cycle),
+  then wipe latch; anything real re-latches next poll.
+- **Clearing a CAN_LOST latch is "seen now", never "never seen"** — the bus-side reset
+  drops the latch and stamps the node's data-age clock at the current tick. A node that is
+  still off the bus therefore re-latches one `bus.lost_s` window later on its own, and a
+  node that comes back still produces the stale→fresh edge that resends its stored config.
+  Erasing the observation instead is absorbing (only an incoming frame leaves it), which
+  makes a dead node permanently un-reportable and lets HOMING start with a joint off the
+  bus. Same rule for the robot-wide re-base on FLASHING exit.
 - Reaction: any hard error (mode ∉ {BOOTING}) → state=DISABLED; if mode ∉
   {ACTIVE_ERROR, FLASHING} → mode=ACTIVE_ERROR (if HOMING: abort homing, un-home).
   No hard errors ∧ mode==ACTIVE_ERROR → auto-return to IDLE.

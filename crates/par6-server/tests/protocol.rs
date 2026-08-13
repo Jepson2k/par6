@@ -442,6 +442,27 @@ async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
     rmp_serde::from_slice(&buf[..n]).expect("minimal recipe layout: [name, seq, mono_ns, tick, q]")
 }
 
+/// A TCP rotation with three substantial components \[rad\] — the only
+/// kind that tells the wire's rotation convention apart from the
+/// fixed-axis reading of the same three numbers.
+const TILTED_RPY: [f64; 3] = [0.7, -0.4, 1.1];
+
+/// `R = Rx(r)·Ry(p)·Rz(y)` as a row-major 3x3: the wire's intrinsic-XYZ
+/// convention (`spec/PROTOCOL-V2.md`) composed the long way round, so it
+/// shares no code with the STATUS builder it judges.
+fn intrinsic_xyz(rpy: [f64; 3]) -> [[f64; 3]; 3] {
+    let (sr, cr) = rpy[0].sin_cos();
+    let (sp, cp) = rpy[1].sin_cos();
+    let (sy, cy) = rpy[2].sin_cos();
+    let rx = [[1.0, 0.0, 0.0], [0.0, cr, -sr], [0.0, sr, cr]];
+    let ry = [[cp, 0.0, sp], [0.0, 1.0, 0.0], [-sp, 0.0, cp]];
+    let rz = [[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]];
+    let mul = |a: [[f64; 3]; 3], b: [[f64; 3]; 3]| {
+        std::array::from_fn(|r| std::array::from_fn(|c| (0..3).map(|k| a[r][k] * b[k][c]).sum()))
+    };
+    mul(mul(rx, ry), rz)
+}
+
 // ---- command builders ------------------------------------------------------
 
 fn move_j(key: u64) -> Command {
@@ -655,14 +676,14 @@ async fn queue_full_rejects_with_comm_queue_full() {
 }
 
 /// The gating table over the wire: un-homed, disabled, e-stop latch and
-/// simulator-only rejections carry their specific error codes; homing
-/// and jogging stay available un-homed.
+/// simulator-only rejections carry their specific error codes; `home`
+/// is the one motion command that stays available un-homed.
 #[tokio::test]
 async fn gating_rejections_carry_specific_codes() {
     let mut h = start(|_| {}).await;
     let mut c = Client::new(&h).await;
 
-    // Un-homed: planned motion refused, home + jog accepted.
+    // Un-homed: planned motion refused, home accepted.
     h.publish(|s| s.homed = false);
     let err = c.expect_error(&move_j(301)).await;
     assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
@@ -670,6 +691,23 @@ async fn gating_rejections_carry_specific_codes() {
         .ok_index(&Command::Home(par6_proto::command::Home { key: 302 }))
         .await;
     assert!(home_idx >= 1);
+
+    // ...and so is a jog: the RT refuses the JOG mode entry without a
+    // home reference, so accepting one here would drop it silently and
+    // leave the operator pressing a button that does nothing. The
+    // rejection reaches the client even though success is unacked.
+    let err = c.expect_error(&jog_j()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
+    assert!(
+        !h.rt_events().contains(&RtEvent::Stream(CmdType::JogJ)),
+        "a refused jog must never reach the RT: {:?}",
+        h.rt_events()
+    );
+
+    // Homed again: the same jog is accepted.
+    h.publish(|_| {});
     c.send(&jog_j()).await; // fire-and-forget: success is unacked
     h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
         .await;
@@ -885,6 +923,84 @@ async fn streaming_preemption_semantics() {
     }
 }
 
+/// What a stream preemption is allowed to throw away.
+///
+/// The command socket carries every client and every command class, so
+/// the drain that follows a stream type change must discard the stale
+/// setpoints of the stream it replaced and NOTHING else. The case that
+/// makes this a safety defect rather than a nicety: the operator jogs
+/// joints, drags a Cartesian axis, and hits the software E-STOP — all
+/// three datagrams queued before the server reads any of them. Draining
+/// the socket destroys the `estop` with no reply and no effect, and the
+/// client's SYSTEM send does not retry, so the UI shows E-STOP ACTIVE
+/// over an arm that was never disabled.
+#[tokio::test]
+async fn stream_preemption_never_destroys_buffered_system_commands() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    // An established jog_j stream — so the jog_l below is a type change,
+    // the arm that drains.
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+
+    // Three datagrams, all buffered before the server reads (ready sends
+    // on a current-thread runtime): the preempting jog_l, a stale jog_j
+    // behind it, and the operator's `estop` behind that. The stale jog_j
+    // sits between them deliberately — it is what the drain is entitled
+    // to discard, and the assertion that it never replayed is also the
+    // proof that the drain saw the `estop` and chose to keep it.
+    c.send(&jog_l()).await;
+    c.send(&jog_j()).await;
+    let estop_req = c.send(&Command::Estop).await;
+
+    // The estop is answered — it was neither dropped nor left unread.
+    // (Against the blind drain there is no reply at all, and this waits
+    // out its budget.)
+    loop {
+        match c.recv().await {
+            Reply::Ok { req_id, .. } if req_id == estop_req => break,
+            Reply::Error { req_id, error } if req_id == estop_req => {
+                panic!("estop refused: {error:?}")
+            }
+            _ => {}
+        }
+    }
+
+    // ...and it took effect: the RT was disabled and halted, and the
+    // latch is standing.
+    let ev = h
+        .wait_rt(|ev| ev.contains(&RtEvent::SetEnabled(false)))
+        .await;
+    assert!(
+        ev.contains(&RtEvent::Halt),
+        "estop must halt motion: {ev:?}"
+    );
+    let err = c.expect_error(&move_j(511)).await;
+    assert_eq!(
+        err.code,
+        ErrorCode::SysEstopActive as u16,
+        "the e-stop latch must be standing after a preemption drain"
+    );
+
+    // The stale jog_j WAS discarded — that is what the drain is for, and
+    // it only reads as discarded if the drain got to it before the estop
+    // did, i.e. all three were queued together.
+    let ev = h.rt_events();
+    let jog_l_pos = ev
+        .iter()
+        .position(|e| *e == RtEvent::Stream(CmdType::JogL))
+        .expect("the preempting jog_l reached the RT");
+    assert!(
+        !ev[jog_l_pos + 1..].contains(&RtEvent::Stream(CmdType::JogJ)),
+        "a superseded jog_j must not replay (if it did, the three \
+         datagrams were not buffered together and this test proved \
+         nothing): {ev:?}"
+    );
+}
+
 /// Chunked move_s: out-of-order reassembly hands the planner the exact
 /// original command; a stalled transfer times out with
 /// COMM_CHUNK_TIMEOUT on the transfer's req_id.
@@ -959,7 +1075,7 @@ async fn status_broadcast_content_and_staleness() {
     h.planner.lock().unwrap().enablement.joint_en = [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0];
     h.publish(|s| {
         s.q = [0.5, 0.0, 0.0, 0.0, 0.0, 0.0];
-        s.tcp = [0.1, 0.2, 0.3, 0.0, 0.0, 0.0];
+        s.tcp = [0.1, 0.2, 0.3, TILTED_RPY[0], TILTED_RPY[1], TILTED_RPY[2]];
     });
 
     // Wait for a fresh-linked packet (the first may predate the publish).
@@ -977,7 +1093,19 @@ async fn status_broadcast_content_and_staleness() {
     assert!((s1.pose[3] - 100.0).abs() < 1e-9, "x translation in mm");
     assert!((s1.pose[7] - 200.0).abs() < 1e-9);
     assert!((s1.pose[11] - 300.0).abs() < 1e-9);
-    assert_eq!(s1.pose[0], 1.0, "identity rotation at zero rpy");
+    // The rotation the snapshot's rpy names, composed independently: a
+    // STATUS matrix built in the fixed-axis order instead would hand every
+    // client an orientation 49° from this snapshot's.
+    for (r, row) in intrinsic_xyz(TILTED_RPY).iter().enumerate() {
+        for (c, want) in row.iter().enumerate() {
+            let got = s1.pose[r * 4 + c];
+            assert!(
+                (got - want).abs() < 1e-12,
+                "STATUS rotation [{r}][{c}] = {got}, want {want} (whole matrix {:?})",
+                s1.pose
+            );
+        }
+    }
     assert_eq!(s1.joint_en, [0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0]);
     assert!(s1.homed);
     assert_eq!(s1.executing_index, -1);
