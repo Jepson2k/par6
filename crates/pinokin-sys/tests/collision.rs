@@ -42,8 +42,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v6() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 6);
+fn abi_version_is_v7() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 7);
 }
 
 #[test]
@@ -397,4 +397,52 @@ fn srdf_removes_named_self_pairs_and_malformed_files_change_nothing() {
     );
 
     std::fs::remove_dir_all(&dir).ok();
+}
+
+/// The escape-depth signal is world-pairs-only: +inf with an empty
+/// world whatever the arm does with itself, and a self contact never
+/// masks the world reading. In the separated regime the signal is
+/// coal's exact pair distance, so an approaching shape must track its
+/// own translation; inside penetration the value only has to stay
+/// negative (the patch-local mesh estimate is deliberately weak there —
+/// see the shim header for why a truer signal was rejected).
+#[test]
+fn world_distance_reads_world_pairs_only_and_tracks_approach() {
+    let mut col = load();
+    let q = [0.0; 6];
+
+    let clear = col.world_distance(&q).unwrap();
+    assert!(
+        clear.is_infinite() && clear > 0.0,
+        "no world shapes must read +inf, got {clear}"
+    );
+
+    // A 0.3 m box walking down onto the robot from above (+z), 30 mm
+    // per step: while separated, each step must show up in the signal
+    // as (close to) its own 30 mm.
+    let step = 0.03;
+    let mut depths = Vec::new();
+    for k in 0..10 {
+        let z = 0.75 - step * k as f64;
+        col.set_layer(Layer::Program, &[box_at(0.0, 0.0, z, 0.3)])
+            .unwrap();
+        depths.push(col.world_distance(&q).unwrap());
+    }
+    assert!(
+        depths.last().unwrap() < &0.0,
+        "the walk must end in contact: {depths:?}"
+    );
+    for w in depths.windows(2) {
+        if w[0] > 0.02 && w[1] > 0.02 {
+            assert!(
+                (w[0] - w[1] - step).abs() < 0.5 * step,
+                "a separated 30 mm approach step reported as {:.4} m ({depths:?})",
+                w[0] - w[1]
+            );
+        }
+        assert!(
+            w[1] < w[0] + 1e-9,
+            "lowering the box must never raise the signal ({depths:?})"
+        );
+    }
 }

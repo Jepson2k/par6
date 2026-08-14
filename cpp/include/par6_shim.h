@@ -328,6 +328,20 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
 par6_status par6_col_distance(par6_col *h, const double *q,
                               double *out_distance);
 
+/* Minimum signed distance over WORLD pairs only at `q` — every robot
+ * link against every world shape, +inf with an empty world. The
+ * escape-depth rule's signal, split from par6_col_distance on purpose:
+ * a deep self contact must never mask the keep-out being watched, and
+ * skipping the self mesh-mesh scans is most of the full-distance cost.
+ * The value carries coal's mesh-pair penetration semantics — a local
+ * contact-patch depth, not the true translation into the volume. A
+ * truer (convex-hull EPA) signal was measured and rejected: true depth
+ * reads a transverse multi-link escape as deepening and refuses the one
+ * motion that gets the arm out of a keep-out dropped onto it. */
+par6_status par6_col_world_distance(par6_col *h, const double *q,
+                                    double *out_distance);
+
+
 /* ABI version of this header/library pair. Bump on any breaking change.
  * v2: par6_traj_* implemented over toppra-cpp — create takes n_gridpoints
  *     + err_buf/err_len, par6_traj_status dropped, par6_traj_nq added.
@@ -341,9 +355,11 @@ par6_status par6_col_distance(par6_col *h, const double *q,
  *     the escape-depth half of the start-in-collision rule). Purely
  *     additive; a stale v4 library merely fails to link it.
  * v6: par6_col_apply_srdf added (SRDF disable_collisions on the robot's
- *     self pairs). Purely additive; a stale v5 library fails to link it. */
+ *     self pairs). Purely additive; a stale v5 library fails to link it.
+ * v7: par6_col_world_distance added (world-pair-only escape-depth
+ *     signal). Purely additive; a stale v6 library fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 6
+#define PAR6_SHIM_ABI_VERSION 7
 
 #ifdef __cplusplus
 } /* extern "C" */

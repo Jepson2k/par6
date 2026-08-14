@@ -178,6 +178,11 @@ struct par6_col {
     pinocchio::GeometryModel geom;
     pinocchio::GeometryData geom_data;
 
+    /* Index of the first WORLD pair in geom.collisionPairs: self pairs
+     * come first (copied from base_geom), world pairs are appended by
+     * rebuild_world() — the depth query walks only the world tail. */
+    std::size_t world_pairs_from = 0;
+
     Eigen::VectorXd q;
 
     par6_col() : data(pinocchio::Model()), geom_data(pinocchio::GeometryModel()) {}
@@ -205,6 +210,7 @@ struct par6_col {
 
     void rebuild_world() {
         geom = base_geom;
+        world_pairs_from = geom.collisionPairs.size();
         /* Per-pair standoff, parallel to geom.collisionPairs: robot self
          * pairs use the default clearance, world pairs the shape's override. */
         std::vector<double> margins(geom.collisionPairs.size(), clearance);
@@ -487,5 +493,48 @@ par6_status par6_col_distance(par6_col *h, const double *q,
         return PAR6_ERR_EXCEPTION;
     }
 }
+
+par6_status par6_col_world_distance(par6_col *h, const double *q,
+                                    double *out_distance) {
+    if (h == nullptr || q == nullptr || out_distance == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    for (Eigen::Index i = 0; i < h->model.nq; ++i) {
+        if (!std::isfinite(q[i])) {
+            return PAR6_ERR_INVALID_ARG;
+        }
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        /* WORLD pairs only (+inf with an empty world): a deep self
+         * contact must never mask the keep-out the escape-depth rule is
+         * watching, and skipping the self mesh-mesh scans is most of the
+         * full computeDistances cost. Per-pair, after one placement
+         * update; margins never enter — raw geometry, like
+         * par6_col_distance. The estimate carries coal's mesh-pair
+         * penetration semantics on purpose: a local contact-patch depth,
+         * NOT the true translation into the volume. A truer (convex
+         * hull, EPA) signal was measured and rejected — true depth reads
+         * a transverse multi-link escape as "deepening" and refuses the
+         * one motion that gets the arm out of a keep-out dropped on it. */
+        pinocchio::updateGeometryPlacements(h->model, h->data, h->geom,
+                                            h->geom_data, h->q);
+        double best = std::numeric_limits<double>::infinity();
+        for (std::size_t k = h->world_pairs_from;
+             k < h->geom.collisionPairs.size(); ++k) {
+            const double d = pinocchio::computeDistance(h->geom, h->geom_data,
+                                                        k)
+                                 .min_distance;
+            if (d < best) {
+                best = d;
+            }
+        }
+        *out_distance = best;
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
 
 } // extern "C"

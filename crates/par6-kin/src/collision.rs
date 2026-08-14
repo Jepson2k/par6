@@ -327,6 +327,16 @@ impl Collision {
         Ok(self.model.min_distance(&self.q_full)?)
     }
 
+    /// Minimum signed distance over WORLD pairs only at `q` (+inf with
+    /// an empty world): the escape-depth rule's signal. Self pairs are
+    /// excluded so a deep arm-arm contact cannot mask the watched
+    /// keep-out, and skipping the self mesh-mesh scans is most of the
+    /// full-distance cost.
+    pub fn world_distance(&mut self, q: &[f64; NQ]) -> Result<f64, KinError> {
+        self.q_full[..NQ].copy_from_slice(q);
+        Ok(self.model.world_distance(&self.q_full)?)
+    }
+
     /// Whether the straight joint-space segment `from → to` stays clear,
     /// sampled at `steps` interior points plus both endpoints.
     ///

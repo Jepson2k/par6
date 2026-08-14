@@ -1538,11 +1538,33 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Cartesian freedom instead of full freedom. The wire slots are 0/1
     /// with no "unknown" spelling, and 1 means "you may move that way",
     /// which is the one thing such a runtime knows to be false.
+    ///
+    /// The RT's live jog latch is folded in on every read: the jog engine
+    /// blocks a direction at its jerk-aware brake-at-limits bound, which
+    /// at jog speed latches well before the static soft-limit margin the
+    /// planner's probe applies — so mid-jog, the flags grey the direction
+    /// the tick the RT actually stops honoring it.
     fn enablement(&self) -> Enablement {
         let mut en = self.runtime.planner.enablement();
         if !self.cfg.cartesian {
             en.cart_en_wrf = [0; EN_SLOTS];
             en.cart_en_trf = [0; EN_SLOTS];
+        }
+        // Only while the jog is live: the latch is the jog engine's
+        // state, and once the mode ends it describes a jog that no
+        // longer exists — the static probe rules again.
+        if self.snap.mode == Mode::Jog {
+            let mask = self.snap.jog.blocked_mask;
+            for j in 0..EN_SLOTS / 2 {
+                // Wire order is [j+, j−, …]; the RT mask carries a blocked
+                // negative direction in bit 2j and positive in bit 2j+1.
+                if mask & (2 << (2 * j)) != 0 {
+                    en.joint_en[2 * j] = 0;
+                }
+                if mask & (1 << (2 * j)) != 0 {
+                    en.joint_en[2 * j + 1] = 0;
+                }
+            }
         }
         en
     }

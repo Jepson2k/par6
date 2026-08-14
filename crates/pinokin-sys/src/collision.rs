@@ -283,6 +283,29 @@ impl CollisionModel {
         }
         Ok(distance)
     }
+
+    /// Minimum signed distance over WORLD pairs only at `q` (+inf with
+    /// an empty world): the escape-depth signal. Self pairs are excluded
+    /// so a deep arm-arm contact cannot mask the watched keep-out, and
+    /// skipping the self mesh-mesh scans is most of the full-distance
+    /// cost. Carries coal's patch-local mesh penetration semantics on
+    /// purpose — see the shim header for why a truer signal was
+    /// rejected.
+    pub fn world_distance(&mut self, q: &[f64]) -> Result<f64, Error> {
+        if q.len() != self.nq {
+            return Err(Error::Dimension {
+                expected: self.nq,
+                got: q.len(),
+            });
+        }
+        let mut distance = f64::NAN;
+        let status =
+            unsafe { ffi::par6_col_world_distance(self.raw.as_ptr(), q.as_ptr(), &mut distance) };
+        if status != ffi::PAR6_OK {
+            return Err(Error::Status(status));
+        }
+        Ok(distance)
+    }
 }
 
 impl Drop for CollisionModel {

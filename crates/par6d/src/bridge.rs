@@ -243,10 +243,10 @@ impl StreamGate {
             .collect())
     }
 
-    fn min_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
+    fn world_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
         let mut nq = [0.0; par6_kin::NQ];
         nq.copy_from_slice(&q[..par6_kin::NQ]);
-        self.collision.min_distance(&nq).map_err(gate_error)
+        self.collision.world_distance(&nq).map_err(gate_error)
     }
 
     /// Whether streaming from `current` toward `target` must stop, and
@@ -255,11 +255,12 @@ impl StreamGate {
     /// parol6's `collision_blocked` rule. Approaching: blocked when the
     /// target configuration collides. Already colliding: blocked when
     /// the target contacts a pair the arm is not already in, or when the
-    /// deepest penetration grows (`min_distance` drops by more than
-    /// [`ESCAPE_TOL_M`]) — a pair-set check alone cannot tell an
-    /// escaping move from one grinding deeper through the same pair, and
-    /// the depth check alone cannot tell an improving start-collision
-    /// from a new shallower one, so both run.
+    /// deepest world penetration grows (the hull-vs-world
+    /// `world_distance` drops by more than [`ESCAPE_TOL_M`]) — a
+    /// pair-set check alone cannot tell an escaping move from one
+    /// grinding deeper through the same pair, and the depth check alone
+    /// cannot tell an improving start-collision from a new shallower
+    /// one, so both run.
     fn blocked(
         &mut self,
         current: &[f64; MAX_JOINTS],
@@ -275,16 +276,15 @@ impl StreamGate {
             return Ok(Some(new));
         }
         // The depth half runs only when the standing collision involves a
-        // WORLD shape — the keep-out case escape exists for. A marginal
-        // arm-arm mesh contact (coarse meshes flickering near the park
-        // set) must not put two full-model `min_distance` scans (tens of
-        // ms each) into every 4 ms housekeeping period; arm-arm remains
-        // guarded by the pair half above.
+        // WORLD shape — the keep-out case escape exists for, and the
+        // only case the signal speaks about: `world_distance` covers
+        // world pairs only, so an arm-arm contact has no depth here and
+        // remains guarded by the pair half above.
         let world_pair = cur
             .iter()
             .any(|p| self.world_names.contains(&p.0) || self.world_names.contains(&p.1));
         if world_pair
-            && self.min_distance(target)? < self.min_distance(current)? - STREAM_ESCAPE_TOL_M
+            && self.world_distance(target)? < self.world_distance(current)? - STREAM_ESCAPE_TOL_M
         {
             return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
         }

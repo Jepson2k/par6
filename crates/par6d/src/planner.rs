@@ -408,10 +408,11 @@ impl Par6Planner {
     ///
     /// Leaving one is bounded by depth: from a start in world
     /// collision, a sample whose pair set stays inside the baseline is
-    /// still refused when its deepest penetration exceeds the start's
-    /// (`min_distance` drops below the start value by more than
-    /// [`ESCAPE_TOL_M`]) — the pair half alone cannot tell an escaping
-    /// path from one grinding deeper through the same pair.
+    /// still refused when its deepest world penetration exceeds the
+    /// start's (the hull-vs-world `world_distance` drops below the start
+    /// value by more than [`ESCAPE_TOL_M`]) — the pair half alone cannot
+    /// tell an escaping path from one grinding deeper through the same
+    /// pair.
     ///
     /// Streaming (`jog_*` / `servo_*`) is gated separately at datagram
     /// admission in the bridge's `StreamGate`, which applies the same
@@ -438,17 +439,16 @@ impl Par6Planner {
         let start_pairs = named(&col.check(&q_now, false).map_err(collision_error)?);
         // The depth half of the escape rule engages only when the start
         // penetrates a WORLD shape (a keep-out dropped over the arm) —
-        // the case escape exists for. Not for arm-arm contact: marginal
-        // mesh-coarseness contacts flicker in and out near touching
-        // poses, and engaging on those would run a full-model
-        // `min_distance` (tens of ms) on every checked sample of every
-        // ordinary plan. An arm-arm start collision is still guarded by
-        // the pair half — the move may not contact anything new.
+        // the case escape exists for, and the only case the signal
+        // speaks about: `world_distance` covers world pairs only, so an
+        // arm-arm start collision has no depth to watch and stays
+        // guarded by the pair half — the move may not contact anything
+        // new.
         let start_depth = if start_pairs
             .iter()
             .any(|p| world.contains(&p.0) || world.contains(&p.1))
         {
-            Some(col.min_distance(&q_now).map_err(collision_error)?)
+            Some(col.world_distance(&q_now).map_err(collision_error)?)
         } else {
             None
         };
@@ -496,7 +496,7 @@ impl Par6Planner {
                 ));
             }
             if let Some(d0) = start_depth {
-                let depth = col.min_distance(&q).map_err(collision_error)?;
+                let depth = col.world_distance(&q).map_err(collision_error)?;
                 if depth < d0 - ESCAPE_TOL_M {
                     let pairs = format_pairs(&touching);
                     log::info!(

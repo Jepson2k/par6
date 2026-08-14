@@ -1305,3 +1305,58 @@ fn is_identity(m: &[f64; 16]) -> bool {
         })
     })
 }
+
+/// The RT jog latch reaches the enablement flags.
+///
+/// The jog engine blocks a direction at its jerk-aware brake-at-limits
+/// bound, which at full jog speed latches with the joint still far from
+/// the soft wall — while the planner's static margin (a fraction of a
+/// degree) would keep reporting the direction free. A frontend greying
+/// its jog buttons off `joint_en` must see the direction the RT actually
+/// stopped honoring, not the wall the arm never got to.
+#[test]
+fn the_rt_jog_latch_greys_the_enablement_flag() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+
+    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let soft_max_deg = cfg.joints[0].limits.soft_max_rad.to_degrees();
+
+    // Park J0 well inside its window but near enough the wall that a
+    // full-speed jog's braking distance covers the gap: the engine
+    // latches the positive direction while the joint is still tens of
+    // degrees from the soft limit.
+    let mut near = park_deg();
+    near[0] = soft_max_deg - 25.0;
+    teleport_home(&rig, &mut c, near);
+    rig.wait_status("both directions free before the jog", |s| {
+        (s.joint_en[0], s.joint_en[1]) == (1, 1)
+    });
+
+    c.send(&jog_j(1.0, 2.0));
+    let s = rig.wait_status("the latched direction greys while far from the wall", |s| {
+        s.joint_en[0] == 0
+    });
+    assert!(
+        soft_max_deg - s.angles[0] > 2.0,
+        "the latch must fire from the brake bound, not the static margin: \
+         J0 at {:.2} deg with the soft wall at {soft_max_deg:.2} deg",
+        s.angles[0]
+    );
+    assert_eq!(
+        s.joint_en[1], 1,
+        "only the latched direction greys; negative stays free"
+    );
+
+    // Jogging away releases the latch: the flag is live state, not a
+    // one-way trip.
+    c.send(&jog_j(-0.3, 1.0));
+    rig.wait_status("the direction frees once the arm moves away", |s| {
+        s.joint_en[0] == 1
+    });
+
+    rig.shutdown();
+}

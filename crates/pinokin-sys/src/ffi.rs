@@ -170,6 +170,14 @@ extern "C" {
         err_buf: *mut c_char,
         err_len: i32,
     ) -> par6_status;
+    /// Minimum signed distance over WORLD pairs only (+inf with an
+    /// empty world): the escape-depth signal, unmaskable by self
+    /// contacts and cheap (no self mesh-mesh scans).
+    pub fn par6_col_world_distance(
+        h: *mut par6_col,
+        q: *const f64,
+        out_distance: *mut f64,
+    ) -> par6_status;
     pub fn par6_col_nq(h: *const par6_col) -> i32;
     /// Robot-link geometry objects; the world layers start at this index.
     pub fn par6_col_robot_geom_count(h: *const par6_col) -> i32;
