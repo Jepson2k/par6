@@ -403,8 +403,8 @@ fn segment_check_finds_the_sample_that_enters_a_keepout() {
 
     // A base sweep: the TCP traces an arc through the workspace while both
     // endpoints stay far from where it passes.
-    let from = [-1.2, 0.3, -0.6, 0.0, 0.5, 0.0];
-    let to = [1.2, 0.3, -0.6, 0.0, 0.5, 0.0];
+    let from = [1.2, -1.2708, 3.7416, 0.0, 0.5, 0.0];
+    let to = [-1.2, -1.2708, 3.7416, 0.0, 0.5, 0.0];
     assert_eq!(
         col.check_segment(&from, &to, 24).unwrap(),
         None,
@@ -551,8 +551,8 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
 fn per_waypoint_check_cost_is_reported() {
     let assets = assets_dir();
     // A base sweep across the workspace — the shape of a real planned move.
-    let from = [-1.2, 0.3, -0.6, 0.0, 0.5, 0.0];
-    let to = [1.2, 0.3, -0.6, 0.0, 0.5, 0.0];
+    let from = [1.2, -1.2708, 3.7416, 0.0, 0.5, 0.0];
+    let to = [-1.2, -1.2708, 3.7416, 0.0, 0.5, 0.0];
     let n = 100;
     let samples: Vec<[f64; NQ]> = (0..n)
         .map(|i| {

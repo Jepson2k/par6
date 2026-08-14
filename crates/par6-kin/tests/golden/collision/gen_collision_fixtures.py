@@ -8,10 +8,11 @@ conformance test rather than a recording of this crate's own output.
 
 The *cases* are derived from the requirement, not from either
 implementation: the home pose and a reachable outstretched pose must be
-clear; a shoulder folded back into the base and a wrist folded onto the
-forearm are self-collisions the arm can actually reach (every joint value
-stays inside PAR6.toml's +/-2.8647 rad soft limits); a keep-out box centred
-on a configuration's TCP must be hit by the tool that reaches into it.
+clear; the tool driven into the base, the tool folded back onto the
+shoulder, and the forearm folded over the base are self-collisions the arm
+can actually reach (every joint value is asserted against the per-joint
+soft limits read from config/PAR6.toml); a keep-out box centred on a
+configuration's TCP must be hit by the tool that reaches into it.
 
 Needs ``pip install pinokin numpy`` (the same release the client uses).
 
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import json
 import math
+import tomllib
 from pathlib import Path
 
 import numpy as np
@@ -32,8 +34,14 @@ ASSETS = REPO / "assets" / "par6_description"
 PACKAGE_DIR = ASSETS / "URDF"
 OUT_DIR = Path(__file__).resolve().parent
 
-# Soft joint limit from config/PAR6.toml — every fixture q stays inside it.
-SOFT_LIMIT = 2.8647335
+# Per-joint soft limits, straight from the shipped config: model q is the
+# vendor motor convention, so the fixture poses must be poses the real arm
+# is allowed to reach.
+with (REPO / "config" / "PAR6.toml").open("rb") as f:
+    SOFT_LIMITS = [
+        (j["limits"]["soft_min_rad"], j["limits"]["soft_max_rad"])
+        for j in tomllib.load(f)["joints"]
+    ]
 
 VARIANTS = {
     "par6_flange": ("URDF/par6_flange/urdf/par6_flange.urdf", "gripper"),
@@ -102,11 +110,20 @@ def shape(name: str, kind: str, params, pose, margin=None) -> dict:
 # asserts that the two "clear" poses really are clear (a fixture where the
 # home pose collided would mean the model, not the test, is wrong).
 CONFIGS = {
-    "home": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
-    "reach_out": [0.4, 0.3, -0.6, 0.2, 0.5, -0.3],
-    "shoulder_into_base": [0.0, -1.57, 0.0, 0.0, 0.0, 0.0],
-    "wrist_onto_forearm": [0.0, 2.0, -2.8, 0.0, -2.5, 0.0],
-    "folded_over_base": [0.0, 2.5, -2.8, 0.0, 0.0, 0.0],
+    # Straight up over the base (the arm's transport/park neighbourhood).
+    "home": [0.0, -1.5708, 3.1416, 0.0, 0.0, 0.0],
+    "reach_out": [-0.4, -1.2708, 3.7416, -0.2, 0.5, 0.3],
+    # Elbow fully flexed with the wrist pitched down: the tool dives into
+    # the base plate.
+    "tool_into_base": [0.0, -0.25, 2.1, 0.0, -1.0, 0.0],
+    # Elbow fully flexed, wrist pitched all the way back: the tool (and
+    # jaws, on the gripper variants) folds onto the shoulder/upper arm.
+    # The bare flange is short enough to stay clear — a genuinely
+    # variant-dependent verdict.
+    "tool_onto_shoulder": [0.0, -1.27, 1.9913, 0.0, -1.73, 0.0],
+    # Shoulder at its soft minimum with the elbow hyper-extended: the
+    # forearm and wrist sweep down over the base.
+    "folded_over_base": [0.0, -2.44, 6.56, 0.0, 0.0, 0.0],
 }
 
 
@@ -125,7 +142,9 @@ def build(variant: str, relpath: str, ee_frame: str) -> dict:
     nq_full = robot.nq
 
     for name, q in CONFIGS.items():
-        assert all(abs(v) <= SOFT_LIMIT for v in q), f"{name} exceeds soft limits"
+        assert all(
+            lo <= v <= hi for v, (lo, hi) in zip(q, SOFT_LIMITS)
+        ), f"{name} exceeds soft limits"
 
     fixture = {
         "urdf": relpath,

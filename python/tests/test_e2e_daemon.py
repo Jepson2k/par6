@@ -779,7 +779,7 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: Li
 #: stretched out (its own meshes clear of each other), rotated back
 #: around J0 so the mid-sweep TCP sits in open workspace where a keep-out
 #: can be parked.
-SWEEP_START_DEG = [-40.0, -15.0, 365.0, 0.0, 0.0, 180.0]
+SWEEP_START_DEG = [-40.0, -20.0, 235.0, 0.0, 15.0, 180.0]
 
 
 @pytest.mark.timeout(180)

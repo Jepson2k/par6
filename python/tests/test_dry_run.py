@@ -515,8 +515,10 @@ async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
 
 #: An open posture the shapes below fit in: extended, clear of the collision
 #: gate the runtime enforces, and away from the wrist singularity the seeded
-#: IK chain cannot be driven through.
-_OPEN_POSE_DEG = [90.0, -30.0, 240.0, 0.0, -50.0, 180.0]
+#: IK chain cannot be driven through. Same posture as the runtime's own
+#: curved-move tests (ffi_kinematics CURVE_START_DEG): straight-line room is
+#: IK-verified in every axis direction and along the diagonals from here.
+_OPEN_POSE_DEG = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0]
 
 #: The shapes the comparison traces, as millimetre offsets from wherever the
 #: arm is standing.

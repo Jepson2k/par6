@@ -2,6 +2,11 @@
 <!-- This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
      Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
      For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<!-- Joint coordinates re-based from the SolidWorks export to the vendor
+     motor convention (rcb-runtime theta): every revolute axis is +z and the
+     shoulder/elbow zero offsets are folded into the joint origins, so a
+     runtime joint vector feeds this model directly. Link frames, meshes and
+     inertials are unchanged (Jepson2k/par6 issue #24). -->
 <robot
   name="par6_flange">
   <link
@@ -96,7 +101,7 @@
     <child
       link="shoulder" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="0"
       upper="0"
@@ -149,7 +154,7 @@
     type="revolute">
     <origin
       xyz="0.0234207210610365 0 0.1105"
-      rpy="-1.5707963267949 0 0" />
+      rpy="-3.07917384359384 1.57079632679489 -1.50837751679894" />
     <parent
       link="shoulder" />
     <child
@@ -208,13 +213,13 @@
     type="revolute">
     <origin
       xyz="0 -0.18 0"
-      rpy="3.14159265358979 0 -1.5707963267949" />
+      rpy="-3.14159265358979 0 1.57079632679489" />
     <parent
       link="upper_arm" />
     <child
       link="elbow" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="0"
       upper="0"
@@ -273,7 +278,7 @@
     <child
       link="lower_arm" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="0"
       upper="0"
@@ -391,7 +396,7 @@
     <child
       link="gripper" />
     <axis
-      xyz="0 0 -1" />
+      xyz="0 0 1" />
     <limit
       lower="0"
       upper="0"

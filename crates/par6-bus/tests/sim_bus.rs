@@ -1283,7 +1283,10 @@ mod dynamics {
         /// Hold tolerance \[deg\] over the watch window.
         const HOLD_TOL_DEG: f64 = 1.0;
         let robot = par6();
-        let q0: Vec<f64> = [0.0f64, -70.0, 150.0, 20.0, 45.0, 180.0]
+        // Inside every soft window with gravity on every joint that can
+        // carry it: G ~ [0, -5.5, 1.4, -0.05, 0.013, 0] Nm — the wrist
+        // value is the physical ceiling for the flange-tipped arm.
+        let q0: Vec<f64> = [-40.0f64, -15.0, 195.0, 0.0, 60.0, 90.0]
             .iter()
             .map(|d| d.to_radians())
             .collect();
@@ -1382,7 +1385,7 @@ mod mujoco {
     use super::*;
 
     /// Reach-down pose over the scene's grasp object (config frame).
-    const GRASP_POSE: [f64; 6] = [0.0, -1.0, 4.2, 0.0, 1.8, 0.0];
+    const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
     fn scene() -> PathBuf {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sim-assets/PAR6_MSG_scene.xml")
@@ -1517,6 +1520,14 @@ mod mujoco {
         let gripper = msg_gripper();
         let mut rig = boot(&robot, Some(&gripper), Some(&GRASP_POSE));
         let cmds = hold_commands(&mut rig, &robot);
+
+        // Ring down the boot transient with the jaws held open: engaging
+        // the position hold from a cold start wobbles the wrist enough to
+        // sweep the jaws centimetres, which would bat the object off its
+        // pedestal if the close ran through it.
+        for _ in 0..u64::from(robot.ticks(1.5)) {
+            rig.step(&cmds, &close_cmd(20));
+        }
 
         // Close on the object (per-tick replay, homing-style).
         for _ in 0..u64::from(robot.ticks(2.0)) {

@@ -62,10 +62,13 @@ fn a_tilted_shape_is_placed_the_way_waldoctl_draws_it() {
         margin: None,
     };
     let quarter = std::f64::consts::FRAC_PI_2;
+    // Upright over the base with the forearm along +X — the pose the bar
+    // placements below were authored against.
+    let q_home = [0.0, -quarter, std::f64::consts::PI, 0.0, 0.0, 0.0];
     let verdict = |col: &mut CollisionModel, shape: ShapeDesc| {
         col.set_layer(Layer::Program, &[shape]).unwrap();
         let mut buf = [0i32; 64];
-        let (active, n) = col.check_into(&[0.0; 6], false, &mut buf).unwrap();
+        let (active, n) = col.check_into(&q_home, false, &mut buf).unwrap();
         let mut names: Vec<String> = buf[..2 * n]
             .iter()
             .map(|&i| col.geom_name(i as usize).unwrap())

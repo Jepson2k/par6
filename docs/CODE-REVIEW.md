@@ -25,7 +25,9 @@ citation in this document is behavioural, not textual.
 > blocking finding: issue #24** — the config's vendor-theta angle space and the URDF's
 > q space differ by per-joint sign/offset (`theta = S·q + O`), self-consistent in sim
 > but wrong against the physical arm. **Issue #24 joins §5.3 as a hardware-bring-up
-> blocker.** The §5.3 HIL checklist itself remains open and hardware-bound.
+> blocker.** (Since resolved: the description tree was re-based onto the vendor
+> convention — `assets/par6_description/CHANGELOG.md`.) The §5.3 HIL checklist
+> itself remains open and hardware-bound.
 
 ---
 

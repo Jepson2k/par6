@@ -33,19 +33,19 @@
     <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="base_link"/>
     <body name="shoulder">
       <inertial pos="0.0065681 0.029094 0.099551" quat="0.438732 0.449118 -0.631911 0.454418" mass="1.993" diaginertia="0.00122723 0.00100741 0.000509712"/>
-      <joint name="shoulder_JOINT" pos="0 0 0" axis="0 0 -1" class="Y"/>
+      <joint name="shoulder_JOINT" pos="0 0 0" axis="0 0 1" class="Y"/>
       <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="shoulder"/>
-      <body name="upper_arm" pos="0.023421 0 0.1105" quat="0.707105 -0.707108 0 0">
+      <body name="upper_arm" pos="0.023421 0 0.1105" quat="0.49999874 -0.50000086 0.50000086 0.49999874">
         <inertial pos="-0.0085493 -0.071342 0.041639" quat="0.419414 0.451905 -0.587174 0.5245" mass="1.332" diaginertia="0.00165491 0.00161199 0.0002696"/>
         <joint name="upper_arm_JOINT" pos="0 0 0" axis="0 0 1" class="Y"/>
         <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="upper_arm"/>
-        <body name="elbow" pos="0 -0.18 0" quat="-2.59734e-06 0.707105 -0.707108 2.59735e-06">
+        <body name="elbow" pos="0 -0.18 0" quat="2.59735e-06 0.707108 0.707105 2.59734e-06">
           <inertial pos="0.015551 -0.019113 -0.0015332" quat="0.29143 0.634234 -0.265884 0.664922" mass="0.681" diaginertia="0.000816953 0.000689258 0.000454939"/>
-          <joint name="elbow_JOINT" pos="0 0 0" axis="0 0 -1" class="Y"/>
+          <joint name="elbow_JOINT" pos="0 0 0" axis="0 0 1" class="Y"/>
           <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="elbow"/>
           <body name="lower_arm" pos="0.0435 0 0" quat="-2.59734e-06 -2.59735e-06 -0.707108 -0.707105">
             <inertial pos="0.00052734 -0.010166 -0.092593" quat="0.959861 -0.262793 -0.0146171 -0.0969154" mass="0.579" diaginertia="0.000384758 0.000361865 0.000214287"/>
-            <joint name="lower_arm_JOINT" pos="0 0 0" axis="0 0 -1" class="Y"/>
+            <joint name="lower_arm_JOINT" pos="0 0 0" axis="0 0 1" class="Y"/>
             <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="lower_arm"/>
             <body name="wrist" pos="0 0 -0.177" quat="0.707105 -0.707108 0 0">
               <inertial pos="-1.5461e-06 -0.0031485 0.00019393" quat="0.721593 0.692318 0.000460117 -0.00048133" mass="0.523" diaginertia="0.00018083 0.000175719 0.000106091"/>
@@ -53,7 +53,7 @@
               <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="wrist"/>
               <body name="gripper" quat="0.707105 0.707108 0 0">
                 <inertial pos="-0.0064247 0.000282669 -0.0695192" quat="0.700694 0.703416 0.0814468 -0.0871836" mass="0.347623" diaginertia="0.000141544 0.000129702 2.45301e-05"/>
-                <joint name="gripper_JOINT" pos="0 0 0" axis="0 0 -1" class="Y"/>
+                <joint name="gripper_JOINT" pos="0 0 0" axis="0 0 1" class="Y"/>
                 <geom type="mesh" rgba="0.79216 0.81961 0.93333 1" mesh="gripper"/>
                             <!-- Camera center -->
                 <body name="camera_center" pos="0.0 -0.09 0.1">

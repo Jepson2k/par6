@@ -465,12 +465,18 @@ fn rotation_drift(a: &[f64; 16], b: &[f64; 16]) -> f64 {
 
 /// A well-conditioned start posture for cartesian moves: away from the
 /// wrist-aligned park singularity, comfortably inside every soft window,
-/// and extended clear of the arm's own collision meshes. The posture this
-/// test used before enforcement landed had the arm wrapped down onto its
-/// own base (TCP 76 mm BELOW the base plane, six link pairs in contact),
-/// where the collision gate rightly refuses a move that tightens the fold
-/// further.
-const CART_START_DEG: [f64; NUM_JOINTS] = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0];
+/// extended clear of the arm's own collision meshes (TCP 0.46 m out from
+/// the base axis), and with straight-line room for the moves below plus
+/// a 1.3x margin along the same ray (verified by sweeping the soft-limit
+/// box with seeded IK when the URDF was re-based, issue #24).
+const CART_START_DEG: [f64; NUM_JOINTS] = [-115.0, -40.0, 200.0, 0.0, 60.0, 180.0];
+
+/// Hold posture for the torque-plant gravity tests: near-vertical, so
+/// every loaded joint's G(q) sits well inside its current authority —
+/// the hold runs on feedforward alone, and at an outstretched pose the
+/// shoulder's load exceeds what its current limit can carry and the arm
+/// sags off the pose.
+const HOLD_POSE_DEG: [f64; NUM_JOINTS] = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0];
 /// Cartesian move duration \[s\]. Long enough that the sim's cascade
 /// tracking lag stays small next to the path tolerances: the lag is
 /// proportional to speed, and the line below is held to 8 mm over a
@@ -749,7 +755,7 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
-    let placed = CART_START_DEG;
+    let placed = HOLD_POSE_DEG;
     c.ok(&Command::Reset);
     enable_and_teleport(&rig, &mut c, placed);
 
@@ -985,8 +991,9 @@ fn gripper_config_mass_changes_published_gravity_torque() {
 /// Start of the base sweep the keep-out tests drive: the arm extended
 /// (its own meshes clear of each other, unlike the folded park pose),
 /// rotated back around J0 so the sweep's midpoint sits in open workspace
-/// where a keep-out can be parked.
-const SWEEP_START_DEG: [f64; NUM_JOINTS] = [-40.0, -15.0, 365.0, 0.0, 0.0, 180.0];
+/// where a keep-out can be parked (midpoint TCP 0.52 m out, endpoints
+/// 0.35 m clear of it).
+const SWEEP_START_DEG: [f64; NUM_JOINTS] = [-40.0, -20.0, 235.0, 0.0, 15.0, 180.0];
 /// J0 travel of the sweep \[deg\]; its midpoint is where the box goes.
 const SWEEP_DEG: f64 = 80.0;
 /// Sweep duration \[s\].
@@ -1783,12 +1790,14 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
 
 // ---- cartesian enablement ---------------------------------------------------
 
-/// A configuration at the edge of the reachable workspace: the arm is
-/// stretched out along −x holding the wrist fixed, so a step further out
-/// has no IK solution while a step back in does. Measured, not assumed —
-/// the test drives a real 20 mm `move_l` each way and the runtime agrees
-/// with the flags.
-const BOUNDARY_DEG: [f64; NUM_JOINTS] = [0.0, -100.0, 285.0, 0.0, -30.0, 180.0];
+/// A configuration at the edge of the reachable workspace: the arm
+/// reaches out along −x with the shoulder against its soft window, so a
+/// step further out has no in-window IK solution while a step back in
+/// does. The shoulder wall (not full extension) is what blocks −x: at
+/// the kinematic-singular full stretch the probe's unclamped DLS solves
+/// blow up and every direction reads blocked, which is a solver
+/// artifact, not the workspace edge.
+const BOUNDARY_DEG: [f64; NUM_JOINTS] = [0.0, -139.8, 322.1, 0.0, -27.1, 180.0];
 /// World-frame enablement slots, positive direction first.
 const X_POS: usize = 0;
 const X_NEG: usize = 1;
@@ -1828,8 +1837,16 @@ fn cartesian_enablement_measures_the_real_workspace() {
 
     enable_and_teleport(&rig, &mut c, BOUNDARY_DEG);
     rig.drain_status();
-    let s = rig.wait_status("parked at the edge of reach", |s| {
+    // The probe is rate- and change-gated and costs 24 seeded IK solves,
+    // so the flags lag the arrival: frames right after the teleport still
+    // carry the pre-probe default (all zero) or the previous pose's
+    // measurement. Wait for a frame whose flags are the boundary's own —
+    // if the probe never converges on (in-free, out-blocked) this times
+    // out and fails just as loudly as the asserts below.
+    let s = rig.wait_status("parked at the edge with the probe refreshed", |s| {
         angles_close(&s.angles, &BOUNDARY_DEG, 0.5)
+            && s.cart_en_wrf[X_POS] == 1
+            && s.cart_en_wrf[X_NEG] == 0
     });
     let edge = tcp_mm(&s);
     assert!(
@@ -1876,12 +1893,17 @@ fn cartesian_enablement_measures_the_real_workspace() {
         !ok,
         "the direction reported blocked must actually be refused"
     );
-    // Either IK verdict says the same thing — the line leaves the
-    // reachable workspace; which one depends on whether the endpoint or
-    // an interior sample loses convergence first.
+    // Any of three verdicts names the same physical fact. At a true
+    // reach edge the solver loses convergence (whole line or an interior
+    // sample first); at this boundary — the shoulder against its soft
+    // window — IK converges fine and the refusal is the soft-window
+    // validation on the solution, exactly the check that withdrew the
+    // flag.
     let code = detail.expect("a failed COMPLETE carries the error").code;
     assert!(
-        code == ErrorCode::IkTargetUnreachable as u16 || code == ErrorCode::IkPartialPath as u16,
+        code == ErrorCode::IkTargetUnreachable as u16
+            || code == ErrorCode::IkPartialPath as u16
+            || code == ErrorCode::CommValidationError as u16,
         "the blocked direction must be blocked for the reason the flag claims, \
          got error code {code}"
     );
@@ -1892,12 +1914,12 @@ fn cartesian_enablement_measures_the_real_workspace() {
 // ---- curved and blended moves ----------------------------------------------
 
 /// Start posture for the curved and blended moves: the same kind of
-/// well-conditioned pose as [`CART_START_DEG`], chosen (by sweeping the
-/// IK + soft-window envelope) for room around it — a 120 mm arc and two
-/// 120 mm legs fit inside every joint's soft window from here, which
-/// they do not from [`CART_START_DEG`], where the elbow is 15° from its
-/// soft stop.
-const CURVE_START_DEG: [f64; NUM_JOINTS] = [0.0, -70.0, 260.0, 0.0, -20.0, 180.0];
+/// well-conditioned pose as [`CART_START_DEG`], chosen (by the same
+/// soft-limit-box sweep) for room around it — 120 mm of straight-line
+/// travel is IK-feasible in every axis direction and along the diagonals
+/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
+/// soft window.
+const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
 /// Duration of the spline move \[s\]. Slower than [`MOVE_S`] because the
 /// sim's tracking lag is proportional to speed AND to path curvature,
 /// and a wave has far more of the second than a straight line does.
@@ -2485,17 +2507,14 @@ fn to_deg(rad: [f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
     rad.map(f64::to_degrees)
 }
 
-/// A posture the seeded solve reaches only by turning: from the park
-/// pose, DLS converges on this configuration with J1 and J4 each a full
-/// revolution out (`+2π` / `−2π`), which is the same arm and a pair of
-/// numbers the soft-limit check rejects.
+/// A posture whose pose the seeded solve reaches only by turning: from
+/// the park pose, DLS converges on a configuration with J4 and J6 each
+/// a full revolution out (`+2π`) — the same arm and numbers the
+/// soft-limit check rejects verbatim. Chosen near the park pose so the
+/// executed move is short and the sim's tracking lag stays far inside
+/// the landing tolerance.
 const TURNED_POSTURE_RAD: [f64; NUM_JOINTS] = [
-    1.151_079_285_338_248,
-    -2.149_645_469_653_074,
-    3.980_431_385_749_838,
-    0.623_123_050_584_976,
-    1.021_342_994_420_38,
-    0.990_794_316_439_534,
+    0.585_609, -1.010_888, 3.205_22, -0.031_356, -0.093_302, 3.045_917,
 ];
 
 /// J5 held past its SOFT window (1.9 rad) but inside its hard one: a
@@ -2546,8 +2565,13 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
         "a solution that is inside every soft window after wrapping must run: {detail:?}"
     );
     let settled = settled_tcp(&rig, "the wrapped solution at rest");
+    // The tolerance is the sim's, not the solver's: the plan ends on the
+    // IK solution exactly, but the sim driver's position mode freezes
+    // whatever following lag remains when the profile's speed reaches
+    // zero, ~10 mm at the CI tick rate. A wrong-branch execution misses
+    // by decimeters, so the assertion still discriminates.
     assert!(
-        distance(tcp_mm(&settled), [target[0], target[1], target[2]]) < 5.0,
+        distance(tcp_mm(&settled), [target[0], target[1], target[2]]) < 25.0,
         "the wrapped solution must land on the commanded pose: {:?} vs {target:?}",
         tcp_mm(&settled)
     );

@@ -3,6 +3,19 @@
 All notable changes to this model will be documented in this file.
 
 
+## [14-8-2026]
+- Re-based the joint coordinates of all URDF variants (and the MJCF copies)
+  onto the vendor motor convention (rcb-runtime theta): every revolute axis
+  is now `+z` and the shoulder/elbow zero offsets (`-pi/2`, `pi`) are folded
+  into the joint origins. The SolidWorks export's coordinates related to the
+  runtime's by `theta = S*q + O`, `S = [-1,1,-1,-1,1,-1]`,
+  `O = [0, -pi/2, pi, 0, 0, 0]`, while every consumer fed runtime angles in
+  verbatim — self-consistent in sim, wrong against the physical arm
+  (Jepson2k/par6 issue #24). Link frames, meshes and inertials are unchanged:
+  the edit was verified frame-for-frame equivalent (< 1e-12) against the old
+  model at mapped configurations. Config angle values (`config/PAR6.toml`)
+  now apply to this model verbatim.
+
 ## [13-8-2026]
 - Replaced the moving-link inertials (`shoulder` … `wrist`) in all three URDF
   variants with the vendor runtime's dynamics table (Source Robotics

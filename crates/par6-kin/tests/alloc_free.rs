@@ -115,8 +115,8 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
 
     // A configuration that collides, so the pair-collection path is the one
     // measured (a clear check writes no pairs at all).
-    let hit = [0.0, 0.3, -0.6, 0.0, 0.5, 0.0];
-    let clear = [0.0, -0.6, 0.9, 0.0, 0.0, 0.0];
+    let hit = [0.0, -1.2708, 3.7416, 0.0, 0.5, 0.0];
+    let clear = [0.0, -2.1708, 2.2416, 0.0, 0.0, 0.0];
     assert!(col.check(&hit, false).unwrap().active());
     assert!(!col.check(&clear, false).unwrap().active());
 

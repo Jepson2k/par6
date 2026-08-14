@@ -87,6 +87,12 @@ conversion → record → single send per joint per tick.
 | RTI stream | limited | limited/ff | limited + G(q) | see Streaming |
 | HOMING / FLASHING | SELF_MANAGED | | | homing sends per-joint; flashing sends nothing |
 
+Joint coordinates: ONE numeric space everywhere — the vendor motor convention
+(rcb-runtime theta). Config angles, wire angles, the homing-latched reference
+and the vendored URDF/MJCF joint coordinates all share it (the description
+tree is re-based to it; see `assets/par6_description/CHANGELOG.md` and issue
+`#24`), so no sign/offset mapping exists anywhere in the runtime.
+
 Gravity: G(q) only — RNEA at zero vel/accel over the arm-only URDF chain (link
 inertials transcribed from the vendor dynamics table; pinned to it by
 `par6-kin/tests/gravity_reference.rs`) plus the ACTIVE gripper's `[kinematics]`

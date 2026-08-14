@@ -10,6 +10,12 @@
 # Units: every time constant is SECONDS (converted round(s/dt) at runtime);
 # motor quantities use wire units (encoder ticks, mA, mV, ms for the driver
 # watchdog); joint quantities are rad-based SI.
+#
+# Angle convention: all joint angles here are the vendor motor convention
+# (rcb-runtime theta), and the vendored URDFs/MJCFs are re-based to the SAME
+# convention (assets/par6_description/CHANGELOG.md, issue #24) — these values
+# feed the kinematics, collision and sim models verbatim, with no sign or
+# offset mapping anywhere.
 
 [robot]
 name = "PAR6"
