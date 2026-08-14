@@ -313,20 +313,6 @@ pub(crate) struct Par6Planner {
     tool_offset: crate::kin::ToolOffset,
     /// Rate/change gate for the cartesian enablement probe.
     probe: EnablementProbe,
-    /// Link pairs that touch in the robot's own configured park pose, and
-    /// are therefore not collisions.
-    ///
-    /// The vendor collision meshes are coarse and `par6-kin` excludes only
-    /// structurally-neighbouring pairs, so PAR6's park pose — forearm
-    /// folded back, resting against the base — reports contact between
-    /// links that legitimately rest against each other there. Without this
-    /// the runtime would refuse every move that returns to its own park
-    /// pose. It is the MoveIt rule (`default_collisions`: pairs colliding
-    /// in the default pose are disabled) derived from the one pose the
-    /// config declares valid; parol6 gets the same effect from a bundled
-    /// SRDF, which `par6-kin` has no support for yet.
-    #[cfg(feature = "ffi")]
-    resting_pairs: Vec<(String, String)>,
 }
 
 impl Par6Planner {
@@ -342,11 +328,9 @@ impl Par6Planner {
         #[cfg(feature = "ffi")]
         let PlannerKin {
             kin,
-            mut collision,
+            collision,
             tool_offset,
         } = models;
-        #[cfg(feature = "ffi")]
-        let resting_pairs = park_contacts(&mut collision, &bundle.robot.robot.park_pose_rad);
         let dt = bundle.robot.robot.tick_dt_s;
         let ticks = |s: f64| (s / dt).round() as u64;
         let tool = bundle
@@ -399,8 +383,6 @@ impl Par6Planner {
             collision_latch: CollisionState::default(),
             #[cfg(feature = "ffi")]
             invalidated: None,
-            #[cfg(feature = "ffi")]
-            resting_pairs,
         })
     }
 
@@ -417,15 +399,14 @@ impl Par6Planner {
     /// the two endpoints.
     ///
     /// Normally any collision along the path refuses the move. The
-    /// exception is a path that STARTS in collision — the arm parked in
-    /// its configured park pose (which folds the forearm back onto the
-    /// upper arm and rests it against the base, so the vendor collision
-    /// meshes touch), or a keep-out dropped on top of it. Refusing
-    /// outright would trap the arm, so a move that adds no colliding
-    /// pair the arm is not already in is allowed: a move may not CREATE
-    /// a collision, it may leave one.
+    /// exception is a path that STARTS in collision — a keep-out
+    /// dropped on top of the arm. Refusing outright would trap the arm,
+    /// so a move that adds no colliding pair the arm is not already in
+    /// is allowed: a move may not CREATE a collision, it may leave one.
+    /// (Self pairs the arm legitimately rests in are excluded
+    /// model-side by the variant's SRDF, so they never reach this rule.)
     ///
-    /// Leaving one is bounded by depth: from a start in (non-resting)
+    /// Leaving one is bounded by depth: from a start in world
     /// collision, a sample whose pair set stays inside the baseline is
     /// still refused when its deepest penetration exceeds the start's
     /// (`min_distance` drops below the start value by more than
@@ -457,13 +438,12 @@ impl Par6Planner {
         let start_pairs = named(&col.check(&q_now, false).map_err(collision_error)?);
         // The depth half of the escape rule engages only when the start
         // penetrates a WORLD shape (a keep-out dropped over the arm) —
-        // the case escape exists for. Not for arm-arm contact: the park
-        // resting pairs penetrate permanently, near-park poses flicker
-        // marginal mesh-coarseness contacts in and out of that set, and
-        // engaging on those would run a full-model `min_distance`
-        // (tens of ms) on every checked sample of every ordinary plan.
-        // An arm-arm start collision is still guarded by the pair half —
-        // the move may not contact anything new.
+        // the case escape exists for. Not for arm-arm contact: marginal
+        // mesh-coarseness contacts flicker in and out near touching
+        // poses, and engaging on those would run a full-model
+        // `min_distance` (tens of ms) on every checked sample of every
+        // ordinary plan. An arm-arm start collision is still guarded by
+        // the pair half — the move may not contact anything new.
         let start_depth = if start_pairs
             .iter()
             .any(|p| world.contains(&p.0) || world.contains(&p.1))
@@ -472,8 +452,7 @@ impl Par6Planner {
         } else {
             None
         };
-        let mut baseline = start_pairs;
-        baseline.extend(self.resting_pairs.iter().cloned());
+        let baseline = start_pairs;
 
         let total = samples.len();
         let mut checked = 0usize;
@@ -1637,13 +1616,11 @@ impl Par6Planner {
     ) -> Result<Vec<(String, String)>, par6_kin::KinError> {
         let world = &self.world_names;
         let col = &mut self.collision;
-        let mut pairs: Vec<(String, String)> = col
+        Ok(col
             .check(q, false)?
             .pairs()
             .map(|(a, b)| (display_name(a, world), display_name(b, world)))
-            .collect();
-        pairs.extend(self.resting_pairs.iter().cloned());
-        Ok(pairs)
+            .collect())
     }
 
     /// Whether a small step to `target` is reachable, inside the soft
@@ -2234,39 +2211,6 @@ fn display_name_ref<'a>(geom: &'a str, world_names: &[String]) -> &'a str {
 #[cfg(feature = "ffi")]
 fn display_name(geom: &str, world_names: &[String]) -> String {
     display_name_ref(geom, world_names).to_owned()
-}
-
-/// Link pairs already in contact at the robot's configured park pose.
-///
-/// A pose the configuration declares the arm rests in cannot be a
-/// collision; the pairs it reports are the coarseness of the vendor
-/// collision meshes showing through, and enforcing them would refuse
-/// every move that returns to park.
-#[cfg(feature = "ffi")]
-fn park_contacts(collision: &mut par6_kin::Collision, park_rad: &[f64]) -> Vec<(String, String)> {
-    let mut park = [0.0; NQ];
-    for (slot, q) in park.iter_mut().zip(park_rad.iter()) {
-        *slot = *q;
-    }
-    let pairs = match collision.check(&park, false) {
-        Ok(report) => report
-            .pairs()
-            .map(|(a, b)| (display_name(a, &[]), display_name(b, &[])))
-            .collect::<Vec<_>>(),
-        Err(e) => {
-            log::warn!("cannot survey the park pose for resting contacts: {e}");
-            Vec::new()
-        }
-    };
-    if !pairs.is_empty() {
-        log::info!(
-            "collision: {} link pair(s) rest in contact at the park pose and are not \
-             enforced: {}",
-            pairs.len(),
-            format_pairs(&pairs)
-        );
-    }
-    pairs
 }
 
 /// The first name two shapes in one layer share, if any.

@@ -170,6 +170,29 @@ impl CollisionModel {
         Ok(err_message(&buf))
     }
 
+    /// Apply an SRDF's `<disable_collisions>` entries to the robot's self
+    /// pairs and rebuild the working world. World-shape pairs are
+    /// unaffected. An unreadable or malformed file errors and leaves the
+    /// model unchanged.
+    pub fn apply_srdf(&mut self, srdf_path: &Path) -> Result<(), Error> {
+        let c_path = CString::new(srdf_path.to_string_lossy().as_bytes())
+            .map_err(|_| Error::InvalidString)?;
+        let mut err_buf = [0u8; 512];
+        let status = unsafe {
+            ffi::par6_col_apply_srdf(
+                self.raw.as_ptr(),
+                c_path.as_ptr(),
+                err_buf.as_mut_ptr().cast(),
+                err_buf.len() as i32,
+            )
+        };
+        if status == ffi::PAR6_OK {
+            Ok(())
+        } else {
+            Err(Error::Create(err_message(&err_buf)))
+        }
+    }
+
     /// Replace `layer` with `shapes` wholesale; the other layer and the
     /// robot geometry are untouched. A malformed shape leaves the previous
     /// world in place. Allocates — keep it off the query path.

@@ -325,7 +325,6 @@ impl Daemon {
         #[cfg(feature = "ffi")]
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
-            &robot.robot.park_pose_rad,
             &jog_limits,
         )));
         #[cfg(feature = "ffi")]

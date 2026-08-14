@@ -141,14 +141,11 @@ pub(crate) fn gripper_move_command(
 /// colliding (a keep-out placed over the arm), it is blocked when it
 /// contacts anything NEW or goes DEEPER (`min_distance` comparison) —
 /// escaping stays allowed, because streaming is the only way OUT of a
-/// keep-out the arm is already inside. Contacts the arm rests in at its
-/// configured park pose are not collisions, same as the planner's rule.
+/// keep-out the arm is already inside. Self pairs the arm may rest in
+/// are excluded model-side by the variant's SRDF.
 #[cfg(feature = "ffi")]
 pub(crate) struct StreamGate {
     collision: par6_kin::Collision,
-    /// Link pairs in contact at the configured park pose (reporting
-    /// names) — the coarse vendor meshes touching where the arm rests.
-    resting: Vec<(String, String)>,
     /// Applied world-shape names per layer (reporting vocabulary).
     layer_names: [Vec<String>; 2],
     world_names: Vec<String>,
@@ -166,29 +163,11 @@ pub(crate) struct StreamGate {
 #[cfg(feature = "ffi")]
 impl StreamGate {
     pub(crate) fn new(
-        mut collision: par6_kin::Collision,
-        park_pose_rad: &[f64],
+        collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
     ) -> Self {
-        let mut park = [0.0; par6_kin::NQ];
-        for (slot, q) in park.iter_mut().zip(park_pose_rad.iter()) {
-            *slot = *q;
-        }
-        // Same rule as the planner's park-contact survey: a pose the
-        // config declares the arm rests in cannot be a collision.
-        let resting: Vec<(String, String)> = match collision.check(&park, false) {
-            Ok(report) => report
-                .pairs()
-                .map(|(a, b)| (trim_geom(a).to_owned(), trim_geom(b).to_owned()))
-                .collect(),
-            Err(e) => {
-                log::warn!("stream gate: cannot survey the park pose ({e}); no resting exemption");
-                Vec::new()
-            }
-        };
         Self {
             collision,
-            resting,
             layer_names: [Vec::new(), Vec::new()],
             world_names: Vec::new(),
             jog_vel: jog_limits.velocity,
@@ -249,7 +228,7 @@ impl StreamGate {
         trim_geom(geom).to_owned()
     }
 
-    /// Colliding pairs at `q` that are NOT park-pose resting contacts.
+    /// Colliding pairs at `q`, in reporting names.
     fn offending(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Vec<(String, String)>, WireError> {
         let mut nq = [0.0; par6_kin::NQ];
         nq.copy_from_slice(&q[..par6_kin::NQ]);
@@ -261,7 +240,6 @@ impl StreamGate {
         Ok(raw
             .into_iter()
             .map(|(a, b)| (self.display(&a), self.display(&b)))
-            .filter(|p| !self.resting.contains(p))
             .collect())
     }
 

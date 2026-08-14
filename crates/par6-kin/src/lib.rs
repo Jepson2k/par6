@@ -53,6 +53,17 @@ impl GripperVariant {
         }
     }
 
+    /// SRDF path relative to the same tree: our authored
+    /// `<disable_collisions>` list for this variant (the vendor ships no
+    /// SRDF), generated from sampled data by `scripts/gen_srdf.py`.
+    pub fn srdf_relpath(self) -> &'static str {
+        match self {
+            GripperVariant::Flange => "URDF/par6_flange/srdf/par6_flange.srdf",
+            GripperVariant::Msg => "URDF/par6_msg_gripper/srdf/PAR6_MSG.srdf",
+            GripperVariant::Ssg48 => "URDF/par6_ssg48_gripper/srdf/par6_ssg48_urdf.srdf",
+        }
+    }
+
     /// Frame name FK/Jacobian/IK resolve at: the tool center point for
     /// gripper variants, the flange (`gripper` link) otherwise.
     pub fn tcp_frame(self) -> &'static str {

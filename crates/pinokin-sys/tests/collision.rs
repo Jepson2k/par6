@@ -42,8 +42,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v5() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 5);
+fn abi_version_is_v6() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 6);
 }
 
 #[test]
@@ -359,4 +359,42 @@ fn every_shape_kind_round_trips_into_the_world() {
         !active,
         "shapes parked outside the workspace must not collide"
     );
+}
+
+/// An SRDF's `<disable_collisions>` entries remove the named self pairs
+/// and nothing else, and a malformed file is an error that leaves the
+/// model's pair set exactly as it was.
+#[test]
+fn srdf_removes_named_self_pairs_and_malformed_files_change_nothing() {
+    let mut col = load();
+    let before = col.pair_count();
+
+    let dir = std::env::temp_dir().join(format!("par6-srdf-test-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+
+    let bad = dir.join("broken.srdf");
+    std::fs::write(&bad, "<robot name=\"par6_flange\"><disable_collisions").unwrap();
+    assert!(matches!(col.apply_srdf(&bad), Err(Error::Create(_))));
+    assert_eq!(
+        col.pair_count(),
+        before,
+        "a rejected SRDF must leave the pair set untouched"
+    );
+
+    let good = dir.join("one_pair.srdf");
+    std::fs::write(
+        &good,
+        "<?xml version=\"1.0\"?>\n<robot name=\"par6_flange\">\n  \
+         <disable_collisions link1=\"base_link\" link2=\"wrist\" reason=\"Never\" />\n\
+         </robot>\n",
+    )
+    .unwrap();
+    col.apply_srdf(&good).unwrap();
+    assert_eq!(
+        col.pair_count(),
+        before - 1,
+        "exactly the one named pair must go"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
 }

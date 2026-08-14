@@ -4,6 +4,7 @@
 #include <pinocchio/fwd.hpp>
 #include <pinocchio/multibody/model.hpp>
 #include <pinocchio/multibody/data.hpp>
+#include <pinocchio/parsers/srdf.hpp>
 #include <pinocchio/parsers/urdf.hpp>
 #include <pinocchio/algorithm/geometry.hpp>
 #include <pinocchio/collision/collision.hpp>
@@ -288,6 +289,27 @@ par6_col *par6_col_create(const char *urdf_path,
         write_err(err_buf, err_len, e.what());
         delete h;
         return nullptr;
+    }
+}
+
+par6_status par6_col_apply_srdf(par6_col *h, const char *srdf_path,
+                                char *err_buf, int32_t err_len) {
+    if (h == nullptr) {
+        write_err(err_buf, err_len, "handle is NULL");
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (srdf_path == nullptr || srdf_path[0] == '\0') {
+        write_err(err_buf, err_len, "srdf_path is NULL or empty");
+        return PAR6_ERR_INVALID_ARG;
+    }
+    try {
+        pinocchio::srdf::removeCollisionPairs(h->model, h->base_geom,
+                                              std::string(srdf_path), false);
+        h->rebuild_world();
+        return PAR6_OK;
+    } catch (const std::exception &e) {
+        write_err(err_buf, err_len, e.what());
+        return PAR6_ERR_EXCEPTION;
     }
 }
 

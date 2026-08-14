@@ -44,9 +44,21 @@ with (REPO / "config" / "PAR6.toml").open("rb") as f:
     ]
 
 VARIANTS = {
-    "par6_flange": ("URDF/par6_flange/urdf/par6_flange.urdf", "gripper"),
-    "par6_msg": ("URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf", "tcp"),
-    "par6_ssg48": ("URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf", "tcp"),
+    "par6_flange": (
+        "URDF/par6_flange/urdf/par6_flange.urdf",
+        "URDF/par6_flange/srdf/par6_flange.srdf",
+        "gripper",
+    ),
+    "par6_msg": (
+        "URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf",
+        "URDF/par6_msg_gripper/srdf/PAR6_MSG.srdf",
+        "tcp",
+    ),
+    "par6_ssg48": (
+        "URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf",
+        "URDF/par6_ssg48_gripper/srdf/par6_ssg48_urdf.srdf",
+        "tcp",
+    ),
 }
 
 # Kind -> coal constructor arity, mirroring waldoctl.shapes.
@@ -134,11 +146,14 @@ def check(checker, q_arm: list[float], nq_full: int):
     return bool(checker.in_collision(q)), [list(p) for p in pairs]
 
 
-def build(variant: str, relpath: str, ee_frame: str) -> dict:
+def build(variant: str, relpath: str, srdf_relpath: str, ee_frame: str) -> dict:
     urdf = str(ASSETS / relpath)
     robot = pinokin.Robot(urdf)
     robot.set_ee_frame(ee_frame)
     base = pinokin.CollisionChecker(robot, urdf, [str(PACKAGE_DIR)])
+    # The same authored SRDF `par6_kin::Collision::load` applies, so the
+    # fixture records the pair set the Rust side actually enforces.
+    base.load_srdf(str(ASSETS / srdf_relpath))
     nq_full = robot.nq
 
     for name, q in CONFIGS.items():
@@ -269,6 +284,7 @@ def build(variant: str, relpath: str, ee_frame: str) -> dict:
 
     for scene in scenes:
         checker = pinokin.CollisionChecker(robot, urdf, [str(PACKAGE_DIR)])
+        checker.load_srdf(str(ASSETS / srdf_relpath))
         for layer in ("installation", "program"):
             for s in scene[layer]:
                 checker.add_obstacle(
@@ -296,8 +312,8 @@ def build(variant: str, relpath: str, ee_frame: str) -> dict:
 
 
 def main() -> None:
-    for variant, (relpath, ee_frame) in VARIANTS.items():
-        fixture = build(variant, relpath, ee_frame)
+    for variant, (relpath, srdf_relpath, ee_frame) in VARIANTS.items():
+        fixture = build(variant, relpath, srdf_relpath, ee_frame)
         out = OUT_DIR / f"{variant}.json"
         out.write_text(json.dumps(fixture, indent=2) + "\n")
         print(f"wrote {out} ({len(fixture['scenes'])} scenes)")

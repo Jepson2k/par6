@@ -161,6 +161,15 @@ extern "C" {
         err_len: i32,
     ) -> *mut par6_col;
     pub fn par6_col_destroy(h: *mut par6_col);
+    /// Applies an SRDF's `<disable_collisions>` entries to the robot's
+    /// self pairs and rebuilds the working world. World-shape pairs are
+    /// unaffected. Errors leave the model unchanged.
+    pub fn par6_col_apply_srdf(
+        h: *mut par6_col,
+        srdf_path: *const c_char,
+        err_buf: *mut c_char,
+        err_len: i32,
+    ) -> par6_status;
     pub fn par6_col_nq(h: *const par6_col) -> i32;
     /// Robot-link geometry objects; the world layers start at this index.
     pub fn par6_col_robot_geom_count(h: *const par6_col) -> i32;

@@ -256,6 +256,15 @@ par6_col *par6_col_create(const char *urdf_path,
 
 void par6_col_destroy(par6_col *h);
 
+/* Apply an SRDF's <disable_collisions> entries to the robot's self pairs
+ * (pinocchio::srdf::removeCollisionPairs) and rebuild the working world.
+ * Call after create (before or after layers — the world is rebuilt either
+ * way). World-shape pairs are unaffected: the SRDF names robot links only.
+ * PAR6_ERR_INVALID_ARG for a NULL handle or NULL/empty path;
+ * PAR6_ERR_EXCEPTION with a message for an unreadable or malformed file. */
+par6_status par6_col_apply_srdf(par6_col *h, const char *srdf_path,
+                                char *err_buf, int32_t err_len);
+
 /* Position variables of the underlying model; 0 for a NULL handle. */
 int32_t par6_col_nq(const par6_col *h);
 
@@ -330,9 +339,11 @@ par6_status par6_col_distance(par6_col *h, const double *q,
  *     different orientation — which is what the version is here to catch.
  * v5: par6_col_distance added (minimum signed distance over active pairs,
  *     the escape-depth half of the start-in-collision rule). Purely
- *     additive; a stale v4 library merely fails to link it. */
+ *     additive; a stale v4 library merely fails to link it.
+ * v6: par6_col_apply_srdf added (SRDF disable_collisions on the robot's
+ *     self pairs). Purely additive; a stale v5 library fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 5
+#define PAR6_SHIM_ABI_VERSION 6
 
 #ifdef __cplusplus
 } /* extern "C" */

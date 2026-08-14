@@ -137,11 +137,29 @@ impl Collision {
         variant: GripperVariant,
         clearance: f64,
     ) -> Result<Self, KinError> {
-        Self::from_urdf(
+        let mut this = Self::from_urdf(
             &assets_dir.join(variant.urdf_relpath()),
             Some(&assets_dir.join("URDF")),
             clearance,
-        )
+        )?;
+        // The variant's authored SRDF disables the self pairs sampling
+        // proved meaningless — the pairs the park pose rests in contact
+        // on, and pairs the joint limits keep in permanent mesh overlap.
+        // A missing file is an error: shipping the assets without the
+        // SRDF would silently re-enable those pairs and the runtime
+        // would refuse its own park pose.
+        this.apply_srdf(&assets_dir.join(variant.srdf_relpath()))?;
+        Ok(this)
+    }
+
+    /// Apply an SRDF's `<disable_collisions>` entries to the robot's self
+    /// pairs. World-shape pairs are unaffected. An unreadable or
+    /// malformed file errors and leaves the model unchanged.
+    pub fn apply_srdf(&mut self, srdf: &Path) -> Result<(), KinError> {
+        self.model.apply_srdf(srdf).map_err(|e| match e {
+            pinokin_sys::Error::Create(msg) => KinError::Load(msg),
+            other => KinError::Ffi(other),
+        })
     }
 
     /// Load an arbitrary URDF's `<collision>` geometry. `package_dir`
