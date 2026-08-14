@@ -1972,6 +1972,27 @@ fn curve_start(rig: &Rig, c: &mut Client) -> Status {
     })
 }
 
+/// Seconds between the first and last TCP movement in a status stream
+/// (consecutive samples further apart than `eps_mm`): the chain's motion
+/// time, indifferent to how long the stream kept being collected after
+/// the arm stopped.
+fn motion_seconds(path: &[Status], eps_mm: f64) -> f64 {
+    let mut first = None;
+    let mut last = None;
+    for w in path.windows(2) {
+        if distance(tcp_mm(&w[1]), tcp_mm(&w[0])) > eps_mm {
+            if first.is_none() {
+                first = Some(w[0].mono_time_ns);
+            }
+            last = Some(w[1].mono_time_ns);
+        }
+    }
+    match (first, last) {
+        (Some(a), Some(b)) if b > a => (b - a) as f64 * 1e-9,
+        _ => 0.0,
+    }
+}
+
 /// The slowest the TCP ever got while it was within `radius_mm` of
 /// `corner`, and the mean speed over the whole move.
 fn corner_and_mean_speed(path: &[Status], corner: [f64; 3], radius_mm: f64) -> (f64, f64) {
@@ -2269,7 +2290,6 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     // --- control: the same corner with no blend radius.
     let s = curve_start(&rig, &mut c);
     let (first, corner, finish) = leg(&s, 5001, None);
-    let started = Instant::now();
     let i1 = c.ok_index(&first);
     let i2 = c.ok_index(&second(&s, 5002, finish));
     let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
@@ -2283,7 +2303,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
         ok,
         "the unblended second leg must complete ok, got {detail:?}"
     );
-    let sharp_time = started.elapsed().as_secs_f64();
+    let sharp_time = motion_seconds(&sharp, 0.1);
     let sharp_points: Vec<[f64; 3]> = sharp.iter().map(tcp_mm).collect();
     let sharp_miss = path_misses(&sharp_points, corner);
     let (sharp_corner_speed, sharp_mean) = corner_and_mean_speed(&sharp, corner, 20.0);
@@ -2301,7 +2321,6 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     // --- the same corner, blended.
     let s = curve_start(&rig, &mut c);
     let (first, corner, finish) = leg(&s, 5003, Some(BLEND_MM));
-    let started = Instant::now();
     let i1 = c.ok_index(&first);
     let i2 = c.ok_index(&second(&s, 5004, finish));
     let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
@@ -2312,7 +2331,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
         ok,
         "the blended second leg must complete ok, got {detail:?}"
     );
-    let blend_time = started.elapsed().as_secs_f64();
+    let blend_time = motion_seconds(&blended, 0.1);
     let blended_points: Vec<[f64; 3]> = blended.iter().map(tcp_mm).collect();
 
     // The corner is rounded: cut by more than the tracking error, and
@@ -2339,10 +2358,13 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
          {blend_mean:.2} mm/s (unblended: {sharp_corner_speed:.2} of {sharp_mean:.2}) — \
          a blend that stops is not a blend"
     );
+    // Motion time from the broadcast's own monotonic clock — the
+    // wall-clock of the collection loop is a fixed window and cannot
+    // tell the two chains apart.
     assert!(
         blend_time < sharp_time,
-        "the blended corner took {blend_time:.2} s and the sharp one {sharp_time:.2} s: \
-         not stopping is supposed to be faster"
+        "the blended corner moved for {blend_time:.2} s and the sharp one for \
+         {sharp_time:.2} s: not stopping is supposed to be faster"
     );
     let end_miss = distance(
         tcp_mm(&settled_tcp(&rig, "settled after the blended chain")),

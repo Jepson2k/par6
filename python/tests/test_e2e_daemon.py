@@ -601,22 +601,24 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert await client.is_estop_pressed() is True
 
         # The latch and the arm are two different facts, and they do not
-        # become true in the same tick: SAFETY_STOP commands 0 Nm
-        # (crates/par6-rt/src/dispatch.rs:94) while the arm is still
-        # carrying a move, so the e-stop is visible on the I/O surface
-        # before the joints read zero. `is_robot_stopped` reports the
-        # arm, not the latch, and asserting it straight off the latch is
-        # a race — it has to be waited for.
+        # become true in the same tick: the e-stop is visible on the I/O
+        # surface while the arm is still braking off a move, and the
+        # brake rings the velocity loop's integral down, so any single
+        # below-threshold frame can be a zero crossing of that ring.
+        # `is_robot_stopped` reports the arm, not the latch — it counts
+        # as stopped only when it holds across consecutive polls.
         #
-        # Note what this does NOT establish: on hardware, 0 Nm means a
-        # torque-held arm sags under gravity, where parol6's steppers
-        # hold. The default sim plant does not model that (the arm here
-        # halts within 0.01deg of where the latch caught it), so no CI
-        # tier currently exercises e-stop sag. Tracked as issue #22.
-        assert await client.wait_status(
-            lambda s: max(abs(v) for v in s.speeds) < 0.01, timeout=STEP_BUDGET_S
-        ), "the arm never came to rest under the e-stop latch"
-        assert await client.is_robot_stopped() is True
+        # Note what this does NOT establish: on hardware, a limp arm
+        # sags under gravity, where parol6's steppers hold. The default
+        # kinematic plant does not model that (the arm here halts where
+        # the latch caught it), so no CI tier currently exercises
+        # e-stop sag.
+        deadline = asyncio.get_running_loop().time() + STEP_BUDGET_S
+        streak = 0
+        while asyncio.get_running_loop().time() < deadline and streak < 3:
+            streak = streak + 1 if await client.is_robot_stopped() else 0
+            await asyncio.sleep(0.05)
+        assert streak >= 3, "the arm never came to rest under the e-stop latch"
 
         assert await client.reset() == 1
         assert await client.wait_status(lambda s: s.io[4] == 1, timeout=STEP_BUDGET_S)
