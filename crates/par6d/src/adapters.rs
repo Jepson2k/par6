@@ -118,15 +118,16 @@ impl StreamTracker for MotionStream {
             Ok(StreamStep { q, qd, .. }) => {
                 *q_out = q;
                 self.clamp(q_out);
-                // The velocity channel of a cmd-2 position frame is a
-                // CAP the driver clamps its own position-loop output to
-                // (spec/CAN.md), not a setpoint. The OTG reports the
-                // velocity it ends the tick AT, which is zero on every
-                // tick that lands on the current target — so forwarding
-                // it caps a still-advancing position channel at a
-                // standstill. Command the larger of the two: the OTG's
-                // own profile velocity, or the rate the position channel
-                // is advancing at this tick.
+                // The velocity channel of a cmd-2 position frame is an
+                // additive feedforward on the driver's position loop
+                // (spec/CAN.md). The OTG reports the velocity it ends the
+                // tick AT, which is zero on every tick that lands on the
+                // current target — a stepped stream advancing a reachable
+                // target every cycle would get no feedforward at all and
+                // track only on position error. Send the larger of the
+                // OTG's profile velocity and the rate the position
+                // channel actually advanced this tick, so the driver is
+                // fed the true rate of the commanded motion.
                 for j in 0..MAX_JOINTS {
                     let advance = (q_out[j] - self.hold_q[j]) / self.dt;
                     qd_out[j] = if advance.abs() > qd[j].abs() {
@@ -165,12 +166,12 @@ mod tests {
     /// the shape a UI slider or a teleoperation feed emits — must be
     /// commanded a velocity that covers the setpoint's advance.
     ///
-    /// The wire velocity is a cap, so a commanded velocity below the rate
-    /// the position channel advances at throttles the arm to a standstill
-    /// while the position channel keeps moving: the failure reports
-    /// nothing anywhere. Ruckig's terminal velocity is exactly 0 on every
-    /// tick whose minimum-time move lands on the target, which is every
-    /// tick of a stream whose steps are reachable within one.
+    /// The wire velocity is the driver's feedforward: without it the
+    /// plant tracks a moving setpoint on position error alone and lags
+    /// by the full `v/kpp`. Ruckig's terminal velocity is exactly 0 on
+    /// every tick whose minimum-time move lands on the target — which is
+    /// every tick of a stream whose steps are reachable within one — so
+    /// forwarding it verbatim starves the stream of its feedforward.
     #[test]
     fn stepped_stream_targets_are_commanded_a_velocity_that_covers_their_advance() {
         let limits = stream_limits();
@@ -201,8 +202,8 @@ mod tests {
                 ticks_advancing += 1;
                 assert!(
                     qd[0].abs() + 1e-12 >= advance.abs(),
-                    "commanded velocity {:.6} rad/s caps a position channel \
-                     advancing at {:.6} rad/s",
+                    "commanded velocity {:.6} rad/s under-feeds a position \
+                     channel advancing at {:.6} rad/s",
                     qd[0],
                     advance,
                 );

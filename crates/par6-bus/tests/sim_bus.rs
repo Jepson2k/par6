@@ -788,9 +788,12 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
     assert!(prev > emax, "never crossed the encoder boundary ({prev})");
 
     // Position mode operates in WIRE coordinates: commanding a value in
-    // the reported frame settles the reported position there.
+    // the reported frame settles the reported position there. Speed 0 —
+    // the channel is a velocity feedforward, and a standing nonzero
+    // feedforward against a fixed target parks the plant offset by
+    // ff/KPP past it.
     let target = reported0 + 3000;
-    cmds[j] = JointCommand::position(target, 20000, 0);
+    cmds[j] = JointCommand::position(target, 0, 0);
     let mut positions = Vec::new();
     for _ in 0..2500 {
         rig.step(&cmds, &GripperCommand::NoGripper);
@@ -821,6 +824,42 @@ fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
             .unwrap_or_else(|| panic!("no device info for node {n} after the sweep"));
         assert_eq!(info.serial, 1_000 + i32::from(joint.node_id));
     }
+}
+
+/// The vendor runtime's hold is a position frame with Speed=0 (last
+/// target, gravity current) — and the firmware's position mode treats the
+/// speed channel as a velocity FEEDFORWARD, so that frame still closes
+/// position error at full authority. A driver model that reads the speed
+/// channel as a per-command velocity cap freezes whatever error exists
+/// when a profile ends at speed 0: the plant settles short permanently
+/// (issues #22/#26).
+#[test]
+fn zero_speed_position_frames_still_close_position_error() {
+    let robot = par6();
+    let j = 0usize;
+    let node = usize::from(robot.joints[j].node_id);
+    let mut rig = Rig::boot(&robot, None, None);
+    let idle = rig.idle_cmds();
+    rig.step(&idle, &GripperCommand::NoGripper);
+    rig.step(&idle, &GripperCommand::NoGripper);
+    let start = rig.state.nodes[node].position_ticks.unwrap();
+
+    // The hold shape verbatim: a fixed position target, speed 0, no
+    // current feedforward — repeated every tick, as EXEC hold does.
+    let target = start + 2000;
+    let mut cmds = rig.idle_cmds();
+    cmds[j] = JointCommand::position(target, 0, 0);
+    for _ in 0..2500 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let last = rig.state.nodes[node].position_ticks.unwrap();
+    assert!(
+        (last - target).abs() <= 30,
+        "a zero-speed position frame left {} ticks of error unclosed \
+         (settled at {last}, commanded {target}) — the speed channel is a \
+         feedforward, not a velocity cap",
+        (last - target).abs(),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1504,7 +1543,10 @@ mod mujoco {
                 let pos = rig.state.nodes[usize::from(jc.node_id)]
                     .position_ticks
                     .expect("boot position");
-                JointCommand::position(pos, 20000, 0)
+                // The hold shape: speed 0 — the channel is a velocity
+                // feedforward, and a standing one would drive the joint
+                // off the held pose.
+                JointCommand::position(pos, 0, 0)
             })
             .collect()
     }

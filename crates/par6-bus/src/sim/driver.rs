@@ -261,8 +261,14 @@ impl VirtualDriver {
                 };
             }
             Mode::Position { pos, speed, cur_ff } => {
-                let cap = speed.abs().min(self.vel_limit);
-                let vt = (self.kpp * (pos - pos_ticks)).clamp(-cap, cap);
+                // Firmware `Position_mode()`: the frame's speed channel is
+                // an ADDITIVE velocity feedforward on the position loop's
+                // output, and only the configured velocity limit clamps
+                // the combined target. It is not a per-command cap — a
+                // hold frame with speed 0 still closes position error at
+                // full authority.
+                let vt =
+                    (self.kpp * (pos - pos_ticks) + speed).clamp(-self.vel_limit, self.vel_limit);
                 self.velocity_pi(vt, vel_ticks_s, cur_ff)
             }
             Mode::Velocity { vel, cur_ff } => {
@@ -294,11 +300,15 @@ impl VirtualDriver {
     /// letting the stale integral discharge there shoves the arm off the
     /// teleported pose (about a thousand ticks after a fast jog) and
     /// rings, violating the teleport contract that the arm lands exactly
-    /// where the client asked. Mode and config survive; only the
-    /// transient is dropped.
+    /// where the client asked. The latched motion command goes with it:
+    /// it names a target in the PRE-teleport report frame, and the
+    /// position loop would drive toward it at full authority until the
+    /// next host frame re-latches — the arm visibly lurches off the
+    /// landing pose. One tick of Idle instead; config survives.
     pub fn reset_motion_transients(&mut self) {
         self.integral_ma = 0.0;
         self.cur_out_ma = 0.0;
+        self.mode = Mode::Idle;
     }
 
     /// Reset the command-silence counter (a valid data frame arrived).

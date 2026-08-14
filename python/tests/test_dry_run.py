@@ -579,10 +579,11 @@ class _CommandStream:
 
         The stream is trimmed to the motion's own samples.  The tick that
         starts it is dropped with them: between two commands the RT holds the
-        last value it commanded, and the sim's plant settles a little short of
-        it, so the first sample of a new plan steps back to where the arm
-        measured — which is the point the plan starts FROM, not a sample of
-        it.  The preview's trajectory starts one tick in for the same reason.
+        last value it commanded, and the sim's plant rests within encoder
+        quantization of it, so the first sample of a new plan steps back to
+        where the arm measured — which is the point the plan starts FROM, not
+        a sample of it.  The preview's trajectory starts one tick in for the
+        same reason.
         """
         by_tick = {}
         for frame in self.drain():

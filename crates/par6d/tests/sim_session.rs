@@ -443,11 +443,9 @@ fn full_sim_session_over_protocol_v2() {
 
     // Queued move_j: ack carries the index, COMPLETE pushes, and the
     // completed_index high-water mark + real sim motion land in STATUS.
-    // Position tolerance is coarse on purpose: the sim's Spectral
-    // cascade treats the commanded velocity as a cap, so fast moves
-    // carry a few degrees of tracking lag and `settled` completes via
-    // its bounded timeout — the assertion proves real closed-loop
-    // motion toward the target, not servo-grade tracking.
+    // The post-profile hold closes the tracking residual on position
+    // error alone, so `settled` completion leaves the arm on the target
+    // for real.
     let target1 = with_j0(park, 10.0);
     let i1 = c.ok_index(&move_j(1001, target1, 0.5));
     let (ok, detail) = c.wait_complete(i1);
@@ -456,8 +454,8 @@ fn full_sim_session_over_protocol_v2() {
         s.completed_index >= i1 as i64
     });
     assert!(
-        s.angles[0] > park[0] + 5.0 && (s.angles[0] - target1[0]).abs() < 6.0,
-        "J0 must have driven toward the target; got {:?}",
+        s.angles[0] > park[0] + 5.0 && (s.angles[0] - target1[0]).abs() < 1.0,
+        "J0 must have settled on the target; got {:?}",
         s.angles
     );
 
@@ -1069,11 +1067,9 @@ fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
     let s = rig.wait_status("the return move is reported complete", |s| {
         s.completed_index >= index as i64
     });
-    // The rig's 50 Hz tick turns the return's 0.5 speed fraction into a
-    // near-step for the sim's cascade, which lands short of any fast
-    // target (`full_sim_session_over_protocol_v2` measures the same
-    // lag) — so the assertion is that home drove the arm to its home
-    // pose and nowhere near where a referencing seek would have left it.
+    // The post-profile hold settles the arm onto the return target, so
+    // home must land ON the park pose — and nowhere near where a
+    // referencing seek would have left it.
     assert!(
         max_deg_error(&s.angles, &park) < max_deg_error(&s.angles, &ready),
         "home must return to the park pose {park:?}, not the referencing \
@@ -1081,9 +1077,9 @@ fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
         s.angles
     );
     assert!(
-        max_deg_error(&s.angles, &park) < 0.5 * max_deg_error(&away, &park),
-        "home must close most of the distance to the park pose: from \
-         {away:?} it reached {:?} (home is {park:?})",
+        max_deg_error(&s.angles, &park) < 1.0,
+        "home must settle on the park pose: from {away:?} it reached {:?} \
+         (home is {park:?})",
         s.angles
     );
     // A referencing seek drops `homed` on its way through; a planned

@@ -85,6 +85,12 @@ check, apply the home reference, mark done, restore normal limits.
 
 **Post-move** (optional per joint): position-mode toward `post_home_position` until
 within 50 ticks for `round(0.08/dt)` consecutive ticks; timeout warns and continues.
+Deliberate deviation: the vendor sends a bare `(target, post_home_speed)` frame, but
+the wire speed channel is an additive velocity feedforward (spec/CAN.md), so that
+standing feedforward parks the joint `speed/KPP` ticks off the target and the vendor's
+own 50-tick arrival check times out. We drive a Hermite profile sized so its peak
+tangent is `post_home_speed`; the feedforward decays to zero at the target and the
+position loop closes the landing.
 
 ## Home reference & gripper-dependent offsets
 

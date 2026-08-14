@@ -2565,13 +2565,12 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
         "a solution that is inside every soft window after wrapping must run: {detail:?}"
     );
     let settled = settled_tcp(&rig, "the wrapped solution at rest");
-    // The tolerance is the sim's, not the solver's: the plan ends on the
-    // IK solution exactly, but the sim driver's position mode freezes
-    // whatever following lag remains when the profile's speed reaches
-    // zero, ~10 mm at the CI tick rate. A wrong-branch execution misses
-    // by decimeters, so the assertion still discriminates.
+    // The plan ends on the IK solution exactly, and once the profile's
+    // feedforward decays to zero the driver's position loop closes the
+    // remaining residual, so the landing is tight even at the CI tick
+    // rate. A wrong-branch execution misses by decimeters.
     assert!(
-        distance(tcp_mm(&settled), [target[0], target[1], target[2]]) < 25.0,
+        distance(tcp_mm(&settled), [target[0], target[1], target[2]]) < 3.0,
         "the wrapped solution must land on the commanded pose: {:?} vs {target:?}",
         tcp_mm(&settled)
     );

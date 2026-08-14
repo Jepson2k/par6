@@ -134,6 +134,7 @@ struct HomerParams {
     pre_post_timeout: u32,
     normal_vel_limit: f32,
     normal_ilim: f32,
+    dt: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -198,6 +199,7 @@ impl HomerParams {
             pre_post_timeout: ticks(PRE_POST_TIMEOUT_S).max(1),
             normal_vel_limit: normal_vel_limit as f32,
             normal_ilim: normal_ilim as f32,
+            dt,
         }
     }
 }
@@ -243,6 +245,11 @@ struct Homer {
     preclear_used: bool,
     post_target_ticks: i32,
     post_streak: u32,
+    /// Position at PostMove entry (captured from the first tick with a
+    /// valid reading) and the Hermite profile sized from it.
+    post_start_ticks: Option<i32>,
+    post_dur_ticks: u32,
+    post_elapsed: u32,
 }
 
 impl Homer {
@@ -262,6 +269,9 @@ impl Homer {
             preclear_used: false,
             post_target_ticks: 0,
             post_streak: 0,
+            post_start_ticks: None,
+            post_dur_ticks: 0,
+            post_elapsed: 0,
         }
     }
 
@@ -273,6 +283,9 @@ impl Homer {
         self.latched = None;
         self.preclear_used = false;
         self.post_streak = 0;
+        self.post_start_ticks = None;
+        self.post_dur_ticks = 0;
+        self.post_elapsed = 0;
         self.reset_detectors();
     }
 
@@ -512,8 +525,39 @@ impl Homer {
             HPhase::PostMove => {
                 self.elapsed += 1;
                 let post = p.post.expect("post move without a plan");
-                let cmd =
-                    JointCommand::position(self.post_target_ticks, trunc_to_wire(post.speed), 0);
+                // Drive a Hermite profile to the post-home target instead
+                // of a bare (target, speed) frame: the wire speed channel
+                // is an additive velocity feedforward, so a standing
+                // nonzero speed against a fixed target parks the joint
+                // speed/KPP ticks off it (the vendor runtime does exactly
+                // that, and its own 50-tick arrival check then times
+                // out). The profile's tangent decays to zero at the
+                // target, where the position loop closes the landing.
+                if self.post_start_ticks.is_none() {
+                    self.post_start_ticks = node.position_ticks;
+                    if let Some(start) = self.post_start_ticks {
+                        let d = f64::from(self.post_target_ticks - start).abs();
+                        // Peak Hermite tangent is 1.5·d/span — size the
+                        // span so the peak feedforward is the configured
+                        // post-home speed.
+                        let speed = post.speed.abs().max(1.0);
+                        self.post_dur_ticks = ((1.5 * d / speed) / p.dt).ceil().max(1.0) as u32;
+                    }
+                }
+                let cmd = match self.post_start_ticks {
+                    Some(start) => {
+                        self.post_elapsed += 1;
+                        let (pos, vel) = hermite(
+                            f64::from(start),
+                            f64::from(self.post_target_ticks),
+                            self.post_elapsed,
+                            self.post_dur_ticks,
+                            p.dt,
+                        );
+                        JointCommand::position(trunc_to_wire(pos), trunc_to_wire(vel), 0)
+                    }
+                    None => JointCommand::idle(),
+                };
                 let in_pos = node
                     .position_ticks
                     .map(|pos| {
@@ -561,19 +605,18 @@ struct MoveToState {
 }
 
 /// Cubic Hermite (zero end velocities) between two tick positions:
-/// returns (position, velocity-limit ticks/s) at `elapsed` of `dur`
-/// ticks. The velocity slot of a position frame is the driver's speed
-/// LIMIT (spec/CAN.md), so it is floored at the mean profile speed —
-/// the raw Hermite tangent is zero at both ends, which would choke the
-/// position loop before the tracking residual closes.
+/// returns (position, signed profile velocity ticks/s) at `elapsed` of
+/// `dur` ticks. The velocity slot of a position frame is the driver's
+/// additive velocity FEEDFORWARD (spec/CAN.md), so the returned value is
+/// the profile's true tangent: zero at both ends, where the position
+/// loop alone closes the landing residual.
 fn hermite(start: f64, end: f64, elapsed: u32, dur: u32, dt: f64) -> (f64, f64) {
     let s = (f64::from(elapsed) / f64::from(dur.max(1))).clamp(0.0, 1.0);
     let d = end - start;
     let pos = start + d * (3.0 * s * s - 2.0 * s * s * s);
     let span_s = f64::from(dur.max(1)) * dt;
     let vel = d * (6.0 * s - 6.0 * s * s) / span_s;
-    let vel_limit = vel.abs().max(d.abs() / span_s);
-    (pos, vel_limit)
+    (pos, vel)
 }
 
 // ---------------------------------------------------------------- orchestrator

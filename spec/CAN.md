@@ -106,6 +106,22 @@ of 0 is wrong. Values are `int()`-TRUNCATED (not rounded) before packing. cmd 4 
 sends DLC 8; the driver computes torque from position+velocity error with onboard KP/KD
 (no integral), Current acts as feedforward.
 
+**Position-variant control law** (firmware `Position_mode()`, verified against the Spectral
+Micro firmware source): the spd and cur channels are additive FEEDFORWARDS, not caps or
+setpoints —
+
+```
+vel_target = KPP · (pos − pos_meas) + spd          # spd = velocity feedforward
+vel_target = clamp(vel_target, ±velocity_limit)     # only the cmd-20 limit caps
+iq = KPV · (vel_target − vel_meas) + Σ KIV·err + cur   # integral clamped to ±cur_limit
+iq = clamp(iq, ±cur_limit)                          # cur = current feedforward
+```
+
+A position frame with spd = 0 still closes position error at full authority — that is
+exactly what the vendor runtime's hold sends (last target, Speed=0, gravity current).
+Loop integrals persist across received frames unless the driver's
+`Reset_integral_accumulator` EEPROM flag is set (default 0).
+
 **Wrong-DLC frames are discarded whole** — never partially update state from them.
 
 ## Units & conversions (SourceRoboticsToolbox `Joint` semantics)

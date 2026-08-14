@@ -185,9 +185,9 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         await teleport_to(client, park)
 
         # -- queued move: ack index, COMPLETE push, real closed-loop motion.
-        #    The sim's cascade treats the commanded velocity as a cap, so a
-        #    short move carries a few degrees of tracking lag; the tolerance
-        #    proves motion toward the target, not servo-grade tracking.
+        #    The post-profile hold closes the tracking residual on position
+        #    error alone, so `settled` completion leaves the arm on the
+        #    target for real.
         target = list(park)
         target[0] += 12.0
         index = await client.move_j(target, duration=1.5)
@@ -199,7 +199,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         landed = await client.angles()
         assert landed is not None
         assert landed[0] > park[0] + 5.0
-        assert abs(landed[0] - target[0]) < 6.0
+        assert abs(landed[0] - target[0]) < 1.0
 
         # -- a jog preempts planned motion --------------------------------
         preempted = await client.move_j(park, duration=6.0)

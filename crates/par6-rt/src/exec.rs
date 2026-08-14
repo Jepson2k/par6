@@ -78,6 +78,14 @@ impl ExecPlayback {
         self.paused = paused;
     }
 
+    /// Simulator/teleport path: re-aim the starved-ring hold at the
+    /// landed pose without touching playback or completion bookkeeping.
+    /// The hold re-sends its position target every tick, so leaving it
+    /// at the pre-teleport pose would actively drag the arm back there.
+    pub fn reseed_hold(&mut self, q: &[f64; MAX_JOINTS]) {
+        self.hold_q = *q;
+    }
+
     /// Discard the samples marked for discard (stop/flush path — NOT
     /// pause): everything up to the marked fill generation, so a
     /// command queued right after the stop keeps its samples even when

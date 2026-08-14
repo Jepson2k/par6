@@ -886,6 +886,7 @@ impl RtCommands for RtBridge {
                 let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
                 core.set_joint_reference(i, wrapped0, q[i]);
             }
+            core.reseed_motion_targets();
             core.set_homed(true);
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
