@@ -63,7 +63,7 @@ impl RtJogEngine for MotionJog {
 }
 
 /// `par6_motion::StreamingExecutor` (jerk-limited OTG) behind the RT
-/// stream hook, with the spec's unconditional soft-limit clamp on the
+/// stream hook, with the vendor's unconditional soft-limit clamp on the
 /// way in and out.
 pub struct MotionStream {
     executor: StreamingExecutor,
@@ -120,7 +120,7 @@ impl StreamTracker for MotionStream {
                 self.clamp(q_out);
                 // The velocity channel of a cmd-2 position frame is an
                 // additive feedforward on the driver's position loop
-                // (spec/CAN.md). The OTG reports the velocity it ends the
+                // (vendor firmware). The OTG reports the velocity it ends the
                 // tick AT, which is zero on every tick that lands on the
                 // current target — a stepped stream advancing a reachable
                 // target every cycle would get no feedforward at all and

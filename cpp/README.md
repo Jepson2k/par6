@@ -69,10 +69,10 @@ dependency lib dir (`.ffi/env/lib`) — also what the CI cache covers.
 - Poses: 4×4 homogeneous, **row-major**, 16 doubles.
 - Jacobians: 6×nq, row-major, rows `[linear; angular]`,
   `LOCAL_WORLD_ALIGNED` (world axes at the frame origin).
-- Gravity: RNEA at zero velocity/acceleration (spec/RT.md `G(q)`).
+- Gravity: `G(q)` — RNEA at zero velocity/acceleration.
 - Optional rigid tool at create: `T_ee_tool` shifts fk/jacobian/ik to the
   tool frame; mass/COM/inertia (ee-frame coords) are appended to the parent
-  joint so gravity covers "arm + active gripper tool link" per spec/RT.md.
+  joint so gravity covers the arm plus the active gripper tool link.
 - All `par6_kin_*` calls after create are allocation-free (`pinocchio::Data`
   and every workspace buffer preallocated in the handle). `par6_kin` handles
   are not thread-safe — one handle per thread.

@@ -1,5 +1,4 @@
-//! Closed-loop simulated [`DriverBus`] backend (Tier-1 sim, spec/CAN.md +
-//! spec/HOMING.md "Sim requirements").
+//! Closed-loop simulated [`DriverBus`] backend (Tier-1 sim).
 //!
 //! One virtual Spectral driver per CAN node consumes the REAL host→driver
 //! frames (encoded by the production codec, parsed by DLC exactly like
@@ -71,7 +70,7 @@ use plant::{JointMap, KinJoint};
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
-/// Poll slots between device-info sweeps (~4 s at 250 Hz, spec/CAN.md).
+/// Poll slots between device-info sweeps (~4 s at 250 Hz).
 const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 /// Default hall-sensor band half-width \[rad\].
 const HALL_HALF_WIDTH_RAD: f64 = 0.02;
@@ -737,7 +736,7 @@ impl SimBus {
 
     /// Send one node's full stored configuration, `repeats` passes
     /// (Watchdog → Limits → Voltage_Limit → PD → Current → Velocity →
-    /// Position gains — the spec/CAN.md boot order).
+    /// Position gains — the boot order).
     fn apply_node_config(&mut self, node: NodeId, repeats: u8) {
         let Some(i) = self.node_configs.iter().position(|c| c.node == node) else {
             return;

@@ -1,4 +1,4 @@
-//! Error latch management (spec/RT.md "Errors").
+//! Error latch management.
 //!
 //! Hard keys LATCH until the user clear sequence; warning keys track live
 //! conditions and self-clear. The clear sequence is driven by the tick

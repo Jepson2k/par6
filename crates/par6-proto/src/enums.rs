@@ -206,7 +206,7 @@ wire_enum! {
 }
 
 wire_enum! {
-    /// Controller-side completion policy for queued motion (see spec/RT.md).
+    /// Controller-side completion policy for queued motion.
     CompletionPolicy: u8 {
         /// Complete at the last commanded sample.
         Commanded = 0,
@@ -244,7 +244,7 @@ wire_enum! {
 
 /// The ack taxonomy: which reply discipline a command follows.
 ///
-/// This is the single queryable table from the spec — servers use it to decide
+/// This is the protocol's single queryable table — servers use it to decide
 /// whether to ack, clients use it to decide whether to wait.
 pub fn command_class(cmd: CmdType) -> CommandClass {
     use CmdType as C;

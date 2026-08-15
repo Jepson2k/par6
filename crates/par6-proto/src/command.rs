@@ -12,7 +12,7 @@
 //!   the configured maxima in `(0, 1]`; jog speeds are signed fractions in
 //!   `[-1, 1]`; durations are seconds.
 //! - A TCP pose `[x, y, z, rx, ry, rz]` rotates intrinsic XYZ,
-//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (`spec/PROTOCOL-V2.md`). A collision
+//!   `R = Rx(rx)·Ry(ry)·Rz(rz)`. A collision
 //!   [`Shape`]'s pose is the other way round — waldoctl's `Shape.pose`
 //!   contract is extrinsic XYZ, `R = Rz·Ry·Rx`, so that the shape the
 //!   frontend draws is the shape the checker enforces.

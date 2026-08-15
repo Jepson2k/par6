@@ -19,7 +19,7 @@ use crate::spectral::codec::{
 };
 use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 
-/// Poll slots between device-info sweeps (~4 s at 250 Hz, spec/CAN.md).
+/// Poll slots between device-info sweeps (~4 s at 250 Hz).
 pub(super) const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 
 /// What one poll slot resolves to.
@@ -40,7 +40,7 @@ pub(super) enum PollStep {
 /// voltage / errors once every `3 × targets` slots, a device-info sweep
 /// replaces the round robin for `targets` slots every
 /// [`DEVICE_INFO_PERIOD_SLOTS`], and a single-slot override queue
-/// preempts everything (spec/CAN.md per-tick pattern).
+/// preempts everything.
 ///
 /// One slot per RT tick keeps the steady-state TX budget at joints +
 /// gripper + 1 — inside the classic-CAN ceiling.
@@ -106,8 +106,8 @@ impl PollScheduler {
     }
 }
 
-/// Per-node data-age clock (spec/CAN.md freshness layer 1): stale is a
-/// self-clearing warning, lost LATCHES until the user clear path.
+/// Per-node data-age clock: stale is a self-clearing warning, lost
+/// LATCHES until the user clear path.
 ///
 /// `None` means "never seen", which only [`configure`](Self::configure)
 /// produces: it is an absorbing state ([`latch_lost`](Self::latch_lost)
@@ -252,7 +252,7 @@ pub(super) struct NodeConfig {
     pub(super) gains: Gains,
 }
 
-/// The seven configuration message types, in spec/CAN.md boot order.
+/// The seven configuration message types, in boot order.
 /// One pass = these seven frames to one node; one paced batch = one
 /// message type to every node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -266,7 +266,7 @@ pub(super) enum ConfigKind {
     PositionGains,
 }
 
-/// Boot order (spec/CAN.md step 2).
+/// The order the boot config load sends message types in.
 pub(super) const CONFIG_ORDER: [ConfigKind; 7] = [
     ConfigKind::Watchdog,
     ConfigKind::Limits,
@@ -304,7 +304,7 @@ pub(super) enum BootStep {
     Frame(CanFrame),
     /// Wait `bus.config_pace_s` before the next batch — the interface TX
     /// queue drops silently on overflow, and the whole load enqueues in
-    /// microseconds against a ~10 frames/ms drain (spec/CAN.md).
+    /// microseconds against a ~10 frames/ms drain.
     Pace,
 }
 

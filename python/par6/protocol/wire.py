@@ -1,8 +1,7 @@
 """Protocol v2 wire layer — Python side.
 
-Mirrors the Rust `par6-proto` codec (the source of truth; see
-``spec/PROTOCOL-V2.md``). Constants come from the generated
-:mod:`par6.protocol.constants`; this module adds:
+Mirrors the Rust `par6-proto` codec (the source of truth). Constants come
+from the generated :mod:`par6.protocol.constants`; this module adds:
 
 - :class:`StatusBuffer` + :func:`decode_status_bin_into` — zero-allocation
   decode of the broadcast STATUS packet into preallocated numpy arrays

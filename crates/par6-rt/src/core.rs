@@ -1,7 +1,7 @@
 //! The tick-loop assembly: [`RtCore`] wires the per-tick modules
 //! (dispatch laws, homing FSM, error latch, e-stop debounce, timing
 //! bands, EXEC playback) over a [`DriverBus`] in the \[OURS\] phase order
-//! from spec/RT.md — measure-then-command within one tick:
+//! — measure-then-command within one tick:
 //!
 //! 1. `begin_tick` — advance the bus time base
 //! 2. GPIO read + debounce (e-stop condition)
@@ -55,7 +55,7 @@ use crate::MAX_JOINTS;
 /// Boot one-shot: bus-scan selfcheck, then request IDLE (exit BOOTING).
 const BOOT_SELFCHECK_TICK: u64 = 8;
 /// Vendor boot workaround: full config re-sends at these ticks (may be
-/// dropped after HIL validation — spec/RT.md).
+/// dropped after HIL validation).
 const BOOT_CONFIG_RESEND_TICKS: [u64; 3] = [50, 150, 300];
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
@@ -298,9 +298,8 @@ pub struct RtCore<B: DriverBus> {
     bus_faults: BusFaultLogs,
 
     // Bus-failure accounting: the backend PROPAGATES send/drain errors
-    // (spec/CAN.md stance) and the tick loop counts every one into the
-    // published loop stats. Consecutive-failure streaks drive the
-    // disconnect latch below.
+    // and the tick loop counts every one into the published loop stats.
+    // Consecutive-failure streaks drive the disconnect latch below.
     bus_tx_failures: u32,
     bus_rx_failures: u32,
     tx_fail_streak: u32,
@@ -310,7 +309,7 @@ pub struct RtCore<B: DriverBus> {
     /// outbound-dead link disables on the same clock as a silent one.
     tx_fault_latch_ticks: u32,
 
-    // State-machine variables (spec/RT.md: mode, state, homed, errors).
+    // State-machine variables: mode, state, homed, errors.
     mode: Mode,
     state: ArmState,
     enable_seq: u64,
@@ -669,7 +668,7 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Rebuild the torque scale around the drivers' own torque constants
-    /// (`kt_source = "auto"`, spec/CAN.md boot step 3): the fetched value
+    /// (`kt_source = "auto"`, the boot cmd-33 fetch): the fetched value
     /// governs, config is the fallback for a driver that did not answer.
     ///
     /// Boot one-shot, by which tick the backend's boot replies have been
@@ -786,7 +785,7 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
-    /// Mode transition request with the spec/RT.md gates, in order:
+    /// Mode transition request with the gates applied in order:
     /// maintenance park assertion, SAFETY_STOP/IDLE unconditional
     /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
@@ -898,7 +897,7 @@ impl<B: DriverBus> RtCore<B> {
         let _ = target;
     }
 
-    /// The user clear sequence (spec/RT.md): Clear_Error ×3 to each
+    /// The user clear sequence: Clear_Error ×3 to each
     /// faulted node (+ gripper), stale per-type flags zeroed, lost
     /// latches reset, then the settle countdown that outlasts the poll
     /// cycle before the latch wipes.

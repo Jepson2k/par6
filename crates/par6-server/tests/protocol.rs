@@ -469,7 +469,7 @@ async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
 const TILTED_RPY: [f64; 3] = [0.7, -0.4, 1.1];
 
 /// `R = Rx(r)·Ry(p)·Rz(y)` as a row-major 3x3: the wire's intrinsic-XYZ
-/// convention (`spec/PROTOCOL-V2.md`) composed the long way round, so it
+/// convention composed the long way round, so it
 /// shares no code with the STATUS builder it judges.
 fn intrinsic_xyz(rpy: [f64; 3]) -> [[f64; 3]; 3] {
     let (sr, cr) = rpy[0].sin_cos();
@@ -1994,7 +1994,7 @@ async fn boot_enables_reset_reports_the_rt_verdict_and_rt_latches_reach_the_clie
 /// The queue engine used to hand the planner exactly one command at a
 /// time, so a corner radius had nowhere to reach and was refused at
 /// accept time. What is asserted here is the contract that replaced it,
-/// including the completion-index semantics `spec/PROTOCOL-V2.md`
+/// including the completion-index semantics protocol v2
 /// prescribes for blended-away commands: one COMPLETE per queued
 /// command, all of them at the end of the motion that carried them, and
 /// a high-water `completed_index` on the LAST of them.

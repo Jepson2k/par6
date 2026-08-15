@@ -6,7 +6,7 @@
 //!   caller-supplied u64 tick count — `Instant`-free so sim backends are
 //!   deterministic.
 //! - Driver model types ([`types`]): `Option`-channel [`JointCommand`]
-//!   (None = channel omitted on the wire, NOT zero — see `spec/CAN.md`),
+//!   (None = channel omitted on the wire, NOT zero),
 //!   gripper commands incl. the DLC-0 empty poll, per-node measured state,
 //!   per-type error flags vs the per-frame live fault bit, freshness
 //!   warn/latch classification, kernel link health.

@@ -140,7 +140,7 @@ par6_kin *par6_kin_create(const char *urdf_path,
             if (tool->mass > 0.0) {
                 // Point/rigid tool inertia given in ee-frame coordinates;
                 // re-express at the parent joint via the ee frame placement
-                // so RNEA (gravity) sees it. Spec: RT.md gravity section.
+                // so RNEA (gravity) sees it.
                 const pinocchio::Frame &fr = h->model.frames[h->ee_frame_id];
                 const Eigen::Vector3d com(tool->com[0], tool->com[1],
                                           tool->com[2]);

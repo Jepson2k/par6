@@ -1,5 +1,5 @@
 //! Frame codec: arbitration ids, big-endian payload primitives, and the
-//! full command table of `spec/CAN.md` — encoding for every host→driver
+//! full Spectral/STEPFOC command table — encoding for every host→driver
 //! frame, decoding for every driver→host reply.
 //!
 //! Everything here is pure and allocation-free ([`CanFrame`] is a fixed
@@ -62,7 +62,7 @@ impl CanFrame {
     }
 }
 
-/// The command table of `spec/CAN.md` (6-bit command field).
+/// The Spectral/STEPFOC command table (6-bit command field).
 ///
 /// Discriminants are the wire values. Cmds 5/7 are in the table but
 /// reserved — [`decode_frame`] refuses them.

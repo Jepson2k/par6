@@ -1,6 +1,6 @@
 //! The `Err` arm of the [`DriverBus`] contract, driven through real
-//! `RtCore` ticks. spec/CAN.md: **propagate send errors** — the vendor
-//! swallowed them and shipped production bugs because of it.
+//! `RtCore` ticks. The bus contract: **propagate send errors** — the
+//! vendor swallowed them and shipped production bugs because of it.
 //!
 //! Neither `LoopbackBus` nor `SimBus` can fail, so [`FailingBus`]
 //! delegates everything to the loopback reference backend with a

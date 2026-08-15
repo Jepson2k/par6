@@ -1,12 +1,12 @@
 //! The declarative gating table: what state a command requires before it
 //! is accepted. Derived from [`command_class`] (SYSTEM and QUERY commands
-//! always apply) plus the per-command requirements from the spec: motion
+//! always apply) plus the protocol's per-command requirements: motion
 //! needs a homed robot, `teleport` is simulator-only, and every
 //! motion-class command needs an ENABLED controller.
 //!
 //! Rejections always answer with a structured ERROR carrying the echoed
 //! `req_id` — including FIRE_AND_FORGET commands, whose SUCCESS stays
-//! unacked. (`teleport` outside sim mode is the spec's canonical case:
+//! unacked. (`teleport` outside sim mode is the protocol's canonical case:
 //! "rejected with a real error", never a silent no-op.)
 
 use par6_proto::{command_class, CmdType, CommandClass};

@@ -1,4 +1,4 @@
-//! EXEC-mode sample-ring playback (spec/RT.md "EXEC").
+//! EXEC-mode sample-ring playback.
 //!
 //! Pops exactly one [`Sample`] per tick from the planner ring and turns
 //! it into the (pos, vel, torque-ff) setpoint. Pause holds in place with

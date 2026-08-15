@@ -1,5 +1,5 @@
-//! Kernel link plane: interface bring-up (spec/CAN.md boot step 1) and
-//! the ~1 Hz netlink health sampler.
+//! Kernel link plane: interface bring-up and the ~1 Hz netlink health
+//! sampler.
 //!
 //! The sampler runs on its own thread because netlink round-trips
 //! allocate and block — the RT tick only ever does a relaxed atomic load
@@ -19,7 +19,7 @@ use socketcan::CanInterface;
 
 use crate::types::{LinkHealth, LinkState};
 
-/// Netlink sampling period (spec/CAN.md freshness layer 3).
+/// Netlink health sampling period.
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 /// Stop-flag polling granularity, so shutdown never waits a full period.
 const STOP_POLL: Duration = Duration::from_millis(50);
@@ -79,8 +79,8 @@ pub enum OpenError {
     },
 }
 
-/// Bring the configured interface into the state spec/CAN.md's boot step
-/// 1 describes, if it is not already there.
+/// Bring the configured interface into its operating state (up at the
+/// configured bitrate), if it is not already there.
 ///
 /// An interface that is already up is left running: only its bitrate is
 /// checked (mismatch is an error, not a silent re-time). A down

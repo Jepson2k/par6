@@ -24,7 +24,7 @@ Environment=RUST_LOG=info
 
 User=par6
 Group=par6
-# CAP_SYS_NICE: the RT thread requests SCHED_FIFO 99 (spec/RT.md). Setup
+# CAP_SYS_NICE: the RT thread requests SCHED_FIFO 99. Setup
 # failure is logged DEGRADED and is not fatal, so a box without the
 # capability still runs — badly.
 # CAP_NET_ADMIN: bring can0 up at the configured bitrate when it is down.

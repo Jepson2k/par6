@@ -20,7 +20,7 @@ use crate::types::{
 /// thresholds in seconds and the caller converts once with
 /// `RobotConfig::ticks`.
 ///
-/// # Per-tick call order (measure-then-command, spec/RT.md \[OURS\])
+/// # Per-tick call order (measure-then-command)
 ///
 /// ```text
 /// begin_tick(tick)            advance the time base

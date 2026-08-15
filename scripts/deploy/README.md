@@ -124,7 +124,7 @@ touching the running service.
 capabilities:
 
 - **`CAP_SYS_NICE`** — the RT thread asks for `SCHED_FIFO` priority 99 and pins
-  itself to CPU 3 (`spec/RT.md`). Failure is logged `DEGRADED` and is *not*
+  itself to CPU 3. Failure is logged `DEGRADED` and is *not*
   fatal, so a misconfigured box runs badly instead of not at all — check the
   journal for `RT thread: SCHED_FIFO priority 99` to confirm it took.
   `LimitRTPRIO=99` is set as well for boxes without the capability path.

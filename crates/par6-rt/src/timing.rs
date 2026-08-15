@@ -1,5 +1,4 @@
-//! Loop-period statistics and the one-sided degradation bands
-//! (spec/RT.md "Rate & timing").
+//! Loop-period statistics and the one-sided degradation bands.
 //!
 //! Fed one measured loop period per tick; keeps a rolling window whose
 //! percentiles are recomputed periodically. Bands are one-sided (the

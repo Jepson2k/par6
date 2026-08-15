@@ -378,8 +378,8 @@ impl Daemon {
                 fifo_priority: None,
             }
         } else {
-            // Hardware: SCHED_FIFO on the isolated core (spec/RT.md
-            // scheduling; setup failure is logged DEGRADED, not fatal).
+            // Hardware: SCHED_FIFO on the isolated core (setup failure
+            // is logged DEGRADED, not fatal).
             RunOptions::default()
         };
         let mut threads = Vec::new();
@@ -739,8 +739,8 @@ fn estop_source(opts: &Options) -> Result<Box<dyn EstopGpio>, DaemonError> {
 /// A flash reboots the driver and the encoder is absolute only within one
 /// motor revolution, so the flashed joint's home reference dies with it:
 /// the vendor consumes a marker file its flasher writes and clears homing
-/// robot-wide. par6 ships no flasher — `spec/CAN.md` leaves the bootloader
-/// protocol to the vendor tools — so nothing here can tell a flash from a
+/// robot-wide. par6 ships no flasher — the bootloader protocol belongs
+/// to the vendor tools — so nothing here can tell a flash from a
 /// scan, and the only answer that is never unrecoverable is "yes". Every
 /// FLASHING exit therefore costs a re-home; a marker-writing flasher is
 /// what would buy the scan-only case back.

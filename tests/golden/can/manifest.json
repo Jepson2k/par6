@@ -1,6 +1,6 @@
 {
   "format": 1,
-  "protocol": "Spectral/STEPFOC CAN application protocol (spec/CAN.md)",
+  "protocol": "Spectral/STEPFOC CAN application protocol",
   "encoding": "Frames are inline: id_hex is the 11-bit arbitration id ((node<<7)|(cmd<<1)|err), rtr marks remote frames, data_hex is the payload (empty string = DLC 0). No .bin files — CAN payloads are at most 8 bytes, so hex-in-manifest keeps each vector self-describing for the Python side.",
   "byte_order": "All multi-byte payload fields are BIG-endian; i24/i16/i32 are two's complement; bitfields fold MSB-first (list index 0 = bit 7).",
   "checked_by": "crates/par6-bus/tests/golden_can.rs (dir=tx: encode and byte-compare; dir=rx: decode and value-compare; malformed: decode must refuse with the named error)",

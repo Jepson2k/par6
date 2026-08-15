@@ -1,12 +1,12 @@
 //! Shared RT state types: mode/state enums, the error latch list, loop
 //! statistics, and the [`StateSnapshot`] the RT thread publishes every
-//! tick (spec/RT.md "Status snapshot").
+//! tick.
 
 use par6_bus::{GripperState, LinkHealth, NodeState};
 
 use crate::{MAX_JOINTS, NUM_NODES};
 
-/// RT operating mode (spec/RT.md state machine).
+/// RT operating mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Startup: bus scan + selfcheck, then requests IDLE.
@@ -46,7 +46,7 @@ pub enum ArmState {
     Enabled,
 }
 
-/// Error keys (spec/RT.md). Per-joint codes are paired with a joint index
+/// Error keys. Per-joint codes are paired with a joint index
 /// in [`ErrorEntry`]; bare codes carry `joint: None`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ErrorCode {
@@ -97,7 +97,7 @@ pub enum ErrorCode {
 
 impl ErrorCode {
     /// Warnings self-clear and do not set `error_active`; everything else
-    /// LATCHES until user clear (spec/RT.md).
+    /// LATCHES until user clear.
     pub fn is_warning(self) -> bool {
         matches!(
             self,
@@ -342,7 +342,7 @@ pub struct StreamStatus {
 /// through the snapshot channel and consumed by the command plane
 /// (status broadcast + telemetry).
 ///
-/// Invariants (spec/RT.md): the RT thread is the ONLY writer of measured
+/// Invariants: the RT thread is the ONLY writer of measured
 /// state; `target_*` carries the raw request while `*_commanded` carries
 /// post-limiter values — their difference makes limiter activity visible.
 /// The struct is `Copy` and fixed-size so seqlock/triple-buffer transport

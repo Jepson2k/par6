@@ -1,4 +1,4 @@
-//! Planner → RT SPSC sample ring (spec/RT.md EXEC section).
+//! Planner → RT SPSC sample ring, consumed by EXEC playback.
 //!
 //! The in-process replacement for the vendor's chunked `RCBX` batches:
 //! the planner pushes interpolated [`Sample`]s (position/velocity/torque

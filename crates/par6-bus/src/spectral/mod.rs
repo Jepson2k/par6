@@ -1,4 +1,4 @@
-//! Spectral/STEPFOC CAN application protocol (spec/CAN.md).
+//! Spectral/STEPFOC CAN application protocol.
 //!
 //! Two pure layers, no I/O:
 //!

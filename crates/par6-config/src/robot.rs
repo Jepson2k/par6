@@ -302,7 +302,7 @@ pub struct BusConfig {
     pub scan: ScanConfig,
 }
 
-/// UDP command/status/telemetry plane parameters (see spec/PROTOCOL-V2.md).
+/// UDP command/status/telemetry plane parameters (protocol v2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -407,7 +407,7 @@ impl Default for StreamDefaults {
     }
 }
 
-/// Loop-period degradation bands (spec/RT.md "Rate & timing").
+/// Loop-period degradation bands.
 ///
 /// The p99 of the measured loop period is compared against multiples of
 /// the tick period: above `degraded_factor · dt` the runtime raises the

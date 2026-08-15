@@ -1,6 +1,6 @@
 //! Error latch/clear lifecycle, e-stop lifecycle (debounce, latch,
 //! reaction, clear), live-bit gating, freshness warn/latch, and the loop
-//! degradation bands (spec/RT.md "Errors" / "E-stop" / "Rate & timing").
+//! degradation bands.
 
 mod common;
 

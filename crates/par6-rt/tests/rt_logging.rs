@@ -1,5 +1,4 @@
-//! Nothing on the RT tick path may log unthrottled (spec/RT.md "Rate &
-//! timing").
+//! Nothing on the RT tick path may log unthrottled.
 //!
 //! A bus fault is permanent while the link is down — `SocketCanBus` maps
 //! ENETDOWN/ENOBUFS straight to `LinkDown`/`TxQueueFull` and `recv` maps

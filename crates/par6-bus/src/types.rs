@@ -1,6 +1,6 @@
 //! Driver-model types shared by every bus backend: per-tick commands, the
 //! decoded per-node state the RX drain fills, and the health/freshness
-//! surface. Wire semantics in `spec/CAN.md`.
+//! surface. Wire semantics live in [`crate::spectral`].
 
 /// CAN node id (low 4 bits of the 11-bit arbitration id).
 pub type NodeId = u8;
@@ -50,7 +50,7 @@ pub enum Pack {
 
 /// Per-joint setpoint for one tick.
 ///
-/// **Channel semantics are load-bearing** (spec/CAN.md): `pos = None` and
+/// **Channel semantics are load-bearing**: `pos = None` and
 /// `vel = None` mean the channel is OMITTED on the wire (the frame DLC
 /// shrinks) — the driver switches control mode accordingly. They do NOT
 /// mean zero. `cur_ma = None` means "unspecified": the current channel is
@@ -59,7 +59,7 @@ pub enum Pack {
 /// `i16`) so the RT mode table's `(pos?, vel?, trq?)` output law maps
 /// 1:1 onto this struct and "mode did not command torque" stays
 /// distinguishable from "mode commanded exactly 0 mA" in telemetry; the
-/// substitute-0 rule lives in the codec, where spec/CAN.md places it.
+/// substitute-0 rule lives in the codec, at the wire boundary.
 ///
 /// Values are truncated toward zero (vendor `int()`), not rounded, when
 /// packed.
@@ -241,7 +241,7 @@ pub enum PollAction {
 
 /// Per-type driver fault flags (cmd 26 reply, DLC 2; list index 0 = bit 7).
 ///
-/// Only ~84 ms fresh at 250 Hz / 7 nodes — per RT.md these are trusted
+/// Only ~84 ms fresh at 250 Hz / 7 nodes — these are trusted
 /// only while the node's live fault bit ([`NodeState::live_error_bit`])
 /// is set.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -312,7 +312,7 @@ pub struct NodeState {
     pub temperature_c: Option<i16>,
     /// Bus voltage \[mV\] (cmd 24).
     pub voltage_mv: Option<i16>,
-    /// Per-type fault flags (cmd 26) — gate on `live_error_bit` per RT.md.
+    /// Per-type fault flags (cmd 26) — gate on `live_error_bit`.
     pub error_flags: Option<ErrorFlags>,
     /// Torque constant reported by the driver \[Nm/A\] (cmd 33).
     pub kt_nm_a: Option<f32>,
@@ -451,7 +451,7 @@ impl BusState {
     }
 }
 
-/// Data-age classification for one node (spec/CAN.md freshness layer 1).
+/// Data-age classification for one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
     /// No frame seen since boot / last re-base.

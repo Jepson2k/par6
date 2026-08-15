@@ -15,7 +15,7 @@ use super::driver::PlantCmd;
 /// Plant viscous drag \[1/s\]: `accel -= VISC · vel`. The binding
 /// constraint is the WEAKEST homing profile (PAR6 J2: 6000 ticks/s at
 /// 250 mA homing current, boot k_a ≈ 213 (ticks/s²)/mA): steady approach
-/// drag `VISC·v/k_a` must sit well below the HOMING.md current-ratio
+/// drag `VISC·v/k_a` must sit well below the homing current-ratio
 /// threshold `0.7 × homing_current_ma` (175 mA) or stall detection
 /// false-fires in free travel. 2.0 puts J2's drag at ~56 mA (32% of
 /// threshold) while still damping the velocity loop.

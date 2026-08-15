@@ -3,12 +3,11 @@
 //! Every test drives [`SimBus`] exactly as the RT loop would — through the
 //! [`DriverBus`] trait, with commands encoded by the production codec and
 //! state decoded from the sim's real reply frames — and asserts the plant
-//! and virtual-driver behaviors that spec/HOMING.md's "Sim requirements"
-//! section names as acceptance criteria: endstop stall signatures for
-//! both homing detection conditions, hall trigger/edge emulation,
-//! release-phase preload relaxation, plus the driver watchdog, fault
-//! injection, wrong-DLC discard, boot 14-bit-wrap semantics, the gripper
-//! model and bit-exact determinism.
+//! and virtual-driver behaviors the homing sequence relies on: endstop
+//! stall signatures for both homing detection conditions, hall
+//! trigger/edge emulation, release-phase preload relaxation, plus the
+//! driver watchdog, fault injection, wrong-DLC discard, boot 14-bit-wrap
+//! semantics, the gripper model and bit-exact determinism.
 
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -43,7 +42,7 @@ fn calibration_pose(robot: &RobotConfig) -> Vec<f64> {
         .collect()
 }
 
-/// Drives the bus in the spec/RT.md per-tick call order.
+/// Drives the bus in the RT loop's per-tick call order.
 struct Rig {
     bus: SimBus,
     state: BusState,
@@ -95,7 +94,7 @@ impl Rig {
 }
 
 // ---------------------------------------------------------------------------
-// HOMING.md detection oracles (transcribed from the spec text, not the code)
+// Homing detection oracles (stated independently of the code under test)
 // ---------------------------------------------------------------------------
 
 /// Windowed stall: displacement from a reference stays below
@@ -174,7 +173,7 @@ impl CurrentWindow {
 /// `drive_slot = Some(j)` drives arm joint `j`; `None` drives the gripper
 /// motor through the gripper slot (`gripper_cmd` then carries the drive).
 /// Returns `(gated-hit position, rest position, peak |current|)` and
-/// asserts the HOMING.md detection fired at the stop, not in free travel.
+/// asserts the homing detection fired at the stop, not in free travel.
 #[allow(clippy::too_many_arguments)]
 fn run_stall_approach(
     rig: &mut Rig,
@@ -208,7 +207,7 @@ fn run_stall_approach(
         if over_current && ratio_pos.is_none() {
             ratio_pos = Some(pos);
         }
-        // HOMING.md gates the two conditions together (current primary,
+        // The homing sequence gates the two conditions together (current primary,
         // stall secondary): the hit is where BOTH hold.
         if stalled && over_current {
             hit_pos = Some(pos);
@@ -243,7 +242,7 @@ fn run_stall_approach(
 }
 
 // ---------------------------------------------------------------------------
-// 1. Endstop stall signatures + release-phase preload (HOMING.md sim reqs)
+// 1. Endstop stall signatures + release-phase preload
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -264,7 +263,7 @@ fn stall_endstop_signatures_and_release_preload() {
     let mut q0 = calibration_pose(&robot);
     q0[j] = jc.limits.hard_min_rad + 0.04;
     let mut rig = Rig::boot(&robot, None, Some(&q0));
-    // Homing entry: Limits(normal vel, homing current) — spec/HOMING.md.
+    // Homing entry: Limits(normal vel, homing current).
     rig.bus
         .send_limits(
             jc.node_id,
@@ -304,7 +303,7 @@ fn stall_endstop_signatures_and_release_preload() {
 
     // Release phase: current-only frame (cmd 2 DLC 2) at the config value
     // relaxes the gearbox windup, moving the REPORTED encoder position —
-    // exactly what HOMING.md's release phase samples.
+    // exactly what the release phase samples.
     let rel = h.release.expect("J1 homing config carries a release phase");
     let rel_ticks = u64::from(robot.ticks(rel.duration_s));
     let sample_at = (rel_ticks as f64 * rel.sample_pct).round() as u64;
@@ -877,7 +876,7 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     let mut rig = Rig::boot(&robot, Some(&gripper), None);
     let cmds = rig.idle_cmds();
 
-    // cmd 62 once, then DLC-0 empty polls every tick (HOMING.md).
+    // cmd 62 once, then DLC-0 empty polls every tick.
     let run_calibration = |rig: &mut Rig| -> Option<u64> {
         rig.step(&cmds.clone(), &GripperCommand::Calibrate);
         for k in 1..=u64::from(robot.ticks(10.0)) {
@@ -997,7 +996,7 @@ fn gripper_motor_mode_homing_stall() {
     let gnode = robot.bus.gripper_node;
     let mut rig = Rig::boot(&robot, Some(&gripper), None);
     // Homing entry Limits — the only path that applies the homing current
-    // to the gripper motor (spec/HOMING.md).
+    // to the gripper motor.
     rig.bus
         .send_limits(
             gnode,
@@ -1266,7 +1265,7 @@ mod dynamics {
         );
     }
 
-    /// The endstop stall signatures HOMING.md requires hold on the
+    /// The endstop stall signatures the homing sequence requires hold on the
     /// dynamics plant too (J0: vertical axis, gravity-neutral).
     #[test]
     fn dynamics_endstop_stall_signatures() {
@@ -1476,7 +1475,7 @@ mod mujoco {
         );
     }
 
-    /// The endstop stall signatures HOMING.md requires hold on the MuJoCo
+    /// The endstop stall signatures the homing sequence requires hold on the MuJoCo
     /// plant too (J0: vertical axis, gravity-neutral).
     #[test]
     fn mujoco_endstop_stall_signatures() {

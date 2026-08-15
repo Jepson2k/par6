@@ -437,7 +437,7 @@ fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
 /// (row-major 4x4, mm) with the translation replaced.
 ///
 /// Decoded the way a client decodes it — `pinokin.so3_rpy`, the wire's
-/// intrinsic-XYZ convention (`spec/PROTOCOL-V2.md`), written out here
+/// intrinsic-XYZ convention, written out here
 /// rather than borrowed from the runtime so the two halves of the
 /// round trip cannot agree on the wrong thing.
 fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
@@ -901,7 +901,7 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
 ///
 /// Failing before the wiring landed, twice over: par6d built its gravity
 /// model with `tool: None`, so `mass_kg` was parsed, validated and read
-/// by nothing — the spec's "masses/COM/inertia from config" was false —
+/// by nothing — the promised "masses/COM/inertia from config" was false —
 /// and plain `--sim` installed `ZeroGravity`, so the same field
 /// published all-zero torques no matter the model. (The feedforward is
 /// still never APPLIED on the kinematic plant: comp is disabled at boot,

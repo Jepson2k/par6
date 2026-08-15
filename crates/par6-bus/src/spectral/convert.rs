@@ -1,7 +1,7 @@
 //! Wire↔SI unit conversions — the vendor `SourceRoboticsToolbox.Joint`
-//! semantics from `spec/CAN.md`, as pure functions plus a per-joint
-//! [`JointConversion`] carrying the calibration state (master position,
-//! offset, direction, sector wrap correction).
+//! semantics, as pure functions plus a per-joint [`JointConversion`]
+//! carrying the calibration state (master position, offset, direction,
+//! sector wrap correction).
 //!
 //! Encoder positions on the wire are motor-shaft ticks (14-bit absolute
 //! encoder, accumulated by the driver). At boot the reading is only

@@ -527,7 +527,7 @@ impl RtCommands for RtBridge {
             Command::JogJ(p) => {
                 // Single-axis by contract: the server refuses a jog with
                 // more than one non-zero speed, because the RT jog engine
-                // ramps one joint at a time (spec/RT.md, Jog).
+                // ramps one joint at a time.
                 let (joint, pct) = p
                     .speeds
                     .iter()

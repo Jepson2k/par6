@@ -1,6 +1,6 @@
 //! Command plane (tokio; never on the RT thread).
 //!
-//! UDP msgpack protocol v2 server per `spec/PROTOCOL-V2.md`:
+//! UDP msgpack protocol v2 server:
 //!
 //! - [`server`]: the actor — datagram dispatch with `req_id` echo, the
 //!   declarative [`gating`] table, the SINGLE command-index allocator

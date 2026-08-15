@@ -1,5 +1,5 @@
-//! Homing: the full PAR6 sequence driven closed-loop against the sim bus
-//! (spec/HOMING.md "Sim requirements"), the mid-homing hard-error abort,
+//! Homing: the full PAR6 sequence driven closed-loop against the sim
+//! bus, the mid-homing hard-error abort,
 //! the home reference the hall FSM latches against the sim's own sensor,
 //! the failure signatures (two-pass mismatch, position-never-valid,
 //! approach timeout), the stall false-positive guards (startup inrush,
@@ -1031,7 +1031,7 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     assert_eq!(rig.snap().mode, Mode::Homing);
 
     // cmd 62 goes out, the calibrated bit never comes back: after the
-    // 10 s calibrate timeout (spec/HOMING.md) the sequence fails and the
+    // 10 s calibrate timeout, the sequence fails and the
     // hard key latches on the next error pass.
     let timeout_ticks = (10.0 / rig.dt).round() as u32;
     tick_uncalibrated(&mut rig, timeout_ticks + 40);

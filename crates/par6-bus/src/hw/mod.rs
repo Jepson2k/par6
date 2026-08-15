@@ -1,5 +1,5 @@
-//! SocketCAN hardware [`DriverBus`] backend (spec/CAN.md link layer and
-//! boot sequence, spec/RT.md tick discipline).
+//! SocketCAN hardware [`DriverBus`] backend: link layer, boot sequence,
+//! and RT tick discipline.
 //!
 //! One classic-CAN 2.0A raw socket carries the whole driver plane. The
 //! wire format is the frozen [`crate::spectral::codec`] — this module
@@ -15,10 +15,9 @@
 //!   first (14-bit-wrapped) accumulated reading in front of the RT loop
 //!   for boot sector selection.
 //! - **Tick**: non-blocking RX drain first, then TX — measure, then
-//!   command (spec/RT.md \[OURS\] ordering). Nothing on that path
-//!   allocates or blocks: every buffer is sized at boot, the drain stops
-//!   at `EWOULDBLOCK` or the configured cap, and sends fail fast instead
-//!   of waiting for queue space.
+//!   command. Nothing on that path allocates or blocks: every buffer is
+//!   sized at boot, the drain stops at `EWOULDBLOCK` or the configured
+//!   cap, and sends fail fast instead of waiting for queue space.
 //! - **Health**: per-node freshness (10-tick warn, 50-tick latch at
 //!   250 Hz), the per-frame live fault bit harvested from the
 //!   arbitration id, and kernel link state sampled off the RT thread
@@ -61,7 +60,7 @@ pub use link::OpenError;
 
 /// RX frames drained per tick while bus-silent (FLASHING): bootloader
 /// page frames alias application ids and arrive far faster than the
-/// application plane (spec/CAN.md).
+/// application plane.
 const SILENT_RX_CAP: usize = 64;
 
 /// SocketCAN [`DriverBus`] backend. Build with [`SocketCanBus::open`],
@@ -169,8 +168,8 @@ impl SocketCanBus {
     }
 
     /// Frames transmitted during the current tick — the per-tick frame
-    /// budget the classic-CAN ceiling constrains (spec/CAN.md link
-    /// layer). Steady state is joints + gripper + one poll.
+    /// budget the classic-CAN ceiling constrains. Steady state is
+    /// joints + gripper + one poll.
     pub fn tx_frames_this_tick(&self) -> u32 {
         self.tx_frames_this_tick
     }
@@ -263,7 +262,7 @@ impl SocketCanBus {
     /// Decode one frame into `state` and update this node's freshness.
     /// The arbitration id's err bit and node are harvested BEFORE payload
     /// dispatch, so a refused frame still refreshes the live fault signal
-    /// and the data-age clock (spec/CAN.md RX rules).
+    /// and the data-age clock.
     fn apply_rx(&mut self, frame: &CanFrame, state: &mut BusState) {
         let node = match decode_frame(frame) {
             Ok(d) => {
@@ -656,7 +655,7 @@ impl DriverBus for SocketCanBus {
 
         // Paced config load. The whole load enqueues in microseconds
         // against a ~10 frames/ms drain, so an unpaced burst silently
-        // overruns the interface TX queue (spec/CAN.md boot step 2).
+        // overruns the interface TX queue.
         boot_config_plan(&self.node_configs, repeats, &mut self.boot_plan);
         let plan = std::mem::take(&mut self.boot_plan);
         let mut result = Ok(());

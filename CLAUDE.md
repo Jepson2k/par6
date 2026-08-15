@@ -1,9 +1,7 @@
 # CLAUDE.md - par6
 
 Rust real-time runtime (`par6d`) + Python waldoctl client for the PAR6 arm.
-Read `README.md` for architecture and the workstream board; read the relevant
-`spec/*.md` BEFORE implementing anything — they are the contract, extracted from
-the vendor stack and from parol6.
+Read `README.md` for architecture and the workstream board.
 
 ## Commands
 
@@ -29,10 +27,10 @@ cd python && pytest                # python tests (JUnit XML at python/test-resu
 
 ## Licensing rules
 
-- This repo is **MIT**. The vendor runtime (RCB-Runtime) is GPL: it is **spec-only
-  reference — port behavior and constants, never code**. Everything needed is in `spec/`.
+- This repo is **MIT**. The vendor runtime (RCB-Runtime) is GPL: it is **behavior-only
+  reference — port behavior and constants, never code**.
 - parol6 (`Jepson2k/PAROL6-python-API`) is GPL-3.0: carry over code only where you hold
-  authorship (self-relicensing); otherwise reimplement from `spec/PROTOCOL-V2.md`.
+  authorship (self-relicensing); otherwise reimplement the semantics independently.
 - `assets/` is Apache-2.0 vendor material — keep `assets/NOTICE` accurate.
 
 ## Testing Guidelines
@@ -72,7 +70,7 @@ cd python && pytest                # python tests (JUnit XML at python/test-resu
   and in-place mutation; no formatting except one-shot error paths). Tests may assert
   this with a counting allocator.
 - `Option<T>` channel semantics on the bus are load-bearing (None = omitted on the
-  wire, NOT zero) — see `spec/CAN.md`. Don't collapse them to defaults.
+  wire, NOT zero — the vendor firmware distinguishes them). Don't collapse them to defaults.
 - `-D warnings` clippy and rustfmt are CI gates. Public trait methods get doc comments —
   contracts are what downstream workstreams code against.
 

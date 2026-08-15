@@ -1,4 +1,4 @@
-//! E-stop GPIO abstraction and debounce (spec/RT.md "E-stop").
+//! E-stop GPIO abstraction and debounce.
 //!
 //! `estop = (debounced ESTOP_1 == 0) OR software_estop_flag`. ESTOP_2 is
 //! deliberately NOT read (known hardware fault: it always reads
@@ -16,7 +16,7 @@
 //! line over the GPIO character device, and [`SharedLineGpio`] is the
 //! flag-backed line the simulator and the tests drive. The debounce is
 //! ours, not the kernel's — the vendor debounces in software over raw
-//! reads and the spec's latency budget is stated in those terms.
+//! reads and the vendor latency budget is stated in those terms.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -30,14 +30,14 @@ pub const DEBOUNCE_READS: u32 = 5;
 ///
 /// ESTOP_2 (BCM 6) is deliberately never requested: it is a known
 /// hardware fault that always reads triggered, so reading it would latch
-/// a permanent e-stop (`spec/RT.md` "E-stop").
+/// a permanent e-stop.
 pub const ESTOP1_OFFSET: u32 = 5;
 
 /// One digital input line, read once per tick from the RT thread.
 ///
 /// Implementations must be non-blocking and allocation-free per read.
 /// `true` = electrically high (e-stop chain intact), `false` = low
-/// (pressed / chain broken) — the spec's `ESTOP_1 == 0` condition.
+/// (pressed / chain broken) — the vendor's `ESTOP_1 == 0` condition.
 pub trait EstopGpio: Send {
     /// Raw ESTOP_1 line level for this tick.
     fn read_estop1(&mut self) -> bool;
@@ -103,7 +103,7 @@ impl EstopGpio for SharedLineGpio {
 ///
 /// The line is read as an ELECTRICAL level, not a logical one: `true` is
 /// high (chain intact), and the active-low interpretation stays in
-/// [`EstopMonitor`] where the spec puts it. Bias is pull-down (vendor
+/// [`EstopMonitor`] where the vendor runtime puts it. Bias is pull-down (vendor
 /// `SET_PULL_DOWN`), so a line nothing drives reads pressed.
 pub fn open_estop1() -> Result<Box<dyn EstopGpio>, GpioError> {
     #[cfg(all(feature = "gpio", target_os = "linux"))]

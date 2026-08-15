@@ -1,7 +1,7 @@
 //! The thin real-time wrapper around [`RtCore::tick`]: absolute-deadline
 //! pacing (`clock_nanosleep TIMER_ABSTIME` on Linux), SCHED_FIFO
 //! priority and CPU pinning with graceful degradation (setup failures are
-//! logged DEGRADED but never fatal — spec/RT.md vendor stance), measured
+//! logged DEGRADED but never fatal — the vendor stance), measured
 //! loop periods fed to the core's degradation bands.
 //!
 //! Kept separate from the testable core: nothing here touches robot

@@ -35,7 +35,7 @@ typedef enum par6_status {
 
 /* Optional tool attached rigidly to the end-effector frame.
  * The transform contributes to fk/jacobian/ik; mass/com/inertia contribute
- * to gravity (RNEA) per spec/RT.md ("arm + active gripper tool link").
+ * to gravity (RNEA), covering the arm plus the active gripper tool link.
  */
 typedef struct par6_tool_params {
     /* T_ee_tool: tool frame in end-effector-frame coordinates, row-major 4x4. */

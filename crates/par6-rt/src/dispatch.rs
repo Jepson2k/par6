@@ -1,5 +1,4 @@
-//! Per-mode output laws and the commit path (spec/RT.md "Per-mode output
-//! law" — the whole control language).
+//! Per-mode output laws and the commit path — the whole control language.
 //!
 //! Modes compute joint-space setpoints as [`JointSetpoint`]s (`Option`
 //! channels mirror the wire semantics: `None` = channel omitted, NOT

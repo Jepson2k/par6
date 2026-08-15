@@ -93,7 +93,7 @@ fn matches_pin_reference_on_par6_urdf() {
     check_cases(&mut model, &fx.cases_flange, "flange");
 
     // Same model with the fixture's rigid tool (transform + inertia): fk/jac
-    // shift to the tool frame, gravity picks up the tool per spec/RT.md.
+    // shift to the tool frame, gravity picks up the tool.
     let tool = ToolParams {
         transform: fx.tool.transform,
         mass: fx.tool.mass,

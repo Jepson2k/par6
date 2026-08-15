@@ -1,4 +1,4 @@
-//! Gravity model seam (spec/RT.md "Per-mode output law", gravity note).
+//! Gravity model seam: the G(q) source for the per-mode output laws.
 //!
 //! G(q) is computed EVERY tick and published always; it is applied as a
 //! current feedforward only when `homed ∧ enabled ∧ mode allows ∧ comp

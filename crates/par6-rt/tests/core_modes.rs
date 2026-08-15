@@ -1,6 +1,5 @@
 //! Mode-law outcomes asserted on the frames the bus received, and the
-//! transition gate matrix (spec/RT.md "State machine" + "Per-mode output
-//! law").
+//! transition gate matrix.
 
 mod common;
 
@@ -81,8 +80,8 @@ fn idle_gravity_hold_is_torque_only_and_gated() {
 
 /// `kt_source = "auto"` means the DRIVER's torque constant governs and
 /// config is only the fallback for a node that does not answer the boot
-/// cmd-33 fetch (spec/CAN.md boot step 3) — the shipped `PAR6.toml` asks
-/// for it on every hardware boot.
+/// cmd-33 fetch — the shipped `PAR6.toml` asks for it on every
+/// hardware boot.
 ///
 /// The fetched value used to be logged as authoritative and then thrown
 /// away: the torque scale was built once from config and never rebuilt.

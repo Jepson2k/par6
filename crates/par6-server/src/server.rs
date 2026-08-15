@@ -2,7 +2,7 @@
 //! socket, the motion queue, the SINGLE command-index allocator, and the
 //! status/telemetry broadcast schedule.
 //!
-//! Decisions resolved here (see `spec/PROTOCOL-V2.md`):
+//! Decisions resolved here:
 //!
 //! - The index allocator is monotonic and NEVER reset — not even by
 //!   `reset_state` — so a stale pre-reset status frame can never satisfy
@@ -145,7 +145,7 @@ struct Executing {
     /// (motion commands only — a blend chain never reaches past one).
     /// They finish when it finishes: each gets its own COMPLETE push and
     /// the high-water `completed_index` jumps to the last of them, which
-    /// is what `spec/PROTOCOL-V2.md` prescribes for blended-away
+    /// is what protocol v2 prescribes for blended-away
     /// commands. There is no earlier honest moment to call one of them
     /// done — the arm never stops at their targets, and their samples
     /// are interleaved with the head's in one trajectory.
@@ -503,7 +503,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             // Nothing in this runtime can drive a digital output: the bus
-            // protocol has no output frame (`spec/CAN.md`) and the RT core
+            // protocol has no output frame and the RT core
             // owns one GPIO line, the e-stop INPUT. Acking the command and
             // echoing the commanded level back in STATUS showed an
             // operator an output state the arm never produced.
@@ -665,7 +665,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// (`server/state.py`, `enabled = True`): its `enabled` flag is a
     /// PROTECTIVE-STOP latch, and nothing is latched on a clean boot.
     /// par6's `ArmState` means the same thing — motors stay energized and
-    /// holding either way (`spec/RT.md`, IDLE law) — so booting DISABLED
+    /// holding either way — so booting DISABLED
     /// only meant that nothing moved until a client sent `reset`, which
     /// no frontend does at startup.
     ///
@@ -924,8 +924,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                      its end pose; send r = nil"
                 )
             }),
-            // The RT jog engine ramps ONE joint at a time (spec/RT.md,
-            // Jog): direction-block latching is keyed on the commanded
+            // The RT jog engine ramps ONE joint at a time:
+            // direction-block latching is keyed on the commanded
             // joint. Collapsing to the dominant axis would move the arm
             // somewhere the client did not ask for.
             Command::JogJ(p) => {
@@ -1217,7 +1217,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// every command class arrives on it, so a blind drain also destroys
     /// a buffered `estop` — with no reply, no effect, and a `_system`
     /// send that does not retry. Preemption discards only what it is
-    /// entitled to discard (`spec/PROTOCOL-V2.md`: "cancels the active
+    /// entitled to discard (the wire contract: "cancels the active
     /// streamable, drains the socket backlog" — the previous stream's
     /// backlog).
     ///
@@ -1751,7 +1751,7 @@ fn rate_period(hz: u32) -> std::time::Duration {
 
 /// 4×4 row-major pose matrix (translation in mm) from the snapshot's
 /// `[x, y, z (m), roll, pitch, yaw (rad)]` TCP, with `R = Rx·Ry·Rz` —
-/// the wire's intrinsic-XYZ rotation convention (`spec/PROTOCOL-V2.md`),
+/// the wire's intrinsic-XYZ rotation convention,
 /// the exact composition the runtime's rpy extraction inverts.
 fn pose_matrix_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     let (x, y, z) = (tcp[0] * 1000.0, tcp[1] * 1000.0, tcp[2] * 1000.0);

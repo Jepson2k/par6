@@ -2,7 +2,7 @@
 //!
 //! The RT core latches hard errors on its own — a streaming watchdog
 //! expiry, a critical loop period, a drive fault — and forces the arm
-//! DISABLED (`spec/RT.md` "Errors"). None of that arrives through a
+//! DISABLED. None of that arrives through a
 //! queued command, so none of it is attributable to one: without this
 //! mapping the command plane answered `error() -> None`,
 //! `activity() -> IDLE` and `action_state = IDLE` while every motion

@@ -1,10 +1,10 @@
 //! Simulated CAN gripper: one physical jaw pair driven in one of two
-//! exclusive modes (spec/CAN.md Gripper section). Motor mode runs the
-//! node's virtual driver + 1-DOF plant like a 7th joint; firmware mode
-//! (cmd 61/62) runs the onboard controller model — byte-position moves,
-//! the DLC-0 empty poll that feeds the watchdog without overwriting the
-//! command, the cmd-62 calibration sequence and object-detection codes
-//! from jaw travel vs the commanded position.
+//! exclusive modes. Motor mode runs the node's virtual driver + 1-DOF
+//! plant like a 7th joint; firmware mode (cmd 61/62) runs the onboard
+//! controller model — byte-position moves, the DLC-0 empty poll that
+//! feeds the watchdog without overwriting the command, the cmd-62
+//! calibration sequence and object-detection codes from jaw travel vs
+//! the commanded position.
 
 use par6_config::GripperConfig;
 

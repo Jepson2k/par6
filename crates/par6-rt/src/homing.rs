@@ -1,4 +1,4 @@
-//! Homing sequence orchestrator + per-joint FSM (spec/HOMING.md).
+//! Homing sequence orchestrator + per-joint FSM.
 //!
 //! Runs as mode HOMING (SELF_MANAGED): each tick this module fills the
 //! complete per-joint command array and the gripper slot — every
@@ -607,7 +607,7 @@ struct MoveToState {
 /// Cubic Hermite (zero end velocities) between two tick positions:
 /// returns (position, signed profile velocity ticks/s) at `elapsed` of
 /// `dur` ticks. The velocity slot of a position frame is the driver's
-/// additive velocity FEEDFORWARD (spec/CAN.md), so the returned value is
+/// additive velocity FEEDFORWARD, so the returned value is
 /// the profile's true tangent: zero at both ends, where the position
 /// loop alone closes the landing residual.
 fn hermite(start: f64, end: f64, elapsed: u32, dur: u32, dt: f64) -> (f64, f64) {

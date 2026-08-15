@@ -4,8 +4,8 @@
 #   robots/PAR6.xml        — joints, gains, limits, homing FSM parameters
 #   config/PAR6_homing.xml — homing sequence steps
 #   config/system.xml      — active gripper, kt source, jog/stream defaults
-# Bus link parameters per spec/CAN.md. Protocol ports/rates are OUR choices
-# (spec/PROTOCOL-V2.md fixes only the :6001 command port).
+# Bus link parameters follow the vendor CAN protocol. Protocol ports/rates are
+# OUR choices (the wire contract fixes only the :6001 command port).
 #
 # Units: every time constant is SECONDS (converted round(s/dt) at runtime);
 # motor quantities use wire units (encoder ticks, mA, mV, ms for the driver
@@ -476,7 +476,7 @@ move_to = [
     { joint = 4, position_rad = -0.5, duration_s = 3.0 },
 ]
 
-# ============================================================ bus (spec/CAN.md)
+# ================================================== bus (vendor CAN protocol)
 [bus]
 interface = "can0"
 bitrate = 1000000
@@ -502,8 +502,8 @@ rounds = 2
 rounds = 2
 wait_s = 0.0025
 
-# ================================================ protocol (spec/PROTOCOL-V2.md)
-# Only the :6001 command port is fixed by the spec; the rest are our defaults,
+# ========================================================== protocol (wire v2)
+# Only the :6001 command port is fixed by the wire contract; the rest are our defaults,
 # env-overridable at runtime (PAR6_* namespace).
 [protocol]
 command_port = 6001

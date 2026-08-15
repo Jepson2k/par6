@@ -1,6 +1,6 @@
 //! Single-writer / single-reader snapshot channel — how the RT thread
 //! publishes [`crate::StateSnapshot`] to the command plane without locks,
-//! allocation, or writer stalls (spec/RT.md \[OURS\]: seqlock or triple
+//! allocation, or writer stalls (\[OURS\]: seqlock or triple
 //! buffer instead of the vendor's lock-free-by-convention POSIX shm).
 //!
 //! This is a classic TRIPLE BUFFER: three slots; the writer owns one, the

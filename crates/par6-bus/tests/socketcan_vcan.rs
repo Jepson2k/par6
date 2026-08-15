@@ -213,7 +213,7 @@ fn quiet_bus(iface: &str) -> (SocketCanBus, RobotConfig, GripperConfig) {
 /// The boot config load must reach the wire batched BY MESSAGE TYPE with
 /// a real pause between batches: ~190 frames enqueue in microseconds
 /// against a ~10 frames/ms drain, and the interface TX queue drops the
-/// overflow silently (spec/CAN.md boot step 2).
+/// overflow silently.
 #[test]
 fn boot_config_load_is_paced_and_ordered_on_the_wire() {
     let iface = require_vcan!();
@@ -511,8 +511,8 @@ fn configured_nodes(robot: &RobotConfig) -> Vec<NodeId> {
         .collect()
 }
 
-/// Boot kt fetch, failure shape 1: NO node answers (spec/CAN.md boot
-/// step 3 — config is the fallback for a driver that does not answer).
+/// Boot kt fetch, failure shape 1: NO node answers (config is the
+/// fallback for a driver that does not answer).
 ///
 /// The retry ladder must actually go out on the wire — every configured
 /// node asked retries×rounds times, each unanswered ask waiting out its

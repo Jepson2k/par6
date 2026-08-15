@@ -6,15 +6,15 @@
 //! deadline timing (clock_nanosleep TIMER_ABSTIME); one-sided p99
 //! degradation bands. NOTE: vendor ordering is command-before-measure
 //! (1 tick extra latency); we measure-then-command — deviation flagged for
-//! HIL validation, config flag restores vendor ordering. See `spec/RT.md`.
+//! HIL validation, config flag restores vendor ordering.
 //!
-//! Semantics ported exactly from the vendor spec: IDLE-with-gravity =
+//! Semantics ported exactly from the vendor runtime: IDLE-with-gravity =
 //! torque-only hold; ACTIVE_ERROR = active zero-velocity; SAFETY_STOP =
 //! limp; e-stop = mode latch (never motor power-off); ESTOP_2 excluded;
 //! debounce first-read seeding; FLASHING = bus-silent + RX-discard +
 //! homing invalidation; hard errors latch, warning keys self-clear,
 //! live-fault-bit gating on stale per-type flags. Homing FSM per
-//! `spec/HOMING.md` (two-pass, release phase, gripper-dependent offsets).
+//! the vendor sequence (two-pass, release phase, gripper-dependent offsets).
 //!
 //! Layout:
 //!

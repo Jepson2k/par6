@@ -1,5 +1,5 @@
 //! Streaming (servo) executor: the jerk-limited per-tick OTG limiter for
-//! online position targets (spec/RT.md, Streaming section).
+//! online position targets.
 //!
 //! rsruckig tracks the newest target under the stream-mode limits;
 //! retargeting mid-motion re-plans from the current kinematic state, so

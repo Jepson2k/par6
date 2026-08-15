@@ -1,6 +1,6 @@
 //! EXEC ring playback through the full core: all three completion
 //! policies, the blend-continues bypass, the strict-timeout error, pause
-//! semantics, and the exec link watchdog (spec/RT.md "EXEC").
+//! semantics, and the exec link watchdog.
 
 mod common;
 

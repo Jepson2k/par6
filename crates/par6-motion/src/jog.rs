@@ -1,28 +1,28 @@
-//! Manual jog engine (spec/RT.md, Jog section).
+//! Manual jog engine.
 //!
 //! Per joint, per tick: target velocity from `(axis, direction, speed
 //! pct)`; jerk-aware lookahead against the soft limits with
 //! direction-block latching; trapezoid or s-curve velocity ramp; hard
 //! clamp past soft limits; target position integration.
 //!
-//! The lookahead stopping distance follows the spec formulas — trapezoid
+//! The lookahead stopping distance follows the vendor formulas — trapezoid
 //! `v²/2a`, s-curve `v²/2a + v·a/2j` — extended with the current
 //! acceleration state: a trip can fire mid-ramp where the joint is still
 //! accelerating outward, and a jerk-limited stop must first reverse that
 //! acceleration (velocity keeps rising by `a₀²/2j` meanwhile). Without
 //! the reversal terms the stop overshoots the soft limit; with `a₀ = 0`
-//! the extension reduces exactly to the spec formula. The ×1.5 safety
-//! factor is applied on top, per spec.
+//! the extension reduces exactly to the vendor formula. The ×1.5 safety
+//! factor is applied on top, per the vendor firmware.
 
 use par6_config::{JogProfile, LimitMode, RobotConfig};
 
 use crate::{MotionError, MotionLimits, NUM_JOINTS};
 
-/// Runtime floor for the jog ramp time \[s\] (spec: 0.05).
+/// Runtime floor for the jog ramp time \[s\].
 pub const MIN_ACCEL_TIME_S: f64 = 0.05;
-/// Runtime floor for the s-curve jerk factor (spec: 0.5).
+/// Runtime floor for the s-curve jerk factor.
 pub const MIN_JERK_FACTOR: f64 = 0.5;
-/// Safety factor on the lookahead stopping distance (spec: 1.5).
+/// Safety factor on the lookahead stopping distance.
 const STOP_MARGIN: f64 = 1.5;
 
 /// Direction of a jog command along a joint axis.

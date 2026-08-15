@@ -14,7 +14,7 @@ use crate::telemetry::TelemetryRecipe;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTransport {
     /// Multicast with a startup reachability probe; permanent unicast
-    /// failover on probe failure or 3 consecutive send errors (the spec
+    /// failover on probe failure or 3 consecutive send errors (the protocol
     /// ladder, the default).
     Auto,
     /// Multicast without a probe (still fails over on send errors).

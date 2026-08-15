@@ -12,8 +12,7 @@
 //! blocks), [`ClampStream`] (soft-limit clamp passthrough), and
 //! [`SpecSettle`] — the FULL spec completion-policy state machine
 //! (commanded / settled / strict with the blend-continues bypass), which
-//! is not a stub but the reference implementation of spec/RT.md's
-//! completion table.
+//! is not a stub but the reference implementation.
 //!
 //! All per-tick methods must be allocation-free.
 
@@ -27,7 +26,7 @@ use crate::MAX_JOINTS;
 
 /// External command vocabulary the tick loop consumes — the RT side of
 /// the command plane's `RtCommands` boundary. The loop consumes AT MOST
-/// ONE per tick (spec/RT.md), so senders must not treat the queue as a
+/// ONE per tick, so senders must not treat the queue as a
 /// synchronous call. Streaming setpoints do NOT travel here — they go
 /// through the dedicated latest-wins stream slot (`StreamInput`).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -78,7 +77,7 @@ pub enum RtCommand {
     /// Run the gripper's firmware calibration sequence (CAN cmd 62). The
     /// frame goes out ONCE and the standing gripper frame then falls back
     /// to the DLC-0 empty poll, which feeds the driver watchdog for the
-    /// whole sweep without overwriting it (spec/CAN.md, Gripper).
+    /// whole sweep without overwriting it.
     GripperCalibrate,
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
@@ -135,7 +134,7 @@ impl ForwardKin for NoFk {
 
 // ---------------------------------------------------------------- jog
 
-/// Per-tick jog ramp engine (spec/RT.md "Jog").
+/// Per-tick jog ramp engine.
 pub trait JogEngine: Send {
     /// JOG-mode entry: sync the integrator to the measured pose and clear
     /// direction blocks.
@@ -287,7 +286,7 @@ impl JogEngine for RampJog {
 
 // ---------------------------------------------------------------- stream
 
-/// Per-tick streaming target tracker (spec/RT.md "Streaming"): newest
+/// Per-tick streaming target tracker: newest
 /// external target in, limited setpoint out. The full OTG limiter lives
 /// in `par6-motion` (`StreamingExecutor`).
 pub trait StreamTracker: Send {
@@ -363,7 +362,7 @@ pub enum SettleVerdict {
     Fault,
 }
 
-/// EXEC completion policy (spec/RT.md "EXEC", completion policies).
+/// EXEC completion policy.
 pub trait SettlePolicy: Send {
     /// Arm at a segment boundary, passing the boundary sample's
     /// `blend_continues`. Returns `true` when the boundary completes
@@ -380,19 +379,19 @@ pub enum CompletionPolicy {
     /// Complete at the last sample of the command.
     Commanded,
     /// Hold until every joint tracks within tolerance, or the timeout
-    /// elapses (then complete anyway). The spec default.
+    /// elapses (then complete anyway). The default.
     #[default]
     Settled,
     /// Like `Settled`, but the timeout is an ERROR.
     Strict,
 }
 
-/// All-joint settle tolerance \[rad\] (spec default).
+/// All-joint settle tolerance \[rad\].
 pub const SETTLE_TOLERANCE_RAD: f64 = 0.01;
-/// Settle timeout \[s\] (spec: 500 ticks at 4 ms).
+/// Settle timeout \[s\] (500 ticks at 4 ms).
 pub const SETTLE_TIMEOUT_S: f64 = 2.0;
 
-/// The spec completion-policy state machine — the reference
+/// The completion-policy state machine — the reference
 /// implementation, not a test stub.
 #[derive(Debug, Clone, Copy)]
 pub struct SpecSettle {

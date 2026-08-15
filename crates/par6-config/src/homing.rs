@@ -1,6 +1,6 @@
 //! Homing schema: per-joint FSM parameters and the parallel step sequence.
-//! Semantics in `spec/HOMING.md`; PAR6 values from the vendor
-//! `robots/PAR6.xml` homing fields and `config/PAR6_homing.xml`.
+//! PAR6 values from the vendor `robots/PAR6.xml` homing fields and
+//! `config/PAR6_homing.xml`.
 
 use serde::{Deserialize, Serialize};
 

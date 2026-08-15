@@ -1,4 +1,4 @@
-//! Controller-side completion policies (spec/RT.md, EXEC section).
+//! Controller-side completion policies.
 //!
 //! A queued command finishes under one of three policies: `commanded`
 //! completes at its last sample; `settled` (default) holds until every
@@ -26,9 +26,9 @@ pub enum CompletionPolicy {
 /// construction (`round(s / dt)`), per the config time-constant rule.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct SettleParams {
-    /// All-joint position error tolerance \[rad\] (spec default 0.01).
+    /// All-joint position error tolerance \[rad\] (default 0.01).
     pub tolerance_rad: f64,
-    /// Settle timeout \[s\] (spec default 2.0 = 500 ticks at 4 ms).
+    /// Settle timeout \[s\] (default 2.0 = 500 ticks at 4 ms).
     pub timeout_s: f64,
 }
 

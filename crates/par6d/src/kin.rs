@@ -11,7 +11,7 @@
 //!
 //! - Wire poses are `[x, y, z (mm), rx, ry, rz (deg)]` with
 //!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ — `pinokin.se3_from_rpy`,
-//!   `scipy` `'XYZ'`), stated in `spec/PROTOCOL-V2.md`. This is the
+//!   `scipy` `'XYZ'`). This is the
 //!   convention `par6.robot.Robot`'s FK/IK, the dry-run client and the
 //!   frontend's STATUS-matrix decode all read the same six numbers in.
 //!   It is NOT the URDF `rpy` attribute's fixed-axis order, which

@@ -38,7 +38,7 @@ impl std::error::Error for Error {}
 /// Rigid tool attached to the end-effector frame. `transform` (T_ee_tool,
 /// row-major) shifts fk/jacobian/ik to the tool frame; `mass`/`com`/`inertia`
 /// (ee-frame coordinates, inertia about the COM, order Ixx, Ixy, Iyy, Ixz,
-/// Iyz, Izz) contribute to gravity per spec/RT.md. `mass <= 0` means no
+/// Iyz, Izz) contribute to gravity. `mass <= 0` means no
 /// inertial contribution.
 #[derive(Clone, Copy, Debug)]
 pub struct ToolParams {

@@ -34,7 +34,6 @@ Kinematics/dynamics run on **Pinocchio via a C-ABI shim** shared with the Python
 | `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
 | `crates/par6d` | the runtime binary; plan-time collision gate (feature `ffi`) |
 | `python/` | the `par6` pip package (waldoctl backend) |
-| `spec/` | behavioral specs extracted from the vendor stack — the coordination contract |
 | `tests/golden/` | cross-language golden vectors (Rust ↔ Python conformance) |
 | `assets/` | PAR6 URDF + meshes (Apache-2.0, from Source Robotics) |
 
@@ -42,7 +41,7 @@ Kinematics/dynamics run on **Pinocchio via a C-ABI shim** shared with the Python
 
 Work is organized as **contract-first workstreams** tracked as GitHub issues:
 
-- **Phase 0 (serial)**: scaffold → `spec/` docs → `par6-proto` + golden vectors
+- **Phase 0 (serial)**: scaffold → `par6-proto` + golden vectors
   (*contract freeze 1*) → `DriverBus`/ring/config trait contracts (*contract freeze 2*) →
   C++ FFI build infrastructure (Pinocchio + toppra-cpp shim toolchain).
 - **Phase 1 (parallel fan-out)**: one issue = one agent session — Spectral codec ·
@@ -53,8 +52,8 @@ Work is organized as **contract-first workstreams** tracked as GitHub issues:
 
 Rules: golden vectors are the inter-agent interface tests; changes to `par6-proto`
 or the trait contracts require a `contracts`-labeled issue and re-freeze; CI gates
-all merges. The vendor runtime (GPL) is **spec-only reference — port behavior and
-constants, never code**; everything needed is written down in `spec/`.
+all merges. The vendor runtime (GPL) is **behavior-only reference — port behavior and
+constants, never code**.
 
 ## Building
 

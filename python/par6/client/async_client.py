@@ -10,13 +10,13 @@ Implements the waldoctl ``RobotClient`` ABC on top of the frozen wire layer in
   into an effectively-once enqueue (a retried enqueue re-acks the original
   index).  SYSTEM commands are one send + wait.
 - Fire-and-forget commands (servo/jog/teleport) encode into a reused buffer.
-- Status subscription: multicast join with the spec's failover ladder
+- Status subscription: multicast join with the protocol's failover ladder
   (configured iface, then the primary NIC, then INADDR_ANY, then unicast),
   decoding into ONE shared :class:`StatusBuffer` guarded by a generation
   counter + ``asyncio.Event``.
 - Completion: COMPLETE pushes resolve per-index waiters; ``wait_command``
   falls back to the status stream (``completed_index`` high-water plus the
-  spec's stale-error ordering rule).
+  protocol's stale-error ordering rule).
 
 Units at this API are mm and degrees (the waldoctl convention), which is
 also what the v2 wire carries — the runtime converts to SI internally.
@@ -129,8 +129,7 @@ def _matrix_to_pose(m: Sequence[float]) -> list[float]:
     RPY convention: R = Rx(rx) @ Ry(ry) @ Rz(rz) (intrinsic XYZ), the
     decomposition ``pinokin.so3_rpy`` performs -- so a pose read here is the
     pose :meth:`par6.robot.Robot.fk` reports, the pose :meth:`move_l` re-encodes
-    and the pose a frontend decoding the STATUS matrix itself sees
-    (``spec/PROTOCOL-V2.md``).
+    and the pose a frontend decoding the STATUS matrix itself sees.
     """
     x, y, z = m[3], m[7], m[11]
     r00, r01, r02 = m[0], m[1], m[2]
@@ -320,7 +319,7 @@ class AsyncRobotClient(_RobotClientABC):
     """Async UDP client for the par6d runtime.
 
     All network knobs default from the ``PAR6_*`` env namespace, then to the
-    spec/config defaults (command port 6001, status port 6002, multicast
+    config defaults (command port 6001, status port 6002, multicast
     group 239.255.0.71).
     """
 
@@ -559,7 +558,7 @@ class AsyncRobotClient(_RobotClientABC):
     def _log_unclaimed_error(self, payload: Sequence) -> None:
         """An ERROR no caller is waiting on — a rejected fire-and-forget
         command, whose SUCCESS is unacked but whose REJECTION is a real
-        ERROR (``spec/PROTOCOL-V2.md``), or a reply that arrived after
+        ERROR, or a reply that arrived after
         its request timed out.  Dropping these silently is how a gated
         jog becomes a button that does nothing.
 
@@ -780,7 +779,7 @@ class AsyncRobotClient(_RobotClientABC):
 
     @staticmethod
     def _blocking_error(status: StatusBuffer, command_index: int) -> tuple | None:
-        """The spec's stale-error ordering rule: a standing error fails a wait
+        """The protocol's stale-error ordering rule: a standing error fails a wait
         on *command_index* only when the frame proves it postdates that
         command's acceptance (acceptance clears stale errors server-side and
         ``accepted_index`` is monotonic)."""
