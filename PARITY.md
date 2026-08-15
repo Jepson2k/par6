@@ -18,7 +18,7 @@ line numbers in comment-heavy files may have drifted a few lines.
 cite them, port their semantics, never their code.
 
 This is the **third** pass. The second (`9074661`, 19 open rows + 7 in flight) is superseded:
-eleven commits since have closed all seven in-flight rows and five register rows — including
+thirteen commits since have closed all seven in-flight rows and five register rows — including
 four of the second pass's five "fix these first" items — and the closures themselves opened
 new preview-fidelity surface, audited on the same terms. Closures are listed with their
 commits in [Closed since the second audit](#closed).
@@ -311,7 +311,7 @@ live-switch half is the real gap.
 
 ### <a name="row-9"></a>Row 9 — digital I/O (M, DIV+GAP; verified ×2)
 
-Unchanged through eleven more commits; the oldest untouched row. The divergence stays
+Unchanged through thirteen more commits; the oldest untouched row. The divergence stays
 justified and documented (`server.rs:505-509`: no output frame on the CAN protocol). The gap
 is the surfacing: `io()` returns `[0,0,0,0,!estop]` (`server.rs:1406-1413`),
 `Robot.digital_inputs/digital_outputs` still say 2/2 (`robot.py:446-457`, counts tied to the
@@ -798,7 +798,7 @@ In each case par6 does the more correct thing, and "parity" would be a regressio
 ## <a name="appendix-a"></a>Appendix A — how this pass was conducted
 
 **No live daemon was driven.** This pass is static by design: the second pass's measurement
-rig established the behavioral baselines; this pass verifies what the eleven intervening
+rig established the behavioral baselines; this pass verifies what the thirteen intervening
 commits did to them, in code.
 
 - **Seven parallel area auditors**, each reading both codebases at the pinned commits:
