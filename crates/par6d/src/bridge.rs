@@ -530,28 +530,44 @@ impl RtCommands for RtBridge {
                         return Err(gate.refuse(pairs));
                     }
                 }
-                if !matches!(
-                    sh.stream,
+                let active = match sh.stream {
                     Some(ActiveStream {
                         kind: StreamKind::Jog,
+                        jog,
                         ..
-                    })
-                ) {
-                    self.enter_stream_mode(Mode::Jog);
-                }
-                if pct == 0.0 {
-                    self.link.send(RtCommand::JogRelease);
-                } else {
-                    self.link.send(RtCommand::Jog {
-                        joint: joint as u8,
-                        signed_pct: pct,
-                    });
+                    }) => jog,
+                    _ => {
+                        self.enter_stream_mode(Mode::Jog);
+                        None
+                    }
+                };
+                // The RT drains one command per tick, so a client
+                // streaming jog faster than the tick rate would grow the
+                // queue without bound and leave the release sitting behind
+                // its own backlog — the arm keeps jogging after the
+                // operator let go. A repeated setpoint carries no new
+                // instruction (the jog engine is already ramping to it),
+                // so only a CHANGE is worth a command. Holding a control
+                // steady therefore costs one command, not one per
+                // datagram, and the release is never more than a couple of
+                // entries deep. The datagram still refreshes the watchdog
+                // deadline below either way.
+                let commanded = (pct != 0.0).then_some((joint, pct));
+                if commanded != active {
+                    if pct == 0.0 {
+                        self.link.send(RtCommand::JogRelease);
+                    } else {
+                        self.link.send(RtCommand::Jog {
+                            joint: joint as u8,
+                            signed_pct: pct,
+                        });
+                    }
                 }
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Jog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
-                    jog: (pct != 0.0).then_some((joint, pct)),
+                    jog: commanded,
                     world_epoch: 0,
                     cart: None,
                 });

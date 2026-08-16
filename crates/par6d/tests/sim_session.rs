@@ -1304,7 +1304,50 @@ fn is_identity(m: &[f64; 16]) -> bool {
 }
 
 /// The RT jog latch reaches the enablement flags.
+/// A client streaming jog faster than the RT ticks must not be able to
+/// build a command backlog that the release then queues behind.
 ///
+/// The RT drains one command per tick. A UI holding a jog control sends the
+/// same speed every frame, so a path that enqueues per datagram puts the
+/// release at the tail of a queue hundreds deep: the arm keeps jogging for
+/// queue-depth ticks after the operator let go. A repeated setpoint carries
+/// no new instruction, so it must cost nothing.
+#[test]
+fn a_flood_of_identical_jog_setpoints_does_not_delay_the_release() {
+    let rig = Rig::boot();
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+    let start = park_deg()[0];
+
+    // Hold the control: many datagrams, one instruction.
+    for _ in 0..300 {
+        c.send(&jog_j(0.5, 5.0));
+    }
+    rig.wait_status("the arm is jogging", |s| s.angles[0] > start + 1.0);
+
+    // Let go, and count STATUS frames until the arm is at rest. Frames are
+    // published once per tick, so this measures the backlog in the RT's own
+    // units rather than in wall-clock time — the arm's ramp-down costs a
+    // handful of ticks, while a per-datagram queue costs one tick per
+    // datagram before the release is even read.
+    let released_at = rig
+        .wait_status("a status frame to anchor the release", |_| true)
+        .seq;
+    c.send(&jog_j(0.0, 5.0));
+    let stopped = rig.wait_status("the jog ramps to rest after the release", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
+    let ticks = stopped.seq.saturating_sub(released_at);
+    assert!(
+        ticks < 150,
+        "the release waited {ticks} ticks behind a backlog of 300 datagrams"
+    );
+
+    rig.shutdown();
+}
+
 /// The jog engine blocks a direction at its jerk-aware brake-at-limits
 /// bound, which at full jog speed latches with the joint still far from
 /// the soft wall — while the planner's static margin (a fraction of a
