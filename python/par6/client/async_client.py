@@ -1347,6 +1347,22 @@ class AsyncRobotClient(_RobotClientABC):
         """
         return await self._system(CmdType.SAFETY_STOP, [])
 
+    async def set_gravity_comp(self, on: bool) -> int:
+        """Apply (or stop applying) the gravity-compensation feedforward.
+
+        G(q) is computed and published in every mode regardless; this is
+        only about whether it is fed forward. Applying it cancels weight
+        that must actually exist in the plant, which is true on hardware
+        and on the torque-level sim and false on the kinematic one — which
+        is why plain ``--sim`` boots with it off.
+
+        Category: Control
+
+        Example:
+            rbt.set_gravity_comp(True)
+        """
+        return await self._system(CmdType.SET_GRAVITY_COMP, [bool(on)])
+
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.
 

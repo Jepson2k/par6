@@ -394,6 +394,11 @@ pub fn vectors() -> Vec<Vector> {
     v.push(cmd_vec("cmd_estop", 2, Command::Estop));
     v.push(cmd_vec("cmd_safety_stop", 2, Command::SafetyStop));
     v.push(cmd_vec(
+        "cmd_set_gravity_comp",
+        2,
+        Command::SetGravityComp(crate::command::SetGravityComp { on: true }),
+    ));
+    v.push(cmd_vec(
         "cmd_stop",
         3,
         Command::Stop(Stop { clear_queue: true }),

@@ -47,6 +47,21 @@
     },
     {
       "class": "SYSTEM",
+      "cmd": "SET_GRAVITY_COMP",
+      "file": "cmd_set_gravity_comp.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_gravity_comp",
+      "req_id": 2,
+      "tag": 23,
+      "wire": [
+        23,
+        2,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
       "cmd": "STOP",
       "file": "cmd_stop.bin",
       "idempotency_key": null,

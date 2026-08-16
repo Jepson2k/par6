@@ -61,6 +61,11 @@ wire_enum! {
         /// holds position actively, this removes drive authority so a
         /// trapped person or a jammed joint can be freed by hand.
         SafetyStop = 22,
+        /// Enable or disable the gravity-compensation feedforward. G(q) is
+        /// computed and published in every mode regardless; this controls
+        /// only whether it is APPLIED, which is correct on hardware and on
+        /// the torque plant but wrong on the kinematic one.
+        SetGravityComp = 23,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -257,6 +262,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         C::Reset
         | C::Estop
         | C::SafetyStop
+        | C::SetGravityComp
         | C::Stop
         | C::WriteIo
         | C::Simulator

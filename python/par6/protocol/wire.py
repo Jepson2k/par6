@@ -244,6 +244,10 @@ def _v_simulator(p: list) -> None:
     _bool(p[0], "simulator.on")
 
 
+def _v_set_gravity_comp(p: list) -> None:
+    _bool(p[0], "set_gravity_comp.on")
+
+
 def _v_select_profile(p: list) -> None:
     _str(p[0], "select_profile.profile", 1, 32)
 
@@ -394,6 +398,7 @@ _COMMAND_SPECS: dict[CmdType, tuple[int, Callable[[list], None]]] = {
     CmdType.RESET: (0, _v_none),
     CmdType.ESTOP: (0, _v_none),
     CmdType.SAFETY_STOP: (0, _v_none),
+    CmdType.SET_GRAVITY_COMP: (1, _v_set_gravity_comp),
     CmdType.STOP: (1, _v_stop),
     CmdType.WRITE_IO: (2, _v_write_io),
     CmdType.SIMULATOR: (1, _v_simulator),

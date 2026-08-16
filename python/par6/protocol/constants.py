@@ -43,6 +43,7 @@ class CmdType(IntEnum):
     SET_COMPLETION_POLICY = 20
     SET_RECIPE = 21
     SAFETY_STOP = 22
+    SET_GRAVITY_COMP = 23
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -191,6 +192,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SET_COMPLETION_POLICY: CommandClass.SYSTEM,
     CmdType.SET_RECIPE: CommandClass.SYSTEM,
     CmdType.SAFETY_STOP: CommandClass.SYSTEM,
+    CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,

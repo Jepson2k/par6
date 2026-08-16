@@ -123,6 +123,13 @@ pub struct Simulator {
     pub on: bool,
 }
 
+/// SET_GRAVITY_COMP: apply (or stop applying) the G(q) feedforward.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SetGravityComp {
+    /// `true` = apply the feedforward.
+    pub on: bool,
+}
+
 /// SELECT_PROFILE: select the motion planner profile.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SelectProfile {
@@ -412,6 +419,7 @@ pub enum Command {
     Reset,
     Estop,
     SafetyStop,
+    SetGravityComp(SetGravityComp),
     Stop(Stop),
     WriteIo(WriteIo),
     Simulator(Simulator),
@@ -471,6 +479,7 @@ impl Command {
             C::Reset => CmdType::Reset,
             C::Estop => CmdType::Estop,
             C::SafetyStop => CmdType::SafetyStop,
+            C::SetGravityComp(_) => CmdType::SetGravityComp,
             C::Stop(_) => CmdType::Stop,
             C::WriteIo(_) => CmdType::WriteIo,
             C::Simulator(_) => CmdType::Simulator,
@@ -546,6 +555,7 @@ impl Command {
         match self {
             C::Stop(_)
             | C::Simulator(_)
+            | C::SetGravityComp(_)
             | C::Reset
             | C::Estop
             | C::SafetyStop
@@ -838,6 +848,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Shapes => 2,
         T::Stop
         | T::Simulator
+        | T::SetGravityComp
         | T::SelectProfile
         | T::ConnectHardware
         | T::SetShapes
@@ -927,6 +938,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_uint(buf, u64::from(p.value));
         }
         C::Simulator(p) => w_bool(buf, p.on),
+        C::SetGravityComp(p) => w_bool(buf, p.on),
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
         C::SetTcpOffset(p) => {
@@ -1218,6 +1230,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             })
         }
         T::Simulator => Command::Simulator(Simulator { on: r.bool()? }),
+        T::SetGravityComp => Command::SetGravityComp(SetGravityComp { on: r.bool()? }),
         T::SelectProfile => Command::SelectProfile(SelectProfile {
             profile: r.str()?.to_owned(),
         }),

@@ -501,6 +501,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.safety_stop();
                 Ok(())
             }
+            C::SetGravityComp(p) => {
+                self.runtime.rt.set_gravity_comp(p.on);
+                Ok(())
+            }
             C::Stop(p) => {
                 self.cancel_active_motion();
                 if p.clear_queue {
@@ -1859,6 +1863,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::Reset => "reset",
         T::Estop => "estop",
         T::SafetyStop => "safety_stop",
+        T::SetGravityComp => "set_gravity_comp",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

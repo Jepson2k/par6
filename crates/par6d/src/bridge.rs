@@ -758,6 +758,10 @@ impl RtCommands for RtBridge {
         self.link.send(RtCommand::SetMode(Mode::SafetyStop));
     }
 
+    fn set_gravity_comp(&mut self, on: bool) {
+        self.link.send(RtCommand::SetGravityComp(on));
+    }
+
     fn set_enabled(&mut self, enabled: bool) {
         let mut sh = self.shared.lock().unwrap();
         if enabled {

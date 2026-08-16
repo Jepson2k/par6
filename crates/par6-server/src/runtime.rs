@@ -272,6 +272,14 @@ pub trait RtCommands: Send {
     /// until a mode change takes the arm out of it.
     fn safety_stop(&mut self);
 
+    /// Apply (or stop applying) the gravity-compensation feedforward.
+    ///
+    /// G(q) is computed and published every tick regardless; this controls
+    /// only whether it is fed forward, which cancels weight that must
+    /// actually exist in the plant — true on hardware and on the torque
+    /// plant, false on the kinematic one.
+    fn set_gravity_comp(&mut self, on: bool);
+
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up
     /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`

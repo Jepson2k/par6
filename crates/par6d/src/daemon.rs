@@ -204,8 +204,8 @@ impl Daemon {
         // integrates commanded current and models no gravity, so an
         // applied G(q) would accelerate an IDLE arm off its pose). Plain
         // `--sim` therefore disables the comp feedforward at boot —
-        // publish-only. Nothing can re-enable it: `SetGravityComp` has
-        // no client-facing sender.
+        // publish-only. `set_gravity_comp` turns it back on for a client
+        // that knows its plant models weight.
         let gravity_hook: Box<dyn GravityModel> = Box::new(kin_gravity);
         if opts.sim && !opts.sim_dynamics {
             cmds_tx

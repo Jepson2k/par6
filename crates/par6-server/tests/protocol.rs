@@ -37,6 +37,7 @@ enum RtEvent {
     CancelStream,
     Halt,
     SafetyStop,
+    SetGravityComp(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
     WriteIo(u8, u8),
@@ -90,6 +91,9 @@ impl RtCommands for TestRt {
     }
     fn safety_stop(&mut self) {
         self.push(RtEvent::SafetyStop);
+    }
+    fn set_gravity_comp(&mut self, on: bool) {
+        self.push(RtEvent::SetGravityComp(on));
     }
     fn set_enabled(&mut self, enabled: bool) {
         self.push(RtEvent::SetEnabled(enabled));
@@ -2209,4 +2213,31 @@ async fn safety_stop_is_reachable_and_halts_motion() {
         ev.contains(&RtEvent::Halt),
         "going limp must halt motion first: {ev:?}"
     );
+}
+
+/// The gravity-comp feedforward is switchable from the wire.
+///
+/// `SetGravityComp` existed as an internal RT command with no client-facing
+/// sender, so once plain `--sim` turned the feedforward off at boot,
+/// nothing could turn it back on — par6d's own comment said as much.
+#[tokio::test]
+async fn gravity_compensation_can_be_switched_from_the_wire() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    for on in [true, false] {
+        assert!(
+            matches!(
+                c.request(&Command::SetGravityComp(
+                    par6_proto::command::SetGravityComp { on }
+                ))
+                .await,
+                Reply::Ok { .. }
+            ),
+            "SET_GRAVITY_COMP({on}) must be acked"
+        );
+        h.wait_rt(|ev| ev.contains(&RtEvent::SetGravityComp(on)))
+            .await;
+    }
 }
