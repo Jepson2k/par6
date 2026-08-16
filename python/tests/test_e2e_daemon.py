@@ -639,9 +639,10 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
     stays there while the button is still held.  The direction block is
     asserted behaviorally, within one jog session: continued same-direction
     jogging advances nothing, and the opposite direction clears it and
-    moves away.  (The RT's per-direction blocked mask is snapshot-only and
-    never carried by STATUS, so the latch has no wire bit to read; the
-    mask itself is pinned at the RT layer in ``core_modes.rs``.)
+    moves away.  (The RT's per-direction blocked mask IS carried: the
+    server folds it into STATUS ``joint_en`` while in JOG, which is what
+    lets a frontend grey the button the RT actually stopped honoring —
+    ``sim_session.rs`` pins that.)
     """
     cfg = _cfg.load_robot_config()
     limit_deg = math.degrees(cfg["joints"][0]["limits"]["soft_max_rad"])

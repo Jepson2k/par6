@@ -41,7 +41,6 @@ https://mujoco-viewer.org/
 * PAR6 with MSG gripper
 * PAR6 with SSG48 gripper
 
-More about URDF here: [Link](./urdf.md)
 
 ## URDF → MJCF derivation steps
 

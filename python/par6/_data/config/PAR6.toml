@@ -377,7 +377,7 @@ home_offset_gripper_dependent = true
 # and relax the gearbox. Vendor-verbatim (robots/PAR6.xml), so it ships
 # as-is — but it means the release presses toward the stop in any plant
 # that reads the sign literally. Verify the real behavior at HIL
-# bring-up (CODE-REVIEW.md §5.3) before trusting J4's home windup.
+# bring-up before trusting J4's home windup.
 [[homing.joints]] # J4 — gripper-dependent; every shipped gripper overrides it
 strategy = "stall"
 speed_ticks_s = 13500.0

@@ -1494,7 +1494,7 @@ class AsyncRobotClient(_RobotClientABC):
         Category: Configuration
 
         Example:
-            rbt.select_tool("PNEUMATIC")
+            rbt.select_tool("SSG48")
         """
         key = canonical_tool_key(tool_name)
         index = await self._queued(

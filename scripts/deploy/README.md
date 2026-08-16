@@ -46,7 +46,7 @@ Nothing needs to run on the control box, and the box needs no compiler:
   pinned commit through a generated CMake toolchain file, exactly like the
   native path.
 - `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
-  `libpar6_shim.so` and copies the whole closure — 22 libraries, ~65 MB —
+  `libpar6_shim.so` and copies the whole closure — 20 libraries, ~65 MB —
   into the shim's own `lib/` directory. That directory is the deploy unit:
   the shim is linked with `$ORIGIN`, `par6d` with an rpath of
   `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
