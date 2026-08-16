@@ -119,6 +119,9 @@ MAX_SHAPES = 256
 #: Elements in the STATUS error tuple:
 #: `[command_index, code, title, cause, effect, remedy]`.
 _ERROR_ELEMS = 6
+#: Reassembly bounds mirrored from `par6-proto::chunk`.
+MAX_TRANSFER_BYTES = 4 * 1024 * 1024
+MAX_TRANSFERS_IN_FLIGHT = 8
 
 
 def _dur(v: object, name: str, hi: float = MAX_DURATION_S) -> None:
@@ -806,13 +809,25 @@ class Reassembler:
     ) -> bytes | None:
         """Feed one decoded chunk; returns the payload when complete."""
         req_id, transfer_id, index, total, data = chunk
+        # Both the bytes in a transfer and the NUMBER of transfers are the
+        # sender's choice, so both are bounded here as they are in Rust.
+        if transfer_id not in self._transfers and (
+            len(self._transfers) >= MAX_TRANSFERS_IN_FLIGHT
+        ):
+            raise ProtocolError(
+                f"too many chunk transfers in flight ({len(self._transfers)})"
+            )
         req0, total0, parts, _ = self._transfers.setdefault(
             transfer_id, (req_id, total, {}, now)
         )
         if total0 != total or req0 != req_id:
             del self._transfers[transfer_id]
             raise ProtocolError("inconsistent chunk transfer")
-        parts[index] = data
+        if index not in parts:
+            if sum(map(len, parts.values())) + len(data) > MAX_TRANSFER_BYTES:
+                del self._transfers[transfer_id]
+                raise ProtocolError("chunk transfer too large")
+            parts[index] = data
         self._transfers[transfer_id] = (req0, total0, parts, now)
         if len(parts) == total:
             del self._transfers[transfer_id]
