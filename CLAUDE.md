@@ -6,6 +6,8 @@ Read `README.md` for architecture and the workstream board.
 ## Commands
 
 ```bash
+scripts/ffi/setup.sh               # once: build the Pinocchio shim into .ffi/
+source .ffi/env.sh                 # each shell: par6d needs the shim to build AND run
 cargo build --workspace            # runtime
 cargo test --workspace             # rust tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # must be clean
@@ -13,6 +15,10 @@ cargo run -p par6d -- --sim        # simulated runtime, no hardware
 pip install -e "python[dev]"       # python client
 cd python && pytest                # python tests (JUnit XML at python/test-results.xml)
 ```
+
+`par6d` links the shim unconditionally — there is no kinematics-free build.
+The library crates still build without a C++ toolchain, which is what the
+`--exclude par6d` legs in CI cover.
 
 ## Contract discipline (multi-agent repo)
 

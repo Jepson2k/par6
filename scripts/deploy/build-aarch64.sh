@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Cross-build par6d for the PAR6 control box (Raspberry Pi 5, aarch64).
 #
-# The deploy build is ALWAYS `--features ffi`. Kinematics is not optional in
-# a shipped runtime — without it there is no TCP pose, no cartesian motion
-# and no collision world — and `par6d` refuses to start when it was built
-# without them, so a feature-less build would be dead on arrival.
+# par6d links the Pinocchio shim unconditionally: without it there is no TCP
+# pose, no cartesian motion and no collision world, so the cross-build needs
+# the aarch64 shim on hand before it starts.
 #
 # Usage:
 #   scripts/ffi/setup.sh --target aarch64      # once (or after a pin bump)
@@ -53,7 +52,7 @@ cd "$ROOT"
 # directory resolves the whole closure from one entry.
 export RUSTFLAGS="${RUSTFLAGS:-} -C link-arg=-Wl,-rpath,$RUNTIME_LIB_DIR"
 # shellcheck disable=SC2086  # PAR6_CARGO_FLAGS is intentionally word-split
-cargo build -p par6d --release --target "$TARGET" --features ffi ${PAR6_CARGO_FLAGS:-}
+cargo build -p par6d --release --target "$TARGET" ${PAR6_CARGO_FLAGS:-}
 
 BIN="$ROOT/target/$TARGET/release/par6d"
 [ -x "$BIN" ] || die "expected binary missing: $BIN"

@@ -28,23 +28,25 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --workspace --all-targets -- -D warnings
-      # Default features = no kinematics, which par6d refuses to boot with
-      # (crates/par6d/tests/no_kinematics.rs). What this leg proves is that
-      # the whole workspace still builds and passes WITHOUT a C++ toolchain,
-      # and that the refusal is the only thing such a build does. par6d's
-      # protocol-plane suite runs under `ffi`, which is what ships.
+        run: cargo clippy --workspace --exclude par6d --all-targets -- -D warnings
+      # par6d links the Pinocchio shim unconditionally, so it needs the C++
+      # toolchain and is covered by the `ffi` job below. What this leg proves
+      # is that every LIBRARY crate still builds and passes without that
+      # toolchain — which is what keeps them usable on their own.
       - name: test
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace
+        run: cargo test --workspace --exclude par6d
       - name: install cross linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
+      # par6d's aarch64 build is the deploy build and lives in
+      # scripts/deploy/build-aarch64.sh, which supplies the cross-compiled
+      # shim; this leg only cross-checks the toolchain-free crates.
       - name: cross check (aarch64)
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --target aarch64-unknown-linux-gnu
+        run: cargo check --workspace --exclude par6d --target aarch64-unknown-linux-gnu
 
   ffi:
     name: ffi (pinocchio shim, x86_64)
@@ -105,14 +107,12 @@ jobs:
           cargo clippy -p par6-bus --all-targets --features sim-dynamics -- -D warnings
           cargo test -p par6-bus --features sim-dynamics
       # `ffi` is the shipped configuration, so this is where par6d's whole
-      # protocol-plane suite runs (sim_session.rs is gated on the feature —
-      # a par6d without kinematics does not boot, so there is no runtime for
-      # those tests to drive).
+      # protocol-plane suite runs against the runtime that actually ships.
       - name: test par6d (the shipped runtime)
         run: |
           source .ffi/env.sh
-          cargo clippy -p par6d --all-targets --features ffi -- -D warnings
-          cargo test -p par6d --features ffi
+          cargo clippy -p par6d --all-targets -- -D warnings
+          cargo test -p par6d
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
       # the unpatched 0.004 runs before it meets the arm. Release because
@@ -121,7 +121,7 @@ jobs:
       - name: shipped 250 Hz soak (par6d, release)
         run: |
           source .ffi/env.sh
-          cargo test -p par6d --release --features ffi --test shipped_tick -- --nocapture
+          cargo test -p par6d --release --test shipped_tick -- --nocapture
 
   # The SocketCAN backend is the only bus that will ever touch the arm,
   # and its vcan suite skips itself wherever no vcan interface exists —
@@ -208,12 +208,11 @@ jobs:
         run: scripts/ffi/setup.sh
       # Release, not debug: the sim runs in wall-clock time and an
       # unoptimized RT loop misses its deadlines and latches LOOP_CRITICAL.
-      # `--features ffi` because that is what deploys — a par6d without
-      # kinematics refuses to boot, so the e2e tests would all skip.
+      # par6d links the shim unconditionally, so this job needs it built.
       - name: build par6d
         run: |
           source .ffi/env.sh
-          cargo build -p par6d --release --features ffi
+          cargo build -p par6d --release
       - name: install python client
         run: pip install -e "python[dev]"
       - name: pytest -m e2e

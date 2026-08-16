@@ -81,7 +81,8 @@ def _find_par6d() -> str:
     if found is None:
         raise RuntimeError(
             "par6d binary not found; set PAR6D_BIN or put it on PATH "
-            "(build with `cargo build -p par6d`)"
+            "(build with `scripts/ffi/setup.sh && source .ffi/env.sh && "
+            "cargo build -p par6d --release`)"
         )
     return found
 

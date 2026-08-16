@@ -5,11 +5,8 @@
 //! to prove the CLI/ready-line/signal path. All waiting is
 //! deadline-bounded polling — no blind sleeps stand in for conditions.
 //!
-//! Feature `ffi` gated because every test here boots a runtime, and a
-//! par6d built without kinematics refuses to boot (`no_kinematics.rs`
-//! covers that). `ffi` is the shipped configuration; these tests
-//! exercise the protocol plane of exactly the binary that deploys.
-#![cfg(feature = "ffi")]
+//! These tests exercise the protocol plane of exactly the binary that
+//! deploys.
 
 use std::io::BufRead;
 use std::net::{SocketAddr, UdpSocket};

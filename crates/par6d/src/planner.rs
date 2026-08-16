@@ -54,9 +54,7 @@ use std::time::{Duration, Instant};
 
 use par6_bus::ObjectDetection;
 use par6_config::ConfigBundle;
-#[cfg(feature = "ffi")]
 use par6_kin::NQ;
-#[cfg(feature = "ffi")]
 use par6_motion::cart::Pose;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
@@ -69,7 +67,6 @@ use par6_server::{
     CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
-#[cfg(feature = "ffi")]
 use crate::bridge::ESCAPE_TOL_M;
 use crate::bridge::{gripper_move_command, CoreLink};
 
@@ -88,7 +85,6 @@ const TOOL_CALIBRATE_TIMEOUT: Duration = Duration::from_secs(12);
 /// from the previous run (same rule as the homing FSM).
 const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
 /// Joint displacement below which a move has no path to time \[rad\].
-#[cfg(feature = "ffi")]
 const NULL_MOVE_RAD: f64 = 1e-9;
 /// Speed fraction the return-to-home move runs at when the arm is
 /// already referenced (vendor `HOME_RETURN_SPEED_FRAC`).
@@ -96,24 +92,19 @@ const HOME_RETURN_SPEED_FRAC: f64 = 0.5;
 
 /// Cartesian sampling pitch: one IK waypoint per this much translation
 /// \[m\] …
-#[cfg(feature = "ffi")]
 const CART_STEP_M: f64 = 0.005;
 /// … or per this much rotation \[rad\], whichever yields more waypoints.
-#[cfg(feature = "ffi")]
 const CART_STEP_RAD: f64 = 0.05;
 /// Waypoint-count ceiling for one `move_l` (bounds planning cost).
-#[cfg(feature = "ffi")]
 const MOVE_L_MAX_STEPS: usize = 400;
 /// Waypoint-count ceiling for a multi-segment cartesian path — an arc, a
 /// spline, a process move, or a blended chain of straight moves. Higher
 /// than a single `move_l`'s because the path is that much longer; the
 /// sampler spreads the budget over the whole path rather than sampling
 /// each piece as if it were alone.
-#[cfg(feature = "ffi")]
 const CART_PATH_MAX_STEPS: usize = 3000;
 /// Below this much translation AND rotation a cartesian move is already
 /// at its target.
-#[cfg(feature = "ffi")]
 const MOVE_L_NULL_M: f64 = 1e-6;
 /// Largest joint change allowed between consecutive cartesian IK
 /// waypoints \[rad\]; a bigger jump means the solver hopped to another
@@ -127,7 +118,6 @@ const MOVE_L_NULL_M: f64 = 1e-6;
 /// solution closer to the seed.
 ///
 /// [`CartKin::ik_within`]: crate::kin::CartKin::ik_within
-#[cfg(feature = "ffi")]
 const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 /// How far a waypoint list's first pose may sit from where the arm
 /// actually is before the current pose is PREPENDED to the path instead
@@ -138,7 +128,6 @@ const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 /// it believes the arm is at means the path to begin there, and the
 /// small FK/IK discrepancy must not become a spurious first segment; a
 /// list that starts somewhere else means the arm to travel there first.
-#[cfg(feature = "ffi")]
 const WAYPOINT_SNAP_M: f64 = 5e-3;
 /// Corner radius `move_p` rounds its interior waypoints with, as a
 /// fraction of the shorter adjacent segment.
@@ -151,7 +140,6 @@ const WAYPOINT_SNAP_M: f64 = 5e-3;
 /// corner, which is the same shape as the zone clamp
 /// ([`par6_motion::cart::corner_trims`]) applied to the largest radius a
 /// corner could take.
-#[cfg(feature = "ffi")]
 const MOVE_P_AUTO_BLEND_FRAC: f64 = 0.25;
 
 /// Joint-space pitch of the collision gate \[rad\]: consecutive checked
@@ -160,7 +148,6 @@ const MOVE_P_AUTO_BLEND_FRAC: f64 = 0.25;
 /// wrist under 10 mm, so a keep-out thicker than that cannot be tunneled
 /// through; the cost is bounded by the path's joint-space length rather
 /// than by the sample count (a 90° single-joint move costs ~79 checks).
-#[cfg(feature = "ffi")]
 const COLLISION_STEP_RAD: f64 = 0.02;
 
 /// The planned-move profiles this planner really implements, in the
@@ -176,7 +163,6 @@ pub(crate) enum Profile {
     Trapezoid,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
     /// acceleration limits bind, nothing else.
-    #[cfg(feature = "ffi")]
     Toppra,
 }
 
@@ -185,7 +171,6 @@ impl Profile {
         match name {
             "RUCKIG" => Some(Self::Ruckig),
             "TRAPEZOID" => Some(Self::Trapezoid),
-            #[cfg(feature = "ffi")]
             "TOPPRA" => Some(Self::Toppra),
             _ => None,
         }
@@ -193,12 +178,9 @@ impl Profile {
 }
 
 /// The profile registry the command plane advertises and validates
-/// `select_profile` against. TOPPRA rides the C++ shim, so a build
-/// without feature `ffi` must not offer it.
+/// `select_profile` against.
 pub(crate) fn profile_names() -> Vec<String> {
-    #[cfg_attr(not(feature = "ffi"), allow(unused_mut))]
     let mut names = vec!["RUCKIG".to_owned(), "TRAPEZOID".to_owned()];
-    #[cfg(feature = "ffi")]
     names.push("TOPPRA".to_owned());
     names
 }
@@ -254,7 +236,6 @@ struct InFlight {
 /// The planner's kinematics kit (feature `ffi`): its own model instance,
 /// the enforced collision world, and the shared TCP-offset cell it
 /// publishes into.
-#[cfg(feature = "ffi")]
 pub(crate) struct PlannerKin {
     pub(crate) kin: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
@@ -281,35 +262,28 @@ pub(crate) struct Par6Planner {
     tool_cal_min_ticks: u64,
     inflight: Option<InFlight>,
     enablement: Enablement,
-    #[cfg(feature = "ffi")]
     kin: crate::kin::CartKin,
     /// The enforced collision world. Planner-side by construction: coal's
     /// C++ narrow phase allocates on deep interpenetration, so no check
     /// may ever run on the RT thread.
-    #[cfg(feature = "ffi")]
     collision: par6_kin::Collision,
     /// Names of the applied world shapes, both layers: the reporting
     /// vocabulary keeps them verbatim while robot geometry is reduced to
     /// its link name.
-    #[cfg(feature = "ffi")]
     world_names: Vec<String>,
     /// The two layers' name lists, so replacing one rebuilds
     /// [`Par6Planner::world_names`] without disturbing the other.
-    #[cfg(feature = "ffi")]
     layer_names: [Vec<String>; 2],
     /// The pairs the last refused motion would have collided at — the
     /// `collision_active` / `collision_pairs` STATUS fields. Latched, not
     /// sampled: it describes the configuration a move was blocked AT, and
     /// the server drops it when it accepts the next motion command.
-    #[cfg(feature = "ffi")]
     collision_latch: CollisionState,
     /// Outcome of a command a world change invalidated mid-flight, handed
     /// to the server by the next [`Planner::poll`].
-    #[cfg(feature = "ffi")]
     invalidated: Option<CommandOutcome>,
     /// The commanded TCP offset, shared with the bridge's and
     /// housekeeping's models and with the RT FK hook.
-    #[cfg(feature = "ffi")]
     tool_offset: crate::kin::ToolOffset,
     /// Rate/change gate for the cartesian enablement probe.
     probe: EnablementProbe,
@@ -322,10 +296,9 @@ impl Par6Planner {
         heartbeat: ExecHeartbeat,
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
-        #[cfg(feature = "ffi")] models: PlannerKin,
+        models: PlannerKin,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
-        #[cfg(feature = "ffi")]
         let PlannerKin {
             kin,
             collision,
@@ -369,19 +342,12 @@ impl Par6Planner {
                 )
                 .max(EN_MIN_PERIOD),
             ),
-            #[cfg(feature = "ffi")]
             tool_offset,
-            #[cfg(feature = "ffi")]
             kin,
-            #[cfg(feature = "ffi")]
             collision,
-            #[cfg(feature = "ffi")]
             world_names: Vec::new(),
-            #[cfg(feature = "ffi")]
             layer_names: [Vec::new(), Vec::new()],
-            #[cfg(feature = "ffi")]
             collision_latch: CollisionState::default(),
-            #[cfg(feature = "ffi")]
             invalidated: None,
         })
     }
@@ -418,7 +384,6 @@ impl Par6Planner {
     /// admission in the bridge's `StreamGate`, which applies the same
     /// two-halves rule: the jog/servo ramp is integrated on the RT
     /// thread, where a coal check cannot go.
-    #[cfg(feature = "ffi")]
     fn gate_collisions(
         &mut self,
         samples: &[[f64; 2 * MAX_JOINTS]],
@@ -534,7 +499,6 @@ impl Par6Planner {
     /// The remainder starts at the planned sample closest to where the
     /// arm actually is: the part already driven cannot be un-driven, and
     /// gating it would fail a move over a keep-out placed behind it.
-    #[cfg(feature = "ffi")]
     fn revalidate_inflight(&mut self) {
         let Some(InFlight {
             server_index,
@@ -582,7 +546,6 @@ impl Par6Planner {
         samples: Vec<[f64; 2 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
-        #[cfg(feature = "ffi")]
         self.gate_collisions(&samples, 0)?;
         // A fresh fill generation: a flush already queued for an earlier
         // command can no longer reach these samples, however far behind
@@ -658,7 +621,6 @@ impl Par6Planner {
             // TOPPRA times the straight joint-space path instead of
             // shaping a point-to-point profile: same waypoints, a
             // different (time-optimal) parameterization.
-            #[cfg(feature = "ffi")]
             Profile::Toppra => {
                 self.exec_limits
                     .require_inside_soft(target)
@@ -713,7 +675,6 @@ impl Par6Planner {
     /// A requested `min_duration` is a minimum: TOPPRA's optimum bounds
     /// how fast the path can be driven, a longer request time-scales the
     /// whole trajectory (velocities scale with it, so limits still hold).
-    #[cfg(feature = "ffi")]
     fn toppra_samples(
         &self,
         waypoints: &[f64],
@@ -851,7 +812,6 @@ impl Par6Planner {
 
     /// MOVE_J_POSE: seeded IK on the target pose, then the joint-move
     /// pipeline. IK failure is a command error, never a silent no-op.
-    #[cfg(feature = "ffi")]
     fn start_move_j_pose(
         &mut self,
         cmd: &par6_proto::command::MoveJPose,
@@ -884,7 +844,6 @@ impl Par6Planner {
 
     /// The TCP pose the arm is standing at — where every cartesian move
     /// starts from.
-    #[cfg(feature = "ffi")]
     fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
         self.kin
             .fk(q)
@@ -892,7 +851,6 @@ impl Par6Planner {
     }
 
     /// Seeded IK on one pose, with the cartesian failure vocabulary.
-    #[cfg(feature = "ffi")]
     fn ik_pose(&mut self, seed: &[f64; NQ], pose: &Pose) -> Result<[f64; NQ], WireError> {
         use crate::kin::IkResult;
         match self.kin.ik(seed, pose) {
@@ -921,7 +879,6 @@ impl Par6Planner {
     ///
     /// `poses[0]` is where the arm already is, so it contributes the
     /// measured configuration rather than an IK solution.
-    #[cfg(feature = "ffi")]
     fn start_cart_path(
         &mut self,
         snap: &StateSnapshot,
@@ -997,7 +954,6 @@ impl Par6Planner {
     }
 
     /// MOVE_L: one straight cartesian segment.
-    #[cfg(feature = "ffi")]
     fn start_move_l(
         &mut self,
         cmd: &par6_proto::command::MoveL,
@@ -1011,7 +967,6 @@ impl Par6Planner {
 
     /// MOVE_C: circular arc through the via pose to the end pose, with
     /// the circle derived from the three points.
-    #[cfg(feature = "ffi")]
     fn start_move_c(
         &mut self,
         cmd: &par6_proto::command::MoveC,
@@ -1026,7 +981,6 @@ impl Par6Planner {
     }
 
     /// MOVE_S: cubic spline through the waypoint list.
-    #[cfg(feature = "ffi")]
     fn start_move_s(
         &mut self,
         cmd: &par6_proto::command::MoveS,
@@ -1042,7 +996,6 @@ impl Par6Planner {
     /// MOVE_P: process move — the waypoint list as straight segments
     /// with every interior corner rounded, so the TCP sweeps the path
     /// without stopping at a single waypoint.
-    #[cfg(feature = "ffi")]
     fn start_move_p(
         &mut self,
         cmd: &par6_proto::command::MoveP,
@@ -1077,7 +1030,6 @@ impl Par6Planner {
     /// in it; durations add up when every move carries one, and are
     /// dropped when they are mixed with speed-parameterised moves —
     /// there is no meaningful total otherwise.
-    #[cfg(feature = "ffi")]
     fn start_move_l_chain(
         &mut self,
         chain: &[&par6_proto::command::MoveL],
@@ -1134,7 +1086,6 @@ impl Par6Planner {
     /// turns `r` into the fraction of each adjacent joint segment the
     /// zone eats. Same conversion as parol6
     /// (`commands/joint_commands.py`, `do_setup_with_blend`).
-    #[cfg(feature = "ffi")]
     fn start_joint_chain(&mut self, chain: &[JointTarget<'_>]) -> Result<InFlightKind, WireError> {
         let snap = self.snapshots.latest();
         let mut waypoints: Vec<[f64; NQ]> = Vec::with_capacity(chain.len() + 1);
@@ -1217,12 +1168,7 @@ impl Par6Planner {
         rest: &[QueuedCommand<'_>],
     ) -> Result<(InFlightKind, usize), WireError> {
         // Rounding a corner means re-planning both of its segments as
-        // one path, which takes IK and TOPPRA: without kinematics
-        // nothing blends, and the command plane has already refused the
-        // radius that would have asked for it.
-        #[cfg(not(feature = "ffi"))]
-        let _ = rest;
-        #[cfg(feature = "ffi")]
+        // one path, which takes IK and TOPPRA.
         if let Some(consumed) = self.blend_chain_len(cmd, rest) {
             let kind = match cmd {
                 Command::MoveL(head) => {
@@ -1281,31 +1227,11 @@ impl Par6Planner {
                 let snap = self.snapshots.latest();
                 self.start_tool_action(&snap, p)?
             }
-            #[cfg(feature = "ffi")]
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
-            #[cfg(feature = "ffi")]
             Command::MoveL(p) => self.start_move_l(p)?,
-            #[cfg(feature = "ffi")]
             Command::MoveC(p) => self.start_move_c(p)?,
-            #[cfg(feature = "ffi")]
             Command::MoveS(p) => self.start_move_s(p)?,
-            #[cfg(feature = "ffi")]
             Command::MoveP(p) => self.start_move_p(p)?,
-            #[cfg(not(feature = "ffi"))]
-            Command::MoveJPose(_)
-            | Command::MoveL(_)
-            | Command::MoveC(_)
-            | Command::MoveS(_)
-            | Command::MoveP(_) => {
-                return Err(make_error(
-                    ErrorCode::MotnSetupFailed,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "cartesian planning needs a par6d build with feature `ffi`",
-                    )],
-                ));
-            }
             other => {
                 return Err(make_error(
                     ErrorCode::CommValidationError,
@@ -1335,7 +1261,6 @@ impl Par6Planner {
     /// round — there is no following segment — so that move stops at its
     /// target like any other. That is also what a lone blended move
     /// does after the server's blend hold expires.
-    #[cfg(feature = "ffi")]
     fn blend_chain_len(&self, cmd: &Command, rest: &[QueuedCommand<'_>]) -> Option<usize> {
         let cartesian = matches!(cmd, Command::MoveL(_));
         let same_family = |c: &Command| {
@@ -1529,7 +1454,6 @@ impl Par6Planner {
             en.joint_en[2 * j + 1] =
                 u8::from(snap.q[j] - EN_JOINT_DELTA_RAD >= self.exec_limits.soft_min[j]);
         }
-        #[cfg(feature = "ffi")]
         self.probe_directions(snap, &mut en);
         self.enablement = en;
     }
@@ -1543,7 +1467,6 @@ impl Par6Planner {
     /// seeded IK at the measured `q` reaches it. A solution outside the
     /// EXEC soft window does not count — that is where par6 refuses the
     /// motion — and neither does one the collision world rejects.
-    #[cfg(feature = "ffi")]
     fn probe_directions(&mut self, snap: &StateSnapshot, en: &mut Enablement) {
         let started = Instant::now();
         let mut q = [0.0; NQ];
@@ -1609,7 +1532,6 @@ impl Par6Planner {
     /// direction may keep without being blocked for them. Same escape rule
     /// as the planner's collision gate: a direction may not CREATE a
     /// collision, it may leave one.
-    #[cfg(feature = "ffi")]
     fn baseline_pairs(
         &mut self,
         q: &[f64; NQ],
@@ -1625,7 +1547,6 @@ impl Par6Planner {
 
     /// Whether a small step to `target` is reachable, inside the soft
     /// window, and clear of the collision world.
-    #[cfg(feature = "ffi")]
     fn direction_free(
         &mut self,
         seed: &[f64; NQ],
@@ -1647,7 +1568,6 @@ impl Par6Planner {
     }
 
     /// Whether `q` collides in no pair the arm is not already in.
-    #[cfg(feature = "ffi")]
     fn adds_no_collision(&mut self, q: &[f64; NQ], baseline: &[(String, String)]) -> bool {
         let world = &self.world_names;
         let col = &mut self.collision;
@@ -1665,7 +1585,6 @@ impl Par6Planner {
 }
 
 /// Sampling of a single straight `move_l`.
-#[cfg(feature = "ffi")]
 fn line_sampling() -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
         step_m: CART_STEP_M,
@@ -1677,7 +1596,6 @@ fn line_sampling() -> par6_motion::cart::CartSampling {
 /// Sampling of a multi-segment cartesian path (arc, spline, process
 /// move, blended chain): the same pitch, a budget sized for the longer
 /// path.
-#[cfg(feature = "ffi")]
 fn path_sampling() -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
         step_m: CART_STEP_M,
@@ -1688,7 +1606,6 @@ fn path_sampling() -> par6_motion::cart::CartSampling {
 
 /// Where a cartesian move's wire pose puts the TCP, resolved against the
 /// pose the move starts from.
-#[cfg(feature = "ffi")]
 fn target_pose(start: &Pose, wire_pose: &[f64; 6], frame: par6_proto::Frame, rel: bool) -> Pose {
     use par6_proto::Frame;
     let wire = crate::kin::wire_pose_to_matrix(wire_pose);
@@ -1720,7 +1637,6 @@ fn target_pose(start: &Pose, wire_pose: &[f64; 6], frame: par6_proto::Frame, rel
 /// otherwise: a client that starts its list where it believes the arm is
 /// gets its shape, not that shape plus a millimetre-long lead-in
 /// segment.
-#[cfg(feature = "ffi")]
 fn waypoint_poses(start: &Pose, waypoints: &[[f64; 6]], frame: par6_proto::Frame) -> Vec<Pose> {
     use par6_motion::cart::translation;
     let mut poses = Vec::with_capacity(waypoints.len() + 1);
@@ -1743,7 +1659,6 @@ fn waypoint_poses(start: &Pose, waypoints: &[[f64; 6]], frame: par6_proto::Frame
 
 /// One move of a joint-space blend chain: where it goes, and the
 /// parameters the chain has to reconcile.
-#[cfg(feature = "ffi")]
 struct JointTarget<'a> {
     goal: JointGoal<'a>,
     blend_radius: Option<f64>,
@@ -1752,7 +1667,6 @@ struct JointTarget<'a> {
     duration: Option<f64>,
 }
 
-#[cfg(feature = "ffi")]
 #[derive(Clone, Copy)]
 enum JointGoal<'a> {
     /// `move_j`: joint angles \[deg\], absolute or relative to where the
@@ -1766,7 +1680,6 @@ enum JointGoal<'a> {
     Pose(&'a [f64; 6]),
 }
 
-#[cfg(feature = "ffi")]
 impl<'a> JointTarget<'a> {
     fn of(cmd: &'a Command) -> Option<Self> {
         match cmd {
@@ -1802,23 +1715,19 @@ const NO_FREEDOM: Enablement = Enablement {
 };
 
 /// Translation probe step for cartesian enablement \[m\] (parol6: 0.5 mm).
-#[cfg(feature = "ffi")]
 const EN_STEP_M: f64 = 0.0005;
 /// Rotation probe step for cartesian enablement \[rad\] (parol6: 0.5°).
-#[cfg(feature = "ffi")]
 const EN_STEP_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 /// Iteration budget for one probe solve (parol6's solver runs 20 per
 /// attempt). A 0.5 mm / 0.5° step off the measured configuration
 /// converges in a handful of iterations when it converges at all, so the
 /// full planning budget would be spent only on the directions that have
 /// no answer — which is exactly where the probe must stay cheap.
-#[cfg(feature = "ffi")]
 const EN_IK_ITERS: i32 = 20;
 /// Joint probe step for the collision half of the joint gate \[rad\]
 /// (parol6: 2°) — big enough that a step actually enters what it is about
 /// to enter, and clamped into the soft window so a pose past the stop
 /// cannot grey a button the jog could still use.
-#[cfg(feature = "ffi")]
 const EN_JOINT_STEP_RAD: f64 = 2.0 * std::f64::consts::PI / 180.0;
 /// Floor on the enablement probe's period.
 ///
@@ -1873,7 +1782,6 @@ impl EnablementProbe {
     /// recompute at the next poll even though the arm has not moved.
     /// Only the cartesian half has such inputs, so only `ffi` builds
     /// have a reason to call it.
-    #[cfg(feature = "ffi")]
     fn invalidate(&mut self) {
         self.due_at = None;
         self.last_q = None;
@@ -1920,7 +1828,6 @@ impl Planner for Par6Planner {
         } else {
             self.update_enablement(&snap);
         }
-        #[cfg(feature = "ffi")]
         if let Some(out) = self.invalidated.take() {
             return Some(out);
         }
@@ -1986,7 +1893,6 @@ impl Planner for Par6Planner {
         // so planning, streaming and the reported pose all resolve at the
         // same point; `TCP_OFFSET` still reads back the COMMANDED value,
         // which the server owns.
-        #[cfg(feature = "ffi")]
         {
             let mm = ctx.tcp_offset_mm;
             self.tool_offset
@@ -1996,7 +1902,6 @@ impl Planner for Par6Planner {
         }
     }
 
-    #[cfg(feature = "ffi")]
     fn set_shapes(
         &mut self,
         layer: ShapeLayer,
@@ -2046,34 +1951,13 @@ impl Planner for Par6Planner {
         Ok(Some(epoch))
     }
 
-    #[cfg(not(feature = "ffi"))]
-    fn set_shapes(
-        &mut self,
-        _layer: ShapeLayer,
-        _shapes: &[par6_proto::Shape],
-    ) -> Result<Option<u64>, WireError> {
-        // No kinematics, no collision world: the server stores and echoes
-        // the shapes, and STATUS keeps reporting nothing enforced.
-        Ok(None)
-    }
-
-    #[cfg(feature = "ffi")]
     fn collision(&mut self) -> Option<CollisionState> {
         Some(self.collision_latch.clone())
     }
 
-    #[cfg(not(feature = "ffi"))]
-    fn collision(&mut self) -> Option<CollisionState> {
-        None
-    }
-
-    #[cfg(feature = "ffi")]
     fn clear_collision(&mut self) {
         self.collision_latch = CollisionState::default();
     }
-
-    #[cfg(not(feature = "ffi"))]
-    fn clear_collision(&mut self) {}
 
     fn enablement(&self) -> Enablement {
         self.enablement
@@ -2168,12 +2052,10 @@ impl Planner for Par6Planner {
 /// Cap on the pairs spelled out in an error payload; a report can carry
 /// up to `par6_kin::MAX_REPORTED_PAIRS` of them and the first few are the
 /// actionable ones.
-#[cfg(feature = "ffi")]
 const MAX_REPORTED_PAIRS: usize = 4;
 
 /// Format colliding pairs the way the v2 error catalog's `{pairs}` slot
 /// and the golden status fixture spell them: `[a, b], [c, d]`.
-#[cfg(feature = "ffi")]
 fn format_pairs(pairs: &[(String, String)]) -> String {
     let mut out = pairs
         .iter()
@@ -2195,7 +2077,6 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
 /// Borrows out of the model's own name table — the enablement probe
 /// compares tens of pairs per probed configuration and must not allocate
 /// to do it.
-#[cfg(feature = "ffi")]
 fn display_name_ref<'a>(geom: &'a str, world_names: &[String]) -> &'a str {
     if world_names.iter().any(|n| n == geom) {
         return geom;
@@ -2208,13 +2089,11 @@ fn display_name_ref<'a>(geom: &'a str, world_names: &[String]) -> &'a str {
 
 /// [`display_name_ref`], owned — for the pair lists that outlive the
 /// report they came from (error payloads, the STATUS latch).
-#[cfg(feature = "ffi")]
 fn display_name(geom: &str, world_names: &[String]) -> String {
     display_name_ref(geom, world_names).to_owned()
 }
 
 /// The first name two shapes in one layer share, if any.
-#[cfg(feature = "ffi")]
 fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
     shapes.iter().enumerate().find_map(|(i, s)| {
         shapes[..i]
@@ -2225,7 +2104,6 @@ fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
 }
 
 /// Max-norm joint distance \[rad\] between two configurations.
-#[cfg(feature = "ffi")]
 fn joint_distance(a: &[f64; MAX_JOINTS], b: &[f64; MAX_JOINTS]) -> f64 {
     a.iter()
         .zip(b.iter())
@@ -2235,7 +2113,6 @@ fn joint_distance(a: &[f64; MAX_JOINTS], b: &[f64; MAX_JOINTS]) -> f64 {
 
 /// A collision-world call the shim refused: a malformed shape (negative
 /// radius, zero-length plane normal) or a broken model.
-#[cfg(feature = "ffi")]
 fn collision_error(e: par6_kin::KinError) -> WireError {
     make_error(
         ErrorCode::CommValidationError,

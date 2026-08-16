@@ -20,17 +20,15 @@ scripts/deploy/build-aarch64.sh
 # -> target/aarch64-unknown-linux-gnu/release/par6d
 ```
 
-**The deploy build always carries kinematics.** `par6d`'s `ffi` feature (the
-Pinocchio C-ABI shim: TCP FK, gravity compensation, `move_l`/`move_j_pose`,
-the cartesian streamables, TOPPRA, and the coal collision world) is not
-optional in a shipped runtime, and a `par6d` built without it **refuses to
-start** — kinematics-less it would broadcast a NaN TCP pose, report zero
-cartesian freedom, refuse every cartesian command, and answer `set_shapes`
-with success against a collision world that does not exist, none of which a
-client can see. `build-aarch64.sh` therefore always passes `--features ffi`
-and fails early if the aarch64 shim has not been built. The feature stays
-off by default in the workspace so that a plain `cargo build` needs no C++
-toolchain; it is the *deploy path* that is fixed, not the default.
+**Every par6d carries kinematics.** The Pinocchio C-ABI shim — TCP FK,
+gravity compensation, `move_l`/`move_j_pose`, the cartesian streamables,
+TOPPRA, and the coal collision world — is linked unconditionally, because a
+runtime without it would broadcast a NaN TCP pose, report zero cartesian
+freedom, refuse every cartesian command, and answer `set_shapes` with success
+against a collision world that does not exist, none of which a client can
+see. `build-aarch64.sh` therefore fails early when the aarch64 shim has not
+been built. The library crates still compile without any C++ toolchain; it is
+only the binary that requires one.
 
 ### How the aarch64 shim is produced
 
@@ -199,9 +197,6 @@ nothing aarch64 executed):
 - `build-aarch64.sh` produces a real aarch64 `par6d` **with kinematics** —
   `ELF 64-bit LSB pie executable, ARM aarch64 … dynamically linked` — and
   refuses to run at all when the aarch64 shim or its env file is absent.
-- A `par6d` built *without* `ffi` refuses to boot and exits nonzero with an
-  actionable message instead of printing `PAR6D_READY`
-  (`crates/par6d/tests/no_kinematics.rs`).
 - `par6d.service` passes `systemd-analyze verify` with no warnings.
 - `install.sh` argument handling, bundle staging (`--stage-only`), upload
   command shape, and every early failure path (missing bundle, missing
@@ -223,7 +218,7 @@ nothing aarch64 executed):
   scripts/ffi/setup.sh                    # native aarch64 build of the same pins
   source .ffi/env.sh
   cargo test -p par6-kin --features ffi   # golden FK/collision fixtures
-  cargo test -p par6d   --features ffi    # the runtime's protocol plane
+  cargo test -p par6d                     # the runtime's protocol plane
   ```
 
   Until that has been done once, treat aarch64 kinematics as *built* but not

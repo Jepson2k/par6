@@ -32,8 +32,6 @@ use par6_rt::{
     GravityModel, RtCore, RtHooks, RunOptions, SharedLineGpio, SnapshotReader, SnapshotWriter,
     SpecSettle, StateSnapshot,
 };
-#[cfg(not(feature = "ffi"))]
-use par6_rt::{NoFk, ZeroGravity};
 use par6_server::{ServerConfig, ServerHandle};
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -46,18 +44,6 @@ use crate::planner::Par6Planner;
 const RING_CAPACITY: usize = 4096;
 /// Grace period for the server task to exit after the shutdown notify.
 const SERVER_GRACE: Duration = Duration::from_millis(100);
-
-/// Why a par6d compiled without feature `ffi` does not boot. Kinematics
-/// is load-bearing for the advertised surface, and its absence is
-/// invisible from the client side, so it is a startup failure rather
-/// than a degraded mode.
-const NO_FFI_REFUSAL: &str = "this par6d was built without feature `ffi`, so it has no \
-     kinematics: the TCP pose broadcast would read NaN, `move_l` / `move_j_pose` / `servo_l` / \
-     `servo_j_pose` / `jog_l` would all be refused, the TOPPRA profile the registry advertises \
-     would be unavailable, and the collision world would be empty while `set_shapes` still \
-     reported success. Refusing to start rather than serve that. Build the runtime with \
-     `--features ffi` (scripts/ffi/setup.sh, then `source .ffi/env.sh`); \
-     see scripts/deploy/README.md for the aarch64 control box.";
 
 /// Startup failure. Every variant renders as a one-line, actionable
 /// message — a missing CAN interface or config file must never panic.
@@ -72,8 +58,8 @@ pub enum DaemonError {
     /// Hardware mode is unavailable (missing interface or backend).
     #[error("{0}")]
     Hardware(String),
-    /// The kinematics stack could not start (missing assets tree, URDF
-    /// load failure, or a build without feature `ffi`).
+    /// The kinematics stack could not start (missing assets tree or a
+    /// URDF that failed to load).
     #[error("kinematics: {0}")]
     Kinematics(String),
     /// The RT core could not be constructed.
@@ -119,21 +105,7 @@ impl Daemon {
     /// Boot the full runtime: load config, build the RT core over the
     /// selected bus backend, wire the planner and bridge, and spawn the
     /// command plane.
-    ///
-    /// Refuses to boot a binary built without feature `ffi`: that build
-    /// has no kinematics at all, and every one of its degradations is
-    /// silent to a client (NaN TCP pose, zero cartesian freedom, an
-    /// empty collision world that still answers `set_shapes` with
-    /// success). Kinematics is not an optional part of the runtime's
-    /// advertised surface, so the build that lacks it does not run.
     pub fn start(opts: &Options) -> Result<Self, DaemonError> {
-        if !cfg!(feature = "ffi") {
-            return Err(DaemonError::Kinematics(NO_FFI_REFUSAL.into()));
-        }
-        Self::start_inner(opts)
-    }
-
-    fn start_inner(opts: &Options) -> Result<Self, DaemonError> {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
@@ -166,18 +138,6 @@ impl Daemon {
                 "--sim-dynamics is a simulator plant; add --sim or drop it".into(),
             ));
         }
-        #[cfg(not(feature = "ffi"))]
-        if opts.sim_dynamics {
-            return Err(DaemonError::Kinematics(
-                "--sim-dynamics needs a par6d build with feature `ffi`".into(),
-            ));
-        }
-        #[cfg(not(feature = "ffi"))]
-        if opts.assets.is_some() {
-            log::warn!("--assets has no effect: this par6d was built without feature `ffi`");
-        }
-
-        #[cfg(feature = "ffi")]
         let KinStack {
             fk: kin_fk,
             gravity: kin_gravity,
@@ -192,7 +152,6 @@ impl Daemon {
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
-        #[cfg(feature = "ffi")]
         let jog_limits = MotionLimits::from_config(robot, LimitMode::Jog)?;
         let jog = MotionJog::new(JogEngine::new(robot)?);
         let stream = MotionStream::new(
@@ -213,7 +172,6 @@ impl Daemon {
         // Hardware prerequisites, in the order an operator fixes them:
         // the CAN interface, then the e-stop line. Both are startup
         // refusals — nothing has been spawned yet.
-        #[cfg(feature = "ffi")]
         let sim_bus = if opts.sim_dynamics {
             // The torque-level plant models the ARM (its URDF must carry
             // exactly the configured joint count, so the bare-flange
@@ -231,8 +189,6 @@ impl Daemon {
         } else {
             SimBus::new()
         };
-        #[cfg(not(feature = "ffi"))]
-        let sim_bus = SimBus::new();
         let bus = if opts.sim {
             RuntimeBus::from(sim_bus)
         } else {
@@ -240,10 +196,6 @@ impl Daemon {
         };
         let estop = estop_source(opts)?;
 
-        // Gravity and TCP FK: Kin-backed (G(q) + real TCP pose) with
-        // feature `ffi`, the built-in defaults (ZeroGravity, NoFk =
-        // all-NaN TCP pose) otherwise.
-        //
         // The real gravity model always runs, so `gravity_torque_nm`
         // publishes the arm's true G(q) in every mode. APPLYING it as a
         // feedforward is a different matter: it cancels weight that must
@@ -254,18 +206,13 @@ impl Daemon {
         // `--sim` therefore disables the comp feedforward at boot —
         // publish-only. Nothing can re-enable it: `SetGravityComp` has
         // no client-facing sender.
-        #[cfg(feature = "ffi")]
         let gravity_hook: Box<dyn GravityModel> = Box::new(kin_gravity);
         if opts.sim && !opts.sim_dynamics {
             cmds_tx
                 .send(par6_rt::RtCommand::SetGravityComp(false))
                 .expect("receiver outlives startup");
         }
-        #[cfg(feature = "ffi")]
         let fk_hook: Box<dyn ForwardKin> = Box::new(kin_fk);
-        #[cfg(not(feature = "ffi"))]
-        let (gravity_hook, fk_hook): (Box<dyn GravityModel>, Box<dyn ForwardKin>) =
-            (Box::new(ZeroGravity), Box::new(NoFk));
         let hooks = RtHooks {
             gravity: gravity_hook,
             jog: Box::new(jog),
@@ -285,9 +232,7 @@ impl Daemon {
         let (hk_w, hk_r) = snapshot_channel::<StateSnapshot>();
         // The bridge only needs its own tap with feature `ffi` (seeding
         // cartesian streams from the measured pose).
-        #[cfg_attr(not(feature = "ffi"), allow(unused_mut))]
         let mut tee_writers = vec![srv_w, plan_w, hk_w];
-        #[cfg(feature = "ffi")]
         let bridge_snapshots = {
             let (br_w, br_r) = snapshot_channel::<StateSnapshot>();
             tee_writers.push(br_w);
@@ -295,7 +240,6 @@ impl Daemon {
         };
 
         let link = CoreLink::new(cmds_tx, ops_tx, rt_break.clone());
-        #[cfg(feature = "ffi")]
         let planner = Par6Planner::new(
             link.clone(),
             producer,
@@ -308,26 +252,16 @@ impl Daemon {
                 tool_offset,
             },
         )?;
-        #[cfg(not(feature = "ffi"))]
-        let planner = Par6Planner::new(
-            link.clone(),
-            producer,
-            handles.heartbeat.clone(),
-            plan_r,
-            &bundle,
-        )?;
         let stream_input = Arc::new(Mutex::new(handles.stream));
         let shared = Arc::new(Mutex::new(SharedState::default()));
         // The streaming collision gate holds its own model instance
         // (pinocchio's GeometryData is mutated by every query, so the
         // planner's cannot be shared) and is itself shared between the
         // bridge's admission check and housekeeping's periodic re-check.
-        #[cfg(feature = "ffi")]
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
         )));
-        #[cfg(feature = "ffi")]
         let bridge = RtBridge::new(
             link.clone(),
             stream_input.clone(),
@@ -343,16 +277,6 @@ impl Daemon {
                 gate: stream_gate.clone(),
             },
         );
-        #[cfg(not(feature = "ffi"))]
-        let bridge = RtBridge::new(
-            link.clone(),
-            stream_input.clone(),
-            shared.clone(),
-            flush_marker,
-            bundle.clone(),
-            opts.sim,
-        );
-
         let cfg = server_config(opts, &bundle);
         let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -406,7 +330,6 @@ impl Daemon {
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
-                        #[cfg(feature = "ffi")]
                         housekeeping_loop(
                             link,
                             stream_input,
@@ -416,8 +339,6 @@ impl Daemon {
                             kin_hk,
                             stream_gate,
                         );
-                        #[cfg(not(feature = "ffi"))]
-                        housekeeping_loop(link, stream_input, shared, hk_r, shutdown);
                     })?,
             );
         }
@@ -562,7 +483,7 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     // controllable DOF.
     cfg.fitted_tool = robot.robot.active_gripper.clone();
     cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
-    cfg.cartesian = cfg!(feature = "ffi");
+    cfg.cartesian = true;
     // The window `teleport` may place a joint in. Refusing outside it is
     // the server's job: the bridge is fire-and-forget and has no reply
     // channel to refuse on.
@@ -615,7 +536,6 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
 /// The kinematics models loaded at startup (feature `ffi`): one
 /// [`par6_kin::Kin`] per consumer — pinocchio's `Data` is mutated by
 /// every call, so instances are never shared across threads.
-#[cfg(feature = "ffi")]
 struct KinStack {
     fk: crate::kin::KinFk,
     gravity: crate::kin::KinGravity,
@@ -637,12 +557,10 @@ struct KinStack {
 /// from itself and from keep-outs that absorbs model and calibration
 /// error. The value parol6 runs the same arm with; a shape that wants a
 /// wider berth carries its own `margin`.
-#[cfg(feature = "ffi")]
 const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
-#[cfg(feature = "ffi")]
 fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,

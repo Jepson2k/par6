@@ -25,7 +25,6 @@
 //! The hard gate here is that `LOOP_CRITICAL` never latches over a
 //! representative session. The p99 assertion is deliberately generous
 //! (see `p99_factor`) because shared CI runners have no RT scheduling.
-#![cfg(feature = "ffi")]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;

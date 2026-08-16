@@ -15,7 +15,6 @@
 //!   is refused before dispatch, STATUS reports the live verdict, and a
 //!   malformed shape set changes neither the epoch nor the enforced
 //!   world.
-#![cfg(feature = "ffi")]
 
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;

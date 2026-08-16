@@ -57,8 +57,13 @@ constants, never code**.
 
 ## Building
 
+`par6d` links the Pinocchio C-ABI shim, so build that once before the runtime
+(the library crates need no C++ toolchain):
+
 ```bash
-cargo build --workspace          # the runtime
+scripts/ffi/setup.sh             # once — builds the shim into .ffi/
+source .ffi/env.sh               # each shell: compiler + loader paths
+cargo build -p par6d             # the runtime
 cargo run -p par6d -- --sim      # simulated runtime (no hardware)
 pip install -e "python[dev]"     # the python client
 ```

@@ -737,8 +737,7 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: Li
 
         taught = await client.pose()
         assert taught is not None
-        if not all(math.isfinite(v) for v in taught):
-            pytest.skip("runtime built without kinematics: STATUS carries no pose")
+        assert all(math.isfinite(v) for v in taught), f"STATUS pose not finite: {taught}"
         angles = await client.angles()
         assert angles is not None
 
@@ -807,8 +806,7 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
         await settle_at(client, mid)
         pose = await client.pose()
         assert pose is not None
-        if not all(math.isfinite(v) for v in pose[:3]):
-            pytest.skip("runtime built without kinematics: STATUS carries no pose")
+        assert all(math.isfinite(v) for v in pose[:3]), f"STATUS pose not finite: {pose}"
         center_m = [v / 1000.0 for v in pose[:3]]
         radius_m = math.hypot(center_m[0], center_m[1])
         assert await client.set_shapes(

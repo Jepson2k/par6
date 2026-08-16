@@ -29,7 +29,6 @@
 mod adapters;
 mod bridge;
 pub mod daemon;
-#[cfg(feature = "ffi")]
 mod kin;
 pub mod options;
 mod planner;
