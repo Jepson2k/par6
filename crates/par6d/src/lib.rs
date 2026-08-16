@@ -28,6 +28,7 @@
 
 mod adapters;
 mod bridge;
+mod collision_world;
 pub mod daemon;
 mod kin;
 pub mod options;

@@ -31,6 +31,7 @@ from waldoctl.shapes import Box
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
+from par6.client.dry_run_client import DryRunRobotClient
 from par6.protocol.constants import ActionState, ErrorCode
 from par6.robot import Robot
 
@@ -871,3 +872,110 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             "the escaping jog out of the keep-out never moved the arm: the "
             "gate is refusing the only way out"
         )
+
+
+@pytest.mark.timeout(180)
+async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
+    """The dry-run preview and the runtime agree about a keep-out.
+
+    The gap this closes: the preview used to draw a confident path through
+    a keep-out the runtime brakes on, so an editor showed a move that the
+    arm then refused. Both sides get the same shape and the same move here,
+    and both must reject it, name the same colliding pair, and leave the
+    arm where it stood. The same move with the keep-out cleared must run on
+    both, so the refusal is the shape's doing and not the move's.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+
+        target = list(SWEEP_START_DEG)
+        target[0] += 80.0
+        await settle_at(client, SWEEP_START_DEG)
+
+        # Park the keep-out on the TCP position half way along the move,
+        # read off the live broadcast rather than transcribed.
+        mid = list(SWEEP_START_DEG)
+        mid[0] += 40.0
+        await settle_at(client, mid)
+        pose = await client.pose()
+        assert pose is not None
+        keepout = Box(
+            name="keepout",
+            x=0.1,
+            y=0.1,
+            z=0.1,
+            pose=(pose[0] / 1000.0, pose[1] / 1000.0, pose[2] / 1000.0, 0.0, 0.0, 0.0),
+        )
+        await settle_at(client, SWEEP_START_DEG)
+
+        preview = DryRunRobotClient(initial_joints_deg=SWEEP_START_DEG)
+        assert preview.set_shapes([keepout])
+        assert await client.set_shapes([keepout])
+
+        with pytest.raises(RobotError) as preview_refusal:
+            preview.move_j(angles=target)
+        assert preview.angles() == pytest.approx(SWEEP_START_DEG, abs=1e-6), (
+            "a refused preview must not advance the previewed pose"
+        )
+
+        # The runtime's collision gate runs at dispatch, so the refusal
+        # rides the COMPLETE push, not the queue ack.
+        with pytest.raises(RobotError) as live_refusal:
+            await client.move_j(target, wait=True, timeout=STEP_BUDGET_S)
+
+        assert preview_refusal.value.code == live_refusal.value.code, (
+            f"preview refused with {preview_refusal.value.code}, runtime with "
+            f"{live_refusal.value.code}"
+        )
+        assert preview_refusal.value.code == ErrorCode.SYS_SELF_COLLISION
+        for refusal in (preview_refusal.value, live_refusal.value):
+            assert "shape:keepout" in refusal.cause, (
+                f"the refusal must name the keep-out in the reporting "
+                f"vocabulary: {refusal.cause!r}"
+            )
+        assert (await client.angles()) == pytest.approx(SWEEP_START_DEG, abs=1.0), (
+            "the refused move drove the arm"
+        )
+
+        # The runtime latches the pairs it refused on. The client-side
+        # checker, asked about the same configuration, must name the same
+        # ones — that is what makes a preview's highlight trustworthy.
+        runtime_pairs: set[tuple[str, ...]] = set()
+
+        def latch(s) -> bool:
+            if not s.collision_active:
+                return False
+            runtime_pairs.update(tuple(sorted(p)) for p in s.collision_pairs)
+            return True
+
+        assert await client.wait_status(latch, timeout=STEP_BUDGET_S), (
+            "the refusal never reached STATUS"
+        )
+        # Local kinematics only — no connection, and the same packaged
+        # config and fitted tool the runtime booted with.
+        robot = Robot()
+        robot.apply_shapes([keepout])
+        local_pairs = {
+            tuple(sorted(p))
+            for p in robot.colliding_pairs(np.radians(mid))
+            if "shape:keepout" in p
+        }
+        assert runtime_pairs & local_pairs, (
+            f"the client-side checker names {sorted(local_pairs)} where the "
+            f"runtime latched {sorted(runtime_pairs)}"
+        )
+        assert robot.in_collision(np.radians(mid))
+        assert robot.min_distance(np.radians(mid)) < 0.0
+        assert robot.check_trajectory(np.radians([SWEEP_START_DEG, mid])) == 1, (
+            "check_trajectory must find the keep-out at the second waypoint"
+        )
+
+        # Same move, no keep-out: both sides run it.
+        assert preview.set_shapes([])
+        assert await client.set_shapes([])
+        assert preview.move_j(angles=target) is not None
+        assert preview.angles() == pytest.approx(target, abs=1e-6)
+        await client.move_j(target, wait=True, timeout=STEP_BUDGET_S)
+        assert await client.wait_status(
+            lambda s: max_deg_error(s.angles, target) < 2.0, timeout=STEP_BUDGET_S
+        ), "the move the keep-out was blocking never ran once it was cleared"

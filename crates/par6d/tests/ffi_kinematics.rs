@@ -1151,22 +1151,22 @@ fn collision_world_is_enforced_over_protocol_v2() {
     );
 
     // STATUS carries the verdict of the refusal: the pairs the blocked
-    // move would have collided in, in the URDF's reporting vocabulary
-    // (link names and the client's own shape names, never the solver's
-    // per-link geometry identifiers).
+    // move would have collided in, in waldoctl's reporting vocabulary —
+    // `shape:<name>` for a program keep-out, a bare URDF link name for
+    // arm geometry, never the solver's per-link geometry identifiers.
     rig.drain_status();
     let s = rig.wait_status("the refusal reaches STATUS", |s| s.collision_active);
     let pair = s
         .collision_pairs
         .iter()
-        .find(|(a, b)| a == "keepout" || b == "keepout")
+        .find(|(a, b)| a == "shape:keepout" || b == "shape:keepout")
         .unwrap_or_else(|| {
             panic!(
-                "collision_pairs must name the keep-out: {:?}",
+                "collision_pairs must name the keep-out as a program shape: {:?}",
                 s.collision_pairs
             )
         });
-    let link = if pair.0 == "keepout" {
+    let link = if pair.0 == "shape:keepout" {
         &pair.1
     } else {
         &pair.0
@@ -1388,8 +1388,8 @@ fn streaming_is_gated_by_the_collision_world() {
     assert!(
         s.collision_pairs
             .iter()
-            .any(|(a, b)| a == "keepout" || b == "keepout"),
-        "the latched pairs must name the keep-out: {:?}",
+            .any(|(a, b)| a == "shape:keepout" || b == "shape:keepout"),
+        "the latched pairs must name the keep-out as a program shape: {:?}",
         s.collision_pairs
     );
     rig.drain_status();
@@ -1539,8 +1539,8 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     assert!(
         s.collision_pairs
             .iter()
-            .any(|(a, b)| a == "cage" || b == "cage"),
-        "{:?}",
+            .any(|(a, b)| a == "install:cage" || b == "install:cage"),
+        "the latched pairs must name the cage as an installation shape: {:?}",
         s.collision_pairs
     );
 

@@ -10,6 +10,7 @@ from :mod:`par6.client` with the config-built tool specs bound.
 
 from __future__ import annotations
 
+import atexit
 import logging
 import math
 import os
@@ -18,15 +19,17 @@ import re
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
+from functools import cache
 from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from pinokin import Damping, IKSolver, se3_from_rpy, so3_rpy
+from pinokin import CollisionChecker, Damping, IKSolver, se3_from_rpy, so3_rpy
 from pinokin import Robot as PinokinRobot
 from waldoctl import (
     CartesianKinodynamicLimits,
@@ -49,6 +52,97 @@ from par6.protocol.wire import ProtocolError, decode_reply, encode_command
 from par6.tools import build_tools
 
 logger = logging.getLogger(__name__)
+
+#: Default standoff the runtime enforces every collision pair at \[m\]
+#: (``par6d::daemon::COLLISION_CLEARANCE_M``). Client-side previews use the
+#: same value, or they call clear what the arm will brake for.
+COLLISION_CLEARANCE_M = 0.005
+
+
+# ===========================================================================
+# Collision naming and geometry
+# ===========================================================================
+
+
+def _shape_geom_name(name: str) -> str:
+    """A keep-out's geometry name — waldoctl's ``shape:`` vocabulary, which
+    is also how the runtime reports it, so a pair list needs no translation.
+
+    ``install:`` has no counterpart here: installation keep-outs live in the
+    runtime's own config and no client can apply them.
+    """
+    return f"shape:{name}"
+
+
+def _display(geom: str) -> str:
+    """The reporting name of one colliding geometry: keep-outs already carry
+    their prefix, robot geometry drops the per-link index pinocchio appends
+    (``upper_arm_0`` → ``upper_arm``) so pairs name URDF links."""
+    if geom.startswith("shape:"):
+        return geom
+    link, sep, index = geom.rpartition("_")
+    return link if sep and index.isdigit() else geom
+
+
+def _shape_world_pose(pose) -> NDArray[np.float64]:
+    """A shape's ``[x, y, z, rx, ry, rz]`` as a column-major SE3.
+
+    ``R = Rz(rz)·Ry(ry)·Rx(rx)`` — extrinsic XYZ, each angle about a fixed
+    world axis. This is NOT :func:`pinokin.se3_from_rpy`'s intrinsic order,
+    and the two diverge on any multi-axis tilt; the runtime's C++ shim
+    (``rpy_to_rotation``) and the frontend's renderer both place shapes
+    this way, so a keep-out is previewed in the orientation it was drawn in.
+    """
+    x, y, z, rx, ry, rz = (float(v) for v in pose)
+    T = np.zeros((4, 4), dtype=np.float64, order="F")
+    cx, sx, cy, sy, cz, sz = (
+        math.cos(rx),
+        math.sin(rx),
+        math.cos(ry),
+        math.sin(ry),
+        math.cos(rz),
+        math.sin(rz),
+    )
+    T[:3, :3] = np.array(
+        [
+            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
+            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
+            [-sy, cy * sx, cy * cx],
+        ]
+    )
+    T[:3, 3] = (x, y, z)
+    T[3, 3] = 1.0
+    return T
+
+
+@cache
+def _resolved_urdf_for_collision(tool_key: str) -> str:
+    """Path to *tool_key*'s URDF with its ``package://`` mesh URIs rewritten
+    absolute, so pinocchio's loader can find the meshes.
+
+    The packaged trees declare meshes under ``package://par6/`` — the name a
+    3-D view resolves through ``{backend_package: mesh_dir}`` — which maps
+    to no directory pinocchio can search. Rewriting into a temp file leaves
+    the packaged tree untouched and avoids a symlink farm. A plain absolute
+    path, not ``file://``: coal strips the scheme naively.
+    """
+    src = _cfg.urdf_path(tool_key)
+    meshes = _cfg.urdf_tree_root(tool_key) / "meshes"
+    rewritten = src.read_text(encoding="utf-8").replace(
+        "package://par6/meshes/", meshes.as_posix() + "/"
+    )
+    fd, path = tempfile.mkstemp(prefix="par6_collision_", suffix=".urdf")
+    with os.fdopen(fd, "w") as f:
+        f.write(rewritten)
+    atexit.register(lambda: _unlink_quietly(path))
+    return path
+
+
+def _unlink_quietly(path: str) -> None:
+    try:
+        os.unlink(path)
+    except OSError as e:
+        logger.debug("could not remove temp URDF %s: %s", path, e)
 
 
 # ===========================================================================
@@ -370,6 +464,13 @@ class Robot(_RobotABC):
         # rebuilding its solver) on every one would stall the UI.
         self._models: dict[str, PinokinRobot] = {}
         self._solvers: dict[str, IKSolver] = {}
+        # Same caching for the collision checkers, keyed the same way.
+        # A value of None records a tree whose checker could not be built,
+        # so the failure is diagnosed once instead of every query.
+        self._checkers: dict[str, CollisionChecker | None] = {}
+        # Keep-outs applied locally, replayed into every checker built
+        # after the call so a tool change cannot silently drop the world.
+        self._shapes: tuple[Any, ...] = ()
         # Both bound by the set_active_tool call below, which every tool
         # change goes through — there is no "no tool selected" state.
         self._pinokin: PinokinRobot
@@ -678,6 +779,105 @@ class Robot(_RobotABC):
             if result.success:
                 q_current[:] = result.q
         return results
+
+    # -- Collision ----------------------------------------------------------
+
+    @property
+    def _collision_checker(self) -> CollisionChecker | None:
+        """The active tool's checker, built on first use; ``None`` when it
+        could not be built.
+
+        One checker per URDF tree, on the tree the runtime is fitted with,
+        so tool geometry and the SRDF's disabled pairs come from the same
+        model both sides enforce. Passive gripper jaws are fixed in the
+        packaged trees, which holds them closed — what
+        ``par6_kin::Collision`` does with the live model's jaw columns.
+        """
+        path = str(_cfg.urdf_path(self._active_tool_key))
+        if path not in self._checkers:
+            self._checkers[path] = self._build_checker(self._active_tool_key, path)
+        return self._checkers[path]
+
+    def _build_checker(self, tool_key: str, path: str) -> CollisionChecker | None:
+        try:
+            checker = CollisionChecker(
+                self._model_for(tool_key)[0],
+                _resolved_urdf_for_collision(tool_key),
+                clearance_margin=COLLISION_CLEARANCE_M,
+            )
+            checker.load_srdf(str(_cfg.srdf_path(tool_key)))
+        except (OSError, ValueError, RuntimeError) as e:
+            logger.warning(
+                "Collision checking unavailable for tool %r (%s): %s",
+                tool_key,
+                path,
+                e,
+            )
+            return None
+        self._load_shapes_into(checker, ())
+        return checker
+
+    def _load_shapes_into(self, checker: CollisionChecker, previous: tuple) -> None:
+        """Replace *previous*'s keep-outs in *checker* with :attr:`_shapes`."""
+        for shape in previous:
+            checker.remove_geometry_by_name(_shape_geom_name(shape.name))
+        for shape in self._shapes:
+            if not getattr(shape, "collision", True):
+                continue
+            checker.add_obstacle(
+                _shape_geom_name(shape.name),
+                shape.kind,
+                shape.params(),
+                _shape_world_pose(shape.pose),
+                shape.margin,
+            )
+
+    @property
+    def has_collision_checking(self) -> bool:
+        return self._collision_checker is not None
+
+    def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
+        c = self._collision_checker
+        if c is None:
+            return False
+        self._load_q_buf(q_rad)
+        return c.in_collision(self._q_buf)
+
+    def colliding_pairs(self, q_rad: NDArray[np.float64]) -> list[tuple[str, str]]:
+        """Colliding pairs at *q_rad*, in the runtime's own reporting
+        vocabulary: URDF link names for arm and tool geometry,
+        ``shape:<name>`` for a keep-out applied through
+        :meth:`apply_shapes`."""
+        c = self._collision_checker
+        if c is None:
+            return []
+        self._load_q_buf(q_rad)
+        return [(_display(a), _display(b)) for a, b in c.colliding_pairs(self._q_buf)]
+
+    def check_trajectory(self, q_path_rad: NDArray[np.float64]) -> int:
+        c = self._collision_checker
+        if c is None:
+            return -1
+        return c.check_path(np.ascontiguousarray(q_path_rad, dtype=np.float64))
+
+    def min_distance(self, q_rad: NDArray[np.float64]) -> float:
+        c = self._collision_checker
+        if c is None:
+            return float("inf")
+        self._load_q_buf(q_rad)
+        return c.min_distance(self._q_buf)
+
+    def apply_shapes(self, shapes: list) -> None:
+        """Replace this process's keep-outs — the local twin of the
+        client's ``set_shapes``, which replaces the *runtime's*.
+
+        Applied to every checker already built, not just the active one, so
+        a later tool change previews against the same world.
+        """
+        previous, self._shapes = self._shapes, tuple(shapes)
+        for checker in self._checkers.values():
+            if checker is not None:
+                self._load_shapes_into(checker, previous)
 
     # -- Lifecycle ----------------------------------------------------------
 

@@ -33,6 +33,8 @@ use par6_rt::{
 use par6_server::RtCommands;
 use par6_server::{CollisionState, ShapeLayer};
 
+use crate::collision_world::{is_world_name, kin_layer, ShapeNames};
+
 /// A closure applied to the core on the RT thread, between `run()`
 /// sessions.
 pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
@@ -139,9 +141,8 @@ pub(crate) fn gripper_move_command(
 /// are excluded model-side by the variant's SRDF.
 pub(crate) struct StreamGate {
     collision: par6_kin::Collision,
-    /// Applied world-shape names per layer (reporting vocabulary).
-    layer_names: [Vec<String>; 2],
-    world_names: Vec<String>,
+    /// Reporting names for the applied keep-out shapes.
+    shape_names: ShapeNames,
     /// Per-joint JOG-mode velocity limits \[rad/s\] — what a `speeds`
     /// fraction of ±1 commands, and therefore what the lookahead
     /// projects with.
@@ -160,8 +161,7 @@ impl StreamGate {
     ) -> Self {
         Self {
             collision,
-            layer_names: [Vec::new(), Vec::new()],
-            world_names: Vec::new(),
+            shape_names: ShapeNames::default(),
             jog_vel: jog_limits.velocity,
             soft_min: jog_limits.soft_min,
             soft_max: jog_limits.soft_max,
@@ -188,12 +188,8 @@ impl StreamGate {
                     &[("detail", &e.to_string())],
                 )
             })?;
-        let (slot, kin_layer) = match layer {
-            ShapeLayer::Installation => (0, par6_kin::Layer::Installation),
-            ShapeLayer::Program => (1, par6_kin::Layer::Program),
-        };
         self.collision
-            .set_layer(kin_layer, &converted)
+            .set_layer(kin_layer(layer), &converted)
             .map_err(|e| {
                 make_error(
                     ErrorCode::CommValidationError,
@@ -201,38 +197,17 @@ impl StreamGate {
                     &[("detail", &format!("stream gate collision world: {e}"))],
                 )
             })?;
-        self.layer_names[slot] = converted
-            .iter()
-            .filter(|s| s.collision)
-            .map(|s| s.name.clone())
-            .collect();
-        self.world_names = self.layer_names.concat();
+        self.shape_names.set_layer(layer, &converted);
         Ok(())
-    }
-
-    /// The reporting name of one colliding geometry: world shapes keep
-    /// the name they were applied with, robot geometry drops the model's
-    /// per-link geometry suffix (`upper_arm_0` → `upper_arm`).
-    fn display(&self, geom: &str) -> String {
-        if self.world_names.iter().any(|n| n == geom) {
-            return geom.to_owned();
-        }
-        trim_geom(geom).to_owned()
     }
 
     /// Colliding pairs at `q`, in reporting names.
     fn offending(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Vec<(String, String)>, WireError> {
         let mut nq = [0.0; par6_kin::NQ];
         nq.copy_from_slice(&q[..par6_kin::NQ]);
+        let names = &self.shape_names;
         let report = self.collision.check(&nq, false).map_err(gate_error)?;
-        let raw: Vec<(String, String)> = report
-            .pairs()
-            .map(|(a, b)| (a.to_owned(), b.to_owned()))
-            .collect();
-        Ok(raw
-            .into_iter()
-            .map(|(a, b)| (self.display(&a), self.display(&b)))
-            .collect())
+        Ok(names.render(&report))
     }
 
     fn world_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
@@ -274,7 +249,7 @@ impl StreamGate {
         // remains guarded by the pair half above.
         let world_pair = cur
             .iter()
-            .any(|p| self.world_names.contains(&p.0) || self.world_names.contains(&p.1));
+            .any(|p| is_world_name(&p.0) || is_world_name(&p.1));
         if world_pair
             && self.world_distance(target)? < self.world_distance(current)? - STREAM_ESCAPE_TOL_M
         {
@@ -323,15 +298,6 @@ impl StreamGate {
             UNATTRIBUTED,
             &[("sample", "0"), ("total", "1"), ("pairs", &rendered)],
         )
-    }
-}
-
-/// Robot geometry names carry the model's per-link geometry index
-/// (`upper_arm_0`); reports name URDF links.
-fn trim_geom(geom: &str) -> &str {
-    match geom.rsplit_once('_') {
-        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => link,
-        _ => geom,
     }
 }
 

@@ -67,20 +67,44 @@ URDF_TREE_BY_TOOL: dict[str, str] = {
 }
 
 
+# Tree directory -> (model, disabled-pair list) the RUNTIME loads for it,
+# mirroring ``par6_kin::GripperVariant::urdf_relpath`` / ``srdf_relpath``.
+# Named rather than globbed: the flange tree also carries
+# ``par6_arm.urdf`` (the arm-only gravity chain the runtime attaches tool
+# inertials onto), so picking a tree's model by directory order hands
+# this side a different model than the runtime enforces against.
+_MODEL_BY_TREE: dict[str, tuple[str, str]] = {
+    "par6_flange": ("par6_flange.urdf", "par6_flange.srdf"),
+    "par6_msg_gripper": ("PAR6_MSG.urdf", "PAR6_MSG.srdf"),
+    "par6_ssg48_gripper": ("par6_ssg48_urdf.urdf", "par6_ssg48_urdf.srdf"),
+}
+
+
 def urdf_tree_root(tool_key: str) -> Path:
     """Root of the URDF tree for *tool_key* (flange tree for unknown keys)."""
     tree = URDF_TREE_BY_TOOL.get(tool_key.strip().upper(), _FLANGE_TREE)
     return data_root() / "urdf" / tree
 
 
-def urdf_path(tool_key: str) -> Path:
-    """The ``.urdf`` file inside the tree for *tool_key*."""
-    matches = sorted((urdf_tree_root(tool_key) / "urdf").glob("*.urdf"))
-    if not matches:
+def _tree_model(tool_key: str, subdir: str, which: int) -> Path:
+    tree = URDF_TREE_BY_TOOL.get(tool_key.strip().upper(), _FLANGE_TREE)
+    path = data_root() / "urdf" / tree / subdir / _MODEL_BY_TREE[tree][which]
+    if not path.is_file():
         raise FileNotFoundError(
-            f"no packaged URDF for tool {tool_key!r}; run scripts/sync_pkg_data.py"
+            f"no packaged {subdir} model for tool {tool_key!r} at {path}; "
+            "run scripts/sync_pkg_data.py"
         )
-    return matches[0]
+    return path
+
+
+def urdf_path(tool_key: str) -> Path:
+    """The kinematic model the runtime loads for *tool_key*."""
+    return _tree_model(tool_key, "urdf", 0)
+
+
+def srdf_path(tool_key: str) -> Path:
+    """The disabled-collision-pair list the runtime loads for *tool_key*."""
+    return _tree_model(tool_key, "srdf", 1)
 
 
 # ---------------------------------------------------------------------------

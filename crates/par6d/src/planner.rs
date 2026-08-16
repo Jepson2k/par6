@@ -69,6 +69,7 @@ use par6_server::{
 
 use crate::bridge::ESCAPE_TOL_M;
 use crate::bridge::{gripper_move_command, CoreLink};
+use crate::collision_world::{first_duplicate, is_world_name, kin_layer, ShapeNames};
 
 /// How long a started command may wait for its RT mode to engage before
 /// the planner declares the start failed.
@@ -267,13 +268,8 @@ pub(crate) struct Par6Planner {
     /// C++ narrow phase allocates on deep interpenetration, so no check
     /// may ever run on the RT thread.
     collision: par6_kin::Collision,
-    /// Names of the applied world shapes, both layers: the reporting
-    /// vocabulary keeps them verbatim while robot geometry is reduced to
-    /// its link name.
-    world_names: Vec<String>,
-    /// The two layers' name lists, so replacing one rebuilds
-    /// [`Par6Planner::world_names`] without disturbing the other.
-    layer_names: [Vec<String>; 2],
+    /// Reporting names for the applied keep-out shapes.
+    shape_names: ShapeNames,
     /// The pairs the last refused motion would have collided at — the
     /// `collision_active` / `collision_pairs` STATUS fields. Latched, not
     /// sampled: it describes the configuration a move was blocked AT, and
@@ -345,8 +341,7 @@ impl Par6Planner {
             tool_offset,
             kin,
             collision,
-            world_names: Vec::new(),
-            layer_names: [Vec::new(), Vec::new()],
+            shape_names: ShapeNames::default(),
             collision_latch: CollisionState::default(),
             invalidated: None,
         })
@@ -393,13 +388,10 @@ impl Par6Planner {
         let q_now = self.snapshots.latest().q;
         // Disjoint field borrows: the name tables are read while the
         // collision model is being driven.
-        let world = &self.world_names;
+        let names = &self.shape_names;
         let col = &mut self.collision;
         let named = |report: &par6_kin::CollisionReport<'_>| -> Vec<(String, String)> {
-            report
-                .pairs()
-                .map(|(a, b)| (display_name(a, world), display_name(b, world)))
-                .collect()
+            names.render(report)
         };
         let start_pairs = named(&col.check(&q_now, false).map_err(collision_error)?);
         // The depth half of the escape rule engages only when the start
@@ -411,7 +403,7 @@ impl Par6Planner {
         // new.
         let start_depth = if start_pairs
             .iter()
-            .any(|p| world.contains(&p.0) || world.contains(&p.1))
+            .any(|p| is_world_name(&p.0) || is_world_name(&p.1))
         {
             Some(col.world_distance(&q_now).map_err(collision_error)?)
         } else {
@@ -1536,13 +1528,9 @@ impl Par6Planner {
         &mut self,
         q: &[f64; NQ],
     ) -> Result<Vec<(String, String)>, par6_kin::KinError> {
-        let world = &self.world_names;
+        let names = &self.shape_names;
         let col = &mut self.collision;
-        Ok(col
-            .check(q, false)?
-            .pairs()
-            .map(|(a, b)| (display_name(a, world), display_name(b, world)))
-            .collect())
+        Ok(names.render(&col.check(q, false)?))
     }
 
     /// Whether a small step to `target` is reachable, inside the soft
@@ -1569,11 +1557,11 @@ impl Par6Planner {
 
     /// Whether `q` collides in no pair the arm is not already in.
     fn adds_no_collision(&mut self, q: &[f64; NQ], baseline: &[(String, String)]) -> bool {
-        let world = &self.world_names;
+        let names = &self.shape_names;
         let col = &mut self.collision;
         match col.check(q, false) {
             Ok(report) => report.pairs().all(|(a, b)| {
-                let (a, b) = (display_name_ref(a, world), display_name_ref(b, world));
+                let (a, b) = (names.display(a), names.display(b));
                 baseline.iter().any(|(x, y)| x == a && y == b)
             }),
             Err(e) => {
@@ -1922,28 +1910,16 @@ impl Planner for Par6Planner {
             .map(par6_kin::Shape::from_proto)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|e| refuse(e.to_string()))?;
-        // Names are the reporting vocabulary: a duplicate would make a
-        // colliding-pair report ambiguous about which shape it means
-        // (and shadow one shape in a frontend's highlight mapping).
         if let Some(dup) = first_duplicate(&converted) {
             return Err(refuse(format!("duplicate shape name {dup:?}")));
         }
-        let (slot, kin_layer) = match layer {
-            ShapeLayer::Installation => (0, par6_kin::Layer::Installation),
-            ShapeLayer::Program => (1, par6_kin::Layer::Program),
-        };
         // The epoch is the collision world's, not a parallel counter:
         // `set_layer` moves it only for a world it actually applied.
         let epoch = self
             .collision
-            .set_layer(kin_layer, &converted)
+            .set_layer(kin_layer(layer), &converted)
             .map_err(collision_error)?;
-        self.layer_names[slot] = converted
-            .iter()
-            .filter(|s| s.collision)
-            .map(|s| s.name.clone())
-            .collect();
-        self.world_names = self.layer_names.concat();
+        self.shape_names.set_layer(layer, &converted);
         // The measured freedom was measured against the previous world.
         self.probe.invalidate();
         // Committed motion is not exempt from a world it now violates.
@@ -2067,40 +2043,6 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
         out.push_str(&format!(" (+{} more)", pairs.len() - MAX_REPORTED_PAIRS));
     }
     out
-}
-
-/// The reporting name of one colliding geometry: a world shape keeps the
-/// name the client gave it, robot geometry drops the per-link geometry
-/// index the model appends (`upper_arm_0` -> `upper_arm`) so pairs name
-/// URDF links, not solver-internal identifiers.
-///
-/// Borrows out of the model's own name table — the enablement probe
-/// compares tens of pairs per probed configuration and must not allocate
-/// to do it.
-fn display_name_ref<'a>(geom: &'a str, world_names: &[String]) -> &'a str {
-    if world_names.iter().any(|n| n == geom) {
-        return geom;
-    }
-    match geom.rsplit_once('_') {
-        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => link,
-        _ => geom,
-    }
-}
-
-/// [`display_name_ref`], owned — for the pair lists that outlive the
-/// report they came from (error payloads, the STATUS latch).
-fn display_name(geom: &str, world_names: &[String]) -> String {
-    display_name_ref(geom, world_names).to_owned()
-}
-
-/// The first name two shapes in one layer share, if any.
-fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
-    shapes.iter().enumerate().find_map(|(i, s)| {
-        shapes[..i]
-            .iter()
-            .any(|prev| prev.name == s.name)
-            .then_some(s.name.as_str())
-    })
 }
 
 /// Max-norm joint distance \[rad\] between two configurations.

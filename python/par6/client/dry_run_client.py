@@ -105,6 +105,12 @@ _TEMPLATES: dict[ErrorCode, tuple[str, str, str, str]] = {
         "Profile unchanged.",
         "Use a profile name supported by the runtime.",
     ),
+    ErrorCode.SYS_SELF_COLLISION: (
+        "Collision predicted",
+        "The planned configuration collides at sample {sample} of {total}: {pairs}",
+        "Motion command rejected before dispatch.",
+        "Choose a different target or add intermediate waypoints.",
+    ),
 }
 
 
@@ -114,6 +120,19 @@ def make_error(code: ErrorCode, **fields: object) -> RobotError:
     for name, value in fields.items():
         cause = cause.replace("{" + name + "}", str(value))
     return RobotError(-1, int(code), title, cause.strip(), effect, remedy)
+
+
+#: Colliding pairs one refusal names before it summarizes the rest
+#: (``planner.rs::MAX_REPORTED_PAIRS``).
+_MAX_REPORTED_PAIRS = 4
+
+
+def _format_pairs(pairs: list[tuple[str, str]]) -> str:
+    """Colliding pairs as the runtime writes them into an error payload."""
+    out = ", ".join(f"[{a}, {b}]" for a, b in pairs[:_MAX_REPORTED_PAIRS])
+    if len(pairs) > _MAX_REPORTED_PAIRS:
+        out += f" (+{len(pairs) - _MAX_REPORTED_PAIRS} more)"
+    return out
 
 
 def _pose_to_matrix(pose: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -409,7 +428,72 @@ class DryRunRobotClient:
             )
         except PlanningError as e:
             raise make_error(ErrorCode.MOTN_SETUP_FAILED, detail=str(e)) from None
+        self._gate_collisions(path)
         return self._result(path)
+
+    def _first_offending(
+        self, path: NDArray[np.float64]
+    ) -> tuple[int, list[tuple[str, str]]] | None:
+        """The first configuration along *path* the collision world refuses,
+        and the pairs it would enter — ``None`` when the path is clear.
+
+        Mirrors ``Par6Planner::gate_collisions``: a configuration may KEEP a
+        pair the start is already in — an arm inside a keep-out has to be
+        able to move its way out — but may not ADD one, and the path is
+        walked at ``COLLISION_STEP_RAD`` joint pitch with the resting
+        configuration always checked.
+
+        The runtime also refuses a path that stays inside its baseline pairs
+        while penetrating a keep-out DEEPER than the start does. That half
+        needs the hull-vs-world distance the runtime's shim exposes and
+        pinokin does not, so a preview starting inside a keep-out is the one
+        case where this is the more permissive of the two.
+        """
+        if not self._robot.has_collision_checking:
+            return None
+        baseline = set(self._robot.colliding_pairs(self._q))
+        last: NDArray[np.float64] | None = None
+        for k, q in enumerate(path):
+            if (
+                last is not None
+                and k + 1 != len(path)
+                and np.all(np.abs(q - last) <= _motion.COLLISION_STEP_RAD)
+            ):
+                continue
+            last = q
+            offending = [p for p in self._robot.colliding_pairs(q) if p not in baseline]
+            if offending:
+                return k, offending
+        return None
+
+    def _gate_collisions(self, path: NDArray[np.float64]) -> None:
+        """Refuse a whole planned path that would enter the collision world,
+        as the runtime's planner does — nothing is queued and the arm does
+        not move."""
+        found = self._first_offending(path)
+        if found is None:
+            return
+        k, offending = found
+        raise make_error(
+            ErrorCode.SYS_SELF_COLLISION,
+            sample=k,
+            total=len(path),
+            pairs=_format_pairs(offending),
+        )
+
+    def _stop_at_collision(self, path: NDArray[np.float64]) -> NDArray[np.float64]:
+        """*path* truncated where the collision world stops it.
+
+        A streamable is not refused whole the way a planned move is: the
+        runtime's ``StreamGate`` lets the arm ramp until the projected
+        configuration would collide and then stops the stream where it
+        stands (``bridge.rs``), so the preview brakes in the same place
+        instead of drawing straight through the keep-out.
+        """
+        found = self._first_offending(path)
+        if found is None:
+            return path
+        return path[: found[0]] if found[0] else self._q[np.newaxis, :].copy()
 
     # ------------------------------------------------------------------
     # Blend chain
@@ -597,6 +681,7 @@ class DryRunRobotClient:
             )
         except PlanningError as e:
             raise make_error(ErrorCode.TRAJ_NO_STEPS, detail=str(e)) from None
+        self._gate_collisions(path)
         return self._result(path)
 
     def _cart_path(
@@ -943,7 +1028,7 @@ class DryRunRobotClient:
             )
         except PlanningError as e:
             raise make_error(ErrorCode.MOTN_SETUP_FAILED, detail=str(e)) from None
-        return self._result(path)
+        return self._result(self._stop_at_collision(path))
 
     def servo_l(
         self, pose: list[float], *, speed: float = 1.0, accel: float = 1.0, **kwargs: Any
@@ -995,7 +1080,9 @@ class DryRunRobotClient:
                 detail="jog_j drives one joint at a time",
             )
         engine = JogEngine(self._q, self._dt)
-        return self._result(engine.run(fractions, float(duration)))
+        return self._result(
+            self._stop_at_collision(engine.run(fractions, float(duration)))
+        )
 
     def jog_l(
         self,
@@ -1053,7 +1140,7 @@ class DryRunRobotClient:
                 self._exec_limits.soft_max,
             )
             path.append(q.copy())
-        return self._result(np.stack(path))
+        return self._result(self._stop_at_collision(np.stack(path)))
 
     # ------------------------------------------------------------------
     # Configuration
@@ -1095,7 +1182,10 @@ class DryRunRobotClient:
         return 1
 
     def set_shapes(self, shapes: list[Shape], **kwargs: Any) -> int:
+        """Replace the preview's keep-outs — and enforce them, as the
+        runtime enforces the set the live client sends."""
         self._shapes = tuple(shapes)
+        self._robot.apply_shapes(list(shapes))
         return 1
 
     def tool_action(

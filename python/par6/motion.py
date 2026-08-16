@@ -59,6 +59,11 @@ NULL_MOVE_RAD = 1e-9
 WAYPOINT_SNAP_M = 5e-3
 MOVE_P_AUTO_BLEND_FRAC = 0.25
 
+#: Joint-space pitch of the collision gate \[rad\]
+#: (``planner.rs::COLLISION_STEP_RAD``): consecutive checked configurations
+#: along a planned path never differ by more than this on any joint.
+COLLISION_STEP_RAD = 0.02
+
 #: Longest chain of blended moves one motion can cover, from
 #: ``par6-server``'s ``blend_lookahead`` (and parol6's
 #: ``PAROL6_MAX_BLEND_LOOKAHEAD``): the planner never sees more of the
