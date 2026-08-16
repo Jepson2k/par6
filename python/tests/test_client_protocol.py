@@ -806,3 +806,23 @@ async def test_config_cased_tool_keys_round_trip_through_a_bare_client(
     await client.tool.close()
     actions = peer.of(CmdType.TOOL_ACTION)
     assert [(p[1], p[2]) for _, _, p in actions] == [(broadcast_key, "move")]
+
+
+async def test_the_client_enforces_the_same_bounds_as_the_runtime(
+    client: AsyncRobotClient, peer: ScriptedRuntime
+):
+    """wire.py claims to match the Rust codec rule-for-rule.
+
+    It did not: durations had no ceiling and collections no cap, so the
+    client happily built commands the daemon is guaranteed to refuse. The
+    jog case is the one that matters — a jog's ``duration`` IS the watchdog
+    that stops it, and an unbounded one arms a watchdog no operator
+    outlives.
+    """
+    with pytest.raises(wire.ProtocolError, match="3600"):
+        await client.delay(1e18)
+    with pytest.raises(wire.ProtocolError, match="60"):
+        await client.jog_j(0, 0.5, duration=1e9)
+    # Values a real program sends still pass.
+    await client.delay(2.0)
+    await client.jog_j(0, 0.5, duration=0.5)

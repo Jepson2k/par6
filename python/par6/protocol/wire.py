@@ -107,9 +107,24 @@ def _opt_frac(v: object, name: str) -> None:
         _frac(v, name)
 
 
-def _dur(v: object, name: str) -> None:
+#: Bounds mirrored from the Rust codec (`par6-proto::command`). They are
+#: not generated, so they are stated here and pinned by
+#: `test_protocol_golden`; the Rust side exists because
+#: `Duration::from_secs_f64` and `Instant + Duration` panic near f64's
+#: range, and a jog `duration` IS the watchdog that stops the jog.
+MAX_DURATION_S = 3600.0
+MAX_JOG_DURATION_S = 60.0
+MAX_WAYPOINTS = 10_000
+MAX_SHAPES = 256
+#: Elements in the STATUS error tuple:
+#: `[command_index, code, title, cause, effect, remedy]`.
+_ERROR_ELEMS = 6
+
+
+def _dur(v: object, name: str, hi: float = MAX_DURATION_S) -> None:
     _f(v, name)
     _req(v > 0.0, f"{name}: must be > 0")  # type: ignore[operator]
+    _req(v <= hi, f"{name}: must be <= {hi}")  # type: ignore[operator]
 
 
 def _uint(v: object, name: str, hi: int = 0xFFFF_FFFF_FFFF_FFFF) -> None:
@@ -172,6 +187,10 @@ def _waypoints(v: object, name: str) -> None:
     _req(
         isinstance(v, list) and len(v) >= 2,
         f"{name}: requires at least 2 waypoints",
+    )
+    _req(
+        len(v) <= MAX_WAYPOINTS,  # type: ignore[arg-type]
+        f"{name}: at most {MAX_WAYPOINTS} waypoints",
     )
     for wp in v:  # type: ignore[union-attr]
         _vec6(wp, name)
@@ -238,6 +257,7 @@ def _v_set_tcp_offset(p: list) -> None:
 
 def _v_set_shapes(p: list) -> None:
     _req(isinstance(p[0], list), "set_shapes.shapes: must be an array")
+    _req(len(p[0]) <= MAX_SHAPES, f"set_shapes.shapes: at most {MAX_SHAPES} shapes")
     for s in p[0]:
         _shape(s)
 
@@ -268,13 +288,13 @@ def _v_servo(prefix: str) -> Callable[[list], None]:
 
 def _v_jog_j(p: list) -> None:
     _signed_frac6(p[0], "jog_j.speeds")
-    _dur(p[1], "jog_j.duration")
+    _dur(p[1], "jog_j.duration", MAX_JOG_DURATION_S)
     _opt_frac(p[2], "jog_j.accel")
 
 
 def _v_jog_l(p: list) -> None:
     _signed_frac6(p[0], "jog_l.velocities")
-    _dur(p[1], "jog_l.duration")
+    _dur(p[1], "jog_l.duration", MAX_JOG_DURATION_S)
     _frame(p[2], "jog_l.frame")
     _opt_frac(p[3], "jog_l.accel")
 
@@ -657,15 +677,34 @@ def decode_status_bin_into(data: bytes, buf: StatusBuffer) -> bool:
         buf.executing_index = msg[16]
         buf.completed_index = msg[17]
         buf.last_checkpoint = msg[18]
+        # Shape-checked, not just coerced: `tuple()` accepts any iterable,
+        # so a string became a tuple of characters and a dict its keys.
+        # The Rust decoder rejects the packet on arity, dropping the frame;
+        # coercing here turned a corrupt frame into wrong robot state.
         raw_error = msg[19]
-        buf.error = tuple(raw_error) if raw_error is not None else None
+        if raw_error is None:
+            buf.error = None
+        elif isinstance(raw_error, (list, tuple)) and len(raw_error) == _ERROR_ELEMS:
+            buf.error = tuple(raw_error)
+        else:
+            raise ProtocolError(
+                f"STATUS error field must be nil or {_ERROR_ELEMS} elements, "
+                f"got {raw_error!r}"
+            )
         buf.queued_segments = msg[20]
         buf.queued_duration = msg[21]
         buf.action_params = msg[22]
 
+        # A malformed tool_status is a corrupt frame, not "no tool": the
+        # Rust decoder returns Arity and drops the packet, where degrading
+        # to None would show the tool detached while the arm still holds it.
         raw_ts = msg[23]
+        if raw_ts is not None and not (
+            isinstance(raw_ts, (list, tuple)) and len(raw_ts) == 8
+        ):
+            raise ProtocolError(f"STATUS tool_status must be nil or 8 elements, got {raw_ts!r}")
         ts = buf.tool_status
-        if raw_ts is not None and isinstance(raw_ts, list) and len(raw_ts) == 8:
+        if raw_ts is not None:
             ts.key = raw_ts[0]
             ts.state = ToolState(raw_ts[1])
             ts.engaged = raw_ts[2]
