@@ -171,10 +171,53 @@ fn replies_map_onto_their_own_bus_state_fields() {
     let g = state.gripper.reply.expect("cmd 60 decoded");
     assert_eq!(g.position, 252);
     assert_eq!(g.current_ma, -120);
-    assert_eq!(g.object_detection, ObjectDetection::DetectedOpening);
+    // 0xa1 = 0b1010_0001: bit 5 set, bit 4 clear. Firmware puts the
+    // status value's LOW bit at 5 and its HIGH bit at 4, so that is
+    // value 1 — detected while closing.
+    assert_eq!(g.object_detection, ObjectDetection::DetectedClosing);
     assert!(g.activated && g.calibrated);
     assert!(state.gripper.live_error_bit);
     assert_eq!(state.nodes[6].position_ticks, None);
+}
+
+/// Every gripper object-detection code, packed the way the firmware packs
+/// it rather than the way our decoder happens to read it.
+///
+/// `Gripper_pack_data` builds a bool array `{activated, action_status,
+/// detection_bit_1, detection_bit_2, …}` where `detection_bit_1` is the
+/// status value's LSB and `detection_bit_2` its MSB, then `bitsToByte`
+/// maps array index `i` onto bit `7 - i`. So the LSB lands on bit 5 and
+/// the MSB on bit 4 — the opposite order from reading the byte's own bits
+/// high-to-low, which is what made codes 1 and 2 decode transposed.
+#[test]
+fn gripper_object_detection_matches_the_firmware_bit_order() {
+    /// Pack a status byte exactly as the firmware does, for status `v`.
+    fn firmware_status_byte(v: u8) -> u8 {
+        let lsb = v & 1;
+        let msb = (v >> 1) & 1;
+        (lsb << 5) | (msb << 4)
+    }
+
+    for (value, expected) in [
+        (0u8, ObjectDetection::Moving),
+        (1, ObjectDetection::DetectedClosing),
+        (2, ObjectDetection::DetectedOpening),
+        (3, ObjectDetection::ReachedNoObject),
+    ] {
+        let mut state = BusState::default();
+        decode_into(
+            &CanFrame::data_frame(
+                pack_can_id(6, CommandId::RespondGripperData, false),
+                &[0, 0, 0, firmware_status_byte(value)],
+            ),
+            &mut state,
+        );
+        let g = state.gripper.reply.expect("cmd 60 decoded");
+        assert_eq!(
+            g.object_detection, expected,
+            "firmware status {value} must decode as {expected:?}"
+        );
+    }
 }
 
 /// Everything the RT tick does between syscalls — schedule the poll slot,

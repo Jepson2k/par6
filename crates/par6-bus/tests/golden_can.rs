@@ -336,7 +336,7 @@ fn rx_vectors_decode_value_exact() {
                     current_ma: -120,
                     activated: true,
                     action_status: false,
-                    object_detection: ObjectDetection::DetectedOpening,
+                    object_detection: ObjectDetection::DetectedClosing,
                     temperature_error: false,
                     timeout_error: false,
                     estop_error: false,

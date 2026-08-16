@@ -346,8 +346,9 @@ impl Default for NodeState {
     }
 }
 
-/// Object-detection field of the firmware gripper reply
-/// (cmd 60, bits (b5<<1)|b4).
+/// Object-detection field of the firmware gripper reply (cmd 60). The
+/// firmware packs this value's low bit into byte bit 5 and its high bit
+/// into bit 4, so the value is `(b4 << 1) | b5`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ObjectDetection {
     /// 0 — jaws moving.

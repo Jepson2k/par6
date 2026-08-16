@@ -712,8 +712,14 @@ fn expect_dlc(
     Ok(())
 }
 
-fn object_detection_from_bits(hi: bool, lo: bool) -> ObjectDetection {
-    match (hi, lo) {
+/// The 2-bit object-detection status, from its high and low bits.
+///
+/// The firmware fills its bool array LSB-first and `bitsToByte` maps array
+/// index `i` onto bit `7 - i`, so the status value's LOW bit lands on byte
+/// bit 5 and its HIGH bit on bit 4 — the reverse of the byte's own
+/// high-to-low order. Take the bits by role, never by position.
+fn object_detection_from_bits(msb: bool, lsb: bool) -> ObjectDetection {
+    match (msb, lsb) {
         (false, false) => ObjectDetection::Moving,
         (false, true) => ObjectDetection::DetectedClosing,
         (true, false) => ObjectDetection::DetectedOpening,
@@ -832,7 +838,9 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
                 current_ma: unpack_i16([d[1], d[2]]),
                 activated: bits[0],
                 action_status: bits[1],
-                object_detection: object_detection_from_bits(bits[2], bits[3]),
+                // bits[3] is byte bit 4 (the value's high bit), bits[2] is
+                // bit 5 (its low bit) — see `object_detection_from_bits`.
+                object_detection: object_detection_from_bits(bits[3], bits[2]),
                 temperature_error: bits[4],
                 timeout_error: bits[5],
                 estop_error: bits[6],

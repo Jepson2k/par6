@@ -518,8 +518,8 @@
       "rtr": false,
       "id_hex": "0x378",
       "data_hex": "fcff88a1",
-      "desc": "cmd 60 gripper reply (DLC 4): position 252, current -120 mA (bytes 1..3!), activated, object detection 2 (detected while opening), calibrated",
-      "derivation": "byte 3 MSB-first [activated,action_status,od_hi,od_lo,temp_err,timeout_err,estop_err,calibrated] = [1,0,1,0,0,0,0,1] -> 0xA1; object_detection = (od_hi<<1)|od_lo = 0b10 = 2"
+      "desc": "cmd 60 gripper reply (DLC 4): position 252, current -120 mA (bytes 1..3!), activated, object detection 1 (detected while closing), calibrated",
+      "derivation": "byte 3 MSB-first [activated,action_status,od_lo,od_hi,temp_err,timeout_err,estop_err,calibrated] = [1,0,1,0,0,0,0,1] -> 0xA1. Gripper_pack_data fills that array LSB-first (index 2 = value & 1, index 3 = value >> 1) and bitsToByte maps index i onto bit 7-i, so the value's LOW bit is byte bit 5 and its HIGH bit is bit 4: object_detection = (od_hi<<1)|od_lo = (0<<1)|1 = 1"
     },
     {
       "name": "rx_cmd10_ping_reply",

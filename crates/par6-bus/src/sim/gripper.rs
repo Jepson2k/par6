@@ -241,8 +241,13 @@ impl GripperSim {
     }
 
     /// Payload of the cmd-60 reply (position byte, i16 current, bit field
-    /// [activated, action_status, det_hi, det_lo, temp, timeout, estop,
+    /// [activated, action_status, det_lo, det_hi, temp, timeout, estop,
     /// calibrated] MSB-first).
+    ///
+    /// The detection bits go low-then-high, matching the firmware's own
+    /// `Gripper_pack_data`: the status value's LOW bit lands on byte bit 5
+    /// and its HIGH bit on bit 4. Emitting them the other way round is
+    /// invisible against our own decoder and wrong against the arm.
     pub fn firmware_reply(&self) -> (u8, i16, [bool; 8]) {
         let cur = if self.pressing {
             f64::from(self.cmd.current_ma)
@@ -258,8 +263,8 @@ impl GripperSim {
             [
                 self.cmd.activate || self.calibration_ticks_left > 0,
                 self.moving || self.calibration_ticks_left > 0,
-                det & 0b10 != 0,
                 det & 0b01 != 0,
+                det & 0b10 != 0,
                 self.driver.flags().temperature,
                 false,
                 self.estop_latched,
