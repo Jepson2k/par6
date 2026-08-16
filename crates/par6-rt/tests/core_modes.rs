@@ -231,7 +231,11 @@ fn homed_gate_refuses_motion_and_raises_not_homed_warning() {
     rig.boot_to_idle();
     rig.cmd(RtCommand::Enable);
 
-    for target in [Mode::Jog, Mode::Exec, Mode::Stream] {
+    // EXEC and STREAM target absolute positions, so they need a
+    // reference. JOG does not: it asks for a direction and a speed, and an
+    // arm can need jogging clear of an obstruction before it can be homed
+    // at all — the same reason the vendor and parol6 permit it.
+    for target in [Mode::Exec, Mode::Stream] {
         rig.cmd(RtCommand::SetMode(target));
         rig.tick();
         assert_eq!(rig.snap().mode, Mode::Idle, "{target:?} needs homed");
@@ -244,6 +248,17 @@ fn homed_gate_refuses_motion_and_raises_not_homed_warning() {
         .any(|e| e.code == par6_rt::ErrorCode::NotHomed);
     assert!(has_not_homed, "refusal raises the NOT_HOMED warning");
     assert!(!s.error_active, "NOT_HOMED is a warning, not a hard error");
+
+    // An unhomed JOG is accepted, so the operator can move the arm.
+    rig.cmd(RtCommand::SetMode(Mode::Jog));
+    rig.tick();
+    assert_eq!(
+        rig.snap().mode,
+        Mode::Jog,
+        "an unhomed arm must still be jog-able"
+    );
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
+    rig.tick();
 
     // HOMING itself is not homed-gated.
     rig.cmd(RtCommand::SetMode(Mode::Homing));

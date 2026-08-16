@@ -211,7 +211,8 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
         },
         E::MotnNotHomed => ErrorTemplate {
             title: "Robot not homed",
-            cause: "Planned motion requested while joint positions are unreferenced.",
+            cause: "Planned or streamed motion requested while joint positions \
+                    are unreferenced.",
             effect: "Motion command rejected before dispatch.",
             remedy: "Run home first; jogging remains available.",
         },

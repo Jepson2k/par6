@@ -47,11 +47,16 @@ pub fn gate(cmd: CmdType) -> Gate {
         | C::MoveP
         | C::ServoJ
         | C::ServoJPose
-        | C::ServoL
-        | C::JogJ
-        | C::JogL => {
+        | C::ServoL => {
             g.needs_homed = true;
         }
+        // Jog is deliberately NOT homed-gated. An arm can need jogging
+        // clear of an obstruction before it can be homed at all, and the
+        // homing sequence itself has to move joints that are by definition
+        // unreferenced. Planned motion still requires a reference, because
+        // it targets absolute coordinates; a jog only asks for a direction
+        // and a speed, and the soft-limit brake still bounds it.
+        C::JogJ | C::JogL => {}
         C::Teleport => g.needs_simulator = true,
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}

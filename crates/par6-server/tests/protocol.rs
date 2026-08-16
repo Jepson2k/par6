@@ -764,23 +764,18 @@ async fn gating_rejections_carry_specific_codes() {
         .await;
     assert!(home_idx >= 1);
 
-    // ...and so is a jog: the RT refuses the JOG mode entry without a
-    // home reference, so accepting one here would drop it silently and
-    // leave the operator pressing a button that does nothing. The
-    // rejection reaches the client even though success is unacked.
-    let err = c.expect_error(&jog_j()).await;
-    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
-    let err = c.expect_error(&jog_l()).await;
-    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
-    assert!(
-        !h.rt_events().contains(&RtEvent::Stream(CmdType::JogJ)),
-        "a refused jog must never reach the RT: {:?}",
-        h.rt_events()
-    );
-
-    // Homed again: the same jog is accepted.
-    h.publish(|_| {});
+    // ...but a jog is NOT refused. An arm can need jogging clear of an
+    // obstruction before it can be homed at all, so jog is gated on the
+    // collision world and the soft-limit brake rather than on a home
+    // reference — the RT's mode gate agrees, so nothing is dropped
+    // silently downstream.
     c.send(&jog_j()).await; // fire-and-forget: success is unacked
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+
+    // Homed: still accepted, unchanged.
+    h.publish(|_| {});
+    c.send(&jog_j()).await;
     h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
         .await;
 

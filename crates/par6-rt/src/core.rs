@@ -830,7 +830,14 @@ impl<B: DriverBus> RtCore<B> {
                 if self.errors.any_hard() {
                     return Err(GateRefusal::ErrorsActive);
                 }
-                let needs_home = matches!(target, Mode::Jog | Mode::Stream | Mode::Exec);
+                // JOG is deliberately absent: an arm can need jogging clear
+                // of an obstruction before it can be homed at all, and a
+                // jog asks only for a direction and a speed — nothing about
+                // it is expressed in absolute coordinates. STREAM and EXEC
+                // do target absolute positions, so they still need a
+                // reference. The soft-limit brake bounds an unhomed jog the
+                // same as any other.
+                let needs_home = matches!(target, Mode::Stream | Mode::Exec);
                 if needs_home && !self.homed {
                     self.not_homed_refused = true;
                     return Err(GateRefusal::NotHomed);
