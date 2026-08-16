@@ -264,6 +264,14 @@ pub trait RtCommands: Send {
     /// Disabling is immediate, and cancels any outstanding enable.
     fn set_enabled(&mut self, enabled: bool);
 
+    /// Drop every joint limp and hold there.
+    ///
+    /// The safest state the arm has: unlike the protective stop, which
+    /// holds position under power, this removes drive authority so a
+    /// trapped person or a jammed joint can be freed by hand. It persists
+    /// until a mode change takes the arm out of it.
+    fn safety_stop(&mut self);
+
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up
     /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`

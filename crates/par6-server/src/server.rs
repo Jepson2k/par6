@@ -494,6 +494,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 Ok(())
             }
+            C::SafetyStop => {
+                // Not a protective stop: the arm goes limp rather than
+                // holding position, and stays that way until a mode change.
+                self.cancel_all_motion();
+                self.runtime.rt.safety_stop();
+                Ok(())
+            }
             C::Stop(p) => {
                 self.cancel_active_motion();
                 if p.clear_queue {
@@ -1851,6 +1858,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
     match tag {
         T::Reset => "reset",
         T::Estop => "estop",
+        T::SafetyStop => "safety_stop",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

@@ -1332,6 +1332,21 @@ class AsyncRobotClient(_RobotClientABC):
         """
         return await self._system(CmdType.ESTOP, [])
 
+    async def safety_stop(self) -> int:
+        """Drop every joint limp and hold there.
+
+        The safest state the arm has. Unlike :meth:`estop`, which holds
+        position under power, this removes drive authority — so a trapped
+        person or a jammed joint can be freed by hand. The arm stays limp
+        until a mode change takes it out.
+
+        Category: Control
+
+        Example:
+            rbt.safety_stop()
+        """
+        return await self._system(CmdType.SAFETY_STOP, [])
+
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.
 

@@ -393,6 +393,7 @@ def _v_tool_action(p: list) -> None:
 _COMMAND_SPECS: dict[CmdType, tuple[int, Callable[[list], None]]] = {
     CmdType.RESET: (0, _v_none),
     CmdType.ESTOP: (0, _v_none),
+    CmdType.SAFETY_STOP: (0, _v_none),
     CmdType.STOP: (1, _v_stop),
     CmdType.WRITE_IO: (2, _v_write_io),
     CmdType.SIMULATOR: (1, _v_simulator),

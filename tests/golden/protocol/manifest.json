@@ -33,6 +33,20 @@
     },
     {
       "class": "SYSTEM",
+      "cmd": "SAFETY_STOP",
+      "file": "cmd_safety_stop.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_safety_stop",
+      "req_id": 2,
+      "tag": 22,
+      "wire": [
+        22,
+        2
+      ]
+    },
+    {
+      "class": "SYSTEM",
       "cmd": "STOP",
       "file": "cmd_stop.bin",
       "idempotency_key": null,

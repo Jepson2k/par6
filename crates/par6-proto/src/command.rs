@@ -411,6 +411,7 @@ pub enum Command {
     // SYSTEM
     Reset,
     Estop,
+    SafetyStop,
     Stop(Stop),
     WriteIo(WriteIo),
     Simulator(Simulator),
@@ -469,6 +470,7 @@ impl Command {
         match self {
             C::Reset => CmdType::Reset,
             C::Estop => CmdType::Estop,
+            C::SafetyStop => CmdType::SafetyStop,
             C::Stop(_) => CmdType::Stop,
             C::WriteIo(_) => CmdType::WriteIo,
             C::Simulator(_) => CmdType::Simulator,
@@ -546,6 +548,7 @@ impl Command {
             | C::Simulator(_)
             | C::Reset
             | C::Estop
+            | C::SafetyStop
             | C::ResetState
             | C::SetCompletionPolicy(_)
             | C::Ping
@@ -815,7 +818,7 @@ fn waypoints(what: &'static str, wps: &[[f64; 6]]) -> Result<(), DecodeError> {
 fn arity(tag: CmdType) -> usize {
     use CmdType as T;
     match tag {
-        T::Reset | T::Estop | T::ResetState | T::ResetLoopStats => 2,
+        T::Reset | T::Estop | T::SafetyStop | T::ResetState | T::ResetLoopStats => 2,
         T::Ping
         | T::Status
         | T::Angles
@@ -898,6 +901,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
     match cmd {
         C::Reset
         | C::Estop
+        | C::SafetyStop
         | C::ResetState
         | C::ResetLoopStats
         | C::Ping
@@ -1195,6 +1199,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
     let cmd = match tag {
         T::Reset => Command::Reset,
         T::Estop => Command::Estop,
+        T::SafetyStop => Command::SafetyStop,
         T::Stop => Command::Stop(Stop {
             clear_queue: r.bool()?,
         }),

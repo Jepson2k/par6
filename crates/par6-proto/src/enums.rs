@@ -56,6 +56,11 @@ wire_enum! {
         SetCompletionPolicy = 20,
         /// Select the telemetry recipe. Unknown names are refused.
         SetRecipe = 21,
+        /// Drop every joint limp (torque-only zero) and stay there until a
+        /// mode change. The safest state the arm has: unlike `Estop`, which
+        /// holds position actively, this removes drive authority so a
+        /// trapped person or a jammed joint can be freed by hand.
+        SafetyStop = 22,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -251,6 +256,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
     match cmd {
         C::Reset
         | C::Estop
+        | C::SafetyStop
         | C::Stop
         | C::WriteIo
         | C::Simulator
