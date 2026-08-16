@@ -146,6 +146,15 @@ impl VirtualDriver {
     /// discarded whole — no state change, no watchdog feed.
     pub fn on_data_frame(&mut self, cmd: CommandId, d: &[u8]) -> ReplyKind {
         use CommandId::*;
+        // Firmware sets `watchdog_reset = 1` only in the data-pack cases
+        // that install a Controller_mode, and only on a well-formed frame:
+        // the wrong-DLC branch sets `Wrong_DL` instead and feeds nothing.
+        let fed = matches!(
+            (cmd, d.len()),
+            (CommandId::DataPack1, 8 | 5 | 2)
+                | (CommandId::DataPackPd, 8)
+                | (CommandId::DataPackHall, 4)
+        );
         let reply = match (cmd, d.len()) {
             (DataPack1, 8) => {
                 self.mode = Mode::Position {
@@ -238,7 +247,15 @@ impl VirtualDriver {
                 self.flags.error = true;
                 ReplyKind::None
             }
-            // Wrong DLC or a non-driver command: whole-frame discard.
+            // A wrong-DLC frame on a command that HAS a reply: firmware
+            // sets `Wrong_DL = 1` and then answers anyway ("Always respond
+            // with this", `Data_pack_1_CAN()` / `Gripper_pack_data()`).
+            // State is untouched and the watchdog is not fed, but replies
+            // keep flowing and the node stays Fresh — the hardware failure
+            // signature is a stream of unchanging replies, not silence.
+            (CommandId::DataPack1 | CommandId::DataPackPd, _) => ReplyKind::Motion,
+            (CommandId::DataPackHall, _) => ReplyKind::Hall,
+            // A non-driver command: nothing to answer.
             _ => return ReplyKind::None,
         };
         // Firmware sets `watchdog_reset = 1` only in the data-pack cases
@@ -249,7 +266,7 @@ impl VirtualDriver {
         // watchdog running even though every frame was accepted. Those
         // arms are exactly the ones that arm the driver, which is what
         // Motion/Hall mark here.
-        if matches!(reply, ReplyKind::Motion | ReplyKind::Hall) {
+        if fed {
             self.ticks_since_data = 0;
         }
         reply

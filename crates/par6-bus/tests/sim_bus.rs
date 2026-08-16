@@ -699,7 +699,12 @@ fn wrong_dlc_frames_discarded_whole() {
 
     // A cmd-2 frame with DLC 6 (a truncated position pack, bytes that
     // would decode as a huge position if partially applied) must change
-    // NOTHING: no mode switch, no reply, no state jump.
+    // NOTHING: no mode switch, no state jump, no watchdog feed. It IS
+    // still answered — firmware sets `Wrong_DL = 1` and then falls through
+    // to `Data_pack_1_CAN()` under a comment reading "Always respond with
+    // this", and the gripper case does the same via `Gripper_pack_data()`.
+    // So the hardware signature of a malformed stream is replies that keep
+    // arriving with nothing changing, not silence.
     let bad_motion = CanFrame::data_frame(
         pack_can_id(robot.joints[3].node_id, CommandId::DataPack1, false),
         &[0x7F; 6],
@@ -715,7 +720,11 @@ fn wrong_dlc_frames_discarded_whole() {
         rig.bus.inject_host_frame(&bad_motion);
         rig.bus.inject_host_frame(&bad_gripper);
         let drained = rig.step(&cmds, &GripperCommand::FirmwarePoll);
-        assert_eq!(drained, baseline, "a discarded frame produced a reply");
+        assert_eq!(
+            drained,
+            baseline + 2,
+            "a malformed frame must still be answered (motor + gripper)"
+        );
         let pos = rig.state.nodes[node].position_ticks.unwrap();
         let step = pos - last_pos;
         assert!(

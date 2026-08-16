@@ -120,8 +120,13 @@ impl GripperSim {
 
     /// DLC-0 empty poll: feeds the watchdog WITHOUT overwriting the
     /// in-progress firmware command or calibration.
+    ///
+    /// It also leaves the control mode alone. Firmware's `len == 0` branch
+    /// sets `Same_command`, feeds the watchdog and clears `Wrong_DL`, but
+    /// its `Controller_mode = 6` line is commented out — so a poll arriving
+    /// while the jaw is motor-driven must not halt the motor loop and snap
+    /// the jaw to the firmware position byte.
     pub fn on_empty_poll(&mut self) {
-        self.ctrl = Ctrl::Firmware;
         self.driver.feed_watchdog();
     }
 
@@ -266,7 +271,10 @@ impl GripperSim {
                 det & 0b01 != 0,
                 det & 0b10 != 0,
                 self.driver.flags().temperature,
-                false,
+                // `Gripper.timeout_error = controller.Watchdog_error`
+                // (motor_control.cpp): hardcoding false meant the bit could
+                // never be exercised, even with the gripper watchdog fired.
+                self.driver.flags().watchdog,
                 self.estop_latched,
                 self.calibrated,
             ],

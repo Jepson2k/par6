@@ -681,6 +681,13 @@ impl SimBus {
                     g.on_empty_poll();
                     None
                 }
+                // Any other DLC on the gripper pack: firmware sets
+                // `Wrong_DL = 1` and then calls `Gripper_pack_data()`
+                // anyway, so the cmd-60 replies keep flowing and the node
+                // stays Fresh. The hardware failure signature is a stream
+                // of replies with nothing changing — not the silence and
+                // staleness the fall-through to the motor path produced.
+                (CommandId::GripperDataPack, _) => None,
                 (CommandId::GripperCalibrate, 0) => {
                     // The calibration sweep replaces the latched command.
                     #[cfg(feature = "sim-mujoco")]
