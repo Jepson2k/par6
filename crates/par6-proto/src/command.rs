@@ -1094,7 +1094,11 @@ fn r_fixed6(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 6], DecodeEr
 /// no cross-check against the bytes actually present, so a nine-byte
 /// datagram can otherwise ask the allocator for hundreds of gigabytes and
 /// abort the process on `handle_alloc_error`.
-fn r_len(r: &mut Reader<'_>, what: &'static str, max: usize) -> Result<usize, DecodeError> {
+pub(crate) fn r_len(
+    r: &mut Reader<'_>,
+    what: &'static str,
+    max: usize,
+) -> Result<usize, DecodeError> {
     let n = r.array_len()?;
     check(n <= max, what, &format!("at most {max} elements"))?;
     Ok(n)

@@ -11,6 +11,7 @@
 //! reports timed-out transfers so the server can answer them with
 //! `COMM_CHUNK_TIMEOUT`.
 
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
@@ -21,6 +22,15 @@ use crate::DecodeError;
 /// Reassembly cap: a transfer larger than this is rejected outright
 /// (memory-exhaustion guard; generous next to any realistic waypoint list).
 pub const MAX_TRANSFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// How many transfers may be in flight at once.
+///
+/// The command socket is unauthenticated, so the number of transfers a
+/// sender can open is as much an input as the bytes inside them. Real
+/// clients run one bulk transfer at a time; a handful of slots covers
+/// retries and overlapping senders without letting the table grow on a
+/// stranger's say-so.
+pub const MAX_TRANSFERS_IN_FLIGHT: usize = 8;
 
 /// One chunk of a bulk transfer.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,6 +124,12 @@ pub enum ChunkError {
         /// `total` on the offending chunk.
         got: u16,
     },
+    /// Too many transfers are already open.
+    #[error("too many chunk transfers in flight ({in_flight})")]
+    TooManyTransfers {
+        /// Transfers open when the new one was refused.
+        in_flight: usize,
+    },
     /// `req_id` changed between chunks of one transfer.
     #[error("chunk req_id mismatch: transfer started with {expected}, got {got}")]
     ReqIdMismatch {
@@ -154,9 +170,13 @@ pub struct Expired {
 struct Transfer {
     req_id: u32,
     total: u16,
-    received: u16,
     bytes: usize,
-    parts: Vec<Option<Vec<u8>>>,
+    /// Received chunks by index. Keyed rather than pre-sized from
+    /// `total`, so the table costs what has actually arrived — a
+    /// 65 535-slot `Vec` would have cost ~1.57 MB on the strength of one
+    /// ~20-byte datagram's `total` field. `BTreeMap` keeps the indices
+    /// ordered for reassembly.
+    parts: BTreeMap<u16, Vec<u8>>,
     last_activity: Instant,
 }
 
@@ -178,15 +198,21 @@ impl Reassembler {
     /// Feed one chunk. Returns the completed transfer once every chunk has
     /// arrived (in any order; duplicates are idempotent).
     pub fn push(&mut self, chunk: Chunk, now: Instant) -> Result<Option<Assembled>, ChunkError> {
+        if !self.transfers.contains_key(&chunk.transfer_id)
+            && self.transfers.len() >= MAX_TRANSFERS_IN_FLIGHT
+        {
+            return Err(ChunkError::TooManyTransfers {
+                in_flight: self.transfers.len(),
+            });
+        }
         let t = self
             .transfers
             .entry(chunk.transfer_id)
             .or_insert_with(|| Transfer {
                 req_id: chunk.req_id,
                 total: chunk.total,
-                received: 0,
                 bytes: 0,
-                parts: vec![None; chunk.total as usize],
+                parts: BTreeMap::new(),
                 last_activity: now,
             });
         if t.total != chunk.total {
@@ -206,21 +232,19 @@ impl Reassembler {
             });
         }
         t.last_activity = now;
-        let slot = &mut t.parts[chunk.index as usize];
-        if slot.is_none() {
+        if !t.parts.contains_key(&chunk.index) {
             if t.bytes + chunk.data.len() > MAX_TRANSFER_BYTES {
                 self.transfers.remove(&chunk.transfer_id);
                 return Err(ChunkError::TooLarge);
             }
             t.bytes += chunk.data.len();
-            t.received += 1;
-            *slot = Some(chunk.data);
+            t.parts.insert(chunk.index, chunk.data);
         }
-        if t.received == t.total {
+        if t.parts.len() == usize::from(t.total) {
             let t = self.transfers.remove(&chunk.transfer_id).expect("present");
             let mut payload = Vec::with_capacity(t.bytes);
-            for part in t.parts {
-                payload.extend_from_slice(&part.expect("all chunks received"));
+            for (_, part) in t.parts {
+                payload.extend_from_slice(&part);
             }
             return Ok(Some(Assembled {
                 req_id: t.req_id,
@@ -248,7 +272,7 @@ impl Reassembler {
                 Expired {
                     req_id: t.req_id,
                     transfer_id: id,
-                    received: t.received,
+                    received: t.parts.len() as u16,
                     total: t.total,
                 }
             })
@@ -315,6 +339,41 @@ mod tests {
         assert_eq!(done.payload, b"aabbcc");
         assert_eq!(done.req_id, 9);
         assert_eq!(ra.in_flight(), 0);
+    }
+
+    /// The command socket is unauthenticated, so both the bytes inside a
+    /// transfer and the number of transfers opened are attacker-chosen.
+    /// Neither may be able to size an allocation.
+    #[test]
+    fn a_transfer_costs_what_arrived_not_what_it_claims() {
+        let mut ra = Reassembler::new(Duration::from_secs(2));
+        let t0 = Instant::now();
+
+        // One ~20-byte datagram claiming the largest possible chunk count
+        // must not reserve a slot table for it: the old `vec![None; total]`
+        // cost ~1.57 MB apiece, before a single byte of payload arrived.
+        assert_eq!(ra.push(mk(1, 0, u16::MAX, b"aa"), t0).unwrap(), None);
+        assert_eq!(ra.in_flight(), 1);
+
+        // And the transfer table itself is bounded: past the cap a NEW
+        // transfer is refused rather than admitted.
+        for id in 2..=(MAX_TRANSFERS_IN_FLIGHT as u32) {
+            assert_eq!(ra.push(mk(id, 0, u16::MAX, b"aa"), t0).unwrap(), None);
+        }
+        assert_eq!(ra.in_flight(), MAX_TRANSFERS_IN_FLIGHT);
+        let over = ra.push(mk(9999, 0, u16::MAX, b"aa"), t0);
+        assert!(
+            matches!(over, Err(ChunkError::TooManyTransfers { .. })),
+            "a transfer past the cap must be refused, got {over:?}"
+        );
+        assert_eq!(
+            ra.in_flight(),
+            MAX_TRANSFERS_IN_FLIGHT,
+            "the refused transfer must not be admitted"
+        );
+
+        // An already-open transfer still accepts chunks at the cap.
+        assert_eq!(ra.push(mk(1, 1, u16::MAX, b"bb"), t0).unwrap(), None);
     }
 
     #[test]

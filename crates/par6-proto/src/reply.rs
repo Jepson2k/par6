@@ -583,8 +583,15 @@ fn r_u8_fixed<const N: usize>(
     Ok(out)
 }
 
+/// Bound on a reply's string list (tool names, queue entries). The
+/// command side has guarded its length headers since `r_len` was written;
+/// the reply and status decoders reserved on the sender's word, so an
+/// eleven-byte datagram could ask the allocator for a hundred gigabytes
+/// and abort the client on `handle_alloc_error`.
+const MAX_REPLY_STRINGS: usize = 512;
+
 fn r_strings(r: &mut Reader<'_>) -> Result<Vec<String>, DecodeError> {
-    let n = r.array_len()?;
+    let n = crate::command::r_len(r, "reply string list", MAX_REPLY_STRINGS)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(r.str()?.to_owned());
@@ -602,7 +609,7 @@ fn r_opt_tool_status(r: &mut Reader<'_>) -> Result<Option<ToolStatusWire>, Decod
 }
 
 fn r_shapes(r: &mut Reader<'_>) -> Result<Vec<crate::command::Shape>, DecodeError> {
-    let n = r.array_len()?;
+    let n = crate::command::r_len(r, "reply shapes", crate::command::MAX_SHAPES)?;
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         out.push(crate::command::r_shape(r)?);

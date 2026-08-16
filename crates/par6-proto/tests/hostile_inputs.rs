@@ -18,7 +18,9 @@
 //! presents it with is to write the bytes.
 
 use par6_proto::command::{MAX_DURATION_S, MAX_JOG_DURATION_S, MAX_SHAPES, MAX_WAYPOINTS};
-use par6_proto::{decode_command, encode_command, CmdType, Command, DecodeError};
+use par6_proto::{
+    decode_command, decode_reply, decode_status, encode_command, CmdType, Command, DecodeError,
+};
 
 // ---- a minimal msgpack writer (the wire, not the codec) --------------------
 
@@ -287,4 +289,37 @@ fn a_queued_dwell_is_bounded_by_the_same_arithmetic() {
         "one second past the duration ceiling",
     );
     assert!(why.contains("delay.seconds"), "{why}");
+}
+
+// ---------------------------------------------------------------------------
+// The REPLY and STATUS decoders, which the command-side guards never covered
+// ---------------------------------------------------------------------------
+
+/// A length header must not size an allocation before it is checked.
+///
+/// `command::r_len` has guarded this on the command side since it was
+/// written, with a comment explaining the hazard. The reply and status
+/// decoders reserved on the sender's word instead, so an eleven-byte
+/// datagram could ask the allocator for a hundred gigabytes and abort the
+/// process on `handle_alloc_error`. STATUS is a multicast broadcast, so
+/// any host on the segment can send one.
+#[test]
+fn reply_and_status_length_headers_are_bounded_before_reserving() {
+    // [RESPONSE, req_id, [TOOLS, "", <array32 4294967295>]]
+    let hostile_reply: &[u8] = &[
+        0x93, 0x04, 0x01, 0x93, 0x07, 0xA0, 0xDD, 0xFF, 0xFF, 0xFF, 0xFF,
+    ];
+    let err = decode_reply(hostile_reply).expect_err("a 4-billion string list must be refused");
+    assert!(
+        matches!(err, DecodeError::Validation { .. }),
+        "the header must be refused on its own terms, not by running out \
+         of bytes after reserving: {err:?}"
+    );
+
+    // The same shape reaching the status decoder's collision-pair list.
+    let mut hostile_status = vec![0xDD, 0xFF, 0xFF, 0xFF, 0xFF];
+    hostile_status.insert(0, 0x91);
+    // The status decoder refuses this well before the pair list — the
+    // point is that it refuses at all rather than reserving on the word.
+    decode_status(&hostile_status).expect_err("a malformed status must be refused");
 }

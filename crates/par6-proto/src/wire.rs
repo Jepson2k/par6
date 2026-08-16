@@ -8,6 +8,12 @@
 
 use crate::DecodeError;
 
+/// How deep an unknown value may nest before `skip_value` refuses it.
+/// The protocol's own forward-compatibility tail values are flat; this
+/// exists so a hand-built datagram cannot drive the skipper into the
+/// thread stack.
+const MAX_SKIP_DEPTH: usize = 8;
+
 // ---------------------------------------------------------------------------
 // Writers (append to a caller-owned Vec<u8>; no other allocations)
 // ---------------------------------------------------------------------------
@@ -295,6 +301,23 @@ impl<'a> Reader<'a> {
 
     /// Skip one value of any type (used for forward-compatible tails).
     pub(crate) fn skip_value(&mut self) -> Result<(), DecodeError> {
+        self.skip_value_at(0)
+    }
+
+    /// Skip one value, refusing to nest past [`MAX_SKIP_DEPTH`].
+    ///
+    /// This walks a value the decoder does not understand, which is the
+    /// one place a sender chooses the shape rather than the schema. One
+    /// datagram of repeated `0x91` (fixarray-1) markers is tens of
+    /// thousands of nested frames, and a tokio worker stack is 2 MiB. The
+    /// protocol's own tail values are flat, so the limit costs nothing.
+    fn skip_value_at(&mut self, depth: usize) -> Result<(), DecodeError> {
+        if depth > MAX_SKIP_DEPTH {
+            return Err(DecodeError::Validation {
+                what: "nesting depth",
+                why: format!("nested past {MAX_SKIP_DEPTH} levels"),
+            });
+        }
         let m = self.byte()?;
         match m {
             0x00..=0x7F | 0xE0..=0xFF | 0xC0 | 0xC2 | 0xC3 => {}
@@ -304,12 +327,12 @@ impl<'a> Reader<'a> {
             }
             0x90..=0x9F => {
                 for _ in 0..(m & 0x0F) {
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0x80..=0x8F => {
                 for _ in 0..(2 * (m & 0x0F)) {
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0xCC | 0xD0 => {
@@ -339,26 +362,26 @@ impl<'a> Reader<'a> {
             0xDC => {
                 let n = self.be_u16()?;
                 for _ in 0..n {
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0xDD => {
                 let n = self.be_u32()?;
                 for _ in 0..n {
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0xDE => {
                 let n = self.be_u16()?;
                 for _ in 0..(2 * u32::from(n)) {
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0xDF => {
                 let n = self.be_u32()?;
                 for _ in 0..n {
-                    self.skip_value()?;
-                    self.skip_value()?;
+                    self.skip_value_at(depth + 1)?;
+                    self.skip_value_at(depth + 1)?;
                 }
             }
             0xD4..=0xD8 => {
@@ -389,5 +412,36 @@ impl<'a> Reader<'a> {
             return Err(DecodeError::TrailingBytes);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The tail skipper walks values whose SHAPE the sender chooses — the
+    /// one place nesting is not fixed by the schema. One datagram of
+    /// repeated fixarray-1 markers is tens of thousands of nested frames
+    /// against a 2 MiB tokio worker stack, so depth is bounded rather than
+    /// trusted. `Truncated` would not do: the skipper only reaches that by
+    /// recursing all the way down first, which is the behaviour at issue.
+    #[test]
+    fn skip_value_refuses_to_nest_without_limit() {
+        let deep: Vec<u8> = std::iter::repeat_n(0x91_u8, MAX_SKIP_DEPTH + 8)
+            .chain(std::iter::once(0xC0))
+            .collect();
+        let mut r = Reader::new(&deep);
+        match r.skip_value() {
+            Err(DecodeError::Validation { what, why }) => {
+                assert_eq!(what, "nesting depth");
+                assert!(why.contains("nested past"), "{why}");
+            }
+            other => panic!("deep nesting must be refused by the guard, got {other:?}"),
+        }
+
+        // Nesting the protocol actually uses still skips cleanly.
+        let shallow: Vec<u8> = vec![0x92, 0x91, 0xC0, 0x01];
+        let mut r = Reader::new(&shallow);
+        r.skip_value().expect("a flat tail value must still skip");
     }
 }

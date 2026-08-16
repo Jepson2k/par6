@@ -338,7 +338,14 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     let tcp_speed = r.f64()?;
     let simulator_active = r.bool()?;
     let collision_active = r.bool()?;
-    let n_pairs = r.array_len()?;
+    // STATUS is a multicast broadcast any host on the segment can send,
+    // so its length headers are as untrusted as a command's. The world is
+    // capped at MAX_SHAPES geometries, which bounds the pairs they form.
+    let n_pairs = crate::command::r_len(
+        &mut r,
+        "collision pairs",
+        crate::command::MAX_SHAPES * crate::command::MAX_SHAPES,
+    )?;
     let mut collision_pairs = Vec::with_capacity(n_pairs);
     for _ in 0..n_pairs {
         let pn = r.array_len()?;
