@@ -241,15 +241,54 @@ impl VirtualDriver {
             // Wrong DLC or a non-driver command: whole-frame discard.
             _ => return ReplyKind::None,
         };
-        self.ticks_since_data = 0;
+        // Firmware sets `watchdog_reset = 1` only in the data-pack cases
+        // that install a Controller_mode (and on RTR polls, fed by
+        // `feed_watchdog`). Idle, Estop, Clear_Error, the gain/limit
+        // config writes and the watchdog setup itself do NOT feed it — so
+        // a config-only or idle-only traffic pattern keeps the arm's
+        // watchdog running even though every frame was accepted. Those
+        // arms are exactly the ones that arm the driver, which is what
+        // Motion/Hall mark here.
+        if matches!(reply, ReplyKind::Motion | ReplyKind::Hall) {
+            self.ticks_since_data = 0;
+        }
         reply
+    }
+
+    /// Feed the watchdog for an answered RTR telemetry poll.
+    ///
+    /// Firmware feeds on every `REMOTE_FRAME` it answers (ping, encoder,
+    /// kt, temperature, …), which is what keeps a driver alive through the
+    /// RT's homing pattern of idle frames plus encoder polls. Unlike
+    /// [`Self::feed_watchdog`] this does NOT arm the driver: a poll is not
+    /// a command, and arming an uncommanded driver would start a watchdog
+    /// that then fires on a node nobody is driving.
+    pub fn feed_watchdog_poll(&mut self) {
+        self.ticks_since_data = 0;
     }
 
     /// One control-loop step at the measured plant state. Ages the
     /// watchdog first (a fire drops to Idle and latches the watchdog
     /// flag), then computes the mode's Ilim-saturated current output.
+    ///
+    /// A latched fault removes drive authority entirely, as it does on the
+    /// arm: firmware runs its mode switch only while `Error == 0`, and the
+    /// else branch forces `Controller_mode = 0` and drops SLEEP/RESET
+    /// until `Clear_Error`.
     pub fn control_step(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
         self.age_watchdog();
+        // Without this a test could fault a joint, keep commanding it, and
+        // pass — against hardware where the arm simply freewheels.
+        if self.flags.error {
+            self.mode = Mode::Idle;
+            self.integral_ma = 0.0;
+            self.cur_out_ma = 0.0;
+            return PlantCmd {
+                current_ma: 0.0,
+                vel_limit_ticks_s: self.vel_limit,
+                idle: true,
+            };
+        }
         let ilim = self.ilim_ma;
         let cur = match self.mode {
             Mode::Idle => {

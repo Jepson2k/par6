@@ -539,6 +539,11 @@ impl SimBus {
         let Some(d) = self.driver_mut(node) else {
             return;
         };
+        // An answered RTR poll is command traffic to the firmware, which
+        // feeds its watchdog on every REMOTE_FRAME it responds to. This is
+        // what keeps a driver alive through the RT's homing pattern of
+        // idle frames plus encoder polls.
+        d.feed_watchdog_poll();
         let err = d.err_bit();
         let frame = match kind {
             PollKind::Temperature => CanFrame::data_frame(

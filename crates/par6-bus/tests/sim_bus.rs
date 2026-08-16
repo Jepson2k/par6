@@ -78,14 +78,25 @@ impl Rig {
         drained
     }
 
-    /// A tick where the RT side fails to send the gripper its frame
-    /// (models the mandatory-empty-poll rule being broken).
-    fn step_without_gripper_frame(&mut self, cmds: &[JointCommand]) {
+    /// A tick with no bus traffic at all: no joint frames, no gripper
+    /// frame, no telemetry poll. This is the loss of the master that the
+    /// driver watchdog exists to catch — an ordinary [`Self::step`] keeps
+    /// polling in round-robin, and an answered poll feeds the watchdog on
+    /// real firmware.
+    fn step_silent(&mut self) {
+        self.tick += 1;
+        self.bus.begin_tick(self.tick);
+        self.bus.drain_rx(&mut self.state).expect("drain_rx");
+    }
+
+    /// A tick that sends joint frames but no telemetry poll and no
+    /// gripper frame — used to prove which frame classes feed the
+    /// firmware watchdog.
+    fn step_joints_only(&mut self, cmds: &[JointCommand]) {
         self.tick += 1;
         self.bus.begin_tick(self.tick);
         self.bus.drain_rx(&mut self.state).expect("drain_rx");
         self.bus.send_joint_commands(cmds).expect("joint send");
-        self.bus.poll_step().expect("poll_step");
     }
 
     fn idle_cmds(&self) -> Vec<JointCommand> {
@@ -473,11 +484,13 @@ fn watchdog_silence_drops_driver_to_idle() {
     let speed = rig.state.nodes[0].speed_ticks_s.unwrap();
     assert!(speed <= -6000, "drive never reached speed (at {speed})");
 
-    // Silence node 0 entirely (no data frame at all) while watching it
-    // through encoder RTR polls — RTR polls keep freshness alive but must
-    // NOT feed the driver watchdog.
+    // Stop COMMANDING node 0 but keep polling it. Firmware feeds its
+    // watchdog on every REMOTE_FRAME it answers (`OUT_IN_ENCODER` and its
+    // siblings set `watchdog_reset = 1`), so an answered poll proves the
+    // master is alive and the driver holds its last command. This is what
+    // carries a joint through the RT's homing pattern of idle frames plus
+    // encoder polls.
     cmds[0] = JointCommand::default();
-    let mut speeds = Vec::new();
     for _ in 0..(wd_ticks + 90) {
         rig.bus.queue_poll_override(
             PollAction::Poll {
@@ -487,20 +500,55 @@ fn watchdog_silence_drops_driver_to_idle() {
             1,
         );
         rig.step(&cmds, &GripperCommand::NoGripper);
-        speeds.push(rig.state.nodes[0].speed_ticks_s.unwrap());
     }
     assert_eq!(
         rig.bus.freshness(0),
         Freshness::Fresh,
         "polls keep freshness"
     );
-    // Driven right up to the configured deadline, idle-decayed after it.
-    let before_fire = speeds[wd_ticks as usize - 3];
+    let polled = rig.state.nodes[0].speed_ticks_s.unwrap();
+    assert!(
+        polled <= -6000,
+        "a polled driver holds its command ({polled}): firmware feeds the \
+         watchdog on every answered RTR request"
+    );
+
+    // Now go properly silent — no frames and no polls, the loss of the
+    // master the watchdog is actually for. Nothing reports during this
+    // window (a silent node sends nothing), so the driver is read back
+    // afterwards with a single poll; the watchdog has already latched by
+    // then and that poll cannot un-fire it.
+    for _ in 0..(wd_ticks - 3) {
+        rig.step_silent();
+    }
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 0,
+            kind: PollKind::Encoder,
+        },
+        1,
+    );
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    // The reply lands in RX and is drained by the NEXT tick's drain_rx.
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    let before_fire = rig.state.nodes[0].speed_ticks_s.unwrap();
     assert!(
         before_fire <= -6000,
         "driver dropped out {before_fire} before the configured watchdog window"
     );
-    let final_speed = *speeds.last().unwrap();
+    for _ in 0..(wd_ticks + 90) {
+        rig.step_silent();
+    }
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 0,
+            kind: PollKind::Encoder,
+        },
+        1,
+    );
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    let final_speed = rig.state.nodes[0].speed_ticks_s.unwrap();
     assert!(
         final_speed.abs() <= 60,
         "velocity {final_speed} did not decay to idle after the watchdog fired"
@@ -685,17 +733,23 @@ fn wrong_dlc_frames_discarded_whole() {
     // Discarded frames must not feed the watchdog either: silence the
     // node except for wrong-DLC frames and the watchdog still fires.
     cmds[3] = JointCommand::default();
+    // Only the malformed frames arrive: no polls, because firmware feeds
+    // its watchdog on every RTR request it answers, which would mask what
+    // this is testing. A wrong-DLC frame sets `Wrong_DL` and feeds
+    // nothing, so the watchdog must still fire.
     for _ in 0..(wd_ticks + 90) {
         rig.bus.inject_host_frame(&bad_motion);
-        rig.bus.queue_poll_override(
-            PollAction::Poll {
-                node: 3,
-                kind: PollKind::Encoder,
-            },
-            1,
-        );
-        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        rig.step_silent();
     }
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 3,
+            kind: PollKind::Encoder,
+        },
+        1,
+    );
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
     assert!(
         rig.state.nodes[node].speed_ticks_s.unwrap().abs() <= 60,
         "wrong-DLC frames fed the watchdog (drive still running)"
@@ -902,8 +956,12 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     for _ in 0..20 {
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
     }
+    // Genuine silence: no gripper frame AND no telemetry poll. An
+    // answered RTR poll feeds the firmware watchdog, so leaving the
+    // round-robin running would keep the gripper alive and the sequence
+    // would legitimately continue.
     for _ in 0..(wd_ticks + 20) {
-        rig.step_without_gripper_frame(&cmds);
+        rig.step_silent();
     }
     for _ in 0..u64::from(robot.ticks(3.0)) {
         rig.step(&cmds, &GripperCommand::FirmwarePoll);
@@ -1640,4 +1698,98 @@ mod mujoco {
             assert!(sa == sb, "mujoco streams diverge at tick {}", t + 1);
         }
     }
+}
+
+/// Which frames feed the driver watchdog, stated against the firmware.
+///
+/// `Gripper_pack_data`'s siblings in `communication_CAN.cpp` set
+/// `watchdog_reset = 1` in exactly two places: the data-pack cases that
+/// install a `Controller_mode`, and the `OUT_IN_*` cases when the request
+/// is a `REMOTE_FRAME`. Idle, Estop, Clear_Error, the gain/limit writes
+/// and the watchdog setup itself do not feed it.
+///
+/// Getting this backwards is invisible from inside the simulator and
+/// wrong in both directions on the arm: the RT's homing pattern of idle
+/// frames plus encoder polls would fault here while running fine on
+/// hardware, and a config-only traffic pattern would pass here while
+/// faulting a real driver.
+#[test]
+fn only_motion_frames_and_answered_polls_feed_the_watchdog() {
+    let mut robot = par6();
+    robot.joints[0].watchdog_timeout_ms = 200;
+    let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
+
+    // Firmware Idle frames (cmd 12) alone do not feed it: the watchdog
+    // fires even though every tick carries an accepted, well-formed
+    // command frame. Note `JointCommand::idle()` is NOT this — that is
+    // velocity(0,0), a real data pack, which does feed.
+    let mut rig = Rig::boot(&robot, None, None);
+    let mut cmds = rig.idle_cmds();
+    cmds[0] = JointCommand::velocity(-8000, 0);
+    for _ in 0..60 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    cmds[0] = JointCommand::drop_to_idle();
+    for _ in 0..(wd_ticks + 60) {
+        rig.step_joints_only(&cmds);
+    }
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 0,
+            kind: PollKind::Errors,
+        },
+        1,
+    );
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    let flags = rig.state.nodes[0].error_flags.unwrap();
+    assert!(
+        flags.watchdog,
+        "idle frames must not feed the watchdog (flags {flags:?})"
+    );
+}
+
+/// A faulted driver has no drive authority until `Clear_Error`.
+///
+/// Firmware runs its whole mode switch inside `if (controller.Error == 0)`;
+/// the else branch forces `Controller_mode = 0` and drops SLEEP/RESET
+/// (`motor_control.cpp`). A simulator that keeps closing the loop through
+/// a fault lets a test fault a joint, keep commanding it, and pass —
+/// against an arm that simply freewheels.
+#[test]
+fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
+    let robot = par6();
+    let mut rig = Rig::boot(&robot, None, None);
+    let mut cmds = rig.idle_cmds();
+
+    cmds[0] = JointCommand::velocity(-8000, 0);
+    for _ in 0..120 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    assert!(
+        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
+        "drive never reached speed"
+    );
+
+    // Fault it while the SAME command keeps arriving every tick.
+    rig.bus.inject_fault(0, FaultKind::Temperature);
+    for _ in 0..200 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let faulted = rig.state.nodes[0].speed_ticks_s.unwrap();
+    assert!(
+        faulted.abs() <= 60,
+        "a faulted driver kept driving at {faulted}: firmware disables the \
+         power stage while Error is latched, however hard the host commands"
+    );
+
+    // Clearing restores authority — the fault gate is not a one-way trip.
+    rig.bus.send_clear_error(0, 3).unwrap();
+    for _ in 0..200 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    assert!(
+        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
+        "drive did not resume after clear-error"
+    );
 }
