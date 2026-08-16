@@ -971,9 +971,21 @@ class DryRunRobotClient:
         self._discard_chain()
         fractions = np.zeros(NUM_JOINTS, dtype=np.float64)
         if joints is not None and speeds is not None:
+            if len(joints) != len(speeds):
+                raise ValueError(
+                    f"jog_j got {len(joints)} joints and {len(speeds)} speeds"
+                )
             for j, s in zip(joints, speeds):
+                # Same guard as the live client: a negative index wraps
+                # onto another joint and previews the wrong axis.
+                if not 0 <= j < NUM_JOINTS:
+                    raise ValueError(f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}")
                 fractions[j] = float(s)
         elif joint >= 0:
+            if joint >= NUM_JOINTS:
+                raise ValueError(
+                    f"jog_j joint {joint} out of range 0..{NUM_JOINTS - 1}"
+                )
             fractions[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")

@@ -446,3 +446,38 @@ fn stream_watchdog_survives_a_fed_stream_and_still_fires_on_a_silent_one() {
     assert_eq!(s.state, ArmState::Disabled);
     assert_eq!(s.mode, Mode::ActiveError);
 }
+
+/// A setpoint the stream mode never consumed must not survive into the
+/// next session.
+///
+/// The latest-wins slot is drained only by the Stream dispatch arm, so a
+/// target published in the tick a session ended stays FRESH indefinitely.
+/// The next session would then consume it on its first tick and drive
+/// toward a pose the client abandoned — and one the admission gate
+/// checked against a collision world that may since have changed.
+#[test]
+fn a_setpoint_left_unconsumed_does_not_leak_into_the_next_stream_session() {
+    let mut rig = Rig::at_tick_dt(0.05);
+    rig.ready();
+
+    // A session that ends in the same tick a setpoint was published: the
+    // Stream arm never ran, so nothing drained the slot.
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    let mut abandoned = rig.pose;
+    abandoned[0] += 0.5;
+    rig.handles.stream.send(&abandoned);
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
+    assert_eq!(rig.snap().mode, Mode::Idle);
+
+    // A fresh session starts from where the arm actually is.
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    rig.tick();
+    let s = rig.snap();
+    assert_eq!(s.mode, Mode::Stream, "the new session must be streaming");
+    assert!(
+        (s.q_target[0] - abandoned[0]).abs() > 1e-6,
+        "the new session picked up the previous session's abandoned target \
+         ({:.4} rad); it must track the live pose instead",
+        s.q_target[0]
+    );
+}

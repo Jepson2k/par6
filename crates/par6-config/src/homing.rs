@@ -324,6 +324,26 @@ impl HomingConfig {
                 }
             }
         }
+        // The sequence must reference every joint. One that skips a joint
+        // (or is empty) still runs to completion, leaving the runtime
+        // nothing to distinguish "finished" from "referenced" — an arm
+        // reporting homed with an axis still on its boot-sector guess,
+        // free to jog, stream and execute.
+        let mut referenced = vec![false; num_joints];
+        for step in &self.sequence {
+            if let Some(home) = &step.home {
+                for j in &home.joints {
+                    referenced[usize::from(*j)] = true;
+                }
+            }
+        }
+        let missing: Vec<usize> = (0..num_joints).filter(|&i| !referenced[i]).collect();
+        if !missing.is_empty() {
+            return Err(invalid(
+                "homing.sequence",
+                format!("no step homes joint(s) {missing:?}; every joint must be referenced"),
+            ));
+        }
         validate_moves(&self.post_moves, num_joints, "homing.post_moves")?;
         Ok(())
     }

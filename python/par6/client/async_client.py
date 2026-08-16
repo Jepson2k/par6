@@ -972,6 +972,16 @@ class AsyncRobotClient(_RobotClientABC):
         """
         d, s = _timing(duration, speed)
         if pose is not None:
+            if rel:
+                # MOVE_J_POSE carries no rel flag on the wire, so honouring
+                # this silently would send an absolute base-frame move —
+                # near the origin that differs from the intended nudge by
+                # the arm's whole reach.
+                raise ValueError(
+                    "move_j(pose=..., rel=True) is not supported: MOVE_J_POSE is "
+                    "absolute. Compose the offset with the current TCP pose, or "
+                    "use move_j(angles=..., rel=True) for a relative joint move."
+                )
             index = await self._queued(
                 CmdType.MOVE_J_POSE,
                 [_f6(pose, "pose"), d, s, float(accel), _blend(r)],
@@ -1207,9 +1217,23 @@ class AsyncRobotClient(_RobotClientABC):
         """
         speed_arr = [0.0] * NUM_JOINTS
         if joints is not None and speeds is not None:
+            if len(joints) != len(speeds):
+                raise ValueError(
+                    f"jog_j got {len(joints)} joints and {len(speeds)} speeds"
+                )
             for j, s in zip(joints, speeds):
+                # An out-of-range index must not reach the array: a
+                # negative one lands on a different physical joint through
+                # Python's wrap-around, and the arm moves the wrong axis
+                # with nothing raised.
+                if not 0 <= j < NUM_JOINTS:
+                    raise ValueError(f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}")
                 speed_arr[j] = float(s)
         elif joint >= 0:
+            if joint >= NUM_JOINTS:
+                raise ValueError(
+                    f"jog_j joint {joint} out of range 0..{NUM_JOINTS - 1}"
+                )
             speed_arr[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")

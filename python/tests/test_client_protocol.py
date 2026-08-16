@@ -30,7 +30,7 @@ from waldoctl.tools import ToolState as WToolState
 
 from par6.client import AsyncRobotClient, RobotError
 from par6.protocol import wire
-from par6.protocol.constants import CmdType, Frame, MsgType, QueryType
+from par6.protocol.constants import NUM_JOINTS, CmdType, Frame, MsgType, QueryType
 
 
 @pytest.fixture
@@ -389,8 +389,42 @@ async def test_jog_semantics_and_validation(
         await client.jog_l("WRF")
     with pytest.raises(ValueError):
         await client.jog_l("BAD", "X", 0.5)
+    with pytest.raises(wire.ProtocolError):
+        await client.jog_j(0, float("inf"))
+    # An out-of-range joint must be refused, not indexed: a negative one
+    # wraps onto another joint in Python and would move the wrong axis with
+    # nothing raised, and a length mismatch silently drops speeds.
+    with pytest.raises(ValueError):
+        await client.jog_j(joints=[-1], speeds=[0.5])
+    with pytest.raises(ValueError):
+        await client.jog_j(joints=[NUM_JOINTS], speeds=[0.5])
+    with pytest.raises(ValueError):
+        await client.jog_j(joints=[0, 1], speeds=[0.5])
     # Nothing invalid ever reached the wire.
     assert len(peer.of(CmdType.JOG_J)) == 2 and len(peer.of(CmdType.JOG_L)) == 1
+
+
+async def test_move_j_refuses_a_relative_pose_instead_of_moving_absolute(
+    client: AsyncRobotClient, peer: ScriptedRuntime
+):
+    """MOVE_J_POSE carries no ``rel`` field on the wire.
+
+    Accepting ``rel=True`` and dropping it turns a small requested nudge
+    into an absolute move to those base-frame coordinates — near the origin
+    that is most of the arm's reach, with no error raised.
+    """
+    pose = [100.0, 0.0, 300.0, 0.0, 0.0, 0.0]
+    with pytest.raises(ValueError, match="absolute"):
+        await client.move_j(pose=pose, rel=True, duration=1.0)
+    assert not peer.of(CmdType.MOVE_J_POSE), "nothing may reach the wire"
+
+    # The absolute pose form still works, and the relative JOINT form is
+    # untouched — MOVE_J does carry a rel flag.
+    await client.move_j(pose=pose, duration=1.0)
+    await peer.wait_until(lambda: len(peer.of(CmdType.MOVE_J_POSE)) == 1)
+    await client.move_j([1.0] * NUM_JOINTS, rel=True, duration=1.0)
+    await peer.wait_until(lambda: len(peer.of(CmdType.MOVE_J)) == 1)
+    assert peer.of(CmdType.MOVE_J)[0][2][-1] is True
 
 
 async def test_servo_stream_reuses_tx_buffer_without_corruption(

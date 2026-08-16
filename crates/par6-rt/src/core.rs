@@ -47,7 +47,8 @@ use crate::hooks::{
 use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
-    ArmState, ErrorCode, JogStatus, Mode, StateSnapshot, StreamStatus, StreamSubstate,
+    ArmState, ErrorCode, HomingJointStatus, JogStatus, Mode, StateSnapshot, StreamStatus,
+    StreamSubstate,
 };
 use crate::timing::{LoopHealth, LoopTiming};
 use crate::MAX_JOINTS;
@@ -889,6 +890,14 @@ impl<B: DriverBus> RtCore<B> {
                     self.homed = false;
                 }
             }
+            Mode::Stream => {
+                // Only the Stream arm drains the latest-wins slot, so a
+                // setpoint published in the tick this session ended would
+                // stay FRESH indefinitely and retarget the NEXT session's
+                // first tick toward an abandoned pose — one the admission
+                // gate never re-checked against the current world.
+                let _ = self.stream_rx.take();
+            }
             _ => {}
         }
         // The park assertion is one-shot: consumed by FLASHING entry,
@@ -1179,9 +1188,26 @@ impl<B: DriverBus> RtCore<B> {
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Complete => {
-                    log::info!("homing sequence complete");
-                    self.homed = true;
-                    self.not_homed_refused = false;
+                    // Complete only says the sequence ran to its end, not
+                    // that it referenced anything: a config whose home
+                    // groups omit a joint still completes. Claiming
+                    // `homed` then unlocks JOG/STREAM/EXEC on axes whose
+                    // absolute position is still the boot sector guess.
+                    let statuses = self.homing.statuses();
+                    let unreferenced: Vec<usize> = (0..MAX_JOINTS)
+                        .filter(|&i| statuses[i] != HomingJointStatus::Done)
+                        .collect();
+                    if unreferenced.is_empty() {
+                        log::info!("homing sequence complete");
+                        self.homed = true;
+                        self.not_homed_refused = false;
+                    } else {
+                        log::warn!(
+                            "homing sequence completed without referencing {unreferenced:?}; \
+                             the arm stays unhomed"
+                        );
+                        self.homed = false;
+                    }
                     // Exit: full normal config reload for every node.
                     for i in 0..MAX_JOINTS {
                         let _ = self.bus.resend_node_config(self.node_of[i], 1);
