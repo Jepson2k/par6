@@ -24,7 +24,6 @@ par6-server = { workspace = true }
 par6-kin = { workspace = true, features = ["ffi"] }
 pinokin-sys = { path = "../pinokin-sys", features = ["ffi"] }
 tokio = { workspace = true }
-socketcan = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }

@@ -19,7 +19,6 @@ sim-mujoco = []
 
 [dependencies]
 par6-config = { workspace = true }
-par6-kin = { workspace = true }
 pinokin-sys = { path = "../pinokin-sys", features = ["ffi"], optional = true }
 socketcan = { workspace = true }
 thiserror = { workspace = true }

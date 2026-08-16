@@ -1,7 +1,44 @@
-The contents of assets/par6_description/ are copied from
-https://github.com/Source-Robotics/PAR6-Collaborative-Robot-Arm
-("PAR6 Description" directory), Copyright Source Robotics,
-licensed under the Apache License, Version 2.0.
+`assets/par6_description/` derives from the "PAR6 Description" directory of
+https://github.com/Source-Robotics/PAR6-Collaborative-Robot-Arm,
+Copyright Source Robotics.
 
-Copied unmodified. Contains: URDF models (flange / MSG gripper / SSG48
-gripper variants), MJCF (MuJoCo) models and scene, and STL meshes.
+## Licence
+
+Upstream states two different licences and neither statement is complete:
+
+- the repository's `LICENSE` file is the **CERN Open Hardware Licence
+  Version 2 - Strongly Reciprocal**, and the top-level `README.md` badge and
+  licensing section both name CERN-OHL-S v2;
+- `PAR6 Description/readme.md` says "This model is released under an
+  [Apache-2.0 License](LICENSE)" — but that link has no target: there is no
+  `LICENSE` file in that directory.
+
+par6 does not resolve the ambiguity. Anyone redistributing these files should
+check with Source Robotics; CERN-OHL-S v2 is the stricter reading and the one
+backed by an actual licence text.
+
+## What was changed
+
+Verbatim from upstream: the STL meshes, the reference images, `scene.xml`,
+`URDF_INERTIAL.pdf`, and everything else not listed below.
+
+Modified — inertials replaced with the vendor runtime's dynamics table, and
+joint coordinates re-based onto the vendor motor convention (see
+`par6_description/CHANGELOG.md` for the derivation and the equivalence check):
+
+    URDF/par6_flange/urdf/par6_flange.urdf
+    URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf
+    URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf
+    PAR6_MSG_gripper.xml
+    PAR6_SSG48_gripper.xml
+    assets/PAR6.xml
+
+Authored by par6, not upstream:
+
+    URDF/par6_flange/srdf/par6_flange.srdf
+    URDF/par6_msg_gripper/srdf/PAR6_MSG.srdf
+    URDF/par6_ssg48_gripper/srdf/par6_ssg48_urdf.srdf
+    URDF/par6_flange/urdf/par6_arm.urdf
+    CHANGELOG.md               (upstream's, with par6's entries appended)
+
+Removed: `urdf.md`. `readme.md` was trimmed of dead links and vendor TODOs.

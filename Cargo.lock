@@ -394,7 +394,6 @@ version = "0.1.0"
 dependencies = [
  "log",
  "par6-config",
- "par6-kin",
  "pinokin-sys",
  "serde_json",
  "socketcan",
@@ -427,7 +426,6 @@ name = "par6-motion"
 version = "0.1.0"
 dependencies = [
  "par6-config",
- "par6-kin",
  "par6-rt",
  "rsruckig",
  "thiserror",
@@ -485,7 +483,6 @@ dependencies = [
  "pinokin-sys",
  "serde",
  "serde_json",
- "socketcan",
  "thiserror",
  "tokio",
 ]

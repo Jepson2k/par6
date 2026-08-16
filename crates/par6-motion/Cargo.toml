@@ -7,12 +7,12 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
-par6-kin = { workspace = true }
 par6-config = { workspace = true }
 rsruckig = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-# Dev-only cycle (par6-rt depends on this crate's lib): used to prove the
-# Sample mirror matches the frozen ring contract and streams through it.
+# Dev-only: par6-rt depends on this crate's lib, so this is a test-time
+# edge only. Used to prove the Sample mirror matches the frozen ring
+# contract and streams through it.
 par6-rt = { workspace = true }
