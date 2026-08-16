@@ -911,6 +911,11 @@ impl<B: DriverBus> RtCore<B> {
     /// latches reset, then the settle countdown that outlasts the poll
     /// cycle before the latch wipes.
     fn begin_clear(&mut self) {
+        // Once per NODE, not once per error entry: a node with several
+        // latched fault types would otherwise get a triple apiece, and a
+        // full error list can run to ~99 frames in a single tick — past
+        // the classic-CAN budget, with the overflow dropped silently.
+        let mut cleared: u32 = 0;
         for entry in self.errors.list().as_slice() {
             let Some(j) = entry.joint else { continue };
             let node = if usize::from(j) < MAX_JOINTS {
@@ -918,10 +923,15 @@ impl<B: DriverBus> RtCore<B> {
             } else {
                 self.gripper_node
             };
+            let bit = 1u32 << u32::from(node);
+            if cleared & bit != 0 {
+                continue;
+            }
+            cleared |= bit;
             let _ = self.bus.send_clear_error(node, CLEAR_ERROR_REPEATS);
             self.bus.clear_lost_latch(node);
         }
-        if self.has_can_gripper {
+        if self.has_can_gripper && cleared & (1u32 << u32::from(self.gripper_node)) == 0 {
             let _ = self
                 .bus
                 .send_clear_error(self.gripper_node, CLEAR_ERROR_REPEATS);

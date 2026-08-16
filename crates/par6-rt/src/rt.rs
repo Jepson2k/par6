@@ -43,7 +43,12 @@ impl<B: DriverBus> RtCore<B> {
         setup_realtime(opts);
         let dt = self.tick_dt_s();
         let dt_ns = (dt * 1e9).round() as u64;
-        let mut deadline = monotonic_ns() + dt_ns;
+        // Anchor the schedule at the FIRST tick, which runs immediately:
+        // the `deadline += dt_ns` after it then puts the second wake
+        // exactly one period out. Starting a period ahead advanced twice
+        // before the first sleep, so the second tick fired at 2·dt and fed
+        // that period into the loop statistics.
+        let mut deadline = monotonic_ns();
         let mut last_wake = 0u64;
         let mut overrun = false;
         while !shutdown.load(Ordering::Relaxed) {
