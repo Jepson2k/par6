@@ -22,7 +22,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use par6_bus::RuntimeBus;
+use par6_bus::sim::SimBus;
+use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::ConfigBundle;
 use par6_proto::command::MAX_JOG_DURATION_S;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
@@ -869,28 +870,15 @@ impl RtCommands for RtBridge {
         if on == self.sim {
             return Ok(());
         }
-        Err(make_error(
-            ErrorCode::MotnSetupFailed,
-            UNATTRIBUTED,
-            &[(
-                "detail",
-                "live backend switching is not wired yet; restart par6d with/without --sim",
-            )],
-        ))
+        if on {
+            self.swap_to_sim()
+        } else {
+            self.swap_to_hardware(&self.bundle.robot.bus.interface.clone())
+        }
     }
 
     fn connect_hardware(&mut self, port: &str) -> Result<(), WireError> {
-        Err(make_error(
-            ErrorCode::MotnSetupFailed,
-            UNATTRIBUTED,
-            &[(
-                "detail",
-                &format!(
-                    "cannot switch to hardware bus '{port}' while running; \
-                     restart par6d without --sim to open the configured interface"
-                ),
-            )],
-        ))
+        self.swap_to_hardware(port)
     }
 
     fn reset_state(&mut self) {
@@ -918,6 +906,94 @@ impl RtCommands for RtBridge {
 
     fn clear_collision(&mut self) {
         self.cart.gate.lock().unwrap().latch = CollisionState::default();
+    }
+}
+
+impl RtBridge {
+    /// Swap the running bus for a fresh simulator, seeded at the pose
+    /// the arm was last measured at.
+    ///
+    /// Seeding is what makes this a mode change rather than a teleport:
+    /// a simulator started at its own default would jump the model to
+    /// the park pose the instant an operator flipped the toggle, and
+    /// every client watching STATUS would see the arm move. The home
+    /// reference survives with it — the pose it refers to is the pose
+    /// the sim now holds — which is the one direction where keeping it
+    /// is true.
+    ///
+    /// What this does NOT do is stop the physical arm. The drivers keep
+    /// whatever they were last commanded until their own watchdogs fire
+    /// (`bus.watchdog_action`), so on hardware this is a way to stop
+    /// LOOKING at the arm, not a way to park it.
+    fn swap_to_sim(&mut self) -> Result<(), WireError> {
+        let sim = SimBus::new();
+        let bundle = self.bundle.clone();
+        self.sim = true;
+        self.link.op(Box::new(move |core| {
+            let q = core.measured_q();
+            if let Err(e) = core.replace_bus(RuntimeBus::from(sim)) {
+                log::error!("simulator swap refused: {e}");
+                return;
+            }
+            let robot = &bundle.robot;
+            let n = robot.joints.len();
+            let Some(bus) = core.bus_mut().sim_mut() else {
+                log::error!("the simulator swap did not install a simulator");
+                return;
+            };
+            if let Err(e) = bus.teleport_joint_rad(&q[..n]) {
+                log::error!("simulator swap: plant re-seed failed: {e}");
+                return;
+            }
+            for (i, joint) in robot.joints.iter().enumerate() {
+                // Same re-basing the teleport path uses: the re-seeded
+                // sim reports the WRAPPED boot reading first, so the
+                // conversion has to be told which revolution it is on
+                // before that reading is interpreted.
+                let conv = par6_bus::spectral::JointConversion::from_config(joint);
+                let true0 = conv.motor_ticks(q[i]);
+                let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
+                core.set_joint_reference(i, wrapped0, q[i]);
+            }
+            core.reseed_motion_targets();
+            core.set_homed(true);
+            log::info!("bus backend: simulator, seeded at {q:?} rad");
+        }));
+        Ok(())
+    }
+
+    /// Swap the running bus for SocketCAN on `interface`.
+    ///
+    /// The interface is opened HERE, on the command plane, because that
+    /// is the only place a failure has a client to answer: a missing
+    /// interface, a missing `CAP_NET_ADMIN` or a wrong bitrate becomes
+    /// the reply to this command instead of a line in the journal.
+    ///
+    /// Homing does not survive: the arm's real joints are wherever they
+    /// are, and a home reference carried over from a simulator refers to
+    /// a pose the physical arm was never in. The core drops it, so the
+    /// first motion command afterwards is refused as un-homed rather
+    /// than run against a fiction.
+    fn swap_to_hardware(&mut self, interface: &str) -> Result<(), WireError> {
+        let mut cfg = self.bundle.robot.bus.clone();
+        interface.clone_into(&mut cfg.interface);
+        let hw = SocketCanBus::open(&cfg).map_err(|e| {
+            make_error(
+                ErrorCode::MotnSetupFailed,
+                UNATTRIBUTED,
+                &[("detail", &format!("cannot open '{}': {e}", cfg.interface))],
+            )
+        })?;
+        self.sim = false;
+        let name = cfg.interface.clone();
+        self.link.op(Box::new(move |core| {
+            if let Err(e) = core.replace_bus(RuntimeBus::from(hw)) {
+                log::error!("hardware swap refused: {e}");
+                return;
+            }
+            log::info!("bus backend: SocketCAN on '{name}' (un-homed)");
+        }));
+        Ok(())
     }
 }
 

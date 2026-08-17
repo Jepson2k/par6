@@ -277,4 +277,23 @@ impl Rig {
     pub fn bus_tick(&mut self) -> u64 {
         self.snap().tick
     }
+
+    /// Tick once, then read the snapshot that tick published.
+    pub fn snap_after_tick(&mut self) -> StateSnapshot {
+        self.tick();
+        self.snap()
+    }
+
+    /// Tick until `pred` holds, up to `max` ticks; panics with the last
+    /// snapshot if it never does.
+    pub fn tick_until(&mut self, max: u32, pred: impl Fn(&StateSnapshot) -> bool) -> StateSnapshot {
+        for _ in 0..max {
+            let s = self.snap_after_tick();
+            if pred(&s) {
+                return s;
+            }
+        }
+        let s = self.snap();
+        panic!("condition never held in {max} ticks; last snapshot: {s:?}");
+    }
 }

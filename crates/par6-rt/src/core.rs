@@ -53,6 +53,13 @@ use crate::state::{
 use crate::timing::{LoopHealth, LoopTiming};
 use crate::MAX_JOINTS;
 
+/// The `boot_configure` arguments, retained for a live bus swap.
+struct BootConfig {
+    robot: par6_config::RobotConfig,
+    gripper: Option<par6_config::GripperConfig>,
+    config_repeats: u8,
+}
+
 /// Boot one-shot: bus-scan selfcheck, then request IDLE (exit BOOTING).
 const BOOT_SELFCHECK_TICK: u64 = 8;
 /// Vendor boot workaround: full config re-sends at these ticks (may be
@@ -299,6 +306,12 @@ pub struct RtCore<B: DriverBus> {
     // Per-joint wire conversion + calibration.
     conv: [JointConversion; MAX_JOINTS],
     sector_done: [bool; MAX_JOINTS],
+    /// Tick the ACTIVE bus was brought up at; the boot one-shots are
+    /// measured from here so a live backend swap re-runs them.
+    bus_booted_at: u64,
+    /// What `boot_configure` needs, kept so a bus swapped in later is
+    /// configured exactly as the one opened at startup was.
+    boot: BootConfig,
     torque_ma_factor: [f64; MAX_JOINTS],
     torque_cal: [TorqueCal; MAX_JOINTS],
     /// `kt_source = "auto"`: adopt the drivers' own kt at the boot
@@ -466,6 +479,12 @@ impl<B: DriverBus> RtCore<B> {
             bus_state: BusState::new(),
             conv,
             sector_done: [false; MAX_JOINTS],
+            bus_booted_at: 0,
+            boot: BootConfig {
+                robot: robot.clone(),
+                gripper: gripper.cloned(),
+                config_repeats: robot.bus.boot_config_repeats,
+            },
             torque_ma_factor,
             torque_cal,
             kt_auto: robot.robot.kt_source == KtSource::Auto,
@@ -590,6 +609,52 @@ impl<B: DriverBus> RtCore<B> {
         &mut self.bus
     }
 
+    /// Measured joint positions \[rad\] — what a backend swap seeds the
+    /// incoming simulator from, so the toggle does not move the model.
+    pub fn measured_q(&self) -> [f64; MAX_JOINTS] {
+        self.q
+    }
+
+    /// Swap the bus backend under a running core.
+    ///
+    /// The arm this core is talking to becomes a DIFFERENT arm, so
+    /// everything derived from the old one is dropped rather than
+    /// carried across: per-node freshness, the encoder sector each
+    /// joint's conversion was boot-calibrated to, the measurement
+    /// filters, and the home reference. The boot one-shots re-run from
+    /// this tick, so the new backend gets the same selfcheck, kt fetch
+    /// and config re-sends it would have got at startup.
+    ///
+    /// Motion is NOT stopped here — the command plane cancels the queue
+    /// and the active stream before it calls this, because a swap that
+    /// left a move running would resume it against an arm whose position
+    /// is not yet known. What is left running is the mode: an ENABLED
+    /// core comes out of this in BOOTING, which every motion mode is
+    /// unreachable from, and reaches IDLE again when the selfcheck says
+    /// the new bus answered.
+    ///
+    /// A backend that cannot be opened never reaches this — callers
+    /// build it first, so the failure has a reply channel — and one that
+    /// cannot be `boot_configure`d is refused here with the OLD bus
+    /// still installed and still driving the arm.
+    pub fn replace_bus(&mut self, mut bus: B) -> Result<(), CoreError> {
+        bus.boot_configure(
+            &self.boot.robot,
+            self.boot.gripper.as_ref(),
+            self.boot.config_repeats,
+        )?;
+        self.bus = bus;
+        self.bus_state = BusState::new();
+        self.sector_done = [false; MAX_JOINTS];
+        self.filters_seeded = false;
+        self.bus_booted_at = self.tick;
+        self.homed = false;
+        self.not_homed_refused = false;
+        self.mode = Mode::Booting;
+        self.state = ArmState::Disabled;
+        Ok(())
+    }
+
     /// Simulator/teleport path: declare the home references valid (or
     /// invalidate them) without running the homing sequence. `par6d`
     /// exposes this only in simulator mode (`SYS_NOT_SIMULATOR` gate) —
@@ -701,7 +766,11 @@ impl<B: DriverBus> RtCore<B> {
     // ------------------------------------------------------------ boot
 
     fn boot_oneshots(&mut self) {
-        if self.tick == BOOT_SELFCHECK_TICK {
+        // Ticks since this BUS came up, not since the process did: a
+        // backend swapped in at tick 90 000 needs the same selfcheck and
+        // the same config re-sends a backend opened at boot got.
+        let since_boot = self.tick - self.bus_booted_at;
+        if since_boot == BOOT_SELFCHECK_TICK {
             let connected = self.bus.connected_nodes();
             for i in 0..MAX_JOINTS {
                 if connected & (1 << u16::from(self.node_of[i])) == 0 {
@@ -718,7 +787,7 @@ impl<B: DriverBus> RtCore<B> {
                 let _ = self.request_mode(Mode::Idle);
             }
         }
-        if BOOT_CONFIG_RESEND_TICKS.contains(&self.tick) && !self.bus.is_silent() {
+        if BOOT_CONFIG_RESEND_TICKS.contains(&since_boot) && !self.bus.is_silent() {
             for i in 0..MAX_JOINTS {
                 let _ = self.bus.resend_node_config(self.node_of[i], 1);
             }

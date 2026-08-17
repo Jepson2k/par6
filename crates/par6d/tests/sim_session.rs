@@ -1313,3 +1313,71 @@ fn the_status_rate_override_changes_the_broadcast_and_refuses_a_bad_rate() {
         "the refusal names the field and the rule: {err}"
     );
 }
+
+/// A backend swap that cannot open its interface is refused to the
+/// CLIENT, and leaves the arm simulating exactly where it was.
+///
+/// This used to be a flat refusal in both directions, with the no-op
+/// direction (`simulator(true)` on a runtime already simulating)
+/// succeeding — which made a categorical failure look intermittent. Now
+/// the command really tries, so what has to be pinned here is that a
+/// try that fails fails LOUDLY and changes nothing: no CAN interface
+/// exists in this container, which is the same thing an operator hits
+/// when they pick the wrong one on the box.
+///
+/// The successful direction needs a control box; the RT core's own
+/// re-boot on a swap is covered in `par6-rt` over the loopback backend.
+#[test]
+fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
+    let rig = Rig::boot(common::shipped_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("boot", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    // Somewhere that is not the park pose, so anything that re-seeded
+    // the plant would be obvious.
+    let mut moved = park_deg();
+    moved[0] += 25.0;
+    moved[3] -= 15.0;
+    teleport_home(&rig, &mut c, moved);
+    let before = rig.wait_status("teleport lands", |s| angles_close(&s.angles, &moved, 1.0));
+
+    // Asking for hardware, two ways in.
+    let err = c.expect_error(&Command::Simulator(par6_proto::command::Simulator {
+        on: false,
+    }));
+    assert!(
+        err.cause.contains("cannot open") && err.cause.contains("can0"),
+        "the refusal names the configured interface: {}",
+        err.cause
+    );
+    let err = c.expect_error(&Command::ConnectHardware(
+        par6_proto::command::ConnectHardware {
+            port: "par6-no-such-can".into(),
+        },
+    ));
+    assert!(
+        err.cause.contains("par6-no-such-can"),
+        "connect_hardware names the interface it was GIVEN, not the configured one: {}",
+        err.cause
+    );
+
+    // Still simulating, still homed, still where it was: a refusal that
+    // had already torn the bus down would show up in any of the three.
+    match c.query(&Command::IsSimulator) {
+        QueryResult::IsSimulator { active } => assert!(active, "still the simulator backend"),
+        other => panic!("unexpected {other:?}"),
+    }
+    let after = rig.wait_status("still up", |s| s.link_ok == 1);
+    assert!(
+        after.homed,
+        "a refused swap dropped the home reference: {after:?}"
+    );
+    assert!(
+        angles_close(&after.angles, &before.angles, 0.5),
+        "a refused swap moved the arm: {:?} -> {:?}",
+        before.angles,
+        after.angles
+    );
+    rig.shutdown();
+}

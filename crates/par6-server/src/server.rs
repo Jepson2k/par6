@@ -582,7 +582,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 // deployment's, not the program's, and survive.
                 self.apply_program_shapes(Vec::new())
             }
-            C::ConnectHardware(p) => self.runtime.rt.connect_hardware(&p.port),
+            // Same reason `simulator` cancels first: the bus under a
+            // running move is about to become a different arm, and a
+            // move resumed against one whose position is not yet known
+            // is a move to somewhere nobody asked for.
+            C::ConnectHardware(p) => {
+                self.cancel_all_motion();
+                self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
+                    self.simulator = false;
+                })
+            }
             C::SetTcpOffset(p) => {
                 self.tcp_offset_mm = [p.x, p.y, p.z];
                 self.sync_planner();
