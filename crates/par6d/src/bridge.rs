@@ -28,7 +28,7 @@ use par6_proto::command::MAX_JOG_DURATION_S;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
     ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput,
-    MAX_JOINTS,
+    StreamSetpoint, MAX_JOINTS,
 };
 use par6_server::RtCommands;
 use par6_server::{CollisionState, ShapeLayer};
@@ -385,6 +385,10 @@ struct ActiveStream {
     /// (and a pathological Plane keep-out cannot starve the keep-alive).
     world_epoch: u64,
     cart: Option<CartJogState>,
+    /// The stream's `(speed, accel)` fractions, carried so housekeeping's
+    /// keep-alive refeeds the setpoint the client asked for rather than
+    /// silently restoring full-speed limits between datagrams.
+    scale: (f64, f64),
 }
 
 /// An enable request in flight, retried by housekeeping until the RT
@@ -519,13 +523,18 @@ impl RtCommands for RtBridge {
                 // entries deep. The datagram still refreshes the watchdog
                 // deadline below either way.
                 let commanded = (pct != 0.0).then_some((joint, pct));
-                if commanded != active {
+                let accel_changed = sh
+                    .stream
+                    .as_ref()
+                    .is_some_and(|a| a.scale.1 != p.accel.unwrap_or(1.0));
+                if commanded != active || (commanded.is_some() && accel_changed) {
                     if pct == 0.0 {
                         self.link.send(RtCommand::JogRelease);
                     } else {
                         self.link.send(RtCommand::Jog {
                             joint: joint as u8,
                             signed_pct: pct,
+                            accel: p.accel.unwrap_or(1.0),
                         });
                     }
                 }
@@ -536,6 +545,10 @@ impl RtCommands for RtBridge {
                     jog: commanded,
                     world_epoch: 0,
                     cart: None,
+                    // JOG runs on the RT jog engine, not the streaming
+                    // executor; its accel rides `RtCommand::Jog`. Kept
+                    // here so a change of accel alone still resends.
+                    scale: (1.0, p.accel.unwrap_or(1.0)),
                 });
             }
             Command::ServoJ(p) => {
@@ -565,7 +578,12 @@ impl RtCommands for RtBridge {
                 ) {
                     self.enter_stream_mode(Mode::Stream);
                 }
-                self.stream_input.lock().unwrap().send(&target);
+                let scale = (p.speed.unwrap_or(1.0), p.accel.unwrap_or(1.0));
+                self.stream_input.lock().unwrap().send(&StreamSetpoint {
+                    q: target,
+                    speed: scale.0,
+                    accel: scale.1,
+                });
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
@@ -573,14 +591,19 @@ impl RtCommands for RtBridge {
                     jog: None,
                     world_epoch,
                     cart: None,
+                    scale,
                 });
             }
             // Cartesian position streams: seeded IK, then the exact
             // servo_j path. An unreachable target drops the datagram
             // (fire-and-forget has no reply channel) — the arm must not
             // move on a pose the solver cannot reach.
-            Command::ServoJPose(par6_proto::command::ServoJPose { pose, .. })
-            | Command::ServoL(par6_proto::command::ServoL { pose, .. }) => {
+            Command::ServoJPose(par6_proto::command::ServoJPose {
+                pose, speed, accel, ..
+            })
+            | Command::ServoL(par6_proto::command::ServoL {
+                pose, speed, accel, ..
+            }) => {
                 let mut sh = self.shared.lock().unwrap();
                 let seed = match &sh.stream {
                     Some(ActiveStream {
@@ -622,7 +645,12 @@ impl RtCommands for RtBridge {
                 ) {
                     self.enter_stream_mode(Mode::Stream);
                 }
-                self.stream_input.lock().unwrap().send(&target);
+                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+                self.stream_input.lock().unwrap().send(&StreamSetpoint {
+                    q: target,
+                    speed: scale.0,
+                    accel: scale.1,
+                });
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
@@ -630,6 +658,7 @@ impl RtCommands for RtBridge {
                     jog: None,
                     world_epoch,
                     cart: None,
+                    scale,
                 });
             }
             // Cartesian velocity jog: housekeeping steps the twist
@@ -695,6 +724,10 @@ impl RtCommands for RtBridge {
                         soft_min: self.cart.soft_min,
                         soft_max: self.cart.soft_max,
                     }),
+                    // A cartesian jog is integrated into joint targets and
+                    // then tracked by the streaming executor, so its accel
+                    // fraction is the stream's.
+                    scale: (1.0, p.accel.unwrap_or(1.0)),
                 });
             }
             other => log::warn!("unexpected stream command {:?}", other.tag()),
@@ -997,7 +1030,11 @@ pub(crate) fn housekeeping_loop(
                     // Keep the RT stream watchdog fed between client
                     // datagrams (its timeout is shorter than the grace).
                     if let Some(t) = a.servo_target {
-                        stream_input.lock().unwrap().send(&t);
+                        stream_input.lock().unwrap().send(&StreamSetpoint {
+                            q: t,
+                            speed: a.scale.0,
+                            accel: a.scale.1,
+                        });
                     }
                 }
                 Some(a) if a.kind == StreamKind::CartJog => {
@@ -1014,7 +1051,13 @@ pub(crate) fn housekeeping_loop(
                                 }
                                 let verdict = gate.lock().unwrap().blocked(&before, &la);
                                 match verdict {
-                                    Ok(None) => stream_input.lock().unwrap().send(&target),
+                                    Ok(None) => {
+                                        stream_input.lock().unwrap().send(&StreamSetpoint {
+                                            q: target,
+                                            speed: a.scale.0,
+                                            accel: a.scale.1,
+                                        })
+                                    }
                                     Ok(Some(pairs)) => {
                                         collision_stop(&link, &gate, "jog_l", pairs);
                                         sh.stream = None;
@@ -1036,7 +1079,11 @@ pub(crate) fn housekeeping_loop(
                                 // failed solve; the stream watchdog still
                                 // needs feeding.
                                 log::warn!("jog_l step failed ({e}); holding");
-                                stream_input.lock().unwrap().send(&state.q);
+                                stream_input.lock().unwrap().send(&StreamSetpoint {
+                                    q: state.q,
+                                    speed: a.scale.0,
+                                    accel: a.scale.1,
+                                });
                             }
                         }
                     }

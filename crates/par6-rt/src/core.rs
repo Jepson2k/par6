@@ -234,18 +234,43 @@ impl ExecHeartbeat {
     }
 }
 
+/// One streamed setpoint: where to go, and how hard to push getting there.
+///
+/// The fractions ride with the target rather than being separate commands
+/// because a stream is latest-wins — a speed sent out of band could be
+/// applied to a target that was already superseded.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct StreamSetpoint {
+    /// Joint-position target \[rad\].
+    pub q: [f64; MAX_JOINTS],
+    /// Velocity fraction of the STREAM limits, in `(0, 1]`.
+    pub speed: f64,
+    /// Acceleration fraction of the STREAM limits, in `(0, 1]`.
+    pub accel: f64,
+}
+
+impl Default for StreamSetpoint {
+    fn default() -> Self {
+        Self {
+            q: [0.0; MAX_JOINTS],
+            speed: 1.0,
+            accel: 1.0,
+        }
+    }
+}
+
 /// Command-plane handle for streaming setpoints: latest-wins slot (the
 /// RT applies only the newest target per tick; superseded targets count
 /// toward the published discard percentage).
 pub struct StreamInput {
-    writer: SnapshotWriter<[f64; MAX_JOINTS]>,
+    writer: SnapshotWriter<StreamSetpoint>,
     sent: Arc<AtomicU64>,
 }
 
 impl StreamInput {
-    /// Publish a new joint-position target \[rad\].
-    pub fn send(&mut self, q_target: &[f64; MAX_JOINTS]) {
-        self.writer.publish(q_target);
+    /// Publish a new setpoint.
+    pub fn send(&mut self, setpoint: &StreamSetpoint) {
+        self.writer.publish(setpoint);
         self.sent.fetch_add(1, Ordering::Relaxed);
     }
 }
@@ -354,7 +379,11 @@ pub struct RtCore<B: DriverBus> {
     hb_timeout_ticks: u32,
 
     // Streaming.
-    stream_rx: SnapshotReader<[f64; MAX_JOINTS]>,
+    stream_rx: SnapshotReader<StreamSetpoint>,
+    /// Fractions currently applied to the streaming executor's limits.
+    stream_scale: (f64, f64),
+    /// Acceleration fraction currently applied to the jog engine.
+    jog_accel_scale: f64,
     stream_sent: Arc<AtomicU64>,
     stream_last_rx_tick: u64,
     stream_timeout_ticks: u32,
@@ -406,7 +435,7 @@ impl<B: DriverBus> RtCore<B> {
         let torque_ma_factor: [f64; MAX_JOINTS] =
             std::array::from_fn(|i| torque_cal[i].factor(torque_cal[i].kt_nm_a));
         let (writer, snapshots) = snapshot_channel::<StateSnapshot>();
-        let (stream_tx, stream_rx) = snapshot_channel::<[f64; MAX_JOINTS]>();
+        let (stream_tx, stream_rx) = snapshot_channel::<StreamSetpoint>();
         let heartbeat = Arc::new(AtomicBool::new(false));
         let stream_sent = Arc::new(AtomicU64::new(0));
         let has_can_gripper = gripper.is_some();
@@ -483,6 +512,8 @@ impl<B: DriverBus> RtCore<B> {
             hb_silence: 0,
             hb_timeout_ticks: robot.ticks(EXEC_HEARTBEAT_TIMEOUT_S).max(1),
             stream_rx,
+            stream_scale: (1.0, 1.0),
+            jog_accel_scale: 1.0,
             stream_sent: stream_sent.clone(),
             stream_last_rx_tick: 0,
             // The watchdog is READ in phase 7 and FED in phase 8 (the
@@ -756,8 +787,16 @@ impl<B: DriverBus> RtCore<B> {
                 log::info!("human park assertion received (arms FLASHING entry)");
                 self.park_asserted = true;
             }
-            RtCommand::Jog { joint, signed_pct } => {
+            RtCommand::Jog {
+                joint,
+                signed_pct,
+                accel,
+            } => {
                 if self.mode == Mode::Jog && usize::from(joint) < MAX_JOINTS {
+                    if self.jog_accel_scale != accel {
+                        self.jog.set_accel_scale(accel);
+                        self.jog_accel_scale = accel;
+                    }
                     self.jog.command(usize::from(joint), signed_pct);
                     self.jog_active = true;
                     self.jog_joint = joint;
@@ -1292,9 +1331,18 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Stream => {
                 let mut applied = false;
-                if let Some(target) = self.stream_rx.take() {
-                    self.q_target = target;
-                    self.stream.set_target(&target);
+                if let Some(sp) = self.stream_rx.take() {
+                    // Scale first: the limits have to be in force for the
+                    // tick that consumes this target, not the one after.
+                    // Only on a change — `set_limits` rewrites the OTG's
+                    // whole input block and most streams never move the
+                    // sliders at all.
+                    if self.stream_scale != (sp.speed, sp.accel) {
+                        self.stream.set_scale(sp.speed, sp.accel);
+                        self.stream_scale = (sp.speed, sp.accel);
+                    }
+                    self.q_target = sp.q;
+                    self.stream.set_target(&sp.q);
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
                 }

@@ -1179,3 +1179,95 @@ fn the_rt_jog_latch_greys_the_enablement_flag() {
 
     rig.shutdown();
 }
+
+/// A jog's `accel` fraction changes how fast it ramps, and a servo
+/// stream's `speed` fraction changes how fast it converges.
+///
+/// Regression for the whole class: `JogJ.accel`, `ServoJ.speed`/`accel`
+/// and friends decoded, validated, and were then dropped on the floor —
+/// every slider in a UI moved and none of them did anything.
+///
+/// Both halves measure DISPLACEMENT over a fixed window rather than the
+/// time to reach a mark. Time-to-mark carries the fixed command→RT→sim
+/// latency in every sample, which dilutes the ratio and moves with how
+/// loaded the box is; distance covered in a fixed window is the quantity
+/// the fraction scales directly. Against the unwired code both fractions
+/// produce the same displacement, so either assertion fails.
+#[test]
+fn stream_speed_and_accel_fractions_reach_the_arm() {
+    let rig = Rig::boot(common::shipped_config());
+    let mut c = Client::new(rig.addr());
+
+    /// How far J0 travels in `window` while `command` is streamed at it.
+    fn travel(
+        rig: &Rig,
+        c: &mut Client,
+        window: Duration,
+        mut command: impl FnMut() -> Command,
+    ) -> f64 {
+        c.ok(&Command::Reset);
+        teleport_home(rig, c, park_deg());
+        rig.drain_status();
+        let start = park_deg()[0];
+        let mut last = start;
+        let until = Instant::now() + window;
+        while Instant::now() < until {
+            c.send(&command());
+            if let Some(s) = rig.recv_status() {
+                last = s.angles[0];
+            }
+        }
+        (last - start).abs()
+    }
+
+    fn jog(accel: Option<f64>) -> Command {
+        Command::JogJ(JogJ {
+            speeds: [0.6, 0.0, 0.0, 0.0, 0.0, 0.0],
+            duration: 2.0,
+            accel,
+        })
+    }
+
+    // Short enough that a full-accel jog is still near the start of its
+    // ramp, so the whole window is the part the fraction scales.
+    let ramp = Duration::from_millis(400);
+    let brisk = travel(&rig, &mut c, ramp, || jog(None));
+    let gentle = travel(&rig, &mut c, ramp, || jog(Some(0.2)));
+    assert!(
+        brisk > 0.5,
+        "the full-accel jog barely moved ({brisk:.3} deg); nothing to compare"
+    );
+    assert!(
+        gentle < brisk * 0.5,
+        "a fifth of the acceleration must cover far less ground in {ramp:?}: \
+         {gentle:.3} deg vs {brisk:.3} at full accel"
+    );
+
+    // Servo: one far target held for a fixed window, so the constant-speed
+    // stretch dominates and the fraction shows up as distance covered.
+    let mut target = park_deg();
+    target[0] += 90.0;
+    let servo = |speed: Option<f64>| {
+        move || {
+            Command::ServoJ(par6_proto::command::ServoJ {
+                angles: target,
+                speed,
+                accel: None,
+            })
+        }
+    };
+    let cruise = Duration::from_millis(600);
+    let full = travel(&rig, &mut c, cruise, servo(None));
+    let quarter = travel(&rig, &mut c, cruise, servo(Some(0.25)));
+    assert!(
+        full > 1.0,
+        "the full-speed stream barely moved ({full:.3} deg); nothing to compare"
+    );
+    assert!(
+        quarter < full * 0.5,
+        "a quarter-speed stream must cover far less ground in {cruise:?}: \
+         {quarter:.3} deg vs {full:.3} at full speed"
+    );
+
+    rig.shutdown();
+}

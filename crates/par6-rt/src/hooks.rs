@@ -58,6 +58,10 @@ pub enum RtCommand {
         joint: u8,
         /// Signed speed fraction.
         signed_pct: f64,
+        /// Acceleration fraction of the configured jog ramp, in `(0, 1]`.
+        /// The ramp time scales inversely: half the fraction is twice the
+        /// time to terminal velocity.
+        accel: f64,
     },
     /// Release the jog button (ramp to zero).
     JogRelease,
@@ -142,6 +146,9 @@ pub trait JogEngine: Send {
     /// Command a jog: joint index and signed speed fraction
     /// (`dir · pct`, in \[-1, 1\]). Replaces any previous command.
     fn command(&mut self, joint: usize, signed_pct: f64);
+    /// Scale the ramp acceleration by `accel` in `(0, 1]`. The core calls
+    /// this only when a jog changes it.
+    fn set_accel_scale(&mut self, accel: f64);
     /// Release the jog button: ramp every joint down to zero.
     fn release(&mut self);
     /// One tick: write integrated target positions and ramped velocities.
@@ -162,6 +169,8 @@ pub trait JogEngine: Send {
 pub struct RampJog {
     dt: f64,
     vmax: [f64; MAX_JOINTS],
+    /// Configured ramp acceleration, before the command's fraction.
+    base_accel: [f64; MAX_JOINTS],
     accel: [f64; MAX_JOINTS],
     soft_min: [f64; MAX_JOINTS],
     soft_max: [f64; MAX_JOINTS],
@@ -188,6 +197,7 @@ impl RampJog {
         Self {
             dt: cfg.robot.tick_dt_s,
             vmax,
+            base_accel: accel,
             accel,
             soft_min,
             soft_max,
@@ -216,6 +226,12 @@ impl JogEngine for RampJog {
                 }
             }
             self.request = Some((joint, signed_pct.clamp(-1.0, 1.0)));
+        }
+    }
+
+    fn set_accel_scale(&mut self, accel: f64) {
+        for (a, base) in self.accel.iter_mut().zip(self.base_accel.iter()) {
+            *a = base * accel;
         }
     }
 
@@ -295,6 +311,11 @@ pub trait StreamTracker: Send {
     /// Newest raw target for this tick (only the newest is applied —
     /// superseded targets are discarded upstream).
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]);
+    /// Scale the velocity and acceleration ceilings by the stream's
+    /// requested fractions, each in `(0, 1]`. The core calls this only
+    /// when a setpoint changes them, so an implementation may treat it as
+    /// the cold path.
+    fn set_scale(&mut self, speed: f64, accel: f64);
     /// One tick: write the post-limiter position/velocity setpoint.
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
 }
@@ -337,6 +358,11 @@ impl StreamTracker for ClampStream {
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
         self.target = *q_target;
     }
+
+    /// No-op: this tracker does no rate limiting at all, so there is no
+    /// ceiling for a fraction to scale. It exists to prove the soft-limit
+    /// clamp survives with limiting off.
+    fn set_scale(&mut self, _speed: f64, _accel: f64) {}
 
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
         for (i, (q, qd)) in q_out.iter_mut().zip(qd_out.iter_mut()).enumerate() {

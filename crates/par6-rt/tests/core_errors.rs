@@ -6,7 +6,7 @@ mod common;
 
 use common::Rig;
 use par6_bus::{ErrorFlags, Reply, TxRecord};
-use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, DEBOUNCE_READS};
+use par6_rt::{ArmState, ErrorCode, Mode, RtCommand, StreamSetpoint, DEBOUNCE_READS};
 
 fn has_error(rig: &mut Rig, code: ErrorCode, joint: Option<u8>) -> bool {
     rig.snap()
@@ -420,7 +420,10 @@ fn stream_watchdog_survives_a_fed_stream_and_still_fires_on_a_silent_one() {
     let mut target = rig.pose;
     for _ in 0..20 {
         target[0] += 0.0005;
-        rig.handles.stream.send(&target);
+        rig.handles.stream.send(&StreamSetpoint {
+            q: target,
+            ..Default::default()
+        });
         rig.tick();
     }
     let s = rig.snap();
@@ -465,7 +468,10 @@ fn a_setpoint_left_unconsumed_does_not_leak_into_the_next_stream_session() {
     rig.cmd(RtCommand::SetMode(Mode::Stream));
     let mut abandoned = rig.pose;
     abandoned[0] += 0.5;
-    rig.handles.stream.send(&abandoned);
+    rig.handles.stream.send(&StreamSetpoint {
+        q: abandoned,
+        ..Default::default()
+    });
     rig.cmd(RtCommand::SetMode(Mode::Idle));
     assert_eq!(rig.snap().mode, Mode::Idle);
 

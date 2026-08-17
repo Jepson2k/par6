@@ -153,12 +153,11 @@ impl Daemon {
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
         let jog_limits = MotionLimits::from_config(robot, LimitMode::Jog)?;
-        let jog = MotionJog::new(JogEngine::new(robot)?);
+        let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let stream = MotionStream::new(
             StreamingExecutor::new(dt, &stream_limits)?,
             dt,
-            stream_limits.soft_min,
-            stream_limits.soft_max,
+            stream_limits,
         );
 
         let (cmds_tx, cmds_rx) = mpsc::channel();

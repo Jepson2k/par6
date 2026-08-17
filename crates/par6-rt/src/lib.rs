@@ -56,7 +56,7 @@ pub mod state;
 pub mod timing;
 
 pub use crate::core::{
-    CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput,
+    CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
 };
 pub use gpio::{Debouncer, EstopGpio, EstopMonitor, SharedLineGpio, DEBOUNCE_READS};
 pub use gravity::{GravityModel, ZeroGravity};

@@ -1,19 +1,25 @@
 //! The real `par6-motion` engines behind the `par6-rt` per-tick hook
 //! traits — thin lifecycle mappings, no behavior of their own.
 
-use par6_motion::{JogDirection, StreamStep, StreamingExecutor};
+use par6_motion::{JogDirection, MotionLimits, StreamStep, StreamingExecutor};
 use par6_rt::{JogEngine as RtJogEngine, StreamTracker, MAX_JOINTS};
 
 /// `par6_motion::JogEngine` (jerk-aware lookahead, direction-block
 /// latching) behind the RT jog hook.
 pub struct MotionJog {
     engine: par6_motion::JogEngine,
+    /// Configured ramp time, so a fraction always scales the config value
+    /// rather than compounding on the last scaled one.
+    base_accel_time_s: f64,
 }
 
 impl MotionJog {
-    /// Wrap a configured jog engine.
-    pub fn new(engine: par6_motion::JogEngine) -> Self {
-        Self { engine }
+    /// Wrap a configured jog engine running the config's `accel_time_s`.
+    pub fn new(engine: par6_motion::JogEngine, base_accel_time_s: f64) -> Self {
+        Self {
+            engine,
+            base_accel_time_s,
+        }
     }
 }
 
@@ -34,6 +40,16 @@ impl RtJogEngine for MotionJog {
         };
         if let Err(e) = self.engine.command(joint, dir, signed_pct.abs().min(1.0)) {
             log::warn!("jog command refused: {e}");
+        }
+    }
+
+    /// A jog asked to accelerate at a fraction of the configured rate
+    /// takes proportionally longer to ramp: the engine's ramp
+    /// acceleration is `v_full / accel_time_s`, so dividing the time by
+    /// the fraction scales the acceleration by it.
+    fn set_accel_scale(&mut self, accel: f64) {
+        if let Err(e) = self.engine.set_accel_time_s(self.base_accel_time_s / accel) {
+            log::warn!("jog accel scale {accel} refused: {e}");
         }
     }
 
@@ -71,24 +87,23 @@ pub struct MotionStream {
     soft_min: [f64; MAX_JOINTS],
     soft_max: [f64; MAX_JOINTS],
     hold_q: [f64; MAX_JOINTS],
+    /// Unscaled STREAM ceilings, kept so a fraction always scales the
+    /// configured limit rather than the last scaled one.
+    base: MotionLimits,
 }
 
 impl MotionStream {
     /// Wrap a configured streaming executor running at tick period `dt`
     /// \[s\]; `soft_min`/`soft_max` are the per-joint soft position
     /// limits \[rad\].
-    pub fn new(
-        executor: StreamingExecutor,
-        dt: f64,
-        soft_min: [f64; MAX_JOINTS],
-        soft_max: [f64; MAX_JOINTS],
-    ) -> Self {
+    pub fn new(executor: StreamingExecutor, dt: f64, base: MotionLimits) -> Self {
         Self {
             executor,
             dt,
-            soft_min,
-            soft_max,
+            soft_min: base.soft_min,
+            soft_max: base.soft_max,
             hold_q: [0.0; MAX_JOINTS],
+            base,
         }
     }
 
@@ -110,6 +125,22 @@ impl StreamTracker for MotionStream {
         self.clamp(&mut clamped);
         if let Err(e) = self.executor.set_target(&clamped) {
             log::warn!("stream target refused: {e}");
+        }
+    }
+
+    fn set_scale(&mut self, speed: f64, accel: f64) {
+        let mut scaled = self.base;
+        for j in 0..MAX_JOINTS {
+            scaled.velocity[j] = self.base.velocity[j] * speed;
+            scaled.acceleration[j] = self.base.acceleration[j] * accel;
+            // Jerk rides the acceleration fraction: a stream asked to
+            // accelerate gently that kept the full jerk ceiling would
+            // reach the lower acceleration just as abruptly, which is the
+            // jolt the fraction is asking to avoid.
+            scaled.jerk[j] = self.base.jerk[j] * accel;
+        }
+        if let Err(e) = self.executor.set_limits(&scaled) {
+            log::warn!("stream limit scale ({speed}, {accel}) refused: {e}");
         }
     }
 
@@ -179,8 +210,7 @@ mod tests {
         let mut stream = MotionStream::new(
             par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
             dt,
-            limits.soft_min,
-            limits.soft_max,
+            limits,
         );
 
         let start = [0.0; MAX_JOINTS];

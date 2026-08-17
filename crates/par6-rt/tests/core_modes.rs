@@ -328,6 +328,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     rig.cmd(RtCommand::Jog {
         joint: 0,
         signed_pct: 1.0,
+        accel: 1.0,
     });
     rig.tick_n(20);
 
@@ -378,6 +379,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     rig.cmd(RtCommand::Jog {
         joint: 0,
         signed_pct: -0.5,
+        accel: 1.0,
     });
     rig.tick_n(20);
     assert!(
