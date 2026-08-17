@@ -178,66 +178,13 @@ robot.start()
 print(robot.create_sync_client().angles())
 ```
 
-## What is verified, and what is not
+### If it does not start
 
-Verified in the development container (**x86_64** Linux, no robot, no systemd,
-nothing aarch64 executed):
+- **`can0` cannot be opened.** The unit's `RestrictAddressFamilies` must
+  include `AF_CAN`; relax it and confirm the bus opens before looking
+  anywhere else.
+- **Starts by hand but not under systemd.** `ProtectSystem=strict` leaves
+  `/usr` readable, so the rpath into `/usr/local/lib/par6` should resolve —
+  run `ldd /usr/local/bin/par6d` from inside the unit's namespace to see
+  which library the sandbox is hiding.
 
-- `scripts/ffi/setup.sh --target aarch64` runs end to end from a clean `.ffi`:
-  the `linux-aarch64` conda env resolves and downloads, the
-  `gxx_linux-aarch64` cross toolchain installs with the pinned glibc 2.17
-  sysroot, `toppra-cpp` cross-compiles from its pinned commit, and
-  `libpar6_shim.so` links against Pinocchio + coal + toppra.
-- The staged runtime closure resolves completely: **20 shared libraries,
-  65.3 MB**, no unresolved `DT_NEEDED`, and every versioned symbol demanded
-  of a shipped library is provided by the copy that ships.
-- **glibc floor `GLIBC_2.17`** across the shim, the closure and the `par6d`
-  binary (measured with the cross `readelf -V`). Bookworm's 2.36 clears it
-  with room; so does bullseye's 2.31.
-- `build-aarch64.sh` produces a real aarch64 `par6d` **with kinematics** —
-  `ELF 64-bit LSB pie executable, ARM aarch64 … dynamically linked` — and
-  refuses to run at all when the aarch64 shim or its env file is absent.
-- `par6d.service` passes `systemd-analyze verify` with no warnings.
-- `install.sh` argument handling, bundle staging (`--stage-only`), upload
-  command shape, and every early failure path (missing bundle, missing
-  binary, missing `lib/`, non-root `--local`, bad flags) — the upload itself
-  was exercised against stub `ssh`/`scp`, and the resulting tarball unpacked
-  and inspected.
-
-**Not verified — no aarch64 hardware and no systemd in this environment:**
-
-- **Nothing has been executed on aarch64.** The cross build links and its
-  symbol versions are internally satisfiable, but no aarch64 instruction has
-  run. In particular the shim's *numerics* are unverified on this target: the
-  golden kinematics and collision fixtures (`cargo test -p par6-kin --features
-  ffi`) only ever ran against the x86_64 shim. **A maintainer with a box must
-  run them there**, natively:
-
-  ```bash
-  # on the control box (Rust toolchain + this checkout required)
-  scripts/ffi/setup.sh                    # native aarch64 build of the same pins
-  source .ffi/env.sh
-  cargo test -p par6-kin --features ffi   # golden FK/collision fixtures
-  cargo test -p par6d                     # the runtime's protocol plane
-  ```
-
-  Until that has been done once, treat aarch64 kinematics as *built* but not
-  *validated*. Everything the cross path can check statically, it checks.
-- The unit has never been started. `Type=exec`, the ambient capabilities
-  actually granting `SCHED_FIFO`, the sandboxing directives
-  (`ProtectSystem=strict`, `RestrictAddressFamilies=…AF_CAN`) not blocking
-  SocketCAN or the netlink link bring-up: all reasoned from the code paths in
-  `crates/par6-rt/src/rt.rs` and `crates/par6d/src/daemon.rs`, none observed.
-  If `can0` cannot be opened after install, relax `RestrictAddressFamilies`
-  first and report it.
-  `ProtectSystem=strict` leaves `/usr` readable, so the rpath into
-  `/usr/local/lib/par6` is expected to resolve under the sandbox — also
-  reasoned, not observed. If `par6d` starts by hand but not under systemd,
-  check `ldd /usr/local/bin/par6d` from inside the unit's namespace first.
-- `install.sh` has never completed a real end-to-end run: no `ssh`/`scp` and no
-  running systemd here, so `useradd`, `systemctl daemon-reload/enable/restart`
-  and the config-preservation branch are untested against a live box.
-- The 250 Hz tick, the PREEMPT_RT latency budget and the loop degradation
-  bands are hardware bring-up (Phase 3) questions. Gravity compensation and
-  the collision world now run on the box's CPU budget for the first time; the
-  per-waypoint collision cost CI reports is an **x86_64** number.
