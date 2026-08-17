@@ -979,3 +979,176 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         assert await client.wait_status(
             lambda s: max_deg_error(s.angles, target) < 2.0, timeout=STEP_BUDGET_S
         ), "the move the keep-out was blocking never ran once it was cleared"
+
+
+@pytest.mark.timeout(180)
+async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
+    daemon: LiveDaemon,
+):
+    """``servo_l`` and ``servo_j(pose=...)`` end to end.
+
+    Both carry a substantial daemon implementation — IK every datagram, the
+    RT stream limiter, the collision gate — and neither had any end-to-end
+    coverage: a break anywhere along that path would have shown up first on
+    a real arm. Streamed at a UI-like cadence here, and then aimed into a
+    keep-out, which must stop them.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await settle_at(client, SWEEP_START_DEG)
+
+        # --- servo_l: stream a straight TCP descent and watch it arrive.
+        start = await client.pose()
+        assert start is not None
+        goal = list(start)
+        goal[2] -= 40.0
+        arrived = False
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and not arrived:
+            await client.servo_l(goal, speed=0.6)
+            arrived = await client.wait_status(
+                lambda s: abs(s.pose[11] - goal[2]) < 5.0, timeout=0.2
+            )
+        assert arrived, (
+            f"servo_l never reached the streamed target: "
+            f"{(await client.pose())[:3]} vs {goal[:3]}"
+        )
+
+        # --- servo_j(pose=...): the same target through the joint-space
+        #     streamer, which IKs the pose rather than interpolating it.
+        back = list(start)
+        arrived = False
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and not arrived:
+            await client.servo_j(pose=back, speed=0.6)
+            arrived = await client.wait_status(
+                lambda s: abs(s.pose[11] - back[2]) < 5.0, timeout=0.2
+            )
+        assert arrived, "servo_j(pose=...) never reached the streamed target"
+
+        # --- the collision gate refuses a stream aimed into a keep-out.
+        here = await client.pose()
+        assert here is not None
+        below = list(here)
+        below[2] -= 60.0
+        keepout = Box(
+            name="floor",
+            x=0.4,
+            y=0.4,
+            z=0.1,
+            pose=(below[0] / 1000.0, below[1] / 1000.0, below[2] / 1000.0, 0, 0, 0),
+        )
+        assert await client.set_shapes([keepout])
+
+        blocked = False
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and not blocked:
+            await client.servo_l(below, speed=0.6)
+            blocked = await client.wait_status(
+                lambda s: bool(s.collision_active), timeout=0.2
+            )
+        assert blocked, (
+            "a servo_l streamed into a keep-out was never gated: the stream "
+            "gate let the arm drive at the shape"
+        )
+        rest = await client.pose()
+        assert rest is not None
+        assert rest[2] > below[2] + 20.0, (
+            f"the gated stream carried the TCP into the keep-out: "
+            f"z={rest[2]:.1f} vs shape centre {below[2]:.1f}"
+        )
+        assert await client.set_shapes([])
+
+
+@pytest.mark.timeout(180)
+async def test_the_python_client_drives_the_gripper_and_write_io_is_refused(
+    daemon: LiveDaemon,
+):
+    """Two things only the Rust client had ever exercised against a runtime.
+
+    The jaw: a tool action through the Python client must reach the
+    simulated driver and come back as a real tool status, not an ack. And
+    ``write_io`` must be REFUSED — par6d drives no digital outputs
+    (issue #28), and a client reporting success would promise the one thing
+    the arm will not do.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await settle_at(client, park_deg())
+
+        tools = await client.tools()
+        assert tools is not None
+        tool = tools.tool
+        # The runtime's verbs are `move` and `calibrate`; the client's
+        # open/close convenience resolves onto `move` with a position.
+        await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        closed = await client.wait_status(
+            lambda s: s.tool_status is not None and s.tool_status.positions, timeout=STEP_BUDGET_S
+        )
+        assert closed, "the gripper never reported a position after a close"
+        after_close = (await client.status()).tool_status
+        assert after_close is not None
+
+        await client.tool_action(tool, "move", [0.0, 0.5, 400.0], wait=True)
+        opened = await client.wait_status(
+            lambda s: s.tool_status is not None
+            and s.tool_status.positions
+            and s.tool_status.positions[0] < after_close.positions[0] - 0.05,
+            timeout=STEP_BUDGET_S,
+        )
+        assert opened, (
+            f"opening the gripper did not move the jaws back: "
+            f"closed at {after_close.positions}"
+        )
+
+        with pytest.raises(RobotError) as io:
+            await client.write_io(0, 1)
+        assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "digital output" in io.value.cause, io.value.cause
+
+
+@pytest.mark.timeout(120)
+async def test_status_arrives_on_the_shipped_transport_defaults(tmp_path):
+    """The defaults par6 actually ships, delivering real STATUS frames.
+
+    Every other rig here pins unicast, so the `auto` ladder — probe the
+    multicast group, keep it when the probe is delivered, fall back to
+    unicast when it is not — and multicast DELIVERY itself have never been
+    exercised end to end. A deployed box runs `auto`.
+
+    The probe has to CLEAR here, not fall back: a fallback would still
+    deliver frames, so the delivery assertions below would pass while
+    covering the unicast path this test exists to leave. The send socket
+    setting `IP_MULTICAST_IF` from the configured interface is what makes
+    the probe reach a receiver joined on loopback.
+    """
+    daemon = LiveDaemon.start(tmp_path, status_transport="auto")
+    try:
+        assert "fall back to unicast" not in daemon.log_path.read_text(), (
+            "the multicast probe failed, so this ran on the unicast leg:\n"
+            f"{daemon.log_path.read_text()}"
+        )
+        async with daemon.client(shipped_transport=True) as client:
+            assert await client.wait_status(
+                lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S
+            ), (
+                "no STATUS reached a client on the shipped transport defaults; "
+                f"daemon log:\n{daemon.log_path.read_text()}"
+            )
+            frames = []
+            async with asyncio.timeout(STEP_BUDGET_S):
+                async for status in client.stream_status():
+                    frames.append(status)
+                    if len(frames) == 5:
+                        break
+            assert all(b.seq > a.seq for a, b in zip(frames, frames[1:])), (
+                "the shipped transport delivered frames out of order or repeated"
+            )
+            assert client.status_seq_gaps == 0
+
+            # The command plane is on its own socket; prove the whole
+            # session works on the defaults, not just the broadcast.
+            assert await client.ping() is not None
+            assert await client.angles() is not None
+    finally:
+        daemon.stop()

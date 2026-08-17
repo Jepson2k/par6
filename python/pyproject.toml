@@ -74,4 +74,5 @@ asyncio_default_fixture_loop_scope = "function"
 markers = [
   "e2e: drives a live `par6d --sim` process over real UDP (skipped without the binary)",
   "slow: runs a full simulated sequence in wall-clock time (tens of seconds)",
+  "examples: runs an examples/ script end to end (opt in with --examples)",
 ]

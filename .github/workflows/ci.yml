@@ -218,6 +218,9 @@ jobs:
       - name: pytest -m e2e
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
+          # This job exists to run the e2e layer. Without the flag a
+          # missing binary would skip all of it and still report green.
+          PAR6_REQUIRE_E2E: "1"
         # Sourced, not hand-listed: par6d embeds no rpath at all (cargo
         # link-args do not propagate across packages), so it needs the
         # shim's own directory as well as the conda prefix its Pinocchio
@@ -229,6 +232,7 @@ jobs:
           source .ffi/env.sh
           cd python
           pytest -m e2e
+          pytest -m examples --examples
 
   # The artifact that actually deploys: par6d cross-built for the control
   # box WITH kinematics, plus the shim and the runtime closure that ship

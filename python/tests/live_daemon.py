@@ -127,9 +127,15 @@ class LiveDaemon:
     telemetry_port: int
     config: Path
     log_path: Path
+    status_transport: str = "unicast"
 
     @classmethod
-    def start(cls, workdir: Path, active_gripper: str | None = None) -> "LiveDaemon":
+    def start(
+        cls,
+        workdir: Path,
+        active_gripper: str | None = None,
+        status_transport: str = "unicast",
+    ) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
@@ -145,7 +151,7 @@ class LiveDaemon:
                 "--config", str(config),
                 "--port", "0",
                 "--bind", "127.0.0.1",
-                "--status-transport", "unicast",
+                "--status-transport", status_transport,
                 "--status-host", "127.0.0.1",
                 "--status-port", str(status_port),
                 "--telemetry-port", str(telemetry_port),
@@ -170,6 +176,7 @@ class LiveDaemon:
             telemetry_port=telemetry_port,
             config=config,
             log_path=log_path,
+            status_transport=status_transport,
         )
 
     @staticmethod
@@ -214,9 +221,22 @@ class LiveDaemon:
             self.process.stdout.close()
 
     def client(self, **kwargs) -> AsyncRobotClient:
-        """An :class:`AsyncRobotClient` wired to this daemon's ports."""
+        """An :class:`AsyncRobotClient` wired to this daemon's ports.
+
+        Pinned to unicast to match the rig's own default, so a test is not
+        at the mercy of whether the host routes multicast. Start the daemon
+        with ``status_transport="auto"`` and pass ``shipped_transport=True``
+        here to exercise the shipped ladder instead.
+        """
         kwargs.setdefault("timeout", 2.0)
         kwargs.setdefault("retries", 2)
+        if kwargs.pop("shipped_transport", False):
+            return AsyncRobotClient(
+                host="127.0.0.1",
+                port=self.command_port,
+                status_port=self.status_port,
+                **kwargs,
+            )
         return AsyncRobotClient(
             host="127.0.0.1",
             port=self.command_port,

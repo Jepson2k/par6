@@ -34,6 +34,7 @@ serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 socketcan = "3.6"
+socket2 = "0.6"
 thread-priority = "3"
 rsruckig = "3"
 toml = "0.8"
