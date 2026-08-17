@@ -53,7 +53,6 @@ pub struct Status {
     pub angles: [f64; NUM_JOINTS],
     /// Joint speeds (rad/s).
     pub speeds: [f64; NUM_JOINTS],
-    /// Digital I/O `[in1, in2, out1, out2, estop]`.
     /// Digital line levels, in the order the runtime's config declares
     /// them, with the e-stop last. Variable-length: a control box with
     /// ten lines publishes ten of them plus the e-stop, and a consumer

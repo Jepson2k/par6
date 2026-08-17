@@ -86,6 +86,17 @@ pub enum RtCommand {
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),
+    /// Drive one declared digital output. `port` indexes `[io].outputs`;
+    /// the level persists until the next write, across mode changes and
+    /// the e-stop alike — the vendor never drops its outputs on a stop,
+    /// and a gripper that let go of a part on every e-stop would be the
+    /// more dangerous machine.
+    WriteIo {
+        /// Output index in `[io].outputs`.
+        port: u8,
+        /// 0 or 1; anything non-zero is high.
+        value: u8,
+    },
 }
 
 /// Where the tick loop pulls external commands from — `par6d` wires the

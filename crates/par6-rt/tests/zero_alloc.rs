@@ -11,7 +11,7 @@ use par6_bus::sim::SimBus;
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
     sample_ring, CompletionPolicy, Mode, NoFk, RtCommand, RtCore, RtHooks, Sample, SampleMeta,
-    SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
+    SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
 };
 
 static ALLOCS: AtomicU64 = AtomicU64::new(0);
@@ -63,6 +63,7 @@ fn steady_state_ticks_allocate_nothing() {
     let (tx, rx) = mpsc::channel();
     let (gpio, _line) = SharedLineGpio::new(true);
     let (marker, _flash) = SharedFlashMarker::new();
+    let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (mut producer, consumer) = sample_ring(4096);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
@@ -70,6 +71,7 @@ fn steady_state_ticks_allocate_nothing() {
         stream: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
         estop: Box::new(gpio),
+        io: Box::new(io),
         flash: Box::new(marker),
         commands: Box::new(rx),
         fk: Box::new(NoFk),

@@ -1178,7 +1178,10 @@ async fn status_broadcast_content_and_staleness() {
     assert_eq!(s1.executing_index, -1);
     assert_eq!(s1.accepted_index, -1);
     assert!(s1.error.is_none());
-    assert_eq!(s1.io[4], 1, "estop slot reads OK");
+    // This harness declares no `[io]` lines, so the array is the e-stop
+    // slot alone — which is the invariant worth pinning here: whatever
+    // the box is wired with, the e-stop is the LAST element.
+    assert_eq!(s1.io, vec![1], "the e-stop slot is last and reads OK");
 
     let s2 = recv_status(&h.status_rx).await;
     assert!(s2.seq > s1.seq, "seq must increase");
@@ -1710,47 +1713,81 @@ async fn unappliable_installation_shapes_fail_startup() {
     );
 }
 
-/// `write_io` is refused rather than acked into a fabricated readback.
+/// `write_io` reaches the backend for a declared port and is refused,
+/// by name, for one the box does not have.
 ///
-/// Nothing in this runtime drives a digital output, so the only honest
-/// answers are an ERROR for the command and an un-asserted level for the
-/// two output slots — whichever port a client picks (the shipped Python
-/// client sends the STATUS slot index, 2, for its logical output 0; the
-/// wire's own numbering starts at 0).
+/// The wire caps `port` at 7 because that is all the field will hold;
+/// the box's own `[io].outputs` is the real bound, and a port past it
+/// names no line — acking it would report a level nothing drove. The
+/// published array is `inputs ++ outputs ++ [estop]`, so this also pins
+/// where a driven output lands: after the inputs, before the e-stop.
 #[tokio::test]
-async fn write_io_is_refused_and_never_reported_as_a_driven_output() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
+async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
+    // Two inputs and two outputs — deliberately not the shipped box's
+    // 7/3, so a hardcoded layout cannot pass this.
+    let mut h = start(|c| {
+        c.digital_outputs = vec!["out_a".into(), "out_b".into()];
+    })
+    .await;
+    h.publish(|s| {
+        s.io_inputs = 2;
+        s.io_outputs = 2;
+        s.io_lines[..4].copy_from_slice(&[1, 0, 0, 0]);
+    });
     let mut c = Client::new(&h).await;
 
-    for port in [0u8, 2] {
+    match c
+        .request(&Command::WriteIo(WriteIo { port: 1, value: 1 }))
+        .await
+    {
+        Reply::Ok { .. } => {}
+        other => panic!("port 1 is declared, expected OK: {other:?}"),
+    }
+    assert!(
+        h.rt_events().contains(&RtEvent::WriteIo(1, 1)),
+        "the accepted write reaches the backend: {:?}",
+        h.rt_events()
+    );
+
+    for port in [2u8, 7] {
         let err = c
             .expect_error(&Command::WriteIo(WriteIo { port, value: 1 }))
             .await;
         assert_eq!(err.code, ErrorCode::CommValidationError as u16);
         assert!(
-            err.cause.contains("digital output"),
-            "the refusal says why: {}",
+            err.cause.contains("2 digital output"),
+            "the refusal names the count the box has: {}",
             err.cause
         );
     }
+    assert_eq!(
+        h.rt_events()
+            .iter()
+            .filter(|e| matches!(e, RtEvent::WriteIo(..)))
+            .count(),
+        1,
+        "refused ports reach no backend: {:?}",
+        h.rt_events()
+    );
 
+    // The levels themselves come from the RT snapshot, so the query and
+    // STATUS both read the lines the tick loop last published.
+    h.publish(|s| {
+        s.io_inputs = 2;
+        s.io_outputs = 2;
+        s.io_lines[..4].copy_from_slice(&[1, 0, 0, 1]);
+    });
     match c.query(&Command::Io).await {
         QueryResult::Io { io } => {
-            assert_eq!(io[2..4], [0, 0], "no output was driven, none is reported");
-            assert_eq!(io[4], 1, "the e-stop slot is the one backed by a real line");
+            assert_eq!(io, vec![1, 0, 0, 1, 1], "2 in + 2 out + e-stop, in order");
         }
         other => panic!("unexpected {other:?}"),
     }
     let status = recv_status(&h.status_rx).await;
-    assert_eq!(status.io[2..4], [0, 0], "STATUS agrees with the IO query");
-
-    assert!(
-        !h.rt_events()
-            .iter()
-            .any(|e| matches!(e, RtEvent::WriteIo(..))),
-        "a refused command reaches no backend: {:?}",
-        h.rt_events()
+    assert_eq!(
+        status.io,
+        vec![1, 0, 0, 1, 1],
+        "STATUS agrees with the query"
     );
 }
 

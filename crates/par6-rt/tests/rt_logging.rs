@@ -25,8 +25,8 @@ use par6_bus::{
 use par6_config::{ConfigBundle, GripperConfig, RobotConfig};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
-    sample_ring, CompletionPolicy, NoFk, RtCore, SharedFlashMarker, SharedLineGpio, SpecSettle,
-    ZeroGravity,
+    sample_ring, CompletionPolicy, NoFk, RtCore, SharedDigitalIo, SharedFlashMarker,
+    SharedLineGpio, SpecSettle, ZeroGravity,
 };
 
 /// Records emitted by the sites this test is about.
@@ -167,6 +167,8 @@ fn a_permanent_bus_fault_does_not_log_once_per_tick() {
     let (_tx, rx) = mpsc::channel();
     let (gpio, _line) = SharedLineGpio::new(true);
     let (marker, _flash) = SharedFlashMarker::new();
+    let (io, _io_lines) =
+        SharedDigitalIo::new(bundle.robot.io.inputs.len(), bundle.robot.io.outputs.len());
     let (_producer, consumer) = sample_ring(64);
     let hooks = par6_rt::RtHooks {
         gravity: Box::new(ZeroGravity),
@@ -174,6 +176,7 @@ fn a_permanent_bus_fault_does_not_log_once_per_tick() {
         stream: Box::new(ClampStream::new(&bundle.robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
         estop: Box::new(gpio),
+        io: Box::new(io),
         flash: Box::new(marker),
         commands: Box::new(rx),
         fk: Box::new(NoFk),

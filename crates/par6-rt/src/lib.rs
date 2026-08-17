@@ -27,7 +27,8 @@
 //! - [`exec`]: EXEC sample-ring playback with the completion policies.
 //! - [`errors`]: the error latch manager (hard/warning keys, clear
 //!   settle).
-//! - [`gpio`]: e-stop line abstraction + first-read-seeded debounce.
+//! - [`gpio`]: e-stop and digital-I/O line abstractions + first-read-seeded
+//!   debounce.
 //! - [`gravity`]: the G(q) model seam ([`ZeroGravity`], pinokin behind
 //!   the `ffi` feature).
 //! - [`timing`]: loop-period statistics and the p99 degradation bands.
@@ -58,7 +59,10 @@ pub mod timing;
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
 };
-pub use gpio::{Debouncer, EstopGpio, EstopMonitor, SharedLineGpio, DEBOUNCE_READS};
+pub use gpio::{
+    Debouncer, DigitalIo, EstopGpio, EstopMonitor, NoDigitalIo, SharedDigitalIo, SharedIoLines,
+    SharedLineGpio, DEBOUNCE_READS,
+};
 pub use gravity::{GravityModel, ZeroGravity};
 pub use hooks::{
     CommandSource, CompletionPolicy, FlashMarker, ForwardKin, JogEngine, NoCommands, NoFk,

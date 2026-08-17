@@ -28,6 +28,7 @@ from waldoctl.status import ActionState as WActionState
 from waldoctl.tools import GripperTool, GripperType
 from waldoctl.tools import ToolState as WToolState
 
+from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.protocol import wire
 from par6.protocol.constants import NUM_JOINTS, CmdType, Frame, MsgType, QueryType
@@ -509,15 +510,17 @@ async def test_system_commands_wire_mapping(
     assert await client.set_tcp_offset(0, 0, -190) == 1
     assert peer.of(CmdType.SET_TCP_OFFSET)[0][2] == [0.0, 0.0, -190.0]
 
-    # write_io maps logical output 0/1 onto controller ports 2/3. The 1
-    # here is the SCRIPTED peer acking, not a runtime succeeding — par6d
-    # refuses every write_io (issue #28), which the e2e suite pins. What
-    # this asserts is the client's encoding, which is real either way.
+    # `index` IS the wire's port: it addresses `[io].outputs`, with no
+    # STATUS-slot arithmetic in between. The 1 here is the scripted peer
+    # acking; what this pins is the encoding.
+    n_out = len(_cfg.io_line_names()[1])
     assert await client.write_io(0, 1) == 1
-    assert await client.write_io(1, 0) == 1
-    assert [r[2] for r in peer.of(CmdType.WRITE_IO)] == [[2, 1], [3, 0]]
+    assert await client.write_io(n_out - 1, 0) == 1
+    assert [r[2] for r in peer.of(CmdType.WRITE_IO)] == [[0, 1], [n_out - 1, 0]]
     with pytest.raises(ValueError):
-        await client.write_io(2, 1)
+        await client.write_io(n_out, 1)
+    with pytest.raises(ValueError):
+        await client.write_io(-1, 1)
     with pytest.raises(ValueError):
         await client.write_io(0, 5)
 

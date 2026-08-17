@@ -34,7 +34,7 @@ from waldoctl.shapes import Box
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, ErrorCode
+from par6.protocol.constants import ActionState, CmdType, ErrorCode
 from par6.robot import Robot
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
@@ -599,7 +599,7 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
 
         await client.estop()
         assert await client.wait_status(
-            lambda s: s.io[4] == 0, timeout=STEP_BUDGET_S
+            lambda s: s.io[-1] == 0, timeout=STEP_BUDGET_S
         ), "the e-stop never reached the I/O surface"
         assert await client.is_estop_pressed() is True
 
@@ -624,7 +624,7 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert streak >= 3, "the arm never came to rest under the e-stop latch"
 
         assert await client.reset() == 1
-        assert await client.wait_status(lambda s: s.io[4] == 1, timeout=STEP_BUDGET_S)
+        assert await client.wait_status(lambda s: s.io[-1] == 1, timeout=STEP_BUDGET_S)
         assert await client.is_estop_pressed() is False
 
 
@@ -1063,16 +1063,18 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
 
 
 @pytest.mark.timeout(180)
-async def test_the_python_client_drives_the_gripper_and_write_io_is_refused(
+async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
     daemon: LiveDaemon,
 ):
     """Two things only the Rust client had ever exercised against a runtime.
 
     The jaw: a tool action through the Python client must reach the
-    simulated driver and come back as a real tool status, not an ack. And
-    ``write_io`` must be REFUSED — par6d drives no digital outputs
-    (issue #28), and a client reporting success would promise the one thing
-    the arm will not do.
+    simulated driver and come back as a real tool status, not an ack.
+
+    The lines: ``write_io`` must reach the runtime and come back on the
+    STATUS ``io`` array, at the slot the declared layout puts it — the
+    array is sized from the ``[io]`` config, so this also pins that a
+    client reading it never has to know a hardcoded length.
     """
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
@@ -1108,10 +1110,44 @@ async def test_the_python_client_drives_the_gripper_and_write_io_is_refused(
             f"closed at {after_close.positions}"
         )
 
+        # WC sizes its I/O chips from these two counts, so the published
+        # array has to be exactly as long as they say.
+        robot = Robot(host="127.0.0.1", port=daemon.command_port, timeout=STEP_BUDGET_S)
+        n_in = robot.digital_inputs
+        n_out = robot.digital_outputs
+        assert n_out >= 2, "the shipped box declares more than one output"
+
+        status = await client.status()
+        assert status is not None
+        assert len(status.io) == n_in + n_out + 1, (
+            f"io carries every declared line plus the e-stop: {list(status.io)}"
+        )
+        assert status.io[-1] == 1, "the e-stop slot is last and reads clear"
+
+        # Drive the LAST output, so a run that ignored `port` and wrote
+        # slot 0 would land somewhere this assertion can see.
+        await client.write_io(n_out - 1, 1)
+        driven = await client.wait_status(
+            lambda s: bool(s.io[n_in + n_out - 1] == 1), timeout=STEP_BUDGET_S
+        )
+        assert driven, "the level never reached the published io array"
+        status = await client.status()
+        assert status is not None
+        assert list(status.io[n_in : n_in + n_out]) == [0] * (n_out - 1) + [1], (
+            f"only the addressed output moved: {list(status.io)}"
+        )
+
+        await client.write_io(n_out - 1, 0)
+        cleared = await client.wait_status(
+            lambda s: bool(s.io[n_in + n_out - 1] == 0), timeout=STEP_BUDGET_S
+        )
+        assert cleared, "the output never went back low"
+
+        # The wire will carry port 7; the box will not.
         with pytest.raises(RobotError) as io:
-            await client.write_io(0, 1)
+            await client._system(CmdType.WRITE_IO, [n_out, 1])
         assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
-        assert "digital output" in io.value.cause, io.value.cause
+        assert "does not exist" in io.value.cause, io.value.cause
 
 
 @pytest.mark.timeout(120)

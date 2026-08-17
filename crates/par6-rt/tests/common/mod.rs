@@ -15,8 +15,8 @@ use par6_config::ConfigBundle;
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
     sample_ring, CompletionPolicy, GravityModel, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks,
-    SampleProducer, SharedFlashMarker, SharedLineGpio, SpecSettle, StateSnapshot, ZeroGravity,
-    MAX_JOINTS,
+    SampleProducer, SharedDigitalIo, SharedFlashMarker, SharedIoLines, SharedLineGpio, SpecSettle,
+    StateSnapshot, ZeroGravity, MAX_JOINTS,
 };
 
 pub fn bundle() -> ConfigBundle {
@@ -52,6 +52,8 @@ pub struct Rig {
     pub estop_line: Arc<AtomicBool>,
     /// FLASHING-exit flash marker.
     pub flash_flag: Arc<AtomicBool>,
+    /// The `[io]` lines: drive inputs, read back driven outputs.
+    pub io_lines: SharedIoLines,
     pub producer: SampleProducer,
     /// Mirror of the core's boot-calibrated conversions, for building
     /// injected encoder readings from joint poses.
@@ -116,6 +118,7 @@ impl Rig {
         let (tx, rx) = mpsc::channel();
         let (gpio, estop_line) = SharedLineGpio::new(line_high);
         let (marker, flash_flag) = SharedFlashMarker::new();
+        let (io, io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
         let (producer, consumer) = sample_ring(4096);
         let hooks = RtHooks {
             gravity,
@@ -123,6 +126,7 @@ impl Rig {
             stream: Box::new(ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(policy, dt)),
             estop: Box::new(gpio),
+            io: Box::new(io),
             flash: Box::new(marker),
             commands: Box::new(rx),
             fk: Box::new(NoFk),
@@ -143,6 +147,7 @@ impl Rig {
             cmds: tx,
             estop_line,
             flash_flag,
+            io_lines,
             producer,
             conv,
             node_of,

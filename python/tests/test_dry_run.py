@@ -450,11 +450,21 @@ class TestCartesianMotion:
         assert clamped.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert dry_run.angles() == pytest.approx(before, abs=1e-9)
 
-        # write_io is refused for the reason the runtime refuses it: par6d
-        # drives no digital outputs, so a success here would be a promise.
+        # The preview owns the readback even though it owns no pins: a
+        # level set here has to show up where the runtime would put it,
+        # or a program that reads its own outputs back behaves
+        # differently against the preview than against the arm.
+        n_in, n_out = (len(g) for g in _cfg.io_line_names())
+        assert dry_run.io() == [0] * (n_in + n_out) + [1]
+        dry_run.write_io(n_out - 1, 1)
+        assert dry_run.io() == [0] * (n_in + n_out - 1) + [1, 1]
+        dry_run.write_io(n_out - 1, 0)
+        assert dry_run.io() == [0] * (n_in + n_out) + [1]
+
         with pytest.raises(RobotError) as io:
-            dry_run.write_io(0, 1)
+            dry_run.write_io(n_out, 1)
         assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "does not exist" in io.value.cause
 
     def test_home_returns_to_park_once_the_arm_is_referenced(self) -> None:
         """HOME is two commands wearing one name, and the preview has to know

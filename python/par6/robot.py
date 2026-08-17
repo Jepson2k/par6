@@ -545,18 +545,13 @@ class Robot(_RobotABC):
 
     # -- Capability flags ---------------------------------------------------
 
-    # Must stay consistent with the STATUS io layout
-    # (`IO_SLOTS = [in1, in2, out1, out2, estop]`): consumers size their IO
-    # buffers as inputs + outputs + 1 and write decoded frames straight into
-    # them, so a count that disagrees with the wire breaks every status frame.
-
     @property
     def digital_outputs(self) -> int:
-        return 2
+        return len(_cfg.io_line_names()[1])
 
     @property
     def digital_inputs(self) -> int:
-        return 2
+        return len(_cfg.io_line_names()[0])
 
     # -- Visualization ------------------------------------------------------
 

@@ -53,7 +53,7 @@ from par6 import motion as _motion
 from par6.client.async_client import StatusResult
 from par6.client.errors import RobotError
 from par6.motion import JogEngine, LineSegment, MotionLimits, PlanningError
-from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CmdType, ErrorCode
+from par6.protocol.constants import NUM_JOINTS, CmdType, ErrorCode
 from par6.protocol.wire import ProtocolError, _validate_command
 
 logger = logging.getLogger(__name__)
@@ -399,6 +399,8 @@ class DryRunRobotClient:
         self._robot.set_active_tool(self._tool_key)
         self._chain = _Chain()
         self._pending: list[DryRunResultData] = []
+        self._io_inputs, self._io_outputs = _cfg.io_line_names()
+        self._io_levels = [0] * len(self._io_outputs)
 
     # ------------------------------------------------------------------
     # State
@@ -1410,22 +1412,32 @@ class DryRunRobotClient:
         return 1
 
     def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
-        """Refused, as the runtime refuses it: par6d drives no digital
-        outputs yet, so a preview that reported success would promise the
-        one thing the arm will not do."""
-        raise make_error(
-            ErrorCode.COMM_VALIDATION_ERROR,
-            detail=(
-                f"write_io is unavailable: this runtime drives no digital "
-                f"outputs, so port {index} cannot be set"
-            ),
-        )
+        """Drive one declared output, and remember the level.
+
+        A preview owns no pins, but it does own the readback: the level
+        shows up in :meth:`io` exactly where the runtime would put it, so a
+        program that sets an output and then reads it back behaves the same
+        against both."""
+        _wire_checked(CmdType.WRITE_IO, [index, value])
+        if not 0 <= index < len(self._io_outputs):
+            raise make_error(
+                ErrorCode.COMM_VALIDATION_ERROR,
+                detail=(
+                    f"write_io port {index} does not exist: this box declares "
+                    f"{len(self._io_outputs)} digital output(s)"
+                ),
+            )
+        self._io_levels[index] = 1 if value else 0
+        return 1
 
     def io(self) -> list[int]:
-        """``[in1, in2, out1, out2, estop]`` — the runtime's own layout. A
-        preview reads no lines and never latches e-stop, so every input is
-        low and the e-stop slot reads clear."""
-        return [0] * (IO_SLOTS - 1) + [1]
+        """``inputs ++ outputs ++ [estop]``, the runtime's own layout.
+
+        A preview reads no lines, so every input is low — which is what an
+        unwired input reads on the box too — and it never latches an e-stop,
+        so the last slot reads clear. The outputs are whatever
+        :meth:`write_io` last set."""
+        return [0] * len(self._io_inputs) + list(self._io_levels) + [1]
 
     def queue(self) -> list[str]:
         """A preview runs each command as it arrives, so nothing is ever

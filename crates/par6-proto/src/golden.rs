@@ -968,9 +968,11 @@ pub fn vectors() -> Vec<Vector> {
     v
 }
 
-/// The vendor control box's line count: 3 isolated in, 3 isolated out,
-/// 4 general in, e-stop last. Nothing about the STATUS layout changes to
-/// carry it — only the length of one array.
+/// The stock control box's lines, in the order the shipped `[io]` config
+/// declares them: seven inputs (3 isolated, 4 general), three isolated
+/// outputs, e-stop last. Nothing about the STATUS layout changes to
+/// carry them — only the length of one array, which is why the suite
+/// also keeps a five-slot status alongside this one.
 fn status_ten_io_lines_fixture() -> Status {
     Status {
         io: vec![1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0],

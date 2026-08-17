@@ -513,23 +513,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
                 Ok(())
             }
-            // Nothing in this runtime can drive a digital output: the bus
-            // protocol has no output frame and the RT core
-            // owns one GPIO line, the e-stop INPUT. Acking the command and
-            // echoing the commanded level back in STATUS showed an
-            // operator an output state the arm never produced.
-            C::WriteIo(p) => Err(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    &format!(
-                        "write_io is unavailable: this runtime drives no digital outputs, \
-                         so port {} cannot be set",
-                        p.port
-                    ),
-                )],
-            )),
+            // `port` indexes the box's DECLARED outputs, so the wire's
+            // own 0..=7 bound is not the answer here: a port past the
+            // end names no line, and acking it would report a level the
+            // arm never drove.
+            C::WriteIo(p) => match self.cfg.digital_outputs.get(usize::from(p.port)) {
+                Some(name) => {
+                    log::debug!("write_io {name} (port {}) = {}", p.port, p.value);
+                    self.runtime.rt.write_io(p.port, p.value);
+                    Ok(())
+                }
+                None => Err(make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        &format!(
+                            "write_io port {} does not exist: this box declares {} digital \
+                             output(s)",
+                            p.port,
+                            self.cfg.digital_outputs.len()
+                        ),
+                    )],
+                )),
+            },
             C::Simulator(p) => {
                 self.cancel_all_motion();
                 self.runtime.rt.set_simulator(p.on).map(|()| {
@@ -1414,16 +1421,21 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 .any(|e| matches!(e.code, RtErr::Estop | RtErr::SwEstop))
     }
 
-    /// The default `[in1, in2, out1, out2, estop]` slots. Only the e-stop
-    /// slot is backed by a real line; the runtime neither reads the two
-    /// inputs nor drives the two outputs, and the wire type (`u8` per
-    /// slot) has no way to say "unknown" — so they report the un-asserted
-    /// level rather than a level the arm was never observed at.
+    /// `inputs ++ outputs ++ [estop]`, in `[io]` config order — the
+    /// declared lines as the RT thread last read and drove them, with
+    /// the e-stop always last.
     ///
-    /// The array is variable-length on the wire; making these lines real
-    /// (and adding the control box's other six) changes only its length.
+    /// The e-stop slot is not a line level: it is the whole e-stop
+    /// CONDITION, hardware chain and software flag together, which is
+    /// what an operator watching this array needs to see.
     fn io(&self) -> Vec<u8> {
-        vec![0, 0, 0, 0, u8::from(!self.estop_pressed())]
+        let inputs = self.snap.io_input_levels();
+        let outputs = self.snap.io_output_levels();
+        let mut io = Vec::with_capacity(inputs.len() + outputs.len() + 1);
+        io.extend_from_slice(inputs);
+        io.extend_from_slice(outputs);
+        io.push(u8::from(!self.estop_pressed()));
+        io
     }
 
     fn angles_deg(&self) -> [f64; NUM_JOINTS] {

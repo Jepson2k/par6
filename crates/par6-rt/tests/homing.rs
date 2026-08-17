@@ -24,8 +24,8 @@ use par6_rt::homing::{HomingSystem, SeqStatus};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, Mode, NoFk, RtCommand,
-    RtCore, RtHandles, RtHooks, SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity,
-    MAX_JOINTS,
+    RtCore, RtHandles, RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle,
+    ZeroGravity, MAX_JOINTS,
 };
 
 /// An RtCore over the closed-loop sim bus. J5's hall band is moved onto
@@ -44,6 +44,7 @@ fn sim_core() -> (
     let (tx, rx) = mpsc::channel();
     let (gpio, line) = SharedLineGpio::new(true);
     let (marker, _flash) = SharedFlashMarker::new();
+    let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
         gravity: Box::new(ZeroGravity),
@@ -51,6 +52,7 @@ fn sim_core() -> (
         stream: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
         estop: Box::new(gpio),
+        io: Box::new(io),
         flash: Box::new(marker),
         commands: Box::new(rx),
         fk: Box::new(NoFk),

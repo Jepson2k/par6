@@ -55,7 +55,7 @@ from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
-from ..config import canonical_tool_key
+from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import (
     NUM_JOINTS,
     CmdType,
@@ -1481,23 +1481,26 @@ class AsyncRobotClient(_RobotClientABC):
     async def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin).
 
-        The controller I/O layout is ``[in1, in2, out1, out2, estop]``, so
-        logical output 0 maps to port 2.
+        *index* addresses the ``[io].outputs`` list, which is also where the
+        STATUS ``io`` array carries the level back — at
+        ``io[digital_inputs + index]``. The level persists until the next
+        write, through mode changes and e-stops alike.
 
-        **Refused by every current runtime** — par6d drives no digital
-        outputs yet, so this raises :class:`RobotError` rather than
-        reporting a success the arm cannot produce (issue #28).
+        The bound checked here is the packaged config's; the runtime checks
+        its own and refuses a port it does not have, so a box wired
+        differently is caught either way.
 
         Category: I/O
 
         Example:
             rbt.write_io(0, 1)   # Set first output HIGH
         """
-        if index not in (0, 1):
-            raise ValueError("Output index must be 0 or 1")
+        outputs = len(io_line_names()[1])
+        if not 0 <= index < outputs:
+            raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        return await self._system(CmdType.WRITE_IO, [index + 2, value])
+        return await self._system(CmdType.WRITE_IO, [index, value])
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1779,10 +1782,11 @@ class AsyncRobotClient(_RobotClientABC):
             pressed = rbt.is_estop_pressed()
         """
         io_status = await self.io()
-        if io_status is None or len(io_status) < 5:
+        if not io_status:
             return False
-        # The e-stop slot carries the LINE, which reads low while pressed.
-        return io_status[4] == 0
+        # The e-stop is the LAST slot whatever the box declares, and it
+        # carries the LINE, which reads low while pressed.
+        return io_status[-1] == 0
 
     async def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
         """Whether every joint is below *threshold_speed* (rad/s).

@@ -28,9 +28,9 @@ use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::{ConfigBundle, ConfigError, LimitMode, TimingConfig};
 use par6_motion::{JogEngine, MotionError, MotionLimits, StreamingExecutor};
 use par6_rt::{
-    sample_ring, snapshot_channel, CompletionPolicy, EstopGpio, FlashMarker, ForwardKin,
-    GravityModel, RtCore, RtHooks, RunOptions, SharedLineGpio, SnapshotReader, SnapshotWriter,
-    SpecSettle, StateSnapshot,
+    sample_ring, snapshot_channel, CompletionPolicy, DigitalIo, EstopGpio, FlashMarker, ForwardKin,
+    GravityModel, RtCore, RtHooks, RunOptions, SharedDigitalIo, SharedLineGpio, SnapshotReader,
+    SnapshotWriter, SpecSettle, StateSnapshot,
 };
 use par6_server::{ServerConfig, ServerHandle};
 
@@ -194,6 +194,7 @@ impl Daemon {
             RuntimeBus::from(open_hardware_bus(&robot.bus)?)
         };
         let estop = estop_source(opts)?;
+        let io = io_source(opts, &robot.io)?;
 
         // The real gravity model always runs, so `gravity_torque_nm`
         // publishes the arm's true G(q) in every mode. APPLYING it as a
@@ -218,6 +219,7 @@ impl Daemon {
             stream: Box::new(stream),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
             estop,
+            io,
             flash: flash_marker(),
             commands: Box::new(cmds_rx),
             fk: fk_hook,
@@ -475,6 +477,7 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     let robot = &bundle.robot;
     let mut cfg = ServerConfig::from_protocol(&robot.protocol);
     cfg.rt_tick_rate_hz = robot.tick_rate_hz();
+    cfg.digital_outputs = robot.io.outputs.iter().map(|l| l.name.clone()).collect();
     cfg.simulator = opts.sim;
     cfg.tools = bundle.grippers.iter().map(|g| g.name.clone()).collect();
     // The fitted tool is the one the kinematics, gravity model and bus
@@ -646,6 +649,35 @@ fn estop_source(opts: &Options) -> Result<Box<dyn EstopGpio>, DaemonError> {
         DaemonError::Hardware(format!(
             "{e} — the physical e-stop must be readable before the arm moves; \
              run with --sim for the simulator"
+        ))
+    })
+}
+
+/// The `[io]` lines this runtime reads and drives.
+///
+/// Hardware opens every declared line on the chip carrying the header
+/// and refuses to start if it cannot, for a weaker version of the
+/// e-stop's reason: STATUS publishes a level per line whether or not one
+/// was measured, and `write_io` would report success for a pin nothing
+/// drove.
+///
+/// `--sim` gets flag-backed lines. Its inputs stay low for the session,
+/// which is exactly what an unwired input on the real box reads (the
+/// header lines are requested with the vendor's pull-down bias), and its
+/// outputs hold whatever `write_io` last set — so the STATUS array a
+/// client sees has the shape and the behaviour it has on hardware, minus
+/// anything to plug into.
+fn io_source(
+    opts: &Options,
+    cfg: &par6_config::IoConfig,
+) -> Result<Box<dyn DigitalIo>, DaemonError> {
+    if opts.sim {
+        let (io, _lines) = SharedDigitalIo::new(cfg.inputs.len(), cfg.outputs.len());
+        return Ok(Box::new(io));
+    }
+    par6_rt::gpio::open_lines(cfg).map_err(|e| {
+        DaemonError::Hardware(format!(
+            "{e} — fix the `[io]` section or the wiring; run with --sim for the simulator"
         ))
     })
 }

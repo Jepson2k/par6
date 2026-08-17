@@ -33,12 +33,12 @@ use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
 };
-use par6_config::{ConfigBundle, ControlMode, KtSource};
+use par6_config::{ConfigBundle, ControlMode, KtSource, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
-use crate::gpio::{EstopGpio, EstopMonitor};
+use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
 use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
@@ -209,6 +209,8 @@ pub struct RtHooks {
     pub settle: Box<dyn SettlePolicy>,
     /// ESTOP_1 GPIO line.
     pub estop: Box<dyn EstopGpio>,
+    /// The box's general-purpose digital lines (`[io]` config).
+    pub io: Box<dyn DigitalIo>,
     /// FLASHING-exit flash marker.
     pub flash: Box<dyn FlashMarker>,
     /// External command intake (one consumed per tick).
@@ -313,6 +315,19 @@ pub struct RtCore<B: DriverBus> {
     stream: Box<dyn StreamTracker>,
     exec: ExecPlayback,
     estop: EstopMonitor,
+    io: Box<dyn DigitalIo>,
+    /// Debounced input levels then driven output levels, in `[io]`
+    /// order — the snapshot's `io_lines` layout, kept here so the
+    /// publish is a copy.
+    io_lines: [u8; MAX_IO_LINES],
+    io_debounce: [Debouncer; MAX_IO_LINES],
+    n_io_inputs: usize,
+    n_io_outputs: usize,
+    /// An output level changed and has not reached the pins yet. The
+    /// vendor re-drives every output every tick; a level that did not
+    /// move is the same pin state either way, and skipping it keeps an
+    /// idle box off the ioctl path entirely.
+    io_out_dirty: bool,
     flash: Box<dyn FlashMarker>,
     commands: Box<dyn CommandSource>,
     fk: Box<dyn ForwardKin>,
@@ -466,6 +481,12 @@ impl<B: DriverBus> RtCore<B> {
             stream: hooks.stream,
             exec: ExecPlayback::new(hooks.samples, hooks.settle),
             estop: EstopMonitor::new(hooks.estop),
+            io: hooks.io,
+            io_lines: [0; MAX_IO_LINES],
+            io_debounce: [Debouncer::new(); MAX_IO_LINES],
+            n_io_inputs: robot.io.inputs.len(),
+            n_io_outputs: robot.io.outputs.len(),
+            io_out_dirty: !robot.io.outputs.is_empty(),
             flash: hooks.flash,
             commands: hooks.commands,
             fk: hooks.fk,
@@ -636,8 +657,11 @@ impl<B: DriverBus> RtCore<B> {
         self.tick += 1;
         self.bus.begin_tick(self.tick);
 
-        // Phase 2: e-stop GPIO read + debounce (reaction in phase 7).
+        // Phase 2: GPIO read + debounce — the e-stop (reaction in phase
+        // 7) and the box's own inputs, which mean nothing to the runtime
+        // and are published verbatim.
         self.hw_estop = self.estop.pressed();
+        self.read_io_inputs();
 
         // Phase 3: loop-period statistics and degradation bands.
         let health = self.timing.record(period_s, overrun);
@@ -649,6 +673,11 @@ impl<B: DriverBus> RtCore<B> {
         if let Some(cmd) = self.commands.poll() {
             self.apply_command(cmd);
         }
+
+        // Phase 5b: a level this tick's command changed reaches the pins
+        // in the same tick, so a client that writes and then reads the
+        // next STATUS sees what it asked for.
+        self.drive_io_outputs();
 
         // Phase 6: RX drain → state pipeline (measure-then-command).
         self.drain_and_derive();
@@ -822,6 +851,58 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
+            RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
+        }
+    }
+
+    /// Read and debounce every declared input.
+    ///
+    /// The vendor debounces its general inputs with the same
+    /// five-consecutive-reads filter it uses on the e-stop, so a
+    /// contact bounce cannot be seen by a client polling STATUS at
+    /// 50 Hz; the first-read seeding matters here too, because an
+    /// unseeded filter would publish LOW for the first four ticks of
+    /// an input that was high the whole time.
+    fn read_io_inputs(&mut self) {
+        if self.n_io_inputs == 0 {
+            return;
+        }
+        let mut raw = [0u8; MAX_IO_LINES];
+        let raw = &mut raw[..self.n_io_inputs];
+        self.io.read_inputs(raw);
+        for (i, level) in raw.iter().enumerate() {
+            self.io_lines[i] = u8::from(self.io_debounce[i].update(*level != 0));
+        }
+    }
+
+    /// Drive the outputs when a level has moved since the last write.
+    fn drive_io_outputs(&mut self) {
+        if !self.io_out_dirty {
+            return;
+        }
+        let start = self.n_io_inputs;
+        self.io
+            .write_outputs(&self.io_lines[start..start + self.n_io_outputs]);
+        self.io_out_dirty = false;
+    }
+
+    /// Set one output by `[io]` port index. Out-of-range ports are
+    /// refused by the command plane against the same declared count, so
+    /// reaching one here is a wiring bug rather than a client error.
+    fn set_io_output(&mut self, port: u8, value: u8) {
+        let port = usize::from(port);
+        if port >= self.n_io_outputs {
+            log::error!(
+                "write_io port {port} past the {} declared outputs",
+                self.n_io_outputs
+            );
+            return;
+        }
+        let slot = self.n_io_inputs + port;
+        let level = u8::from(value != 0);
+        if self.io_lines[slot] != level {
+            self.io_lines[slot] = level;
+            self.io_out_dirty = true;
         }
     }
 
@@ -1479,6 +1560,9 @@ impl<B: DriverBus> RtCore<B> {
             joint: self.jog_joint,
             blocked_mask: self.jog_blocked,
         };
+        s.io_lines = self.io_lines;
+        s.io_inputs = self.n_io_inputs as u8;
+        s.io_outputs = self.n_io_outputs as u8;
         s.stream = StreamStatus {
             substate: if self.mode == Mode::Stream {
                 StreamSubstate::ControlActive

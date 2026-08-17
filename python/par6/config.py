@@ -242,6 +242,25 @@ def jog_ramp_acceleration() -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
+# Digital I/O
+# ---------------------------------------------------------------------------
+
+
+def io_line_names() -> tuple[list[str], list[str]]:
+    """``(inputs, outputs)`` from the runtime's ``[io]`` section, in order.
+
+    The same order the STATUS ``io`` array uses — inputs, then outputs, then
+    the e-stop, which is never declared and always last. ``write_io(port)``
+    indexes the *outputs* list.
+    """
+    io = load_robot_config().get("io", {})
+    return (
+        [line["name"] for line in io.get("inputs", [])],
+        [line["name"] for line in io.get("outputs", [])],
+    )
+
+
+# ---------------------------------------------------------------------------
 # Tools
 # ---------------------------------------------------------------------------
 

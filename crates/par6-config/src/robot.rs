@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 use crate::homing::HomingConfig;
+use crate::io::IoConfig;
 use crate::{invalid, read_to_string, ConfigError};
 
 /// Strictly positive AND comparable — rejects NaN, unlike `v <= 0.0`.
@@ -471,6 +472,11 @@ pub struct RobotConfig {
     pub bus: BusConfig,
     /// UDP protocol plane configuration.
     pub protocol: ProtocolConfig,
+    /// Digital I/O lines. Omitted = the stock control box's ten, which
+    /// is the hardware par6 ships against; declare the section to
+    /// describe a box wired differently.
+    #[serde(default)]
+    pub io: IoConfig,
     /// Jog startup defaults.
     #[serde(default)]
     pub jog: JogDefaults,
@@ -551,6 +557,7 @@ impl RobotConfig {
             self.validate_joint(i, j, &reserved)?;
         }
         self.homing.validate(self.joints.len())?;
+        self.io.validate()?;
         self.validate_bus()?;
         self.validate_protocol()?;
         self.validate_defaults()?;

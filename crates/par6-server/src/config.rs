@@ -107,6 +107,11 @@ pub struct ServerConfig {
     /// would otherwise be dropped without a word — a fire-and-forget
     /// command the runtime cannot execute must still say so.
     pub cartesian: bool,
+    /// Names of the declared digital output lines, in `write_io` port
+    /// order — `write_io(port, …)` is refused past the end of this list,
+    /// naming the line count the box actually has. Empty = a box that
+    /// drives no outputs, and every `write_io` is refused.
+    pub digital_outputs: Vec<String>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -160,6 +165,7 @@ impl Default for ServerConfig {
             fitted_tool: String::new(),
             tool_dof: 0,
             cartesian: true,
+            digital_outputs: Vec::new(),
             profiles: vec!["default".to_owned()],
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],

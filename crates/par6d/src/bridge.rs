@@ -859,9 +859,10 @@ impl RtCommands for RtBridge {
     }
 
     fn write_io(&mut self, port: u8, value: u8) {
-        // The sim backend has no digital output pins; the server mirrors
-        // outputs into STATUS. Physical GPIO lands with hardware mode.
-        log::info!("write_io port={port} value={value} (no physical outputs in sim)");
+        // The server has already checked `port` against the declared
+        // outputs, so this only forwards; the RT thread owns the pins
+        // and drives them on the tick that consumes the command.
+        self.link.send(RtCommand::WriteIo { port, value });
     }
 
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError> {

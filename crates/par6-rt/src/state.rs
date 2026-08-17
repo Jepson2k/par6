@@ -3,6 +3,7 @@
 //! tick.
 
 use par6_bus::{GripperState, LinkHealth, NodeState};
+use par6_config::MAX_IO_LINES;
 
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -418,6 +419,34 @@ pub struct StateSnapshot {
     pub jog: JogStatus,
     /// Streaming live state.
     pub stream: StreamStatus,
+    /// Digital I/O levels: the first `io_inputs` entries are the
+    /// debounced input levels, the next `io_outputs` are the levels the
+    /// tick loop is driving, both in `[io]` config order.
+    ///
+    /// Fixed-capacity because the snapshot is published from the tick
+    /// path and may not allocate; the counts are what the wire's
+    /// variable-length `io` array sizes itself from. The e-stop is NOT
+    /// here — it is a latch condition rather than a line level, and the
+    /// command plane appends it as the last STATUS slot.
+    pub io_lines: [u8; MAX_IO_LINES],
+    /// Declared input count (the live prefix of `io_lines`).
+    pub io_inputs: u8,
+    /// Declared output count (the slice after the inputs).
+    pub io_outputs: u8,
+}
+
+impl StateSnapshot {
+    /// The debounced input levels, in config order.
+    pub fn io_input_levels(&self) -> &[u8] {
+        &self.io_lines[..usize::from(self.io_inputs)]
+    }
+
+    /// The levels the tick loop is driving the outputs to, in config
+    /// order — which is `write_io` port order.
+    pub fn io_output_levels(&self) -> &[u8] {
+        let start = usize::from(self.io_inputs);
+        &self.io_lines[start..start + usize::from(self.io_outputs)]
+    }
 }
 
 impl Default for StateSnapshot {
@@ -453,6 +482,9 @@ impl Default for StateSnapshot {
             exec: ExecStatus::default(),
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
+            io_lines: [0; MAX_IO_LINES],
+            io_inputs: 0,
+            io_outputs: 0,
         }
     }
 }

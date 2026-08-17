@@ -512,6 +512,33 @@ status_multicast_group = "239.255.0.71"
 telemetry_port = 6003
 status_rate_hz = 50 # must divide the 250 Hz tick rate
 
+# ============================================================ digital I/O lines
+# The control box's general-purpose lines, by BCM offset on the 40-pin header.
+# Declaration order IS the STATUS `io` order: inputs, then outputs, then the
+# e-stop, which always occupies the last slot and is never listed here (it has
+# its own line, its own debounce and its own startup refusal). `write_io(port)`
+# addresses `outputs` by index, so port 0 is `isolated_out_1`.
+#
+# Every input is read and debounced once per tick; every output is driven when
+# its level changes. Delete a line to stop publishing it, or re-point an offset
+# for a box wired differently — the array's length follows this section, and
+# clients size their I/O buffers from it.
+[io]
+inputs = [
+  { name = "isolated_in_1", offset = 19 }, # BOARD 35
+  { name = "isolated_in_2", offset = 13 }, # BOARD 33
+  { name = "isolated_in_3", offset = 7 },  # BOARD 26
+  { name = "gpio_1", offset = 4 },         # BOARD 7
+  { name = "gpio_2", offset = 27 },        # BOARD 13
+  { name = "gpio_3", offset = 18 },        # BOARD 12
+  { name = "gpio_4", offset = 17 },        # BOARD 11
+]
+outputs = [
+  { name = "isolated_out_1", offset = 25 }, # BOARD 22
+  { name = "isolated_out_2", offset = 24 }, # BOARD 18
+  { name = "isolated_out_3", offset = 22 }, # BOARD 15
+]
+
 # ==================================================== mode defaults (system.xml)
 [jog]
 speed_pct = 0.2
