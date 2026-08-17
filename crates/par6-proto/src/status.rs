@@ -5,7 +5,7 @@
 //! ```text
 //! [STATUS, proto_version u8, controller_id u32, seq u64, mono_time_ns u64,
 //!  link_ok u8, data_age_ms u16,
-//!  pose f64[16], angles f64[6], speeds f64[6], io u8[5],
+//!  pose f64[16], angles f64[6], speeds f64[6], io u8[] (estop last),
 //!  action_current str, action_state u8, joint_en u8[12], cart_en_wrf u8[12],
 //!  cart_en_trf u8[12], executing_index i64, completed_index i64,
 //!  last_checkpoint str, error nil|err6, queued_segments u32,
@@ -20,11 +20,12 @@
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
 
+use crate::command::r_len;
 use crate::enums::{ActionState, MsgType};
 use crate::error::WireError;
 use crate::reply::ToolStatusWire;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
-use crate::{DecodeError, EN_SLOTS, IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
+use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
 
 /// Total number of elements in a v2 STATUS array (including the tag).
 pub const STATUS_LEN: usize = 31;
@@ -53,7 +54,11 @@ pub struct Status {
     /// Joint speeds (rad/s).
     pub speeds: [f64; NUM_JOINTS],
     /// Digital I/O `[in1, in2, out1, out2, estop]`.
-    pub io: [u8; IO_SLOTS],
+    /// Digital line levels, in the order the runtime's config declares
+    /// them, with the e-stop last. Variable-length: a control box with
+    /// ten lines publishes ten of them plus the e-stop, and a consumer
+    /// sizes from `io.len()` rather than from [`IO_SLOTS`].
+    pub io: Vec<u8>,
     /// Name of the current action (empty = idle).
     pub action_current: String,
     /// Action state.
@@ -110,7 +115,7 @@ impl Default for Status {
             pose: [0.0; POSE_ELEMS],
             angles: [0.0; NUM_JOINTS],
             speeds: [0.0; NUM_JOINTS],
-            io: [0; IO_SLOTS],
+            io: vec![0; IO_SLOTS],
             action_current: String::new(),
             action_state: ActionState::Idle,
             joint_en: [1; EN_SLOTS],
@@ -161,7 +166,7 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     for v in &s.speeds {
         w_f64(buf, *v);
     }
-    w_array(buf, IO_SLOTS);
+    w_array(buf, s.io.len());
     for v in &s.io {
         w_uint(buf, u64::from(*v));
     }
@@ -242,6 +247,22 @@ fn r_f64_fixed<const N: usize>(
     Ok(out)
 }
 
+/// Read the variable-length `io` array, bounded before anything is
+/// reserved on the length header's word.
+fn r_u8_dyn(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    let n = r_len(r, what, MAX_IO_SLOTS)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(
+            u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+                what,
+                why: "exceeds u8".into(),
+            })?,
+        );
+    }
+    Ok(out)
+}
+
 fn r_u8_fixed<const N: usize>(
     r: &mut Reader<'_>,
     what: &'static str,
@@ -303,7 +324,7 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     let pose = r_f64_fixed(&mut r, "status.pose")?;
     let angles = r_f64_fixed(&mut r, "status.angles")?;
     let speeds = r_f64_fixed(&mut r, "status.speeds")?;
-    let io = r_u8_fixed(&mut r, "status.io")?;
+    let io = r_u8_dyn(&mut r, "status.io")?;
     let action_current = r.str()?.to_owned();
     let raw_state = r.uint()?;
     let action_state =

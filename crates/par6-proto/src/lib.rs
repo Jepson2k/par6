@@ -64,8 +64,25 @@ pub const PROTO_VERSION: u8 = 2;
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.
 pub const POSE_ELEMS: usize = 16;
-/// Digital I/O slots in STATUS: `[in1, in2, out1, out2, estop]`.
+/// Digital I/O slots in the DEFAULT STATUS layout:
+/// `[in1, in2, out1, out2, estop]`.
+///
+/// NOT the wire arity. The STATUS `io` array is variable-length — the
+/// runtime publishes the lines its config declares, and a control box
+/// with ten of them says so in the array's own length. This constant is
+/// what a config declaring no lines produces, and what decoders
+/// preallocate before the first packet arrives.
+///
+/// One position is fixed whatever the length: **the e-stop is always the
+/// LAST element**, read as `io[io.len() - 1]`.
 pub const IO_SLOTS: usize = 5;
+/// Decode ceiling on the STATUS `io` array.
+///
+/// A length header is attacker-controlled, so it is refused before
+/// anything is reserved on its word (see [`command::r_len`]). The vendor
+/// control box exposes ten lines; this leaves room for a much larger one
+/// without letting a nine-byte datagram size an allocation.
+pub const MAX_IO_SLOTS: usize = 64;
 /// Enablement flag slots (6 joints/axes × 2 directions).
 pub const EN_SLOTS: usize = 12;
 

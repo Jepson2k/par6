@@ -8,10 +8,11 @@
 //!
 //! `req_id` is the client-generated u32 echoed verbatim; pushes use 0.
 
+use crate::command::r_len;
 use crate::enums::{ActionState, MsgType, QueryType, ToolState};
 use crate::error::WireError;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
-use crate::{DecodeError, EN_SLOTS, IO_SLOTS, NUM_JOINTS, POSE_ELEMS};
+use crate::{DecodeError, EN_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS};
 
 /// Full tool status as it travels on the wire (STATUS body, STATUS query and
 /// TOOL_STATUS query). 8 slots:
@@ -143,8 +144,9 @@ pub enum QueryResult {
         angles: [f64; NUM_JOINTS],
         /// Joint speeds (rad/s).
         speeds: [f64; NUM_JOINTS],
-        /// Digital I/O `[in1, in2, out1, out2, estop]`.
-        io: [u8; IO_SLOTS],
+        /// Digital line levels, e-stop last. Variable-length — see
+        /// [`crate::IO_SLOTS`].
+        io: Vec<u8>,
         /// Tool status, if a tool is selected.
         tool_status: Option<ToolStatusWire>,
     },
@@ -160,8 +162,9 @@ pub enum QueryResult {
     },
     /// IO result.
     Io {
-        /// Digital I/O `[in1, in2, out1, out2, estop]`.
-        io: [u8; IO_SLOTS],
+        /// Digital line levels, e-stop last. Variable-length — see
+        /// [`crate::IO_SLOTS`].
+        io: Vec<u8>,
     },
     /// SPEEDS result.
     Speeds {
@@ -561,6 +564,22 @@ fn r_f64_fixed<const N: usize>(
     Ok(out)
 }
 
+/// Read a variable-length `u8` array, refusing the length header before
+/// anything is reserved on its word.
+fn r_u8_dyn(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<u8>, DecodeError> {
+    let n = r_len(r, what, MAX_IO_SLOTS)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(
+            u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+                what,
+                why: "exceeds u8".into(),
+            })?,
+        );
+    }
+    Ok(out)
+}
+
 fn r_u8_fixed<const N: usize>(
     r: &mut Reader<'_>,
     what: &'static str,
@@ -653,7 +672,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 pose: r_f64_fixed(r, "status.pose")?,
                 angles: r_f64_fixed(r, "status.angles")?,
                 speeds: r_f64_fixed(r, "status.speeds")?,
-                io: r_u8_fixed(r, "status.io")?,
+                io: r_u8_dyn(r, "status.io")?,
                 tool_status: r_opt_tool_status(r)?,
             }
         }
@@ -672,7 +691,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::Io => {
             expect_arity("io result", n, 2)?;
             QueryResult::Io {
-                io: r_u8_fixed(r, "io")?,
+                io: r_u8_dyn(r, "io")?,
             }
         }
         T::Speeds => {

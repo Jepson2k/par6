@@ -31,6 +31,7 @@ from waldoctl import ActionState, ToolState, ToolStatus
 from .constants import (
     EN_SLOTS,
     IO_SLOTS,
+    MAX_IO_SLOTS,
     NUM_JOINTS,
     POSE_ELEMS,
     STATUS_LEN,
@@ -667,7 +668,19 @@ def decode_status_bin_into(data: bytes, buf: StatusBuffer) -> bool:
         buf.pose[:] = msg[7]
         buf.angles[:] = msg[8]
         buf.speeds[:] = msg[9]
-        buf.io[:] = msg[10]
+        # The io array is VARIABLE-LENGTH: the runtime publishes the lines
+        # its config declares, with the e-stop last. Reallocate only when
+        # the count actually changes — it is fixed for a given controller,
+        # so the steady state stays allocation-free like the rest of the
+        # buffer.
+        io = msg[10]
+        if not isinstance(io, list) or len(io) > MAX_IO_SLOTS:
+            raise ProtocolError(
+                f"STATUS io must be a list of at most {MAX_IO_SLOTS} levels"
+            )
+        if buf.io.shape[0] != len(io):
+            buf.io = np.zeros(len(io), dtype=np.int32)
+        buf.io[:] = io
         buf.action_current = msg[11]
         buf.action_state = ActionState(msg[12])
         buf.joint_en[:] = msg[13]

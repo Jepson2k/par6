@@ -348,7 +348,7 @@ fn status_full_fixture() -> Status {
         pose: pose16(),
         angles: ANGLES,
         speeds: [0.1, -0.2, 0.0, 0.3, 0.0, 0.05],
-        io: [1, 0, 1, 1, 0],
+        io: vec![1, 0, 1, 1, 0],
         action_current: "MOVE_L".into(),
         action_state: ActionState::Executing,
         joint_en: [1, 1, 1, 1, 0, 1, 1, 1, 1, 1, 1, 1],
@@ -775,7 +775,7 @@ pub fn vectors() -> Vec<Vector> {
                 pose: pose16(),
                 angles: ANGLES,
                 speeds: [0.1, -0.2, 0.0, 0.3, 0.0, 0.05],
-                io: [1, 0, 1, 0, 0],
+                io: vec![1, 0, 1, 0, 0],
                 tool_status: Some(tool_status_fixture()),
             },
         },
@@ -799,7 +799,7 @@ pub fn vectors() -> Vec<Vector> {
         Reply::Response {
             req_id: 104,
             result: QueryResult::Io {
-                io: [1, 1, 0, 0, 0],
+                io: vec![1, 1, 0, 0, 0],
             },
         },
     ));
@@ -951,6 +951,13 @@ pub fn vectors() -> Vec<Vector> {
     v.push(status_vec("status_full", status_full_fixture()));
     v.push(status_vec("status_idle", Status::default()));
     v.push(status_longer_tail_vec());
+    // The vendor control box's ten lines plus the e-stop. `io` is
+    // variable-length, so covering them is a longer array and NOT a
+    // layout change; this vector is what says so across both languages.
+    v.push(status_vec(
+        "status_ten_io_lines",
+        status_ten_io_lines_fixture(),
+    ));
 
     // -- CHUNK sequence: a MOVE_S split into 3 envelopes --
     v.extend(chunk_vectors());
@@ -959,6 +966,16 @@ pub fn vectors() -> Vec<Vector> {
     v.extend(malformed_vectors());
 
     v
+}
+
+/// The vendor control box's line count: 3 isolated in, 3 isolated out,
+/// 4 general in, e-stop last. Nothing about the STATUS layout changes to
+/// carry it — only the length of one array.
+fn status_ten_io_lines_fixture() -> Status {
+    Status {
+        io: vec![1, 0, 1, 0, 0, 1, 1, 0, 0, 1, 0],
+        ..status_full_fixture()
+    }
 }
 
 /// A v2 status packet with two extra tail elements, as a v3 producer would

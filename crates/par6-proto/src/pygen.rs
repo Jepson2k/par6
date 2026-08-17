@@ -13,7 +13,7 @@ use crate::enums::{
 };
 use crate::error::ErrorCode;
 use crate::status::{STATUS_HEADER_LEN, STATUS_LEN};
-use crate::{EN_SLOTS, IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
+use crate::{EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
 
 /// `MoveJPose` → `MOVE_J_POSE`.
 fn upper_snake(name: &str) -> String {
@@ -54,6 +54,7 @@ pub fn generate() -> String {
     writeln!(out, "NUM_JOINTS = {NUM_JOINTS}").unwrap();
     writeln!(out, "POSE_ELEMS = {POSE_ELEMS}").unwrap();
     writeln!(out, "IO_SLOTS = {IO_SLOTS}").unwrap();
+    writeln!(out, "MAX_IO_SLOTS = {MAX_IO_SLOTS}").unwrap();
     writeln!(out, "EN_SLOTS = {EN_SLOTS}").unwrap();
     writeln!(out, "STATUS_LEN = {STATUS_LEN}").unwrap();
     writeln!(out, "STATUS_HEADER_LEN = {STATUS_HEADER_LEN}").unwrap();

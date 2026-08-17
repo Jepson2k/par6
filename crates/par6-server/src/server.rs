@@ -40,7 +40,7 @@ use par6_proto::{
     command_class, decode_chunk, decode_command, encode_reply, make_error, peek_tag, ActionState,
     CmdType, Command, CommandClass, CompletionPolicy, DecodeError, ErrorCode, LoopStatsResult,
     MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState, ToolStatusWire,
-    WireError, EN_SLOTS, IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
+    WireError, EN_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
 };
 use par6_rt::{ArmState, Mode, StateSnapshot};
 use tokio::net::UdpSocket;
@@ -1414,13 +1414,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 .any(|e| matches!(e.code, RtErr::Estop | RtErr::SwEstop))
     }
 
-    /// The `[in1, in2, out1, out2, estop]` slots. Only the e-stop slot is
-    /// backed by a real line; the runtime neither reads the two inputs nor
-    /// drives the two outputs, and the wire type (`u8` per slot) has no way
-    /// to say "unknown" — so they report the un-asserted level rather than
-    /// a level the arm was never observed at.
-    fn io(&self) -> [u8; IO_SLOTS] {
-        [0, 0, 0, 0, u8::from(!self.estop_pressed())]
+    /// The default `[in1, in2, out1, out2, estop]` slots. Only the e-stop
+    /// slot is backed by a real line; the runtime neither reads the two
+    /// inputs nor drives the two outputs, and the wire type (`u8` per
+    /// slot) has no way to say "unknown" — so they report the un-asserted
+    /// level rather than a level the arm was never observed at.
+    ///
+    /// The array is variable-length on the wire; making these lines real
+    /// (and adding the control box's other six) changes only its length.
+    fn io(&self) -> Vec<u8> {
+        vec![0, 0, 0, 0, u8::from(!self.estop_pressed())]
     }
 
     fn angles_deg(&self) -> [f64; NUM_JOINTS] {
