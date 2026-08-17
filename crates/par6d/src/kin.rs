@@ -577,6 +577,44 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
 mod tests {
     use super::*;
 
+    /// Every tool par6 ships resolves to a model that is actually on
+    /// disk, and the ones that have their own tree get it.
+    ///
+    /// The failure this exists for is silent: `variant_for` falls back
+    /// to the bare flange for a name it does not recognise, which loads,
+    /// runs, and models the wrong tool — right arm, wrong end of it. A
+    /// gripper TOML added under a name the prefix rule misses would ship
+    /// exactly that.
+    #[test]
+    fn every_shipped_tool_resolves_to_a_model_that_exists() {
+        let config =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let assets = resolve_assets_dir(None, &config).expect("assets tree");
+        let bundle = par6_config::ConfigBundle::load(&config).expect("bundle");
+        assert!(bundle.grippers.len() > 3, "the shipped tools are all here");
+
+        for g in &bundle.grippers {
+            let variant = variant_for(&g.name);
+            for relpath in [variant.urdf_relpath(), variant.srdf_relpath()] {
+                let path = assets.join(relpath);
+                assert!(path.is_file(), "{}: no model at {}", g.name, path.display());
+            }
+            let expected = if g.name.eq_ignore_ascii_case("flange") {
+                GripperVariant::Flange
+            } else if g.name.starts_with("SSG48") {
+                GripperVariant::Ssg48
+            } else if g.name.starts_with("MSG") {
+                GripperVariant::Msg
+            } else {
+                // MHZ2-10D is the honest fallback: the vendor ships no
+                // tree for it, so the flange model is the closest thing
+                // that exists. Its mass still comes from its own TOML.
+                GripperVariant::Flange
+            };
+            assert_eq!(variant, expected, "{} picked the wrong variant", g.name);
+        }
+    }
+
     /// `R = Rx(rx)·Ry(ry)·Rz(rz)` built from the module's own axis
     /// rotations — the wire convention stated the long way round, and an
     /// oracle no ordering mistake inside [`wire_pose_to_matrix`] can

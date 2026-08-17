@@ -59,14 +59,6 @@ def load_gripper_configs() -> dict[str, dict]:
 
 _FLANGE_TREE = "par6_flange"
 
-# Gripper-TOML name (canonical) -> packaged URDF tree directory.
-URDF_TREE_BY_TOOL: dict[str, str] = {
-    "FLANGE": _FLANGE_TREE,
-    "MSG_SMALL_MOTOR_150MM_RAIL": "par6_msg_gripper",
-    "SSG48": "par6_ssg48_gripper",
-}
-
-
 # Tree directory -> (model, disabled-pair list) the RUNTIME loads for it,
 # mirroring ``par6_kin::GripperVariant::urdf_relpath`` / ``srdf_relpath``.
 # Named rather than globbed: the flange tree also carries
@@ -80,14 +72,32 @@ _MODEL_BY_TREE: dict[str, tuple[str, str]] = {
 }
 
 
+def urdf_tree(tool_key: str) -> str:
+    """Packaged URDF tree directory for *tool_key*.
+
+    A PREFIX rule, not a lookup table, because that is what the runtime
+    uses (``par6d::kin::variant_for``) and the two have to agree: every
+    MSG rail/motor variant shares one gripper mesh set, so a table would
+    need an entry per gripper TOML and a new TOML would silently fall
+    back to the flange here while the runtime loaded the MSG model.
+    An unrecognised tool really does get the flange tree on both sides —
+    the arm is always modeled, the tool is not.
+    """
+    key = tool_key.strip().upper()
+    if key.startswith("MSG"):
+        return "par6_msg_gripper"
+    if key.startswith("SSG48"):
+        return "par6_ssg48_gripper"
+    return _FLANGE_TREE
+
+
 def urdf_tree_root(tool_key: str) -> Path:
     """Root of the URDF tree for *tool_key* (flange tree for unknown keys)."""
-    tree = URDF_TREE_BY_TOOL.get(tool_key.strip().upper(), _FLANGE_TREE)
-    return data_root() / "urdf" / tree
+    return data_root() / "urdf" / urdf_tree(tool_key)
 
 
 def _tree_model(tool_key: str, subdir: str, which: int) -> Path:
-    tree = URDF_TREE_BY_TOOL.get(tool_key.strip().upper(), _FLANGE_TREE)
+    tree = urdf_tree(tool_key)
     path = data_root() / "urdf" / tree / subdir / _MODEL_BY_TREE[tree][which]
     if not path.is_file():
         raise FileNotFoundError(

@@ -27,7 +27,13 @@ import numpy as np
 import pytest
 from live_daemon import LiveDaemon, requires_par6d, settle_at
 
-from par6.config import load_gripper_configs, urdf_path
+from par6.config import (
+    _MODEL_BY_TREE,
+    load_gripper_configs,
+    srdf_path,
+    urdf_path,
+    urdf_tree,
+)
 
 if TYPE_CHECKING:
     import pinokin
@@ -436,11 +442,31 @@ class TestPackagedData:
                     _tree_digest(src_urdf / tree / sub, (pattern,), packaged_bytes)
                 ), f"{tree}/{sub}: {stale_msg}"
 
-    def test_gripper_tomls_cover_all_urdf_trees(self) -> None:
+    def test_every_shipped_tool_resolves_to_a_packaged_model(self) -> None:
+        """The tree a tool resolves to has to be the runtime's, not a fallback.
+
+        ``par6d::kin::variant_for`` matches ``MSG*`` and ``SSG48*`` by prefix
+        and falls back to the flange; this side has to agree, or the client
+        checks a collision model and renders a mesh for a different tool than
+        the one the arm is wearing. A gripper TOML added under a name either
+        rule misses is the way that goes wrong, so this walks every shipped
+        file rather than a list.
+        """
         grippers = load_gripper_configs()
-        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
-            assert key in grippers
-            assert urdf_path(key).is_file()
+        assert len(grippers) > 3, "the shipped tools are all here"
+        seen_trees = set()
+        for key in grippers:
+            assert urdf_path(key).is_file(), key
+            assert srdf_path(key).is_file(), key
+            tree = urdf_tree(key)
+            seen_trees.add(tree)
+            if key.startswith("MSG"):
+                assert tree == "par6_msg_gripper", f"{key} fell back to {tree}"
+            elif key.startswith("SSG48"):
+                assert tree == "par6_ssg48_gripper", f"{key} fell back to {tree}"
+        assert seen_trees == set(_MODEL_BY_TREE), (
+            f"a packaged tree no shipped tool reaches: {set(_MODEL_BY_TREE) - seen_trees}"
+        )
 
     @needs_pinokin
     def test_packaged_urdfs_are_consumable_by_a_scene(self) -> None:

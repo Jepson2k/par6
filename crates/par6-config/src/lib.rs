@@ -484,7 +484,21 @@ mod tests {
     #[test]
     fn bundle_resolves_gripper_dependent_offsets() {
         let bundle = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("bundle");
-        assert_eq!(bundle.grippers.len(), 3);
+        // Every shipped TOML is loaded and cross-validated, under a name
+        // no other file claims — a duplicate would make
+        // `active_gripper` pick by file order.
+        let files = std::fs::read_dir(config_dir().join("grippers"))
+            .expect("gripper dir")
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .count();
+        assert_eq!(bundle.grippers.len(), files, "one config per shipped file");
+        let mut names: Vec<&str> = bundle.grippers.iter().map(|g| g.name.as_str()).collect();
+        names.sort_unstable();
+        let distinct = names.len();
+        names.dedup();
+        assert_eq!(names.len(), distinct, "gripper names collide: {names:?}");
+
         let active = bundle.active_gripper().expect("active gripper");
         assert_eq!(active.name, "MSG_small_motor_150mm_rail");
         assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 106.0);
