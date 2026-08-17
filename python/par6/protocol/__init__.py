@@ -4,7 +4,17 @@
 (`cargo run -p par6-proto --bin gen_python`) — do not edit by hand;
 `cargo test -p par6-proto` fails if it is stale. Golden vectors under
 `tests/golden/protocol` are the cross-language conformance suite.
+
+`ActionState` and `ToolState` are the exceptions to "the public name is
+the generated one": a decoded :class:`StatusBuffer` is handed to waldoctl
+consumers, which compare those fields by identity against
+`waldoctl.ActionState` / `waldoctl.ToolState`, and two `IntEnum`s with
+equal values are still different classes — `is` would be false for every
+member. So the public exports are waldoctl's, and `test_protocol_golden`
+pins the generated members to them.
 """
+
+from waldoctl import ActionState, ToolState
 
 from . import constants, wire
 from .constants import (
@@ -16,7 +26,6 @@ from .constants import (
     PROTO_VERSION,
     STATUS_HEADER_LEN,
     STATUS_LEN,
-    ActionState,
     CmdType,
     CommandClass,
     CompletionPolicy,
@@ -24,7 +33,6 @@ from .constants import (
     Frame,
     MsgType,
     QueryType,
-    ToolState,
 )
 from .wire import (
     ProtocolError,

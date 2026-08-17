@@ -15,6 +15,7 @@ import asyncio
 import math
 import socket
 import time
+from typing import Any
 
 import numpy as np
 import ormsgpack
@@ -24,7 +25,7 @@ from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
 from par6 import config as _cfg
 from par6 import motion as _motion
 from par6.client import RobotError
-from par6.client.dry_run_client import DryRunRobotClient
+from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
 from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
@@ -41,6 +42,17 @@ pytestmark = pytest.mark.skipif(
 
 def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
+
+
+def _planned(result: DryRunResultData | None) -> DryRunResultData:
+    """The plan a move returned, refusing the blended-away case.
+
+    A move with ``r > 0`` is held for the one behind it and returns
+    ``None``; a test that then reads ``.duration`` off it would fail with
+    an ``AttributeError`` pointing at the read, not at the move.
+    """
+    assert result is not None, "the move was blended into the next one, not planned"
+    return result
 
 
 def _offset(pose: np.ndarray, delta: tuple[float, float, float]) -> np.ndarray:
@@ -512,18 +524,18 @@ class TestProgramWorkflow:
             initial_joints_deg=[0.0] * 6, initial_homed=False
         )
         results = []
-        results.append(client.home())
+        results.append(_planned(client.home()))
         np.testing.assert_allclose(
             results[-1].end_joints_rad, _cfg.homing_ready_pose_rad(), atol=1e-9
         )
 
         above = np.asarray(client.pose())
         above[2] += 30.0
-        results.append(client.move_l(above.tolist(), speed=0.4))
-        results.append(client.tool.close())
+        results.append(_planned(client.move_l(above.tolist(), speed=0.4)))
+        results.append(_planned(client.tool.close()))
         joints = list(client.angles())
         joints[0] -= 15.0
-        results.append(client.move_j(joints, speed=0.6))
+        results.append(_planned(client.move_j(joints, speed=0.6)))
         assert client.flush() == []
 
         assert all(r.error is None for r in results)
@@ -575,7 +587,7 @@ async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
                 target = list(live_start)
                 target[0] += 25.0
 
-                predicted = preview.move_j(target, duration=requested)
+                predicted = _planned(preview.move_j(target, duration=requested))
                 preview.teleport(live_start)  # re-seed for the next comparison
 
                 started = time.monotonic()
@@ -667,8 +679,12 @@ class _CommandStream:
         self._sock.bind(("127.0.0.1", port))
         self._sock.setblocking(False)
 
-    def drain(self) -> list[list[float]]:
-        """Every frame waiting on the socket, oldest first."""
+    def drain(self) -> list[list[Any]]:
+        """Every frame waiting on the socket, oldest first.
+
+        A frame is a heterogeneous msgpack array — scalars in the header,
+        then the recipe's fields, one of which is itself a joint vector.
+        """
         frames = []
         while True:
             try:

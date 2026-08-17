@@ -20,7 +20,7 @@ import math
 import time
 
 import pytest
-from live_daemon import LiveDaemon, requires_par6d, settle_at
+from live_daemon import LiveDaemon, angles_now, requires_par6d, settle_at
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -163,7 +163,7 @@ async def test_healthy_jog_stream_is_not_serialized(daemon: LiveDaemon):
     async with daemon.client() as client:
         await settle_at(client, park)
         assert await client.error() is None
-        start = (await client.angles())[0]
+        start = (await angles_now(client))[0]
 
         t0 = time.monotonic()
         for _ in range(100):

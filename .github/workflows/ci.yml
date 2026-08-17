@@ -201,8 +201,24 @@ jobs:
           python-version: ${{ matrix.python }}
       - name: install
         run: pip install -e "python[dev]"
+      # waldoctl is pinned to a tag, but a cross-repo change lands on a
+      # branch of the same name first (CLAUDE.md's dev workflow), and the
+      # type gate below is what notices when the two sides disagree.
+      - name: use a matching waldoctl branch, if one exists
+        run: |
+          branch="${{ github.head_ref || github.ref_name }}"
+          repo=https://github.com/Jepson2k/waldoctl.git
+          if git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+            echo "installing waldoctl from branch $branch"
+            pip install --force-reinstall --no-deps "waldoctl @ git+$repo@$branch"
+          else
+            echo "no waldoctl branch $branch; keeping the pinned tag"
+          fi
       - name: ruff
         run: ruff check python/
+      - name: ty
+        working-directory: python
+        run: ty check .
       - name: pytest
         working-directory: python
         run: pytest

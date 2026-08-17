@@ -13,6 +13,8 @@ import math
 from pathlib import Path
 
 import pytest
+from waldoctl.status import ActionState as WActionState
+from waldoctl.tools import ToolState as WToolState
 
 from par6.protocol import wire
 from par6.protocol.constants import (
@@ -52,6 +54,24 @@ def by_kind(kind: str) -> list[dict]:
 
 def read_bin(entry: dict) -> bytes:
     return (GOLDEN_DIR / entry["file"]).read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("generated", "public"),
+    [(ActionState, WActionState), (ToolState, WToolState)],
+    ids=["action_state", "tool_state"],
+)
+def test_the_public_state_enums_carry_the_generated_wire_values(generated, public):
+    """`par6.protocol` re-exports waldoctl's `ActionState`/`ToolState` rather
+    than the ones generated from the Rust codec, so a decoded STATUS compares
+    by identity against what a waldoctl consumer holds.  That substitution is
+    only sound while the two agree member-for-member: if Rust ever renumbers a
+    state, the wire would decode into a waldoctl member naming a different
+    one, and nothing downstream would notice.
+    """
+    assert {m.name: m.value for m in generated} == {m.name: m.value for m in public}
+    for member in generated:
+        assert public(int(member)).name == member.name
 
 
 def test_manifest_covers_every_command_and_class():
@@ -155,6 +175,7 @@ def test_status_vectors(entry):
     if f["error"] is None:
         assert buf.error is None
     else:
+        assert buf.error is not None
         assert list(buf.error) == f["error"]
     assert buf.queued_segments == f["queued_segments"]
     assert buf.queued_duration == f["queued_duration"]

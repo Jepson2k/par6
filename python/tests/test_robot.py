@@ -30,13 +30,18 @@ from live_daemon import LiveDaemon, requires_par6d, settle_at
 from par6.config import load_gripper_configs, urdf_path
 
 if TYPE_CHECKING:
-    from par6.robot import Robot
-
-try:
     import pinokin
-except ImportError:  # binary wheel unavailable on this platform
-    pinokin = None
 
+    from par6.robot import Robot
+else:
+    try:
+        import pinokin
+    except ImportError:  # binary wheel unavailable on this platform
+        pinokin = None
+
+#: Every use of `pinokin` below is inside a test carrying this marker, which
+#: is why the import above is typed as the module rather than `module | None`:
+#: the marker, not a runtime check, is what keeps the `None` case out.
 needs_pinokin = pytest.mark.skipif(
     pinokin is None, reason="pinokin binary wheel not installed"
 )
@@ -283,7 +288,8 @@ class TestToolTransforms:
                     out = np.zeros(6)
                     pose = client_robot.fk(np.radians(status.angles), out)
                     T_client = np.zeros((4, 4))
-                    pinokin.se3_from_rpy(*pose, T_client)
+                    x, y, z, rx, ry, rz = pose
+                    pinokin.se3_from_rpy(x, y, z, rx, ry, rz, T_client)
 
                     assert np.allclose(
                         T_client[:3, 3] * 1000.0, T_runtime[:3, 3], atol=1e-3

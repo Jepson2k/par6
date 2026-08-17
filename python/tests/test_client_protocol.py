@@ -31,6 +31,7 @@ from waldoctl.tools import ToolState as WToolState
 from par6.client import AsyncRobotClient, RobotError
 from par6.protocol import wire
 from par6.protocol.constants import NUM_JOINTS, CmdType, Frame, MsgType, QueryType
+from par6.tools import _ClientBound
 
 
 @pytest.fixture
@@ -611,7 +612,8 @@ async def test_pose_converts_matrix_to_xyz_rpy_degrees(
     wrist angle negated.
     """
     mat = np.zeros((4, 4))
-    se3_from_rpy(120.0, -45.5, 310.0, *np.radians([30.0, -40.0, 55.0]), mat)
+    rx, ry, rz = np.radians([30.0, -40.0, 55.0])
+    se3_from_rpy(120.0, -45.5, 310.0, rx, ry, rz, mat)
 
     peer.handlers[CmdType.POSE] = lambda cmd, req_id, params: wire.encode_wire(
         [int(MsgType.RESPONSE), req_id, [int(QueryType.POSE), mat.flatten().tolist()]]
@@ -660,7 +662,10 @@ async def test_motion_timing_maps_to_exactly_one_of_duration_speed(
 # ---------------------------------------------------------------------------
 
 
-class _StubGripper(GripperTool):
+class _StubGripper(_ClientBound, GripperTool):
+    """A gripper spec with par6's own dispatch mixin — only the verbs are
+    stubbed, so what `bind_tools` wires up is the real hook path."""
+
     def __init__(self) -> None:
         super().__init__(
             key="GRIP",
@@ -674,16 +679,13 @@ class _StubGripper(GripperTool):
         return GripperType.ELECTRIC
 
     async def set_position(self, position: float, **kwargs) -> int:
-        return await self._execute(self.key, "move", [float(position)])
+        return await self._cmd("move", [float(position)])
 
     async def open(self, **kwargs) -> int:
-        return await self._execute(self.key, "open", [])
+        return await self._cmd("open")
 
     async def close(self, **kwargs) -> int:
-        return await self._execute(self.key, "close", [])
-
-    async def status(self):
-        return await self._get_status()
+        return await self._cmd("close")
 
 
 async def test_bound_tool_actions_go_through_tool_action(
@@ -697,12 +699,14 @@ async def test_bound_tool_actions_go_through_tool_action(
     assert index >= 0
     assert peer.of(CmdType.SELECT_TOOL)[0][2][1:] == ["GRIP", None]
 
-    assert await client.tool.set_position(0.25) >= 0
-    assert await client.tool.open() >= 0
+    grip = client.tool
+    assert isinstance(grip, GripperTool)
+    assert await grip.set_position(0.25) >= 0
+    assert await grip.open() >= 0
     actions = [(r[2][1], r[2][2], r[2][3]) for r in peer.of(CmdType.TOOL_ACTION)]
     assert actions == [("GRIP", "move", [0.25]), ("GRIP", "open", [])]
 
-    tool_status = await client.tool.status()
+    tool_status = await grip.status()
     assert tool_status is not None
     assert tool_status.key == "SSG48" and tool_status.variant_key == "fin_ray"
 
@@ -716,7 +720,7 @@ async def test_bound_tool_actions_go_through_tool_action(
     with pytest.raises(RobotError) as excinfo:
         await client.select_tool("not_fitted")
     assert excinfo.value.code == 43
-    assert await client.tool.set_position(0.5) >= 0
+    assert await grip.set_position(0.5) >= 0
     assert peer.of(CmdType.TOOL_ACTION)[-1][2][1] == "GRIP"
 
 
@@ -805,8 +809,10 @@ async def test_config_cased_tool_keys_round_trip_through_a_bare_client(
     # A bare client binds the packaged tools, so a user script can drive the
     # selected tool without going through the Robot factory.
     assert await client.select_tool(reported.tool) >= 0
-    assert client.tool.key == broadcast_key
-    await client.tool.close()
+    fitted = client.tool
+    assert fitted.key == broadcast_key
+    assert isinstance(fitted, GripperTool)
+    await fitted.close()
     actions = peer.of(CmdType.TOOL_ACTION)
     assert [(p[1], p[2]) for _, _, p in actions] == [(broadcast_key, "move")]
 

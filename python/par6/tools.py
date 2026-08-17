@@ -146,20 +146,28 @@ def build_tools() -> ToolsCollection:
         # From the tool's URDF tree, never from the TOML's DH row — see
         # :func:`par6.config.flange_to_tcp`.
         origin, rpy = _cfg.flange_to_tcp(key)
-        common = dict(
-            key=key,
-            display_name=cfg["name"],
-            description=_describe(cfg),
-            tcp_origin=origin,
-            tcp_rpy=rpy,
-        )
+        name = str(cfg["name"])
         driver = cfg.get("driver")
         if driver is None:
-            tools.append(PassiveTool(tool_type=ToolType.NONE, **common))
+            tools.append(
+                PassiveTool(
+                    key=key,
+                    display_name=name,
+                    description=_describe(cfg),
+                    tcp_origin=origin,
+                    tcp_rpy=rpy,
+                    tool_type=ToolType.NONE,
+                )
+            )
             continue
         stroke_m = driver["stroke_mm"] / 1000.0
         tools.append(
             ElectricGripper(
+                key=key,
+                display_name=name,
+                description=_describe(cfg),
+                tcp_origin=origin,
+                tcp_rpy=rpy,
                 position_range=(0.0, 1.0),
                 speed_range=(0.0, 1.0),
                 current_range=(0, int(driver["ilim_ma"])),
@@ -171,7 +179,6 @@ def build_tools() -> ToolsCollection:
                         symmetric=True,
                     ),
                 ),
-                **common,
             )
         )
     return ToolsCollection(tuple(tools), default_key=fitted)

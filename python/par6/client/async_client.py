@@ -34,7 +34,7 @@ import random
 import socket
 import struct
 import time
-from collections.abc import AsyncIterator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -514,12 +514,23 @@ class AsyncRobotClient(_RobotClientABC):
         hooks pointing at this client, so ``client.tool.open()`` etc. drive
         ``tool_action`` on the runtime.  The ``par6.robot`` factory calls this
         with the registry it builds from config.
+
+        A spec without the hooks is refused here rather than at first use:
+        setting them on a plain :class:`ToolSpec` would succeed and leave a
+        tool whose verbs raise only once someone drives it.
         """
+        from par6.tools import _ClientBound
+
         bound: dict[str, ToolSpec] = {}
         for spec in specs:
+            if not isinstance(spec, _ClientBound):
+                raise TypeError(
+                    f"tool spec {spec.key!r} carries no dispatch hooks; par6 "
+                    "specs come from par6.tools.build_tools"
+                )
             bound_spec = copy.copy(spec)
-            bound_spec._execute = self.tool_action  # type: ignore[attr-defined]
-            bound_spec._get_status = self._tool_status  # type: ignore[attr-defined]
+            bound_spec._execute = self.tool_action
+            bound_spec._get_status = self._tool_status
             bound[bound_spec.key] = bound_spec
         self._bound_tools = bound
 
@@ -716,7 +727,7 @@ class AsyncRobotClient(_RobotClientABC):
     # Status streaming
     # ------------------------------------------------------------------
 
-    async def stream_status_shared(self) -> AsyncIterator[StatusBuffer]:
+    async def stream_status_shared(self) -> AsyncGenerator[StatusBuffer, None]:
         """Async iterator over the ONE shared status buffer (zero-copy).
 
         The same instance is yielded every iteration and is overwritten by
@@ -739,7 +750,7 @@ class AsyncRobotClient(_RobotClientABC):
                 last_gen = self._status_generation
                 yield self._shared_status
 
-    async def stream_status(self) -> AsyncIterator[StatusBuffer]:
+    async def stream_status(self) -> AsyncGenerator[StatusBuffer, None]:
         """Async iterator of status snapshots — yields copies, safe to store.
 
         For zero-copy hot paths use :meth:`stream_status_shared`.

@@ -201,7 +201,14 @@ def _plan_ruckig(
     speed_fraction: float,
     min_duration_s: float | None,
 ) -> NDArray[np.float64]:
-    from ruckig import InputParameter, OutputParameter, Result, Ruckig
+    # ruckig ships a bare extension module with no stubs and no `py.typed`,
+    # so there is nothing for a type checker to resolve.
+    from ruckig import (  # ty: ignore[unresolved-import]
+        InputParameter,
+        OutputParameter,
+        Result,
+        Ruckig,
+    )
 
     if not np.all(np.isfinite(limits.jerk)):
         raise PlanningError("the RUCKIG profile needs a finite jerk limit on every joint")
@@ -336,7 +343,10 @@ def plan_toppra_path(
     ).compute_trajectory(0, 0)
     if traj is None:
         raise PlanningError("TOPPRA found no feasible parameterization for the path")
-    t_path = float(traj.duration)
+    # `compute_trajectory` is annotated to return the base `AbstractGeometricPath`,
+    # but a parameterized trajectory is what it actually builds, and only that
+    # carries `duration`.
+    t_path = float(traj.duration)  # ty: ignore[unresolved-attribute]
     if not math.isfinite(t_path) or t_path <= 0.0:
         raise PlanningError(f"TOPPRA produced duration {t_path}")
 

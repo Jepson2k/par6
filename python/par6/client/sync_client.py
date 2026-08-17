@@ -105,7 +105,9 @@ def _sync_tool(tool: ToolSpec) -> ToolSpec:
     contract is that nothing is a coroutine.
     """
     sync = make_sync_tool(tool, _run)
-    sync.status = lambda: _run(tool.status())  # type: ignore[method-assign]
+    # Deliberately narrowing an async method to a sync one, which is what
+    # waldoctl's own sync wrappers do to every action verb.
+    sync.status = lambda: _run(tool.status())  # ty: ignore[invalid-assignment]
     return sync
 
 

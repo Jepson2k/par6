@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable, Sequence
+from typing import cast
 
 from par6.protocol import wire
 from par6.protocol.constants import (
@@ -164,7 +165,10 @@ class ScriptedRuntime(asyncio.DatagramProtocol):
         self._waiters: list[tuple[Callable[[], bool], asyncio.Future]] = []
 
     def connection_made(self, transport: asyncio.BaseTransport) -> None:
-        self.transport = transport  # type: ignore[assignment]
+        # A datagram endpoint always hands back a datagram transport, but the
+        # base signature cannot say so and CPython's concrete transport does
+        # not inherit the ABC — `isinstance` against it is false.
+        self.transport = cast(asyncio.DatagramTransport, transport)
 
     @property
     def address(self) -> tuple[str, int]:

@@ -21,7 +21,9 @@ import numpy as np
 import pytest
 from live_daemon import (
     LiveDaemon,
+    angles_now,
     free_udp_port,
+    pose_now,
     repo_assets_dir,
     requires_par6d,
     settle_at,
@@ -207,7 +209,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         assert await client.wait_status(
             lambda s: s.executing_index == preempted, timeout=STEP_BUDGET_S
         )
-        before = (await client.angles())[0]
+        before = (await angles_now(client))[0]
         for _ in range(4):  # UI-style jog stream
             await client.jog_j(0, 0.25, duration=0.4)
             await asyncio.sleep(0.05)
@@ -529,7 +531,7 @@ async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
         await teleport_to(client, park)
-        start = (await client.angles())[0]
+        start = (await angles_now(client))[0]
 
         # A UI's streaming cadence (20 Hz), stepping the target by a
         # fraction of a degree per cycle — each one inside a single tick's
@@ -670,7 +672,7 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
             await client.jog_j(0, 0.5, duration=0.4)
             await client.wait_status(track, timeout=0.1)
 
-        rest = (await client.angles())[0]
+        rest = (await angles_now(client))[0]
         assert rest > start[0] + 10.0, (
             f"the jog never moved: {start[0]:.2f} -> {rest:.2f} deg"
         )
@@ -684,7 +686,7 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
         for _ in range(10):
             await client.jog_j(0, 0.5, duration=0.4)
             await client.wait_status(track, timeout=0.1)
-        held = (await client.angles())[0]
+        held = (await angles_now(client))[0]
         assert abs(held - rest) < 0.5, (
             f"blocked direction advanced under the held button: "
             f"{rest:.2f} -> {held:.2f} deg"
@@ -850,7 +852,7 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
         assert await client.wait_status(
             lambda s: abs(s.speeds[0]) < 0.05, timeout=STEP_BUDGET_S
         ), "the blocked jog never came to rest"
-        rest = (await client.angles())[0]
+        rest = (await angles_now(client))[0]
         assert rest < mid[0] - 5.0, (
             f"the blocked jog stopped at {rest:.2f} deg -- inside the keep-out "
             f"centred at {mid[0]:.2f}"
@@ -1011,7 +1013,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             )
         assert arrived, (
             f"servo_l never reached the streamed target: "
-            f"{(await client.pose())[:3]} vs {goal[:3]}"
+            f"{(await pose_now(client))[:3]} vs {goal[:3]}"
         )
 
         # --- servo_j(pose=...): the same target through the joint-space
@@ -1083,17 +1085,22 @@ async def test_the_python_client_drives_the_gripper_and_write_io_is_refused(
         # open/close convenience resolves onto `move` with a position.
         await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
         closed = await client.wait_status(
-            lambda s: s.tool_status is not None and s.tool_status.positions, timeout=STEP_BUDGET_S
+            lambda s: bool(s.tool_status is not None and s.tool_status.positions),
+            timeout=STEP_BUDGET_S,
         )
         assert closed, "the gripper never reported a position after a close"
-        after_close = (await client.status()).tool_status
+        status = await client.status()
+        assert status is not None, "the STATUS query went unanswered"
+        after_close = status.tool_status
         assert after_close is not None
 
         await client.tool_action(tool, "move", [0.0, 0.5, 400.0], wait=True)
         opened = await client.wait_status(
-            lambda s: s.tool_status is not None
-            and s.tool_status.positions
-            and s.tool_status.positions[0] < after_close.positions[0] - 0.05,
+            lambda s: bool(
+                s.tool_status is not None
+                and s.tool_status.positions
+                and s.tool_status.positions[0] < after_close.positions[0] - 0.05
+            ),
             timeout=STEP_BUDGET_S,
         )
         assert opened, (

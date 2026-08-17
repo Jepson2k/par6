@@ -26,6 +26,7 @@ from typing import Any, Callable, Sequence
 import msgspec
 import numpy as np
 import ormsgpack
+from waldoctl import ActionState, ToolState, ToolStatus
 
 from .constants import (
     EN_SLOTS,
@@ -33,13 +34,11 @@ from .constants import (
     NUM_JOINTS,
     POSE_ELEMS,
     STATUS_LEN,
-    ActionState,
     CmdType,
     CompletionPolicy,
     Frame,
     MsgType,
     QueryType,
-    ToolState,
 )
 
 logger = logging.getLogger(__name__)
@@ -79,17 +78,23 @@ def encode_command(cmd: CmdType, req_id: int, params: Sequence[object] = ()) -> 
 # =============================================================================
 
 
-def _is_f64(v: object) -> bool:
-    return type(v) is float and math.isfinite(v)
-
-
 def _req(ok: bool, why: str) -> None:
     if not ok:
         raise ProtocolError(why)
 
 
-def _f(v: object, name: str) -> None:
-    _req(_is_f64(v), f"{name}: must be a finite float")
+def _f(v: object, name: str) -> float:
+    """Check `v` is a finite f64 and hand it back as one.
+
+    The validators return their narrowed argument rather than only
+    asserting it, so a caller that needs to compare or iterate the value
+    afterwards works on a typed one — `type(v) is float`, not
+    `isinstance`, because the Rust codec this mirrors accepts no float
+    subclasses either.
+    """
+    if type(v) is not float or not math.isfinite(v):
+        raise ProtocolError(f"{name}: must be a finite float")
+    return v
 
 
 def _opt_f(v: object, name: str) -> None:
@@ -98,8 +103,7 @@ def _opt_f(v: object, name: str) -> None:
 
 
 def _frac(v: object, name: str) -> None:
-    _f(v, name)
-    _req(0.0 < v <= 1.0, f"{name}: must be in (0, 1]")  # type: ignore[operator]
+    _req(0.0 < _f(v, name) <= 1.0, f"{name}: must be in (0, 1]")
 
 
 def _opt_frac(v: object, name: str) -> None:
@@ -125,9 +129,9 @@ MAX_TRANSFERS_IN_FLIGHT = 8
 
 
 def _dur(v: object, name: str, hi: float = MAX_DURATION_S) -> None:
-    _f(v, name)
-    _req(v > 0.0, f"{name}: must be > 0")  # type: ignore[operator]
-    _req(v <= hi, f"{name}: must be <= {hi}")  # type: ignore[operator]
+    secs = _f(v, name)
+    _req(secs > 0.0, f"{name}: must be > 0")
+    _req(secs <= hi, f"{name}: must be <= {hi}")
 
 
 def _uint(v: object, name: str, hi: int = 0xFFFF_FFFF_FFFF_FFFF) -> None:
@@ -145,18 +149,14 @@ def _str(v: object, name: str, lo: int, hi: int) -> None:
     )
 
 
-def _vec6(v: object, name: str) -> None:
-    _req(
-        isinstance(v, list) and len(v) == NUM_JOINTS,
-        f"{name}: must be a {NUM_JOINTS}-element float array",
-    )
-    for x in v:  # type: ignore[union-attr]
-        _f(x, name)
+def _vec6(v: object, name: str) -> list[float]:
+    if not isinstance(v, list) or len(v) != NUM_JOINTS:
+        raise ProtocolError(f"{name}: must be a {NUM_JOINTS}-element float array")
+    return [_f(x, name) for x in v]
 
 
 def _signed_frac6(v: object, name: str) -> None:
-    _vec6(v, name)
-    for x in v:  # type: ignore[union-attr]
+    for x in _vec6(v, name):
         _req(-1.0 <= x <= 1.0, f"{name}: must be in [-1, 1]")
 
 
@@ -182,26 +182,21 @@ def _timing(dur: object, speed: object, name: str) -> None:
 
 def _blend(v: object, name: str) -> None:
     if v is not None:
-        _f(v, name)
-        _req(v >= 0.0, f"{name}: must be >= 0")  # type: ignore[operator]
+        _req(_f(v, name) >= 0.0, f"{name}: must be >= 0")
 
 
 def _waypoints(v: object, name: str) -> None:
-    _req(
-        isinstance(v, list) and len(v) >= 2,
-        f"{name}: requires at least 2 waypoints",
-    )
-    _req(
-        len(v) <= MAX_WAYPOINTS,  # type: ignore[arg-type]
-        f"{name}: at most {MAX_WAYPOINTS} waypoints",
-    )
-    for wp in v:  # type: ignore[union-attr]
+    if not isinstance(v, list) or len(v) < 2:
+        raise ProtocolError(f"{name}: requires at least 2 waypoints")
+    _req(len(v) <= MAX_WAYPOINTS, f"{name}: at most {MAX_WAYPOINTS} waypoints")
+    for wp in v:
         _vec6(wp, name)
 
 
 def _shape(v: object) -> None:
-    _req(isinstance(v, list) and len(v) == 6, "shape: must have 6 elements")
-    kind, params, pose, collision, margin, name = v  # type: ignore[misc]
+    if not isinstance(v, list) or len(v) != 6:
+        raise ProtocolError("shape: must have 6 elements")
+    kind, params, pose, collision, margin, name = v
     _str(kind, "shape.kind", 1, 32)
     _req(isinstance(params, list), "shape.params: must be a float array")
     for x in params:
@@ -211,14 +206,14 @@ def _shape(v: object) -> None:
         _f(x, "shape.pose")
     _bool(collision, "shape.collision")
     if margin is not None:
-        _f(margin, "shape.margin")
-        _req(margin >= 0.0, "shape.margin: must be >= 0")
+        _req(_f(margin, "shape.margin") >= 0.0, "shape.margin: must be >= 0")
     _str(name, "shape.name", 0, 128)
 
 
 def _tool_params(v: object, name: str) -> None:
-    _req(isinstance(v, list) and len(v) <= 16, f"{name}: at most 16 values")
-    for x in v:  # type: ignore[union-attr]
+    if not isinstance(v, list) or len(v) > 16:
+        raise ProtocolError(f"{name}: at most 16 values")
+    for x in v:
         if type(x) is float:
             _f(x, name)
         elif type(x) in (int, bool) or isinstance(x, str):
@@ -590,18 +585,13 @@ def decode_reply(data: bytes) -> tuple[MsgType, int, Any]:
 # =============================================================================
 
 
-@dataclass
-class ToolStatusWire:
-    """Reusable tool-status slot of a :class:`StatusBuffer`."""
-
-    key: str = ""
-    state: ToolState = ToolState.OFF
-    engaged: bool = False
-    part_detected: bool = False
-    fault_code: int = 0
-    positions: tuple[float, ...] = ()
-    channels: tuple[float, ...] = ()
-    variant_key: str = ""
+#: Reusable tool-status slot of a :class:`StatusBuffer`.
+#:
+#: waldoctl's own dataclass, not a wire-side copy of it: par6 had a
+#: structurally identical `ToolStatusWire` whose `state` was the
+#: generated `ToolState`, so `status.tool_status.state is ToolState.ACTIVE`
+#: was false for a waldoctl consumer however well the values matched.
+ToolStatusWire = ToolStatus
 
 
 @dataclass

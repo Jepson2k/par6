@@ -1497,7 +1497,10 @@ def _merge(results: list[DryRunResultData]) -> DryRunResultData:
         if any(r.valid is not None for r in drawn)
         else None
     )
+    # A joint trajectory is stitched only when every leg carries one: a gap
+    # would splice non-adjacent configurations into one continuous path.
     trajectories = [r.joint_trajectory_rad for r in drawn]
+    present = [t for t in trajectories if t is not None]
     return DryRunResultData(
         tcp_poses=np.vstack([r.tcp_poses for r in drawn]),
         end_joints_rad=drawn[-1].end_joints_rad,
@@ -1505,7 +1508,7 @@ def _merge(results: list[DryRunResultData]) -> DryRunResultData:
         error=error,
         valid=valid,
         joint_trajectory_rad=(
-            np.vstack(trajectories) if all(t is not None for t in trajectories) else None
+            np.vstack(present) if len(present) == len(trajectories) else None
         ),
     )
 

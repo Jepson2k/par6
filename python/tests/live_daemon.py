@@ -270,3 +270,23 @@ async def settle_at(
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"the sim arm never reached {angles_deg}")
+
+
+async def angles_now(client: AsyncRobotClient) -> list[float]:
+    """The arm's joint angles, refusing the dropped-query case.
+
+    ``angles()`` returns ``None`` when every retry of the query goes
+    unanswered.  Subscripting that directly reports a ``NoneType`` error at
+    the read instead of naming the lost query, and a test that meant to
+    measure a motion silently becomes a test of nothing.
+    """
+    angles = await client.angles()
+    assert angles is not None, "the ANGLES query went unanswered"
+    return angles
+
+
+async def pose_now(client: AsyncRobotClient) -> list[float]:
+    """The TCP pose, refusing the dropped-query case — see :func:`angles_now`."""
+    pose = await client.pose()
+    assert pose is not None, "the POSE query went unanswered"
+    return pose
