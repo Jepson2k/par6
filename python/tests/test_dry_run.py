@@ -25,7 +25,8 @@ from par6 import config as _cfg
 from par6 import motion as _motion
 from par6.client import RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
+from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
+from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
 
 try:
@@ -399,13 +400,117 @@ class TestCartesianMotion:
         # Jogging stays available while un-homed, as it does on the runtime.
         assert unhomed.jog_j(0, 0.2, 0.2).duration > 0.0
 
+    def test_the_preview_refuses_the_inputs_the_wire_refuses(self, dry_run) -> None:
+        """Values the codec rejects must be rejected before they are drawn.
+
+        Each of these previously produced a confident trajectory the arm
+        would never make: a jog past full scale, a watchdog longer than the
+        runtime's ceiling, a non-finite speed, a short angle list numpy pads
+        silently, and a teleport clamped into range instead of refused.
+        """
+        dry_run.teleport(park_deg())
+        for kwargs in (
+            {"joint": 0, "speed": 5.0, "duration": 0.5},
+            {"joint": 0, "speed": 0.5, "duration": MAX_JOG_DURATION_S + 1.0},
+            {"joint": 0, "speed": float("nan"), "duration": 0.5},
+            {"joint": 0, "speed": float("inf"), "duration": 0.5},
+        ):
+            with pytest.raises(RobotError) as jog:
+                dry_run.jog_j(**kwargs)
+            assert jog.value.code == ErrorCode.COMM_VALIDATION_ERROR, kwargs
+
+        with pytest.raises(RobotError) as short_move:
+            dry_run.move_j([0.0, 0.0, 0.0])
+        assert short_move.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        with pytest.raises(RobotError) as short_teleport:
+            dry_run.teleport([0.0, 0.0, 0.0])
+        assert short_teleport.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        # Outside a joint's travel the runtime refuses rather than clamping,
+        # because clamping lands the arm somewhere else and reports success.
+        hard = _cfg.load_robot_config()["joints"][0]["limits"]
+        beyond = list(park_deg())
+        beyond[0] = math.degrees(hard["hard_max_rad"]) + 10.0
+        before = dry_run.angles()
+        with pytest.raises(RobotError) as clamped:
+            dry_run.teleport(beyond)
+        assert clamped.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert dry_run.angles() == pytest.approx(before, abs=1e-9)
+
+        # write_io is refused for the reason the runtime refuses it: par6d
+        # drives no digital outputs, so a success here would be a promise.
+        with pytest.raises(RobotError) as io:
+            dry_run.write_io(0, 1)
+        assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+    def test_home_returns_to_park_once_the_arm_is_referenced(self) -> None:
+        """HOME is two commands wearing one name, and the preview has to know
+        which one it is drawing.
+
+        Un-referenced it is the seek, which ends wherever the configured
+        sequence's ``move_to`` steps leave the arm and reports no duration.
+        Referenced it is an ordinary planned move to the park pose — which is
+        what makes a Home button cost seconds rather than a full seek.
+        """
+        robot = Robot()
+        cold = robot.create_dry_run_client(
+            initial_joints_deg=park_deg(), initial_homed=False
+        )
+        seek = cold.home()
+        assert seek.duration == 0.0
+        assert seek.end_joints_rad == pytest.approx(
+            _cfg.homing_ready_pose_rad(), abs=1e-6
+        )
+
+        warm = robot.create_dry_run_client(
+            initial_joints_deg=np.degrees(_cfg.homing_ready_pose_rad()).tolist()
+        )
+        ret = warm.home()
+        assert ret.duration > 0.0, "a referenced HOME is a planned move, not a jump"
+        assert ret.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-6)
+        assert ret.tcp_poses.shape[0] > 1, "a planned move draws a path"
+
+    def test_the_preview_answers_the_queries_a_program_reads_back(self) -> None:
+        """A script that reads state between moves must not hit AttributeError,
+        and the tool's jaw state must follow what the program told it to do."""
+        client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+
+        assert len(client.io()) == IO_SLOTS
+        assert client.error() is None
+        assert client.queue() == []
+        assert client.is_robot_stopped()
+        assert not client.is_estop_pressed()
+        assert client.joint_speeds() == [0.0] * NUM_JOINTS
+        assert client.tcp_speed() == 0.0
+
+        status = client.status()
+        assert status.angles == pytest.approx(client.angles(), abs=1e-9)
+        assert status.pose[3:12:4] == pytest.approx(client.pose()[:3], abs=1e-6)
+
+        assert client.tool.is_open()
+        client.tool.close()
+        assert not client.tool.is_open()
+        assert client.tool.status().engaged
+        client.tool.open()
+        assert client.tool.is_open()
+        assert client.tool.status().key == client.active_tool_key
+
 
 class TestProgramWorkflow:
     def test_a_program_previews_as_one_continuous_timeline(self) -> None:
         """Drive a whole program the way the editor does and check the results
         chain: every segment starts where the previous one ended, the tool
-        action holds position, and home lands on the configured ready pose."""
-        client = Robot().create_dry_run_client(initial_joints_deg=[0.0] * 6)
+        action holds position, and home lands on the configured ready pose.
+
+        Un-referenced to start with, because that is the state an editor
+        opens on and it is why a program's first line is ``home()``. Seeding
+        a configuration instead would have to seed a REACHABLE one: all-zeros
+        is outside joints 1 and 2's travel, so no plan out of it is meaningful.
+        """
+        client = Robot().create_dry_run_client(
+            initial_joints_deg=[0.0] * 6, initial_homed=False
+        )
         results = []
         results.append(client.home())
         np.testing.assert_allclose(

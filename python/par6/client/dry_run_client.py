@@ -37,20 +37,26 @@ the failure before the arm does.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 from pinokin import se3_from_rpy, so3_rpy
+from waldoctl import ToolState, ToolStatus
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld
 
 from par6 import config as _cfg
 from par6 import motion as _motion
+from par6.client.async_client import StatusResult
 from par6.client.errors import RobotError
 from par6.motion import JogEngine, LineSegment, MotionLimits, PlanningError
-from par6.protocol.constants import NUM_JOINTS, ErrorCode
+from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CmdType, ErrorCode
+from par6.protocol.wire import ProtocolError, _validate_command
+
+logger = logging.getLogger(__name__)
 
 #: Wire axis order for ``jog_l`` / Cartesian velocity vectors.
 _AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
@@ -58,6 +64,10 @@ _AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5
 #: Minimum time the runtime holds a gripper calibration
 #: (``crates/par6d/src/planner.rs::TOOL_CALIBRATE_MIN_WAIT_S``).
 _TOOL_CALIBRATE_MIN_WAIT_S = 2.0
+
+#: Speed fraction an already-referenced HOME returns to the park pose at
+#: (``crates/par6d/src/planner.rs::HOME_RETURN_SPEED_FRAC``).
+_HOME_SPEED_FRAC = 0.5
 
 # Error templates, mirroring ``crates/par6-proto/src/error.rs`` for the codes
 # an offline plan can produce. The runtime formats these server-side; a
@@ -120,6 +130,19 @@ def make_error(code: ErrorCode, **fields: object) -> RobotError:
     for name, value in fields.items():
         cause = cause.replace("{" + name + "}", str(value))
     return RobotError(-1, int(code), title, cause.strip(), effect, remedy)
+
+
+def _wire_checked(cmd: CmdType, params: list) -> None:
+    """Refuse what the wire refuses, through the wire's own validator.
+
+    A preview that integrates a jog the codec would reject draws a motion
+    the arm will never make. Running the real rules rather than restating
+    them keeps the two from drifting.
+    """
+    try:
+        _validate_command(cmd, params)
+    except ProtocolError as e:
+        raise make_error(ErrorCode.COMM_VALIDATION_ERROR, detail=str(e)) from None
 
 
 #: Colliding pairs one refusal names before it summarizes the rest
@@ -284,10 +307,50 @@ class _Chain:
 
 
 class _DryRunTool:
-    """``client.tool`` for the preview — routes actions through the plan."""
+    """``client.tool`` for the preview — routes actions through the plan.
+
+    Jaw position is tracked here rather than left at a default: a program
+    that closes the gripper and asks ``is_open()`` two lines later gets the
+    answer the arm would give.
+    """
 
     def __init__(self, client: "DryRunRobotClient") -> None:
         self._client = client
+        self._position = 0.0
+
+    def status(self) -> ToolStatus:
+        """The previewed tool state. Not a query — the preview knows what it
+        was told to do and nothing else, so nothing is faulted or detected."""
+        spec = self._client._robot.tools[self._client.active_tool_key]
+        return ToolStatus(
+            key=spec.key,
+            variant_key=self._client._variant_key,
+            state=ToolState.IDLE,
+            engaged=self._position > 0.5,
+            positions=(self._position,) * len(getattr(spec, "motions", ()) or (1,)),
+        )
+
+    def is_open(self, position: float | None = None) -> bool:
+        """True when the jaws are open; defaults to the previewed position."""
+        return (self._position if position is None else position) < 0.5
+
+    def set_position(self, position: float, **kwargs: Any) -> DryRunResultData:
+        return self._act("set_position", [position], position)
+
+    def open(self, **kwargs: Any) -> DryRunResultData:
+        return self._act("open", [], 0.0)
+
+    def close(self, **kwargs: Any) -> DryRunResultData:
+        return self._act("close", [], 1.0)
+
+    def _act(
+        self, verb: str, params: list[Any], position: float
+    ) -> DryRunResultData:
+        result = self._client.tool_action(
+            self._client.active_tool_key, verb, params
+        )
+        self._position = min(max(float(position), 0.0), 1.0)
+        return result
 
     def __getattr__(self, name: str) -> Any:
         def method(*args: Any, **kwargs: Any) -> DryRunResultData:
@@ -748,22 +811,34 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def home(self, **kwargs: Any) -> DryRunResultData:
-        """Reference the arm and park it where the homing sequence ends.
+        """Reference the arm, or return it to the park pose when it already
+        holds its references.
 
-        The runtime runs its full referencing sequence on every ``home()``
-        (it does not short-circuit when already homed), and that sequence's
-        ``move_to`` steps decide the final pose — so the preview lands there.
-        Its wall-clock duration is a property of the physical seek, not of a
-        plan, and is reported as 0.
+        Two different commands wear one name on the runtime
+        (``Par6Planner``'s ``Command::Home``). Un-referenced, HOME runs the
+        configured seek, and where it ends is decided by that sequence's
+        ``move_to`` steps; its wall-clock duration is a property of the
+        physical seek rather than of a plan, so it is reported as 0.
+        Already referenced, HOME is an ordinary planned joint move to
+        ``[robot].park_pose_rad`` at half speed — which is what makes a Home
+        button press cost seconds instead of a full seek, and it is planned
+        and collision-gated here like any other move.
         """
         self._close_chain()
+        if self._homed:
+            return self._emit(
+                self._plan(self._robot.joints.home.rad, speed_fraction=_HOME_SPEED_FRAC)
+            )
         return self._emit(self._snap_to(_cfg.homing_ready_pose_rad()))
 
     def teleport(
         self, angles_deg: list[float], tool_positions: list[float] | None = None
     ) -> DryRunResultData:
-        """Sim-only jump to *angles_deg*, clamped to the hard limits as the
-        runtime clamps them, and establishing the position reference.
+        """Sim-only jump to *angles_deg*, establishing the position reference.
+
+        A pose outside a joint's travel is REFUSED, not clamped — the
+        runtime's rule (``teleport_angle_fault``), because clamping lands the
+        arm tens of degrees from where the caller asked and reports success.
 
         ``tool_positions`` places the jaws on the runtime's simulated tool;
         the preview carries no tool geometry, so it changes nothing here.
@@ -772,15 +847,33 @@ class DryRunRobotClient:
         motion, so a move still held for blending never runs.
         """
         self._discard_chain()
+        if len(angles_deg) != NUM_JOINTS:
+            raise make_error(
+                ErrorCode.COMM_VALIDATION_ERROR,
+                detail=f"teleport requires {NUM_JOINTS} angles, got {len(angles_deg)}",
+            )
         config = _cfg.load_robot_config()
-        hard = np.array(
-            [
-                [j["limits"]["hard_min_rad"], j["limits"]["hard_max_rad"]]
-                for j in config["joints"]
-            ]
+        hard_deg = np.degrees(
+            np.array(
+                [
+                    [j["limits"]["hard_min_rad"], j["limits"]["hard_max_rad"]]
+                    for j in config["joints"]
+                ]
+            )
         )
-        q = np.radians(np.asarray(angles_deg, dtype=np.float64))
-        return self._snap_to(np.clip(q, hard[:, 0], hard[:, 1]))
+        deg = np.asarray(angles_deg, dtype=np.float64)
+        outside = np.flatnonzero((deg < hard_deg[:, 0]) | (deg > hard_deg[:, 1]))
+        if outside.size:
+            i = int(outside[0])
+            raise make_error(
+                ErrorCode.COMM_VALIDATION_ERROR,
+                detail=(
+                    f"angles[{i}] = {deg[i]:.3f} deg is outside joint {i}'s travel "
+                    f"[{hard_deg[i, 0]:.3f}, {hard_deg[i, 1]:.3f}] deg; teleport "
+                    "places the arm exactly where it is told or not at all"
+                ),
+            )
+        return self._snap_to(np.radians(deg))
 
     def move_j(
         self,
@@ -808,6 +901,11 @@ class DryRunRobotClient:
         else:
             if angles is None:
                 raise ValueError("move_j requires angles or pose=")
+            if len(angles) != NUM_JOINTS:
+                raise make_error(
+                    ErrorCode.COMM_VALIDATION_ERROR,
+                    detail=f"move_j requires {NUM_JOINTS} angles, got {len(angles)}",
+                )
             target = None
             angles_rad = np.radians(np.asarray(angles, dtype=np.float64))
         return self._queue_move(
@@ -1079,6 +1177,9 @@ class DryRunRobotClient:
                 ErrorCode.COMM_VALIDATION_ERROR,
                 detail="jog_j drives one joint at a time",
             )
+        _wire_checked(
+            CmdType.JOG_J, [fractions.tolist(), float(duration), float(accel)]
+        )
         engine = JogEngine(self._q, self._dt)
         return self._result(
             self._stop_at_collision(engine.run(fractions, float(duration)))
@@ -1115,6 +1216,10 @@ class DryRunRobotClient:
             raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
         if frame not in ("WRF", "TRF"):
             raise ValueError(f"unknown frame {frame!r} (par6 supports WRF and TRF)")
+        _wire_checked(
+            CmdType.JOG_L,
+            [velocities.tolist(), float(duration), frame, float(accel)],
+        )
 
         twist = np.concatenate(
             [
@@ -1147,8 +1252,28 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def select_tool(self, tool_name: str, variant_key: str = "", **kwargs: Any) -> int:
-        """Select a tool — refused for any tool the runtime is not fitted with."""
+        """Select a tool — refused for any tool the runtime is not fitted with,
+        matching the runtime's own rule (``server.rs``: par6d is built around
+        one fitted gripper and rejects SELECT_TOOL for any other).
+
+        No par6 tool declares variants: the vendor CAD fuses the gripper body
+        into the arm's final link mesh, so there are no per-variant mesh sets
+        to swap. ``variant_key`` is carried anyway because the runtime carries
+        it — it reappears in STATUS's ``tool_status.variant_key`` and clears
+        the TCP offset when it changes — but it selects no geometry here, and
+        a key naming a variant that does not exist is warned about rather than
+        silently absorbed.
+        """
         self._close_chain()
+        if variant_key and not getattr(
+            self._robot.tools[_cfg.canonical_tool_key(tool_name)], "variants", ()
+        ):
+            logger.warning(
+                "tool %r declares no variants; variant_key=%r selects no "
+                "geometry and only rides through to STATUS",
+                tool_name,
+                variant_key,
+            )
         key = _cfg.canonical_tool_key(tool_name)
         if key != _cfg.fitted_tool_key():
             raise make_error(
@@ -1253,6 +1378,97 @@ class DryRunRobotClient:
 
     def wait_ready(self, **kwargs: Any) -> bool:
         return True
+
+    def safety_stop(self, **kwargs: Any) -> int:
+        self._discard_chain()
+        return 1
+
+    def set_gravity_comp(self, on: bool = True, **kwargs: Any) -> int:
+        """Gravity feed-forward changes what the drives are asked for, not
+        where the planner sends the arm, so a preview plans the same path."""
+        return 1
+
+    def simulator(self, enabled: bool = True, **kwargs: Any) -> int:
+        """A preview has no bus to switch; it is always the simulator."""
+        return 1
+
+    def connect_hardware(self, port_str: str = "", **kwargs: Any) -> int:
+        """A preview has no bus to connect."""
+        return 1
+
+    def set_completion_policy(self, policy: Any = 0, **kwargs: Any) -> int:
+        """When a queued command reports COMPLETE — a timing choice about
+        acknowledgement, not about the path, so the preview only checks that
+        the policy exists."""
+        _wire_checked(CmdType.SET_COMPLETION_POLICY, [int(policy)])
+        return 1
+
+    def set_recipe(self, name: str = "", **kwargs: Any) -> int:
+        """Recipes name a settings bundle the runtime holds; a preview has
+        none, so it validates the name and carries on."""
+        _wire_checked(CmdType.SET_RECIPE, [name])
+        return 1
+
+    def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
+        """Refused, as the runtime refuses it: par6d drives no digital
+        outputs yet, so a preview that reported success would promise the
+        one thing the arm will not do."""
+        raise make_error(
+            ErrorCode.COMM_VALIDATION_ERROR,
+            detail=(
+                f"write_io is unavailable: this runtime drives no digital "
+                f"outputs, so port {index} cannot be set"
+            ),
+        )
+
+    def io(self) -> list[int]:
+        """``[in1, in2, out1, out2, estop]`` — the runtime's own layout. A
+        preview reads no lines and never latches e-stop, so every input is
+        low and the e-stop slot reads clear."""
+        return [0] * (IO_SLOTS - 1) + [1]
+
+    def queue(self) -> list[str]:
+        """A preview runs each command as it arrives, so nothing is ever
+        waiting; a held blend chain is the one exception."""
+        return [m.__class__.__name__ for m in self._chain.moves]
+
+    def error(self) -> RobotError | None:
+        """A preview RAISES its refusals rather than latching them, so there
+        is never a standing error to read back."""
+        return None
+
+    def status(self) -> StatusResult:
+        """The previewed state in the shape the STATUS query answers."""
+        out = np.zeros(6, dtype=np.float64)
+        self._robot.fk(self._q, out)
+        T = _pose_to_matrix(out)
+        T[:3, 3] *= 1000.0
+        return StatusResult(
+            pose=T.flatten().tolist(),
+            angles=self.angles(),
+            speeds=[0.0] * NUM_JOINTS,
+            io=self.io(),
+            tool_status=self._tool.status(),
+        )
+
+    def is_estop_pressed(self) -> bool:
+        return False
+
+    def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
+        """A preview holds still between commands: every motion it reports
+        has already run to its end."""
+        return True
+
+    def joint_speeds(self) -> list[float]:
+        return [0.0] * NUM_JOINTS
+
+    def tcp_speed(self) -> float:
+        return 0.0
+
+    def _robot_pose_si(self) -> list[float]:
+        out = np.zeros(6, dtype=np.float64)
+        self._robot.fk(self._q, out)
+        return out.tolist()
 
     def close(self) -> None:
         return None

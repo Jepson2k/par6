@@ -95,6 +95,20 @@ def _run(coro: Coroutine[Any, Any, T]) -> T:
     )
 
 
+def _sync_tool(tool: ToolSpec) -> ToolSpec:
+    """waldoctl's sync wrapper for *tool*, with ``status()`` made synchronous.
+
+    The wrapper overrides the action verbs but not ``status()``, and a tool
+    with no action verbs is not wrapped at all — either way ``status()``
+    reaches the async implementation and hands the caller an un-awaited
+    coroutine, so ``rbt.tool.status().key`` raises on a facade whose whole
+    contract is that nothing is a coroutine.
+    """
+    sync = make_sync_tool(tool, _run)
+    sync.status = lambda: _run(tool.status())  # type: ignore[method-assign]
+    return sync
+
+
 class RobotClient:
     """Synchronous wrapper around :class:`AsyncRobotClient` — every method
     returns a concrete result, never a coroutine.
@@ -117,7 +131,7 @@ class RobotClient:
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
         self._bound_tools: dict[str, ToolSpec] = {
-            key: make_sync_tool(tool, _run)
+            key: _sync_tool(tool)
             for key, tool in self._inner._bound_tools.items()
         }
 
@@ -152,7 +166,7 @@ class RobotClient:
         """Bind tool specs; actions run through this facade's background loop."""
         self._inner.bind_tools(specs)
         self._bound_tools = {
-            key: make_sync_tool(tool, _run)
+            key: _sync_tool(tool)
             for key, tool in self._inner._bound_tools.items()
         }
 
