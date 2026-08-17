@@ -1271,3 +1271,45 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
 
     rig.shutdown();
 }
+
+/// The STATUS rate override reaches the broadcast, and a rate the tick
+/// clock cannot divide refuses to boot.
+///
+/// The reason it exists: a CI conftest wants a slower broadcast under
+/// load, and the only way to get one used to be writing a patched TOML
+/// to a temp file. The rate is not free-form though — the status loop
+/// samples a snapshot the RT publishes at the tick rate, so a cadence
+/// that does not divide it beats against the snapshot instead of
+/// tracking it, and the config validator has always said so. The
+/// override runs through that same rule rather than a second one.
+#[test]
+fn the_status_rate_override_changes_the_broadcast_and_refuses_a_bad_rate() {
+    const HZ: u32 = 10;
+    let rig = Rig::boot_at_status_rate(common::shipped_config(), HZ);
+    rig.set_status_timeout(Duration::from_secs(1));
+    rig.wait_status("first broadcast", |_| true);
+
+    // Time five INTERVALS, not five frames: the first read lands mid-period.
+    let start = Instant::now();
+    for _ in 0..5 {
+        rig.recv_status().expect("a broadcast within the timeout");
+    }
+    let elapsed = start.elapsed();
+    let nominal = Duration::from_secs_f64(5.0 / f64::from(HZ));
+    assert!(
+        elapsed > nominal.mul_f64(0.8),
+        "five frames at {HZ} Hz took {elapsed:?}, which is the shipped 50 Hz cadence, \
+         not the override (expected about {nominal:?})"
+    );
+    rig.shutdown();
+
+    // A rate that does not divide 250 Hz is a startup failure, in the
+    // config validator's own words.
+    let Err(err) = Rig::try_boot_at_status_rate(common::shipped_config(), 7) else {
+        panic!("7 Hz does not divide the 250 Hz tick and must refuse startup");
+    };
+    assert!(
+        err.contains("status_rate_hz") && err.contains("divide"),
+        "the refusal names the field and the rule: {err}"
+    );
+}

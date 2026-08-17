@@ -68,6 +68,29 @@ impl Rig {
     /// Boot the simulator on `config`; `sim_dynamics` selects the
     /// torque-level plant over the kinematic one.
     pub fn boot_with(config: PathBuf, sim_dynamics: bool) -> Rig {
+        Rig::boot_opts(config, sim_dynamics, None)
+    }
+
+    /// Boot the simulator with the STATUS broadcast rate overridden, as
+    /// `--status-rate` / `PAR6_STATUS_RATE_HZ` do.
+    pub fn boot_at_status_rate(config: PathBuf, hz: u32) -> Rig {
+        Rig::try_boot_at_status_rate(config, hz).expect("daemon boots in sim mode")
+    }
+
+    /// The same, surfacing the startup error instead of panicking.
+    pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
+        Rig::try_boot_opts(config, false, Some(hz))
+    }
+
+    fn boot_opts(config: PathBuf, sim_dynamics: bool, status_rate_hz: Option<u32>) -> Rig {
+        Rig::try_boot_opts(config, sim_dynamics, status_rate_hz).expect("daemon boots in sim mode")
+    }
+
+    fn try_boot_opts(
+        config: PathBuf,
+        sim_dynamics: bool,
+        status_rate_hz: Option<u32>,
+    ) -> Result<Rig, String> {
         let _ = env_logger::builder().is_test(true).try_init();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
@@ -85,13 +108,15 @@ impl Rig {
             status_port: Some(status_rx.local_addr().unwrap().port()),
             telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
             status_transport: Some(StatusTransport::Unicast),
+            status_rate_hz,
             ..Options::default()
         };
-        Rig {
-            daemon: Some(Daemon::start(&opts).expect("daemon boots in sim mode")),
+        let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
+        Ok(Rig {
+            daemon: Some(daemon),
             status_rx,
             _telemetry_rx: telemetry_rx,
-        }
+        })
     }
 
     /// The command plane's bound address.
@@ -102,6 +127,15 @@ impl Rig {
     /// The telemetry socket, for tests that decode the stream.
     pub fn telemetry(&self) -> &UdpSocket {
         &self._telemetry_rx
+    }
+
+    /// Widen the STATUS socket's read timeout past the default
+    /// [`READ_TIMEOUT`], for tests that run the broadcast slower than
+    /// one frame per 100 ms.
+    pub fn set_status_timeout(&self, t: Duration) {
+        self.status_rx
+            .set_read_timeout(Some(t))
+            .expect("status timeout");
     }
 
     /// One STATUS datagram, or `None` on a quiet [`READ_TIMEOUT`] window.

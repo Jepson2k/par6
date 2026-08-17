@@ -47,8 +47,11 @@ pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=p
 ```
 
 That gives you the client, the offline preview and the kinematics — but **not** the
-`par6d` binary, so `Robot().start()` has nothing to spawn until the workspace is built
-or a runtime is already listening (see [#33](https://github.com/Jepson2k/par6/issues/33)).
+`par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
+client-only install has nothing to spawn until either the workspace above is built or
+a runtime is already listening — which is the normal case, since the runtime belongs on
+the control box and the client does not. Shipping a per-platform runtime wheel is
+[#33](https://github.com/Jepson2k/par6/issues/33).
 
 Deploying to a control box (Raspberry Pi 5, aarch64, PREEMPT_RT) is its own document:
 [`scripts/deploy/README.md`](scripts/deploy/README.md).
@@ -314,6 +317,7 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_STATUS_PORT` | status broadcast port (`--status-port`) |
 | `PAR6_TELEMETRY_PORT` | telemetry stream port (`--telemetry-port`) |
 | `PAR6_STATUS_TRANSPORT` | `auto` \| `multicast` \| `unicast` (`--status-transport`) |
+| `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 

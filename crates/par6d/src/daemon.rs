@@ -112,6 +112,15 @@ impl Daemon {
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
         loaded.robot.stream.command_timeout_s =
             resolve_stream_timeout(opts.sim, loaded.robot.stream.command_timeout_s);
+        if let Some(hz) = opts.status_rate_hz {
+            // Re-validated rather than range-checked here: the STATUS
+            // cadence has to divide the tick rate exactly, and running
+            // the override through the config's own rule is what keeps
+            // the two from drifting apart — and gives the same message.
+            loaded.robot.protocol.status_rate_hz = hz;
+            loaded.robot.validate()?;
+            log::info!("STATUS rate overridden to {hz} Hz");
+        }
         let bundle = Arc::new(loaded);
         let robot = &bundle.robot;
         let bands = robot.loop_timing();

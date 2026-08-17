@@ -40,6 +40,9 @@ OPTIONS:
     --status-port <PORT>       Status broadcast port [env: PAR6_STATUS_PORT]
     --telemetry-port <PORT>    Telemetry stream port [env: PAR6_TELEMETRY_PORT]
     --status-transport <MODE>  auto | multicast | unicast [env: PAR6_STATUS_TRANSPORT]
+    --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
+                               exactly [env: PAR6_STATUS_RATE_HZ]
+                               [config: protocol.status_rate_hz]
     -h, --help                 Print this help
 ";
 
@@ -67,6 +70,8 @@ pub struct Options {
     pub telemetry_port: Option<u16>,
     /// Status transport ladder override.
     pub status_transport: Option<StatusTransport>,
+    /// STATUS broadcast rate override \[Hz\].
+    pub status_rate_hz: Option<u32>,
     /// `--help` was requested.
     pub help: bool,
 }
@@ -98,6 +103,9 @@ impl Options {
                 }
                 "--status-transport" => {
                     o.status_transport = Some(parse_transport(&value(&mut args, &arg)?)?);
+                }
+                "--status-rate" => {
+                    o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
                 }
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
@@ -153,6 +161,11 @@ impl Options {
                 self.status_transport = Some(parse_transport(&v)?);
             }
         }
+        if self.status_rate_hz.is_none() {
+            if let Some(v) = env_var("PAR6_STATUS_RATE_HZ") {
+                self.status_rate_hz = Some(parse_rate(&v, "PAR6_STATUS_RATE_HZ")?);
+            }
+        }
         Ok(())
     }
 }
@@ -205,6 +218,11 @@ fn value(
 fn parse_num(v: &str, what: &str) -> Result<u16, String> {
     v.parse::<u16>()
         .map_err(|_| format!("{what}: invalid port `{v}`"))
+}
+
+fn parse_rate(v: &str, what: &str) -> Result<u32, String> {
+    v.parse::<u32>()
+        .map_err(|_| format!("{what}: invalid rate `{v}`"))
 }
 
 fn parse_ip(v: &str, what: &str) -> Result<IpAddr, String> {
