@@ -4,9 +4,9 @@
 //! gravity G(q) → mode dispatch (pure per-mode setpoint fns) → bus TX →
 //! state snapshot (triple buffer) for status/telemetry. Absolute-
 //! deadline timing (clock_nanosleep TIMER_ABSTIME); one-sided p99
-//! degradation bands. NOTE: vendor ordering is command-before-measure
-//! (1 tick extra latency); we measure-then-command — deviation flagged for
-//! HIL validation, config flag restores vendor ordering.
+//! degradation bands. The vendor runtime orders the tick
+//! command-before-measure, which costs a tick of latency; par6 measures
+//! then commands. That deviation has not been validated on hardware.
 //!
 //! Semantics ported exactly from the vendor runtime: IDLE-with-gravity =
 //! torque-only hold; ACTIVE_ERROR = active zero-velocity; SAFETY_STOP =

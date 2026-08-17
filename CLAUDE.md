@@ -1,7 +1,7 @@
 # CLAUDE.md - par6
 
 Rust real-time runtime (`par6d`) + Python waldoctl client for the PAR6 arm.
-Read `README.md` for architecture and the workstream board.
+Read `README.md` for architecture, the command system, and the collision world.
 
 ## Commands
 

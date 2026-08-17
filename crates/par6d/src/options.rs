@@ -27,11 +27,9 @@ OPTIONS:
                                ./config/PAR6.toml, then <exe>/../../config/PAR6.toml)
     --assets <DIR>             assets/par6_description tree with the PAR6 URDFs
                                (default: $PAR6_ASSETS, then the tree next to the
-                               config directory). Used by the kinematics stack;
-                               requires a build with feature `ffi`.
+                               config directory). Used by the kinematics stack.
     --sim-dynamics             With --sim: torque-level physics plant (Pinocchio
                                forward dynamics) instead of the kinematic plant.
-                               Requires a build with feature `ffi`.
                                [env: PAR6_SIM_DYNAMICS=1]
     --port <PORT>              Command UDP port; 0 = ephemeral. The bound port is
                                printed on stdout as `PAR6D_READY command_port=...`.

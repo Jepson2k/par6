@@ -1473,6 +1473,10 @@ class AsyncRobotClient(_RobotClientABC):
         The controller I/O layout is ``[in1, in2, out1, out2, estop]``, so
         logical output 0 maps to port 2.
 
+        **Refused by every current runtime** — par6d drives no digital
+        outputs yet, so this raises :class:`RobotError` rather than
+        reporting a success the arm cannot produce (issue #28).
+
         Category: I/O
 
         Example:
@@ -1491,10 +1495,17 @@ class AsyncRobotClient(_RobotClientABC):
     async def select_tool(self, tool_name: str, variant_key: str = "") -> int:
         """Set the active end-effector tool on the controller.
 
+        A runtime is built around ONE fitted gripper and refuses any other
+        key, so this selects the tool the box is already wearing — read the
+        available one from ``robot.tools`` rather than naming it literally.
+        No par6 tool declares variants, so ``variant_key`` selects no
+        geometry; it rides through to STATUS and clears the TCP offset when
+        it changes.
+
         Category: Configuration
 
         Example:
-            rbt.select_tool("SSG48")
+            rbt.select_tool(robot.tools.default.key)
         """
         key = canonical_tool_key(tool_name)
         index = await self._queued(
