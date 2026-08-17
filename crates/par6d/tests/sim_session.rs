@@ -1381,3 +1381,128 @@ fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
     );
     rig.shutdown();
 }
+
+/// A running par6d is VISIBLE to the vendor's CAN tools.
+///
+/// Those tools decide whether they may transmit on `can0` by reading
+/// `loop_tick` and `robot_mode` from the shared-memory directory, and a
+/// box with neither reads as "no runtime, bus is free". par6d published
+/// neither, so a firmware flash run against a live par6d would have
+/// taken the recovery path and transmitted into its traffic — the
+/// two-transmitter corruption the arrangement exists to prevent.
+///
+/// This drives the SHIPPED binary rather than the library, because the
+/// segments are a property of the process: they have to exist while it
+/// runs, advance while its RT thread ticks, and be gone once it stops.
+/// The reader here is the vendor's own three lines, not ours.
+#[test]
+fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
+    // A scratch directory, not the real one: `/dev/shm/loop_tick` names
+    // the claim on ONE bus, and a test that removed it would be lying to
+    // whatever else on the machine is reading it.
+    let dir = std::env::temp_dir().join(format!("par6-grant-e2e-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("scratch shm dir");
+    let tick_path = dir.join("loop_tick");
+    let mode_path = dir.join("robot_mode");
+
+    let read_tick = || -> Option<f64> {
+        let raw = std::fs::read(&tick_path).ok()?;
+        Some(f64::from_le_bytes(raw.get(..8)?.try_into().ok()?))
+    };
+    let read_mode = || -> Option<String> {
+        let raw = std::fs::read(&mode_path).ok()?;
+        let len = u32::from_le_bytes(raw.get(..4)?.try_into().ok()?) as usize;
+        if len == 0 || len > raw.len() - 4 {
+            return None;
+        }
+        String::from_utf8(raw[4..4 + len].to_vec()).ok()
+    };
+    let poll = |mut f: Box<dyn FnMut() -> bool>| -> bool {
+        let deadline = Instant::now() + BUDGET;
+        while Instant::now() < deadline {
+            if f() {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        false
+    };
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
+        .args([
+            "--sim",
+            "--config",
+            common::shipped_config().to_str().expect("utf-8 path"),
+            "--port",
+            "0",
+            "--bind",
+            "127.0.0.1",
+        ])
+        .env("PAR6_SHM_DIR", &dir)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn par6d");
+
+    assert!(
+        poll(Box::new(|| read_tick().is_some() && read_mode().is_some())),
+        "a running par6d published no bus-grant signal; every CAN tool would \
+         read this box as having no runtime"
+    );
+    let first = read_tick().expect("loop_tick");
+    let mode = read_mode().expect("robot_mode");
+    assert!(
+        !mode.is_empty() && mode != "FLASHING",
+        "a runtime that is not in FLASHING must not read as granting the bus: {mode:?}"
+    );
+    // Liveness is "advancing", sampled twice — a fixed value reads as a
+    // runtime that has stopped, which is a grant by another name.
+    assert!(
+        poll(Box::new(move || read_tick().is_some_and(|t| t > first))),
+        "loop_tick never advanced past {first}; a live runtime would read as stopped"
+    );
+
+    // A KILLED runtime cannot clean up after itself, and the design
+    // does not ask it to: the tools read liveness before the mode
+    // precisely because these segments outlive their writer. What has to
+    // hold is that the tick STOPS — a stale value that kept advancing
+    // would be a dead runtime still claiming the bus.
+    // SAFETY: plain kill(2) on our own child with a standard signal.
+    unsafe { libc::kill(child.id() as i32, libc::SIGKILL) };
+    let _ = child.wait();
+    let killed_at = read_tick().expect("the segment outlives the process");
+    std::thread::sleep(Duration::from_millis(400));
+    assert_eq!(
+        read_tick(),
+        Some(killed_at),
+        "loop_tick advanced after the runtime was killed; it would read as live"
+    );
+
+    // The clean path DOES take the claim away, so a restart never has to
+    // wait out a stale one.
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
+        .args([
+            "--sim",
+            "--config",
+            common::shipped_config().to_str().expect("utf-8 path"),
+            "--port",
+            "0",
+            "--bind",
+            "127.0.0.1",
+        ])
+        .env("PAR6_SHM_DIR", &dir)
+        .stdout(Stdio::null())
+        .spawn()
+        .expect("spawn par6d");
+    assert!(
+        poll(Box::new(|| read_tick().is_some_and(|t| t != killed_at))),
+        "the restarted runtime never republished loop_tick"
+    );
+    // SAFETY: as above.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let _ = child.wait();
+    assert!(
+        poll(Box::new(|| !tick_path.exists() && !mode_path.exists())),
+        "a cleanly stopped par6d left its claim on the bus behind"
+    );
+    std::fs::remove_dir_all(&dir).expect("clean up");
+}

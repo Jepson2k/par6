@@ -320,6 +320,31 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
+| `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
+
+### The bus-grant signal
+
+`can0` is a system-wide exclusive resource, and the vendor's CAN tools (the
+firmware flasher, the motor tuners) decide whether they may transmit by reading
+two shared-memory segments the runtime publishes:
+
+| Segment | Contents | Meaning |
+|---|---|---|
+| `/dev/shm/loop_tick` | one little-endian `f64` | advancing = a runtime is live and owns the bus |
+| `/dev/shm/robot_mode` | 4-byte LE length + UTF-8 | `FLASHING` = bus granted; anything else = keep off |
+
+par6d publishes both, from the RT core's own tick counter — so a stalled RT
+thread reads as stalled — and removes them on a clean stop. **A box publishing
+neither reads as having no runtime at all**, which is a flasher's cue to
+transmit; that is the failure this exists to prevent, not a nicety.
+
+Liveness is read before the mode, so a segment left behind by a crash is safe:
+its tick stops advancing and the box reads as free, which by then it is.
+
+`par6d.service` sets `BindPaths=/dev/shm` because a private `/dev/shm` would put
+the segments somewhere only par6d can see. Point a second runtime on the same
+box at `PAR6_SHM_DIR` so it does not overwrite the claim of the one that owns
+the arm.
 
 The Python side reads three of its own:
 

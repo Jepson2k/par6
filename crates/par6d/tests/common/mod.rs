@@ -52,6 +52,26 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
     )
 }
 
+/// Point the bus-grant segments at a scratch directory, once per test
+/// binary.
+///
+/// `/dev/shm/loop_tick` names the claim on the ONE `can0` a box has. A
+/// test rig that wrote it would tell every CAN tool on the machine that
+/// a runtime it cannot see owns the bus — and its teardown would then
+/// take a real runtime's claim away.
+fn redirect_bus_grant() {
+    static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    let dir = ONCE.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch shm dir");
+        // SAFETY: set before any daemon in this binary reads it, and
+        // always to the same value.
+        std::env::set_var("PAR6_SHM_DIR", &dir);
+        dir
+    });
+    debug_assert!(dir.is_dir());
+}
+
 /// A running daemon plus the sockets its broadcasts land on.
 pub struct Rig {
     daemon: Option<Daemon>,
@@ -92,6 +112,7 @@ impl Rig {
         status_rate_hz: Option<u32>,
     ) -> Result<Rig, String> {
         let _ = env_logger::builder().is_test(true).try_init();
+        redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))

@@ -30,6 +30,7 @@ mod adapters;
 mod bridge;
 mod collision_world;
 pub mod daemon;
+mod grant;
 mod kin;
 pub mod options;
 mod planner;

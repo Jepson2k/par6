@@ -46,6 +46,13 @@ SyslogIdentifier=par6d
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+# par6d publishes /dev/shm/loop_tick and /dev/shm/robot_mode so the vendor's
+# CAN tools can see that something already owns can0. A private /dev/shm would
+# put both somewhere only par6d can look, and a flasher that finds neither
+# concludes no runtime is up and transmits into a live bus. Whether PrivateTmp=
+# also covers /dev/shm has changed across systemd versions, so this pins it
+# rather than depending on the one installed.
+BindPaths=/dev/shm
 PrivateDevices=no
 ProtectControlGroups=yes
 ProtectKernelModules=yes

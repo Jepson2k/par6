@@ -36,6 +36,7 @@ use par6_server::{ServerConfig, ServerHandle};
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
+use crate::grant::{self, BusGrant};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::Par6Planner;
 
@@ -328,10 +329,26 @@ impl Daemon {
         {
             let shutdown = shutdown.clone();
             let rt_reader = handles.snapshots;
+            // Publishing this is how the vendor's CAN tools learn that
+            // something already owns the bus. Not fatal: a runtime that
+            // cannot publish it drives the arm exactly as well, it just
+            // cannot be seen — which is what every par6d did before.
+            let shm_dir = grant::shm_dir();
+            let grant = match BusGrant::create(&shm_dir) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    log::error!(
+                        "cannot publish the bus-grant signal in {}: {e} — \
+                         CAN tools will read this box as having no runtime",
+                        shm_dir.display()
+                    );
+                    None
+                }
+            };
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-tee".into())
-                    .spawn(move || tee_loop(rt_reader, tee_writers, shutdown))?,
+                    .spawn(move || tee_loop(rt_reader, tee_writers, grant, shutdown))?,
             );
         }
         {
@@ -430,13 +447,29 @@ fn rt_loop(
 fn tee_loop(
     mut reader: SnapshotReader<StateSnapshot>,
     mut writers: Vec<SnapshotWriter<StateSnapshot>>,
+    mut grant: Option<BusGrant>,
     shutdown: Arc<AtomicBool>,
 ) {
+    let mut grant_failing = false;
     while !shutdown.load(Ordering::SeqCst) {
         match reader.take() {
             Some(s) => {
                 for w in &mut writers {
                     w.publish(&s);
+                }
+                // Off the RT thread deliberately, but driven by ITS
+                // tick: the value other tools sample for liveness has to
+                // stop advancing when the tick loop stops, not when this
+                // thread does.
+                if let Some(g) = grant.as_mut() {
+                    match g.publish(s.tick, s.mode) {
+                        Ok(()) => grant_failing = false,
+                        Err(e) if !grant_failing => {
+                            grant_failing = true;
+                            log::error!("bus-grant signal write failed: {e}");
+                        }
+                        Err(_) => {}
+                    }
                 }
             }
             None => std::thread::sleep(Duration::from_millis(1)),
