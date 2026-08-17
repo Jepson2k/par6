@@ -33,6 +33,8 @@ pub mod daemon;
 mod kin;
 pub mod options;
 mod planner;
+#[cfg(test)]
+mod py_mirror;
 
 pub use daemon::{Daemon, DaemonError};
 pub use options::Options;

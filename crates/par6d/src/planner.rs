@@ -2103,3 +2103,29 @@ fn rt_error(snap: &StateSnapshot) -> WireError {
         )
     })
 }
+
+#[cfg(test)]
+mod mirror {
+    use crate::py_mirror::{assert_float, assert_str, assert_usize};
+
+    /// The offline preview restates the planner's tuning numbers so it can
+    /// plan without a runtime. Drift makes it draw a motion the arm will
+    /// not make, and the preview agrees with itself either way.
+    #[test]
+    fn python_motion_mirrors_the_planner_constants() {
+        assert_float("CART_STEP_M", super::CART_STEP_M);
+        assert_float("CART_STEP_RAD", super::CART_STEP_RAD);
+        assert_usize("MOVE_L_MAX_STEPS", super::MOVE_L_MAX_STEPS);
+        assert_usize("CART_PATH_MAX_STEPS", super::CART_PATH_MAX_STEPS);
+        assert_float("MOVE_L_NULL_M", super::MOVE_L_NULL_M);
+        assert_float(
+            "MOVE_L_MAX_JOINT_STEP_RAD",
+            super::MOVE_L_MAX_JOINT_STEP_RAD,
+        );
+        assert_float("NULL_MOVE_RAD", super::NULL_MOVE_RAD);
+        assert_float("WAYPOINT_SNAP_M", super::WAYPOINT_SNAP_M);
+        assert_float("MOVE_P_AUTO_BLEND_FRAC", super::MOVE_P_AUTO_BLEND_FRAC);
+        assert_float("COLLISION_STEP_RAD", super::COLLISION_STEP_RAD);
+        assert_str("DEFAULT_PROFILE", super::DEFAULT_PROFILE);
+    }
+}

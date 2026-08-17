@@ -364,7 +364,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         match decode_command(data) {
             Ok((req_id, cmd)) => self.dispatch(req_id, cmd, addr).await,
             Err(e) => {
-                let req_id = peek_req_id(data).unwrap_or(0);
+                let req_id = par6_proto::peek_req_id(data).unwrap_or(0);
                 let error = decode_error_to_wire(&e);
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
@@ -384,7 +384,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let chunk = match decode_chunk(data) {
             Ok(c) => c,
             Err(e) => {
-                let req_id = peek_req_id(data).unwrap_or(0);
+                let req_id = par6_proto::peek_req_id(data).unwrap_or(0);
                 let error = decode_error_to_wire(&e);
                 self.reply(addr, &Reply::Error { req_id, error }).await;
                 return;
@@ -1765,28 +1765,10 @@ fn rate_period(hz: u32) -> std::time::Duration {
 /// the wire's intrinsic-XYZ rotation convention,
 /// the exact composition the runtime's rpy extraction inverts.
 fn pose_matrix_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
-    let (x, y, z) = (tcp[0] * 1000.0, tcp[1] * 1000.0, tcp[2] * 1000.0);
-    let (sr, cr) = tcp[3].sin_cos();
-    let (sp, cp) = tcp[4].sin_cos();
-    let (sy, cy) = tcp[5].sin_cos();
-    [
-        cp * cy,
-        -cp * sy,
-        sp,
-        x,
-        sr * sp * cy + cr * sy,
-        cr * cy - sr * sp * sy,
-        -sr * cp,
-        y,
-        sr * sy - cr * sp * cy,
-        cr * sp * sy + sr * cy,
-        cr * cp,
-        z,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
+    par6_proto::pose_matrix(
+        [tcp[0] * 1000.0, tcp[1] * 1000.0, tcp[2] * 1000.0],
+        [tcp[3], tcp[4], tcp[5]],
+    )
 }
 
 /// The world origin expressed in the tool frame: the inverse of
@@ -1853,9 +1835,6 @@ fn params_summary(cmd: &Command) -> String {
     s
 }
 
-/// Explicitly specified time a queued command will take; speed-based
-/// moves contribute 0 (the planner learns their duration only after
-/// parameterization).
 /// Wire name of a command (STATUS `action_current`, QUEUE listing).
 fn cmd_name(tag: CmdType) -> &'static str {
     use CmdType as T;
@@ -1920,45 +1899,4 @@ fn decode_error_to_wire(e: &DecodeError) -> WireError {
         _ => ErrorCode::CommDecodeError,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
-}
-
-/// Best-effort `req_id` salvage from a malformed datagram so the decode
-/// ERROR still correlates; 0 (the push convention) when unreadable.
-fn peek_req_id(data: &[u8]) -> Option<u32> {
-    fn uint(data: &[u8], pos: &mut usize) -> Option<u64> {
-        let b = *data.get(*pos)?;
-        *pos += 1;
-        match b {
-            0x00..=0x7f => Some(u64::from(b)),
-            0xcc => {
-                let v = *data.get(*pos)?;
-                *pos += 1;
-                Some(u64::from(v))
-            }
-            0xcd => {
-                let v = u16::from_be_bytes(data.get(*pos..*pos + 2)?.try_into().ok()?);
-                *pos += 2;
-                Some(u64::from(v))
-            }
-            0xce => {
-                let v = u32::from_be_bytes(data.get(*pos..*pos + 4)?.try_into().ok()?);
-                *pos += 4;
-                Some(u64::from(v))
-            }
-            0xcf => {
-                let v = u64::from_be_bytes(data.get(*pos..*pos + 8)?.try_into().ok()?);
-                *pos += 8;
-                Some(v)
-            }
-            _ => None,
-        }
-    }
-    let mut pos = match *data.first()? {
-        0x90..=0x9f => 1usize,
-        0xdc => 3,
-        0xdd => 5,
-        _ => return None,
-    };
-    uint(data, &mut pos)?; // tag
-    u32::try_from(uint(data, &mut pos)?).ok()
 }

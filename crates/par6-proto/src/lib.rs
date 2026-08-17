@@ -69,6 +69,43 @@ pub const IO_SLOTS: usize = 5;
 /// Enablement flag slots (6 joints/axes × 2 directions).
 pub const EN_SLOTS: usize = 12;
 
+/// A flattened row-major 4×4 from a translation and an intrinsic-XYZ
+/// rotation `[rx, ry, rz]` in radians: `R = Rx(rx)·Ry(ry)·Rz(rz)`.
+///
+/// This is `pinokin.se3_from_rpy`'s order, which is the convention every
+/// TCP pose on the wire uses — and NOT the extrinsic order keep-out
+/// shapes are placed with (`par6_kin::Shape::pose`). The two agree on a
+/// single-axis rotation and diverge on any multi-axis tilt, which is why
+/// there is one builder here rather than a hand-derived matrix per
+/// caller.
+///
+/// The translation passes through in whatever unit it arrives in: the
+/// wire speaks millimetres and the kinematics stack metres, and the
+/// rotation block is identical either way.
+pub fn pose_matrix(xyz: [f64; 3], rpy_rad: [f64; 3]) -> [f64; POSE_ELEMS] {
+    let (sr, cr) = rpy_rad[0].sin_cos();
+    let (sp, cp) = rpy_rad[1].sin_cos();
+    let (sy, cy) = rpy_rad[2].sin_cos();
+    [
+        cp * cy,
+        -cp * sy,
+        sp,
+        xyz[0],
+        sr * sp * cy + cr * sy,
+        cr * cy - sr * sp * sy,
+        -sr * cp,
+        xyz[1],
+        sr * sy - cr * sp * cy,
+        cr * sp * sy + sr * cy,
+        cr * cp,
+        xyz[2],
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+    ]
+}
+
 /// Why a payload failed to decode (or a command failed validation).
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum DecodeError {
@@ -137,4 +174,52 @@ pub fn peek_tag(data: &[u8]) -> Result<i64, DecodeError> {
         });
     }
     r.int()
+}
+
+/// Best-effort `req_id` salvage from a malformed datagram, so the decode
+/// ERROR a server sends back still correlates with the request that
+/// caused it; `None` when even the envelope is unreadable (callers
+/// substitute 0, the push convention).
+///
+/// Deliberately hand-rolled rather than routed through [`Reader`]: the
+/// input has ALREADY failed a real decode, so this walks only the two
+/// msgpack uints it needs and gives up on anything else, instead of
+/// re-running a parser that is known to reject the bytes.
+pub fn peek_req_id(data: &[u8]) -> Option<u32> {
+    fn uint(data: &[u8], pos: &mut usize) -> Option<u64> {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        match b {
+            0x00..=0x7f => Some(u64::from(b)),
+            0xcc => {
+                let v = *data.get(*pos)?;
+                *pos += 1;
+                Some(u64::from(v))
+            }
+            0xcd => {
+                let v = u16::from_be_bytes(data.get(*pos..*pos + 2)?.try_into().ok()?);
+                *pos += 2;
+                Some(u64::from(v))
+            }
+            0xce => {
+                let v = u32::from_be_bytes(data.get(*pos..*pos + 4)?.try_into().ok()?);
+                *pos += 4;
+                Some(u64::from(v))
+            }
+            0xcf => {
+                let v = u64::from_be_bytes(data.get(*pos..*pos + 8)?.try_into().ok()?);
+                *pos += 8;
+                Some(v)
+            }
+            _ => None,
+        }
+    }
+    let mut pos = match *data.first()? {
+        0x90..=0x9f => 1usize,
+        0xdc => 3,
+        0xdd => 5,
+        _ => return None,
+    };
+    uint(data, &mut pos)?; // tag
+    u32::try_from(uint(data, &mut pos)?).ok()
 }

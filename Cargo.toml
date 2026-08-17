@@ -19,7 +19,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Jepson2k/par6"
-rust-version = "1.85"
+# Verified by the `msrv` CI job, not asserted: 1.85 was declared and does
+# not build — rsruckig 3.0 calls `is_multiple_of` on an unsigned integer,
+# stabilized in 1.87.
+rust-version = "1.87"
 
 [workspace.dependencies]
 par6-proto = { path = "crates/par6-proto" }

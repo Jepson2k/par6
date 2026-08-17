@@ -26,20 +26,13 @@
 //! representative session. The p99 assertion is deliberately generous
 //! (see `p99_factor`) because shared CI runners have no RT scheduling.
 
-use std::net::{SocketAddr, UdpSocket};
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{JogJ, MoveJ, Teleport};
-use par6_proto::{
-    decode_reply, decode_status, encode_command, Command, ErrorCode, QueryResult, Reply, Status,
-    WireError, NUM_JOINTS,
-};
-use par6d::options::StatusTransport;
-use par6d::{Daemon, Options};
+use par6_proto::{Command, ErrorCode, QueryResult, Status, WireError, NUM_JOINTS};
 
-const BUDGET: Duration = Duration::from_secs(20);
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
+mod common;
+use common::{shipped_config, Client, Rig, BUDGET};
 
 /// CI gate on the loop p99, as a multiple of the tick period
 /// (`PAR6_P99_FACTOR` overrides; the pre-deploy run on the box sets 1.05).
@@ -58,93 +51,13 @@ fn p99_factor() -> f64 {
         .unwrap_or(3.0)
 }
 
-fn config_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml")
-}
-
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     let mut a = [0.0; NUM_JOINTS];
     for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
         *out = rad.to_degrees();
     }
     a
-}
-
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
-struct Rig {
-    daemon: Option<Daemon>,
-    status_rx: UdpSocket,
-    _telemetry_rx: UdpSocket,
-}
-
-impl Rig {
-    /// Boot the full runtime on the UNPATCHED shipped config.
-    fn boot() -> Rig {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
-        status_rx
-            .set_read_timeout(Some(READ_TIMEOUT))
-            .expect("timeout");
-        let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
-        let opts = Options {
-            sim: true,
-            config: Some(config_path()),
-            command_port: Some(0),
-            bind: Some("127.0.0.1".parse().unwrap()),
-            status_host: Some("127.0.0.1".parse().unwrap()),
-            status_port: Some(status_rx.local_addr().unwrap().port()),
-            telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
-            status_transport: Some(StatusTransport::Unicast),
-            ..Options::default()
-        };
-        Rig {
-            daemon: Some(Daemon::start(&opts).expect("daemon boots in sim mode")),
-            status_rx,
-            _telemetry_rx: telemetry_rx,
-        }
-    }
-
-    fn addr(&self) -> SocketAddr {
-        self.daemon.as_ref().expect("running").command_addr()
-    }
-
-    fn recv_status(&self) -> Option<Status> {
-        let mut buf = [0u8; 65535];
-        match self.status_rx.recv_from(&mut buf) {
-            Ok((n, _)) => Some(decode_status(&buf[..n]).expect("decodable status")),
-            Err(e) if is_timeout(&e) => None,
-            Err(e) => panic!("status recv failed: {e}"),
-        }
-    }
-
-    fn wait_status(&self, what: &str, pred: impl Fn(&Status) -> bool) -> Status {
-        let deadline = Instant::now() + BUDGET;
-        let mut last: Option<Status> = None;
-        loop {
-            if let Some(s) = self.recv_status() {
-                assert_never_loop_critical(&s);
-                if pred(&s) {
-                    return s;
-                }
-                last = Some(s);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "status condition `{what}` not met within budget; last: {last:?}"
-            );
-        }
-    }
-
-    fn shutdown(mut self) {
-        self.daemon.take().expect("running").shutdown();
-    }
 }
 
 /// The hard gate, applied to every STATUS this test ever decodes.
@@ -158,114 +71,15 @@ fn assert_never_loop_critical(s: &Status) {
     }
 }
 
-struct Client {
-    sock: UdpSocket,
-    server: SocketAddr,
-    next_req: u32,
-    completes: Vec<(u64, bool, Option<WireError>)>,
-}
-
-impl Client {
-    fn new(server: SocketAddr) -> Client {
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        sock.set_read_timeout(Some(READ_TIMEOUT)).expect("timeout");
-        Client {
-            sock,
-            server,
-            next_req: 1,
-            completes: Vec::new(),
-        }
-    }
-
-    fn send(&mut self, cmd: &Command) -> u32 {
-        let req_id = self.next_req;
-        self.next_req += 1;
-        let mut buf = Vec::new();
-        encode_command(cmd, req_id, &mut buf).expect("encodable command");
-        self.sock.send_to(&buf, self.server).expect("send");
-        req_id
-    }
-
-    fn try_recv(&mut self) -> Option<Reply> {
-        let mut buf = [0u8; 65535];
-        match self.sock.recv_from(&mut buf) {
-            Ok((n, _)) => Some(decode_reply(&buf[..n]).expect("decodable reply")),
-            Err(e) if is_timeout(&e) => None,
-            Err(e) => panic!("client recv failed: {e}"),
-        }
-    }
-
-    fn request(&mut self, cmd: &Command) -> Reply {
-        let req_id = self.send(cmd);
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(r) = self.try_recv() {
-                match &r {
-                    Reply::Ok { req_id: id, .. }
-                    | Reply::Error { req_id: id, .. }
-                    | Reply::Response { req_id: id, .. }
-                        if *id == req_id =>
-                    {
-                        return r;
-                    }
-                    Reply::Complete { index, ok, detail } => {
-                        self.completes.push((*index, *ok, detail.clone()));
-                    }
-                    _ => {}
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no reply to {cmd:?} within budget"
-            );
-        }
-    }
-
-    fn query(&mut self, cmd: &Command) -> QueryResult {
-        match self.request(cmd) {
-            Reply::Response { result, .. } => result,
-            other => panic!("expected RESPONSE, got {other:?}"),
-        }
-    }
-
-    fn ok(&mut self, cmd: &Command) {
-        match self.request(cmd) {
-            Reply::Ok { index: None, .. } => {}
-            other => panic!("expected plain OK, got {other:?}"),
-        }
-    }
-
-    fn ok_index(&mut self, cmd: &Command) -> u64 {
-        match self.request(cmd) {
-            Reply::Ok { index: Some(i), .. } => i,
-            other => panic!("expected OK with index, got {other:?}"),
-        }
-    }
-
-    fn wait_complete(&mut self, index: u64) -> (bool, Option<WireError>) {
-        if let Some(pos) = self.completes.iter().position(|c| c.0 == index) {
-            let (_, ok, detail) = self.completes.remove(pos);
-            return (ok, detail);
-        }
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(Reply::Complete {
-                index: i,
-                ok,
-                detail,
-            }) = self.try_recv()
-            {
-                if i == index {
-                    return (ok, detail);
-                }
-                self.completes.push((i, ok, detail));
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no COMPLETE for index {index} within budget"
-            );
-        }
-    }
+/// [`Rig::wait_status`] with the hard gate applied to every frame it
+/// walks past — not just the one that satisfies the predicate. A
+/// LOOP_CRITICAL that latches and clears mid-wait is exactly what this
+/// test exists to catch.
+fn wait_status(rig: &Rig, what: &str, pred: impl Fn(&Status) -> bool) -> Status {
+    rig.wait_status(what, |s| {
+        assert_never_loop_critical(s);
+        pred(s)
+    })
 }
 
 fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; NUM_JOINTS]) {
@@ -314,7 +128,7 @@ fn shipped_250hz_configuration_holds_a_full_session() {
 
     // Guard the premise: this test exists to run the SHIPPED numbers, so
     // it fails loudly if the config it points at stops being them.
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     let dt = cfg.robot.tick_dt_s;
     assert_eq!(dt, 0.004, "this soak must run the shipped tick period");
     assert_eq!(
@@ -322,9 +136,9 @@ fn shipped_250hz_configuration_holds_a_full_session() {
         "this soak must run the shipped status decimation"
     );
 
-    let rig = Rig::boot();
+    let rig = Rig::boot(shipped_config());
     let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    wait_status(&rig, "link_ok", |s| s.link_ok == 1);
 
     // -- enable + sim-home ------------------------------------------------
     c.ok(&Command::Reset);
@@ -346,10 +160,10 @@ fn shipped_250hz_configuration_holds_a_full_session() {
     }));
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "move_j must complete ok at 250 Hz, got {detail:?}");
-    rig.wait_status("move landed", |s| s.completed_index >= index as i64);
+    wait_status(&rig, "move landed", |s| s.completed_index >= index as i64);
 
     // -- a UI-style jog burst: fresh watchdogged jogs at ~10 Hz ----------
-    let before = rig.wait_status("angles", |_| true).angles[0];
+    let before = wait_status(&rig, "angles", |_| true).angles[0];
     for _ in 0..12 {
         c.send(&Command::JogJ(JogJ {
             speeds: [-0.3, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -358,8 +172,10 @@ fn shipped_250hz_configuration_holds_a_full_session() {
         }));
         std::thread::sleep(Duration::from_millis(100));
     }
-    rig.wait_status("jog moved the arm", |s| s.angles[0] < before - 1.0);
-    rig.wait_status("jog watchdog self-terminated", |s| s.speeds[0].abs() < 0.05);
+    wait_status(&rig, "jog moved the arm", |s| s.angles[0] < before - 1.0);
+    wait_status(&rig, "jog watchdog self-terminated", |s| {
+        s.speeds[0].abs() < 0.05
+    });
 
     // -- STATUS at the real decimation: ~50 Hz on the wire, not 250 -------
     let window = Duration::from_secs(3);

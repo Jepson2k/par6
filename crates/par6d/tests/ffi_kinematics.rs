@@ -16,7 +16,6 @@
 //!   malformed shape set changes neither the epoch nor the enforced
 //!   world.
 
-use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -24,29 +23,18 @@ use par6_proto::command::{
     JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetRecipe, SetShapes, SetTcpOffset,
     Shape, Stop, Teleport,
 };
-use par6_proto::{
-    decode_reply, decode_status, encode_command, Command, ErrorCode, Frame, QueryResult, Reply,
-    Status, WireError, NUM_JOINTS,
-};
+use par6_proto::{Command, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
+
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
-const BUDGET: Duration = Duration::from_secs(30);
-const READ_TIMEOUT: Duration = Duration::from_millis(100);
+mod common;
+use common::{is_timeout, repo_root, shipped_config, Client, Rig, BUDGET, READ_TIMEOUT};
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .expect("repo root")
-}
-
-fn assets_dir() -> PathBuf {
-    repo_root().join("assets/par6_description")
-}
-
-fn config_path() -> PathBuf {
-    repo_root().join("config/PAR6.toml")
+/// Boot on a config patched for this test's `tag`, so parallel tests do
+/// not share a temp config directory.
+fn boot_tagged(tag: &str, sim_dynamics: bool) -> Rig {
+    Rig::boot_with(test_config(tag), sim_dynamics)
 }
 
 /// The PAR6 config re-ticked to 50 Hz, like the sim-session test: loaded
@@ -54,7 +42,7 @@ fn config_path() -> PathBuf {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    let src = config_path();
+    let src = shipped_config();
     let dir = std::env::temp_dir().join(format!("par6d-ffi-{tag}-{}", std::process::id()));
     let grippers = dir.join("grippers");
     std::fs::create_dir_all(&grippers).expect("test config dir");
@@ -92,238 +80,6 @@ fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
 
 // ---- in-process rig --------------------------------------------------------
 
-struct Rig {
-    daemon: Option<Daemon>,
-    status_rx: UdpSocket,
-    _telemetry_rx: UdpSocket,
-}
-
-impl Rig {
-    fn boot(tag: &str, sim_dynamics: bool) -> Rig {
-        Self::boot_config(test_config(tag), sim_dynamics)
-    }
-
-    fn boot_config(config: PathBuf, sim_dynamics: bool) -> Rig {
-        let _ = env_logger::builder().is_test(true).try_init();
-        let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
-        status_rx
-            .set_read_timeout(Some(READ_TIMEOUT))
-            .expect("timeout");
-        let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
-        let opts = Options {
-            sim: true,
-            sim_dynamics,
-            config: Some(config),
-            assets: Some(assets_dir()),
-            command_port: Some(0),
-            bind: Some("127.0.0.1".parse().unwrap()),
-            status_host: Some("127.0.0.1".parse().unwrap()),
-            status_port: Some(status_rx.local_addr().unwrap().port()),
-            telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
-            status_transport: Some(StatusTransport::Unicast),
-            ..Options::default()
-        };
-        Rig {
-            daemon: Some(Daemon::start(&opts).expect("daemon boots in sim mode")),
-            status_rx,
-            _telemetry_rx: telemetry_rx,
-        }
-    }
-
-    fn addr(&self) -> SocketAddr {
-        self.daemon.as_ref().expect("running").command_addr()
-    }
-
-    fn recv_status(&self) -> Option<Status> {
-        let mut buf = [0u8; 65535];
-        match self.status_rx.recv_from(&mut buf) {
-            Ok((n, _)) => Some(decode_status(&buf[..n]).expect("decodable status")),
-            Err(e) if is_timeout(&e) => None,
-            Err(e) => panic!("status recv failed: {e}"),
-        }
-    }
-
-    fn wait_status(&self, what: &str, pred: impl Fn(&Status) -> bool) -> Status {
-        let deadline = Instant::now() + BUDGET;
-        let mut last: Option<Status> = None;
-        loop {
-            if let Some(s) = self.recv_status() {
-                if pred(&s) {
-                    return s;
-                }
-                last = Some(s);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "status condition `{what}` not met within budget; last: {last:?}"
-            );
-        }
-    }
-
-    /// Drop the STATUS frames the socket has already buffered.
-    ///
-    /// The broadcast runs at 50 Hz whatever the test is doing, so by the
-    /// time a multi-second move ends there is a queue of history waiting:
-    /// a stale frame can satisfy a wait for a condition that has not
-    /// happened yet. Draining first makes the next frame a live one.
-    fn drain_status(&self) {
-        self.status_rx
-            .set_nonblocking(true)
-            .expect("nonblocking status socket");
-        let mut buf = [0u8; 65535];
-        while self.status_rx.recv_from(&mut buf).is_ok() {}
-        self.status_rx
-            .set_nonblocking(false)
-            .expect("blocking status socket");
-    }
-
-    /// Collect every STATUS arriving in `window`.
-    fn collect_status(&self, window: Duration) -> Vec<Status> {
-        let until = Instant::now() + window;
-        let mut out = Vec::new();
-        while Instant::now() < until {
-            if let Some(s) = self.recv_status() {
-                out.push(s);
-            }
-        }
-        out
-    }
-
-    fn shutdown(mut self) {
-        self.daemon.take().expect("running").shutdown();
-    }
-}
-
-fn is_timeout(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
-    )
-}
-
-// ---- protocol client -------------------------------------------------------
-
-struct Client {
-    sock: UdpSocket,
-    server: SocketAddr,
-    next_req: u32,
-    completes: Vec<(u64, bool, Option<WireError>)>,
-}
-
-impl Client {
-    fn new(server: SocketAddr) -> Client {
-        let sock = UdpSocket::bind("127.0.0.1:0").expect("client socket");
-        sock.set_read_timeout(Some(READ_TIMEOUT)).expect("timeout");
-        Client {
-            sock,
-            server,
-            next_req: 1,
-            completes: Vec::new(),
-        }
-    }
-
-    fn send(&mut self, cmd: &Command) -> u32 {
-        let req_id = self.next_req;
-        self.next_req += 1;
-        let mut buf = Vec::new();
-        encode_command(cmd, req_id, &mut buf).expect("encodable command");
-        self.sock.send_to(&buf, self.server).expect("send");
-        req_id
-    }
-
-    fn try_recv(&mut self) -> Option<Reply> {
-        let mut buf = [0u8; 65535];
-        match self.sock.recv_from(&mut buf) {
-            Ok((n, _)) => Some(decode_reply(&buf[..n]).expect("decodable reply")),
-            Err(e) if is_timeout(&e) => None,
-            Err(e) => panic!("client recv failed: {e}"),
-        }
-    }
-
-    fn request(&mut self, cmd: &Command) -> Reply {
-        let req_id = self.send(cmd);
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(r) = self.try_recv() {
-                match &r {
-                    Reply::Ok { req_id: id, .. }
-                    | Reply::Error { req_id: id, .. }
-                    | Reply::Response { req_id: id, .. }
-                        if *id == req_id =>
-                    {
-                        return r;
-                    }
-                    Reply::Complete { index, ok, detail } => {
-                        self.completes.push((*index, *ok, detail.clone()));
-                    }
-                    _ => {}
-                }
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no reply to {cmd:?} within budget"
-            );
-        }
-    }
-
-    fn ok(&mut self, cmd: &Command) {
-        match self.request(cmd) {
-            Reply::Ok { .. } => {}
-            other => panic!("expected OK, got {other:?}"),
-        }
-    }
-
-    fn query(&mut self, cmd: &Command) -> QueryResult {
-        match self.request(cmd) {
-            Reply::Response { result, .. } => result,
-            other => panic!("expected RESPONSE, got {other:?}"),
-        }
-    }
-
-    fn expect_error(&mut self, cmd: &Command) -> WireError {
-        match self.request(cmd) {
-            Reply::Error { error, .. } => error,
-            other => panic!("expected ERROR, got {other:?}"),
-        }
-    }
-
-    fn ok_index(&mut self, cmd: &Command) -> u64 {
-        match self.request(cmd) {
-            Reply::Ok { index: Some(i), .. } => i,
-            other => panic!("expected OK with index, got {other:?}"),
-        }
-    }
-
-    fn wait_complete(&mut self, index: u64) -> (bool, Option<WireError>) {
-        if let Some(pos) = self.completes.iter().position(|c| c.0 == index) {
-            let (_, ok, detail) = self.completes.remove(pos);
-            return (ok, detail);
-        }
-        let deadline = Instant::now() + BUDGET;
-        loop {
-            if let Some(Reply::Complete {
-                index: i,
-                ok,
-                detail,
-            }) = self.try_recv()
-            {
-                if i == index {
-                    return (ok, detail);
-                }
-                self.completes.push((i, ok, detail));
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no COMPLETE for index {index} within budget"
-            );
-        }
-    }
-}
-
-/// Put the sim arm at `angles_deg` (teleport is the sim's fast homing)
-/// and wait for the broadcast to show it there. One datagram per
-/// attempt with a generous confirmation window: a duplicate teleport
-/// applies later on the RT thread and would jerk the arm mid-test.
 fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS]) {
     let deadline = Instant::now() + BUDGET;
     loop {
@@ -368,7 +124,7 @@ struct FixtureCase {
 /// The golden fixture for the URDF variant the configured gripper
 /// selects — the same file `par6-kin`'s conformance test uses.
 fn golden_fixture() -> Fixture {
-    let gripper = par6_config::RobotConfig::load(&config_path())
+    let gripper = par6_config::RobotConfig::load(&shipped_config())
         .expect("PAR6 config")
         .robot
         .active_gripper;
@@ -390,7 +146,7 @@ fn golden_fixture() -> Fixture {
 /// fixtures sample the whole joint space, teleport clamps to the hard
 /// window, and a clamped pose would no longer match the golden FK.
 fn reachable_golden_case() -> FixtureCase {
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     golden_fixture()
         .cases
         .into_iter()
@@ -492,7 +248,7 @@ const MOVE_S: f64 = 15.0;
 /// of moving the arm.
 #[test]
 fn cartesian_surface_over_protocol_v2() {
-    let rig = Rig::boot("cart", false);
+    let rig = boot_tagged("cart", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -750,7 +506,7 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     /// them (J0 is on the vertical axis and carries nothing).
     const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
 
-    let rig = Rig::boot("gravity", true);
+    let rig = boot_tagged("gravity", true);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
@@ -908,7 +664,7 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
     fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], Vec<f64>) {
-        let rig = Rig::boot_config(test_config_with_tool_mass(tag, mass_kg), false);
+        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg), false);
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
@@ -921,13 +677,13 @@ fn gripper_config_mass_changes_published_gravity_torque() {
         c.ok(&Command::SetRecipe(SetRecipe {
             name: "full".into(),
         }));
-        rig._telemetry_rx
+        rig.telemetry()
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("telemetry timeout");
         let deadline = Instant::now() + BUDGET;
         let mut buf = [0u8; 65535];
         let g = loop {
-            match rig._telemetry_rx.recv_from(&mut buf) {
+            match rig.telemetry().recv_from(&mut buf) {
                 Ok((n, _)) => {
                     if let Some(g) = gravity_from_telemetry(&buf[..n]) {
                         break g;
@@ -1055,7 +811,7 @@ fn shapes_readback(c: &mut Client) -> (Vec<Shape>, u64) {
 
 /// The configured park pose in wire units — where every program ends.
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     let mut a = [0.0; NUM_JOINTS];
     for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
         *out = rad.to_degrees();
@@ -1087,7 +843,7 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
 ///   the program layer.
 #[test]
 fn collision_world_is_enforced_over_protocol_v2() {
-    let rig = Rig::boot("collision", false);
+    let rig = boot_tagged("collision", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1325,8 +1081,8 @@ fn jog_j(joint: usize, signed_pct: f64, duration_s: f64) -> Command {
 /// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
 /// loads — where a keep-out has to go to sit on the swept path.
 fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
-    let mut kin =
-        par6_kin::Kin::load(&assets_dir(), par6_kin::GripperVariant::Msg).expect("kin model");
+    let mut kin = par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
+        .expect("kin model");
     let mut q = [0.0; NUM_JOINTS];
     for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
         *out = deg.to_radians();
@@ -1339,7 +1095,7 @@ fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
 /// The configured JOG-mode velocity limit of J0 \[rad/s\] — what a jog
 /// `speeds` fraction commands, and what the gate's lookahead projects.
 fn j0_jog_velocity() -> f64 {
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     cfg.joints[0]
         .limits
         .for_mode(par6_config::LimitMode::Jog)
@@ -1362,7 +1118,7 @@ fn j0_jog_velocity() -> f64 {
 ///   it), while the outward jog from the same spot runs.
 #[test]
 fn streaming_is_gated_by_the_collision_world() {
-    let rig = Rig::boot("streamgate", false);
+    let rig = boot_tagged("streamgate", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1493,7 +1249,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
         ),
     )
     .expect("write config");
-    let rig = Rig::boot_config(config, false);
+    let rig = Rig::boot_with(config, false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1584,7 +1340,7 @@ fn a_malformed_installation_shape_refuses_boot_by_name() {
     let opts = Options {
         sim: true,
         config: Some(config),
-        assets: Some(assets_dir()),
+        assets: Some(common::assets_dir()),
         command_port: Some(0),
         bind: Some("127.0.0.1".parse().unwrap()),
         status_host: Some("127.0.0.1".parse().unwrap()),
@@ -1664,7 +1420,7 @@ fn settled_tcp(rig: &Rig, what: &str) -> Status {
 /// runs parked the arm in the same configuration.
 #[test]
 fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
-    let rig = Rig::boot("tcpoffset", false);
+    let rig = boot_tagged("tcpoffset", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1829,7 +1585,7 @@ fn move_l_to(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
 /// a jog button for a motion the runtime would refuse.
 #[test]
 fn cartesian_enablement_measures_the_real_workspace() {
-    let rig = Rig::boot("enablement", false);
+    let rig = boot_tagged("enablement", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2040,7 +1796,7 @@ fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
 ///   when it goes through.
 #[test]
 fn curved_moves_trace_their_geometry() {
-    let rig = Rig::boot("curved", false);
+    let rig = boot_tagged("curved", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2248,7 +2004,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     /// with speed and the corner geometry is what is being measured.
     const LEG_S: f64 = 8.0;
 
-    let rig = Rig::boot("blend", false);
+    let rig = boot_tagged("blend", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2401,7 +2157,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     const BLEND_MM: f64 = 30.0;
     const LEG_S: f64 = 4.0;
 
-    let rig = Rig::boot("jointblend", false);
+    let rig = boot_tagged("jointblend", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2516,7 +2272,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
 
 /// The configured soft window, in radians, per joint.
 fn soft_window_rad() -> [(f64, f64); NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&config_path()).expect("PAR6 config");
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
     let mut out = [(0.0, 0.0); NUM_JOINTS];
     for (slot, joint) in out.iter_mut().zip(cfg.joints.iter()) {
         *slot = (joint.limits.soft_min_rad, joint.limits.soft_max_rad);
@@ -2559,7 +2315,7 @@ const BEYOND_SOFT_J5_RAD: f64 = 1.9;
 /// way past the limits.
 #[test]
 fn ik_solutions_are_wrapped_into_their_soft_window() {
-    let rig = Rig::boot("ikwrap", false);
+    let rig = boot_tagged("ikwrap", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);

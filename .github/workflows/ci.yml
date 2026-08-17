@@ -36,6 +36,16 @@ jobs:
       - name: test
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo test --workspace --exclude par6d
+      # pinokin-sys is its OWN workspace (its ffi build needs the C++
+      # toolchain), so `--workspace` above never reaches it — its
+      # toolchain-free surface would otherwise be the one crate in the
+      # tree with no fmt or clippy gate at all.
+      - name: fmt + clippy (pinokin-sys)
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: |
+          cargo fmt --manifest-path crates/pinokin-sys/Cargo.toml --all --check
+          cargo clippy --manifest-path crates/pinokin-sys/Cargo.toml \
+            --all-targets -- -D warnings
       - name: install cross linker
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
@@ -47,6 +57,26 @@ jobs:
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
         run: cargo check --workspace --exclude par6d --target aarch64-unknown-linux-gnu
+
+  msrv:
+    name: msrv (rust ${{ env.MSRV }})
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # The declared rust-version had never been built, so nothing stopped
+      # a newer-toolchain feature from landing and breaking the floor the
+      # workspace advertises. par6d is excluded for the same reason as the
+      # stable leg: it needs the C++ shim.
+      - name: read MSRV from Cargo.toml
+        run: |
+          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
+          echo "MSRV=$msrv" >> "$GITHUB_ENV"
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.MSRV }}
+      - uses: Swatinem/rust-cache@v2
+      - name: check
+        run: cargo check --workspace --exclude par6d --all-targets
 
   ffi:
     name: ffi (pinocchio shim, x86_64)

@@ -1146,3 +1146,16 @@ mod tests {
         assert!(deadline < before + Duration::from_millis(200));
     }
 }
+
+#[cfg(test)]
+mod mirror {
+    use crate::py_mirror::assert_float;
+
+    /// The preview integrates `jog_l` against these full-scale rates; a
+    /// drift here previews a cartesian jog at the wrong speed entirely.
+    #[test]
+    fn python_motion_mirrors_the_jog_l_full_scale_rates() {
+        assert_float("JOG_L_LINEAR_MAX_M_S", super::JOG_L_LINEAR_MAX_M_S);
+        assert_float("JOG_L_ANGULAR_MAX_RAD_S", super::JOG_L_ANGULAR_MAX_RAD_S);
+    }
+}

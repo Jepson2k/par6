@@ -227,36 +227,21 @@ pub(crate) fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
     [m[3], m[7], m[11], roll, pitch, yaw]
 }
 
-/// Row-major 4x4 from a wire pose `[x y z (mm), rx ry rz (deg)]`,
-/// `R = Rx(rx)·Ry(ry)·Rz(rz)` — `pinokin.se3_from_rpy` in the units the
-/// wire speaks.
+/// Row-major 4x4 from a wire pose `[x y z (mm), rx ry rz (deg)]`, in the
+/// metres and radians the kinematics stack works in.
 pub(crate) fn wire_pose_to_matrix(pose_mm_deg: &[f64; 6]) -> Pose {
-    let (x, y, z) = (
-        pose_mm_deg[0] / 1000.0,
-        pose_mm_deg[1] / 1000.0,
-        pose_mm_deg[2] / 1000.0,
-    );
-    let (sr, cr) = pose_mm_deg[3].to_radians().sin_cos();
-    let (sp, cp) = pose_mm_deg[4].to_radians().sin_cos();
-    let (sy, cy) = pose_mm_deg[5].to_radians().sin_cos();
-    [
-        cp * cy,
-        -cp * sy,
-        sp,
-        x,
-        sr * sp * cy + cr * sy,
-        cr * cy - sr * sp * sy,
-        -sr * cp,
-        y,
-        sr * sy - cr * sp * cy,
-        cr * sp * sy + sr * cy,
-        cr * cp,
-        z,
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
+    par6_proto::pose_matrix(
+        [
+            pose_mm_deg[0] / 1000.0,
+            pose_mm_deg[1] / 1000.0,
+            pose_mm_deg[2] / 1000.0,
+        ],
+        [
+            pose_mm_deg[3].to_radians(),
+            pose_mm_deg[4].to_radians(),
+            pose_mm_deg[5].to_radians(),
+        ],
+    )
 }
 
 /// A one-axis delta transform: `axis` 0..=2 translates along x/y/z by
