@@ -89,6 +89,20 @@ par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
                                       const double *v, const double *a,
                                       double *out_tau);
 
+/** Damped-least-squares IK with a backtracking line search and damping
+ *  that rises with the residual.
+ *
+ *  Same signature and return convention as par6_kin_ik_step (1 =
+ *  converged, 0 = budget exhausted or no step reduced the error,
+ *  negative = par6_status). Differs in that a step is ACCEPTED only if it
+ *  reduces the residual: ik_step commits unconditionally, so an
+ *  ill-conditioned step near a singularity can increase the error and
+ *  still consume the whole budget. Allocation-free.
+ */
+int32_t par6_kin_ik_solve(par6_kin *h, const double *q_seed,
+                          const double *target_pose16, double *out_q,
+                          int32_t max_iters, double tol, double damping);
+
 /* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
  * the tool inertia when given at create. q/v/tau: nq doubles each;
  * out_a: nq doubles. Allocation-free after create. */
@@ -371,9 +385,13 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
  * v8: par6_kin_inverse_dynamics added (RNEA with real velocity and
  *     acceleration, so a planner can feed forward inertial torque instead
  *     of the zeros Sample::tau_ff carried). Purely additive; a stale v7
- *     library fails to link it. */
+ *     library fails to link it.
+ * v9: par6_kin_ik_solve added (DLS with a backtracking line search and
+ *     residual-scaled damping, so a step that would increase the error is
+ *     refused instead of committed). Purely additive; a stale v8 library
+ *     fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 8
+#define PAR6_SHIM_ABI_VERSION 9
 
 #ifdef __cplusplus
 } /* extern "C" */

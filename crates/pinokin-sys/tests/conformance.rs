@@ -273,14 +273,10 @@ fn inverse_dynamics_reduces_to_gravity_at_rest_and_adds_symmetric_inertia() {
                 mass[k][j] = tau[k] - grav[k];
             }
         }
-        for j in 0..nq {
-            assert!(
-                mass[j][j] > 0.0,
-                "M[{j}][{j}] = {} must be positive",
-                mass[j][j]
-            );
-            for k in 0..j {
-                let (a, b) = (mass[j][k], mass[k][j]);
+        for (j, row) in mass.iter().enumerate() {
+            assert!(row[j] > 0.0, "M[{j}][{j}] = {} must be positive", row[j]);
+            for (k, column) in mass.iter().enumerate().take(j) {
+                let (a, b) = (row[k], column[j]);
                 let scale = a.abs().max(b.abs()).max(1.0);
                 assert!(
                     (a - b).abs() < 1e-8 * scale,
@@ -289,4 +285,78 @@ fn inverse_dynamics_reduces_to_gravity_at_rest_and_adds_symmetric_inertia() {
             }
         }
     }
+}
+
+/// `ik_solve` never walks away from the target; `ik_step` can.
+///
+/// `par6_kin_ik_step` commits every damped-least-squares step
+/// unconditionally with a fixed lambda, so near a singularity — or from a
+/// seed far enough out that the linearisation is poor — a step can INCREASE
+/// the residual and the solver still burns its whole budget getting worse.
+/// `ik_solve` backtracks: a step is accepted only if it reduces the error,
+/// and it refuses outright rather than committing when no probe does.
+///
+/// Asserted as a monotonicity property, which is the actual contract, not
+/// as "converges more often" — that would be true by construction on any
+/// seed close enough to work either way.
+#[test]
+fn ik_solve_never_increases_the_residual_where_ik_step_can() {
+    /// The residual the solver actually minimises: squared translation
+    /// error plus squared rotation angle. Measuring translation alone
+    /// would be the wrong contract — a step may trade position against
+    /// orientation and still reduce the combined error.
+    fn pose_err(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+        let trans = (a[3] - b[3]).powi(2) + (a[7] - b[7]).powi(2) + (a[11] - b[11]).powi(2);
+        // trace(R_a * R_b^T) for the two row-major 3x3 blocks.
+        let rows = |m: &[f64; 16], r: usize| [m[4 * r], m[4 * r + 1], m[4 * r + 2]];
+        let (a0, a1, a2) = (rows(a, 0), rows(a, 1), rows(a, 2));
+        let (b0, b1, b2) = (rows(b, 0), rows(b, 1), rows(b, 2));
+        let dot = |x: [f64; 3], y: [f64; 3]| x[0] * y[0] + x[1] * y[1] + x[2] * y[2];
+        let trace = dot(a0, b0) + dot(a1, b1) + dot(a2, b2);
+        let angle = ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos();
+        trans + angle * angle
+    }
+
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), None).unwrap();
+    let nq = model.nq();
+    // Few iterations and a coarse tolerance: the point is what the solver
+    // does on the way, not whether it eventually arrives.
+    let opts = IkOptions {
+        max_iters: 6,
+        tol: 1e-12,
+        damping: 1e-3,
+    };
+
+    let mut regressions_step = 0usize;
+    for case in fx.cases_flange.iter() {
+        let target = model.fk(&case.q).unwrap();
+        // Seeds displaced hard enough that the first linearisation is poor.
+        for bump in [0.9_f64, -1.2, 1.6] {
+            let seed: Vec<f64> = case.q.iter().map(|v| v + bump).collect();
+            let seed_err = pose_err(&model.fk(&seed).unwrap(), &target);
+
+            let mut out = vec![0.0; nq];
+            model.ik_solve(&seed, &target, &mut out, opts).unwrap();
+            let solve_err = pose_err(&model.fk(&out).unwrap(), &target);
+            assert!(
+                solve_err <= seed_err + 1e-12,
+                "ik_solve increased its own residual: {seed_err:e} -> {solve_err:e}"
+            );
+
+            let mut out_step = vec![0.0; nq];
+            model.ik_step(&seed, &target, &mut out_step, opts).unwrap();
+            if pose_err(&model.fk(&out_step).unwrap(), &target) > seed_err + 1e-12 {
+                regressions_step += 1;
+            }
+        }
+    }
+    // Guard against the test silently becoming vacuous: if ik_step stops
+    // regressing on every one of these seeds, the seeds are no longer
+    // exercising the case the line search exists for.
+    assert!(
+        regressions_step > 0,
+        "no seed made ik_step regress, so this proves nothing about the line search"
+    );
 }

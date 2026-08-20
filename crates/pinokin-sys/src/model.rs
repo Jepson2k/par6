@@ -272,6 +272,39 @@ impl Model {
     /// frame as [`Model::fk`]). Writes the final iterate into `out_q` either
     /// way; returns `Ok(true)` on convergence, `Ok(false)` when the iteration
     /// budget ran out.
+    /// DLS IK that refuses a step which would increase the residual.
+    ///
+    /// Same contract as [`Model::ik_step`] — `Ok(true)` converged,
+    /// `Ok(false)` did not — but with a backtracking line search and
+    /// damping scaled by the current error, so an ill-conditioned step
+    /// near a singularity is rejected rather than committed.
+    pub fn ik_solve(
+        &mut self,
+        q_seed: &[f64],
+        target: &[f64; 16],
+        out_q: &mut [f64],
+        opts: IkOptions,
+    ) -> Result<bool, Error> {
+        self.check_len(q_seed, self.nq)?;
+        self.check_len(out_q, self.nq)?;
+        let rc = unsafe {
+            ffi::par6_kin_ik_solve(
+                self.raw.as_ptr(),
+                q_seed.as_ptr(),
+                target.as_ptr(),
+                out_q.as_mut_ptr(),
+                opts.max_iters,
+                opts.tol,
+                opts.damping,
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            other => Err(Error::Status(other)),
+        }
+    }
+
     pub fn ik_step(
         &mut self,
         q_seed: &[f64],

@@ -45,6 +45,7 @@ struct par6_kin {
     Eigen::VectorXd v_zero;
     Eigen::VectorXd a_zero;
     Eigen::VectorXd dq;
+    Eigen::VectorXd q_trial;
     Eigen::VectorXd v_in;
     Eigen::VectorXd a_in;
     Eigen::VectorXd tau_in;
@@ -58,6 +59,7 @@ struct par6_kin {
         v_zero.setZero(model.nv);
         a_zero.setZero(model.nv);
         dq.setZero(model.nv);
+        q_trial.setZero(model.nq);
         v_in.setZero(model.nv);
         a_in.setZero(model.nv);
         tau_in.setZero(model.nv);
@@ -304,6 +306,97 @@ int32_t par6_kin_ik_step(par6_kin *h,
         }
         Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
         return 0;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+int32_t par6_kin_ik_solve(par6_kin *h,
+                          const double *q_seed,
+                          const double *target_pose16,
+                          double *out_q,
+                          int32_t max_iters,
+                          double tol,
+                          double damping) {
+    if (h == nullptr || q_seed == nullptr || target_pose16 == nullptr ||
+        out_q == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (max_iters <= 0) max_iters = 100;
+    if (tol <= 0.0) tol = 1e-10;
+    if (damping < 0.0) damping = 1e-3;
+
+    try {
+        const Eigen::Map<const RowMat4> target(target_pose16);
+        const Eigen::Matrix3d R_t = target.block<3, 3>(0, 0);
+        const Eigen::Vector3d p_t = target.block<3, 1>(0, 3);
+
+        h->q = Eigen::Map<const Eigen::VectorXd>(q_seed, h->model.nq);
+
+        Eigen::Matrix4d T_cur;
+        Vec6 e;
+        Mat6 A;
+
+        // Error at the CURRENT iterate, carried across the loop so a probe
+        // has something to compare against without re-running FK.
+        h->fk_into(T_cur);
+        e.head<3>() = p_t - T_cur.block<3, 1>(0, 3);
+        e.tail<3>() = pinocchio::log3(
+            Eigen::Matrix3d(R_t * T_cur.block<3, 3>(0, 0).transpose()));
+        double err = e.squaredNorm();
+
+        for (int32_t it = 0; it < max_iters; ++it) {
+            if (err < tol) {
+                Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+                return 1;
+            }
+
+            // Damping rises with the current residual, so a step taken far
+            // from the target is shorter and better conditioned than the
+            // fixed-lambda step par6_kin_ik_step always takes.
+            const double lam = damping * std::max(1.0, std::sqrt(err) * 10.0);
+            h->jacobian_into();
+            A.noalias() = h->J * h->J.transpose();
+            A.diagonal().array() += lam * lam;
+            const Vec6 w = A.ldlt().solve(e);
+            h->dq.noalias() = h->J.transpose() * w;
+
+            // Backtracking: halve the step until it actually reduces the
+            // residual. Without this the solver commits unconditionally and
+            // an ill-conditioned step near a singularity can INCREASE the
+            // error while still consuming the whole iteration budget.
+            double alpha = 1.0;
+            bool accepted = false;
+            for (int probe = 0; probe < 4; ++probe) {
+                h->q_trial = h->q + alpha * h->dq;
+                h->q.swap(h->q_trial);
+                h->fk_into(T_cur);
+                h->q.swap(h->q_trial);
+
+                Vec6 e_trial;
+                e_trial.head<3>() = p_t - T_cur.block<3, 1>(0, 3);
+                e_trial.tail<3>() = pinocchio::log3(
+                    Eigen::Matrix3d(R_t * T_cur.block<3, 3>(0, 0).transpose()));
+                const double err_trial = e_trial.squaredNorm();
+                if (err_trial < err) {
+                    h->q.swap(h->q_trial);
+                    e = e_trial;
+                    err = err_trial;
+                    accepted = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            // Every probe made it worse: this is a step the solver should
+            // refuse rather than take. Report non-convergence with the last
+            // good iterate instead of walking away from the target.
+            if (!accepted) {
+                Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+                return 0;
+            }
+        }
+        Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+        return err < tol ? 1 : 0;
     } catch (const std::exception &) {
         return PAR6_ERR_EXCEPTION;
     }

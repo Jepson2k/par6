@@ -109,6 +109,17 @@ extern "C" {
         out_tau: *mut f64,
     ) -> par6_status;
 
+    /// DLS IK that refuses a step which would increase the residual.
+    pub fn par6_kin_ik_solve(
+        h: *mut par6_kin,
+        q_seed: *const f64,
+        target_pose16: *const f64,
+        out_q: *mut f64,
+        max_iters: i32,
+        tol: f64,
+        damping: f64,
+    ) -> i32;
+
     pub fn par6_kin_aba(
         h: *mut par6_kin,
         q: *const f64,
