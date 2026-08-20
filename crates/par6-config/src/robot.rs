@@ -379,31 +379,18 @@ pub struct StreamDefaults {
     /// Silence on the stream link before the robot stops itself and
     /// latches `RTI_LINK_LOST` \[s\]. Also the minimum command rate.
     pub command_timeout_s: f64,
-    /// Hold position this long after any stop, clean or error \[s\].
-    pub stopping_hold_s: f64,
-    /// Max distance of the first setpoint after claim from the measured
-    /// pose \[rad\].
-    pub start_pose_tol_rad: f64,
     /// Command low-pass cutoff \[Hz\]; 0 = off.
     pub lowpass_cutoff_hz: f64,
     /// Moving success-rate window \[s\] (0.4 s = 100 ticks at 250 Hz).
     pub success_window_s: f64,
-    /// Warn when the success rate drops below this.
-    pub success_warn: f64,
-    /// Alarm when the success rate drops below this.
-    pub success_bad: f64,
 }
 
 impl Default for StreamDefaults {
     fn default() -> Self {
         Self {
             command_timeout_s: 0.040,
-            stopping_hold_s: 0.5,
-            start_pose_tol_rad: 0.1,
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
-            success_warn: 0.95,
-            success_bad: 0.90,
         }
     }
 }
@@ -772,8 +759,6 @@ impl RobotConfig {
         let s = &self.stream;
         for (v, name) in [
             (s.command_timeout_s, "stream.command_timeout_s"),
-            (s.stopping_hold_s, "stream.stopping_hold_s"),
-            (s.start_pose_tol_rad, "stream.start_pose_tol_rad"),
             (s.success_window_s, "stream.success_window_s"),
         ] {
             if !is_positive(v) {
@@ -784,12 +769,6 @@ impl RobotConfig {
             return Err(invalid(
                 "stream.lowpass_cutoff_hz",
                 "must be >= 0 (0 = off)",
-            ));
-        }
-        if !(s.success_bad <= s.success_warn && s.success_warn <= 1.0 && s.success_bad >= 0.0) {
-            return Err(invalid(
-                "stream.success_warn",
-                "need 0 <= success_bad <= success_warn <= 1",
             ));
         }
         Ok(())

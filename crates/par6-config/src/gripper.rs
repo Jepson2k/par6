@@ -74,16 +74,6 @@ pub struct ToolKinematics {
     pub com_m: [f64; 3],
     /// Inertia Ixx Iyy Izz Ixy Iyz Ixz \[kg·m^2\].
     pub inertia_kg_m2: [f64; 6],
-    /// Motor rotor inertia \[kg·m^2\] (vendor `Jm`).
-    pub motor_inertia_kg_m2: f64,
-    /// Tool-joint gear ratio (vendor `G`).
-    pub gear_ratio: f64,
-    /// Viscous friction \[N·m·s/rad\] (vendor `B`).
-    pub viscous_friction: f64,
-    /// Coulomb friction \[+, −\] \[N·m\] (vendor `Tc`).
-    pub coulomb_friction_nm: [f64; 2],
-    /// Tool-joint limits \[deg\] (vendor `qlim_deg`, transcribed verbatim).
-    pub qlim_deg: [f64; 2],
 }
 
 /// Root of a gripper TOML file.
@@ -176,9 +166,6 @@ impl GripperConfig {
         }
         if self.kinematics.mass_kg < 0.0 {
             return Err(invalid("kinematics.mass_kg", "must be >= 0"));
-        }
-        if self.kinematics.gear_ratio <= 0.0 {
-            return Err(invalid("kinematics.gear_ratio", "must be > 0"));
         }
         Ok(())
     }

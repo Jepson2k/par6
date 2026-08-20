@@ -322,10 +322,6 @@ pub enum StreamSubstate {
     Connected,
     /// Claimed and streaming setpoints.
     ControlActive,
-    /// Clean stop hold in progress.
-    StoppingClean,
-    /// Error stop hold in progress.
-    StoppingError,
 }
 
 /// Streaming live state.

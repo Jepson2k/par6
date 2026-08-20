@@ -184,6 +184,20 @@ pub enum GateRefusal {
     NotImplemented,
 }
 
+/// Per-tick coefficient of a first-order low-pass at *cutoff_hz*, or 0
+/// when the filter is off.
+///
+/// `y += alpha · (x − y)` with `alpha = dt / (dt + 1/(2π·fc))`. A cutoff
+/// at or above the Nyquist of the tick rate cannot filter anything, so it
+/// is reported as off rather than as an alpha of ~1 that pretends to.
+fn lowpass_alpha(cutoff_hz: f64, dt: f64) -> f64 {
+    if cutoff_hz <= 0.0 || cutoff_hz >= 0.5 / dt {
+        return 0.0;
+    }
+    let tau = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz);
+    dt / (dt + tau)
+}
+
 /// Construction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -422,6 +436,10 @@ pub struct RtCore<B: DriverBus> {
     stream_sent_base: u64,
     stream_success: f32,
     stream_discard: f32,
+    /// Command low-pass coefficient per tick; 0 = the filter is off.
+    stream_lp_alpha: f64,
+    /// Filter state, in joint space, carried across ticks.
+    stream_filt: [f64; MAX_JOINTS],
 
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
@@ -585,6 +603,8 @@ impl<B: DriverBus> RtCore<B> {
             stream_sent_base: 0,
             stream_success: 0.0,
             stream_discard: 0.0,
+            stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
+            stream_filt: [0.0; MAX_JOINTS],
             writer,
             snap: StateSnapshot::default(),
         };
@@ -1070,6 +1090,10 @@ impl<B: DriverBus> RtCore<B> {
                 self.stream_sent_base = self.stream_sent.load(Ordering::Relaxed);
                 self.stream_success = 0.0;
                 self.stream_discard = 0.0;
+                // Seeding the filter at the measured pose is what keeps a
+                // filtered session from starting with a ramp out of
+                // whatever the last session left behind.
+                self.stream_filt = self.q;
             }
             Mode::Flashing => {
                 log::info!("entering FLASHING: bus-silent maintenance window");
@@ -1503,8 +1527,12 @@ impl<B: DriverBus> RtCore<B> {
                         self.stream.set_scale(sp.speed, sp.accel);
                         self.stream_scale = (sp.speed, sp.accel);
                     }
+                    // `q_target` carries the raw request; the filter sits
+                    // between it and the executor, so the pair makes the
+                    // smoothing visible.
                     self.q_target = sp.q;
-                    self.stream.set_target(&sp.q);
+                    let target = self.filtered_target(&sp.q);
+                    self.stream.set_target(&target);
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
                 }
@@ -1579,6 +1607,19 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
         }
+    }
+
+    /// The streamed target as the executor should see it: the raw request
+    /// when `stream.lowpass_cutoff_hz` is off, otherwise one step of the
+    /// first-order filter.
+    fn filtered_target(&mut self, q: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+        if self.stream_lp_alpha == 0.0 {
+            return *q;
+        }
+        for (y, x) in self.stream_filt.iter_mut().zip(q.iter()) {
+            *y += self.stream_lp_alpha * (x - *y);
+        }
+        self.stream_filt
     }
 
     fn stream_window(&mut self, applied: bool) {
