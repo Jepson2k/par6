@@ -1377,6 +1377,30 @@ class AsyncRobotClient(_RobotClientABC):
         """
         return await self._system(CmdType.SET_GRAVITY_COMP, [bool(on)])
 
+    async def pause(self) -> int:
+        """Hold the executing trajectory where it is.
+
+        Unlike :meth:`stop`, the queued samples are left intact, so
+        :meth:`resume` continues the move rather than requiring the caller
+        to re-issue it.
+
+        Category: Control
+
+        Example:
+            rbt.pause()
+        """
+        return await self._system(CmdType.PAUSE, [True])
+
+    async def resume(self) -> int:
+        """Continue a trajectory held by :meth:`pause`.
+
+        Category: Control
+
+        Example:
+            rbt.resume()
+        """
+        return await self._system(CmdType.PAUSE, [False])
+
     async def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive (hand-guiding).
 

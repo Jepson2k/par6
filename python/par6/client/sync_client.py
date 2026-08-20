@@ -405,6 +405,14 @@ class RobotClient:
         """
         return _run(self._inner.safety_stop())
 
+    def pause(self) -> int:
+        """Hold the executing trajectory; the queue survives."""
+        return _run(self._inner.pause())
+
+    def resume(self) -> int:
+        """Continue a trajectory held by :meth:`pause`."""
+        return _run(self._inner.resume())
+
     def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive: IDLE under G(q) with no position hold."""
         return _run(self._inner.freedrive(enabled))

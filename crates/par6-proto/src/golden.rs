@@ -411,6 +411,11 @@ pub fn vectors() -> Vec<Vector> {
         Command::SetGravityComp(crate::command::SetGravityComp { on: true }),
     ));
     v.push(cmd_vec(
+        "cmd_pause",
+        2,
+        Command::Pause(crate::command::Pause { on: true }),
+    ));
+    v.push(cmd_vec(
         "cmd_stop",
         3,
         Command::Stop(Stop { clear_queue: true }),

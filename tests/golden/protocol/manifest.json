@@ -62,6 +62,21 @@
     },
     {
       "class": "SYSTEM",
+      "cmd": "PAUSE",
+      "file": "cmd_pause.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_pause",
+      "req_id": 2,
+      "tag": 24,
+      "wire": [
+        24,
+        2,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
       "cmd": "STOP",
       "file": "cmd_stop.bin",
       "idempotency_key": null,

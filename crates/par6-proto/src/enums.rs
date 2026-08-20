@@ -101,6 +101,10 @@ wire_enum! {
         /// only whether it is APPLIED, which is correct on hardware and on
         /// the torque plant but wrong on the kinematic one.
         SetGravityComp = 23,
+        /// `[PAUSE, req_id, on]` — hold or resume the executing trajectory.
+        /// Unlike STOP this leaves the sample ring intact, so the move
+        /// continues from where it paused rather than being re-issued.
+        Pause = 24,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -298,6 +302,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Estop
         | C::SafetyStop
         | C::SetGravityComp
+        | C::Pause
         | C::Stop
         | C::WriteIo
         | C::Simulator

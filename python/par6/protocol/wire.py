@@ -241,6 +241,10 @@ def _v_simulator(p: list) -> None:
     _bool(p[0], "simulator.on")
 
 
+def _v_pause(p: list) -> None:
+    _bool(p[0], "pause.on")
+
+
 def _v_set_gravity_comp(p: list) -> None:
     _bool(p[0], "set_gravity_comp.on")
 
@@ -396,6 +400,7 @@ _COMMAND_SPECS: dict[CmdType, tuple[int, Callable[[list], None]]] = {
     CmdType.ESTOP: (0, _v_none),
     CmdType.SAFETY_STOP: (0, _v_none),
     CmdType.SET_GRAVITY_COMP: (1, _v_set_gravity_comp),
+    CmdType.PAUSE: (1, _v_pause),
     CmdType.STOP: (1, _v_stop),
     CmdType.WRITE_IO: (2, _v_write_io),
     CmdType.SIMULATOR: (1, _v_simulator),

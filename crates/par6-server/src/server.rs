@@ -501,6 +501,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.safety_stop();
                 Ok(())
             }
+            C::Pause(p) => {
+                self.runtime.rt.set_exec_paused(p.on);
+                Ok(())
+            }
             C::SetGravityComp(p) => {
                 self.runtime.rt.set_gravity_comp(p.on);
                 Ok(())
@@ -1898,6 +1902,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::Estop => "estop",
         T::SafetyStop => "safety_stop",
         T::SetGravityComp => "set_gravity_comp",
+        T::Pause => "pause",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

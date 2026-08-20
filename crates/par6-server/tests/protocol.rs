@@ -38,6 +38,7 @@ enum RtEvent {
     Halt,
     SafetyStop,
     SetGravityComp(bool),
+    ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
     WriteIo(u8, u8),
@@ -94,6 +95,10 @@ impl RtCommands for TestRt {
     }
     fn set_gravity_comp(&mut self, on: bool) {
         self.push(RtEvent::SetGravityComp(on));
+    }
+
+    fn set_exec_paused(&mut self, paused: bool) {
+        self.push(RtEvent::ExecPaused(paused));
     }
     fn set_enabled(&mut self, enabled: bool) {
         self.push(RtEvent::SetEnabled(enabled));
@@ -2271,5 +2276,36 @@ async fn gravity_compensation_can_be_switched_from_the_wire() {
         );
         h.wait_rt(|ev| ev.contains(&RtEvent::SetGravityComp(on)))
             .await;
+    }
+}
+
+/// PAUSE reaches the RT, and is accepted where planned motion is refused.
+///
+/// The RT half shipped complete and untouched: `ExecSetPaused` holds the
+/// playback position with the sample ring INTACT (unlike a flush, which
+/// clears it), and `ExecStatus.paused` was already published. There was
+/// simply no wire command, so an operator holding a running program could
+/// only flush it and re-issue.
+///
+/// The second half of this asserts the gating decision rather than leaving
+/// it to `gate()`'s `_` arm: pausing is deliberately ungated, so it is
+/// acked in a state where a move is refused. Holding a moving arm must not
+/// depend on the controller being enabled.
+#[tokio::test]
+async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    for on in [true, false] {
+        assert!(
+            matches!(
+                c.request(&Command::Pause(par6_proto::command::Pause { on }))
+                    .await,
+                Reply::Ok { .. }
+            ),
+            "PAUSE({on}) must be acked"
+        );
+        h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
     }
 }

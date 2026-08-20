@@ -57,6 +57,12 @@ pub fn gate(cmd: CmdType) -> Gate {
         // it targets absolute coordinates; a jog only asks for a direction
         // and a speed, and the soft-limit brake still bounds it.
         C::JogJ | C::JogL => {}
+        // Pause is deliberately ungated. Holding a moving arm has to work
+        // whatever state the controller is in, and an un-pause that is no
+        // longer legal is refused by the RT's own mode table rather than
+        // here. Written out rather than left to the `_` arm so the choice
+        // is visible instead of accidental.
+        C::Pause => {}
         C::Teleport => g.needs_simulator = true,
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}

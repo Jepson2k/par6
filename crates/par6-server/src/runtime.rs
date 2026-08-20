@@ -280,6 +280,10 @@ pub trait RtCommands: Send {
     /// plant, false on the kinematic one.
     fn set_gravity_comp(&mut self, on: bool);
 
+    /// Hold or resume the executing trajectory, leaving the sample ring
+    /// intact so a resume continues rather than restarts.
+    fn set_exec_paused(&mut self, paused: bool);
+
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up
     /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`

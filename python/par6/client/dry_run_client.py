@@ -1385,6 +1385,14 @@ class DryRunRobotClient:
         self._discard_chain()
         return 1
 
+    def pause(self, **kwargs: Any) -> int:
+        """A preview has no executing trajectory to hold."""
+        return 1
+
+    def resume(self, **kwargs: Any) -> int:
+        """A preview has no held trajectory to continue."""
+        return 1
+
     def set_gravity_comp(self, on: bool = True, **kwargs: Any) -> int:
         """Gravity feed-forward changes what the drives are asked for, not
         where the planner sends the arm, so a preview plans the same path."""
