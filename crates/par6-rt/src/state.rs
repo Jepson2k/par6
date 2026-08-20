@@ -305,8 +305,8 @@ pub struct ExecStatus {
 pub struct JogStatus {
     /// Whether a jog is in progress.
     pub active: bool,
-    /// Joint being jogged (meaningful while `active`).
-    pub joint: u8,
+    /// Bitmask of the joints being jogged (meaningful while `active`).
+    pub joints: u8,
     /// Per-joint direction-block latches: bit 2i = negative direction
     /// blocked, bit 2i+1 = positive blocked (survive button release).
     pub blocked_mask: u16,

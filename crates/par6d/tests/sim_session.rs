@@ -572,16 +572,6 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         ErrorCode::CommValidationError as u16,
         "a blend radius par6d cannot honour must be refused, got {err:?}"
     );
-    let err = c.expect_error(&Command::JogJ(JogJ {
-        speeds: [0.2, 0.2, 0.0, 0.0, 0.0, 0.0],
-        duration: 0.2,
-        accel: None,
-    }));
-    assert_eq!(
-        err.code,
-        ErrorCode::CommValidationError as u16,
-        "a multi-axis jog must be refused rather than collapsed, got {err:?}"
-    );
     let err = c.expect_error(&Command::Teleport(Teleport {
         angles: park,
         tool_positions: Some(vec![0.5, 0.5]),
@@ -1123,6 +1113,57 @@ fn a_flood_of_identical_jog_setpoints_does_not_delay_the_release() {
         ticks < 150,
         "the release waited {ticks} ticks behind a backlog of 300 datagrams"
     );
+
+    rig.shutdown();
+}
+
+/// `jog_j` drives every commanded joint at once, each on its own ramp.
+///
+/// `speeds` has been six-wide on the wire since protocol-v2 and the RT
+/// engine's ramp state was already per joint, but the command plane
+/// refused anything with more than one non-zero entry — so an operator
+/// holding two axes on a pendant got a validation error instead of a
+/// diagonal.
+#[test]
+fn jog_j_drives_several_joints_at_once() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let start = park_deg();
+    teleport_home(&rig, &mut c, start);
+
+    // J0 positive, J3 negative, everything else still.
+    let diagonal = Command::JogJ(JogJ {
+        speeds: [0.5, 0.0, 0.0, -0.5, 0.0, 0.0],
+        duration: 5.0,
+        accel: None,
+    });
+    for _ in 0..40 {
+        c.send(&diagonal);
+    }
+    let moved = rig.wait_status("both commanded joints move", |s| {
+        s.angles[0] > start[0] + 1.0 && s.angles[3] < start[3] - 1.0
+    });
+    for (j, (now, was)) in moved.angles.iter().zip(start.iter()).enumerate() {
+        if j == 0 || j == 3 {
+            continue;
+        }
+        assert!(
+            (now - was).abs() < 0.5,
+            "J{j} moved {:.3} deg on a jog that never commanded it",
+            now - was
+        );
+    }
+
+    c.send(&Command::JogJ(JogJ {
+        speeds: [0.0; NUM_JOINTS],
+        duration: 5.0,
+        accel: None,
+    }));
+    rig.wait_status("the diagonal ramps to rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
 
     rig.shutdown();
 }

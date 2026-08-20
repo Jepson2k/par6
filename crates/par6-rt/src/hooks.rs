@@ -51,13 +51,12 @@ pub enum RtCommand {
     /// Human park assertion (PARKED/FORCE): arms the next FLASHING entry.
     /// One-shot — consumed on entry, dropped by any other transition.
     AssertParked,
-    /// Jog `joint` at a signed speed fraction (`dir · pct` in \[-1, 1\]).
-    /// Only meaningful in JOG mode; replaces any previous jog command.
+    /// Jog joints at signed speed fractions (`dir · pct` in \[-1, 1\],
+    /// 0 leaving a joint still). Only meaningful in JOG mode; replaces
+    /// any previous jog command.
     Jog {
-        /// Arm joint index.
-        joint: u8,
-        /// Signed speed fraction.
-        signed_pct: f64,
+        /// Per-joint signed speed fraction.
+        speeds: [f64; MAX_JOINTS],
         /// Acceleration fraction of the configured jog ramp, in `(0, 1]`.
         /// The ramp time scales inversely: half the fraction is twice the
         /// time to terminal velocity.
@@ -154,9 +153,10 @@ pub trait JogEngine: Send {
     /// JOG-mode entry: sync the integrator to the measured pose and clear
     /// direction blocks.
     fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]);
-    /// Command a jog: joint index and signed speed fraction
-    /// (`dir · pct`, in \[-1, 1\]). Replaces any previous command.
-    fn command(&mut self, joint: usize, signed_pct: f64);
+    /// Command a jog: per-joint signed speed fraction (`dir · pct`, in
+    /// \[-1, 1\]), 0 leaving that joint still. Replaces any previous
+    /// command.
+    fn command(&mut self, speeds: &[f64; MAX_JOINTS]);
     /// Scale the ramp acceleration by `accel` in `(0, 1]`. The core calls
     /// this only when a jog changes it.
     fn set_accel_scale(&mut self, accel: f64);
@@ -187,7 +187,7 @@ pub struct RampJog {
     soft_max: [f64; MAX_JOINTS],
     target_q: [f64; MAX_JOINTS],
     vel: [f64; MAX_JOINTS],
-    request: Option<(usize, f64)>,
+    request: [f64; MAX_JOINTS],
     blocked: u16,
 }
 
@@ -214,7 +214,7 @@ impl RampJog {
             soft_max,
             target_q: [0.0; MAX_JOINTS],
             vel: [0.0; MAX_JOINTS],
-            request: None,
+            request: [0.0; MAX_JOINTS],
             blocked: 0,
         }
     }
@@ -224,19 +224,20 @@ impl JogEngine for RampJog {
     fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
         self.target_q = *q_meas;
         self.vel = [0.0; MAX_JOINTS];
-        self.request = None;
+        self.request = [0.0; MAX_JOINTS];
         self.blocked = 0;
     }
 
-    fn command(&mut self, joint: usize, signed_pct: f64) {
-        if joint < MAX_JOINTS && signed_pct.is_finite() {
-            if let Some((prev, _)) = self.request {
-                if prev != joint {
-                    // Joint switch clears the previous joint's blocks.
-                    self.blocked &= !(0b11 << (2 * prev));
-                }
+    fn command(&mut self, speeds: &[f64; MAX_JOINTS]) {
+        for (i, (want, v)) in self.request.iter_mut().zip(speeds.iter()).enumerate() {
+            if !v.is_finite() {
+                continue;
             }
-            self.request = Some((joint, signed_pct.clamp(-1.0, 1.0)));
+            // A joint dropping out of the driven set clears its blocks.
+            if *want != 0.0 && *v == 0.0 {
+                self.blocked &= !(0b11 << (2 * i));
+            }
+            *want = v.clamp(-1.0, 1.0);
         }
     }
 
@@ -247,7 +248,7 @@ impl JogEngine for RampJog {
     }
 
     fn release(&mut self) {
-        self.request = None;
+        self.request = [0.0; MAX_JOINTS];
     }
 
     fn tick(
@@ -260,27 +261,22 @@ impl JogEngine for RampJog {
         // arrays; iterator zipping would only obscure that.
         #[allow(clippy::needless_range_loop)]
         for i in 0..MAX_JOINTS {
-            let mut want = 0.0;
-            if let Some((j, pct)) = self.request {
-                if j == i {
-                    want = pct * self.vmax[i];
-                    // A latched block in the commanded direction zeroes the
-                    // request; the opposite direction clears the latch.
-                    let neg_bit = 1u16 << (2 * i);
-                    let pos_bit = 2u16 << (2 * i);
-                    if want > 0.0 {
-                        if self.blocked & pos_bit != 0 {
-                            want = 0.0;
-                        } else {
-                            self.blocked &= !neg_bit;
-                        }
-                    } else if want < 0.0 {
-                        if self.blocked & neg_bit != 0 {
-                            want = 0.0;
-                        } else {
-                            self.blocked &= !pos_bit;
-                        }
-                    }
+            let mut want = self.request[i] * self.vmax[i];
+            // A latched block in the commanded direction zeroes the
+            // request; the opposite direction clears the latch.
+            let neg_bit = 1u16 << (2 * i);
+            let pos_bit = 2u16 << (2 * i);
+            if want > 0.0 {
+                if self.blocked & pos_bit != 0 {
+                    want = 0.0;
+                } else {
+                    self.blocked &= !neg_bit;
+                }
+            } else if want < 0.0 {
+                if self.blocked & neg_bit != 0 {
+                    want = 0.0;
+                } else {
+                    self.blocked &= !pos_bit;
                 }
             }
             let dv = (want - self.vel[i]).clamp(-self.accel[i] * self.dt, self.accel[i] * self.dt);

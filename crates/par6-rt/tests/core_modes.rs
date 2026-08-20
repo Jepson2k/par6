@@ -326,8 +326,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     let start = rig.snap().tick;
 
     rig.cmd(RtCommand::Jog {
-        joint: 0,
-        signed_pct: 1.0,
+        speeds: [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         accel: 1.0,
     });
     rig.tick_n(20);
@@ -352,7 +351,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     assert!(last_vel > 0, "jog is moving");
     let s = rig.snap();
     assert!(s.jog.active);
-    assert_eq!(s.jog.joint, 0);
+    assert_eq!(s.jog.joints, 0b1);
 
     // Drive into the soft limit: target clamps, positive direction latches.
     rig.tick_n(300);
@@ -377,8 +376,7 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
         "block survives release"
     );
     rig.cmd(RtCommand::Jog {
-        joint: 0,
-        signed_pct: -0.5,
+        speeds: [-0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
         accel: 1.0,
     });
     rig.tick_n(20);

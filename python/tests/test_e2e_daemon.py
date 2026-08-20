@@ -861,6 +861,23 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             f"the arm entered the keep-out in flight: max {max(trace):.2f} deg"
         )
 
+        # The refusal itself must reach a caller that never awaits a
+        # fire-and-forget reply (issue #23).  From the resting pose at the
+        # gate's boundary, jogs at the box keep being turned away, and the
+        # refusal stands in error() naming the keep-out.
+        refusal: RobotError | None = None
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and refusal is None:
+            assert await client.jog_j(0, 0.5, duration=0.4) == 1
+            await asyncio.sleep(0.1)
+            refusal = await client.error()
+        assert refusal is not None, (
+            f"the refused jog never surfaced through error(); "
+            f"daemon log:\n{daemon.log()}"
+        )
+        assert refusal.code == ErrorCode.SYS_SELF_COLLISION, str(refusal)
+        assert "keepout" in refusal.cause, str(refusal)
+
         # A keep-out dropped over the arm: the outward jog still runs.
         await settle_at(client, mid)
         escaped = False
@@ -874,6 +891,9 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             "the escaping jog out of the keep-out never moved the arm: the "
             "gate is refusing the only way out"
         )
+        # The accepted escape cleared the standing refusal, like any
+        # accepted motion command.
+        assert await client.error() is None, f"daemon log:\n{daemon.log()}"
 
 
 @pytest.mark.timeout(180)

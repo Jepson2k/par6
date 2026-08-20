@@ -271,12 +271,13 @@ impl StreamGate {
     fn jog_lookahead(
         &self,
         q: &[f64; MAX_JOINTS],
-        joint: usize,
-        signed_pct: f64,
+        speeds: &[f64; MAX_JOINTS],
     ) -> [f64; MAX_JOINTS] {
         let mut la = *q;
-        la[joint] = (la[joint] + signed_pct * self.jog_vel[joint] * STREAM_LOOKAHEAD_S)
-            .clamp(self.soft_min[joint], self.soft_max[joint]);
+        for (j, pct) in speeds.iter().enumerate() {
+            la[j] = (la[j] + pct * self.jog_vel[j] * STREAM_LOOKAHEAD_S)
+                .clamp(self.soft_min[j], self.soft_max[j]);
+        }
         la
     }
 
@@ -375,10 +376,10 @@ struct ActiveStream {
     kind: StreamKind,
     deadline: Instant,
     servo_target: Option<[f64; MAX_JOINTS]>,
-    /// The live `jog_j` command `(joint, signed speed fraction)`; `None`
-    /// once the button released. What housekeeping's periodic collision
-    /// re-check projects the lookahead from.
-    jog: Option<(usize, f64)>,
+    /// The live `jog_j` command: per-joint signed speed fraction, all
+    /// zero once the button released. What housekeeping's periodic
+    /// collision re-check projects the lookahead from.
+    jog: [f64; MAX_JOINTS],
     /// `scene_epoch` of the collision world a held SERVO target was last
     /// checked against. A held target cannot move, so it only needs
     /// re-testing when the WORLD does — this is what housekeeping's
@@ -477,26 +478,25 @@ impl RtCommands for RtBridge {
     fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
         match cmd {
             Command::JogJ(p) => {
-                // Single-axis by contract: the server refuses a jog with
-                // more than one non-zero speed, because the RT jog engine
-                // ramps one joint at a time.
-                let (joint, pct) = p
-                    .speeds
-                    .iter()
-                    .copied()
-                    .enumerate()
-                    .max_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))
-                    .expect("NUM_JOINTS > 0");
+                let mut speeds = [0.0; MAX_JOINTS];
+                for (out, v) in speeds.iter_mut().zip(p.speeds.iter()) {
+                    *out = *v;
+                }
+                let moving = speeds.iter().any(|v| *v != 0.0);
                 let mut sh = self.shared.lock().unwrap();
                 // Admission gate: where this jog will be one lookahead
                 // horizon ahead must not collide (or, from inside a
                 // keep-out, must not deepen it). The commanded velocity
                 // bounds the RT integrator's ramp from above, so a jog
-                // this projection clears cannot outrun it.
-                if pct != 0.0 {
+                // this projection clears cannot outrun it. Every driven
+                // joint is projected at once, so the configuration under
+                // test is the one the arm will actually be in — a
+                // per-joint check would clear two axes that only collide
+                // together.
+                if moving {
                     let q = self.cart.snapshots.latest().q;
                     let mut gate = self.cart.gate.lock().unwrap();
-                    let la = gate.jog_lookahead(&q, joint, pct);
+                    let la = gate.jog_lookahead(&q, &speeds);
                     if let Some(pairs) = gate.blocked(&q, &la)? {
                         return Err(gate.refuse(pairs));
                     }
@@ -509,7 +509,7 @@ impl RtCommands for RtBridge {
                     }) => jog,
                     _ => {
                         self.enter_stream_mode(Mode::Jog);
-                        None
+                        [0.0; MAX_JOINTS]
                     }
                 };
                 // The RT drains one command per tick, so a client
@@ -523,27 +523,25 @@ impl RtCommands for RtBridge {
                 // datagram, and the release is never more than a couple of
                 // entries deep. The datagram still refreshes the watchdog
                 // deadline below either way.
-                let commanded = (pct != 0.0).then_some((joint, pct));
                 let accel_changed = sh
                     .stream
                     .as_ref()
                     .is_some_and(|a| a.scale.1 != p.accel.unwrap_or(1.0));
-                if commanded != active || (commanded.is_some() && accel_changed) {
-                    if pct == 0.0 {
-                        self.link.send(RtCommand::JogRelease);
-                    } else {
+                if speeds != active || (moving && accel_changed) {
+                    if moving {
                         self.link.send(RtCommand::Jog {
-                            joint: joint as u8,
-                            signed_pct: pct,
+                            speeds,
                             accel: p.accel.unwrap_or(1.0),
                         });
+                    } else {
+                        self.link.send(RtCommand::JogRelease);
                     }
                 }
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Jog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
-                    jog: commanded,
+                    jog: speeds,
                     world_epoch: 0,
                     cart: None,
                     // JOG runs on the RT jog engine, not the streaming
@@ -589,7 +587,7 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
                     servo_target: Some(target),
-                    jog: None,
+                    jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
                     scale,
@@ -656,7 +654,7 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + SERVO_GRACE,
                     servo_target: Some(target),
-                    jog: None,
+                    jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
                     scale,
@@ -716,7 +714,7 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::CartJog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
-                    jog: None,
+                    jog: [0.0; MAX_JOINTS],
                     world_epoch: 0,
                     cart: Some(CartJogState {
                         twist,
@@ -1050,10 +1048,10 @@ pub(crate) fn housekeeping_loop(
                 // from the measured pose and re-tested — against the
                 // world as it is NOW, so a keep-out dropped onto a
                 // running jog stops it too.
-                Some(a) if a.kind == StreamKind::Jog && a.jog.is_some() => {
-                    let (joint, pct) = a.jog.expect("guarded");
+                Some(a) if a.kind == StreamKind::Jog && a.jog.iter().any(|v| *v != 0.0) => {
+                    let speeds = a.jog;
                     let mut g = gate.lock().unwrap();
-                    let la = g.jog_lookahead(&snap.q, joint, pct);
+                    let la = g.jog_lookahead(&snap.q, &speeds);
                     match g.blocked(&snap.q, &la) {
                         Ok(None) => {}
                         Ok(Some(pairs)) => {

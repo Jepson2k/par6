@@ -1,16 +1,22 @@
 """End-to-end: refused fire-and-forget commands reach the caller (issue #23).
 
-Before the fix, an out-of-range ``teleport`` and a multi-axis ``jog_j`` both
-"succeeded" at the client while the arm stood still: the runtime answered a
-real ERROR datagram, but nothing awaits a fire-and-forget reply, so the
-refusal evaporated — ``error()`` stayed ``None`` and STATUS carried nothing.
-The runtime now latches such a refusal as the standing error (while the
-pipeline is idle), so it surfaces through the ERROR query and the STATUS
-broadcast, and the next accepted motion command clears it.
+Before the fix, a refused fire-and-forget "succeeded" at the client while
+the arm stood still: the runtime answered a real ERROR datagram, but
+nothing awaits a fire-and-forget reply, so the refusal evaporated —
+``error()`` stayed ``None`` and STATUS carried nothing.  The runtime now
+latches such a refusal as the standing error (while the pipeline is idle),
+so it surfaces through the ERROR query and the STATUS broadcast, and the
+next accepted motion command clears it.
+
+The repro here is an out-of-range ``teleport`` — a runtime-side range
+check no client-side validation mirrors.  The other daemon-only
+fire-and-forget refusal, a jog the collision gate turns away, exercises
+the same latch in ``test_e2e_daemon.py::
+test_jog_streams_are_gated_by_the_collision_world``.
 
 Everything here drives a real ``par6d --sim`` over real UDP with the real
 client — no fakes, no scripted peer.  These tests fail against the pre-fix
-runtime: ``error()`` then answers ``None`` after both refusals.
+runtime: ``error()`` then answers ``None`` after the refusal.
 """
 
 from __future__ import annotations
@@ -77,14 +83,14 @@ async def error_clears(
 
 
 @pytest.mark.timeout(120)
-async def test_rejected_teleport_and_jog_surface_as_errors(daemon: LiveDaemon):
-    """The issue's two reproductions, against the live runtime.
+async def test_rejected_teleport_surfaces_as_error(daemon: LiveDaemon):
+    """A refused fire-and-forget reaches the caller, against the live runtime.
 
-    A teleport outside the joint travel window and a multi-axis ``jog_j``
-    are both refused server-side; the refusal must reach a caller that
-    never awaits a reply — through ``error()`` AND through the STATUS
-    broadcast (the surface Waldo Commander renders) — while the arm stays
-    exactly where it was.  An accepted motion command then clears it.
+    A teleport outside the joint travel window is refused server-side; the
+    refusal must reach a caller that never awaits a reply — through
+    ``error()`` AND through the STATUS broadcast (the surface Waldo
+    Commander renders) — while the arm stays exactly where it was.  An
+    accepted motion command then clears it.
     """
     park = park_deg()
     async with daemon.client() as client:
@@ -122,29 +128,6 @@ async def test_rejected_teleport_and_jog_surface_as_errors(daemon: LiveDaemon):
 
         # An accepted motion command clears the refusal, like any
         # standing error.
-        await client.teleport(park)
-        assert await error_clears(client), "acceptance must clear the refusal"
-
-        # -- multi-axis jog_j ---------------------------------------------
-        before = await client.angles()
-        assert before is not None
-        assert await client.jog_j(joints=[0, 1], speeds=[0.2, -0.2], duration=0.4) == 1
-
-        err = await standing_error(client)
-        assert err is not None, (
-            "a refused multi-axis jog must surface through error(); "
-            f"daemon log:\n{daemon.log()}"
-        )
-        assert err.code == ErrorCode.COMM_VALIDATION_ERROR, str(err)
-        assert "jog_j" in err.cause, str(err)
-
-        # Still unmoved.
-        angles = await client.angles()
-        assert angles is not None
-        assert max_abs_delta(angles, before) < 1.0, (
-            f"a REFUSED jog must not move the arm: {angles} vs {before}"
-        )
-
         await client.teleport(park)
         assert await error_clears(client), "acceptance must clear the refusal"
 

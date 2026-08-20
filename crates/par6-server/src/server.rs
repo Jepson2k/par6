@@ -955,16 +955,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                      its end pose; send r = nil"
                 )
             }),
-            // The RT jog engine ramps ONE joint at a time:
-            // direction-block latching is keyed on the commanded
-            // joint. Collapsing to the dominant axis would move the arm
-            // somewhere the client did not ask for.
-            Command::JogJ(p) => {
-                let axes = p.speeds.iter().filter(|s| **s != 0.0).count();
-                (axes > 1).then(|| {
-                    format!("jog_j drives one joint at a time; {axes} axes were commanded")
-                })
-            }
             // A pose the runtime cannot place the arm at is refused, not
             // clamped: clamping landed the arm tens of degrees from where
             // the client asked and answered success, which is the silent

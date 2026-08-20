@@ -1218,11 +1218,8 @@ class AsyncRobotClient(_RobotClientABC):
 
         Single joint: ``jog_j(0, 0.5, 1.0)``
 
-        The ``joints=``/``speeds=`` form exists for waldoctl parity, but
-        the PAR6 runtime drives ONE joint at a time: a request with more
-        than one non-zero speed is refused with a validation error, which
-        surfaces through :meth:`error` and the STATUS broadcast (the send
-        itself still returns 1 — fire-and-forget success is unacked).
+        The ``joints=``/``speeds=`` form drives several joints at once,
+        each on its own ramp: ``jog_j(joints=[0, 3], speeds=[0.5, -0.2])``.
 
         Category: Jog
 

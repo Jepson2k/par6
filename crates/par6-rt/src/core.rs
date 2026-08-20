@@ -184,6 +184,17 @@ pub enum GateRefusal {
     NotImplemented,
 }
 
+/// Bitmask of the joints a per-joint speed array actually drives.
+fn joint_mask(speeds: &[f64; MAX_JOINTS]) -> u8 {
+    let mut mask = 0u8;
+    for (i, v) in speeds.iter().enumerate() {
+        if *v != 0.0 {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
 /// Per-tick coefficient of a first-order low-pass at *cutoff_hz*, or 0
 /// when the filter is off.
 ///
@@ -413,7 +424,7 @@ pub struct RtCore<B: DriverBus> {
 
     // Jog live state.
     jog_active: bool,
-    jog_joint: u8,
+    jog_joints: u8,
     jog_blocked: u16,
 
     // EXEC link watchdog.
@@ -576,7 +587,7 @@ impl<B: DriverBus> RtCore<B> {
             gripper_cmd,
             homing_gcmd: gripper_cmd,
             jog_active: false,
-            jog_joint: 0,
+            jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
             hb_silence: 0,
@@ -917,24 +928,21 @@ impl<B: DriverBus> RtCore<B> {
                 log::info!("human park assertion received (arms FLASHING entry)");
                 self.park_asserted = true;
             }
-            RtCommand::Jog {
-                joint,
-                signed_pct,
-                accel,
-            } => {
-                if self.mode == Mode::Jog && usize::from(joint) < MAX_JOINTS {
+            RtCommand::Jog { speeds, accel } => {
+                if self.mode == Mode::Jog {
                     if self.jog_accel_scale != accel {
                         self.jog.set_accel_scale(accel);
                         self.jog_accel_scale = accel;
                     }
-                    self.jog.command(usize::from(joint), signed_pct);
+                    self.jog.command(&speeds);
                     self.jog_active = true;
-                    self.jog_joint = joint;
+                    self.jog_joints = joint_mask(&speeds);
                 }
             }
             RtCommand::JogRelease => {
                 self.jog.release();
                 self.jog_active = false;
+                self.jog_joints = 0;
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
             RtCommand::ExecFlush => {
@@ -1686,7 +1694,7 @@ impl<B: DriverBus> RtCore<B> {
         s.exec = self.exec.status();
         s.jog = JogStatus {
             active: self.jog_active,
-            joint: self.jog_joint,
+            joints: self.jog_joints,
             blocked_mask: self.jog_blocked,
         };
         s.io_lines = self.io_lines;

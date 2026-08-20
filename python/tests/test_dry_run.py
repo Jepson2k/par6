@@ -412,6 +412,23 @@ class TestCartesianMotion:
         # Jogging stays available while un-homed, as it does on the runtime.
         assert unhomed.jog_j(0, 0.2, 0.2).duration > 0.0
 
+    def test_the_preview_jogs_several_joints_at_once(self, dry_run) -> None:
+        """A diagonal jog must preview as a diagonal.
+
+        The preview refused any jog with more than one non-zero speed, so
+        the two-axis gesture a pendant makes had no preview at all — while
+        the engine underneath had been per-joint the whole time.
+        """
+        dry_run.teleport(park_deg())
+        start = [math.radians(a) for a in dry_run.angles()]
+        end = dry_run.jog_j(joints=[0, 3], speeds=[0.4, -0.4], duration=0.4).end_joints_rad
+        assert end[0] > start[0] + 0.01, "J0 must have jogged forward"
+        assert end[3] < start[3] - 0.01, "J3 must have jogged back"
+        for j in (1, 2, 4, 5):
+            assert abs(end[j] - start[j]) < 1e-9, (
+                f"J{j} was never commanded and must not move"
+            )
+
     def test_the_preview_refuses_the_inputs_the_wire_refuses(self, dry_run) -> None:
         """Values the codec rejects must be rejected before they are drawn.
 

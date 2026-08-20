@@ -377,8 +377,6 @@ re-running to recover console output.
 
 Deliberate, and unlikely to change:
 
-- **`jog_j` drives one joint at a time.** The RT jog engine ramps a single axis; a
-  multi-joint jog is refused with a validation error rather than partially honoured.
 - **Three motion profiles**, not five — `QUINTIC` and `LINEAR` are absent, consistently
   on the runtime and in the preview.
 - **`select_tool` accepts only the fitted tool.** The runtime is built around one

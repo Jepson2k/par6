@@ -1174,11 +1174,6 @@ class DryRunRobotClient:
             fractions[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")
-        if np.count_nonzero(fractions) > 1:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail="jog_j drives one joint at a time",
-            )
         _wire_checked(
             CmdType.JOG_J, [fractions.tolist(), float(duration), float(accel)]
         )

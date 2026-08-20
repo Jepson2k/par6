@@ -18,6 +18,13 @@ use par6_motion::{JogDirection, JogEngine, MotionError, NUM_JOINTS};
 
 const HOME: [f64; NUM_JOINTS] = [0.0, -1.5, 3.0, 0.0, 0.0, 3.1];
 
+/// A speed array driving `joint` alone at `signed_pct`.
+fn one(joint: usize, signed_pct: f64) -> [f64; NUM_JOINTS] {
+    let mut speeds = [0.0; NUM_JOINTS];
+    speeds[joint] = signed_pct;
+    speeds
+}
+
 /// Velocity tracking-lag time constant \[s\] for the test plant. Sized
 /// like the sim's closed-loop driver cascade (~tens of ms): at J0's
 /// 4.8 rad/s jog speed this trails the target by ~0.3 rad — the
@@ -96,7 +103,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
     // Jog J0 positive at max speed until the lookahead stops it. The
     // MEASURED pose — trailing the target through the lag — must come to
     // rest short of the soft limit.
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
     run_tracked(&mut engine, &mut plant, 3000, &max_dv);
     assert!(
         engine.velocity(0) == 0.0,
@@ -129,7 +136,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
     // ...and survives release + re-press in the same direction.
     engine.release();
     run_tracked(&mut engine, &mut plant, 50, &max_dv);
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
     run_tracked(&mut engine, &mut plant, 200, &max_dv);
     assert!(
         (plant.q[0] - stopped_at).abs() < 1e-3,
@@ -140,7 +147,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
     assert_eq!(engine.blocked_direction(0), Some(JogDirection::Positive));
 
     // The opposite direction clears the latch and moves.
-    engine.command(0, JogDirection::Negative, 0.5).unwrap();
+    engine.command(&one(0, -0.5)).unwrap();
     assert_eq!(engine.blocked_direction(0), None);
     run_tracked(&mut engine, &mut plant, 500, &max_dv);
     assert!(
@@ -151,7 +158,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
 
     // After moving away, the positive direction works again until the
     // lookahead re-latches.
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
     let before = plant.q[0];
     run_tracked(&mut engine, &mut plant, 3000, &max_dv);
     assert!(plant.q[0] > before, "cleared direction must jog again");
@@ -159,7 +166,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
     assert_eq!(engine.blocked_direction(0), Some(JogDirection::Positive));
 
     // Switching joints clears the latch.
-    engine.command(3, JogDirection::Positive, 0.2).unwrap();
+    engine.command(&one(3, 0.2)).unwrap();
     assert_eq!(engine.blocked_direction(0), None);
     run_tracked(&mut engine, &mut plant, 100, &max_dv);
     assert!(plant.q[3] > 0.0, "switched joint must jog");
@@ -167,7 +174,7 @@ fn lookahead_blocks_before_soft_limit_and_latches() {
     // Negative side blocks too.
     engine.activate(&HOME);
     let mut plant = LagPlant::new(&HOME, dt);
-    engine.command(4, JogDirection::Negative, 1.0).unwrap();
+    engine.command(&one(4, -1.0)).unwrap();
     run_tracked(&mut engine, &mut plant, 3000, &max_dv);
     assert!(plant.q[4] > cfg.joints[4].limits.soft_min_rad);
     assert!(plant.q[4] < -0.5, "negative jog must have moved");
@@ -185,7 +192,7 @@ fn trapezoid_ramp_runs_to_the_block() {
     engine.activate(&HOME);
     engine.set_profile(JogProfile::Trapezoid);
     let mut plant = LagPlant::new(&HOME, dt);
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
 
     // Trapezoid ramp: the very first tick slews at exactly a·dt.
     let out = engine.tick(&plant.q);
@@ -225,7 +232,7 @@ fn hard_clamp_stops_commanding_a_plant_carried_past_the_limit() {
     let mut plant = LagPlant::new(&q0, dt);
     // A legal EXEC-mode speed the preempted move was still carrying.
     plant.v[0] = 3.0;
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
 
     let mut overran = false;
     let mut max_meas = plant.q[0];
@@ -264,7 +271,7 @@ fn hard_clamp_stops_commanding_a_plant_carried_past_the_limit() {
 
     // Inward is the escape route: the same engine jogs the joint back
     // inside the soft window.
-    engine.command(0, JogDirection::Negative, 0.5).unwrap();
+    engine.command(&one(0, -0.5)).unwrap();
     for _ in 0..400 {
         let out = engine.tick(&plant.q);
         plant.step(&out.qd);
@@ -287,7 +294,7 @@ fn config_floors_and_input_validation() {
     engine.activate(&HOME);
     engine.set_profile(JogProfile::Trapezoid);
     engine.set_accel_time_s(0.001).unwrap();
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
     let l = &cfg.joints[0].limits;
     let a_floor = (l.velocity_rad_s / par6_motion::MIN_ACCEL_TIME_S).min(l.acceleration_rad_s2);
     let out = engine.tick(&HOME);
@@ -304,7 +311,7 @@ fn config_floors_and_input_validation() {
     engine.activate(&HOME);
     engine.set_profile(JogProfile::Scurve);
     engine.set_jerk_factor(0.01).unwrap();
-    engine.command(0, JogDirection::Positive, 1.0).unwrap();
+    engine.command(&one(0, 1.0)).unwrap();
     let a = jog_accels(&cfg)[0];
     let expected_dv = (a * par6_motion::MIN_JERK_FACTOR) * dt * dt;
     let out = engine.tick(&HOME);
@@ -314,24 +321,109 @@ fn config_floors_and_input_validation() {
         out.qd[0]
     );
 
-    // Requirement-derived rejections: bad joint index, zero/negative/NaN/
-    // over-unity speed.
+    // Requirement-derived rejections: NaN, infinite and over-unity
+    // speeds. Zero is now a legitimate entry — it is how a multi-joint
+    // command says "leave this axis alone".
     let mut engine = JogEngine::new(&cfg).unwrap();
-    assert!(matches!(
-        engine.command(NUM_JOINTS, JogDirection::Positive, 0.5),
-        Err(MotionError::InvalidInput { what: "joint", .. })
-    ));
-    for bad in [0.0, -0.2, 1.5, f64::NAN, f64::INFINITY] {
+    for bad in [-1.2, 1.5, f64::NAN, f64::INFINITY] {
         assert!(matches!(
-            engine.command(0, JogDirection::Positive, bad),
-            Err(MotionError::InvalidInput {
-                what: "speed_pct",
-                ..
-            })
+            engine.command(&one(0, bad)),
+            Err(MotionError::InvalidInput { what: "speeds", .. })
         ));
     }
+    assert!(
+        engine.command(&[0.0; NUM_JOINTS]).is_ok(),
+        "an all-zero command is a release, not an error"
+    );
     for bad in [0.0, -1.0, f64::NAN] {
         assert!(engine.set_accel_time_s(bad).is_err());
         assert!(engine.set_jerk_factor(bad).is_err());
     }
+}
+
+/// Several joints jog at once, each on its own ramp, and the direction
+/// blocks stay per joint.
+///
+/// The engine's `v`/`acc`/`q`/`blocked` arrays were already six-wide with
+/// a six-wide tick loop; only the command was scalar, so the fifth of the
+/// engine that decided WHICH joint to drive threw the rest away. A
+/// diagonal jog is the ordinary pendant gesture that could not be
+/// expressed.
+#[test]
+fn several_joints_jog_together_with_independent_ramps_and_blocks() {
+    let cfg = par6_config();
+    let dt = cfg.robot.tick_dt_s;
+    let a = jog_accels(&cfg);
+    let v_full: [f64; NUM_JOINTS] = std::array::from_fn(|j| cfg.joints[j].limits.velocity_rad_s);
+
+    let mut engine = JogEngine::new(&cfg).unwrap();
+    engine.activate(&HOME);
+    engine.set_profile(JogProfile::Trapezoid);
+
+    // Gentle fractions on three joints, chosen so every one of them
+    // reaches terminal velocity with room to spare before its own
+    // brake-at-limits lookahead has anything to say.
+    let driven = [(0usize, 0.1), (3, -0.2), (5, 0.3)];
+    let mut speeds = [0.0; NUM_JOINTS];
+    for (j, pct) in driven {
+        speeds[j] = pct;
+    }
+    engine.command(&speeds).unwrap();
+
+    // Each joint slews at its OWN a·dt on the first tick — a shared ramp
+    // would put them all on one.
+    let out = engine.tick(&HOME);
+    for (j, pct) in driven {
+        let want = pct.signum() * a[j] * dt;
+        assert!(
+            (out.qd[j] - want).abs() < 1e-12,
+            "J{j} first tick must slew at its own a*dt {want}, got {}",
+            out.qd[j]
+        );
+    }
+
+    let mut plant = LagPlant::new(&HOME, dt);
+    plant.step(&out.qd);
+    for _ in 0..100 {
+        let out = engine.tick(&plant.q);
+        plant.step(&out.qd);
+    }
+    for (j, pct) in driven {
+        let want = pct * v_full[j];
+        assert!(
+            (engine.velocity(j) - want).abs() < 1e-9,
+            "J{j} must cruise at {want} rad/s, got {}",
+            engine.velocity(j)
+        );
+    }
+    for j in [1usize, 2, 4] {
+        assert_eq!(
+            engine.velocity(j),
+            0.0,
+            "J{j} was never commanded and must not move"
+        );
+    }
+
+    // Blocks are per joint. Same driven SET, so no block clearing: J0 goes
+    // to full speed and runs into its wall while J3 crawls nowhere near
+    // its own.
+    speeds[0] = 1.0;
+    speeds[3] = -0.005;
+    speeds[5] = 0.0;
+    engine.command(&speeds).unwrap();
+    let max_dv: [f64; NUM_JOINTS] = std::array::from_fn(|j| a[j] * dt);
+    run_tracked(&mut engine, &mut plant, 3000, &max_dv);
+    assert_eq!(engine.blocked_direction(0), Some(JogDirection::Positive));
+    assert_eq!(
+        engine.blocked_direction(3),
+        None,
+        "J3 is nowhere near its limit; J0's block must not spill onto it"
+    );
+
+    // Changing the driven SET clears every block — the multi-joint reading
+    // of "switching joints clears the blocks".
+    let mut other = [0.0; NUM_JOINTS];
+    other[1] = 0.3;
+    engine.command(&other).unwrap();
+    assert_eq!(engine.blocked_direction(0), None);
 }
