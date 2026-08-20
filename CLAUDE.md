@@ -39,6 +39,16 @@ The library crates still build without a C++ toolchain, which is what the
   authorship (self-relicensing); otherwise reimplement the semantics independently.
 - `assets/` is Apache-2.0 vendor material — keep `assets/NOTICE` accurate.
 
+## Kinematics/dynamics changes
+
+Kinematics is easy to get subtly wrong (frames, sign/direction conventions,
+q vs vendor theta, RPY order, gear/Kt mappings). Before implementing or
+changing any kinematics or dynamics behavior, read the corresponding code in
+parol6 (`/workspace/jepson2k/parol6-python-api`) and the reBot ecosystem /
+vendor runtime (`/workspace/source-robotics`) and match their semantics and
+numeric conventions — under the licensing rules above: study behavior and
+constants, never copy code.
+
 ## Testing Guidelines
 
 - **No tautological tests.** Assert behavior, not what's true by construction — not
