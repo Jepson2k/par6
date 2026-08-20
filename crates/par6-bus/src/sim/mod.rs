@@ -1054,6 +1054,7 @@ impl DriverBus for SimBus {
         self.cmd_buf = vec![
             PlantCmd {
                 current_ma: 0.0,
+                ff_ma: 0.0,
                 vel_limit_ticks_s: 0.0,
                 idle: true,
             };

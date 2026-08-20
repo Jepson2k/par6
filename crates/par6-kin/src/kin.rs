@@ -79,6 +79,9 @@ pub struct Kin {
     q_scratch: Vec<f64>,
     jac_full: Vec<f64>,
     tau_full: Vec<f64>,
+    v_full: Vec<f64>,
+    a_full: Vec<f64>,
+    g_full: Vec<f64>,
 }
 
 impl std::fmt::Debug for Kin {
@@ -205,6 +208,9 @@ impl Kin {
             q_scratch: vec![0.0; nq_full],
             jac_full: vec![0.0; 6 * nq_full],
             tau_full: vec![0.0; nq_full],
+            v_full: vec![0.0; nq_full],
+            a_full: vec![0.0; nq_full],
+            g_full: vec![0.0; nq_full],
         })
     }
 
@@ -268,6 +274,37 @@ impl Kin {
         self.set_q(q);
         self.model.gravity_into(&self.q_full, &mut self.tau_full)?;
         tau.copy_from_slice(&self.tau_full[..NQ]);
+        Ok(())
+    }
+
+    /// Dynamic feedforward torque `M(q)·q̈ + C(q,q̇)·q̇` \[Nm\] for the arm
+    /// joints, written into `tau`: full inverse dynamics (RNEA) with the
+    /// gravity term subtracted back out, so the result composes with a
+    /// control law that adds G(q) itself. Jaw joints ride at zero
+    /// position, velocity and acceleration.
+    pub fn dyn_feedforward(
+        &mut self,
+        q: &[f64; NQ],
+        qd: &[f64; NQ],
+        qdd: &[f64; NQ],
+        tau: &mut [f64; NQ],
+    ) -> Result<(), KinError> {
+        self.set_q(q);
+        self.v_full[..NQ].copy_from_slice(qd);
+        self.a_full[..NQ].copy_from_slice(qdd);
+        self.model.inverse_dynamics_into(
+            &self.q_full,
+            &self.v_full,
+            &self.a_full,
+            &mut self.tau_full,
+        )?;
+        self.model.gravity_into(&self.q_full, &mut self.g_full)?;
+        for (out, (id, g)) in tau
+            .iter_mut()
+            .zip(self.tau_full.iter().zip(self.g_full.iter()))
+        {
+            *out = id - g;
+        }
         Ok(())
     }
 

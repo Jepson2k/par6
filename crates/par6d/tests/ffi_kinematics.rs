@@ -558,6 +558,57 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     rig.shutdown();
 }
 
+#[test]
+fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
+    // The planner's torque feedforward (M·q̈ + C·q̇ per sample, G(q) added
+    // by the law) is applied for real on this tier: the plant integrates
+    // rigid-body dynamics from the commanded current. This pins the tier
+    // staying stable under a full-speed swing with the feedforward
+    // riding the current channel — the FEEDFORWARD VALUES are pinned by
+    // the ABA round-trip in par6-kin and the qdd-consistency tests in
+    // par6-motion, because on an arm this small the drives' Ilim clamp
+    // and the position loop absorb even a wildly wrong feedforward. The
+    // swing stays on the gravity-free axes (base and wrist): the
+    // shoulder lift saturates this plant's drive current against
+    // gravity, feedforward or not.
+    let rig = boot_tagged("tauff", true);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, HOLD_POSE_DEG);
+
+    let mut target = HOLD_POSE_DEG;
+    target[0] += 40.0;
+    target[4] += 20.0;
+    target[5] -= 30.0;
+    let i = c.ok_index(&Command::MoveJ(MoveJ {
+        key: 9301,
+        angles: target,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the full-speed move must complete: {detail:?}");
+    // This tier holds with degrees of steady-state give (see the hold
+    // test above), so the landing tolerance asks "did the trajectory
+    // arrive", not "did the servo null out" — a feedforward with the
+    // wrong sign or scale misses by tens of degrees or latches an error.
+    let s = rig.wait_status("landed on the target", |s| {
+        angles_close(&s.angles, &target, 8.0)
+    });
+    assert!(
+        s.error.is_none(),
+        "standing error after the move: {:?}",
+        s.error
+    );
+
+    rig.shutdown();
+}
+
 // ---- gravity reads the gripper config --------------------------------------
 
 /// Just enough msgpack to read a telemetry packet: arrays, strings,

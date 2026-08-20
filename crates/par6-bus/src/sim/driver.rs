@@ -42,6 +42,14 @@ pub enum FaultKind {
 pub(crate) struct PlantCmd {
     /// Loop output current \[mA\], already Ilim-saturated.
     pub current_ma: f64,
+    /// The additive torque-feedforward share of `current_ma` (the loop
+    /// modes' `cur_ff` channel). The kinematic plant subtracts it: its
+    /// current→acceleration gain is a synthetic Ilim mapping, not a
+    /// torque model, so current calibrated for the real drives' Kt and
+    /// gearing would fabricate acceleration there — the kinematic tier
+    /// treats feedforward as exactly absorbed by the physics it does not
+    /// model. The dynamics tier integrates the full current for real.
+    pub ff_ma: f64,
     /// Driver velocity limit \[ticks/s\] the plant must respect.
     pub vel_limit_ticks_s: f64,
     /// Driver is in Idle (no drive; shorted-phase-style damping).
@@ -302,16 +310,24 @@ impl VirtualDriver {
             self.cur_out_ma = 0.0;
             return PlantCmd {
                 current_ma: 0.0,
+                ff_ma: 0.0,
                 vel_limit_ticks_s: self.vel_limit,
                 idle: true,
             };
         }
         let ilim = self.ilim_ma;
+        let ff = match self.mode {
+            Mode::Position { cur_ff, .. }
+            | Mode::Velocity { cur_ff, .. }
+            | Mode::Pd { cur_ff, .. } => cur_ff,
+            _ => 0.0,
+        };
         let cur = match self.mode {
             Mode::Idle => {
                 self.cur_out_ma = 0.0;
                 return PlantCmd {
                     current_ma: 0.0,
+                    ff_ma: 0.0,
                     vel_limit_ticks_s: self.vel_limit,
                     idle: true,
                 };
@@ -343,6 +359,7 @@ impl VirtualDriver {
         self.cur_out_ma = cur.clamp(-ilim, ilim);
         PlantCmd {
             current_ma: self.cur_out_ma,
+            ff_ma: ff.clamp(-ilim, ilim),
             vel_limit_ticks_s: self.vel_limit,
             idle: false,
         }

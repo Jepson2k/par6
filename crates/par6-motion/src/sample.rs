@@ -27,18 +27,18 @@ pub struct SampleMeta {
     pub is_last: bool,
 }
 
-/// One tick of planned motion for all joints (mirror of
-/// `par6_rt::ring::Sample`).
+/// One tick of planned motion for all joints. The metadata mirrors
+/// `par6_rt::ring::Sample`; the kinematic channels carry acceleration
+/// instead of torque because this crate has no dynamics model — the
+/// daemon turns `qdd` into the ring's torque feedforward.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
     /// Joint positions \[rad\].
     pub q: [f64; NUM_JOINTS],
     /// Joint velocities \[rad/s\].
     pub qd: [f64; NUM_JOINTS],
-    /// Torque feedforward \[Nm\] (gravity is NOT included — the RT adds
-    /// G(q) itself). Planned inertial feedforward arrives with par6-kin
-    /// dynamics; until then planners emit zero.
-    pub tau_ff: [f32; NUM_JOINTS],
+    /// Joint accelerations \[rad/s²\] of the planned profile.
+    pub qdd: [f64; NUM_JOINTS],
     /// Segment metadata.
     pub meta: SampleMeta,
 }
@@ -48,7 +48,7 @@ impl Default for Sample {
         Self {
             q: [0.0; NUM_JOINTS],
             qd: [0.0; NUM_JOINTS],
-            tau_ff: [0.0; NUM_JOINTS],
+            qdd: [0.0; NUM_JOINTS],
             meta: SampleMeta::default(),
         }
     }

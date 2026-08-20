@@ -14,12 +14,13 @@ use par6_motion::{MotionLimits, MoveParams, ProgramBuilder};
 // The mirror is only valid while both sides agree on the joint count.
 const _: () = assert!(par6_motion::NUM_JOINTS == par6_rt::MAX_JOINTS);
 
-/// The field-for-field copy par6-rt's EXEC glue performs.
+/// The copy par6d's EXEC glue performs (torque feedforward is computed
+/// there from `qdd` and the dynamics model; zero stands in for it here).
 fn to_ring(s: &par6_motion::Sample) -> par6_rt::Sample {
     par6_rt::Sample {
         q: s.q,
         qd: s.qd,
-        tau_ff: s.tau_ff,
+        tau_ff: [0.0; par6_rt::MAX_JOINTS],
         meta: par6_rt::SampleMeta {
             command_index: s.meta.command_index,
             checkpoint_id: s.meta.checkpoint_id,

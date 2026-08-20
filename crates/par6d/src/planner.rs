@@ -379,9 +379,9 @@ impl Par6Planner {
     /// admission in the bridge's `StreamGate`, which applies the same
     /// two-halves rule: the jog/servo ramp is integrated on the RT
     /// thread, where a coal check cannot go.
-    fn gate_collisions(
+    fn gate_collisions<const W: usize>(
         &mut self,
-        samples: &[[f64; 2 * MAX_JOINTS]],
+        samples: &[[f64; W]],
         from: usize,
     ) -> Result<(), WireError> {
         let started = Instant::now();
@@ -535,7 +535,7 @@ impl Par6Planner {
     /// change is requested, for a path that would collide.
     fn start_exec(
         &mut self,
-        samples: Vec<[f64; 2 * MAX_JOINTS]>,
+        samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
         self.gate_collisions(&samples, 0)?;
@@ -546,10 +546,16 @@ impl Par6Planner {
         let ring_index = self.next_ring_index;
         self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         let n = samples.len();
+        // The planned acceleration becomes the ring's torque feedforward
+        // (`M(q)·q̈ + C(q,q̇)·q̇`; the law adds G(q) itself). A feedforward
+        // is not a safety path: a model failure degrades to zero torque
+        // for that sample and the PID loop carries the move.
+        let kin = &mut self.kin;
+        let mut id_failed = false;
         let samples: Vec<RingSample> = samples
             .into_iter()
             .enumerate()
-            .map(|(k, qqd)| {
+            .map(|(k, qqa)| {
                 let mut s = RingSample {
                     q: [0.0; MAX_JOINTS],
                     qd: [0.0; MAX_JOINTS],
@@ -561,8 +567,22 @@ impl Par6Planner {
                         is_last: k + 1 == n,
                     },
                 };
-                s.q.copy_from_slice(&qqd[..MAX_JOINTS]);
-                s.qd.copy_from_slice(&qqd[MAX_JOINTS..]);
+                s.q.copy_from_slice(&qqa[..MAX_JOINTS]);
+                s.qd.copy_from_slice(&qqa[MAX_JOINTS..2 * MAX_JOINTS]);
+                let mut qdd = [0.0; MAX_JOINTS];
+                qdd.copy_from_slice(&qqa[2 * MAX_JOINTS..]);
+                match kin.dyn_feedforward(&s.q, &s.qd, &qdd) {
+                    Ok(tau) => {
+                        for (out, t) in s.tau_ff.iter_mut().zip(tau.iter()) {
+                            *out = *t as f32;
+                        }
+                    }
+                    Err(e) if !id_failed => {
+                        id_failed = true;
+                        log::warn!("torque feedforward degraded to zero: {e}");
+                    }
+                    Err(_) => {}
+                }
                 s
             })
             .collect();
@@ -606,7 +626,7 @@ impl Par6Planner {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
-    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid => ProfileKind::Trapezoid,
@@ -663,10 +683,11 @@ impl Par6Planner {
             .samples()
             .iter()
             .map(|s| {
-                let mut qqd = [0.0; 2 * MAX_JOINTS];
-                qqd[..MAX_JOINTS].copy_from_slice(&s.q);
-                qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
-                qqd
+                let mut qqa = [0.0; 3 * MAX_JOINTS];
+                qqa[..MAX_JOINTS].copy_from_slice(&s.q);
+                qqa[MAX_JOINTS..2 * MAX_JOINTS].copy_from_slice(&s.qd);
+                qqa[2 * MAX_JOINTS..].copy_from_slice(&s.qdd);
+                qqa
             })
             .collect())
     }
@@ -681,7 +702,7 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
         min_duration: Option<f64>,
-    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let speed_frac = speed.unwrap_or(1.0);
         let accel_frac = accel.unwrap_or(1.0);
         let vel: Vec<f64> = self
@@ -727,12 +748,17 @@ impl Par6Planner {
                         &[("detail", &format!("trajectory sampling failed: {e}"))],
                     )
                 })?;
-            let mut qqd = [0.0; 2 * MAX_JOINTS];
-            qqd[..MAX_JOINTS].copy_from_slice(&q);
-            for (out, v) in qqd[MAX_JOINTS..].iter_mut().zip(qd.iter()) {
+            let mut qqa = [0.0; 3 * MAX_JOINTS];
+            qqa[..MAX_JOINTS].copy_from_slice(&q);
+            for (out, v) in qqa[MAX_JOINTS..2 * MAX_JOINTS].iter_mut().zip(qd.iter()) {
                 *out = v * scale;
             }
-            samples.push(qqd);
+            // A min-duration stretch is a time reparameterization t → t/scale:
+            // velocities pick up one factor of `scale`, accelerations two.
+            for (out, a) in qqa[2 * MAX_JOINTS..].iter_mut().zip(qdd.iter()) {
+                *out = a * scale * scale;
+            }
+            samples.push(qqa);
         }
         Ok(samples)
     }

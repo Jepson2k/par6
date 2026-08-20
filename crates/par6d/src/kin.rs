@@ -415,6 +415,21 @@ impl CartKin {
         Ok(pose)
     }
 
+    /// Dynamic feedforward torque `M(q)·q̈ + C(q,q̇)·q̇` \[Nm\] — gravity
+    /// excluded, the RT law adds G(q) itself.
+    pub(crate) fn dyn_feedforward(
+        &mut self,
+        q: &[f64; NQ],
+        qd: &[f64; NQ],
+        qdd: &[f64; NQ],
+    ) -> Result<[f64; NQ], String> {
+        let mut tau = [0.0; NQ];
+        self.kin
+            .dyn_feedforward(q, qd, qdd, &mut tau)
+            .map_err(|e| format!("inverse dynamics failed: {e}"))?;
+        Ok(tau)
+    }
+
     /// FK matrix at the URDF's own TCP frame, offset NOT applied.
     fn fk_model(&mut self, q: &[f64; NQ]) -> Result<Pose, String> {
         let mut pose = [0.0; 16];
