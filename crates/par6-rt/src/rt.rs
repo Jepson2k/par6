@@ -71,7 +71,44 @@ impl<B: DriverBus> RtCore<B> {
             }
         }
     }
+
+    /// Deliberate exit path, run ONCE after the final `run()` returns on
+    /// process shutdown (not on the op-application breaks): halt to IDLE
+    /// and tick until the arm measures at rest (bounded by
+    /// [`SHUTDOWN_SETTLE_BUDGET_S`]), then one SAFETY_STOP tick so the
+    /// last frame on the bus idles the drives on purpose. In FLASHING
+    /// the bus is silent by contract and the whole sequence is skipped.
+    pub fn shutdown_stop(&mut self) {
+        if self.mode() == crate::Mode::Flashing {
+            return;
+        }
+        let dt = self.tick_dt_s();
+        let dt_ns = (dt * 1e9).round() as u64;
+        let budget = (SHUTDOWN_SETTLE_BUDGET_S / dt).ceil() as u32;
+        self.shutdown_halt();
+        let mut deadline = monotonic_ns();
+        for _ in 0..budget {
+            self.tick(dt, false);
+            if self.at_rest() {
+                break;
+            }
+            deadline += dt_ns;
+            let now = monotonic_ns();
+            if now < deadline {
+                sleep_until(deadline);
+            } else {
+                deadline = now;
+            }
+        }
+        self.shutdown_limp();
+        self.tick(dt, false);
+    }
 }
+
+/// Ceiling on the shutdown hold-to-rest window \[s\]. Generous against
+/// the worst commanded deceleration; the loop leaves as soon as the arm
+/// measures at rest, so a stationary arm pays one tick.
+const SHUTDOWN_SETTLE_BUDGET_S: f64 = 2.0;
 
 fn setup_realtime(opts: &RunOptions) {
     if let Some(prio) = opts.fifo_priority {

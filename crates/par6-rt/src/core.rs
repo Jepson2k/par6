@@ -73,6 +73,10 @@ const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;
+/// Measured-speed band \[rad/s\] under which every joint counts as at
+/// rest for the shutdown exit path. Above encoder quantization noise,
+/// far below any commanded motion.
+const SHUTDOWN_REST_RAD_S: f64 = 0.02;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
 /// Minimum spacing between two bus-fault log lines from the RT thread
@@ -756,6 +760,42 @@ impl<B: DriverBus> RtCore<B> {
     /// follow-through); the warmup gate re-arms.
     pub fn reset_loop_stats(&mut self) {
         self.timing.reset();
+    }
+
+    /// Shutdown phase 1: force the standing halt. Any working mode drops
+    /// to IDLE, whose law commands active zero velocity (or the gravity
+    /// float), so subsequent ticks bring the arm to a commanded stop
+    /// before the process exits. BOOTING / ACTIVE_ERROR / SAFETY_STOP
+    /// already run a stationary law and are left in place; FLASHING is a
+    /// bus-silent maintenance window and must stay silent.
+    pub fn shutdown_halt(&mut self) {
+        if matches!(
+            self.mode,
+            Mode::Idle | Mode::Booting | Mode::ActiveError | Mode::SafetyStop | Mode::Flashing
+        ) {
+            return;
+        }
+        let _ = self.request_mode(Mode::Idle);
+    }
+
+    /// Whether every joint's measured speed is inside the shutdown rest
+    /// band — the condition the exit path waits on before idling the
+    /// drives.
+    pub fn at_rest(&self) -> bool {
+        self.qd_filt.iter().all(|v| v.abs() < SHUTDOWN_REST_RAD_S)
+    }
+
+    /// Shutdown phase 2: terminal limp. SAFETY_STOP's law is torque-only
+    /// 0 N·m, so the tick after this call puts a frame on the bus that
+    /// idles the drives on purpose — instead of leaving them to act on
+    /// the last motion frame until the CAN watchdog expires and drops
+    /// them out mid-hold. No-op in FLASHING (the bus is silent by
+    /// contract there, and the arm is parked and asserted).
+    pub fn shutdown_limp(&mut self) {
+        if self.mode == Mode::Flashing {
+            return;
+        }
+        let _ = self.request_mode(Mode::SafetyStop);
     }
 
     /// One tick of the core. `period_s` is the measured loop period (the

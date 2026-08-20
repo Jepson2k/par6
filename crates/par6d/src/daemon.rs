@@ -440,6 +440,10 @@ fn rt_loop(
         }
         core.run(&run_opts, &rt_break);
     }
+    // Deliberate exit: stop the arm and idle the drives with a terminal
+    // limp frame, instead of leaving them to act on the last motion frame
+    // until the CAN watchdog expires.
+    core.shutdown_stop();
     log::info!("RT thread stopped");
 }
 
