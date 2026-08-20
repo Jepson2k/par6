@@ -46,6 +46,7 @@ struct par6_kin {
     Eigen::VectorXd a_zero;
     Eigen::VectorXd dq;
     Eigen::VectorXd v_in;
+    Eigen::VectorXd a_in;
     Eigen::VectorXd tau_in;
     Mat6x J;
 
@@ -58,6 +59,7 @@ struct par6_kin {
         a_zero.setZero(model.nv);
         dq.setZero(model.nv);
         v_in.setZero(model.nv);
+        a_in.setZero(model.nv);
         tau_in.setZero(model.nv);
         J.setZero(6, model.nv);
     }
@@ -211,6 +213,25 @@ par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau) {
     try {
         h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
         pinocchio::rnea(h->model, h->data, h->q, h->v_zero, h->a_zero);
+        Eigen::Map<Eigen::VectorXd>(out_tau, h->model.nv) = h->data.tau;
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
+                                      const double *v, const double *a,
+                                      double *out_tau) {
+    if (h == nullptr || q == nullptr || v == nullptr || a == nullptr ||
+        out_tau == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        h->v_in = Eigen::Map<const Eigen::VectorXd>(v, h->model.nv);
+        h->a_in = Eigen::Map<const Eigen::VectorXd>(a, h->model.nv);
+        pinocchio::rnea(h->model, h->data, h->q, h->v_in, h->a_in);
         Eigen::Map<Eigen::VectorXd>(out_tau, h->model.nv) = h->data.tau;
         return PAR6_OK;
     } catch (const std::exception &) {

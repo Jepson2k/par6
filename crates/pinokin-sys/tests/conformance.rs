@@ -222,3 +222,71 @@ fn create_reports_urdf_and_frame_errors() {
         other => panic!("expected Create error, got {other:?}"),
     }
 }
+
+/// Inverse dynamics agrees with the gravity entry at rest, and the torque
+/// it adds under acceleration is the mass matrix acting on that
+/// acceleration.
+///
+/// The shim called `pinocchio::rnea` exactly once, always with its two zero
+/// vectors, so the only dynamics it could express was G(q). `Sample::tau_ff`
+/// was wired ring -> law -> wire and every planner wrote zeros into it,
+/// because there was nothing to compute a feedforward WITH.
+#[test]
+fn inverse_dynamics_reduces_to_gravity_at_rest_and_adds_symmetric_inertia() {
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), None).unwrap();
+    let nq = model.nq();
+    let zeros = vec![0.0; nq];
+
+    for (i, case) in fx.cases_flange.iter().enumerate() {
+        // Zero velocity and acceleration must reproduce G(q) exactly — not
+        // approximately: it is literally the same RNEA call.
+        let mut grav = vec![0.0; nq];
+        model.gravity_into(&case.q, &mut grav).unwrap();
+        let mut rest = vec![0.0; nq];
+        model
+            .inverse_dynamics_into(&case.q, &zeros, &zeros, &mut rest)
+            .unwrap();
+        for k in 0..nq {
+            assert_eq!(
+                rest[k], grav[k],
+                "case {i}: tau[{k}] at rest must equal the gravity entry"
+            );
+        }
+
+        // tau(q, 0, a) - G(q) is M(q)·a. Probing one axis at a time reads
+        // out M(q) column by column, and physics requires it symmetric with
+        // a positive diagonal.
+        if i > 0 {
+            continue;
+        }
+        let mut mass = vec![vec![0.0; nq]; nq];
+        for j in 0..nq {
+            let mut a = vec![0.0; nq];
+            a[j] = 1.0;
+            let mut tau = vec![0.0; nq];
+            model
+                .inverse_dynamics_into(&case.q, &zeros, &a, &mut tau)
+                .unwrap();
+            for k in 0..nq {
+                mass[k][j] = tau[k] - grav[k];
+            }
+        }
+        for j in 0..nq {
+            assert!(
+                mass[j][j] > 0.0,
+                "M[{j}][{j}] = {} must be positive",
+                mass[j][j]
+            );
+            for k in 0..j {
+                let (a, b) = (mass[j][k], mass[k][j]);
+                let scale = a.abs().max(b.abs()).max(1.0);
+                assert!(
+                    (a - b).abs() < 1e-8 * scale,
+                    "M[{j}][{k}] = {a:e} vs M[{k}][{j}] = {b:e}: not symmetric"
+                );
+            }
+        }
+    }
+}

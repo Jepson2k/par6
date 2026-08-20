@@ -98,6 +98,17 @@ extern "C" {
 
     pub fn par6_kin_gravity(h: *mut par6_kin, q: *const f64, out_tau: *mut f64) -> par6_status;
 
+    /// RNEA with real velocity and acceleration: the torque that produces
+    /// `a` at `q` with `v`. Gravity is included, so zero `v`/`a` reduces
+    /// exactly to [`par6_kin_gravity`].
+    pub fn par6_kin_inverse_dynamics(
+        h: *mut par6_kin,
+        q: *const f64,
+        v: *const f64,
+        a: *const f64,
+        out_tau: *mut f64,
+    ) -> par6_status;
+
     pub fn par6_kin_aba(
         h: *mut par6_kin,
         q: *const f64,

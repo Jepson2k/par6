@@ -79,6 +79,16 @@ par6_status par6_kin_jacobian(par6_kin *h, const double *q, double *out_J);
  * tool inertia when given at create. out_tau: nq doubles. */
 par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau);
 
+/** Inverse dynamics: the joint torque that produces acceleration `a` at
+ *  configuration `q` with velocity `v` (RNEA, gravity included).
+ *
+ *  `q` is `nq` doubles; `v`, `a` and `out_tau` are `nv`. Allocation-free.
+ *  Passing zero `v` and `a` reduces exactly to par6_kin_gravity().
+ */
+par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
+                                      const double *v, const double *a,
+                                      double *out_tau);
+
 /* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
  * the tool inertia when given at create. q/v/tau: nq doubles each;
  * out_a: nq doubles. Allocation-free after create. */
@@ -357,9 +367,13 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
  * v6: par6_col_apply_srdf added (SRDF disable_collisions on the robot's
  *     self pairs). Purely additive; a stale v5 library fails to link it.
  * v7: par6_col_world_distance added (world-pair-only escape-depth
- *     signal). Purely additive; a stale v6 library fails to link it. */
+ *     signal). Purely additive; a stale v6 library fails to link it.
+ * v8: par6_kin_inverse_dynamics added (RNEA with real velocity and
+ *     acceleration, so a planner can feed forward inertial torque instead
+ *     of the zeros Sample::tau_ff carried). Purely additive; a stale v7
+ *     library fails to link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 7
+#define PAR6_SHIM_ABI_VERSION 8
 
 #ifdef __cplusplus
 } /* extern "C" */

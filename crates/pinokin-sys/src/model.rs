@@ -210,6 +210,32 @@ impl Model {
         Self::check_status(status)
     }
 
+    /// Inverse dynamics: the torque producing acceleration `a` at `q`
+    /// with velocity `v`. Gravity is included, so zero `v` and `a` give
+    /// exactly [`Model::gravity_into`].
+    pub fn inverse_dynamics_into(
+        &mut self,
+        q: &[f64],
+        v: &[f64],
+        a: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), Error> {
+        self.check_len(q, self.nq)?;
+        self.check_len(v, self.nq)?;
+        self.check_len(a, self.nq)?;
+        self.check_len(out, self.nq)?;
+        let status = unsafe {
+            ffi::par6_kin_inverse_dynamics(
+                self.raw.as_ptr(),
+                q.as_ptr(),
+                v.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
+        Self::check_status(status)
+    }
+
     /// Convenience allocating variant of [`Model::gravity_into`].
     pub fn gravity(&mut self, q: &[f64]) -> Result<Vec<f64>, Error> {
         let mut out = vec![0.0; self.nq];
