@@ -10,11 +10,13 @@ tests instead of failing, so a checkout without a Rust build stays green.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import queue
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -69,12 +71,28 @@ def repo_assets_dir() -> Path | None:
 
 
 def daemon_env() -> dict[str, str]:
-    """Environment for the daemon under test."""
+    """Environment for the daemon under test.
+
+    The bus-ownership grant (``loop_tick`` / ``robot_mode``) is published
+    under fixed names, and a stopping daemon REMOVES them — so two test
+    runs sharing ``/dev/shm`` would delete each other's live claim. Ports
+    are already allocated per run; the grant needs the same treatment.
+    The Rust harness does this per process id; do the same here.
+    """
     env = dict(os.environ)
     assets = repo_assets_dir()
     if "PAR6_ASSETS" not in env and assets is not None:
         env["PAR6_ASSETS"] = str(assets)
+    env.setdefault("PAR6_SHM_DIR", str(_shm_dir()))
     return env
+
+
+@functools.lru_cache(maxsize=1)
+def _shm_dir() -> Path:
+    """A per-process scratch directory for this run's grant segments."""
+    path = Path(tempfile.gettempdir()) / f"par6-test-shm-{os.getpid()}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def free_udp_port() -> int:

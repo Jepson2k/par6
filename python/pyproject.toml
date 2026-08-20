@@ -39,6 +39,9 @@ dependencies = [
   "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-manylinux_2_39_aarch64.whl ; python_version == '3.14' and platform_system == 'Linux' and platform_machine == 'aarch64'",
 ]
 
+[project.scripts]
+par6 = "par6.cli:main"
+
 [project.optional-dependencies]
 # ruff is pinned: it was unpinned and unconfigured, so CI installed whatever
 # was newest and linted against that version's default rule set while devs ran

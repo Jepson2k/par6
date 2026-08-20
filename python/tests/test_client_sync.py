@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import socket
 import threading
 
 import pytest
@@ -109,3 +110,30 @@ def test_sync_facade_refuses_use_inside_a_running_loop(threaded_peer):
             asyncio.run(misuse())
     finally:
         client.close()
+
+
+def test_cli_reads_a_live_runtime_and_reports_an_unreachable_one(threaded_peer, capsys):
+    """The console script is the shell view of the sync client.
+
+    par6 shipped no [project.scripts] at all, so the only way to read an
+    arm's state was to write Python. Drive the real entry point against the
+    scripted peer, then against an address nothing answers — a CLI that
+    exits 0 on an unreachable runtime is worse than no CLI.
+    """
+    from par6.cli import EXIT_UNREACHABLE, main
+
+    peer, _ = threaded_peer
+    host, port = peer.address
+
+    assert main(["--host", host, "--port", str(port), "angles"]) == 0
+    reported = [float(v) for v in capsys.readouterr().out.split()]
+    assert reported == pytest.approx(ANGLES)
+
+    # Nothing is listening on a port we know is free.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead = int(probe.getsockname()[1])
+    assert main(["--host", "127.0.0.1", "--port", str(dead), "--timeout", "0.2", "angles"]) == (
+        EXIT_UNREACHABLE
+    )
+    assert "did not answer" in capsys.readouterr().err

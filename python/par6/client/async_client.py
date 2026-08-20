@@ -183,7 +183,9 @@ class StatusResult:
     speeds: list[float]
     """Joint speeds (rad/s)."""
     io: list[int]
-    """Digital I/O [in1, in2, out1, out2, estop]."""
+    """Digital I/O: the configured inputs, then the outputs, then the
+    e-stop — which is ALWAYS the last element. The width follows the
+    `[io]` config block, so index by role, never by a fixed position."""
     tool_status: ToolStatus | None
     """Tool status, if a tool is selected."""
 
