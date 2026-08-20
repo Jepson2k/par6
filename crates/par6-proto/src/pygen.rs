@@ -8,8 +8,8 @@
 use std::fmt::Write;
 
 use crate::enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, Frame, MsgType, QueryType,
-    ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
+    MsgType, QueryType, ToolState,
 };
 use crate::error::ErrorCode;
 use crate::status::{STATUS_HEADER_LEN, STATUS_LEN};
@@ -88,6 +88,12 @@ pub fn generate() -> String {
         "ActionState",
         "State of the currently executing action.",
         ActionState::variants(),
+    );
+    emit_enum(
+        &mut out,
+        "ControllerMode",
+        "Controller mode as published on STATUS.",
+        ControllerMode::variants(),
     );
     emit_enum(
         &mut out,

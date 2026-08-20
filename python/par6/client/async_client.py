@@ -60,6 +60,7 @@ from ..protocol.constants import (
     NUM_JOINTS,
     CmdType,
     CompletionPolicy,
+    ControllerMode,
     Frame,
     MsgType,
 )
@@ -1375,6 +1376,44 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_gravity_comp(True)
         """
         return await self._system(CmdType.SET_GRAVITY_COMP, [bool(on)])
+
+    async def freedrive(self, enabled: bool) -> int:
+        """Enter or leave freedrive (hand-guiding).
+
+        par6 has no separate freedrive mode and does not need one: with the
+        gravity feedforward applied, IDLE emits a torque-only G(q) hold with
+        no position term, so a homed and enabled arm floats and can be
+        pushed by hand. Freedrive here is therefore exactly that switch.
+
+        Category: Control
+
+        Example:
+            rbt.freedrive(True)
+        """
+        return await self.set_gravity_comp(enabled)
+
+    async def is_freedrive(self, timeout: float = 1.0) -> bool:
+        """Whether the arm is floating right now.
+
+        Reads the broadcast rather than trusting the last command: the
+        condition is the runtime's own ``gravity_applied()`` — IDLE, homed,
+        enabled, gravity on. Anything else has a position term holding the
+        arm, so it is not back-driveable no matter what was last requested.
+
+        Reads the LATEST received broadcast rather than waiting for the
+        next one — waiting would make the answer depend on which frame
+        happened to land first. Blocks only when no status has arrived at
+        all, and reports False if none ever does: an arm whose state is
+        unknown is not one to declare safe to grab.
+
+        Category: Control
+        """
+        if self._status_generation == 0:
+            await self.wait_status(lambda _s: True, timeout=timeout)
+        s = self._shared_status
+        return bool(
+            s.mode == ControllerMode.IDLE and s.homed and s.enabled and s.gravity_comp
+        )
 
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.

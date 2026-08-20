@@ -25,6 +25,41 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// Controller mode as published on STATUS.
+    ///
+    /// This is the WIRE's mode vocabulary, not the RT core's. `par6-rt`
+    /// deliberately does not depend on `par6-proto`, so `par6-server` maps
+    /// its `Mode` onto this with an exhaustive match — which is what forces
+    /// a decision when a new RT mode appears rather than silently leaking a
+    /// discriminant whose meaning nobody pinned.
+    ControllerMode: u8 {
+        /// Bus scan and selfcheck; requests IDLE when it passes.
+        Booting = 0,
+        /// At rest. With gravity comp on and the arm homed and enabled this
+        /// is a torque-only hold with no position term — i.e. freedrive.
+        Idle = 1,
+        /// Hard-error latch: active zero-velocity hold, drives DISABLED.
+        ActiveError = 2,
+        /// The homing FSM owns the bus.
+        Homing = 3,
+        /// Manual jogging.
+        Jog = 4,
+        /// Streamed external control.
+        Stream = 5,
+        /// Queued planned motion consuming the sample ring.
+        Exec = 6,
+        /// Hand guiding (declared; the RT refuses it as unimplemented).
+        HandGuiding = 7,
+        /// Joint-space impedance (declared; refused as unimplemented).
+        Impedance = 8,
+        /// Limp: torque-only zero, so the arm can be moved by hand.
+        SafetyStop = 9,
+        /// Bus granted to an external flasher.
+        Flashing = 10,
+    }
+}
+
+wire_enum! {
     /// Command tags (slot 0 of every client→server payload).
     ///
     /// Values are grouped by ack class — SYSTEM 10+, QUERY 30+,

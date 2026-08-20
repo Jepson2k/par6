@@ -1621,6 +1621,7 @@ impl<B: DriverBus> RtCore<B> {
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
+        s.gravity_comp = self.gravity_comp;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);

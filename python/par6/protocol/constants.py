@@ -13,7 +13,7 @@ POSE_ELEMS = 16
 IO_SLOTS = 11
 MAX_IO_SLOTS = 64
 EN_SLOTS = 12
-STATUS_LEN = 31
+STATUS_LEN = 35
 STATUS_HEADER_LEN = 7
 
 
@@ -121,6 +121,22 @@ class ActionState(IntEnum):
     IDLE = 0
     EXECUTING = 1
     ERROR = 2
+
+
+class ControllerMode(IntEnum):
+    """Controller mode as published on STATUS."""
+
+    BOOTING = 0
+    IDLE = 1
+    ACTIVE_ERROR = 2
+    HOMING = 3
+    JOG = 4
+    STREAM = 5
+    EXEC = 6
+    HAND_GUIDING = 7
+    IMPEDANCE = 8
+    SAFETY_STOP = 9
+    FLASHING = 10
 
 
 class CompletionPolicy(IntEnum):

@@ -12,23 +12,23 @@
 //!  queued_duration f64, action_params str, tool_status nil|ts8,
 //!  tcp_speed f64, simulator_active bool, collision_active bool,
 //!  collision_pairs [[str,str]], scene_epoch u64, accepted_index i64,
-//!  homed bool]
+//!  homed bool, tau f64[6], mode u8, enabled bool, gravity_comp bool]
 //! ```
 //!
-//! 31 elements total. STATUS is broadcast even when the bus link is down —
+//! 35 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
 
 use crate::command::r_len;
-use crate::enums::{ActionState, MsgType};
+use crate::enums::{ActionState, ControllerMode, MsgType};
 use crate::error::WireError;
 use crate::reply::ToolStatusWire;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
 
 /// Total number of elements in a v2 STATUS array (including the tag).
-pub const STATUS_LEN: usize = 31;
+pub const STATUS_LEN: usize = 35;
 /// Number of header elements (tag through `data_age_ms`).
 pub const STATUS_HEADER_LEN: usize = 7;
 
@@ -100,6 +100,17 @@ pub struct Status {
     pub accepted_index: i64,
     /// All joints homed.
     pub homed: bool,
+    /// Measured joint torque \[Nm\], kt-calibrated and filtered.
+    pub tau: [f64; NUM_JOINTS],
+    /// Controller mode. `par6-server` maps the RT core's own `Mode` onto
+    /// this with an exhaustive match, so the wire vocabulary is owned here.
+    pub mode: ControllerMode,
+    /// Drive authority is granted (the RT's `ArmState::Enabled`).
+    pub enabled: bool,
+    /// The gravity feedforward is being applied. With `mode` IDLE and the
+    /// arm homed and enabled, this is exactly the freedrive condition:
+    /// torque-only G(q) with no position hold.
+    pub gravity_comp: bool,
 }
 
 impl Default for Status {
@@ -135,6 +146,10 @@ impl Default for Status {
             scene_epoch: 0,
             accepted_index: -1,
             homed: false,
+            tau: [0.0; NUM_JOINTS],
+            mode: ControllerMode::Booting,
+            enabled: false,
+            gravity_comp: false,
         }
     }
 }
@@ -203,6 +218,13 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     w_uint(buf, s.scene_epoch);
     w_int(buf, s.accepted_index);
     w_bool(buf, s.homed);
+    w_array(buf, NUM_JOINTS);
+    for v in s.tau {
+        w_f64(buf, v);
+    }
+    w_uint(buf, u64::from(s.mode as u8));
+    w_bool(buf, s.enabled);
+    w_bool(buf, s.gravity_comp);
 }
 
 /// Reusable STATUS encoder: owns the broadcast buffer so the hot path
@@ -381,6 +403,14 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     let scene_epoch = r.uint()?;
     let accepted_index = r.int()?;
     let homed = r.bool()?;
+    let tau: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.tau")?;
+    let raw_mode = r.uint()? as i64;
+    let mode = ControllerMode::from_wire(raw_mode).ok_or(DecodeError::InvalidEnum {
+        what: "controller mode",
+        value: raw_mode,
+    })?;
+    let enabled = r.bool()?;
+    let gravity_comp = r.bool()?;
 
     // Forward compatibility: skip any fields a newer producer appended.
     for _ in STATUS_LEN..n {
@@ -419,5 +449,9 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         scene_epoch,
         accepted_index,
         homed,
+        tau,
+        mode,
+        enabled,
+        gravity_comp,
     })
 }

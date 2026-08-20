@@ -16,7 +16,7 @@ from protocol_peer import ANGLES, ScriptedRuntime, start_peer
 
 from par6.client import RobotClient
 from par6.protocol import wire
-from par6.protocol.constants import CmdType, MsgType
+from par6.protocol.constants import CmdType, ControllerMode, MsgType
 
 
 @pytest.fixture
@@ -137,3 +137,52 @@ def test_cli_reads_a_live_runtime_and_reports_an_unreachable_one(threaded_peer, 
         EXIT_UNREACHABLE
     )
     assert "did not answer" in capsys.readouterr().err
+
+
+def test_freedrive_reads_the_broadcast_not_the_last_command(threaded_peer):
+    """Freedrive is a state of the arm, not a flag the client remembers.
+
+    par6 has no freedrive MODE: with the gravity feedforward applied, IDLE
+    emits a torque-only G(q) hold with no position term, so the arm floats.
+    That means the honest answer to "is it floating?" is the runtime's own
+    gravity_applied() condition, read off STATUS — IDLE, homed, enabled,
+    gravity on. Gravity comp is also applied in JOG/EXEC/STREAM, where a
+    position term IS holding the arm, so trusting the last set_gravity_comp
+    would report freedrive while the arm was rigidly tracking a trajectory.
+    """
+    peer, peer_loop = threaded_peer
+    host, port = peer.address
+    with RobotClient(
+        host=host, port=port, timeout=1.0, retries=1,
+        status_transport="UNICAST", status_port=0,
+    ) as client:
+        assert client.wait_ready(timeout=2.0) is True
+        addr = client._inner.status_address
+        assert addr is not None
+
+        def publish_and_settle(seq: int, **kw):
+            """Publish a frame and block until THAT frame has been decoded.
+
+            Without the seq wait this races: the client would answer from
+            whichever frame arrived first, which made this test flaky.
+            """
+            peer_loop.call_soon_threadsafe(
+                functools.partial(peer.send_status, addr, seq=seq, **kw)
+            )
+            assert client.wait_status(lambda s: s.seq == seq, timeout=2.0) is True
+
+        # Floating: IDLE, homed, enabled, gravity applied.
+        publish_and_settle(10, mode=int(ControllerMode.IDLE), homed=True,
+                           enabled=True, gravity_comp=True)
+        assert client.is_freedrive() is True
+
+        # Same gravity switch, but EXEC is tracking a trajectory — a
+        # position term is holding the arm, so it is not back-driveable.
+        publish_and_settle(11, mode=int(ControllerMode.EXEC), homed=True,
+                           enabled=True, gravity_comp=True)
+        assert client.is_freedrive() is False
+
+        # And IDLE without the feedforward is an active zero-velocity hold.
+        publish_and_settle(12, mode=int(ControllerMode.IDLE), homed=True,
+                           enabled=True, gravity_comp=False)
+        assert client.is_freedrive() is False

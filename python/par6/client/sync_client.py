@@ -405,6 +405,14 @@ class RobotClient:
         """
         return _run(self._inner.safety_stop())
 
+    def freedrive(self, enabled: bool) -> int:
+        """Enter or leave freedrive: IDLE under G(q) with no position hold."""
+        return _run(self._inner.freedrive(enabled))
+
+    def is_freedrive(self, timeout: float = 1.0) -> bool:
+        """Whether the arm is floating right now, read from the broadcast."""
+        return _run(self._inner.is_freedrive(timeout=timeout))
+
     def set_gravity_comp(self, on: bool) -> int:
         """Apply (or stop applying) the gravity-compensation feedforward.
 

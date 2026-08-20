@@ -19,7 +19,9 @@ use crate::command::{
     ServoL, SetCompletionPolicy, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator, Stop,
     Teleport, ToolAction, ToolParam, WriteIo,
 };
-use crate::enums::{command_class, ActionState, CompletionPolicy, Frame, ToolState};
+use crate::enums::{
+    command_class, ActionState, CompletionPolicy, ControllerMode, Frame, ToolState,
+};
 use crate::error::{make_error, ErrorCode, UNATTRIBUTED};
 use crate::pygen;
 use crate::reply::{encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
@@ -260,6 +262,10 @@ fn status_fields(s: &Status) -> Value {
         "link_ok": s.link_ok,
         "data_age_ms": s.data_age_ms,
         "pose": s.pose.to_vec(),
+        "tau": s.tau.to_vec(),
+        "mode": s.mode as u8,
+        "enabled": s.enabled,
+        "gravity_comp": s.gravity_comp,
         "angles": s.angles.to_vec(),
         "speeds": s.speeds.to_vec(),
         "io": s.io.to_vec(),
@@ -377,6 +383,12 @@ fn status_full_fixture() -> Status {
         scene_epoch: 5,
         accepted_index: 14,
         homed: true,
+        // Non-default on every new field, so a decoder that silently
+        // defaults them cannot pass the cross-language vector.
+        tau: [0.75, -1.5, 0.25, -0.125, 0.0625, -0.03125],
+        mode: ControllerMode::Exec,
+        enabled: true,
+        gravity_comp: true,
     }
 }
 

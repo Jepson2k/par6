@@ -379,6 +379,8 @@ pub struct StateSnapshot {
     pub qd_filtered: [f64; MAX_JOINTS],
     /// Filtered measured torques \[Nm\].
     pub tau_filtered: [f64; MAX_JOINTS],
+    /// The gravity feedforward is being applied this tick.
+    pub gravity_comp: bool,
     /// Commanded joint positions \[rad\] (post-limiter, what went on the bus).
     pub q_commanded: [f64; MAX_JOINTS],
     /// Commanded joint velocities \[rad/s\].
@@ -463,6 +465,7 @@ impl Default for StateSnapshot {
             q_filtered: [0.0; MAX_JOINTS],
             qd_filtered: [0.0; MAX_JOINTS],
             tau_filtered: [0.0; MAX_JOINTS],
+            gravity_comp: false,
             q_commanded: [0.0; MAX_JOINTS],
             qd_commanded: [0.0; MAX_JOINTS],
             tau_commanded: [0.0; MAX_JOINTS],

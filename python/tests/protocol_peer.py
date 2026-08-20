@@ -16,6 +16,7 @@ from typing import cast
 from par6.protocol import wire
 from par6.protocol.constants import (
     COMMAND_CLASS,
+    STATUS_LEN,
     CmdType,
     CommandClass,
     MsgType,
@@ -100,8 +101,18 @@ def status_frame(
     last_checkpoint: str = "",
     tool_status: list | None = None,
     homed: bool = True,
+    tau: Sequence[float] | None = None,
+    mode: int = 0,
+    enabled: bool = False,
+    gravity_comp: bool = False,
 ) -> bytes:
-    """A full 31-element v2 STATUS packet with the given overrides."""
+    """A full STATUS packet (``STATUS_LEN`` elements) with the overrides.
+
+    The element count is asserted rather than trusted: this list is written
+    by hand, and a decoder only rejects a packet SHORTER than it expects. A
+    peer that silently stopped one element short would leave every later
+    field reading as its default while every peer-driven test stayed green.
+    """
     arr = [
         int(MsgType.STATUS),
         2,          # proto_version
@@ -134,7 +145,15 @@ def status_frame(
         0,          # scene_epoch
         accepted_index,
         homed,
+        list(tau) if tau is not None else [0.0] * 6,
+        mode,
+        enabled,
+        gravity_comp,
     ]
+    if len(arr) != STATUS_LEN:
+        raise AssertionError(
+            f"status_frame builds {len(arr)} elements, the wire declares {STATUS_LEN}"
+        )
     return wire.encode_wire(arr)
 
 

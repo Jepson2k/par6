@@ -37,6 +37,7 @@ from .constants import (
     STATUS_LEN,
     CmdType,
     CompletionPolicy,
+    ControllerMode,
     Frame,
     MsgType,
     QueryType,
@@ -636,6 +637,10 @@ class StatusBuffer:
     scene_epoch: int = 0
     accepted_index: int = -1
     homed: bool = False
+    tau: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
+    mode: ControllerMode = ControllerMode.BOOTING
+    enabled: bool = False
+    gravity_comp: bool = False
     # Aliases into the two enable arrays the decoder mutates in place.
     cart_en: dict[str, np.ndarray] = field(init=False, repr=False, compare=False)
 
@@ -740,6 +745,10 @@ def decode_status_bin_into(data: bytes, buf: StatusBuffer) -> bool:
         buf.scene_epoch = msg[28]
         buf.accepted_index = msg[29]
         buf.homed = bool(msg[30])
+        buf.tau[:] = msg[31]
+        buf.mode = ControllerMode(msg[32])
+        buf.enabled = bool(msg[33])
+        buf.gravity_comp = bool(msg[34])
         return True
     except Exception as e:  # malformed packet: report False, never raise
         logger.debug("decode_status_bin_into: %s", e)

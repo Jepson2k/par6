@@ -23,6 +23,7 @@ from par6.protocol.constants import (
     ActionState,
     CmdType,
     CommandClass,
+    ControllerMode,
     MsgType,
     QueryType,
     ToolState,
@@ -201,6 +202,10 @@ def test_status_vectors(entry):
     assert buf.scene_epoch == f["scene_epoch"]
     assert buf.accepted_index == f["accepted_index"]
     assert buf.homed == f["homed"]
+    assert buf.tau.tolist() == f["tau"]
+    assert buf.mode == ControllerMode(f["mode"])
+    assert buf.enabled == f["enabled"]
+    assert buf.gravity_comp == f["gravity_comp"]
 
 
 def test_status_decode_is_allocation_stable():

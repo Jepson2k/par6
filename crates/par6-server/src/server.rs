@@ -38,9 +38,9 @@ use std::time::Instant;
 
 use par6_proto::{
     command_class, decode_chunk, decode_command, encode_reply, make_error, peek_tag, ActionState,
-    CmdType, Command, CommandClass, CompletionPolicy, DecodeError, ErrorCode, LoopStatsResult,
-    MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState, ToolStatusWire,
-    WireError, EN_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
+    CmdType, Command, CommandClass, CompletionPolicy, ControllerMode, DecodeError, ErrorCode,
+    LoopStatsResult, MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState,
+    ToolStatusWire, WireError, EN_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
 };
 use par6_rt::{ArmState, Mode, StateSnapshot};
 use tokio::net::UdpSocket;
@@ -1638,6 +1638,37 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             scene_epoch: self.scene_epoch,
             accepted_index: self.accepted_index,
             homed: self.snap.homed,
+            // Filtered, not raw: this is an operator readout, and the raw
+            // per-tick current estimate is noisy.
+            tau: {
+                let mut out = [0.0; par6_proto::NUM_JOINTS];
+                out.copy_from_slice(&self.snap.tau_filtered[..par6_proto::NUM_JOINTS]);
+                out
+            },
+            mode: Self::wire_mode(self.snap.mode),
+            enabled: self.snap.state == ArmState::Enabled,
+            gravity_comp: self.snap.gravity_comp,
+        }
+    }
+
+    /// The RT core's mode in the wire's own vocabulary.
+    ///
+    /// Exhaustive on purpose: `par6-rt` does not depend on `par6-proto`, so a
+    /// new RT mode has to be given a wire meaning here rather than silently
+    /// riding a discriminant.
+    fn wire_mode(mode: Mode) -> ControllerMode {
+        match mode {
+            Mode::Booting => ControllerMode::Booting,
+            Mode::Idle => ControllerMode::Idle,
+            Mode::ActiveError => ControllerMode::ActiveError,
+            Mode::Homing => ControllerMode::Homing,
+            Mode::Jog => ControllerMode::Jog,
+            Mode::Stream => ControllerMode::Stream,
+            Mode::Exec => ControllerMode::Exec,
+            Mode::HandGuiding => ControllerMode::HandGuiding,
+            Mode::Impedance => ControllerMode::Impedance,
+            Mode::SafetyStop => ControllerMode::SafetyStop,
+            Mode::Flashing => ControllerMode::Flashing,
         }
     }
 

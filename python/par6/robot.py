@@ -553,6 +553,13 @@ class Robot(_RobotABC):
     def digital_inputs(self) -> int:
         return len(_cfg.io_line_names()[0])
 
+    @property
+    def has_freedrive(self) -> bool:
+        """par6 back-drives through the gravity feedforward rather than a
+        dedicated mode: IDLE with G(q) applied is a torque-only hold with no
+        position term, so the arm floats."""
+        return True
+
     # -- Visualization ------------------------------------------------------
 
     @property

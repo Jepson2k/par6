@@ -1642,6 +1642,7 @@
         "completed_index": 11,
         "controller_id": 12648430,
         "data_age_ms": 4,
+        "enabled": true,
         "error": [
           12,
           53,
@@ -1651,6 +1652,7 @@
           "Choose a different target or add intermediate waypoints."
         ],
         "executing_index": 12,
+        "gravity_comp": true,
         "homed": true,
         "io": [
           1,
@@ -1675,6 +1677,7 @@
         ],
         "last_checkpoint": "approach",
         "link_ok": 1,
+        "mode": 6,
         "mono_time_ns": 3600000000123,
         "pose": [
           1.0,
@@ -1707,6 +1710,14 @@
           0.3,
           0.0,
           0.05
+        ],
+        "tau": [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
         ],
         "tcp_speed": 33.25,
         "tool_status": [
@@ -1861,6 +1872,17 @@
         ],
         5,
         14,
+        true,
+        [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
+        ],
+        6,
+        true,
         true
       ]
     },
@@ -1911,8 +1933,10 @@
         "completed_index": -1,
         "controller_id": 0,
         "data_age_ms": 0,
+        "enabled": false,
         "error": null,
         "executing_index": -1,
+        "gravity_comp": false,
         "homed": false,
         "io": [
           0,
@@ -1943,6 +1967,7 @@
         ],
         "last_checkpoint": "",
         "link_ok": 0,
+        "mode": 0,
         "mono_time_ns": 0,
         "pose": [
           0.0,
@@ -1969,6 +1994,14 @@
         "seq": 0,
         "simulator_active": false,
         "speeds": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "tau": [
           0.0,
           0.0,
           0.0,
@@ -2095,6 +2128,17 @@
         [],
         0,
         -1,
+        false,
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        0,
+        false,
         false
       ]
     },
@@ -2150,6 +2194,7 @@
         "completed_index": 11,
         "controller_id": 12648430,
         "data_age_ms": 4,
+        "enabled": true,
         "error": [
           12,
           53,
@@ -2159,6 +2204,7 @@
           "Choose a different target or add intermediate waypoints."
         ],
         "executing_index": 12,
+        "gravity_comp": true,
         "homed": true,
         "io": [
           1,
@@ -2183,6 +2229,7 @@
         ],
         "last_checkpoint": "approach",
         "link_ok": 1,
+        "mode": 6,
         "mono_time_ns": 3600000000123,
         "pose": [
           1.0,
@@ -2215,6 +2262,14 @@
           0.3,
           0.0,
           0.05
+        ],
+        "tau": [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
         ],
         "tcp_speed": 33.25,
         "tool_status": [
@@ -2370,6 +2425,17 @@
         5,
         14,
         true,
+        [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
+        ],
+        6,
+        true,
+        true,
         "future-field",
         1.25
       ]
@@ -2426,6 +2492,7 @@
         "completed_index": 11,
         "controller_id": 12648430,
         "data_age_ms": 4,
+        "enabled": true,
         "error": [
           12,
           53,
@@ -2435,6 +2502,7 @@
           "Choose a different target or add intermediate waypoints."
         ],
         "executing_index": 12,
+        "gravity_comp": true,
         "homed": true,
         "io": [
           1,
@@ -2465,6 +2533,7 @@
         ],
         "last_checkpoint": "approach",
         "link_ok": 1,
+        "mode": 6,
         "mono_time_ns": 3600000000123,
         "pose": [
           1.0,
@@ -2497,6 +2566,14 @@
           0.3,
           0.0,
           0.05
+        ],
+        "tau": [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
         ],
         "tcp_speed": 33.25,
         "tool_status": [
@@ -2657,6 +2734,17 @@
         ],
         5,
         14,
+        true,
+        [
+          0.75,
+          -1.5,
+          0.25,
+          -0.125,
+          0.0625,
+          -0.03125
+        ],
+        6,
+        true,
         true
       ]
     },
