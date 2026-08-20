@@ -72,6 +72,15 @@ def test_sync_facade_smoke(threaded_peer):
         assert client.jog_j(1, 0.4, 0.2) == 1
         assert client.stop() == 1
 
+        # The two control commands a synchronous script needs to make the
+        # arm safe to touch: limp it, and float it under G(q) alone. Both
+        # reached the async client only, so a sync-only consumer could do
+        # neither. Assert they land on the wire, with the flag carried.
+        assert client.safety_stop() == 1
+        assert peer.of(CmdType.SAFETY_STOP), "safety_stop never reached the wire"
+        assert client.set_gravity_comp(True) == 1
+        assert peer.of(CmdType.SET_GRAVITY_COMP)[-1][2] == [True]
+
         # Status stream reaches the facade: wait on a checkpoint frame.
         status_addr = client._inner.status_address
         assert status_addr is not None

@@ -124,13 +124,20 @@ class MotionLimits:
                 )
 
     def scaled(self, accel_fraction: float) -> "MotionLimits":
-        """Acceleration scaled by a move's ``accel`` parameter."""
+        """Acceleration and jerk scaled by a move's ``accel`` parameter.
+
+        Jerk rides the acceleration fraction, matching the streaming path
+        (``MotionStream::set_scale``): a move asked to accelerate gently
+        that kept the full jerk ceiling would reach the lower acceleration
+        just as abruptly, which is the jolt the fraction is asking to
+        avoid. An unconstrained (infinite) jerk stays unconstrained.
+        """
         if accel_fraction == 1.0:
             return self
         return MotionLimits(
             velocity=self.velocity,
             acceleration=self.acceleration * accel_fraction,
-            jerk=self.jerk,
+            jerk=self.jerk * accel_fraction,
             soft_min=self.soft_min,
             soft_max=self.soft_max,
         )

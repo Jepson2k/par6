@@ -396,6 +396,23 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
+    def safety_stop(self) -> int:
+        """Drop every joint limp and hold there.
+
+        Unlike :meth:`estop`, which holds position under power, this removes
+        drive authority — so a trapped person or a jammed joint can be freed
+        by hand.
+        """
+        return _run(self._inner.safety_stop())
+
+    def set_gravity_comp(self, on: bool) -> int:
+        """Apply (or stop applying) the gravity-compensation feedforward.
+
+        With it on in IDLE the arm floats under G(q) alone with no position
+        hold, which is what makes hand-guiding reachable.
+        """
+        return _run(self._inner.set_gravity_comp(on))
+
     def reset(self) -> int:
         """Clear a latched protective stop."""
         return _run(self._inner.reset())

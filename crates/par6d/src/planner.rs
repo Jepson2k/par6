@@ -636,6 +636,14 @@ impl Par6Planner {
             for a in limits.acceleration.iter_mut() {
                 *a *= accel;
             }
+            // Jerk rides the acceleration fraction, matching the streaming
+            // path (`MotionStream::set_scale`): a move asked to accelerate
+            // gently that kept the full jerk ceiling would reach the lower
+            // acceleration just as abruptly, which is the jolt the fraction
+            // is asking to avoid. An infinite jerk stays infinite.
+            for j in limits.jerk.iter_mut() {
+                *j *= accel;
+            }
         }
         let mut builder = ProgramBuilder::new(*start, limits, self.dt).map_err(planning_error)?;
         builder
