@@ -33,7 +33,7 @@ use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
 };
-use par6_config::{ConfigBundle, ControlMode, KtSource, MAX_IO_LINES};
+use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
@@ -313,6 +313,7 @@ pub struct RtCore<B: DriverBus> {
     /// configured exactly as the one opened at startup was.
     boot: BootConfig,
     torque_ma_factor: [f64; MAX_JOINTS],
+    torque_slew: dispatch::TorqueSlew,
     torque_cal: [TorqueCal; MAX_JOINTS],
     /// `kt_source = "auto"`: adopt the drivers' own kt at the boot
     /// one-shot, before anything can be enabled.
@@ -462,6 +463,16 @@ impl<B: DriverBus> RtCore<B> {
         // (`kt_source = "auto"`), which happens while still BOOTING.
         let torque_ma_factor: [f64; MAX_JOINTS] =
             std::array::from_fn(|i| torque_cal[i].factor(torque_cal[i].kt_nm_a));
+        // Per-tick torque budget from each joint's declared slew ceiling.
+        // A joint that declares none is unlimited, which is the behaviour
+        // every joint had before the limit was enforced.
+        let torque_slew = dispatch::TorqueSlew::new(std::array::from_fn(|i| {
+            robot.joints[i]
+                .limits
+                .for_mode(LimitMode::Exec)
+                .torque_rate_nm_s
+                .map_or(f64::INFINITY, |rate| rate * dt)
+        }));
         let (writer, snapshots) = snapshot_channel::<StateSnapshot>();
         let (stream_tx, stream_rx) = snapshot_channel::<StreamSetpoint>();
         let heartbeat = Arc::new(AtomicBool::new(false));
@@ -486,6 +497,7 @@ impl<B: DriverBus> RtCore<B> {
                 config_repeats: robot.bus.boot_config_repeats,
             },
             torque_ma_factor,
+            torque_slew,
             torque_cal,
             kt_auto: robot.robot.kt_source == KtSource::Auto,
             node_of: std::array::from_fn(|i| robot.joints[i].node_id),
@@ -1511,10 +1523,16 @@ impl<B: DriverBus> RtCore<B> {
             _ => dispatch::law_booting(&mut self.setpoints),
         }
 
+        // The protective laws must reach the drive this tick, so they are
+        // never rate-limited; they snap the slew state instead, which is
+        // what makes the mode they hand back to ramp from zero.
+        let rate_limit = !matches!(self.mode, Mode::ActiveError | Mode::SafetyStop);
         dispatch::commit(
             &self.setpoints,
             &self.conv,
             &self.torque_ma_factor,
+            &mut self.torque_slew,
+            rate_limit,
             &mut self.cmds,
             &mut self.mirror,
         );

@@ -6,7 +6,7 @@ mod common;
 use common::{ConstGravity, Rig};
 use par6_bus::spectral::{torque_to_ma_factor, trunc_to_wire};
 use par6_bus::{JointCommand, Pack, Reply, TxRecord};
-use par6_config::KtSource;
+use par6_config::{KtSource, LimitMode};
 use par6_rt::{Mode, RtCommand, MAX_JOINTS};
 
 fn assert_zero_velocity(frames: &[JointCommand], ctx: &str) {
@@ -403,4 +403,78 @@ fn gripper_slot_gets_exactly_one_frame_every_tick() {
         .filter(|(_, r)| matches!(r, TxRecord::Gripper(_)))
         .collect();
     assert_eq!(grips.len(), 10, "one gripper-slot frame per tick");
+}
+
+/// Leaving a protective stop must RAMP the gravity feedforward back, not
+/// restore it in one tick.
+///
+/// `torque_rate_nm_s` was declared per joint in `PAR6.toml` (364 Nm/s on
+/// J1), range-validated on load and resolved into `ResolvedLimits` — and
+/// then read by nothing. SAFETY_STOP holds every joint at 0 Nm, so the
+/// single tick that took the arm back to IDLE restored the whole of G(q)
+/// at once: several Nm at the shoulder, delivered in one 4 ms tick.
+///
+/// The limit binds only on the way UP. Dropping drive authority is the one
+/// thing that may never be slowed down, so the protective laws are exempt
+/// and snap the slew state instead — which is precisely what makes the
+/// ramp start from zero rather than from a stale pre-stop value.
+#[test]
+fn leaving_safety_stop_ramps_gravity_instead_of_stepping_it() {
+    // Well above J1's per-tick budget so the ramp is several ticks long.
+    const HOLD: f64 = 5.0;
+    let g = [HOLD, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mut rig = Rig::with_gravity(Box::new(ConstGravity(g)));
+    let bundle = common::bundle();
+    let dt = bundle.robot.robot.tick_dt_s;
+    let budget = bundle.robot.joints[0]
+        .limits
+        .for_mode(LimitMode::Exec)
+        .torque_rate_nm_s
+        .expect("J1 declares a torque slew ceiling")
+        * dt;
+    assert!(
+        budget < HOLD,
+        "test is vacuous unless the hold exceeds one tick's budget \
+         ({HOLD} Nm vs {budget} Nm/tick)"
+    );
+
+    rig.ready();
+    rig.tick_n(20);
+    assert!(
+        (rig.snap().tau_commanded[0] - HOLD).abs() < 1e-9,
+        "the full hold should be reached given enough ticks"
+    );
+
+    // Down is immediate: a limp command is never rate-limited.
+    rig.cmd(RtCommand::SetMode(Mode::SafetyStop));
+    assert_eq!(
+        rig.snap().tau_commanded[0],
+        0.0,
+        "SAFETY_STOP must drop authority this tick, not over several"
+    );
+
+    // Up is rationed, and no single tick may exceed the declared budget.
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
+    let mut prev = 0.0;
+    let mut ticks = 1;
+    loop {
+        let tau = rig.snap().tau_commanded[0];
+        assert!(
+            tau - prev <= budget + 1e-9,
+            "tick {ticks} jumped {:.4} Nm against a {:.4} Nm budget",
+            tau - prev,
+            budget
+        );
+        prev = tau;
+        if (tau - HOLD).abs() < 1e-9 {
+            break;
+        }
+        assert!(ticks < 50, "the hold never converged: stuck at {tau:.4} Nm");
+        ticks += 1;
+        rig.tick();
+    }
+    assert!(
+        ticks > 1,
+        "the hold came back in a single tick — the slew limit is not enforced"
+    );
 }
