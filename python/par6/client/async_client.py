@@ -1,22 +1,12 @@
-"""Async UDP client for the par6d runtime — protocol v2.
+"""Async client for the par6d runtime — protocol v2.
 
-Implements the waldoctl ``RobotClient`` ABC on top of the frozen wire layer in
-:mod:`par6.protocol`:
-
-- req_id correlation: every in-flight request owns a future in a pending map;
-  replies are matched by the echoed req_id, never by arrival order.
-- Retries: queries retry with backoff under the same req_id; QUEUED commands
-  retry with the same idempotency key, which the runtime's dedup window turns
-  into an effectively-once enqueue (a retried enqueue re-acks the original
-  index).  SYSTEM commands are one send + wait.
-- Fire-and-forget commands (servo/jog/teleport) encode into a reused buffer.
-- Status subscription: multicast join with the protocol's failover ladder
-  (configured iface, then the primary NIC, then INADDR_ANY, then unicast),
-  decoding into ONE shared :class:`StatusBuffer` guarded by a generation
-  counter + ``asyncio.Event``.
-- Completion: COMPLETE pushes resolve per-index waiters; ``wait_command``
-  falls back to the status stream (``completed_index`` high-water plus the
-  protocol's stale-error ordering rule).
+Implements the waldoctl ``RobotClient`` ABC as a thin shim over the Rust
+engine's client (`par6._par6.CoreClient`, the `par6-client` crate). The
+transport — req_id correlation, retries with the idempotency-key dedup
+contract, the multicast status ladder, chunking, COMPLETE tracking — all
+lives in Rust; this layer owns the Python-facing API: waldoctl types and
+result containers, unit conventions, tool binding, and the ONE shared
+:class:`StatusBuffer` consumers iterate with :meth:`stream_status_shared`.
 
 Units at this API are mm and degrees (the waldoctl convention), which is
 also what the v2 wire carries — the runtime converts to SI internally.
@@ -30,15 +20,11 @@ import copy
 import logging
 import math
 import os
-import random
-import socket
-import struct
 import time
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-import msgspec
 import numpy as np
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
@@ -55,24 +41,16 @@ from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
+from par6._par6 import CoreClient, RobotWireError
+
 from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import (
     NUM_JOINTS,
-    CmdType,
     CompletionPolicy,
     ControllerMode,
     Frame,
-    MsgType,
 )
-from ..protocol.wire import (
-    ProtocolError,
-    StatusBuffer,
-    _validate_command,
-    decode_reply,
-    decode_status_bin_into,
-    encode_command,
-    split_into_chunks,
-)
+from ..protocol.wire import StatusBuffer, update_status_from_dict
 from .errors import RobotError
 
 logger = logging.getLogger(__name__)
@@ -80,10 +58,10 @@ logger = logging.getLogger(__name__)
 _AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
 _FRAMES: dict[str, Frame] = {"WRF": Frame.WRF, "TRF": Frame.TRF}
 
-_COMPLETIONS_KEPT = 1024
-
-# How often one error code may be logged for a reply nobody awaits.
-_UNCLAIMED_ERROR_PERIOD_S = 1.0
+#: How long one status_after poll blocks in the pump before re-checking
+#: for shutdown. Frames arrive far faster than this whenever a runtime is
+#: broadcasting; the value only bounds close() latency on a silent link.
+_STATUS_POLL_S = 0.5
 
 
 def _env_str(name: str, default: str) -> str:
@@ -147,19 +125,18 @@ def _matrix_to_pose(m: Sequence[float]) -> list[float]:
     return [x, y, z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
 
 
-def _wire_tool_status(raw: Sequence | None) -> ToolStatus | None:
+def _tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
     if raw is None:
         return None
-    key, state, engaged, part_detected, fault_code, positions, channels, variant = raw
     return ToolStatus(
-        key=canonical_tool_key(key),
-        variant_key=variant,
-        state=WToolState(state),
-        engaged=engaged,
-        part_detected=part_detected,
-        fault_code=fault_code,
-        positions=tuple(positions),
-        channels=tuple(channels),
+        key=canonical_tool_key(raw["key"]),
+        variant_key=raw["variant_key"],
+        state=WToolState(raw["state"]),
+        engaged=raw["engaged"],
+        part_detected=raw["part_detected"],
+        fault_code=raw["fault_code"],
+        positions=tuple(raw["positions"]),
+        channels=tuple(raw["channels"]),
     )
 
 
@@ -227,99 +204,8 @@ class QueueResult:
     queued_duration: float
 
 
-# ---------------------------------------------------------------------------
-# Sockets for the status subscription (spec failover ladder)
-# ---------------------------------------------------------------------------
-
-
-def _primary_iface_ip() -> str:
-    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        probe.connect(("1.1.1.1", 80))
-        return probe.getsockname()[0]
-    except OSError:
-        return "127.0.0.1"
-    finally:
-        probe.close()
-
-
-def _multicast_socket(group: str, port: int, iface: str) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        with contextlib.suppress(AttributeError, OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        try:
-            sock.bind(("", port))
-        except OSError:
-            sock.bind((iface, port))
-        group_raw = socket.inet_aton(group)
-        for member in (iface, _primary_iface_ip(), None):
-            try:
-                if member is None:
-                    mreq = struct.pack("=4sl", group_raw, socket.INADDR_ANY)
-                else:
-                    mreq = struct.pack("=4s4s", group_raw, socket.inet_aton(member))
-                sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP, mreq)
-                break
-            except OSError:
-                continue
-        else:
-            raise OSError(f"could not join multicast group {group}")
-        sock.setblocking(False)
-        return sock
-    except OSError:
-        sock.close()
-        raise
-
-
-def _unicast_socket(host: str, port: int) -> socket.socket:
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-    try:
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        with contextlib.suppress(AttributeError, OSError):
-            sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
-        sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 20)
-        try:
-            sock.bind((host, port))
-        except OSError:
-            sock.bind(("", port))
-        sock.setblocking(False)
-        return sock
-    except OSError:
-        sock.close()
-        raise
-
-
-class _ReplyProtocol(asyncio.DatagramProtocol):
-    """Command-endpoint protocol: forwards every datagram to the client."""
-
-    def __init__(self, on_datagram: Callable[[bytes], None]) -> None:
-        self._on_datagram = on_datagram
-
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._on_datagram(data)
-
-    def error_received(self, exc: Exception) -> None:
-        logger.debug("command endpoint error: %s", exc)
-
-
-class _StatusProtocol(asyncio.DatagramProtocol):
-    """Status-endpoint protocol: decodes into the client's shared buffer."""
-
-    def __init__(self, on_datagram: Callable[[bytes], None]) -> None:
-        self._on_datagram = on_datagram
-
-    def datagram_received(self, data: bytes, addr: tuple[str, int]) -> None:
-        self._on_datagram(data)
-
-    def error_received(self, exc: Exception) -> None:
-        logger.debug("status endpoint error: %s", exc)
-
-
 class AsyncRobotClient(_RobotClientABC):
-    """Async UDP client for the par6d runtime.
+    """Async client for the par6d runtime.
 
     All network knobs default from the ``PAR6_*`` env namespace, then to the
     config defaults (command port 6001, status port 6002, multicast
@@ -358,33 +244,16 @@ class AsyncRobotClient(_RobotClientABC):
         )
         self.mtu = mtu if mtu is not None else _env_int("PAR6_MTU", 1400)
 
-        self._transport: asyncio.DatagramTransport | None = None
-        self._status_transport: asyncio.DatagramTransport | None = None
-        self._status_sock: socket.socket | None = None
-        self._ep_lock = asyncio.Lock()
+        self._core: CoreClient | None = None
+        self._core_lock = asyncio.Lock()
         self._closed = False
 
-        # req_id correlation: one future per in-flight request.
-        self._pending: dict[int, asyncio.Future[tuple[MsgType, Any]]] = {}
-        # Last time each error code was logged for a reply nobody awaits.
-        self._unclaimed_errors: dict[int, float] = {}
-        self._req_id = random.randrange(1, 1 << 32)
-        self._transfer_id = random.randrange(0, 1 << 32)
-
-        # Reused TX buffer for fire-and-forget encodes.
-        self._tx_buf = bytearray(256)
-        self._encoder = msgspec.msgpack.Encoder()
-
-        # Shared status buffer + generation/event notification.
+        # Shared status buffer + generation/event notification, filled by
+        # the pump task from the engine's STATUS stream.
         self._shared_status = StatusBuffer()
         self._status_generation = 0
         self._status_event = asyncio.Event()
-        self._last_status_seq: int | None = None
-        self._status_seq_gaps = 0
-
-        # COMPLETE push bookkeeping.
-        self._completions: dict[int, tuple[bool, tuple | None]] = {}
-        self._complete_waiters: dict[int, list[asyncio.Future[tuple[bool, tuple | None]]]] = {}
+        self._status_task: asyncio.Task | None = None
 
         self._last_command_index: int | None = None
         self._active_tool_key: str | None = None
@@ -415,88 +284,94 @@ class AsyncRobotClient(_RobotClientABC):
         return self._port
 
     @property
-    def status_address(self) -> tuple[str, int] | None:
-        """Local (host, port) the status listener is bound to, once created."""
-        if self._status_sock is None:
-            return None
-        return self._status_sock.getsockname()
-
-    @property
     def status_seq_gaps(self) -> int:
         """Total STATUS packets lost so far, detected via header ``seq`` gaps."""
-        return self._status_seq_gaps
+        return self._core.status_seq_gaps() if self._core is not None else 0
 
-    async def _ensure_endpoint(self) -> None:
+    async def _ensure_core(self) -> CoreClient:
         if self._closed:
             raise RuntimeError("AsyncRobotClient is closed")
-        if self._transport is not None:
-            return
-        async with self._ep_lock:
+        core = self._core
+        if core is not None:
+            return core
+        async with self._core_lock:
             if self._closed:
                 raise RuntimeError("AsyncRobotClient is closed")
-            if self._transport is not None:
-                return
-            loop = asyncio.get_running_loop()
-            transport, _ = await loop.create_datagram_endpoint(
-                lambda: _ReplyProtocol(self._handle_reply),
-                remote_addr=(self._host, self._port),
+            if self._core is not None:
+                return self._core
+            core = await CoreClient.connect(
+                self._host,
+                self._port,
+                self.timeout,
+                self.retries,
+                self._status_transport_kind,
+                self._status_port,
+                self._mcast_group,
+                self._mcast_iface,
+                self._status_unicast_host,
+                self.mtu,
             )
-            self._transport = transport
-            await self._start_status_listener()
+            self._core = core
+            self._status_task = asyncio.create_task(self._status_pump())
             logger.info(
-                "par6 client endpoint: %s:%s (status %s @ %s)",
+                "par6 client endpoint: %s:%s (status %s @ port %s)",
                 self._host,
                 self._port,
                 self._status_transport_kind,
-                self.status_address,
+                self._status_port,
             )
+            return core
 
-    async def _start_status_listener(self) -> None:
-        if self._status_transport is not None:
-            return
-        if self._status_transport_kind == "UNICAST":
-            sock = _unicast_socket(self._status_unicast_host, self._status_port)
-        else:
+    async def _status_pump(self) -> None:
+        """Fill the ONE shared buffer from the engine's STATUS stream and
+        wake every waiter, preserving the generation/event contract."""
+        core = self._core
+        assert core is not None
+        last_seq = -1
+        while not self._closed:
             try:
-                sock = _multicast_socket(
-                    self._mcast_group, self._status_port, self._mcast_iface
-                )
-            except OSError:
-                logger.warning(
-                    "multicast status subscription failed; falling back to unicast"
-                )
-                sock = _unicast_socket(self._status_unicast_host, self._status_port)
-        self._status_sock = sock
-        loop = asyncio.get_running_loop()
-        self._status_transport, _ = await loop.create_datagram_endpoint(
-            lambda: _StatusProtocol(self._handle_status), sock=sock
-        )
+                frame = await core.status_after(last_seq, _STATUS_POLL_S)
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                if self._closed:
+                    return
+                raise
+            if frame is None:
+                continue
+            last_seq = frame["seq"]
+            update_status_from_dict(self._shared_status, frame)
+            # The wire carries the config spelling of the tool key; every
+            # consumer (and ``waldoctl.ToolSpec``, which upper-cases what it
+            # is given) indexes tools by the canonical one.
+            tool_status = self._shared_status.tool_status
+            tool_status.key = canonical_tool_key(tool_status.key)
+            self._status_generation += 1
+            self._status_event.set()
+
+    async def _call(self, awaitable: Any) -> Any:
+        """Await an engine call, translating its structured refusals into
+        :class:`RobotError` (the exception this API raises)."""
+        try:
+            return await awaitable
+        except RobotWireError as e:
+            raise RobotError.from_wire(e.args) from None
 
     async def close(self) -> None:
-        """Release transports and wake all waiters.  Safe to call repeatedly."""
+        """Release the engine client and wake all waiters.  Safe to call
+        repeatedly."""
         if self._closed:
             return
         self._closed = True
         self._status_event.set()
-        for fut in list(self._pending.values()):
-            if not fut.done():
-                fut.cancel()
-        self._pending.clear()
-        for waiters in list(self._complete_waiters.values()):
-            for fut in waiters:
-                if not fut.done():
-                    fut.cancel()
-        self._complete_waiters.clear()
-        await asyncio.sleep(0)  # let in-flight datagram callbacks drain
-        if self._status_transport is not None:
-            with contextlib.suppress(OSError):
-                self._status_transport.close()
-            self._status_transport = None
-            self._status_sock = None
-        if self._transport is not None:
-            with contextlib.suppress(OSError):
-                self._transport.close()
-            self._transport = None
+        if self._status_task is not None:
+            self._status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_task
+            self._status_task = None
+        if self._core is not None:
+            self._core.close()
+            self._core = None
 
     async def __aenter__(self) -> "AsyncRobotClient":
         if self._closed:
@@ -546,187 +421,6 @@ class AsyncRobotClient(_RobotClientABC):
         return self._bound_tools[key]
 
     # ------------------------------------------------------------------
-    # Wire plumbing
-    # ------------------------------------------------------------------
-
-    def _handle_reply(self, data: bytes) -> None:
-        if self._closed:
-            return
-        try:
-            msg_type, req_id, payload = decode_reply(data)
-        except ProtocolError as e:
-            logger.debug("ignoring undecodable reply datagram: %s", e)
-            return
-        if msg_type is MsgType.COMPLETE:
-            index, ok, detail = payload
-            self._record_complete(index, ok, detail)
-            return
-        fut = self._pending.get(req_id)
-        if fut is None:
-            if msg_type is MsgType.ERROR:
-                self._log_unclaimed_error(payload)
-            return
-        if not fut.done():
-            fut.set_result((msg_type, payload))
-
-    def _log_unclaimed_error(self, payload: Sequence) -> None:
-        """An ERROR no caller is waiting on — a rejected fire-and-forget
-        command, whose SUCCESS is unacked but whose REJECTION is a real
-        ERROR, or a reply that arrived after
-        its request timed out.  Dropping these silently is how a gated
-        jog becomes a button that does nothing.
-
-        Throttled per error code, because a UI streaming jogs at 20-50 Hz
-        gets one refusal per datagram and the operator needs to read the
-        reason, not scroll past it.  Returning it to the caller is a
-        wider change than a log line: ``jog_j`` returns before the reply
-        could exist.  The authoritative surface is the runtime's standing
-        error — a refused fire-and-forget latches there (issue #23), so
-        :meth:`error` and the STATUS broadcast carry the reason; this log
-        line is corroboration, not the delivery path.
-        """
-        try:
-            err = RobotError.from_wire(payload)
-        except (TypeError, ValueError):
-            logger.debug("ignoring malformed unclaimed ERROR payload")
-            return
-        now = time.monotonic()
-        last = self._unclaimed_errors.get(err.code)
-        if last is not None and now - last < _UNCLAIMED_ERROR_PERIOD_S:
-            return
-        self._unclaimed_errors[err.code] = now
-        logger.warning("runtime reported an error nothing is waiting on: %s", err)
-
-    def _record_complete(self, index: int, ok: bool, detail: tuple | None) -> None:
-        self._completions[index] = (ok, detail)
-        while len(self._completions) > _COMPLETIONS_KEPT:
-            self._completions.pop(next(iter(self._completions)))
-        for fut in self._complete_waiters.pop(index, []):
-            if not fut.done():
-                fut.set_result((ok, detail))
-
-    def _handle_status(self, data: bytes) -> None:
-        if self._closed:
-            return
-        if not decode_status_bin_into(data, self._shared_status):
-            return
-        # The wire carries the config spelling of the tool key; every consumer
-        # (and ``waldoctl.ToolSpec``, which upper-cases what it is given)
-        # indexes tools by the canonical one.
-        tool_status = self._shared_status.tool_status
-        tool_status.key = canonical_tool_key(tool_status.key)
-        seq = self._shared_status.seq
-        last = self._last_status_seq
-        if last is not None and seq > last + 1:
-            self._status_seq_gaps += seq - last - 1
-        self._last_status_seq = seq
-        self._status_generation += 1
-        self._status_event.set()
-
-    def _next_req_id(self) -> int:
-        while True:
-            req_id = self._req_id
-            self._req_id = self._req_id % 0xFFFF_FFFF + 1  # wraps to 1, skipping 0
-            if req_id not in self._pending:
-                return req_id
-
-    def _next_transfer_id(self) -> int:
-        self._transfer_id = (self._transfer_id + 1) & 0xFFFF_FFFF
-        return self._transfer_id
-
-    def _datagrams(self, data: bytes, req_id: int) -> list[bytes]:
-        """Auto-chunk encodings that exceed the MTU threshold."""
-        if len(data) <= self.mtu:
-            return [data]
-        return split_into_chunks(req_id, self._next_transfer_id(), data, self.mtu - 32)
-
-    async def _roundtrip(
-        self, datagrams: list[bytes], req_id: int, attempts: int
-    ) -> tuple[MsgType, Any] | None:
-        await self._ensure_endpoint()
-        transport = self._transport
-        assert transport is not None
-        loop = asyncio.get_running_loop()
-        fut: asyncio.Future[tuple[MsgType, Any]] = loop.create_future()
-        self._pending[req_id] = fut
-        try:
-            for attempt in range(attempts):
-                if not fut.done():
-                    for datagram in datagrams:
-                        transport.sendto(datagram)
-                try:
-                    return await asyncio.wait_for(asyncio.shield(fut), self.timeout)
-                except TimeoutError:
-                    if attempt + 1 < attempts:
-                        backoff = min(0.5, 0.05 * 2**attempt) + random.uniform(0, 0.05)
-                        await asyncio.sleep(backoff)
-                        if fut.done():  # a late reply landed during the backoff
-                            return fut.result()
-            return None
-        finally:
-            self._pending.pop(req_id, None)
-
-    async def _query(self, cmd: CmdType, params: Sequence[object] = ()) -> list | None:
-        """QUERY roundtrip with retries.  Returns the ``[query_tag, ...fields]``
-        payload, or None when the runtime is unreachable.  Raises
-        :class:`RobotError` on an ERROR reply."""
-        req_id = self._next_req_id()
-        data = encode_command(cmd, req_id, params)
-        out = await self._roundtrip(self._datagrams(data, req_id), req_id, 1 + self.retries)
-        if out is None:
-            return None
-        msg_type, payload = out
-        if msg_type is MsgType.ERROR:
-            raise RobotError.from_wire(payload)
-        if msg_type is MsgType.RESPONSE:
-            return payload
-        logger.debug("query %s got unexpected %s reply", cmd.name, msg_type.name)
-        return None
-
-    async def _system(self, cmd: CmdType, params: Sequence[object] = ()) -> int:
-        """SYSTEM roundtrip: one send + wait.  1 confirmed, 0 unconfirmed;
-        raises :class:`RobotError` on rejection."""
-        req_id = self._next_req_id()
-        data = encode_command(cmd, req_id, params)
-        out = await self._roundtrip(self._datagrams(data, req_id), req_id, 1)
-        if out is None:
-            return 0
-        msg_type, payload = out
-        if msg_type is MsgType.ERROR:
-            raise RobotError.from_wire(payload)
-        return 1
-
-    async def _queued(self, cmd: CmdType, params: Sequence[object]) -> int:
-        """QUEUED roundtrip: idempotency-keyed, retried.  Returns the queue
-        index (>= 0), -1 when unconfirmed; raises :class:`RobotError` on
-        rejection."""
-        key = random.getrandbits(64)
-        req_id = self._next_req_id()
-        data = encode_command(cmd, req_id, [key, *params])
-        out = await self._roundtrip(self._datagrams(data, req_id), req_id, 1 + self.retries)
-        if out is None:
-            return -1
-        msg_type, payload = out
-        if msg_type is MsgType.ERROR:
-            raise RobotError.from_wire(payload)
-        if msg_type is MsgType.OK and payload is not None:
-            self._last_command_index = payload
-            return payload
-        logger.debug("queued %s ack carried no index", cmd.name)
-        return -1
-
-    async def _fire(self, cmd: CmdType, params: Sequence[object]) -> int:
-        """Fire-and-forget send, encoding into the reused TX buffer."""
-        await self._ensure_endpoint()
-        transport = self._transport
-        assert transport is not None
-        params = list(params)
-        _validate_command(cmd, params)
-        self._encoder.encode_into([int(cmd), self._next_req_id(), *params], self._tx_buf)
-        transport.sendto(self._tx_buf)
-        return 1
-
-    # ------------------------------------------------------------------
     # Status streaming
     # ------------------------------------------------------------------
 
@@ -738,7 +432,7 @@ class AsyncRobotClient(_RobotClientABC):
         consumers skip to the latest state.  Terminates when the client is
         closed.
         """
-        await self._ensure_endpoint()
+        await self._ensure_core()
         last_gen = 0
         while not self._closed:
             self._status_event.clear()
@@ -765,7 +459,7 @@ class AsyncRobotClient(_RobotClientABC):
         self, predicate: Callable[[StatusBuffer], bool], timeout: float = 5.0
     ) -> bool:
         """Block until *predicate* is True for a status snapshot."""
-        await self._ensure_endpoint()
+        await self._ensure_core()
         last_gen = 0
         deadline = time.monotonic() + timeout
         while not self._closed:
@@ -791,25 +485,13 @@ class AsyncRobotClient(_RobotClientABC):
     # Completion / synchronization
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def _blocking_error(status: StatusBuffer, command_index: int) -> tuple | None:
-        """The protocol's stale-error ordering rule: a standing error fails a wait
-        on *command_index* only when the frame proves it postdates that
-        command's acceptance (acceptance clears stale errors server-side and
-        ``accepted_index`` is monotonic)."""
-        err = status.error
-        if err is None or err[0] > command_index:
-            return None
-        if status.accepted_index >= command_index:
-            return err
-        return None
-
     async def wait_command(self, command_index: int, timeout: float = 10.0) -> bool:
         """Block until *command_index* has completed.
 
         Satisfied by the COMPLETE push for that index, with the status stream
         as fallback (``completed_index`` high-water mark, or a blocking error
-        under the stale-error ordering rule).
+        under the stale-error ordering rule) — the engine client implements
+        both sides.
 
         Returns True on completion, False on timeout.  Raises
         :class:`RobotError` if the command finished in error or the pipeline
@@ -820,48 +502,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_command(<index>)
         """
-        await self._ensure_endpoint()
-        done = self._completions.get(command_index)
-        if done is None:
-            loop = asyncio.get_running_loop()
-            fut: asyncio.Future[tuple[bool, tuple | None]] = loop.create_future()
-            self._complete_waiters.setdefault(command_index, []).append(fut)
-            status_task = asyncio.create_task(
-                self.wait_status(
-                    lambda s: s.completed_index >= command_index
-                    or self._blocking_error(s, command_index) is not None,
-                    timeout=timeout,
-                )
-            )
-            try:
-                await asyncio.wait(
-                    {fut, status_task},
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
-                if fut.done() and not fut.cancelled():
-                    done = fut.result()
-                elif status_task.done() and status_task.result():
-                    err = self._blocking_error(self._shared_status, command_index)
-                    if err is not None:
-                        raise RobotError.from_wire(err)
-                    return True
-                else:
-                    return False
-            finally:
-                status_task.cancel()
-                waiters = self._complete_waiters.get(command_index)
-                if waiters is not None:
-                    with contextlib.suppress(ValueError):
-                        waiters.remove(fut)
-                    if not waiters:
-                        self._complete_waiters.pop(command_index, None)
-        ok, detail = done
-        if not ok:
-            if detail is not None:
-                raise RobotError.from_wire(detail)
-            raise RobotError(command_index, 0, "Command failed", "", "", "")
-        return True
+        core = await self._ensure_core()
+        return await self._call(core.wait_command(command_index, timeout))
 
     async def wait_checkpoint(self, label: str, timeout: float = 30.0) -> bool:
         """Block until the checkpoint *label* is reached.
@@ -895,7 +537,7 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_motion()
         """
-        await self._ensure_endpoint()
+        await self._ensure_core()
         last_angles: np.ndarray | None = None
         settle_start: float | None = None
         motion_started = False
@@ -943,6 +585,15 @@ class AsyncRobotClient(_RobotClientABC):
     # Motion (queued)
     # ------------------------------------------------------------------
 
+    async def _finish_queued(
+        self, index: int, wait: bool, timeout: float
+    ) -> int:
+        if index >= 0:
+            self._last_command_index = index
+            if wait:
+                await self.wait_command(index, timeout=timeout)
+        return index
+
     async def home(
         self, wait: bool = False, timeout: float = 60.0, **wait_kwargs: Any
     ) -> int:
@@ -954,10 +605,12 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.home()
         """
-        index = await self._queued(CmdType.HOME, [])
-        if wait and index >= 0:
-            if not await self.wait_command(index, timeout=timeout):
-                raise TimeoutError(f"home() timed out after {timeout}s")
+        core = await self._ensure_core()
+        index = await self._call(core.home())
+        if index >= 0:
+            self._last_command_index = index
+        if wait and index >= 0 and not await self.wait_command(index, timeout=timeout):
+            raise TimeoutError(f"home() timed out after {timeout}s")
         return index
 
     async def move_j(
@@ -984,6 +637,7 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_j(<joint_angles_deg>, speed=0.5)
         """
+        core = await self._ensure_core()
         d, s = _timing(duration, speed)
         if pose is not None:
             if rel:
@@ -996,20 +650,18 @@ class AsyncRobotClient(_RobotClientABC):
                     "absolute. Compose the offset with the current TCP pose, or "
                     "use move_j(angles=..., rel=True) for a relative joint move."
                 )
-            index = await self._queued(
-                CmdType.MOVE_J_POSE,
-                [_f6(pose, "pose"), d, s, float(accel), _blend(r)],
+            index = await self._call(
+                core.move_j_pose(_f6(pose, "pose"), d, s, float(accel), _blend(r))
             )
         else:
             if angles is None:
                 raise ValueError("move_j requires angles or pose=")
-            index = await self._queued(
-                CmdType.MOVE_J,
-                [_f6(angles, "angles"), d, s, float(accel), _blend(r), bool(rel)],
+            index = await self._call(
+                core.move_j(
+                    _f6(angles, "angles"), d, s, float(accel), _blend(r), bool(rel)
+                )
             )
-        if wait and index >= 0:
-            await self.wait_command(index, timeout=timeout)
-        return index
+        return await self._finish_queued(index, wait, timeout)
 
     async def move_l(
         self,
@@ -1034,10 +686,10 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_l(<tcp_pose_mm_deg>, speed=0.5)
         """
+        core = await self._ensure_core()
         d, s = _timing(duration, speed)
-        index = await self._queued(
-            CmdType.MOVE_L,
-            [
+        index = await self._call(
+            core.move_l(
                 _f6(pose, "pose"),
                 _wire_frame(frame),
                 d,
@@ -1045,11 +697,9 @@ class AsyncRobotClient(_RobotClientABC):
                 float(accel),
                 _blend(r),
                 bool(rel),
-            ],
+            )
         )
-        if wait and index >= 0:
-            await self.wait_command(index, timeout=timeout)
-        return index
+        return await self._finish_queued(index, wait, timeout)
 
     async def move_c(
         self,
@@ -1072,10 +722,10 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_c(<via_pose>, <end_pose>, speed=0.5)
         """
+        core = await self._ensure_core()
         d, s = _timing(duration, speed)
-        index = await self._queued(
-            CmdType.MOVE_C,
-            [
+        index = await self._call(
+            core.move_c(
                 _f6(via, "via"),
                 _f6(end, "end"),
                 _wire_frame(frame),
@@ -1083,15 +733,13 @@ class AsyncRobotClient(_RobotClientABC):
                 s,
                 float(accel),
                 _blend(r),
-            ],
+            )
         )
-        if wait and index >= 0:
-            await self.wait_command(index, timeout=timeout)
-        return index
+        return await self._finish_queued(index, wait, timeout)
 
     async def _move_multi(
         self,
-        cmd: CmdType,
+        method: str,
         waypoints: list[list[float]],
         frame: WFrame,
         duration: float | None,
@@ -1100,12 +748,13 @@ class AsyncRobotClient(_RobotClientABC):
         wait: bool,
         timeout: float,
     ) -> int:
+        core = await self._ensure_core()
         d, s = _timing(duration, speed)
         wps = [_f6(wp, "waypoint") for wp in waypoints]
-        index = await self._queued(cmd, [wps, _wire_frame(frame), d, s, float(accel)])
-        if wait and index >= 0:
-            await self.wait_command(index, timeout=timeout)
-        return index
+        index = await self._call(
+            getattr(core, method)(wps, _wire_frame(frame), d, s, float(accel))
+        )
+        return await self._finish_queued(index, wait, timeout)
 
     async def move_s(
         self,
@@ -1127,7 +776,7 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.move_s(<waypoints>, speed=0.5)
         """
         return await self._move_multi(
-            CmdType.MOVE_S, waypoints, frame, duration, speed, accel, wait, timeout
+            "move_s", waypoints, frame, duration, speed, accel, wait, timeout
         )
 
     async def move_p(
@@ -1150,7 +799,7 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.move_p(<waypoints>, speed=0.5)
         """
         return await self._move_multi(
-            CmdType.MOVE_P, waypoints, frame, duration, speed, accel, wait, timeout
+            "move_p", waypoints, frame, duration, speed, accel, wait, timeout
         )
 
     # ------------------------------------------------------------------
@@ -1173,14 +822,15 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.servo_j(<joint_angles_deg>)
         """
+        core = await self._ensure_core()
         if pose is not None:
-            return await self._fire(
-                CmdType.SERVO_J_POSE, [_f6(pose, "pose"), float(speed), float(accel)]
+            return await self._call(
+                core.servo_j_pose(_f6(pose, "pose"), float(speed), float(accel))
             )
         if angles is None:
             raise ValueError("servo_j requires angles or pose=")
-        return await self._fire(
-            CmdType.SERVO_J, [_f6(angles, "angles"), float(speed), float(accel)]
+        return await self._call(
+            core.servo_j(_f6(angles, "angles"), float(speed), float(accel))
         )
 
     async def servo_l(
@@ -1197,8 +847,9 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.servo_l(<tcp_pose_mm_deg>)
         """
-        return await self._fire(
-            CmdType.SERVO_L, [_f6(pose, "pose"), float(speed), float(accel)]
+        core = await self._ensure_core()
+        return await self._call(
+            core.servo_l(_f6(pose, "pose"), float(speed), float(accel))
         )
 
     async def jog_j(
@@ -1248,9 +899,8 @@ class AsyncRobotClient(_RobotClientABC):
             speed_arr[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")
-        return await self._fire(
-            CmdType.JOG_J, [speed_arr, float(duration), float(accel)]
-        )
+        core = await self._ensure_core()
+        return await self._call(core.jog_j(speed_arr, float(duration), float(accel)))
 
     async def jog_l(
         self,
@@ -1282,9 +932,9 @@ class AsyncRobotClient(_RobotClientABC):
             velocities[_AXIS_INDEX[axis]] = float(speed)
         else:
             raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
-        return await self._fire(
-            CmdType.JOG_L,
-            [velocities, float(duration), _wire_frame(frame), float(accel)],
+        core = await self._ensure_core()
+        return await self._call(
+            core.jog_l(velocities, float(duration), _wire_frame(frame), float(accel))
         )
 
     async def teleport(
@@ -1303,8 +953,9 @@ class AsyncRobotClient(_RobotClientABC):
         positions = (
             [float(p) for p in tool_positions] if tool_positions is not None else None
         )
-        return await self._fire(
-            CmdType.TELEPORT, [_f6(angles_deg, "angles_deg"), positions]
+        core = await self._ensure_core()
+        return await self._call(
+            core.teleport(_f6(angles_deg, "angles_deg"), positions)
         )
 
     async def reset_loop_stats(self) -> int:
@@ -1315,7 +966,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.reset_loop_stats()
         """
-        return await self._fire(CmdType.RESET_LOOP_STATS, [])
+        core = await self._ensure_core()
+        return await self._call(core.reset_loop_stats())
 
     # ------------------------------------------------------------------
     # Control (SYSTEM)
@@ -1330,7 +982,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.stop()
         """
-        return await self._system(CmdType.STOP, [bool(clear_queue)])
+        core = await self._ensure_core()
+        return await self._call(core.stop(bool(clear_queue)))
 
     async def estop(self) -> int:
         """Protective stop: halt motion and latch the controller disabled
@@ -1341,7 +994,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.estop()
         """
-        return await self._system(CmdType.ESTOP, [])
+        core = await self._ensure_core()
+        return await self._call(core.estop())
 
     async def safety_stop(self) -> int:
         """Drop every joint limp and hold there.
@@ -1356,7 +1010,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.safety_stop()
         """
-        return await self._system(CmdType.SAFETY_STOP, [])
+        core = await self._ensure_core()
+        return await self._call(core.safety_stop())
 
     async def set_gravity_comp(self, on: bool) -> int:
         """Apply (or stop applying) the gravity-compensation feedforward.
@@ -1372,7 +1027,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.set_gravity_comp(True)
         """
-        return await self._system(CmdType.SET_GRAVITY_COMP, [bool(on)])
+        core = await self._ensure_core()
+        return await self._call(core.set_gravity_comp(bool(on)))
 
     async def pause(self) -> int:
         """Hold the executing trajectory where it is.
@@ -1386,7 +1042,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.pause()
         """
-        return await self._system(CmdType.PAUSE, [True])
+        core = await self._ensure_core()
+        return await self._call(core.pause(True))
 
     async def resume(self) -> int:
         """Continue a trajectory held by :meth:`pause`.
@@ -1396,7 +1053,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.resume()
         """
-        return await self._system(CmdType.PAUSE, [False])
+        core = await self._ensure_core()
+        return await self._call(core.pause(False))
 
     async def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive (hand-guiding).
@@ -1444,7 +1102,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.reset()
         """
-        return await self._system(CmdType.RESET, [])
+        core = await self._ensure_core()
+        return await self._call(core.reset())
 
     async def reset_state(self) -> int:
         """Full controller state reset (world, tool, errors) + re-sync.
@@ -1454,7 +1113,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.reset_state()
         """
-        return await self._system(CmdType.RESET_STATE, [])
+        core = await self._ensure_core()
+        return await self._call(core.reset_state())
 
     async def simulator(self, enabled: bool) -> int:
         """Enable or disable simulator mode (live bus-backend switch).
@@ -1464,7 +1124,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.simulator(True)
         """
-        return await self._system(CmdType.SIMULATOR, [bool(enabled)])
+        core = await self._ensure_core()
+        return await self._call(core.simulator(bool(enabled)))
 
     async def connect_hardware(self, port_str: str) -> int:
         """Connect to robot hardware via serial port.
@@ -1476,7 +1137,8 @@ class AsyncRobotClient(_RobotClientABC):
         """
         if not port_str:
             raise ValueError("No port provided")
-        return await self._system(CmdType.CONNECT_HARDWARE, [port_str])
+        core = await self._ensure_core()
+        return await self._call(core.connect_hardware(port_str))
 
     async def select_profile(self, profile: str) -> int:
         """Set the motion profile (e.g. ``"TOPPRA"``).
@@ -1486,7 +1148,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.select_profile("TOPPRA")
         """
-        return await self._system(CmdType.SELECT_PROFILE, [profile.upper()])
+        core = await self._ensure_core()
+        return await self._call(core.select_profile(profile.upper()))
 
     async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm, composed on top of the current tool
@@ -1497,9 +1160,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.set_tcp_offset(0, 0, -190)
         """
-        return await self._system(
-            CmdType.SET_TCP_OFFSET, [float(x), float(y), float(z)]
-        )
+        core = await self._ensure_core()
+        return await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
 
     async def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes.
@@ -1517,28 +1179,31 @@ class AsyncRobotClient(_RobotClientABC):
         for shape in shapes:
             kind, params, pose, collision, margin, name = shape.to_wire()
             wire_shapes.append(
-                [
-                    kind,
-                    [float(p) for p in params],
-                    [float(p) for p in pose],
-                    bool(collision),
-                    float(margin) if margin is not None else None,
-                    name,
-                ]
+                {
+                    "kind": kind,
+                    "params": [float(p) for p in params],
+                    "pose": [float(p) for p in pose],
+                    "collision": bool(collision),
+                    "margin": float(margin) if margin is not None else None,
+                    "name": name,
+                }
             )
-        return await self._system(CmdType.SET_SHAPES, [wire_shapes])
+        core = await self._ensure_core()
+        return await self._call(core.set_shapes(wire_shapes))
 
     async def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion
         (commanded | settled | strict)."""
-        return await self._system(
-            CmdType.SET_COMPLETION_POLICY, [int(CompletionPolicy(policy))]
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_completion_policy(int(CompletionPolicy(policy)))
         )
 
     async def set_recipe(self, name: str) -> int:
         """Select the telemetry recipe.  Unknown names are refused by the
         runtime (raises :class:`RobotError`)."""
-        return await self._system(CmdType.SET_RECIPE, [name])
+        core = await self._ensure_core()
+        return await self._call(core.set_recipe(name))
 
     async def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin).
@@ -1562,7 +1227,8 @@ class AsyncRobotClient(_RobotClientABC):
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        return await self._system(CmdType.WRITE_IO, [index, value])
+        core = await self._ensure_core()
+        return await self._call(core.write_io(index, value))
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1584,8 +1250,9 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.select_tool(robot.tools.default.key)
         """
         key = canonical_tool_key(tool_name)
-        index = await self._queued(
-            CmdType.SELECT_TOOL, [key, variant_key if variant_key else None]
+        core = await self._ensure_core()
+        index = await self._call(
+            core.select_tool(key, variant_key if variant_key else None)
         )
         # Only a tool the runtime accepted is the active one: a refused
         # selection (the runtime is fitted with a different tool) would
@@ -1593,7 +1260,7 @@ class AsyncRobotClient(_RobotClientABC):
         # at hardware that is not on the arm.
         self._active_tool_key = key
         self._active_variant_key = variant_key
-        return index
+        return await self._finish_queued(index, False, 0.0)
 
     async def checkpoint(self, label: str) -> int:
         """Insert a checkpoint marker in the command queue.
@@ -1603,7 +1270,9 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.checkpoint("pick_done")
         """
-        return await self._queued(CmdType.CHECKPOINT, [label])
+        core = await self._ensure_core()
+        index = await self._call(core.checkpoint(label))
+        return await self._finish_queued(index, False, 0.0)
 
     async def delay(self, seconds: float) -> int:
         """Insert a non-blocking delay in the command queue.
@@ -1615,7 +1284,9 @@ class AsyncRobotClient(_RobotClientABC):
         """
         if seconds <= 0:
             raise ValueError("Delay must be positive")
-        return await self._queued(CmdType.DELAY, [float(seconds)])
+        core = await self._ensure_core()
+        index = await self._call(core.delay(float(seconds)))
+        return await self._finish_queued(index, False, 0.0)
 
     async def tool_action(
         self,
@@ -1633,13 +1304,13 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.tool_action("ELECTRIC", "calibrate")
         """
-        index = await self._queued(
-            CmdType.TOOL_ACTION,
-            [canonical_tool_key(tool_key), action.strip().lower(), list(params or [])],
+        core = await self._ensure_core()
+        index = await self._call(
+            core.tool_action(
+                canonical_tool_key(tool_key), action.strip().lower(), list(params or [])
+            )
         )
-        if wait and index >= 0:
-            await self.wait_command(index, timeout=timeout)
-        return index
+        return await self._finish_queued(index, wait, timeout)
 
     # ------------------------------------------------------------------
     # Queries
@@ -1653,10 +1324,11 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.ping()
         """
-        result = await self._query(CmdType.PING)
-        if result is None:
+        core = await self._ensure_core()
+        hardware = await self._call(core.ping())
+        if hardware is None:
             return None
-        return PingResult(hardware_connected=bool(result[1]))
+        return PingResult(hardware_connected=bool(hardware))
 
     async def angles(self) -> list[float] | None:
         """Current joint angles in degrees.
@@ -1666,8 +1338,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             angles = rbt.angles()
         """
-        result = await self._query(CmdType.ANGLES)
-        return result[1] if result is not None else None
+        core = await self._ensure_core()
+        return await self._call(core.angles())
 
     async def pose(self, frame: WFrame = "WRF") -> list[float] | None:
         """Current TCP pose as [x, y, z, rx, ry, rz] in mm and degrees.
@@ -1677,10 +1349,11 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             pose = rbt.pose()
         """
-        result = await self._query(CmdType.POSE, [_wire_frame(frame)])
-        if result is None:
+        core = await self._ensure_core()
+        matrix = await self._call(core.pose(_wire_frame(frame)))
+        if matrix is None:
             return None
-        return _matrix_to_pose(result[1])
+        return _matrix_to_pose(matrix)
 
     async def io(self) -> list[int] | None:
         """Digital I/O state [in1, in2, out1, out2, estop].
@@ -1690,8 +1363,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             io = rbt.io()
         """
-        result = await self._query(CmdType.IO)
-        return result[1] if result is not None else None
+        core = await self._ensure_core()
+        return await self._call(core.io())
 
     async def joint_speeds(self) -> list[float] | None:
         """Current joint velocities in rad/s.
@@ -1701,8 +1374,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             speeds = rbt.joint_speeds()
         """
-        result = await self._query(CmdType.SPEEDS)
-        return result[1] if result is not None else None
+        core = await self._ensure_core()
+        return await self._call(core.joint_speeds())
 
     async def status(self) -> StatusResult | None:
         """Aggregate status snapshot.
@@ -1712,16 +1385,16 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             status = rbt.status()
         """
-        result = await self._query(CmdType.STATUS)
+        core = await self._ensure_core()
+        result = await self._call(core.status_query())
         if result is None:
             return None
-        _, pose, angles, speeds, io, tool_status = result
         return StatusResult(
-            pose=pose,
-            angles=angles,
-            speeds=speeds,
-            io=io,
-            tool_status=_wire_tool_status(tool_status),
+            pose=result["pose"],
+            angles=result["angles"],
+            speeds=result["speeds"],
+            io=result["io"],
+            tool_status=_tool_status_from_dict(result["tool_status"]),
         )
 
     async def queue(self) -> list[str] | None:
@@ -1737,16 +1410,16 @@ class AsyncRobotClient(_RobotClientABC):
 
     async def queue_state(self) -> QueueResult | None:
         """Full QUEUE snapshot (names, indices, checkpoint, duration)."""
-        result = await self._query(CmdType.QUEUE)
+        core = await self._ensure_core()
+        result = await self._call(core.queue())
         if result is None:
             return None
-        _, names, executing, completed, last_checkpoint, queued_duration = result
         return QueueResult(
-            queue=names,
-            executing_index=executing,
-            completed_index=completed,
-            last_checkpoint=last_checkpoint,
-            queued_duration=queued_duration,
+            queue=result["queue"],
+            executing_index=result["executing_index"],
+            completed_index=result["completed_index"],
+            last_checkpoint=result["last_checkpoint"],
+            queued_duration=result["queued_duration"],
         )
 
     async def tools(self) -> ToolResult | None:
@@ -1757,12 +1430,13 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             tools = rbt.tools()
         """
-        result = await self._query(CmdType.TOOLS)
+        core = await self._ensure_core()
+        result = await self._call(core.tools())
         if result is None:
             return None
         return ToolResult(
-            tool=canonical_tool_key(result[1]),
-            available=[canonical_tool_key(k) for k in result[2]],
+            tool=canonical_tool_key(result["tool"]),
+            available=[canonical_tool_key(k) for k in result["available"]],
         )
 
     async def activity(self) -> ActivityResult | None:
@@ -1773,15 +1447,16 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             act = rbt.activity()
         """
-        result = await self._query(CmdType.ACTIVITY)
+        core = await self._ensure_core()
+        result = await self._call(core.activity())
         if result is None:
             return None
-        _, current, state, _next_action, params = result
-        action_state = WActionState(state)
+        action_state = WActionState(result["state"])
+        current = result["current"]
         return ActivityResult(
             state=action_state,
             command=current,
-            params=params,
+            params=result["params"],
             error=current if action_state is WActionState.ERROR else "",
         )
 
@@ -1793,11 +1468,14 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             en = rbt.reachable()
         """
-        result = await self._query(CmdType.REACHABLE)
+        core = await self._ensure_core()
+        result = await self._call(core.reachable())
         if result is None:
             return None
         return ReachableResult(
-            joint_en=result[1], cart_en_wrf=result[2], cart_en_trf=result[3]
+            joint_en=result["joint_en"],
+            cart_en_wrf=result["cart_en_wrf"],
+            cart_en_trf=result["cart_en_trf"],
         )
 
     async def error(self) -> RobotError | None:
@@ -1808,10 +1486,11 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             err = rbt.error()
         """
-        result = await self._query(CmdType.ERROR)
-        if result is None or result[1] is None:
+        core = await self._ensure_core()
+        result = await self._call(core.error())
+        if result is None:
             return None
-        return RobotError.from_wire(result[1])
+        return RobotError.from_wire(result)
 
     async def profile(self) -> str | None:
         """Current motion profile name.
@@ -1821,8 +1500,9 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             profile = rbt.profile()
         """
-        result = await self._query(CmdType.PROFILE)
-        return result[1].upper() if result is not None else None
+        core = await self._ensure_core()
+        result = await self._call(core.profile())
+        return result.upper() if result is not None else None
 
     async def tcp_speed(self) -> float | None:
         """TCP linear velocity in mm/s.
@@ -1832,8 +1512,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             speed = rbt.tcp_speed()
         """
-        result = await self._query(CmdType.TCP_SPEED)
-        return result[1] if result is not None else None
+        core = await self._ensure_core()
+        return await self._call(core.tcp_speed())
 
     async def is_estop_pressed(self) -> bool:
         """Whether the e-stop is engaged.
@@ -1875,10 +1555,11 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             offset = rbt.tcp_offset()
         """
-        result = await self._query(CmdType.TCP_OFFSET)
+        core = await self._ensure_core()
+        result = await self._call(core.tcp_offset())
         if result is None:
             return [0.0, 0.0, 0.0]
-        return [result[1], result[2], result[3]]
+        return list(result)
 
     async def is_simulator(self) -> bool:
         """Query whether simulator mode is active.
@@ -1888,8 +1569,9 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             active = rbt.is_simulator()
         """
-        result = await self._query(CmdType.IS_SIMULATOR)
-        return bool(result[1]) if result is not None else False
+        core = await self._ensure_core()
+        result = await self._call(core.is_simulator())
+        return bool(result) if result is not None else False
 
     async def loop_stats(self) -> LoopStatsResult | None:
         """Control-loop runtime metrics.
@@ -1899,10 +1581,11 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             stats = rbt.loop_stats()
         """
-        result = await self._query(CmdType.LOOP_STATS)
+        core = await self._ensure_core()
+        result = await self._call(core.loop_stats())
         if result is None:
             return None
-        return LoopStatsResult(*result[1:])
+        return LoopStatsResult(**result)
 
     async def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is currently enforcing, by layer.
@@ -1915,21 +1598,26 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             world = rbt.shapes()
         """
-        result = await self._query(CmdType.SHAPES)
+        core = await self._ensure_core()
+        result = await self._call(core.shapes())
         if result is None:
             return None
-        _, installation, program, _scene_epoch = result
+
+        def _shape(w: dict) -> Shape:
+            return shape_from_wire(
+                w["kind"], w["params"], w["pose"], w["collision"], w["margin"], w["name"]
+            )
+
         return ShapeWorld(
-            installation=tuple(shape_from_wire(*w) for w in installation),
-            program=tuple(shape_from_wire(*w) for w in program),
+            installation=tuple(_shape(w) for w in result["installation"]),
+            program=tuple(_shape(w) for w in result["program"]),
         )
 
     async def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""
-        result = await self._query(CmdType.TOOL_STATUS)
-        if result is None:
-            return None
-        return _wire_tool_status(result[1])
+        core = await self._ensure_core()
+        result = await self._call(core.tool_status())
+        return _tool_status_from_dict(result)
 
 
 # Re-exported for callers that type against the concrete buffer.

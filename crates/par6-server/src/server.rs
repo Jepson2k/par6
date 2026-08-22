@@ -1942,7 +1942,11 @@ fn cmd_name(tag: CmdType) -> &'static str {
     }
 }
 
-fn decode_error_to_wire(e: &DecodeError) -> WireError {
+/// The server's decode-failure answer: validation failures map to
+/// `CommValidationError`, unknown tags to `CommUnknownCommand`, the rest
+/// to `CommDecodeError`. Public so an offline preview refuses exactly
+/// what the wire refuses.
+pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
     let code = match e {
         DecodeError::Validation { .. } => ErrorCode::CommValidationError,
         DecodeError::UnknownTag(_) => ErrorCode::CommUnknownCommand,

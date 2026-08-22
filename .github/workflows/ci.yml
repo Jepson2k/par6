@@ -28,14 +28,20 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --workspace --exclude par6d --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --exclude par6d --exclude par6-py \
+            --exclude par6-client --all-targets -- -D warnings
+          # par6-client's LIBRARY is toolchain-free; only its tests boot a
+          # daemon in-process (covered in `ffi`).
+          cargo clippy -p par6-client -- -D warnings
       # par6d links the Pinocchio shim unconditionally, so it needs the C++
-      # toolchain and is covered by the `ffi` job below. What this leg proves
-      # is that every LIBRARY crate still builds and passes without that
-      # toolchain — which is what keeps them usable on their own.
+      # toolchain and is covered by the `ffi` job below (par6-py wraps it
+      # and rides along). What this leg proves is that every LIBRARY crate
+      # still builds and passes without that toolchain — which is what
+      # keeps them usable on their own.
       - name: test
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --exclude par6d
+        run: cargo test --workspace --exclude par6d --exclude par6-py --exclude par6-client
       # pinokin-sys is its OWN workspace (its ffi build needs the C++
       # toolchain), so `--workspace` above never reaches it — its
       # toolchain-free surface would otherwise be the one crate in the
@@ -56,7 +62,7 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --exclude par6d --target aarch64-unknown-linux-gnu
+        run: cargo check --workspace --exclude par6d --exclude par6-py --target aarch64-unknown-linux-gnu
 
   msrv:
     name: msrv (rust ${{ env.MSRV }})
@@ -76,7 +82,10 @@ jobs:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
       - name: check
-        run: cargo check --workspace --exclude par6d --all-targets
+        run: |
+          cargo check --workspace --exclude par6d --exclude par6-py \
+            --exclude par6-client --all-targets
+          cargo check -p par6-client
 
   ffi:
     name: ffi (pinocchio shim, x86_64)
@@ -141,8 +150,9 @@ jobs:
       - name: test par6d (the shipped runtime)
         run: |
           source .ffi/env.sh
-          cargo clippy -p par6d --all-targets -- -D warnings
+          cargo clippy -p par6d -p par6-py -p par6-client --all-targets -- -D warnings
           cargo test -p par6d
+          cargo test -p par6-client
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
       # the unpatched 0.004 runs before it meets the arm. Release because
@@ -199,8 +209,27 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      # The package is a maturin build now: pip compiles the par6-py
+      # extension, which links the pinocchio shim like every other crate,
+      # so this job carries the same toolchain (and cache key) as `ffi`.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+      - name: cache pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/env
+            .ffi/shim
+          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build shim (scripts/ffi/setup.sh)
+        run: scripts/ffi/setup.sh
       - name: install
-        run: pip install -e "python[dev]"
+        run: |
+          source .ffi/env.sh
+          pip install -e "python[dev]"
       # waldoctl is pinned to a tag, but a cross-repo change lands on a
       # branch of the same name first (CLAUDE.md's dev workflow), and the
       # type gate below is what notices when the two sides disagree.
@@ -219,9 +248,12 @@ jobs:
       - name: ty
         working-directory: python
         run: ty check .
+      # env.sh at run time too: the extension dlopens the shim on import.
       - name: pytest
-        working-directory: python
-        run: pytest
+        run: |
+          source .ffi/env.sh
+          cd python
+          pytest
 
   # End-to-end: the real python client against a real `par6d --sim` process
   # over real UDP. Needs the binary, so it builds par6d here and points
@@ -260,7 +292,9 @@ jobs:
           source .ffi/env.sh
           cargo build -p par6d --release
       - name: install python client
-        run: pip install -e "python[dev]"
+        run: |
+          source .ffi/env.sh
+          pip install -e "python[dev]"
       - name: pytest -m e2e
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d

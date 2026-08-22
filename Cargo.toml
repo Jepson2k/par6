@@ -10,6 +10,7 @@ members = [
     "crates/par6-server",
     "crates/par6-client",
     "crates/par6d",
+    "crates/par6-py",
 ]
 # pinokin-sys stays a standalone workspace (its ffi build needs the C++
 # toolchain); par6-bus reaches it via an optional path dependency.

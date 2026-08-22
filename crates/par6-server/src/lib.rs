@@ -48,5 +48,5 @@ pub use runtime::{
     blend_radius_mm, CollisionState, CommandOutcome, Enablement, PlanContext, Planner,
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
-pub use server::{spawn, ServerHandle};
+pub use server::{decode_error_to_wire, spawn, ServerHandle};
 pub use telemetry::{TelemetryField, TelemetryRecipe};

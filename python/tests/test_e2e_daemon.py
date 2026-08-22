@@ -34,7 +34,7 @@ from waldoctl.shapes import Box
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, CmdType, ErrorCode
+from par6.protocol.constants import ActionState, ErrorCode
 from par6.robot import Robot
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
@@ -1163,9 +1163,11 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         )
         assert cleared, "the output never went back low"
 
-        # The wire will carry port 7; the box will not.
+        # The wire will carry the port; the box will not — sent through the
+        # engine client directly, past the shim's own bound check, so the
+        # refusal under test is the RUNTIME's.
         with pytest.raises(RobotError) as io:
-            await client._system(CmdType.WRITE_IO, [n_out, 1])
+            await client._call(client._core.write_io(n_out, 1))
         assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert "does not exist" in io.value.cause, io.value.cause
 

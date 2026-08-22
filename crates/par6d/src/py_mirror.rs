@@ -1,20 +1,20 @@
-//! Guard for the hand-copied constants in `python/par6/motion.py`.
+//! Guard for the hand-copied constants in
+//! `python/par6/client/dry_run_client.py`.
 //!
-//! The protocol constants are GENERATED (`par6-proto`'s `gen_python`), but
-//! the planner's and bridge's tuning numbers are not: the offline preview
-//! restates them so it can plan without the runtime. A number that drifts
-//! on one side makes the preview draw a motion the arm will not make, and
-//! nothing else would catch it — the preview agrees with itself either
-//! way. So the values are read back out of the Python source and compared.
-//!
-//! Adding a constant to the Python module without listing it here is
-//! fine; changing one on either side without changing the other is not.
+//! The preview engine plans with the runtime's own code, so nothing about
+//! planning is restated Python-side any more. The one exception is the
+//! cartesian jog: the dry-run client integrates `jog_l` itself (the RT
+//! bridge's `step_cart_jog` has no offline harness yet), so it restates
+//! the full-scale TCP rates. A number that drifts on one side previews a
+//! cartesian jog at the wrong speed, and nothing else would catch it — so
+//! the values are read back out of the Python source and compared.
 
 use std::path::PathBuf;
 
-/// The `python/par6/motion.py` source.
-fn motion_py() -> String {
-    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../python/par6/motion.py");
+/// The `python/par6/client/dry_run_client.py` source.
+fn dry_run_py() -> String {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../python/par6/client/dry_run_client.py");
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()))
 }
 
@@ -23,7 +23,7 @@ fn binding<'a>(source: &'a str, name: &str) -> &'a str {
     source
         .lines()
         .find_map(|line| line.strip_prefix(name)?.strip_prefix(" = "))
-        .unwrap_or_else(|| panic!("python/par6/motion.py defines no `{name}`"))
+        .unwrap_or_else(|| panic!("dry_run_client.py defines no `{name}`"))
         .trim()
 }
 
@@ -32,38 +32,14 @@ fn binding<'a>(source: &'a str, name: &str) -> &'a str {
 /// Compared as parsed numbers, not as text: `5e-3` and `0.005` are the
 /// same constant, and a guard that failed on the spelling would be noise.
 pub fn assert_float(name: &str, expected: f64) {
-    let source = motion_py();
+    let source = dry_run_py();
     let text = binding(&source, name);
     let got: f64 = text
         .parse()
-        .unwrap_or_else(|e| panic!("motion.py `{name} = {text}` is not a float: {e}"));
+        .unwrap_or_else(|e| panic!("dry_run_client.py `{name} = {text}` is not a float: {e}"));
     assert_eq!(
         got, expected,
-        "python/par6/motion.py `{name}` is {got}, the runtime uses {expected} — \
+        "dry_run_client.py `{name}` is {got}, the runtime uses {expected} — \
          the preview and the arm now disagree"
-    );
-}
-
-/// [`assert_float`] for an integer constant.
-pub fn assert_usize(name: &str, expected: usize) {
-    let source = motion_py();
-    let text = binding(&source, name);
-    let got: usize = text
-        .parse()
-        .unwrap_or_else(|e| panic!("motion.py `{name} = {text}` is not an integer: {e}"));
-    assert_eq!(
-        got, expected,
-        "python/par6/motion.py `{name}` is {got}, the runtime uses {expected}"
-    );
-}
-
-/// [`assert_float`] for a string constant.
-pub fn assert_str(name: &str, expected: &str) {
-    let source = motion_py();
-    let text = binding(&source, name);
-    let got = text.trim_matches(['"', '\'']);
-    assert_eq!(
-        got, expected,
-        "python/par6/motion.py `{name}` is {got:?}, the runtime uses {expected:?}"
     );
 }

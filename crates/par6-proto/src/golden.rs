@@ -4,7 +4,7 @@
 //! plus its manifest entry. The manifest's `wire` arrays are produced by
 //! decoding the encoded bytes back to JSON, so manifest and bytes cannot
 //! drift; the Python tests re-encode `wire` with an independent packer
-//! (ormsgpack) and byte-compare against the Rust encoder's output.
+//! and byte-compare against the Rust encoder's output.
 //!
 //! Regenerate the committed files with
 //! `cargo run -p par6-proto --bin gen_golden`; `cargo test -p par6-proto`
@@ -55,7 +55,7 @@ pub enum Check {
     MalformedCommand,
     /// `decode_reply` must fail.
     MalformedReply,
-    /// `decode_status` must fail (Python: `decode_status_bin_into` → False).
+    /// `decode_status` must fail.
     MalformedStatus,
 }
 

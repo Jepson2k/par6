@@ -2,7 +2,8 @@
 
 PAR6 robot backend for [Waldo Commander](https://github.com/Jepson2k/Waldo-Commander):
 a **Rust real-time runtime** (`par6d`) that replaces Source Robotics' RCB-Runtime on the
-control box, plus a **Python client package** (`python/par6`) implementing the
+control box, a **Rust client library** (`par6-client`), and a **Python package**
+(`python/par6`) — a thin binding over the Rust engine — implementing the
 [waldoctl](https://github.com/Jepson2k/waldoctl) backend contracts.
 
 `par6d --sim` runs anywhere — no hardware, no CAN interface, no root — so everything
@@ -43,9 +44,13 @@ started without it exits with `libpar6_shim.so: cannot open shared object file`.
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
+source .ffi/env.sh   # the package compiles the par6-py extension against the shim
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
+The package is a maturin build: pip compiles the `par6-py` extension (the engine's
+client + preview), so a source install needs the Rust toolchain and the shim from
+`scripts/ffi/setup.sh`. Prebuilt wheels that need neither are the wheel CI's job.
 That gives you the client, the offline preview and the kinematics — but **not** the
 `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
@@ -125,6 +130,7 @@ codes — so an editor shows the failure before the arm does.
 ```
 Waldo Commander (NiceGUI frontend, unchanged)
   └─ python/par6 — waldoctl Robot + AsyncRobotClient + sync facade + dry-run preview
+       │   (a thin shim over crates/par6-client + the par6d preview, via crates/par6-py)
        │ protocol v2: UDP msgpack commands · binary status broadcast · telemetry
   par6d (single Rust binary; `par6d --sim` runs anywhere, including CI)
    ├─ command plane (tokio): validation/gating, queue, index allocator,
@@ -152,10 +158,12 @@ rather than approximate it.
 | `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + simulator backends |
 | `crates/par6-rt` | RT tick loop, mode dispatch, homing FSM, error latching, e-stop |
 | `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
-| `crates/par6d` | the runtime binary: config load, thread spawn/wiring, planner, RT bridge |
+| `crates/par6-client` | the client library: command round-trips, retries/dedup, status subscription |
+| `crates/par6d` | the runtime binary: config load, thread spawn/wiring, planner, RT bridge — plus the offline preview harness |
+| `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
-| `tests/golden/` | cross-language golden vectors (Rust encodes, Python decodes) |
+| `tests/golden/` | golden wire vectors (encode/decode conformance for the frozen codec) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
 ### Two planes, one process
@@ -226,8 +234,9 @@ The recipe, in the order that keeps the golden-vector guard happy:
 3. **Dispatch** — `crates/par6-server/src/server.rs`, then the `RtCommands` trait method
    in `runtime.rs`, then its implementation in `crates/par6d/src/bridge.rs` (immediate)
    or `planner.rs` (queued).
-4. **Clients** — `python/par6/client/async_client.py`, the sync façade, and the dry-run
-   preview. The preview has to model the same refusals.
+4. **Clients** — `crates/par6-client/src/api.rs`, the `crates/par6-py` binding, and the
+   Python shim (`python/par6/client/`). The preview needs nothing per-command: it drives
+   the daemon's own planner.
 5. **Golden vectors** — regenerate; the manifest's coverage guard fails on a tag with no
    vector, which is the guard working.
 6. **Test** — a sim e2e that drives the command through the real client against a real

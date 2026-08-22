@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64"]
-build-backend = "setuptools.build_meta"
+requires = ["maturin>=1.7,<2"]
+build-backend = "maturin"
 
 [project]
 name = "par6"
@@ -10,14 +10,6 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
-  "msgspec>=0.18",
-  "ormsgpack>=1.4.0",
-  # The offline dry-run client plans with the algorithms the runtime plans
-  # with: ruckig is the reference implementation of the jerk-limited OTG
-  # par6-motion drives through rsruckig, and toppra is the library the C++
-  # shim (cpp/src/par6_traj.cpp) parameterizes paths with.
-  "ruckig>=0.12.2",
-  "toppra>=0.6.3",
   "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.7.0",
   # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
   # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)
@@ -47,18 +39,19 @@ par6 = "par6.cli:main"
 # was newest and linted against that version's default rule set while devs ran
 # an older one — every push was red on rules the code had never been checked
 # against. The pin and the explicit `select` below are what make the two agree.
-dev = ["ruff==0.15.8", "ty", "pytest", "pytest-asyncio", "pytest-timeout"]
+dev = ["ruff==0.15.8", "ty", "pytest", "pytest-asyncio", "pytest-timeout", "ormsgpack>=1.4.0"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"
 
-[tool.setuptools.packages.find]
-include = ["par6*"]
-
-[tool.setuptools.package-data]
-# Runtime config + URDF trees mirrored from the repo root by
-# scripts/sync_pkg_data.py (freshness-guarded in tests/test_robot.py).
-par6 = ["_data/**/*"]
+[tool.maturin]
+# The extension crate (the engine binding); the pure-Python shim package
+# lives right here and is bundled alongside it. `par6/_data` (runtime
+# config + URDF trees mirrored by scripts/sync_pkg_data.py) rides along as
+# ordinary package files.
+manifest-path = "../crates/par6-py/Cargo.toml"
+python-source = "."
+module-name = "par6._par6"
 
 [tool.ruff]
 target-version = "py311"

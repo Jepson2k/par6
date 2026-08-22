@@ -23,7 +23,7 @@ import pytest
 from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
 
 from par6 import config as _cfg
-from par6 import motion as _motion
+from par6._par6 import Preview as DryRunProfiles
 from par6.client import RobotError
 from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
 from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
@@ -123,26 +123,43 @@ class TestPlannedMotion:
         """Each advertised profile must produce a plan the runtime's own limits
         admit: no tick may step a joint faster than its EXEC velocity ceiling
         (scaled by the requested speed), and every plan must land on the target.
-        A slower speed must take longer."""
-        limits = _motion.MotionLimits.from_config("exec")
-        dt = _motion.tick_dt_s()
+        A slower speed must take longer.
+
+        Driven through the dry-run client — the plan under test is the one
+        the runtime's own planner produces — with the config as the oracle.
+        """
+        config = _cfg.load_robot_config()
+        dt = float(config["robot"]["tick_dt_s"])
+        velocity = np.array(
+            [
+                _cfg.resolve_mode_limits(j["limits"], "exec")[0]
+                for j in config["joints"]
+            ]
+        )
         start = _cfg.homing_ready_pose_rad()
         target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
+        # Full-rate trajectories: the velocity check reads per-tick steps,
+        # which downsampling would smear across several ticks.
+        client = Robot().create_dry_run_client(
+            initial_joints_deg=np.degrees(start).tolist(),
+            max_snapshot_points=1_000_000,
+        )
 
-        for profile in _motion.PROFILES:
+        for profile in DryRunProfiles.profiles():
+            client.select_profile(profile)
             durations: list[float] = []
             for speed in (1.0, 0.25):
-                path = _motion.plan_joint_move(
-                    start, target, limits, dt, profile=profile, speed_fraction=speed
-                )
+                client.teleport(np.degrees(start).tolist())
+                planned = client.move_j(np.degrees(target).tolist(), speed=speed)
+                path = planned.joint_trajectory_rad
                 np.testing.assert_allclose(path[-1], target, atol=1e-6)
                 step = np.abs(np.diff(np.vstack([start, path]), axis=0)) / dt
-                ceiling = limits.velocity * speed
+                ceiling = velocity * speed
                 assert np.all(step <= ceiling * 1.02 + 1e-9), (
                     f"{profile} at speed {speed} exceeds the velocity ceiling: "
                     f"{step.max(axis=0)} vs {ceiling}"
                 )
-                durations.append(len(path) * dt)
+                durations.append(planned.duration)
             full_speed, quarter_speed = durations
             assert quarter_speed > full_speed, (
                 f"{profile}: a quarter-speed move must take longer"
@@ -157,7 +174,9 @@ class TestPlannedMotion:
         dry_run.teleport(park_deg())
         slow = dry_run.move_j(target, duration=4.0)
         assert fast.duration < 1.5
-        assert slow.duration == pytest.approx(4.0, abs=2 * _motion.tick_dt_s())
+        assert slow.duration == pytest.approx(
+            4.0, abs=2 * float(_cfg.load_robot_config()["robot"]["tick_dt_s"])
+        )
         np.testing.assert_allclose(
             slow.end_joints_rad, np.radians(target), atol=1e-6
         )
@@ -191,11 +210,12 @@ class TestCartesianMotion:
         before = list(dry_run.angles())
         unreachable = np.asarray(dry_run.pose())
         unreachable[0] += 5000.0
-        blocked = dry_run.move_l(unreachable.tolist(), speed=0.5)
-        assert blocked.error is not None
-        assert blocked.error.code == ErrorCode.IK_PARTIAL_PATH
-        assert blocked.valid is not None and not blocked.valid.all()
-        assert len(blocked.valid) == blocked.tcp_poses.shape[0]
+        # The endpoint decides reachable-at-all before the path decides
+        # reachable-along-the-way (the planner's own precheck), so a
+        # target outside the workspace refuses the whole command.
+        with pytest.raises(RobotError) as blocked:
+            dry_run.move_l(unreachable.tolist(), speed=0.5)
+        assert blocked.value.code == ErrorCode.IK_TARGET_UNREACHABLE
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
@@ -401,7 +421,9 @@ class TestCartesianMotion:
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
         with pytest.raises(RobotError) as outside:
             dry_run.move_j(far)
-        assert outside.value.code == ErrorCode.MOTN_SETUP_FAILED
+        # A target outside the soft window is invalid input to the planner
+        # (``planning_error``), the same class the runtime answers with.
+        assert outside.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         unhomed = Robot().create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False

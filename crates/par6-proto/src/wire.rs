@@ -3,8 +3,8 @@
 //! Hand-rolled rather than serde-based: every protocol payload is a positional
 //! array with an integer tag in slot 0 and heterogeneous fields after it, and
 //! golden-vector byte equality across languages requires full control over the
-//! encoding. Writers always emit the *smallest* representation (what msgspec
-//! and ormsgpack emit on the Python side); floats are always 9-byte float64.
+//! encoding. Writers always emit the *smallest* representation (what the
+//! reference msgpack encoders emit); floats are always 9-byte float64.
 
 use crate::DecodeError;
 

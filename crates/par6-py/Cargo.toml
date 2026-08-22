@@ -1,0 +1,25 @@
+[package]
+name = "par6-py"
+description = "Python binding for the par6 engine (client, preview, sync client)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "_par6"
+crate-type = ["cdylib"]
+test = false
+doctest = false
+
+[dependencies]
+par6-client = { workspace = true }
+par6-proto = { workspace = true }
+par6-config = { workspace = true }
+par6-server = { workspace = true }
+par6d = { path = "../par6d" }
+pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
+pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
+tokio = { workspace = true }
+log = { workspace = true }

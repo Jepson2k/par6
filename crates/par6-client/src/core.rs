@@ -244,8 +244,10 @@ impl Client {
         }
     }
 
-    /// A fresh 64-bit idempotency key (xorshift over a time-seeded state).
-    pub(crate) fn fresh_key(&self) -> u64 {
+    /// A fresh 64-bit idempotency key (xorshift over a time-seeded
+    /// state) — what the named queued-command methods stamp; callers
+    /// building [`Command`] values directly use it the same way.
+    pub fn fresh_key(&self) -> u64 {
         let mut x = self.inner.key_state.load(Ordering::Relaxed);
         loop {
             let mut n = x;

@@ -14,10 +14,8 @@ import atexit
 import logging
 import math
 import os
-import random
 import re
 import shutil
-import socket
 import subprocess
 import tempfile
 import threading
@@ -44,11 +42,10 @@ from waldoctl import (
 from waldoctl.results import IKResult
 
 from par6 import config as _cfg
+from par6._par6 import ping_blocking
 from par6.client.async_client import AsyncRobotClient
 from par6.client.dry_run_client import DryRunRobotClient
 from par6.client.sync_client import RobotClient as SyncRobotClient
-from par6.protocol.constants import CmdType, MsgType
-from par6.protocol.wire import ProtocolError, decode_reply, encode_command
 from par6.tools import build_tools
 
 logger = logging.getLogger(__name__)
@@ -152,16 +149,7 @@ def _unlink_quietly(path: str) -> None:
 
 def _ping_runtime(host: str, port: int, timeout: float = 0.5) -> bool:
     """True when a par6d runtime answers a protocol-v2 PING at host:port."""
-    req_id = random.randrange(1, 1 << 32)
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(timeout)
-            sock.sendto(encode_command(CmdType.PING, req_id, []), (host, port))
-            data, _ = sock.recvfrom(4096)
-        msg_type, reply_id, _payload = decode_reply(data)
-        return msg_type is MsgType.RESPONSE and reply_id == req_id
-    except (OSError, TimeoutError, ProtocolError):
-        return False
+    return ping_blocking(host, port, timeout)
 
 
 def _find_par6d() -> str:

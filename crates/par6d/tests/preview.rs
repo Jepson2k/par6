@@ -266,3 +266,36 @@ fn the_preview_runs_the_cartesian_pipeline() {
         "{err:?}"
     );
 }
+
+/// The jog preview runs the runtime's own ramp: a diagonal jog moves
+/// both commanded joints in their commanded directions, and the wire's
+/// validation refusals (over-unity speed, an over-long watchdog) come
+/// back as the runtime's structured errors without a daemon anywhere.
+#[test]
+fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview");
+    let start = preview.angles_rad();
+
+    let jogged = preview.preview_jog([0.4, 0.0, 0.0, -0.4, 0.0, 0.0], 0.4, None);
+    assert!(jogged.valid(), "{jogged:?}");
+    let end = jogged.end_joints_rad;
+    assert!(end[0] > start[0] + 0.01, "J0 must jog forward");
+    assert!(end[3] < start[3] - 0.01, "J3 must jog back");
+    assert!(jogged.duration_s > 0.3, "{}", jogged.duration_s);
+    assert_eq!(
+        preview.angles_rad(),
+        end,
+        "the virtual arm advances to where the jog ends"
+    );
+
+    for (speeds, duration) in [
+        ([1.5, 0.0, 0.0, 0.0, 0.0, 0.0], 0.4),
+        ([0.2, 0.0, 0.0, 0.0, 0.0, 0.0], 100.0),
+    ] {
+        let refused = preview.preview_jog(speeds, duration, None);
+        let err = refused.error.expect("the wire refuses this jog");
+        assert_eq!(err.code, ErrorCode::CommValidationError as u16, "{err:?}");
+        assert_eq!(refused.end_joints_rad, end, "a refused jog moves nothing");
+    }
+}

@@ -9,13 +9,16 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use par6_proto::{Command, CompletionPolicy, WireError};
+use par6_motion::JogEngine;
+use par6_proto::{command::JogJ, Command, CompletionPolicy, WireError, NUM_JOINTS};
+use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
-    sample_ring, snapshot_channel, ExecHeartbeat, Mode, SampleConsumer, SnapshotWriter,
-    StateSnapshot, MAX_JOINTS,
+    sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
+    SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
-use par6_server::{PlanContext, Planner, QueuedCommand, ShapeLayer};
+use par6_server::{decode_error_to_wire, gate, PlanContext, Planner, QueuedCommand, ShapeLayer};
 
+use crate::adapters::MotionJog;
 use crate::bridge::{CoreLink, CoreOp};
 use crate::daemon::{load_kin_stack, DaemonError};
 use crate::options::{resolve_config_path, Options};
@@ -49,6 +52,7 @@ impl PreviewResult {
 /// The offline preview session: a virtual arm pose plus the real planner.
 pub struct Preview {
     planner: Par6Planner,
+    jog: MotionJog,
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
     next_index: u64,
@@ -100,9 +104,11 @@ impl Preview {
         }
         snap.homed = true;
         snap.mode = Mode::Idle;
+        let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let dt = robot.robot.tick_dt_s;
         let mut preview = Self {
             planner,
+            jog,
             snap,
             snap_w,
             next_index: 0,
@@ -127,6 +133,20 @@ impl Preview {
     /// Move the virtual arm instantly (the preview's teleport).
     pub fn teleport_rad(&mut self, q: [f64; MAX_JOINTS]) {
         self.snap.q = q;
+        self.publish();
+    }
+
+    /// Whether the virtual arm holds its position references.
+    pub fn homed(&self) -> bool {
+        self.snap.homed
+    }
+
+    /// Set the virtual arm's homed state. While unhomed, commands the
+    /// server gates on homing are refused with the server's own refusal,
+    /// and HOME previews as the referencing seek instead of a planned
+    /// park return.
+    pub fn set_homed(&mut self, homed: bool) {
+        self.snap.homed = homed;
         self.publish();
     }
 
@@ -177,6 +197,70 @@ impl Preview {
         self.preview_batch(&[cmd]).pop().expect("one command in")
     }
 
+    fn refusal(&self, error: WireError) -> PreviewResult {
+        PreviewResult {
+            joint_trajectory_rad: Vec::new(),
+            tcp_poses: Vec::new(),
+            end_joints_rad: self.snap.q,
+            duration_s: 0.0,
+            error: Some(error),
+        }
+    }
+
+    /// Preview a velocity jog held for `duration_s`: the same
+    /// `par6-motion` jog engine the RT core ticks, integrated from the
+    /// virtual pose (per-joint ramps, soft-limit direction blocking).
+    /// Wire-invalid parameters are refused exactly as the runtime
+    /// refuses the datagram; the virtual arm advances to where the jog
+    /// ends.
+    pub fn preview_jog(
+        &mut self,
+        speeds: [f64; NUM_JOINTS],
+        duration_s: f64,
+        accel: Option<f64>,
+    ) -> PreviewResult {
+        let cmd = Command::JogJ(JogJ {
+            speeds,
+            duration: duration_s,
+            accel,
+        });
+        if let Err(e) = cmd.validate() {
+            return self.refusal(decode_error_to_wire(&e));
+        }
+        let mut fractions = [0.0; MAX_JOINTS];
+        fractions[..NUM_JOINTS].copy_from_slice(&speeds);
+        self.jog.set_accel_scale(accel.unwrap_or(1.0));
+        self.jog.activate(&self.snap.q);
+        self.jog.command(&fractions);
+        let ticks = ((duration_s / self.dt).round() as usize).max(1);
+        let mut q = self.snap.q;
+        let mut trajectory = Vec::with_capacity(ticks);
+        for _ in 0..ticks {
+            let mut q_out = [0.0; MAX_JOINTS];
+            let mut qd_out = [0.0; MAX_JOINTS];
+            self.jog.tick(&q, &mut q_out, &mut qd_out);
+            q = q_out;
+            trajectory.push(q);
+        }
+        self.jog.release();
+        let mut tcp_poses = Vec::with_capacity(trajectory.len());
+        for q in &trajectory {
+            match self.planner.current_pose(q) {
+                Ok(pose) => tcp_poses.push(pose),
+                Err(_) => break,
+            }
+        }
+        self.snap.q = q;
+        self.publish();
+        PreviewResult {
+            duration_s: trajectory.len() as f64 * self.dt,
+            joint_trajectory_rad: trajectory,
+            tcp_poses,
+            end_joints_rad: q,
+            error: None,
+        }
+    }
+
     /// Preview a queued program: commands are offered to the planner in
     /// server order, so blend chains fold exactly as they would live.
     /// One result per command; commands folded into a predecessor's
@@ -185,8 +269,28 @@ impl Preview {
         let mut results = Vec::with_capacity(cmds.len());
         let mut rest = cmds;
         while !rest.is_empty() {
+            // The runtime validates every datagram at decode; an invalid
+            // command is refused there and never reaches the queue, so it
+            // never enters the planner here either.
+            if let Err(e) = rest[0].validate() {
+                results.push(self.refusal(decode_error_to_wire(&e)));
+                rest = &rest[1..];
+                continue;
+            }
+            // The server refuses planned motion while unreferenced —
+            // its own gate table, applied here so the preview answers
+            // exactly what the runtime would.
+            if gate(rest[0].tag()).needs_homed && !self.snap.homed {
+                results.push(self.refusal(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[])));
+                rest = &rest[1..];
+                continue;
+            }
+            // Only offer the leading run of wire-valid commands: a later
+            // invalid one would have been refused at its own datagram, so
+            // the planner must not fold it into this chain.
+            let valid = rest.iter().take_while(|c| c.validate().is_ok()).count();
             self.publish();
-            let batch: Vec<QueuedCommand<'_>> = rest
+            let batch: Vec<QueuedCommand<'_>> = rest[..valid]
                 .iter()
                 .enumerate()
                 .map(|(k, cmd)| QueuedCommand {
@@ -206,11 +310,20 @@ impl Preview {
                     1,
                 ),
                 Ok(consumed) => {
+                    let mut homing_seek = false;
                     let trajectory: Vec<[f64; MAX_JOINTS]> = match self.planner.planned_motion() {
                         PlannedMotion::Exec(samples) => samples.iter().map(|s| s.q).collect(),
-                        PlannedMotion::Home => vec![self.planner.home_pose()],
+                        PlannedMotion::Home => {
+                            homing_seek = true;
+                            vec![self.planner.home_pose()]
+                        }
                         PlannedMotion::Still => Vec::new(),
                     };
+                    if homing_seek {
+                        // The seek establishes the references; where it
+                        // ends is the configured homing-ready pose.
+                        self.snap.homed = true;
+                    }
                     self.planner.cancel();
                     let end = trajectory.last().copied().unwrap_or(self.snap.q);
                     let duration_s = trajectory.len() as f64 * self.dt;

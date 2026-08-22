@@ -1,0 +1,271 @@
+//! Wire ⇄ Python conversions: STATUS frames and query results become
+//! plain dicts (the Python shim owns the typed surface), errors become a
+//! structured exception carrying the wire's six-tuple.
+
+use pyo3::exceptions::PyRuntimeError;
+use pyo3::prelude::*;
+use pyo3::types::{PyDict, PyList};
+
+use par6_client::ClientError;
+use par6_proto::command::ToolParam;
+use par6_proto::{QueryResult, Shape, Status, ToolStatusWire, WireError};
+
+pyo3::create_exception!(
+    _par6,
+    RobotWireError,
+    pyo3::exceptions::PyException,
+    "A structured runtime refusal: args = (command_index, code, title, cause, effect, remedy)."
+);
+
+pub fn robot_err(e: &WireError) -> PyErr {
+    RobotWireError::new_err((
+        e.command_index,
+        e.code,
+        e.title.clone(),
+        e.cause.clone(),
+        e.effect.clone(),
+        e.remedy.clone(),
+    ))
+}
+
+/// Map a client error onto the Python surface. `Unreachable` is NOT an
+/// exception — callers map it to `None`/`0`/`-1` per method — so this
+/// only covers the genuinely exceptional arms.
+pub fn client_err(e: ClientError) -> PyErr {
+    match e {
+        ClientError::Robot(err) => robot_err(&err),
+        other => PyRuntimeError::new_err(other.to_string()),
+    }
+}
+
+pub fn wire_error_tuple(py: Python<'_>, e: &WireError) -> PyObject {
+    (
+        e.command_index,
+        e.code,
+        e.title.clone(),
+        e.cause.clone(),
+        e.effect.clone(),
+        e.remedy.clone(),
+    )
+        .into_pyobject(py)
+        .expect("tuple converts")
+        .into_any()
+        .unbind()
+}
+
+pub fn tool_status_dict(py: Python<'_>, t: &ToolStatusWire) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("key", &t.key)?;
+    d.set_item("state", t.state as u8)?;
+    d.set_item("engaged", t.engaged)?;
+    d.set_item("part_detected", t.part_detected)?;
+    d.set_item("fault_code", t.fault_code)?;
+    d.set_item("positions", t.positions.clone())?;
+    d.set_item("channels", t.channels.clone())?;
+    d.set_item("variant_key", &t.variant_key)?;
+    Ok(d.into_any().unbind())
+}
+
+/// `Vec<u8>` converts to Python `bytes`; these flag arrays must land as
+/// lists of ints (the numpy buffers slice-assign from them).
+fn int_list(v: &[u8]) -> Vec<u16> {
+    v.iter().map(|b| u16::from(*b)).collect()
+}
+
+/// One STATUS frame as a dict of plain values (field names match the
+/// Python `StatusBuffer`).
+pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("proto_version", s.proto_version)?;
+    d.set_item("controller_id", s.controller_id)?;
+    d.set_item("seq", s.seq)?;
+    d.set_item("mono_time_ns", s.mono_time_ns)?;
+    d.set_item("link_ok", s.link_ok)?;
+    d.set_item("data_age_ms", s.data_age_ms)?;
+    d.set_item("pose", s.pose.to_vec())?;
+    d.set_item("angles", s.angles.to_vec())?;
+    d.set_item("speeds", s.speeds.to_vec())?;
+    d.set_item("io", int_list(&s.io))?;
+    d.set_item("action_current", &s.action_current)?;
+    d.set_item("action_state", s.action_state as u8)?;
+    d.set_item("joint_en", int_list(&s.joint_en))?;
+    d.set_item("cart_en_wrf", int_list(&s.cart_en_wrf))?;
+    d.set_item("cart_en_trf", int_list(&s.cart_en_trf))?;
+    d.set_item("executing_index", s.executing_index)?;
+    d.set_item("completed_index", s.completed_index)?;
+    d.set_item("last_checkpoint", &s.last_checkpoint)?;
+    match &s.error {
+        Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
+        None => d.set_item("error", py.None())?,
+    }
+    d.set_item("queued_segments", s.queued_segments)?;
+    d.set_item("queued_duration", s.queued_duration)?;
+    d.set_item("action_params", &s.action_params)?;
+    match &s.tool_status {
+        Some(t) => d.set_item("tool_status", tool_status_dict(py, t)?)?,
+        None => d.set_item("tool_status", py.None())?,
+    }
+    d.set_item("tcp_speed", s.tcp_speed)?;
+    d.set_item("simulator_active", s.simulator_active)?;
+    d.set_item("collision_active", s.collision_active)?;
+    d.set_item("collision_pairs", s.collision_pairs.clone())?;
+    d.set_item("scene_epoch", s.scene_epoch)?;
+    d.set_item("accepted_index", s.accepted_index)?;
+    d.set_item("homed", s.homed)?;
+    d.set_item("tau", s.tau.to_vec())?;
+    d.set_item("mode", s.mode as u8)?;
+    d.set_item("enabled", s.enabled)?;
+    d.set_item("gravity_comp", s.gravity_comp)?;
+    Ok(d.into_any().unbind())
+}
+
+fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("kind", &s.kind)?;
+    d.set_item("params", s.params.clone())?;
+    d.set_item("pose", s.pose.clone())?;
+    d.set_item("collision", s.collision)?;
+    d.set_item("margin", s.margin)?;
+    d.set_item("name", &s.name)?;
+    Ok(d.into_any().unbind())
+}
+
+/// A composite query result as a dict tagged with its query name.
+pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    match r {
+        QueryResult::Ping { hardware_connected } => {
+            d.set_item("hardware_connected", *hardware_connected)?;
+        }
+        QueryResult::Status {
+            pose,
+            angles,
+            speeds,
+            io,
+            tool_status,
+        } => {
+            d.set_item("pose", pose.to_vec())?;
+            d.set_item("angles", angles.to_vec())?;
+            d.set_item("speeds", speeds.to_vec())?;
+            d.set_item("io", int_list(io))?;
+            match tool_status {
+                Some(t) => d.set_item("tool_status", tool_status_dict(py, t)?)?,
+                None => d.set_item("tool_status", py.None())?,
+            }
+        }
+        QueryResult::Tools { tool, available } => {
+            d.set_item("tool", tool)?;
+            d.set_item("available", available.clone())?;
+        }
+        QueryResult::Queue {
+            queue,
+            executing_index,
+            completed_index,
+            last_checkpoint,
+            queued_duration,
+        } => {
+            d.set_item("queue", queue.clone())?;
+            d.set_item("executing_index", *executing_index)?;
+            d.set_item("completed_index", *completed_index)?;
+            d.set_item("last_checkpoint", last_checkpoint)?;
+            d.set_item("queued_duration", *queued_duration)?;
+        }
+        QueryResult::Activity {
+            current,
+            state,
+            next,
+            params,
+        } => {
+            d.set_item("current", current)?;
+            d.set_item("state", *state as u8)?;
+            d.set_item("next", next)?;
+            d.set_item("params", params)?;
+        }
+        QueryResult::LoopStats(s) => {
+            d.set_item("target_hz", s.target_hz)?;
+            d.set_item("loop_count", s.loop_count)?;
+            d.set_item("overrun_count", s.overrun_count)?;
+            d.set_item("mean_period_s", s.mean_period_s)?;
+            d.set_item("std_period_s", s.std_period_s)?;
+            d.set_item("min_period_s", s.min_period_s)?;
+            d.set_item("max_period_s", s.max_period_s)?;
+            d.set_item("p95_period_s", s.p95_period_s)?;
+            d.set_item("p99_period_s", s.p99_period_s)?;
+            d.set_item("mean_hz", s.mean_hz)?;
+        }
+        QueryResult::Reachable {
+            joint_en,
+            cart_en_wrf,
+            cart_en_trf,
+        } => {
+            d.set_item("joint_en", int_list(joint_en))?;
+            d.set_item("cart_en_wrf", int_list(cart_en_wrf))?;
+            d.set_item("cart_en_trf", int_list(cart_en_trf))?;
+        }
+        QueryResult::Shapes {
+            installation,
+            program,
+            epoch,
+        } => {
+            let inst = PyList::empty(py);
+            for s in installation {
+                inst.append(shape_dict(py, s)?)?;
+            }
+            let prog = PyList::empty(py);
+            for s in program {
+                prog.append(shape_dict(py, s)?)?;
+            }
+            d.set_item("installation", inst)?;
+            d.set_item("program", prog)?;
+            d.set_item("epoch", *epoch)?;
+        }
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "query result {:?} has a dedicated accessor",
+                other.tag()
+            )));
+        }
+    }
+    Ok(d.into_any().unbind())
+}
+
+/// Python shape dict → wire shape.
+pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
+    let get = |k: &str| -> PyResult<Bound<'_, PyAny>> {
+        d.get_item(k)?
+            .ok_or_else(|| PyRuntimeError::new_err(format!("shape is missing '{k}'")))
+    };
+    Ok(Shape {
+        kind: get("kind")?.extract()?,
+        params: get("params")?.extract()?,
+        pose: get("pose")?.extract()?,
+        collision: match d.get_item("collision")? {
+            Some(v) => v.extract()?,
+            None => true,
+        },
+        margin: match d.get_item("margin")? {
+            Some(v) => v.extract()?,
+            None => None,
+        },
+        name: get("name")?.extract()?,
+    })
+}
+
+/// Python value → tool-action parameter.
+pub fn tool_param_from_py(v: &Bound<'_, PyAny>) -> PyResult<ToolParam> {
+    if let Ok(b) = v.downcast::<pyo3::types::PyBool>() {
+        return Ok(ToolParam::Bool(b.is_true()));
+    }
+    if let Ok(i) = v.extract::<i64>() {
+        return Ok(ToolParam::Int(i));
+    }
+    if let Ok(f) = v.extract::<f64>() {
+        return Ok(ToolParam::Float(f));
+    }
+    if let Ok(s) = v.extract::<String>() {
+        return Ok(ToolParam::Str(s));
+    }
+    Err(PyRuntimeError::new_err(
+        "tool parameters must be bool, int, float, or str",
+    ))
+}
