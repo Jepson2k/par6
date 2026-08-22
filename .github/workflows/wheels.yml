@@ -94,6 +94,47 @@ jobs:
           name: wheel-${{ matrix.arch }}
           path: dist/*.whl
 
+  # The daemon half of a release: par6d cross-built for the control box,
+  # with the shim, the runtime closure, config and assets staged by
+  # scripts/deploy/install.sh — the same bundle ci.yml stages, packed as
+  # a tarball a box installs with `tar -x`.
+  daemon-bundle:
+    name: daemon bundle (aarch64)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: deploy-aarch64
+      - name: cache aarch64 pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/cross-aarch64
+          key: ffi-aarch64-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build aarch64 shim + runtime closure
+        run: scripts/ffi/setup.sh --target aarch64
+      - name: cross-build par6d
+        run: |
+          source .ffi/env-aarch64.sh
+          scripts/deploy/build-aarch64.sh
+      - name: stage and pack the bundle
+        run: |
+          source .ffi/env-aarch64.sh
+          scripts/deploy/install.sh --stage-only "$RUNNER_TEMP/bundle"
+          test -x "$RUNNER_TEMP/bundle/par6d"
+          mkdir -p dist-bundle
+          tar -C "$RUNNER_TEMP" -czf dist-bundle/par6d-aarch64.tar.gz bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: par6d-aarch64-bundle
+          path: dist-bundle/par6d-aarch64.tar.gz
+
   sdist:
     name: sdist
     runs-on: ubuntu-latest
@@ -116,7 +157,7 @@ jobs:
   release:
     name: attach to release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [wheel, sdist]
+    needs: [wheel, sdist, daemon-bundle]
     runs-on: ubuntu-latest
     permissions:
       contents: write
