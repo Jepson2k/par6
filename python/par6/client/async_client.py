@@ -33,6 +33,7 @@ from waldoctl.status import (
 )
 from waldoctl.status import (
     ActivityResult,
+    LoopStatsResult,
     PingResult,
     ToolResult,
 )
@@ -175,30 +176,6 @@ class ReachableResult:
     joint_en: list[int]
     cart_en_wrf: list[int]
     cart_en_trf: list[int]
-
-
-@dataclass
-class LoopStatsResult:
-    """Control-loop runtime metrics."""
-
-    target_hz: float
-    loop_count: int
-    overrun_count: int
-    mean_period_s: float
-    std_period_s: float
-    min_period_s: float
-    max_period_s: float
-    p95_period_s: float
-    p99_period_s: float
-    mean_hz: float
-    p50_period_s: float
-    p90_period_s: float
-    can_frame_age_min_ticks: int
-    can_frame_age_max_ticks: int
-    rt_fifo: bool
-    """Whether the RT thread runs under SCHED_FIFO (setup succeeded)."""
-    rt_pinned: bool
-    """Whether the RT thread is pinned to its configured CPU."""
 
 
 @dataclass

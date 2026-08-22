@@ -542,6 +542,13 @@ class Robot(_RobotABC):
         return len(_cfg.io_line_names()[0])
 
     @property
+    def has_force_torque(self) -> bool:
+        """Joint torques are measured every tick (motor currents through
+        the torque constants), and the external-torque estimate rides the
+        status broadcast."""
+        return True
+
+    @property
     def has_freedrive(self) -> bool:
         """par6 back-drives through the gravity feedforward rather than a
         dedicated mode: IDLE with G(q) applied is a torque-only hold with no

@@ -10,7 +10,7 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
-  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.7.0",
+  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.8.0",
   # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
   # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)
   "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-macosx_15_0_arm64.whl ; python_version == '3.11' and platform_system == 'Darwin' and platform_machine == 'arm64'",
