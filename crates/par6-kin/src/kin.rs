@@ -227,6 +227,24 @@ impl Kin {
         self.q_full[..NQ].copy_from_slice(q);
     }
 
+    /// Replace the runtime payload attached at the model's end-effector
+    /// frame — an inertial update only (FK, jacobian and collision
+    /// geometry unchanged), reversible: `mass = 0` restores the
+    /// create-time inertia. `com` is in end-effector-frame coordinates
+    /// \[m\]; `inertia` about the COM in ee-frame axes
+    /// (`Ixx, Ixy, Iyy, Ixz, Iyz, Izz`), `None` = point mass.
+    /// Mass/COM finiteness and inertia positive-semidefiniteness are
+    /// validated in the wrapper before the model is touched.
+    pub fn set_tool(
+        &mut self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<(), KinError> {
+        self.model.set_tool(mass, com, inertia)?;
+        Ok(())
+    }
+
     /// Forward kinematics: TCP pose of arm configuration `q` as a
     /// row-major 4x4 transform written into `pose`.
     pub fn fk(&mut self, q: &[f64; NQ], pose: &mut Pose) -> Result<(), KinError> {

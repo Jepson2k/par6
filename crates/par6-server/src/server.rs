@@ -52,8 +52,8 @@ use crate::faults::{gripper_fault_code, rt_standing_error};
 use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
 use crate::runtime::{
-    blend_radius_mm, CollisionState, Enablement, PlanContext, Planner, QueuedCommand, RtCommands,
-    RuntimeHandle, ShapeLayer,
+    blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
+    RtCommands, RuntimeHandle, ShapeLayer,
 };
 use crate::telemetry;
 
@@ -235,6 +235,8 @@ struct Core<P: Planner, R: RtCommands> {
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    /// The commanded runtime payload — served back by the PAYLOAD query.
+    payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
     collision: CollisionState,
@@ -305,6 +307,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            payload: PayloadSpec::default(),
             shapes: Vec::new(),
             scene_epoch: 0,
             collision: CollisionState::default(),
@@ -611,6 +614,17 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             }
             C::SetTcpOffset(p) => {
                 self.tcp_offset_mm = [p.x, p.y, p.z];
+                self.sync_planner();
+                Ok(())
+            }
+            C::SetPayload(p) => {
+                let payload = PayloadSpec {
+                    mass: p.mass,
+                    com: p.com,
+                    inertia: p.inertia,
+                };
+                self.payload = payload;
+                self.runtime.rt.set_payload(payload);
                 self.sync_planner();
                 Ok(())
             }
@@ -1338,6 +1352,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
             completion_policy: self.completion_policy,
+            payload: self.payload,
         };
         self.runtime.planner.sync(ctx);
     }
@@ -1877,6 +1892,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::IsSimulator => QueryResult::IsSimulator {
                 active: self.simulator,
             },
+            C::Payload => QueryResult::Payload {
+                mass: self.payload.mass,
+                com: self.payload.com,
+                inertia: self.payload.inertia.unwrap_or_default(),
+            },
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -2012,6 +2032,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::ResetState => "reset_state",
         T::ConnectHardware => "connect_hardware",
         T::SetTcpOffset => "set_tcp_offset",
+        T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
         T::SetRecipe => "set_recipe",
@@ -2034,6 +2055,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
         T::ConfigInfo => "config_info",
+        T::Payload => "payload",
         T::ServoJ => "servo_j",
         T::ServoJPose => "servo_j_pose",
         T::ServoL => "servo_l",

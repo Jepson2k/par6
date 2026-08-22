@@ -224,6 +224,25 @@ impl Client {
             .await
     }
 
+    /// Replace the runtime payload carried at the TCP (mass \[kg\], COM
+    /// \[m\] ee-frame, inertia about the COM or `None` for a point
+    /// mass). `mass = 0` clears. Inertial update only — collision
+    /// geometry is unchanged.
+    pub async fn set_payload(
+        &self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::SetPayload(cmd::SetPayload { mass, com, inertia }))
+            .await
+    }
+
+    /// The effective runtime payload (zeros = none).
+    pub async fn payload(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::Payload).await
+    }
+
     /// Replace the program-layer collision shapes.
     pub async fn set_shapes(&self, shapes: Vec<Shape>) -> Result<Ack, ClientError> {
         self.system(Command::SetShapes(cmd::SetShapes { shapes }))

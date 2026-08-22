@@ -16,8 +16,8 @@ use crate::chunk::{encode_chunk, split_into_chunks, Chunk};
 use crate::command::{
     encode_command, Checkpoint, Command, ConnectHardware, Delay, Home, JogJ, JogL, MoveC, MoveJ,
     MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ, ServoJPose,
-    ServoL, SetCompletionPolicy, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator, Stop,
-    Teleport, ToolAction, ToolParam, WriteIo,
+    ServoL, SetCompletionPolicy, SetPayload, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator,
+    Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use crate::enums::{
     command_class, ActionState, CompletionPolicy, ControllerMode, Frame, ToolState,
@@ -574,6 +574,25 @@ pub fn vectors() -> Vec<Vector> {
     v.push(cmd_vec("cmd_is_simulator", 37, Command::IsSimulator));
     v.push(cmd_vec("cmd_shapes", 38, Command::Shapes));
     v.push(cmd_vec("cmd_config_info", 39, Command::ConfigInfo));
+    v.push(cmd_vec(
+        "cmd_set_payload",
+        40,
+        Command::SetPayload(SetPayload {
+            mass: 1.25,
+            com: [0.0, 0.01, 0.055],
+            inertia: Some([0.002, 0.0, 0.003, 0.0001, 0.0, 0.004]),
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_set_payload_point",
+        41,
+        Command::SetPayload(SetPayload {
+            mass: 0.5,
+            com: [0.0, 0.0, 0.04],
+            inertia: None,
+        }),
+    ));
+    v.push(cmd_vec("cmd_payload", 42, Command::Payload));
 
     // -- commands: FIRE_AND_FORGET --
     v.push(cmd_vec(
@@ -1058,6 +1077,17 @@ pub fn vectors() -> Vec<Vector> {
             },
         },
     ));
+    v.push(reply_vec(
+        "response_payload",
+        Reply::Response {
+            req_id: 120,
+            result: QueryResult::Payload {
+                mass: 1.25,
+                com: [0.0, 0.01, 0.055],
+                inertia: [0.002, 0.0, 0.003, 0.0001, 0.0, 0.004],
+            },
+        },
+    ));
 
     // -- STATUS broadcasts --
     v.push(status_vec("status_full", status_full_fixture()));
@@ -1374,6 +1404,45 @@ fn malformed_vectors() -> Vec<Vector> {
         "malformed_status_bad_field",
         "status",
         "pose must be a float array",
+        b,
+    ));
+
+    // set_payload: negative mass
+    let mut b = Vec::new();
+    w_array(&mut b, 5);
+    w_uint(&mut b, 25);
+    w_uint(&mut b, 9);
+    w_f64(&mut b, -0.5);
+    w_array(&mut b, 3);
+    for _ in 0..3 {
+        w_f64(&mut b, 0.0);
+    }
+    w_nil(&mut b);
+    out.push(malformed_vec(
+        "malformed_payload_negative_mass",
+        "command",
+        "payload mass must be >= 0",
+        b,
+    ));
+
+    // set_payload: negative-definite inertia (fails the PSD check)
+    let mut b = Vec::new();
+    w_array(&mut b, 5);
+    w_uint(&mut b, 25);
+    w_uint(&mut b, 9);
+    w_f64(&mut b, 1.0);
+    w_array(&mut b, 3);
+    for _ in 0..3 {
+        w_f64(&mut b, 0.0);
+    }
+    w_array(&mut b, 6);
+    for v in [-1.0, 0.0, 1.0, 0.0, 0.0, 1.0] {
+        w_f64(&mut b, v);
+    }
+    out.push(malformed_vec(
+        "malformed_payload_indefinite_inertia",
+        "command",
+        "payload inertia must be positive semidefinite",
         b,
     ));
 

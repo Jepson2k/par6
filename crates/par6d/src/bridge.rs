@@ -773,6 +773,14 @@ impl RtCommands for RtBridge {
         self.link.send(RtCommand::SetGravityComp(on));
     }
 
+    fn set_payload(&mut self, payload: par6_server::PayloadSpec) {
+        self.link.send(RtCommand::SetPayload {
+            mass: payload.mass,
+            com: payload.com,
+            inertia: payload.inertia,
+        });
+    }
+
     fn set_exec_paused(&mut self, paused: bool) {
         self.link.send(RtCommand::ExecSetPaused(paused));
     }

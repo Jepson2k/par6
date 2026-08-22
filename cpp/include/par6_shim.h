@@ -390,8 +390,20 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
  *     residual-scaled damping, so a step that would increase the error is
  *     refused instead of committed). Purely additive; a stale v8 library
  *     fails to link it. */
+/* Replace the runtime payload attached at the end-effector frame.
+ * Reversible: each call restores the create-time parent-joint inertia
+ * (config tool included) before appending the new payload.
+ *   mass      payload mass [kg]; <= 0 clears the payload.
+ *   com3      COM in end-effector-frame coordinates [m] (required when
+ *             mass > 0).
+ *   inertia6  rotational inertia about the COM, ee-frame axes,
+ *             (Ixx, Ixy, Iyy, Ixz, Iyz, Izz) [kg m^2]; NULL = point mass.
+ * The collision geometry is unchanged — this is an inertial update only. */
+par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
+                              const double *inertia6);
+
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 9
+#define PAR6_SHIM_ABI_VERSION 10
 
 #ifdef __cplusplus
 } /* extern "C" */

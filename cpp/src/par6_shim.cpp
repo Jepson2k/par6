@@ -14,6 +14,7 @@
 
 #include <Eigen/Dense>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -39,6 +40,13 @@ struct par6_kin {
     bool has_tool = false;
     Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity();
     Eigen::Vector3d tool_offset = Eigen::Vector3d::Zero();
+
+    // Create-time inertia of the ee frame's parent joint (config tool
+    // included) — the baseline every par6_kin_set_tool call restores
+    // before appending the new payload, which is what makes the payload
+    // replaceable and clearable at runtime.
+    pinocchio::Inertia pristine_inertia = pinocchio::Inertia::Zero();
+    pinocchio::JointIndex payload_joint = 0;
 
     // Preallocated workspace — every post-create call is allocation-free.
     Eigen::VectorXd q;
@@ -157,6 +165,11 @@ par6_kin *par6_kin_create(const char *urdf_path,
             }
         }
 
+        {
+            const pinocchio::Frame &fr = h->model.frames[h->ee_frame_id];
+            h->payload_joint = fr.parentJoint;
+            h->pristine_inertia = h->model.inertias[h->payload_joint];
+        }
         h->alloc_workspace();
         return h;
     } catch (const std::bad_alloc &) {
@@ -403,6 +416,56 @@ int32_t par6_kin_ik_solve(par6_kin *h,
 }
 
 /* par6_traj_* live in par6_traj.cpp (toppra-cpp). */
+
+par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
+                              const double *inertia6) {
+    if (h == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (!std::isfinite(mass)) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (mass > 0.0) {
+        if (com3 == nullptr) {
+            return PAR6_ERR_INVALID_ARG;
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(com3[i])) {
+                return PAR6_ERR_INVALID_ARG;
+            }
+        }
+        if (inertia6 != nullptr) {
+            for (int i = 0; i < 6; ++i) {
+                if (!std::isfinite(inertia6[i])) {
+                    return PAR6_ERR_INVALID_ARG;
+                }
+            }
+        }
+    }
+    try {
+        // Reversible by construction: start from the create-time joint
+        // inertia every call, then append the requested payload (if any)
+        // at the ee frame placement — the same composition create uses
+        // for the config tool.
+        h->model.inertias[h->payload_joint] = h->pristine_inertia;
+        if (mass > 0.0) {
+            const pinocchio::Frame &fr = h->model.frames[h->ee_frame_id];
+            const Eigen::Vector3d com(com3[0], com3[1], com3[2]);
+            const pinocchio::Symmetric3 I =
+                inertia6 != nullptr
+                    ? pinocchio::Symmetric3(inertia6[0], inertia6[1],
+                                            inertia6[2], inertia6[3],
+                                            inertia6[4], inertia6[5])
+                    : pinocchio::Symmetric3::Zero();
+            h->model.appendBodyToJoint(h->payload_joint,
+                                       pinocchio::Inertia(mass, com, I),
+                                       fr.placement);
+        }
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
 
 int32_t par6_shim_abi_version(void) { return PAR6_SHIM_ABI_VERSION; }
 

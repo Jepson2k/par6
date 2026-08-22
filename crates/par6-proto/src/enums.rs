@@ -105,6 +105,8 @@ wire_enum! {
         /// Unlike STOP this leaves the sample ring intact, so the move
         /// continues from where it paused rather than being re-issued.
         Pause = 24,
+        /// Set the runtime payload (mass/COM/inertia at the TCP frame).
+        SetPayload = 25,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -146,6 +148,8 @@ wire_enum! {
         /// Effective-configuration readback (path, fingerprint, limits,
         /// motion constants) — the config-skew hook.
         ConfigInfo = 48,
+        /// Runtime payload readback (mass/COM/inertia).
+        Payload = 49,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -230,6 +234,8 @@ wire_enum! {
         Shapes = 18,
         /// See [`CmdType::ConfigInfo`].
         ConfigInfo = 19,
+        /// See [`CmdType::Payload`].
+        Payload = 20,
     }
 }
 
@@ -385,7 +391,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetTcpOffset
         | C::SetShapes
         | C::SetCompletionPolicy
-        | C::SetRecipe => CommandClass::System,
+        | C::SetRecipe
+        | C::SetPayload => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -405,7 +412,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
-        | C::ConfigInfo => CommandClass::Query,
+        | C::ConfigInfo
+        | C::Payload => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

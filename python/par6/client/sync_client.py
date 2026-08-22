@@ -421,6 +421,19 @@ class RobotClient:
         """Whether the arm is floating right now, read from the broadcast."""
         return _run(self._inner.is_freedrive(timeout=timeout))
 
+    def set_payload(
+        self,
+        mass: float,
+        com: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        inertia: tuple[float, float, float, float, float, float] | None = None,
+    ) -> int:
+        """Declare the payload the arm is carrying at the TCP."""
+        return _run(self._inner.set_payload(mass, com, inertia))
+
+    def payload(self) -> dict | None:
+        """The effective runtime payload (zeros = none)."""
+        return _run(self._inner.payload())
+
     def set_gravity_comp(self, on: bool) -> int:
         """Apply (or stop applying) the gravity-compensation feedforward.
 

@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    JogJ, JogL, MoveJ, MoveS, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport, WriteIo,
+    JogJ, JogL, MoveJ, MoveS, SetPayload, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport,
+    WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -38,6 +39,7 @@ enum RtEvent {
     Halt,
     SafetyStop,
     SetGravityComp(bool),
+    SetPayload(f64),
     ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
@@ -95,6 +97,9 @@ impl RtCommands for TestRt {
     }
     fn set_gravity_comp(&mut self, on: bool) {
         self.push(RtEvent::SetGravityComp(on));
+    }
+    fn set_payload(&mut self, payload: par6_server::PayloadSpec) {
+        self.push(RtEvent::SetPayload(payload.mass));
     }
 
     fn set_exec_paused(&mut self, paused: bool) {
@@ -2319,5 +2324,77 @@ async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
             "PAUSE({on}) must be acked"
         );
         h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
+    }
+}
+
+/// SET_PAYLOAD: a valid payload reaches the RT and the planner sync, and
+/// the PAYLOAD query reads back what was set; invalid inertia and
+/// negative mass are refused at the wire and leave the readback
+/// untouched.
+#[tokio::test]
+async fn set_payload_applies_reads_back_and_refuses_garbage() {
+    let h = start(|_| {}).await;
+    let mut c = Client::new(&h).await;
+
+    // Nothing set: the readback is all zeros.
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, com, inertia },
+            ..
+        } => {
+            assert_eq!(mass, 0.0);
+            assert_eq!(com, [0.0; 3]);
+            assert_eq!(inertia, [0.0; 6]);
+        }
+        other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+
+    let set = Command::SetPayload(SetPayload {
+        mass: 1.25,
+        com: [0.0, 0.01, 0.055],
+        inertia: Some([0.002, 0.0, 0.003, 0.0, 0.0, 0.004]),
+    });
+    match c.request(&set).await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    assert!(
+        h.rt_events().contains(&RtEvent::SetPayload(1.25)),
+        "the payload must reach the RT gravity model"
+    );
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, com, inertia },
+            ..
+        } => {
+            assert_eq!(mass, 1.25);
+            assert_eq!(com, [0.0, 0.01, 0.055]);
+            assert_eq!(inertia, [0.002, 0.0, 0.003, 0.0, 0.0, 0.004]);
+        }
+        other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+
+    // Refusals (negative mass, indefinite inertia) are decode-side —
+    // the malformed_payload_* golden vectors pin them, and encode_command
+    // refuses the same inputs client-side before a byte leaves.
+
+    // Clearing is mass 0.
+    match c
+        .request(&Command::SetPayload(SetPayload {
+            mass: 0.0,
+            com: [0.0; 3],
+            inertia: None,
+        }))
+        .await
+    {
+        Reply::Ok { .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, .. },
+            ..
+        } => assert_eq!(mass, 0.0),
+        other => panic!("expected PAYLOAD response, got {other:?}"),
     }
 }

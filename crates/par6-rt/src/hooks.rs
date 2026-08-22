@@ -85,6 +85,18 @@ pub enum RtCommand {
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),
+    /// Replace the runtime payload in the gravity model (mass \[kg\],
+    /// COM \[m\] ee-frame, inertia about the COM or `None` for a point
+    /// mass). Plain data into the tick loop — the model updates between
+    /// ticks, never mid-G(q).
+    SetPayload {
+        /// Payload mass \[kg\]; 0 clears.
+        mass: f64,
+        /// COM in end-effector-frame coordinates \[m\].
+        com: [f64; 3],
+        /// Rotational inertia `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)`.
+        inertia: Option<[f64; 6]>,
+    },
     /// Drive one declared digital output. `port` indexes `[io].outputs`;
     /// the level persists until the next write, across mode changes and
     /// the e-stop alike — the vendor never drops its outputs on a stop,

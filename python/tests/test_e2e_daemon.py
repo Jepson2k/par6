@@ -1325,3 +1325,39 @@ def test_check_config_validates_the_bundle_and_exits(tmp_path):
     )
     assert bad.returncode == 1
     assert "tick_dt_s" in bad.stderr
+
+
+async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
+    """SET_PAYLOAD reaches the runtime and PAYLOAD reads back exactly what
+    was set; a negative mass and a negative-definite inertia are refused
+    with the structured validation error (the client encodes with the
+    same table the runtime decodes with, so the refusal is identical
+    wherever it fires); clearing is mass 0."""
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        info = await client.payload()
+        assert info == {"mass": 0.0, "com": [0.0] * 3, "inertia": [0.0] * 6}
+
+        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        info = await client.payload()
+        assert info is not None
+        assert info["mass"] == pytest.approx(1.2)
+        assert info["com"] == pytest.approx([0.0, 0.01, 0.05])
+        assert info["inertia"] == [0.0] * 6
+
+        with pytest.raises(RobotError) as neg:
+            await client.set_payload(-1.0)
+        assert neg.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        with pytest.raises(RobotError) as indef:
+            await client.set_payload(1.0, inertia=(-1.0, 0.0, 1.0, 0.0, 0.0, 1.0))
+        assert indef.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        info = await client.payload()
+        assert info is not None and info["mass"] == pytest.approx(1.2), (
+            "a refused set must not change the payload"
+        )
+
+        assert await client.set_payload(0.0) == 1
+        info = await client.payload()
+        assert info is not None and info["mass"] == 0.0

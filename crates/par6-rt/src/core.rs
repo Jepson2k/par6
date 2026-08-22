@@ -1048,6 +1048,9 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
+            RtCommand::SetPayload { mass, com, inertia } => {
+                self.gravity.set_payload(mass, com, inertia);
+            }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
         }
     }

@@ -547,6 +547,69 @@
       ]
     },
     {
+      "class": "SYSTEM",
+      "cmd": "SET_PAYLOAD",
+      "file": "cmd_set_payload.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_payload",
+      "req_id": 40,
+      "tag": 25,
+      "wire": [
+        25,
+        40,
+        1.25,
+        [
+          0.0,
+          0.01,
+          0.055
+        ],
+        [
+          0.002,
+          0.0,
+          0.003,
+          0.0001,
+          0.0,
+          0.004
+        ]
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_PAYLOAD",
+      "file": "cmd_set_payload_point.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_payload_point",
+      "req_id": 41,
+      "tag": 25,
+      "wire": [
+        25,
+        41,
+        0.5,
+        [
+          0.0,
+          0.0,
+          0.04
+        ],
+        null
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "PAYLOAD",
+      "file": "cmd_payload.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_payload",
+      "req_id": 42,
+      "tag": 49,
+      "wire": [
+        49,
+        42
+      ]
+    },
+    {
       "class": "FIRE_AND_FORGET",
       "cmd": "SERVO_J",
       "file": "cmd_servo_j.bin",
@@ -1685,6 +1748,33 @@
               6.0,
               20.0
             ]
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_payload.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/PAYLOAD",
+      "name": "response_payload",
+      "wire": [
+        4,
+        120,
+        [
+          20,
+          1.25,
+          [
+            0.0,
+            0.01,
+            0.055
+          ],
+          [
+            0.002,
+            0.0,
+            0.003,
+            0.0001,
+            0.0,
+            0.004
           ]
         ]
       ]
@@ -3633,6 +3723,20 @@
       "name": "malformed_status_bad_field",
       "reason": "pose must be a float array",
       "target": "status"
+    },
+    {
+      "file": "malformed_payload_negative_mass.bin",
+      "kind": "malformed",
+      "name": "malformed_payload_negative_mass",
+      "reason": "payload mass must be >= 0",
+      "target": "command"
+    },
+    {
+      "file": "malformed_payload_indefinite_inertia.bin",
+      "kind": "malformed",
+      "name": "malformed_payload_indefinite_inertia",
+      "reason": "payload inertia must be positive semidefinite",
+      "target": "command"
     }
   ]
 }

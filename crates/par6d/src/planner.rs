@@ -268,6 +268,9 @@ pub(crate) struct Par6Planner {
     /// The `[motion]` feel constants (sampling pitch, IK step guard,
     /// settle parameters).
     motion: par6_config::MotionConfig,
+    /// The applied runtime payload, mirrored so `sync` only touches the
+    /// model on a change.
+    payload: par6_server::PayloadSpec,
 }
 
 impl Par6Planner {
@@ -331,6 +334,7 @@ impl Par6Planner {
             collision_latch: CollisionState::default(),
             invalidated: None,
             motion,
+            payload: par6_server::PayloadSpec::default(),
         })
     }
 
@@ -1910,6 +1914,17 @@ impl Planner for Par6Planner {
     }
 
     fn sync(&mut self, ctx: PlanContext<'_>) {
+        if ctx.payload != self.payload {
+            // The torque feedforward (and TOPPRA's dynamics, when that
+            // profile runs) must carry what the arm carries.
+            match self
+                .kin
+                .set_tool(ctx.payload.mass, ctx.payload.com, ctx.payload.inertia)
+            {
+                Ok(()) => self.payload = ctx.payload,
+                Err(e) => log::error!("planner payload update refused: {e}"),
+            }
+        }
         if ctx.completion_policy != self.policy {
             self.policy = ctx.completion_policy;
             let rt_policy = match ctx.completion_policy {

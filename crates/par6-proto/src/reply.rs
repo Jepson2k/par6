@@ -279,6 +279,16 @@ pub enum QueryResult {
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
     },
+    /// PAYLOAD result: the effective runtime payload (zeros = none).
+    Payload {
+        /// Payload mass \[kg\].
+        mass: f64,
+        /// Payload COM in end-effector-frame coordinates \[m\].
+        com: [f64; 3],
+        /// Rotational inertia about the COM, ee-frame axes,
+        /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\].
+        inertia: [f64; 6],
+    },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
         /// Installation-layer shapes (persistent keep-outs).
@@ -313,6 +323,7 @@ impl QueryResult {
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
+            Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
         }
     }
@@ -555,6 +566,19 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
+            }
+        }
+        Q::Payload { mass, com, inertia } => {
+            w_array(buf, 4);
+            w_uint(buf, u64::from(tag));
+            w_f64(buf, *mass);
+            w_array(buf, 3);
+            for v in com {
+                w_f64(buf, *v);
+            }
+            w_array(buf, 6);
+            for v in inertia {
+                w_f64(buf, *v);
             }
         }
         Q::Shapes {
@@ -889,6 +913,14 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 tick_dt_s,
                 motion,
                 joints,
+            }
+        }
+        T::Payload => {
+            expect_arity("payload result", n, 4)?;
+            QueryResult::Payload {
+                mass: r.f64()?,
+                com: r_f64_fixed(r, "payload.com")?,
+                inertia: r_f64_fixed(r, "payload.inertia")?,
             }
         }
         T::Shapes => {

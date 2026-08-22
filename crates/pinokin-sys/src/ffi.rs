@@ -247,5 +247,16 @@ extern "C" {
         out_distance: *mut f64,
     ) -> par6_status;
 
+    /// Replace the runtime payload attached at the end-effector frame
+    /// (reversible: each call restores the create-time parent-joint
+    /// inertia before appending). `mass <= 0` clears; `inertia6` may be
+    /// null for a point mass. Collision geometry is unchanged.
+    pub fn par6_kin_set_tool(
+        h: *mut par6_kin,
+        mass: f64,
+        com3: *const f64,
+        inertia6: *const f64,
+    ) -> par6_status;
+
     pub fn par6_shim_abi_version() -> i32;
 }

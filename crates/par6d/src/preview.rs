@@ -58,6 +58,9 @@ pub struct Preview {
     next_index: u64,
     dt: f64,
     motion: par6_config::MotionConfig,
+    /// The preview's runtime payload — none today; the field keeps the
+    /// planner sync honest if a payload surface is added offline.
+    payload: par6_server::PayloadSpec,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -116,6 +119,7 @@ impl Preview {
             next_index: 0,
             dt,
             motion,
+            payload: par6_server::PayloadSpec::default(),
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
@@ -180,6 +184,7 @@ impl Preview {
             tool_variant: None,
             tcp_offset_mm,
             completion_policy: policy,
+            payload: self.payload,
         });
     }
 

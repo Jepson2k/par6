@@ -272,6 +272,25 @@ impl CoreClient {
         query_future(py, self.rt(), Command::ConfigInfo)
     }
 
+    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::Payload)
+    }
+
+    #[pyo3(signature = (mass, com, inertia=None))]
+    fn set_payload<'py>(
+        &self,
+        py: Python<'py>,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        sys_future(
+            py,
+            self.rt(),
+            Command::SetPayload(cmd::SetPayload { mass, com, inertia }),
+        )
+    }
+
     fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         future_into_py(py, async move {

@@ -360,3 +360,45 @@ fn ik_solve_never_increases_the_residual_where_ik_step_can() {
         "no seed made ik_step regress, so this proves nothing about the line search"
     );
 }
+
+#[test]
+fn set_tool_reproduces_create_time_gravity_and_reverts() {
+    let fx = load_fixture();
+    let urdf = repo_root().join(&fx.urdf);
+    // Built WITHOUT a tool; the runtime payload call must reproduce the
+    // create-time tool's gravity exactly — same composition, same
+    // numbers as the pin reference.
+    let mut model = Model::from_urdf(&urdf, Some(&fx.ee_frame), None).unwrap();
+    let nq = model.nq();
+    let mut tau = vec![0.0; nq];
+
+    model
+        .set_tool(fx.tool.mass, fx.tool.com, Some(fx.tool.inertia))
+        .unwrap();
+    for (i, case) in fx.cases_tool.iter().enumerate() {
+        model.gravity_into(&case.q, &mut tau).unwrap();
+        assert_close("set_tool.tau", i, &tau, &case.tau);
+    }
+
+    // Clearing restores the create-time model exactly (reversible).
+    model.set_tool(0.0, [0.0; 3], None).unwrap();
+    for (i, case) in fx.cases_flange.iter().enumerate() {
+        model.gravity_into(&case.q, &mut tau).unwrap();
+        assert_close("set_tool.cleared.tau", i, &tau, &case.tau);
+    }
+
+    // Refused inputs: negative mass, NaN, non-PSD inertia — and a
+    // refusal must leave the model untouched.
+    assert!(model.set_tool(-1.0, [0.0; 3], None).is_err());
+    assert!(model.set_tool(f64::NAN, [0.0; 3], None).is_err());
+    assert!(model
+        .set_tool(1.0, [0.0; 3], Some([-1.0, 0.0, 1.0, 0.0, 0.0, 1.0]))
+        .is_err());
+    model.gravity_into(&fx.cases_flange[0].q, &mut tau).unwrap();
+    assert_close(
+        "set_tool.after_refusal.tau",
+        0,
+        &tau,
+        &fx.cases_flange[0].tau,
+    );
+}

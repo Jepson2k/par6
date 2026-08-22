@@ -46,6 +46,7 @@ class CmdType(IntEnum):
     SAFETY_STOP = 22
     SET_GRAVITY_COMP = 23
     PAUSE = 24
+    SET_PAYLOAD = 25
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -65,6 +66,7 @@ class CmdType(IntEnum):
     IS_SIMULATOR = 46
     SHAPES = 47
     CONFIG_INFO = 48
+    PAYLOAD = 49
     SERVO_J = 60
     SERVO_J_POSE = 61
     SERVO_L = 62
@@ -107,6 +109,7 @@ class QueryType(IntEnum):
     IS_SIMULATOR = 17
     SHAPES = 18
     CONFIG_INFO = 19
+    PAYLOAD = 20
 
 
 class CommandClass(IntEnum):
@@ -261,6 +264,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SAFETY_STOP: CommandClass.SYSTEM,
     CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
     CmdType.PAUSE: CommandClass.SYSTEM,
+    CmdType.SET_PAYLOAD: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,
@@ -280,6 +284,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.IS_SIMULATOR: CommandClass.QUERY,
     CmdType.SHAPES: CommandClass.QUERY,
     CmdType.CONFIG_INFO: CommandClass.QUERY,
+    CmdType.PAYLOAD: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

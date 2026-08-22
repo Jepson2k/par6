@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, Pose, NQ};
+use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, KinError, Pose, NQ};
 use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 
 /// Map a configured gripper name onto the URDF variant whose tool the
@@ -348,6 +348,14 @@ impl GravityModel for KinGravity {
         }
         *out = self.last_good;
     }
+
+    fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
+        // Wire-validated before it gets here; a refusal now is a model
+        // fault worth shouting about, not silently absorbing.
+        if let Err(e) = self.kin.set_tool(mass, com, inertia) {
+            log::error!("gravity payload update refused: {e}");
+        }
+    }
 }
 
 // -------------------------------------------------------- solver wrapper
@@ -423,6 +431,18 @@ impl CartKin {
         let mut pose = self.fk_model(q)?;
         translate_local(&mut pose, self.offset.get());
         Ok(pose)
+    }
+
+    /// Replace the runtime payload in this model (inertial only — FK,
+    /// jacobian and the soft window are untouched). Wire-validated
+    /// upstream.
+    pub(crate) fn set_tool(
+        &mut self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<(), KinError> {
+        self.kin.set_tool(mass, com, inertia)
     }
 
     /// Dynamic feedforward torque `M(q)·q̈ + C(q,q̇)·q̇` \[Nm\] — gravity

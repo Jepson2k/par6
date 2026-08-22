@@ -63,6 +63,11 @@ pub fn gate(cmd: CmdType) -> Gate {
         // is visible instead of accidental.
         C::Pause => {}
         C::Teleport => g.needs_simulator = true,
+        // SetPayload is deliberately ungated beyond the SYSTEM default:
+        // a payload change while motion runs is legal (the model updates
+        // mid-move, exactly like a TCP-offset change), and clearing a
+        // payload must work whatever state the controller is in.
+        C::SetPayload => {}
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}
     }

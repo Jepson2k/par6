@@ -244,6 +244,11 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("program", prog)?;
             d.set_item("epoch", *epoch)?;
         }
+        QueryResult::Payload { mass, com, inertia } => {
+            d.set_item("mass", *mass)?;
+            d.set_item("com", com.to_vec())?;
+            d.set_item("inertia", inertia.to_vec())?;
+        }
         QueryResult::ConfigInfo {
             path,
             fingerprint,

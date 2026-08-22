@@ -92,6 +92,19 @@ pub struct Model {
     nq: usize,
 }
 
+/// Whether the symmetric 3×3 matrix `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` is
+/// positive semidefinite, by Sylvester's criterion on leading principal
+/// minors (with a small tolerance so a legitimate rank-deficient point
+/// mass passes).
+fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
+    let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
+    const EPS: f64 = 1e-12;
+    let m2 = ixx * iyy - ixy * ixy;
+    let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
+        + ixz * (ixy * iyz - iyy * ixz);
+    ixx >= -EPS && m2 >= -EPS && det >= -EPS && iyy >= -EPS && izz >= -EPS
+}
+
 impl fmt::Debug for Model {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Model").field("nq", &self.nq).finish()
@@ -199,6 +212,40 @@ impl Model {
         let mut out = vec![0.0; 6 * self.nq];
         self.jacobian_into(q, &mut out)?;
         Ok(out)
+    }
+
+    /// Replace the runtime payload attached at the end-effector frame —
+    /// an inertial update only (collision geometry unchanged), reversible
+    /// because the shim restores the create-time parent-joint inertia
+    /// before appending. `mass = 0` clears the payload.
+    ///
+    /// Validated before it reaches the model: mass must be finite and
+    /// non-negative, the COM finite, and the rotational inertia (about
+    /// the COM, `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)`) positive semidefinite —
+    /// a negative-definite "payload" makes RNEA lie quietly ever after.
+    pub fn set_tool(
+        &mut self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<(), Error> {
+        if !mass.is_finite() || mass < 0.0 || com.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG));
+        }
+        if let Some(i) = &inertia {
+            if i.iter().any(|v| !v.is_finite()) || !symmetric3_is_psd(i) {
+                return Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG));
+            }
+        }
+        let status = unsafe {
+            ffi::par6_kin_set_tool(
+                self.raw.as_ptr(),
+                mass,
+                com.as_ptr(),
+                inertia.as_ref().map_or(std::ptr::null(), |i| i.as_ptr()),
+            )
+        };
+        Self::check_status(status)
     }
 
     /// Gravity torque G(q) — RNEA at zero velocity/acceleration — into `out`.

@@ -321,7 +321,19 @@ impl Client {
 
     fn encode(&self, cmd: &Command, req_id: u32) -> Result<Vec<u8>, ClientError> {
         let mut buf = Vec::new();
-        encode_command(cmd, req_id, &mut buf)?;
+        encode_command(cmd, req_id, &mut buf).map_err(|e| match e {
+            // The codec validates on encode with the same table the
+            // runtime decodes with, so a locally refused command carries
+            // the exact structured error the runtime would answer.
+            par6_proto::DecodeError::Validation { .. } => {
+                ClientError::Robot(par6_proto::make_error(
+                    par6_proto::ErrorCode::CommValidationError,
+                    par6_proto::UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                ))
+            }
+            other => ClientError::Decode(other),
+        })?;
         Ok(buf)
     }
 

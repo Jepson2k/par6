@@ -212,6 +212,12 @@ class QueueResult:
     queued_duration: float
 
 
+def _inertia6(
+    inertia: tuple[float, float, float, float, float, float] | None,
+) -> list[float] | None:
+    return None if inertia is None else [float(v) for v in inertia]
+
+
 class AsyncRobotClient(_RobotClientABC):
     """Async client for the par6d runtime.
 
@@ -1037,6 +1043,44 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         return await self._call(core.set_gravity_comp(bool(on)))
+
+    async def set_payload(
+        self,
+        mass: float,
+        com: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        inertia: tuple[float, float, float, float, float, float] | None = None,
+    ) -> int:
+        """Declare the payload the arm is carrying at the TCP.
+
+        The gravity feedforward and the torque planning carry it from the
+        next tick; the collision geometry is unchanged.  *mass* is in kg
+        (0 clears the payload), *com* the centre of mass in
+        end-effector-frame metres, *inertia* the rotational inertia about
+        the COM ``(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)`` — omitted = a point
+        mass.  Refused (COMM_VALIDATION_ERROR) for negative mass or a
+        non-positive-semidefinite inertia.
+
+        Category: Control
+
+        Example:
+            rbt.set_payload(1.2, com=(0.0, 0.0, 0.05))
+        """
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
+        )
+
+    async def payload(self) -> dict | None:
+        """The effective runtime payload: ``mass``, ``com``, ``inertia``
+        (zeros = none).  Returns None if unreachable.
+
+        Category: Query
+
+        Example:
+            info = rbt.payload()
+        """
+        core = await self._ensure_core()
+        return await self._call(core.payload())
 
     async def pause(self) -> int:
         """Hold the executing trajectory where it is.
