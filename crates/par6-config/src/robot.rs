@@ -319,6 +319,18 @@ pub struct ProtocolConfig {
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
     /// (validated) so the broadcaster is a clean tick decimation.
     pub status_rate_hz: u32,
+    /// Telemetry stream rate \[Hz\].
+    #[serde(default = "default_telemetry_rate_hz")]
+    pub telemetry_rate_hz: u32,
+    /// Telemetry recipe active from boot. Omitted = the stream stays
+    /// silent until a client's `set_recipe` — the shipped default. An
+    /// unknown name refuses startup, like `set_recipe` refuses it live.
+    #[serde(default)]
+    pub initial_recipe: Option<String>,
+}
+
+fn default_telemetry_rate_hz() -> u32 {
+    100
 }
 
 /// Jog profile shape.
@@ -775,6 +787,9 @@ impl RobotConfig {
         }
         if p.status_rate_hz == 0 {
             return Err(invalid("protocol.status_rate_hz", "must be > 0"));
+        }
+        if !(1..=1000).contains(&p.telemetry_rate_hz) {
+            return Err(invalid("protocol.telemetry_rate_hz", "must be 1..=1000"));
         }
         let rate = self.tick_rate_hz();
         let per = rate / f64::from(p.status_rate_hz);

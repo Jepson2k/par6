@@ -102,6 +102,16 @@ where
     P: Planner + 'static,
     R: RtCommands + 'static,
 {
+    // An unknown startup recipe is a startup failure, exactly as
+    // `set_recipe` refuses it live — a silent fallback looks like a
+    // dead robot.
+    if let Some(name) = &cfg.initial_recipe {
+        if !cfg.recipes.iter().any(|r| r.name == *name) {
+            return Err(std::io::Error::other(format!(
+                "unknown initial telemetry recipe {name:?}"
+            )));
+        }
+    }
     let socket = UdpSocket::bind(cfg.bind).await?;
     let addr = socket.local_addr()?;
     let link = BroadcastLink::open(&cfg).await?;

@@ -13,12 +13,9 @@ from __future__ import annotations
 
 import asyncio
 import math
-import socket
 import time
-from typing import Any
 
 import numpy as np
-import ormsgpack
 import pytest
 from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
 
@@ -29,6 +26,7 @@ from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
 from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
+from par6.telemetry import TelemetryReader
 
 try:
     import pinokin
@@ -151,7 +149,9 @@ class TestPlannedMotion:
             for speed in (1.0, 0.25):
                 client.teleport(np.degrees(start).tolist())
                 planned = client.move_j(np.degrees(target).tolist(), speed=speed)
+                assert planned is not None
                 path = planned.joint_trajectory_rad
+                assert path is not None
                 np.testing.assert_allclose(path[-1], target, atol=1e-6)
                 step = np.abs(np.diff(np.vstack([start, path]), axis=0)) / dt
                 ceiling = velocity * speed
@@ -710,36 +710,20 @@ _PATH_GAP_MM = 2.0
 class _CommandStream:
     """The joint stream the runtime commands, read off its telemetry port.
 
-    ``set_recipe("commanded")`` makes ``par6d`` publish one msgpack frame per
-    telemetry tick — ``[recipe, seq, mono_ns, tick, measured, commanded, …]``
-    (``crates/par6-server/src/telemetry.rs``) — and the commanded positions
-    are the planner's own output, which is what an offline plan has to
-    reproduce.  The MEASURED positions are the sim plant's response to that
-    stream and carry its tracking lag, so they answer a different question.
+    ``set_recipe("commanded")`` makes ``par6d`` publish one frame per
+    telemetry tick, and the shipped :class:`~par6.telemetry.TelemetryReader`
+    decodes it — the ``commanded_positions`` field is the planner's own
+    output, which is what an offline plan has to reproduce.  The MEASURED
+    positions are the sim plant's response to that stream and carry its
+    tracking lag, so they answer a different question.
     """
 
-    #: Frame index of the commanded positions: 3 header elements, then the
-    #: ``commanded`` recipe's fields (tick, measured, commanded, …).
-    _COMMANDED = 5
-
     def __init__(self, port: int) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
-        self._sock.bind(("127.0.0.1", port))
-        self._sock.setblocking(False)
+        self._reader = TelemetryReader(port)
 
-    def drain(self) -> list[list[Any]]:
-        """Every frame waiting on the socket, oldest first.
-
-        A frame is a heterogeneous msgpack array — scalars in the header,
-        then the recipe's fields, one of which is itself a joint vector.
-        """
-        frames = []
-        while True:
-            try:
-                frames.append(ormsgpack.unpackb(self._sock.recv(65535)))
-            except BlockingIOError:
-                return frames
+    def drain(self) -> None:
+        """Discard everything waiting on the socket (case isolation)."""
+        self._reader.drain()
 
     def executed(self) -> np.ndarray:
         """The commanded joint path since the last drain, ``(N, 6)`` radians.
@@ -756,17 +740,20 @@ class _CommandStream:
         same reason.
         """
         by_tick = {}
-        for frame in self.drain():
-            commanded = np.asarray(frame[self._COMMANDED][:NUM_JOINTS], dtype=np.float64)
+        for frame in self._reader.drain():
+            fields = frame["fields"]
+            commanded = np.asarray(
+                fields["commanded_positions"][:NUM_JOINTS], dtype=np.float64
+            )
             if np.all(np.isfinite(commanded)):
-                by_tick[frame[3]] = commanded
+                by_tick[fields["tick"]] = commanded
         path = np.stack([by_tick[tick] for tick in sorted(by_tick)])
         moving = np.flatnonzero(np.abs(np.diff(path, axis=0)).max(axis=1) > 1e-12)
         assert moving.size > 1, "the runtime commanded no motion"
         return path[moving[0] + 1 : moving[-1] + 2]
 
     def close(self) -> None:
-        self._sock.close()
+        self._reader.close()
 
 
 def _shape_from(pose: list[float], deltas) -> list[list[float]]:

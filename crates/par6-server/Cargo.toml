@@ -13,5 +13,4 @@ par6-rt = { workspace = true }
 tokio = { workspace = true }
 socket2 = { workspace = true }
 serde = { workspace = true }
-rmp-serde = { workspace = true }
 log = { workspace = true }

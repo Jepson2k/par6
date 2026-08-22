@@ -188,6 +188,8 @@ impl ServerConfig {
             status_port: p.status_port,
             status_rate_hz: p.status_rate_hz,
             telemetry_port: p.telemetry_port,
+            telemetry_rate_hz: p.telemetry_rate_hz,
+            initial_recipe: p.initial_recipe.clone(),
             ..Self::default()
         }
     }

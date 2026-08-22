@@ -102,7 +102,9 @@ def free_udp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def sim_config(dest: Path, active_gripper: str | None = None) -> Path:
+def sim_config(
+    dest: Path, active_gripper: str | None = None, initial_recipe: str | None = None
+) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
     Sourced from ``par6/_data`` (the same tree the client reads), so the
@@ -120,6 +122,14 @@ def sim_config(dest: Path, active_gripper: str | None = None) -> Path:
     )
     if patched == text:
         raise RuntimeError("PAR6.toml patch points (tick_dt_s / status_rate_hz) missing")
+    if initial_recipe is not None:
+        swapped = patched.replace(
+            "telemetry_rate_hz = 100",
+            f'telemetry_rate_hz = 100\ninitial_recipe = "{initial_recipe}"',
+        )
+        if swapped == patched:
+            raise RuntimeError("PAR6.toml patch point (telemetry_rate_hz) missing")
+        patched = swapped
     if active_gripper is not None:
         fitted = _cfg.load_robot_config()["robot"]["active_gripper"]
         swapped = patched.replace(
@@ -153,11 +163,12 @@ class LiveDaemon:
         workdir: Path,
         active_gripper: str | None = None,
         status_transport: str = "unicast",
+        initial_recipe: str | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
-        config = sim_config(workdir / "config", active_gripper)
+        config = sim_config(workdir / "config", active_gripper, initial_recipe)
         status_port = free_udp_port()
         telemetry_port = free_udp_port()
         log_path = workdir / "par6d.log"

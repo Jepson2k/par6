@@ -473,7 +473,19 @@ async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
         .await
         .expect("telemetry within budget")
         .expect("recv");
-    rmp_serde::from_slice(&buf[..n]).expect("minimal recipe layout: [name, seq, mono_ns, tick, q]")
+    let frame = par6_proto::decode_telemetry(&buf[..n]).expect("decodable telemetry");
+    let [par6_proto::TelemetryValue::U64(tick), par6_proto::TelemetryValue::Arr(q)] =
+        frame.values.as_slice()
+    else {
+        panic!("minimal recipe layout: [name, seq, mono_ns, tick, q]");
+    };
+    (
+        frame.recipe,
+        frame.seq,
+        frame.mono_time_ns,
+        *tick,
+        q.clone(),
+    )
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only

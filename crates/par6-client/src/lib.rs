@@ -11,10 +11,12 @@ mod core;
 mod error;
 mod sockets;
 mod sync;
+pub mod telemetry;
 
 pub use crate::core::{Ack, Client, ClientConfig, Completion, StatusTransport};
 pub use crate::error::ClientError;
 pub use crate::sync::SyncClient;
+pub use crate::telemetry::{TelemetryPacket, TelemetryReader};
 
 pub use par6_proto::{
     ActionState, CompletionPolicy, ControllerMode, ErrorCode, Frame, LoopStatsResult, QueryResult,

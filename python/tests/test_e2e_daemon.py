@@ -36,6 +36,7 @@ from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
 from par6.protocol.constants import ActionState, ErrorCode
 from par6.robot import Robot
+from par6.telemetry import TelemetryReader
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
 
@@ -1166,8 +1167,10 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         # The wire will carry the port; the box will not — sent through the
         # engine client directly, past the shim's own bound check, so the
         # refusal under test is the RUNTIME's.
+        core = client._core
+        assert core is not None
         with pytest.raises(RobotError) as io:
-            await client._call(client._core.write_io(n_out, 1))
+            await client._call(core.write_io(n_out, 1))
         assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert "does not exist" in io.value.cause, io.value.cause
 
@@ -1215,5 +1218,37 @@ async def test_status_arrives_on_the_shipped_transport_defaults(tmp_path):
             # session works on the defaults, not just the broadcast.
             assert await client.ping() is not None
             assert await client.angles() is not None
+    finally:
+        daemon.stop()
+
+
+def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
+    """``[protocol] initial_recipe`` makes the telemetry stream live from
+    boot — no client ever calls ``set_recipe`` — and the shipped
+    :class:`par6.telemetry.TelemetryReader` decodes what arrives. Omitting
+    the key keeps the stream silent (every other e2e test binds nothing to
+    the telemetry port and would see stray traffic fail its asserts)."""
+    daemon = LiveDaemon.start(tmp_path, initial_recipe="standard")
+    try:
+        reader = TelemetryReader(daemon.telemetry_port)
+        try:
+            frame = reader.recv(timeout=STEP_BUDGET_S)
+            assert frame is not None, (
+                f"no telemetry from boot; daemon log:\n{daemon.log_path.read_text()}"
+            )
+            assert frame["recipe"] == "standard"
+            fields = frame["fields"]
+            assert set(fields) == {
+                "tick",
+                "measured_positions",
+                "measured_velocities",
+                "measured_torques",
+            }
+            assert len(fields["measured_positions"]) == 6
+            # A second frame advances: this is a stream, not one packet.
+            later = reader.recv(timeout=STEP_BUDGET_S)
+            assert later is not None and later["seq"] > frame["seq"]
+        finally:
+            reader.close()
     finally:
         daemon.stop()

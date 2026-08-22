@@ -39,7 +39,7 @@ par6 = "par6.cli:main"
 # was newest and linted against that version's default rule set while devs ran
 # an older one — every push was red on rules the code had never been checked
 # against. The pin and the explicit `select` below are what make the two agree.
-dev = ["ruff==0.15.8", "ty", "pytest", "pytest-asyncio", "pytest-timeout", "ormsgpack>=1.4.0"]
+dev = ["ruff==0.15.8", "ty", "pytest", "pytest-asyncio", "pytest-timeout"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"
