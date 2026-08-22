@@ -416,6 +416,12 @@ pub struct TimingConfig {
     pub critical_factor: f64,
     /// How long the hard band must hold before latching \[s\].
     pub critical_sustain_s: f64,
+    /// CPU the RT thread pins to on hardware; negative disables pinning.
+    /// Ignored under `--sim`, which always runs unpinned and unprivileged.
+    pub cpu: i64,
+    /// SCHED_FIFO priority the RT thread requests on hardware (1..=99);
+    /// 0 disables the request. Ignored under `--sim`.
+    pub fifo_priority: u8,
 }
 
 impl Default for TimingConfig {
@@ -424,6 +430,8 @@ impl Default for TimingConfig {
             degraded_factor: 1.05,
             critical_factor: 1.10,
             critical_sustain_s: 1.0,
+            cpu: 3,
+            fifo_priority: 99,
         }
     }
 }
@@ -442,6 +450,10 @@ impl TimingConfig {
         degraded_factor: 1.5,
         critical_factor: 4.0,
         critical_sustain_s: 5.0,
+        // Scheduling knobs are hardware-only; the sim path never reads
+        // them, so the vendor defaults ride along unchanged.
+        cpu: 3,
+        fifo_priority: 99,
     };
 }
 
@@ -799,6 +811,12 @@ impl RobotConfig {
         }
         if !is_positive(t.critical_sustain_s) || !t.critical_sustain_s.is_finite() {
             return Err(invalid("timing.critical_sustain_s", "must be > 0"));
+        }
+        if t.fifo_priority > 99 {
+            return Err(invalid(
+                "timing.fifo_priority",
+                "must be 0..=99 (0 disables SCHED_FIFO)",
+            ));
         }
         Ok(())
     }

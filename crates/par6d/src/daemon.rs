@@ -313,9 +313,14 @@ impl Daemon {
                 fifo_priority: None,
             }
         } else {
-            // Hardware: SCHED_FIFO on the isolated core (setup failure
-            // is logged DEGRADED, not fatal).
-            RunOptions::default()
+            // Hardware: SCHED_FIFO on the configured core (setup failure
+            // is logged DEGRADED, not fatal; the outcome is published
+            // through LOOP_STATS).
+            let timing = robot.loop_timing();
+            RunOptions {
+                cpu: usize::try_from(timing.cpu).ok(),
+                fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+            }
         };
         let mut threads = Vec::new();
         {
@@ -776,6 +781,7 @@ mod tests {
             degraded_factor: 1.01,
             critical_factor: 1.02,
             critical_sustain_s: 0.1,
+            ..TimingConfig::default()
         };
         assert_eq!(resolve_loop_bands(true, Some(tight)), tight);
         assert_eq!(resolve_loop_bands(false, Some(tight)), tight);

@@ -1745,6 +1745,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     } else {
                         0.0
                     },
+                    p50_period_s: ls.p50_s,
+                    p90_period_s: ls.p90_s,
+                    can_frame_age_min_ticks: ls.can_frame_age_min_ticks,
+                    can_frame_age_max_ticks: ls.can_frame_age_max_ticks,
+                    rt_fifo: ls.rt_fifo,
+                    rt_pinned: ls.rt_pinned,
                 })
             }
             C::Profile => QueryResult::Profile {

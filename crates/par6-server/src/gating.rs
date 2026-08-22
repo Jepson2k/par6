@@ -16,13 +16,12 @@ use par6_proto::{command_class, CmdType, CommandClass};
 pub struct Gate {
     /// Controller must be ENABLED (and the e-stop latch clear).
     pub needs_enabled: bool,
-    /// Robot must be homed. Every motion MODE the RT can enter needs a
-    /// home reference: `RtCore::request_mode` refuses `Jog`, `Stream`
-    /// and `Exec` without one, following the vendor's `REQUIRES_HOMED`
-    /// set — so streaming setpoints are gated here exactly like planned
-    /// moves. `parol6` leaves jogging available un-homed, which is why
-    /// this table once did too; par6's RT does not, and the two sides
-    /// disagreeing is what makes a jog vanish with nothing said.
+    /// Robot must be homed. Set for commands that target absolute
+    /// coordinates — planned moves and streamed setpoints — mirroring the
+    /// RT's own mode gate (`RtCore::request_mode` refuses `Stream` and
+    /// `Exec` without a reference, but not `Jog`). Jogging stays
+    /// available un-homed on BOTH sides, and the two tables agreeing is
+    /// what keeps a refusal a structured error instead of a silent drop.
     pub needs_homed: bool,
     /// Simulator backend must be active.
     pub needs_simulator: bool,

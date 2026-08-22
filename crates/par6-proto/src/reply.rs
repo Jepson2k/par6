@@ -122,6 +122,18 @@ pub struct LoopStatsResult {
     pub p99_period_s: f64,
     /// Mean achieved rate (Hz).
     pub mean_hz: f64,
+    /// 50th-percentile period (seconds).
+    pub p50_period_s: f64,
+    /// 90th-percentile period (seconds).
+    pub p90_period_s: f64,
+    /// Min CAN frame age seen in the last bus drain \[ticks\].
+    pub can_frame_age_min_ticks: u64,
+    /// Max CAN frame age seen in the last bus drain \[ticks\].
+    pub can_frame_age_max_ticks: u64,
+    /// Whether the RT thread runs under SCHED_FIFO (setup succeeded).
+    pub rt_fifo: bool,
+    /// Whether the RT thread is pinned to its configured CPU.
+    pub rt_pinned: bool,
 }
 
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
@@ -435,7 +447,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_str(buf, params);
         }
         Q::LoopStats(s) => {
-            w_array(buf, 11);
+            w_array(buf, 17);
             w_uint(buf, u64::from(tag));
             w_f64(buf, s.target_hz);
             w_uint(buf, s.loop_count);
@@ -447,6 +459,12 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_f64(buf, s.p95_period_s);
             w_f64(buf, s.p99_period_s);
             w_f64(buf, s.mean_hz);
+            w_f64(buf, s.p50_period_s);
+            w_f64(buf, s.p90_period_s);
+            w_uint(buf, s.can_frame_age_min_ticks);
+            w_uint(buf, s.can_frame_age_max_ticks);
+            w_bool(buf, s.rt_fifo);
+            w_bool(buf, s.rt_pinned);
         }
         Q::Profile { profile } => {
             w_array(buf, 2);
@@ -733,7 +751,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::LoopStats => {
-            expect_arity("loop_stats result", n, 11)?;
+            expect_arity("loop_stats result", n, 17)?;
             QueryResult::LoopStats(LoopStatsResult {
                 target_hz: r.f64()?,
                 loop_count: r.uint()?,
@@ -745,6 +763,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 p95_period_s: r.f64()?,
                 p99_period_s: r.f64()?,
                 mean_hz: r.f64()?,
+                p50_period_s: r.f64()?,
+                p90_period_s: r.f64()?,
+                can_frame_age_min_ticks: r.uint()?,
+                can_frame_age_max_ticks: r.uint()?,
+                rt_fifo: r.bool()?,
+                rt_pinned: r.bool()?,
             })
         }
         T::Profile => {

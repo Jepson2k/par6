@@ -393,6 +393,10 @@ pub struct RtCore<B: DriverBus> {
     // and the tick loop counts every one into the published loop stats.
     // Consecutive-failure streaks drive the disconnect latch below.
     bus_tx_failures: u32,
+    /// Scheduling setup outcome recorded by the run loop (SCHED_FIFO
+    /// applied, CPU pinned) — published through `LoopStats`.
+    rt_fifo: bool,
+    rt_pinned: bool,
     bus_rx_failures: u32,
     tx_fail_streak: u32,
     gripper_tx_fail_streak: u32,
@@ -567,6 +571,8 @@ impl<B: DriverBus> RtCore<B> {
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
             bus_tx_failures: 0,
+            rt_fifo: false,
+            rt_pinned: false,
             bus_rx_failures: 0,
             tx_fail_streak: 0,
             gripper_tx_fail_streak: 0,
@@ -765,9 +771,16 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Reset the loop timing statistics (the `reset_loop_stats`
-    /// follow-through); the warmup gate re-arms.
+    /// follow-through); the warmup gate re-arms. The scheduling flags are
+    /// state, not statistics, and survive.
     pub fn reset_loop_stats(&mut self) {
         self.timing.reset();
+    }
+
+    /// Record whether the run loop's scheduling setup took effect.
+    pub fn record_rt_sched(&mut self, fifo: bool, pinned: bool) {
+        self.rt_fifo = fifo;
+        self.rt_pinned = pinned;
     }
 
     /// Shutdown phase 1: force the standing halt. Any working mode drops
@@ -1734,6 +1747,8 @@ impl<B: DriverBus> RtCore<B> {
         s.errors = *self.errors.list();
         s.error_active = self.errors.any_hard();
         s.loop_stats = self.timing.stats();
+        s.loop_stats.rt_fifo = self.rt_fifo;
+        s.loop_stats.rt_pinned = self.rt_pinned;
         s.loop_stats.can_frame_age_max_ticks = self.bus_state.frame_age_max_ticks;
         s.loop_stats.can_frame_age_min_ticks = self.bus_state.frame_age_min_ticks;
         s.loop_stats.bus_tx_failures = self.bus_tx_failures;

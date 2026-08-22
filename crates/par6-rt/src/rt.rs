@@ -40,7 +40,10 @@ impl<B: DriverBus> RtCore<B> {
     /// missed deadline counts as an overrun and re-bases the schedule
     /// (no catch-up burst).
     pub fn run(&mut self, opts: &RunOptions, shutdown: &AtomicBool) {
-        setup_realtime(opts);
+        let (fifo, pinned) = setup_realtime(opts);
+        // Idempotent across re-entries (op application breaks re-call
+        // `run`): the latest attempt's outcome is the published one.
+        self.record_rt_sched(fifo, pinned);
         let dt = self.tick_dt_s();
         let dt_ns = (dt * 1e9).round() as u64;
         // Anchor the schedule at the FIRST tick, which runs immediately:
@@ -110,19 +113,30 @@ impl<B: DriverBus> RtCore<B> {
 /// measures at rest, so a stationary arm pays one tick.
 const SHUTDOWN_SETTLE_BUDGET_S: f64 = 2.0;
 
-fn setup_realtime(opts: &RunOptions) {
+/// Returns whether SCHED_FIFO and pinning actually took effect, so the
+/// outcome is publishable (LOOP_STATS) instead of a boot-log line only.
+fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
+    let mut fifo = false;
+    let mut pinned = false;
     if let Some(prio) = opts.fifo_priority {
         match set_fifo_priority(prio) {
-            Ok(()) => log::info!("RT thread: SCHED_FIFO priority {prio}"),
+            Ok(()) => {
+                fifo = true;
+                log::info!("RT thread: SCHED_FIFO priority {prio}");
+            }
             Err(e) => log::warn!("RT thread DEGRADED: SCHED_FIFO setup failed ({e}); continuing"),
         }
     }
     if let Some(cpu) = opts.cpu {
         match pin_to_cpu(cpu) {
-            Ok(()) => log::info!("RT thread pinned to CPU {cpu}"),
+            Ok(()) => {
+                pinned = true;
+                log::info!("RT thread pinned to CPU {cpu}");
+            }
             Err(e) => log::warn!("RT thread DEGRADED: CPU pinning failed ({e}); continuing"),
         }
     }
+    (fifo, pinned)
 }
 
 #[cfg(unix)]

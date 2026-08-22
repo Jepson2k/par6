@@ -191,6 +191,14 @@ class LoopStatsResult:
     p95_period_s: float
     p99_period_s: float
     mean_hz: float
+    p50_period_s: float
+    p90_period_s: float
+    can_frame_age_min_ticks: int
+    can_frame_age_max_ticks: int
+    rt_fifo: bool
+    """Whether the RT thread runs under SCHED_FIFO (setup succeeded)."""
+    rt_pinned: bool
+    """Whether the RT thread is pinned to its configured CPU."""
 
 
 @dataclass

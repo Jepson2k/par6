@@ -879,6 +879,12 @@ pub fn vectors() -> Vec<Vector> {
                 p95_period_s: 0.0042,
                 p99_period_s: 0.0044,
                 mean_hz: 249.9,
+                p50_period_s: 0.0039,
+                p90_period_s: 0.0041,
+                can_frame_age_min_ticks: 1,
+                can_frame_age_max_ticks: 4,
+                rt_fifo: true,
+                rt_pinned: true,
             }),
         },
     ));

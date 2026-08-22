@@ -192,6 +192,12 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("p95_period_s", s.p95_period_s)?;
             d.set_item("p99_period_s", s.p99_period_s)?;
             d.set_item("mean_hz", s.mean_hz)?;
+            d.set_item("p50_period_s", s.p50_period_s)?;
+            d.set_item("p90_period_s", s.p90_period_s)?;
+            d.set_item("can_frame_age_min_ticks", s.can_frame_age_min_ticks)?;
+            d.set_item("can_frame_age_max_ticks", s.can_frame_age_max_ticks)?;
+            d.set_item("rt_fifo", s.rt_fifo)?;
+            d.set_item("rt_pinned", s.rt_pinned)?;
         }
         QueryResult::Reachable {
             joint_en,

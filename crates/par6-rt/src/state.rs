@@ -283,6 +283,10 @@ pub struct LoopStats {
     pub bus_tx_failures: u32,
     /// Bus RX drains the backend refused with an error, since boot.
     pub bus_rx_failures: u32,
+    /// Whether the RT thread runs under SCHED_FIFO (setup succeeded).
+    pub rt_fifo: bool,
+    /// Whether the RT thread is pinned to its configured CPU.
+    pub rt_pinned: bool,
 }
 
 /// EXEC-mode live state.
