@@ -870,7 +870,7 @@ impl Par6Planner {
 
     /// The TCP pose the arm is standing at — where every cartesian move
     /// starts from.
-    fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
+    pub(crate) fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
         self.kin
             .fk(q)
             .map_err(|e| make_error(ErrorCode::MotnSetupFailed, UNATTRIBUTED, &[("detail", &e)]))
@@ -1807,6 +1807,40 @@ impl EnablementProbe {
     fn invalidate(&mut self) {
         self.due_at = None;
         self.last_q = None;
+    }
+}
+
+/// What the in-flight command would do to the arm — the offline preview's
+/// read on a plan it will never execute.
+pub(crate) enum PlannedMotion<'a> {
+    /// A sampled trajectory (tick-dt EXEC samples).
+    Exec(&'a [RingSample]),
+    /// The homing sequence; on a referenced arm it lands at the
+    /// configured home pose.
+    Home,
+    /// No motion (tool actions, delays, checkpoints, null moves).
+    Still,
+}
+
+impl Par6Planner {
+    /// The in-flight command's planned motion, for the offline preview.
+    pub(crate) fn planned_motion(&self) -> PlannedMotion<'_> {
+        match &self.inflight {
+            Some(InFlight {
+                kind: InFlightKind::Exec { samples, .. },
+                ..
+            }) => PlannedMotion::Exec(samples),
+            Some(InFlight {
+                kind: InFlightKind::Home { .. },
+                ..
+            }) => PlannedMotion::Home,
+            _ => PlannedMotion::Still,
+        }
+    }
+
+    /// The configured home pose \[rad\].
+    pub(crate) fn home_pose(&self) -> [f64; MAX_JOINTS] {
+        self.home_pose_rad
     }
 }
 

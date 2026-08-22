@@ -270,6 +270,14 @@ impl ExecHeartbeat {
     pub fn feed(&self) {
         self.flag.store(true, Ordering::Relaxed);
     }
+
+    /// A heartbeat no watchdog consumes — for driving planning machinery
+    /// outside a running RT core (offline preview).
+    pub fn unmonitored() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 /// One streamed setpoint: where to go, and how hard to push getting there.

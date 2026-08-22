@@ -584,19 +584,19 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
 /// The kinematics models loaded at startup (feature `ffi`): one
 /// [`par6_kin::Kin`] per consumer — pinocchio's `Data` is mutated by
 /// every call, so instances are never shared across threads.
-struct KinStack {
+pub(crate) struct KinStack {
     fk: crate::kin::KinFk,
     gravity: crate::kin::KinGravity,
-    planner: crate::kin::CartKin,
+    pub(crate) planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
     housekeeping: crate::kin::CartKin,
-    collision: par6_kin::Collision,
+    pub(crate) collision: par6_kin::Collision,
     /// The streaming gate's own collision world (pinocchio `Data` is
     /// mutated by every query, so the planner's instance cannot be
     /// shared across threads).
     gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
-    tool_offset: crate::kin::ToolOffset,
+    pub(crate) tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
 }
 
@@ -609,7 +609,7 @@ const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
-fn load_kin_stack(
+pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,

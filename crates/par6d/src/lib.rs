@@ -34,6 +34,7 @@ mod grant;
 mod kin;
 pub mod options;
 mod planner;
+pub mod preview;
 #[cfg(test)]
 mod py_mirror;
 
