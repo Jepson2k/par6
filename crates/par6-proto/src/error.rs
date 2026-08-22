@@ -83,6 +83,10 @@ wire_enum! {
         /// The motor-bus controller is error-passive (warning,
         /// self-clears when the error counters recover).
         SysLinkErrorPassive = 62,
+        /// A joint's external-torque estimate stayed beyond the
+        /// configured envelope margin (hard latch — unexpected contact
+        /// or an unmodeled payload).
+        SysTorqueEnvelope = 63,
     }
 }
 
@@ -348,6 +352,12 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "The motor-bus controller is error-passive.",
             effect: "Warning only; clears when the error counters recover.",
             remedy: "Check bus wiring and termination before it goes bus-off.",
+        },
+        E::SysTorqueEnvelope => ErrorTemplate {
+            title: "Torque envelope exceeded",
+            cause: "Joint {joint}'s external torque stayed beyond the configured margin.",
+            effect: "Controller DISABLED; error latched.",
+            remedy: "Remove the obstruction or update the payload model, then send reset.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

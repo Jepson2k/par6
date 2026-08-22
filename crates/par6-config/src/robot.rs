@@ -457,6 +457,31 @@ impl TimingConfig {
     };
 }
 
+/// `[limits]`: safety-envelope enforcement thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsSection {
+    /// External-torque envelope margin \[Nm\]: hard fault when a joint's
+    /// external torque estimate (measured minus model, minus the active
+    /// motion's feed-forward) stays beyond this for the window below.
+    /// 0 disables the envelope — the shipped default, because the
+    /// estimate is only as good as the torque constants and the gravity
+    /// model; hardware opts in with a calibrated margin.
+    pub tau_ext_margin_nm: f64,
+    /// How long a joint must stay beyond the margin before the fault
+    /// latches \[s\] — rides out measurement transients and filter lag.
+    pub tau_ext_window_s: f64,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            tau_ext_margin_nm: 0.0,
+            tau_ext_window_s: 0.1,
+        }
+    }
+}
+
 /// Root of a robot TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -487,6 +512,10 @@ pub struct RobotConfig {
     /// fills this in with [`TimingConfig::SIM`] when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingConfig>,
+    /// Safety-envelope enforcement thresholds. Omitted = everything
+    /// disabled.
+    #[serde(default)]
+    pub limits: LimitsSection,
 }
 
 impl RobotConfig {
@@ -561,6 +590,7 @@ impl RobotConfig {
         self.validate_protocol()?;
         self.validate_defaults()?;
         self.validate_timing()?;
+        self.validate_limits()?;
         Ok(())
     }
 
@@ -817,6 +847,20 @@ impl RobotConfig {
                 "timing.fifo_priority",
                 "must be 0..=99 (0 disables SCHED_FIFO)",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_limits(&self) -> Result<(), ConfigError> {
+        let l = &self.limits;
+        if l.tau_ext_margin_nm < 0.0 || !l.tau_ext_margin_nm.is_finite() {
+            return Err(invalid(
+                "limits.tau_ext_margin_nm",
+                "must be >= 0 (0 disables the envelope)",
+            ));
+        }
+        if !is_positive(l.tau_ext_window_s) || !l.tau_ext_window_s.is_finite() {
+            return Err(invalid("limits.tau_ext_window_s", "must be > 0"));
         }
         Ok(())
     }

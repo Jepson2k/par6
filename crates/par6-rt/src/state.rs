@@ -99,6 +99,9 @@ pub enum ErrorCode {
     /// Motor-bus controller error-passive (warning, self-clears when
     /// the error counters recover).
     LinkErrorPassive,
+    /// Per-joint: external-torque estimate beyond the configured
+    /// envelope margin for the configured window (hard latch).
+    TorqueEnvelope,
 }
 
 impl ErrorCode {

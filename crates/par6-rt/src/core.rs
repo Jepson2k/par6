@@ -433,6 +433,12 @@ pub struct RtCore<B: DriverBus> {
     /// like in the torque domain.
     tau_ext: [f64; MAX_JOINTS],
     filters_seeded: bool,
+    /// `[limits] tau_ext_margin_nm`; 0 disables the envelope.
+    tau_env_margin_nm: f64,
+    /// Ticks a joint must stay beyond the margin before latching.
+    tau_env_window_ticks: u32,
+    /// Per-joint consecutive over-margin tick counters.
+    tau_env_over: [u32; MAX_JOINTS],
 
     // Per-tick compute buffers.
     g: [f64; MAX_JOINTS],
@@ -604,6 +610,9 @@ impl<B: DriverBus> RtCore<B> {
             tau_filt: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
             filters_seeded: false,
+            tau_env_margin_nm: robot.limits.tau_ext_margin_nm,
+            tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
+            tau_env_over: [0; MAX_JOINTS],
             g: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
             cmds: [JointCommand::idle(); MAX_JOINTS],
@@ -1350,6 +1359,41 @@ impl<B: DriverBus> RtCore<B> {
             None,
             link.state == par6_bus::LinkState::ErrorPassive,
         );
+
+        // External-torque envelope: a joint whose external-torque
+        // estimate stays beyond the margin for the window latches hard —
+        // unexpected contact or an unmodeled payload. Enforced only
+        // where the estimate is meaningful: homed (the gravity model
+        // needs referenced angles), enabled, and in a mode whose drives
+        // actively bear the load — a limp or protective-hold arm reads
+        // `-g(q)` as "external" torque and would re-latch forever. The
+        // EXEC feed-forward is subtracted so planned acceleration does
+        // not count against the margin (one tick stale, matching the
+        // measurement's own lag). Hand-guiding and impedance modes are
+        // exempt: external torque is their input, not a fault.
+        if self.tau_env_margin_nm > 0.0 {
+            let enforce = self.homed
+                && self.state == ArmState::Enabled
+                && matches!(
+                    self.mode,
+                    Mode::Idle | Mode::Jog | Mode::Stream | Mode::Exec
+                );
+            for i in 0..MAX_JOINTS {
+                let ff = if self.mode == Mode::Exec {
+                    self.scratch_tau[i]
+                } else {
+                    0.0
+                };
+                if enforce && (self.tau_ext[i] - ff).abs() > self.tau_env_margin_nm {
+                    self.tau_env_over[i] = self.tau_env_over[i].saturating_add(1);
+                    if self.tau_env_over[i] >= self.tau_env_window_ticks {
+                        self.errors.latch(ErrorCode::TorqueEnvelope, Some(i as u8));
+                    }
+                } else {
+                    self.tau_env_over[i] = 0;
+                }
+            }
+        }
 
         if !self.bus.is_silent() {
             // A sustained TX-failure streak is a disconnect: the arm has

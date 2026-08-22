@@ -239,6 +239,7 @@ class ErrorCode(IntEnum):
     SYS_CAN_STALE = 60
     SYS_BUS_OFF = 61
     SYS_LINK_ERROR_PASSIVE = 62
+    SYS_TORQUE_ENVELOPE = 63
 
 
 # The ack taxonomy: one table, both sides consult it.

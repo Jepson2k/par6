@@ -552,6 +552,15 @@ command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4 # 100 ticks @ 250 Hz
 
+[limits]
+# External-torque envelope: hard fault when a joint's external-torque
+# estimate (measured minus the gravity model, minus the active motion's
+# feed-forward) stays beyond the margin for the window. 0 disables —
+# the shipped default, because the estimate is only as good as the
+# torque constants and the gravity model; calibrate before opting in.
+tau_ext_margin_nm = 0.0
+tau_ext_window_s = 0.1
+
 # ============================================= installation keep-outs (issue #19)
 # Standing collision restrictions of THIS installation — cage walls, the
 # table, fixtures — enforced from boot in the planner's collision gate AND

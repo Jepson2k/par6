@@ -62,6 +62,8 @@ pub struct Rig {
     pub gripper_node: NodeId,
     /// The measured pose the rig injects every tick.
     pub pose: [f64; MAX_JOINTS],
+    /// The measured motor current the rig injects every tick [mA].
+    pub current_ma: [i16; MAX_JOINTS],
     /// Bitmask of NODES whose injection is suppressed (staleness tests).
     pub skip_nodes: u16,
     /// Bitmask of NODES with a live driver fault: every injected frame
@@ -153,6 +155,7 @@ impl Rig {
             node_of,
             gripper_node,
             pose,
+            current_ma: [0; MAX_JOINTS],
             skip_nodes: 0,
             fault_nodes: 0,
             auto_inject: true,
@@ -195,7 +198,7 @@ impl Rig {
                     node,
                     position_ticks: ticks,
                     speed_ticks_s: 0,
-                    current_ma: 0,
+                    current_ma: self.current_ma[i],
                 },
             );
         }

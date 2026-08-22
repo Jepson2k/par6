@@ -48,6 +48,12 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[])
     } else if has(RtCode::BusOff) {
         make_error(ErrorCode::SysBusOff, UNATTRIBUTED, &[])
+    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::TorqueEnvelope) {
+        make_error(
+            ErrorCode::SysTorqueEnvelope,
+            UNATTRIBUTED,
+            &[("joint", &e.joint.unwrap_or(0).to_string())],
+        )
     } else if has(RtCode::LoopCritical) {
         make_error(ErrorCode::SysLoopCritical, UNATTRIBUTED, &[])
     } else if has(RtCode::ExecLinkLost) {
