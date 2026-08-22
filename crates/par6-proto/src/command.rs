@@ -462,6 +462,7 @@ pub enum Command {
     ToolStatus,
     IsSimulator,
     Shapes,
+    ConfigInfo,
     // FIRE_AND_FORGET
     ServoJ(ServoJ),
     ServoJPose(ServoJPose),
@@ -522,6 +523,7 @@ impl Command {
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
+            C::ConfigInfo => CmdType::ConfigInfo,
             C::ServoJ(_) => CmdType::ServoJ,
             C::ServoJPose(_) => CmdType::ServoJPose,
             C::ServoL(_) => CmdType::ServoL,
@@ -594,6 +596,7 @@ impl Command {
             | C::ToolStatus
             | C::IsSimulator
             | C::Shapes
+            | C::ConfigInfo
             | C::ResetLoopStats => Ok(()),
             C::WriteIo(p) => {
                 check(p.port <= 7, "write_io.port", "must be 0..=7")?;
@@ -860,7 +863,8 @@ fn arity(tag: CmdType) -> usize {
         | T::TcpOffset
         | T::ToolStatus
         | T::IsSimulator
-        | T::Shapes => 2,
+        | T::Shapes
+        | T::ConfigInfo => 2,
         T::Stop
         | T::Simulator
         | T::SetGravityComp
@@ -947,7 +951,8 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::TcpOffset
         | C::ToolStatus
         | C::IsSimulator
-        | C::Shapes => {}
+        | C::Shapes
+        | C::ConfigInfo => {}
         C::Stop(p) => w_bool(buf, p.clear_queue),
         C::WriteIo(p) => {
             w_uint(buf, u64::from(p.port));
@@ -1306,6 +1311,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,
+        T::ConfigInfo => Command::ConfigInfo,
         T::ServoJ => Command::ServoJ(ServoJ {
             angles: r_fixed6(&mut r, "servo_j.angles")?,
             speed: r.opt_f64()?,

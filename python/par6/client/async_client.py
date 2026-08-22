@@ -1621,6 +1621,23 @@ class AsyncRobotClient(_RobotClientABC):
             program=tuple(_shape(w) for w in result["program"]),
         )
 
+    async def config_info(self) -> dict | None:
+        """The runtime's effective configuration.
+
+        A dict with ``path``, ``fingerprint`` (sha256 hex over the config
+        bundle's files — compare against a local mirror to detect skew),
+        ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
+        name), and ``joints`` (per-joint soft limits + EXEC
+        velocity/acceleration).  Returns None if unreachable.
+
+        Category: Query
+
+        Example:
+            info = rbt.config_info()
+        """
+        core = await self._ensure_core()
+        return await self._call(core.config_info())
+
     async def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""
         core = await self._ensure_core()

@@ -268,6 +268,10 @@ impl CoreClient {
         query_future(py, self.rt(), Command::Shapes)
     }
 
+    fn config_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::ConfigInfo)
+    }
+
     fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         future_into_py(py, async move {

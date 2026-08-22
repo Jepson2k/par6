@@ -37,6 +37,25 @@ fn main() {
         print!("{USAGE}");
         return;
     }
+    if opts.check_config {
+        let path = match par6d::options::resolve_config_path(opts.config.as_deref()) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("par6d: {e}");
+                std::process::exit(1);
+            }
+        };
+        match par6_config::ConfigBundle::load(&path) {
+            Ok(_) => {
+                println!("config OK: {}", path.display());
+                return;
+            }
+            Err(e) => {
+                eprintln!("par6d: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     // SAFETY: the handler only stores to an atomic (async-signal-safe).
     unsafe {
         let handler = on_signal as extern "C" fn(libc::c_int) as libc::sighandler_t;

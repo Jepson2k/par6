@@ -573,6 +573,7 @@ pub fn vectors() -> Vec<Vector> {
     v.push(cmd_vec("cmd_tool_status", 36, Command::ToolStatus));
     v.push(cmd_vec("cmd_is_simulator", 37, Command::IsSimulator));
     v.push(cmd_vec("cmd_shapes", 38, Command::Shapes));
+    v.push(cmd_vec("cmd_config_info", 39, Command::ConfigInfo));
 
     // -- commands: FIRE_AND_FORGET --
     v.push(cmd_vec(
@@ -1033,6 +1034,27 @@ pub fn vectors() -> Vec<Vector> {
                 installation: vec![shape_box()],
                 program: vec![shape_sphere()],
                 epoch: 3,
+            },
+        },
+    ));
+    v.push(reply_vec(
+        "response_config_info",
+        Reply::Response {
+            req_id: 119,
+            result: QueryResult::ConfigInfo {
+                path: "/etc/par6/PAR6.toml".to_owned(),
+                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_owned(),
+                tick_dt_s: 0.004,
+                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                joints: vec![
+                    [-2.15, 2.15, 3.0, 12.0],
+                    [-1.0, 1.9, 2.5, 10.0],
+                    [-1.8, 1.2, 2.5, 10.0],
+                    [-1.9, 1.9, 4.0, 16.0],
+                    [-2.0, 2.0, 4.0, 16.0],
+                    [-6.3, 6.3, 6.0, 20.0],
+                ],
             },
         },
     ));

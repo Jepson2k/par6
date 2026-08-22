@@ -123,6 +123,12 @@ impl Client {
         self.query(Command::Shapes).await
     }
 
+    /// The runtime's effective configuration (path, content fingerprint,
+    /// per-joint limits, motion constants) — the config-skew hook.
+    pub async fn config_info(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::ConfigInfo).await
+    }
+
     /// Poll [`Client::ping`] until the runtime responds or `timeout` expires.
     pub async fn wait_ready(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;

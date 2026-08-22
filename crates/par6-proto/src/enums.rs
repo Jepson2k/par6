@@ -143,6 +143,9 @@ wire_enum! {
         IsSimulator = 46,
         /// Collision-world readback (installation + program layers).
         Shapes = 47,
+        /// Effective-configuration readback (path, fingerprint, limits,
+        /// motion constants) — the config-skew hook.
+        ConfigInfo = 48,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -225,6 +228,8 @@ wire_enum! {
         IsSimulator = 17,
         /// See [`CmdType::Shapes`].
         Shapes = 18,
+        /// See [`CmdType::ConfigInfo`].
+        ConfigInfo = 19,
     }
 }
 
@@ -399,7 +404,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::TcpOffset
         | C::ToolStatus
         | C::IsSimulator
-        | C::Shapes => CommandClass::Query,
+        | C::Shapes
+        | C::ConfigInfo => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

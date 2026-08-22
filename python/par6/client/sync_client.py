@@ -581,6 +581,11 @@ class RobotClient:
         """The collision world the runtime is enforcing, by layer."""
         return _run(self._inner.shapes())
 
+    def config_info(self) -> dict | None:
+        """The runtime's effective configuration (path, fingerprint,
+        limits, motion constants)."""
+        return _run(self._inner.config_info())
+
     def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""
         return _run(self._inner._tool_status())

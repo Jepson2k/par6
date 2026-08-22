@@ -259,6 +259,26 @@ pub enum QueryResult {
         /// Whether the simulator backend is active.
         active: bool,
     },
+    /// CONFIG_INFO result: the runtime's effective configuration — the
+    /// config-skew hook a UI compares against its packaged mirror.
+    ConfigInfo {
+        /// Config file path on the daemon host.
+        path: String,
+        /// Content fingerprint: sha256 hex over the robot TOML and each
+        /// gripper TOML (sorted by filename), each hashed as
+        /// `filename\n` then content bytes.
+        fingerprint: String,
+        /// RT tick period \[s\].
+        tick_dt_s: f64,
+        /// The `[motion]` feel constants, in declaration order:
+        /// `jog_l_linear_max_m_s, jog_l_angular_max_rad_s, cart_step_m,
+        /// cart_step_rad, move_l_max_joint_step_rad, dls_lambda,
+        /// settle_tolerance_rad, settle_timeout_s`.
+        motion: [f64; 8],
+        /// Per-joint effective EXEC limits: `[soft_min_rad,
+        /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
+        joints: Vec<[f64; 4]>,
+    },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
         /// Installation-layer shapes (persistent keep-outs).
@@ -292,6 +312,7 @@ impl QueryResult {
             Q::TcpOffset { .. } => QueryType::TcpOffset,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
+            Q::ConfigInfo { .. } => QueryType::ConfigInfo,
             Q::Shapes { .. } => QueryType::Shapes,
         }
     }
@@ -511,6 +532,30 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 2);
             w_uint(buf, u64::from(tag));
             w_bool(buf, *active);
+        }
+        Q::ConfigInfo {
+            path,
+            fingerprint,
+            tick_dt_s,
+            motion,
+            joints,
+        } => {
+            w_array(buf, 6);
+            w_uint(buf, u64::from(tag));
+            w_str(buf, path);
+            w_str(buf, fingerprint);
+            w_f64(buf, *tick_dt_s);
+            w_array(buf, motion.len());
+            for v in motion {
+                w_f64(buf, *v);
+            }
+            w_array(buf, joints.len());
+            for j in joints {
+                w_array(buf, j.len());
+                for v in j {
+                    w_f64(buf, *v);
+                }
+            }
         }
         Q::Shapes {
             installation,
@@ -817,6 +862,34 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::IsSimulator => {
             expect_arity("is_simulator result", n, 2)?;
             QueryResult::IsSimulator { active: r.bool()? }
+        }
+        T::ConfigInfo => {
+            expect_arity("config_info result", n, 6)?;
+            let path = r.str()?.to_owned();
+            let fingerprint = r.str()?.to_owned();
+            let tick_dt_s = r.f64()?;
+            let motion = r_f64_fixed(r, "config_info.motion")?;
+            let jn = r.array_len()?;
+            // One entry per arm joint; anything past the node-slot cap
+            // is a corrupt packet, not a big robot.
+            if jn > 32 {
+                return Err(DecodeError::Arity {
+                    what: "config_info.joints",
+                    expected: 32,
+                    got: jn,
+                });
+            }
+            let mut joints = Vec::with_capacity(jn);
+            for _ in 0..jn {
+                joints.push(r_f64_fixed(r, "config_info.joints[]")?);
+            }
+            QueryResult::ConfigInfo {
+                path,
+                fingerprint,
+                tick_dt_s,
+                motion,
+                joints,
+            }
         }
         T::Shapes => {
             expect_arity("shapes result", n, 4)?;

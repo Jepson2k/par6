@@ -244,6 +244,44 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("program", prog)?;
             d.set_item("epoch", *epoch)?;
         }
+        QueryResult::ConfigInfo {
+            path,
+            fingerprint,
+            tick_dt_s,
+            motion,
+            joints,
+        } => {
+            d.set_item("path", path)?;
+            d.set_item("fingerprint", fingerprint)?;
+            d.set_item("tick_dt_s", *tick_dt_s)?;
+            let m = PyDict::new(py);
+            for (key, v) in [
+                "jog_l_linear_max_m_s",
+                "jog_l_angular_max_rad_s",
+                "cart_step_m",
+                "cart_step_rad",
+                "move_l_max_joint_step_rad",
+                "dls_lambda",
+                "settle_tolerance_rad",
+                "settle_timeout_s",
+            ]
+            .iter()
+            .zip(motion)
+            {
+                m.set_item(key, *v)?;
+            }
+            d.set_item("motion", m)?;
+            let js = PyList::empty(py);
+            for j in joints {
+                let jd = PyDict::new(py);
+                jd.set_item("soft_min_rad", j[0])?;
+                jd.set_item("soft_max_rad", j[1])?;
+                jd.set_item("velocity_rad_s", j[2])?;
+                jd.set_item("acceleration_rad_s2", j[3])?;
+                js.append(jd)?;
+            }
+            d.set_item("joints", js)?;
+        }
         other => {
             return Err(PyRuntimeError::new_err(format!(
                 "query result {:?} has a dedicated accessor",

@@ -1252,3 +1252,76 @@ def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
             reader.close()
     finally:
         daemon.stop()
+
+
+async def test_config_info_reports_the_effective_configuration(tmp_path):
+    """CONFIG_INFO answers the runtime's effective configuration, and its
+    fingerprint is reproducible over the same files — the skew check a UI
+    runs against its packaged config mirror."""
+    import hashlib
+    import tomllib
+
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client() as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            info = await client.config_info()
+        assert info is not None
+        assert info["path"] == str(daemon.config)
+
+        # The wire-contract fingerprint: sha256 over the robot TOML and
+        # each grippers/*.toml (sorted), each as `name\n` + content.
+        h = hashlib.sha256()
+        for f in [daemon.config] + sorted((daemon.config.parent / "grippers").glob("*.toml")):
+            h.update(f.name.encode())
+            h.update(b"\n")
+            h.update(f.read_bytes())
+        assert info["fingerprint"] == h.hexdigest()
+
+        cfg = tomllib.loads(daemon.config.read_text())
+        assert info["tick_dt_s"] == pytest.approx(cfg["robot"]["tick_dt_s"])
+        assert info["motion"]["jog_l_linear_max_m_s"] == pytest.approx(
+            cfg["motion"]["jog_l_linear_max_m_s"]
+        )
+        assert info["motion"]["settle_timeout_s"] == pytest.approx(
+            cfg["motion"]["settle_timeout_s"]
+        )
+        joints = info["joints"]
+        assert len(joints) == len(cfg["joints"])
+        for got, declared in zip(joints, cfg["joints"]):
+            assert got["soft_min_rad"] == pytest.approx(declared["limits"]["soft_min_rad"])
+            assert got["soft_max_rad"] == pytest.approx(declared["limits"]["soft_max_rad"])
+    finally:
+        daemon.stop()
+
+
+def test_check_config_validates_the_bundle_and_exits(tmp_path):
+    """``par6d --check-config`` is the deploy-time gate: exit 0 on a valid
+    bundle, exit 1 (with the validation error on stderr) on a broken one —
+    without binding a socket or touching a bus."""
+    import subprocess
+
+    from live_daemon import par6d_binary
+
+    binary = par6d_binary()
+    assert binary is not None
+    config = sim_config(tmp_path / "config")
+    ok = subprocess.run(
+        [binary, "--check-config", "--config", str(config)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ok.returncode == 0, ok.stderr
+    assert "config OK" in ok.stdout
+
+    broken = tmp_path / "config" / "broken.toml"
+    broken.write_text(config.read_text().replace("tick_dt_s = ", "tick_dt_s = -"))
+    bad = subprocess.run(
+        [binary, "--check-config", "--config", str(broken)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert bad.returncode == 1
+    assert "tick_dt_s" in bad.stderr

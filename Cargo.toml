@@ -45,6 +45,7 @@ thread-priority = "3"
 rsruckig = "3"
 toml = "0.8"
 thiserror = "2"
+sha2 = "0.10"
 log = "0.4"
 env_logger = "0.11"
 

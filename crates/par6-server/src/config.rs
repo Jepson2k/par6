@@ -129,6 +129,29 @@ pub struct ServerConfig {
     /// array; the server pushes it into both collision gates at spawn and
     /// refuses to start on a shape the world cannot apply.
     pub installation_shapes: Vec<Shape>,
+    /// Effective-configuration readback served for the CONFIG_INFO
+    /// query. The daemon fills it from the loaded bundle at startup.
+    pub config_info: ConfigInfoData,
+}
+
+/// The CONFIG_INFO payload: where the runtime's config came from, what
+/// its content hashes to, and the effective values a client would want
+/// to compare or display.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ConfigInfoData {
+    /// Config file path on the daemon host.
+    pub path: String,
+    /// Content fingerprint: sha256 hex over the robot TOML and each
+    /// gripper TOML (sorted by filename), each hashed as `filename\n`
+    /// then content bytes.
+    pub fingerprint: String,
+    /// RT tick period \[s\].
+    pub tick_dt_s: f64,
+    /// The `[motion]` feel constants, in declaration order.
+    pub motion: [f64; 8],
+    /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
+    /// velocity_rad_s, acceleration_rad_s2]`.
+    pub joints: Vec<[f64; 4]>,
 }
 
 impl Default for ServerConfig {
@@ -170,6 +193,7 @@ impl Default for ServerConfig {
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
             installation_shapes: Vec::new(),
+            config_info: ConfigInfoData::default(),
         }
     }
 }

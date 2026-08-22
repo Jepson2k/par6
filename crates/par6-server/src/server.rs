@@ -1877,6 +1877,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::IsSimulator => QueryResult::IsSimulator {
                 active: self.simulator,
             },
+            C::ConfigInfo => {
+                let ci = &self.cfg.config_info;
+                QueryResult::ConfigInfo {
+                    path: ci.path.clone(),
+                    fingerprint: ci.fingerprint.clone(),
+                    tick_dt_s: ci.tick_dt_s,
+                    motion: ci.motion,
+                    joints: ci.joints.clone(),
+                }
+            }
             C::Shapes => QueryResult::Shapes {
                 installation: self.cfg.installation_shapes.clone(),
                 program: self.shapes.clone(),
@@ -2023,6 +2033,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::ToolStatus => "tool_status",
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
+        T::ConfigInfo => "config_info",
         T::ServoJ => "servo_j",
         T::ServoJPose => "servo_j_pose",
         T::ServoL => "servo_l",

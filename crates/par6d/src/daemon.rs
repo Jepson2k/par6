@@ -32,7 +32,7 @@ use par6_rt::{
     GravityModel, RtCore, RtHooks, RunOptions, SharedDigitalIo, SharedLineGpio, SnapshotReader,
     SnapshotWriter, SpecSettle, StateSnapshot,
 };
-use par6_server::{ServerConfig, ServerHandle};
+use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
@@ -312,7 +312,8 @@ impl Daemon {
                 gate: stream_gate.clone(),
             },
         );
-        let cfg = server_config(opts, &bundle);
+        let mut cfg = server_config(opts, &bundle);
+        cfg.config_info = config_info(&config_path, &bundle.robot);
         let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -545,6 +546,75 @@ fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
         declared.max(2.0 * crate::bridge::SERVO_GRACE.as_secs_f64())
     } else {
         declared
+    }
+}
+
+/// The CONFIG_INFO fingerprint: sha256 hex over the robot TOML and each
+/// `grippers/*.toml` (sorted by file name), each hashed as its file name,
+/// a newline, then its content bytes. A client computes the same digest
+/// over its packaged config mirror to detect skew, so the definition is
+/// part of the wire contract.
+fn config_fingerprint(robot_toml: &std::path::Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut add = |path: &std::path::Path| -> std::io::Result<()> {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(std::fs::read(path)?);
+        Ok(())
+    };
+    add(robot_toml)?;
+    let dir = robot_toml
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("grippers");
+    let mut grippers: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    grippers.sort();
+    for g in &grippers {
+        add(g)?;
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
+    let m = robot.motion;
+    ConfigInfoData {
+        path: config_path.display().to_string(),
+        fingerprint: config_fingerprint(config_path).unwrap_or_else(|e| {
+            log::warn!("config fingerprint failed: {e}");
+            String::new()
+        }),
+        tick_dt_s: robot.robot.tick_dt_s,
+        motion: [
+            m.jog_l_linear_max_m_s,
+            m.jog_l_angular_max_rad_s,
+            m.cart_step_m,
+            m.cart_step_rad,
+            m.move_l_max_joint_step_rad,
+            m.dls_lambda,
+            m.settle_tolerance_rad,
+            m.settle_timeout_s,
+        ],
+        joints: robot
+            .joints
+            .iter()
+            .map(|j| {
+                let exec = j.limits.for_mode(par6_config::LimitMode::Exec);
+                [
+                    j.limits.soft_min_rad,
+                    j.limits.soft_max_rad,
+                    exec.velocity_rad_s,
+                    exec.acceleration_rad_s2,
+                ]
+            })
+            .collect(),
     }
 }
 

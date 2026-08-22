@@ -41,7 +41,7 @@ pub mod runtime;
 pub mod server;
 pub mod telemetry;
 
-pub use config::{ServerConfig, StatusTransport};
+pub use config::{ConfigInfoData, ServerConfig, StatusTransport};
 pub use faults::{gripper_fault_code, rt_standing_error};
 pub use gating::{gate, Gate};
 pub use runtime::{

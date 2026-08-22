@@ -533,6 +533,20 @@
       ]
     },
     {
+      "class": "QUERY",
+      "cmd": "CONFIG_INFO",
+      "file": "cmd_config_info.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_config_info",
+      "req_id": 39,
+      "tag": 48,
+      "wire": [
+        48,
+        39
+      ]
+    },
+    {
       "class": "FIRE_AND_FORGET",
       "cmd": "SERVO_J",
       "file": "cmd_servo_j.bin",
@@ -1608,6 +1622,70 @@
             ]
           ],
           3
+        ]
+      ]
+    },
+    {
+      "file": "response_config_info.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/CONFIG_INFO",
+      "name": "response_config_info",
+      "wire": [
+        4,
+        119,
+        [
+          19,
+          "/etc/par6/PAR6.toml",
+          "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          0.004,
+          [
+            0.08,
+            0.6,
+            0.005,
+            0.05,
+            0.35,
+            0.05,
+            0.01,
+            2.0
+          ],
+          [
+            [
+              -2.15,
+              2.15,
+              3.0,
+              12.0
+            ],
+            [
+              -1.0,
+              1.9,
+              2.5,
+              10.0
+            ],
+            [
+              -1.8,
+              1.2,
+              2.5,
+              10.0
+            ],
+            [
+              -1.9,
+              1.9,
+              4.0,
+              16.0
+            ],
+            [
+              -2.0,
+              2.0,
+              4.0,
+              16.0
+            ],
+            [
+              -6.3,
+              6.3,
+              6.0,
+              20.0
+            ]
+          ]
         ]
       ]
     },
