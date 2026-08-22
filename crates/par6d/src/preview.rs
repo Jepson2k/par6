@@ -57,6 +57,7 @@ pub struct Preview {
     snap_w: SnapshotWriter<StateSnapshot>,
     next_index: u64,
     dt: f64,
+    motion: par6_config::MotionConfig,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -106,6 +107,7 @@ impl Preview {
         snap.mode = Mode::Idle;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let dt = robot.robot.tick_dt_s;
+        let motion = robot.motion;
         let mut preview = Self {
             planner,
             jog,
@@ -113,6 +115,7 @@ impl Preview {
             snap_w,
             next_index: 0,
             dt,
+            motion,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
@@ -365,6 +368,14 @@ impl Preview {
             rest = &rest[consumed..];
         }
         results
+    }
+
+    /// The effective `[motion]` feel constants the preview plans with —
+    /// the same file the daemon reads, so a consumer that integrates a
+    /// motion itself (the dry-run client's `jog_l`) uses the runtime's
+    /// own values.
+    pub fn motion(&self) -> par6_config::MotionConfig {
+        self.motion
     }
 
     /// The tick period \[s\] trajectories are sampled at.

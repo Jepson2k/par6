@@ -469,6 +469,54 @@ impl TimingConfig {
     };
 }
 
+/// `[motion]`: the runtime's motion "feel" constants — sampling pitch,
+/// solver damping, jog full-scale rates, completion settling. Defaults
+/// are the values par6 shipped with as compiled constants; the section
+/// makes them installation-tunable, and the offline preview reads the
+/// same file, so a tuned deployment previews the way it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MotionConfig {
+    /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities`
+    /// fraction of ±1 maps to this).
+    pub jog_l_linear_max_m_s: f64,
+    /// Full-scale `jog_l` angular TCP speed \[rad/s\].
+    pub jog_l_angular_max_rad_s: f64,
+    /// Cartesian sampling pitch: one IK waypoint per this much
+    /// translation \[m\] …
+    pub cart_step_m: f64,
+    /// … or per this much rotation \[rad\], whichever yields more
+    /// waypoints.
+    pub cart_step_rad: f64,
+    /// Largest joint change allowed between consecutive cartesian IK
+    /// waypoints \[rad\]; a bigger jump means the solver hopped to
+    /// another IK branch and the commanded path would whip the arm.
+    pub move_l_max_joint_step_rad: f64,
+    /// DLS damping λ for the jacobian velocity solve
+    /// (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
+    pub dls_lambda: f64,
+    /// All-joint settle tolerance \[rad\] for the `settled`/`strict`
+    /// completion policies.
+    pub settle_tolerance_rad: f64,
+    /// Settle timeout \[s\].
+    pub settle_timeout_s: f64,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            jog_l_linear_max_m_s: 0.08,
+            jog_l_angular_max_rad_s: 0.6,
+            cart_step_m: 0.005,
+            cart_step_rad: 0.05,
+            move_l_max_joint_step_rad: 0.35,
+            dls_lambda: 0.05,
+            settle_tolerance_rad: 0.01,
+            settle_timeout_s: 2.0,
+        }
+    }
+}
+
 /// `[limits]`: safety-envelope enforcement thresholds.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
@@ -528,6 +576,9 @@ pub struct RobotConfig {
     /// disabled.
     #[serde(default)]
     pub limits: LimitsSection,
+    /// Motion feel constants. Omitted = the shipped defaults.
+    #[serde(default)]
+    pub motion: MotionConfig,
 }
 
 impl RobotConfig {
@@ -603,6 +654,7 @@ impl RobotConfig {
         self.validate_defaults()?;
         self.validate_timing()?;
         self.validate_limits()?;
+        self.validate_motion()?;
         Ok(())
     }
 
@@ -862,6 +914,28 @@ impl RobotConfig {
                 "timing.fifo_priority",
                 "must be 0..=99 (0 disables SCHED_FIFO)",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_motion(&self) -> Result<(), ConfigError> {
+        let m = &self.motion;
+        for (v, name) in [
+            (m.jog_l_linear_max_m_s, "motion.jog_l_linear_max_m_s"),
+            (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
+            (m.cart_step_m, "motion.cart_step_m"),
+            (m.cart_step_rad, "motion.cart_step_rad"),
+            (
+                m.move_l_max_joint_step_rad,
+                "motion.move_l_max_joint_step_rad",
+            ),
+            (m.dls_lambda, "motion.dls_lambda"),
+            (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
+            (m.settle_timeout_s, "motion.settle_timeout_s"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
         }
         Ok(())
     }

@@ -554,6 +554,19 @@ command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4 # 100 ticks @ 250 Hz
 
+[motion]
+# The runtime's motion "feel": sampling pitch, solver damping, jog
+# full-scale rates, completion settling. The offline preview reads this
+# same file, so a tuned deployment previews the way it runs.
+jog_l_linear_max_m_s = 0.08
+jog_l_angular_max_rad_s = 0.6
+cart_step_m = 0.005
+cart_step_rad = 0.05
+move_l_max_joint_step_rad = 0.35
+dls_lambda = 0.05
+settle_tolerance_rad = 0.01
+settle_timeout_s = 2.0
+
 [limits]
 # External-torque envelope: hard fault when a joint's external-torque
 # estimate (measured minus the gravity model, minus the active motion's

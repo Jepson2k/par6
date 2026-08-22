@@ -247,7 +247,11 @@ impl Daemon {
             gravity: gravity_hook,
             jog: Box::new(jog),
             stream: Box::new(stream),
-            settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
+            settle: Box::new(SpecSettle::new(
+                CompletionPolicy::Settled,
+                dt,
+                bundle.robot.motion,
+            )),
             estop,
             io,
             flash: flash_marker(),
@@ -683,12 +687,13 @@ pub(crate) fn load_kin_stack(
     // massless point, not a load.
     let tool_offset = ToolOffset::new();
     let window = SoftWindow::from_config(robot);
+    let dls_lambda = robot.motion.dls_lambda;
     Ok(KinStack {
         fk: KinFk::new(load()?, tool_offset.clone()),
         gravity: KinGravity::new(gravity_kin),
-        planner: CartKin::new(load()?, tool_offset.clone(), window),
-        bridge: CartKin::new(load()?, tool_offset.clone(), window),
-        housekeeping: CartKin::new(load()?, tool_offset.clone(), window),
+        planner: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
+        bridge: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
+        housekeeping: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
         collision,
         gate_collision,
         tool_offset,

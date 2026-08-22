@@ -126,7 +126,7 @@ impl Rig {
             gravity,
             jog: Box::new(RampJog::new(robot)),
             stream: Box::new(ClampStream::new(robot)),
-            settle: Box::new(SpecSettle::new(policy, dt)),
+            settle: Box::new(SpecSettle::new(policy, dt, robot.motion)),
             estop: Box::new(gpio),
             io: Box::new(io),
             flash: Box::new(marker),

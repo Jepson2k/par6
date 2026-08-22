@@ -174,7 +174,11 @@ fn a_permanent_bus_fault_does_not_log_once_per_tick() {
         gravity: Box::new(ZeroGravity),
         jog: Box::new(RampJog::new(&bundle.robot)),
         stream: Box::new(ClampStream::new(&bundle.robot)),
-        settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
+        settle: Box::new(SpecSettle::new(
+            CompletionPolicy::Settled,
+            dt,
+            bundle.robot.motion,
+        )),
         estop: Box::new(gpio),
         io: Box::new(io),
         flash: Box::new(marker),

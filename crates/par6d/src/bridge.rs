@@ -69,13 +69,6 @@ fn jog_deadline(duration_s: f64) -> Instant {
     Instant::now() + Duration::from_secs_f64(bounded)
 }
 
-/// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities` fraction
-/// of ±1 maps to this; conservative — the RT stream limiter still owns
-/// the joint-space envelope).
-const JOG_L_LINEAR_MAX_M_S: f64 = 0.08;
-/// Full-scale `jog_l` angular TCP speed \[rad/s\].
-const JOG_L_ANGULAR_MAX_RAD_S: f64 = 0.6;
-
 /// Velocity-scaled streaming lookahead horizon \[s\]: a jog is refused or
 /// stopped when the configuration this far ahead AT THE COMMANDED
 /// VELOCITY would collide, so faster jogs stop further from contact.
@@ -693,11 +686,12 @@ impl RtCommands for RtBridge {
                     _ => self.cart.snapshots.latest().q,
                 };
                 let mut twist = [0.0; 6];
+                let motion = &self.bundle.robot.motion;
                 for (i, (out, frac)) in twist.iter_mut().zip(p.velocities.iter()).enumerate() {
                     let full = if i < 3 {
-                        JOG_L_LINEAR_MAX_M_S
+                        motion.jog_l_linear_max_m_s
                     } else {
-                        JOG_L_ANGULAR_MAX_RAD_S
+                        motion.jog_l_angular_max_rad_s
                     };
                     *out = frac * full;
                 }
@@ -1316,18 +1310,5 @@ mod tests {
         let deadline = jog_deadline(0.1);
         assert!(deadline >= before + Duration::from_millis(100));
         assert!(deadline < before + Duration::from_millis(200));
-    }
-}
-
-#[cfg(test)]
-mod mirror {
-    use crate::py_mirror::assert_float;
-
-    /// The preview integrates `jog_l` against these full-scale rates; a
-    /// drift here previews a cartesian jog at the wrong speed entirely.
-    #[test]
-    fn python_dry_run_mirrors_the_jog_l_full_scale_rates() {
-        assert_float("_JOG_L_LINEAR_MAX_M_S", super::JOG_L_LINEAR_MAX_M_S);
-        assert_float("_JOG_L_ANGULAR_MAX_RAD_S", super::JOG_L_ANGULAR_MAX_RAD_S);
     }
 }

@@ -91,11 +91,6 @@ const NULL_MOVE_RAD: f64 = 1e-9;
 /// already referenced (vendor `HOME_RETURN_SPEED_FRAC`).
 const HOME_RETURN_SPEED_FRAC: f64 = 0.5;
 
-/// Cartesian sampling pitch: one IK waypoint per this much translation
-/// \[m\] …
-const CART_STEP_M: f64 = 0.005;
-/// … or per this much rotation \[rad\], whichever yields more waypoints.
-const CART_STEP_RAD: f64 = 0.05;
 /// Waypoint-count ceiling for one `move_l` (bounds planning cost).
 const MOVE_L_MAX_STEPS: usize = 400;
 /// Waypoint-count ceiling for a multi-segment cartesian path — an arc, a
@@ -107,19 +102,6 @@ const CART_PATH_MAX_STEPS: usize = 3000;
 /// Below this much translation AND rotation a cartesian move is already
 /// at its target.
 const MOVE_L_NULL_M: f64 = 1e-6;
-/// Largest joint change allowed between consecutive cartesian IK
-/// waypoints \[rad\]; a bigger jump means the solver hopped to another
-/// IK branch and the commanded path would whip the arm.
-///
-/// Measured against the wrap-normalized solution — [`CartKin::ik_within`]
-/// picks the 2π branch nearest the seed, and the seed here is the
-/// previous waypoint. A whole turn on one joint is the same
-/// configuration and must not read as a branch flip; the postures that
-/// genuinely are one still do, because wrapping only ever moves a
-/// solution closer to the seed.
-///
-/// [`CartKin::ik_within`]: crate::kin::CartKin::ik_within
-const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 /// How far a waypoint list's first pose may sit from where the arm
 /// actually is before the current pose is PREPENDED to the path instead
 /// of replacing that first waypoint \[m\].
@@ -283,6 +265,9 @@ pub(crate) struct Par6Planner {
     tool_offset: crate::kin::ToolOffset,
     /// Rate/change gate for the cartesian enablement probe.
     probe: EnablementProbe,
+    /// The `[motion]` feel constants (sampling pitch, IK step guard,
+    /// settle parameters).
+    motion: par6_config::MotionConfig,
 }
 
 impl Par6Planner {
@@ -313,6 +298,7 @@ impl Par6Planner {
         {
             *out = *rad;
         }
+        let motion = bundle.robot.motion;
         Ok(Self {
             link,
             producer,
@@ -344,6 +330,7 @@ impl Par6Planner {
             shape_names: ShapeNames::default(),
             collision_latch: CollisionState::default(),
             invalidated: None,
+            motion,
         })
     }
 
@@ -967,7 +954,7 @@ impl Par6Planner {
                         )],
                     ));
                 }
-                if (q[j] - seed[j]).abs() > MOVE_L_MAX_JOINT_STEP_RAD {
+                if (q[j] - seed[j]).abs() > self.motion.move_l_max_joint_step_rad {
                     return Err(partial());
                 }
             }
@@ -987,7 +974,7 @@ impl Par6Planner {
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
         let target = target_pose(&start_pose, &cmd.pose, cmd.frame, cmd.rel);
-        let poses = par6_motion::cart::line(&start_pose, &target, line_sampling());
+        let poses = par6_motion::cart::line(&start_pose, &target, line_sampling(&self.motion));
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -1001,7 +988,7 @@ impl Par6Planner {
         let start_pose = self.current_pose(&snap.q)?;
         let via = target_pose(&start_pose, &cmd.via, cmd.frame, false);
         let end = target_pose(&start_pose, &cmd.end, cmd.frame, false);
-        let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling())
+        let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling(&self.motion))
             .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
@@ -1014,8 +1001,8 @@ impl Par6Planner {
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
         let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame);
-        let poses =
-            par6_motion::cart::spline(&waypoints, path_sampling()).map_err(planning_error)?;
+        let poses = par6_motion::cart::spline(&waypoints, path_sampling(&self.motion))
+            .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -1038,8 +1025,9 @@ impl Par6Planner {
             .windows(2)
             .map(|w| MOVE_P_AUTO_BLEND_FRAC * w[0].min(w[1]))
             .collect();
-        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
-            .map_err(planning_error)?;
+        let poses =
+            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
+                .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -1074,8 +1062,9 @@ impl Par6Planner {
             .iter()
             .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
             .collect();
-        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
-            .map_err(planning_error)?;
+        let poses =
+            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
+                .map_err(planning_error)?;
 
         let speed = chain
             .iter()
@@ -1161,7 +1150,7 @@ impl Par6Planner {
         let path = par6_motion::cart::blended_polyline_joint(
             &waypoints,
             &fracs,
-            CART_STEP_RAD,
+            self.motion.cart_step_rad,
             CART_PATH_MAX_STEPS,
         )
         .map_err(planning_error)?;
@@ -1607,10 +1596,10 @@ impl Par6Planner {
 }
 
 /// Sampling of a single straight `move_l`.
-fn line_sampling() -> par6_motion::cart::CartSampling {
+fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
-        step_m: CART_STEP_M,
-        step_rad: CART_STEP_RAD,
+        step_m: motion.cart_step_m,
+        step_rad: motion.cart_step_rad,
         max_points: MOVE_L_MAX_STEPS + 1,
     }
 }
@@ -1618,10 +1607,10 @@ fn line_sampling() -> par6_motion::cart::CartSampling {
 /// Sampling of a multi-segment cartesian path (arc, spline, process
 /// move, blended chain): the same pitch, a budget sized for the longer
 /// path.
-fn path_sampling() -> par6_motion::cart::CartSampling {
+fn path_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
-        step_m: CART_STEP_M,
-        step_rad: CART_STEP_RAD,
+        step_m: motion.cart_step_m,
+        step_rad: motion.cart_step_rad,
         max_points: CART_PATH_MAX_STEPS,
     }
 }
@@ -1929,8 +1918,9 @@ impl Planner for Par6Planner {
                 par6_proto::CompletionPolicy::Strict => par6_rt::CompletionPolicy::Strict,
             };
             let dt = self.dt;
+            let motion = self.motion;
             self.link.op(Box::new(move |core| {
-                core.set_settle_policy(Box::new(SpecSettle::new(rt_policy, dt)));
+                core.set_settle_policy(Box::new(SpecSettle::new(rt_policy, dt, motion)));
             }));
         }
         match Profile::from_name(ctx.profile) {

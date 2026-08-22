@@ -401,18 +401,19 @@ pub(crate) struct CartKin {
     jac: [f64; 6 * NQ],
     offset: ToolOffset,
     window: SoftWindow,
+    /// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`),
+    /// from `[motion] dls_lambda`.
+    dls_lambda: f64,
 }
 
-/// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
-const DLS_LAMBDA: f64 = 0.05;
-
 impl CartKin {
-    pub(crate) fn new(kin: Kin, offset: ToolOffset, window: SoftWindow) -> Self {
+    pub(crate) fn new(kin: Kin, offset: ToolOffset, window: SoftWindow, dls_lambda: f64) -> Self {
         Self {
             kin,
             jac: [0.0; 6 * NQ],
             offset,
             window,
+            dls_lambda,
         }
     }
 
@@ -550,7 +551,7 @@ impl CartKin {
                 }
                 a[r][c] = s;
             }
-            a[r][r] += DLS_LAMBDA * DLS_LAMBDA;
+            a[r][r] += self.dls_lambda * self.dls_lambda;
         }
         let y = solve6(&mut a, v).ok_or_else(|| "singular jacobian system".to_string())?;
         let mut qd = [0.0; NQ];

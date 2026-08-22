@@ -55,12 +55,6 @@ _AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5
 #: (``crates/par6d/src/planner.rs::TOOL_CALIBRATE_MIN_WAIT_S``).
 _TOOL_CALIBRATE_MIN_WAIT_S = 2.0
 
-#: Full-scale TCP rates a ``jog_l`` fraction of 1.0 commands
-#: (``crates/par6d/src/bridge.rs``); the preview integrates the same twist.
-_JOG_L_LINEAR_MAX_M_S = 0.08
-_JOG_L_ANGULAR_MAX_RAD_S = 0.6
-
-
 def make_error(code: ErrorCode, **params: Any) -> RobotError:
     """The runtime's structured refusal for *code* — rendered by the
     engine's own error templates, so a preview-side refusal says exactly
@@ -791,10 +785,11 @@ class DryRunRobotClient:
 
         robot = self._kin_robot()
         soft = _cfg.soft_limits_rad()
+        motion = self._preview.motion()
         twist = np.concatenate(
             [
-                velocities[:3] * _JOG_L_LINEAR_MAX_M_S,
-                velocities[3:] * _JOG_L_ANGULAR_MAX_RAD_S,
+                velocities[:3] * motion["jog_l_linear_max_m_s"],
+                velocities[3:] * motion["jog_l_angular_max_rad_s"],
             ]
         )
         ticks = max(int(round(float(duration) / self._dt)), 1)

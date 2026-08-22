@@ -419,11 +419,6 @@ pub enum CompletionPolicy {
     Strict,
 }
 
-/// All-joint settle tolerance \[rad\].
-pub const SETTLE_TOLERANCE_RAD: f64 = 0.01;
-/// Settle timeout \[s\] (500 ticks at 4 ms).
-pub const SETTLE_TIMEOUT_S: f64 = 2.0;
-
 /// The completion-policy state machine — the reference
 /// implementation, not a test stub.
 #[derive(Debug, Clone, Copy)]
@@ -435,12 +430,13 @@ pub struct SpecSettle {
 }
 
 impl SpecSettle {
-    /// Policy runner at tick period `dt` \[s\], spec tolerances.
-    pub fn new(policy: CompletionPolicy, dt: f64) -> Self {
+    /// Policy runner at tick period `dt` \[s\], settling per the
+    /// `[motion]` config (`settle_tolerance_rad` / `settle_timeout_s`).
+    pub fn new(policy: CompletionPolicy, dt: f64, motion: par6_config::MotionConfig) -> Self {
         Self {
             policy,
-            tolerance_rad: SETTLE_TOLERANCE_RAD,
-            timeout_ticks: ((SETTLE_TIMEOUT_S / dt).round() as u32).max(1),
+            tolerance_rad: motion.settle_tolerance_rad,
+            timeout_ticks: ((motion.settle_timeout_s / dt).round() as u32).max(1),
             elapsed: 0,
         }
     }
