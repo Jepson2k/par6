@@ -1675,6 +1675,40 @@
         "executing_index": 12,
         "gravity_comp": true,
         "homed": true,
+        "homing": [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
         "io": [
           1,
           0,
@@ -1697,9 +1731,46 @@
           1
         ],
         "last_checkpoint": "approach",
+        "link_health": [
+          2,
+          2,
+          17,
+          987654
+        ],
         "link_ok": 1,
+        "min_clearance_m": 0.0375,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "node_ages": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ],
         "pose": [
           1.0,
           0.0,
@@ -1740,6 +1811,14 @@
           0.0625,
           -0.03125
         ],
+        "tau_ext": [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
         "tcp_speed": 33.25,
         "tool_status": [
           "SSG48",
@@ -1755,6 +1834,24 @@
             3.3
           ],
           "fin_ray"
+        ],
+        "warnings": [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
         ]
       },
       "file": "status_full.bin",
@@ -1904,7 +2001,104 @@
         ],
         6,
         true,
-        true
+        true,
+        [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
+        ],
+        [
+          2,
+          2,
+          17,
+          987654
+        ],
+        [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
+        0.0375,
+        [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
+        [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ]
       ]
     },
     {
@@ -1959,6 +2153,11 @@
         "executing_index": -1,
         "gravity_comp": false,
         "homed": false,
+        "homing": [
+          false,
+          0,
+          []
+        ],
         "io": [
           0,
           0,
@@ -1987,9 +2186,17 @@
           1
         ],
         "last_checkpoint": "",
+        "link_health": [
+          0,
+          0,
+          0,
+          0
+        ],
         "link_ok": 0,
+        "min_clearance_m": null,
         "mode": 0,
         "mono_time_ns": 0,
+        "node_ages": [],
         "pose": [
           0.0,
           0.0,
@@ -2030,8 +2237,17 @@
           0.0,
           0.0
         ],
+        "tau_ext": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
         "tcp_speed": 0.0,
-        "tool_status": null
+        "tool_status": null,
+        "warnings": []
       },
       "file": "status_idle.bin",
       "kind": "status",
@@ -2160,7 +2376,29 @@
         ],
         0,
         false,
-        false
+        false,
+        [],
+        [
+          0,
+          0,
+          0,
+          0
+        ],
+        [
+          false,
+          0,
+          []
+        ],
+        null,
+        [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        []
       ]
     },
     {
@@ -2227,6 +2465,40 @@
         "executing_index": 12,
         "gravity_comp": true,
         "homed": true,
+        "homing": [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
         "io": [
           1,
           0,
@@ -2249,9 +2521,46 @@
           1
         ],
         "last_checkpoint": "approach",
+        "link_health": [
+          2,
+          2,
+          17,
+          987654
+        ],
         "link_ok": 1,
+        "min_clearance_m": 0.0375,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "node_ages": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ],
         "pose": [
           1.0,
           0.0,
@@ -2292,6 +2601,14 @@
           0.0625,
           -0.03125
         ],
+        "tau_ext": [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
         "tcp_speed": 33.25,
         "tool_status": [
           "SSG48",
@@ -2307,6 +2624,24 @@
             3.3
           ],
           "fin_ray"
+        ],
+        "warnings": [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
         ]
       },
       "file": "status_longer_tail.bin",
@@ -2457,6 +2792,103 @@
         6,
         true,
         true,
+        [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
+        ],
+        [
+          2,
+          2,
+          17,
+          987654
+        ],
+        [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
+        0.0375,
+        [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
+        [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ],
         "future-field",
         1.25
       ]
@@ -2525,6 +2957,40 @@
         "executing_index": 12,
         "gravity_comp": true,
         "homed": true,
+        "homing": [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
         "io": [
           1,
           0,
@@ -2553,9 +3019,46 @@
           1
         ],
         "last_checkpoint": "approach",
+        "link_health": [
+          2,
+          2,
+          17,
+          987654
+        ],
         "link_ok": 1,
+        "min_clearance_m": 0.0375,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "node_ages": [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ],
         "pose": [
           1.0,
           0.0,
@@ -2596,6 +3099,14 @@
           0.0625,
           -0.03125
         ],
+        "tau_ext": [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
         "tcp_speed": 33.25,
         "tool_status": [
           "SSG48",
@@ -2611,6 +3122,24 @@
             3.3
           ],
           "fin_ray"
+        ],
+        "warnings": [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
         ]
       },
       "file": "status_ten_io_lines.bin",
@@ -2766,7 +3295,104 @@
         ],
         6,
         true,
-        true
+        true,
+        [
+          [
+            -1,
+            60,
+            "CAN data stale",
+            "Joint 2's bus data is older than the stale threshold.",
+            "Warning only; clears on the next frame.",
+            "Check bus load and wiring if this persists."
+          ],
+          [
+            -1,
+            59,
+            "Control loop degraded",
+            "The loop's p99 period exceeds the warning band.",
+            "Warning only; motion continues.",
+            "Reduce host load; sustained degradation hard-latches."
+          ]
+        ],
+        [
+          2,
+          2,
+          17,
+          987654
+        ],
+        [
+          true,
+          3,
+          [
+            [
+              2,
+              8
+            ],
+            [
+              1,
+              6
+            ],
+            [
+              3,
+              1
+            ],
+            [
+              0,
+              0
+            ],
+            [
+              1,
+              3
+            ],
+            [
+              2,
+              8
+            ],
+            [
+              0,
+              0
+            ]
+          ]
+        ],
+        0.0375,
+        [
+          0.5,
+          -0.25,
+          0.125,
+          -0.0625,
+          0.03125,
+          -0.015625
+        ],
+        [
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            1
+          ],
+          [
+            250,
+            2
+          ],
+          [
+            2,
+            1
+          ],
+          [
+            5000,
+            3
+          ],
+          [
+            3,
+            1
+          ],
+          [
+            18446744073709551615,
+            0
+          ]
+        ]
       ]
     },
     {

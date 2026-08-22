@@ -68,12 +68,14 @@ pub use hooks::{
     CommandSource, CompletionPolicy, FlashMarker, ForwardKin, JogEngine, NoCommands, NoFk,
     RtCommand, SettlePolicy, SharedFlashMarker, SpecSettle, StreamTracker,
 };
+pub use par6_bus::{Freshness, LinkHealth, LinkState, NodeState};
 pub use ring::{sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer};
 pub use rt::RunOptions;
 pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{
-    ArmState, ErrorCode, ErrorEntry, ErrorList, ExecStatus, HomingJointStatus, HomingStatus,
-    JogStatus, LoopStats, Mode, StateSnapshot, StreamStatus, StreamSubstate, MAX_ERRORS,
+    ArmState, ErrorCode, ErrorEntry, ErrorList, ExecStatus, HomingJointStatus, HomingPhase,
+    HomingStatus, JogStatus, LoopStats, Mode, StateSnapshot, StreamStatus, StreamSubstate,
+    MAX_ERRORS,
 };
 
 /// Compile-time arm joint count the fixed-size RT types are dimensioned

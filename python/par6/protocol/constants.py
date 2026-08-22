@@ -13,7 +13,7 @@ POSE_ELEMS = 16
 IO_SLOTS = 11
 MAX_IO_SLOTS = 64
 EN_SLOTS = 12
-STATUS_LEN = 35
+STATUS_LEN = 41
 STATUS_HEADER_LEN = 7
 
 
@@ -164,6 +164,47 @@ class ToolState(IntEnum):
     ERROR = 3
 
 
+class LinkState(IntEnum):
+    """Motor-bus kernel link state (STATUS link_health)."""
+
+    UNKNOWN = 0
+    UP = 1
+    ERROR_PASSIVE = 2
+    BUS_OFF = 3
+
+
+class NodeFreshness(IntEnum):
+    """Data-age classification for one CAN node (STATUS node_ages)."""
+
+    UNKNOWN = 0
+    FRESH = 1
+    STALE = 2
+    LOST = 3
+
+
+class HomingJointState(IntEnum):
+    """Per-actuator homing FSM status (STATUS homing)."""
+
+    IDLE = 0
+    RUNNING = 1
+    DONE = 2
+    FAILED = 3
+
+
+class HomingPhase(IntEnum):
+    """Homing FSM phase; for a Failed status it names the phase the FSM failed in."""
+
+    IDLE = 0
+    APPROACH = 1
+    DWELL = 2
+    BACKOFF = 3
+    PAUSE = 4
+    RELEASE = 5
+    SETTLE = 6
+    POST_MOVE = 7
+    FINISHED = 8
+
+
 class ErrorCode(IntEnum):
     """Error codes in subsystem ranges of 10: IK 10-19, TRAJ 20-29, MOTN 30-39, COMM 40-49, SYS 50-59."""
 
@@ -178,6 +219,7 @@ class ErrorCode(IntEnum):
     MOTN_TICK_FAILED = 34
     MOTN_NOT_HOMED = 35
     MOTN_SETTLE_TIMEOUT = 36
+    MOTN_HOMING_FAILED = 37
     COMM_QUEUE_FULL = 40
     COMM_UNKNOWN_COMMAND = 41
     COMM_DECODE_ERROR = 42
@@ -193,6 +235,10 @@ class ErrorCode(IntEnum):
     SYS_RTI_LINK_LOST = 56
     SYS_LOOP_CRITICAL = 57
     SYS_JOINT_FAULT = 58
+    SYS_LOOP_DEGRADED = 59
+    SYS_CAN_STALE = 60
+    SYS_BUS_OFF = 61
+    SYS_LINK_ERROR_PASSIVE = 62
 
 
 # The ack taxonomy: one table, both sides consult it.

@@ -254,6 +254,12 @@ fn tool_status_json(ts: &ToolStatusWire) -> Value {
 }
 
 fn status_fields(s: &Status) -> Value {
+    let warnings: Vec<Value> = s.warnings.iter().map(error_json).collect();
+    let lh = &s.link_health;
+    let link_health = json!([lh.state, lh.restarts, lh.tx_errors, lh.rx_frames]);
+    let homing_joints: Vec<Vec<u8>> = s.homing.joints.iter().map(|(a, b)| vec![*a, *b]).collect();
+    let homing = json!([s.homing.active, s.homing.sequence_step, homing_joints]);
+    let node_ages: Vec<Value> = s.node_ages.iter().map(|(a, f)| json!([a, f])).collect();
     json!({
         "proto_version": s.proto_version,
         "controller_id": s.controller_id,
@@ -289,6 +295,12 @@ fn status_fields(s: &Status) -> Value {
         "scene_epoch": s.scene_epoch,
         "accepted_index": s.accepted_index,
         "homed": s.homed,
+        "warnings": warnings,
+        "link_health": link_health,
+        "homing": homing,
+        "min_clearance_m": s.min_clearance_m,
+        "tau_ext": s.tau_ext.to_vec(),
+        "node_ages": node_ages,
     })
 }
 
@@ -389,6 +401,61 @@ fn status_full_fixture() -> Status {
         mode: ControllerMode::Exec,
         enabled: true,
         gravity_comp: true,
+        warnings: vec![
+            make_error(ErrorCode::SysCanStale, UNATTRIBUTED, &[("joint", "2")]),
+            make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
+        ],
+        link_health: crate::status::LinkHealthWire {
+            state: crate::LinkState::ErrorPassive as u8,
+            restarts: 2,
+            tx_errors: 17,
+            rx_frames: 987_654,
+        },
+        homing: crate::status::HomingWire {
+            active: true,
+            sequence_step: 3,
+            joints: vec![
+                (
+                    crate::HomingJointState::Done as u8,
+                    crate::HomingPhase::Finished as u8,
+                ),
+                (
+                    crate::HomingJointState::Running as u8,
+                    crate::HomingPhase::Settle as u8,
+                ),
+                (
+                    crate::HomingJointState::Failed as u8,
+                    crate::HomingPhase::Approach as u8,
+                ),
+                (
+                    crate::HomingJointState::Idle as u8,
+                    crate::HomingPhase::Idle as u8,
+                ),
+                (
+                    crate::HomingJointState::Running as u8,
+                    crate::HomingPhase::Backoff as u8,
+                ),
+                (
+                    crate::HomingJointState::Done as u8,
+                    crate::HomingPhase::Finished as u8,
+                ),
+                (
+                    crate::HomingJointState::Idle as u8,
+                    crate::HomingPhase::Idle as u8,
+                ),
+            ],
+        },
+        min_clearance_m: Some(0.0375),
+        tau_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
+        node_ages: vec![
+            (0, crate::NodeFreshness::Fresh as u8),
+            (1, crate::NodeFreshness::Fresh as u8),
+            (250, crate::NodeFreshness::Stale as u8),
+            (2, crate::NodeFreshness::Fresh as u8),
+            (5000, crate::NodeFreshness::Lost as u8),
+            (3, crate::NodeFreshness::Fresh as u8),
+            (u64::MAX, crate::NodeFreshness::Unknown as u8),
+        ],
     }
 }
 

@@ -38,6 +38,8 @@ wire_enum! {
         MotnNotHomed = 35,
         /// `Strict` completion policy: settle window expired.
         MotnSettleTimeout = 36,
+        /// A joint's homing FSM failed (warning; the sequence fails too).
+        MotnHomingFailed = 37,
 
         /// Command queue at capacity.
         CommQueueFull = 40,
@@ -70,6 +72,17 @@ wire_enum! {
         SysLoopCritical = 57,
         /// A joint drive reported a hard fault.
         SysJointFault = 58,
+        /// Control loop period degraded past the warning threshold
+        /// (self-clears).
+        SysLoopDegraded = 59,
+        /// A CAN node's data is stale (warning, self-clears on the next
+        /// frame).
+        SysCanStale = 60,
+        /// The motor-bus controller went bus-off (hard latch).
+        SysBusOff = 61,
+        /// The motor-bus controller is error-passive (warning,
+        /// self-clears when the error counters recover).
+        SysLinkErrorPassive = 62,
     }
 }
 
@@ -311,6 +324,36 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint} reported {kind}.",
             effect: "Controller DISABLED; error latched.",
             remedy: "Inspect the drive, clear the fault, then send reset.",
+        },
+        E::SysLoopDegraded => ErrorTemplate {
+            title: "Control loop degraded",
+            cause: "The loop's p99 period exceeds the warning band.",
+            effect: "Warning only; motion continues.",
+            remedy: "Reduce host load; sustained degradation hard-latches.",
+        },
+        E::SysCanStale => ErrorTemplate {
+            title: "CAN data stale",
+            cause: "Joint {joint}'s bus data is older than the stale threshold.",
+            effect: "Warning only; clears on the next frame.",
+            remedy: "Check bus load and wiring if this persists.",
+        },
+        E::SysBusOff => ErrorTemplate {
+            title: "CAN bus-off",
+            cause: "The motor-bus controller entered bus-off.",
+            effect: "Controller DISABLED; error latched.",
+            remedy: "Fix the bus fault (wiring, termination), then send reset.",
+        },
+        E::SysLinkErrorPassive => ErrorTemplate {
+            title: "CAN link error-passive",
+            cause: "The motor-bus controller is error-passive.",
+            effect: "Warning only; clears when the error counters recover.",
+            remedy: "Check bus wiring and termination before it goes bus-off.",
+        },
+        E::MotnHomingFailed => ErrorTemplate {
+            title: "Homing failed",
+            cause: "Joint {joint}'s homing FSM failed in the {phase} phase.",
+            effect: "The homing sequence fails; the arm stays un-referenced.",
+            remedy: "Clear the mechanism around the endstop and re-home.",
         },
     }
 }

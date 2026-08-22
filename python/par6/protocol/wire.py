@@ -102,6 +102,25 @@ class StatusBuffer:
     mode: ControllerMode = ControllerMode.BOOTING
     enabled: bool = False
     gravity_comp: bool = False
+    warnings: list[tuple] = field(default_factory=list)
+    """Warning-class latch entries (wire 6-tuples): self-clearing
+    conditions — stale CAN data, degraded loop, failed homing. The
+    ``error`` slot carries only hard latches; these are the rest."""
+    link_health: dict = field(default_factory=dict)
+    """Motor-bus link health: ``state`` (a ``LinkState`` value),
+    ``restarts``, ``tx_errors``, ``rx_frames``."""
+    homing: dict = field(default_factory=dict)
+    """Homing progress: ``active``, ``sequence_step``, and per-actuator
+    ``joints`` — ``(HomingJointState, HomingPhase)`` pairs, gripper last."""
+    min_clearance_m: float | None = None
+    """Minimum signed clearance over every active collision pair [m]
+    (negative = penetration); ``None`` when not computed."""
+    tau_ext: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
+    """External joint torque estimate [Nm]: filtered measured torque
+    minus the model's gravity torque."""
+    node_ages: list[tuple[int, int]] = field(default_factory=list)
+    """Per-node bus data age: ``(age_ticks, NodeFreshness)`` pairs, arm
+    joints first, gripper last."""
     # Aliases into the two enable arrays the filler mutates in place.
     cart_en: dict[str, np.ndarray] = field(init=False, repr=False, compare=False)
 
@@ -173,3 +192,9 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.mode = ControllerMode(d["mode"])
     buf.enabled = d["enabled"]
     buf.gravity_comp = d["gravity_comp"]
+    buf.warnings = [tuple(w) for w in d["warnings"]]
+    buf.link_health = d["link_health"]
+    buf.homing = d["homing"]
+    buf.min_clearance_m = d["min_clearance_m"]
+    buf.tau_ext[:] = d["tau_ext"]
+    buf.node_ages = [tuple(a) for a in d["node_ages"]]

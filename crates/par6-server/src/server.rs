@@ -228,6 +228,8 @@ struct Core<P: Planner, R: RtCommands> {
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
     collision: CollisionState,
+    /// Latest housekeeping clearance sweep (STATUS `min_clearance_m`).
+    min_clearance_m: Option<f64>,
     completion_policy: CompletionPolicy,
     recipe: Option<String>,
     simulator: bool,
@@ -296,6 +298,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             shapes: Vec::new(),
             scene_epoch: 0,
             collision: CollisionState::default(),
+            min_clearance_m: None,
             completion_policy: CompletionPolicy::Settled,
             queue_estimate: 0.0,
             queue_estimate_for: (0, 0),
@@ -1385,6 +1388,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// accepting a motion clears both, so they never disagree — the
     /// merge simply reports whichever is active.
     fn update_collision(&mut self) {
+        self.min_clearance_m = self.runtime.rt.min_clearance_m();
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.collision() {
             self.collision = if state.active {
@@ -1642,6 +1646,88 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             mode: Self::wire_mode(self.snap.mode),
             enabled: self.snap.state == ArmState::Enabled,
             gravity_comp: self.snap.gravity_comp,
+            warnings: crate::faults::rt_warnings(&self.snap),
+            link_health: Self::wire_link_health(&self.snap.link),
+            homing: Self::wire_homing(&self.snap.homing),
+            min_clearance_m: self.min_clearance_m,
+            tau_ext: {
+                let mut out = [0.0; par6_proto::NUM_JOINTS];
+                out.copy_from_slice(&self.snap.tau_ext[..par6_proto::NUM_JOINTS]);
+                out
+            },
+            node_ages: self
+                .snap
+                .nodes
+                .iter()
+                .zip(self.snap.node_freshness.iter())
+                .map(|(n, f)| (n.data_age_ticks, Self::wire_freshness(*f) as u8))
+                .collect(),
+        }
+    }
+
+    /// The bus link health in the wire's own vocabulary (exhaustive for
+    /// the same reason as [`Self::wire_mode`]).
+    fn wire_link_health(l: &par6_rt::LinkHealth) -> par6_proto::LinkHealthWire {
+        use par6_proto::LinkState as W;
+        use par6_rt::LinkState as R;
+        let state = match l.state {
+            R::Unknown => W::Unknown,
+            R::Up => W::Up,
+            R::ErrorPassive => W::ErrorPassive,
+            R::BusOff => W::BusOff,
+        };
+        par6_proto::LinkHealthWire {
+            state: state as u8,
+            restarts: l.restarts,
+            tx_errors: l.tx_errors,
+            rx_frames: l.rx_frames,
+        }
+    }
+
+    fn wire_freshness(f: par6_rt::Freshness) -> par6_proto::NodeFreshness {
+        use par6_proto::NodeFreshness as W;
+        use par6_rt::Freshness as R;
+        match f {
+            R::Unknown => W::Unknown,
+            R::Fresh => W::Fresh,
+            R::Stale => W::Stale,
+            R::Lost => W::Lost,
+        }
+    }
+
+    fn wire_homing(h: &par6_rt::HomingStatus) -> par6_proto::HomingWire {
+        use par6_proto::HomingJointState as WS;
+        use par6_proto::HomingPhase as WP;
+        use par6_rt::{HomingJointStatus as RS, HomingPhase as RP};
+        let joints = h
+            .per_joint
+            .iter()
+            .zip(h.phase.iter())
+            .map(|(status, phase)| {
+                let ws = match status {
+                    RS::Idle => WS::Idle,
+                    RS::Running => WS::Running,
+                    RS::Done => WS::Done,
+                    RS::Failed => WS::Failed,
+                };
+                let wp = match phase {
+                    RP::Idle => WP::Idle,
+                    RP::Approach => WP::Approach,
+                    RP::Dwell => WP::Dwell,
+                    RP::Backoff => WP::Backoff,
+                    RP::Pause => WP::Pause,
+                    RP::Release => WP::Release,
+                    RP::Settle => WP::Settle,
+                    RP::PostMove => WP::PostMove,
+                    RP::Finished => WP::Finished,
+                };
+                (ws as u8, wp as u8)
+            })
+            .collect();
+        par6_proto::HomingWire {
+            active: h.active,
+            sequence_step: h.sequence_step,
+            joints,
         }
     }
 

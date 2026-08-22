@@ -2,7 +2,7 @@
 //! statistics, and the [`StateSnapshot`] the RT thread publishes every
 //! tick.
 
-use par6_bus::{GripperState, LinkHealth, NodeState};
+use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
 use crate::{MAX_JOINTS, NUM_NODES};
@@ -94,6 +94,11 @@ pub enum ErrorCode {
     GripperFault,
     /// Gripper firmware calibration failed/timed out.
     GripperCalibrationFailed,
+    /// Motor-bus controller bus-off (hard latch — the bus is gone).
+    BusOff,
+    /// Motor-bus controller error-passive (warning, self-clears when
+    /// the error counters recover).
+    LinkErrorPassive,
 }
 
 impl ErrorCode {
@@ -106,6 +111,7 @@ impl ErrorCode {
                 | ErrorCode::HomingFailed
                 | ErrorCode::NotHomed
                 | ErrorCode::LoopDegraded
+                | ErrorCode::LinkErrorPassive
         )
     }
 }
@@ -228,6 +234,32 @@ pub enum HomingJointStatus {
     Failed = 3,
 }
 
+/// Homing FSM phase, published per actuator. For a `Failed` status the
+/// phase holds the phase the FSM failed IN — which is what attributes
+/// the failure (approach timeout vs settle mismatch vs post-move stall).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum HomingPhase {
+    /// Not running.
+    #[default]
+    Idle = 0,
+    /// Driving toward the endstop.
+    Approach = 1,
+    /// Holding on the endstop before backoff.
+    Dwell = 2,
+    /// Backing off the endstop.
+    Backoff = 3,
+    /// Pausing between passes.
+    Pause = 4,
+    /// Releasing to the reference position.
+    Release = 5,
+    /// Waiting for the reading to settle / latch.
+    Settle = 6,
+    /// Driving the configured post-home move.
+    PostMove = 7,
+    /// Reference applied.
+    Finished = 8,
+}
+
 /// Homing progress published every tick.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct HomingStatus {
@@ -237,6 +269,9 @@ pub struct HomingStatus {
     pub sequence_step: u8,
     /// Per-actuator status: arm joints 0..MAX_JOINTS, gripper last.
     pub per_joint: [HomingJointStatus; NUM_NODES],
+    /// Per-actuator FSM phase (see [`HomingPhase`]); for a `Failed`
+    /// status this is the phase the FSM failed in.
+    pub phase: [HomingPhase; NUM_NODES],
     /// EFFECTIVE per-actuator current limit \[mA\]: the homing current
     /// while that actuator's status < Done, the normal Ilim otherwise.
     pub effective_current_limit_ma: [f32; NUM_NODES],
@@ -248,6 +283,7 @@ impl Default for HomingStatus {
             active: false,
             sequence_step: 0,
             per_joint: [HomingJointStatus::default(); NUM_NODES],
+            phase: [HomingPhase::default(); NUM_NODES],
             effective_current_limit_ma: [0.0; NUM_NODES],
         }
     }
@@ -400,8 +436,14 @@ pub struct StateSnapshot {
     /// Gravity torque G(q) \[Nm\] — computed and published every tick,
     /// applied only when the mode allows.
     pub gravity_torque_nm: [f64; MAX_JOINTS],
+    /// External torque estimate \[Nm\]: filtered measured torque minus
+    /// the model's gravity torque.
+    pub tau_ext: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
+    /// Per-node data-age classification, same order — the backend's own
+    /// verdict (thresholds and the lost latch live there, not here).
+    pub node_freshness: [Freshness; NUM_NODES],
     /// Firmware-mode gripper state.
     pub gripper: GripperState,
     /// Homing progress.
@@ -475,7 +517,9 @@ impl Default for StateSnapshot {
             tcp_commanded: [0.0; 6],
             tcp_target: [0.0; 6],
             gravity_torque_nm: [0.0; MAX_JOINTS],
+            tau_ext: [0.0; MAX_JOINTS],
             nodes: [NodeState::default(); NUM_NODES],
+            node_freshness: [Freshness::Unknown; NUM_NODES],
             gripper: GripperState::default(),
             homing: HomingStatus::default(),
             errors: ErrorList::new(),

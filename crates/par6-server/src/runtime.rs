@@ -341,6 +341,14 @@ pub trait RtCommands: Send {
     /// Drop the streaming gate's latched verdict (the next accepted
     /// motion command supersedes it, exactly like the planner's).
     fn clear_collision(&mut self) {}
+
+    /// Latest housekeeping clearance sweep \[m\] (minimum signed
+    /// distance over every active collision pair), or `None` while a
+    /// stream owns the gate, no sweep has run, or this runtime runs no
+    /// sweep at all.
+    fn min_clearance_m(&mut self) -> Option<f64> {
+        None
+    }
 }
 
 /// Everything the server needs from the rest of `par6d`, bundled.

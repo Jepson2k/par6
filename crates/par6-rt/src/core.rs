@@ -423,6 +423,10 @@ pub struct RtCore<B: DriverBus> {
     q_filt: [f64; MAX_JOINTS],
     qd_filt: [f64; MAX_JOINTS],
     tau_filt: [f64; MAX_JOINTS],
+    /// External torque estimate \[Nm\]: filtered measured torque minus
+    /// the model's gravity torque. What a hand pushing the arm looks
+    /// like in the torque domain.
+    tau_ext: [f64; MAX_JOINTS],
     filters_seeded: bool,
 
     // Per-tick compute buffers.
@@ -592,6 +596,7 @@ impl<B: DriverBus> RtCore<B> {
             q_filt: [0.0; MAX_JOINTS],
             qd_filt: [0.0; MAX_JOINTS],
             tau_filt: [0.0; MAX_JOINTS],
+            tau_ext: [0.0; MAX_JOINTS],
             filters_seeded: false,
             g: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
@@ -853,6 +858,13 @@ impl<B: DriverBus> RtCore<B> {
 
         // Gravity: computed every tick, published always.
         self.gravity.gravity(&self.q, &mut self.g);
+
+        // External torque: what the measured (filtered) torque carries
+        // beyond the model's gravity — a contact, a payload the model
+        // does not know, a hand on the arm.
+        for i in 0..MAX_JOINTS {
+            self.tau_ext[i] = self.tau_filt[i] - self.g[i];
+        }
 
         // Phase 7: error checks and reactions.
         self.check_errors(health);
@@ -1320,6 +1332,19 @@ impl<B: DriverBus> RtCore<B> {
             self.errors.latch(ErrorCode::LoopCritical, None);
         }
 
+        // Motor-bus controller state: bus-off is a hard latch (nothing
+        // reaches the drives until the kernel restarts the interface),
+        // error-passive the self-clearing warning on the way there.
+        let link = self.bus.link_health();
+        if link.state == par6_bus::LinkState::BusOff {
+            self.errors.latch(ErrorCode::BusOff, None);
+        }
+        self.errors.condition(
+            ErrorCode::LinkErrorPassive,
+            None,
+            link.state == par6_bus::LinkState::ErrorPassive,
+        );
+
         if !self.bus.is_silent() {
             // A sustained TX-failure streak is a disconnect: the arm has
             // stopped receiving commands even if RX freshness still reads
@@ -1728,6 +1753,7 @@ impl<B: DriverBus> RtCore<B> {
         s.q_filtered = self.q_filt;
         s.qd_filtered = self.qd_filt;
         s.tau_filtered = self.tau_filt;
+        s.tau_ext = self.tau_ext;
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
@@ -1740,8 +1766,10 @@ impl<B: DriverBus> RtCore<B> {
         s.gravity_torque_nm = self.g;
         for i in 0..MAX_JOINTS {
             s.nodes[i] = self.bus_state.nodes[usize::from(self.node_of[i])];
+            s.node_freshness[i] = self.bus.freshness(self.node_of[i]);
         }
         s.nodes[MAX_JOINTS] = self.bus_state.nodes[usize::from(self.gripper_node)];
+        s.node_freshness[MAX_JOINTS] = self.bus.freshness(self.gripper_node);
         s.gripper = self.bus_state.gripper;
         s.homing = self.homing.status();
         s.errors = *self.errors.list();

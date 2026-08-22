@@ -116,6 +116,25 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("mode", s.mode as u8)?;
     d.set_item("enabled", s.enabled)?;
     d.set_item("gravity_comp", s.gravity_comp)?;
+    let warnings = PyList::empty(py);
+    for w in &s.warnings {
+        warnings.append(wire_error_tuple(py, w))?;
+    }
+    d.set_item("warnings", warnings)?;
+    let lh = PyDict::new(py);
+    lh.set_item("state", s.link_health.state)?;
+    lh.set_item("restarts", s.link_health.restarts)?;
+    lh.set_item("tx_errors", s.link_health.tx_errors)?;
+    lh.set_item("rx_frames", s.link_health.rx_frames)?;
+    d.set_item("link_health", lh)?;
+    let homing = PyDict::new(py);
+    homing.set_item("active", s.homing.active)?;
+    homing.set_item("sequence_step", s.homing.sequence_step)?;
+    homing.set_item("joints", s.homing.joints.clone())?;
+    d.set_item("homing", homing)?;
+    d.set_item("min_clearance_m", s.min_clearance_m)?;
+    d.set_item("tau_ext", s.tau_ext.to_vec())?;
+    d.set_item("node_ages", s.node_ages.clone())?;
     Ok(d.into_any().unbind())
 }
 

@@ -153,6 +153,10 @@ pub(crate) struct StreamGate {
     /// The pairs the last refused or stopped stream would have collided
     /// in — the streaming half of the STATUS `collision_active` fields.
     latch: CollisionState,
+    /// Latest housekeeping clearance sweep: minimum signed distance over
+    /// every active collision pair \[m\]. `None` while a stream owns the
+    /// gate (the sweep pauses) or the query fails.
+    min_clearance_m: Option<f64>,
 }
 
 impl StreamGate {
@@ -162,6 +166,7 @@ impl StreamGate {
     ) -> Self {
         Self {
             collision,
+            min_clearance_m: None,
             shape_names: ShapeNames::default(),
             jog_vel: jog_limits.velocity,
             soft_min: jog_limits.soft_min,
@@ -284,6 +289,20 @@ impl StreamGate {
     /// Latch `pairs` as the streaming collision verdict and build the
     /// refusal the client reads. One checked configuration, so the error
     /// template's path slots read `0` of `1`.
+    /// Refresh the housekeeping clearance sweep at `q`, or clear it (a
+    /// live stream pauses the sweep; its verdicts come from `blocked`).
+    fn sweep_clearance(&mut self, q: Option<&[f64; MAX_JOINTS]>) {
+        self.min_clearance_m = match q {
+            Some(q) => self.collision.min_distance(q).ok(),
+            None => None,
+        };
+    }
+
+    /// The latest clearance sweep (STATUS `min_clearance_m`).
+    pub(crate) fn min_clearance(&self) -> Option<f64> {
+        self.min_clearance_m
+    }
+
     fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
         let rendered = pairs
             .iter()
@@ -909,6 +928,10 @@ impl RtCommands for RtBridge {
     fn clear_collision(&mut self) {
         self.cart.gate.lock().unwrap().latch = CollisionState::default();
     }
+
+    fn min_clearance_m(&mut self) -> Option<f64> {
+        self.cart.gate.lock().unwrap().min_clearance()
+    }
 }
 
 impl RtBridge {
@@ -1011,6 +1034,12 @@ pub(crate) fn housekeeping_loop(
     mut kin: crate::kin::CartKin,
     gate: Arc<Mutex<StreamGate>>,
 ) {
+    // The clearance sweep is throttled well below the housekeeping rate:
+    // a full min-distance query runs every pair with no early exit, and a
+    // Plane keep-out makes each pair expensive — an every-period sweep
+    // could starve the stream keep-alives this loop exists for.
+    const CLEARANCE_EVERY: u32 = 250; // ~1 Hz at the 4 ms period
+    let mut clearance_tick: u32 = 0;
     // Stops the live stream because its next step is collision-blocked:
     // latch the verdict for STATUS and put the RT back to IDLE. The
     // abrupt stop is deliberate — the alternative is driving on toward
@@ -1167,7 +1196,24 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                 }
-                _ => {}
+                _ => {
+                    if sh.stream.is_none() {
+                        // No stream owns the gate: keep the published
+                        // clearance fresh (throttled — see
+                        // CLEARANCE_EVERY).
+                        clearance_tick += 1;
+                        if clearance_tick >= CLEARANCE_EVERY {
+                            clearance_tick = 0;
+                            gate.lock().unwrap().sweep_clearance(Some(&snap.q));
+                        }
+                    }
+                }
+            }
+            if sh.stream.is_some() {
+                // A live stream pauses the sweep; a stale reading is
+                // worse than none.
+                clearance_tick = 0;
+                gate.lock().unwrap().sweep_clearance(None);
             }
             if let Some(req) = &mut sh.enable {
                 // `enable_seq` counts every Enable the core PROCESSED,

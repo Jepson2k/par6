@@ -291,6 +291,74 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// Motor-bus kernel link state, as STATUS `link_health` carries it.
+    LinkState: u8 {
+        /// State not (yet) known — e.g. loopback/sim backends.
+        Unknown = 0,
+        /// Link up and error-active.
+        Up = 1,
+        /// Controller error-passive.
+        ErrorPassive = 2,
+        /// Bus-off (kernel auto-restart pending).
+        BusOff = 3,
+    }
+}
+
+wire_enum! {
+    /// Data-age classification for one CAN node (STATUS `node_ages`).
+    NodeFreshness: u8 {
+        /// No frame seen since boot / last re-base.
+        Unknown = 0,
+        /// Data younger than the stale threshold.
+        Fresh = 1,
+        /// Age past the stale threshold — live warning, self-clears.
+        Stale = 2,
+        /// Age reached the lost threshold — latched until user clear.
+        Lost = 3,
+    }
+}
+
+wire_enum! {
+    /// Per-actuator homing FSM status (STATUS `homing`, vendor codes 0–3).
+    HomingJointState: u8 {
+        /// Not started.
+        Idle = 0,
+        /// FSM running.
+        Running = 1,
+        /// Done, reference applied.
+        Done = 2,
+        /// Failed — the paired phase names where.
+        Failed = 3,
+    }
+}
+
+wire_enum! {
+    /// Homing FSM phase (STATUS `homing`). For a `Failed` status the phase
+    /// holds the phase the FSM failed IN, which is what attributes the
+    /// failure (approach timeout vs settle mismatch vs post-move stall).
+    HomingPhase: u8 {
+        /// Not running.
+        Idle = 0,
+        /// Driving toward the endstop.
+        Approach = 1,
+        /// Holding on the endstop before backoff.
+        Dwell = 2,
+        /// Backing off the endstop.
+        Backoff = 3,
+        /// Pausing between passes.
+        Pause = 4,
+        /// Releasing to the reference position.
+        Release = 5,
+        /// Waiting for the reading to settle / latch.
+        Settle = 6,
+        /// Driving the configured post-home move.
+        PostMove = 7,
+        /// Reference applied.
+        Finished = 8,
+    }
+}
+
 /// The ack taxonomy: which reply discipline a command follows.
 ///
 /// This is the protocol's single queryable table — servers use it to decide

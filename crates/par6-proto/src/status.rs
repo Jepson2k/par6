@@ -12,10 +12,14 @@
 //!  queued_duration f64, action_params str, tool_status nil|ts8,
 //!  tcp_speed f64, simulator_active bool, collision_active bool,
 //!  collision_pairs [[str,str]], scene_epoch u64, accepted_index i64,
-//!  homed bool, tau f64[6], mode u8, enabled bool, gravity_comp bool]
+//!  homed bool, tau f64[6], mode u8, enabled bool, gravity_comp bool,
+//!  warnings [err6], link_health [state u8, restarts u32, tx_errors u64,
+//!  rx_frames u64], homing [active bool, step u8, [[status u8, phase u8]]],
+//!  min_clearance_m nil|f64, tau_ext f64[6],
+//!  node_ages [[age_ticks u64, freshness u8]]]
 //! ```
 //!
-//! 35 elements total. STATUS is broadcast even when the bus link is down —
+//! 41 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
@@ -26,9 +30,15 @@ use crate::error::WireError;
 use crate::reply::ToolStatusWire;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
+use crate::{HomingJointState, HomingPhase, LinkState, NodeFreshness};
 
 /// Total number of elements in a v2 STATUS array (including the tag).
-pub const STATUS_LEN: usize = 35;
+pub const STATUS_LEN: usize = 41;
+/// Decode cap on the `warnings` list (the RT latch holds at most 32
+/// entries; a longer claim is hostile input).
+const MAX_WARNINGS: usize = 64;
+/// Decode cap on per-node lists (`homing.joints`, `node_ages`).
+const MAX_NODE_SLOTS: usize = 32;
 /// Number of header elements (tag through `data_age_ms`).
 pub const STATUS_HEADER_LEN: usize = 7;
 
@@ -111,6 +121,50 @@ pub struct Status {
     /// arm homed and enabled, this is exactly the freedrive condition:
     /// torque-only G(q) with no position hold.
     pub gravity_comp: bool,
+    /// Warning-class latch entries (self-clearing conditions: stale CAN
+    /// data, degraded loop, failed homing, …). The standing `error` slot
+    /// carries only HARD latches; these are the rest of the RT's list.
+    pub warnings: Vec<WireError>,
+    /// Motor-bus link health.
+    pub link_health: LinkHealthWire,
+    /// Homing progress.
+    pub homing: HomingWire,
+    /// Minimum signed clearance over every active collision pair \[m\]
+    /// from the last housekeeping sweep (negative = penetration depth);
+    /// `None` when not computed (a stream owns the gate).
+    pub min_clearance_m: Option<f64>,
+    /// External joint torque estimate \[Nm\]: filtered measured torque
+    /// minus the model's gravity torque.
+    pub tau_ext: [f64; NUM_JOINTS],
+    /// Per-node bus data age: `[age_ticks, freshness]` per node, arm
+    /// joints first, gripper last. `age_ticks` saturates at `u64::MAX`
+    /// (= never seen); `freshness` is a [`NodeFreshness`] value.
+    pub node_ages: Vec<(u64, u8)>,
+}
+
+/// Motor-bus link health as STATUS carries it (slot 36).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkHealthWire {
+    /// Kernel link state — a [`LinkState`] value.
+    pub state: u8,
+    /// Interface restarts observed.
+    pub restarts: u32,
+    /// TX errors observed.
+    pub tx_errors: u64,
+    /// Total frames received.
+    pub rx_frames: u64,
+}
+
+/// Homing progress as STATUS carries it (slot 37).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HomingWire {
+    /// Whether the homing sequence is running.
+    pub active: bool,
+    /// Current sequence step (0-based); meaningful while `active`.
+    pub sequence_step: u8,
+    /// Per-actuator `[status, phase]` — a [`HomingJointState`] and a
+    /// [`HomingPhase`] value — arm joints first, gripper last.
+    pub joints: Vec<(u8, u8)>,
 }
 
 impl Default for Status {
@@ -150,6 +204,12 @@ impl Default for Status {
             mode: ControllerMode::Booting,
             enabled: false,
             gravity_comp: false,
+            warnings: Vec::new(),
+            link_health: LinkHealthWire::default(),
+            homing: HomingWire::default(),
+            min_clearance_m: None,
+            tau_ext: [0.0; NUM_JOINTS],
+            node_ages: Vec::new(),
         }
     }
 }
@@ -225,6 +285,38 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     w_uint(buf, u64::from(s.mode as u8));
     w_bool(buf, s.enabled);
     w_bool(buf, s.gravity_comp);
+    w_array(buf, s.warnings.len());
+    for w in &s.warnings {
+        w.encode(buf);
+    }
+    w_array(buf, 4);
+    w_uint(buf, u64::from(s.link_health.state));
+    w_uint(buf, u64::from(s.link_health.restarts));
+    w_uint(buf, s.link_health.tx_errors);
+    w_uint(buf, s.link_health.rx_frames);
+    w_array(buf, 3);
+    w_bool(buf, s.homing.active);
+    w_uint(buf, u64::from(s.homing.sequence_step));
+    w_array(buf, s.homing.joints.len());
+    for (status, phase) in &s.homing.joints {
+        w_array(buf, 2);
+        w_uint(buf, u64::from(*status));
+        w_uint(buf, u64::from(*phase));
+    }
+    match s.min_clearance_m {
+        Some(v) => w_f64(buf, v),
+        None => w_nil(buf),
+    }
+    w_array(buf, NUM_JOINTS);
+    for v in s.tau_ext {
+        w_f64(buf, v);
+    }
+    w_array(buf, s.node_ages.len());
+    for (age, freshness) in &s.node_ages {
+        w_array(buf, 2);
+        w_uint(buf, *age);
+        w_uint(buf, u64::from(*freshness));
+    }
 }
 
 /// Reusable STATUS encoder: owns the broadcast buffer so the hot path
@@ -411,6 +503,112 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     })?;
     let enabled = r.bool()?;
     let gravity_comp = r.bool()?;
+    let n_warnings = r_len(&mut r, "status.warnings", MAX_WARNINGS)?;
+    let mut warnings = Vec::with_capacity(n_warnings);
+    for _ in 0..n_warnings {
+        warnings.push(WireError::decode(&mut r)?);
+    }
+    let lh = r.array_len()?;
+    if lh != 4 {
+        return Err(DecodeError::Arity {
+            what: "status.link_health",
+            expected: 4,
+            got: lh,
+        });
+    }
+    let link_state = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+        what: "status.link_health.state",
+        why: "exceeds u8".into(),
+    })?;
+    LinkState::from_wire(i64::from(link_state)).ok_or(DecodeError::InvalidEnum {
+        what: "link state",
+        value: i64::from(link_state),
+    })?;
+    let link_health = LinkHealthWire {
+        state: link_state,
+        restarts: u32::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.link_health.restarts",
+            why: "exceeds u32".into(),
+        })?,
+        tx_errors: r.uint()?,
+        rx_frames: r.uint()?,
+    };
+    let hn = r.array_len()?;
+    if hn != 3 {
+        return Err(DecodeError::Arity {
+            what: "status.homing",
+            expected: 3,
+            got: hn,
+        });
+    }
+    let homing_active = r.bool()?;
+    let sequence_step = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+        what: "status.homing.sequence_step",
+        why: "exceeds u8".into(),
+    })?;
+    let n_hj = r_len(&mut r, "status.homing.joints", MAX_NODE_SLOTS)?;
+    let mut homing_joints = Vec::with_capacity(n_hj);
+    for _ in 0..n_hj {
+        let pn = r.array_len()?;
+        if pn != 2 {
+            return Err(DecodeError::Arity {
+                what: "status.homing joint",
+                expected: 2,
+                got: pn,
+            });
+        }
+        let status = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.homing status",
+            why: "exceeds u8".into(),
+        })?;
+        HomingJointState::from_wire(i64::from(status)).ok_or(DecodeError::InvalidEnum {
+            what: "homing status",
+            value: i64::from(status),
+        })?;
+        let phase = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.homing phase",
+            why: "exceeds u8".into(),
+        })?;
+        HomingPhase::from_wire(i64::from(phase)).ok_or(DecodeError::InvalidEnum {
+            what: "homing phase",
+            value: i64::from(phase),
+        })?;
+        homing_joints.push((status, phase));
+    }
+    let homing = HomingWire {
+        active: homing_active,
+        sequence_step,
+        joints: homing_joints,
+    };
+    let min_clearance_m = if r.peek_nil() {
+        r.nil()?;
+        None
+    } else {
+        Some(r.f64()?)
+    };
+    let tau_ext: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.tau_ext")?;
+    let n_ages = r_len(&mut r, "status.node_ages", MAX_NODE_SLOTS)?;
+    let mut node_ages = Vec::with_capacity(n_ages);
+    for _ in 0..n_ages {
+        let pn = r.array_len()?;
+        if pn != 2 {
+            return Err(DecodeError::Arity {
+                what: "status node age",
+                expected: 2,
+                got: pn,
+            });
+        }
+        let age = r.uint()?;
+        let freshness = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.node_ages freshness",
+            why: "exceeds u8".into(),
+        })?;
+        NodeFreshness::from_wire(i64::from(freshness)).ok_or(DecodeError::InvalidEnum {
+            what: "node freshness",
+            value: i64::from(freshness),
+        })?;
+        node_ages.push((age, freshness));
+    }
 
     // Forward compatibility: skip any fields a newer producer appended.
     for _ in STATUS_LEN..n {
@@ -453,5 +651,11 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         mode,
         enabled,
         gravity_comp,
+        warnings,
+        link_health,
+        homing,
+        min_clearance_m,
+        tau_ext,
+        node_ages,
     })
 }
