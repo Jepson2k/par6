@@ -487,3 +487,56 @@ fn a_setpoint_left_unconsumed_does_not_leak_into_the_next_stream_session() {
         s.q_target[0]
     );
 }
+
+/// A node that goes quiet gets ONE config resend to provoke recovery —
+/// through the poll slot, while it is still silent (the stale→fresh edge
+/// resend only helps a node that already came back on its own). The shot
+/// re-arms only on an actual recovery, so a truly disconnected node costs
+/// one frame per silence episode, not one per tick.
+#[test]
+fn a_stale_node_gets_one_self_heal_resend_per_episode() {
+    let mut rig = Rig::new();
+    rig.ready();
+    let stale_ticks = 10u32;
+    let config_passes = |rig: &mut Rig| {
+        rig.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
+            .count()
+    };
+
+    rig.clear_tx();
+    rig.skip_nodes = 1 << 3;
+    rig.tick_n(stale_ticks + 2);
+    assert!(has_error(&mut rig, ErrorCode::CanStale, Some(3)));
+    assert_eq!(
+        config_passes(&mut rig),
+        1,
+        "going stale fires exactly one config resend while still silent"
+    );
+
+    // Still silent: no second shot while the episode lasts. (Bounded
+    // below the lost threshold: crossing it aborts homing, whose restore
+    // pass resends configs of its own.)
+    rig.tick_n(20);
+    assert_eq!(config_passes(&mut rig), 1, "the one-shot must not repeat");
+
+    // Recovery re-arms; the NEXT silence episode fires again. The
+    // stale→fresh edge resend also fires here, so count from a clean log.
+    rig.skip_nodes = 0;
+    rig.tick_n(8);
+    assert!(
+        !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
+        "recovered before the second episode starts"
+    );
+    rig.clear_tx();
+    rig.skip_nodes = 1 << 3;
+    rig.tick_n(stale_ticks + 2);
+    assert_eq!(
+        config_passes(&mut rig),
+        1,
+        "a new silence episode gets a new shot"
+    );
+}

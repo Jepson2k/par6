@@ -6,6 +6,7 @@
 # gains and pinion radius. Only stroke and the tool link change.
 
 name = "MSG_medium_motor_200mm_rail"
+urdf_variant = "msg"
 
 [driver]
 driver_type = "stepfoc"

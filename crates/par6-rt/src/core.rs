@@ -32,6 +32,7 @@ use std::sync::Arc;
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
+    PollAction,
 };
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
@@ -397,6 +398,10 @@ pub struct RtCore<B: DriverBus> {
     /// applied, CPU pinned) — published through `LoopStats`.
     rt_fifo: bool,
     rt_pinned: bool,
+    /// Per-node self-heal one-shot (indexed by error index): armed while
+    /// the node is fresh, fired once when it goes stale/lost, re-armed on
+    /// recovery.
+    self_heal_armed: [bool; crate::NUM_NODES],
     bus_rx_failures: u32,
     tx_fail_streak: u32,
     gripper_tx_fail_streak: u32,
@@ -577,6 +582,7 @@ impl<B: DriverBus> RtCore<B> {
             bus_tx_failures: 0,
             rt_fifo: false,
             rt_pinned: false,
+            self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
             tx_fail_streak: 0,
             gripper_tx_fail_streak: 0,
@@ -1468,6 +1474,25 @@ impl<B: DriverBus> RtCore<B> {
                 log::warn!("node {node} disconnected: homing invalidated");
                 self.homed = false;
             }
+        }
+        // Self-heal: a node gone quiet may just have dropped its config
+        // (brown-out, watchdog reset) — a config resend provokes a reply
+        // where plain polls stay unanswered. One shot per silence episode,
+        // through the poll slot so the tick's TX budget is untouched;
+        // re-armed only by an actual recovery, so a node that is truly
+        // gone costs one frame, not one per tick.
+        let armed = &mut self.self_heal_armed[usize::from(err_idx)];
+        match f {
+            Freshness::Fresh => *armed = true,
+            Freshness::Stale | Freshness::Lost => {
+                if *armed {
+                    *armed = false;
+                    log::warn!("node {node}: {f:?}; queueing a config resend to provoke recovery");
+                    self.bus
+                        .queue_poll_override(PollAction::ResendConfig { node }, 1);
+                }
+            }
+            Freshness::Unknown => {}
         }
     }
 

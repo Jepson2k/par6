@@ -38,7 +38,16 @@ use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 /// model must carry (mass for gravity, TCP frame for FK/IK). Unknown
 /// names fall back to the bare flange — the arm itself is always
 /// modeled — with a startup warning.
-pub(crate) fn variant_for(gripper_name: &str) -> GripperVariant {
+pub(crate) fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
+    if let Some(key) = urdf_variant {
+        match GripperVariant::from_key(key) {
+            Some(v) => return v,
+            None => log::warn!(
+                "gripper '{gripper_name}': unknown urdf_variant '{key}'; \
+                 falling back to the name-prefix rule"
+            ),
+        }
+    }
     if gripper_name.eq_ignore_ascii_case("flange") {
         GripperVariant::Flange
     } else if gripper_name.starts_with("MSG") {
@@ -609,7 +618,12 @@ mod tests {
         assert!(bundle.grippers.len() > 3, "the shipped tools are all here");
 
         for g in &bundle.grippers {
-            let variant = variant_for(&g.name);
+            assert!(
+                g.urdf_variant.is_some(),
+                "{}: shipped gripper TOMLs declare urdf_variant explicitly",
+                g.name
+            );
+            let variant = variant_for(&g.name, g.urdf_variant.as_deref());
             for relpath in [variant.urdf_relpath(), variant.srdf_relpath()] {
                 let path = assets.join(relpath);
                 assert!(path.is_file(), "{}: no model at {}", g.name, path.display());
@@ -788,5 +802,23 @@ mod tests {
         for (g, w) in x.iter().zip(x_true.iter()) {
             assert!((g - w).abs() < 1e-12);
         }
+    }
+
+    /// The explicit key decides; the prefix rule is only the fallback.
+    /// A name the prefix rule would misroute still gets the keyed model,
+    /// and an unknown key degrades to the prefix rule instead of
+    /// panicking or silently flanging a keyed gripper.
+    #[test]
+    fn urdf_variant_key_overrides_the_name_prefix_rule() {
+        assert_eq!(
+            variant_for("WEIRD_CUSTOM", Some("ssg48")),
+            GripperVariant::Ssg48
+        );
+        assert_eq!(
+            variant_for("SSG48_custom", Some("flange")),
+            GripperVariant::Flange
+        );
+        assert_eq!(variant_for("MSG_rail", Some("bogus")), GripperVariant::Msg);
+        assert_eq!(variant_for("MSG_rail", None), GripperVariant::Msg);
     }
 }

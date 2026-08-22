@@ -89,7 +89,7 @@ struct NodeConfig {
 enum ArmPlant {
     Kinematic(Vec<KinJoint>),
     #[cfg(feature = "sim-dynamics")]
-    Dynamics(dynamics::DynamicsPlant),
+    Dynamics(Box<dynamics::DynamicsPlant>),
     #[cfg(feature = "sim-mujoco")]
     Mujoco(mujoco::MujocoPlant),
 }
@@ -129,6 +129,12 @@ pub struct SimBus {
     initial_q: Option<Vec<f64>>,
     #[cfg(feature = "sim-dynamics")]
     urdf: Option<PathBuf>,
+    /// Active tool inertials attached to the dynamics plant's wrist.
+    #[cfg(feature = "sim-dynamics")]
+    dyn_tool: Option<pinokin_sys::ToolParams>,
+    /// Frame the tool inertials attach at (`None` = the URDF's last frame).
+    #[cfg(feature = "sim-dynamics")]
+    dyn_ee_frame: Option<String>,
     #[cfg(feature = "sim-mujoco")]
     mjcf_scene: Option<PathBuf>,
     /// Mirror of the gripper front end's latched firmware command, used
@@ -171,6 +177,10 @@ impl SimBus {
             initial_q: None,
             #[cfg(feature = "sim-dynamics")]
             urdf: None,
+            #[cfg(feature = "sim-dynamics")]
+            dyn_tool: None,
+            #[cfg(feature = "sim-dynamics")]
+            dyn_ee_frame: None,
             #[cfg(feature = "sim-mujoco")]
             mjcf_scene: None,
             #[cfg(feature = "sim-mujoco")]
@@ -179,13 +189,23 @@ impl SimBus {
     }
 
     /// A sim bus whose arm plant is the torque-level Pinocchio dynamics
-    /// model built from `urdf` at [`DriverBus::boot_configure`] time.
-    /// Panics at boot if the URDF cannot be loaded or its joint count
-    /// does not match the robot config.
+    /// model built from `urdf` at [`DriverBus::boot_configure`] time,
+    /// with `tool`'s inertials attached to the wrist — the plant swings
+    /// the same body the runtime's gravity model describes, so an IDLE
+    /// arm under G(q) feedforward floats instead of sagging (no tool) or
+    /// rising (tool compensated but not carried). Panics at boot if the
+    /// URDF cannot be loaded or its joint count does not match the robot
+    /// config.
     #[cfg(feature = "sim-dynamics")]
-    pub fn with_dynamics(urdf: impl Into<PathBuf>) -> Self {
+    pub fn with_dynamics(
+        urdf: impl Into<PathBuf>,
+        ee_frame: Option<String>,
+        tool: Option<pinokin_sys::ToolParams>,
+    ) -> Self {
         let mut bus = Self::new();
         bus.urdf = Some(urdf.into());
+        bus.dyn_ee_frame = ee_frame;
+        bus.dyn_tool = tool;
         bus
     }
 
@@ -414,9 +434,18 @@ impl SimBus {
     /// same value it reports, and host position commands echo it back.
     fn step_once(&mut self) {
         let dt = self.dt;
-        for j in 0..self.drivers.len() {
-            let (p, v) = self.motor_state(j);
-            self.cmd_buf[j] = self.drivers[j].control_step(p + self.maps[j].report_offset, v);
+        // The dynamics plant closes the driver loops itself, at its
+        // physics substep rate; everything else latches one loop output
+        // per tick here.
+        #[cfg(feature = "sim-dynamics")]
+        let latched = !matches!(self.plant, ArmPlant::Dynamics(_));
+        #[cfg(not(feature = "sim-dynamics"))]
+        let latched = true;
+        if latched {
+            for j in 0..self.drivers.len() {
+                let (p, v) = self.motor_state(j);
+                self.cmd_buf[j] = self.drivers[j].control_step(p + self.maps[j].report_offset, v);
+            }
         }
         #[cfg(feature = "sim-mujoco")]
         let jaw_drive = self.mj_jaw_drive();
@@ -427,7 +456,14 @@ impl SimBus {
                 }
             }
             #[cfg(feature = "sim-dynamics")]
-            ArmPlant::Dynamics(d) => d.step(dt, &self.cmd_buf, &self.loads_ma, &self.maps),
+            ArmPlant::Dynamics(d) => {
+                // Watchdog aging is per bus tick, not per substep; the
+                // control law itself runs inside the plant step.
+                for drv in self.drivers.iter_mut() {
+                    drv.age_watchdog();
+                }
+                d.step(dt, &mut self.drivers, &self.loads_ma, &self.maps);
+            }
             #[cfg(feature = "sim-mujoco")]
             ArmPlant::Mujoco(p) => {
                 p.step(dt, &self.cmd_buf, &self.loads_ma, &self.maps, jaw_drive);
@@ -1199,7 +1235,13 @@ impl SimBus {
         }
         #[cfg(feature = "sim-dynamics")]
         if let Some(urdf) = &self.urdf {
-            return ArmPlant::Dynamics(dynamics::DynamicsPlant::new(urdf, &self.maps, q0));
+            return ArmPlant::Dynamics(Box::new(dynamics::DynamicsPlant::new(
+                urdf,
+                self.dyn_ee_frame.as_deref(),
+                self.dyn_tool.as_ref(),
+                &self.maps,
+                q0,
+            )));
         }
         ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, q0, self.dt))
     }

@@ -2,6 +2,7 @@
 # Values transcribed from vendor grippers/SSG48.xml.
 
 name = "SSG48"
+urdf_variant = "ssg48"
 
 [driver]
 driver_type = "spectral-bldc"

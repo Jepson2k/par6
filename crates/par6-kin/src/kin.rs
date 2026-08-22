@@ -100,6 +100,10 @@ impl Kin {
     /// `assets/par6_description` tree.
     pub const ARM_URDF_RELPATH: &'static str = "URDF/par6_flange/urdf/par6_arm.urdf";
 
+    /// End-effector frame of the arm-only chain ([`Kin::ARM_URDF_RELPATH`]) —
+    /// the frame tool inertials attach at.
+    pub const ARM_EE_FRAME: &'static str = "gripper";
+
     /// The vendor gripper configs describe the tool as one extra DH link
     /// hanging off the wrist (`Rz(q6)·Tz(d)·Tx(a)·Rx(alpha)`), with its
     /// mass/COM/inertia in that DH tool frame. The URDF's `gripper` frame
@@ -174,7 +178,7 @@ impl Kin {
     ) -> Result<Self, KinError> {
         Self::from_urdf_with_tool(
             &assets_dir.join(Self::ARM_URDF_RELPATH),
-            Some("gripper"),
+            Some(Self::ARM_EE_FRAME),
             tool,
         )
     }

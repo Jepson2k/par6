@@ -3,6 +3,7 @@
 # Vendor TODO markers carried over: kt, kinematics d/mass/com unverified.
 
 name = "MSG"
+urdf_variant = "msg"
 
 [driver]
 driver_type = "stepfoc"

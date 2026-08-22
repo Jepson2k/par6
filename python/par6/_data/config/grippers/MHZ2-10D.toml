@@ -11,6 +11,7 @@
 # the keep-out check does not. Authoring the tree is what fixes that.
 
 name = "MHZ2-10D"
+urdf_variant = "flange"
 
 # J4 homes against the gripper's lower arm — offset depends on gripper geometry.
 [[arm_joint_home_offsets]]

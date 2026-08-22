@@ -2,6 +2,7 @@
 # Values transcribed from vendor grippers/Flange.xml (vendor CAN_gripper = 0).
 
 name = "Flange"
+urdf_variant = "flange"
 
 # J4 homes against the flange — offset depends on tool geometry.
 [[arm_joint_home_offsets]]

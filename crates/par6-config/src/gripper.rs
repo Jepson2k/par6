@@ -82,6 +82,11 @@ pub struct ToolKinematics {
 pub struct GripperConfig {
     /// Tool name — what `robot.active_gripper` selects.
     pub name: String,
+    /// Which URDF variant models this tool ("flange", "msg", "ssg48").
+    /// Absent = the name-prefix rule decides (with a warning), which is
+    /// how a rail/motor variant sharing the MSG mesh set stays one line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub urdf_variant: Option<String>,
     /// CAN driver parameters; absent = passive tool (vendor
     /// `CAN_gripper = 0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]

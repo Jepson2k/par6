@@ -182,19 +182,39 @@ impl Daemon {
         // the CAN interface, then the e-stop line. Both are startup
         // refusals — nothing has been spawned yet.
         let sim_bus = if opts.sim_dynamics {
-            // The torque-level plant models the ARM (its URDF must carry
-            // exactly the configured joint count, so the bare-flange
-            // model is the only fit); the active tool's mass rides the
-            // gravity model, not the plant.
-            let urdf = assets_dir.join(par6_kin::GripperVariant::Flange.urdf_relpath());
+            // The plant swings exactly the body G(q) describes: the
+            // arm-only chain plus the ACTIVE tool's inertials on the
+            // wrist (the same DH conversion the gravity model uses).
+            // Loading a variant URDF here would double-count whatever
+            // its final link already fuses in.
+            let urdf = assets_dir.join(par6_kin::Kin::ARM_URDF_RELPATH);
             if !urdf.is_file() {
                 return Err(DaemonError::Kinematics(format!(
                     "sim-dynamics URDF missing: {}",
                     urdf.display()
                 )));
             }
-            log::info!("sim plant: torque-level dynamics ({})", urdf.display());
-            SimBus::with_dynamics(urdf)
+            let tool = bundle.active_gripper().map(|g| {
+                let k = &g.kinematics;
+                par6_kin::Kin::dh_tool_params(
+                    k.d_m,
+                    k.a_m,
+                    k.alpha_rad,
+                    k.mass_kg,
+                    k.com_m,
+                    k.inertia_kg_m2,
+                )
+            });
+            log::info!(
+                "sim plant: torque-level dynamics ({}, tool inertials: {})",
+                urdf.display(),
+                if tool.is_some() {
+                    "active gripper"
+                } else {
+                    "none"
+                },
+            );
+            SimBus::with_dynamics(urdf, Some(par6_kin::Kin::ARM_EE_FRAME.to_owned()), tool)
         } else {
             SimBus::new()
         };
@@ -626,26 +646,23 @@ pub(crate) fn load_kin_stack(
     };
     let assets_dir =
         resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
-    let variant = variant_for(&robot.robot.active_gripper);
+    let variant = variant_for(
+        &robot.robot.active_gripper,
+        active_gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
     log::info!(
         "kinematics: {} from {}",
         variant.urdf_relpath(),
         assets_dir.display()
     );
     let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
-    // G(q) must describe the body that actually swings. Under
-    // `--sim-dynamics` that body is the plant's own URDF (the flange
-    // variant — the gripper variants carry jaw joints the plant cannot
-    // take), so compensating a tool the plant is not carrying would push
-    // an IDLE arm upward. Everywhere else it is the real arm: the
-    // arm-only chain plus the ACTIVE gripper's inertials from config
-    // (see `kin::load_gravity_kin` for the one-source-per-mass rule).
-    let gravity_kin = if opts.sim_dynamics {
-        load_kin(&assets_dir, par6_kin::GripperVariant::Flange).map_err(DaemonError::Kinematics)?
-    } else {
-        crate::kin::load_gravity_kin(&assets_dir, active_gripper)
-            .map_err(DaemonError::Kinematics)?
-    };
+    // G(q) describes the body that actually swings: the arm-only chain
+    // plus the ACTIVE gripper's inertials from config (one source per
+    // mass — see `kin::load_gravity_kin`). The `--sim-dynamics` plant
+    // carries the same tool inertials on its wrist, so the model and the
+    // plant agree there too and an IDLE arm under the feedforward floats.
+    let gravity_kin = crate::kin::load_gravity_kin(&assets_dir, active_gripper)
+        .map_err(DaemonError::Kinematics)?;
     // The collision world models the same body the planner plans for,
     // tool included — a keep-out the gripper enters is a collision even
     // when the flange clears it. Two instances, one per consumer thread
