@@ -32,6 +32,9 @@ from .constants import (
     NUM_JOINTS,
     POSE_ELEMS,
     ControllerMode,
+    HomingJointState,
+    HomingPhase,
+    LinkState,
 )
 
 __all__ = [
@@ -193,8 +196,15 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.enabled = d["enabled"]
     buf.gravity_comp = d["gravity_comp"]
     buf.warnings = [tuple(w) for w in d["warnings"]]
-    buf.link_health = d["link_health"]
-    buf.homing = d["homing"]
+    link = dict(d["link_health"])
+    link["state"] = LinkState(link["state"])
+    buf.link_health = link
+    homing = dict(d["homing"])
+    homing["joints"] = [
+        (HomingJointState(state), HomingPhase(phase))
+        for state, phase in homing["joints"]
+    ]
+    buf.homing = homing
     buf.min_clearance_m = d["min_clearance_m"]
     buf.tau_ext[:] = d["tau_ext"]
     buf.node_ages = [tuple(a) for a in d["node_ages"]]
