@@ -107,7 +107,9 @@ def _circle_through(
     a, b = p2 - p1, p3 - p1
     aa, bb, ab = a @ a, b @ b, a @ b
     det = aa * bb - ab * ab
-    centre = p1 + a * (bb * (aa - ab)) / (2.0 * det) + b * (aa * (bb - ab)) / (2.0 * det)
+    centre = (
+        p1 + a * (bb * (aa - ab)) / (2.0 * det) + b * (aa * (bb - ab)) / (2.0 * det)
+    )
     return centre, float(np.linalg.norm(centre - p1))
 
 
@@ -129,10 +131,7 @@ class TestPlannedMotion:
         config = _cfg.load_robot_config()
         dt = float(config["robot"]["tick_dt_s"])
         velocity = np.array(
-            [
-                _cfg.resolve_mode_limits(j["limits"], "exec")[0]
-                for j in config["joints"]
-            ]
+            [_cfg.resolve_mode_limits(j["limits"], "exec")[0] for j in config["joints"]]
         )
         start = _cfg.homing_ready_pose_rad()
         target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
@@ -177,9 +176,7 @@ class TestPlannedMotion:
         assert slow.duration == pytest.approx(
             4.0, abs=2 * float(_cfg.load_robot_config()["robot"]["tick_dt_s"])
         )
-        np.testing.assert_allclose(
-            slow.end_joints_rad, np.radians(target), atol=1e-6
-        )
+        np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
 
 class TestCartesianMotion:
@@ -232,7 +229,9 @@ class TestCartesianMotion:
         points = curve.tcp_poses[:, :3] * 1000.0
         centre, radius = _circle_through(base[:3], via[:3], end[:3])
         off_circle = np.abs(np.linalg.norm(points - centre, axis=1) - radius)
-        assert off_circle.max() < 0.5, f"arc leaves its circle by {off_circle.max():.3f} mm"
+        assert off_circle.max() < 0.5, (
+            f"arc leaves its circle by {off_circle.max():.3f} mm"
+        )
         assert _closest(points, via[:3]) < 1.0, "the arc missed its via point"
         assert np.allclose(points[-1], end[:3], atol=0.5)
 
@@ -247,7 +246,10 @@ class TestCartesianMotion:
         for w in waypoints:
             assert _closest(spline, np.asarray(w[:3])) < 1.0, f"spline missed {w[:3]}"
         # A spline is not the polyline it interpolates: it bows off the chords.
-        assert _polyline_gap(spline, [base[:3]] + [np.asarray(w[:3]) for w in waypoints]) > 2.0
+        assert (
+            _polyline_gap(spline, [base[:3]] + [np.asarray(w[:3]) for w in waypoints])
+            > 2.0
+        )
 
         dry_run.teleport(park_deg())
         process = dry_run.move_p(waypoints, speed=0.4)
@@ -271,7 +273,10 @@ class TestCartesianMotion:
         chain (or ``flush()``) that reports it."""
         dry_run.teleport(park_deg())
         base = np.asarray(dry_run.pose())
-        corner, finish = _offset(base, (50.0, 0.0, 0.0)), _offset(base, (50.0, 0.0, 40.0))
+        corner, finish = (
+            _offset(base, (50.0, 0.0, 0.0)),
+            _offset(base, (50.0, 0.0, 40.0)),
+        )
 
         sharp = [
             dry_run.move_l(corner.tolist(), speed=0.4),
@@ -290,7 +295,9 @@ class TestCartesianMotion:
 
         miss = _closest(rounded, corner[:3])
         assert 1.0 < miss < 15.0, f"corner rounded by {miss:.2f} mm, radius was 15 mm"
-        assert _closest(stopped, corner[:3]) < 0.5, "the sharp pair must reach the corner"
+        assert _closest(stopped, corner[:3]) < 0.5, (
+            "the sharp pair must reach the corner"
+        )
         assert np.allclose(rounded[-1], finish[:3], atol=0.5)
         assert _length(rounded) < _length(stopped) - 1.0
         # One motion, so the TCP sweeps through the corner instead of coming
@@ -339,9 +346,7 @@ class TestCartesianMotion:
         chain = dry_run.move_j(second, speed=0.5)
         assert chain is not None and chain.error is None
         assert chain.duration < separate
-        np.testing.assert_allclose(
-            np.degrees(chain.end_joints_rad), second, atol=1e-6
-        )
+        np.testing.assert_allclose(np.degrees(chain.end_joints_rad), second, atol=1e-6)
         # The corner is rounded in joint space: the chain passes close by the
         # interior target without ever reaching it.
         interior = np.abs(np.degrees(chain.joint_trajectory_rad) - first).max(axis=1)
@@ -443,7 +448,9 @@ class TestCartesianMotion:
         """
         dry_run.teleport(park_deg())
         start = [math.radians(a) for a in dry_run.angles()]
-        end = dry_run.jog_j(joints=[0, 3], speeds=[0.4, -0.4], duration=0.4).end_joints_rad
+        end = dry_run.jog_j(
+            joints=[0, 3], speeds=[0.4, -0.4], duration=0.4
+        ).end_joints_rad
         assert end[0] > start[0] + 0.01, "J0 must have jogged forward"
         assert end[3] < start[3] - 0.01, "J3 must have jogged back"
         for j in (1, 2, 4, 5):
@@ -646,7 +653,9 @@ async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
                 measured = time.monotonic() - started
                 observed[requested] = (predicted.duration, measured)
 
-                assert predicted.duration - 0.3 <= measured <= predicted.duration + 1.5, (
+                assert (
+                    predicted.duration - 0.3 <= measured <= predicted.duration + 1.5
+                ), (
                     f"duration={requested}: runtime took {measured:.3f}s, "
                     f"preview predicted {predicted.duration:.3f}s"
                 )
@@ -890,7 +899,9 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                     _closest(np.stack([predicted[0], predicted[-1]]), p)
                     for p in predicted
                 )
-                assert bow > 5 * _PATH_GAP_MM, f"{case}: previewed path is nearly straight"
+                assert bow > 5 * _PATH_GAP_MM, (
+                    f"{case}: previewed path is nearly straight"
+                )
 
                 gap = max(
                     max(_closest(predicted, p) for p in executed),
@@ -937,8 +948,9 @@ async def _teleport_to(client, angles: list[float]) -> None:
     while time.monotonic() < deadline:
         await client.teleport(angles)
         if await client.wait_status(
-            lambda s: s.homed
-            and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0,
+            lambda s: (
+                s.homed and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0
+            ),
             timeout=0.5,
         ):
             return

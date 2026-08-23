@@ -1,0 +1,37 @@
+repos:
+  # Ruff for Python linting and formatting (the Rust side is gated by
+  # cargo fmt/clippy in the rust CI job).
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.8
+    hooks:
+      - id: ruff
+        args: [--fix]
+        files: ^python/
+      - id: ruff-format
+        files: ^python/
+
+  # ty for static type checking
+  - repo: local
+    hooks:
+      - id: ty
+        name: ty (par6 python)
+        entry: bash -c 'cd python && ty check .'
+        language: system
+        files: ^python/
+        pass_filenames: false
+
+  # Built-in hooks for file quality. Golden wire vectors are byte-exact
+  # fixtures and the asset trees are vendored — neither may be "fixed".
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: trailing-whitespace
+        exclude: ^(assets/|tests/golden/|python/par6/_data/|crates/par6-bus/sim-assets/)
+      - id: end-of-file-fixer
+        exclude: ^(assets/|tests/golden/|python/par6/_data/|crates/par6-bus/sim-assets/)
+      - id: check-yaml
+      - id: check-json
+      - id: check-added-large-files
+        args: [--maxkb=1024]
+        exclude: ^(assets/|tests/golden/|Cargo\.lock)
+      - id: check-merge-conflict

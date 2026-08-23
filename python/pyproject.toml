@@ -42,7 +42,7 @@ par6 = "par6.cli:main"
 # ty pinned: 0.0.74 regressed ParamSpec-typed calls (numba's Dispatcher
 # stubs) — every 2-arg call of a jitted pinokin function reports
 # invalid-argument-type. Unpin once a fixed release lands.
-dev = ["ruff==0.15.8", "ty==0.0.73", "pytest", "pytest-asyncio", "pytest-timeout"]
+dev = ["ruff==0.15.8", "ty==0.0.73", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"

@@ -67,9 +67,7 @@ def daemon(tmp_path):
 
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every soft window."""
-    return [
-        math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]
-    ]
+    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
 
 
 def ready_pose_deg() -> list[float]:
@@ -158,7 +156,9 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         # The gap counter is fed by the datagram callback, not by this
         # consumer, so it sees every packet the runtime actually sent.
         assert client.status_seq_gaps == 0
-        assert frames[-1].homed is False, "a fresh runtime must not claim a home reference"
+        assert frames[-1].homed is False, (
+            "a fresh runtime must not claim a home reference"
+        )
         queried = await client.angles()
         assert queried is not None
         assert max_deg_error(queried, frames[-1].angles) < 1.0, (
@@ -256,14 +256,18 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
             try:
                 attempt = await client.move_j(target, duration=1.5)
             except RobotError as exc:
-                assert exc.code in RETRIABLE, f"unexpected rejection while re-enabling: {exc}"
+                assert exc.code in RETRIABLE, (
+                    f"unexpected rejection while re-enabling: {exc}"
+                )
                 await asyncio.sleep(0.2)
                 continue
             try:
                 if await client.wait_command(attempt, timeout=STEP_BUDGET_S):
                     recovered = attempt
             except RobotError as exc:
-                assert exc.code in RETRIABLE, f"unexpected failure while re-enabling: {exc}"
+                assert exc.code in RETRIABLE, (
+                    f"unexpected failure while re-enabling: {exc}"
+                )
                 await asyncio.sleep(0.2)
         assert recovered > queued_b, (
             f"the index allocator must never rewind ({recovered} must follow {queued_b})"
@@ -300,8 +304,9 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
         assert home_index >= 0
 
         assert await client.wait_status(
-            lambda s: s.action_current == "home"
-            and s.action_state == ActionState.EXECUTING,
+            lambda s: (
+                s.action_current == "home" and s.action_state == ActionState.EXECUTING
+            ),
             timeout=STEP_BUDGET_S,
         ), f"homing never started executing; daemon log:\n{daemon.log()}"
 
@@ -485,9 +490,13 @@ async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
             f"defaults to {robot.tools.default.key}"
         )
         for key in reported.available:
-            assert key in robot.tools, f"{key} is not in {[t.key for t in robot.tools.available]}"
+            assert key in robot.tools, (
+                f"{key} is not in {[t.key for t in robot.tools.available]}"
+            )
 
-        assert await client.wait_status(lambda s: s.tool_status_present, timeout=STEP_BUDGET_S)
+        assert await client.wait_status(
+            lambda s: s.tool_status_present, timeout=STEP_BUDGET_S
+        )
         broadcast = await client.wait_status(lambda s: True, timeout=STEP_BUDGET_S)
         assert broadcast
         streamed_key = client._shared_status.tool_status.key
@@ -719,7 +728,9 @@ TILTED_POSTURE_DEG = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0]
 
 
 @pytest.mark.timeout(180)
-async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: LiveDaemon):
+async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
+    daemon: LiveDaemon,
+):
     """A pose read off the wire, sent straight back, must not move the arm.
 
     This is the teach-and-replay path: Waldo Commander decodes the STATUS
@@ -742,7 +753,9 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: Li
 
         taught = await client.pose()
         assert taught is not None
-        assert all(math.isfinite(v) for v in taught), f"STATUS pose not finite: {taught}"
+        assert all(math.isfinite(v) for v in taught), (
+            f"STATUS pose not finite: {taught}"
+        )
         angles = await client.angles()
         assert angles is not None
 
@@ -811,7 +824,9 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
         await settle_at(client, mid)
         pose = await client.pose()
         assert pose is not None
-        assert all(math.isfinite(v) for v in pose[:3]), f"STATUS pose not finite: {pose}"
+        assert all(math.isfinite(v) for v in pose[:3]), (
+            f"STATUS pose not finite: {pose}"
+        )
         center_m = [v / 1000.0 for v in pose[:3]]
         radius_m = math.hypot(center_m[0], center_m[1])
         assert await client.set_shapes(
@@ -1272,7 +1287,9 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
         # The wire-contract fingerprint: sha256 over the robot TOML and
         # each grippers/*.toml (sorted), each as `name\n` + content.
         h = hashlib.sha256()
-        for f in [daemon.config] + sorted((daemon.config.parent / "grippers").glob("*.toml")):
+        for f in [daemon.config] + sorted(
+            (daemon.config.parent / "grippers").glob("*.toml")
+        ):
             h.update(f.name.encode())
             h.update(b"\n")
             h.update(f.read_bytes())
@@ -1289,8 +1306,12 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
         joints = info["joints"]
         assert len(joints) == len(cfg["joints"])
         for got, declared in zip(joints, cfg["joints"]):
-            assert got["soft_min_rad"] == pytest.approx(declared["limits"]["soft_min_rad"])
-            assert got["soft_max_rad"] == pytest.approx(declared["limits"]["soft_max_rad"])
+            assert got["soft_min_rad"] == pytest.approx(
+                declared["limits"]["soft_min_rad"]
+            )
+            assert got["soft_max_rad"] == pytest.approx(
+                declared["limits"]["soft_max_rad"]
+            )
     finally:
         daemon.stop()
 

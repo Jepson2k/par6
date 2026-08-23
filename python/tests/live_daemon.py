@@ -121,7 +121,9 @@ def sim_config(
         "status_rate_hz = 50", f"status_rate_hz = {STATUS_RATE_HZ}"
     )
     if patched == text:
-        raise RuntimeError("PAR6.toml patch points (tick_dt_s / status_rate_hz) missing")
+        raise RuntimeError(
+            "PAR6.toml patch points (tick_dt_s / status_rate_hz) missing"
+        )
     if initial_recipe is not None:
         swapped = patched.replace(
             "telemetry_rate_hz = 100",
@@ -177,13 +179,20 @@ class LiveDaemon:
             [
                 binary,
                 "--sim",
-                "--config", str(config),
-                "--port", "0",
-                "--bind", "127.0.0.1",
-                "--status-transport", status_transport,
-                "--status-host", "127.0.0.1",
-                "--status-port", str(status_port),
-                "--telemetry-port", str(telemetry_port),
+                "--config",
+                str(config),
+                "--port",
+                "0",
+                "--bind",
+                "127.0.0.1",
+                "--status-transport",
+                status_transport,
+                "--status-host",
+                "127.0.0.1",
+                "--status-port",
+                str(status_port),
+                "--telemetry-port",
+                str(telemetry_port),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
@@ -291,8 +300,9 @@ async def settle_at(
     while time.monotonic() < deadline:
         await client.teleport(angles_deg)
         arrived = await client.wait_status(
-            lambda s: s.homed
-            and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg)),
+            lambda s: (
+                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg))
+            ),
             timeout=0.5,
         )
         if arrived:

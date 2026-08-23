@@ -244,7 +244,9 @@ def jog_ramp_acceleration() -> np.ndarray:
     """
     config = load_robot_config()
     jog = config.get("jog", {})
-    accel_time_s = max(float(jog.get("accel_time_s", MIN_JOG_ACCEL_TIME_S)), MIN_JOG_ACCEL_TIME_S)
+    accel_time_s = max(
+        float(jog.get("accel_time_s", MIN_JOG_ACCEL_TIME_S)), MIN_JOG_ACCEL_TIME_S
+    )
     resolved = [resolve_mode_limits(j["limits"], "jog") for j in config["joints"]]
     return np.array(
         [min(vel / accel_time_s, acc) for vel, acc, _ in resolved], dtype=np.float64
@@ -304,7 +306,12 @@ def _rotation(rpy: str | None) -> np.ndarray:
         return np.eye(3)
     r, p, y = (float(v) for v in rpy.split())
     cr, sr, cp, sp, cy, sy = (
-        np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+        np.cos(r),
+        np.sin(r),
+        np.cos(p),
+        np.sin(p),
+        np.cos(y),
+        np.sin(y),
     )
     return (
         np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
@@ -322,12 +329,18 @@ def _rpy_xyz(R: np.ndarray) -> tuple[float, float, float]:
     """
     pitch = float(np.arcsin(np.clip(R[0, 2], -1.0, 1.0)))
     if abs(R[0, 2]) < 1.0 - 1e-12:
-        return float(np.arctan2(-R[1, 2], R[2, 2])), pitch, float(np.arctan2(-R[0, 1], R[0, 0]))
+        return (
+            float(np.arctan2(-R[1, 2], R[2, 2])),
+            pitch,
+            float(np.arctan2(-R[0, 1], R[0, 0])),
+        )
     return float(np.arctan2(R[2, 1], R[1, 1])), pitch, 0.0
 
 
 @cache
-def flange_to_tcp(tool_key: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+def flange_to_tcp(
+    tool_key: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Flange->TCP of *tool_key*'s URDF tree as ``(origin_m, rpy_rad)``.
 
     The ONE definition of a native tool's tool center point: the ``tcp`` link
@@ -360,8 +373,10 @@ def flange_to_tcp(tool_key: str) -> tuple[tuple[float, float, float], tuple[floa
     link = TCP_LINK
     while link in fixed:
         origin = fixed[link].find("origin")
-        xyz = np.zeros(3) if origin is None else np.array(
-            [float(v) for v in str(origin.get("xyz", "0 0 0")).split()]
+        xyz = (
+            np.zeros(3)
+            if origin is None
+            else np.array([float(v) for v in str(origin.get("xyz", "0 0 0")).split()])
         )
         R_j = _rotation(None if origin is None else origin.get("rpy"))
         t = xyz + R_j @ t

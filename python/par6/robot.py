@@ -654,7 +654,9 @@ class Robot(_RobotABC):
         if key not in self._grippers:
             origin, rpy = self._plugin_tool_tcp(key, variant_key)
             T_tool = np.zeros((4, 4), dtype=np.float64)
-            se3_from_rpy(origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool)
+            se3_from_rpy(
+                origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool
+            )
 
         if tcp_offset_m is not None and any(v != 0 for v in tcp_offset_m):
             T_offset = np.eye(4)

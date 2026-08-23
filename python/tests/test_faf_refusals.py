@@ -48,9 +48,7 @@ def daemon(tmp_path):
 
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every travel window."""
-    return [
-        math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]
-    ]
+    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
 
 
 def max_abs_delta(actual, expected) -> float:
@@ -114,8 +112,9 @@ async def test_rejected_teleport_surfaces_as_error(daemon: LiveDaemon):
 
         # The broadcast carries the same refusal — what a UI banner shows.
         assert await client.wait_status(
-            lambda s: s.error is not None
-            and s.error[1] == ErrorCode.COMM_VALIDATION_ERROR,
+            lambda s: (
+                s.error is not None and s.error[1] == ErrorCode.COMM_VALIDATION_ERROR
+            ),
             timeout=STEP_BUDGET_S,
         ), "the refusal never reached the STATUS broadcast"
 

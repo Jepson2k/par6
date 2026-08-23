@@ -76,15 +76,27 @@ class StatusBuffer:
     link_ok: int = 0
     data_age_ms: int = 0
     # body
-    pose: np.ndarray = field(default_factory=lambda: np.zeros(POSE_ELEMS, dtype=np.float64))
-    angles: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
-    speeds: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
+    pose: np.ndarray = field(
+        default_factory=lambda: np.zeros(POSE_ELEMS, dtype=np.float64)
+    )
+    angles: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
+    )
+    speeds: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
+    )
     io: np.ndarray = field(default_factory=lambda: np.zeros(IO_SLOTS, dtype=np.int32))
     action_current: str = ""
     action_state: ActionState = ActionState.IDLE
-    joint_en: np.ndarray = field(default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32))
-    cart_en_wrf: np.ndarray = field(default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32))
-    cart_en_trf: np.ndarray = field(default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32))
+    joint_en: np.ndarray = field(
+        default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32)
+    )
+    cart_en_wrf: np.ndarray = field(
+        default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32)
+    )
+    cart_en_trf: np.ndarray = field(
+        default_factory=lambda: np.ones(EN_SLOTS, dtype=np.int32)
+    )
     executing_index: int = -1
     completed_index: int = -1
     last_checkpoint: str = ""
@@ -101,7 +113,9 @@ class StatusBuffer:
     scene_epoch: int = 0
     accepted_index: int = -1
     homed: bool = False
-    tau: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
+    tau: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
+    )
     mode: ControllerMode = ControllerMode.BOOTING
     enabled: bool = False
     gravity_comp: bool = False
@@ -118,7 +132,9 @@ class StatusBuffer:
     min_clearance_m: float | None = None
     """Minimum signed clearance over every active collision pair [m]
     (negative = penetration); ``None`` when not computed."""
-    tau_ext: np.ndarray = field(default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64))
+    tau_ext: np.ndarray = field(
+        default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
+    )
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
     node_ages: list[tuple[int, int]] = field(default_factory=list)

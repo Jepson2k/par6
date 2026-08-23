@@ -243,11 +243,8 @@ jobs:
           else
             echo "no waldoctl branch $branch; keeping the pinned tag"
           fi
-      - name: ruff
-        run: ruff check python/
-      - name: ty
-        working-directory: python
-        run: ty check .
+      - name: pre-commit (ruff, ruff-format, ty, file hygiene)
+        run: pre-commit run --show-diff-on-failure --color=always --all-files
       # env.sh at run time too: the extension dlopens the shim on import.
       - name: pytest
         run: |
