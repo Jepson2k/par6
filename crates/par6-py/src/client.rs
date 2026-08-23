@@ -371,10 +371,6 @@ impl CoreClient {
         sys_future(py, self.rt(), Command::Estop)
     }
 
-    fn safety_stop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::SafetyStop)
-    }
-
     fn set_gravity_comp<'py>(&self, py: Python<'py>, on: bool) -> PyResult<Bound<'py, PyAny>> {
         sys_future(
             py,

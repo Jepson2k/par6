@@ -155,11 +155,6 @@ impl Client {
         self.system(Command::Estop).await
     }
 
-    /// Go limp: torque-only 0 N·m on every drive until a mode change.
-    pub async fn safety_stop(&self) -> Result<Ack, ClientError> {
-        self.system(Command::SafetyStop).await
-    }
-
     /// Enable/disable the gravity-compensation feedforward.
     pub async fn set_gravity_comp(&self, on: bool) -> Result<Ack, ClientError> {
         self.system(Command::SetGravityComp(cmd::SetGravityComp { on }))

@@ -510,13 +510,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 Ok(())
             }
-            C::SafetyStop => {
-                // Not a protective stop: the arm goes limp rather than
-                // holding position, and stays that way until a mode change.
-                self.cancel_all_motion();
-                self.runtime.rt.safety_stop();
-                Ok(())
-            }
             C::Pause(p) => {
                 self.runtime.rt.set_exec_paused(p.on);
                 Ok(())
@@ -2022,7 +2015,6 @@ fn cmd_name(tag: CmdType) -> &'static str {
     match tag {
         T::Reset => "reset",
         T::Estop => "estop",
-        T::SafetyStop => "safety_stop",
         T::SetGravityComp => "set_gravity_comp",
         T::Pause => "pause",
         T::Stop => "stop",

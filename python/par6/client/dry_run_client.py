@@ -55,6 +55,7 @@ _AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5
 #: (``crates/par6d/src/planner.rs::TOOL_CALIBRATE_MIN_WAIT_S``).
 _TOOL_CALIBRATE_MIN_WAIT_S = 2.0
 
+
 def make_error(code: ErrorCode, **params: Any) -> RobotError:
     """The runtime's structured refusal for *code* — rendered by the
     engine's own error templates, so a preview-side refusal says exactly
@@ -81,7 +82,9 @@ def _f6(values: Any, name: str) -> list[float]:
     return out
 
 
-def _timing(duration: float | None, speed: float | None) -> tuple[float | None, float | None]:
+def _timing(
+    duration: float | None, speed: float | None
+) -> tuple[float | None, float | None]:
     """The waldoctl duration/speed pair (0/None = unset) as the wire's
     exactly-one-of convention.  Neither set means full profile speed."""
     d = float(duration) if duration else None
@@ -174,12 +177,8 @@ class _DryRunTool:
     def close(self, **kwargs: Any) -> DryRunResultData:
         return self._act("close", [], 1.0)
 
-    def _act(
-        self, verb: str, params: list[Any], position: float
-    ) -> DryRunResultData:
-        result = self._client.tool_action(
-            self._client.active_tool_key, verb, params
-        )
+    def _act(self, verb: str, params: list[Any], position: float) -> DryRunResultData:
+        result = self._client.tool_action(self._client.active_tool_key, verb, params)
         self._position = min(max(float(position), 0.0), 1.0)
         return result
 
@@ -601,9 +600,7 @@ class DryRunRobotClient:
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_s",
-            "waypoints": [_f6(wp, "waypoint") for wp in waypoints]
-            if waypoints
-            else [],
+            "waypoints": [_f6(wp, "waypoint") for wp in waypoints] if waypoints else [],
             "frame": _wire_frame(frame),
             "duration": min_duration,
             "speed": speed_fraction,
@@ -627,9 +624,7 @@ class DryRunRobotClient:
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_p",
-            "waypoints": [_f6(wp, "waypoint") for wp in waypoints]
-            if waypoints
-            else [],
+            "waypoints": [_f6(wp, "waypoint") for wp in waypoints] if waypoints else [],
             "frame": _wire_frame(frame),
             "duration": min_duration,
             "speed": speed_fraction,
@@ -689,7 +684,12 @@ class DryRunRobotClient:
         return _merge(self._run_batch([cmd]))
 
     def servo_l(
-        self, pose: list[float], *, speed: float = 1.0, accel: float = 1.0, **kwargs: Any
+        self,
+        pose: list[float],
+        *,
+        speed: float = 1.0,
+        accel: float = 1.0,
+        **kwargs: Any,
     ) -> DryRunResultData:
         """A streamed Cartesian target — IK'd, then tracked like ``servo_j``.
 
@@ -724,7 +724,9 @@ class DryRunRobotClient:
                 # Same guard as the live client: a negative index wraps
                 # onto another joint and previews the wrong axis.
                 if not 0 <= j < NUM_JOINTS:
-                    raise ValueError(f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}")
+                    raise ValueError(
+                        f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}"
+                    )
                 fractions[j] = float(s)
         elif joint >= 0:
             if joint >= NUM_JOINTS:
@@ -865,7 +867,9 @@ class DryRunRobotClient:
         self._sync_context()
         return 0
 
-    def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any) -> int:
+    def set_tcp_offset(
+        self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any
+    ) -> int:
         """TCP offset in mm, composed on top of the tool transform."""
         self._tcp_offset_mm = (float(x), float(y), float(z))
         self._sync_context()
@@ -981,10 +985,6 @@ class DryRunRobotClient:
 
     def wait_ready(self, **kwargs: Any) -> bool:
         return True
-
-    def safety_stop(self, **kwargs: Any) -> int:
-        self._discard_chain()
-        return 1
 
     def pause(self, **kwargs: Any) -> int:
         """A preview has no executing trajectory to hold."""

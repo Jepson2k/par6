@@ -133,8 +133,7 @@ class RobotClient:
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
         self._bound_tools: dict[str, ToolSpec] = {
-            key: _sync_tool(tool)
-            for key, tool in self._inner._bound_tools.items()
+            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
         }
 
     # ---------- lifecycle ----------
@@ -168,8 +167,7 @@ class RobotClient:
         """Bind tool specs; actions run through this facade's background loop."""
         self._inner.bind_tools(specs)
         self._bound_tools = {
-            key: _sync_tool(tool)
-            for key, tool in self._inner._bound_tools.items()
+            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
         }
 
     @property
@@ -396,15 +394,6 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
-    def safety_stop(self) -> int:
-        """Drop every joint limp and hold there.
-
-        Unlike :meth:`estop`, which holds position under power, this removes
-        drive authority — so a trapped person or a jammed joint can be freed
-        by hand.
-        """
-        return _run(self._inner.safety_stop())
-
     def pause(self) -> int:
         """Hold the executing trajectory; the queue survives."""
         return _run(self._inner.pause())
@@ -497,7 +486,9 @@ class RobotClient:
     ) -> int:
         """Invoke a tool-specific action by key (blocking by default)."""
         return _run(
-            self._inner.tool_action(tool_key, action, params, wait=wait, timeout=timeout)
+            self._inner.tool_action(
+                tool_key, action, params, wait=wait, timeout=timeout
+            )
         )
 
     def checkpoint(self, label: str) -> int:

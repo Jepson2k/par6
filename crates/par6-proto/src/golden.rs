@@ -471,7 +471,6 @@ pub fn vectors() -> Vec<Vector> {
     // -- commands: SYSTEM --
     v.push(cmd_vec("cmd_reset", 1, Command::Reset));
     v.push(cmd_vec("cmd_estop", 2, Command::Estop));
-    v.push(cmd_vec("cmd_safety_stop", 2, Command::SafetyStop));
     v.push(cmd_vec(
         "cmd_set_gravity_comp",
         2,

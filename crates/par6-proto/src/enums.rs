@@ -91,11 +91,8 @@ wire_enum! {
         SetCompletionPolicy = 20,
         /// Select the telemetry recipe. Unknown names are refused.
         SetRecipe = 21,
-        /// Drop every joint limp (torque-only zero) and stay there until a
-        /// mode change. The safest state the arm has: unlike `Estop`, which
-        /// holds position actively, this removes drive authority so a
-        /// trapped person or a jammed joint can be freed by hand.
-        SafetyStop = 22,
+        // 22 was SafetyStop: removed — limp mode is the physical e-stop's
+        // job; a digital path must not be relied on in that emergency.
         /// Enable or disable the gravity-compensation feedforward. G(q) is
         /// computed and published in every mode regardless; this controls
         /// only whether it is APPLIED, which is correct on hardware and on
@@ -379,7 +376,6 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
     match cmd {
         C::Reset
         | C::Estop
-        | C::SafetyStop
         | C::SetGravityComp
         | C::Pause
         | C::Stop

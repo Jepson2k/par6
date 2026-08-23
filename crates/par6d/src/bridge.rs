@@ -764,11 +764,6 @@ impl RtCommands for RtBridge {
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
 
-    fn safety_stop(&mut self) {
-        self.halt();
-        self.link.send(RtCommand::SetMode(Mode::SafetyStop));
-    }
-
     fn set_gravity_comp(&mut self, on: bool) {
         self.link.send(RtCommand::SetGravityComp(on));
     }

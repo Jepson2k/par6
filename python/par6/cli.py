@@ -98,12 +98,6 @@ def _cmd_estop(client: RobotClient, args: argparse.Namespace) -> int:
     return 0
 
 
-def _cmd_safety_stop(client: RobotClient, args: argparse.Namespace) -> int:
-    client.safety_stop()
-    _emit("drive authority removed; the arm is limp", args.json)
-    return 0
-
-
 def _cmd_reset(client: RobotClient, args: argparse.Namespace) -> int:
     client.reset()
     _emit("protective stop cleared", args.json)
@@ -146,29 +140,38 @@ def build_parser() -> argparse.ArgumentParser:
         default=int(os.environ.get("PAR6_COMMAND_PORT", "6001")),
         help="command port (default: $PAR6_COMMAND_PORT or 6001)",
     )
-    parser.add_argument("--timeout", type=float, default=2.0, help="per-request timeout [s]")
-    parser.add_argument("--json", action="store_true", help="emit JSON instead of plain text")
+    parser.add_argument(
+        "--timeout", type=float, default=2.0, help="per-request timeout [s]"
+    )
+    parser.add_argument(
+        "--json", action="store_true", help="emit JSON instead of plain text"
+    )
 
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("ping", help="check that a runtime is answering").set_defaults(fn=_cmd_ping)
+    sub.add_parser("ping", help="check that a runtime is answering").set_defaults(
+        fn=_cmd_ping
+    )
     sub.add_parser("angles", help="joint angles [deg]").set_defaults(fn=_cmd_angles)
 
     pose = sub.add_parser("pose", help="TCP pose [mm, deg]")
     pose.add_argument("--frame", choices=("WRF", "TRF"), default="WRF")
     pose.set_defaults(fn=_cmd_pose)
 
-    sub.add_parser("status", help="a summary of controller state").set_defaults(fn=_cmd_status)
-    sub.add_parser("estop", help="protective stop: hold position, latch disabled").set_defaults(
-        fn=_cmd_estop
+    sub.add_parser("status", help="a summary of controller state").set_defaults(
+        fn=_cmd_status
     )
     sub.add_parser(
-        "safety-stop", help="remove drive authority so the arm can be moved by hand"
-    ).set_defaults(fn=_cmd_safety_stop)
-    sub.add_parser("reset", help="clear a latched protective stop").set_defaults(fn=_cmd_reset)
+        "estop", help="protective stop: hold position, latch disabled"
+    ).set_defaults(fn=_cmd_estop)
+    sub.add_parser("reset", help="clear a latched protective stop").set_defaults(
+        fn=_cmd_reset
+    )
 
     stop = sub.add_parser("stop", help="stop motion")
-    stop.add_argument("--keep-queue", action="store_true", help="leave the queue in place")
+    stop.add_argument(
+        "--keep-queue", action="store_true", help="leave the queue in place"
+    )
     stop.set_defaults(fn=_cmd_stop)
 
     home = sub.add_parser("home", help="run the homing sequence")
@@ -178,8 +181,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     move = sub.add_parser("move-j", help="joint move to six angles [deg]")
     move.add_argument("angles", type=float, nargs=6, metavar="DEG")
-    move.add_argument("--speed", type=float, default=0.2, help="velocity fraction (0, 1]")
-    move.add_argument("--wait", action="store_true", help="block until the move completes")
+    move.add_argument(
+        "--speed", type=float, default=0.2, help="velocity fraction (0, 1]"
+    )
+    move.add_argument(
+        "--wait", action="store_true", help="block until the move completes"
+    )
     move.add_argument("--move-timeout", type=float, default=120.0)
     move.set_defaults(fn=_cmd_move_j)
 

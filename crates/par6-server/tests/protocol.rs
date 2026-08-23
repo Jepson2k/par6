@@ -37,7 +37,6 @@ enum RtEvent {
     Stream(CmdType),
     CancelStream,
     Halt,
-    SafetyStop,
     SetGravityComp(bool),
     SetPayload(f64),
     ExecPaused(bool),
@@ -91,9 +90,6 @@ impl RtCommands for TestRt {
     }
     fn halt(&mut self) {
         self.push(RtEvent::Halt);
-    }
-    fn safety_stop(&mut self) {
-        self.push(RtEvent::SafetyStop);
     }
     fn set_gravity_comp(&mut self, on: bool) {
         self.push(RtEvent::SetGravityComp(on));
@@ -2241,31 +2237,6 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
         h.planner.lock().unwrap().estimates,
         before,
         "an unchanged queue must not be re-estimated"
-    );
-}
-
-/// The arm's fully-limp state, reachable from the wire.
-///
-/// The RT has had the control law (`law_safety_stop` fills every joint
-/// with torque-only zero) and an unconditional transition into it since
-/// the core was written — but no command tag reached it, so an operator
-/// who needed the arm limp to free a trapped person or a jammed joint had
-/// nothing to send. Unlike the protective stop, which holds position under
-/// power, this drops drive authority.
-#[tokio::test]
-async fn safety_stop_is_reachable_and_halts_motion() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    assert!(
-        matches!(c.request(&Command::SafetyStop).await, Reply::Ok { .. }),
-        "SAFETY_STOP must be acked as a SYSTEM command"
-    );
-    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::SafetyStop)).await;
-    assert!(
-        ev.contains(&RtEvent::Halt),
-        "going limp must halt motion first: {ev:?}"
     );
 }
 

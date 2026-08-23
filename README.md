@@ -207,7 +207,7 @@ Wire tags are banded by class, which is what makes gating table-driven
 
 | Band | Class | Semantics |
 |---|---|---|
-| 10+ | SYSTEM | reset, stop, e-stop, safety stop, gravity comp, tool/profile selection |
+| 10+ | SYSTEM | reset, stop, e-stop, gravity comp, tool/profile selection |
 | 30+ | QUERY | angles, pose, status, io, queue, error, reachable, loop stats |
 | 60+ | FIRE_AND_FORGET | jog, servo, teleport — unacked, latest-wins |
 | 80+ | QUEUED | move_j / move_l / move_c / move_s / move_p, tool actions, checkpoints |

@@ -30,12 +30,12 @@ def daemon(tmp_path):
 
 
 def park_deg() -> list[float]:
-    return [
-        math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]
-    ]
+    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
 
 
-def settle_at(client: RobotClient, angles_deg: list[float], budget_s: float = 20.0) -> None:
+def settle_at(
+    client: RobotClient, angles_deg: list[float], budget_s: float = 20.0
+) -> None:
     """Reset and re-send teleport until the broadcast shows the arm there —
     the sync twin of ``live_daemon.settle_at`` (teleport is unacked and
     gated on ENABLED, so one send can land before the RT clear settles)."""
@@ -44,8 +44,9 @@ def settle_at(client: RobotClient, angles_deg: list[float], budget_s: float = 20
     while time.monotonic() < deadline:
         client.teleport(angles_deg)
         if client.wait_status(
-            lambda s: s.homed
-            and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg)),
+            lambda s: (
+                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg))
+            ),
             timeout=0.5,
         ):
             return
@@ -89,9 +90,8 @@ def test_sync_facade_smoke(daemon):
         assert client.jog_j(1, 0.4, 0.2) == 1
         assert client.stop() == 1
 
-        # The two control commands a synchronous script needs to make the
-        # arm safe to touch: limp it, and float it under G(q) alone.
-        assert client.safety_stop() == 1
+        # Clearing a protective stop and floating the arm under G(q)
+        # alone — the control pair a synchronous script needs.
         assert client.reset() == 1
         assert client.set_gravity_comp(True) == 1
         assert client.set_gravity_comp(False) == 1
@@ -131,8 +131,7 @@ def test_cli_reads_a_live_runtime_and_reports_an_unreachable_one(daemon, capsys)
         settle_at(client, park_deg())
 
     assert (
-        main(["--host", "127.0.0.1", "--port", str(daemon.command_port), "angles"])
-        == 0
+        main(["--host", "127.0.0.1", "--port", str(daemon.command_port), "angles"]) == 0
     )
     reported = [float(v) for v in capsys.readouterr().out.split()]
     assert reported == pytest.approx(park_deg(), abs=0.5)
@@ -165,9 +164,7 @@ def test_freedrive_reads_the_broadcast_not_the_last_command(daemon):
         # Homed + IDLE + enabled + gravity on: floating.
         settle_at(client, park_deg())
         assert client.set_gravity_comp(True) == 1
-        assert client.wait_status(
-            lambda s: s.homed and s.gravity_comp, timeout=10.0
-        )
+        assert client.wait_status(lambda s: s.homed and s.gravity_comp, timeout=10.0)
         assert client.is_freedrive() is True
 
         # Gravity comp off: same arm, no longer back-driveable — the

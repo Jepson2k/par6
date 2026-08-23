@@ -33,20 +33,6 @@
     },
     {
       "class": "SYSTEM",
-      "cmd": "SAFETY_STOP",
-      "file": "cmd_safety_stop.bin",
-      "idempotency_key": null,
-      "kind": "command",
-      "name": "cmd_safety_stop",
-      "req_id": 2,
-      "tag": 22,
-      "wire": [
-        22,
-        2
-      ]
-    },
-    {
-      "class": "SYSTEM",
       "cmd": "SET_GRAVITY_COMP",
       "file": "cmd_set_gravity_comp.bin",
       "idempotency_key": null,

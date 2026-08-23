@@ -231,12 +231,6 @@ fn a_full_session_over_the_rust_client() {
         let stats = client.loop_stats().await.expect("loop_stats");
         assert!(stats.loop_count > 0, "the loop must be ticking: {stats:?}");
         assert!(!client.profile().await.expect("profile").is_empty());
-
-        // The go-limp stop is reachable and confirmed.
-        assert_eq!(
-            client.safety_stop().await.expect("safety_stop"),
-            Ack::Confirmed
-        );
     })
 }
 

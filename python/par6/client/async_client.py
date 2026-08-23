@@ -78,7 +78,9 @@ def _wire_frame(frame: WFrame) -> int:
     try:
         return int(_FRAMES[frame])
     except KeyError:
-        raise ValueError(f"unknown frame {frame!r} (par6 supports WRF and TRF)") from None
+        raise ValueError(
+            f"unknown frame {frame!r} (par6 supports WRF and TRF)"
+        ) from None
 
 
 def _f6(values: Sequence[float], name: str) -> list[float]:
@@ -87,7 +89,9 @@ def _f6(values: Sequence[float], name: str) -> list[float]:
     return [float(v) for v in values]
 
 
-def _timing(duration: float | None, speed: float | None) -> tuple[float | None, float | None]:
+def _timing(
+    duration: float | None, speed: float | None
+) -> tuple[float | None, float | None]:
     """Map the waldoctl duration/speed pair (0/None = unset) onto the wire's
     exactly-one-of convention.  Neither set means full profile speed."""
     d = float(duration) if duration else None
@@ -226,9 +230,13 @@ class AsyncRobotClient(_RobotClientABC):
             status_transport or _env_str("PAR6_STATUS_TRANSPORT", "MULTICAST")
         ).upper()
         self._status_port = (
-            status_port if status_port is not None else _env_int("PAR6_STATUS_PORT", 6002)
+            status_port
+            if status_port is not None
+            else _env_int("PAR6_STATUS_PORT", 6002)
         )
-        self._mcast_group = mcast_group or _env_str("PAR6_STATUS_MCAST_GROUP", "239.255.0.71")
+        self._mcast_group = mcast_group or _env_str(
+            "PAR6_STATUS_MCAST_GROUP", "239.255.0.71"
+        )
         self._mcast_iface = mcast_iface or _env_str("PAR6_STATUS_MCAST_IF", "127.0.0.1")
         self._status_unicast_host = status_unicast_host or _env_str(
             "PAR6_STATUS_UNICAST_HOST", "127.0.0.1"
@@ -544,7 +552,9 @@ class AsyncRobotClient(_RobotClientABC):
                         max_delta = float(np.abs(status.angles - last_angles).max())
                         last_angles[:] = status.angles
                     now = time.monotonic()
-                    moving = max_speed >= speed_threshold or max_delta >= angle_threshold
+                    moving = (
+                        max_speed >= speed_threshold or max_delta >= angle_threshold
+                    )
                     if not motion_started:
                         if moving or now - start > motion_start_timeout:
                             motion_started = True
@@ -576,9 +586,7 @@ class AsyncRobotClient(_RobotClientABC):
     # Motion (queued)
     # ------------------------------------------------------------------
 
-    async def _finish_queued(
-        self, index: int, wait: bool, timeout: float
-    ) -> int:
+    async def _finish_queued(self, index: int, wait: bool, timeout: float) -> int:
         if index >= 0:
             self._last_command_index = index
             if wait:
@@ -880,7 +888,9 @@ class AsyncRobotClient(_RobotClientABC):
                 # Python's wrap-around, and the arm moves the wrong axis
                 # with nothing raised.
                 if not 0 <= j < NUM_JOINTS:
-                    raise ValueError(f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}")
+                    raise ValueError(
+                        f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}"
+                    )
                 speed_arr[j] = float(s)
         elif joint >= 0:
             if joint >= NUM_JOINTS:
@@ -945,9 +955,7 @@ class AsyncRobotClient(_RobotClientABC):
             [float(p) for p in tool_positions] if tool_positions is not None else None
         )
         core = await self._ensure_core()
-        return await self._call(
-            core.teleport(_f6(angles_deg, "angles_deg"), positions)
-        )
+        return await self._call(core.teleport(_f6(angles_deg, "angles_deg"), positions))
 
     async def reset_loop_stats(self) -> int:
         """Reset control-loop min/max metrics and overrun count (unacked).
@@ -987,22 +995,6 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         return await self._call(core.estop())
-
-    async def safety_stop(self) -> int:
-        """Drop every joint limp and hold there.
-
-        The safest state the arm has. Unlike :meth:`estop`, which holds
-        position under power, this removes drive authority — so a trapped
-        person or a jammed joint can be freed by hand. The arm stays limp
-        until a mode change takes it out.
-
-        Category: Control
-
-        Example:
-            rbt.safety_stop()
-        """
-        core = await self._ensure_core()
-        return await self._call(core.safety_stop())
 
     async def set_gravity_comp(self, on: bool) -> int:
         """Apply (or stop applying) the gravity-compensation feedforward.
@@ -1634,7 +1626,12 @@ class AsyncRobotClient(_RobotClientABC):
 
         def _shape(w: dict) -> Shape:
             return shape_from_wire(
-                w["kind"], w["params"], w["pose"], w["collision"], w["margin"], w["name"]
+                w["kind"],
+                w["params"],
+                w["pose"],
+                w["collision"],
+                w["margin"],
+                w["name"],
             )
 
         return ShapeWorld(
