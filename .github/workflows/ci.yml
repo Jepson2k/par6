@@ -229,22 +229,29 @@ jobs:
           key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
       - name: build shim (scripts/ffi/setup.sh)
         run: scripts/ffi/setup.sh
-      - name: install
+      # waldoctl branch-matching must happen BEFORE the package install:
+      # a cross-repo change lands on a branch of the same name first
+      # (CLAUDE.md's dev workflow), and while the release chain is in
+      # flight the pinned tag may not exist yet — a dead pin fails the
+      # whole resolve. The pin is rewritten for this resolve only.
+      - name: install (waldoctl branch-matched)
         run: |
           source .ffi/env.sh
-          pip install -e "python[dev]"
-      # waldoctl is pinned to a tag, but a cross-repo change lands on a
-      # branch of the same name first (CLAUDE.md's dev workflow), and the
-      # type gate below is what notices when the two sides disagree.
-      - name: use a matching waldoctl branch, if one exists
-        run: |
           branch="${{ github.head_ref || github.ref_name }}"
           repo=https://github.com/Jepson2k/waldoctl.git
-          if git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+          matched=""
+          if [ "$branch" != "main" ] && \
+             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
             echo "installing waldoctl from branch $branch"
-            pip install --force-reinstall --no-deps "waldoctl @ git+$repo@$branch"
+            matched=1
+            pip install "waldoctl @ git+$repo@$branch"
+            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
           else
             echo "no waldoctl branch $branch; keeping the pinned tag"
+          fi
+          pip install -e "python[dev]"
+          if [ -n "$matched" ]; then
+            mv python/pyproject.toml.bak python/pyproject.toml
           fi
       - name: pre-commit (ruff, ruff-format, ty, file hygiene)
         run: pre-commit run --show-diff-on-failure --color=always --all-files
@@ -291,10 +298,24 @@ jobs:
         run: |
           source .ffi/env.sh
           cargo build -p par6d --release
-      - name: install python client
+      # Same branch-matching as the python job: the pinned waldoctl tag
+      # may not exist while the release chain is in flight.
+      - name: install python client (waldoctl branch-matched)
         run: |
           source .ffi/env.sh
+          branch="${{ github.head_ref || github.ref_name }}"
+          repo=https://github.com/Jepson2k/waldoctl.git
+          matched=""
+          if [ "$branch" != "main" ] && \
+             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+            matched=1
+            pip install "waldoctl @ git+$repo@$branch"
+            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
+          fi
           pip install -e "python[dev]"
+          if [ -n "$matched" ]; then
+            mv python/pyproject.toml.bak python/pyproject.toml
+          fi
       - name: pytest -m e2e
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
