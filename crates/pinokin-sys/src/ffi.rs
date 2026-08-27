@@ -98,6 +98,28 @@ extern "C" {
 
     pub fn par6_kin_gravity(h: *mut par6_kin, q: *const f64, out_tau: *mut f64) -> par6_status;
 
+    /// RNEA with real velocity and acceleration: the torque that produces
+    /// `a` at `q` with `v`. Gravity is included, so zero `v`/`a` reduces
+    /// exactly to [`par6_kin_gravity`].
+    pub fn par6_kin_inverse_dynamics(
+        h: *mut par6_kin,
+        q: *const f64,
+        v: *const f64,
+        a: *const f64,
+        out_tau: *mut f64,
+    ) -> par6_status;
+
+    /// DLS IK that refuses a step which would increase the residual.
+    pub fn par6_kin_ik_solve(
+        h: *mut par6_kin,
+        q_seed: *const f64,
+        target_pose16: *const f64,
+        out_q: *mut f64,
+        max_iters: i32,
+        tol: f64,
+        damping: f64,
+    ) -> i32;
+
     pub fn par6_kin_aba(
         h: *mut par6_kin,
         q: *const f64,
@@ -223,6 +245,17 @@ extern "C" {
         h: *mut par6_col,
         q: *const f64,
         out_distance: *mut f64,
+    ) -> par6_status;
+
+    /// Replace the runtime payload attached at the end-effector frame
+    /// (reversible: each call restores the create-time parent-joint
+    /// inertia before appending). `mass <= 0` clears; `inertia6` may be
+    /// null for a point mass. Collision geometry is unchanged.
+    pub fn par6_kin_set_tool(
+        h: *mut par6_kin,
+        mass: f64,
+        com3: *const f64,
+        inertia6: *const f64,
     ) -> par6_status;
 
     pub fn par6_shim_abi_version() -> i32;

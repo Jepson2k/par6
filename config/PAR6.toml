@@ -511,6 +511,8 @@ status_port = 6002
 status_multicast_group = "239.255.0.71"
 telemetry_port = 6003
 status_rate_hz = 50 # must divide the 250 Hz tick rate
+telemetry_rate_hz = 100
+# initial_recipe = "standard" # omitted = telemetry silent until set_recipe
 
 # ============================================================ digital I/O lines
 # The control box's general-purpose lines, by BCM offset on the 40-pin header.
@@ -549,12 +551,30 @@ control_mode = "pid"
 
 [stream]
 command_timeout_s = 0.04
-stopping_hold_s = 0.5
-start_pose_tol_rad = 0.1
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4 # 100 ticks @ 250 Hz
-success_warn = 0.95
-success_bad = 0.9
+
+[motion]
+# The runtime's motion "feel": sampling pitch, solver damping, jog
+# full-scale rates, completion settling. The offline preview reads this
+# same file, so a tuned deployment previews the way it runs.
+jog_l_linear_max_m_s = 0.08
+jog_l_angular_max_rad_s = 0.6
+cart_step_m = 0.005
+cart_step_rad = 0.05
+move_l_max_joint_step_rad = 0.35
+dls_lambda = 0.05
+settle_tolerance_rad = 0.01
+settle_timeout_s = 2.0
+
+[limits]
+# External-torque envelope: hard fault when a joint's external-torque
+# estimate (measured minus the gravity model, minus the active motion's
+# feed-forward) stays beyond the margin for the window. 0 disables —
+# the shipped default, because the estimate is only as good as the
+# torque constants and the gravity model; calibrate before opting in.
+tau_ext_margin_nm = 0.0
+tau_ext_window_s = 0.1
 
 # ============================================= installation keep-outs (issue #19)
 # Standing collision restrictions of THIS installation — cage walls, the

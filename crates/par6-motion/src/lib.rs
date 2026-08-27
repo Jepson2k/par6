@@ -16,8 +16,6 @@
 //!   by Bézier blend zones (`move_p`, and blend-radius chains).
 //! - [`JogEngine`]: per-joint velocity ramps (trapezoid / s-curve) with
 //!   jerk-aware soft-limit lookahead and direction-block latching.
-//! - [`CompletionMonitor`]: commanded / settled / strict completion
-//!   policies as controller-side state machines.
 //! - [`StreamingExecutor`]: rsruckig online target tracker for
 //!   servo-style streaming targets, stepped at tick rate.
 //!
@@ -32,12 +30,10 @@
 //! produce the same tick-rate sample streams under the same ring
 //! metadata contract.
 //!
-//! Generation is planner-side and may allocate; only [`JogEngine::tick`],
-//! [`CompletionMonitor::tick`], and [`StreamingExecutor::step`] are meant
-//! for the RT thread.
+//! Generation is planner-side and may allocate; only [`JogEngine::tick`]
+//! and [`StreamingExecutor::step`] are meant for the RT thread.
 
 pub mod cart;
-mod completion;
 mod error;
 mod jog;
 mod limits;
@@ -46,7 +42,6 @@ mod plan;
 mod sample;
 mod stream;
 
-pub use completion::{CompletionEvent, CompletionMonitor, CompletionPolicy, SettleParams};
 pub use error::MotionError;
 pub use jog::{JogDirection, JogEngine, JogTick, MIN_ACCEL_TIME_S, MIN_JERK_FACTOR};
 pub use limits::MotionLimits;

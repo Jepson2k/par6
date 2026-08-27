@@ -2,6 +2,7 @@
 # Values transcribed from vendor grippers/SSG48.xml.
 
 name = "SSG48"
+urdf_variant = "ssg48"
 
 [driver]
 driver_type = "spectral-bldc"
@@ -45,8 +46,3 @@ alpha_rad = 3.141592653589793
 mass_kg = 0.41484
 com_m = [1e-5, -0.00012, -0.03721]
 inertia_kg_m2 = [3.2619e-4, 2.2519e-4, 2.8541e-4, -3.917e-7, -1.2089e-6, -2.998e-7]
-motor_inertia_kg_m2 = 1.5e-6
-gear_ratio = 10.0
-viscous_friction = 1e-4
-coulomb_friction_nm = [0.02, -0.02]
-qlim_deg = [-160.0, 160.0]

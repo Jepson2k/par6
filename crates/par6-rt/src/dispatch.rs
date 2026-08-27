@@ -177,14 +177,68 @@ impl Default for CommandMirror {
     }
 }
 
+/// Per-joint commanded-torque slew state.
+///
+/// `max_step` is the configured `torque_rate_nm_s` converted to a per-tick
+/// budget; a joint whose config declares no rate gets `INFINITY` and is
+/// therefore never limited.
+///
+/// `applied` is the torque actually commanded last tick. Rate-limiting
+/// against it is what turns a mode change into a ramp instead of a step —
+/// `SafetyStop → Idle` otherwise restores the whole of `G(q)` in one tick,
+/// several Nm at the shoulder.
+#[derive(Debug, Clone, Copy)]
+pub struct TorqueSlew {
+    applied: [f64; MAX_JOINTS],
+    max_step: [f64; MAX_JOINTS],
+}
+
+impl TorqueSlew {
+    /// Build from each joint's per-tick budget (`torque_rate_nm_s * dt`);
+    /// pass `f64::INFINITY` for a joint that declares no rate.
+    pub fn new(max_step: [f64; MAX_JOINTS]) -> Self {
+        Self {
+            applied: [0.0; MAX_JOINTS],
+            max_step,
+        }
+    }
+
+    /// The torque commanded on the previous tick, per joint.
+    pub fn applied(&self) -> &[f64; MAX_JOINTS] {
+        &self.applied
+    }
+
+    /// Rate-limit `want` toward the previous command and record the result.
+    fn step(&mut self, i: usize, want: f64) -> f64 {
+        let prev = self.applied[i];
+        let out = (want - prev).clamp(-self.max_step[i], self.max_step[i]) + prev;
+        self.applied[i] = out;
+        out
+    }
+
+    /// Adopt `want` unchanged, so a later rate-limited tick ramps from
+    /// what the drive was actually told rather than from a stale value.
+    fn snap(&mut self, i: usize, want: f64) -> f64 {
+        self.applied[i] = want;
+        want
+    }
+}
+
 /// Convert joint-space setpoints to wire commands: motor ticks via each
 /// joint's [`JointConversion`], torque→mA via the precomputed factor with
 /// truncation toward zero (vendor `int()`), i16 saturation on current.
 /// Fills the record-sent mirror alongside.
+///
+/// `rate_limit` must be FALSE for the protective laws (ACTIVE_ERROR,
+/// SAFETY_STOP): dropping drive authority is the one thing that may never
+/// be slowed down. Those ticks snap the slew state instead, so the mode
+/// they hand back to ramps from the torque the drive really holds.
 pub fn commit(
     setpoints: &[JointSetpoint; MAX_JOINTS],
     conv: &[JointConversion; MAX_JOINTS],
     torque_ma_factor: &[f64; MAX_JOINTS],
+    slew: &mut TorqueSlew,
+    rate_limit: bool,
     cmds: &mut [JointCommand; MAX_JOINTS],
     mirror: &mut CommandMirror,
 ) {
@@ -194,7 +248,18 @@ pub fn commit(
         let vel = sp
             .vel_rad_s
             .map(|v| trunc_to_wire(conv[i].motor_speed_ticks_s(v)));
-        let cur = sp.torque_nm.map(|t| {
+        // A joint with no torque channel this tick commands no current, so
+        // the slew has to follow it to zero or the next torque tick would
+        // ramp from a value the drive never held.
+        let torque_nm = match sp.torque_nm {
+            Some(t) if rate_limit => Some(slew.step(i, t)),
+            Some(t) => Some(slew.snap(i, t)),
+            None => {
+                slew.snap(i, 0.0);
+                None
+            }
+        };
+        let cur = torque_nm.map(|t| {
             trunc_to_wire(t * torque_ma_factor[i]).clamp(i32::from(i16::MIN), i32::from(i16::MAX))
                 as i16
         });
@@ -206,6 +271,8 @@ pub fn commit(
         };
         mirror.q[i] = sp.pos_rad.unwrap_or(f64::NAN);
         mirror.qd[i] = sp.vel_rad_s.unwrap_or(f64::NAN);
-        mirror.tau[i] = sp.torque_nm.unwrap_or(0.0);
+        // The rate-limited value, not the requested one — the mirror is
+        // what was actually sent.
+        mirror.tau[i] = torque_nm.unwrap_or(0.0);
     }
 }

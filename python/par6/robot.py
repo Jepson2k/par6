@@ -14,10 +14,8 @@ import atexit
 import logging
 import math
 import os
-import random
 import re
 import shutil
-import socket
 import subprocess
 import tempfile
 import threading
@@ -44,11 +42,11 @@ from waldoctl import (
 from waldoctl.results import IKResult
 
 from par6 import config as _cfg
+from par6._par6 import ping_blocking
 from par6.client.async_client import AsyncRobotClient
 from par6.client.dry_run_client import DryRunRobotClient
+from par6.client.errors import RobotError
 from par6.client.sync_client import RobotClient as SyncRobotClient
-from par6.protocol.constants import CmdType, MsgType
-from par6.protocol.wire import ProtocolError, decode_reply, encode_command
 from par6.tools import build_tools
 
 logger = logging.getLogger(__name__)
@@ -152,16 +150,7 @@ def _unlink_quietly(path: str) -> None:
 
 def _ping_runtime(host: str, port: int, timeout: float = 0.5) -> bool:
     """True when a par6d runtime answers a protocol-v2 PING at host:port."""
-    req_id = random.randrange(1, 1 << 32)
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(timeout)
-            sock.sendto(encode_command(CmdType.PING, req_id, []), (host, port))
-            data, _ = sock.recvfrom(4096)
-        msg_type, reply_id, _payload = decode_reply(data)
-        return msg_type is MsgType.RESPONSE and reply_id == req_id
-    except (OSError, TimeoutError, ProtocolError):
-        return False
+    return ping_blocking(host, port, timeout)
 
 
 def _find_par6d() -> str:
@@ -553,6 +542,20 @@ class Robot(_RobotABC):
     def digital_inputs(self) -> int:
         return len(_cfg.io_line_names()[0])
 
+    @property
+    def has_force_torque(self) -> bool:
+        """Joint torques are measured every tick (motor currents through
+        the torque constants), and the external-torque estimate rides the
+        status broadcast."""
+        return True
+
+    @property
+    def has_freedrive(self) -> bool:
+        """par6 back-drives through the gravity feedforward rather than a
+        dedicated mode: IDLE with G(q) applied is a torque-only hold with no
+        position term, so the arm floats."""
+        return True
+
     # -- Visualization ------------------------------------------------------
 
     @property
@@ -652,7 +655,9 @@ class Robot(_RobotABC):
         if key not in self._grippers:
             origin, rpy = self._plugin_tool_tcp(key, variant_key)
             T_tool = np.zeros((4, 4), dtype=np.float64)
-            se3_from_rpy(origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool)
+            se3_from_rpy(
+                origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool
+            )
 
         if tcp_offset_m is not None and any(v != 0 for v in tcp_offset_m):
             T_offset = np.eye(4)
@@ -975,9 +980,42 @@ class Robot(_RobotABC):
         """Offline preview client — the command stream without a runtime.
 
         Keyword args: ``initial_joints_deg`` (defaults to home),
-        ``initial_homed``, ``max_snapshot_points``.
+        ``initial_homed``, ``max_snapshot_points``, ``config_path``.
+
+        When a runtime answers at the target address its config is
+        fetched and the preview runs the daemon's numbers; otherwise the
+        local resolution (``PAR6_CONFIG``, then the repo checkout)
+        applies.
         """
+        if kwargs.get("config_path") is None:
+            kwargs["config_path"] = self._daemon_config_path()
         return DryRunRobotClient(**kwargs)
+
+    def _daemon_config_path(self) -> str | None:
+        """The reachable daemon's config, materialized locally."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not _ping_runtime(self._host, self._port, timeout=0.5):
+            return None
+
+        def fetch() -> dict | None:
+            client = self.create_sync_client(timeout=2.0)
+            try:
+                return client.config_bundle()
+            finally:
+                client.close()
+
+        try:
+            # Own thread: the sync client refuses to run inside an event
+            # loop, and this factory is called from async hosts too.
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                bundle = ex.submit(fetch).result()
+            if not bundle:
+                return None
+            return str(_cfg.materialize_bundle(bundle))
+        except (OSError, ValueError, KeyError, RobotError) as e:
+            logger.debug("daemon config fetch failed; preview uses local config: %s", e)
+            return None
 
 
 __all__ = ["Par6IKResult", "Robot"]

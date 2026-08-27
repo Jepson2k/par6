@@ -50,7 +50,7 @@ fn sim_core() -> (
         gravity: Box::new(ZeroGravity),
         jog: Box::new(RampJog::new(robot)),
         stream: Box::new(ClampStream::new(robot)),
-        settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
+        settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
         estop: Box::new(gpio),
         io: Box::new(io),
         flash: Box::new(marker),

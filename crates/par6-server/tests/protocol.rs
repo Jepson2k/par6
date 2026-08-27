@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    JogJ, JogL, MoveJ, MoveS, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport, WriteIo,
+    JogJ, JogL, MoveJ, MoveS, SetPayload, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport,
+    WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -36,8 +37,9 @@ enum RtEvent {
     Stream(CmdType),
     CancelStream,
     Halt,
-    SafetyStop,
     SetGravityComp(bool),
+    SetPayload(f64),
+    ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
     WriteIo(u8, u8),
@@ -89,11 +91,15 @@ impl RtCommands for TestRt {
     fn halt(&mut self) {
         self.push(RtEvent::Halt);
     }
-    fn safety_stop(&mut self) {
-        self.push(RtEvent::SafetyStop);
-    }
     fn set_gravity_comp(&mut self, on: bool) {
         self.push(RtEvent::SetGravityComp(on));
+    }
+    fn set_payload(&mut self, payload: par6_server::PayloadSpec) {
+        self.push(RtEvent::SetPayload(payload.mass));
+    }
+
+    fn set_exec_paused(&mut self, paused: bool) {
+        self.push(RtEvent::ExecPaused(paused));
     }
     fn set_enabled(&mut self, enabled: bool) {
         self.push(RtEvent::SetEnabled(enabled));
@@ -468,7 +474,19 @@ async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
         .await
         .expect("telemetry within budget")
         .expect("recv");
-    rmp_serde::from_slice(&buf[..n]).expect("minimal recipe layout: [name, seq, mono_ns, tick, q]")
+    let frame = par6_proto::decode_telemetry(&buf[..n]).expect("decodable telemetry");
+    let [par6_proto::TelemetryValue::U64(tick), par6_proto::TelemetryValue::Arr(q)] =
+        frame.values.as_slice()
+    else {
+        panic!("minimal recipe layout: [name, seq, mono_ns, tick, q]");
+    };
+    (
+        frame.recipe,
+        frame.seq,
+        frame.mono_time_ns,
+        *tick,
+        q.clone(),
+    )
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only
@@ -2222,31 +2240,6 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     );
 }
 
-/// The arm's fully-limp state, reachable from the wire.
-///
-/// The RT has had the control law (`law_safety_stop` fills every joint
-/// with torque-only zero) and an unconditional transition into it since
-/// the core was written — but no command tag reached it, so an operator
-/// who needed the arm limp to free a trapped person or a jammed joint had
-/// nothing to send. Unlike the protective stop, which holds position under
-/// power, this drops drive authority.
-#[tokio::test]
-async fn safety_stop_is_reachable_and_halts_motion() {
-    let mut h = start(|_| {}).await;
-    h.publish(|_| {});
-    let mut c = Client::new(&h).await;
-
-    assert!(
-        matches!(c.request(&Command::SafetyStop).await, Reply::Ok { .. }),
-        "SAFETY_STOP must be acked as a SYSTEM command"
-    );
-    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::SafetyStop)).await;
-    assert!(
-        ev.contains(&RtEvent::Halt),
-        "going limp must halt motion first: {ev:?}"
-    );
-}
-
 /// The gravity-comp feedforward is switchable from the wire.
 ///
 /// `SetGravityComp` existed as an internal RT command with no client-facing
@@ -2271,5 +2264,108 @@ async fn gravity_compensation_can_be_switched_from_the_wire() {
         );
         h.wait_rt(|ev| ev.contains(&RtEvent::SetGravityComp(on)))
             .await;
+    }
+}
+
+/// PAUSE reaches the RT, and is accepted where planned motion is refused.
+///
+/// The RT half shipped complete and untouched: `ExecSetPaused` holds the
+/// playback position with the sample ring INTACT (unlike a flush, which
+/// clears it), and `ExecStatus.paused` was already published. There was
+/// simply no wire command, so an operator holding a running program could
+/// only flush it and re-issue.
+///
+/// The second half of this asserts the gating decision rather than leaving
+/// it to `gate()`'s `_` arm: pausing is deliberately ungated, so it is
+/// acked in a state where a move is refused. Holding a moving arm must not
+/// depend on the controller being enabled.
+#[tokio::test]
+async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    for on in [true, false] {
+        assert!(
+            matches!(
+                c.request(&Command::Pause(par6_proto::command::Pause { on }))
+                    .await,
+                Reply::Ok { .. }
+            ),
+            "PAUSE({on}) must be acked"
+        );
+        h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
+    }
+}
+
+/// SET_PAYLOAD: a valid payload reaches the RT and the planner sync, and
+/// the PAYLOAD query reads back what was set; invalid inertia and
+/// negative mass are refused at the wire and leave the readback
+/// untouched.
+#[tokio::test]
+async fn set_payload_applies_reads_back_and_refuses_garbage() {
+    let h = start(|_| {}).await;
+    let mut c = Client::new(&h).await;
+
+    // Nothing set: the readback is all zeros.
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, com, inertia },
+            ..
+        } => {
+            assert_eq!(mass, 0.0);
+            assert_eq!(com, [0.0; 3]);
+            assert_eq!(inertia, [0.0; 6]);
+        }
+        other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+
+    let set = Command::SetPayload(SetPayload {
+        mass: 1.25,
+        com: [0.0, 0.01, 0.055],
+        inertia: Some([0.002, 0.0, 0.003, 0.0, 0.0, 0.004]),
+    });
+    match c.request(&set).await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    assert!(
+        h.rt_events().contains(&RtEvent::SetPayload(1.25)),
+        "the payload must reach the RT gravity model"
+    );
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, com, inertia },
+            ..
+        } => {
+            assert_eq!(mass, 1.25);
+            assert_eq!(com, [0.0, 0.01, 0.055]);
+            assert_eq!(inertia, [0.002, 0.0, 0.003, 0.0, 0.0, 0.004]);
+        }
+        other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+
+    // Refusals (negative mass, indefinite inertia) are decode-side —
+    // the malformed_payload_* golden vectors pin them, and encode_command
+    // refuses the same inputs client-side before a byte leaves.
+
+    // Clearing is mass 0.
+    match c
+        .request(&Command::SetPayload(SetPayload {
+            mass: 0.0,
+            com: [0.0; 3],
+            inertia: None,
+        }))
+        .await
+    {
+        Reply::Ok { .. } => {}
+        other => panic!("expected OK, got {other:?}"),
+    }
+    match c.request(&Command::Payload).await {
+        Reply::Response {
+            result: QueryResult::Payload { mass, .. },
+            ..
+        } => assert_eq!(mass, 0.0),
+        other => panic!("expected PAYLOAD response, got {other:?}"),
     }
 }

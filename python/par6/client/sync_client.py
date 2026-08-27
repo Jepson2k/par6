@@ -133,8 +133,7 @@ class RobotClient:
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
         self._bound_tools: dict[str, ToolSpec] = {
-            key: _sync_tool(tool)
-            for key, tool in self._inner._bound_tools.items()
+            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
         }
 
     # ---------- lifecycle ----------
@@ -168,8 +167,7 @@ class RobotClient:
         """Bind tool specs; actions run through this facade's background loop."""
         self._inner.bind_tools(specs)
         self._bound_tools = {
-            key: _sync_tool(tool)
-            for key, tool in self._inner._bound_tools.items()
+            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
         }
 
     @property
@@ -396,6 +394,43 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
+    def pause(self) -> int:
+        """Hold the executing trajectory; the queue survives."""
+        return _run(self._inner.pause())
+
+    def resume(self) -> int:
+        """Continue a trajectory held by :meth:`pause`."""
+        return _run(self._inner.resume())
+
+    def freedrive(self, enabled: bool) -> int:
+        """Enter or leave freedrive: IDLE under G(q) with no position hold."""
+        return _run(self._inner.freedrive(enabled))
+
+    def is_freedrive(self, timeout: float = 1.0) -> bool:
+        """Whether the arm is floating right now, read from the broadcast."""
+        return _run(self._inner.is_freedrive(timeout=timeout))
+
+    def set_payload(
+        self,
+        mass: float,
+        com: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        inertia: tuple[float, float, float, float, float, float] | None = None,
+    ) -> int:
+        """Declare the payload the arm is carrying at the TCP."""
+        return _run(self._inner.set_payload(mass, com, inertia))
+
+    def payload(self) -> dict | None:
+        """The effective runtime payload (zeros = none)."""
+        return _run(self._inner.payload())
+
+    def set_gravity_comp(self, on: bool) -> int:
+        """Apply (or stop applying) the gravity-compensation feedforward.
+
+        With it on in IDLE the arm floats under G(q) alone with no position
+        hold, which is what makes hand-guiding reachable.
+        """
+        return _run(self._inner.set_gravity_comp(on))
+
     def reset(self) -> int:
         """Clear a latched protective stop."""
         return _run(self._inner.reset())
@@ -451,7 +486,9 @@ class RobotClient:
     ) -> int:
         """Invoke a tool-specific action by key (blocking by default)."""
         return _run(
-            self._inner.tool_action(tool_key, action, params, wait=wait, timeout=timeout)
+            self._inner.tool_action(
+                tool_key, action, params, wait=wait, timeout=timeout
+            )
         )
 
     def checkpoint(self, label: str) -> int:
@@ -547,6 +584,16 @@ class RobotClient:
     def shapes(self) -> ShapeWorld | None:
         """The collision world the runtime is enforcing, by layer."""
         return _run(self._inner.shapes())
+
+    def config_info(self) -> dict | None:
+        """The runtime's effective configuration (path, fingerprint,
+        limits, motion constants)."""
+        return _run(self._inner.config_info())
+
+    def config_bundle(self) -> dict | None:
+        """The config files the runtime loaded, verbatim (robot +
+        gripper TOMLs) — see ``AsyncRobotClient.config_bundle``."""
+        return _run(self._inner.config_bundle())
 
     def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""

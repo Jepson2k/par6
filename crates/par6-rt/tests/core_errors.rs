@@ -487,3 +487,126 @@ fn a_setpoint_left_unconsumed_does_not_leak_into_the_next_stream_session() {
         s.q_target[0]
     );
 }
+
+/// A node that goes quiet gets ONE config resend to provoke recovery —
+/// through the poll slot, while it is still silent (the stale→fresh edge
+/// resend only helps a node that already came back on its own). The shot
+/// re-arms only on an actual recovery, so a truly disconnected node costs
+/// one frame per silence episode, not one per tick.
+#[test]
+fn a_stale_node_gets_one_self_heal_resend_per_episode() {
+    let mut rig = Rig::new();
+    rig.ready();
+    let stale_ticks = 10u32;
+    let config_passes = |rig: &mut Rig| {
+        rig.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
+            .count()
+    };
+
+    rig.clear_tx();
+    rig.skip_nodes = 1 << 3;
+    rig.tick_n(stale_ticks + 2);
+    assert!(has_error(&mut rig, ErrorCode::CanStale, Some(3)));
+    assert_eq!(
+        config_passes(&mut rig),
+        1,
+        "going stale fires exactly one config resend while still silent"
+    );
+
+    // Still silent: no second shot while the episode lasts. (Bounded
+    // below the lost threshold: crossing it aborts homing, whose restore
+    // pass resends configs of its own.)
+    rig.tick_n(20);
+    assert_eq!(config_passes(&mut rig), 1, "the one-shot must not repeat");
+
+    // Recovery re-arms; the NEXT silence episode fires again. The
+    // stale→fresh edge resend also fires here, so count from a clean log.
+    rig.skip_nodes = 0;
+    rig.tick_n(8);
+    assert!(
+        !has_error(&mut rig, ErrorCode::CanStale, Some(3)),
+        "recovered before the second episode starts"
+    );
+    rig.clear_tx();
+    rig.skip_nodes = 1 << 3;
+    rig.tick_n(stale_ticks + 2);
+    assert_eq!(
+        config_passes(&mut rig),
+        1,
+        "a new silence episode gets a new shot"
+    );
+}
+
+#[test]
+fn torque_envelope_latches_only_when_configured_and_sustained() {
+    use par6_bus::spectral::convert::torque_to_ma_factor;
+    use par6_rt::CompletionPolicy;
+
+    // ~10 Nm of "external" torque on J2: ZeroGravity makes the whole
+    // measured torque external, so the injected current maps straight to
+    // tau_ext through the config torque factor.
+    let inject_ma = |b: &par6_config::ConfigBundle| {
+        let j = &b.robot.joints[2];
+        (10.0 * torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir)) as i16
+    };
+
+    // Shipped default: margin 0 disables the envelope. The same sustained
+    // torque that latches below must do nothing here.
+    let mut rig = Rig::new();
+    rig.ready();
+    rig.current_ma[2] = inject_ma(&common::bundle());
+    rig.tick_n(100);
+    let s = rig.snap();
+    assert!(
+        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
+        "margin 0 must disable the envelope"
+    );
+    assert!(!s.error_active);
+
+    // Margin configured: 2 Nm over a 0.1 s window (25 ticks at 4 ms).
+    let mut b = common::bundle();
+    b.robot.limits.tau_ext_margin_nm = 2.0;
+    b.robot.limits.tau_ext_window_s = 0.1;
+    let window_ticks = (0.1_f64 / b.robot.robot.tick_dt_s).round() as u32;
+    let cur = inject_ma(&b);
+    let mut rig = Rig::build_bundle(
+        b,
+        CompletionPolicy::Settled,
+        Box::new(par6_rt::ZeroGravity),
+        true,
+    );
+    rig.ready();
+
+    // A transient shorter than the window stays green: the counter never
+    // reaches the window before the load disappears and resets it.
+    rig.current_ma[2] = cur;
+    rig.tick_n(window_ticks / 2);
+    assert!(
+        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
+        "a transient inside the window must not latch"
+    );
+    rig.current_ma[2] = 0;
+    rig.tick_n(60); // filter decays, counter resets
+    assert!(
+        !has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
+        "a released transient must never latch"
+    );
+    assert!(!rig.snap().error_active);
+
+    // Sustained past the window: hard latch on the joint, controller
+    // DISABLED, ACTIVE_ERROR reaction — the full hard-fault path.
+    rig.current_ma[2] = cur;
+    rig.tick_n(window_ticks + 20);
+    let s = rig.snap();
+    assert!(
+        has_error(&mut rig, ErrorCode::TorqueEnvelope, Some(2)),
+        "sustained over-margin torque must latch"
+    );
+    assert!(s.error_active);
+    assert_eq!(s.state, ArmState::Disabled);
+    assert_eq!(s.mode, Mode::ActiveError);
+}

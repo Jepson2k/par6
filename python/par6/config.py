@@ -30,6 +30,50 @@ from waldoctl import (
 MIN_JOG_ACCEL_TIME_S = 0.05
 
 
+def materialize_bundle(bundle: dict) -> Path:
+    """Write a CONFIG_BUNDLE query result to a local cache directory and
+    return the robot TOML's path — the config the preview engine should
+    load so previews run exactly the daemon's numbers.
+
+    The directory is keyed by the bundle's content fingerprint, so a
+    re-fetch of unchanged config is a no-op and a tuned daemon lands in a
+    fresh directory.  Writes go to a temp dir first and are renamed into
+    place, so a concurrent materialization of the same fingerprint cannot
+    be observed half-written.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    fingerprint = str(bundle["fingerprint"])
+    robot_filename = str(bundle["robot_filename"])
+    if not fingerprint or not robot_filename:
+        raise ValueError("config bundle has no fingerprint/robot file")
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    target = cache_root / "par6" / "daemon-config" / fingerprint
+    robot_path = target / robot_filename
+    if robot_path.is_file():
+        return robot_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=target.parent, prefix=".materialize-"))
+    try:
+        (tmp / robot_filename).write_text(str(bundle["robot_toml"]))
+        (tmp / "grippers").mkdir()
+        for g in bundle.get("grippers", []):
+            name = Path(str(g["filename"])).name
+            (tmp / "grippers" / name).write_text(str(g["content"]))
+        try:
+            tmp.rename(target)
+        except OSError:
+            # A concurrent materialization of the same fingerprint won the
+            # rename; its content is byte-identical by construction.
+            if not robot_path.is_file():
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return robot_path
+
+
 def data_root() -> Path:
     """Absolute path of the packaged ``par6/_data`` directory."""
     return Path(str(pkg_files("par6") / "_data")).resolve()
@@ -244,7 +288,9 @@ def jog_ramp_acceleration() -> np.ndarray:
     """
     config = load_robot_config()
     jog = config.get("jog", {})
-    accel_time_s = max(float(jog.get("accel_time_s", MIN_JOG_ACCEL_TIME_S)), MIN_JOG_ACCEL_TIME_S)
+    accel_time_s = max(
+        float(jog.get("accel_time_s", MIN_JOG_ACCEL_TIME_S)), MIN_JOG_ACCEL_TIME_S
+    )
     resolved = [resolve_mode_limits(j["limits"], "jog") for j in config["joints"]]
     return np.array(
         [min(vel / accel_time_s, acc) for vel, acc, _ in resolved], dtype=np.float64
@@ -304,7 +350,12 @@ def _rotation(rpy: str | None) -> np.ndarray:
         return np.eye(3)
     r, p, y = (float(v) for v in rpy.split())
     cr, sr, cp, sp, cy, sy = (
-        np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+        np.cos(r),
+        np.sin(r),
+        np.cos(p),
+        np.sin(p),
+        np.cos(y),
+        np.sin(y),
     )
     return (
         np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
@@ -322,12 +373,18 @@ def _rpy_xyz(R: np.ndarray) -> tuple[float, float, float]:
     """
     pitch = float(np.arcsin(np.clip(R[0, 2], -1.0, 1.0)))
     if abs(R[0, 2]) < 1.0 - 1e-12:
-        return float(np.arctan2(-R[1, 2], R[2, 2])), pitch, float(np.arctan2(-R[0, 1], R[0, 0]))
+        return (
+            float(np.arctan2(-R[1, 2], R[2, 2])),
+            pitch,
+            float(np.arctan2(-R[0, 1], R[0, 0])),
+        )
     return float(np.arctan2(R[2, 1], R[1, 1])), pitch, 0.0
 
 
 @cache
-def flange_to_tcp(tool_key: str) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
+def flange_to_tcp(
+    tool_key: str,
+) -> tuple[tuple[float, float, float], tuple[float, float, float]]:
     """Flange->TCP of *tool_key*'s URDF tree as ``(origin_m, rpy_rad)``.
 
     The ONE definition of a native tool's tool center point: the ``tcp`` link
@@ -360,8 +417,10 @@ def flange_to_tcp(tool_key: str) -> tuple[tuple[float, float, float], tuple[floa
     link = TCP_LINK
     while link in fixed:
         origin = fixed[link].find("origin")
-        xyz = np.zeros(3) if origin is None else np.array(
-            [float(v) for v in str(origin.get("xyz", "0 0 0")).split()]
+        xyz = (
+            np.zeros(3)
+            if origin is None
+            else np.array([float(v) for v in str(origin.get("xyz", "0 0 0")).split()])
         )
         R_j = _rotation(None if origin is None else origin.get("rpy"))
         t = xyz + R_j @ t

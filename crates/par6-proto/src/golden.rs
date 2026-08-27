@@ -4,7 +4,7 @@
 //! plus its manifest entry. The manifest's `wire` arrays are produced by
 //! decoding the encoded bytes back to JSON, so manifest and bytes cannot
 //! drift; the Python tests re-encode `wire` with an independent packer
-//! (ormsgpack) and byte-compare against the Rust encoder's output.
+//! and byte-compare against the Rust encoder's output.
 //!
 //! Regenerate the committed files with
 //! `cargo run -p par6-proto --bin gen_golden`; `cargo test -p par6-proto`
@@ -16,10 +16,12 @@ use crate::chunk::{encode_chunk, split_into_chunks, Chunk};
 use crate::command::{
     encode_command, Checkpoint, Command, ConnectHardware, Delay, Home, JogJ, JogL, MoveC, MoveJ,
     MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ, ServoJPose,
-    ServoL, SetCompletionPolicy, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator, Stop,
-    Teleport, ToolAction, ToolParam, WriteIo,
+    ServoL, SetCompletionPolicy, SetPayload, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator,
+    Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
-use crate::enums::{command_class, ActionState, CompletionPolicy, Frame, ToolState};
+use crate::enums::{
+    command_class, ActionState, CompletionPolicy, ControllerMode, Frame, ToolState,
+};
 use crate::error::{make_error, ErrorCode, UNATTRIBUTED};
 use crate::pygen;
 use crate::reply::{encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
@@ -53,7 +55,7 @@ pub enum Check {
     MalformedCommand,
     /// `decode_reply` must fail.
     MalformedReply,
-    /// `decode_status` must fail (Python: `decode_status_bin_into` → False).
+    /// `decode_status` must fail.
     MalformedStatus,
 }
 
@@ -252,6 +254,11 @@ fn tool_status_json(ts: &ToolStatusWire) -> Value {
 }
 
 fn status_fields(s: &Status) -> Value {
+    let warnings: Vec<Value> = s.warnings.iter().map(error_json).collect();
+    let lh = &s.link_health;
+    let link_health = json!([lh.state, lh.restarts, lh.tx_errors, lh.rx_frames]);
+    let homing_joints: Vec<Vec<u8>> = s.homing.joints.iter().map(|(a, b)| vec![*a, *b]).collect();
+    let homing = json!([s.homing.active, s.homing.sequence_step, homing_joints]);
     json!({
         "proto_version": s.proto_version,
         "controller_id": s.controller_id,
@@ -260,6 +267,10 @@ fn status_fields(s: &Status) -> Value {
         "link_ok": s.link_ok,
         "data_age_ms": s.data_age_ms,
         "pose": s.pose.to_vec(),
+        "torques": s.torques.to_vec(),
+        "mode": s.mode as u8,
+        "enabled": s.enabled,
+        "gravity_comp": s.gravity_comp,
         "angles": s.angles.to_vec(),
         "speeds": s.speeds.to_vec(),
         "io": s.io.to_vec(),
@@ -283,6 +294,10 @@ fn status_fields(s: &Status) -> Value {
         "scene_epoch": s.scene_epoch,
         "accepted_index": s.accepted_index,
         "homed": s.homed,
+        "warnings": warnings,
+        "link_health": link_health,
+        "homing": homing,
+        "torques_ext": s.torques_ext.to_vec(),
     })
 }
 
@@ -377,6 +392,57 @@ fn status_full_fixture() -> Status {
         scene_epoch: 5,
         accepted_index: 14,
         homed: true,
+        // Non-default on every new field, so a decoder that silently
+        // defaults them cannot pass the cross-language vector.
+        torques: [0.75, -1.5, 0.25, -0.125, 0.0625, -0.03125],
+        mode: ControllerMode::Exec,
+        enabled: true,
+        gravity_comp: true,
+        warnings: vec![
+            make_error(ErrorCode::SysCanStale, UNATTRIBUTED, &[("joint", "2")]),
+            make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
+        ],
+        link_health: crate::status::LinkHealthWire {
+            state: crate::LinkState::ErrorPassive as u8,
+            restarts: 2,
+            tx_errors: 17,
+            rx_frames: 987_654,
+        },
+        homing: crate::status::HomingWire {
+            active: true,
+            sequence_step: 3,
+            joints: vec![
+                (
+                    crate::HomingJointState::Done as u8,
+                    crate::HomingPhase::Finished as u8,
+                ),
+                (
+                    crate::HomingJointState::Running as u8,
+                    crate::HomingPhase::Settle as u8,
+                ),
+                (
+                    crate::HomingJointState::Failed as u8,
+                    crate::HomingPhase::Approach as u8,
+                ),
+                (
+                    crate::HomingJointState::Idle as u8,
+                    crate::HomingPhase::Idle as u8,
+                ),
+                (
+                    crate::HomingJointState::Running as u8,
+                    crate::HomingPhase::Backoff as u8,
+                ),
+                (
+                    crate::HomingJointState::Done as u8,
+                    crate::HomingPhase::Finished as u8,
+                ),
+                (
+                    crate::HomingJointState::Idle as u8,
+                    crate::HomingPhase::Idle as u8,
+                ),
+            ],
+        },
+        torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
     }
 }
 
@@ -392,11 +458,15 @@ pub fn vectors() -> Vec<Vector> {
     // -- commands: SYSTEM --
     v.push(cmd_vec("cmd_reset", 1, Command::Reset));
     v.push(cmd_vec("cmd_estop", 2, Command::Estop));
-    v.push(cmd_vec("cmd_safety_stop", 2, Command::SafetyStop));
     v.push(cmd_vec(
         "cmd_set_gravity_comp",
         2,
         Command::SetGravityComp(crate::command::SetGravityComp { on: true }),
+    ));
+    v.push(cmd_vec(
+        "cmd_pause",
+        2,
+        Command::Pause(crate::command::Pause { on: true }),
     ));
     v.push(cmd_vec(
         "cmd_stop",
@@ -489,6 +559,27 @@ pub fn vectors() -> Vec<Vector> {
     v.push(cmd_vec("cmd_tool_status", 36, Command::ToolStatus));
     v.push(cmd_vec("cmd_is_simulator", 37, Command::IsSimulator));
     v.push(cmd_vec("cmd_shapes", 38, Command::Shapes));
+    v.push(cmd_vec("cmd_config_info", 39, Command::ConfigInfo));
+    v.push(cmd_vec(
+        "cmd_set_payload",
+        40,
+        Command::SetPayload(SetPayload {
+            mass: 1.25,
+            com: [0.0, 0.01, 0.055],
+            inertia: Some([0.002, 0.0, 0.003, 0.0001, 0.0, 0.004]),
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_set_payload_point",
+        41,
+        Command::SetPayload(SetPayload {
+            mass: 0.5,
+            com: [0.0, 0.0, 0.04],
+            inertia: None,
+        }),
+    ));
+    v.push(cmd_vec("cmd_payload", 42, Command::Payload));
+    v.push(cmd_vec("cmd_config_bundle", 43, Command::ConfigBundle));
 
     // -- commands: FIRE_AND_FORGET --
     v.push(cmd_vec(
@@ -862,6 +953,12 @@ pub fn vectors() -> Vec<Vector> {
                 p95_period_s: 0.0042,
                 p99_period_s: 0.0044,
                 mean_hz: 249.9,
+                p50_period_s: 0.0039,
+                p90_period_s: 0.0041,
+                can_frame_age_min_ticks: 1,
+                can_frame_age_max_ticks: 4,
+                rt_fifo: true,
+                rt_pinned: true,
             }),
         },
     ));
@@ -943,6 +1040,56 @@ pub fn vectors() -> Vec<Vector> {
                 installation: vec![shape_box()],
                 program: vec![shape_sphere()],
                 epoch: 3,
+            },
+        },
+    ));
+    v.push(reply_vec(
+        "response_config_info",
+        Reply::Response {
+            req_id: 119,
+            result: QueryResult::ConfigInfo {
+                path: "/etc/par6/PAR6.toml".to_owned(),
+                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_owned(),
+                tick_dt_s: 0.004,
+                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                joints: vec![
+                    [-2.15, 2.15, 3.0, 12.0],
+                    [-1.0, 1.9, 2.5, 10.0],
+                    [-1.8, 1.2, 2.5, 10.0],
+                    [-1.9, 1.9, 4.0, 16.0],
+                    [-2.0, 2.0, 4.0, 16.0],
+                    [-6.3, 6.3, 6.0, 20.0],
+                ],
+            },
+        },
+    ));
+    v.push(reply_vec(
+        "response_payload",
+        Reply::Response {
+            req_id: 120,
+            result: QueryResult::Payload {
+                mass: 1.25,
+                com: [0.0, 0.01, 0.055],
+                inertia: [0.002, 0.0, 0.003, 0.0001, 0.0, 0.004],
+            },
+        },
+    ));
+
+    v.push(reply_vec(
+        "response_config_bundle",
+        Reply::Response {
+            req_id: 121,
+            result: QueryResult::ConfigBundle {
+                path: "/etc/par6/PAR6.toml".to_owned(),
+                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_owned(),
+                robot_filename: "PAR6.toml".to_owned(),
+                robot_toml: "[robot]\nname = \"PAR6\"\ntick_hz = 250\n".to_owned(),
+                grippers: vec![
+                    ("SSG-48.toml".to_owned(), "name = \"SSG-48\"\n".to_owned()),
+                    ("SSG-66.toml".to_owned(), "name = \"SSG-66\"\n".to_owned()),
+                ],
             },
         },
     ));
@@ -1262,6 +1409,45 @@ fn malformed_vectors() -> Vec<Vector> {
         "malformed_status_bad_field",
         "status",
         "pose must be a float array",
+        b,
+    ));
+
+    // set_payload: negative mass
+    let mut b = Vec::new();
+    w_array(&mut b, 5);
+    w_uint(&mut b, 25);
+    w_uint(&mut b, 9);
+    w_f64(&mut b, -0.5);
+    w_array(&mut b, 3);
+    for _ in 0..3 {
+        w_f64(&mut b, 0.0);
+    }
+    w_nil(&mut b);
+    out.push(malformed_vec(
+        "malformed_payload_negative_mass",
+        "command",
+        "payload mass must be >= 0",
+        b,
+    ));
+
+    // set_payload: negative-definite inertia (fails the PSD check)
+    let mut b = Vec::new();
+    w_array(&mut b, 5);
+    w_uint(&mut b, 25);
+    w_uint(&mut b, 9);
+    w_f64(&mut b, 1.0);
+    w_array(&mut b, 3);
+    for _ in 0..3 {
+        w_f64(&mut b, 0.0);
+    }
+    w_array(&mut b, 6);
+    for v in [-1.0, 0.0, 1.0, 0.0, 0.0, 1.0] {
+        w_f64(&mut b, v);
+    }
+    out.push(malformed_vec(
+        "malformed_payload_indefinite_inertia",
+        "command",
+        "payload inertia must be positive semidefinite",
         b,
     ));
 

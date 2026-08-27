@@ -13,22 +13,20 @@ from __future__ import annotations
 
 import asyncio
 import math
-import socket
 import time
-from typing import Any
 
 import numpy as np
-import ormsgpack
 import pytest
 from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
 
 from par6 import config as _cfg
-from par6 import motion as _motion
+from par6._par6 import Preview as DryRunProfiles
 from par6.client import RobotError
 from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
 from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
+from par6.telemetry import TelemetryReader
 
 try:
     import pinokin
@@ -109,7 +107,9 @@ def _circle_through(
     a, b = p2 - p1, p3 - p1
     aa, bb, ab = a @ a, b @ b, a @ b
     det = aa * bb - ab * ab
-    centre = p1 + a * (bb * (aa - ab)) / (2.0 * det) + b * (aa * (bb - ab)) / (2.0 * det)
+    centre = (
+        p1 + a * (bb * (aa - ab)) / (2.0 * det) + b * (aa * (bb - ab)) / (2.0 * det)
+    )
     return centre, float(np.linalg.norm(centre - p1))
 
 
@@ -123,26 +123,42 @@ class TestPlannedMotion:
         """Each advertised profile must produce a plan the runtime's own limits
         admit: no tick may step a joint faster than its EXEC velocity ceiling
         (scaled by the requested speed), and every plan must land on the target.
-        A slower speed must take longer."""
-        limits = _motion.MotionLimits.from_config("exec")
-        dt = _motion.tick_dt_s()
+        A slower speed must take longer.
+
+        Driven through the dry-run client — the plan under test is the one
+        the runtime's own planner produces — with the config as the oracle.
+        """
+        config = _cfg.load_robot_config()
+        dt = float(config["robot"]["tick_dt_s"])
+        velocity = np.array(
+            [_cfg.resolve_mode_limits(j["limits"], "exec")[0] for j in config["joints"]]
+        )
         start = _cfg.homing_ready_pose_rad()
         target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
+        # Full-rate trajectories: the velocity check reads per-tick steps,
+        # which downsampling would smear across several ticks.
+        client = Robot().create_dry_run_client(
+            initial_joints_deg=np.degrees(start).tolist(),
+            max_snapshot_points=1_000_000,
+        )
 
-        for profile in _motion.PROFILES:
+        for profile in DryRunProfiles.profiles():
+            client.select_profile(profile)
             durations: list[float] = []
             for speed in (1.0, 0.25):
-                path = _motion.plan_joint_move(
-                    start, target, limits, dt, profile=profile, speed_fraction=speed
-                )
+                client.teleport(np.degrees(start).tolist())
+                planned = client.move_j(np.degrees(target).tolist(), speed=speed)
+                assert planned is not None
+                path = planned.joint_trajectory_rad
+                assert path is not None
                 np.testing.assert_allclose(path[-1], target, atol=1e-6)
                 step = np.abs(np.diff(np.vstack([start, path]), axis=0)) / dt
-                ceiling = limits.velocity * speed
+                ceiling = velocity * speed
                 assert np.all(step <= ceiling * 1.02 + 1e-9), (
                     f"{profile} at speed {speed} exceeds the velocity ceiling: "
                     f"{step.max(axis=0)} vs {ceiling}"
                 )
-                durations.append(len(path) * dt)
+                durations.append(planned.duration)
             full_speed, quarter_speed = durations
             assert quarter_speed > full_speed, (
                 f"{profile}: a quarter-speed move must take longer"
@@ -157,10 +173,10 @@ class TestPlannedMotion:
         dry_run.teleport(park_deg())
         slow = dry_run.move_j(target, duration=4.0)
         assert fast.duration < 1.5
-        assert slow.duration == pytest.approx(4.0, abs=2 * _motion.tick_dt_s())
-        np.testing.assert_allclose(
-            slow.end_joints_rad, np.radians(target), atol=1e-6
+        assert slow.duration == pytest.approx(
+            4.0, abs=2 * float(_cfg.load_robot_config()["robot"]["tick_dt_s"])
         )
+        np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
 
 class TestCartesianMotion:
@@ -191,11 +207,12 @@ class TestCartesianMotion:
         before = list(dry_run.angles())
         unreachable = np.asarray(dry_run.pose())
         unreachable[0] += 5000.0
-        blocked = dry_run.move_l(unreachable.tolist(), speed=0.5)
-        assert blocked.error is not None
-        assert blocked.error.code == ErrorCode.IK_PARTIAL_PATH
-        assert blocked.valid is not None and not blocked.valid.all()
-        assert len(blocked.valid) == blocked.tcp_poses.shape[0]
+        # The endpoint decides reachable-at-all before the path decides
+        # reachable-along-the-way (the planner's own precheck), so a
+        # target outside the workspace refuses the whole command.
+        with pytest.raises(RobotError) as blocked:
+            dry_run.move_l(unreachable.tolist(), speed=0.5)
+        assert blocked.value.code == ErrorCode.IK_TARGET_UNREACHABLE
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
@@ -212,7 +229,9 @@ class TestCartesianMotion:
         points = curve.tcp_poses[:, :3] * 1000.0
         centre, radius = _circle_through(base[:3], via[:3], end[:3])
         off_circle = np.abs(np.linalg.norm(points - centre, axis=1) - radius)
-        assert off_circle.max() < 0.5, f"arc leaves its circle by {off_circle.max():.3f} mm"
+        assert off_circle.max() < 0.5, (
+            f"arc leaves its circle by {off_circle.max():.3f} mm"
+        )
         assert _closest(points, via[:3]) < 1.0, "the arc missed its via point"
         assert np.allclose(points[-1], end[:3], atol=0.5)
 
@@ -227,7 +246,10 @@ class TestCartesianMotion:
         for w in waypoints:
             assert _closest(spline, np.asarray(w[:3])) < 1.0, f"spline missed {w[:3]}"
         # A spline is not the polyline it interpolates: it bows off the chords.
-        assert _polyline_gap(spline, [base[:3]] + [np.asarray(w[:3]) for w in waypoints]) > 2.0
+        assert (
+            _polyline_gap(spline, [base[:3]] + [np.asarray(w[:3]) for w in waypoints])
+            > 2.0
+        )
 
         dry_run.teleport(park_deg())
         process = dry_run.move_p(waypoints, speed=0.4)
@@ -251,7 +273,10 @@ class TestCartesianMotion:
         chain (or ``flush()``) that reports it."""
         dry_run.teleport(park_deg())
         base = np.asarray(dry_run.pose())
-        corner, finish = _offset(base, (50.0, 0.0, 0.0)), _offset(base, (50.0, 0.0, 40.0))
+        corner, finish = (
+            _offset(base, (50.0, 0.0, 0.0)),
+            _offset(base, (50.0, 0.0, 40.0)),
+        )
 
         sharp = [
             dry_run.move_l(corner.tolist(), speed=0.4),
@@ -270,7 +295,9 @@ class TestCartesianMotion:
 
         miss = _closest(rounded, corner[:3])
         assert 1.0 < miss < 15.0, f"corner rounded by {miss:.2f} mm, radius was 15 mm"
-        assert _closest(stopped, corner[:3]) < 0.5, "the sharp pair must reach the corner"
+        assert _closest(stopped, corner[:3]) < 0.5, (
+            "the sharp pair must reach the corner"
+        )
         assert np.allclose(rounded[-1], finish[:3], atol=0.5)
         assert _length(rounded) < _length(stopped) - 1.0
         # One motion, so the TCP sweeps through the corner instead of coming
@@ -319,9 +346,7 @@ class TestCartesianMotion:
         chain = dry_run.move_j(second, speed=0.5)
         assert chain is not None and chain.error is None
         assert chain.duration < separate
-        np.testing.assert_allclose(
-            np.degrees(chain.end_joints_rad), second, atol=1e-6
-        )
+        np.testing.assert_allclose(np.degrees(chain.end_joints_rad), second, atol=1e-6)
         # The corner is rounded in joint space: the chain passes close by the
         # interior target without ever reaching it.
         interior = np.abs(np.degrees(chain.joint_trajectory_rad) - first).max(axis=1)
@@ -401,7 +426,9 @@ class TestCartesianMotion:
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
         with pytest.raises(RobotError) as outside:
             dry_run.move_j(far)
-        assert outside.value.code == ErrorCode.MOTN_SETUP_FAILED
+        # A target outside the soft window is invalid input to the planner
+        # (``planning_error``), the same class the runtime answers with.
+        assert outside.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         unhomed = Robot().create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False
@@ -411,6 +438,25 @@ class TestCartesianMotion:
         assert gate.value.code == ErrorCode.MOTN_NOT_HOMED
         # Jogging stays available while un-homed, as it does on the runtime.
         assert unhomed.jog_j(0, 0.2, 0.2).duration > 0.0
+
+    def test_the_preview_jogs_several_joints_at_once(self, dry_run) -> None:
+        """A diagonal jog must preview as a diagonal.
+
+        The preview refused any jog with more than one non-zero speed, so
+        the two-axis gesture a pendant makes had no preview at all — while
+        the engine underneath had been per-joint the whole time.
+        """
+        dry_run.teleport(park_deg())
+        start = [math.radians(a) for a in dry_run.angles()]
+        end = dry_run.jog_j(
+            joints=[0, 3], speeds=[0.4, -0.4], duration=0.4
+        ).end_joints_rad
+        assert end[0] > start[0] + 0.01, "J0 must have jogged forward"
+        assert end[3] < start[3] - 0.01, "J3 must have jogged back"
+        for j in (1, 2, 4, 5):
+            assert abs(end[j] - start[j]) < 1e-9, (
+                f"J{j} was never commanded and must not move"
+            )
 
     def test_the_preview_refuses_the_inputs_the_wire_refuses(self, dry_run) -> None:
         """Values the codec rejects must be rejected before they are drawn.
@@ -607,7 +653,9 @@ async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
                 measured = time.monotonic() - started
                 observed[requested] = (predicted.duration, measured)
 
-                assert predicted.duration - 0.3 <= measured <= predicted.duration + 1.5, (
+                assert (
+                    predicted.duration - 0.3 <= measured <= predicted.duration + 1.5
+                ), (
                     f"duration={requested}: runtime took {measured:.3f}s, "
                     f"preview predicted {predicted.duration:.3f}s"
                 )
@@ -671,36 +719,20 @@ _PATH_GAP_MM = 2.0
 class _CommandStream:
     """The joint stream the runtime commands, read off its telemetry port.
 
-    ``set_recipe("commanded")`` makes ``par6d`` publish one msgpack frame per
-    telemetry tick — ``[recipe, seq, mono_ns, tick, measured, commanded, …]``
-    (``crates/par6-server/src/telemetry.rs``) — and the commanded positions
-    are the planner's own output, which is what an offline plan has to
-    reproduce.  The MEASURED positions are the sim plant's response to that
-    stream and carry its tracking lag, so they answer a different question.
+    ``set_recipe("commanded")`` makes ``par6d`` publish one frame per
+    telemetry tick, and the shipped :class:`~par6.telemetry.TelemetryReader`
+    decodes it — the ``commanded_positions`` field is the planner's own
+    output, which is what an offline plan has to reproduce.  The MEASURED
+    positions are the sim plant's response to that stream and carry its
+    tracking lag, so they answer a different question.
     """
 
-    #: Frame index of the commanded positions: 3 header elements, then the
-    #: ``commanded`` recipe's fields (tick, measured, commanded, …).
-    _COMMANDED = 5
-
     def __init__(self, port: int) -> None:
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self._sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4 << 20)
-        self._sock.bind(("127.0.0.1", port))
-        self._sock.setblocking(False)
+        self._reader = TelemetryReader(port)
 
-    def drain(self) -> list[list[Any]]:
-        """Every frame waiting on the socket, oldest first.
-
-        A frame is a heterogeneous msgpack array — scalars in the header,
-        then the recipe's fields, one of which is itself a joint vector.
-        """
-        frames = []
-        while True:
-            try:
-                frames.append(ormsgpack.unpackb(self._sock.recv(65535)))
-            except BlockingIOError:
-                return frames
+    def drain(self) -> None:
+        """Discard everything waiting on the socket (case isolation)."""
+        self._reader.drain()
 
     def executed(self) -> np.ndarray:
         """The commanded joint path since the last drain, ``(N, 6)`` radians.
@@ -717,17 +749,20 @@ class _CommandStream:
         same reason.
         """
         by_tick = {}
-        for frame in self.drain():
-            commanded = np.asarray(frame[self._COMMANDED][:NUM_JOINTS], dtype=np.float64)
+        for frame in self._reader.drain():
+            fields = frame["fields"]
+            commanded = np.asarray(
+                fields["commanded_positions"][:NUM_JOINTS], dtype=np.float64
+            )
             if np.all(np.isfinite(commanded)):
-                by_tick[frame[3]] = commanded
+                by_tick[fields["tick"]] = commanded
         path = np.stack([by_tick[tick] for tick in sorted(by_tick)])
         moving = np.flatnonzero(np.abs(np.diff(path, axis=0)).max(axis=1) > 1e-12)
         assert moving.size > 1, "the runtime commanded no motion"
         return path[moving[0] + 1 : moving[-1] + 2]
 
     def close(self) -> None:
-        self._sock.close()
+        self._reader.close()
 
 
 def _shape_from(pose: list[float], deltas) -> list[list[float]]:
@@ -864,7 +899,9 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                     _closest(np.stack([predicted[0], predicted[-1]]), p)
                     for p in predicted
                 )
-                assert bow > 5 * _PATH_GAP_MM, f"{case}: previewed path is nearly straight"
+                assert bow > 5 * _PATH_GAP_MM, (
+                    f"{case}: previewed path is nearly straight"
+                )
 
                 gap = max(
                     max(_closest(predicted, p) for p in executed),
@@ -911,8 +948,9 @@ async def _teleport_to(client, angles: list[float]) -> None:
     while time.monotonic() < deadline:
         await client.teleport(angles)
         if await client.wait_status(
-            lambda s: s.homed
-            and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0,
+            lambda s: (
+                s.homed and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0
+            ),
             timeout=0.5,
         ):
             return

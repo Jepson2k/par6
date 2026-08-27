@@ -42,8 +42,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v7() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 7);
+fn abi_version_is_v10() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 10);
 }
 
 #[test]

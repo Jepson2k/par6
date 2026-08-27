@@ -122,6 +122,18 @@ pub struct LoopStatsResult {
     pub p99_period_s: f64,
     /// Mean achieved rate (Hz).
     pub mean_hz: f64,
+    /// 50th-percentile period (seconds).
+    pub p50_period_s: f64,
+    /// 90th-percentile period (seconds).
+    pub p90_period_s: f64,
+    /// Min CAN frame age seen in the last bus drain \[ticks\].
+    pub can_frame_age_min_ticks: u64,
+    /// Max CAN frame age seen in the last bus drain \[ticks\].
+    pub can_frame_age_max_ticks: u64,
+    /// Whether the RT thread runs under SCHED_FIFO (setup succeeded).
+    pub rt_fifo: bool,
+    /// Whether the RT thread is pinned to its configured CPU.
+    pub rt_pinned: bool,
 }
 
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
@@ -247,6 +259,36 @@ pub enum QueryResult {
         /// Whether the simulator backend is active.
         active: bool,
     },
+    /// CONFIG_INFO result: the runtime's effective configuration — the
+    /// config-skew hook a UI compares against its packaged mirror.
+    ConfigInfo {
+        /// Config file path on the daemon host.
+        path: String,
+        /// Content fingerprint: sha256 hex over the robot TOML and each
+        /// gripper TOML (sorted by filename), each hashed as
+        /// `filename\n` then content bytes.
+        fingerprint: String,
+        /// RT tick period \[s\].
+        tick_dt_s: f64,
+        /// The `[motion]` feel constants, in declaration order:
+        /// `jog_l_linear_max_m_s, jog_l_angular_max_rad_s, cart_step_m,
+        /// cart_step_rad, move_l_max_joint_step_rad, dls_lambda,
+        /// settle_tolerance_rad, settle_timeout_s`.
+        motion: [f64; 8],
+        /// Per-joint effective EXEC limits: `[soft_min_rad,
+        /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
+        joints: Vec<[f64; 4]>,
+    },
+    /// PAYLOAD result: the effective runtime payload (zeros = none).
+    Payload {
+        /// Payload mass \[kg\].
+        mass: f64,
+        /// Payload COM in end-effector-frame coordinates \[m\].
+        com: [f64; 3],
+        /// Rotational inertia about the COM, ee-frame axes,
+        /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\].
+        inertia: [f64; 6],
+    },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
         /// Installation-layer shapes (persistent keep-outs).
@@ -255,6 +297,20 @@ pub enum QueryResult {
         program: Vec<crate::command::Shape>,
         /// Scene epoch this readback represents.
         epoch: u64,
+    },
+    /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
+    /// client can run previews from exactly the daemon's numbers.
+    ConfigBundle {
+        /// Config file path on the daemon host.
+        path: String,
+        /// Same content fingerprint as CONFIG_INFO.
+        fingerprint: String,
+        /// Robot TOML file name (base name, e.g. `PAR6.toml`).
+        robot_filename: String,
+        /// Robot TOML content.
+        robot_toml: String,
+        /// Gripper TOMLs as `(file name, content)`, sorted by file name.
+        grippers: Vec<(String, String)>,
     },
 }
 
@@ -280,6 +336,9 @@ impl QueryResult {
             Q::TcpOffset { .. } => QueryType::TcpOffset,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
+            Q::ConfigInfo { .. } => QueryType::ConfigInfo,
+            Q::ConfigBundle { .. } => QueryType::ConfigBundle,
+            Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
         }
     }
@@ -435,7 +494,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_str(buf, params);
         }
         Q::LoopStats(s) => {
-            w_array(buf, 11);
+            w_array(buf, 17);
             w_uint(buf, u64::from(tag));
             w_f64(buf, s.target_hz);
             w_uint(buf, s.loop_count);
@@ -447,6 +506,12 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_f64(buf, s.p95_period_s);
             w_f64(buf, s.p99_period_s);
             w_f64(buf, s.mean_hz);
+            w_f64(buf, s.p50_period_s);
+            w_f64(buf, s.p90_period_s);
+            w_uint(buf, s.can_frame_age_min_ticks);
+            w_uint(buf, s.can_frame_age_max_ticks);
+            w_bool(buf, s.rt_fifo);
+            w_bool(buf, s.rt_pinned);
         }
         Q::Profile { profile } => {
             w_array(buf, 2);
@@ -493,6 +558,63 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 2);
             w_uint(buf, u64::from(tag));
             w_bool(buf, *active);
+        }
+        Q::ConfigInfo {
+            path,
+            fingerprint,
+            tick_dt_s,
+            motion,
+            joints,
+        } => {
+            w_array(buf, 6);
+            w_uint(buf, u64::from(tag));
+            w_str(buf, path);
+            w_str(buf, fingerprint);
+            w_f64(buf, *tick_dt_s);
+            w_array(buf, motion.len());
+            for v in motion {
+                w_f64(buf, *v);
+            }
+            w_array(buf, joints.len());
+            for j in joints {
+                w_array(buf, j.len());
+                for v in j {
+                    w_f64(buf, *v);
+                }
+            }
+        }
+        Q::ConfigBundle {
+            path,
+            fingerprint,
+            robot_filename,
+            robot_toml,
+            grippers,
+        } => {
+            w_array(buf, 6);
+            w_uint(buf, u64::from(tag));
+            w_str(buf, path);
+            w_str(buf, fingerprint);
+            w_str(buf, robot_filename);
+            w_str(buf, robot_toml);
+            w_array(buf, grippers.len());
+            for (name, content) in grippers {
+                w_array(buf, 2);
+                w_str(buf, name);
+                w_str(buf, content);
+            }
+        }
+        Q::Payload { mass, com, inertia } => {
+            w_array(buf, 4);
+            w_uint(buf, u64::from(tag));
+            w_f64(buf, *mass);
+            w_array(buf, 3);
+            for v in com {
+                w_f64(buf, *v);
+            }
+            w_array(buf, 6);
+            for v in inertia {
+                w_f64(buf, *v);
+            }
         }
         Q::Shapes {
             installation,
@@ -733,7 +855,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::LoopStats => {
-            expect_arity("loop_stats result", n, 11)?;
+            expect_arity("loop_stats result", n, 17)?;
             QueryResult::LoopStats(LoopStatsResult {
                 target_hz: r.f64()?,
                 loop_count: r.uint()?,
@@ -745,6 +867,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 p95_period_s: r.f64()?,
                 p99_period_s: r.f64()?,
                 mean_hz: r.f64()?,
+                p50_period_s: r.f64()?,
+                p90_period_s: r.f64()?,
+                can_frame_age_min_ticks: r.uint()?,
+                can_frame_age_max_ticks: r.uint()?,
+                rt_fifo: r.bool()?,
+                rt_pinned: r.bool()?,
             })
         }
         T::Profile => {
@@ -793,6 +921,71 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::IsSimulator => {
             expect_arity("is_simulator result", n, 2)?;
             QueryResult::IsSimulator { active: r.bool()? }
+        }
+        T::ConfigInfo => {
+            expect_arity("config_info result", n, 6)?;
+            let path = r.str()?.to_owned();
+            let fingerprint = r.str()?.to_owned();
+            let tick_dt_s = r.f64()?;
+            let motion = r_f64_fixed(r, "config_info.motion")?;
+            let jn = r.array_len()?;
+            // One entry per arm joint; anything past the node-slot cap
+            // is a corrupt packet, not a big robot.
+            if jn > 32 {
+                return Err(DecodeError::Arity {
+                    what: "config_info.joints",
+                    expected: 32,
+                    got: jn,
+                });
+            }
+            let mut joints = Vec::with_capacity(jn);
+            for _ in 0..jn {
+                joints.push(r_f64_fixed(r, "config_info.joints[]")?);
+            }
+            QueryResult::ConfigInfo {
+                path,
+                fingerprint,
+                tick_dt_s,
+                motion,
+                joints,
+            }
+        }
+        T::ConfigBundle => {
+            expect_arity("config_bundle result", n, 6)?;
+            let path = r.str()?.to_owned();
+            let fingerprint = r.str()?.to_owned();
+            let robot_filename = r.str()?.to_owned();
+            let robot_toml = r.str()?.to_owned();
+            let gn = r.array_len()?;
+            // A config dir holds a handful of gripper files; hundreds is
+            // a corrupt packet, not a big deployment.
+            if gn > 64 {
+                return Err(DecodeError::Arity {
+                    what: "config_bundle.grippers",
+                    expected: 64,
+                    got: gn,
+                });
+            }
+            let mut grippers = Vec::with_capacity(gn);
+            for _ in 0..gn {
+                expect_arity("config_bundle.grippers[]", r.array_len()?, 2)?;
+                grippers.push((r.str()?.to_owned(), r.str()?.to_owned()));
+            }
+            QueryResult::ConfigBundle {
+                path,
+                fingerprint,
+                robot_filename,
+                robot_toml,
+                grippers,
+            }
+        }
+        T::Payload => {
+            expect_arity("payload result", n, 4)?;
+            QueryResult::Payload {
+                mass: r.f64()?,
+                com: r_f64_fixed(r, "payload.com")?,
+                inertia: r_f64_fixed(r, "payload.inertia")?,
+            }
         }
         T::Shapes => {
             expect_arity("shapes result", n, 4)?;

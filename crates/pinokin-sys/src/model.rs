@@ -92,6 +92,19 @@ pub struct Model {
     nq: usize,
 }
 
+/// Whether the symmetric 3×3 matrix `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` is
+/// positive semidefinite, by Sylvester's criterion on leading principal
+/// minors (with a small tolerance so a legitimate rank-deficient point
+/// mass passes).
+fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
+    let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
+    const EPS: f64 = 1e-12;
+    let m2 = ixx * iyy - ixy * ixy;
+    let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
+        + ixz * (ixy * iyz - iyy * ixz);
+    ixx >= -EPS && m2 >= -EPS && det >= -EPS && iyy >= -EPS && izz >= -EPS
+}
+
 impl fmt::Debug for Model {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Model").field("nq", &self.nq).finish()
@@ -201,12 +214,72 @@ impl Model {
         Ok(out)
     }
 
+    /// Replace the runtime payload attached at the end-effector frame —
+    /// an inertial update only (collision geometry unchanged), reversible
+    /// because the shim restores the create-time parent-joint inertia
+    /// before appending. `mass = 0` clears the payload.
+    ///
+    /// Validated before it reaches the model: mass must be finite and
+    /// non-negative, the COM finite, and the rotational inertia (about
+    /// the COM, `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)`) positive semidefinite —
+    /// a negative-definite "payload" makes RNEA lie quietly ever after.
+    pub fn set_tool(
+        &mut self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<(), Error> {
+        if !mass.is_finite() || mass < 0.0 || com.iter().any(|v| !v.is_finite()) {
+            return Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG));
+        }
+        if let Some(i) = &inertia {
+            if i.iter().any(|v| !v.is_finite()) || !symmetric3_is_psd(i) {
+                return Err(Error::Status(ffi::PAR6_ERR_INVALID_ARG));
+            }
+        }
+        let status = unsafe {
+            ffi::par6_kin_set_tool(
+                self.raw.as_ptr(),
+                mass,
+                com.as_ptr(),
+                inertia.as_ref().map_or(std::ptr::null(), |i| i.as_ptr()),
+            )
+        };
+        Self::check_status(status)
+    }
+
     /// Gravity torque G(q) — RNEA at zero velocity/acceleration — into `out`.
     pub fn gravity_into(&mut self, q: &[f64], out: &mut [f64]) -> Result<(), Error> {
         self.check_len(q, self.nq)?;
         self.check_len(out, self.nq)?;
         let status =
             unsafe { ffi::par6_kin_gravity(self.raw.as_ptr(), q.as_ptr(), out.as_mut_ptr()) };
+        Self::check_status(status)
+    }
+
+    /// Inverse dynamics: the torque producing acceleration `a` at `q`
+    /// with velocity `v`. Gravity is included, so zero `v` and `a` give
+    /// exactly [`Model::gravity_into`].
+    pub fn inverse_dynamics_into(
+        &mut self,
+        q: &[f64],
+        v: &[f64],
+        a: &[f64],
+        out: &mut [f64],
+    ) -> Result<(), Error> {
+        self.check_len(q, self.nq)?;
+        self.check_len(v, self.nq)?;
+        self.check_len(a, self.nq)?;
+        self.check_len(out, self.nq)?;
+        let status = unsafe {
+            ffi::par6_kin_inverse_dynamics(
+                self.raw.as_ptr(),
+                q.as_ptr(),
+                v.as_ptr(),
+                a.as_ptr(),
+                out.as_mut_ptr(),
+            )
+        };
         Self::check_status(status)
     }
 
@@ -246,6 +319,39 @@ impl Model {
     /// frame as [`Model::fk`]). Writes the final iterate into `out_q` either
     /// way; returns `Ok(true)` on convergence, `Ok(false)` when the iteration
     /// budget ran out.
+    /// DLS IK that refuses a step which would increase the residual.
+    ///
+    /// Same contract as [`Model::ik_step`] — `Ok(true)` converged,
+    /// `Ok(false)` did not — but with a backtracking line search and
+    /// damping scaled by the current error, so an ill-conditioned step
+    /// near a singularity is rejected rather than committed.
+    pub fn ik_solve(
+        &mut self,
+        q_seed: &[f64],
+        target: &[f64; 16],
+        out_q: &mut [f64],
+        opts: IkOptions,
+    ) -> Result<bool, Error> {
+        self.check_len(q_seed, self.nq)?;
+        self.check_len(out_q, self.nq)?;
+        let rc = unsafe {
+            ffi::par6_kin_ik_solve(
+                self.raw.as_ptr(),
+                q_seed.as_ptr(),
+                target.as_ptr(),
+                out_q.as_mut_ptr(),
+                opts.max_iters,
+                opts.tol,
+                opts.damping,
+            )
+        };
+        match rc {
+            1 => Ok(true),
+            0 => Ok(false),
+            other => Err(Error::Status(other)),
+        }
+    }
+
     pub fn ik_step(
         &mut self,
         q_seed: &[f64],

@@ -11,7 +11,7 @@
 //! an operator cannot work around.
 
 use par6_proto::{make_error, ErrorCode, WireError, UNATTRIBUTED};
-use par6_rt::{ErrorCode as RtCode, StateSnapshot, MAX_JOINTS};
+use par6_rt::{ErrorCode as RtCode, HomingPhase as RtHomingPhase, StateSnapshot, MAX_JOINTS};
 
 /// The gripper's fault bitfield as the wire spells it: bit 0 temperature,
 /// 1 timeout, 2 e-stop, 3 the node's live fault bit. 0 = healthy (also
@@ -46,6 +46,14 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
     let has = |c: RtCode| errs.iter().any(|e| e.code == c);
     let err = if has(RtCode::Estop) || has(RtCode::SwEstop) {
         make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[])
+    } else if has(RtCode::BusOff) {
+        make_error(ErrorCode::SysBusOff, UNATTRIBUTED, &[])
+    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::TorqueEnvelope) {
+        make_error(
+            ErrorCode::SysTorqueEnvelope,
+            UNATTRIBUTED,
+            &[("joint", &e.joint.unwrap_or(0).to_string())],
+        )
     } else if has(RtCode::LoopCritical) {
         make_error(ErrorCode::SysLoopCritical, UNATTRIBUTED, &[])
     } else if has(RtCode::ExecLinkLost) {
@@ -94,6 +102,50 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         )
     };
     Some(err)
+}
+
+/// The RT latch's warning-class entries as wire errors — the STATUS
+/// `warnings` slot. Warnings track live conditions and self-clear, so
+/// unlike [`rt_standing_error`] every one is reported, not just the
+/// first: an operator watching a banner wants the whole set.
+pub fn rt_warnings(snap: &StateSnapshot) -> Vec<WireError> {
+    snap.errors
+        .as_slice()
+        .iter()
+        .filter(|e| e.code.is_warning())
+        .filter_map(|e| {
+            let joint = e.joint.map(|j| j.to_string()).unwrap_or_default();
+            Some(match e.code {
+                RtCode::CanStale => {
+                    make_error(ErrorCode::SysCanStale, UNATTRIBUTED, &[("joint", &joint)])
+                }
+                RtCode::LoopDegraded => make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
+                RtCode::NotHomed => make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]),
+                RtCode::LinkErrorPassive => {
+                    make_error(ErrorCode::SysLinkErrorPassive, UNATTRIBUTED, &[])
+                }
+                RtCode::HomingFailed => {
+                    let phase = e
+                        .joint
+                        .and_then(|j| snap.homing.phase.get(usize::from(j)).copied())
+                        .unwrap_or(RtHomingPhase::Idle);
+                    make_error(
+                        ErrorCode::MotnHomingFailed,
+                        UNATTRIBUTED,
+                        &[("joint", &joint), ("phase", &format!("{phase:?}"))],
+                    )
+                }
+                // is_warning() and this match are maintained together; a
+                // new warning key must get a wire rendering here or it
+                // never reaches a client.
+                other => {
+                    debug_assert!(false, "warning key {other:?} has no wire rendering");
+                    log::warn!("warning key {other:?} has no wire rendering; dropped");
+                    return None;
+                }
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

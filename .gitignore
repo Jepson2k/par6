@@ -5,3 +5,4 @@ __pycache__/
 .venv/
 dist/
 test-results.xml
+python/par6/*.so

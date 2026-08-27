@@ -62,6 +62,19 @@ impl Default for Enablement {
     }
 }
 
+/// A runtime payload: mass at a COM with optional rotational inertia,
+/// in end-effector-frame coordinates. `mass == 0` = no payload.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct PayloadSpec {
+    /// Payload mass \[kg\].
+    pub mass: f64,
+    /// COM in end-effector-frame coordinates \[m\].
+    pub com: [f64; 3],
+    /// Rotational inertia about the COM `(Ixx, Ixy, Iyy, Ixz, Iyz,
+    /// Izz)`; `None` = point mass.
+    pub inertia: Option<[f64; 6]>,
+}
+
 /// Planning context the server pushes to the planner whenever one of its
 /// pieces changes (profile / tool / TCP offset / completion policy). The
 /// planner needs it to plan correctly; the server remains the owner of
@@ -82,6 +95,8 @@ pub struct PlanContext<'a> {
     pub tcp_offset_mm: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
+    /// The runtime payload the torque feedforward must carry.
+    pub payload: PayloadSpec,
 }
 
 /// Which replaceable layer of the collision world a shape set belongs to.
@@ -264,14 +279,6 @@ pub trait RtCommands: Send {
     /// Disabling is immediate, and cancels any outstanding enable.
     fn set_enabled(&mut self, enabled: bool);
 
-    /// Drop every joint limp and hold there.
-    ///
-    /// The safest state the arm has: unlike the protective stop, which
-    /// holds position under power, this removes drive authority so a
-    /// trapped person or a jammed joint can be freed by hand. It persists
-    /// until a mode change takes the arm out of it.
-    fn safety_stop(&mut self);
-
     /// Apply (or stop applying) the gravity-compensation feedforward.
     ///
     /// G(q) is computed and published every tick regardless; this controls
@@ -279,6 +286,16 @@ pub trait RtCommands: Send {
     /// actually exist in the plant — true on hardware and on the torque
     /// plant, false on the kinematic one.
     fn set_gravity_comp(&mut self, on: bool);
+
+    /// Replace the runtime payload in the gravity model (the planner's
+    /// own dynamics follow through [`Planner::sync`]'s `payload`).
+    /// Inputs are wire-validated (finite, mass >= 0, PSD inertia)
+    /// before this is called.
+    fn set_payload(&mut self, payload: PayloadSpec);
+
+    /// Hold or resume the executing trajectory, leaving the sample ring
+    /// intact so a resume continues rather than restarts.
+    fn set_exec_paused(&mut self, paused: bool);
 
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up

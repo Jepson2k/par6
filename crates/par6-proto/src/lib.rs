@@ -41,6 +41,7 @@ pub mod golden;
 pub mod pygen;
 pub mod reply;
 pub mod status;
+pub mod telemetry;
 mod wire;
 
 pub use chunk::{
@@ -49,13 +50,18 @@ pub use chunk::{
 };
 pub use command::{decode_command, encode_command, Command, Shape, ToolParam};
 pub use enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, Frame, MsgType, QueryType,
-    ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
+    HomingJointState, HomingPhase, LinkState, MsgType, QueryType, ToolState,
 };
 pub use error::{make_error, template, ErrorCode, ErrorTemplate, WireError, UNATTRIBUTED};
 pub use reply::{decode_reply, encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
 pub use status::{
-    decode_status, encode_status_into, Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
+    decode_status, encode_status_into, HomingWire, LinkHealthWire, Status, StatusEncoder,
+    STATUS_HEADER_LEN, STATUS_LEN,
+};
+pub use telemetry::{
+    decode_telemetry, encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe,
+    TelemetryValue,
 };
 
 /// Protocol version carried in the STATUS header.

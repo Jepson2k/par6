@@ -286,7 +286,7 @@ impl ProgramBuilder {
                 out.push(Sample {
                     q: seg.q[t],
                     qd: seg.qd[t],
-                    tau_ff: [0.0; NUM_JOINTS],
+                    qdd: seg.qdd[t],
                     meta,
                 });
             }
@@ -296,16 +296,13 @@ impl ProgramBuilder {
                 for t in 0..ov_next {
                     let mut q = [0.0; NUM_JOINTS];
                     let mut qd = [0.0; NUM_JOINTS];
+                    let mut qdd = [0.0; NUM_JOINTS];
                     for j in 0..NUM_JOINTS {
                         q[j] = seg.q[len - ov_next + t][j] + next.q[t][j] - corner[j];
                         qd[j] = seg.qd[len - ov_next + t][j] + next.qd[t][j];
+                        qdd[j] = seg.qdd[len - ov_next + t][j] + next.qdd[t][j];
                     }
-                    out.push(Sample {
-                        q,
-                        qd,
-                        tau_ff: [0.0; NUM_JOINTS],
-                        meta,
-                    });
+                    out.push(Sample { q, qd, qdd, meta });
                 }
             }
             consumed_head = ov_next;
@@ -396,15 +393,17 @@ impl ProgramBuilder {
             }
             let mut q = [0.0; NUM_JOINTS];
             let mut qd = [0.0; NUM_JOINTS];
+            let mut qdd = [0.0; NUM_JOINTS];
             for j in 0..NUM_JOINTS {
                 q[j] = output.new_position[j];
                 qd[j] = output.new_velocity[j];
+                qdd[j] = output.new_acceleration[j];
             }
             let k = output.new_section.min(last);
             out.push(Sample {
                 q,
                 qd,
-                tau_ff: [0.0; NUM_JOINTS],
+                qdd,
                 meta: self.meta_for(chain, chain_offset, k),
             });
             n_emitted += 1;
@@ -424,6 +423,7 @@ impl ProgramBuilder {
 struct SegSamples {
     q: Vec<[f64; NUM_JOINTS]>,
     qd: Vec<[f64; NUM_JOINTS]>,
+    qdd: Vec<[f64; NUM_JOINTS]>,
     entry_ticks: usize,
     exit_ticks: usize,
 }
@@ -467,22 +467,26 @@ impl STrapezoid {
         }
     }
 
-    /// `(s, ds/dt)` at time `t`, clamped to the profile ends.
-    fn sample(&self, t: f64) -> (f64, f64) {
+    /// `(s, ds/dt, d²s/dt²)` at time `t`, clamped to the profile ends.
+    fn sample(&self, t: f64) -> (f64, f64, f64) {
         if t <= 0.0 {
-            return (0.0, 0.0);
+            return (0.0, 0.0, 0.0);
         }
         if t >= self.t_total {
-            return (1.0, 0.0);
+            return (1.0, 0.0, 0.0);
         }
         if t < self.t_in {
-            (0.5 * self.a_in * t * t, self.a_in * t)
+            (0.5 * self.a_in * t * t, self.a_in * t, self.a_in)
         } else if t < self.t_in + self.t_cruise {
             let d_in = self.v * self.v / (2.0 * self.a_in);
-            (d_in + self.v * (t - self.t_in), self.v)
+            (d_in + self.v * (t - self.t_in), self.v, 0.0)
         } else {
             let tt = self.t_total - t;
-            (1.0 - 0.5 * self.a_out * tt * tt, self.a_out * tt)
+            (
+                1.0 - 0.5 * self.a_out * tt * tt,
+                self.a_out * tt,
+                -self.a_out,
+            )
         }
     }
 }
@@ -518,6 +522,7 @@ fn trapezoid_segment(
         return SegSamples {
             q: vec![q],
             qd: vec![[0.0; NUM_JOINTS]],
+            qdd: vec![[0.0; NUM_JOINTS]],
             entry_ticks: 0,
             exit_ticks: 0,
         };
@@ -526,28 +531,36 @@ fn trapezoid_segment(
     let n = ((prof.t_total / dt).ceil() as usize).max(1);
     let mut qs = Vec::with_capacity(n);
     let mut qds = Vec::with_capacity(n);
+    let mut qdds = Vec::with_capacity(n);
     let mut dq_ds = [0.0; NUM_JOINTS];
     for k in 1..=n {
-        let (s, s_dot) = prof.sample(k as f64 * dt);
+        let (s, s_dot, s_ddot) = prof.sample(k as f64 * dt);
         let mut q = [0.0; NUM_JOINTS];
         let mut qd = [0.0; NUM_JOINTS];
+        let mut qdd = [0.0; NUM_JOINTS];
         path.sample(s, &mut q);
         path.derivative(s, &mut dq_ds);
         for j in 0..NUM_JOINTS {
             qd[j] = dq_ds[j] * s_dot;
+            // q(s) is affine in s for every path this profile times, so
+            // the chain rule's curvature term dq²/ds²·ṡ² is zero.
+            qdd[j] = dq_ds[j] * s_ddot;
         }
         qs.push(q);
         qds.push(qd);
+        qdds.push(qdd);
     }
     // Land exactly on the segment target, at rest.
     let last = n - 1;
     path.sample(1.0, &mut qs[last]);
     qds[last] = [0.0; NUM_JOINTS];
+    qdds[last] = [0.0; NUM_JOINTS];
     let entry_ticks = ((prof.t_in / dt).floor() as usize).min(n);
     let exit_ticks = (((prof.v / prof.a_out) / dt).floor() as usize).min(n);
     SegSamples {
         q: qs,
         qd: qds,
+        qdd: qdds,
         entry_ticks,
         exit_ticks,
     }

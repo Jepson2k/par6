@@ -14,6 +14,7 @@
 
 #include <Eigen/Dense>
 
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <exception>
@@ -40,12 +41,21 @@ struct par6_kin {
     Eigen::Matrix4d T_tool = Eigen::Matrix4d::Identity();
     Eigen::Vector3d tool_offset = Eigen::Vector3d::Zero();
 
+    // Create-time inertia of the ee frame's parent joint (config tool
+    // included) — the baseline every par6_kin_set_tool call restores
+    // before appending the new payload, which is what makes the payload
+    // replaceable and clearable at runtime.
+    pinocchio::Inertia pristine_inertia = pinocchio::Inertia::Zero();
+    pinocchio::JointIndex payload_joint = 0;
+
     // Preallocated workspace — every post-create call is allocation-free.
     Eigen::VectorXd q;
     Eigen::VectorXd v_zero;
     Eigen::VectorXd a_zero;
     Eigen::VectorXd dq;
+    Eigen::VectorXd q_trial;
     Eigen::VectorXd v_in;
+    Eigen::VectorXd a_in;
     Eigen::VectorXd tau_in;
     Mat6x J;
 
@@ -57,7 +67,9 @@ struct par6_kin {
         v_zero.setZero(model.nv);
         a_zero.setZero(model.nv);
         dq.setZero(model.nv);
+        q_trial.setZero(model.nq);
         v_in.setZero(model.nv);
+        a_in.setZero(model.nv);
         tau_in.setZero(model.nv);
         J.setZero(6, model.nv);
     }
@@ -153,6 +165,11 @@ par6_kin *par6_kin_create(const char *urdf_path,
             }
         }
 
+        {
+            const pinocchio::Frame &fr = h->model.frames[h->ee_frame_id];
+            h->payload_joint = fr.parentJoint;
+            h->pristine_inertia = h->model.inertias[h->payload_joint];
+        }
         h->alloc_workspace();
         return h;
     } catch (const std::bad_alloc &) {
@@ -211,6 +228,25 @@ par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau) {
     try {
         h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
         pinocchio::rnea(h->model, h->data, h->q, h->v_zero, h->a_zero);
+        Eigen::Map<Eigen::VectorXd>(out_tau, h->model.nv) = h->data.tau;
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
+                                      const double *v, const double *a,
+                                      double *out_tau) {
+    if (h == nullptr || q == nullptr || v == nullptr || a == nullptr ||
+        out_tau == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        h->v_in = Eigen::Map<const Eigen::VectorXd>(v, h->model.nv);
+        h->a_in = Eigen::Map<const Eigen::VectorXd>(a, h->model.nv);
+        pinocchio::rnea(h->model, h->data, h->q, h->v_in, h->a_in);
         Eigen::Map<Eigen::VectorXd>(out_tau, h->model.nv) = h->data.tau;
         return PAR6_OK;
     } catch (const std::exception &) {
@@ -288,7 +324,148 @@ int32_t par6_kin_ik_step(par6_kin *h,
     }
 }
 
+int32_t par6_kin_ik_solve(par6_kin *h,
+                          const double *q_seed,
+                          const double *target_pose16,
+                          double *out_q,
+                          int32_t max_iters,
+                          double tol,
+                          double damping) {
+    if (h == nullptr || q_seed == nullptr || target_pose16 == nullptr ||
+        out_q == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (max_iters <= 0) max_iters = 100;
+    if (tol <= 0.0) tol = 1e-10;
+    if (damping < 0.0) damping = 1e-3;
+
+    try {
+        const Eigen::Map<const RowMat4> target(target_pose16);
+        const Eigen::Matrix3d R_t = target.block<3, 3>(0, 0);
+        const Eigen::Vector3d p_t = target.block<3, 1>(0, 3);
+
+        h->q = Eigen::Map<const Eigen::VectorXd>(q_seed, h->model.nq);
+
+        Eigen::Matrix4d T_cur;
+        Vec6 e;
+        Mat6 A;
+
+        // Error at the CURRENT iterate, carried across the loop so a probe
+        // has something to compare against without re-running FK.
+        h->fk_into(T_cur);
+        e.head<3>() = p_t - T_cur.block<3, 1>(0, 3);
+        e.tail<3>() = pinocchio::log3(
+            Eigen::Matrix3d(R_t * T_cur.block<3, 3>(0, 0).transpose()));
+        double err = e.squaredNorm();
+
+        for (int32_t it = 0; it < max_iters; ++it) {
+            if (err < tol) {
+                Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+                return 1;
+            }
+
+            // Damping rises with the current residual, so a step taken far
+            // from the target is shorter and better conditioned than the
+            // fixed-lambda step par6_kin_ik_step always takes.
+            const double lam = damping * std::max(1.0, std::sqrt(err) * 10.0);
+            h->jacobian_into();
+            A.noalias() = h->J * h->J.transpose();
+            A.diagonal().array() += lam * lam;
+            const Vec6 w = A.ldlt().solve(e);
+            h->dq.noalias() = h->J.transpose() * w;
+
+            // Backtracking: halve the step until it actually reduces the
+            // residual. Without this the solver commits unconditionally and
+            // an ill-conditioned step near a singularity can INCREASE the
+            // error while still consuming the whole iteration budget.
+            double alpha = 1.0;
+            bool accepted = false;
+            for (int probe = 0; probe < 4; ++probe) {
+                h->q_trial = h->q + alpha * h->dq;
+                h->q.swap(h->q_trial);
+                h->fk_into(T_cur);
+                h->q.swap(h->q_trial);
+
+                Vec6 e_trial;
+                e_trial.head<3>() = p_t - T_cur.block<3, 1>(0, 3);
+                e_trial.tail<3>() = pinocchio::log3(
+                    Eigen::Matrix3d(R_t * T_cur.block<3, 3>(0, 0).transpose()));
+                const double err_trial = e_trial.squaredNorm();
+                if (err_trial < err) {
+                    h->q.swap(h->q_trial);
+                    e = e_trial;
+                    err = err_trial;
+                    accepted = true;
+                    break;
+                }
+                alpha *= 0.5;
+            }
+            // Every probe made it worse: this is a step the solver should
+            // refuse rather than take. Report non-convergence with the last
+            // good iterate instead of walking away from the target.
+            if (!accepted) {
+                Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+                return 0;
+            }
+        }
+        Eigen::Map<Eigen::VectorXd>(out_q, h->model.nq) = h->q;
+        return err < tol ? 1 : 0;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
 /* par6_traj_* live in par6_traj.cpp (toppra-cpp). */
+
+par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
+                              const double *inertia6) {
+    if (h == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (!std::isfinite(mass)) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (mass > 0.0) {
+        if (com3 == nullptr) {
+            return PAR6_ERR_INVALID_ARG;
+        }
+        for (int i = 0; i < 3; ++i) {
+            if (!std::isfinite(com3[i])) {
+                return PAR6_ERR_INVALID_ARG;
+            }
+        }
+        if (inertia6 != nullptr) {
+            for (int i = 0; i < 6; ++i) {
+                if (!std::isfinite(inertia6[i])) {
+                    return PAR6_ERR_INVALID_ARG;
+                }
+            }
+        }
+    }
+    try {
+        // Reversible by construction: start from the create-time joint
+        // inertia every call, then append the requested payload (if any)
+        // at the ee frame placement — the same composition create uses
+        // for the config tool.
+        h->model.inertias[h->payload_joint] = h->pristine_inertia;
+        if (mass > 0.0) {
+            const pinocchio::Frame &fr = h->model.frames[h->ee_frame_id];
+            const Eigen::Vector3d com(com3[0], com3[1], com3[2]);
+            const pinocchio::Symmetric3 I =
+                inertia6 != nullptr
+                    ? pinocchio::Symmetric3(inertia6[0], inertia6[1],
+                                            inertia6[2], inertia6[3],
+                                            inertia6[4], inertia6[5])
+                    : pinocchio::Symmetric3::Zero();
+            h->model.appendBodyToJoint(h->payload_joint,
+                                       pinocchio::Inertia(mass, com, I),
+                                       fr.placement);
+        }
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
 
 int32_t par6_shim_abi_version(void) { return PAR6_SHIM_ABI_VERSION; }
 

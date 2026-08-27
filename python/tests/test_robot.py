@@ -64,7 +64,9 @@ def robot() -> Robot:
     return Robot()
 
 
-def _sample_q(rng: np.random.Generator, robot: Robot, margin: float = 0.15) -> np.ndarray:
+def _sample_q(
+    rng: np.random.Generator, robot: Robot, margin: float = 0.15
+) -> np.ndarray:
     lim = robot.joints.limits.position.rad
     return np.array([rng.uniform(lo + margin, hi - margin) for lo, hi in lim])
 
@@ -89,7 +91,12 @@ def _urdf_transform(element: ET.Element | None) -> np.ndarray:
         return T
     r, p, y = (float(v) for v in str(element.get("rpy", "0 0 0")).split())
     cr, sr, cp, sp, cy, sy = (
-        np.cos(r), np.sin(r), np.cos(p), np.sin(p), np.cos(y), np.sin(y)
+        np.cos(r),
+        np.sin(r),
+        np.cos(p),
+        np.sin(p),
+        np.cos(y),
+        np.sin(y),
     )
     T[:3, :3] = (
         np.array([[cy, -sy, 0.0], [sy, cy, 0.0], [0.0, 0.0, 1.0]])
@@ -238,7 +245,10 @@ class TestToolTransforms:
         rz_pi = np.eye(4)
         rz_pi[:3, :3] = np.diag([-1.0, -1.0, 1.0])
         grippers = load_gripper_configs()
-        for key, jaw in (("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"), ("SSG48", "jaw1_JOINT")):
+        for key, jaw in (
+            ("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"),
+            ("SSG48", "jaw1_JOINT"),
+        ):
             kin = grippers[key]["kinematics"]
             dh = np.zeros((4, 4))
             pinokin.se3_from_rpy(
@@ -527,8 +537,6 @@ class TestDiscovery:
                 text=True,
             )
             assert install.returncode == 0, install.stderr
-            out = subprocess.run(
-                [str(py), "-c", probe], capture_output=True, text=True
-            )
+            out = subprocess.run([str(py), "-c", probe], capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
         assert out.stdout.split() == ["PAR6", "par6"]

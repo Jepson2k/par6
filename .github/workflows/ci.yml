@@ -28,14 +28,20 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo clippy --workspace --exclude par6d --all-targets -- -D warnings
+        run: |
+          cargo clippy --workspace --exclude par6d --exclude par6-py \
+            --exclude par6-client --all-targets -- -D warnings
+          # par6-client's LIBRARY is toolchain-free; only its tests boot a
+          # daemon in-process (covered in `ffi`).
+          cargo clippy -p par6-client -- -D warnings
       # par6d links the Pinocchio shim unconditionally, so it needs the C++
-      # toolchain and is covered by the `ffi` job below. What this leg proves
-      # is that every LIBRARY crate still builds and passes without that
-      # toolchain — which is what keeps them usable on their own.
+      # toolchain and is covered by the `ffi` job below (par6-py wraps it
+      # and rides along). What this leg proves is that every LIBRARY crate
+      # still builds and passes without that toolchain — which is what
+      # keeps them usable on their own.
       - name: test
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --exclude par6d
+        run: cargo test --workspace --exclude par6d --exclude par6-py --exclude par6-client
       # pinokin-sys is its OWN workspace (its ffi build needs the C++
       # toolchain), so `--workspace` above never reaches it — its
       # toolchain-free surface would otherwise be the one crate in the
@@ -56,10 +62,13 @@ jobs:
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --exclude par6d --target aarch64-unknown-linux-gnu
+        run: cargo check --workspace --exclude par6d --exclude par6-py --target aarch64-unknown-linux-gnu
 
   msrv:
-    name: msrv (rust ${{ env.MSRV }})
+    # The env context is not available to jobs.<id>.name, and a workflow
+    # using it there is invalid as a whole — every run of this file dies
+    # at parse with zero jobs. The toolchain version shows in the job log.
+    name: msrv
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -76,7 +85,10 @@ jobs:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
       - name: check
-        run: cargo check --workspace --exclude par6d --all-targets
+        run: |
+          cargo check --workspace --exclude par6d --exclude par6-py \
+            --exclude par6-client --all-targets
+          cargo check -p par6-client
 
   ffi:
     name: ffi (pinocchio shim, x86_64)
@@ -141,8 +153,9 @@ jobs:
       - name: test par6d (the shipped runtime)
         run: |
           source .ffi/env.sh
-          cargo clippy -p par6d --all-targets -- -D warnings
+          cargo clippy -p par6d -p par6-py -p par6-client --all-targets -- -D warnings
           cargo test -p par6d
+          cargo test -p par6-client
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
       # the unpatched 0.004 runs before it meets the arm. Release because
@@ -199,29 +212,55 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      - name: install
-        run: pip install -e "python[dev]"
-      # waldoctl is pinned to a tag, but a cross-repo change lands on a
-      # branch of the same name first (CLAUDE.md's dev workflow), and the
-      # type gate below is what notices when the two sides disagree.
-      - name: use a matching waldoctl branch, if one exists
+      # The package is a maturin build now: pip compiles the par6-py
+      # extension, which links the pinocchio shim like every other crate,
+      # so this job carries the same toolchain (and cache key) as `ffi`.
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: python
+      - name: cache pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/env
+            .ffi/shim
+          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build shim (scripts/ffi/setup.sh)
+        run: scripts/ffi/setup.sh
+      # waldoctl branch-matching must happen BEFORE the package install:
+      # a cross-repo change lands on a branch of the same name first
+      # (CLAUDE.md's dev workflow), and while the release chain is in
+      # flight the pinned tag may not exist yet — a dead pin fails the
+      # whole resolve. The pin is rewritten for this resolve only.
+      - name: install (waldoctl branch-matched)
         run: |
+          source .ffi/env.sh
           branch="${{ github.head_ref || github.ref_name }}"
           repo=https://github.com/Jepson2k/waldoctl.git
-          if git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+          matched=""
+          if [ "$branch" != "main" ] && \
+             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
             echo "installing waldoctl from branch $branch"
-            pip install --force-reinstall --no-deps "waldoctl @ git+$repo@$branch"
+            matched=1
+            pip install "waldoctl @ git+$repo@$branch"
+            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
           else
             echo "no waldoctl branch $branch; keeping the pinned tag"
           fi
-      - name: ruff
-        run: ruff check python/
-      - name: ty
-        working-directory: python
-        run: ty check .
+          pip install -e "python[dev]"
+          if [ -n "$matched" ]; then
+            mv python/pyproject.toml.bak python/pyproject.toml
+          fi
+      - name: pre-commit (ruff, ruff-format, ty, file hygiene)
+        run: pre-commit run --show-diff-on-failure --color=always --all-files
+      # env.sh at run time too: the extension dlopens the shim on import.
       - name: pytest
-        working-directory: python
-        run: pytest
+        run: |
+          source .ffi/env.sh
+          cd python
+          pytest
 
   # End-to-end: the real python client against a real `par6d --sim` process
   # over real UDP. Needs the binary, so it builds par6d here and points
@@ -259,8 +298,24 @@ jobs:
         run: |
           source .ffi/env.sh
           cargo build -p par6d --release
-      - name: install python client
-        run: pip install -e "python[dev]"
+      # Same branch-matching as the python job: the pinned waldoctl tag
+      # may not exist while the release chain is in flight.
+      - name: install python client (waldoctl branch-matched)
+        run: |
+          source .ffi/env.sh
+          branch="${{ github.head_ref || github.ref_name }}"
+          repo=https://github.com/Jepson2k/waldoctl.git
+          matched=""
+          if [ "$branch" != "main" ] && \
+             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+            matched=1
+            pip install "waldoctl @ git+$repo@$branch"
+            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
+          fi
+          pip install -e "python[dev]"
+          if [ -n "$matched" ]; then
+            mv python/pyproject.toml.bak python/pyproject.toml
+          fi
       - name: pytest -m e2e
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
@@ -322,3 +377,12 @@ jobs:
           test -f "$RUNNER_TEMP/bundle/lib/libpar6_shim.so"
           test -f "$RUNNER_TEMP/bundle/config/PAR6.toml"
           test -d "$RUNNER_TEMP/bundle/par6_description"
+      # Tarred so the executable bit and the closure's symlinks survive
+      # the artifact round-trip; `scp` + `tar -x` on the box is the whole
+      # install.
+      - name: pack the bundle
+        run: tar -C "$RUNNER_TEMP" -czf par6d-aarch64.tar.gz bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: par6d-aarch64-bundle
+          path: par6d-aarch64.tar.gz

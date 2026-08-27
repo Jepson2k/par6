@@ -32,7 +32,7 @@ use par6_rt::{
     GravityModel, RtCore, RtHooks, RunOptions, SharedDigitalIo, SharedLineGpio, SnapshotReader,
     SnapshotWriter, SpecSettle, StateSnapshot,
 };
-use par6_server::{ServerConfig, ServerHandle};
+use par6_server::{ConfigInfoData, ServerConfig, ServerHandle};
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{housekeeping_loop, CoreLink, CoreOp, RtBridge, SharedState};
@@ -182,19 +182,39 @@ impl Daemon {
         // the CAN interface, then the e-stop line. Both are startup
         // refusals — nothing has been spawned yet.
         let sim_bus = if opts.sim_dynamics {
-            // The torque-level plant models the ARM (its URDF must carry
-            // exactly the configured joint count, so the bare-flange
-            // model is the only fit); the active tool's mass rides the
-            // gravity model, not the plant.
-            let urdf = assets_dir.join(par6_kin::GripperVariant::Flange.urdf_relpath());
+            // The plant swings exactly the body G(q) describes: the
+            // arm-only chain plus the ACTIVE tool's inertials on the
+            // wrist (the same DH conversion the gravity model uses).
+            // Loading a variant URDF here would double-count whatever
+            // its final link already fuses in.
+            let urdf = assets_dir.join(par6_kin::Kin::ARM_URDF_RELPATH);
             if !urdf.is_file() {
                 return Err(DaemonError::Kinematics(format!(
                     "sim-dynamics URDF missing: {}",
                     urdf.display()
                 )));
             }
-            log::info!("sim plant: torque-level dynamics ({})", urdf.display());
-            SimBus::with_dynamics(urdf)
+            let tool = bundle.active_gripper().map(|g| {
+                let k = &g.kinematics;
+                par6_kin::Kin::dh_tool_params(
+                    k.d_m,
+                    k.a_m,
+                    k.alpha_rad,
+                    k.mass_kg,
+                    k.com_m,
+                    k.inertia_kg_m2,
+                )
+            });
+            log::info!(
+                "sim plant: torque-level dynamics ({}, tool inertials: {})",
+                urdf.display(),
+                if tool.is_some() {
+                    "active gripper"
+                } else {
+                    "none"
+                },
+            );
+            SimBus::with_dynamics(urdf, Some(par6_kin::Kin::ARM_EE_FRAME.to_owned()), tool)
         } else {
             SimBus::new()
         };
@@ -227,7 +247,11 @@ impl Daemon {
             gravity: gravity_hook,
             jog: Box::new(jog),
             stream: Box::new(stream),
-            settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt)),
+            settle: Box::new(SpecSettle::new(
+                CompletionPolicy::Settled,
+                dt,
+                bundle.robot.motion,
+            )),
             estop,
             io,
             flash: flash_marker(),
@@ -288,7 +312,8 @@ impl Daemon {
                 gate: stream_gate.clone(),
             },
         );
-        let cfg = server_config(opts, &bundle);
+        let mut cfg = server_config(opts, &bundle);
+        cfg.config_info = config_info(&config_path, &bundle.robot);
         let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
@@ -313,9 +338,14 @@ impl Daemon {
                 fifo_priority: None,
             }
         } else {
-            // Hardware: SCHED_FIFO on the isolated core (setup failure
-            // is logged DEGRADED, not fatal).
-            RunOptions::default()
+            // Hardware: SCHED_FIFO on the configured core (setup failure
+            // is logged DEGRADED, not fatal; the outcome is published
+            // through LOOP_STATS).
+            let timing = robot.loop_timing();
+            RunOptions {
+                cpu: usize::try_from(timing.cpu).ok(),
+                fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+            }
         };
         let mut threads = Vec::new();
         {
@@ -440,6 +470,10 @@ fn rt_loop(
         }
         core.run(&run_opts, &rt_break);
     }
+    // Deliberate exit: stop the arm and idle the drives with a terminal
+    // limp frame, instead of leaving them to act on the last motion frame
+    // until the CAN watchdog expires.
+    core.shutdown_stop();
     log::info!("RT thread stopped");
 }
 
@@ -515,6 +549,102 @@ fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
     }
 }
 
+/// The config files as loaded, plus their CONFIG_INFO fingerprint:
+/// sha256 hex over the robot TOML and each `grippers/*.toml` (sorted by
+/// file name), each hashed as its file name, a newline, then its content
+/// bytes. Contents and digest come from one read, so CONFIG_BUNDLE
+/// serves exactly the bytes the fingerprint describes.
+struct ConfigFiles {
+    fingerprint: String,
+    robot_filename: String,
+    robot_toml: String,
+    grippers: Vec<(String, String)>,
+}
+
+fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    let mut read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let content = std::fs::read_to_string(path)?;
+        hasher.update(name.as_bytes());
+        hasher.update(b"\n");
+        hasher.update(content.as_bytes());
+        Ok((name, content))
+    };
+    let (robot_filename, robot_content) = read(robot_toml)?;
+    let dir = robot_toml
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("grippers");
+    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().is_some_and(|e| e == "toml"))
+            .collect(),
+        Err(_) => Vec::new(),
+    };
+    paths.sort();
+    let grippers = paths
+        .iter()
+        .map(|g| read(g))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(ConfigFiles {
+        fingerprint: format!("{:x}", hasher.finalize()),
+        robot_filename,
+        robot_toml: robot_content,
+        grippers,
+    })
+}
+
+fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
+    let m = robot.motion;
+    let files = read_config_files(config_path).unwrap_or_else(|e| {
+        log::warn!("config file readback failed: {e}");
+        ConfigFiles {
+            fingerprint: String::new(),
+            robot_filename: String::new(),
+            robot_toml: String::new(),
+            grippers: Vec::new(),
+        }
+    });
+    ConfigInfoData {
+        path: config_path.display().to_string(),
+        fingerprint: files.fingerprint,
+        tick_dt_s: robot.robot.tick_dt_s,
+        motion: [
+            m.jog_l_linear_max_m_s,
+            m.jog_l_angular_max_rad_s,
+            m.cart_step_m,
+            m.cart_step_rad,
+            m.move_l_max_joint_step_rad,
+            m.dls_lambda,
+            m.settle_tolerance_rad,
+            m.settle_timeout_s,
+        ],
+        joints: robot
+            .joints
+            .iter()
+            .map(|j| {
+                let exec = j.limits.for_mode(par6_config::LimitMode::Exec);
+                [
+                    j.limits.soft_min_rad,
+                    j.limits.soft_max_rad,
+                    exec.velocity_rad_s,
+                    exec.acceleration_rad_s2,
+                ]
+            })
+            .collect(),
+        robot_filename: files.robot_filename,
+        robot_toml: files.robot_toml,
+        grippers: files.grippers,
+    }
+}
+
 fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     let robot = &bundle.robot;
     let mut cfg = ServerConfig::from_protocol(&robot.protocol);
@@ -580,19 +710,19 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
 /// The kinematics models loaded at startup (feature `ffi`): one
 /// [`par6_kin::Kin`] per consumer — pinocchio's `Data` is mutated by
 /// every call, so instances are never shared across threads.
-struct KinStack {
+pub(crate) struct KinStack {
     fk: crate::kin::KinFk,
     gravity: crate::kin::KinGravity,
-    planner: crate::kin::CartKin,
+    pub(crate) planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
     housekeeping: crate::kin::CartKin,
-    collision: par6_kin::Collision,
+    pub(crate) collision: par6_kin::Collision,
     /// The streaming gate's own collision world (pinocchio `Data` is
     /// mutated by every query, so the planner's instance cannot be
     /// shared across threads).
     gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
-    tool_offset: crate::kin::ToolOffset,
+    pub(crate) tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
 }
 
@@ -605,7 +735,7 @@ const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
-fn load_kin_stack(
+pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
@@ -617,26 +747,23 @@ fn load_kin_stack(
     };
     let assets_dir =
         resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
-    let variant = variant_for(&robot.robot.active_gripper);
+    let variant = variant_for(
+        &robot.robot.active_gripper,
+        active_gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
     log::info!(
         "kinematics: {} from {}",
         variant.urdf_relpath(),
         assets_dir.display()
     );
     let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
-    // G(q) must describe the body that actually swings. Under
-    // `--sim-dynamics` that body is the plant's own URDF (the flange
-    // variant — the gripper variants carry jaw joints the plant cannot
-    // take), so compensating a tool the plant is not carrying would push
-    // an IDLE arm upward. Everywhere else it is the real arm: the
-    // arm-only chain plus the ACTIVE gripper's inertials from config
-    // (see `kin::load_gravity_kin` for the one-source-per-mass rule).
-    let gravity_kin = if opts.sim_dynamics {
-        load_kin(&assets_dir, par6_kin::GripperVariant::Flange).map_err(DaemonError::Kinematics)?
-    } else {
-        crate::kin::load_gravity_kin(&assets_dir, active_gripper)
-            .map_err(DaemonError::Kinematics)?
-    };
+    // G(q) describes the body that actually swings: the arm-only chain
+    // plus the ACTIVE gripper's inertials from config (one source per
+    // mass — see `kin::load_gravity_kin`). The `--sim-dynamics` plant
+    // carries the same tool inertials on its wrist, so the model and the
+    // plant agree there too and an IDLE arm under the feedforward floats.
+    let gravity_kin = crate::kin::load_gravity_kin(&assets_dir, active_gripper)
+        .map_err(DaemonError::Kinematics)?;
     // The collision world models the same body the planner plans for,
     // tool included — a keep-out the gripper enters is a collision even
     // when the flange clears it. Two instances, one per consumer thread
@@ -657,12 +784,13 @@ fn load_kin_stack(
     // massless point, not a load.
     let tool_offset = ToolOffset::new();
     let window = SoftWindow::from_config(robot);
+    let dls_lambda = robot.motion.dls_lambda;
     Ok(KinStack {
         fk: KinFk::new(load()?, tool_offset.clone()),
         gravity: KinGravity::new(gravity_kin),
-        planner: CartKin::new(load()?, tool_offset.clone(), window),
-        bridge: CartKin::new(load()?, tool_offset.clone(), window),
-        housekeeping: CartKin::new(load()?, tool_offset.clone(), window),
+        planner: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
+        bridge: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
+        housekeeping: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
         collision,
         gate_collision,
         tool_offset,
@@ -772,6 +900,7 @@ mod tests {
             degraded_factor: 1.01,
             critical_factor: 1.02,
             critical_sustain_s: 0.1,
+            ..TimingConfig::default()
         };
         assert_eq!(resolve_loop_bands(true, Some(tight)), tight);
         assert_eq!(resolve_loop_bands(false, Some(tight)), tight);

@@ -300,6 +300,71 @@ fn corner_blending_is_velocity_continuous_ruckig() {
     assert_blend_behavior(ProfileKind::Ruckig);
 }
 
+/// `qdd` against the centered difference of the emitted `qd`. A
+/// jerk-limited profile has continuous acceleration and the two must
+/// agree everywhere; a trapezoid steps its acceleration between phases
+/// and the difference smears each step across two ticks, so there a
+/// mismatch is legal only where the profile actually steps. The last
+/// two samples are excluded: the final sample is forced to land at
+/// rest, which the difference stencil reads as a spurious deceleration.
+fn assert_qdd_is_the_derivative_of_qd(
+    case: &str,
+    profile: ProfileKind,
+    plan: &Plan,
+    limits: &MotionLimits,
+    dt: f64,
+) {
+    let steps = matches!(profile, ProfileKind::Trapezoid);
+    let s = plan.samples();
+    assert!(
+        s.iter().any(|x| x.qdd.iter().any(|a| a.abs() > 1e-3)),
+        "a move that starts and ends at rest must accelerate somewhere"
+    );
+    for j in 0..NUM_JOINTS {
+        for k in 1..s.len().saturating_sub(2) {
+            let fd = (s[k + 1].qd[j] - s[k - 1].qd[j]) / (2.0 * dt);
+            let err = (fd - s[k].qdd[j]).abs();
+            if !steps {
+                let tol = limits.jerk[j] * dt + 1e-6;
+                assert!(
+                    err <= tol,
+                    "{case}: joint {j} sample {k}: qdd {} vs finite-difference {fd} (tol {tol})",
+                    s[k].qdd[j]
+                );
+            } else if err > 1e-6 {
+                assert!(
+                    (s[k + 1].qdd[j] - s[k - 1].qdd[j]).abs() > 1e-9,
+                    "{case}: joint {j} sample {k}: qdd {} vs finite-difference {fd} \
+                     away from any phase boundary",
+                    s[k].qdd[j]
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn emitted_acceleration_is_the_derivative_of_emitted_velocity() {
+    for profile in [ProfileKind::Trapezoid, ProfileKind::Ruckig] {
+        let (plan, limits, dt) = plan_one(profile, MoveParams::default());
+        assert_qdd_is_the_derivative_of_qd(
+            &format!("{profile:?} single"),
+            profile,
+            &plan,
+            &limits,
+            dt,
+        );
+        let (plan, limits, dt) = plan_two(profile, true);
+        assert_qdd_is_the_derivative_of_qd(
+            &format!("{profile:?} blend"),
+            profile,
+            &plan,
+            &limits,
+            dt,
+        );
+    }
+}
+
 #[test]
 fn ruckig_waypoint_chain_passes_through_waypoints() {
     let (limits, dt) = exec_limits();

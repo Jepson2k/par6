@@ -91,11 +91,6 @@ const NULL_MOVE_RAD: f64 = 1e-9;
 /// already referenced (vendor `HOME_RETURN_SPEED_FRAC`).
 const HOME_RETURN_SPEED_FRAC: f64 = 0.5;
 
-/// Cartesian sampling pitch: one IK waypoint per this much translation
-/// \[m\] …
-const CART_STEP_M: f64 = 0.005;
-/// … or per this much rotation \[rad\], whichever yields more waypoints.
-const CART_STEP_RAD: f64 = 0.05;
 /// Waypoint-count ceiling for one `move_l` (bounds planning cost).
 const MOVE_L_MAX_STEPS: usize = 400;
 /// Waypoint-count ceiling for a multi-segment cartesian path — an arc, a
@@ -107,19 +102,6 @@ const CART_PATH_MAX_STEPS: usize = 3000;
 /// Below this much translation AND rotation a cartesian move is already
 /// at its target.
 const MOVE_L_NULL_M: f64 = 1e-6;
-/// Largest joint change allowed between consecutive cartesian IK
-/// waypoints \[rad\]; a bigger jump means the solver hopped to another
-/// IK branch and the commanded path would whip the arm.
-///
-/// Measured against the wrap-normalized solution — [`CartKin::ik_within`]
-/// picks the 2π branch nearest the seed, and the seed here is the
-/// previous waypoint. A whole turn on one joint is the same
-/// configuration and must not read as a branch flip; the postures that
-/// genuinely are one still do, because wrapping only ever moves a
-/// solution closer to the seed.
-///
-/// [`CartKin::ik_within`]: crate::kin::CartKin::ik_within
-const MOVE_L_MAX_JOINT_STEP_RAD: f64 = 0.35;
 /// How far a waypoint list's first pose may sit from where the arm
 /// actually is before the current pose is PREPENDED to the path instead
 /// of replacing that first waypoint \[m\].
@@ -283,6 +265,12 @@ pub(crate) struct Par6Planner {
     tool_offset: crate::kin::ToolOffset,
     /// Rate/change gate for the cartesian enablement probe.
     probe: EnablementProbe,
+    /// The `[motion]` feel constants (sampling pitch, IK step guard,
+    /// settle parameters).
+    motion: par6_config::MotionConfig,
+    /// The applied runtime payload, mirrored so `sync` only touches the
+    /// model on a change.
+    payload: par6_server::PayloadSpec,
 }
 
 impl Par6Planner {
@@ -313,6 +301,7 @@ impl Par6Planner {
         {
             *out = *rad;
         }
+        let motion = bundle.robot.motion;
         Ok(Self {
             link,
             producer,
@@ -344,6 +333,8 @@ impl Par6Planner {
             shape_names: ShapeNames::default(),
             collision_latch: CollisionState::default(),
             invalidated: None,
+            motion,
+            payload: par6_server::PayloadSpec::default(),
         })
     }
 
@@ -379,9 +370,9 @@ impl Par6Planner {
     /// admission in the bridge's `StreamGate`, which applies the same
     /// two-halves rule: the jog/servo ramp is integrated on the RT
     /// thread, where a coal check cannot go.
-    fn gate_collisions(
+    fn gate_collisions<const W: usize>(
         &mut self,
-        samples: &[[f64; 2 * MAX_JOINTS]],
+        samples: &[[f64; W]],
         from: usize,
     ) -> Result<(), WireError> {
         let started = Instant::now();
@@ -535,7 +526,7 @@ impl Par6Planner {
     /// change is requested, for a path that would collide.
     fn start_exec(
         &mut self,
-        samples: Vec<[f64; 2 * MAX_JOINTS]>,
+        samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
         self.gate_collisions(&samples, 0)?;
@@ -546,10 +537,16 @@ impl Par6Planner {
         let ring_index = self.next_ring_index;
         self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         let n = samples.len();
+        // The planned acceleration becomes the ring's torque feedforward
+        // (`M(q)·q̈ + C(q,q̇)·q̇`; the law adds G(q) itself). A feedforward
+        // is not a safety path: a model failure degrades to zero torque
+        // for that sample and the PID loop carries the move.
+        let kin = &mut self.kin;
+        let mut id_failed = false;
         let samples: Vec<RingSample> = samples
             .into_iter()
             .enumerate()
-            .map(|(k, qqd)| {
+            .map(|(k, qqa)| {
                 let mut s = RingSample {
                     q: [0.0; MAX_JOINTS],
                     qd: [0.0; MAX_JOINTS],
@@ -561,8 +558,22 @@ impl Par6Planner {
                         is_last: k + 1 == n,
                     },
                 };
-                s.q.copy_from_slice(&qqd[..MAX_JOINTS]);
-                s.qd.copy_from_slice(&qqd[MAX_JOINTS..]);
+                s.q.copy_from_slice(&qqa[..MAX_JOINTS]);
+                s.qd.copy_from_slice(&qqa[MAX_JOINTS..2 * MAX_JOINTS]);
+                let mut qdd = [0.0; MAX_JOINTS];
+                qdd.copy_from_slice(&qqa[2 * MAX_JOINTS..]);
+                match kin.dyn_feedforward(&s.q, &s.qd, &qdd) {
+                    Ok(tau) => {
+                        for (out, t) in s.tau_ff.iter_mut().zip(tau.iter()) {
+                            *out = *t as f32;
+                        }
+                    }
+                    Err(e) if !id_failed => {
+                        id_failed = true;
+                        log::warn!("torque feedforward degraded to zero: {e}");
+                    }
+                    Err(_) => {}
+                }
                 s
             })
             .collect();
@@ -606,7 +617,7 @@ impl Par6Planner {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
-    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid => ProfileKind::Trapezoid,
@@ -636,6 +647,14 @@ impl Par6Planner {
             for a in limits.acceleration.iter_mut() {
                 *a *= accel;
             }
+            // Jerk rides the acceleration fraction, matching the streaming
+            // path (`MotionStream::set_scale`): a move asked to accelerate
+            // gently that kept the full jerk ceiling would reach the lower
+            // acceleration just as abruptly, which is the jolt the fraction
+            // is asking to avoid. An infinite jerk stays infinite.
+            for j in limits.jerk.iter_mut() {
+                *j *= accel;
+            }
         }
         let mut builder = ProgramBuilder::new(*start, limits, self.dt).map_err(planning_error)?;
         builder
@@ -655,10 +674,11 @@ impl Par6Planner {
             .samples()
             .iter()
             .map(|s| {
-                let mut qqd = [0.0; 2 * MAX_JOINTS];
-                qqd[..MAX_JOINTS].copy_from_slice(&s.q);
-                qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
-                qqd
+                let mut qqa = [0.0; 3 * MAX_JOINTS];
+                qqa[..MAX_JOINTS].copy_from_slice(&s.q);
+                qqa[MAX_JOINTS..2 * MAX_JOINTS].copy_from_slice(&s.qd);
+                qqa[2 * MAX_JOINTS..].copy_from_slice(&s.qdd);
+                qqa
             })
             .collect())
     }
@@ -673,7 +693,7 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
         min_duration: Option<f64>,
-    ) -> Result<Vec<[f64; 2 * MAX_JOINTS]>, WireError> {
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let speed_frac = speed.unwrap_or(1.0);
         let accel_frac = accel.unwrap_or(1.0);
         let vel: Vec<f64> = self
@@ -719,12 +739,17 @@ impl Par6Planner {
                         &[("detail", &format!("trajectory sampling failed: {e}"))],
                     )
                 })?;
-            let mut qqd = [0.0; 2 * MAX_JOINTS];
-            qqd[..MAX_JOINTS].copy_from_slice(&q);
-            for (out, v) in qqd[MAX_JOINTS..].iter_mut().zip(qd.iter()) {
+            let mut qqa = [0.0; 3 * MAX_JOINTS];
+            qqa[..MAX_JOINTS].copy_from_slice(&q);
+            for (out, v) in qqa[MAX_JOINTS..2 * MAX_JOINTS].iter_mut().zip(qd.iter()) {
                 *out = v * scale;
             }
-            samples.push(qqd);
+            // A min-duration stretch is a time reparameterization t → t/scale:
+            // velocities pick up one factor of `scale`, accelerations two.
+            for (out, a) in qqa[2 * MAX_JOINTS..].iter_mut().zip(qdd.iter()) {
+                *out = a * scale * scale;
+            }
+            samples.push(qqa);
         }
         Ok(samples)
     }
@@ -836,7 +861,7 @@ impl Par6Planner {
 
     /// The TCP pose the arm is standing at — where every cartesian move
     /// starts from.
-    fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
+    pub(crate) fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
         self.kin
             .fk(q)
             .map_err(|e| make_error(ErrorCode::MotnSetupFailed, UNATTRIBUTED, &[("detail", &e)]))
@@ -933,7 +958,7 @@ impl Par6Planner {
                         )],
                     ));
                 }
-                if (q[j] - seed[j]).abs() > MOVE_L_MAX_JOINT_STEP_RAD {
+                if (q[j] - seed[j]).abs() > self.motion.move_l_max_joint_step_rad {
                     return Err(partial());
                 }
             }
@@ -953,7 +978,7 @@ impl Par6Planner {
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
         let target = target_pose(&start_pose, &cmd.pose, cmd.frame, cmd.rel);
-        let poses = par6_motion::cart::line(&start_pose, &target, line_sampling());
+        let poses = par6_motion::cart::line(&start_pose, &target, line_sampling(&self.motion));
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -967,7 +992,7 @@ impl Par6Planner {
         let start_pose = self.current_pose(&snap.q)?;
         let via = target_pose(&start_pose, &cmd.via, cmd.frame, false);
         let end = target_pose(&start_pose, &cmd.end, cmd.frame, false);
-        let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling())
+        let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling(&self.motion))
             .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
@@ -980,8 +1005,8 @@ impl Par6Planner {
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
         let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame);
-        let poses =
-            par6_motion::cart::spline(&waypoints, path_sampling()).map_err(planning_error)?;
+        let poses = par6_motion::cart::spline(&waypoints, path_sampling(&self.motion))
+            .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -1004,8 +1029,9 @@ impl Par6Planner {
             .windows(2)
             .map(|w| MOVE_P_AUTO_BLEND_FRAC * w[0].min(w[1]))
             .collect();
-        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
-            .map_err(planning_error)?;
+        let poses =
+            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
+                .map_err(planning_error)?;
         self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
     }
 
@@ -1040,8 +1066,9 @@ impl Par6Planner {
             .iter()
             .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
             .collect();
-        let poses = par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling())
-            .map_err(planning_error)?;
+        let poses =
+            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
+                .map_err(planning_error)?;
 
         let speed = chain
             .iter()
@@ -1127,7 +1154,7 @@ impl Par6Planner {
         let path = par6_motion::cart::blended_polyline_joint(
             &waypoints,
             &fracs,
-            CART_STEP_RAD,
+            self.motion.cart_step_rad,
             CART_PATH_MAX_STEPS,
         )
         .map_err(planning_error)?;
@@ -1573,10 +1600,10 @@ impl Par6Planner {
 }
 
 /// Sampling of a single straight `move_l`.
-fn line_sampling() -> par6_motion::cart::CartSampling {
+fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
-        step_m: CART_STEP_M,
-        step_rad: CART_STEP_RAD,
+        step_m: motion.cart_step_m,
+        step_rad: motion.cart_step_rad,
         max_points: MOVE_L_MAX_STEPS + 1,
     }
 }
@@ -1584,10 +1611,10 @@ fn line_sampling() -> par6_motion::cart::CartSampling {
 /// Sampling of a multi-segment cartesian path (arc, spline, process
 /// move, blended chain): the same pitch, a budget sized for the longer
 /// path.
-fn path_sampling() -> par6_motion::cart::CartSampling {
+fn path_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
-        step_m: CART_STEP_M,
-        step_rad: CART_STEP_RAD,
+        step_m: motion.cart_step_m,
+        step_rad: motion.cart_step_rad,
         max_points: CART_PATH_MAX_STEPS,
     }
 }
@@ -1776,6 +1803,40 @@ impl EnablementProbe {
     }
 }
 
+/// What the in-flight command would do to the arm — the offline preview's
+/// read on a plan it will never execute.
+pub(crate) enum PlannedMotion<'a> {
+    /// A sampled trajectory (tick-dt EXEC samples).
+    Exec(&'a [RingSample]),
+    /// The homing sequence; on a referenced arm it lands at the
+    /// configured home pose.
+    Home,
+    /// No motion (tool actions, delays, checkpoints, null moves).
+    Still,
+}
+
+impl Par6Planner {
+    /// The in-flight command's planned motion, for the offline preview.
+    pub(crate) fn planned_motion(&self) -> PlannedMotion<'_> {
+        match &self.inflight {
+            Some(InFlight {
+                kind: InFlightKind::Exec { samples, .. },
+                ..
+            }) => PlannedMotion::Exec(samples),
+            Some(InFlight {
+                kind: InFlightKind::Home { .. },
+                ..
+            }) => PlannedMotion::Home,
+            _ => PlannedMotion::Still,
+        }
+    }
+
+    /// The configured home pose \[rad\].
+    pub(crate) fn home_pose(&self) -> [f64; MAX_JOINTS] {
+        self.home_pose_rad
+    }
+}
+
 impl Planner for Par6Planner {
     fn start(&mut self, batch: &[QueuedCommand<'_>]) -> Result<usize, WireError> {
         let Some(head) = batch.first() else {
@@ -1853,6 +1914,17 @@ impl Planner for Par6Planner {
     }
 
     fn sync(&mut self, ctx: PlanContext<'_>) {
+        if ctx.payload != self.payload {
+            // The torque feedforward (and TOPPRA's dynamics, when that
+            // profile runs) must carry what the arm carries.
+            match self
+                .kin
+                .set_tool(ctx.payload.mass, ctx.payload.com, ctx.payload.inertia)
+            {
+                Ok(()) => self.payload = ctx.payload,
+                Err(e) => log::error!("planner payload update refused: {e}"),
+            }
+        }
         if ctx.completion_policy != self.policy {
             self.policy = ctx.completion_policy;
             let rt_policy = match ctx.completion_policy {
@@ -1861,8 +1933,9 @@ impl Planner for Par6Planner {
                 par6_proto::CompletionPolicy::Strict => par6_rt::CompletionPolicy::Strict,
             };
             let dt = self.dt;
+            let motion = self.motion;
             self.link.op(Box::new(move |core| {
-                core.set_settle_policy(Box::new(SpecSettle::new(rt_policy, dt)));
+                core.set_settle_policy(Box::new(SpecSettle::new(rt_policy, dt, motion)));
             }));
         }
         match Profile::from_name(ctx.profile) {
@@ -2102,30 +2175,4 @@ fn rt_error(snap: &StateSnapshot) -> WireError {
             &[("detail", "the RT core latched a hard error")],
         )
     })
-}
-
-#[cfg(test)]
-mod mirror {
-    use crate::py_mirror::{assert_float, assert_str, assert_usize};
-
-    /// The offline preview restates the planner's tuning numbers so it can
-    /// plan without a runtime. Drift makes it draw a motion the arm will
-    /// not make, and the preview agrees with itself either way.
-    #[test]
-    fn python_motion_mirrors_the_planner_constants() {
-        assert_float("CART_STEP_M", super::CART_STEP_M);
-        assert_float("CART_STEP_RAD", super::CART_STEP_RAD);
-        assert_usize("MOVE_L_MAX_STEPS", super::MOVE_L_MAX_STEPS);
-        assert_usize("CART_PATH_MAX_STEPS", super::CART_PATH_MAX_STEPS);
-        assert_float("MOVE_L_NULL_M", super::MOVE_L_NULL_M);
-        assert_float(
-            "MOVE_L_MAX_JOINT_STEP_RAD",
-            super::MOVE_L_MAX_JOINT_STEP_RAD,
-        );
-        assert_float("NULL_MOVE_RAD", super::NULL_MOVE_RAD);
-        assert_float("WAYPOINT_SNAP_M", super::WAYPOINT_SNAP_M);
-        assert_float("MOVE_P_AUTO_BLEND_FRAC", super::MOVE_P_AUTO_BLEND_FRAC);
-        assert_float("COLLISION_STEP_RAD", super::COLLISION_STEP_RAD);
-        assert_str("DEFAULT_PROFILE", super::DEFAULT_PROFILE);
-    }
 }

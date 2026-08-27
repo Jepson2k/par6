@@ -319,6 +319,18 @@ pub struct ProtocolConfig {
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
     /// (validated) so the broadcaster is a clean tick decimation.
     pub status_rate_hz: u32,
+    /// Telemetry stream rate \[Hz\].
+    #[serde(default = "default_telemetry_rate_hz")]
+    pub telemetry_rate_hz: u32,
+    /// Telemetry recipe active from boot. Omitted = the stream stays
+    /// silent until a client's `set_recipe` — the shipped default. An
+    /// unknown name refuses startup, like `set_recipe` refuses it live.
+    #[serde(default)]
+    pub initial_recipe: Option<String>,
+}
+
+fn default_telemetry_rate_hz() -> u32 {
+    100
 }
 
 /// Jog profile shape.
@@ -379,31 +391,18 @@ pub struct StreamDefaults {
     /// Silence on the stream link before the robot stops itself and
     /// latches `RTI_LINK_LOST` \[s\]. Also the minimum command rate.
     pub command_timeout_s: f64,
-    /// Hold position this long after any stop, clean or error \[s\].
-    pub stopping_hold_s: f64,
-    /// Max distance of the first setpoint after claim from the measured
-    /// pose \[rad\].
-    pub start_pose_tol_rad: f64,
     /// Command low-pass cutoff \[Hz\]; 0 = off.
     pub lowpass_cutoff_hz: f64,
     /// Moving success-rate window \[s\] (0.4 s = 100 ticks at 250 Hz).
     pub success_window_s: f64,
-    /// Warn when the success rate drops below this.
-    pub success_warn: f64,
-    /// Alarm when the success rate drops below this.
-    pub success_bad: f64,
 }
 
 impl Default for StreamDefaults {
     fn default() -> Self {
         Self {
             command_timeout_s: 0.040,
-            stopping_hold_s: 0.5,
-            start_pose_tol_rad: 0.1,
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
-            success_warn: 0.95,
-            success_bad: 0.90,
         }
     }
 }
@@ -429,6 +428,12 @@ pub struct TimingConfig {
     pub critical_factor: f64,
     /// How long the hard band must hold before latching \[s\].
     pub critical_sustain_s: f64,
+    /// CPU the RT thread pins to on hardware; negative disables pinning.
+    /// Ignored under `--sim`, which always runs unpinned and unprivileged.
+    pub cpu: i64,
+    /// SCHED_FIFO priority the RT thread requests on hardware (1..=99);
+    /// 0 disables the request. Ignored under `--sim`.
+    pub fifo_priority: u8,
 }
 
 impl Default for TimingConfig {
@@ -437,6 +442,8 @@ impl Default for TimingConfig {
             degraded_factor: 1.05,
             critical_factor: 1.10,
             critical_sustain_s: 1.0,
+            cpu: 3,
+            fifo_priority: 99,
         }
     }
 }
@@ -455,7 +462,84 @@ impl TimingConfig {
         degraded_factor: 1.5,
         critical_factor: 4.0,
         critical_sustain_s: 5.0,
+        // Scheduling knobs are hardware-only; the sim path never reads
+        // them, so the vendor defaults ride along unchanged.
+        cpu: 3,
+        fifo_priority: 99,
     };
+}
+
+/// `[motion]`: the runtime's motion "feel" constants — sampling pitch,
+/// solver damping, jog full-scale rates, completion settling. Defaults
+/// are the values par6 shipped with as compiled constants; the section
+/// makes them installation-tunable, and the offline preview reads the
+/// same file, so a tuned deployment previews the way it runs.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MotionConfig {
+    /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities`
+    /// fraction of ±1 maps to this).
+    pub jog_l_linear_max_m_s: f64,
+    /// Full-scale `jog_l` angular TCP speed \[rad/s\].
+    pub jog_l_angular_max_rad_s: f64,
+    /// Cartesian sampling pitch: one IK waypoint per this much
+    /// translation \[m\] …
+    pub cart_step_m: f64,
+    /// … or per this much rotation \[rad\], whichever yields more
+    /// waypoints.
+    pub cart_step_rad: f64,
+    /// Largest joint change allowed between consecutive cartesian IK
+    /// waypoints \[rad\]; a bigger jump means the solver hopped to
+    /// another IK branch and the commanded path would whip the arm.
+    pub move_l_max_joint_step_rad: f64,
+    /// DLS damping λ for the jacobian velocity solve
+    /// (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
+    pub dls_lambda: f64,
+    /// All-joint settle tolerance \[rad\] for the `settled`/`strict`
+    /// completion policies.
+    pub settle_tolerance_rad: f64,
+    /// Settle timeout \[s\].
+    pub settle_timeout_s: f64,
+}
+
+impl Default for MotionConfig {
+    fn default() -> Self {
+        Self {
+            jog_l_linear_max_m_s: 0.08,
+            jog_l_angular_max_rad_s: 0.6,
+            cart_step_m: 0.005,
+            cart_step_rad: 0.05,
+            move_l_max_joint_step_rad: 0.35,
+            dls_lambda: 0.05,
+            settle_tolerance_rad: 0.01,
+            settle_timeout_s: 2.0,
+        }
+    }
+}
+
+/// `[limits]`: safety-envelope enforcement thresholds.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct LimitsSection {
+    /// External-torque envelope margin \[Nm\]: hard fault when a joint's
+    /// external torque estimate (measured minus model, minus the active
+    /// motion's feed-forward) stays beyond this for the window below.
+    /// 0 disables the envelope — the shipped default, because the
+    /// estimate is only as good as the torque constants and the gravity
+    /// model; hardware opts in with a calibrated margin.
+    pub tau_ext_margin_nm: f64,
+    /// How long a joint must stay beyond the margin before the fault
+    /// latches \[s\] — rides out measurement transients and filter lag.
+    pub tau_ext_window_s: f64,
+}
+
+impl Default for LimitsSection {
+    fn default() -> Self {
+        Self {
+            tau_ext_margin_nm: 0.0,
+            tau_ext_window_s: 0.1,
+        }
+    }
 }
 
 /// Root of a robot TOML file.
@@ -488,6 +572,13 @@ pub struct RobotConfig {
     /// fills this in with [`TimingConfig::SIM`] when it is absent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timing: Option<TimingConfig>,
+    /// Safety-envelope enforcement thresholds. Omitted = everything
+    /// disabled.
+    #[serde(default)]
+    pub limits: LimitsSection,
+    /// Motion feel constants. Omitted = the shipped defaults.
+    #[serde(default)]
+    pub motion: MotionConfig,
 }
 
 impl RobotConfig {
@@ -562,6 +653,8 @@ impl RobotConfig {
         self.validate_protocol()?;
         self.validate_defaults()?;
         self.validate_timing()?;
+        self.validate_limits()?;
+        self.validate_motion()?;
         Ok(())
     }
 
@@ -747,6 +840,9 @@ impl RobotConfig {
         if p.status_rate_hz == 0 {
             return Err(invalid("protocol.status_rate_hz", "must be > 0"));
         }
+        if !(1..=1000).contains(&p.telemetry_rate_hz) {
+            return Err(invalid("protocol.telemetry_rate_hz", "must be 1..=1000"));
+        }
         let rate = self.tick_rate_hz();
         let per = rate / f64::from(p.status_rate_hz);
         if per < 1.0 || (per - per.round()).abs() > 1e-9 {
@@ -772,8 +868,6 @@ impl RobotConfig {
         let s = &self.stream;
         for (v, name) in [
             (s.command_timeout_s, "stream.command_timeout_s"),
-            (s.stopping_hold_s, "stream.stopping_hold_s"),
-            (s.start_pose_tol_rad, "stream.start_pose_tol_rad"),
             (s.success_window_s, "stream.success_window_s"),
         ] {
             if !is_positive(v) {
@@ -784,12 +878,6 @@ impl RobotConfig {
             return Err(invalid(
                 "stream.lowpass_cutoff_hz",
                 "must be >= 0 (0 = off)",
-            ));
-        }
-        if !(s.success_bad <= s.success_warn && s.success_warn <= 1.0 && s.success_bad >= 0.0) {
-            return Err(invalid(
-                "stream.success_warn",
-                "need 0 <= success_bad <= success_warn <= 1",
             ));
         }
         Ok(())
@@ -820,6 +908,48 @@ impl RobotConfig {
         }
         if !is_positive(t.critical_sustain_s) || !t.critical_sustain_s.is_finite() {
             return Err(invalid("timing.critical_sustain_s", "must be > 0"));
+        }
+        if t.fifo_priority > 99 {
+            return Err(invalid(
+                "timing.fifo_priority",
+                "must be 0..=99 (0 disables SCHED_FIFO)",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_motion(&self) -> Result<(), ConfigError> {
+        let m = &self.motion;
+        for (v, name) in [
+            (m.jog_l_linear_max_m_s, "motion.jog_l_linear_max_m_s"),
+            (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
+            (m.cart_step_m, "motion.cart_step_m"),
+            (m.cart_step_rad, "motion.cart_step_rad"),
+            (
+                m.move_l_max_joint_step_rad,
+                "motion.move_l_max_joint_step_rad",
+            ),
+            (m.dls_lambda, "motion.dls_lambda"),
+            (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
+            (m.settle_timeout_s, "motion.settle_timeout_s"),
+        ] {
+            if !is_positive(v) || !v.is_finite() {
+                return Err(invalid(name, "must be > 0 and finite"));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_limits(&self) -> Result<(), ConfigError> {
+        let l = &self.limits;
+        if l.tau_ext_margin_nm < 0.0 || !l.tau_ext_margin_nm.is_finite() {
+            return Err(invalid(
+                "limits.tau_ext_margin_nm",
+                "must be >= 0 (0 disables the envelope)",
+            ));
+        }
+        if !is_positive(l.tau_ext_window_s) || !l.tau_ext_window_s.is_finite() {
+            return Err(invalid("limits.tau_ext_window_s", "must be > 0"));
         }
         Ok(())
     }

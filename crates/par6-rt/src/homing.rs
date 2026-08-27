@@ -42,7 +42,7 @@ use par6_config::{
     ConfigBundle, GripperHomeMode, HomingStrategy, JointHoming, PreMove, RobotConfig,
 };
 
-use crate::state::{HomingJointStatus, HomingStatus};
+use crate::state::{HomingJointStatus, HomingPhase, HomingStatus};
 use crate::{MAX_JOINTS, NUM_NODES};
 
 /// Pre/post-move timeout \[s\] (warn and continue).
@@ -232,6 +232,10 @@ enum HomerEvent {
 #[derive(Debug)]
 struct Homer {
     phase: HPhase,
+    /// The phase the FSM was in when it failed — what the published
+    /// `HomingPhase` reports for a `Failed` status, so the operator can
+    /// tell an approach timeout from a settle mismatch.
+    failed_in: HPhase,
     elapsed: u32,
     pass: u8,
     pass_hits: [i64; 2],
@@ -256,6 +260,7 @@ impl Homer {
     fn new(p: &HomerParams) -> Self {
         Self {
             phase: HPhase::Finished,
+            failed_in: HPhase::Finished,
             elapsed: 0,
             pass: 1,
             pass_hits: [0; 2],
@@ -300,6 +305,25 @@ impl Homer {
 
     fn running(&self) -> bool {
         !matches!(self.phase, HPhase::Finished | HPhase::Failed)
+    }
+
+    /// The published phase; `Failed` reports the phase the FSM failed in.
+    fn public_phase(&self) -> HomingPhase {
+        let map = |p: &HPhase| match p {
+            HPhase::Approach => HomingPhase::Approach,
+            HPhase::Dwell => HomingPhase::Dwell,
+            HPhase::Backoff { .. } => HomingPhase::Backoff,
+            HPhase::Pause => HomingPhase::Pause,
+            HPhase::Release => HomingPhase::Release,
+            HPhase::Settle => HomingPhase::Settle,
+            HPhase::PostMove => HomingPhase::PostMove,
+            HPhase::Finished => HomingPhase::Finished,
+            HPhase::Failed => HomingPhase::Finished,
+        };
+        match self.phase {
+            HPhase::Failed => map(&self.failed_in),
+            ref p => map(p),
+        }
     }
 
     /// `speed` is the signed speed commanded THIS tick — the threshold
@@ -358,6 +382,7 @@ impl Homer {
             HPhase::Approach => {
                 self.elapsed += 1;
                 if self.elapsed > p.timeout_ticks {
+                    self.failed_in = self.phase;
                     self.phase = HPhase::Failed;
                     return (JointCommand::idle(), Some(HomerEvent::Failed));
                 }
@@ -489,6 +514,7 @@ impl Homer {
                     match self.latched {
                         None if self.elapsed < 2 * p.settle_ticks => {}
                         None => {
+                            self.failed_in = self.phase;
                             self.phase = HPhase::Failed;
                             return (JointCommand::idle(), Some(HomerEvent::Failed));
                         }
@@ -501,6 +527,7 @@ impl Homer {
                                         p.node,
                                         p.max_diff_ticks
                                     );
+                                    self.failed_in = self.phase;
                                     self.phase = HPhase::Failed;
                                     return (JointCommand::idle(), Some(HomerEvent::Failed));
                                 }
@@ -905,10 +932,22 @@ impl HomingSystem {
                 gp.normal_ilim
             };
         }
+        // Phase is meaningful only once that actuator's FSM has been
+        // started (a firmware-calibrated gripper never drives a Homer and
+        // stays at Idle).
+        let mut phase = [HomingPhase::Idle; NUM_NODES];
+        for (i, out) in phase.iter_mut().enumerate() {
+            if self.statuses[i] != HomingJointStatus::Idle {
+                if let Some(h) = self.homers.get(i) {
+                    *out = h.public_phase();
+                }
+            }
+        }
         HomingStatus {
             active: self.active,
             sequence_step: self.step_idx.min(u8::MAX as usize) as u8,
             per_joint: self.statuses,
+            phase,
             effective_current_limit_ma: eff,
         }
     }

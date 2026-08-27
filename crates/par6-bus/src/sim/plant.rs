@@ -84,8 +84,13 @@ impl KinJoint {
 
     /// Integrate one fixed step. `load_ma` is a constant external load in
     /// motor-current equivalent (positive opposes positive motion).
+    /// The feedforward share of the command is excluded: this plant's
+    /// current→acceleration gain is a synthetic Ilim mapping, so torque
+    /// feedforward calibrated for the real drives is taken as exactly
+    /// absorbed by the physics this tier does not model (see
+    /// [`PlantCmd::ff_ma`]).
     pub fn step(&mut self, dt: f64, cmd: &PlantCmd, load_ma: f64) {
-        let net = cmd.current_ma - load_ma;
+        let net = cmd.current_ma - cmd.ff_ma - load_ma;
         if cmd.idle {
             self.vel *= self.idle_keep;
         }

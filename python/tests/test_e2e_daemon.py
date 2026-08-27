@@ -20,6 +20,7 @@ import time
 import numpy as np
 import pytest
 from live_daemon import (
+    TICK_DT_S,
     LiveDaemon,
     angles_now,
     free_udp_port,
@@ -34,8 +35,9 @@ from waldoctl.shapes import Box
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, CmdType, ErrorCode
+from par6.protocol.constants import ActionState, ErrorCode
 from par6.robot import Robot
+from par6.telemetry import TelemetryReader
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
 
@@ -66,9 +68,7 @@ def daemon(tmp_path):
 
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every soft window."""
-    return [
-        math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]
-    ]
+    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
 
 
 def ready_pose_deg() -> list[float]:
@@ -157,7 +157,9 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         # The gap counter is fed by the datagram callback, not by this
         # consumer, so it sees every packet the runtime actually sent.
         assert client.status_seq_gaps == 0
-        assert frames[-1].homed is False, "a fresh runtime must not claim a home reference"
+        assert frames[-1].homed is False, (
+            "a fresh runtime must not claim a home reference"
+        )
         queried = await client.angles()
         assert queried is not None
         assert max_deg_error(queried, frames[-1].angles) < 1.0, (
@@ -255,14 +257,18 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
             try:
                 attempt = await client.move_j(target, duration=1.5)
             except RobotError as exc:
-                assert exc.code in RETRIABLE, f"unexpected rejection while re-enabling: {exc}"
+                assert exc.code in RETRIABLE, (
+                    f"unexpected rejection while re-enabling: {exc}"
+                )
                 await asyncio.sleep(0.2)
                 continue
             try:
                 if await client.wait_command(attempt, timeout=STEP_BUDGET_S):
                     recovered = attempt
             except RobotError as exc:
-                assert exc.code in RETRIABLE, f"unexpected failure while re-enabling: {exc}"
+                assert exc.code in RETRIABLE, (
+                    f"unexpected failure while re-enabling: {exc}"
+                )
                 await asyncio.sleep(0.2)
         assert recovered > queued_b, (
             f"the index allocator must never rewind ({recovered} must follow {queued_b})"
@@ -299,8 +305,9 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
         assert home_index >= 0
 
         assert await client.wait_status(
-            lambda s: s.action_current == "home"
-            and s.action_state == ActionState.EXECUTING,
+            lambda s: (
+                s.action_current == "home" and s.action_state == ActionState.EXECUTING
+            ),
             timeout=STEP_BUDGET_S,
         ), f"homing never started executing; daemon log:\n{daemon.log()}"
 
@@ -484,9 +491,13 @@ async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
             f"defaults to {robot.tools.default.key}"
         )
         for key in reported.available:
-            assert key in robot.tools, f"{key} is not in {[t.key for t in robot.tools.available]}"
+            assert key in robot.tools, (
+                f"{key} is not in {[t.key for t in robot.tools.available]}"
+            )
 
-        assert await client.wait_status(lambda s: s.tool_status_present, timeout=STEP_BUDGET_S)
+        assert await client.wait_status(
+            lambda s: s.tool_status_present, timeout=STEP_BUDGET_S
+        )
         broadcast = await client.wait_status(lambda s: True, timeout=STEP_BUDGET_S)
         assert broadcast
         streamed_key = client._shared_status.tool_status.key
@@ -718,7 +729,9 @@ TILTED_POSTURE_DEG = [0.0, -75.0, 305.0, 20.0, -30.0, 180.0]
 
 
 @pytest.mark.timeout(180)
-async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: LiveDaemon):
+async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
+    daemon: LiveDaemon,
+):
     """A pose read off the wire, sent straight back, must not move the arm.
 
     This is the teach-and-replay path: Waldo Commander decodes the STATUS
@@ -741,7 +754,9 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(daemon: Li
 
         taught = await client.pose()
         assert taught is not None
-        assert all(math.isfinite(v) for v in taught), f"STATUS pose not finite: {taught}"
+        assert all(math.isfinite(v) for v in taught), (
+            f"STATUS pose not finite: {taught}"
+        )
         angles = await client.angles()
         assert angles is not None
 
@@ -810,7 +825,9 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
         await settle_at(client, mid)
         pose = await client.pose()
         assert pose is not None
-        assert all(math.isfinite(v) for v in pose[:3]), f"STATUS pose not finite: {pose}"
+        assert all(math.isfinite(v) for v in pose[:3]), (
+            f"STATUS pose not finite: {pose}"
+        )
         center_m = [v / 1000.0 for v in pose[:3]]
         radius_m = math.hypot(center_m[0], center_m[1])
         assert await client.set_shapes(
@@ -861,6 +878,23 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             f"the arm entered the keep-out in flight: max {max(trace):.2f} deg"
         )
 
+        # The refusal itself must reach a caller that never awaits a
+        # fire-and-forget reply (issue #23).  From the resting pose at the
+        # gate's boundary, jogs at the box keep being turned away, and the
+        # refusal stands in error() naming the keep-out.
+        refusal: RobotError | None = None
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline and refusal is None:
+            assert await client.jog_j(0, 0.5, duration=0.4) == 1
+            await asyncio.sleep(0.1)
+            refusal = await client.error()
+        assert refusal is not None, (
+            f"the refused jog never surfaced through error(); "
+            f"daemon log:\n{daemon.log()}"
+        )
+        assert refusal.code == ErrorCode.SYS_SELF_COLLISION, str(refusal)
+        assert "keepout" in refusal.cause, str(refusal)
+
         # A keep-out dropped over the arm: the outward jog still runs.
         await settle_at(client, mid)
         escaped = False
@@ -874,6 +908,9 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             "the escaping jog out of the keep-out never moved the arm: the "
             "gate is refusing the only way out"
         )
+        # The accepted escape cleared the standing refusal, like any
+        # accepted motion command.
+        assert await client.error() is None, f"daemon log:\n{daemon.log()}"
 
 
 @pytest.mark.timeout(180)
@@ -1143,9 +1180,13 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         )
         assert cleared, "the output never went back low"
 
-        # The wire will carry port 7; the box will not.
+        # The wire will carry the port; the box will not — sent through the
+        # engine client directly, past the shim's own bound check, so the
+        # refusal under test is the RUNTIME's.
+        core = client._core
+        assert core is not None
         with pytest.raises(RobotError) as io:
-            await client._system(CmdType.WRITE_IO, [n_out, 1])
+            await client._call(core.write_io(n_out, 1))
         assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert "does not exist" in io.value.cause, io.value.cause
 
@@ -1195,3 +1236,195 @@ async def test_status_arrives_on_the_shipped_transport_defaults(tmp_path):
             assert await client.angles() is not None
     finally:
         daemon.stop()
+
+
+def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
+    """``[protocol] initial_recipe`` makes the telemetry stream live from
+    boot — no client ever calls ``set_recipe`` — and the shipped
+    :class:`par6.telemetry.TelemetryReader` decodes what arrives. Omitting
+    the key keeps the stream silent (every other e2e test binds nothing to
+    the telemetry port and would see stray traffic fail its asserts)."""
+    daemon = LiveDaemon.start(tmp_path, initial_recipe="standard")
+    try:
+        reader = TelemetryReader(daemon.telemetry_port)
+        try:
+            frame = reader.recv(timeout=STEP_BUDGET_S)
+            assert frame is not None, (
+                f"no telemetry from boot; daemon log:\n{daemon.log_path.read_text()}"
+            )
+            assert frame["recipe"] == "standard"
+            fields = frame["fields"]
+            assert set(fields) == {
+                "tick",
+                "measured_positions",
+                "measured_velocities",
+                "measured_torques",
+            }
+            assert len(fields["measured_positions"]) == 6
+            # A second frame advances: this is a stream, not one packet.
+            later = reader.recv(timeout=STEP_BUDGET_S)
+            assert later is not None and later["seq"] > frame["seq"]
+        finally:
+            reader.close()
+    finally:
+        daemon.stop()
+
+
+async def test_config_info_reports_the_effective_configuration(tmp_path):
+    """CONFIG_INFO answers the runtime's effective configuration, and its
+    fingerprint is reproducible over the same files — the skew check a UI
+    runs against its packaged config mirror."""
+    import hashlib
+    import tomllib
+
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client() as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            info = await client.config_info()
+        assert info is not None
+        assert info["path"] == str(daemon.config)
+
+        # The wire-contract fingerprint: sha256 over the robot TOML and
+        # each grippers/*.toml (sorted), each as `name\n` + content.
+        h = hashlib.sha256()
+        for f in [daemon.config] + sorted(
+            (daemon.config.parent / "grippers").glob("*.toml")
+        ):
+            h.update(f.name.encode())
+            h.update(b"\n")
+            h.update(f.read_bytes())
+        assert info["fingerprint"] == h.hexdigest()
+
+        cfg = tomllib.loads(daemon.config.read_text())
+        assert info["tick_dt_s"] == pytest.approx(cfg["robot"]["tick_dt_s"])
+        assert info["motion"]["jog_l_linear_max_m_s"] == pytest.approx(
+            cfg["motion"]["jog_l_linear_max_m_s"]
+        )
+        assert info["motion"]["settle_timeout_s"] == pytest.approx(
+            cfg["motion"]["settle_timeout_s"]
+        )
+        joints = info["joints"]
+        assert len(joints) == len(cfg["joints"])
+        for got, declared in zip(joints, cfg["joints"]):
+            assert got["soft_min_rad"] == pytest.approx(
+                declared["limits"]["soft_min_rad"]
+            )
+            assert got["soft_max_rad"] == pytest.approx(
+                declared["limits"]["soft_max_rad"]
+            )
+    finally:
+        daemon.stop()
+
+
+async def test_config_bundle_feeds_previews_the_daemons_numbers(tmp_path, monkeypatch):
+    """CONFIG_BUNDLE serves the loaded config files verbatim, and a dry-run
+    client created against a live daemon previews with those numbers.
+
+    The test daemon runs a re-ticked copy of the packaged config
+    (``tick_dt_s`` patched for CI) — a stand-in for a tuned deployment.
+    A preview that read the local/packaged config would come up with the
+    stock tick; one built from the daemon's bundle must report the
+    daemon's."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client() as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            info = await client.config_info()
+            bundle = await client.config_bundle()
+        assert bundle is not None and info is not None
+
+        # Verbatim file service: content and inventory match the daemon's
+        # config dir, and the fingerprint is CONFIG_INFO's.
+        assert bundle["robot_filename"] == daemon.config.name
+        assert bundle["robot_toml"] == daemon.config.read_text()
+        served = {g["filename"]: g["content"] for g in bundle["grippers"]}
+        on_disk = sorted((daemon.config.parent / "grippers").glob("*.toml"))
+        assert sorted(served) == [f.name for f in on_disk]
+        assert all(served[f.name] == f.read_text() for f in on_disk)
+        assert bundle["fingerprint"] == info["fingerprint"]
+
+        materialized = _cfg.materialize_bundle(bundle)
+        assert materialized.read_text() == daemon.config.read_text()
+        # Same fingerprint → same directory: re-materializing is a no-op.
+        assert _cfg.materialize_bundle(bundle) == materialized
+        assert str(tmp_path / "cache") in str(materialized)
+
+        # The factory fetches the bundle itself and the preview engine
+        # runs the daemon's tick, not the stock 0.004 the local config
+        # (PAR6_CONFIG / repo checkout) carries.
+        robot = Robot(host="127.0.0.1", port=daemon.command_port)
+        dr = robot.create_dry_run_client()
+        assert dr._dt == pytest.approx(TICK_DT_S)
+        assert dr._dt != pytest.approx(0.004)
+    finally:
+        daemon.stop()
+
+
+def test_check_config_validates_the_bundle_and_exits(tmp_path):
+    """``par6d --check-config`` is the deploy-time gate: exit 0 on a valid
+    bundle, exit 1 (with the validation error on stderr) on a broken one —
+    without binding a socket or touching a bus."""
+    import subprocess
+
+    from live_daemon import par6d_binary
+
+    binary = par6d_binary()
+    assert binary is not None
+    config = sim_config(tmp_path / "config")
+    ok = subprocess.run(
+        [binary, "--check-config", "--config", str(config)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert ok.returncode == 0, ok.stderr
+    assert "config OK" in ok.stdout
+
+    broken = tmp_path / "config" / "broken.toml"
+    broken.write_text(config.read_text().replace("tick_dt_s = ", "tick_dt_s = -"))
+    bad = subprocess.run(
+        [binary, "--check-config", "--config", str(broken)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert bad.returncode == 1
+    assert "tick_dt_s" in bad.stderr
+
+
+async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
+    """SET_PAYLOAD reaches the runtime and PAYLOAD reads back exactly what
+    was set; a negative mass and a negative-definite inertia are refused
+    with the structured validation error (the client encodes with the
+    same table the runtime decodes with, so the refusal is identical
+    wherever it fires); clearing is mass 0."""
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        info = await client.payload()
+        assert info == {"mass": 0.0, "com": [0.0] * 3, "inertia": [0.0] * 6}
+
+        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        info = await client.payload()
+        assert info is not None
+        assert info["mass"] == pytest.approx(1.2)
+        assert info["com"] == pytest.approx([0.0, 0.01, 0.05])
+        assert info["inertia"] == [0.0] * 6
+
+        with pytest.raises(RobotError) as neg:
+            await client.set_payload(-1.0)
+        assert neg.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        with pytest.raises(RobotError) as indef:
+            await client.set_payload(1.0, inertia=(-1.0, 0.0, 1.0, 0.0, 0.0, 1.0))
+        assert indef.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        info = await client.payload()
+        assert info is not None and info["mass"] == pytest.approx(1.2), (
+            "a refused set must not change the payload"
+        )
+
+        assert await client.set_payload(0.0) == 1
+        info = await client.payload()
+        assert info is not None and info["mass"] == 0.0

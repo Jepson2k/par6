@@ -12,23 +12,32 @@
 //!  queued_duration f64, action_params str, tool_status nil|ts8,
 //!  tcp_speed f64, simulator_active bool, collision_active bool,
 //!  collision_pairs [[str,str]], scene_epoch u64, accepted_index i64,
-//!  homed bool]
+//!  homed bool, torques f64[6], mode u8, enabled bool, gravity_comp bool,
+//!  warnings [err6], link_health [state u8, restarts u32, tx_errors u64,
+//!  rx_frames u64], homing [active bool, step u8, [[status u8, phase u8]]],
+//!  torques_ext f64[6]]
 //! ```
 //!
-//! 31 elements total. STATUS is broadcast even when the bus link is down —
+//! 39 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
 
 use crate::command::r_len;
-use crate::enums::{ActionState, MsgType};
+use crate::enums::{ActionState, ControllerMode, MsgType};
 use crate::error::WireError;
 use crate::reply::ToolStatusWire;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
+use crate::{HomingJointState, HomingPhase, LinkState};
 
 /// Total number of elements in a v2 STATUS array (including the tag).
-pub const STATUS_LEN: usize = 31;
+pub const STATUS_LEN: usize = 39;
+/// Decode cap on the `warnings` list (the RT latch holds at most 32
+/// entries; a longer claim is hostile input).
+const MAX_WARNINGS: usize = 64;
+/// Decode cap on the per-node `homing.joints` list.
+const MAX_NODE_SLOTS: usize = 32;
 /// Number of header elements (tag through `data_age_ms`).
 pub const STATUS_HEADER_LEN: usize = 7;
 
@@ -100,6 +109,53 @@ pub struct Status {
     pub accepted_index: i64,
     /// All joints homed.
     pub homed: bool,
+    /// Measured joint torque \[Nm\], kt-calibrated and filtered.
+    pub torques: [f64; NUM_JOINTS],
+    /// Controller mode. `par6-server` maps the RT core's own `Mode` onto
+    /// this with an exhaustive match, so the wire vocabulary is owned here.
+    pub mode: ControllerMode,
+    /// Drive authority is granted (the RT's `ArmState::Enabled`).
+    pub enabled: bool,
+    /// The gravity feedforward is being applied. With `mode` IDLE and the
+    /// arm homed and enabled, this is exactly the freedrive condition:
+    /// torque-only G(q) with no position hold.
+    pub gravity_comp: bool,
+    /// Warning-class latch entries (self-clearing conditions: stale CAN
+    /// data, degraded loop, failed homing, …). The standing `error` slot
+    /// carries only HARD latches; these are the rest of the RT's list.
+    pub warnings: Vec<WireError>,
+    /// Motor-bus link health.
+    pub link_health: LinkHealthWire,
+    /// Homing progress.
+    pub homing: HomingWire,
+    /// External joint torque estimate \[Nm\]: filtered measured torque
+    /// minus the model's gravity torque.
+    pub torques_ext: [f64; NUM_JOINTS],
+}
+
+/// Motor-bus link health as STATUS carries it (slot 36).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct LinkHealthWire {
+    /// Kernel link state — a [`LinkState`] value.
+    pub state: u8,
+    /// Interface restarts observed.
+    pub restarts: u32,
+    /// TX errors observed.
+    pub tx_errors: u64,
+    /// Total frames received.
+    pub rx_frames: u64,
+}
+
+/// Homing progress as STATUS carries it (slot 37).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct HomingWire {
+    /// Whether the homing sequence is running.
+    pub active: bool,
+    /// Current sequence step (0-based); meaningful while `active`.
+    pub sequence_step: u8,
+    /// Per-actuator `[status, phase]` — a [`HomingJointState`] and a
+    /// [`HomingPhase`] value — arm joints first, gripper last.
+    pub joints: Vec<(u8, u8)>,
 }
 
 impl Default for Status {
@@ -135,6 +191,14 @@ impl Default for Status {
             scene_epoch: 0,
             accepted_index: -1,
             homed: false,
+            torques: [0.0; NUM_JOINTS],
+            mode: ControllerMode::Booting,
+            enabled: false,
+            gravity_comp: false,
+            warnings: Vec::new(),
+            link_health: LinkHealthWire::default(),
+            homing: HomingWire::default(),
+            torques_ext: [0.0; NUM_JOINTS],
         }
     }
 }
@@ -203,6 +267,35 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     w_uint(buf, s.scene_epoch);
     w_int(buf, s.accepted_index);
     w_bool(buf, s.homed);
+    w_array(buf, NUM_JOINTS);
+    for v in s.torques {
+        w_f64(buf, v);
+    }
+    w_uint(buf, u64::from(s.mode as u8));
+    w_bool(buf, s.enabled);
+    w_bool(buf, s.gravity_comp);
+    w_array(buf, s.warnings.len());
+    for w in &s.warnings {
+        w.encode(buf);
+    }
+    w_array(buf, 4);
+    w_uint(buf, u64::from(s.link_health.state));
+    w_uint(buf, u64::from(s.link_health.restarts));
+    w_uint(buf, s.link_health.tx_errors);
+    w_uint(buf, s.link_health.rx_frames);
+    w_array(buf, 3);
+    w_bool(buf, s.homing.active);
+    w_uint(buf, u64::from(s.homing.sequence_step));
+    w_array(buf, s.homing.joints.len());
+    for (status, phase) in &s.homing.joints {
+        w_array(buf, 2);
+        w_uint(buf, u64::from(*status));
+        w_uint(buf, u64::from(*phase));
+    }
+    w_array(buf, NUM_JOINTS);
+    for v in s.torques_ext {
+        w_f64(buf, v);
+    }
 }
 
 /// Reusable STATUS encoder: owns the broadcast buffer so the hot path
@@ -381,6 +474,92 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     let scene_epoch = r.uint()?;
     let accepted_index = r.int()?;
     let homed = r.bool()?;
+    let torques: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.torques")?;
+    let raw_mode = r.uint()? as i64;
+    let mode = ControllerMode::from_wire(raw_mode).ok_or(DecodeError::InvalidEnum {
+        what: "controller mode",
+        value: raw_mode,
+    })?;
+    let enabled = r.bool()?;
+    let gravity_comp = r.bool()?;
+    let n_warnings = r_len(&mut r, "status.warnings", MAX_WARNINGS)?;
+    let mut warnings = Vec::with_capacity(n_warnings);
+    for _ in 0..n_warnings {
+        warnings.push(WireError::decode(&mut r)?);
+    }
+    let lh = r.array_len()?;
+    if lh != 4 {
+        return Err(DecodeError::Arity {
+            what: "status.link_health",
+            expected: 4,
+            got: lh,
+        });
+    }
+    let link_state = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+        what: "status.link_health.state",
+        why: "exceeds u8".into(),
+    })?;
+    LinkState::from_wire(i64::from(link_state)).ok_or(DecodeError::InvalidEnum {
+        what: "link state",
+        value: i64::from(link_state),
+    })?;
+    let link_health = LinkHealthWire {
+        state: link_state,
+        restarts: u32::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.link_health.restarts",
+            why: "exceeds u32".into(),
+        })?,
+        tx_errors: r.uint()?,
+        rx_frames: r.uint()?,
+    };
+    let hn = r.array_len()?;
+    if hn != 3 {
+        return Err(DecodeError::Arity {
+            what: "status.homing",
+            expected: 3,
+            got: hn,
+        });
+    }
+    let homing_active = r.bool()?;
+    let sequence_step = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+        what: "status.homing.sequence_step",
+        why: "exceeds u8".into(),
+    })?;
+    let n_hj = r_len(&mut r, "status.homing.joints", MAX_NODE_SLOTS)?;
+    let mut homing_joints = Vec::with_capacity(n_hj);
+    for _ in 0..n_hj {
+        let pn = r.array_len()?;
+        if pn != 2 {
+            return Err(DecodeError::Arity {
+                what: "status.homing joint",
+                expected: 2,
+                got: pn,
+            });
+        }
+        let status = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.homing status",
+            why: "exceeds u8".into(),
+        })?;
+        HomingJointState::from_wire(i64::from(status)).ok_or(DecodeError::InvalidEnum {
+            what: "homing status",
+            value: i64::from(status),
+        })?;
+        let phase = u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+            what: "status.homing phase",
+            why: "exceeds u8".into(),
+        })?;
+        HomingPhase::from_wire(i64::from(phase)).ok_or(DecodeError::InvalidEnum {
+            what: "homing phase",
+            value: i64::from(phase),
+        })?;
+        homing_joints.push((status, phase));
+    }
+    let homing = HomingWire {
+        active: homing_active,
+        sequence_step,
+        joints: homing_joints,
+    };
+    let torques_ext: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.torques_ext")?;
 
     // Forward compatibility: skip any fields a newer producer appended.
     for _ in STATUS_LEN..n {
@@ -419,5 +598,13 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         scene_epoch,
         accepted_index,
         homed,
+        torques,
+        mode,
+        enabled,
+        gravity_comp,
+        warnings,
+        link_health,
+        homing,
+        torques_ext,
     })
 }

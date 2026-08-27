@@ -79,6 +79,30 @@ par6_status par6_kin_jacobian(par6_kin *h, const double *q, double *out_J);
  * tool inertia when given at create. out_tau: nq doubles. */
 par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau);
 
+/** Inverse dynamics: the joint torque that produces acceleration `a` at
+ *  configuration `q` with velocity `v` (RNEA, gravity included).
+ *
+ *  `q` is `nq` doubles; `v`, `a` and `out_tau` are `nv`. Allocation-free.
+ *  Passing zero `v` and `a` reduces exactly to par6_kin_gravity().
+ */
+par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,
+                                      const double *v, const double *a,
+                                      double *out_tau);
+
+/** Damped-least-squares IK with a backtracking line search and damping
+ *  that rises with the residual.
+ *
+ *  Same signature and return convention as par6_kin_ik_step (1 =
+ *  converged, 0 = budget exhausted or no step reduced the error,
+ *  negative = par6_status). Differs in that a step is ACCEPTED only if it
+ *  reduces the residual: ik_step commits unconditionally, so an
+ *  ill-conditioned step near a singularity can increase the error and
+ *  still consume the whole budget. Allocation-free.
+ */
+int32_t par6_kin_ik_solve(par6_kin *h, const double *q_seed,
+                          const double *target_pose16, double *out_q,
+                          int32_t max_iters, double tol, double damping);
+
 /* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
  * the tool inertia when given at create. q/v/tau: nq doubles each;
  * out_a: nq doubles. Allocation-free after create. */
@@ -357,9 +381,29 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
  * v6: par6_col_apply_srdf added (SRDF disable_collisions on the robot's
  *     self pairs). Purely additive; a stale v5 library fails to link it.
  * v7: par6_col_world_distance added (world-pair-only escape-depth
- *     signal). Purely additive; a stale v6 library fails to link it. */
+ *     signal). Purely additive; a stale v6 library fails to link it.
+ * v8: par6_kin_inverse_dynamics added (RNEA with real velocity and
+ *     acceleration, so a planner can feed forward inertial torque instead
+ *     of the zeros Sample::tau_ff carried). Purely additive; a stale v7
+ *     library fails to link it.
+ * v9: par6_kin_ik_solve added (DLS with a backtracking line search and
+ *     residual-scaled damping, so a step that would increase the error is
+ *     refused instead of committed). Purely additive; a stale v8 library
+ *     fails to link it. */
+/* Replace the runtime payload attached at the end-effector frame.
+ * Reversible: each call restores the create-time parent-joint inertia
+ * (config tool included) before appending the new payload.
+ *   mass      payload mass [kg]; <= 0 clears the payload.
+ *   com3      COM in end-effector-frame coordinates [m] (required when
+ *             mass > 0).
+ *   inertia6  rotational inertia about the COM, ee-frame axes,
+ *             (Ixx, Ixy, Iyy, Ixz, Iyz, Izz) [kg m^2]; NULL = point mass.
+ * The collision geometry is unchanged — this is an inertial update only. */
+par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
+                              const double *inertia6);
+
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 7
+#define PAR6_SHIM_ABI_VERSION 10
 
 #ifdef __cplusplus
 } /* extern "C" */

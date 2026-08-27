@@ -8,7 +8,9 @@ members = [
     "crates/par6-bus",
     "crates/par6-rt",
     "crates/par6-server",
+    "crates/par6-client",
     "crates/par6d",
+    "crates/par6-py",
 ]
 # pinokin-sys stays a standalone workspace (its ffi build needs the C++
 # toolchain); par6-bus reaches it via an optional path dependency.
@@ -32,6 +34,7 @@ par6-motion = { path = "crates/par6-motion" }
 par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }
+par6-client = { path = "crates/par6-client" }
 
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
@@ -42,6 +45,7 @@ thread-priority = "3"
 rsruckig = "3"
 toml = "0.8"
 thiserror = "2"
+sha2 = "0.10"
 log = "0.4"
 env_logger = "0.11"
 

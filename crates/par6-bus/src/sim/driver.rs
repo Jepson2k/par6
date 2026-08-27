@@ -14,7 +14,7 @@ use crate::types::{DeviceInfo, ErrorFlags, NodeId};
 /// iteration (`dt / FW_LOOP_DT` times per tick). Without this the
 /// integral unwinds so slowly that a homing backoff cannot break the
 /// endstop seat within the vendor-configured backoff window.
-const FW_LOOP_DT: f64 = 0.001;
+pub(crate) const FW_LOOP_DT: f64 = 0.001;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -42,6 +42,14 @@ pub enum FaultKind {
 pub(crate) struct PlantCmd {
     /// Loop output current \[mA\], already Ilim-saturated.
     pub current_ma: f64,
+    /// The additive torque-feedforward share of `current_ma` (the loop
+    /// modes' `cur_ff` channel). The kinematic plant subtracts it: its
+    /// current→acceleration gain is a synthetic Ilim mapping, not a
+    /// torque model, so current calibrated for the real drives' Kt and
+    /// gearing would fabricate acceleration there — the kinematic tier
+    /// treats feedforward as exactly absorbed by the physics it does not
+    /// model. The dynamics tier integrates the full current for real.
+    pub ff_ma: f64,
     /// Driver velocity limit \[ticks/s\] the plant must respect.
     pub vel_limit_ticks_s: f64,
     /// Driver is in Idle (no drive; shorted-phase-style damping).
@@ -294,6 +302,17 @@ impl VirtualDriver {
     /// until `Clear_Error`.
     pub fn control_step(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
         self.age_watchdog();
+        let fw_steps = self.fw_steps;
+        self.loop_step(pos_ticks, vel_ticks_s, fw_steps)
+    }
+
+    /// The control law alone, integrating the velocity loop over
+    /// `fw_steps` firmware iterations — separated from the per-tick
+    /// watchdog aging so the dynamics plant can close the loops at its
+    /// physics substep rate (the firmware's own loops run at ~1 kHz; a
+    /// current held over a whole coarse bus tick destabilizes a
+    /// strongly-driven joint).
+    pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
@@ -302,16 +321,24 @@ impl VirtualDriver {
             self.cur_out_ma = 0.0;
             return PlantCmd {
                 current_ma: 0.0,
+                ff_ma: 0.0,
                 vel_limit_ticks_s: self.vel_limit,
                 idle: true,
             };
         }
         let ilim = self.ilim_ma;
+        let ff = match self.mode {
+            Mode::Position { cur_ff, .. }
+            | Mode::Velocity { cur_ff, .. }
+            | Mode::Pd { cur_ff, .. } => cur_ff,
+            _ => 0.0,
+        };
         let cur = match self.mode {
             Mode::Idle => {
                 self.cur_out_ma = 0.0;
                 return PlantCmd {
                     current_ma: 0.0,
+                    ff_ma: 0.0,
                     vel_limit_ticks_s: self.vel_limit,
                     idle: true,
                 };
@@ -325,15 +352,15 @@ impl VirtualDriver {
                 // full authority.
                 let vt =
                     (self.kpp * (pos - pos_ticks) + speed).clamp(-self.vel_limit, self.vel_limit);
-                self.velocity_pi(vt, vel_ticks_s, cur_ff)
+                self.velocity_pi(vt, vel_ticks_s, cur_ff, fw_steps)
             }
             Mode::Velocity { vel, cur_ff } => {
                 let vt = vel.clamp(-self.vel_limit, self.vel_limit);
-                self.velocity_pi(vt, vel_ticks_s, cur_ff)
+                self.velocity_pi(vt, vel_ticks_s, cur_ff, fw_steps)
             }
             Mode::Hall { vel } => {
                 let vt = vel.clamp(-self.vel_limit, self.vel_limit);
-                self.velocity_pi(vt, vel_ticks_s, 0.0)
+                self.velocity_pi(vt, vel_ticks_s, 0.0, fw_steps)
             }
             Mode::Current { cur } => cur,
             Mode::Pd { pos, vel, cur_ff } => {
@@ -343,6 +370,7 @@ impl VirtualDriver {
         self.cur_out_ma = cur.clamp(-ilim, ilim);
         PlantCmd {
             current_ma: self.cur_out_ma,
+            ff_ma: ff.clamp(-ilim, ilim),
             vel_limit_ticks_s: self.vel_limit,
             idle: false,
         }
@@ -396,10 +424,10 @@ impl VirtualDriver {
         self.armed && self.ticks_since_data >= self.watchdog_ticks
     }
 
-    fn velocity_pi(&mut self, vel_target: f64, vel_meas: f64, cur_ff: f64) -> f64 {
+    fn velocity_pi(&mut self, vel_target: f64, vel_meas: f64, cur_ff: f64, fw_steps: f64) -> f64 {
         let err = vel_target - vel_meas;
         self.integral_ma =
-            (self.integral_ma + self.kiv * err * self.fw_steps).clamp(-self.ilim_ma, self.ilim_ma);
+            (self.integral_ma + self.kiv * err * fw_steps).clamp(-self.ilim_ma, self.ilim_ma);
         self.kpv * err + self.integral_ma + cur_ff
     }
 

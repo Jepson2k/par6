@@ -25,6 +25,41 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// Controller mode as published on STATUS.
+    ///
+    /// This is the WIRE's mode vocabulary, not the RT core's. `par6-rt`
+    /// deliberately does not depend on `par6-proto`, so `par6-server` maps
+    /// its `Mode` onto this with an exhaustive match — which is what forces
+    /// a decision when a new RT mode appears rather than silently leaking a
+    /// discriminant whose meaning nobody pinned.
+    ControllerMode: u8 {
+        /// Bus scan and selfcheck; requests IDLE when it passes.
+        Booting = 0,
+        /// At rest. With gravity comp on and the arm homed and enabled this
+        /// is a torque-only hold with no position term — i.e. freedrive.
+        Idle = 1,
+        /// Hard-error latch: active zero-velocity hold, drives DISABLED.
+        ActiveError = 2,
+        /// The homing FSM owns the bus.
+        Homing = 3,
+        /// Manual jogging.
+        Jog = 4,
+        /// Streamed external control.
+        Stream = 5,
+        /// Queued planned motion consuming the sample ring.
+        Exec = 6,
+        /// Hand guiding (declared; the RT refuses it as unimplemented).
+        HandGuiding = 7,
+        /// Joint-space impedance (declared; refused as unimplemented).
+        Impedance = 8,
+        /// Limp: torque-only zero, so the arm can be moved by hand.
+        SafetyStop = 9,
+        /// Bus granted to an external flasher.
+        Flashing = 10,
+    }
+}
+
+wire_enum! {
     /// Command tags (slot 0 of every client→server payload).
     ///
     /// Values are grouped by ack class — SYSTEM 10+, QUERY 30+,
@@ -56,16 +91,19 @@ wire_enum! {
         SetCompletionPolicy = 20,
         /// Select the telemetry recipe. Unknown names are refused.
         SetRecipe = 21,
-        /// Drop every joint limp (torque-only zero) and stay there until a
-        /// mode change. The safest state the arm has: unlike `Estop`, which
-        /// holds position actively, this removes drive authority so a
-        /// trapped person or a jammed joint can be freed by hand.
-        SafetyStop = 22,
+        // 22 was SafetyStop: removed — limp mode is the physical e-stop's
+        // job; a digital path must not be relied on in that emergency.
         /// Enable or disable the gravity-compensation feedforward. G(q) is
         /// computed and published in every mode regardless; this controls
         /// only whether it is APPLIED, which is correct on hardware and on
         /// the torque plant but wrong on the kinematic one.
         SetGravityComp = 23,
+        /// `[PAUSE, req_id, on]` — hold or resume the executing trajectory.
+        /// Unlike STOP this leaves the sample ring intact, so the move
+        /// continues from where it paused rather than being re-issued.
+        Pause = 24,
+        /// Set the runtime payload (mass/COM/inertia at the TCP frame).
+        SetPayload = 25,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -104,6 +142,15 @@ wire_enum! {
         IsSimulator = 46,
         /// Collision-world readback (installation + program layers).
         Shapes = 47,
+        /// Effective-configuration readback (path, fingerprint, limits,
+        /// motion constants) — the config-skew hook.
+        ConfigInfo = 48,
+        /// Runtime payload readback (mass/COM/inertia).
+        Payload = 49,
+        /// The loaded config files verbatim (robot + gripper TOMLs) —
+        /// the daemon serves its own config, parol6-style, so clients
+        /// preview with exactly the numbers the arm enforces.
+        ConfigBundle = 50,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -186,6 +233,12 @@ wire_enum! {
         IsSimulator = 17,
         /// See [`CmdType::Shapes`].
         Shapes = 18,
+        /// See [`CmdType::ConfigInfo`].
+        ConfigInfo = 19,
+        /// See [`CmdType::Payload`].
+        Payload = 20,
+        /// See [`CmdType::ConfigBundle`].
+        ConfigBundle = 21,
     }
 }
 
@@ -252,6 +305,60 @@ wire_enum! {
     }
 }
 
+wire_enum! {
+    /// Motor-bus kernel link state, as STATUS `link_health` carries it.
+    LinkState: u8 {
+        /// State not (yet) known — e.g. loopback/sim backends.
+        Unknown = 0,
+        /// Link up and error-active.
+        Up = 1,
+        /// Controller error-passive.
+        ErrorPassive = 2,
+        /// Bus-off (kernel auto-restart pending).
+        BusOff = 3,
+    }
+}
+
+wire_enum! {
+    /// Per-actuator homing FSM status (STATUS `homing`, vendor codes 0–3).
+    HomingJointState: u8 {
+        /// Not started.
+        Idle = 0,
+        /// FSM running.
+        Running = 1,
+        /// Done, reference applied.
+        Done = 2,
+        /// Failed — the paired phase names where.
+        Failed = 3,
+    }
+}
+
+wire_enum! {
+    /// Homing FSM phase (STATUS `homing`). For a `Failed` status the phase
+    /// holds the phase the FSM failed IN, which is what attributes the
+    /// failure (approach timeout vs settle mismatch vs post-move stall).
+    HomingPhase: u8 {
+        /// Not running.
+        Idle = 0,
+        /// Driving toward the endstop.
+        Approach = 1,
+        /// Holding on the endstop before backoff.
+        Dwell = 2,
+        /// Backing off the endstop.
+        Backoff = 3,
+        /// Pausing between passes.
+        Pause = 4,
+        /// Releasing to the reference position.
+        Release = 5,
+        /// Waiting for the reading to settle / latch.
+        Settle = 6,
+        /// Driving the configured post-home move.
+        PostMove = 7,
+        /// Reference applied.
+        Finished = 8,
+    }
+}
+
 /// The ack taxonomy: which reply discipline a command follows.
 ///
 /// This is the protocol's single queryable table — servers use it to decide
@@ -261,8 +368,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
     match cmd {
         C::Reset
         | C::Estop
-        | C::SafetyStop
         | C::SetGravityComp
+        | C::Pause
         | C::Stop
         | C::WriteIo
         | C::Simulator
@@ -272,7 +379,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetTcpOffset
         | C::SetShapes
         | C::SetCompletionPolicy
-        | C::SetRecipe => CommandClass::System,
+        | C::SetRecipe
+        | C::SetPayload => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -291,7 +399,10 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::TcpOffset
         | C::ToolStatus
         | C::IsSimulator
-        | C::Shapes => CommandClass::Query,
+        | C::Shapes
+        | C::ConfigInfo
+        | C::Payload
+        | C::ConfigBundle => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

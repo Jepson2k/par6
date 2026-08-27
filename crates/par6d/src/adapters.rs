@@ -28,17 +28,20 @@ impl RtJogEngine for MotionJog {
         self.engine.activate(q_meas);
     }
 
-    fn command(&mut self, joint: usize, signed_pct: f64) {
-        if signed_pct == 0.0 || !signed_pct.is_finite() {
+    fn command(&mut self, speeds: &[f64; MAX_JOINTS]) {
+        let mut clean = [0.0; MAX_JOINTS];
+        for (out, v) in clean.iter_mut().zip(speeds.iter()) {
+            *out = if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
+        }
+        if clean.iter().all(|v| *v == 0.0) {
             self.engine.release();
             return;
         }
-        let dir = if signed_pct > 0.0 {
-            JogDirection::Positive
-        } else {
-            JogDirection::Negative
-        };
-        if let Err(e) = self.engine.command(joint, dir, signed_pct.abs().min(1.0)) {
+        if let Err(e) = self.engine.command(&clean) {
             log::warn!("jog command refused: {e}");
         }
     }

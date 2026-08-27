@@ -38,9 +38,9 @@ use std::time::Instant;
 
 use par6_proto::{
     command_class, decode_chunk, decode_command, encode_reply, make_error, peek_tag, ActionState,
-    CmdType, Command, CommandClass, CompletionPolicy, DecodeError, ErrorCode, LoopStatsResult,
-    MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState, ToolStatusWire,
-    WireError, EN_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
+    CmdType, Command, CommandClass, CompletionPolicy, ControllerMode, DecodeError, ErrorCode,
+    LoopStatsResult, MsgType, QueryResult, Reassembler, Reply, Status, StatusEncoder, ToolState,
+    ToolStatusWire, WireError, EN_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION, UNATTRIBUTED,
 };
 use par6_rt::{ArmState, Mode, StateSnapshot};
 use tokio::net::UdpSocket;
@@ -52,8 +52,8 @@ use crate::faults::{gripper_fault_code, rt_standing_error};
 use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
 use crate::runtime::{
-    blend_radius_mm, CollisionState, Enablement, PlanContext, Planner, QueuedCommand, RtCommands,
-    RuntimeHandle, ShapeLayer,
+    blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
+    RtCommands, RuntimeHandle, ShapeLayer,
 };
 use crate::telemetry;
 
@@ -102,6 +102,16 @@ where
     P: Planner + 'static,
     R: RtCommands + 'static,
 {
+    // An unknown startup recipe is a startup failure, exactly as
+    // `set_recipe` refuses it live — a silent fallback looks like a
+    // dead robot.
+    if let Some(name) = &cfg.initial_recipe {
+        if !cfg.recipes.iter().any(|r| r.name == *name) {
+            return Err(std::io::Error::other(format!(
+                "unknown initial telemetry recipe {name:?}"
+            )));
+        }
+    }
     let socket = UdpSocket::bind(cfg.bind).await?;
     let addr = socket.local_addr()?;
     let link = BroadcastLink::open(&cfg).await?;
@@ -225,6 +235,8 @@ struct Core<P: Planner, R: RtCommands> {
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    /// The commanded runtime payload — served back by the PAYLOAD query.
+    payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
     collision: CollisionState,
@@ -293,6 +305,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            payload: PayloadSpec::default(),
             shapes: Vec::new(),
             scene_epoch: 0,
             collision: CollisionState::default(),
@@ -494,11 +507,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 Ok(())
             }
-            C::SafetyStop => {
-                // Not a protective stop: the arm goes limp rather than
-                // holding position, and stays that way until a mode change.
-                self.cancel_all_motion();
-                self.runtime.rt.safety_stop();
+            C::Pause(p) => {
+                self.runtime.rt.set_exec_paused(p.on);
                 Ok(())
             }
             C::SetGravityComp(p) => {
@@ -594,6 +604,17 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             }
             C::SetTcpOffset(p) => {
                 self.tcp_offset_mm = [p.x, p.y, p.z];
+                self.sync_planner();
+                Ok(())
+            }
+            C::SetPayload(p) => {
+                let payload = PayloadSpec {
+                    mass: p.mass,
+                    com: p.com,
+                    inertia: p.inertia,
+                };
+                self.payload = payload;
+                self.runtime.rt.set_payload(payload);
                 self.sync_planner();
                 Ok(())
             }
@@ -951,16 +972,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                      its end pose; send r = nil"
                 )
             }),
-            // The RT jog engine ramps ONE joint at a time:
-            // direction-block latching is keyed on the commanded
-            // joint. Collapsing to the dominant axis would move the arm
-            // somewhere the client did not ask for.
-            Command::JogJ(p) => {
-                let axes = p.speeds.iter().filter(|s| **s != 0.0).count();
-                (axes > 1).then(|| {
-                    format!("jog_j drives one joint at a time; {axes} axes were commanded")
-                })
-            }
             // A pose the runtime cannot place the arm at is refused, not
             // clamped: clamping landed the arm tens of degrees from where
             // the client asked and answered success, which is the silent
@@ -1331,6 +1342,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
             completion_policy: self.completion_policy,
+            payload: self.payload,
         };
         self.runtime.planner.sync(ctx);
     }
@@ -1638,6 +1650,100 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             scene_epoch: self.scene_epoch,
             accepted_index: self.accepted_index,
             homed: self.snap.homed,
+            // Filtered, not raw: this is an operator readout, and the raw
+            // per-tick current estimate is noisy.
+            torques: {
+                let mut out = [0.0; par6_proto::NUM_JOINTS];
+                out.copy_from_slice(&self.snap.tau_filtered[..par6_proto::NUM_JOINTS]);
+                out
+            },
+            mode: Self::wire_mode(self.snap.mode),
+            enabled: self.snap.state == ArmState::Enabled,
+            gravity_comp: self.snap.gravity_comp,
+            warnings: crate::faults::rt_warnings(&self.snap),
+            link_health: Self::wire_link_health(&self.snap.link),
+            homing: Self::wire_homing(&self.snap.homing),
+            torques_ext: {
+                let mut out = [0.0; par6_proto::NUM_JOINTS];
+                out.copy_from_slice(&self.snap.tau_ext[..par6_proto::NUM_JOINTS]);
+                out
+            },
+        }
+    }
+
+    /// The bus link health in the wire's own vocabulary (exhaustive for
+    /// the same reason as [`Self::wire_mode`]).
+    fn wire_link_health(l: &par6_rt::LinkHealth) -> par6_proto::LinkHealthWire {
+        use par6_proto::LinkState as W;
+        use par6_rt::LinkState as R;
+        let state = match l.state {
+            R::Unknown => W::Unknown,
+            R::Up => W::Up,
+            R::ErrorPassive => W::ErrorPassive,
+            R::BusOff => W::BusOff,
+        };
+        par6_proto::LinkHealthWire {
+            state: state as u8,
+            restarts: l.restarts,
+            tx_errors: l.tx_errors,
+            rx_frames: l.rx_frames,
+        }
+    }
+
+    fn wire_homing(h: &par6_rt::HomingStatus) -> par6_proto::HomingWire {
+        use par6_proto::HomingJointState as WS;
+        use par6_proto::HomingPhase as WP;
+        use par6_rt::{HomingJointStatus as RS, HomingPhase as RP};
+        let joints = h
+            .per_joint
+            .iter()
+            .zip(h.phase.iter())
+            .map(|(status, phase)| {
+                let ws = match status {
+                    RS::Idle => WS::Idle,
+                    RS::Running => WS::Running,
+                    RS::Done => WS::Done,
+                    RS::Failed => WS::Failed,
+                };
+                let wp = match phase {
+                    RP::Idle => WP::Idle,
+                    RP::Approach => WP::Approach,
+                    RP::Dwell => WP::Dwell,
+                    RP::Backoff => WP::Backoff,
+                    RP::Pause => WP::Pause,
+                    RP::Release => WP::Release,
+                    RP::Settle => WP::Settle,
+                    RP::PostMove => WP::PostMove,
+                    RP::Finished => WP::Finished,
+                };
+                (ws as u8, wp as u8)
+            })
+            .collect();
+        par6_proto::HomingWire {
+            active: h.active,
+            sequence_step: h.sequence_step,
+            joints,
+        }
+    }
+
+    /// The RT core's mode in the wire's own vocabulary.
+    ///
+    /// Exhaustive on purpose: `par6-rt` does not depend on `par6-proto`, so a
+    /// new RT mode has to be given a wire meaning here rather than silently
+    /// riding a discriminant.
+    fn wire_mode(mode: Mode) -> ControllerMode {
+        match mode {
+            Mode::Booting => ControllerMode::Booting,
+            Mode::Idle => ControllerMode::Idle,
+            Mode::ActiveError => ControllerMode::ActiveError,
+            Mode::Homing => ControllerMode::Homing,
+            Mode::Jog => ControllerMode::Jog,
+            Mode::Stream => ControllerMode::Stream,
+            Mode::Exec => ControllerMode::Exec,
+            Mode::HandGuiding => ControllerMode::HandGuiding,
+            Mode::Impedance => ControllerMode::Impedance,
+            Mode::SafetyStop => ControllerMode::SafetyStop,
+            Mode::Flashing => ControllerMode::Flashing,
         }
     }
 
@@ -1720,6 +1826,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     } else {
                         0.0
                     },
+                    p50_period_s: ls.p50_s,
+                    p90_period_s: ls.p90_s,
+                    can_frame_age_min_ticks: ls.can_frame_age_min_ticks,
+                    can_frame_age_max_ticks: ls.can_frame_age_max_ticks,
+                    rt_fifo: ls.rt_fifo,
+                    rt_pinned: ls.rt_pinned,
                 })
             }
             C::Profile => QueryResult::Profile {
@@ -1750,11 +1862,36 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::IsSimulator => QueryResult::IsSimulator {
                 active: self.simulator,
             },
+            C::Payload => QueryResult::Payload {
+                mass: self.payload.mass,
+                com: self.payload.com,
+                inertia: self.payload.inertia.unwrap_or_default(),
+            },
+            C::ConfigInfo => {
+                let ci = &self.cfg.config_info;
+                QueryResult::ConfigInfo {
+                    path: ci.path.clone(),
+                    fingerprint: ci.fingerprint.clone(),
+                    tick_dt_s: ci.tick_dt_s,
+                    motion: ci.motion,
+                    joints: ci.joints.clone(),
+                }
+            }
             C::Shapes => QueryResult::Shapes {
                 installation: self.cfg.installation_shapes.clone(),
                 program: self.shapes.clone(),
                 epoch: self.scene_epoch,
             },
+            C::ConfigBundle => {
+                let ci = &self.cfg.config_info;
+                QueryResult::ConfigBundle {
+                    path: ci.path.clone(),
+                    fingerprint: ci.fingerprint.clone(),
+                    robot_filename: ci.robot_filename.clone(),
+                    robot_toml: ci.robot_toml.clone(),
+                    grippers: ci.grippers.clone(),
+                }
+            }
             _ => unreachable!("dispatch routes only QUERY commands here"),
         }
     }
@@ -1865,8 +2002,8 @@ fn cmd_name(tag: CmdType) -> &'static str {
     match tag {
         T::Reset => "reset",
         T::Estop => "estop",
-        T::SafetyStop => "safety_stop",
         T::SetGravityComp => "set_gravity_comp",
+        T::Pause => "pause",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",
@@ -1874,6 +2011,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::ResetState => "reset_state",
         T::ConnectHardware => "connect_hardware",
         T::SetTcpOffset => "set_tcp_offset",
+        T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
         T::SetRecipe => "set_recipe",
@@ -1895,6 +2033,9 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::ToolStatus => "tool_status",
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
+        T::ConfigInfo => "config_info",
+        T::ConfigBundle => "config_bundle",
+        T::Payload => "payload",
         T::ServoJ => "servo_j",
         T::ServoJPose => "servo_j_pose",
         T::ServoL => "servo_l",
@@ -1916,7 +2057,11 @@ fn cmd_name(tag: CmdType) -> &'static str {
     }
 }
 
-fn decode_error_to_wire(e: &DecodeError) -> WireError {
+/// The server's decode-failure answer: validation failures map to
+/// `CommValidationError`, unknown tags to `CommUnknownCommand`, the rest
+/// to `CommDecodeError`. Public so an offline preview refuses exactly
+/// what the wire refuses.
+pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
     let code = match e {
         DecodeError::Validation { .. } => ErrorCode::CommValidationError,
         DecodeError::UnknownTag(_) => ErrorCode::CommUnknownCommand,

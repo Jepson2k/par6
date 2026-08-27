@@ -43,6 +43,8 @@ OPTIONS:
     --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
                                exactly [env: PAR6_STATUS_RATE_HZ]
                                [config: protocol.status_rate_hz]
+    --check-config             Validate the config bundle (robot TOML + grippers)
+                               and exit: 0 = valid, 1 = invalid.
     -h, --help                 Print this help
 ";
 
@@ -72,6 +74,8 @@ pub struct Options {
     pub status_transport: Option<StatusTransport>,
     /// STATUS broadcast rate override \[Hz\].
     pub status_rate_hz: Option<u32>,
+    /// `--check-config` was requested: validate the bundle and exit.
+    pub check_config: bool,
     /// `--help` was requested.
     pub help: bool,
 }
@@ -107,6 +111,7 @@ impl Options {
                 "--status-rate" => {
                     o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
                 }
+                "--check-config" => o.check_config = true,
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
             }

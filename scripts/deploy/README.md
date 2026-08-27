@@ -187,4 +187,3 @@ print(robot.create_sync_client().angles())
   `/usr` readable, so the rpath into `/usr/local/lib/par6` should resolve —
   run `ldd /usr/local/bin/par6d` from inside the unit's namespace to see
   which library the sandbox is hiding.
-

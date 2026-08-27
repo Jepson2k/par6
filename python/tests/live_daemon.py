@@ -10,11 +10,13 @@ tests instead of failing, so a checkout without a Rust build stays green.
 from __future__ import annotations
 
 import asyncio
+import functools
 import os
 import queue
 import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from dataclasses import dataclass
@@ -69,12 +71,28 @@ def repo_assets_dir() -> Path | None:
 
 
 def daemon_env() -> dict[str, str]:
-    """Environment for the daemon under test."""
+    """Environment for the daemon under test.
+
+    The bus-ownership grant (``loop_tick`` / ``robot_mode``) is published
+    under fixed names, and a stopping daemon REMOVES them — so two test
+    runs sharing ``/dev/shm`` would delete each other's live claim. Ports
+    are already allocated per run; the grant needs the same treatment.
+    The Rust harness does this per process id; do the same here.
+    """
     env = dict(os.environ)
     assets = repo_assets_dir()
     if "PAR6_ASSETS" not in env and assets is not None:
         env["PAR6_ASSETS"] = str(assets)
+    env.setdefault("PAR6_SHM_DIR", str(_shm_dir()))
     return env
+
+
+@functools.lru_cache(maxsize=1)
+def _shm_dir() -> Path:
+    """A per-process scratch directory for this run's grant segments."""
+    path = Path(tempfile.gettempdir()) / f"par6-test-shm-{os.getpid()}"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
 
 
 def free_udp_port() -> int:
@@ -84,7 +102,9 @@ def free_udp_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def sim_config(dest: Path, active_gripper: str | None = None) -> Path:
+def sim_config(
+    dest: Path, active_gripper: str | None = None, initial_recipe: str | None = None
+) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
     Sourced from ``par6/_data`` (the same tree the client reads), so the
@@ -101,7 +121,17 @@ def sim_config(dest: Path, active_gripper: str | None = None) -> Path:
         "status_rate_hz = 50", f"status_rate_hz = {STATUS_RATE_HZ}"
     )
     if patched == text:
-        raise RuntimeError("PAR6.toml patch points (tick_dt_s / status_rate_hz) missing")
+        raise RuntimeError(
+            "PAR6.toml patch points (tick_dt_s / status_rate_hz) missing"
+        )
+    if initial_recipe is not None:
+        swapped = patched.replace(
+            "telemetry_rate_hz = 100",
+            f'telemetry_rate_hz = 100\ninitial_recipe = "{initial_recipe}"',
+        )
+        if swapped == patched:
+            raise RuntimeError("PAR6.toml patch point (telemetry_rate_hz) missing")
+        patched = swapped
     if active_gripper is not None:
         fitted = _cfg.load_robot_config()["robot"]["active_gripper"]
         swapped = patched.replace(
@@ -135,11 +165,12 @@ class LiveDaemon:
         workdir: Path,
         active_gripper: str | None = None,
         status_transport: str = "unicast",
+        initial_recipe: str | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
-        config = sim_config(workdir / "config", active_gripper)
+        config = sim_config(workdir / "config", active_gripper, initial_recipe)
         status_port = free_udp_port()
         telemetry_port = free_udp_port()
         log_path = workdir / "par6d.log"
@@ -148,13 +179,20 @@ class LiveDaemon:
             [
                 binary,
                 "--sim",
-                "--config", str(config),
-                "--port", "0",
-                "--bind", "127.0.0.1",
-                "--status-transport", status_transport,
-                "--status-host", "127.0.0.1",
-                "--status-port", str(status_port),
-                "--telemetry-port", str(telemetry_port),
+                "--config",
+                str(config),
+                "--port",
+                "0",
+                "--bind",
+                "127.0.0.1",
+                "--status-transport",
+                status_transport,
+                "--status-host",
+                "127.0.0.1",
+                "--status-port",
+                str(status_port),
+                "--telemetry-port",
+                str(telemetry_port),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
@@ -262,8 +300,9 @@ async def settle_at(
     while time.monotonic() < deadline:
         await client.teleport(angles_deg)
         arrived = await client.wait_status(
-            lambda s: s.homed
-            and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg)),
+            lambda s: (
+                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg))
+            ),
             timeout=0.5,
         )
         if arrived:

@@ -123,6 +123,17 @@ pub struct Simulator {
     pub on: bool,
 }
 
+/// PAUSE: hold or resume the executing trajectory.
+///
+/// Distinct from STOP: the sample ring is left intact, so resuming
+/// continues the move from where it paused instead of requiring the
+/// caller to re-issue it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Pause {
+    /// `true` holds the executing trajectory; `false` resumes it.
+    pub on: bool,
+}
+
 /// SET_GRAVITY_COMP: apply (or stop applying) the G(q) feedforward.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SetGravityComp {
@@ -153,6 +164,20 @@ pub struct SetTcpOffset {
     pub y: f64,
     /// Z offset (mm).
     pub z: f64,
+}
+
+/// SET_PAYLOAD: replace the runtime payload carried at the TCP frame.
+/// An inertial update only — gravity feedforward and torque planning see
+/// it; the collision geometry is unchanged.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetPayload {
+    /// Payload mass \[kg\]; 0 clears the payload.
+    pub mass: f64,
+    /// Payload COM in end-effector-frame coordinates \[m\].
+    pub com: [f64; 3],
+    /// Rotational inertia about the COM, end-effector-frame axes,
+    /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\]; `None` = point mass.
+    pub inertia: Option<[f64; 6]>,
 }
 
 /// SET_SHAPES: replace the workspace collision-world shapes.
@@ -418,8 +443,9 @@ pub enum Command {
     // SYSTEM
     Reset,
     Estop,
-    SafetyStop,
     SetGravityComp(SetGravityComp),
+    /// Hold or resume the executing trajectory.
+    Pause(Pause),
     Stop(Stop),
     WriteIo(WriteIo),
     Simulator(Simulator),
@@ -427,6 +453,7 @@ pub enum Command {
     ResetState,
     ConnectHardware(ConnectHardware),
     SetTcpOffset(SetTcpOffset),
+    SetPayload(SetPayload),
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
     SetRecipe(SetRecipe),
@@ -449,6 +476,9 @@ pub enum Command {
     ToolStatus,
     IsSimulator,
     Shapes,
+    ConfigInfo,
+    Payload,
+    ConfigBundle,
     // FIRE_AND_FORGET
     ServoJ(ServoJ),
     ServoJPose(ServoJPose),
@@ -478,8 +508,8 @@ impl Command {
         match self {
             C::Reset => CmdType::Reset,
             C::Estop => CmdType::Estop,
-            C::SafetyStop => CmdType::SafetyStop,
             C::SetGravityComp(_) => CmdType::SetGravityComp,
+            C::Pause(_) => CmdType::Pause,
             C::Stop(_) => CmdType::Stop,
             C::WriteIo(_) => CmdType::WriteIo,
             C::Simulator(_) => CmdType::Simulator,
@@ -487,6 +517,7 @@ impl Command {
             C::ResetState => CmdType::ResetState,
             C::ConnectHardware(_) => CmdType::ConnectHardware,
             C::SetTcpOffset(_) => CmdType::SetTcpOffset,
+            C::SetPayload(_) => CmdType::SetPayload,
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
             C::SetRecipe(_) => CmdType::SetRecipe,
@@ -508,6 +539,9 @@ impl Command {
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
+            C::ConfigInfo => CmdType::ConfigInfo,
+            C::Payload => CmdType::Payload,
+            C::ConfigBundle => CmdType::ConfigBundle,
             C::ServoJ(_) => CmdType::ServoJ,
             C::ServoJPose(_) => CmdType::ServoJPose,
             C::ServoL(_) => CmdType::ServoL,
@@ -556,9 +590,9 @@ impl Command {
             C::Stop(_)
             | C::Simulator(_)
             | C::SetGravityComp(_)
+            | C::Pause(_)
             | C::Reset
             | C::Estop
-            | C::SafetyStop
             | C::ResetState
             | C::SetCompletionPolicy(_)
             | C::Ping
@@ -579,6 +613,9 @@ impl Command {
             | C::ToolStatus
             | C::IsSimulator
             | C::Shapes
+            | C::ConfigInfo
+            | C::Payload
+            | C::ConfigBundle
             | C::ResetLoopStats => Ok(()),
             C::WriteIo(p) => {
                 check(p.port <= 7, "write_io.port", "must be 0..=7")?;
@@ -590,6 +627,20 @@ impl Command {
                 finite("set_tcp_offset.x", p.x)?;
                 finite("set_tcp_offset.y", p.y)?;
                 finite("set_tcp_offset.z", p.z)
+            }
+            C::SetPayload(p) => {
+                finite("set_payload.mass", p.mass)?;
+                check(p.mass >= 0.0, "set_payload.mass", "must be >= 0 kg")?;
+                finite_all("set_payload.com", &p.com)?;
+                if let Some(inertia) = &p.inertia {
+                    finite_all("set_payload.inertia", inertia)?;
+                    check(
+                        symmetric3_is_psd(inertia),
+                        "set_payload.inertia",
+                        "must be positive semidefinite",
+                    )?;
+                }
+                Ok(())
             }
             C::SetShapes(p) => {
                 check(
@@ -731,6 +782,20 @@ fn finite_all(what: &'static str, vs: &[f64]) -> Result<(), DecodeError> {
     Ok(())
 }
 
+/// Whether the symmetric 3×3 `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` is positive
+/// semidefinite (Sylvester's criterion, small tolerance so a legitimate
+/// rank-deficient point mass passes). A negative-definite "inertia" would
+/// make the dynamics model lie quietly ever after, so it is refused at
+/// the wire.
+fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
+    let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
+    const EPS: f64 = 1e-12;
+    let m2 = ixx * iyy - ixy * ixy;
+    let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
+        + ixz * (ixy * iyz - iyy * ixz);
+    ixx >= -EPS && iyy >= -EPS && izz >= -EPS && m2 >= -EPS && det >= -EPS
+}
+
 fn frac(what: &'static str, v: f64) -> Result<(), DecodeError> {
     finite(what, v)?;
     check(v > 0.0 && v <= 1.0, what, "must be in (0, 1]")
@@ -828,7 +893,7 @@ fn waypoints(what: &'static str, wps: &[[f64; 6]]) -> Result<(), DecodeError> {
 fn arity(tag: CmdType) -> usize {
     use CmdType as T;
     match tag {
-        T::Reset | T::Estop | T::SafetyStop | T::ResetState | T::ResetLoopStats => 2,
+        T::Reset | T::Estop | T::ResetState | T::ResetLoopStats => 2,
         T::Ping
         | T::Status
         | T::Angles
@@ -845,10 +910,14 @@ fn arity(tag: CmdType) -> usize {
         | T::TcpOffset
         | T::ToolStatus
         | T::IsSimulator
-        | T::Shapes => 2,
+        | T::Shapes
+        | T::ConfigInfo
+        | T::Payload
+        | T::ConfigBundle => 2,
         T::Stop
         | T::Simulator
         | T::SetGravityComp
+        | T::Pause
         | T::SelectProfile
         | T::ConnectHardware
         | T::SetShapes
@@ -857,6 +926,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Pose => 3,
         T::WriteIo => 4,
         T::SetTcpOffset => 5,
+        T::SetPayload => 5,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -912,7 +982,6 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
     match cmd {
         C::Reset
         | C::Estop
-        | C::SafetyStop
         | C::ResetState
         | C::ResetLoopStats
         | C::Ping
@@ -931,7 +1000,10 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::TcpOffset
         | C::ToolStatus
         | C::IsSimulator
-        | C::Shapes => {}
+        | C::Shapes
+        | C::ConfigInfo
+        | C::Payload
+        | C::ConfigBundle => {}
         C::Stop(p) => w_bool(buf, p.clear_queue),
         C::WriteIo(p) => {
             w_uint(buf, u64::from(p.port));
@@ -939,12 +1011,29 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         }
         C::Simulator(p) => w_bool(buf, p.on),
         C::SetGravityComp(p) => w_bool(buf, p.on),
+        C::Pause(p) => w_bool(buf, p.on),
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
         C::SetTcpOffset(p) => {
             w_f64(buf, p.x);
             w_f64(buf, p.y);
             w_f64(buf, p.z);
+        }
+        C::SetPayload(p) => {
+            w_f64(buf, p.mass);
+            w_array(buf, 3);
+            for v in &p.com {
+                w_f64(buf, *v);
+            }
+            match &p.inertia {
+                Some(i) => {
+                    w_array(buf, 6);
+                    for v in i {
+                        w_f64(buf, *v);
+                    }
+                }
+                None => w_nil(buf),
+            }
         }
         C::SetShapes(p) => {
             w_array(buf, p.shapes.len());
@@ -1089,6 +1178,22 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
 // Decode
 // ---------------------------------------------------------------------------
 
+fn r_fixed3(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 3], DecodeError> {
+    let n = r.array_len()?;
+    if n != 3 {
+        return Err(DecodeError::Arity {
+            what,
+            expected: 3,
+            got: n,
+        });
+    }
+    let mut out = [0.0; 3];
+    for v in &mut out {
+        *v = r.f64()?;
+    }
+    Ok(out)
+}
+
 fn r_fixed6(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 6], DecodeError> {
     let n = r.array_len()?;
     if n != 6 {
@@ -1211,7 +1316,6 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
     let cmd = match tag {
         T::Reset => Command::Reset,
         T::Estop => Command::Estop,
-        T::SafetyStop => Command::SafetyStop,
         T::Stop => Command::Stop(Stop {
             clear_queue: r.bool()?,
         }),
@@ -1231,6 +1335,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         }
         T::Simulator => Command::Simulator(Simulator { on: r.bool()? }),
         T::SetGravityComp => Command::SetGravityComp(SetGravityComp { on: r.bool()? }),
+        T::Pause => Command::Pause(Pause { on: r.bool()? }),
         T::SelectProfile => Command::SelectProfile(SelectProfile {
             profile: r.str()?.to_owned(),
         }),
@@ -1242,6 +1347,16 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             x: r.f64()?,
             y: r.f64()?,
             z: r.f64()?,
+        }),
+        T::SetPayload => Command::SetPayload(SetPayload {
+            mass: r.f64()?,
+            com: r_fixed3(&mut r, "set_payload.com")?,
+            inertia: if r.peek_nil() {
+                r.nil()?;
+                None
+            } else {
+                Some(r_fixed6(&mut r, "set_payload.inertia")?)
+            },
         }),
         T::SetShapes => {
             let n = r_len(&mut r, "set_shapes.shapes", MAX_SHAPES)?;
@@ -1288,6 +1403,9 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,
+        T::ConfigInfo => Command::ConfigInfo,
+        T::Payload => Command::Payload,
+        T::ConfigBundle => Command::ConfigBundle,
         T::ServoJ => Command::ServoJ(ServoJ {
             angles: r_fixed6(&mut r, "servo_j.angles")?,
             speed: r.opt_f64()?,

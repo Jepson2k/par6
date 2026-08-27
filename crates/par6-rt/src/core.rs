@@ -32,8 +32,9 @@ use std::sync::Arc;
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
+    PollAction,
 };
-use par6_config::{ConfigBundle, ControlMode, KtSource, MAX_IO_LINES};
+use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
 use crate::errors::ErrorManager;
@@ -73,6 +74,10 @@ const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;
+/// Measured-speed band \[rad/s\] under which every joint counts as at
+/// rest for the shutdown exit path. Above encoder quantization noise,
+/// far below any commanded motion.
+const SHUTDOWN_REST_RAD_S: f64 = 0.02;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
 /// Minimum spacing between two bus-fault log lines from the RT thread
@@ -184,6 +189,31 @@ pub enum GateRefusal {
     NotImplemented,
 }
 
+/// Bitmask of the joints a per-joint speed array actually drives.
+fn joint_mask(speeds: &[f64; MAX_JOINTS]) -> u8 {
+    let mut mask = 0u8;
+    for (i, v) in speeds.iter().enumerate() {
+        if *v != 0.0 {
+            mask |= 1 << i;
+        }
+    }
+    mask
+}
+
+/// Per-tick coefficient of a first-order low-pass at *cutoff_hz*, or 0
+/// when the filter is off.
+///
+/// `y += alpha · (x − y)` with `alpha = dt / (dt + 1/(2π·fc))`. A cutoff
+/// at or above the Nyquist of the tick rate cannot filter anything, so it
+/// is reported as off rather than as an alpha of ~1 that pretends to.
+fn lowpass_alpha(cutoff_hz: f64, dt: f64) -> f64 {
+    if cutoff_hz <= 0.0 || cutoff_hz >= 0.5 / dt {
+        return 0.0;
+    }
+    let tau = 1.0 / (2.0 * std::f64::consts::PI * cutoff_hz);
+    dt / (dt + tau)
+}
+
 /// Construction failure.
 #[derive(Debug, thiserror::Error)]
 pub enum CoreError {
@@ -240,6 +270,14 @@ impl ExecHeartbeat {
     /// Mark the link alive for this heartbeat period.
     pub fn feed(&self) {
         self.flag.store(true, Ordering::Relaxed);
+    }
+
+    /// A heartbeat no watchdog consumes — for driving planning machinery
+    /// outside a running RT core (offline preview).
+    pub fn unmonitored() -> Self {
+        Self {
+            flag: Arc::new(AtomicBool::new(false)),
+        }
     }
 }
 
@@ -313,6 +351,7 @@ pub struct RtCore<B: DriverBus> {
     /// configured exactly as the one opened at startup was.
     boot: BootConfig,
     torque_ma_factor: [f64; MAX_JOINTS],
+    torque_slew: dispatch::TorqueSlew,
     torque_cal: [TorqueCal; MAX_JOINTS],
     /// `kt_source = "auto"`: adopt the drivers' own kt at the boot
     /// one-shot, before anything can be enabled.
@@ -355,6 +394,14 @@ pub struct RtCore<B: DriverBus> {
     // and the tick loop counts every one into the published loop stats.
     // Consecutive-failure streaks drive the disconnect latch below.
     bus_tx_failures: u32,
+    /// Scheduling setup outcome recorded by the run loop (SCHED_FIFO
+    /// applied, CPU pinned) — published through `LoopStats`.
+    rt_fifo: bool,
+    rt_pinned: bool,
+    /// Per-node self-heal one-shot (indexed by error index): armed while
+    /// the node is fresh, fired once when it goes stale/lost, re-armed on
+    /// recovery.
+    self_heal_armed: [bool; crate::NUM_NODES],
     bus_rx_failures: u32,
     tx_fail_streak: u32,
     gripper_tx_fail_streak: u32,
@@ -381,7 +428,17 @@ pub struct RtCore<B: DriverBus> {
     q_filt: [f64; MAX_JOINTS],
     qd_filt: [f64; MAX_JOINTS],
     tau_filt: [f64; MAX_JOINTS],
+    /// External torque estimate \[Nm\]: filtered measured torque minus
+    /// the model's gravity torque. What a hand pushing the arm looks
+    /// like in the torque domain.
+    tau_ext: [f64; MAX_JOINTS],
     filters_seeded: bool,
+    /// `[limits] tau_ext_margin_nm`; 0 disables the envelope.
+    tau_env_margin_nm: f64,
+    /// Ticks a joint must stay beyond the margin before latching.
+    tau_env_window_ticks: u32,
+    /// Per-joint consecutive over-margin tick counters.
+    tau_env_over: [u32; MAX_JOINTS],
 
     // Per-tick compute buffers.
     g: [f64; MAX_JOINTS],
@@ -398,7 +455,7 @@ pub struct RtCore<B: DriverBus> {
 
     // Jog live state.
     jog_active: bool,
-    jog_joint: u8,
+    jog_joints: u8,
     jog_blocked: u16,
 
     // EXEC link watchdog.
@@ -421,6 +478,10 @@ pub struct RtCore<B: DriverBus> {
     stream_sent_base: u64,
     stream_success: f32,
     stream_discard: f32,
+    /// Command low-pass coefficient per tick; 0 = the filter is off.
+    stream_lp_alpha: f64,
+    /// Filter state, in joint space, carried across ticks.
+    stream_filt: [f64; MAX_JOINTS],
 
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
@@ -462,6 +523,16 @@ impl<B: DriverBus> RtCore<B> {
         // (`kt_source = "auto"`), which happens while still BOOTING.
         let torque_ma_factor: [f64; MAX_JOINTS] =
             std::array::from_fn(|i| torque_cal[i].factor(torque_cal[i].kt_nm_a));
+        // Per-tick torque budget from each joint's declared slew ceiling.
+        // A joint that declares none is unlimited, which is the behaviour
+        // every joint had before the limit was enforced.
+        let torque_slew = dispatch::TorqueSlew::new(std::array::from_fn(|i| {
+            robot.joints[i]
+                .limits
+                .for_mode(LimitMode::Exec)
+                .torque_rate_nm_s
+                .map_or(f64::INFINITY, |rate| rate * dt)
+        }));
         let (writer, snapshots) = snapshot_channel::<StateSnapshot>();
         let (stream_tx, stream_rx) = snapshot_channel::<StreamSetpoint>();
         let heartbeat = Arc::new(AtomicBool::new(false));
@@ -486,6 +557,7 @@ impl<B: DriverBus> RtCore<B> {
                 config_repeats: robot.bus.boot_config_repeats,
             },
             torque_ma_factor,
+            torque_slew,
             torque_cal,
             kt_auto: robot.robot.kt_source == KtSource::Auto,
             node_of: std::array::from_fn(|i| robot.joints[i].node_id),
@@ -514,6 +586,9 @@ impl<B: DriverBus> RtCore<B> {
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
             bus_tx_failures: 0,
+            rt_fifo: false,
+            rt_pinned: false,
+            self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
             tx_fail_streak: 0,
             gripper_tx_fail_streak: 0,
@@ -533,7 +608,11 @@ impl<B: DriverBus> RtCore<B> {
             q_filt: [0.0; MAX_JOINTS],
             qd_filt: [0.0; MAX_JOINTS],
             tau_filt: [0.0; MAX_JOINTS],
+            tau_ext: [0.0; MAX_JOINTS],
             filters_seeded: false,
+            tau_env_margin_nm: robot.limits.tau_ext_margin_nm,
+            tau_env_window_ticks: robot.ticks(robot.limits.tau_ext_window_s).max(1),
+            tau_env_over: [0; MAX_JOINTS],
             g: [0.0; MAX_JOINTS],
             setpoints: [JointSetpoint::zero_velocity(); MAX_JOINTS],
             cmds: [JointCommand::idle(); MAX_JOINTS],
@@ -546,7 +625,7 @@ impl<B: DriverBus> RtCore<B> {
             gripper_cmd,
             homing_gcmd: gripper_cmd,
             jog_active: false,
-            jog_joint: 0,
+            jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
             hb_silence: 0,
@@ -573,6 +652,8 @@ impl<B: DriverBus> RtCore<B> {
             stream_sent_base: 0,
             stream_success: 0.0,
             stream_discard: 0.0,
+            stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
+            stream_filt: [0.0; MAX_JOINTS],
             writer,
             snap: StateSnapshot::default(),
         };
@@ -710,9 +791,52 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Reset the loop timing statistics (the `reset_loop_stats`
-    /// follow-through); the warmup gate re-arms.
+    /// follow-through); the warmup gate re-arms. The scheduling flags are
+    /// state, not statistics, and survive.
     pub fn reset_loop_stats(&mut self) {
         self.timing.reset();
+    }
+
+    /// Record whether the run loop's scheduling setup took effect.
+    pub fn record_rt_sched(&mut self, fifo: bool, pinned: bool) {
+        self.rt_fifo = fifo;
+        self.rt_pinned = pinned;
+    }
+
+    /// Shutdown phase 1: force the standing halt. Any working mode drops
+    /// to IDLE, whose law commands active zero velocity (or the gravity
+    /// float), so subsequent ticks bring the arm to a commanded stop
+    /// before the process exits. BOOTING / ACTIVE_ERROR / SAFETY_STOP
+    /// already run a stationary law and are left in place; FLASHING is a
+    /// bus-silent maintenance window and must stay silent.
+    pub fn shutdown_halt(&mut self) {
+        if matches!(
+            self.mode,
+            Mode::Idle | Mode::Booting | Mode::ActiveError | Mode::SafetyStop | Mode::Flashing
+        ) {
+            return;
+        }
+        let _ = self.request_mode(Mode::Idle);
+    }
+
+    /// Whether every joint's measured speed is inside the shutdown rest
+    /// band — the condition the exit path waits on before idling the
+    /// drives.
+    pub fn at_rest(&self) -> bool {
+        self.qd_filt.iter().all(|v| v.abs() < SHUTDOWN_REST_RAD_S)
+    }
+
+    /// Shutdown phase 2: terminal limp. SAFETY_STOP's law is torque-only
+    /// 0 N·m, so the tick after this call puts a frame on the bus that
+    /// idles the drives on purpose — instead of leaving them to act on
+    /// the last motion frame until the CAN watchdog expires and drops
+    /// them out mid-hold. No-op in FLASHING (the bus is silent by
+    /// contract there, and the arm is parked and asserted).
+    pub fn shutdown_limp(&mut self) {
+        if self.mode == Mode::Flashing {
+            return;
+        }
+        let _ = self.request_mode(Mode::SafetyStop);
     }
 
     /// One tick of the core. `period_s` is the measured loop period (the
@@ -749,6 +873,13 @@ impl<B: DriverBus> RtCore<B> {
 
         // Gravity: computed every tick, published always.
         self.gravity.gravity(&self.q, &mut self.g);
+
+        // External torque: what the measured (filtered) torque carries
+        // beyond the model's gravity — a contact, a payload the model
+        // does not know, a hand on the arm.
+        for i in 0..MAX_JOINTS {
+            self.tau_ext[i] = self.tau_filt[i] - self.g[i];
+        }
 
         // Phase 7: error checks and reactions.
         self.check_errors(health);
@@ -885,24 +1016,21 @@ impl<B: DriverBus> RtCore<B> {
                 log::info!("human park assertion received (arms FLASHING entry)");
                 self.park_asserted = true;
             }
-            RtCommand::Jog {
-                joint,
-                signed_pct,
-                accel,
-            } => {
-                if self.mode == Mode::Jog && usize::from(joint) < MAX_JOINTS {
+            RtCommand::Jog { speeds, accel } => {
+                if self.mode == Mode::Jog {
                     if self.jog_accel_scale != accel {
                         self.jog.set_accel_scale(accel);
                         self.jog_accel_scale = accel;
                     }
-                    self.jog.command(usize::from(joint), signed_pct);
+                    self.jog.command(&speeds);
                     self.jog_active = true;
-                    self.jog_joint = joint;
+                    self.jog_joints = joint_mask(&speeds);
                 }
             }
             RtCommand::JogRelease => {
                 self.jog.release();
                 self.jog_active = false;
+                self.jog_joints = 0;
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
             RtCommand::ExecFlush => {
@@ -920,6 +1048,9 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
+            RtCommand::SetPayload { mass, com, inertia } => {
+                self.gravity.set_payload(mass, com, inertia);
+            }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
         }
     }
@@ -1058,6 +1189,10 @@ impl<B: DriverBus> RtCore<B> {
                 self.stream_sent_base = self.stream_sent.load(Ordering::Relaxed);
                 self.stream_success = 0.0;
                 self.stream_discard = 0.0;
+                // Seeding the filter at the measured pose is what keeps a
+                // filtered session from starting with a ramp out of
+                // whatever the last session left behind.
+                self.stream_filt = self.q;
             }
             Mode::Flashing => {
                 log::info!("entering FLASHING: bus-silent maintenance window");
@@ -1215,6 +1350,54 @@ impl<B: DriverBus> RtCore<B> {
             self.errors.latch(ErrorCode::LoopCritical, None);
         }
 
+        // Motor-bus controller state: bus-off is a hard latch (nothing
+        // reaches the drives until the kernel restarts the interface),
+        // error-passive the self-clearing warning on the way there.
+        let link = self.bus.link_health();
+        if link.state == par6_bus::LinkState::BusOff {
+            self.errors.latch(ErrorCode::BusOff, None);
+        }
+        self.errors.condition(
+            ErrorCode::LinkErrorPassive,
+            None,
+            link.state == par6_bus::LinkState::ErrorPassive,
+        );
+
+        // External-torque envelope: a joint whose external-torque
+        // estimate stays beyond the margin for the window latches hard —
+        // unexpected contact or an unmodeled payload. Enforced only
+        // where the estimate is meaningful: homed (the gravity model
+        // needs referenced angles), enabled, and in a mode whose drives
+        // actively bear the load — a limp or protective-hold arm reads
+        // `-g(q)` as "external" torque and would re-latch forever. The
+        // EXEC feed-forward is subtracted so planned acceleration does
+        // not count against the margin (one tick stale, matching the
+        // measurement's own lag). Hand-guiding and impedance modes are
+        // exempt: external torque is their input, not a fault.
+        if self.tau_env_margin_nm > 0.0 {
+            let enforce = self.homed
+                && self.state == ArmState::Enabled
+                && matches!(
+                    self.mode,
+                    Mode::Idle | Mode::Jog | Mode::Stream | Mode::Exec
+                );
+            for i in 0..MAX_JOINTS {
+                let ff = if self.mode == Mode::Exec {
+                    self.scratch_tau[i]
+                } else {
+                    0.0
+                };
+                if enforce && (self.tau_ext[i] - ff).abs() > self.tau_env_margin_nm {
+                    self.tau_env_over[i] = self.tau_env_over[i].saturating_add(1);
+                    if self.tau_env_over[i] >= self.tau_env_window_ticks {
+                        self.errors.latch(ErrorCode::TorqueEnvelope, Some(i as u8));
+                    }
+                } else {
+                    self.tau_env_over[i] = 0;
+                }
+            }
+        }
+
         if !self.bus.is_silent() {
             // A sustained TX-failure streak is a disconnect: the arm has
             // stopped receiving commands even if RX freshness still reads
@@ -1338,6 +1521,25 @@ impl<B: DriverBus> RtCore<B> {
                 log::warn!("node {node} disconnected: homing invalidated");
                 self.homed = false;
             }
+        }
+        // Self-heal: a node gone quiet may just have dropped its config
+        // (brown-out, watchdog reset) — a config resend provokes a reply
+        // where plain polls stay unanswered. One shot per silence episode,
+        // through the poll slot so the tick's TX budget is untouched;
+        // re-armed only by an actual recovery, so a node that is truly
+        // gone costs one frame, not one per tick.
+        let armed = &mut self.self_heal_armed[usize::from(err_idx)];
+        match f {
+            Freshness::Fresh => *armed = true,
+            Freshness::Stale | Freshness::Lost => {
+                if *armed {
+                    *armed = false;
+                    log::warn!("node {node}: {f:?}; queueing a config resend to provoke recovery");
+                    self.bus
+                        .queue_poll_override(PollAction::ResendConfig { node }, 1);
+                }
+            }
+            Freshness::Unknown => {}
         }
     }
 
@@ -1491,8 +1693,12 @@ impl<B: DriverBus> RtCore<B> {
                         self.stream.set_scale(sp.speed, sp.accel);
                         self.stream_scale = (sp.speed, sp.accel);
                     }
+                    // `q_target` carries the raw request; the filter sits
+                    // between it and the executor, so the pair makes the
+                    // smoothing visible.
                     self.q_target = sp.q;
-                    self.stream.set_target(&sp.q);
+                    let target = self.filtered_target(&sp.q);
+                    self.stream.set_target(&target);
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
                 }
@@ -1511,10 +1717,16 @@ impl<B: DriverBus> RtCore<B> {
             _ => dispatch::law_booting(&mut self.setpoints),
         }
 
+        // The protective laws must reach the drive this tick, so they are
+        // never rate-limited; they snap the slew state instead, which is
+        // what makes the mode they hand back to ramp from zero.
+        let rate_limit = !matches!(self.mode, Mode::ActiveError | Mode::SafetyStop);
         dispatch::commit(
             &self.setpoints,
             &self.conv,
             &self.torque_ma_factor,
+            &mut self.torque_slew,
+            rate_limit,
             &mut self.cmds,
             &mut self.mirror,
         );
@@ -1563,6 +1775,19 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
+    /// The streamed target as the executor should see it: the raw request
+    /// when `stream.lowpass_cutoff_hz` is off, otherwise one step of the
+    /// first-order filter.
+    fn filtered_target(&mut self, q: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+        if self.stream_lp_alpha == 0.0 {
+            return *q;
+        }
+        for (y, x) in self.stream_filt.iter_mut().zip(q.iter()) {
+            *y += self.stream_lp_alpha * (x - *y);
+        }
+        self.stream_filt
+    }
+
     fn stream_window(&mut self, applied: bool) {
         self.stream_window_pos += 1;
         if applied {
@@ -1600,9 +1825,11 @@ impl<B: DriverBus> RtCore<B> {
         s.q_filtered = self.q_filt;
         s.qd_filtered = self.qd_filt;
         s.tau_filtered = self.tau_filt;
+        s.tau_ext = self.tau_ext;
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
+        s.gravity_comp = self.gravity_comp;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);
@@ -1611,13 +1838,17 @@ impl<B: DriverBus> RtCore<B> {
         s.gravity_torque_nm = self.g;
         for i in 0..MAX_JOINTS {
             s.nodes[i] = self.bus_state.nodes[usize::from(self.node_of[i])];
+            s.node_freshness[i] = self.bus.freshness(self.node_of[i]);
         }
         s.nodes[MAX_JOINTS] = self.bus_state.nodes[usize::from(self.gripper_node)];
+        s.node_freshness[MAX_JOINTS] = self.bus.freshness(self.gripper_node);
         s.gripper = self.bus_state.gripper;
         s.homing = self.homing.status();
         s.errors = *self.errors.list();
         s.error_active = self.errors.any_hard();
         s.loop_stats = self.timing.stats();
+        s.loop_stats.rt_fifo = self.rt_fifo;
+        s.loop_stats.rt_pinned = self.rt_pinned;
         s.loop_stats.can_frame_age_max_ticks = self.bus_state.frame_age_max_ticks;
         s.loop_stats.can_frame_age_min_ticks = self.bus_state.frame_age_min_ticks;
         s.loop_stats.bus_tx_failures = self.bus_tx_failures;
@@ -1626,7 +1857,7 @@ impl<B: DriverBus> RtCore<B> {
         s.exec = self.exec.status();
         s.jog = JogStatus {
             active: self.jog_active,
-            joint: self.jog_joint,
+            joints: self.jog_joints,
             blocked_mask: self.jog_blocked,
         };
         s.io_lines = self.io_lines;

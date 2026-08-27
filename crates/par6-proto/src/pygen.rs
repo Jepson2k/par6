@@ -8,8 +8,8 @@
 use std::fmt::Write;
 
 use crate::enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, Frame, MsgType, QueryType,
-    ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
+    HomingJointState, HomingPhase, LinkState, MsgType, QueryType, ToolState,
 };
 use crate::error::ErrorCode;
 use crate::status::{STATUS_HEADER_LEN, STATUS_LEN};
@@ -91,6 +91,12 @@ pub fn generate() -> String {
     );
     emit_enum(
         &mut out,
+        "ControllerMode",
+        "Controller mode as published on STATUS.",
+        ControllerMode::variants(),
+    );
+    emit_enum(
+        &mut out,
         "CompletionPolicy",
         "Controller-side completion policy for queued motion.",
         CompletionPolicy::variants(),
@@ -106,6 +112,25 @@ pub fn generate() -> String {
         "ToolState",
         "State of an end-of-arm tool.",
         ToolState::variants(),
+    );
+    emit_enum(
+        &mut out,
+        "LinkState",
+        "Motor-bus kernel link state (STATUS link_health).",
+        LinkState::variants(),
+    );
+    emit_enum(
+        &mut out,
+        "HomingJointState",
+        "Per-actuator homing FSM status (STATUS homing).",
+        HomingJointState::variants(),
+    );
+    emit_enum(
+        &mut out,
+        "HomingPhase",
+        "Homing FSM phase; for a Failed status it names the phase the FSM \
+         failed in.",
+        HomingPhase::variants(),
     );
     emit_enum(
         &mut out,

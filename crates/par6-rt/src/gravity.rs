@@ -19,6 +19,12 @@ pub trait GravityModel: Send {
     /// Write G(q) \[Nm\] for the arm joints into `out`. Must not allocate
     /// and must not block — it runs on the RT thread every tick.
     fn gravity(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]);
+
+    /// Replace the runtime payload carried at the TCP (mass \[kg\], COM
+    /// \[m\] in ee-frame coordinates, rotational inertia about the COM,
+    /// `None` = point mass). Inputs are validated at the wire before
+    /// they reach here. Models without a payload notion ignore it.
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
 }
 
 /// Zero-torque model: gravity compensation contributes nothing.

@@ -31,14 +31,23 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, Pose, NQ};
+use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, KinError, Pose, NQ};
 use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 
 /// Map a configured gripper name onto the URDF variant whose tool the
 /// model must carry (mass for gravity, TCP frame for FK/IK). Unknown
 /// names fall back to the bare flange — the arm itself is always
 /// modeled — with a startup warning.
-pub(crate) fn variant_for(gripper_name: &str) -> GripperVariant {
+pub(crate) fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
+    if let Some(key) = urdf_variant {
+        match GripperVariant::from_key(key) {
+            Some(v) => return v,
+            None => log::warn!(
+                "gripper '{gripper_name}': unknown urdf_variant '{key}'; \
+                 falling back to the name-prefix rule"
+            ),
+        }
+    }
     if gripper_name.eq_ignore_ascii_case("flange") {
         GripperVariant::Flange
     } else if gripper_name.starts_with("MSG") {
@@ -339,6 +348,14 @@ impl GravityModel for KinGravity {
         }
         *out = self.last_good;
     }
+
+    fn set_payload(&mut self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
+        // Wire-validated before it gets here; a refusal now is a model
+        // fault worth shouting about, not silently absorbing.
+        if let Err(e) = self.kin.set_tool(mass, com, inertia) {
+            log::error!("gravity payload update refused: {e}");
+        }
+    }
 }
 
 // -------------------------------------------------------- solver wrapper
@@ -392,18 +409,19 @@ pub(crate) struct CartKin {
     jac: [f64; 6 * NQ],
     offset: ToolOffset,
     window: SoftWindow,
+    /// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`),
+    /// from `[motion] dls_lambda`.
+    dls_lambda: f64,
 }
 
-/// DLS damping λ for the jacobian velocity solve (`Jᵀ(JJᵀ+λ²I)⁻¹v`).
-const DLS_LAMBDA: f64 = 0.05;
-
 impl CartKin {
-    pub(crate) fn new(kin: Kin, offset: ToolOffset, window: SoftWindow) -> Self {
+    pub(crate) fn new(kin: Kin, offset: ToolOffset, window: SoftWindow, dls_lambda: f64) -> Self {
         Self {
             kin,
             jac: [0.0; 6 * NQ],
             offset,
             window,
+            dls_lambda,
         }
     }
 
@@ -413,6 +431,33 @@ impl CartKin {
         let mut pose = self.fk_model(q)?;
         translate_local(&mut pose, self.offset.get());
         Ok(pose)
+    }
+
+    /// Replace the runtime payload in this model (inertial only — FK,
+    /// jacobian and the soft window are untouched). Wire-validated
+    /// upstream.
+    pub(crate) fn set_tool(
+        &mut self,
+        mass: f64,
+        com: [f64; 3],
+        inertia: Option<[f64; 6]>,
+    ) -> Result<(), KinError> {
+        self.kin.set_tool(mass, com, inertia)
+    }
+
+    /// Dynamic feedforward torque `M(q)·q̈ + C(q,q̇)·q̇` \[Nm\] — gravity
+    /// excluded, the RT law adds G(q) itself.
+    pub(crate) fn dyn_feedforward(
+        &mut self,
+        q: &[f64; NQ],
+        qd: &[f64; NQ],
+        qdd: &[f64; NQ],
+    ) -> Result<[f64; NQ], String> {
+        let mut tau = [0.0; NQ];
+        self.kin
+            .dyn_feedforward(q, qd, qdd, &mut tau)
+            .map_err(|e| format!("inverse dynamics failed: {e}"))?;
+        Ok(tau)
     }
 
     /// FK matrix at the URDF's own TCP frame, offset NOT applied.
@@ -526,7 +571,7 @@ impl CartKin {
                 }
                 a[r][c] = s;
             }
-            a[r][r] += DLS_LAMBDA * DLS_LAMBDA;
+            a[r][r] += self.dls_lambda * self.dls_lambda;
         }
         let y = solve6(&mut a, v).ok_or_else(|| "singular jacobian system".to_string())?;
         let mut qd = [0.0; NQ];
@@ -594,7 +639,12 @@ mod tests {
         assert!(bundle.grippers.len() > 3, "the shipped tools are all here");
 
         for g in &bundle.grippers {
-            let variant = variant_for(&g.name);
+            assert!(
+                g.urdf_variant.is_some(),
+                "{}: shipped gripper TOMLs declare urdf_variant explicitly",
+                g.name
+            );
+            let variant = variant_for(&g.name, g.urdf_variant.as_deref());
             for relpath in [variant.urdf_relpath(), variant.srdf_relpath()] {
                 let path = assets.join(relpath);
                 assert!(path.is_file(), "{}: no model at {}", g.name, path.display());
@@ -773,5 +823,23 @@ mod tests {
         for (g, w) in x.iter().zip(x_true.iter()) {
             assert!((g - w).abs() < 1e-12);
         }
+    }
+
+    /// The explicit key decides; the prefix rule is only the fallback.
+    /// A name the prefix rule would misroute still gets the keyed model,
+    /// and an unknown key degrades to the prefix rule instead of
+    /// panicking or silently flanging a keyed gripper.
+    #[test]
+    fn urdf_variant_key_overrides_the_name_prefix_rule() {
+        assert_eq!(
+            variant_for("WEIRD_CUSTOM", Some("ssg48")),
+            GripperVariant::Ssg48
+        );
+        assert_eq!(
+            variant_for("SSG48_custom", Some("flange")),
+            GripperVariant::Flange
+        );
+        assert_eq!(variant_for("MSG_rail", Some("bogus")), GripperVariant::Msg);
+        assert_eq!(variant_for("MSG_rail", None), GripperVariant::Msg);
     }
 }

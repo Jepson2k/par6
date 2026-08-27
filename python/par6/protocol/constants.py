@@ -13,7 +13,7 @@ POSE_ELEMS = 16
 IO_SLOTS = 11
 MAX_IO_SLOTS = 64
 EN_SLOTS = 12
-STATUS_LEN = 31
+STATUS_LEN = 39
 STATUS_HEADER_LEN = 7
 
 
@@ -43,8 +43,9 @@ class CmdType(IntEnum):
     SET_SHAPES = 19
     SET_COMPLETION_POLICY = 20
     SET_RECIPE = 21
-    SAFETY_STOP = 22
     SET_GRAVITY_COMP = 23
+    PAUSE = 24
+    SET_PAYLOAD = 25
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -63,6 +64,9 @@ class CmdType(IntEnum):
     TOOL_STATUS = 45
     IS_SIMULATOR = 46
     SHAPES = 47
+    CONFIG_INFO = 48
+    PAYLOAD = 49
+    CONFIG_BUNDLE = 50
     SERVO_J = 60
     SERVO_J_POSE = 61
     SERVO_L = 62
@@ -104,6 +108,9 @@ class QueryType(IntEnum):
     TOOL_STATUS = 16
     IS_SIMULATOR = 17
     SHAPES = 18
+    CONFIG_INFO = 19
+    PAYLOAD = 20
+    CONFIG_BUNDLE = 21
 
 
 class CommandClass(IntEnum):
@@ -121,6 +128,22 @@ class ActionState(IntEnum):
     IDLE = 0
     EXECUTING = 1
     ERROR = 2
+
+
+class ControllerMode(IntEnum):
+    """Controller mode as published on STATUS."""
+
+    BOOTING = 0
+    IDLE = 1
+    ACTIVE_ERROR = 2
+    HOMING = 3
+    JOG = 4
+    STREAM = 5
+    EXEC = 6
+    HAND_GUIDING = 7
+    IMPEDANCE = 8
+    SAFETY_STOP = 9
+    FLASHING = 10
 
 
 class CompletionPolicy(IntEnum):
@@ -147,6 +170,38 @@ class ToolState(IntEnum):
     ERROR = 3
 
 
+class LinkState(IntEnum):
+    """Motor-bus kernel link state (STATUS link_health)."""
+
+    UNKNOWN = 0
+    UP = 1
+    ERROR_PASSIVE = 2
+    BUS_OFF = 3
+
+
+class HomingJointState(IntEnum):
+    """Per-actuator homing FSM status (STATUS homing)."""
+
+    IDLE = 0
+    RUNNING = 1
+    DONE = 2
+    FAILED = 3
+
+
+class HomingPhase(IntEnum):
+    """Homing FSM phase; for a Failed status it names the phase the FSM failed in."""
+
+    IDLE = 0
+    APPROACH = 1
+    DWELL = 2
+    BACKOFF = 3
+    PAUSE = 4
+    RELEASE = 5
+    SETTLE = 6
+    POST_MOVE = 7
+    FINISHED = 8
+
+
 class ErrorCode(IntEnum):
     """Error codes in subsystem ranges of 10: IK 10-19, TRAJ 20-29, MOTN 30-39, COMM 40-49, SYS 50-59."""
 
@@ -161,6 +216,7 @@ class ErrorCode(IntEnum):
     MOTN_TICK_FAILED = 34
     MOTN_NOT_HOMED = 35
     MOTN_SETTLE_TIMEOUT = 36
+    MOTN_HOMING_FAILED = 37
     COMM_QUEUE_FULL = 40
     COMM_UNKNOWN_COMMAND = 41
     COMM_DECODE_ERROR = 42
@@ -176,6 +232,11 @@ class ErrorCode(IntEnum):
     SYS_RTI_LINK_LOST = 56
     SYS_LOOP_CRITICAL = 57
     SYS_JOINT_FAULT = 58
+    SYS_LOOP_DEGRADED = 59
+    SYS_CAN_STALE = 60
+    SYS_BUS_OFF = 61
+    SYS_LINK_ERROR_PASSIVE = 62
+    SYS_TORQUE_ENVELOPE = 63
 
 
 # The ack taxonomy: one table, both sides consult it.
@@ -192,8 +253,9 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SET_SHAPES: CommandClass.SYSTEM,
     CmdType.SET_COMPLETION_POLICY: CommandClass.SYSTEM,
     CmdType.SET_RECIPE: CommandClass.SYSTEM,
-    CmdType.SAFETY_STOP: CommandClass.SYSTEM,
     CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
+    CmdType.PAUSE: CommandClass.SYSTEM,
+    CmdType.SET_PAYLOAD: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,
@@ -212,6 +274,9 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.TOOL_STATUS: CommandClass.QUERY,
     CmdType.IS_SIMULATOR: CommandClass.QUERY,
     CmdType.SHAPES: CommandClass.QUERY,
+    CmdType.CONFIG_INFO: CommandClass.QUERY,
+    CmdType.PAYLOAD: CommandClass.QUERY,
+    CmdType.CONFIG_BUNDLE: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

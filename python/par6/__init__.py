@@ -35,7 +35,6 @@ from .protocol import (
     StatusBuffer,
     ToolState,
     ToolStatusWire,
-    decode_status_bin_into,
 )
 
 try:
@@ -78,6 +77,5 @@ __all__ = [
     "StatusBuffer",
     "ToolState",
     "ToolStatusWire",
-    "decode_status_bin_into",
     "__version__",
 ]

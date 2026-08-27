@@ -12,22 +12,26 @@ cargo build --workspace            # runtime
 cargo test --workspace             # rust tests
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # must be clean
 cargo run -p par6d -- --sim        # simulated runtime, no hardware
-pip install -e "python[dev]"       # python client
+pip install -e "python[dev]"       # python package (maturin: compiles the par6-py extension)
 cd python && pytest                # python tests (JUnit XML at python/test-results.xml)
 ```
 
 `par6d` links the shim unconditionally — there is no kinematics-free build.
 The library crates still build without a C++ toolchain, which is what the
-`--exclude par6d` legs in CI cover.
+`--exclude par6d --exclude par6-py --exclude par6-client` legs in CI cover
+(par6-py wraps par6d; par6-client's tests boot a daemon in-process).
+The python package builds the `par6._par6` extension, so `pip install`
+needs `source .ffi/env.sh` first, and so does running anything that
+imports `par6` (the extension dlopens the shim).
 
 ## Contract discipline (multi-agent repo)
 
 - `crates/par6-proto` and the trait contracts (`DriverBus`, sample ring, config schema)
   are **frozen interfaces**. Changing them requires a `contracts`-labeled issue — never
   drive-by edits from a feature branch.
-- `tests/golden/` vectors are the cross-language conformance suite. Rust encodes them,
-  Python must decode them (and vice versa). A contract change without regenerated
-  vectors + passing tests on BOTH sides is incomplete.
+- `tests/golden/` vectors are the wire conformance suite for the frozen codec
+  (encode + decode, `par6-proto`). A contract change without regenerated
+  vectors + passing tests is incomplete.
 - `python/par6/protocol/constants.py` is GENERATED from `par6-proto` — never edit by
   hand; regenerate and let the freshness-guard test prove it.
 

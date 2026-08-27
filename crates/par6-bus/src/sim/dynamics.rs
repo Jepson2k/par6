@@ -13,7 +13,7 @@ use std::path::Path;
 
 use pinokin_sys::Model;
 
-use super::driver::PlantCmd;
+use super::driver::VirtualDriver;
 use super::plant::JointMap;
 
 /// Physics substeps per bus tick (contact stability at 250 Hz).
@@ -51,13 +51,22 @@ pub(crate) struct DynamicsPlant {
     k_stop: Vec<f64>,
     c_stop: Vec<f64>,
     coulomb_eps: Vec<f64>,
+    /// Per-substep scratch: the driver-enforced velocity limit in joint
+    /// space, captured alongside the loop output.
+    vlim_joint: Vec<f64>,
 }
 
 impl DynamicsPlant {
     /// Build the plant from the URDF; panics with a descriptive message on
     /// model/FFI failure (a sim construction bug, not a runtime error).
-    pub fn new(urdf: &Path, maps: &[JointMap], q0: &[f64]) -> Self {
-        let mut model = Model::from_urdf(urdf, None, None)
+    pub fn new(
+        urdf: &Path,
+        ee_frame: Option<&str>,
+        tool: Option<&pinokin_sys::ToolParams>,
+        maps: &[JointMap],
+        q0: &[f64],
+    ) -> Self {
+        let mut model = Model::from_urdf(urdf, ee_frame, tool)
             .unwrap_or_else(|e| panic!("sim-dynamics: cannot load {}: {e}", urdf.display()));
         let n = maps.len();
         assert_eq!(
@@ -87,6 +96,7 @@ impl DynamicsPlant {
             inertia,
             k_stop,
             c_stop,
+            vlim_joint: vec![f64::INFINITY; n],
         }
     }
 
@@ -128,22 +138,38 @@ impl DynamicsPlant {
         (pos, vel)
     }
 
-    /// Advance one bus tick: convert loop currents (minus injected loads)
-    /// to joint torques, add friction and endstop torques, integrate ABA
-    /// accelerations over `SUBSTEPS` semi-implicit Euler substeps.
-    pub fn step(&mut self, dt: f64, cmds: &[PlantCmd], loads_ma: &[f64], maps: &[JointMap]) {
+    /// Advance one bus tick: close each driver's control law at the
+    /// SUBSTEP rate on the substep's own measured state (the firmware
+    /// loops run at ~1 kHz; a current held over a whole coarse bus tick
+    /// destabilizes a strongly-driven joint), convert loop currents
+    /// (minus injected loads) to joint torques, add friction and endstop
+    /// torques, integrate ABA accelerations over `SUBSTEPS` semi-implicit
+    /// Euler substeps.
+    pub fn step(
+        &mut self,
+        dt: f64,
+        drivers: &mut [VirtualDriver],
+        loads_ma: &[f64],
+        maps: &[JointMap],
+    ) {
         let h = dt / f64::from(SUBSTEPS);
+        let fw_steps = (h / super::driver::FW_LOOP_DT).round().max(1.0);
         for (eps, inertia) in self.coulomb_eps.iter_mut().zip(&self.inertia) {
             *eps = Self::coulomb_eps(*inertia, h);
         }
         for _ in 0..SUBSTEPS {
             for j in 0..self.q.len() {
                 let map = &maps[j];
-                let drive_nm = (cmds[j].current_ma - loads_ma[j]) / map.factor_ma_per_nm;
+                let (pos, vel) = self.motor_state(j, map);
+                let cmd = drivers[j].loop_step(pos + map.report_offset, vel, fw_steps);
+                self.vlim_joint[j] = cmd.vel_limit_ticks_s.abs()
+                    * (std::f64::consts::TAU / f64::from(map.encoder_max_counts))
+                    / map.gear_ratio;
+                let drive_nm = (cmd.current_ma - loads_ma[j]) / map.factor_ma_per_nm;
                 let mut t = drive_nm
                     - VISC_RATE * self.inertia[j] * self.v[j]
                     - COULOMB_NM * (self.v[j] / self.coulomb_eps[j]).tanh();
-                if cmds[j].idle {
+                if cmd.idle {
                     t -= IDLE_RATE * self.inertia[j] * self.v[j];
                 }
                 if self.q[j] > map.hard_hi_rad {
@@ -159,10 +185,8 @@ impl DynamicsPlant {
                 .aba_into(&self.q, &self.v, &self.tau, &mut self.a)
                 .expect("ABA step");
             for j in 0..self.q.len() {
-                // Driver-enforced velocity limit, converted to joint space.
-                let vlim = cmds[j].vel_limit_ticks_s.abs()
-                    * (std::f64::consts::TAU / f64::from(maps[j].encoder_max_counts))
-                    / maps[j].gear_ratio;
+                // Driver-enforced velocity limit, already in joint space.
+                let vlim = self.vlim_joint[j];
                 self.v[j] = (self.v[j] + self.a[j] * h).clamp(-vlim, vlim);
                 self.q[j] += self.v[j] * h;
             }

@@ -16,13 +16,12 @@ use par6_proto::{command_class, CmdType, CommandClass};
 pub struct Gate {
     /// Controller must be ENABLED (and the e-stop latch clear).
     pub needs_enabled: bool,
-    /// Robot must be homed. Every motion MODE the RT can enter needs a
-    /// home reference: `RtCore::request_mode` refuses `Jog`, `Stream`
-    /// and `Exec` without one, following the vendor's `REQUIRES_HOMED`
-    /// set — so streaming setpoints are gated here exactly like planned
-    /// moves. `parol6` leaves jogging available un-homed, which is why
-    /// this table once did too; par6's RT does not, and the two sides
-    /// disagreeing is what makes a jog vanish with nothing said.
+    /// Robot must be homed. Set for commands that target absolute
+    /// coordinates — planned moves and streamed setpoints — mirroring the
+    /// RT's own mode gate (`RtCore::request_mode` refuses `Stream` and
+    /// `Exec` without a reference, but not `Jog`). Jogging stays
+    /// available un-homed on BOTH sides, and the two tables agreeing is
+    /// what keeps a refusal a structured error instead of a silent drop.
     pub needs_homed: bool,
     /// Simulator backend must be active.
     pub needs_simulator: bool,
@@ -57,7 +56,18 @@ pub fn gate(cmd: CmdType) -> Gate {
         // it targets absolute coordinates; a jog only asks for a direction
         // and a speed, and the soft-limit brake still bounds it.
         C::JogJ | C::JogL => {}
+        // Pause is deliberately ungated. Holding a moving arm has to work
+        // whatever state the controller is in, and an un-pause that is no
+        // longer legal is refused by the RT's own mode table rather than
+        // here. Written out rather than left to the `_` arm so the choice
+        // is visible instead of accidental.
+        C::Pause => {}
         C::Teleport => g.needs_simulator = true,
+        // SetPayload is deliberately ungated beyond the SYSTEM default:
+        // a payload change while motion runs is legal (the model updates
+        // mid-move, exactly like a TCP-offset change), and clearing a
+        // payload must work whatever state the controller is in.
+        C::SetPayload => {}
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}
     }

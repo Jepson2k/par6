@@ -35,13 +35,6 @@ pub enum JogDirection {
 }
 
 impl JogDirection {
-    fn sign(self) -> f64 {
-        match self {
-            Self::Positive => 1.0,
-            Self::Negative => -1.0,
-        }
-    }
-
     fn from_sign(v: f64) -> Self {
         if v >= 0.0 {
             Self::Positive
@@ -77,11 +70,11 @@ pub struct JogEngine {
     profile: JogProfile,
     accel_time_s: f64,
     jerk_factor: f64,
-    /// Active command: joint index and signed speed fraction.
-    active: Option<(usize, f64)>,
-    /// Last commanded joint; survives release so a joint switch (the
-    /// block-clearing event) is detected across button releases.
-    last_joint: Option<usize>,
+    /// Active command: per-joint signed speed fraction, 0 = not driven.
+    active: [f64; NUM_JOINTS],
+    /// The joint SET of the last command; survives release so a change of
+    /// set (the block-clearing event) is detected across button releases.
+    last_set: [bool; NUM_JOINTS],
     v: [f64; NUM_JOINTS],
     acc: [f64; NUM_JOINTS],
     q: [f64; NUM_JOINTS],
@@ -101,8 +94,8 @@ impl JogEngine {
             profile: cfg.jog.profile,
             accel_time_s: cfg.jog.accel_time_s.max(MIN_ACCEL_TIME_S),
             jerk_factor: cfg.jog.jerk_factor.max(MIN_JERK_FACTOR),
-            active: None,
-            last_joint: None,
+            active: [0.0; NUM_JOINTS],
+            last_set: [false; NUM_JOINTS],
             v: [0.0; NUM_JOINTS],
             acc: [0.0; NUM_JOINTS],
             q: [0.0; NUM_JOINTS],
@@ -118,52 +111,46 @@ impl JogEngine {
         self.v = [0.0; NUM_JOINTS];
         self.acc = [0.0; NUM_JOINTS];
         self.blocked = [None; NUM_JOINTS];
-        self.active = None;
-        self.last_joint = None;
+        self.active = [0.0; NUM_JOINTS];
+        self.last_set = [false; NUM_JOINTS];
         self.activated = true;
     }
 
-    /// Start (or retarget) jogging `joint` in `dir` at `speed_pct` of the
-    /// joint's jog velocity limit.
+    /// Start (or retarget) a jog: `speeds[j]` is joint `j`'s signed
+    /// fraction of its jog velocity limit, and 0 leaves that joint still.
+    /// Joints move together, each on its own ramp.
     ///
-    /// Switching joints clears all direction blocks; commanding the
-    /// opposite direction clears that joint's block — the only two ways a
-    /// latched block clears.
-    pub fn command(
-        &mut self,
-        joint: usize,
-        dir: JogDirection,
-        speed_pct: f64,
-    ) -> Result<(), MotionError> {
-        if joint >= NUM_JOINTS {
-            return Err(MotionError::InvalidInput {
-                what: "joint",
-                reason: format!("must be < {NUM_JOINTS}, got {joint}"),
-            });
+    /// Changing the SET of driven joints clears all direction blocks;
+    /// commanding a joint in the opposite direction clears that joint's
+    /// block — the only two ways a latched block clears.
+    pub fn command(&mut self, speeds: &[f64; NUM_JOINTS]) -> Result<(), MotionError> {
+        for (j, v) in speeds.iter().enumerate() {
+            if !(v.is_finite() && (-1.0..=1.0).contains(v)) {
+                return Err(MotionError::InvalidInput {
+                    what: "speeds",
+                    reason: format!("speeds[{j}] must be finite and in [-1, 1], got {v}"),
+                });
+            }
         }
-        if !(speed_pct.is_finite() && speed_pct > 0.0 && speed_pct <= 1.0) {
-            return Err(MotionError::InvalidInput {
-                what: "speed_pct",
-                reason: format!("must be in (0, 1], got {speed_pct}"),
-            });
-        }
-        match self.last_joint {
-            Some(prev) if prev != joint => self.blocked = [None; NUM_JOINTS],
-            _ => {
-                if self.blocked[joint].is_some_and(|b| b != dir) {
-                    self.blocked[joint] = None;
+        let set = speeds.map(|v| v != 0.0);
+        if set != self.last_set {
+            self.blocked = [None; NUM_JOINTS];
+        } else {
+            for (j, v) in speeds.iter().enumerate() {
+                if *v != 0.0 && self.blocked[j].is_some_and(|b| b != JogDirection::from_sign(*v)) {
+                    self.blocked[j] = None;
                 }
             }
         }
-        self.active = Some((joint, dir.sign() * speed_pct));
-        self.last_joint = Some(joint);
+        self.active = *speeds;
+        self.last_set = set;
         Ok(())
     }
 
     /// Release the jog button: target velocity drops to zero everywhere.
     /// Direction blocks survive release.
     pub fn release(&mut self) {
-        self.active = None;
+        self.active = [0.0; NUM_JOINTS];
     }
 
     /// Latched direction block for `joint`, if any (telemetry).
@@ -219,10 +206,7 @@ impl JogEngine {
             let a = (v_full / self.accel_time_s).min(self.limits.acceleration[j]);
             let jerk = a * self.jerk_factor;
 
-            let mut v_t = match self.active {
-                Some((joint, signed_pct)) if joint == j => signed_pct * v_full,
-                _ => 0.0,
-            };
+            let mut v_t = self.active[j] * v_full;
 
             // Jerk-aware lookahead on the direction of motion (or of the
             // command, when starting from rest).

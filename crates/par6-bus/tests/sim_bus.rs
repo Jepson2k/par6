@@ -1287,7 +1287,7 @@ mod dynamics {
     }
 
     fn boot(robot: &RobotConfig, q0: Option<&[f64]>) -> Rig {
-        let mut bus = SimBus::with_dynamics(urdf());
+        let mut bus = SimBus::with_dynamics(urdf(), None, None);
         if let Some(q) = q0 {
             bus.set_initial_joint_rad(q);
         }

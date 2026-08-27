@@ -44,6 +44,21 @@ impl GripperVariant {
         GripperVariant::Ssg48,
     ];
 
+    /// The variant a config's `urdf_variant` key names, if any. Keys are
+    /// the variant names themselves ("flange", "msg", "ssg48"),
+    /// case-insensitive.
+    pub fn from_key(key: &str) -> Option<Self> {
+        if key.eq_ignore_ascii_case("flange") {
+            Some(GripperVariant::Flange)
+        } else if key.eq_ignore_ascii_case("msg") {
+            Some(GripperVariant::Msg)
+        } else if key.eq_ignore_ascii_case("ssg48") {
+            Some(GripperVariant::Ssg48)
+        } else {
+            None
+        }
+    }
+
     /// URDF path relative to the repo's `assets/par6_description` tree.
     pub fn urdf_relpath(self) -> &'static str {
         match self {

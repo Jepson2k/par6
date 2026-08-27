@@ -34,8 +34,7 @@ mod grant;
 mod kin;
 pub mod options;
 mod planner;
-#[cfg(test)]
-mod py_mirror;
+pub mod preview;
 
 pub use daemon::{Daemon, DaemonError};
 pub use options::Options;
