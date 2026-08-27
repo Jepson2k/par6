@@ -113,9 +113,10 @@ class StatusBuffer:
     scene_epoch: int = 0
     accepted_index: int = -1
     homed: bool = False
-    tau: np.ndarray = field(
+    torques: np.ndarray = field(
         default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
     )
+    """Measured joint torques [Nm], kt-calibrated and filtered."""
     mode: ControllerMode = ControllerMode.BOOTING
     enabled: bool = False
     gravity_comp: bool = False
@@ -148,17 +149,11 @@ class StatusBuffer:
     homing: dict = field(default_factory=dict)
     """Homing progress: ``active``, ``sequence_step``, and per-actuator
     ``joints`` — ``(HomingJointState, HomingPhase)`` pairs, gripper last."""
-    min_clearance_m: float | None = None
-    """Minimum signed clearance over every active collision pair [m]
-    (negative = penetration); ``None`` when not computed."""
-    tau_ext: np.ndarray = field(
+    torques_ext: np.ndarray = field(
         default_factory=lambda: np.zeros(NUM_JOINTS, dtype=np.float64)
     )
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
-    node_ages: list[tuple[int, int]] = field(default_factory=list)
-    """Per-node bus data age: ``(age_ticks, NodeFreshness)`` pairs, arm
-    joints first, gripper last."""
     # Aliases into the two enable arrays the filler mutates in place.
     cart_en: dict[str, np.ndarray] = field(init=False, repr=False, compare=False)
 
@@ -226,7 +221,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.scene_epoch = d["scene_epoch"]
     buf.accepted_index = d["accepted_index"]
     buf.homed = d["homed"]
-    buf.tau[:] = d["tau"]
+    buf.torques[:] = d["torques"]
     buf.mode = ControllerMode(d["mode"])
     buf.enabled = d["enabled"]
     buf.gravity_comp = d["gravity_comp"]
@@ -240,6 +235,4 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
         for state, phase in homing["joints"]
     ]
     buf.homing = homing
-    buf.min_clearance_m = d["min_clearance_m"]
-    buf.tau_ext[:] = d["tau_ext"]
-    buf.node_ages = [tuple(a) for a in d["node_ages"]]
+    buf.torques_ext[:] = d["torques_ext"]

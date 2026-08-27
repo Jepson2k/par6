@@ -9,7 +9,7 @@ use std::fmt::Write;
 
 use crate::enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
-    HomingJointState, HomingPhase, LinkState, MsgType, NodeFreshness, QueryType, ToolState,
+    HomingJointState, HomingPhase, LinkState, MsgType, QueryType, ToolState,
 };
 use crate::error::ErrorCode;
 use crate::status::{STATUS_HEADER_LEN, STATUS_LEN};
@@ -118,12 +118,6 @@ pub fn generate() -> String {
         "LinkState",
         "Motor-bus kernel link state (STATUS link_health).",
         LinkState::variants(),
-    );
-    emit_enum(
-        &mut out,
-        "NodeFreshness",
-        "Data-age classification for one CAN node (STATUS node_ages).",
-        NodeFreshness::variants(),
     );
     emit_enum(
         &mut out,

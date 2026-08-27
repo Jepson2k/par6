@@ -240,8 +240,6 @@ struct Core<P: Planner, R: RtCommands> {
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
     collision: CollisionState,
-    /// Latest housekeeping clearance sweep (STATUS `min_clearance_m`).
-    min_clearance_m: Option<f64>,
     completion_policy: CompletionPolicy,
     recipe: Option<String>,
     simulator: bool,
@@ -311,7 +309,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             shapes: Vec::new(),
             scene_epoch: 0,
             collision: CollisionState::default(),
-            min_clearance_m: None,
             completion_policy: CompletionPolicy::Settled,
             queue_estimate: 0.0,
             queue_estimate_for: (0, 0),
@@ -1406,7 +1403,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// accepting a motion clears both, so they never disagree — the
     /// merge simply reports whichever is active.
     fn update_collision(&mut self) {
-        self.min_clearance_m = self.runtime.rt.min_clearance_m();
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.collision() {
             self.collision = if state.active {
@@ -1656,7 +1652,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             homed: self.snap.homed,
             // Filtered, not raw: this is an operator readout, and the raw
             // per-tick current estimate is noisy.
-            tau: {
+            torques: {
                 let mut out = [0.0; par6_proto::NUM_JOINTS];
                 out.copy_from_slice(&self.snap.tau_filtered[..par6_proto::NUM_JOINTS]);
                 out
@@ -1667,19 +1663,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             warnings: crate::faults::rt_warnings(&self.snap),
             link_health: Self::wire_link_health(&self.snap.link),
             homing: Self::wire_homing(&self.snap.homing),
-            min_clearance_m: self.min_clearance_m,
-            tau_ext: {
+            torques_ext: {
                 let mut out = [0.0; par6_proto::NUM_JOINTS];
                 out.copy_from_slice(&self.snap.tau_ext[..par6_proto::NUM_JOINTS]);
                 out
             },
-            node_ages: self
-                .snap
-                .nodes
-                .iter()
-                .zip(self.snap.node_freshness.iter())
-                .map(|(n, f)| (n.data_age_ticks, Self::wire_freshness(*f) as u8))
-                .collect(),
         }
     }
 
@@ -1699,17 +1687,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             restarts: l.restarts,
             tx_errors: l.tx_errors,
             rx_frames: l.rx_frames,
-        }
-    }
-
-    fn wire_freshness(f: par6_rt::Freshness) -> par6_proto::NodeFreshness {
-        use par6_proto::NodeFreshness as W;
-        use par6_rt::Freshness as R;
-        match f {
-            R::Unknown => W::Unknown,
-            R::Fresh => W::Fresh,
-            R::Stale => W::Stale,
-            R::Lost => W::Lost,
         }
     }
 

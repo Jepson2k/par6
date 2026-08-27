@@ -13,7 +13,7 @@ POSE_ELEMS = 16
 IO_SLOTS = 11
 MAX_IO_SLOTS = 64
 EN_SLOTS = 12
-STATUS_LEN = 41
+STATUS_LEN = 39
 STATUS_HEADER_LEN = 7
 
 
@@ -175,15 +175,6 @@ class LinkState(IntEnum):
     UP = 1
     ERROR_PASSIVE = 2
     BUS_OFF = 3
-
-
-class NodeFreshness(IntEnum):
-    """Data-age classification for one CAN node (STATUS node_ages)."""
-
-    UNKNOWN = 0
-    FRESH = 1
-    STALE = 2
-    LOST = 3
 
 
 class HomingJointState(IntEnum):

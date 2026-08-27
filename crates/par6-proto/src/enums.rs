@@ -314,20 +314,6 @@ wire_enum! {
 }
 
 wire_enum! {
-    /// Data-age classification for one CAN node (STATUS `node_ages`).
-    NodeFreshness: u8 {
-        /// No frame seen since boot / last re-base.
-        Unknown = 0,
-        /// Data younger than the stale threshold.
-        Fresh = 1,
-        /// Age past the stale threshold — live warning, self-clears.
-        Stale = 2,
-        /// Age reached the lost threshold — latched until user clear.
-        Lost = 3,
-    }
-}
-
-wire_enum! {
     /// Per-actuator homing FSM status (STATUS `homing`, vendor codes 0–3).
     HomingJointState: u8 {
         /// Not started.

@@ -259,7 +259,6 @@ fn status_fields(s: &Status) -> Value {
     let link_health = json!([lh.state, lh.restarts, lh.tx_errors, lh.rx_frames]);
     let homing_joints: Vec<Vec<u8>> = s.homing.joints.iter().map(|(a, b)| vec![*a, *b]).collect();
     let homing = json!([s.homing.active, s.homing.sequence_step, homing_joints]);
-    let node_ages: Vec<Value> = s.node_ages.iter().map(|(a, f)| json!([a, f])).collect();
     json!({
         "proto_version": s.proto_version,
         "controller_id": s.controller_id,
@@ -268,7 +267,7 @@ fn status_fields(s: &Status) -> Value {
         "link_ok": s.link_ok,
         "data_age_ms": s.data_age_ms,
         "pose": s.pose.to_vec(),
-        "tau": s.tau.to_vec(),
+        "torques": s.torques.to_vec(),
         "mode": s.mode as u8,
         "enabled": s.enabled,
         "gravity_comp": s.gravity_comp,
@@ -298,9 +297,7 @@ fn status_fields(s: &Status) -> Value {
         "warnings": warnings,
         "link_health": link_health,
         "homing": homing,
-        "min_clearance_m": s.min_clearance_m,
-        "tau_ext": s.tau_ext.to_vec(),
-        "node_ages": node_ages,
+        "torques_ext": s.torques_ext.to_vec(),
     })
 }
 
@@ -397,7 +394,7 @@ fn status_full_fixture() -> Status {
         homed: true,
         // Non-default on every new field, so a decoder that silently
         // defaults them cannot pass the cross-language vector.
-        tau: [0.75, -1.5, 0.25, -0.125, 0.0625, -0.03125],
+        torques: [0.75, -1.5, 0.25, -0.125, 0.0625, -0.03125],
         mode: ControllerMode::Exec,
         enabled: true,
         gravity_comp: true,
@@ -445,17 +442,7 @@ fn status_full_fixture() -> Status {
                 ),
             ],
         },
-        min_clearance_m: Some(0.0375),
-        tau_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
-        node_ages: vec![
-            (0, crate::NodeFreshness::Fresh as u8),
-            (1, crate::NodeFreshness::Fresh as u8),
-            (250, crate::NodeFreshness::Stale as u8),
-            (2, crate::NodeFreshness::Fresh as u8),
-            (5000, crate::NodeFreshness::Lost as u8),
-            (3, crate::NodeFreshness::Fresh as u8),
-            (u64::MAX, crate::NodeFreshness::Unknown as u8),
-        ],
+        torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
     }
 }
 

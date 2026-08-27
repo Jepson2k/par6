@@ -112,7 +112,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("scene_epoch", s.scene_epoch)?;
     d.set_item("accepted_index", s.accepted_index)?;
     d.set_item("homed", s.homed)?;
-    d.set_item("tau", s.tau.to_vec())?;
+    d.set_item("torques", s.torques.to_vec())?;
     d.set_item("mode", s.mode as u8)?;
     d.set_item("enabled", s.enabled)?;
     d.set_item("gravity_comp", s.gravity_comp)?;
@@ -132,9 +132,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     homing.set_item("sequence_step", s.homing.sequence_step)?;
     homing.set_item("joints", s.homing.joints.clone())?;
     d.set_item("homing", homing)?;
-    d.set_item("min_clearance_m", s.min_clearance_m)?;
-    d.set_item("tau_ext", s.tau_ext.to_vec())?;
-    d.set_item("node_ages", s.node_ages.clone())?;
+    d.set_item("torques_ext", s.torques_ext.to_vec())?;
     Ok(d.into_any().unbind())
 }
 
