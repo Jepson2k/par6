@@ -298,6 +298,20 @@ pub enum QueryResult {
         /// Scene epoch this readback represents.
         epoch: u64,
     },
+    /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
+    /// client can run previews from exactly the daemon's numbers.
+    ConfigBundle {
+        /// Config file path on the daemon host.
+        path: String,
+        /// Same content fingerprint as CONFIG_INFO.
+        fingerprint: String,
+        /// Robot TOML file name (base name, e.g. `PAR6.toml`).
+        robot_filename: String,
+        /// Robot TOML content.
+        robot_toml: String,
+        /// Gripper TOMLs as `(file name, content)`, sorted by file name.
+        grippers: Vec<(String, String)>,
+    },
 }
 
 impl QueryResult {
@@ -323,6 +337,7 @@ impl QueryResult {
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
+            Q::ConfigBundle { .. } => QueryType::ConfigBundle,
             Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
         }
@@ -566,6 +581,26 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
+            }
+        }
+        Q::ConfigBundle {
+            path,
+            fingerprint,
+            robot_filename,
+            robot_toml,
+            grippers,
+        } => {
+            w_array(buf, 6);
+            w_uint(buf, u64::from(tag));
+            w_str(buf, path);
+            w_str(buf, fingerprint);
+            w_str(buf, robot_filename);
+            w_str(buf, robot_toml);
+            w_array(buf, grippers.len());
+            for (name, content) in grippers {
+                w_array(buf, 2);
+                w_str(buf, name);
+                w_str(buf, content);
             }
         }
         Q::Payload { mass, com, inertia } => {
@@ -913,6 +948,35 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 tick_dt_s,
                 motion,
                 joints,
+            }
+        }
+        T::ConfigBundle => {
+            expect_arity("config_bundle result", n, 6)?;
+            let path = r.str()?.to_owned();
+            let fingerprint = r.str()?.to_owned();
+            let robot_filename = r.str()?.to_owned();
+            let robot_toml = r.str()?.to_owned();
+            let gn = r.array_len()?;
+            // A config dir holds a handful of gripper files; hundreds is
+            // a corrupt packet, not a big deployment.
+            if gn > 64 {
+                return Err(DecodeError::Arity {
+                    what: "config_bundle.grippers",
+                    expected: 64,
+                    got: gn,
+                });
+            }
+            let mut grippers = Vec::with_capacity(gn);
+            for _ in 0..gn {
+                expect_arity("config_bundle.grippers[]", r.array_len()?, 2)?;
+                grippers.push((r.str()?.to_owned(), r.str()?.to_owned()));
+            }
+            QueryResult::ConfigBundle {
+                path,
+                fingerprint,
+                robot_filename,
+                robot_toml,
+                grippers,
             }
         }
         T::Payload => {

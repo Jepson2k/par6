@@ -590,6 +590,11 @@ class RobotClient:
         limits, motion constants)."""
         return _run(self._inner.config_info())
 
+    def config_bundle(self) -> dict | None:
+        """The config files the runtime loaded, verbatim (robot +
+        gripper TOMLs) — see ``AsyncRobotClient.config_bundle``."""
+        return _run(self._inner.config_bundle())
+
     def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""
         return _run(self._inner._tool_status())

@@ -277,6 +277,10 @@ impl CoreClient {
         query_future(py, self.rt(), Command::ConfigInfo)
     }
 
+    fn config_bundle<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::ConfigBundle)
+    }
+
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         query_future(py, self.rt(), Command::Payload)
     }

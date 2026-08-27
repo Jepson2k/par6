@@ -1673,6 +1673,25 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.config_info())
 
+    async def config_bundle(self) -> dict | None:
+        """The config files the runtime loaded, verbatim.
+
+        A dict with ``path``, ``fingerprint`` (as ``config_info``),
+        ``robot_filename``, ``robot_toml`` (the robot TOML's content) and
+        ``grippers`` (list of ``{filename, content}``).  This is how a
+        client previews with exactly the numbers the arm enforces —
+        materialize it with :func:`par6.config.materialize_bundle` and
+        hand the path to the preview engine.  Returns None if
+        unreachable.
+
+        Category: Query
+
+        Example:
+            bundle = rbt.config_bundle()
+        """
+        core = await self._ensure_core()
+        return await self._call(core.config_bundle())
+
     async def _tool_status(self) -> ToolStatus | None:
         """Query tool status (internal — use ``rbt.tool.status()``)."""
         core = await self._ensure_core()

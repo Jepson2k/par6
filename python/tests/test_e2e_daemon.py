@@ -20,6 +20,7 @@ import time
 import numpy as np
 import pytest
 from live_daemon import (
+    TICK_DT_S,
     LiveDaemon,
     angles_now,
     free_udp_port,
@@ -1312,6 +1313,51 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
             assert got["soft_max_rad"] == pytest.approx(
                 declared["limits"]["soft_max_rad"]
             )
+    finally:
+        daemon.stop()
+
+
+async def test_config_bundle_feeds_previews_the_daemons_numbers(tmp_path, monkeypatch):
+    """CONFIG_BUNDLE serves the loaded config files verbatim, and a dry-run
+    client created against a live daemon previews with those numbers.
+
+    The test daemon runs a re-ticked copy of the packaged config
+    (``tick_dt_s`` patched for CI) — a stand-in for a tuned deployment.
+    A preview that read the local/packaged config would come up with the
+    stock tick; one built from the daemon's bundle must report the
+    daemon's."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client() as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            info = await client.config_info()
+            bundle = await client.config_bundle()
+        assert bundle is not None and info is not None
+
+        # Verbatim file service: content and inventory match the daemon's
+        # config dir, and the fingerprint is CONFIG_INFO's.
+        assert bundle["robot_filename"] == daemon.config.name
+        assert bundle["robot_toml"] == daemon.config.read_text()
+        served = {g["filename"]: g["content"] for g in bundle["grippers"]}
+        on_disk = sorted((daemon.config.parent / "grippers").glob("*.toml"))
+        assert sorted(served) == [f.name for f in on_disk]
+        assert all(served[f.name] == f.read_text() for f in on_disk)
+        assert bundle["fingerprint"] == info["fingerprint"]
+
+        materialized = _cfg.materialize_bundle(bundle)
+        assert materialized.read_text() == daemon.config.read_text()
+        # Same fingerprint → same directory: re-materializing is a no-op.
+        assert _cfg.materialize_bundle(bundle) == materialized
+        assert str(tmp_path / "cache") in str(materialized)
+
+        # The factory fetches the bundle itself and the preview engine
+        # runs the daemon's tick, not the stock 0.004 the local config
+        # (PAR6_CONFIG / repo checkout) carries.
+        robot = Robot(host="127.0.0.1", port=daemon.command_port)
+        dr = robot.create_dry_run_client()
+        assert dr._dt == pytest.approx(TICK_DT_S)
+        assert dr._dt != pytest.approx(0.004)
     finally:
         daemon.stop()
 

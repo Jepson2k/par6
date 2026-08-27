@@ -596,6 +596,20 @@
       ]
     },
     {
+      "class": "QUERY",
+      "cmd": "CONFIG_BUNDLE",
+      "file": "cmd_config_bundle.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_config_bundle",
+      "req_id": 43,
+      "tag": 50,
+      "wire": [
+        50,
+        43
+      ]
+    },
+    {
       "class": "FIRE_AND_FORGET",
       "cmd": "SERVO_J",
       "file": "cmd_servo_j.bin",
@@ -1761,6 +1775,33 @@
             0.0001,
             0.0,
             0.004
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_config_bundle.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/CONFIG_BUNDLE",
+      "name": "response_config_bundle",
+      "wire": [
+        4,
+        121,
+        [
+          21,
+          "/etc/par6/PAR6.toml",
+          "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          "PAR6.toml",
+          "[robot]\nname = \"PAR6\"\ntick_hz = 250\n",
+          [
+            [
+              "SSG-48.toml",
+              "name = \"SSG-48\"\n"
+            ],
+            [
+              "SSG-66.toml",
+              "name = \"SSG-66\"\n"
+            ]
           ]
         ]
       ]

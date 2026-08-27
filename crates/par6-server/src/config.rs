@@ -152,6 +152,13 @@ pub struct ConfigInfoData {
     /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
     /// velocity_rad_s, acceleration_rad_s2]`.
     pub joints: Vec<[f64; 4]>,
+    /// Robot TOML file name (base name), served by CONFIG_BUNDLE.
+    pub robot_filename: String,
+    /// Robot TOML content verbatim, served by CONFIG_BUNDLE.
+    pub robot_toml: String,
+    /// Gripper TOMLs as `(file name, content)`, sorted by file name,
+    /// served by CONFIG_BUNDLE.
+    pub grippers: Vec<(String, String)>,
 }
 
 impl Default for ServerConfig {

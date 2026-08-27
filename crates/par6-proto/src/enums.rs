@@ -147,6 +147,10 @@ wire_enum! {
         ConfigInfo = 48,
         /// Runtime payload readback (mass/COM/inertia).
         Payload = 49,
+        /// The loaded config files verbatim (robot + gripper TOMLs) —
+        /// the daemon serves its own config, parol6-style, so clients
+        /// preview with exactly the numbers the arm enforces.
+        ConfigBundle = 50,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -233,6 +237,8 @@ wire_enum! {
         ConfigInfo = 19,
         /// See [`CmdType::Payload`].
         Payload = 20,
+        /// See [`CmdType::ConfigBundle`].
+        ConfigBundle = 21,
     }
 }
 
@@ -395,7 +401,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::IsSimulator
         | C::Shapes
         | C::ConfigInfo
-        | C::Payload => CommandClass::Query,
+        | C::Payload
+        | C::ConfigBundle => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

@@ -66,6 +66,7 @@ class CmdType(IntEnum):
     SHAPES = 47
     CONFIG_INFO = 48
     PAYLOAD = 49
+    CONFIG_BUNDLE = 50
     SERVO_J = 60
     SERVO_J_POSE = 61
     SERVO_L = 62
@@ -109,6 +110,7 @@ class QueryType(IntEnum):
     SHAPES = 18
     CONFIG_INFO = 19
     PAYLOAD = 20
+    CONFIG_BUNDLE = 21
 
 
 class CommandClass(IntEnum):
@@ -274,6 +276,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SHAPES: CommandClass.QUERY,
     CmdType.CONFIG_INFO: CommandClass.QUERY,
     CmdType.PAYLOAD: CommandClass.QUERY,
+    CmdType.CONFIG_BUNDLE: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

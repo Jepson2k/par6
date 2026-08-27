@@ -549,48 +549,72 @@ fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
     }
 }
 
-/// The CONFIG_INFO fingerprint: sha256 hex over the robot TOML and each
-/// `grippers/*.toml` (sorted by file name), each hashed as its file name,
-/// a newline, then its content bytes. A client computes the same digest
-/// over its packaged config mirror to detect skew, so the definition is
-/// part of the wire contract.
-fn config_fingerprint(robot_toml: &std::path::Path) -> std::io::Result<String> {
+/// The config files as loaded, plus their CONFIG_INFO fingerprint:
+/// sha256 hex over the robot TOML and each `grippers/*.toml` (sorted by
+/// file name), each hashed as its file name, a newline, then its content
+/// bytes. Contents and digest come from one read, so CONFIG_BUNDLE
+/// serves exactly the bytes the fingerprint describes.
+struct ConfigFiles {
+    fingerprint: String,
+    robot_filename: String,
+    robot_toml: String,
+    grippers: Vec<(String, String)>,
+}
+
+fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
-    let mut add = |path: &std::path::Path| -> std::io::Result<()> {
-        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+    let mut read = |path: &std::path::Path| -> std::io::Result<(String, String)> {
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("")
+            .to_owned();
+        let content = std::fs::read_to_string(path)?;
         hasher.update(name.as_bytes());
         hasher.update(b"\n");
-        hasher.update(std::fs::read(path)?);
-        Ok(())
+        hasher.update(content.as_bytes());
+        Ok((name, content))
     };
-    add(robot_toml)?;
+    let (robot_filename, robot_content) = read(robot_toml)?;
     let dir = robot_toml
         .parent()
         .unwrap_or_else(|| std::path::Path::new("."))
         .join("grippers");
-    let mut grippers: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
+    let mut paths: Vec<std::path::PathBuf> = match std::fs::read_dir(&dir) {
         Ok(rd) => rd
             .filter_map(|e| e.ok().map(|e| e.path()))
             .filter(|p| p.extension().is_some_and(|e| e == "toml"))
             .collect(),
         Err(_) => Vec::new(),
     };
-    grippers.sort();
-    for g in &grippers {
-        add(g)?;
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    paths.sort();
+    let grippers = paths
+        .iter()
+        .map(|g| read(g))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    Ok(ConfigFiles {
+        fingerprint: format!("{:x}", hasher.finalize()),
+        robot_filename,
+        robot_toml: robot_content,
+        grippers,
+    })
 }
 
 fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) -> ConfigInfoData {
     let m = robot.motion;
+    let files = read_config_files(config_path).unwrap_or_else(|e| {
+        log::warn!("config file readback failed: {e}");
+        ConfigFiles {
+            fingerprint: String::new(),
+            robot_filename: String::new(),
+            robot_toml: String::new(),
+            grippers: Vec::new(),
+        }
+    });
     ConfigInfoData {
         path: config_path.display().to_string(),
-        fingerprint: config_fingerprint(config_path).unwrap_or_else(|e| {
-            log::warn!("config fingerprint failed: {e}");
-            String::new()
-        }),
+        fingerprint: files.fingerprint,
         tick_dt_s: robot.robot.tick_dt_s,
         motion: [
             m.jog_l_linear_max_m_s,
@@ -615,6 +639,9 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
                 ]
             })
             .collect(),
+        robot_filename: files.robot_filename,
+        robot_toml: files.robot_toml,
+        grippers: files.grippers,
     }
 }
 

@@ -285,6 +285,26 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             }
             d.set_item("joints", js)?;
         }
+        QueryResult::ConfigBundle {
+            path,
+            fingerprint,
+            robot_filename,
+            robot_toml,
+            grippers,
+        } => {
+            d.set_item("path", path)?;
+            d.set_item("fingerprint", fingerprint)?;
+            d.set_item("robot_filename", robot_filename)?;
+            d.set_item("robot_toml", robot_toml)?;
+            let gs = PyList::empty(py);
+            for (name, content) in grippers {
+                let gd = PyDict::new(py);
+                gd.set_item("filename", name)?;
+                gd.set_item("content", content)?;
+                gs.append(gd)?;
+            }
+            d.set_item("grippers", gs)?;
+        }
         other => {
             return Err(PyRuntimeError::new_err(format!(
                 "query result {:?} has a dedicated accessor",

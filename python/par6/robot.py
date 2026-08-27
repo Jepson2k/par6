@@ -45,6 +45,7 @@ from par6 import config as _cfg
 from par6._par6 import ping_blocking
 from par6.client.async_client import AsyncRobotClient
 from par6.client.dry_run_client import DryRunRobotClient
+from par6.client.errors import RobotError
 from par6.client.sync_client import RobotClient as SyncRobotClient
 from par6.tools import build_tools
 
@@ -979,9 +980,42 @@ class Robot(_RobotABC):
         """Offline preview client — the command stream without a runtime.
 
         Keyword args: ``initial_joints_deg`` (defaults to home),
-        ``initial_homed``, ``max_snapshot_points``.
+        ``initial_homed``, ``max_snapshot_points``, ``config_path``.
+
+        When a runtime answers at the target address its config is
+        fetched and the preview runs the daemon's numbers; otherwise the
+        local resolution (``PAR6_CONFIG``, then the repo checkout)
+        applies.
         """
+        if kwargs.get("config_path") is None:
+            kwargs["config_path"] = self._daemon_config_path()
         return DryRunRobotClient(**kwargs)
+
+    def _daemon_config_path(self) -> str | None:
+        """The reachable daemon's config, materialized locally."""
+        from concurrent.futures import ThreadPoolExecutor
+
+        if not _ping_runtime(self._host, self._port, timeout=0.5):
+            return None
+
+        def fetch() -> dict | None:
+            client = self.create_sync_client(timeout=2.0)
+            try:
+                return client.config_bundle()
+            finally:
+                client.close()
+
+        try:
+            # Own thread: the sync client refuses to run inside an event
+            # loop, and this factory is called from async hosts too.
+            with ThreadPoolExecutor(max_workers=1) as ex:
+                bundle = ex.submit(fetch).result()
+            if not bundle:
+                return None
+            return str(_cfg.materialize_bundle(bundle))
+        except (OSError, ValueError, KeyError, RobotError) as e:
+            logger.debug("daemon config fetch failed; preview uses local config: %s", e)
+            return None
 
 
 __all__ = ["Par6IKResult", "Robot"]

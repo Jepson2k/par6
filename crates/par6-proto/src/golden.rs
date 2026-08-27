@@ -579,6 +579,7 @@ pub fn vectors() -> Vec<Vector> {
         }),
     ));
     v.push(cmd_vec("cmd_payload", 42, Command::Payload));
+    v.push(cmd_vec("cmd_config_bundle", 43, Command::ConfigBundle));
 
     // -- commands: FIRE_AND_FORGET --
     v.push(cmd_vec(
@@ -1071,6 +1072,24 @@ pub fn vectors() -> Vec<Vector> {
                 mass: 1.25,
                 com: [0.0, 0.01, 0.055],
                 inertia: [0.002, 0.0, 0.003, 0.0001, 0.0, 0.004],
+            },
+        },
+    ));
+
+    v.push(reply_vec(
+        "response_config_bundle",
+        Reply::Response {
+            req_id: 121,
+            result: QueryResult::ConfigBundle {
+                path: "/etc/par6/PAR6.toml".to_owned(),
+                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_owned(),
+                robot_filename: "PAR6.toml".to_owned(),
+                robot_toml: "[robot]\nname = \"PAR6\"\ntick_hz = 250\n".to_owned(),
+                grippers: vec![
+                    ("SSG-48.toml".to_owned(), "name = \"SSG-48\"\n".to_owned()),
+                    ("SSG-66.toml".to_owned(), "name = \"SSG-66\"\n".to_owned()),
+                ],
             },
         },
     ));

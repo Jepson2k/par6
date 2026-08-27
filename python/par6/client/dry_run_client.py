@@ -113,25 +113,27 @@ def _matrix_to_si_pose(m: list[float] | NDArray[np.float64]) -> NDArray[np.float
     return np.array([T[0, 3], T[1, 3], T[2, 3], *rpy], dtype=np.float64)
 
 
-def _resolve_engine_paths() -> tuple[str, str]:
+def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     """The config file + assets tree the preview engine loads.
 
-    ``PAR6_CONFIG`` / ``PAR6_ASSETS`` take precedence; otherwise the repo
-    tree around an editable install is used (the packaged ``_data`` URDFs
-    carry rewritten mesh URIs the engine's loader cannot resolve, so they
-    cannot feed it yet).
+    An explicit *config* (a daemon-fetched bundle materialized by
+    :func:`par6.config.materialize_bundle`) wins; then ``PAR6_CONFIG``.
+    ``PAR6_ASSETS`` takes precedence for the assets tree; otherwise the
+    repo tree around an editable install is used (the packaged ``_data``
+    URDFs carry rewritten mesh URIs the engine's loader cannot resolve,
+    so they cannot feed it yet).
     """
     import os
     from pathlib import Path
 
-    config = os.environ.get("PAR6_CONFIG")
+    config = config or os.environ.get("PAR6_CONFIG")
     assets = os.environ.get("PAR6_ASSETS")
     if config and assets:
         return config, assets
     root = Path(__file__).resolve().parents[3]
     repo_config = root / "config" / "PAR6.toml"
     repo_assets = root / "assets" / "par6_description"
-    if repo_config.is_file() and repo_assets.is_dir():
+    if repo_assets.is_dir() and (config or repo_config.is_file()):
         return (config or str(repo_config)), (assets or str(repo_assets))
     raise RuntimeError(
         "the dry-run engine needs the runtime config and assets tree; set "
@@ -204,10 +206,11 @@ class DryRunRobotClient:
         initial_joints_deg: list[float] | None = None,
         max_snapshot_points: int = 200,
         initial_homed: bool = True,
+        config_path: str | None = None,
     ) -> None:
         from par6.tools import build_tools
 
-        config, assets = _resolve_engine_paths()
+        config, assets = _resolve_engine_paths(config_path)
         self._preview = Preview(config=config, assets=assets)
         self._dt = self._preview.tick_dt_s()
         self._max_points = max(2, int(max_snapshot_points))

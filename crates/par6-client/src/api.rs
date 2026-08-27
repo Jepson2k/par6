@@ -129,6 +129,12 @@ impl Client {
         self.query(Command::ConfigInfo).await
     }
 
+    /// The loaded config files verbatim (robot + gripper TOMLs), so a
+    /// client can run previews from exactly the daemon's numbers.
+    pub async fn config_bundle(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::ConfigBundle).await
+    }
+
     /// Poll [`Client::ping`] until the runtime responds or `timeout` expires.
     pub async fn wait_ready(&self, timeout: Duration) -> bool {
         let deadline = tokio::time::Instant::now() + timeout;

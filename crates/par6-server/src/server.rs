@@ -1882,6 +1882,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 program: self.shapes.clone(),
                 epoch: self.scene_epoch,
             },
+            C::ConfigBundle => {
+                let ci = &self.cfg.config_info;
+                QueryResult::ConfigBundle {
+                    path: ci.path.clone(),
+                    fingerprint: ci.fingerprint.clone(),
+                    robot_filename: ci.robot_filename.clone(),
+                    robot_toml: ci.robot_toml.clone(),
+                    grippers: ci.grippers.clone(),
+                }
+            }
             _ => unreachable!("dispatch routes only QUERY commands here"),
         }
     }
@@ -2024,6 +2034,7 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
         T::ConfigInfo => "config_info",
+        T::ConfigBundle => "config_bundle",
         T::Payload => "payload",
         T::ServoJ => "servo_j",
         T::ServoJPose => "servo_j_pose",

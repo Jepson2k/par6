@@ -30,6 +30,50 @@ from waldoctl import (
 MIN_JOG_ACCEL_TIME_S = 0.05
 
 
+def materialize_bundle(bundle: dict) -> Path:
+    """Write a CONFIG_BUNDLE query result to a local cache directory and
+    return the robot TOML's path — the config the preview engine should
+    load so previews run exactly the daemon's numbers.
+
+    The directory is keyed by the bundle's content fingerprint, so a
+    re-fetch of unchanged config is a no-op and a tuned daemon lands in a
+    fresh directory.  Writes go to a temp dir first and are renamed into
+    place, so a concurrent materialization of the same fingerprint cannot
+    be observed half-written.
+    """
+    import os
+    import shutil
+    import tempfile
+
+    fingerprint = str(bundle["fingerprint"])
+    robot_filename = str(bundle["robot_filename"])
+    if not fingerprint or not robot_filename:
+        raise ValueError("config bundle has no fingerprint/robot file")
+    cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
+    target = cache_root / "par6" / "daemon-config" / fingerprint
+    robot_path = target / robot_filename
+    if robot_path.is_file():
+        return robot_path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp = Path(tempfile.mkdtemp(dir=target.parent, prefix=".materialize-"))
+    try:
+        (tmp / robot_filename).write_text(str(bundle["robot_toml"]))
+        (tmp / "grippers").mkdir()
+        for g in bundle.get("grippers", []):
+            name = Path(str(g["filename"])).name
+            (tmp / "grippers" / name).write_text(str(g["content"]))
+        try:
+            tmp.rename(target)
+        except OSError:
+            # A concurrent materialization of the same fingerprint won the
+            # rename; its content is byte-identical by construction.
+            if not robot_path.is_file():
+                raise
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+    return robot_path
+
+
 def data_root() -> Path:
     """Absolute path of the packaged ``par6/_data`` directory."""
     return Path(str(pkg_files("par6") / "_data")).resolve()
