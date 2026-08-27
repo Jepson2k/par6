@@ -999,6 +999,15 @@ class DryRunRobotClient:
         where the planner sends the arm, so a preview plans the same path."""
         return 1
 
+    def freedrive(self, enabled: bool = True, **kwargs: Any) -> int:
+        """Hand guiding changes what the drives are asked for, not where
+        the planner sends the arm, so a preview plans the same path."""
+        return 1
+
+    def is_freedrive(self, **kwargs: Any) -> bool:
+        """A preview has no arm to push around."""
+        return False
+
     def simulator(self, enabled: bool = True, **kwargs: Any) -> int:
         """A preview has no bus to switch; it is always the simulator."""
         return 1

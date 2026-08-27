@@ -48,7 +48,6 @@ from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import (
     NUM_JOINTS,
     CompletionPolicy,
-    ControllerMode,
     Frame,
 )
 from ..protocol.wire import StatusBuffer, update_status_from_dict
@@ -1110,10 +1109,7 @@ class AsyncRobotClient(_RobotClientABC):
         """
         if self._status_generation == 0:
             await self.wait_status(lambda _s: True, timeout=timeout)
-        s = self._shared_status
-        return bool(
-            s.mode == ControllerMode.IDLE and s.homed and s.enabled and s.gravity_comp
-        )
+        return self._shared_status.freedrive
 
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.

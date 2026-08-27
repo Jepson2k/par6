@@ -123,6 +123,25 @@ class StatusBuffer:
     """Warning-class latch entries (wire 6-tuples): self-clearing
     conditions — stale CAN data, degraded loop, failed homing. The
     ``error`` slot carries only hard latches; these are the rest."""
+
+    @property
+    def freedrive(self) -> bool:
+        """Whether the arm is back-driveable right now.
+
+        Not "was freedrive requested" — the runtime applies the gravity
+        feedforward only while referenced, enabled and idle (its own
+        ``gravity_applied()``), and keeps a hold term on the joints
+        otherwise. A command that was accepted but cannot yet take effect
+        reports False here, so nobody is told an arm is safe to grab on
+        the strength of a flag.
+        """
+        return bool(
+            self.mode == ControllerMode.IDLE
+            and self.homed
+            and self.enabled
+            and self.gravity_comp
+        )
+
     link_health: dict = field(default_factory=dict)
     """Motor-bus link health: ``state`` (a ``LinkState`` value),
     ``restarts``, ``tx_errors``, ``rx_frames``."""
