@@ -15,12 +15,14 @@ also what the v2 wire carries — the runtime converts to SI internally.
 from __future__ import annotations
 
 import asyncio
+import atexit
 import contextlib
 import copy
 import logging
 import math
 import os
 import time
+import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any
@@ -198,6 +200,24 @@ def _inertia6(
     return None if inertia is None else [float(v) for v in inertia]
 
 
+# Engine clients whose tokio tasks are still live. Interpreter finalization
+# tears the process down under those tasks and a worker then dies with a
+# non-unwinding panic (SIGABRT); atexit runs while everything is still
+# alive, so every leftover engine client is stopped here. Clients closed
+# properly have already left the set.
+_LIVE_CORES: "weakref.WeakSet[AsyncRobotClient]" = weakref.WeakSet()
+
+
+@atexit.register
+def _close_leftover_cores() -> None:
+    for client in list(_LIVE_CORES):
+        core = client._core
+        client._core = None
+        client._closed = True
+        if core is not None:
+            core.close()
+
+
 class AsyncRobotClient(_RobotClientABC):
     """Async client for the par6d runtime.
 
@@ -245,6 +265,7 @@ class AsyncRobotClient(_RobotClientABC):
         self._core: CoreClient | None = None
         self._core_lock = asyncio.Lock()
         self._closed = False
+        _LIVE_CORES.add(self)
 
         # Shared status buffer + generation/event notification, filled by
         # the pump task from the engine's STATUS stream.

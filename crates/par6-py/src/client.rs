@@ -121,9 +121,14 @@ impl CoreClient {
         })
     }
 
-    /// Stop the listeners and wake every waiter.
-    fn close(&self) {
-        self.client.close();
+    /// Stop the listeners, wake every waiter, and wait for the listener
+    /// tasks to wind down — after this returns the runtime runs nothing
+    /// of this client's, so interpreter exit cannot race a worker.
+    fn close(&self, py: Python<'_>) {
+        let client = &self.client;
+        py.allow_threads(|| {
+            pyo3_async_runtimes::tokio::get_runtime().block_on(client.close_joined());
+        });
     }
 
     /// STATUS packets lost so far (header seq gaps).

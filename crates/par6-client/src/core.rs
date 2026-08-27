@@ -209,13 +209,27 @@ impl Client {
         if self.inner.closed.swap(true, Ordering::SeqCst) {
             return;
         }
-        for task in self.tasks.lock().unwrap().drain(..) {
+        for task in self.tasks.lock().unwrap().iter() {
             task.abort();
         }
         self.inner.pending.lock().unwrap().clear();
         self.inner.completions.lock().unwrap().waiters.clear();
         // Wake status waiters so they observe the closed flag.
         self.inner.status_tx.send_modify(|_| {});
+    }
+
+    /// Wait for the aborted listener tasks to wind down.
+    ///
+    /// `close` only requests the abort; the tasks' teardown still runs on
+    /// a runtime worker afterwards. A caller that is about to let the
+    /// process exit must wait it out — a worker mid-teardown while the C
+    /// runtime tears the process down dies with a non-unwinding panic.
+    pub async fn close_joined(&self) {
+        self.close();
+        let tasks: Vec<_> = self.tasks.lock().unwrap().drain(..).collect();
+        for task in tasks {
+            let _ = task.await;
+        }
     }
 
     /// Whether [`Client::close`] has been called.
