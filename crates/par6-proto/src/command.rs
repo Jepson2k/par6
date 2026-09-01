@@ -860,17 +860,25 @@ fn finite_all(what: &'static str, vs: &[f64]) -> Result<(), DecodeError> {
 }
 
 /// Whether the symmetric 3×3 `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` is positive
-/// semidefinite (Sylvester's criterion, small tolerance so a legitimate
-/// rank-deficient point mass passes). A negative-definite "inertia" would
-/// make the dynamics model lie quietly ever after, so it is refused at
-/// the wire.
+/// semidefinite. Semi-definiteness needs ALL principal minors
+/// non-negative — the leading ones alone admit indefinite matrices with
+/// a zero diagonal entry (e.g. `[[0,0,0],[0,1,5],[0,5,0]]` passes the
+/// leading test with eigenvalue ≈ −4.52). Small tolerance so a
+/// legitimate rank-deficient point mass passes. A negative-definite
+/// "inertia" would make the dynamics model lie quietly ever after, so it
+/// is refused at the wire.
 fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
     let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
     const EPS: f64 = 1e-12;
-    let m2 = ixx * iyy - ixy * ixy;
     let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
         + ixz * (ixy * iyz - iyy * ixz);
-    ixx >= -EPS && iyy >= -EPS && izz >= -EPS && m2 >= -EPS && det >= -EPS
+    ixx >= -EPS
+        && iyy >= -EPS
+        && izz >= -EPS
+        && ixx * iyy - ixy * ixy >= -EPS
+        && ixx * izz - ixz * ixz >= -EPS
+        && iyy * izz - iyz * iyz >= -EPS
+        && det >= -EPS
 }
 
 fn frac(what: &'static str, v: f64) -> Result<(), DecodeError> {

@@ -119,9 +119,13 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     An explicit *config* (a daemon-fetched bundle materialized by
     :func:`par6.config.materialize_bundle`) wins; then ``PAR6_CONFIG``.
     ``PAR6_ASSETS`` takes precedence for the assets tree; otherwise the
-    repo tree around an editable install is used (the packaged ``_data``
-    URDFs carry rewritten mesh URIs the engine's loader cannot resolve,
-    so they cannot feed it yet).
+    repo tree around an editable install, then the deploy bundle's
+    install locations (``/etc/par6`` + ``/usr/share/par6``, what
+    ``scripts/deploy/install.sh`` stages on a control box) — so a wheel
+    installed next to a deployed daemon previews with the exact files
+    the daemon runs. The packaged ``_data`` URDFs carry rewritten mesh
+    URIs the engine's loader cannot resolve, so they cannot feed it yet;
+    a wheel with no daemon, repo, or env vars raises with that remedy.
     """
     import os
     from pathlib import Path
@@ -131,13 +135,19 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     if config and assets:
         return config, assets
     root = Path(__file__).resolve().parents[3]
-    repo_config = root / "config" / "PAR6.toml"
-    repo_assets = root / "assets" / "par6_description"
-    if repo_assets.is_dir() and (config or repo_config.is_file()):
-        return (config or str(repo_config)), (assets or str(repo_assets))
+    for cfg_probe, assets_probe in (
+        (root / "config" / "PAR6.toml", root / "assets" / "par6_description"),
+        (
+            Path("/etc/par6/PAR6.toml"),
+            Path("/usr/share/par6/par6_description"),
+        ),
+    ):
+        if (assets or assets_probe.is_dir()) and (config or cfg_probe.is_file()):
+            return (config or str(cfg_probe)), (assets or str(assets_probe))
     raise RuntimeError(
         "the dry-run engine needs the runtime config and assets tree; set "
-        "PAR6_CONFIG and PAR6_ASSETS (no repo checkout was found near "
+        "PAR6_CONFIG and PAR6_ASSETS (no repo checkout, and no deployed "
+        f"bundle under /etc/par6 + /usr/share/par6, found near "
         f"{Path(__file__).resolve()})"
     )
 
@@ -214,8 +224,13 @@ class DryRunRobotClient:
         self._preview = Preview(config=config, assets=assets)
         self._dt = self._preview.tick_dt_s()
         self._max_points = max(2, int(max_snapshot_points))
-        self._profile = "TOPPRA"
-        self._policy = int(CompletionPolicy.COMMANDED)
+        # The runtime's own startup context (planner DEFAULT_PROFILE +
+        # the server's boot completion policy), pushed to the engine NOW:
+        # a mirror the engine never heard of would report one profile
+        # while planning with another until the first context-changing
+        # call happened to sync them.
+        self._profile = "RUCKIG"
+        self._policy = int(CompletionPolicy.SETTLED)
 
         if initial_joints_deg is not None:
             q = np.radians(np.asarray(initial_joints_deg, dtype=np.float64))
@@ -231,6 +246,7 @@ class DryRunRobotClient:
         self._held: list[dict] = []
         self._io_inputs, self._io_outputs = _cfg.io_line_names()
         self._io_levels = [0] * len(self._io_outputs)
+        self._sync_context()
 
     # ------------------------------------------------------------------
     # State
@@ -502,6 +518,16 @@ class DryRunRobotClient:
         """
         min_duration, speed_fraction = _timing(duration, speed)
         if pose is not None:
+            if rel:
+                # The live client raises exactly this (MOVE_J_POSE is
+                # absolute on the wire); a preview that quietly planned
+                # the absolute move would validate a program the arm
+                # then refuses.
+                raise ValueError(
+                    "move_j(pose=..., rel=True) is not supported: MOVE_J_POSE is "
+                    "absolute. Compose the offset with the current TCP pose, or "
+                    "use move_j(angles=..., rel=True) for a relative joint move."
+                )
             cmd = {
                 "type": "move_j_pose",
                 "pose": _f6(pose, "pose"),

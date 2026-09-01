@@ -1369,7 +1369,7 @@
           -1,
           22,
           "Near-singular path",
-          "The planned path passes near a singular configuration                     (condition 2400, sigma_min 0.00007).",
+          "The planned path passes near a singular configuration (condition 2400, sigma_min 0.00007).",
           "Warning only; motion continues with degraded cartesian accuracy.",
           "Re-route the segment away from the singular pose if precision matters."
         ]

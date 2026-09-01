@@ -133,32 +133,36 @@ fn an_uncalibrated_gripper_gets_polls_not_dlc5_frames() {
     );
 }
 
-/// `stop` with a live mid-stroke jaw byte re-targets it in place —
-/// the DLC-5 stream continues at the reported position with the
-/// standing command's speed/current. With the byte out of the trusted
-/// 1..=254 range (an uncalibrated gripper reports 0 = fully open),
-/// stop degrades to the release announcement instead of commanding a
-/// full-open travel.
+/// `stop` with a live jaw byte re-targets it in place — the DLC-5
+/// stream continues at the reported position with the standing
+/// command's speed/current, byte 255 (fully closed, a thin part gripped
+/// at the end of the stroke) included. Only byte 0 is untrusted: an
+/// uncalibrated gripper reports 0, which the firmware maps to fully
+/// open, so there stop degrades to the release announcement instead of
+/// commanding a full-open travel.
 #[test]
 fn stop_retargets_the_reported_jaw_byte_or_degrades_to_release() {
-    let mut rig = common::Rig::new();
-    rig.gripper_reply.position = 120;
-    rig.ready();
-    rig.cmd(RtCommand::Gripper(close_cmd()));
-    rig.tick_n(2);
+    for byte in [120u8, 255] {
+        let mut rig = common::Rig::new();
+        rig.gripper_reply.position = byte;
+        rig.ready();
+        rig.cmd(RtCommand::Gripper(close_cmd()));
+        rig.tick_n(2);
 
-    rig.clear_tx();
-    rig.cmd(RtCommand::GripperStop);
-    rig.tick_n(3);
-    let held = FirmwareGripperCommand {
-        position: 120,
-        ..close_cmd()
-    };
-    assert_eq!(
-        gripper_sends(&mut rig),
-        vec![GripperCommand::Firmware(held); 4],
-        "stop holds at the reported byte with the standing speed/current"
-    );
+        rig.clear_tx();
+        rig.cmd(RtCommand::GripperStop);
+        rig.tick_n(3);
+        let held = FirmwareGripperCommand {
+            position: byte,
+            ..close_cmd()
+        };
+        assert_eq!(
+            gripper_sends(&mut rig),
+            vec![GripperCommand::Firmware(held); 4],
+            "stop holds at reported byte {byte} with the standing speed/current \
+             — releasing at 255 would drop a part gripped at the stroke end"
+        );
+    }
 
     // Same stop against a gripper whose byte cannot be trusted.
     let mut rig = common::Rig::new();

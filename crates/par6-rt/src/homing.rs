@@ -986,7 +986,6 @@ impl HomingSystem {
         }
     }
 
-    /// Per-actuator statuses (arm joints then gripper).
     /// The last firmware gripper frame this sequence put on the bus
     /// (`None` when the sequence never commanded the gripper). The
     /// hand-back to the normal path announces idle from these bytes, so
@@ -995,6 +994,7 @@ impl HomingSystem {
         self.last_fw_cmd
     }
 
+    /// Per-actuator statuses (arm joints then gripper).
     pub fn statuses(&self) -> &[HomingJointStatus; NUM_NODES] {
         &self.statuses
     }

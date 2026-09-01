@@ -1086,14 +1086,15 @@ impl<B: DriverBus> RtCore<B> {
                     // race the reply stream and stop at a stale position.
                     let byte = self.bus_state.gripper.reply.map(|r| r.position);
                     match byte {
-                        Some(b @ 1..=254) if self.gripper_gate.has_standing() => {
+                        Some(b @ 1..) if self.gripper_gate.has_standing() => {
                             self.gripper_gate.stop_at(b);
                         }
                         // An uncalibrated gripper reports 0, which the
                         // firmware maps to fully open — a naive stop
                         // would fling the jaws open. No standing command
                         // means no speed/current budget to hold with.
-                        // Both degrade to a release.
+                        // Both degrade to a release. 255 (fully closed)
+                        // is a legitimate hold target and stays above.
                         _ => self.gripper_gate.idle(),
                     }
                 }

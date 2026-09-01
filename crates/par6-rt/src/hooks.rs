@@ -86,9 +86,9 @@ pub enum RtCommand {
     /// position with the standing command's speed/current, so the
     /// firmware is already within tolerance and holds there (its only
     /// native stop is the ESTOP bit, which latches a fault). With no
-    /// standing command, or a jaw byte outside `1..=254` (an
-    /// uncalibrated gripper reports 0, which the firmware maps to fully
-    /// open), the gripper is released instead.
+    /// standing command, or a jaw byte of 0 (an uncalibrated gripper
+    /// reports 0, which the firmware maps to fully open), the gripper is
+    /// released instead.
     GripperStop,
     /// Release the gripper: `action = 0` announced with repeated DLC-5
     /// frames, then the watchdog poll — limp on spectral-bldc,

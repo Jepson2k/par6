@@ -524,15 +524,6 @@ impl CartKin {
         }
     }
 
-    /// Joint velocities tracking the world-frame TCP twist `v`
-    /// (`[vx vy vz (m/s), wx wy wz (rad/s)]`, LOCAL_WORLD_ALIGNED) at
-    /// configuration `q`, via damped least squares — bounded near
-    /// singularities instead of exploding.
-    ///
-    /// The twist is the OFFSET TCP's, so with an offset set the jacobian's
-    /// linear rows are moved to that point (`v_tcp = v_model + ω × r`,
-    /// `r = R·d`) — otherwise a pure rotation jog would pivot the arm
-    /// about the flange while FK reported the offset point moving.
     /// Singularity metrics of the arm jacobian at `q`: `(sigma_min,
     /// condition)`, the smallest singular value and the max/min ratio
     /// (capped at 1e12 — a rank-deficient J has no finite condition).
@@ -566,6 +557,15 @@ impl CartKin {
         Ok((sigma_min, condition))
     }
 
+    /// Joint velocities tracking the world-frame TCP twist `v`
+    /// (`[vx vy vz (m/s), wx wy wz (rad/s)]`, LOCAL_WORLD_ALIGNED) at
+    /// configuration `q`, via damped least squares — bounded near
+    /// singularities instead of exploding.
+    ///
+    /// The twist is the OFFSET TCP's, so with an offset set the jacobian's
+    /// linear rows are moved to that point (`v_tcp = v_model + ω × r`,
+    /// `r = R·d`) — otherwise a pure rotation jog would pivot the arm
+    /// about the flange while FK reported the offset point moving.
     pub(crate) fn twist_to_qd(&mut self, q: &[f64; NQ], v: &[f64; 6]) -> Result<[f64; NQ], String> {
         let d = self.offset.get();
         let r = if d == [0.0; 3] {
@@ -619,9 +619,6 @@ impl CartKin {
     }
 }
 
-/// Solve the 6x6 system `A·x = b` in place (partial-pivot Gaussian
-/// elimination). `None` when a pivot vanishes (the DLS damping makes
-/// that unreachable for real jacobians; this is pure defense).
 /// Eigenvalues of a symmetric 6x6 by cyclic Jacobi rotations. The input
 /// is destroyed; convergence to ~1e-12 off-diagonal mass takes a handful
 /// of sweeps for the well-scaled `J·Jᵀ` matrices this serves.
@@ -666,6 +663,9 @@ fn sym6_eigenvalues(a: &mut [[f64; 6]; 6]) -> [f64; 6] {
     out
 }
 
+/// Solve the 6x6 system `A·x = b` in place (partial-pivot Gaussian
+/// elimination). `None` when a pivot vanishes (the DLS damping makes
+/// that unreachable for real jacobians; this is pure defense).
 fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
     let mut x = *b;
     for col in 0..6 {

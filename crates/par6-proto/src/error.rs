@@ -211,7 +211,8 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
         },
         E::TrajNearSingularity => ErrorTemplate {
             title: "Near-singular path",
-            cause: "The planned path passes near a singular configuration                     (condition {cond}, sigma_min {sigma}).",
+            cause: "The planned path passes near a singular configuration \
+                    (condition {cond}, sigma_min {sigma}).",
             effect: "Warning only; motion continues with degraded cartesian accuracy.",
             remedy: "Re-route the segment away from the singular pose if precision matters.",
         },

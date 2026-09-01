@@ -1502,6 +1502,13 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         with pytest.raises(RobotError) as indef:
             await client.set_payload(1.0, inertia=(-1.0, 0.0, 1.0, 0.0, 0.0, 1.0))
         assert indef.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        # Indefinite despite non-negative LEADING minors (zero diagonal
+        # entry, coupling hidden in a trailing minor): eigenvalue ≈ −4.5.
+        # Only checking all principal minors catches it.
+        with pytest.raises(RobotError) as hidden:
+            await client.set_payload(1.0, inertia=(0.0, 0.0, 1.0, 0.0, 5.0, 0.0))
+        assert hidden.value.code == ErrorCode.COMM_VALIDATION_ERROR
         info = await client.payload()
         assert info is not None and info["mass"] == pytest.approx(1.2), (
             "a refused set must not change the payload"
@@ -1559,3 +1566,32 @@ async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaem
         assert await client.wait_status(lambda s: not s.homed, timeout=STEP_BUDGET_S), (
             "a closed window must read un-homed until the operator re-homes"
         )
+
+
+def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon):
+    """The ``par6`` shell exits with its documented codes for the outcomes
+    that matter from a terminal in a hurry: a runtime REFUSAL is a spoken
+    ``EXIT_REFUSED`` (not a traceback — refusals raise RobotError, which
+    main must catch), and an estop/stop/reset nothing acknowledged exits
+    ``EXIT_UNREACHABLE`` instead of printing success on a lost datagram."""
+    import socket
+
+    from par6.cli import EXIT_REFUSED, EXIT_UNREACHABLE, main
+
+    addr = ["--host", "127.0.0.1", "--port", str(daemon.command_port)]
+    deadline = time.monotonic() + STEP_BUDGET_S
+    while main([*addr, "ping"]) != 0:
+        assert time.monotonic() < deadline, "the daemon never answered ping"
+
+    # The boot arm is un-referenced (and possibly still DISABLED): a
+    # move is refused either way, and the shell speaks the refusal.
+    assert main([*addr, "move-j", "0", "0", "0", "0", "0", "0"]) == EXIT_REFUSED
+
+    # A port nothing listens on: system commands come back unconfirmed,
+    # and "estop latched" printed there would be the dangerous lie.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+    dead = ["--host", "127.0.0.1", "--port", str(dead_port), "--timeout", "0.5"]
+    for verb in ("estop", "stop", "reset"):
+        assert main([*dead, verb]) == EXIT_UNREACHABLE, verb

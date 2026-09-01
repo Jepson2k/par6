@@ -1066,82 +1066,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         ))
     }
 
-    /// Parameters the runtime cannot honour. Refusing them is the whole
-    /// point: a silently dropped parameter makes the arm do something
-    /// other than what the client asked for, with no way to tell.
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
-        let refuse = |detail: String| {
-            Some(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &detail)],
-            ))
-        };
-        // A corner is rounded by re-planning both of its segments as one
-        // path, which needs kinematics (IK along the rounded corner, and
-        // TOPPRA to time it). A runtime without them can only stop at
-        // every waypoint, and saying so beats doing it silently.
-        let blend = |r: Option<f64>| {
-            r.filter(|r| *r > 0.0 && !self.cfg.cartesian).map(|r| {
-                format!(
-                    "blend radius {r} mm needs kinematics: this runtime has none, \
-                     so every move stops at its target; send r = nil"
-                )
-            })
-        };
-        let unsupported = match cmd {
-            Command::MoveJ(p) => blend(p.blend_radius),
-            Command::MoveJPose(p) => blend(p.blend_radius),
-            Command::MoveL(p) => blend(p.blend_radius),
-            // An arc ends where its `end` pose is: par6d rounds corners
-            // between straight segments and between joint moves, but has
-            // no arc-to-successor blend, and a radius that quietly did
-            // nothing would be the silent alteration this function
-            // exists to prevent.
-            Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
-                format!(
-                    "blend radius {r} mm is not supported on move_c: an arc stops at \
-                     its end pose; send r = nil"
-                )
-            }),
-            // A pose the runtime cannot place the arm at is refused, not
-            // clamped: clamping landed the arm tens of degrees from where
-            // the client asked and answered success, which is the silent
-            // alteration this whole function exists to prevent.
-            Command::Teleport(p) => {
-                teleport_angle_fault(&p.angles, &self.cfg).or(match p.tool_positions.as_deref() {
-                    None => None,
-                    Some(_) if self.cfg.tool_dof == 0 => Some(format!(
-                        "tool '{}' has no controllable position",
-                        self.cfg.fitted_tool
-                    )),
-                    Some(pos) if pos.len() != self.cfg.tool_dof => Some(format!(
-                        "tool '{}' has {} position(s), {} given",
-                        self.cfg.fitted_tool,
-                        self.cfg.tool_dof,
-                        pos.len()
-                    )),
-                    Some(pos) => pos
-                        .iter()
-                        .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-                        .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
-                })
-            }
-            // A passive tool (no driver) has nothing to actuate.
-            Command::ToolAction(p) if self.cfg.tool_dof == 0 => Some(format!(
-                "tool '{}' is passive: it has no actions",
-                p.tool_key
-            )),
-            // Cartesian streamables need IK every tick; a runtime without
-            // kinematics can only drop them.
-            Command::ServoJPose(_) | Command::ServoL(_) | Command::JogL(_)
-                if !self.cfg.cartesian =>
-            {
-                Some("this runtime has no kinematics: cartesian commands are unavailable".into())
-            }
-            _ => None,
-        };
-        unsupported.and_then(refuse)
+        validate_supported(&self.cfg, cmd)
     }
 
     // ---- queue engine ------------------------------------------------------
@@ -2139,6 +2065,84 @@ fn world_in_tool_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     }
     out[15] = 1.0;
     out
+}
+
+/// Parameters the runtime cannot honour. Refusing them is the whole
+/// point: a silently dropped parameter makes the arm do something
+/// other than what the client asked for, with no way to tell. A free
+/// function over the config so the offline preview refuses exactly what
+/// the wire refuses.
+pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError> {
+    let refuse = |detail: String| {
+        Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[("detail", &detail)],
+        ))
+    };
+    // A corner is rounded by re-planning both of its segments as one
+    // path, which needs kinematics (IK along the rounded corner, and
+    // TOPPRA to time it). A runtime without them can only stop at
+    // every waypoint, and saying so beats doing it silently.
+    let blend = |r: Option<f64>| {
+        r.filter(|r| *r > 0.0 && !cfg.cartesian).map(|r| {
+            format!(
+                "blend radius {r} mm needs kinematics: this runtime has none, \
+                 so every move stops at its target; send r = nil"
+            )
+        })
+    };
+    let unsupported = match cmd {
+        Command::MoveJ(p) => blend(p.blend_radius),
+        Command::MoveJPose(p) => blend(p.blend_radius),
+        Command::MoveL(p) => blend(p.blend_radius),
+        // An arc ends where its `end` pose is: par6d rounds corners
+        // between straight segments and between joint moves, but has
+        // no arc-to-successor blend, and a radius that quietly did
+        // nothing would be the silent alteration this function
+        // exists to prevent.
+        Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
+            format!(
+                "blend radius {r} mm is not supported on move_c: an arc stops at \
+                 its end pose; send r = nil"
+            )
+        }),
+        // A pose the runtime cannot place the arm at is refused, not
+        // clamped: clamping landed the arm tens of degrees from where
+        // the client asked and answered success, which is the silent
+        // alteration this whole function exists to prevent.
+        Command::Teleport(p) => {
+            teleport_angle_fault(&p.angles, cfg).or(match p.tool_positions.as_deref() {
+                None => None,
+                Some(_) if cfg.tool_dof == 0 => Some(format!(
+                    "tool '{}' has no controllable position",
+                    cfg.fitted_tool
+                )),
+                Some(pos) if pos.len() != cfg.tool_dof => Some(format!(
+                    "tool '{}' has {} position(s), {} given",
+                    cfg.fitted_tool,
+                    cfg.tool_dof,
+                    pos.len()
+                )),
+                Some(pos) => pos
+                    .iter()
+                    .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
+            })
+        }
+        // A passive tool (no driver) has nothing to actuate.
+        Command::ToolAction(p) if cfg.tool_dof == 0 => Some(format!(
+            "tool '{}' is passive: it has no actions",
+            p.tool_key
+        )),
+        // Cartesian streamables need IK every tick; a runtime without
+        // kinematics can only drop them.
+        Command::ServoJPose(_) | Command::ServoL(_) | Command::JogL(_) if !cfg.cartesian => {
+            Some("this runtime has no kinematics: cartesian commands are unavailable".into())
+        }
+        _ => None,
+    };
+    unsupported.and_then(refuse)
 }
 
 /// The first `teleport` angle the runtime cannot honour, described in

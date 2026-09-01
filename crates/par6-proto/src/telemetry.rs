@@ -67,8 +67,8 @@ pub enum TelemetryField {
     GripperPosition,
     /// Gripper motor current \[mA\] (NaN = no reply yet).
     GripperCurrentMa,
-    /// Gripper object-detection code (0 moving, 1 detected opening,
-    /// 2 detected closing, 3 reached with no object; NaN = no reply).
+    /// Gripper object-detection code (0 moving, 1 detected closing,
+    /// 2 detected opening, 3 reached with no object; NaN = no reply).
     GripperObjectDetection,
     /// Gripper fault bitfield (bit 0 temperature, 1 timeout, 2 e-stop,
     /// 3 live fault bit; 0 = healthy).

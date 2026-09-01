@@ -691,10 +691,6 @@ impl Par6Planner {
             .collect())
     }
 
-    /// TOPPRA-time a joint waypoint list and sample it at tick dt.
-    /// A requested `min_duration` is a minimum: TOPPRA's optimum bounds
-    /// how fast the path can be driven, a longer request time-scales the
-    /// whole trajectory (velocities scale with it, so limits still hold).
     /// Joint-space blend-chain pitch: half the per-tick travel at the
     /// full EXEC velocity norm (the vendor rule), floored at 10 mrad;
     /// `motion.joint_step_rad` overrides.
@@ -711,6 +707,10 @@ impl Par6Planner {
         })
     }
 
+    /// TOPPRA-time a joint waypoint list and sample it at tick dt.
+    /// A requested `min_duration` is a minimum: TOPPRA's optimum bounds
+    /// how fast the path can be driven, a longer request time-scales the
+    /// whole trajectory (velocities scale with it, so limits still hold).
     fn toppra_samples(
         &self,
         waypoints: &[f64],
@@ -1031,9 +1031,14 @@ impl Par6Planner {
         // Every sample solved: the path runs — but a pass near a
         // singular configuration degrades cartesian accuracy, and the
         // operator hears about it (vendor thresholds; warning only).
-        self.near_singularity = singularity_verdict(worst_sigma, worst_cond);
+        // Latched only once the motion is actually queued: a timing or
+        // collision refusal below runs nothing, and a warning standing
+        // in STATUS with nothing in flight would be attributed to
+        // whatever move runs next.
         let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
-        self.start_exec(samples, snap.mode == Mode::Exec)
+        let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
+        self.near_singularity = singularity_verdict(worst_sigma, worst_cond);
+        Ok(kind)
     }
 
     /// MOVE_L: one straight cartesian segment.

@@ -93,16 +93,21 @@ pub struct Model {
 }
 
 /// Whether the symmetric 3×3 matrix `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` is
-/// positive semidefinite, by Sylvester's criterion on leading principal
-/// minors (with a small tolerance so a legitimate rank-deficient point
-/// mass passes).
+/// positive semidefinite: ALL principal minors non-negative (the leading
+/// ones alone admit indefinite matrices with a zero diagonal entry), with
+/// a small tolerance so a legitimate rank-deficient point mass passes.
 fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
     let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
     const EPS: f64 = 1e-12;
-    let m2 = ixx * iyy - ixy * ixy;
     let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
         + ixz * (ixy * iyz - iyy * ixz);
-    ixx >= -EPS && m2 >= -EPS && det >= -EPS && iyy >= -EPS && izz >= -EPS
+    ixx >= -EPS
+        && iyy >= -EPS
+        && izz >= -EPS
+        && ixx * iyy - ixy * ixy >= -EPS
+        && ixx * izz - ixz * ixz >= -EPS
+        && iyy * izz - iyz * iyz >= -EPS
+        && det >= -EPS
 }
 
 impl fmt::Debug for Model {
@@ -315,10 +320,6 @@ impl Model {
         Self::check_status(status)
     }
 
-    /// Seeded damped-least-squares IK toward `target` (row-major 4x4, same
-    /// frame as [`Model::fk`]). Writes the final iterate into `out_q` either
-    /// way; returns `Ok(true)` on convergence, `Ok(false)` when the iteration
-    /// budget ran out.
     /// DLS IK that refuses a step which would increase the residual.
     ///
     /// Same contract as [`Model::ik_step`] — `Ok(true)` converged,
@@ -352,6 +353,10 @@ impl Model {
         }
     }
 
+    /// Seeded damped-least-squares IK toward `target` (row-major 4x4, same
+    /// frame as [`Model::fk`]). Writes the final iterate into `out_q` either
+    /// way; returns `Ok(true)` on convergence, `Ok(false)` when the iteration
+    /// budget ran out.
     pub fn ik_step(
         &mut self,
         q_seed: &[f64],

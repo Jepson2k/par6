@@ -646,7 +646,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
     }
 }
 
-fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
+pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     let robot = &bundle.robot;
     let mut cfg = ServerConfig::from_protocol(&robot.protocol);
     cfg.rt_tick_rate_hz = robot.tick_rate_hz();

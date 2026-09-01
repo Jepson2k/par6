@@ -540,3 +540,39 @@ class TestDiscovery:
             out = subprocess.run([str(py), "-c", probe], capture_output=True, text=True)
         assert out.returncode == 0, out.stderr
         assert out.stdout.split() == ["PAR6", "par6"]
+
+
+def test_materialize_bundle_confines_hostile_filenames_to_the_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A CONFIG_BUNDLE reply is an unauthenticated datagram, so its file
+    names are attacker-controlled: path components must be stripped (the
+    write lands IN the cache, never where the traversal pointed) and a
+    fingerprint with separators is refused outright."""
+    from par6.config import materialize_bundle
+
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+    bundle = {
+        "fingerprint": "deadbeef",
+        "robot_filename": "../../../../escape.toml",
+        "robot_toml": "x = 1\n",
+        "grippers": [{"filename": "../gripper-escape.toml", "content": "y = 2\n"}],
+    }
+    path = materialize_bundle(bundle)
+    root = tmp_path / "par6" / "daemon-config" / "deadbeef"
+    assert path == root / "escape.toml", "the basename lands inside the cache"
+    assert path.read_text() == "x = 1\n"
+    assert (root / "grippers" / "gripper-escape.toml").read_text() == "y = 2\n"
+    assert not (tmp_path.parent / "escape.toml").exists()
+
+    for hostile in (
+        {"fingerprint": "../pwn"},
+        {"fingerprint": ".."},
+        {"robot_filename": ".."},
+        {"fingerprint": "cafe", "grippers": [{"filename": "..", "content": ""}]},
+    ):
+        with pytest.raises(ValueError):
+            materialize_bundle({**bundle, **hostile})
+    assert sorted(p.name for p in (tmp_path / "par6" / "daemon-config").iterdir()) == [
+        "deadbeef"
+    ], "a refused bundle leaves no directory behind"
