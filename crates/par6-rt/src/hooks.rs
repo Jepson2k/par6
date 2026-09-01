@@ -82,6 +82,18 @@ pub enum RtCommand {
     /// to the DLC-0 empty poll, which feeds the driver watchdog for the
     /// whole sweep without overwriting it.
     GripperCalibrate,
+    /// Halt the gripper in place: re-target the freshest reported jaw
+    /// position with the standing command's speed/current, so the
+    /// firmware is already within tolerance and holds there (its only
+    /// native stop is the ESTOP bit, which latches a fault). With no
+    /// standing command, or a jaw byte outside `1..=254` (an
+    /// uncalibrated gripper reports 0, which the firmware maps to fully
+    /// open), the gripper is released instead.
+    GripperStop,
+    /// Release the gripper: `action = 0` announced with repeated DLC-5
+    /// frames, then the watchdog poll — limp on spectral-bldc,
+    /// velocity-0 hold on stepfoc.
+    GripperIdle,
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),

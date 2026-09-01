@@ -1120,8 +1120,21 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         tools = await client.tools()
         assert tools is not None
         tool = tools.tool
-        # The runtime's verbs are `move` and `calibrate`; the client's
-        # open/close convenience resolves onto `move` with a position.
+
+        # A fresh sim boots uncalibrated, and the RT send gate never
+        # streams a move to an uncalibrated gripper (the firmware's own
+        # gate drops it) — so the daemon refuses the move up front
+        # instead of letting it silently move nothing.
+        with pytest.raises(RobotError) as refused:
+            await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "calibrat" in str(refused.value).lower()
+
+        await client.tool_action(tool, "calibrate", wait=True)
+
+        # The runtime's verbs are `move`, `calibrate`, `stop` and `idle`;
+        # the client's open/close convenience resolves onto `move` with a
+        # position.
         await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
         closed = await client.wait_status(
             lambda s: bool(s.tool_status is not None and s.tool_status.positions),
@@ -1132,19 +1145,40 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         assert status is not None, "the STATUS query went unanswered"
         after_close = status.tool_status
         assert after_close is not None
+        assert after_close.positions[0] > 0.9, (
+            f"a full close must report jaws closed: {after_close.positions}"
+        )
 
+        # Halt an open in flight: the jaws must hold near where the stop
+        # caught them, nowhere near the abandoned fully-open target. The
+        # interrupted travel starts from a mid-stroke hold so the stop
+        # always reads a trustable jaw byte, not the 255 edge.
+        await client.tool_action(tool, "move", [0.7, 0.5, 400.0], wait=True)
+        await client.tool_action(tool, "move", [0.0, 0.15, 400.0])
+        await client.tool_action(tool, "stop", wait=True)
+        status = await client.status()
+        assert status is not None and status.tool_status is not None
+        held = status.tool_status.positions[0]
+        assert held > 0.5, (
+            f"the stop did not hold the jaws: they carried on to {held} "
+            f"after the open was abandoned"
+        )
+
+        # Release, then a fresh move must still stream — the idle
+        # handshake ends in watchdog polls, not a dead send slot.
+        await client.tool_action(tool, "idle", wait=True)
         await client.tool_action(tool, "move", [0.0, 0.5, 400.0], wait=True)
         opened = await client.wait_status(
             lambda s: bool(
                 s.tool_status is not None
                 and s.tool_status.positions
-                and s.tool_status.positions[0] < after_close.positions[0] - 0.05
+                and s.tool_status.positions[0] < 0.05
             ),
             timeout=STEP_BUDGET_S,
         )
         assert opened, (
-            f"opening the gripper did not move the jaws back: "
-            f"closed at {after_close.positions}"
+            f"opening the gripper after a release did not move the jaws "
+            f"back: closed at {after_close.positions}"
         )
 
         # WC sizes its I/O chips from these two counts, so the published

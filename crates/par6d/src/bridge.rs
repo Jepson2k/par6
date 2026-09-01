@@ -858,6 +858,10 @@ impl RtCommands for RtBridge {
         }));
     }
 
+    fn tool_stop(&mut self) {
+        self.link.send(RtCommand::GripperStop);
+    }
+
     fn write_io(&mut self, port: u8, value: u8) {
         // The server has already checked `port` against the declared
         // outputs, so this only forwards; the RT thread owns the pins

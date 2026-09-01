@@ -818,4 +818,32 @@ mod tests {
         ))
         .is_err());
     }
+
+    /// The shipped SSG48 values are the vendor's arm-measured retune
+    /// (grippers/SSG48.xml at rcb-runtime 307477c); the shipped defaults
+    /// before it were copied from the MSG and never verified against the
+    /// hardware. These are transmitted at boot and on every config
+    /// re-push, so a drifted transcription drives the real output stage —
+    /// this pin makes the next vendor tune show up as a red diff instead
+    /// of a silent divergence.
+    #[test]
+    fn ssg48_driver_values_match_the_vendor_retune() {
+        let cfg = GripperConfig::load(&config_dir().join("grippers/SSG48.toml"))
+            .expect("shipped SSG48.toml must load");
+        let drv = cfg.driver.expect("SSG48 is a CAN gripper");
+        assert_eq!(drv.stroke_mm, 47.0);
+        assert_eq!(drv.kt_nm_a, 0.3);
+        assert_eq!(drv.ilim_ma, 1700.0);
+        assert_eq!(
+            drv.voltage_limit_mv, 0,
+            "0 = use VBUS (vendor removed the 6 V clamp)"
+        );
+        assert_eq!(drv.gains.kpp, 11.0);
+        assert_eq!(drv.gains.kpv, 0.03);
+        assert_eq!(drv.gains.kiv, 0.0003);
+        assert_eq!(drv.gains.kpiq, 3.0);
+        assert_eq!(drv.gains.kiiq, 1.5);
+        assert_eq!(drv.gains.kp, 0.12);
+        assert_eq!(drv.gains.kd, 0.002);
+    }
 }

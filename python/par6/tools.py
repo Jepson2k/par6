@@ -65,7 +65,8 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
     """Electric gripper driving the runtime's ``tool_action`` verbs.
 
     ``move`` takes ``[position 0..1, speed 0..1, current mA]``; ``calibrate``
-    runs the driver's homing/activation sequence.
+    runs the driver's homing/activation sequence; ``stop`` halts the jaws
+    in place; ``idle`` releases them.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -80,6 +81,24 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
 
     async def calibrate(self, **kwargs: object) -> int:
         return await self._cmd("calibrate")
+
+    async def stop(self, **kwargs: object) -> int:
+        """Halt the jaws in place, effective immediately: the physical
+        stop fires when the daemon admits the command, ahead of anything
+        still settling in the queue, and the runtime re-targets the
+        reported jaw position — which the firmware already satisfies, so
+        it holds there. Falls back to :meth:`release` when no command is
+        standing or the gripper is uncalibrated (a naive stop would drive
+        fully open)."""
+        return await self._cmd("stop")
+
+    async def release(self, **kwargs: object) -> int:
+        """Drop the grip once the action in flight settles: the runtime
+        announces ``action = 0`` and falls back to the watchdog poll —
+        limp on spectral-bldc, velocity-0 hold on stepfoc. The way to
+        free the jaws for manual handling; for release-*now* mid-travel,
+        :meth:`stop` first."""
+        return await self._cmd("idle")
 
     async def action_r(self, engaged: bool) -> None:
         await self.calibrate()

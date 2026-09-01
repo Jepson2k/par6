@@ -664,11 +664,28 @@ fn tool_actions_profiles_and_unsupported_parameters() {
             .is_some_and(|t| t.variant_key == "wide")
     });
 
+    // ---- a move before calibration is refused: the RT send gate never
+    // streams to an uncalibrated gripper (the firmware's own gate drops
+    // it), so admitting the move could only pretend.
+    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 500.0]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "an uncalibrated gripper must refuse a move");
+    assert_eq!(
+        detail.expect("failed COMPLETE carries detail").code,
+        ErrorCode::CommValidationError as u16
+    );
+
+    // ---- calibrate runs the firmware sweep and leaves the jaws open.
+    let i = c.ok_index(&tool_action(6005, &tool, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    let s = rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
+
     // ---- tool_action drives the jaw. Closing runs it to the commanded
     // position with nothing between the jaws (detection: reached, no
     // object), opening runs it back.
     let before = jaw(&s);
-    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 500.0]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper close must complete, got {detail:?}");
     let s = rig.wait_status("the jaw reaches the closed command and stops", |s| {
@@ -687,12 +704,6 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
     rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
-
-    // ---- calibrate runs the firmware sweep and leaves the jaws open.
-    let i = c.ok_index(&tool_action(6005, &tool, "calibrate", &[]));
-    let (ok, detail) = c.wait_complete(i);
-    assert!(ok, "gripper calibrate must complete, got {detail:?}");
-    rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
 
     // ---- an action the tool does not implement fails the command; it is
     // never reported as done.

@@ -185,6 +185,9 @@ enum ToolWait {
     /// Firmware calibration sweep: done when the `calibrated` bit is set,
     /// no earlier than the minimum wait.
     Calibrate,
+    /// Release: done when the firmware drops its action-status bit —
+    /// the idle announcement landed and the output stage let go.
+    Idle,
 }
 
 enum InFlightKind {
@@ -788,6 +791,15 @@ impl Par6Planner {
                         return Err(invalid(format!("{what} = {v} is outside [0, {hi}]")));
                     }
                 }
+                // The RT gate never streams a move to an uncalibrated
+                // gripper (the firmware's own gate drops it), so admitting
+                // one here could only time out or trivially "succeed"
+                // without moving a jaw.
+                if !snap.gripper.reply.is_some_and(|r| r.calibrated) {
+                    return Err(invalid(
+                        "the gripper is not calibrated: run the calibrate action first".into(),
+                    ));
+                }
                 self.link.send(RtCommand::Gripper(gripper_move_command(
                     position, speed, current,
                 )));
@@ -800,9 +812,33 @@ impl Par6Planner {
                 self.link.send(RtCommand::GripperCalibrate);
                 (ToolWait::Calibrate, TOOL_CALIBRATE_TIMEOUT)
             }
+            // Halt in place: the RT re-targets the freshest reported jaw
+            // byte with the standing command's speed/current (already in
+            // tolerance, so it holds). Degrades to a release when nothing
+            // is standing or the byte is out of range — an uncalibrated
+            // gripper reports 0, which the firmware maps to fully open.
+            // The wait is the stop's actual promise — the jaws are no
+            // longer travelling — not the move-settle verdict, whose
+            // object-detection term can predate any commanded motion.
+            "stop" => {
+                if !cmd.params.is_empty() {
+                    return Err(invalid("stop takes no parameters".into()));
+                }
+                self.link.send(RtCommand::GripperStop);
+                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
+            }
+            // Release: action = 0 — limp on spectral-bldc, velocity-0
+            // hold on stepfoc.
+            "idle" => {
+                if !cmd.params.is_empty() {
+                    return Err(invalid("idle takes no parameters".into()));
+                }
+                self.link.send(RtCommand::GripperIdle);
+                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
+            }
             other => {
                 return Err(invalid(format!(
-                    "tool '{}' has no action '{other}' (move | calibrate)",
+                    "tool '{}' has no action '{other}' (move | calibrate | stop | idle)",
                     cmd.tool_key
                 )));
             }
@@ -1361,6 +1397,7 @@ impl Par6Planner {
                 && reply.object_detection != ObjectDetection::Moving)
                 .then_some(Ok(())),
             ToolWait::Calibrate => (elapsed >= cal_min_ticks && reply.calibrated).then_some(Ok(())),
+            ToolWait::Idle => (!reply.action_status).then_some(Ok(())),
         }
     }
 
@@ -1387,6 +1424,7 @@ impl Par6Planner {
                         let state = match wait {
                             ToolWait::Move => "move",
                             ToolWait::Calibrate => "calibrate",
+                            ToolWait::Idle => "idle",
                         };
                         Some(Err(make_error(
                             ErrorCode::MotnToolTimeout,

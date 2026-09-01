@@ -42,6 +42,7 @@ enum RtEvent {
     ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
+    ToolStop,
     WriteIo(u8, u8),
     Simulator(bool),
     ConnectHardware(String),
@@ -127,6 +128,9 @@ impl RtCommands for TestRt {
     }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
+    }
+    fn tool_stop(&mut self) {
+        self.push(RtEvent::ToolStop);
     }
     fn write_io(&mut self, port: u8, value: u8) {
         self.push(RtEvent::WriteIo(port, value));
@@ -1924,6 +1928,89 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     h.complete_ok(i3);
     c.wait_complete(i3).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
+}
+
+/// A tool `stop` halts the jaws at ADMISSION, not when the queue reaches
+/// it: queued behind the very move it is meant to halt, a stop that
+/// waited its turn could only run after the jaws had finished the travel
+/// it was sent to interrupt. The queued instance still dispatches in
+/// order behind the move and carries the COMPLETE discipline; other
+/// actions get no out-of-band effect.
+#[tokio::test]
+async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let action = |key: u64, name: &str, params: &[f64]| {
+        Command::ToolAction(par6_proto::command::ToolAction {
+            key,
+            tool_key: "GRIPPER".to_owned(),
+            action: name.to_owned(),
+            params: params
+                .iter()
+                .map(|v| par6_proto::command::ToolParam::Float(*v))
+                .collect(),
+        })
+    };
+
+    // The move dispatches and stays in flight (no outcome yet).
+    let mv = c.ok_index(&action(801, "move", &[0.0, 0.2, 400.0])).await;
+    let started = |p: &PlannerState| p.started.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while started(&h.planner.lock().unwrap()) != vec![mv] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the move never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Admitting the stop fires the RT halt immediately, while the move
+    // still owns the queue head.
+    let st = c.ok_index(&action(802, "stop", &[])).await;
+    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::ToolStop)).await;
+    assert_eq!(
+        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
+        1,
+        "one admission, one halt: {ev:?}"
+    );
+    assert_eq!(
+        started(&h.planner.lock().unwrap()),
+        vec![mv],
+        "the queued stop must not jump the dispatch order"
+    );
+
+    // The halted move settles; only then does the queued stop dispatch.
+    h.complete_ok(mv);
+    c.wait_complete(mv).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while started(&h.planner.lock().unwrap()) != vec![mv, st] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the queued stop never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    h.complete_ok(st);
+    c.wait_complete(st).await;
+
+    // `idle` (or any other action) is a plain queued command: no
+    // out-of-band halt fires for it.
+    let idle = c.ok_index(&action(803, "idle", &[])).await;
+    h.complete_ok(idle);
+    c.wait_complete(idle).await;
+    let ev = h.rt_events();
+    assert_eq!(
+        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
+        1,
+        "only the stop admission halts out-of-band: {ev:?}"
+    );
 }
 
 /// Gaps 2 + 3, together: the controller comes up ready to accept motion,

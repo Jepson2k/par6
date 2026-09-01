@@ -860,6 +860,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // A planned move cancels streaming.
             self.runtime.rt.cancel_stream();
         }
+        if matches!(&cmd, Command::ToolAction(p) if p.action == "stop") {
+            // Halt-in-place cannot wait its turn behind the very move it
+            // halts: the physical stop fires now, and the queued instance
+            // (idempotent at the RT) carries the COMPLETE discipline once
+            // the queue reaches it.
+            self.runtime.rt.tool_stop();
+        }
         self.pending.push_back(Pending { index, cmd, addr });
         self.reply(
             addr,

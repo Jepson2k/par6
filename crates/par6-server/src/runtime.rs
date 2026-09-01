@@ -316,6 +316,16 @@ pub trait RtCommands: Send {
     /// Set one digital output (`port` 0..=7, `value` 0/1).
     fn write_io(&mut self, port: u8, value: u8);
 
+    /// Halt the tool's jaws in place now, out-of-band of the queue.
+    ///
+    /// A queued `ToolAction("stop")` dispatches only after the very move
+    /// it is meant to halt has settled, so the server fires the physical
+    /// stop at admission; the queued instance re-applies it (idempotent
+    /// at the RT — the re-target reads the same held jaw byte) and
+    /// carries the ack/COMPLETE discipline. Like any command frame, the
+    /// halt aborts a firmware calibration sweep in progress.
+    fn tool_stop(&mut self);
+
     /// Switch the bus backend between hardware and simulator live
     /// (state re-seeded by the implementation).
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError>;

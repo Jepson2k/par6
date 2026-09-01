@@ -70,6 +70,9 @@ pub struct Rig {
     /// from them carries the arbitration-id err bit, as real firmware
     /// does while a fault is active.
     pub fault_nodes: u16,
+    /// The cmd-60 reply the rig injects every tick (calibrated by
+    /// default; tests reshape it for uncalibrated or mid-stroke cases).
+    pub gripper_reply: GripperReply,
     pub auto_inject: bool,
     pub dt: f64,
 }
@@ -158,6 +161,10 @@ impl Rig {
             current_ma: [0; MAX_JOINTS],
             skip_nodes: 0,
             fault_nodes: 0,
+            gripper_reply: GripperReply {
+                calibrated: true,
+                ..GripperReply::default()
+            },
             auto_inject: true,
             dt,
         }
@@ -206,10 +213,7 @@ impl Rig {
             self.core.bus_mut().inject(
                 false,
                 Reply::Gripper {
-                    reply: GripperReply {
-                        calibrated: true,
-                        ..GripperReply::default()
-                    },
+                    reply: self.gripper_reply,
                 },
             );
         }
