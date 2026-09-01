@@ -93,13 +93,28 @@ pub struct MotionStream {
     /// Unscaled STREAM ceilings, kept so a fraction always scales the
     /// configured limit rather than the last scaled one.
     base: MotionLimits,
+    /// Consecutive `step()` failures; at `fault_latch_ticks` the core
+    /// hard-latches `StreamFault` — a limiter that holds in place
+    /// instead of tracking must not stay silent.
+    fail_streak: u32,
+    fault_latch_ticks: u32,
+    /// Log-throttle edges: each failure site speaks once per streak,
+    /// never once per 250 Hz tick.
+    target_refused: bool,
+    scale_refused: bool,
 }
 
 impl MotionStream {
     /// Wrap a configured streaming executor running at tick period `dt`
     /// \[s\]; `soft_min`/`soft_max` are the per-joint soft position
-    /// limits \[rad\].
-    pub fn new(executor: StreamingExecutor, dt: f64, base: MotionLimits) -> Self {
+    /// limits \[rad\]. `fault_latch_s` is how long `step()` may keep
+    /// failing before [`StreamTracker::faulted`] reads true.
+    pub fn new(
+        executor: StreamingExecutor,
+        dt: f64,
+        base: MotionLimits,
+        fault_latch_s: f64,
+    ) -> Self {
         Self {
             executor,
             dt,
@@ -107,6 +122,10 @@ impl MotionStream {
             soft_max: base.soft_max,
             hold_q: [0.0; MAX_JOINTS],
             base,
+            fail_streak: 0,
+            fault_latch_ticks: (fault_latch_s / dt).round().max(1.0) as u32,
+            target_refused: false,
+            scale_refused: false,
         }
     }
 
@@ -126,8 +145,14 @@ impl StreamTracker for MotionStream {
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
         let mut clamped = *q_target;
         self.clamp(&mut clamped);
-        if let Err(e) = self.executor.set_target(&clamped) {
-            log::warn!("stream target refused: {e}");
+        match self.executor.set_target(&clamped) {
+            Ok(()) => self.target_refused = false,
+            Err(e) => {
+                if !self.target_refused {
+                    log::warn!("stream target refused: {e} (repeats suppressed)");
+                }
+                self.target_refused = true;
+            }
         }
     }
 
@@ -142,8 +167,16 @@ impl StreamTracker for MotionStream {
             // jolt the fraction is asking to avoid.
             scaled.jerk[j] = self.base.jerk[j] * accel;
         }
-        if let Err(e) = self.executor.set_limits(&scaled) {
-            log::warn!("stream limit scale ({speed}, {accel}) refused: {e}");
+        match self.executor.set_limits(&scaled) {
+            Ok(()) => self.scale_refused = false,
+            Err(e) => {
+                if !self.scale_refused {
+                    log::warn!(
+                        "stream limit scale ({speed}, {accel}) refused: {e} (repeats suppressed)"
+                    );
+                }
+                self.scale_refused = true;
+            }
         }
     }
 
@@ -171,15 +204,30 @@ impl StreamTracker for MotionStream {
                     };
                 }
                 self.hold_q = *q_out;
+                if self.fail_streak > 0 {
+                    log::info!(
+                        "stream limiter recovered after {} failed tick(s)",
+                        self.fail_streak
+                    );
+                    self.fail_streak = 0;
+                }
             }
             Err(e) => {
                 // Hold in place rather than emit garbage; the RT loop
-                // must keep ticking.
-                log::warn!("stream step failed ({e}); holding");
+                // must keep ticking. One record per streak — this site
+                // runs at the tick rate.
+                if self.fail_streak == 0 {
+                    log::warn!("stream step failed ({e}); holding (repeats suppressed)");
+                }
+                self.fail_streak = self.fail_streak.saturating_add(1);
                 *q_out = self.hold_q;
                 qd_out.fill(0.0);
             }
         }
+    }
+
+    fn faulted(&self) -> bool {
+        self.fail_streak >= self.fault_latch_ticks
     }
 }
 
@@ -189,11 +237,86 @@ mod tests {
     use par6_config::LimitMode;
     use par6_motion::MotionLimits;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Counts "stream step failed" warn records (throttle assertion).
+    static STEP_FAIL_RECORDS: AtomicUsize = AtomicUsize::new(0);
+
+    struct CountingLogger;
+    static LOGGER: CountingLogger = CountingLogger;
+
+    impl log::Log for CountingLogger {
+        fn enabled(&self, _meta: &log::Metadata) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record) {
+            if format!("{}", record.args()).contains("stream step failed") {
+                STEP_FAIL_RECORDS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        fn flush(&self) {}
+    }
 
     fn stream_limits() -> MotionLimits {
         let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let cfg = par6_config::RobotConfig::load(&path).expect("PAR6 config");
         MotionLimits::from_config(&cfg, LimitMode::Stream).expect("stream limits")
+    }
+
+    /// A failing rate limiter must hold in place, speak ONCE per streak
+    /// (its failure site runs at the tick rate), flip `faulted()` after
+    /// exactly `round(fault_latch_s / dt)` consecutive failures, and
+    /// recover cleanly the moment a step succeeds again. The failure is
+    /// the real one: a zeroed velocity ceiling that Ruckig refuses on
+    /// every update.
+    #[test]
+    fn a_failing_limiter_throttles_its_log_and_faults_after_the_window() {
+        let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
+        let limits = stream_limits();
+        let dt = 0.05;
+        let fault_latch_s = 0.5; // 10 ticks at this dt
+        let mut stream = MotionStream::new(
+            par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
+            dt,
+            limits,
+            fault_latch_s,
+        );
+        let start = [0.0; MAX_JOINTS];
+        stream.activate(&start);
+        let mut target = start;
+        target[0] = 0.3;
+        stream.set_target(&target);
+        stream.set_scale(0.0, 0.0);
+
+        let mut q = [f64::NAN; MAX_JOINTS];
+        let mut qd = [f64::NAN; MAX_JOINTS];
+        STEP_FAIL_RECORDS.store(0, Ordering::Relaxed);
+        for tick in 1..10 {
+            stream.step(&mut q, &mut qd);
+            assert!(
+                !stream.faulted(),
+                "tick {tick}: the latch window is {fault_latch_s} s = 10 ticks"
+            );
+            assert_eq!(q[0], start[0], "a failing step holds, never emits garbage");
+            assert_eq!(qd[0], 0.0);
+        }
+        stream.step(&mut q, &mut qd);
+        assert!(
+            stream.faulted(),
+            "10 consecutive failures = round(fault_latch_s / dt) must fault"
+        );
+        assert_eq!(
+            STEP_FAIL_RECORDS.load(Ordering::Relaxed),
+            1,
+            "one warn per streak, not one per 250 Hz tick"
+        );
+
+        // Recovery: a healthy scale makes the next step succeed and the
+        // fault reads clear again.
+        stream.set_scale(1.0, 1.0);
+        stream.step(&mut q, &mut qd);
+        assert!(!stream.faulted(), "a recovered limiter is healthy");
+        assert!(q[0] > start[0], "and it is tracking the target again");
     }
 
     /// A servo source nudging its target a little further every cycle —
@@ -214,6 +337,7 @@ mod tests {
             par6_motion::StreamingExecutor::new(dt, &limits).expect("executor"),
             dt,
             limits,
+            0.5,
         );
 
         let start = [0.0; MAX_JOINTS];

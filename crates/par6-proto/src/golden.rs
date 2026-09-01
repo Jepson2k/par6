@@ -858,6 +858,25 @@ pub fn vectors() -> Vec<Vector> {
             )),
         },
     ));
+    v.push(reply_vec(
+        "reply_complete_cancelled",
+        Reply::Complete {
+            index: 9,
+            ok: false,
+            detail: Some(make_error(
+                ErrorCode::MotnCancelled,
+                9,
+                &[("scope", "stop")],
+            )),
+        },
+    ));
+    v.push(reply_vec(
+        "reply_error_stream_fault",
+        Reply::Error {
+            req_id: 46,
+            error: make_error(ErrorCode::SysStreamFault, UNATTRIBUTED, &[]),
+        },
+    ));
 
     // -- RESPONSE payloads, one per query type --
     v.push(reply_vec(

@@ -16,11 +16,17 @@
 //!   (`validate_supported`), never dropped: a command that half-executes
 //!   moves the arm somewhere the client did not ask for, and the client
 //!   has no way to find out.
-//! - Cancellation (stop/estop/reset/simulator toggle/stream preemption)
-//!   drops commands WITHOUT a COMPLETE push; clients observe it through
-//!   the status stream (queue emptied, `executing_index` = −1, and for
-//!   estop a standing `SYS_ESTOP_ACTIVE` error whose ordering fails
-//!   their waits).
+//! - Cancellation (stop/estop/reset_state/simulator toggle/stream
+//!   preemption) is SPOKEN: every dropped command — the active one, the
+//!   moves blended into its motion, and the pending queue on a
+//!   queue-clearing scope — gets `COMPLETE(ok=false, MOTN_CANCELLED)`
+//!   and advances the high-water `completed_index`, so a client's wait
+//!   resolves promptly instead of running out its timeout. (A lost
+//!   cancel push therefore reads as success through the
+//!   `completed_index` fallback — the documented cost of the simple
+//!   form.) A queue-clearing `stop` latches `MOTN_CANCELLED` as the
+//!   standing error; `estop` keeps its truer `SYS_ESTOP_ACTIVE`; a
+//!   plain stop or an accepted preemption latches nothing.
 //! - A failed queued command latches its error (attributed to its
 //!   index), pushes `COMPLETE(ok=false)`, and clears the pending queue —
 //!   later commands must not run from an unexpected position. Acceptance
@@ -500,7 +506,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
         let result: Result<(), WireError> = match cmd {
             C::Estop => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("estop", dropped).await;
                 self.estop_latched = true;
                 self.runtime.rt.set_enabled(false);
                 self.standing_error =
@@ -516,10 +523,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::Stop(p) => {
-                self.cancel_active_motion();
+                let mut dropped = self.cancel_active_motion();
                 if p.clear_queue {
-                    self.pending.clear();
-                    self.blend_hold = None;
+                    dropped.extend(self.drop_pending());
+                }
+                let latch = p.clear_queue && !dropped.is_empty();
+                self.complete_cancelled("stop", dropped).await;
+                if latch {
+                    // A cleared program is a fact the operator has to
+                    // see; the next accepted motion wipes it.
+                    self.standing_error = Some(make_error(
+                        ErrorCode::MotnCancelled,
+                        UNATTRIBUTED,
+                        &[("scope", "stop")],
+                    ));
                 }
                 Ok(())
             }
@@ -548,7 +565,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 )),
             },
             C::Simulator(p) => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("the simulator switch", dropped)
+                    .await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
                 })
@@ -576,7 +595,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::ResetState => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("reset", dropped).await;
                 self.standing_error = None;
                 self.action_state = ActionState::Idle;
                 self.last_checkpoint.clear();
@@ -597,7 +617,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("the hardware connect", dropped)
+                    .await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
                 })
@@ -758,7 +780,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.cancel_stream();
                 self.drain_stream_backlog(superseded);
             }
-            self.cancel_planned();
+            let dropped = self.cancel_planned();
+            self.complete_cancelled("a streaming preemption", dropped)
+                .await;
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
@@ -788,7 +812,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.runtime.rt.cancel_stream();
                     self.drain_stream_backlog(superseded);
                 }
-                self.cancel_planned();
+                let dropped = self.cancel_planned();
+                self.complete_cancelled("a streaming preemption", dropped)
+                    .await;
                 let outcome = self.runtime.rt.stream(&cmd);
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
@@ -1082,7 +1108,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     });
                 }
                 Err(e) => {
-                    self.fail_command(pc.index, pc.addr, e).await;
+                    self.fail_command(pc.index, pc.addr, Vec::new(), e).await;
                     break;
                 }
             }
@@ -1154,58 +1180,99 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
                 Some(e) => {
                     // The whole blended motion failed. The error is
-                    // attributed to the command that started it, and the
-                    // ones folded into it are dropped exactly like the
-                    // pending queue behind them.
-                    self.fail_command(ex.index, ex.addr, e).await;
+                    // attributed to the command that started it; the
+                    // ones folded into it report their cancellation like
+                    // the pending queue behind them.
+                    self.fail_command(ex.index, ex.addr, ex.blended, e).await;
                 }
             }
         }
     }
 
     /// A queued command finished with an error: latch it (attributed),
-    /// clear the pending queue (later commands must not run from an
-    /// unexpected position), and push COMPLETE(ok=false).
-    async fn fail_command(&mut self, index: u64, addr: SocketAddr, mut e: WireError) {
+    /// push COMPLETE(ok=false), and clear the pending queue (later
+    /// commands must not run from an unexpected position) — with the
+    /// blended-away and drained commands each reporting their
+    /// cancellation rather than vanishing.
+    async fn fail_command(
+        &mut self,
+        index: u64,
+        addr: SocketAddr,
+        blended: Vec<(u64, SocketAddr)>,
+        mut e: WireError,
+    ) {
         e.command_index = index as i64;
         self.completed_index = self.completed_index.max(index as i64);
         self.standing_error = Some(e.clone());
         self.action_state = ActionState::Error;
-        self.pending.clear();
-        self.blend_hold = None;
+        let mut dropped = blended;
+        dropped.extend(self.drop_pending());
         self.push_complete(addr, index, Some(e)).await;
+        self.complete_cancelled("a failed preceding command", dropped)
+            .await;
+    }
+
+    /// Take the active command and the moves blended into its motion —
+    /// the commands a cancellation of the running motion drops.
+    fn drop_active(&mut self) -> Vec<(u64, SocketAddr)> {
+        match self.executing.take() {
+            Some(ex) => {
+                self.action_state = ActionState::Idle;
+                let mut dropped = vec![(ex.index, ex.addr)];
+                dropped.extend(ex.blended);
+                dropped
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Drain the pending queue — the commands a queue-clearing scope
+    /// drops behind the active motion.
+    fn drop_pending(&mut self) -> Vec<(u64, SocketAddr)> {
+        self.blend_hold = None;
+        self.pending.drain(..).map(|p| (p.index, p.addr)).collect()
+    }
+
+    /// Speak every drop: `COMPLETE(ok=false, MOTN_CANCELLED)` per
+    /// command, advancing the high-water mark so the queue readout moves
+    /// past them. Touches neither the standing error nor the action
+    /// state — the SCOPE decides those.
+    async fn complete_cancelled(&mut self, scope: &'static str, dropped: Vec<(u64, SocketAddr)>) {
+        for (index, addr) in dropped {
+            self.completed_index = self.completed_index.max(index as i64);
+            let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
+            self.push_complete(addr, index, Some(e)).await;
+        }
     }
 
     /// stop scope: active motion (planned + streaming) halts; the
-    /// pending queue is untouched.
-    fn cancel_active_motion(&mut self) {
+    /// pending queue is untouched. Returns the dropped commands for the
+    /// caller's [`Self::complete_cancelled`].
+    fn cancel_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        if self.executing.take().is_some() {
-            self.action_state = ActionState::Idle;
-        }
+        let dropped = self.drop_active();
         if self.active_stream.take().is_some() {
             self.runtime.rt.cancel_stream();
         }
         self.runtime.rt.halt();
+        dropped
     }
 
     /// estop / reset_state / simulator-toggle scope: everything.
-    fn cancel_all_motion(&mut self) {
-        self.cancel_active_motion();
-        self.pending.clear();
-        self.blend_hold = None;
+    fn cancel_all_motion(&mut self) -> Vec<(u64, SocketAddr)> {
+        let mut dropped = self.cancel_active_motion();
+        dropped.extend(self.drop_pending());
+        dropped
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
     /// cancelled — the queued program must not resume from wherever a
     /// manual jog left the arm.
-    fn cancel_planned(&mut self) {
+    fn cancel_planned(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        if self.executing.take().is_some() {
-            self.action_state = ActionState::Idle;
-        }
-        self.pending.clear();
-        self.blend_hold = None;
+        let mut dropped = self.drop_active();
+        dropped.extend(self.drop_pending());
+        dropped
     }
 
     /// A refused fire-and-forget command answered its sender with ERROR,

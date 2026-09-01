@@ -328,10 +328,18 @@ fn full_sim_session_over_protocol_v2() {
         "the index allocator is never reset ({i5} must follow {i4})"
     );
 
-    // Cancellation drops commands WITHOUT a COMPLETE push (jog-preempted
-    // i2, stopped i3, queue-cleared i4).
+    // Cancellation is spoken: the jog-preempted i2, the stopped i3 and
+    // the queue-cleared i4 each pushed COMPLETE(ok=false, MOTN_CANCELLED)
+    // so a waiting client resolves promptly instead of timing out.
+    c.drain();
     for i in [i2, i3, i4] {
-        assert!(!c.saw_complete(i), "cancelled command {i} pushed COMPLETE");
+        let (ok, detail) = c.wait_complete(i);
+        assert!(!ok, "cancelled command {i} must not read as success");
+        assert_eq!(
+            detail.expect("cancelled COMPLETE carries detail").code,
+            ErrorCode::MotnCancelled as u16,
+            "index {i}"
+        );
     }
 
     rig.shutdown();
@@ -478,7 +486,12 @@ fn stop_then_move_completes_without_losing_samples() {
         "the move after the stop never drove J0 to the target: {:?}",
         s.angles
     );
-    assert!(!c.saw_complete(i_long), "the stopped move pushed COMPLETE");
+    let (ok, detail) = c.wait_complete(i_long);
+    assert!(!ok, "the stopped move must report its cancellation");
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
 
     rig.shutdown();
 }

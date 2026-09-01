@@ -401,6 +401,11 @@ pub struct StreamDefaults {
     /// (hard): the executor would otherwise ramp the arm to wherever the
     /// client happened to start publishing (vendor value 0.1).
     pub start_pose_tol_rad: f64,
+    /// Consecutive rate-limiter step failures tolerated before the
+    /// runtime hard-latches `STREAM_FAULT` \[s\] — a failing limiter
+    /// holds in place, and a stream that silently holds instead of
+    /// tracking must become an error the operator can see.
+    pub fault_latch_s: f64,
 }
 
 impl Default for StreamDefaults {
@@ -410,6 +415,7 @@ impl Default for StreamDefaults {
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
             start_pose_tol_rad: 0.1,
+            fault_latch_s: 0.5,
         }
     }
 }
@@ -877,6 +883,7 @@ impl RobotConfig {
             (s.command_timeout_s, "stream.command_timeout_s"),
             (s.success_window_s, "stream.success_window_s"),
             (s.start_pose_tol_rad, "stream.start_pose_tol_rad"),
+            (s.fault_latch_s, "stream.fault_latch_s"),
         ] {
             if !is_positive(v) {
                 return Err(invalid(name, "must be > 0"));

@@ -1790,6 +1790,12 @@ impl<B: DriverBus> RtCore<B> {
                 }
                 self.stream_window(applied);
                 self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
+                if self.stream.faulted() {
+                    // The limiter is holding in place instead of
+                    // tracking; a stream that silently stops following
+                    // its setpoints must become a visible hard error.
+                    self.errors.latch(ErrorCode::StreamFault, None);
+                }
                 dispatch::law_stream(
                     &self.scratch_q,
                     &self.scratch_qd,

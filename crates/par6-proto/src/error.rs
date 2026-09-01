@@ -40,6 +40,9 @@ wire_enum! {
         MotnSettleTimeout = 36,
         /// A joint's homing FSM failed (warning; the sequence fails too).
         MotnHomingFailed = 37,
+        /// The command was cancelled before it finished (stop, estop,
+        /// preemption, or a queue clear).
+        MotnCancelled = 38,
 
         /// Command queue at capacity.
         CommQueueFull = 40,
@@ -87,6 +90,10 @@ wire_enum! {
         /// configured envelope margin (hard latch — unexpected contact
         /// or an unmodeled payload).
         SysTorqueEnvelope = 63,
+        /// The streaming rate limiter failed to produce setpoints for a
+        /// sustained interval (hard latch — the stream was silently
+        /// holding, not tracking).
+        SysStreamFault = 64,
         /// A streaming session's first setpoint was beyond the
         /// start-pose tolerance; the setpoint never applied (hard latch).
         SysStreamStartPose = 65,
@@ -373,6 +380,18 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint}'s homing FSM failed in the {phase} phase.",
             effect: "The homing sequence fails; the arm stays un-referenced.",
             remedy: "Clear the mechanism around the endstop and re-home.",
+        },
+        E::MotnCancelled => ErrorTemplate {
+            title: "Command cancelled",
+            cause: "The command was cancelled by {scope} before it finished.",
+            effect: "The motion did not run to completion.",
+            remedy: "Re-issue the command if the motion is still wanted.",
+        },
+        E::SysStreamFault => ErrorTemplate {
+            title: "Stream limiter fault",
+            cause: "The streaming rate limiter kept failing for a sustained interval.",
+            effect: "Streaming stopped; controller DISABLED; error latched.",
+            remedy: "Check the daemon log for the limiter failure, then send reset.",
         },
     }
 }

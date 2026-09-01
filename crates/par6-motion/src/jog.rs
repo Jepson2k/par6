@@ -120,9 +120,12 @@ impl JogEngine {
     /// fraction of its jog velocity limit, and 0 leaves that joint still.
     /// Joints move together, each on its own ramp.
     ///
-    /// Changing the SET of driven joints clears all direction blocks;
-    /// commanding a joint in the opposite direction clears that joint's
-    /// block — the only two ways a latched block clears.
+    /// A latch belongs to its joint: leaving the driven set clears a
+    /// joint's own block, and so does commanding it the opposite way —
+    /// the only two ways a latched block clears. A joint still driven
+    /// the same way keeps its latch whatever the rest of the set does
+    /// (wiping every block on any set change would let a limit-parked
+    /// joint drive further out the moment a second axis joined the jog).
     pub fn command(&mut self, speeds: &[f64; NUM_JOINTS]) -> Result<(), MotionError> {
         for (j, v) in speeds.iter().enumerate() {
             if !(v.is_finite() && (-1.0..=1.0).contains(v)) {
@@ -133,13 +136,12 @@ impl JogEngine {
             }
         }
         let set = speeds.map(|v| v != 0.0);
-        if set != self.last_set {
-            self.blocked = [None; NUM_JOINTS];
-        } else {
-            for (j, v) in speeds.iter().enumerate() {
-                if *v != 0.0 && self.blocked[j].is_some_and(|b| b != JogDirection::from_sign(*v)) {
-                    self.blocked[j] = None;
-                }
+        for (j, v) in speeds.iter().enumerate() {
+            let leaving = self.last_set[j] && !set[j];
+            let reversed =
+                *v != 0.0 && self.blocked[j].is_some_and(|b| b != JogDirection::from_sign(*v));
+            if leaving || reversed {
+                self.blocked[j] = None;
             }
         }
         self.active = *speeds;
@@ -213,10 +215,14 @@ impl JogEngine {
             let probe = if self.v[j] != 0.0 { self.v[j] } else { v_t };
             if probe != 0.0 {
                 let sgn = probe.signum();
+                // Remaining travel is measured, not integrated: the arm
+                // is what approaches the limit, and a stalled joint
+                // whose integrator ran ahead must not latch its whole
+                // direction while the plant is still far away.
                 let remaining = if sgn > 0.0 {
-                    self.limits.soft_max[j] - self.q[j]
+                    self.limits.soft_max[j] - qm
                 } else {
-                    self.q[j] - self.limits.soft_min[j]
+                    qm - self.limits.soft_min[j]
                 };
                 let speed = self.v[j].abs();
                 let stop = match self.profile {

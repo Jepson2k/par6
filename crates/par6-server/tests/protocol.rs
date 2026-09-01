@@ -915,6 +915,152 @@ async fn stop_estop_reset_semantics() {
     assert_eq!(i5, 5);
 }
 
+/// Cancellation is spoken, not silent: every dropped command gets
+/// COMPLETE(ok=false, MOTN_CANCELLED) — the active command, the moves
+/// blended into its motion, and the pending queue when the scope clears
+/// it — so a client's `wait_command` resolves promptly instead of
+/// running out its timeout. The scope decides the standing error: a
+/// queue-clearing stop latches MOTN_CANCELLED, estop keeps its own
+/// SYS_ESTOP_ACTIVE, and a plain stop or a streamable preemption
+/// latches nothing.
+#[tokio::test]
+async fn cancellation_pushes_complete_for_every_dropped_command() {
+    let mut h = start(|cfg| {
+        cfg.blend_hold = Duration::from_millis(150);
+        cfg.blend_lookahead = 4;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    async fn standing(c: &mut Client) -> Option<WireError> {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error } => error,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // The pump dispatches asynchronously after the ack, so every scope
+    // waits for its head command to actually START before cancelling it —
+    // otherwise the scope races the dispatch and drops a still-pending
+    // command through a different path.
+    async fn started(h: &Harness, index: u64) {
+        let deadline = tokio::time::Instant::now() + BUDGET;
+        loop {
+            if h.planner
+                .lock()
+                .unwrap()
+                .started
+                .iter()
+                .any(|(i, _)| *i == index)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "command {index} never started"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // stop {clear_queue: false}: the active command reports cancelled,
+    // the pending one survives and completes normally.
+    let i1 = c.ok_index(&move_j(901)).await;
+    let i2 = c.ok_index(&move_j(902)).await;
+    started(&h, i1).await;
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    let (ok, detail) = c.wait_complete(i1).await;
+    assert!(!ok, "a cancelled command must not read as success");
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
+    assert!(
+        standing(&mut c).await.is_none(),
+        "a plain stop leaves no standing error"
+    );
+    started(&h, i2).await;
+    h.complete_ok(i2);
+    assert!(c.wait_complete(i2).await.0, "the queue continued past i1");
+
+    // stop {clear_queue: true} against a blended motion plus a pending
+    // command: all three report cancelled and the standing error names
+    // the cancellation.
+    h.planner.lock().unwrap().consume = 2;
+    let i3 = c.ok_index(&move_j_blended(903, Some(15.0))).await;
+    let i4 = c.ok_index(&move_j_blended(904, None)).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while h.planner.lock().unwrap().started.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chain never started"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    h.planner.lock().unwrap().consume = 1;
+    let i5 = c.ok_index(&move_j(905)).await;
+    c.request(&Command::Stop(Stop { clear_queue: true })).await;
+    for i in [i3, i4, i5] {
+        let (ok, detail) = c.wait_complete(i).await;
+        assert!(!ok, "index {i} must report its cancellation");
+        assert_eq!(
+            detail.expect("cancelled COMPLETE carries detail").code,
+            ErrorCode::MotnCancelled as u16,
+            "index {i}"
+        );
+    }
+    let e = standing(&mut c).await.expect("queue-clearing stop latches");
+    assert_eq!(e.code, ErrorCode::MotnCancelled as u16);
+    assert_eq!(e.command_index, UNATTRIBUTED);
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            completed_index, ..
+        } => assert_eq!(
+            completed_index, i5 as i64,
+            "the high-water mark covers every dropped index"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // estop: the drop reports cancelled; the standing error stays the
+    // e-stop latch (the truer fact about the arm).
+    let i6 = c.ok_index(&move_j(906)).await;
+    started(&h, i6).await;
+    c.request(&Command::Estop).await;
+    let (ok, detail) = c.wait_complete(i6).await;
+    assert!(!ok);
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
+    let e = standing(&mut c).await.expect("estop stands");
+    assert_eq!(e.code, ErrorCode::SysEstopActive as u16);
+    c.request(&Command::Reset).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::SetEnabled(true)))
+        .await;
+
+    // A streamable preempting planned motion drops it the same spoken
+    // way, with nothing latched — the preempting motion was accepted.
+    let i7 = c.ok_index(&move_j(907)).await;
+    let i8 = c.ok_index(&move_j(908)).await;
+    started(&h, i7).await;
+    c.send(&jog_j()).await;
+    for i in [i7, i8] {
+        let (ok, detail) = c.wait_complete(i).await;
+        assert!(!ok, "index {i} must report its preemption");
+        assert_eq!(
+            detail.expect("cancelled COMPLETE carries detail").code,
+            ErrorCode::MotnCancelled as u16,
+            "index {i}"
+        );
+    }
+    assert!(
+        standing(&mut c).await.is_none(),
+        "an accepted preemption latches nothing"
+    );
+}
+
 /// Streaming preemption: same-type updates in place, a different type
 /// cancels + drains the socket backlog, a planned move cancels the
 /// stream, and a stream cancels planned motion.

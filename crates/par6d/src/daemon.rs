@@ -168,6 +168,7 @@ impl Daemon {
             StreamingExecutor::new(dt, &stream_limits)?,
             dt,
             stream_limits,
+            robot.stream.fault_latch_s,
         );
 
         let (cmds_tx, cmds_rx) = mpsc::channel();

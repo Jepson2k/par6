@@ -1216,6 +1216,44 @@
       ]
     },
     {
+      "file": "reply_complete_cancelled.bin",
+      "kind": "reply",
+      "msg": "COMPLETE",
+      "name": "reply_complete_cancelled",
+      "wire": [
+        5,
+        0,
+        9,
+        false,
+        [
+          9,
+          38,
+          "Command cancelled",
+          "The command was cancelled by stop before it finished.",
+          "The motion did not run to completion.",
+          "Re-issue the command if the motion is still wanted."
+        ]
+      ]
+    },
+    {
+      "file": "reply_error_stream_fault.bin",
+      "kind": "reply",
+      "msg": "ERROR",
+      "name": "reply_error_stream_fault",
+      "wire": [
+        2,
+        46,
+        [
+          -1,
+          64,
+          "Stream limiter fault",
+          "The streaming rate limiter kept failing for a sustained interval.",
+          "Streaming stopped; controller DISABLED; error latched.",
+          "Check the daemon log for the limiter failure, then send reset."
+        ]
+      ]
+    },
+    {
       "file": "response_ping.bin",
       "kind": "reply",
       "msg": "RESPONSE/PING",

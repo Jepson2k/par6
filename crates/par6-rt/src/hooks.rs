@@ -349,6 +349,13 @@ pub trait StreamTracker: Send {
     fn set_scale(&mut self, speed: f64, accel: f64);
     /// One tick: write the post-limiter position/velocity setpoint.
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
+    /// Whether the tracker's own machinery has been failing for a
+    /// sustained interval (a limiter that holds in place instead of
+    /// tracking). The core hard-latches `StreamFault` while this reads
+    /// true. Trackers with no failure mode report `false`.
+    fn faulted(&self) -> bool {
+        false
+    }
 }
 
 /// Built-in tracker: unconditional soft-limit clamp, no rate limiting

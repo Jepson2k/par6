@@ -226,8 +226,10 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
             lambda s: s.action_state == ActionState.IDLE and abs(s.speeds[0]) < 0.05,
             timeout=STEP_BUDGET_S,
         ), "the jog duration watchdog must self-terminate the motion"
-        assert await client.wait_command(preempted, timeout=1.5) is False, (
-            "a preempted command must never complete"
+        with pytest.raises(RobotError) as preempt_err:
+            await client.wait_command(preempted, timeout=STEP_BUDGET_S)
+        assert preempt_err.value.code == ErrorCode.MOTN_CANCELLED, (
+            "a preempted command must report its cancellation, not hang or succeed"
         )
 
         # -- stop {clear_queue} drops everything pending -------------------
@@ -239,7 +241,16 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         assert state is not None
         assert state.queue == []
         assert state.executing_index == -1
-        assert await client.wait_command(queued_b, timeout=1.5) is False
+        for dropped in (queued_a, queued_b):
+            with pytest.raises(RobotError) as stop_err:
+                await client.wait_command(dropped, timeout=STEP_BUDGET_S)
+            assert stop_err.value.code == ErrorCode.MOTN_CANCELLED, (
+                f"index {dropped} must report the queue-clearing stop"
+            )
+        standing = await client.error()
+        assert standing is not None and standing.code == ErrorCode.MOTN_CANCELLED, (
+            "a queue-clearing stop leaves the cancellation standing"
+        )
 
         # -- e-stop latches DISABLED with a standing error until reset -----
         assert await client.estop() == 1

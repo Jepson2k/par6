@@ -60,6 +60,8 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         make_error(ErrorCode::SysExecLinkLost, UNATTRIBUTED, &[])
     } else if has(RtCode::RtiLinkLost) {
         make_error(ErrorCode::SysRtiLinkLost, UNATTRIBUTED, &[])
+    } else if has(RtCode::StreamFault) {
+        make_error(ErrorCode::SysStreamFault, UNATTRIBUTED, &[])
     } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::StreamStartPose) {
         make_error(
             ErrorCode::SysStreamStartPose,
@@ -191,6 +193,7 @@ mod tests {
                 Some(4),
                 ErrorCode::SysStreamStartPose,
             ),
+            (RtCode::StreamFault, None, ErrorCode::SysStreamFault),
             (RtCode::LoopCritical, None, ErrorCode::SysLoopCritical),
             (RtCode::ExecLinkLost, None, ErrorCode::SysExecLinkLost),
             (RtCode::SwEstop, None, ErrorCode::SysEstopActive),
