@@ -200,6 +200,12 @@ pub struct JointConfig {
     pub encoder_bits: u8,
     /// Gear ratio motor→joint.
     pub gear_ratio: f64,
+    /// Gear ratio the SIM dynamics reflections use (rotor inertia,
+    /// motor friction); omitted = `gear_ratio`. Exists because the
+    /// vendor's dynamics table and motor config can disagree (J1: 20 in
+    /// the dynamics table vs 25 in the motor config).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dynamics_gear_ratio: Option<f64>,
     /// Gear efficiency (0–1], used in the torque→current conversion.
     pub gear_efficiency: f64,
     /// 0 = joint positive rotation matches the kinematic model, 1 = inverted.
@@ -292,6 +298,12 @@ pub struct BusConfig {
     pub rx_frames_per_tick_cap: u32,
     /// Config passes per node during boot configuration.
     pub boot_config_repeats: u8,
+    /// How long daemon startup keeps retrying a failed bus open \[s\]
+    /// (1 s pacing; 0 = fail on the first attempt). Covers the boot
+    /// race where par6d starts before the CAN driver has enumerated
+    /// the interface.
+    #[serde(default = "default_open_retry_s")]
+    pub open_retry_s: f64,
     /// Pacing between message-type batches during config load \[s\]
     /// (the TX queue silently drops on overflow).
     pub config_pace_s: f64,
@@ -416,6 +428,37 @@ impl Default for StreamDefaults {
             success_window_s: 0.4,
             start_pose_tol_rad: 0.1,
             fault_latch_s: 0.5,
+        }
+    }
+}
+
+fn default_open_retry_s() -> f64 {
+    10.0
+}
+
+/// Torque-level sim plant parameters (feature `sim-dynamics`): the
+/// motor-referred rotor dynamics the vendor models
+/// (robots/PAR6.py dynamics table — values only, no code). Reflected
+/// through each joint's dynamics gear ratio G as G²·jm (inertia),
+/// G²·b (viscous) and G·tc (Coulomb). Ignored by the kinematic plant
+/// and by hardware.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SimConfig {
+    /// Motor rotor inertia per joint \[kg·m², motor side\].
+    pub motor_jm_kg_m2: Vec<f64>,
+    /// Motor viscous friction \[Nm·s/rad, motor side\], shared.
+    pub motor_b_nm_s: f64,
+    /// Motor Coulomb friction \[Nm, motor side\], shared.
+    pub motor_tc_nm: f64,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
+            motor_b_nm_s: 1.0e-4,
+            motor_tc_nm: 0.02,
         }
     }
 }
@@ -592,6 +635,9 @@ pub struct RobotConfig {
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
+    /// Torque-level sim plant parameters. Omitted = the vendor table.
+    #[serde(default)]
+    pub sim: SimConfig,
 }
 
 impl RobotConfig {
@@ -668,6 +714,7 @@ impl RobotConfig {
         self.validate_timing()?;
         self.validate_limits()?;
         self.validate_motion()?;
+        self.validate_sim()?;
         Ok(())
     }
 
@@ -817,6 +864,9 @@ impl RobotConfig {
         if b.boot_config_repeats == 0 {
             return Err(invalid("bus.boot_config_repeats", "must be >= 1"));
         }
+        if !(b.open_retry_s.is_finite() && b.open_retry_s >= 0.0) {
+            return Err(invalid("bus.open_retry_s", "must be finite and >= 0"));
+        }
         if b.config_pace_s < 0.0 {
             return Err(invalid("bus.config_pace_s", "must be >= 0"));
         }
@@ -894,6 +944,43 @@ impl RobotConfig {
                 "stream.lowpass_cutoff_hz",
                 "must be >= 0 (0 = off)",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_sim(&self) -> Result<(), ConfigError> {
+        let sim = &self.sim;
+        if sim.motor_jm_kg_m2.len() != self.joints.len() {
+            return Err(invalid(
+                "sim.motor_jm_kg_m2",
+                "must carry one entry per joint",
+            ));
+        }
+        for (j, v) in sim.motor_jm_kg_m2.iter().enumerate() {
+            if !(v.is_finite() && *v >= 0.0) {
+                return Err(invalid(
+                    "sim.motor_jm_kg_m2",
+                    format!("entry {j} must be finite and >= 0"),
+                ));
+            }
+        }
+        for (v, name) in [
+            (sim.motor_b_nm_s, "sim.motor_b_nm_s"),
+            (sim.motor_tc_nm, "sim.motor_tc_nm"),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(invalid(name, "must be finite and >= 0"));
+            }
+        }
+        for (i, j) in self.joints.iter().enumerate() {
+            if let Some(g) = j.dynamics_gear_ratio {
+                if !is_positive(g) {
+                    return Err(invalid(
+                        "joints.dynamics_gear_ratio",
+                        format!("joint {i}: must be > 0"),
+                    ));
+                }
+            }
         }
         Ok(())
     }

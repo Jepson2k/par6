@@ -877,15 +877,112 @@ fn flash_marker() -> Box<dyn FlashMarker> {
 /// Open the hardware bus, turning the backend's bring-up diagnosis into a
 /// clean startup error (the operator needs to know which problem to fix:
 /// missing interface, no `CAP_NET_ADMIN`, wrong bitrate).
+///
+/// Startup retries for `bus.open_retry_s`: at boot the daemon can win
+/// the race against the CAN driver still enumerating the interface
+/// (systemd's device ordering only helps once the device unit exists),
+/// and a bounded retry turns that into a delay instead of a crash-loop.
 fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, DaemonError> {
     log::info!("bus backend: SocketCAN on '{}'", cfg.interface);
-    SocketCanBus::open(cfg)
-        .map_err(|e| DaemonError::Hardware(format!("{e} — run with --sim for the simulator")))
+    open_with_retry(
+        cfg.open_retry_s,
+        || SocketCanBus::open(cfg),
+        std::thread::sleep,
+    )
+    .map_err(|e| DaemonError::Hardware(format!("{e} — run with --sim for the simulator")))
+}
+
+/// The retry loop behind [`open_hardware_bus`], with the clock seam
+/// injectable: one attempt per second until `retry_s` is spent, the
+/// first attempt always runs, and the LAST error is the one reported.
+fn open_with_retry<T, E: std::fmt::Display>(
+    retry_s: f64,
+    mut open: impl FnMut() -> Result<T, E>,
+    mut wait: impl FnMut(std::time::Duration),
+) -> Result<T, E> {
+    let attempts = 1 + retry_s.max(0.0).floor() as u32;
+    let mut last = None;
+    for attempt in 1..=attempts {
+        match open() {
+            Ok(v) => {
+                if attempt > 1 {
+                    log::info!("bus open succeeded on attempt {attempt}");
+                }
+                return Ok(v);
+            }
+            Err(e) => {
+                if attempt < attempts {
+                    log::warn!("bus open attempt {attempt}/{attempts} failed ({e}); retrying");
+                    wait(std::time::Duration::from_secs(1));
+                }
+                last = Some(e);
+            }
+        }
+    }
+    Err(last.expect("at least one attempt ran"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The startup retry: a bus that appears mid-window opens (the boot
+    /// race the loop exists for), a bus that never appears fails with
+    /// the last error after exactly `1 + floor(retry_s)` second-paced
+    /// attempts, and `retry_s = 0` means one attempt and no waiting.
+    #[test]
+    fn bus_open_retries_once_per_second_until_the_window_closes() {
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let opened = open_with_retry(
+            10.0,
+            || {
+                calls += 1;
+                if calls < 4 {
+                    Err("ENODEV")
+                } else {
+                    Ok(calls)
+                }
+            },
+            |d| waits.push(d),
+        );
+        assert_eq!(opened, Ok(4), "the interface appearing mid-window opens");
+        assert_eq!(waits.len(), 3, "one second-paced wait per failed attempt");
+        assert!(waits
+            .iter()
+            .all(|d| *d == std::time::Duration::from_secs(1)));
+
+        let mut calls = 0;
+        let mut waits = Vec::new();
+        let failed: Result<u32, &str> = open_with_retry(
+            3.9,
+            || {
+                calls += 1;
+                Err("ENODEV")
+            },
+            |d| waits.push(d),
+        );
+        assert_eq!(failed, Err("ENODEV"));
+        assert_eq!(calls, 4, "1 + floor(3.9) attempts");
+        assert_eq!(waits.len(), 3, "no wait after the last attempt");
+
+        let mut calls = 0;
+        let mut waits: Vec<std::time::Duration> = Vec::new();
+        let failed: Result<u32, &str> = open_with_retry(
+            0.0,
+            || {
+                calls += 1;
+                Err("EPERM")
+            },
+            |d| waits.push(d),
+        );
+        assert_eq!(failed, Err("EPERM"));
+        assert_eq!(
+            (calls, waits.len()),
+            (1, 0),
+            "0 = fail on the first attempt"
+        );
+    }
 
     /// `--sim` supplies the relaxed bands only where the config is silent;
     /// a declared section is authoritative in both directions.

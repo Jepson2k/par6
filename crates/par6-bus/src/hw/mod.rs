@@ -34,6 +34,7 @@ mod link;
 /// The freshness clock in here is shared by every backend; the rest is
 /// SocketCAN-only (see the module doc).
 pub(crate) mod sched;
+mod xstats;
 
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime};

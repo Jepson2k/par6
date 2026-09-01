@@ -4,10 +4,12 @@ Documentation=https://github.com/Jepson2k/par6
 After=network.target
 # par6d brings the CAN link up itself when it is down (needs CAP_NET_ADMIN),
 # so the device is not a hard dependency — but do not race the driver.
+# (Startup also retries a failed can0 open for bus.open_retry_s itself.)
 After=sys-subsystem-net-devices-can0.device
-# Crash-loop guard: five failed starts inside a minute stops the retries.
-StartLimitIntervalSec=60
-StartLimitBurst=5
+# No permanent give-up: a start-limit burst would leave the arm dead until
+# someone runs `systemctl reset-failed`, which on an unattended box means
+# forever. RestartSec below is the back-off that bounds a crash loop.
+StartLimitIntervalSec=0
 
 [Service]
 Type=exec
@@ -36,8 +38,11 @@ NoNewPrivileges=yes
 # par6d pins its own RT thread to CPU 3; do NOT constrain the process
 # affinity here or that pin (and the tokio command plane) fight over cores.
 
+# Always come back, paced: 10 s between attempts caps a persistent crash
+# loop at ~6 starts/minute while recovering unattended the moment the
+# cause clears (CAN adapter re-seated, config fixed, power blip).
 Restart=always
-RestartSec=2
+RestartSec=10
 
 StandardOutput=journal
 StandardError=journal

@@ -1241,6 +1241,7 @@ impl SimBus {
                 self.dyn_tool.as_ref(),
                 &self.maps,
                 q0,
+                &robot.sim,
             )));
         }
         ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, q0, self.dt))

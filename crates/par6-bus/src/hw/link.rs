@@ -17,6 +17,8 @@ use par6_config::BusConfig;
 use socketcan::nl::CanState;
 use socketcan::CanInterface;
 
+use super::xstats;
+
 use crate::types::{LinkHealth, LinkState};
 
 /// Netlink health sampling period.
@@ -250,6 +252,15 @@ impl Drop for LinkMonitor {
 
 fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool) {
     let mut previous = LinkState::Unknown;
+    // Cumulative-counter side channel: catches a bus-off that fires and
+    // auto-recovers BETWEEN two state samples, which the state reads
+    // straight through. Unavailable (vcan, old kernels) degrades to the
+    // state-only monitor.
+    let ifidx = xstats::ifindex(iface)
+        .map_err(|e| log::debug!("CAN link monitor '{iface}': no ifindex ({e})"))
+        .ok();
+    let mut counters: Option<xstats::CanDeviceStats> = None;
+    let mut counters_missing_logged = false;
     while !stop.load(Ordering::Relaxed) {
         let state = match nl.state() {
             Ok(Some(CanState::ErrorActive | CanState::ErrorWarning)) => LinkState::Up,
@@ -263,11 +274,70 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                 LinkState::Unknown
             }
         };
-        // The kernel exposes no restart counter through this netlink
-        // attribute set, so a restart is counted where it is observable:
-        // the bus-off → recovered edge the 100 ms auto-restart produces.
+        let mut state = state;
+        let mut kernel_restarts = None;
+        if let Some(idx) = ifidx {
+            match xstats::query(idx) {
+                Ok(Some(now)) => {
+                    kernel_restarts = Some(now.restarts);
+                    if let Some(prev) = counters {
+                        let d = xstats::counter_deltas(&prev, &now);
+                        if d.rebased {
+                            log::info!(
+                                "CAN interface '{iface}': counters re-based (interface re-created)"
+                            );
+                        } else {
+                            if d.bus_off > 0 && state != LinkState::BusOff {
+                                // Report the missed event for one sample
+                                // so the RT latch sees it: frames were
+                                // lost whether or not the auto-restart
+                                // already recovered the controller.
+                                log::error!(
+                                    "CAN interface '{iface}': {} bus-off event(s) between samples",
+                                    d.bus_off
+                                );
+                                state = LinkState::BusOff;
+                            } else if d.error_passive > 0 && state == LinkState::Up {
+                                log::warn!(
+                                    "CAN interface '{iface}': {} error-passive transition(s) \
+                                     between samples",
+                                    d.error_passive
+                                );
+                                state = LinkState::ErrorPassive;
+                            }
+                        }
+                    }
+                    counters = Some(now);
+                }
+                Ok(None) => {
+                    if !counters_missing_logged {
+                        log::debug!(
+                            "CAN interface '{iface}': no device counters (vcan or old kernel); \
+                             state-only monitoring"
+                        );
+                        counters_missing_logged = true;
+                    }
+                    counters = None;
+                }
+                Err(e) => {
+                    log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
+                    counters = None;
+                }
+            }
+        }
+        match kernel_restarts {
+            // The kernel's own auto-restart counter is authoritative.
+            Some(r) => shared.restarts.store(r, Ordering::Relaxed),
+            // Without counters a restart is counted where it is
+            // observable: the bus-off -> recovered edge the 100 ms
+            // auto-restart produces.
+            None => {
+                if previous == LinkState::BusOff && state != LinkState::BusOff {
+                    shared.restarts.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
         if previous == LinkState::BusOff && state != LinkState::BusOff {
-            shared.restarts.fetch_add(1, Ordering::Relaxed);
             log::warn!("CAN interface '{iface}' recovered from bus-off");
         } else if previous != LinkState::BusOff && state == LinkState::BusOff {
             log::error!("CAN interface '{iface}' is BUS-OFF");

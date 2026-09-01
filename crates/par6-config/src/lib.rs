@@ -36,7 +36,7 @@ pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
     KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, StreamDefaults, TimingConfig,
+    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
     WatchdogAction,
 };
 
@@ -817,6 +817,38 @@ mod tests {
             "{text}\n[timing]\ncritical_factor_x = 4.0\n"
         ))
         .is_err());
+    }
+
+    /// The sim dynamics table is the vendor's motor model
+    /// (robots/PAR6.py at rcb-runtime 307477c), and J1's dynamics gear
+    /// is the 20 the vendor's dynamics were modeled with — deliberately
+    /// NOT the 25 the wire conversion uses (the vendor's own two tables
+    /// disagree; user decision 2026-09-01: follow the dynamics table,
+    /// switch to 25 if real movement proves it stale).
+    #[test]
+    fn sim_dynamics_table_matches_the_vendor_model() {
+        let robot =
+            RobotConfig::load(&config_dir().join("PAR6.toml")).expect("shipped PAR6 config");
+        assert_eq!(
+            robot.sim.motor_jm_kg_m2,
+            vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
+        );
+        assert_eq!(robot.sim.motor_b_nm_s, 1.0e-4);
+        assert_eq!(robot.sim.motor_tc_nm, 0.02);
+        assert_eq!(robot.joints[1].gear_ratio, 25.0, "wire conversion keeps 25");
+        assert_eq!(
+            robot.joints[1].dynamics_gear_ratio,
+            Some(20.0),
+            "the dynamics follow the vendor's dynamics table"
+        );
+        assert!(
+            robot
+                .joints
+                .iter()
+                .enumerate()
+                .all(|(i, j)| i == 1 || j.dynamics_gear_ratio.is_none()),
+            "every other joint's tables agree, so no override is declared"
+        );
     }
 
     /// The shipped SSG48 values are the vendor's arm-measured retune

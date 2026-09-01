@@ -186,6 +186,10 @@ pub(crate) struct JointMap {
         allow(dead_code)
     )]
     pub gear_ratio: f64,
+    /// Gear ratio the dynamics reflections use (`dynamics_gear_ratio`,
+    /// falling back to `gear_ratio` — the vendor's J1 tables disagree).
+    #[cfg_attr(not(feature = "sim-dynamics"), allow(dead_code))]
+    pub dyn_gear: f64,
     pub encoder_max_counts: i32,
 }
 
@@ -214,6 +218,7 @@ impl JointMap {
             hard_hi_rad: j.limits.hard_max_rad,
             tpr: ticks_per_radian(encoder_max_counts, j.gear_ratio),
             gear_ratio: j.gear_ratio,
+            dyn_gear: j.dynamics_gear_ratio.unwrap_or(j.gear_ratio),
             encoder_max_counts,
         }
     }
