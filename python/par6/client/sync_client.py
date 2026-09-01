@@ -250,6 +250,7 @@ class RobotClient:
         speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -263,6 +264,7 @@ class RobotClient:
                 speed=speed,
                 accel=accel,
                 r=r,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -276,6 +278,7 @@ class RobotClient:
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -287,6 +290,7 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -300,6 +304,7 @@ class RobotClient:
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -311,6 +316,7 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )

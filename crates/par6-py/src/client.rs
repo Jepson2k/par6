@@ -570,7 +570,7 @@ impl CoreClient {
     }
 
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (via, end, frame, duration, speed, accel, blend_radius))]
+    #[pyo3(signature = (via, end, frame, duration, speed, accel, blend_radius, rel=false))]
     fn move_c<'py>(
         &self,
         py: Python<'py>,
@@ -581,6 +581,7 @@ impl CoreClient {
         speed: Option<f64>,
         accel: Option<f64>,
         blend_radius: Option<f64>,
+        rel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         queued_future(
@@ -595,11 +596,13 @@ impl CoreClient {
                 speed,
                 accel,
                 blend_radius,
+                rel,
             }),
         )
     }
 
-    #[pyo3(signature = (waypoints, frame, duration, speed, accel))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (waypoints, frame, duration, speed, accel, rel=false))]
     fn move_s<'py>(
         &self,
         py: Python<'py>,
@@ -608,6 +611,7 @@ impl CoreClient {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
+        rel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         queued_future(
@@ -620,11 +624,13 @@ impl CoreClient {
                 duration,
                 speed,
                 accel,
+                rel,
             }),
         )
     }
 
-    #[pyo3(signature = (waypoints, frame, duration, speed, accel))]
+    #[allow(clippy::too_many_arguments)]
+    #[pyo3(signature = (waypoints, frame, duration, speed, accel, rel=false))]
     fn move_p<'py>(
         &self,
         py: Python<'py>,
@@ -633,6 +639,7 @@ impl CoreClient {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
+        rel: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         queued_future(
@@ -645,6 +652,7 @@ impl CoreClient {
                 duration,
                 speed,
                 accel,
+                rel,
             }),
         )
     }

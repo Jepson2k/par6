@@ -183,21 +183,40 @@ fn pose_of(q: &[f64; 4], p: [f64; 3]) -> Pose {
 /// whichever asks for more, with `max_points` bounding the whole path.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct CartSampling {
-    /// Translation pitch \[m\].
+    /// Pitch \[m\] against the chosen metric.
     pub step_m: f64,
-    /// Rotation pitch \[rad\].
-    pub step_rad: f64,
+    /// How rotation enters the metric.
+    pub rotation: RotationPitch,
     /// Ceiling on the waypoints of one path (bounds planning cost).
     pub max_points: usize,
+}
+
+/// How a piece's rotation contributes to its sample count.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RotationPitch {
+    /// Rotation counts on its own pitch \[rad\]; the piece takes the
+    /// larger of the translation and rotation counts (the MOVE_L form).
+    Independent(f64),
+    /// Rotation folds into the length metric as `√(t² + (w·θ)²)` with
+    /// weight `w` \[m/rad\] — the vendor's multi-segment path form.
+    Weighted(f64),
 }
 
 impl CartSampling {
     /// Intervals a piece of `len_m` translation and `angle_rad` rotation
     /// wants, at least one.
     fn intervals(&self, len_m: f64, angle_rad: f64) -> usize {
-        let by_len = (len_m / self.step_m).ceil() as usize;
-        let by_ang = (angle_rad / self.step_rad).ceil() as usize;
-        by_len.max(by_ang).max(1)
+        let n = match self.rotation {
+            RotationPitch::Independent(step_rad) => {
+                let by_len = (len_m / self.step_m).ceil() as usize;
+                let by_ang = (angle_rad / step_rad).ceil() as usize;
+                by_len.max(by_ang)
+            }
+            RotationPitch::Weighted(w) => {
+                (len_m.hypot(w * angle_rad) / self.step_m).ceil() as usize
+            }
+        };
+        n.max(1)
     }
 }
 
@@ -867,7 +886,7 @@ mod tests {
     fn sampling() -> CartSampling {
         CartSampling {
             step_m: 0.005,
-            step_rad: 0.05,
+            rotation: RotationPitch::Independent(0.05),
             max_points: 4000,
         }
     }
@@ -1209,6 +1228,40 @@ mod tests {
         );
     }
 
+    /// The multi-segment metric folds rotation into path length as
+    /// √(t² + (w·θ)²): a pure twist is priced at w·θ metres, a mixed
+    /// piece at the hypotenuse — never the max form the MOVE_L pitch
+    /// keeps.
+    #[test]
+    fn the_weighted_metric_prices_rotation_as_path_length() {
+        let s = CartSampling {
+            step_m: 0.002,
+            rotation: RotationPitch::Weighted(0.15),
+            max_points: 4000,
+        };
+        assert_eq!(s.intervals(0.01, 0.0), 5);
+        assert_eq!(s.intervals(0.0, 0.1), 8, "0.1 rad at 0.15 m/rad = 15 mm");
+        assert_eq!(
+            s.intervals(0.01, 0.1),
+            10,
+            "hypot(10, 15) mm, not max(5, 8)"
+        );
+        assert_eq!(s.intervals(0.0, 0.0), 1, "a degenerate piece still samples");
+
+        let ind = CartSampling {
+            step_m: 0.01,
+            rotation: RotationPitch::Independent(0.034906585),
+            max_points: 4000,
+        };
+        assert_eq!(ind.intervals(0.02, 0.0), 2);
+        assert_eq!(
+            ind.intervals(0.0, 0.07),
+            3,
+            "rotation on its own 2-degree pitch"
+        );
+        assert_eq!(ind.intervals(0.02, 0.07), 3, "the max of the two counts");
+    }
+
     #[test]
     fn the_sample_budget_bounds_a_long_path() {
         let wps: Vec<Pose> = (0..50)
@@ -1216,7 +1269,7 @@ mod tests {
             .collect();
         let s = CartSampling {
             step_m: 0.0001,
-            step_rad: 0.05,
+            rotation: RotationPitch::Independent(0.05),
             max_points: 300,
         };
         let radii = vec![0.002; wps.len() - 2];

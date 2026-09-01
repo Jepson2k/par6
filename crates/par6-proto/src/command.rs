@@ -358,6 +358,8 @@ pub struct MoveC {
     pub accel: Option<f64>,
     /// Blend radius (mm, ≥ 0); `None` = no blending.
     pub blend_radius: Option<f64>,
+    /// Interpret `via`/`end` as deltas from the pose the move starts at.
+    pub rel: bool,
 }
 
 /// MOVE_S: cubic spline through waypoints (bulk; may arrive chunked).
@@ -375,6 +377,9 @@ pub struct MoveS {
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
     pub accel: Option<f64>,
+    /// Interpret every waypoint as a delta from the pose the move
+    /// starts at (each against the START, not chained).
+    pub rel: bool,
 }
 
 /// MOVE_P: process move — constant TCP speed, auto-blended corners (bulk).
@@ -392,6 +397,9 @@ pub struct MoveP {
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
     pub accel: Option<f64>,
+    /// Interpret every waypoint as a delta from the pose the move
+    /// starts at (each against the START, not chained).
+    pub rel: bool,
 }
 
 /// SELECT_TOOL: select the active end-of-arm tool.
@@ -935,8 +943,8 @@ fn arity(tag: CmdType) -> usize {
         T::MoveJ => 9,
         T::MoveJPose => 8,
         T::MoveL => 10,
-        T::MoveC => 10,
-        T::MoveS | T::MoveP => 8,
+        T::MoveC => 11,
+        T::MoveS | T::MoveP => 9,
         T::SelectTool => 5,
         T::Delay => 4,
         T::Checkpoint => 4,
@@ -1117,6 +1125,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_opt_f64(buf, p.speed);
             w_opt_f64(buf, p.accel);
             w_opt_f64(buf, p.blend_radius);
+            w_bool(buf, p.rel);
         }
         C::MoveS(p) => {
             w_uint(buf, p.key);
@@ -1128,6 +1137,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_opt_f64(buf, p.duration);
             w_opt_f64(buf, p.speed);
             w_opt_f64(buf, p.accel);
+            w_bool(buf, p.rel);
         }
         C::MoveP(p) => {
             w_uint(buf, p.key);
@@ -1139,6 +1149,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_opt_f64(buf, p.duration);
             w_opt_f64(buf, p.speed);
             w_opt_f64(buf, p.accel);
+            w_bool(buf, p.rel);
         }
         C::SelectTool(p) => {
             w_uint(buf, p.key);
@@ -1479,6 +1490,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             speed: r.opt_f64()?,
             accel: r.opt_f64()?,
             blend_radius: r.opt_f64()?,
+            rel: r.bool()?,
         }),
         T::MoveS => Command::MoveS(MoveS {
             key: r.uint()?,
@@ -1487,6 +1499,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             duration: r.opt_f64()?,
             speed: r.opt_f64()?,
             accel: r.opt_f64()?,
+            rel: r.bool()?,
         }),
         T::MoveP => Command::MoveP(MoveP {
             key: r.uint()?,
@@ -1495,6 +1508,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             duration: r.opt_f64()?,
             speed: r.opt_f64()?,
             accel: r.opt_f64()?,
+            rel: r.bool()?,
         }),
         T::SelectTool => Command::SelectTool(SelectTool {
             key: r.uint()?,

@@ -567,10 +567,12 @@ class DryRunRobotClient:
         speed: float = 0.0,
         accel: float = 1.0,
         r: float = 0.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Circular arc through *via* to *end*, on the circle the three poses
         define; an *end* that repeats the start sweeps the whole circle.
+        With ``rel=True``, *via* and *end* are deltas from the start pose.
 
         A blend radius is refused: an arc stops at its end pose, and the
         runtime has no arc-to-successor blend to offer instead.
@@ -585,6 +587,7 @@ class DryRunRobotClient:
             "speed": speed_fraction,
             "accel": float(accel),
             "blend_radius": _blend(r),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 
@@ -596,10 +599,12 @@ class DryRunRobotClient:
         duration: float = 0.0,
         speed: float = 0.0,
         accel: float = 1.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Cubic spline through the waypoint list (every one is passed
-        through), starting from where the arm stands."""
+        through), starting from where the arm stands. With ``rel=True``,
+        every waypoint is a delta from the start pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_s",
@@ -608,6 +613,7 @@ class DryRunRobotClient:
             "duration": min_duration,
             "speed": speed_fraction,
             "accel": float(accel),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 
@@ -619,11 +625,13 @@ class DryRunRobotClient:
         duration: float = 0.0,
         speed: float = 0.0,
         accel: float = 1.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Process move: the waypoints as straight segments with every
         interior corner rounded by the planner's auto-blend rule, so the TCP
-        sweeps the path without stopping."""
+        sweeps the path without stopping. With ``rel=True``, every waypoint
+        is a delta from the start pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_p",
@@ -632,6 +640,7 @@ class DryRunRobotClient:
             "duration": min_duration,
             "speed": speed_fraction,
             "accel": float(accel),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 

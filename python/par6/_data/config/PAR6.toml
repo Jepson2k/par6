@@ -577,8 +577,9 @@ fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT l
 # same file, so a tuned deployment previews the way it runs.
 jog_l_linear_max_m_s = 0.08
 jog_l_angular_max_rad_s = 0.6
-cart_step_m = 0.005
-cart_step_rad = 0.05
+cart_step_m = 0.01          # move_l pitch (vendor 10 mm / 2 deg)
+cart_step_rad = 0.034906585
+path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (0.15*rot)^2)
 move_l_max_joint_step_rad = 0.35
 dls_lambda = 0.05
 settle_tolerance_rad = 0.01

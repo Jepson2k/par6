@@ -214,6 +214,14 @@ pub trait Planner: Send {
     /// already decided — never a fresh check.
     fn collision(&mut self) -> Option<CollisionState>;
 
+    /// Planner-side warnings for the STATUS `warnings` slot (merged with
+    /// the RT latch's own), e.g. a near-singular cartesian path. Read at
+    /// the status cadence — a read of what planning already decided,
+    /// never fresh work. Planners with nothing to report return empty.
+    fn warnings(&self) -> Vec<WireError> {
+        Vec::new()
+    }
+
     /// Drop the latched collision verdict. The server calls this when it
     /// accepts a motion command, so a refusal's pairs never outlive the
     /// motion that produced them.

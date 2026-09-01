@@ -718,6 +718,22 @@ pub fn vectors() -> Vec<Vector> {
             speed: None,
             accel: None,
             blend_radius: None,
+            rel: false,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_move_c_rel",
+        79,
+        Command::MoveC(MoveC {
+            key: 109,
+            via: [10.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+            end: [20.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            frame: Frame::Wrf,
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: true,
         }),
     ));
     v.push(cmd_vec(
@@ -734,6 +750,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.6),
             accel: None,
+            rel: false,
         }),
     ));
     v.push(cmd_vec(
@@ -749,6 +766,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.3),
             accel: Some(0.4),
+            rel: false,
         }),
     ));
     v.push(cmd_vec(
@@ -868,6 +886,17 @@ pub fn vectors() -> Vec<Vector> {
                 9,
                 &[("scope", "stop")],
             )),
+        },
+    ));
+    v.push(reply_vec(
+        "reply_error_near_singularity",
+        Reply::Error {
+            req_id: 47,
+            error: make_error(
+                ErrorCode::TrajNearSingularity,
+                UNATTRIBUTED,
+                &[("cond", "2400"), ("sigma", "0.00007")],
+            ),
         },
     ));
     v.push(reply_vec(
@@ -1199,6 +1228,7 @@ fn chunk_vectors() -> Vec<Vector> {
         duration: None,
         speed: Some(0.5),
         accel: None,
+        rel: false,
     });
     let mut payload = Vec::new();
     encode_command(&inner, 300, &mut payload).expect("valid inner command");

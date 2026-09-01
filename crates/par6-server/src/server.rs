@@ -1734,7 +1734,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             mode: Self::wire_mode(self.snap.mode),
             enabled: self.snap.state == ArmState::Enabled,
             gravity_comp: self.snap.gravity_comp,
-            warnings: crate::faults::rt_warnings(&self.snap),
+            warnings: {
+                let mut w = crate::faults::rt_warnings(&self.snap);
+                w.extend(self.runtime.planner.warnings());
+                w
+            },
             link_health: Self::wire_link_health(&self.snap.link),
             homing: Self::wire_homing(&self.snap.homing),
             torques_ext: {

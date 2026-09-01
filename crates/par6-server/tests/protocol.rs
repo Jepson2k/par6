@@ -174,6 +174,8 @@ struct PlannerState {
     estimates: usize,
     /// Seconds the in-flight motion reports it has left.
     inflight_duration: f64,
+    /// Planner-side warnings the trait hands the STATUS builder.
+    warnings: Vec<WireError>,
 }
 
 #[derive(Clone)]
@@ -238,6 +240,52 @@ impl Planner for TestPlanner {
     }
     fn inflight_duration(&self, _snap: &StateSnapshot) -> f64 {
         self.0.lock().unwrap().inflight_duration
+    }
+    fn warnings(&self) -> Vec<WireError> {
+        self.0.lock().unwrap().warnings.clone()
+    }
+}
+
+/// Planner-side warnings ride the STATUS `warnings` slot alongside the
+/// RT latch's own — the path a near-singular cartesian plan takes to
+/// the operator's banner.
+#[tokio::test]
+async fn planner_warnings_reach_the_status_broadcast() {
+    let mut h = start(|_| {}).await;
+    h.planner.lock().unwrap().warnings = vec![make_error(
+        ErrorCode::TrajNearSingularity,
+        UNATTRIBUTED,
+        &[("cond", "2400"), ("sigma", "0.00007")],
+    )];
+    h.publish(|_| {});
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.warnings
+            .iter()
+            .any(|w| w.code == ErrorCode::TrajNearSingularity as u16)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the planner warning never reached STATUS: {:?}",
+            s.warnings
+        );
+    }
+    // ...and it clears from the broadcast when the planner drops it.
+    h.planner.lock().unwrap().warnings.clear();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.warnings.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleared warning still broadcasts: {:?}",
+            s.warnings
+        );
     }
 }
 
@@ -558,6 +606,7 @@ fn move_s(key: u64, n: usize) -> Command {
         duration: Some(2.0),
         speed: None,
         accel: None,
+        rel: false,
     })
 }
 

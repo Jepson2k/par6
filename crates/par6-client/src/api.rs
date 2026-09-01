@@ -356,6 +356,7 @@ impl Client {
         speed: Option<f64>,
         accel: Option<f64>,
         blend_radius: Option<f64>,
+        rel: bool,
     ) -> Result<Option<u64>, ClientError> {
         self.queued(Command::MoveC(cmd::MoveC {
             key: self.fresh_key(),
@@ -366,6 +367,7 @@ impl Client {
             speed,
             accel,
             blend_radius,
+            rel,
         }))
         .await
     }
@@ -378,6 +380,7 @@ impl Client {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
+        rel: bool,
     ) -> Result<Option<u64>, ClientError> {
         self.queued(Command::MoveS(cmd::MoveS {
             key: self.fresh_key(),
@@ -386,6 +389,7 @@ impl Client {
             duration,
             speed,
             accel,
+            rel,
         }))
         .await
     }
@@ -398,6 +402,7 @@ impl Client {
         duration: Option<f64>,
         speed: Option<f64>,
         accel: Option<f64>,
+        rel: bool,
     ) -> Result<Option<u64>, ClientError> {
         self.queued(Command::MoveP(cmd::MoveP {
             key: self.fresh_key(),
@@ -406,6 +411,7 @@ impl Client {
             duration,
             speed,
             accel,
+            rel,
         }))
         .await
     }

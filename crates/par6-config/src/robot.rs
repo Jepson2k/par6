@@ -538,12 +538,21 @@ pub struct MotionConfig {
     pub jog_l_linear_max_m_s: f64,
     /// Full-scale `jog_l` angular TCP speed \[rad/s\].
     pub jog_l_angular_max_rad_s: f64,
-    /// Cartesian sampling pitch: one IK waypoint per this much
+    /// MOVE_L sampling pitch: one IK waypoint per this much
     /// translation \[m\] …
     pub cart_step_m: f64,
     /// … or per this much rotation \[rad\], whichever yields more
-    /// waypoints.
+    /// waypoints (vendor: 2°).
     pub cart_step_rad: f64,
+    /// Multi-segment cartesian paths (arc, spline, process move, blend
+    /// chains) sample much finer, on the combined length metric
+    /// √(t² + (0.15·θ)²) \[m\] — the vendor's path pitch.
+    pub path_step_m: f64,
+    /// Joint-space blend-chain pitch \[rad\]; omitted = half the
+    /// per-tick travel at the full EXEC velocity norm
+    /// (0.5·‖v_exec‖·dt, floored at 0.01 — the vendor rule).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub joint_step_rad: Option<f64>,
     /// Largest joint change allowed between consecutive cartesian IK
     /// waypoints \[rad\]; a bigger jump means the solver hopped to
     /// another IK branch and the commanded path would whip the arm.
@@ -563,8 +572,10 @@ impl Default for MotionConfig {
         Self {
             jog_l_linear_max_m_s: 0.08,
             jog_l_angular_max_rad_s: 0.6,
-            cart_step_m: 0.005,
-            cart_step_rad: 0.05,
+            cart_step_m: 0.01,
+            cart_step_rad: 0.034906585,
+            path_step_m: 0.002,
+            joint_step_rad: None,
             move_l_max_joint_step_rad: 0.35,
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
@@ -1027,6 +1038,8 @@ impl RobotConfig {
             (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
             (m.cart_step_m, "motion.cart_step_m"),
             (m.cart_step_rad, "motion.cart_step_rad"),
+            (m.path_step_m, "motion.path_step_m"),
+            (m.joint_step_rad.unwrap_or(0.01), "motion.joint_step_rad"),
             (
                 m.move_l_max_joint_step_rad,
                 "motion.move_l_max_joint_step_rad",

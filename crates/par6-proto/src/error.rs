@@ -23,6 +23,9 @@ wire_enum! {
         TrajEmptyResult = 20,
         /// Trajectory timing produced zero steps.
         TrajNoSteps = 21,
+        /// The planned cartesian path passes near a singular
+        /// configuration (warning; the motion still runs).
+        TrajNearSingularity = 22,
 
         /// Homing did not start/finish in time.
         MotnHomeTimeout = 30,
@@ -205,6 +208,12 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Trajectory timing produced zero samples. {detail}",
             effect: "Motion command rejected.",
             remedy: "Increase the duration or reduce the speed fraction.",
+        },
+        E::TrajNearSingularity => ErrorTemplate {
+            title: "Near-singular path",
+            cause: "The planned path passes near a singular configuration                     (condition {cond}, sigma_min {sigma}).",
+            effect: "Warning only; motion continues with degraded cartesian accuracy.",
+            remedy: "Re-route the segment away from the singular pose if precision matters.",
         },
         E::MotnHomeTimeout => ErrorTemplate {
             title: "Homing timeout",

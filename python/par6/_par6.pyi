@@ -113,6 +113,7 @@ class CoreClient:
         speed: float | None,
         accel: float | None,
         blend_radius: float | None,
+        rel: bool = False,
     ) -> Awaitable[int]: ...
     def move_s(
         self,
@@ -121,6 +122,7 @@ class CoreClient:
         duration: float | None,
         speed: float | None,
         accel: float | None,
+        rel: bool = False,
     ) -> Awaitable[int]: ...
     def move_p(
         self,
@@ -129,6 +131,7 @@ class CoreClient:
         duration: float | None,
         speed: float | None,
         accel: float | None,
+        rel: bool = False,
     ) -> Awaitable[int]: ...
     def select_tool(
         self, tool_name: str, variant_key: str | None

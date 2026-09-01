@@ -730,11 +730,15 @@ class AsyncRobotClient(_RobotClientABC):
         speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
+        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Circular arc through *via* to *end*.
+
+        With ``rel=True``, *via* and *end* are deltas from the pose the
+        move starts at (each against the start, not chained).
 
         Category: Motion
 
@@ -752,6 +756,7 @@ class AsyncRobotClient(_RobotClientABC):
                 s,
                 float(accel),
                 _blend(r),
+                bool(rel),
             )
         )
         return await self._finish_queued(index, wait, timeout)
@@ -764,6 +769,7 @@ class AsyncRobotClient(_RobotClientABC):
         duration: float | None,
         speed: float | None,
         accel: float,
+        rel: bool,
         wait: bool,
         timeout: float,
     ) -> int:
@@ -771,7 +777,7 @@ class AsyncRobotClient(_RobotClientABC):
         d, s = _timing(duration, speed)
         wps = [_f6(wp, "waypoint") for wp in waypoints]
         index = await self._call(
-            getattr(core, method)(wps, _wire_frame(frame), d, s, float(accel))
+            getattr(core, method)(wps, _wire_frame(frame), d, s, float(accel), bool(rel))
         )
         return await self._finish_queued(index, wait, timeout)
 
@@ -783,11 +789,15 @@ class AsyncRobotClient(_RobotClientABC):
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Cubic spline move through waypoints (auto-chunked when large).
+
+        With ``rel=True``, every waypoint is a delta from the pose the
+        move starts at (each against the start, not chained).
 
         Category: Motion
 
@@ -795,7 +805,7 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.move_s(<waypoints>, speed=0.5)
         """
         return await self._move_multi(
-            "move_s", waypoints, frame, duration, speed, accel, wait, timeout
+            "move_s", waypoints, frame, duration, speed, accel, rel, wait, timeout
         )
 
     async def move_p(
@@ -806,11 +816,15 @@ class AsyncRobotClient(_RobotClientABC):
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Process move with auto-blending through waypoints (auto-chunked).
+
+        With ``rel=True``, every waypoint is a delta from the pose the
+        move starts at (each against the start, not chained).
 
         Category: Motion
 
@@ -818,7 +832,7 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.move_p(<waypoints>, speed=0.5)
         """
         return await self._move_multi(
-            "move_p", waypoints, frame, duration, speed, accel, wait, timeout
+            "move_p", waypoints, frame, duration, speed, accel, rel, wait, timeout
         )
 
     # ------------------------------------------------------------------

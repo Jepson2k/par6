@@ -579,6 +579,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         speed: None,
         accel: None,
         blend_radius: Some(5.0),
+        rel: false,
     }));
     assert_eq!(
         err.code,

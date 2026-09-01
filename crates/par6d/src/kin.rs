@@ -533,6 +533,39 @@ impl CartKin {
     /// linear rows are moved to that point (`v_tcp = v_model + ω × r`,
     /// `r = R·d`) — otherwise a pure rotation jog would pivot the arm
     /// about the flange while FK reported the offset point moving.
+    /// Singularity metrics of the arm jacobian at `q`: `(sigma_min,
+    /// condition)`, the smallest singular value and the max/min ratio
+    /// (capped at 1e12 — a rank-deficient J has no finite condition).
+    /// Singular values come from the eigenvalues of the 6x6 `J·Jᵀ`
+    /// (Jacobi rotations; symmetric PSD by construction).
+    pub(crate) fn singularity(&mut self, q: &[f64; NQ]) -> Result<(f64, f64), String> {
+        self.kin
+            .jacobian(q, &mut self.jac)
+            .map_err(|e| format!("jacobian failed: {e}"))?;
+        let mut a = [[0.0f64; 6]; 6];
+        for (r, row) in a.iter_mut().enumerate() {
+            for (c, v) in row.iter_mut().enumerate() {
+                let mut sum = 0.0;
+                for k in 0..NQ {
+                    sum += self.jac[r * NQ + k] * self.jac[c * NQ + k];
+                }
+                *v = sum;
+            }
+        }
+        let eig = sym6_eigenvalues(&mut a);
+        let sigma_max = eig.iter().fold(0.0f64, |m, &l| m.max(l.max(0.0))).sqrt();
+        let sigma_min = eig
+            .iter()
+            .fold(f64::INFINITY, |m, &l| m.min(l.max(0.0)))
+            .sqrt();
+        let condition = if sigma_min > sigma_max / 1e12 {
+            sigma_max / sigma_min
+        } else {
+            1e12
+        };
+        Ok((sigma_min, condition))
+    }
+
     pub(crate) fn twist_to_qd(&mut self, q: &[f64; NQ], v: &[f64; 6]) -> Result<[f64; NQ], String> {
         let d = self.offset.get();
         let r = if d == [0.0; 3] {
@@ -589,6 +622,50 @@ impl CartKin {
 /// Solve the 6x6 system `A·x = b` in place (partial-pivot Gaussian
 /// elimination). `None` when a pivot vanishes (the DLS damping makes
 /// that unreachable for real jacobians; this is pure defense).
+/// Eigenvalues of a symmetric 6x6 by cyclic Jacobi rotations. The input
+/// is destroyed; convergence to ~1e-12 off-diagonal mass takes a handful
+/// of sweeps for the well-scaled `J·Jᵀ` matrices this serves.
+#[allow(clippy::needless_range_loop)] // (p,q) plane rotations mutate rows AND columns
+fn sym6_eigenvalues(a: &mut [[f64; 6]; 6]) -> [f64; 6] {
+    for _sweep in 0..32 {
+        let mut off = 0.0;
+        for p in 0..6 {
+            for q in (p + 1)..6 {
+                off += a[p][q] * a[p][q];
+            }
+        }
+        if off < 1e-24 {
+            break;
+        }
+        for p in 0..6 {
+            for q in (p + 1)..6 {
+                if a[p][q].abs() < 1e-30 {
+                    continue;
+                }
+                let theta = (a[q][q] - a[p][p]) / (2.0 * a[p][q]);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for k in 0..6 {
+                    let (akp, akq) = (a[k][p], a[k][q]);
+                    a[k][p] = c * akp - s * akq;
+                    a[k][q] = s * akp + c * akq;
+                }
+                for k in 0..6 {
+                    let (apk, aqk) = (a[p][k], a[q][k]);
+                    a[p][k] = c * apk - s * aqk;
+                    a[q][k] = s * apk + c * aqk;
+                }
+            }
+        }
+    }
+    let mut out = [0.0; 6];
+    for (i, v) in out.iter_mut().enumerate() {
+        *v = a[i][i];
+    }
+    out
+}
+
 fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
     let mut x = *b;
     for col in 0..6 {
@@ -621,6 +698,45 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The jacobian singularity metrics on the REAL arm model: the
+    /// straight-wrist configuration (q5 = 0 aligns the J4/J6 axes) must
+    /// cross the vendor's warning thresholds, and a healthy working
+    /// pose must not — the two sides that make the near-singularity
+    /// warning a signal instead of a constant.
+    #[test]
+    fn wrist_singularity_crosses_the_vendor_thresholds_and_a_healthy_pose_does_not() {
+        let config =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let assets = resolve_assets_dir(None, &config).expect("assets tree");
+        let bundle = par6_config::ConfigBundle::load(&config).expect("bundle");
+        let kin = load_kin(&assets, GripperVariant::Flange).expect("model");
+        let window = SoftWindow::from_config(&bundle.robot);
+        let mut cart = CartKin::new(kin, ToolOffset::new(), window, 0.05);
+
+        // Wrist straight: J4 and J6 axes align, rank drops.
+        let singular = [
+            0.0,
+            -std::f64::consts::FRAC_PI_2,
+            std::f64::consts::PI,
+            0.0,
+            0.0,
+            std::f64::consts::PI,
+        ];
+        let (sigma, cond) = cart.singularity(&singular).expect("metrics");
+        assert!(
+            cond > 1000.0 || sigma < 1e-4,
+            "the straight wrist must read singular: sigma {sigma:.6}, cond {cond:.0}"
+        );
+
+        // A bent working pose keeps its distance from every singularity.
+        let healthy = [0.3, -1.2, 2.4, 0.4, -0.9, 2.0];
+        let (sigma, cond) = cart.singularity(&healthy).expect("metrics");
+        assert!(
+            cond <= 1000.0 && sigma >= 1e-4,
+            "a bent pose must read healthy: sigma {sigma:.6}, cond {cond:.0}"
+        );
+    }
 
     /// Every tool par6 ships resolves to a model that is actually on
     /// disk, and the ones that have their own tree get it.
