@@ -104,6 +104,18 @@ wire_enum! {
         Pause = 24,
         /// Set the runtime payload (mass/COM/inertia at the TCP frame).
         SetPayload = 25,
+        /// Enter FLASHING (bus-silent maintenance window for the vendor
+        /// firmware flasher). Carries the mandatory human park assertion;
+        /// reachable only from IDLE and ACTIVE_ERROR, and deliberately
+        /// NOT gated on enabled/homed — a faulted arm still needs its
+        /// firmware fixed. The ack waits for the mode to actually change.
+        EnterFlashing = 26,
+        /// Leave FLASHING: bus wakes, stored driver config is re-pushed,
+        /// homing is invalidated if firmware was flashed.
+        ExitFlashing = 27,
+        /// Push per-node drive tuning (cascade-PID gains + limits) live,
+        /// through the same stored-config path a boot pass uses.
+        SetPidGains = 28,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -292,6 +304,21 @@ wire_enum! {
 }
 
 wire_enum! {
+    /// The human assertion ENTER_FLASHING must carry — what the operator
+    /// vouches for before the runtime silences the bus and hands it to a
+    /// firmware flasher. There is no "none": a datagram without an
+    /// assertion does not decode.
+    FlashingAssertion: u8 {
+        /// "The arm is parked on its rest": the normal maintenance entry.
+        Parked = 1,
+        /// "Silence the bus regardless of pose" — bench and recovery work
+        /// where the arm may be unpowered, dismounted, or mid-repair. The
+        /// operator owns whatever the unpowered arm does next.
+        Force = 2,
+    }
+}
+
+wire_enum! {
     /// State of an end-of-arm tool (mirrors waldoctl).
     ToolState: u8 {
         /// Tool powered off / not present.
@@ -380,7 +407,10 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetShapes
         | C::SetCompletionPolicy
         | C::SetRecipe
-        | C::SetPayload => CommandClass::System,
+        | C::SetPayload
+        | C::EnterFlashing
+        | C::ExitFlashing
+        | C::SetPidGains => CommandClass::System,
 
         C::Ping
         | C::Status

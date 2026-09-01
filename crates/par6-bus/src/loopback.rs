@@ -16,8 +16,8 @@ use par6_config::{GripperConfig, RobotConfig};
 use crate::bus::DriverBus;
 use crate::hw::sched::FreshnessClock;
 use crate::types::{
-    BusError, BusState, DeviceInfo, ErrorFlags, Freshness, GripperCommand, GripperReply, HallState,
-    JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
+    BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, Freshness, GripperCommand, GripperReply,
+    HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
 };
 
 /// A decoded reply a test injects into the loopback RX queue.
@@ -133,6 +133,13 @@ pub enum TxRecord {
     ConfigPass {
         /// Target node.
         node: NodeId,
+    },
+    /// A live drive retune preceding its config passes.
+    Retune {
+        /// Target node.
+        node: NodeId,
+        /// The tune stored and pushed.
+        tune: DriveTune,
     },
 }
 
@@ -433,6 +440,22 @@ impl DriverBus for LoopbackBus {
 
     fn resend_node_config(&mut self, node: NodeId, repeats: u8) -> Result<(), BusError> {
         self.ensure_ready()?;
+        for _ in 0..repeats {
+            self.record_config_pass(node);
+        }
+        Ok(())
+    }
+
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if !self.joint_nodes.contains(&node) && node != self.gripper_node {
+            return Err(BusError::InvalidCommand {
+                reason: "retune_node for a node with no stored configuration",
+            });
+        }
+        let tick = self.tick;
+        self.tx_log
+            .push((tick, TxRecord::Retune { node, tune: *tune }));
         for _ in 0..repeats {
             self.record_config_pass(node);
         }

@@ -524,6 +524,26 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.wait_command(command_index, timeout))
 
+    async def command_verdict(self, command_index: int) -> int | None:
+        """Settle verdict from *command_index*'s completion push.
+
+        For a completed gripper ``move``: 1 = object detected while
+        closing, 2 = object detected while opening, 3 = target reached
+        with no object — the atomic pick check (polling
+        :meth:`tool_status` afterwards races the next queued motion).
+        None for non-tool commands and commands that have not completed
+        yet, so call it after a ``wait=True`` action or
+        :meth:`wait_command`.
+
+        Category: Synchronization
+
+        Example:
+            idx = rbt.tool_action("ELECTRIC", "move", [1.0, 0.5, 600], wait=True)
+            caught = rbt.command_verdict(idx) == 1
+        """
+        core = await self._ensure_core()
+        return core.command_verdict(command_index)
+
     async def wait_checkpoint(self, label: str, timeout: float = 30.0) -> bool:
         """Block until the checkpoint *label* is reached.
 
@@ -777,7 +797,9 @@ class AsyncRobotClient(_RobotClientABC):
         d, s = _timing(duration, speed)
         wps = [_f6(wp, "waypoint") for wp in waypoints]
         index = await self._call(
-            getattr(core, method)(wps, _wire_frame(frame), d, s, float(accel), bool(rel))
+            getattr(core, method)(
+                wps, _wire_frame(frame), d, s, float(accel), bool(rel)
+            )
         )
         return await self._finish_queued(index, wait, timeout)
 
@@ -1202,6 +1224,85 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         return await self._call(core.select_profile(profile.upper()))
+
+    async def enter_flashing(self, assertion: str) -> int:
+        """Hand the CAN bus to a firmware flasher (bus-silent FLASHING).
+
+        *assertion* is the operator's vouching, and there is no default:
+        ``"parked"`` (the arm is on its rest) or ``"force"`` (silence the
+        bus regardless of pose — bench/recovery work).  Only reachable
+        from IDLE and ACTIVE_ERROR; deliberately not gated on enabled or
+        homed.  The call resolves once the mode actually changed, and
+        raises :class:`RobotError` when the runtime refused it.
+
+        Category: Configuration
+
+        Example:
+            rbt.enter_flashing("parked")
+        """
+        core = await self._ensure_core()
+        return await self._call(core.enter_flashing(assertion))
+
+    async def exit_flashing(self) -> int:
+        """Take the CAN bus back after flashing: the bus wakes, stored
+        driver config is re-pushed, and homing is invalidated if firmware
+        was actually flashed.  Refused when not in FLASHING.
+
+        Category: Configuration
+
+        Example:
+            rbt.exit_flashing()
+        """
+        core = await self._ensure_core()
+        return await self._call(core.exit_flashing())
+
+    async def set_pid_gains(
+        self,
+        node: int,
+        *,
+        kpp: float,
+        kpv: float,
+        kiv: float,
+        kpiq: float,
+        kiiq: float,
+        kp: float,
+        kd: float,
+        ilim_ma: float,
+        velocity_limit_ticks_s: float,
+        voltage_limit_mv: int = 0,
+    ) -> int:
+        """Push one drive node's tuning live, through the same stored
+        config path a boot pass uses (so reconnect resends keep it).
+
+        Every gain is required — the frame replaces the node's whole
+        tuple, so a partial call would silently zero what it omitted.
+        ``voltage_limit_mv=0`` means "use VBUS".  The node id must be a
+        configured drive (a joint node, or the gripper node when a CAN
+        gripper is fitted); anything else raises :class:`RobotError`.
+
+        Category: Configuration
+
+        Example:
+            rbt.set_pid_gains(2, kpp=9.0, kpv=0.05, kiv=0.005, kpiq=1.2,
+                              kiiq=1.0, kp=0.12, kd=0.002, ilim_ma=2200,
+                              velocity_limit_ticks_s=150000)
+        """
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_pid_gains(
+                int(node),
+                float(kpp),
+                float(kpv),
+                float(kiv),
+                float(kpiq),
+                float(kiiq),
+                float(kp),
+                float(kd),
+                float(ilim_ma),
+                float(velocity_limit_ticks_s),
+                int(voltage_limit_mv),
+            )
+        )
 
     async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm, composed on top of the current tool
@@ -1676,8 +1777,10 @@ class AsyncRobotClient(_RobotClientABC):
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
         ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
-        name), and ``joints`` (per-joint soft limits + EXEC
-        velocity/acceleration).  Returns None if unreachable.
+        name), ``joints`` (per-joint soft limits + EXEC
+        velocity/acceleration), ``active_recipe`` (the running telemetry
+        recipe, or None when telemetry is off) and ``recipes`` (the names
+        :meth:`set_recipe` accepts).  Returns None if unreachable.
 
         Category: Query
 

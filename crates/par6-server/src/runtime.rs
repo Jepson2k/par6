@@ -24,6 +24,12 @@ pub struct CommandOutcome {
     /// overwrites `command_index` with the queue index before it goes on
     /// the wire, so implementations may leave it unattributed.
     pub error: Option<WireError>,
+    /// Settle verdict on a successful tool move, straight off the
+    /// gripper reply (1 = object while closing, 2 = object while
+    /// opening, 3 = target reached, no object); `None` elsewhere. Rides
+    /// the COMPLETE push so a pick verifies atomically instead of racing
+    /// a TOOL_STATUS poll against the next queued motion.
+    pub verdict: Option<u8>,
 }
 
 /// Per-joint / per-axis enablement flags (freedom before hitting limits),
@@ -323,6 +329,32 @@ pub trait RtCommands: Send {
 
     /// Set one digital output (`port` 0..=7, `value` 0/1).
     fn write_io(&mut self, port: u8, value: u8);
+
+    /// Ask the RT to enter FLASHING: assert the human park vouching and
+    /// request the mode. Like an enable this is a REQUEST — the core
+    /// refuses it outside IDLE/ACTIVE_ERROR, asynchronously — so
+    /// implementations start it here and publish the verdict through
+    /// [`take_flashing_outcome`](RtCommands::take_flashing_outcome).
+    fn enter_flashing(&mut self);
+
+    /// Ask the RT to leave FLASHING (mode back to IDLE; the bus wakes and
+    /// the stored config is re-pushed). Same deferred-verdict discipline
+    /// as [`enter_flashing`](RtCommands::enter_flashing). Only called
+    /// when the reported mode IS `Flashing` — the server refuses an exit
+    /// from any other mode, because `SetMode(Idle)` from a working mode
+    /// would cancel motion the client never asked to stop.
+    fn exit_flashing(&mut self);
+
+    /// Take the outcome of the last `enter_flashing`/`exit_flashing`
+    /// request once the published mode answers it: `Some(Ok(()))` when
+    /// the mode reached the requested one, `Some(Err(..))` when the
+    /// window closed without it. Each outcome is delivered exactly once.
+    fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>>;
+
+    /// Push one node's drive tuning through the stored boot-config path
+    /// (`SET_PID_GAINS`). The server has already validated the values
+    /// (codec) and the node id (config), so this only forwards.
+    fn set_pid_gains(&mut self, gains: &par6_proto::command::SetPidGains);
 
     /// Halt the tool's jaws in place now, out-of-band of the queue.
     ///

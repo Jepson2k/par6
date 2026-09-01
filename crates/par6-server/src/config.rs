@@ -112,6 +112,11 @@ pub struct ServerConfig {
     /// naming the line count the box actually has. Empty = a box that
     /// drives no outputs, and every `write_io` is refused.
     pub digital_outputs: Vec<String>,
+    /// CAN node ids `set_pid_gains` may target (the configured joint
+    /// nodes plus the CAN gripper node when one is fitted). Empty = a
+    /// runtime with no tunable drives, and every `set_pid_gains` is
+    /// refused.
+    pub tunable_nodes: Vec<u8>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -180,7 +185,8 @@ impl Default for ServerConfig {
             probe_timeout: Duration::from_millis(200),
             rt_tick_rate_hz: 250.0,
             link_stale: Duration::from_millis(200),
-            queue_capacity: 128,
+            // Vendor parity: rcb-runtime's queue admits 256 before FULL.
+            queue_capacity: 256,
             dedup_window: 256,
             chunk_timeout: Duration::from_secs(2),
             poll_interval: Duration::from_millis(2),
@@ -196,6 +202,7 @@ impl Default for ServerConfig {
             tool_dof: 0,
             cartesian: true,
             digital_outputs: Vec::new(),
+            tunable_nodes: Vec::new(),
             profiles: vec!["default".to_owned()],
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],

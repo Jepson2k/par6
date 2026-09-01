@@ -1108,6 +1108,12 @@ impl<B: DriverBus> RtCore<B> {
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
+            RtCommand::RetuneNode { node, tune } => {
+                match self.bus.retune_node(node, &tune, self.boot.config_repeats) {
+                    Ok(()) => log::info!("node {node} retuned (drive gains/limits pushed)"),
+                    Err(e) => log::error!("retune of node {node} refused: {e}"),
+                }
+            }
         }
     }
 

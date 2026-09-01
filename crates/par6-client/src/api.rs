@@ -244,6 +244,29 @@ impl Client {
         self.query(Command::Payload).await
     }
 
+    /// Enter FLASHING (bus-silent maintenance window), carrying the
+    /// mandatory human park assertion. The ack reports whether the mode
+    /// actually changed — entry is refused outside IDLE/ACTIVE_ERROR.
+    pub async fn enter_flashing(
+        &self,
+        assertion: par6_proto::FlashingAssertion,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::EnterFlashing(cmd::EnterFlashing { assertion }))
+            .await
+    }
+
+    /// Leave FLASHING (bus wakes, stored driver config re-pushed).
+    /// Refused when the controller is not in FLASHING.
+    pub async fn exit_flashing(&self) -> Result<Ack, ClientError> {
+        self.system(Command::ExitFlashing).await
+    }
+
+    /// Push one node's drive tuning live (`SET_PID_GAINS`); values apply
+    /// like a boot pass and persist across that node's reconnect resends.
+    pub async fn set_pid_gains(&self, gains: cmd::SetPidGains) -> Result<Ack, ClientError> {
+        self.system(Command::SetPidGains(gains)).await
+    }
+
     /// Replace the program-layer collision shapes.
     pub async fn set_shapes(&self, shapes: Vec<Shape>) -> Result<Ack, ClientError> {
         self.system(Command::SetShapes(cmd::SetShapes { shapes }))

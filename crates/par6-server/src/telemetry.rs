@@ -41,6 +41,24 @@ fn extract(field: TelemetryField, snap: &StateSnapshot) -> TelemetryValue {
         F::LoopPeriodEmaS => V::F64(snap.loop_stats.period_ema_s),
         F::LoopP99S => V::F64(snap.loop_stats.p99_s),
         F::LoopOverruns => V::U64(u64::from(snap.loop_stats.overruns)),
+        F::GripperPosition => V::F64(
+            snap.gripper
+                .reply
+                .map_or(f64::NAN, |r| f64::from(r.position) / 255.0),
+        ),
+        F::GripperCurrentMa => V::F64(
+            snap.gripper
+                .reply
+                .map_or(f64::NAN, |r| f64::from(r.current_ma)),
+        ),
+        F::GripperObjectDetection => V::F64(
+            snap.gripper
+                .reply
+                .map_or(f64::NAN, |r| f64::from(r.object_detection as u8)),
+        ),
+        F::GripperFault => V::U64(u64::from(
+            u32::try_from(crate::faults::gripper_fault_code(snap)).unwrap_or(0),
+        )),
     }
 }
 

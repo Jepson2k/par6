@@ -10,12 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    JogJ, JogL, MoveJ, MoveS, SetPayload, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport,
-    WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SetPayload, SetPidGains, SetRecipe, SetShapes, Shape,
+    Simulator, Stop, Teleport, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
-    ActionState, CmdType, Command, ErrorCode, Frame, QueryResult, Reply, WireError, UNATTRIBUTED,
+    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply,
+    WireError, UNATTRIBUTED,
 };
 use par6_rt::{
     snapshot_channel, ArmState, ErrorCode as RtCode, ErrorEntry, Mode, SnapshotWriter,
@@ -43,6 +44,9 @@ enum RtEvent {
     SetEnabled(bool),
     Teleport([f64; 6]),
     ToolStop,
+    EnterFlashing,
+    ExitFlashing,
+    SetPidGains { node: u8, kpp: f64, ilim_ma: f64 },
     WriteIo(u8, u8),
     Simulator(bool),
     ConnectHardware(String),
@@ -67,6 +71,12 @@ struct RtLog {
     /// answers `None`, the way the real core does for several ticks —
     /// which is what lets `reset` waiters pile up.
     hold_enable_outcome: bool,
+    /// What the RT answers the NEXT flashing enter/exit with. `None` =
+    /// the mode changed; `Some` = the window expired without it, the way
+    /// the real core refuses an entry from a working mode.
+    flashing_verdict: Option<WireError>,
+    /// The pending answer, collected exactly once by the server.
+    flashing_outcome: Option<Result<(), WireError>>,
 }
 
 #[derive(Clone)]
@@ -125,6 +135,32 @@ impl RtCommands for TestRt {
             return None;
         }
         log.enable_outcome.take()
+    }
+    fn enter_flashing(&mut self) {
+        self.push(RtEvent::EnterFlashing);
+        let mut log = self.0.lock().unwrap();
+        log.flashing_outcome = Some(match log.flashing_verdict.take() {
+            None => Ok(()),
+            Some(e) => Err(e),
+        });
+    }
+    fn exit_flashing(&mut self) {
+        self.push(RtEvent::ExitFlashing);
+        let mut log = self.0.lock().unwrap();
+        log.flashing_outcome = Some(match log.flashing_verdict.take() {
+            None => Ok(()),
+            Some(e) => Err(e),
+        });
+    }
+    fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.0.lock().unwrap().flashing_outcome.take()
+    }
+    fn set_pid_gains(&mut self, p: &par6_proto::command::SetPidGains) {
+        self.push(RtEvent::SetPidGains {
+            node: p.node,
+            kpp: p.kpp,
+            ilim_ma: p.ilim_ma,
+        });
     }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
@@ -370,7 +406,11 @@ impl Harness {
             .lock()
             .unwrap()
             .outcomes
-            .push_back(CommandOutcome { index, error: None });
+            .push_back(CommandOutcome {
+                index,
+                error: None,
+                verdict: None,
+            });
     }
 
     fn complete_err(&self, index: u64, error: WireError) {
@@ -381,6 +421,7 @@ impl Harness {
             .push_back(CommandOutcome {
                 index,
                 error: Some(error),
+                verdict: None,
             });
     }
 
@@ -479,6 +520,14 @@ impl Client {
         }
     }
 
+    /// Expect a plain OK (no queue index) — the SYSTEM ack shape.
+    async fn ok(&mut self, cmd: &Command) {
+        match self.request(cmd).await {
+            Reply::Ok { index: None, .. } => {}
+            other => panic!("expected plain OK, got {other:?}"),
+        }
+    }
+
     async fn expect_error(&mut self, cmd: &Command) -> WireError {
         match self.request(cmd).await {
             Reply::Error { error, .. } => error,
@@ -501,6 +550,7 @@ impl Client {
                 index: i,
                 ok,
                 detail,
+                ..
             } = self.recv().await
             {
                 if i == index {
@@ -816,6 +866,99 @@ async fn reset_waiter_overflow_names_itself_in_the_refusal() {
             other => panic!("held reset waiters must be answered, got {other:?}"),
         }
     }
+}
+
+/// FLASHING over the wire: the enter ack waits for the RT's verdict
+/// (mode changed, or the window expired), and an exit is refused up
+/// front from any mode but FLASHING — dispatching `SetMode(Idle)` from a
+/// working mode would cancel motion nobody asked to stop.
+#[tokio::test]
+async fn flashing_enter_and_exit_follow_the_rt_verdict() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.mode = Mode::Idle);
+    let mut c = Client::new(&h).await;
+
+    // Exit outside FLASHING: refused at the server, nothing reaches the RT.
+    let err = c.expect_error(&Command::ExitFlashing).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("FLASHING"),
+        "the refusal must say what mode gate failed: {}",
+        err.cause
+    );
+    assert!(!h.rt_events().contains(&RtEvent::ExitFlashing));
+
+    // Enter: acked only once the RT reports the mode changed.
+    let enter = Command::EnterFlashing(EnterFlashing {
+        assertion: FlashingAssertion::Parked,
+    });
+    c.ok(&enter).await;
+    assert!(h.rt_events().contains(&RtEvent::EnterFlashing));
+
+    // Enter refused by the RT (e.g. requested from EXEC): the ERROR
+    // carries the RT's own verdict instead of a fabricated OK.
+    h.rt.lock().unwrap().flashing_verdict = Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", "the controller mode stayed EXEC")],
+    ));
+    let err = c.expect_error(&enter).await;
+    assert!(err.cause.contains("EXEC"), "{}", err.cause);
+
+    // Exit from FLASHING: dispatched and acked on the verdict.
+    h.publish(|s| s.mode = Mode::Flashing);
+    c.ok(&Command::ExitFlashing).await;
+    assert!(h.rt_events().contains(&RtEvent::ExitFlashing));
+}
+
+/// `set_pid_gains` reaches the RT only for a node the config declares as
+/// a drive; anything else is refused with the tunable set named, and
+/// nothing is forwarded — an ack would report a tune nothing received.
+#[tokio::test]
+async fn set_pid_gains_validates_the_node_against_the_config() {
+    let mut h = start(|cfg| cfg.tunable_nodes = vec![0, 1, 2, 3, 4, 5]).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let gains = |node| {
+        Command::SetPidGains(SetPidGains {
+            node,
+            kpp: 9.0,
+            kpv: 0.05,
+            kiv: 0.005,
+            kpiq: 1.2,
+            kiiq: 1.0,
+            kp: 0.12,
+            kd: 0.002,
+            ilim_ma: 2200.0,
+            velocity_limit_ticks_s: 150_000.0,
+            voltage_limit_mv: 0,
+        })
+    };
+    c.ok(&gains(2)).await;
+    let ev = h.rt_events();
+    assert!(
+        ev.contains(&RtEvent::SetPidGains {
+            node: 2,
+            kpp: 9.0,
+            ilim_ma: 2200.0
+        }),
+        "the accepted tune must reach the RT: {ev:?}"
+    );
+
+    let err = c.expect_error(&gains(9)).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("node 9"),
+        "the refusal must name the node: {}",
+        err.cause
+    );
+    let forwarded = h
+        .rt_events()
+        .iter()
+        .filter(|e| matches!(e, RtEvent::SetPidGains { .. }))
+        .count();
+    assert_eq!(forwarded, 1, "the refused node must not be forwarded");
 }
 
 /// The gating table over the wire: un-homed, disabled, e-stop latch and

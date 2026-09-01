@@ -120,6 +120,16 @@ pub enum RtCommand {
         /// 0 or 1; anything non-zero is high.
         value: u8,
     },
+    /// Replace one node's stored drive tuning and push it through the
+    /// bus's boot-config path, `boot.config_repeats` passes — the RT half
+    /// of `SET_PID_GAINS`. The server validates the node and values;
+    /// a bus refusal (unknown node, bus-silent) is logged and dropped.
+    RetuneNode {
+        /// Target CAN node.
+        node: par6_bus::NodeId,
+        /// The gains/limits to store and push.
+        tune: par6_bus::DriveTune,
+    },
 }
 
 /// Where the tick loop pulls external commands from — `par6d` wires the

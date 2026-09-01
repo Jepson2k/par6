@@ -109,6 +109,15 @@ impl DriverBus for FailingBus {
         self.inner.resend_node_config(node, repeats)
     }
 
+    fn retune_node(
+        &mut self,
+        node: NodeId,
+        tune: &par6_bus::DriveTune,
+        repeats: u8,
+    ) -> Result<(), BusError> {
+        self.inner.retune_node(node, tune, repeats)
+    }
+
     fn send_limits(
         &mut self,
         node: NodeId,

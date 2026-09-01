@@ -496,6 +496,22 @@ pub struct LinkHealth {
     pub rx_frames: u64,
 }
 
+/// A live drive retune: the values `SET_PID_GAINS` replaces in one
+/// node's stored configuration before the push. The watchdog settings
+/// are deliberately absent — retuning must never touch the safety
+/// timeout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriveTune {
+    /// Cascade-PID and impedance-PD gains (cmds 16/22/23/24).
+    pub gains: par6_config::Gains,
+    /// Driver current limit \[mA\] (cmd 20).
+    pub ilim_ma: f64,
+    /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
+    pub velocity_limit_ticks_s: f64,
+    /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS.
+    pub voltage_limit_mv: u32,
+}
+
 /// Bus operation failure. Send errors are propagated, never swallowed
 /// (vendor swallowed them — documented production bug class).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]

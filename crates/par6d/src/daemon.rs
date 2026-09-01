@@ -659,6 +659,12 @@ fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConfig {
     cfg.fitted_tool = robot.robot.active_gripper.clone();
     cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
     cfg.cartesian = true;
+    // The drives `set_pid_gains` may retune: every joint node, plus the
+    // gripper motor when the fitted tool drives one over CAN.
+    cfg.tunable_nodes = robot.joints.iter().map(|j| j.node_id).collect();
+    if cfg.tool_dof > 0 {
+        cfg.tunable_nodes.push(robot.bus.gripper_node);
+    }
     // The window `teleport` may place a joint in. Refusing outside it is
     // the server's job: the bridge is fire-and-forget and has no reply
     // channel to refuse on.

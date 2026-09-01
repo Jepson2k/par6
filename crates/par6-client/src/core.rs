@@ -114,8 +114,11 @@ pub enum Ack {
     Unconfirmed,
 }
 
-/// A finished queued command: success flag plus failure detail.
-pub type Completion = (bool, Option<WireError>);
+/// A finished queued command: success flag, failure detail, and the tool
+/// settle verdict a successful gripper move completes with (1 = object
+/// while closing, 2 = object while opening, 3 = target reached, no
+/// object).
+pub type Completion = (bool, Option<WireError>, Option<u8>);
 
 struct Completions {
     /// Finished commands by index, insertion-ordered for eviction.
@@ -513,7 +516,7 @@ impl Client {
                                     return Err(ClientError::Robot(err));
                                 }
                             }
-                            Some((true, None))
+                            Some((true, None, None))
                         } else {
                             return Ok(false);
                         }
@@ -522,9 +525,9 @@ impl Client {
             }
         };
         match done {
-            Some((true, _)) => Ok(true),
-            Some((false, Some(detail))) => Err(ClientError::Robot(detail)),
-            Some((false, None)) => Err(ClientError::Robot(WireError {
+            Some((true, _, _)) => Ok(true),
+            Some((false, Some(detail), _)) => Err(ClientError::Robot(detail)),
+            Some((false, None, _)) => Err(ClientError::Robot(WireError {
                 command_index: index as i64,
                 code: 0,
                 title: "Command failed".into(),
@@ -534,6 +537,21 @@ impl Client {
             })),
             None => Ok(false),
         }
+    }
+
+    /// Settle verdict off command `index`'s COMPLETE push: 1 = object
+    /// while closing, 2 = object while opening, 3 = target reached with
+    /// no object. `None` for non-tool commands, unfinished ones, and
+    /// completions that fell out of the log (last 1024 are kept) — call
+    /// after [`Self::wait_command`] returns `Ok(true)`.
+    pub fn command_verdict(&self, index: u64) -> Option<u8> {
+        self.inner
+            .completions
+            .lock()
+            .unwrap()
+            .log
+            .get(&index)
+            .and_then(|(_, _, v)| *v)
     }
 }
 
@@ -558,9 +576,14 @@ async fn reply_rx(inner: Arc<Inner>) {
             }
         };
         match reply {
-            Reply::Complete { index, ok, detail } => {
+            Reply::Complete {
+                index,
+                ok,
+                detail,
+                verdict,
+            } => {
                 let mut comp = inner.completions.lock().unwrap();
-                comp.log.insert(index, (ok, detail.clone()));
+                comp.log.insert(index, (ok, detail.clone(), verdict));
                 comp.order.push_back(index);
                 while comp.order.len() > COMPLETIONS_KEPT {
                     if let Some(old) = comp.order.pop_front() {
@@ -568,7 +591,7 @@ async fn reply_rx(inner: Arc<Inner>) {
                     }
                 }
                 for tx in comp.waiters.remove(&index).unwrap_or_default() {
-                    let _ = tx.send((ok, detail.clone()));
+                    let _ = tx.send((ok, detail.clone(), verdict));
                 }
             }
             other => {

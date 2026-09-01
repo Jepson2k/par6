@@ -251,6 +251,75 @@
       ]
     },
     {
+      "class": "SYSTEM",
+      "cmd": "ENTER_FLASHING",
+      "file": "cmd_enter_flashing.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_enter_flashing",
+      "req_id": 13,
+      "tag": 26,
+      "wire": [
+        26,
+        13,
+        1
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "ENTER_FLASHING",
+      "file": "cmd_enter_flashing_force.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_enter_flashing_force",
+      "req_id": 14,
+      "tag": 26,
+      "wire": [
+        26,
+        14,
+        2
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "EXIT_FLASHING",
+      "file": "cmd_exit_flashing.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_exit_flashing",
+      "req_id": 15,
+      "tag": 27,
+      "wire": [
+        27,
+        15
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_PID_GAINS",
+      "file": "cmd_set_pid_gains.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_pid_gains",
+      "req_id": 16,
+      "tag": 28,
+      "wire": [
+        28,
+        16,
+        2,
+        9.0,
+        0.05,
+        0.005,
+        1.2,
+        1.0,
+        0.12,
+        0.002,
+        2200.0,
+        150000.0,
+        0
+      ]
+    },
+    {
       "class": "QUERY",
       "cmd": "PING",
       "file": "cmd_ping.bin",
@@ -1276,6 +1345,19 @@
       ]
     },
     {
+      "file": "reply_complete_tool_verdict.bin",
+      "kind": "reply",
+      "msg": "COMPLETE",
+      "name": "reply_complete_tool_verdict",
+      "wire": [
+        5,
+        0,
+        10,
+        true,
+        1
+      ]
+    },
+    {
       "file": "reply_error_near_singularity.bin",
       "kind": "reply",
       "msg": "ERROR",
@@ -1862,6 +1944,52 @@
               6.0,
               20.0
             ]
+          ],
+          "standard",
+          [
+            "minimal",
+            "standard",
+            "full",
+            "diagnostics"
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_config_info_telemetry_off.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/CONFIG_INFO",
+      "name": "response_config_info_telemetry_off",
+      "wire": [
+        4,
+        127,
+        [
+          19,
+          "/etc/par6/PAR6.toml",
+          "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
+          0.004,
+          [
+            0.08,
+            0.6,
+            0.005,
+            0.05,
+            0.35,
+            0.05,
+            0.01,
+            2.0
+          ],
+          [
+            [
+              -2.15,
+              2.15,
+              3.0,
+              12.0
+            ]
+          ],
+          null,
+          [
+            "minimal",
+            "standard"
           ]
         ]
       ]

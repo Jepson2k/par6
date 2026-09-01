@@ -15,12 +15,12 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, MoveC, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, Stop, Teleport, ToolAction,
-    ToolParam,
+    EnterFlashing, JogJ, MoveC, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, Stop,
+    Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
-    ActionState, Command, CompletionPolicy, ErrorCode, Frame, QueryResult, Reply, Status,
-    ToolState, NUM_JOINTS,
+    ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
+    QueryResult, Reply, Status, ToolState, NUM_JOINTS,
 };
 use par6d::{Daemon, Options};
 
@@ -505,6 +505,73 @@ const PROFILE_PROBE_DEG: f64 = 4.0;
 /// ack → COMPLETE. The profile is what shapes the trajectory, so its
 /// duration is the observable that proves the selection reached the
 /// planner rather than being stored and ignored.
+/// The FLASHING maintenance window over the wire: entry carries the
+/// human park assertion and is acked only once the mode really changed;
+/// the window is genuinely bus-silent (the link reads stale); the exit
+/// wakes the bus and leaves a homed, movable arm; and the gates refuse
+/// what must be refused — an exit with no window open, and an entry
+/// while motion is executing.
+#[test]
+fn flashing_window_over_protocol_v2() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let enter = Command::EnterFlashing(EnterFlashing {
+        assertion: FlashingAssertion::Parked,
+    });
+
+    // No window open: the exit is refused up front — dispatching its
+    // SetMode(Idle) from a working mode would cancel motion nobody
+    // asked to stop.
+    let err = c.expect_error(&Command::ExitFlashing);
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(err.cause.contains("FLASHING"), "{}", err.cause);
+
+    // Entry while a move executes: FLASHING is reachable only from IDLE
+    // and ACTIVE_ERROR, so the RT refuses — and the ERROR carries that
+    // verdict after the window, never a fabricated OK.
+    let i = c.ok_index(&move_j(7001, with_j0(park, 15.0), 8.0));
+    rig.wait_status("the long move is executing", |s| {
+        s.executing_index == i as i64
+    });
+    let err = c.expect_error(&enter);
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    c.drain();
+    rig.wait_status("idle after the stop", |s| s.mode == ControllerMode::Idle);
+
+    // From IDLE with the assertion: acked once the mode is FLASHING, and
+    // the silent bus reads as a stale link — the wire really is handed
+    // to the flasher.
+    c.ok(&enter);
+    rig.wait_status("the mode is FLASHING", |s| {
+        s.mode == ControllerMode::Flashing
+    });
+    rig.wait_status("the silent bus reads stale", |s| s.link_ok == 0);
+
+    // Exit: the bus wakes (the stored-config re-push is pinned at the RT
+    // layer) and homing is INVALIDATED — the daemon's flash marker
+    // cannot tell a flash from a scan, so every window costs a re-home
+    // rather than trusting references a reflash may have moved.
+    c.ok(&Command::ExitFlashing);
+    let s = rig.wait_status("IDLE with a live link again", |s| {
+        s.mode == ControllerMode::Idle && s.link_ok == 1
+    });
+    assert!(
+        !s.homed,
+        "a window that may have flashed must invalidate homing"
+    );
+    let err = c.expect_error(&move_j(7002, with_j0(park, 5.0), 0.5));
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
+    teleport_home(&rig, &mut c, park);
+    let i = c.ok_index(&move_j(7003, with_j0(park, 5.0), 0.5));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "motion after a re-home must complete, got {detail:?}");
+}
+
 fn timed_move_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> Duration {
     let park = park_deg();
     teleport_home(rig, c, park);
@@ -691,8 +758,9 @@ fn tool_actions_profiles_and_unsupported_parameters() {
 
     // ---- calibrate runs the firmware sweep and leaves the jaws open.
     let i = c.ok_index(&tool_action(6005, &tool, "calibrate", &[]));
-    let (ok, detail) = c.wait_complete(i);
+    let (ok, detail, verdict) = c.wait_complete_full(i);
     assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    assert_eq!(verdict, None, "only a settled move carries a verdict");
     let s = rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
 
     // ---- tool_action drives the jaw. Closing runs it to the commanded
@@ -700,8 +768,13 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // object), opening runs it back.
     let before = jaw(&s);
     let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 500.0]));
-    let (ok, detail) = c.wait_complete(i);
+    let (ok, detail, verdict) = c.wait_complete_full(i);
     assert!(ok, "gripper close must complete, got {detail:?}");
+    assert_eq!(
+        verdict,
+        Some(3),
+        "closing on air must complete with the reached-no-object verdict"
+    );
     let s = rig.wait_status("the jaw reaches the closed command and stops", |s| {
         jaw(s) > 0.99 && tool_status(s).state == ToolState::Idle
     });

@@ -51,6 +51,10 @@ const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
 /// Housekeeping loop period.
 const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+/// How long a FLASHING enter/exit waits for the published mode to
+/// answer. The RT decides on the next tick, so this only has to cover
+/// command-queue and snapshot latency on a loaded host.
+const FLASHING_WINDOW: Duration = Duration::from_secs(2);
 
 /// Watchdog deadline for a jog carrying `duration_s` seconds.
 ///
@@ -400,6 +404,18 @@ struct EnableRequest {
     sent_at_seq: Option<u64>,
 }
 
+/// A FLASHING enter/exit in flight: resolved when the published mode
+/// reaches `want`, failed when the window closes first. No retry — the
+/// RT processes `SetMode` on the next tick, so the window only covers
+/// command-queue latency.
+struct FlashingRequest {
+    /// The mode the ack is waiting for (`Flashing` on enter, `Idle` on
+    /// exit).
+    want: Mode,
+    /// When to give up and report the mode unchanged.
+    deadline: Instant,
+}
+
 /// State shared between the bridge (server task) and housekeeping.
 #[derive(Default)]
 pub(crate) struct SharedState {
@@ -407,6 +423,9 @@ pub(crate) struct SharedState {
     enable: Option<EnableRequest>,
     /// Resolved enable outcome, waiting to be collected by the server.
     enable_outcome: Option<Result<(), WireError>>,
+    flashing: Option<FlashingRequest>,
+    /// Resolved FLASHING outcome, waiting to be collected by the server.
+    flashing_outcome: Option<Result<(), WireError>>,
 }
 
 /// The bridge's kinematics kit (feature `ffi`): its own model instance,
@@ -793,6 +812,54 @@ impl RtCommands for RtBridge {
 
     fn take_enable_outcome(&mut self) -> Option<Result<(), WireError>> {
         self.shared.lock().unwrap().enable_outcome.take()
+    }
+
+    fn enter_flashing(&mut self) {
+        let mut sh = self.shared.lock().unwrap();
+        // The assertion rides the same queue as the mode request, so the
+        // core consumes them in order; any transition in between drops
+        // the one-shot assertion, which is the safety property intended.
+        self.link.send(RtCommand::AssertParked);
+        self.link.send(RtCommand::SetMode(Mode::Flashing));
+        sh.flashing_outcome = None;
+        sh.flashing = Some(FlashingRequest {
+            want: Mode::Flashing,
+            deadline: Instant::now() + FLASHING_WINDOW,
+        });
+    }
+
+    fn exit_flashing(&mut self) {
+        let mut sh = self.shared.lock().unwrap();
+        self.link.send(RtCommand::SetMode(Mode::Idle));
+        sh.flashing_outcome = None;
+        sh.flashing = Some(FlashingRequest {
+            want: Mode::Idle,
+            deadline: Instant::now() + FLASHING_WINDOW,
+        });
+    }
+
+    fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.shared.lock().unwrap().flashing_outcome.take()
+    }
+
+    fn set_pid_gains(&mut self, p: &par6_proto::command::SetPidGains) {
+        self.link.send(RtCommand::RetuneNode {
+            node: p.node,
+            tune: par6_bus::DriveTune {
+                gains: par6_config::Gains {
+                    kpp: p.kpp,
+                    kpv: p.kpv,
+                    kiv: p.kiv,
+                    kpiq: p.kpiq,
+                    kiiq: p.kiiq,
+                    kp: p.kp,
+                    kd: p.kd,
+                },
+                ilim_ma: p.ilim_ma,
+                velocity_limit_ticks_s: p.velocity_limit_ticks_s,
+                voltage_limit_mv: p.voltage_limit_mv,
+            },
+        });
     }
 
     fn teleport(&mut self, angles_deg: &[f64; NUM_JOINTS], tool_positions: Option<&[f64]>) {
@@ -1198,6 +1265,31 @@ pub(crate) fn housekeeping_loop(
                     req.sent_at_seq = Some(snap.enable_seq);
                     req.last_sent = Some(now);
                     link.send(RtCommand::Enable);
+                }
+            }
+            if let Some(req) = &sh.flashing {
+                if snap.mode == req.want {
+                    sh.flashing = None;
+                    sh.flashing_outcome = Some(Ok(()));
+                } else if now >= req.deadline {
+                    let detail = match req.want {
+                        Mode::Flashing => format!(
+                            "the controller mode stayed {:?}: FLASHING is reachable only \
+                             from IDLE and ACTIVE_ERROR",
+                            snap.mode
+                        ),
+                        _ => format!(
+                            "the controller mode stayed {:?} instead of returning to IDLE",
+                            snap.mode
+                        ),
+                    };
+                    log::warn!("FLASHING request expired: {detail}");
+                    sh.flashing = None;
+                    sh.flashing_outcome = Some(Err(make_error(
+                        ErrorCode::CommValidationError,
+                        UNATTRIBUTED,
+                        &[("detail", &detail)],
+                    )));
                 }
             }
         }

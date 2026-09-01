@@ -234,6 +234,9 @@ struct Core<P: Planner, R: RtCommands> {
     drainbuf: Vec<u8>,
     /// Clients whose `reset` is still waiting for the RT's answer.
     reset_waiters: Vec<(u32, SocketAddr)>,
+    /// Clients whose `enter_flashing`/`exit_flashing` is still waiting
+    /// for the RT's mode change.
+    flashing_waiters: Vec<(u32, SocketAddr)>,
     /// Whether the boot-time enable has been requested yet.
     booted: bool,
 
@@ -308,6 +311,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
             reset_waiters: Vec::new(),
+            flashing_waiters: Vec::new(),
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
@@ -461,6 +465,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.refresh_snapshot();
         self.request_boot_enable();
         self.settle_enable().await;
+        self.settle_flashing().await;
         self.expire_chunks().await;
         self.collect_outcomes().await;
         self.pump().await;
@@ -502,6 +507,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         use Command as C;
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
+            return;
+        }
+        if let C::EnterFlashing(_) | C::ExitFlashing = cmd {
+            self.on_flashing(req_id, matches!(cmd, C::EnterFlashing(_)), addr)
+                .await;
             return;
         }
         let result: Result<(), WireError> = match cmd {
@@ -641,6 +651,28 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::SetShapes(p) => self.apply_program_shapes(p.shapes.clone()),
+            // Values are codec-validated; the node id is config
+            // knowledge, so it is checked here — an ack for a node this
+            // arm does not have would report a tune nothing received.
+            C::SetPidGains(p) => {
+                if self.cfg.tunable_nodes.contains(&p.node) {
+                    self.runtime.rt.set_pid_gains(p);
+                    Ok(())
+                } else {
+                    Err(make_error(
+                        ErrorCode::CommValidationError,
+                        UNATTRIBUTED,
+                        &[(
+                            "detail",
+                            &format!(
+                                "set_pid_gains node {} is not a configured drive \
+                                 (tunable nodes: {:?})",
+                                p.node, self.cfg.tunable_nodes
+                            ),
+                        )],
+                    ))
+                }
+            }
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -717,6 +749,73 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             return;
         }
         for (req_id, addr) in std::mem::take(&mut self.reset_waiters) {
+            let reply = match &outcome {
+                Ok(()) => Reply::Ok {
+                    req_id,
+                    index: None,
+                },
+                Err(error) => Reply::Error {
+                    req_id,
+                    error: error.clone(),
+                },
+            };
+            self.reply(addr, &reply).await;
+        }
+    }
+
+    /// `enter_flashing`/`exit_flashing`: only the RT can change the mode,
+    /// so like `reset` the ack waits for the published verdict
+    /// ([`RtCommands::take_flashing_outcome`]) instead of reporting a
+    /// mode change that may never happen (entry is refused outside
+    /// IDLE/ACTIVE_ERROR, asynchronously).
+    async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
+        self.refresh_snapshot();
+        // An exit from any mode but FLASHING is refused HERE: it would
+        // dispatch `SetMode(Idle)`, which from a working mode cancels
+        // motion the client never asked to stop.
+        if !enter && self.snap.mode != Mode::Flashing {
+            let error = make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "exit_flashing while the controller mode is {:?}, not FLASHING",
+                        self.snap.mode
+                    ),
+                )],
+            );
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        if self.flashing_waiters.len() >= MAX_RESET_WAITERS {
+            let error = make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "Too many FLASHING requests are already awaiting the \
+                     controller's verdict; stop retrying until the \
+                     outstanding one is answered.",
+                )],
+            );
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        if enter {
+            self.runtime.rt.enter_flashing();
+        } else {
+            self.runtime.rt.exit_flashing();
+        }
+        self.flashing_waiters.push((req_id, addr));
+    }
+
+    /// Hand the RT's FLASHING verdict to whoever is waiting on it.
+    async fn settle_flashing(&mut self) {
+        let Some(outcome) = self.runtime.rt.take_flashing_outcome() else {
+            return;
+        };
+        for (req_id, addr) in std::mem::take(&mut self.flashing_waiters) {
             let reply = match &outcome {
                 Ok(()) => Reply::Ok {
                     req_id,
@@ -1169,13 +1268,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                             self.sync_planner();
                         }
                     }
-                    self.push_complete(ex.addr, ex.index, None).await;
+                    self.push_complete(ex.addr, ex.index, None, out.verdict)
+                        .await;
                     // Blended-away commands finished in the same motion:
                     // each is completed in queue order, and the
                     // high-water mark ends on the last of them.
                     for (index, addr) in ex.blended {
                         self.completed_index = self.completed_index.max(index as i64);
-                        self.push_complete(addr, index, None).await;
+                        self.push_complete(addr, index, None, None).await;
                     }
                 }
                 Some(e) => {
@@ -1207,7 +1307,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.action_state = ActionState::Error;
         let mut dropped = blended;
         dropped.extend(self.drop_pending());
-        self.push_complete(addr, index, Some(e)).await;
+        self.push_complete(addr, index, Some(e), None).await;
         self.complete_cancelled("a failed preceding command", dropped)
             .await;
     }
@@ -1241,7 +1341,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         for (index, addr) in dropped {
             self.completed_index = self.completed_index.max(index as i64);
             let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
-            self.push_complete(addr, index, Some(e)).await;
+            self.push_complete(addr, index, Some(e), None).await;
         }
     }
 
@@ -1953,6 +2053,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
+                    active_recipe: self.recipe.clone(),
+                    recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }
             }
             C::Shapes => QueryResult::Shapes {
@@ -1983,11 +2085,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
-    async fn push_complete(&mut self, addr: SocketAddr, index: u64, detail: Option<WireError>) {
+    async fn push_complete(
+        &mut self,
+        addr: SocketAddr,
+        index: u64,
+        detail: Option<WireError>,
+        verdict: Option<u8>,
+    ) {
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
             detail,
+            verdict,
         };
         self.reply(addr, &reply).await;
     }
@@ -2093,6 +2202,9 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
         T::SetRecipe => "set_recipe",
+        T::EnterFlashing => "enter_flashing",
+        T::ExitFlashing => "exit_flashing",
+        T::SetPidGains => "set_pid_gains",
         T::Ping => "ping",
         T::Status => "status",
         T::Angles => "angles",

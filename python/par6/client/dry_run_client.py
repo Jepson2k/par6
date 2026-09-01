@@ -930,17 +930,20 @@ class DryRunRobotClient:
 
         Duration is only what the config supports.  A ``move`` finishes when
         the driver reports it did — the config carries no jaw speed model to
-        predict that from, so it contributes no time.  A ``calibrate`` runs
-        the driver's homing sequence, which the runtime holds for at least
+        predict that from, so it contributes no time; ``stop`` and ``idle``
+        settle the same way.  A ``calibrate`` runs the driver's homing
+        sequence, which the runtime holds for at least
         ``TOOL_CALIBRATE_MIN_WAIT_S`` (``crates/par6d/src/planner.rs``).
         """
         verb = action.strip().lower()
         if verb in ("open", "close", "set_position"):
             verb = "move"
-        if verb not in ("move", "calibrate"):
+        if verb not in ("move", "calibrate", "stop", "idle"):
             raise make_error(
                 ErrorCode.COMM_VALIDATION_ERROR,
-                detail=f"unknown tool action {action!r} (move, calibrate)",
+                detail=(
+                    f"unknown tool action {action!r} (move, calibrate, stop, idle)"
+                ),
             )
         pending = self._close_chain()
         result = DryRunResultData(
@@ -992,6 +995,12 @@ class DryRunRobotClient:
     def wait_command(self, command_index: int = -1, **kwargs: Any) -> bool:
         return True
 
+    def command_verdict(self, command_index: int = -1, **kwargs: Any) -> int | None:
+        """Always None: a dry run has no jaw physics to produce a settle
+        verdict, so a preview never claims an object was (or wasn't)
+        caught."""
+        return None
+
     def wait_checkpoint(self, label: str = "", **kwargs: Any) -> bool:
         return True
 
@@ -1026,6 +1035,19 @@ class DryRunRobotClient:
 
     def connect_hardware(self, port_str: str = "", **kwargs: Any) -> int:
         """A preview has no bus to connect."""
+        return 1
+
+    def enter_flashing(self, assertion: str = "", **kwargs: Any) -> int:
+        """A preview has no bus to silence."""
+        return 1
+
+    def exit_flashing(self, **kwargs: Any) -> int:
+        """A preview has no bus to wake."""
+        return 1
+
+    def set_pid_gains(self, node: int = 0, **kwargs: Any) -> int:
+        """Drive tuning changes how the real arm tracks, not where the
+        planner sends it, so a preview plans the same path."""
         return 1
 
     def set_completion_policy(self, policy: Any = 0, **kwargs: Any) -> int:

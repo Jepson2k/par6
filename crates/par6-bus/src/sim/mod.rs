@@ -59,8 +59,8 @@ use crate::spectral::codec::{
 };
 use crate::spectral::convert::JointConversion;
 use crate::types::{
-    BusError, BusState, DeviceInfo, ErrorFlags, FirmwareGripperCommand, Freshness, GripperCommand,
-    HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
+    BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, FirmwareGripperCommand, Freshness,
+    GripperCommand, HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
 };
 
 use driver::{PlantCmd, ReplyKind, VirtualDriver};
@@ -1170,6 +1170,21 @@ impl DriverBus for SimBus {
 
     fn resend_node_config(&mut self, node: NodeId, repeats: u8) -> Result<(), BusError> {
         self.ensure_ready()?;
+        self.apply_node_config(node, repeats);
+        Ok(())
+    }
+
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) else {
+            return Err(BusError::InvalidCommand {
+                reason: "retune_node for a node with no stored configuration",
+            });
+        };
+        c.gains = tune.gains;
+        c.ilim_ma = tune.ilim_ma;
+        c.velocity_limit_ticks_s = tune.velocity_limit_ticks_s;
+        c.voltage_limit_mv = tune.voltage_limit_mv;
         self.apply_node_config(node, repeats);
         Ok(())
     }

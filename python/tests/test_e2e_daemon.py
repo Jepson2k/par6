@@ -1167,8 +1167,14 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
 
         # The runtime's verbs are `move`, `calibrate`, `stop` and `idle`;
         # the client's open/close convenience resolves onto `move` with a
-        # position.
-        await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        # position. The completion push carries the settle verdict, so a
+        # close on air reads "target reached, no object" without racing a
+        # tool-status poll.
+        idx = await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        assert await client.command_verdict(idx) == 3, (
+            "a close with nothing between the jaws must complete with "
+            "verdict 3 (reached, no object)"
+        )
         closed = await client.wait_status(
             lambda s: bool(s.tool_status is not None and s.tool_status.positions),
             timeout=STEP_BUDGET_S,
@@ -1349,7 +1355,16 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
         async with daemon.client() as client:
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
             info = await client.config_info()
-        assert info is not None
+            assert info is not None
+
+            # Recipe discovery/readback: the valid SET_RECIPE vocabulary
+            # is published, and the active name tracks what was set (the
+            # shipped config boots with telemetry off).
+            assert info["active_recipe"] is None
+            assert "standard" in info["recipes"] and "minimal" in info["recipes"]
+            await client.set_recipe("standard")
+            info2 = await client.config_info()
+            assert info2 is not None and info2["active_recipe"] == "standard"
         assert info["path"] == str(daemon.config)
 
         # The wire-contract fingerprint: sha256 over the robot TOML and
@@ -1495,3 +1510,52 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         assert await client.set_payload(0.0) == 1
         info = await client.payload()
         assert info is not None and info["mass"] == 0.0
+
+
+async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaemon):
+    """The maintenance surface end to end: SET_PID_GAINS re-pushes a
+    configured drive's tuning and refuses a node the config does not
+    declare; the FLASHING window requires the operator's spelled-out
+    assertion, opens from IDLE, and its exit invalidates homing — the
+    runtime cannot tell a flash from a scan, so every window costs a
+    re-home."""
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        # Re-push a joint's own configured tuning: semantically a no-op,
+        # but the ack still proves the node check and the RT push ran.
+        j = _cfg.load_robot_config()["joints"][2]
+        tune = dict(
+            kpp=j["gains"]["kpp"],
+            kpv=j["gains"]["kpv"],
+            kiv=j["gains"]["kiv"],
+            kpiq=j["gains"]["kpiq"],
+            kiiq=j["gains"]["kiiq"],
+            kp=j["gains"]["kp"],
+            kd=j["gains"]["kd"],
+            ilim_ma=j["ilim_ma"],
+            velocity_limit_ticks_s=j["velocity_limit_ticks_s"],
+            voltage_limit_mv=j["voltage_limit_mv"],
+        )
+        assert await client.set_pid_gains(j["node_id"], **tune) == 1
+        with pytest.raises(RobotError) as bad:
+            await client.set_pid_gains(15, **tune)
+        assert bad.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "15" in str(bad.value)
+
+        # The assertion is an argument with no default — a typo dies
+        # locally, before any datagram.
+        with pytest.raises(ValueError):
+            await client.enter_flashing("definitely")
+        # No window open: the exit is refused by the runtime.
+        with pytest.raises(RobotError) as noexit:
+            await client.exit_flashing()
+        assert noexit.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        await client.reset()
+        await teleport_to(client, park_deg())
+        assert await client.enter_flashing("parked") == 1
+        assert await client.exit_flashing() == 1
+        assert await client.wait_status(lambda s: not s.homed, timeout=STEP_BUDGET_S), (
+            "a closed window must read un-homed until the operator re-homes"
+        )

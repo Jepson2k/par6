@@ -8,7 +8,8 @@ use crate::bus::DriverBus;
 use crate::hw::SocketCanBus;
 use crate::sim::SimBus;
 use crate::types::{
-    BusError, BusState, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId, PollAction,
+    BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
+    PollAction,
 };
 
 /// The bus backend a running daemon talks to.
@@ -97,6 +98,10 @@ impl DriverBus for RuntimeBus {
 
     fn resend_node_config(&mut self, node: NodeId, repeats: u8) -> Result<(), BusError> {
         dispatch!(self, resend_node_config(node, repeats))
+    }
+
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError> {
+        dispatch!(self, retune_node(node, tune, repeats))
     }
 
     fn send_limits(

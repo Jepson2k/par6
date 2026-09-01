@@ -7,7 +7,7 @@
 
 mod common;
 
-use par6_bus::TxRecord;
+use par6_bus::{DriveTune, TxRecord};
 use par6_rt::{Mode, RtCommand, MAX_JOINTS};
 
 fn config_passes(rig: &mut common::Rig) -> usize {
@@ -87,4 +87,63 @@ fn flashing_exit_repushes_config_now_and_rearms_the_schedule() {
     let s = rig.snap();
     assert_eq!(s.mode, Mode::Idle);
     assert!(!s.error_active, "no selfcheck relatch after the exit");
+}
+
+/// `SET_PID_GAINS` through the RT command path: the tune replaces the
+/// node's STORED config and goes out as `boot_config_repeats` passes now
+/// — so a later resend (reconnect, FLASHING exit) carries the new
+/// values, exactly like a boot pass. A node the bus never configured is
+/// refused and pushes nothing.
+#[test]
+fn a_retune_stores_the_tune_and_pushes_it_like_a_boot_shot() {
+    let bundle = common::bundle();
+    let repeats = bundle.robot.bus.boot_config_repeats as usize;
+    let mut rig = common::Rig::new();
+    rig.ready();
+    rig.clear_tx();
+
+    let tune = DriveTune {
+        gains: par6_config::Gains {
+            kpp: 9.0,
+            kpv: 0.05,
+            kiv: 0.005,
+            kpiq: 1.2,
+            kiiq: 1.0,
+            kp: 0.12,
+            kd: 0.002,
+        },
+        ilim_ma: 2200.0,
+        velocity_limit_ticks_s: 150_000.0,
+        voltage_limit_mv: 0,
+    };
+    let node = bundle.robot.joints[2].node_id;
+    rig.cmd(RtCommand::RetuneNode { node, tune });
+
+    let log = &rig.core.bus_mut().tx_log;
+    assert!(
+        log.iter().any(
+            |(_, r)| matches!(r, TxRecord::Retune { node: n, tune: t } if *n == node && *t == tune)
+        ),
+        "the stored tune must carry the wire's values verbatim"
+    );
+    let passes = log
+        .iter()
+        .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: n } if *n == node))
+        .count();
+    assert_eq!(
+        passes, repeats,
+        "the push must run boot-shot redundancy, not a single pass"
+    );
+
+    // An unconfigured node: refused at the bus, no config traffic.
+    rig.clear_tx();
+    rig.cmd(RtCommand::RetuneNode { node: 13, tune });
+    assert!(
+        !rig.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .any(|(_, r)| matches!(r, TxRecord::Retune { .. } | TxRecord::ConfigPass { .. })),
+        "a refused retune must push nothing"
+    );
 }

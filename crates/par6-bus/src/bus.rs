@@ -5,7 +5,8 @@
 use par6_config::{GripperConfig, RobotConfig};
 
 use crate::types::{
-    BusError, BusState, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId, PollAction,
+    BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
+    PollAction,
 };
 
 /// What the RT tick loop needs from a motor bus.
@@ -106,6 +107,13 @@ pub trait DriverBus {
     /// the reconnect path for nodes reported in
     /// [`BusState::reconnected_mask`].
     fn resend_node_config(&mut self, node: NodeId, repeats: u8) -> Result<(), BusError>;
+
+    /// Replace one node's stored drive tuning (gains + limits + voltage
+    /// limit; the watchdog is untouched) and push it now, `repeats`
+    /// passes — the live half of `SET_PID_GAINS`. Because the STORED
+    /// config changes, every later resend (reconnect, FLASHING exit)
+    /// carries the new tune too. Unknown nodes are refused.
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError>;
 
     /// Send a Limits frame (cmd 20: velocity limit ticks/s + current
     /// limit mA), `repeats` times. Homing uses this to drop a node to its

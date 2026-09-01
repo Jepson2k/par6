@@ -187,6 +187,13 @@ impl CoreClient {
         })
     }
 
+    /// Settle verdict off queued command `index`'s completion (1 = object
+    /// while closing, 2 = object while opening, 3 = target reached, no
+    /// object); None for non-tool commands or ones not completed yet.
+    fn command_verdict(&self, index: u64) -> Option<u8> {
+        self.rt().command_verdict(index)
+    }
+
     // ---------------------------------------------------------- queries
 
     fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -425,6 +432,63 @@ impl CoreClient {
             py,
             self.rt(),
             Command::ConnectHardware(cmd::ConnectHardware { port }),
+        )
+    }
+
+    /// `assertion` is "parked" or "force" (the wire refuses anything else).
+    fn enter_flashing<'py>(&self, py: Python<'py>, assertion: &str) -> PyResult<Bound<'py, PyAny>> {
+        let assertion = match assertion.to_ascii_lowercase().as_str() {
+            "parked" => par6_proto::FlashingAssertion::Parked,
+            "force" => par6_proto::FlashingAssertion::Force,
+            other => {
+                return Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "flashing assertion must be 'parked' or 'force', got {other:?}"
+                )))
+            }
+        };
+        sys_future(
+            py,
+            self.rt(),
+            Command::EnterFlashing(cmd::EnterFlashing { assertion }),
+        )
+    }
+
+    fn exit_flashing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        sys_future(py, self.rt(), Command::ExitFlashing)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn set_pid_gains<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        kpp: f64,
+        kpv: f64,
+        kiv: f64,
+        kpiq: f64,
+        kiiq: f64,
+        kp: f64,
+        kd: f64,
+        ilim_ma: f64,
+        velocity_limit_ticks_s: f64,
+        voltage_limit_mv: u32,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        sys_future(
+            py,
+            self.rt(),
+            Command::SetPidGains(cmd::SetPidGains {
+                node,
+                kpp,
+                kpv,
+                kiv,
+                kpiq,
+                kiiq,
+                kp,
+                kd,
+                ilim_ma,
+                velocity_limit_ticks_s,
+                voltage_limit_mv,
+            }),
         )
     }
 

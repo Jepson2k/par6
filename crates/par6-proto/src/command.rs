@@ -21,7 +21,7 @@
 //!   recipe names are configuration, validated in the server layer (the codec
 //!   performs no process-global lookups).
 
-use crate::enums::{CmdType, CompletionPolicy, Frame};
+use crate::enums::{CmdType, CompletionPolicy, FlashingAssertion, Frame};
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, NUM_JOINTS};
 
@@ -178,6 +178,43 @@ pub struct SetPayload {
     /// Rotational inertia about the COM, end-effector-frame axes,
     /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\]; `None` = point mass.
     pub inertia: Option<[f64; 6]>,
+}
+
+/// ENTER_FLASHING: silence the bus and hand it to a firmware flasher.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EnterFlashing {
+    /// The mandatory human assertion (parked, or force).
+    pub assertion: FlashingAssertion,
+}
+
+/// SET_PID_GAINS: push one node's drive tuning live, through the stored
+/// boot-config path (the node keeps these values across its own
+/// reconnect resends). Field names match the vendor XML tags, and
+/// [`crate::CmdType::SetPidGains`]'s wire order is declaration order.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetPidGains {
+    /// Target CAN node id, validated against the config server-side.
+    pub node: u8,
+    /// Position-loop proportional gain (cascade PID).
+    pub kpp: f64,
+    /// Velocity-loop proportional gain (cascade PID).
+    pub kpv: f64,
+    /// Velocity-loop integral gain (cascade PID).
+    pub kiv: f64,
+    /// Current-loop proportional gain (cascade PID).
+    pub kpiq: f64,
+    /// Current-loop integral gain (cascade PID).
+    pub kiiq: f64,
+    /// Impedance PD stiffness (cmd 16).
+    pub kp: f64,
+    /// Impedance PD damping (cmd 16).
+    pub kd: f64,
+    /// Driver current limit \[mA\] (cmd 20).
+    pub ilim_ma: f64,
+    /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
+    pub velocity_limit_ticks_s: f64,
+    /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS.
+    pub voltage_limit_mv: u32,
 }
 
 /// SET_SHAPES: replace the workspace collision-world shapes.
@@ -465,6 +502,9 @@ pub enum Command {
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
     SetRecipe(SetRecipe),
+    EnterFlashing(EnterFlashing),
+    ExitFlashing,
+    SetPidGains(SetPidGains),
     // QUERY
     Ping,
     Status,
@@ -529,6 +569,9 @@ impl Command {
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
             C::SetRecipe(_) => CmdType::SetRecipe,
+            C::EnterFlashing(_) => CmdType::EnterFlashing,
+            C::ExitFlashing => CmdType::ExitFlashing,
+            C::SetPidGains(_) => CmdType::SetPidGains,
             C::Ping => CmdType::Ping,
             C::Status => CmdType::Status,
             C::Angles => CmdType::Angles,
@@ -669,6 +712,32 @@ impl Command {
                 Ok(())
             }
             C::SetRecipe(p) => str_len("set_recipe.name", &p.name, 1, 64),
+            C::EnterFlashing(_) | C::ExitFlashing => Ok(()),
+            C::SetPidGains(p) => {
+                for (what, v) in [
+                    ("set_pid_gains.kpp", p.kpp),
+                    ("set_pid_gains.kpv", p.kpv),
+                    ("set_pid_gains.kiv", p.kiv),
+                    ("set_pid_gains.kpiq", p.kpiq),
+                    ("set_pid_gains.kiiq", p.kiiq),
+                    ("set_pid_gains.kp", p.kp),
+                    ("set_pid_gains.kd", p.kd),
+                ] {
+                    finite(what, v)?;
+                    check(v >= 0.0, what, "must be >= 0")?;
+                }
+                finite("set_pid_gains.ilim_ma", p.ilim_ma)?;
+                check(p.ilim_ma > 0.0, "set_pid_gains.ilim_ma", "must be > 0")?;
+                finite(
+                    "set_pid_gains.velocity_limit_ticks_s",
+                    p.velocity_limit_ticks_s,
+                )?;
+                check(
+                    p.velocity_limit_ticks_s > 0.0,
+                    "set_pid_gains.velocity_limit_ticks_s",
+                    "must be > 0",
+                )
+            }
             C::ServoJ(p) => {
                 finite_all("servo_j.angles", &p.angles)?;
                 opt_frac("servo_j.speed", p.speed)?;
@@ -901,7 +970,7 @@ fn waypoints(what: &'static str, wps: &[[f64; 6]]) -> Result<(), DecodeError> {
 fn arity(tag: CmdType) -> usize {
     use CmdType as T;
     match tag {
-        T::Reset | T::Estop | T::ResetState | T::ResetLoopStats => 2,
+        T::Reset | T::Estop | T::ResetState | T::ResetLoopStats | T::ExitFlashing => 2,
         T::Ping
         | T::Status
         | T::Angles
@@ -931,10 +1000,12 @@ fn arity(tag: CmdType) -> usize {
         | T::SetShapes
         | T::SetCompletionPolicy
         | T::SetRecipe
+        | T::EnterFlashing
         | T::Pose => 3,
         T::WriteIo => 4,
         T::SetTcpOffset => 5,
         T::SetPayload => 5,
+        T::SetPidGains => 13,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -992,6 +1063,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Estop
         | C::ResetState
         | C::ResetLoopStats
+        | C::ExitFlashing
         | C::Ping
         | C::Status
         | C::Angles
@@ -1051,6 +1123,24 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         }
         C::SetCompletionPolicy(p) => w_uint(buf, u64::from(p.policy as u8)),
         C::SetRecipe(p) => w_str(buf, &p.name),
+        C::EnterFlashing(p) => w_uint(buf, u64::from(p.assertion as u8)),
+        C::SetPidGains(p) => {
+            w_uint(buf, u64::from(p.node));
+            for v in [
+                p.kpp,
+                p.kpv,
+                p.kiv,
+                p.kpiq,
+                p.kiiq,
+                p.kp,
+                p.kd,
+                p.ilim_ma,
+                p.velocity_limit_ticks_s,
+            ] {
+                w_f64(buf, v);
+            }
+            w_uint(buf, u64::from(p.voltage_limit_mv));
+        }
         C::Pose(p) => match p.frame {
             Some(f) => w_uint(buf, u64::from(f as u8)),
             None => w_nil(buf),
@@ -1387,6 +1477,35 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         }
         T::SetRecipe => Command::SetRecipe(SetRecipe {
             name: r.str()?.to_owned(),
+        }),
+        T::EnterFlashing => {
+            let v = r.uint()?;
+            let assertion =
+                FlashingAssertion::from_wire(v as i64).ok_or(DecodeError::InvalidEnum {
+                    what: "flashing assertion",
+                    value: v as i64,
+                })?;
+            Command::EnterFlashing(EnterFlashing { assertion })
+        }
+        T::ExitFlashing => Command::ExitFlashing,
+        T::SetPidGains => Command::SetPidGains(SetPidGains {
+            node: u8::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+                what: "set_pid_gains.node",
+                why: "must fit a CAN node id (0..=255)".into(),
+            })?,
+            kpp: r.f64()?,
+            kpv: r.f64()?,
+            kiv: r.f64()?,
+            kpiq: r.f64()?,
+            kiiq: r.f64()?,
+            kp: r.f64()?,
+            kd: r.f64()?,
+            ilim_ma: r.f64()?,
+            velocity_limit_ticks_s: r.f64()?,
+            voltage_limit_mv: u32::try_from(r.uint()?).map_err(|_| DecodeError::Validation {
+                what: "set_pid_gains.voltage_limit_mv",
+                why: "must fit u32".into(),
+            })?,
         }),
         T::Ping => Command::Ping,
         T::Status => Command::Status,

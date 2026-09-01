@@ -523,6 +523,7 @@ impl Par6Planner {
             self.invalidated = Some(CommandOutcome {
                 index,
                 error: Some(error),
+                verdict: None,
             });
         }
     }
@@ -1398,13 +1399,15 @@ impl Par6Planner {
     /// Poll-time verdict for a gripper action, read off the cmd-60 reply
     /// in the snapshot. Replies from before the command reached the bus
     /// describe the previous action, so nothing counts until the grace.
+    /// A settled move carries its detection code (`Ok(Some(1..=3))`) so
+    /// the completion can say whether the jaws caught anything.
     fn tool_verdict(
         wait: &ToolWait,
         start_tick: u64,
         grace_ticks: u64,
         cal_min_ticks: u64,
         snap: &StateSnapshot,
-    ) -> Option<Result<(), WireError>> {
+    ) -> Option<Result<Option<u8>, WireError>> {
         let elapsed = snap.tick.saturating_sub(start_tick);
         if elapsed < grace_ticks {
             return None;
@@ -1424,14 +1427,21 @@ impl Par6Planner {
         match wait {
             ToolWait::Move => (!reply.action_status
                 && reply.object_detection != ObjectDetection::Moving)
-                .then_some(Ok(())),
-            ToolWait::Calibrate => (elapsed >= cal_min_ticks && reply.calibrated).then_some(Ok(())),
-            ToolWait::Idle => (!reply.action_status).then_some(Ok(())),
+                .then_some(Ok(Some(reply.object_detection as u8))),
+            ToolWait::Calibrate => {
+                (elapsed >= cal_min_ticks && reply.calibrated).then_some(Ok(None))
+            }
+            ToolWait::Idle => (!reply.action_status).then_some(Ok(None)),
         }
     }
 
-    /// Poll-time verdict for the in-flight command; `None` = keep going.
-    fn verdict(&self, fl: &mut InFlight, snap: &StateSnapshot) -> Option<Result<(), WireError>> {
+    /// Poll-time verdict for the in-flight command; `None` = keep going,
+    /// `Ok(Some(_))` = success with a tool settle verdict to report.
+    fn verdict(
+        &self,
+        fl: &mut InFlight,
+        snap: &StateSnapshot,
+    ) -> Option<Result<Option<u8>, WireError>> {
         if snap.error_active {
             return Some(Err(rt_error(snap)));
         }
@@ -1481,7 +1491,7 @@ impl Par6Planner {
                     }
                 }
                 if snap.exec.completed_index >= *ring_index {
-                    return Some(Ok(()));
+                    return Some(Ok(None));
                 }
                 None
             }
@@ -1499,7 +1509,7 @@ impl Par6Planner {
                     None
                 } else if snap.mode != Mode::Homing {
                     if snap.homed {
-                        Some(Ok(()))
+                        Some(Ok(None))
                     } else {
                         Some(Err(make_error(
                             ErrorCode::MotnTickFailed,
@@ -1511,8 +1521,8 @@ impl Par6Planner {
                     None
                 }
             }
-            InFlightKind::Delay { target_tick } => (snap.tick >= *target_tick).then_some(Ok(())),
-            InFlightKind::Instant => Some(Ok(())),
+            InFlightKind::Delay { target_tick } => (snap.tick >= *target_tick).then_some(Ok(None)),
+            InFlightKind::Instant => Some(Ok(None)),
         }
     }
 
@@ -1983,10 +1993,14 @@ impl Planner for Par6Planner {
         self.inflight = Some(fl);
         match verdict {
             None => None,
-            Some(Ok(())) => {
+            Some(Ok(v)) => {
                 self.inflight = None;
                 self.near_singularity = None;
-                Some(CommandOutcome { index, error: None })
+                Some(CommandOutcome {
+                    index,
+                    error: None,
+                    verdict: v,
+                })
             }
             Some(Err(e)) => {
                 self.discard_planned();
@@ -1994,6 +2008,7 @@ impl Planner for Par6Planner {
                 Some(CommandOutcome {
                     index,
                     error: Some(e),
+                    verdict: None,
                 })
             }
         }
