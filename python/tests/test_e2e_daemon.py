@@ -1032,6 +1032,30 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
     a real arm. Streamed at a UI-like cadence here, and then aimed into a
     keep-out, which must stop them.
     """
+
+    async def stream_toward(client, goal, send, budget=STEP_BUDGET_S):
+        """UI-style pose streaming: each datagram commands at most a few
+        mm beyond the MEASURED pose, the way a 50 Hz frontend tracks a
+        gesture. The runtime's start-pose gate refuses a session whose
+        first setpoint is far from the arm, and the daemon self-ends
+        quiet sessions, so a re-opened session must always start where
+        the arm actually is — stepping from the measurement guarantees
+        that by construction."""
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            here = await client.pose()
+            assert here is not None
+            step = list(goal)
+            for i in range(3):
+                d = goal[i] - here[i]
+                step[i] = here[i] + max(-5.0, min(5.0, d))
+            await send(step)
+            if await client.wait_status(
+                lambda s: abs(s.pose[11] - goal[2]) < 5.0, timeout=0.05
+            ):
+                return True
+        return False
+
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
         await settle_at(client, SWEEP_START_DEG)
@@ -1041,13 +1065,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         assert start is not None
         goal = list(start)
         goal[2] -= 40.0
-        arrived = False
-        deadline = time.monotonic() + STEP_BUDGET_S
-        while time.monotonic() < deadline and not arrived:
-            await client.servo_l(goal, speed=0.6)
-            arrived = await client.wait_status(
-                lambda s: abs(s.pose[11] - goal[2]) < 5.0, timeout=0.2
-            )
+        arrived = await stream_toward(
+            client, goal, lambda p: client.servo_l(p, speed=0.6)
+        )
         assert arrived, (
             f"servo_l never reached the streamed target: "
             f"{(await pose_now(client))[:3]} vs {goal[:3]}"
@@ -1056,13 +1076,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # --- servo_j(pose=...): the same target through the joint-space
         #     streamer, which IKs the pose rather than interpolating it.
         back = list(start)
-        arrived = False
-        deadline = time.monotonic() + STEP_BUDGET_S
-        while time.monotonic() < deadline and not arrived:
-            await client.servo_j(pose=back, speed=0.6)
-            arrived = await client.wait_status(
-                lambda s: abs(s.pose[11] - back[2]) < 5.0, timeout=0.2
-            )
+        arrived = await stream_toward(
+            client, back, lambda p: client.servo_j(pose=p, speed=0.6)
+        )
         assert arrived, "servo_j(pose=...) never reached the streamed target"
 
         # --- the collision gate refuses a stream aimed into a keep-out.
@@ -1082,9 +1098,15 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
-            await client.servo_l(below, speed=0.6)
+            here = await client.pose()
+            assert here is not None
+            step = list(below)
+            for i in range(3):
+                d = below[i] - here[i]
+                step[i] = here[i] + max(-5.0, min(5.0, d))
+            await client.servo_l(step, speed=0.6)
             blocked = await client.wait_status(
-                lambda s: bool(s.collision_active), timeout=0.2
+                lambda s: bool(s.collision_active), timeout=0.05
             )
         assert blocked, (
             "a servo_l streamed into a keep-out was never gated: the stream "

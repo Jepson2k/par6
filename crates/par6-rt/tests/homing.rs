@@ -932,6 +932,16 @@ fn hall_homing_latches_at_the_sensor_not_on_a_cached_trigger() {
     h.sys.start(&mut h.bus);
     assert_eq!(h.run(6000), SeqStatus::Complete, "first home completes");
 
+    // The pre-clear's until-clear reversal lets the final approach
+    // carry enough speed to coast OUT the top of this narrow band, so
+    // park below it first — the probe assumes it approaches from the
+    // clear side (part (b) parks the same way).
+    for _ in 0..250 {
+        h.drive(
+            5,
+            JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
+        );
+    }
     let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
     let sensor_rad = h.conv[5].joint_rad(sensor);
     assert!(
@@ -1065,4 +1075,83 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     let s = rig.snap();
     assert_eq!(s.state, ArmState::Enabled, "enable is granted again");
     assert_eq!(s.mode, Mode::Homing, "homing can be retried after a clear");
+}
+
+// ------------------------------------------------------------------
+// Hall pre-clear: a joint that BOOTS on its sensor must reference the
+// band edge, never wherever it happens to stand, and a sensor that
+// never clears must fail rather than latch.
+// ------------------------------------------------------------------
+
+/// Motor ticks per joint radian around `q` for joint 5 — sizes hall
+/// bands relative to the config backoff travel.
+fn j5_ticks_per_rad(h: &SimHomingHarness, q: f64) -> f64 {
+    f64::from(h.conv[5].motor_ticks(q + 0.1) - h.conv[5].motor_ticks(q)).abs() / 0.1
+}
+
+/// A hall band WIDER than one backoff's travel: a blind fixed backoff
+/// re-approaches from inside the band, and accepting that early trigger
+/// latches the reference at the boot pose instead of the band edge —
+/// every later move is off by up to the band half-width. The pre-clear
+/// must keep backing off until the sensor actually reads clear, then
+/// approach and latch the true edge.
+#[test]
+fn a_boot_inside_a_wide_hall_band_still_references_the_band_edge() {
+    let bundle = single_joint_bundle(5);
+    let jh = &bundle.robot.homing.joints[5];
+    let eff = bundle
+        .effective_home_offset(5)
+        .unwrap_or(jh.home_offset_rad);
+    let n5 = usize::from(bundle.robot.joints[5].node_id);
+    let q0: [f64; MAX_JOINTS] =
+        std::array::from_fn(|i| bundle.robot.joints[i].sector_home_offset_rad);
+
+    let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], 0.02);
+    let backoff_travel_rad = jh.backoff_s * jh.speed_ticks_s / j5_ticks_per_rad(&h, q0[5]);
+    // Boot at the band CENTER of a band two backoffs deep per side.
+    let half = 2.0 * backoff_travel_rad;
+    h.bus.set_hall_trigger(5, q0[5], half);
+
+    h.sys.start(&mut h.bus);
+    assert_eq!(h.run(20_000), SeqStatus::Complete, "the wide band homes");
+
+    // The reference must put the SENSOR EDGE at the home offset: drive
+    // back out of the band, then measure where the trigger latches.
+    for _ in 0..2000 {
+        h.drive(
+            5,
+            JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
+        );
+        if matches!(h.state.nodes[n5].hall, Some(hall) if hall.trigger && !hall.edge) {
+            break;
+        }
+        h.drive(5, JointCommand::hall(trunc_to_wire(-jh.speed_ticks_s), 2));
+    }
+    let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
+    let sensor_rad = h.conv[5].joint_rad(sensor);
+    assert!(
+        (sensor_rad - eff).abs() < 0.02,
+        "the reference must be the band edge, not the boot pose: the \
+         sensor edge reads {sensor_rad:.4} rad, home offset is {eff:.4} \
+         (band half {half:.4})"
+    );
+}
+
+/// A sensor that never clears — shorted, or the magnet fell onto the
+/// band — must FAIL the joint. Accepting the second early trigger after
+/// one blind backoff latches a reference at an arbitrary pose instead.
+#[test]
+fn a_hall_sensor_that_never_clears_fails_instead_of_latching() {
+    let bundle = single_joint_bundle(5);
+    let q0: [f64; MAX_JOINTS] =
+        std::array::from_fn(|i| bundle.robot.joints[i].sector_home_offset_rad);
+    // Half-width of PI covers the whole circle: always in band.
+    let mut h = SimHomingHarness::new(&bundle, &q0, 5, q0[5], std::f64::consts::PI);
+    h.sys.start(&mut h.bus);
+    assert_eq!(
+        h.run(20_000),
+        SeqStatus::Failed,
+        "an always-triggered sensor must fail, never latch a reference"
+    );
+    assert_eq!(h.sys.statuses()[5], HomingJointStatus::Failed);
 }

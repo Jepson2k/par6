@@ -209,8 +209,13 @@ impl HomerParams {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HPhase {
     Approach,
+    /// Reversing off a hall band that triggered right at approach
+    /// start, until the sensor actually reads clear (bounded by the
+    /// joint's timeout budget).
+    Preclear,
     Dwell,
-    Backoff { rehome_after: bool },
+    /// Post-dwell backoff before the pass-2 pause.
+    Backoff,
     Pause,
     Release,
     Settle,
@@ -246,7 +251,13 @@ struct Homer {
     cur_idx: usize,
     cur_filled: u32,
     cur_hits: u32,
-    preclear_used: bool,
+    /// The current approach verifiably began OFF the hall band (set by
+    /// a completed pre-clear); its trigger is trusted however early.
+    started_clear: bool,
+    /// Timeout budget already consumed by earlier approach segments and
+    /// pre-clears — the per-joint timeout bounds the WHOLE attempt, so
+    /// a sensor that never clears exhausts it instead of looping.
+    spent: u32,
     post_target_ticks: i32,
     post_streak: u32,
     /// Position at PostMove entry (captured from the first tick with a
@@ -271,7 +282,8 @@ impl Homer {
             cur_idx: 0,
             cur_filled: 0,
             cur_hits: 0,
-            preclear_used: false,
+            started_clear: false,
+            spent: 0,
             post_target_ticks: 0,
             post_streak: 0,
             post_start_ticks: None,
@@ -286,7 +298,8 @@ impl Homer {
         self.pass = 1;
         self.pass_hits = [0; 2];
         self.latched = None;
-        self.preclear_used = false;
+        self.started_clear = false;
+        self.spent = 0;
         self.post_streak = 0;
         self.post_start_ticks = None;
         self.post_dur_ticks = 0;
@@ -311,8 +324,9 @@ impl Homer {
     fn public_phase(&self) -> HomingPhase {
         let map = |p: &HPhase| match p {
             HPhase::Approach => HomingPhase::Approach,
+            HPhase::Preclear => HomingPhase::Backoff,
             HPhase::Dwell => HomingPhase::Dwell,
-            HPhase::Backoff { .. } => HomingPhase::Backoff,
+            HPhase::Backoff => HomingPhase::Backoff,
             HPhase::Pause => HomingPhase::Pause,
             HPhase::Release => HomingPhase::Release,
             HPhase::Settle => HomingPhase::Settle,
@@ -381,7 +395,7 @@ impl Homer {
         match self.phase {
             HPhase::Approach => {
                 self.elapsed += 1;
-                if self.elapsed > p.timeout_ticks {
+                if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
                     self.failed_in = self.phase;
                     self.phase = HPhase::Failed;
                     return (JointCommand::idle(), Some(HomerEvent::Failed));
@@ -414,17 +428,21 @@ impl Homer {
                 if !hit {
                     return (cmd, None);
                 }
-                // Hall pre-clear guard: a trigger right at start means the
-                // joint began ON the sensor — back off and re-approach.
+                // Hall pre-clear guard: a trigger right at start means
+                // the joint began ON the sensor — reverse until the
+                // sensor reads clear, then re-approach. An approach that
+                // verifiably began off-band trusts its trigger however
+                // early it comes.
                 if p.strategy == HomingStrategy::Hall
                     && self.elapsed <= p.preclear_ticks
-                    && !self.preclear_used
+                    && !self.started_clear
                 {
-                    self.preclear_used = true;
-                    self.phase = HPhase::Backoff {
-                        rehome_after: false,
-                    };
+                    self.spent = self.spent.saturating_add(self.elapsed);
                     self.elapsed = 0;
+                    self.phase = HPhase::Preclear;
+                    // Only replies solicited by the pre-clear itself may
+                    // prove the band clear.
+                    node.hall = None;
                     return (JointCommand::idle(), None);
                 }
                 let hit_pos = i64::from(node.position_ticks.unwrap_or(0));
@@ -455,26 +473,42 @@ impl Homer {
             HPhase::Dwell => {
                 self.elapsed += 1;
                 if self.elapsed >= p.dwell_ticks {
-                    self.phase = HPhase::Backoff { rehome_after: true };
+                    self.phase = HPhase::Backoff;
                     self.elapsed = 0;
                 }
                 (JointCommand::idle(), None)
             }
-            HPhase::Backoff { rehome_after } => {
+            HPhase::Preclear => {
+                self.elapsed += 1;
+                if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
+                    self.failed_in = self.phase;
+                    self.phase = HPhase::Failed;
+                    return (JointCommand::idle(), Some(HomerEvent::Failed));
+                }
+                // Reverse WITH the hall pack: each tick's cmd-32 reply
+                // carries the live band state, and only an off-band
+                // reply with no pending edge proves the next approach
+                // starts clear. A sensor that never clears runs the
+                // budget out and fails.
+                if matches!(node.hall, Some(h) if h.trigger && !h.edge) {
+                    self.spent = self.spent.saturating_add(self.elapsed);
+                    self.elapsed = 0;
+                    self.started_clear = true;
+                    self.phase = HPhase::Approach;
+                    self.reset_detectors();
+                    return (JointCommand::idle(), None);
+                }
+                (
+                    JointCommand::hall(trunc_to_wire(-p.speed), HALL_TRIGGER_VALUE),
+                    None,
+                )
+            }
+            HPhase::Backoff => {
                 self.elapsed += 1;
                 let cmd = JointCommand::velocity(trunc_to_wire(-p.speed), 0);
                 if self.elapsed >= p.backoff_ticks {
                     self.elapsed = 0;
-                    if rehome_after {
-                        self.phase = HPhase::Pause;
-                    } else {
-                        // Pre-clear return path: restart pass 1. The
-                        // trigger that sent us here is dropped by the
-                        // approach entry, not here — no cmd-32 reply can
-                        // arrive during a velocity backoff anyway.
-                        self.phase = HPhase::Approach;
-                        self.reset_detectors();
-                    }
+                    self.phase = HPhase::Pause;
                 }
                 (cmd, None)
             }

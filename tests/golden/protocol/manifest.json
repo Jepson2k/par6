@@ -1166,6 +1166,24 @@
       ]
     },
     {
+      "file": "reply_error_stream_start_pose.bin",
+      "kind": "reply",
+      "msg": "ERROR",
+      "name": "reply_error_stream_start_pose",
+      "wire": [
+        2,
+        45,
+        [
+          -1,
+          65,
+          "Stream start pose mismatch",
+          "The session's first setpoint was beyond the start-pose tolerance on joint 3.",
+          "Setpoint dropped; controller DISABLED; error latched.",
+          "Start the stream at the arm's measured pose, then send reset."
+        ]
+      ]
+    },
+    {
       "file": "reply_complete_ok.bin",
       "kind": "reply",
       "msg": "COMPLETE",

@@ -348,6 +348,10 @@ pub struct RtCore<B: DriverBus> {
     /// Tick the ACTIVE bus was brought up at; the boot one-shots are
     /// measured from here so a live backend swap re-runs them.
     bus_booted_at: u64,
+    /// Tick the 50/150/300 config-shot schedule counts from: the bus
+    /// boot, or the last FLASHING exit (which must not reset
+    /// `bus_booted_at` — the selfcheck already ran).
+    config_repush_armed_at: u64,
     /// What `boot_configure` needs, kept so a bus swapped in later is
     /// configured exactly as the one opened at startup was.
     boot: BootConfig,
@@ -474,6 +478,11 @@ pub struct RtCore<B: DriverBus> {
     stream_sent: Arc<AtomicU64>,
     stream_last_rx_tick: u64,
     stream_timeout_ticks: u32,
+    /// True until the session's first setpoint passes the start-pose
+    /// gate; re-armed by every STREAM entry.
+    stream_first_rx: bool,
+    /// Worst-joint gap allowed on that first setpoint \[rad\].
+    stream_start_tol_rad: f64,
     stream_window_ticks: u32,
     stream_window_pos: u32,
     stream_window_applied: u32,
@@ -553,6 +562,7 @@ impl<B: DriverBus> RtCore<B> {
             conv,
             sector_done: [false; MAX_JOINTS],
             bus_booted_at: 0,
+            config_repush_armed_at: 0,
             boot: BootConfig {
                 robot: robot.clone(),
                 gripper: gripper.cloned(),
@@ -649,6 +659,8 @@ impl<B: DriverBus> RtCore<B> {
             // window exactly; only rates whose tick period approaches
             // the window itself are raised.
             stream_timeout_ticks: robot.ticks(robot.stream.command_timeout_s).max(2),
+            stream_first_rx: true,
+            stream_start_tol_rad: robot.stream.start_pose_tol_rad,
             stream_window_ticks: robot.ticks(robot.stream.success_window_s).max(1),
             stream_window_pos: 0,
             stream_window_applied: 0,
@@ -732,6 +744,7 @@ impl<B: DriverBus> RtCore<B> {
         self.sector_done = [false; MAX_JOINTS];
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
+        self.config_repush_armed_at = self.tick;
         self.homed = false;
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
@@ -921,13 +934,28 @@ impl<B: DriverBus> RtCore<B> {
                 let _ = self.request_mode(Mode::Idle);
             }
         }
-        if BOOT_CONFIG_RESEND_TICKS.contains(&since_boot) && !self.bus.is_silent() {
-            for i in 0..MAX_JOINTS {
-                let _ = self.bus.resend_node_config(self.node_of[i], 1);
-            }
-            if self.has_can_gripper {
-                let _ = self.bus.resend_node_config(self.gripper_node, 1);
-            }
+        // The scheduled shots ride their own arm point, not the bus
+        // boot: a FLASHING exit re-arms them without re-running the
+        // selfcheck above.
+        let since_armed = self.tick - self.config_repush_armed_at;
+        if BOOT_CONFIG_RESEND_TICKS.contains(&since_armed) && !self.bus.is_silent() {
+            self.config_repush();
+        }
+    }
+
+    /// One full stored-config shot: `bus.boot_config_repeats` passes to
+    /// every arm node and the CAN gripper motor (the vendor pushes 4 per
+    /// shot; the config key governs the redundancy).
+    fn config_repush(&mut self) {
+        for i in 0..MAX_JOINTS {
+            let _ = self
+                .bus
+                .resend_node_config(self.node_of[i], self.boot.config_repeats);
+        }
+        if self.has_can_gripper {
+            let _ = self
+                .bus
+                .resend_node_config(self.gripper_node, self.boot.config_repeats);
         }
     }
 
@@ -1212,6 +1240,7 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 self.stream.activate(&self.q);
                 self.stream_last_rx_tick = self.tick;
+                self.stream_first_rx = true;
                 self.stream_window_pos = 0;
                 self.stream_window_applied = 0;
                 self.stream_sent_base = self.stream_sent.load(Ordering::Relaxed);
@@ -1247,6 +1276,12 @@ impl<B: DriverBus> RtCore<B> {
                 self.bus.set_silent(false);
                 // The silent window must not read as a mass disconnect.
                 self.bus.rebase_freshness();
+                // ... which also masks every real power-cycle or reflash
+                // that happened during it from the reconnect path, so
+                // the exit pushes the stored config itself — one pass
+                // now, then the re-armed 50/150/300 shots.
+                self.config_repush();
+                self.config_repush_armed_at = self.tick;
                 if self.flash.flashed() {
                     log::info!("firmware was flashed: homing invalidated");
                     self.homed = false;
@@ -1729,23 +1764,29 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 let mut applied = false;
                 if let Some(sp) = self.stream_rx.take() {
-                    // Scale first: the limits have to be in force for the
-                    // tick that consumes this target, not the one after.
-                    // Only on a change — `set_limits` rewrites the OTG's
-                    // whole input block and most streams never move the
-                    // sliders at all.
-                    if self.stream_scale != (sp.speed, sp.accel) {
-                        self.stream.set_scale(sp.speed, sp.accel);
-                        self.stream_scale = (sp.speed, sp.accel);
+                    if self.stream_first_rx && !self.stream_admit(&sp) {
+                        // Dropped un-applied; the latch's reaction lands
+                        // on the next error pass.
+                    } else {
+                        self.stream_first_rx = false;
+                        // Scale first: the limits have to be in force for
+                        // the tick that consumes this target, not the one
+                        // after. Only on a change — `set_limits` rewrites
+                        // the OTG's whole input block and most streams
+                        // never move the sliders at all.
+                        if self.stream_scale != (sp.speed, sp.accel) {
+                            self.stream.set_scale(sp.speed, sp.accel);
+                            self.stream_scale = (sp.speed, sp.accel);
+                        }
+                        // `q_target` carries the raw request; the filter
+                        // sits between it and the executor, so the pair
+                        // makes the smoothing visible.
+                        self.q_target = sp.q;
+                        let target = self.filtered_target(&sp.q);
+                        self.stream.set_target(&target);
+                        self.stream_last_rx_tick = self.tick;
+                        applied = true;
                     }
-                    // `q_target` carries the raw request; the filter sits
-                    // between it and the executor, so the pair makes the
-                    // smoothing visible.
-                    self.q_target = sp.q;
-                    let target = self.filtered_target(&sp.q);
-                    self.stream.set_target(&target);
-                    self.stream_last_rx_tick = self.tick;
-                    applied = true;
                 }
                 self.stream_window(applied);
                 self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
@@ -1837,6 +1878,35 @@ impl<B: DriverBus> RtCore<B> {
             *y += self.stream_lp_alpha * (x - *y);
         }
         self.stream_filt
+    }
+
+    /// The start-pose gate on a session's first setpoint: worst-joint
+    /// gap to the measured pose within `stream.start_pose_tol_rad`, or
+    /// the setpoint is refused and the hard `StreamStartPose` key
+    /// latches on the worst joint — the executor would otherwise ramp
+    /// the arm to wherever the client happened to start publishing.
+    fn stream_admit(&mut self, sp: &StreamSetpoint) -> bool {
+        let mut worst = 0usize;
+        let mut gap = 0.0f64;
+        for i in 0..MAX_JOINTS {
+            let d = (sp.q[i] - self.q[i]).abs();
+            if d > gap {
+                gap = d;
+                worst = i;
+            }
+        }
+        if gap <= self.stream_start_tol_rad {
+            return true;
+        }
+        // Refusal path: runs at most a tick or two before ACTIVE_ERROR.
+        log::warn!(
+            "stream refused: first setpoint {gap:.3} rad from the measured pose on J{worst} \
+             (tolerance {:.3})",
+            self.stream_start_tol_rad
+        );
+        self.errors
+            .latch(ErrorCode::StreamStartPose, Some(worst as u8));
+        false
     }
 
     fn stream_window(&mut self, applied: bool) {

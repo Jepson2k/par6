@@ -552,7 +552,8 @@ control_mode = "pid"
 [stream]
 command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
-success_window_s = 0.4 # 100 ticks @ 250 Hz
+success_window_s = 0.4      # 100 ticks @ 250 Hz
+start_pose_tol_rad = 0.1    # worst-joint gap allowed on a session's first setpoint
 
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog

@@ -162,10 +162,15 @@ impl FreshnessClock {
 
     /// Record a frame from `node`. Returns `true` when it is a
     /// stale→fresh edge (the reconnect signal that re-sends config).
+    /// A node's FIRST-ever frame counts as an edge: one that boots
+    /// after the last scheduled config shot has missed every push it
+    /// will get, and this sighting is the only signal left to
+    /// configure it (the boot pass it did receive makes the extra
+    /// per-node pass idempotent).
     pub(crate) fn mark(&mut self, node: NodeId, tick: u64) -> bool {
         let n = usize::from(node);
         let reconnected = self.last_rx_tick[n]
-            .is_some_and(|last| tick.saturating_sub(last) >= self.stale_warn_ticks);
+            .is_none_or(|last| tick.saturating_sub(last) >= self.stale_warn_ticks);
         self.last_rx_tick[n] = Some(tick);
         reconnected
     }
@@ -477,8 +482,17 @@ mod tests {
         assert_eq!(f.classify(0, 0), Freshness::Unknown);
         assert_eq!(f.age(0, 0), u64::MAX);
 
-        assert!(!f.mark(0, 1), "first frame is not a reconnect");
+        assert!(
+            f.mark(0, 1),
+            "the first-ever frame IS an edge: a node that boots after the \
+             last scheduled config shot has missed every push it will get, \
+             and this edge is the only signal left to configure it"
+        );
         assert_eq!(f.classify(0, 1), Freshness::Fresh);
+        assert!(
+            f.mark(5, 1) && !f.mark(5, 2),
+            "only the FIRST frame is the edge"
+        );
         assert_eq!(f.classify(0, 1 + stale - 1), Freshness::Fresh);
         assert_eq!(f.classify(0, 1 + stale), Freshness::Stale);
         assert_eq!(f.age(0, 1 + stale), stale);

@@ -107,3 +107,106 @@ fn a_cutoff_at_or_above_nyquist_is_reported_as_off() {
         q[0] - s.q_commanded[0]
     );
 }
+
+/// The start-pose gate: a session's FIRST setpoint farther than
+/// `stream.start_pose_tol_rad` from the measured pose (worst joint) is
+/// dropped un-applied and latches the hard `StreamStartPose` key — the
+/// executor must never ramp the arm to wherever a client happened to
+/// start publishing. Within tolerance the session admits, and once
+/// admitted later setpoints range freely (the watchdog and limiter own
+/// them); every NEW session re-arms the check.
+#[test]
+fn a_first_setpoint_beyond_the_start_tolerance_never_moves_the_arm() {
+    use par6_rt::ErrorCode;
+
+    let mut rig = rig_with_cutoff(0.0);
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    // Baseline is the MEASURED pose — the session holds at what the RT
+    // decoded, and the encoder round trip quantises `rig.pose`.
+    let start = rig.snap().q;
+    let mut q = start;
+    q[0] += 0.2; // double the shipped 0.1 rad tolerance
+    rig.handles.stream.send(&StreamSetpoint {
+        q,
+        ..Default::default()
+    });
+    // The tick that consumes the refused setpoint must not move the
+    // command at all — an applied one would step the OTG toward the
+    // target this very tick.
+    let s = rig.snap_after_tick();
+    assert_eq!(
+        s.mode,
+        Mode::Stream,
+        "the reaction lands on the NEXT error pass; this tick still \
+         publishes the streaming law's command"
+    );
+    assert!(
+        (s.q_commanded[0] - start[0]).abs() < 1e-9,
+        "the refused setpoint must never move the command: {} vs {}",
+        s.q_commanded[0],
+        start[0]
+    );
+    for _ in 0..20 {
+        rig.tick();
+    }
+    let s = rig.snap();
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::StreamStartPose && e.joint == Some(0)),
+        "the refusal must latch the dedicated key on the worst joint: {:?}",
+        s.errors.as_slice()
+    );
+    assert_eq!(s.mode, Mode::ActiveError, "a hard latch reacts");
+
+    // Within tolerance the session admits, and the gate is first-only:
+    // an in-session jump twice the tolerance is the limiter's business.
+    let mut rig = rig_with_cutoff(0.0);
+    let start = rig.pose;
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    let mut q = start;
+    q[0] += 0.05;
+    rig.handles.stream.send(&StreamSetpoint {
+        q,
+        ..Default::default()
+    });
+    rig.tick();
+    assert!(
+        (rig.snap().q_target[0] - q[0]).abs() < 1e-12,
+        "within tolerance the first setpoint applies"
+    );
+    q[0] += 0.2;
+    rig.handles.stream.send(&StreamSetpoint {
+        q,
+        ..Default::default()
+    });
+    rig.tick();
+    let s = rig.snap();
+    assert!(
+        (s.q_target[0] - q[0]).abs() < 1e-12,
+        "in-session setpoints are not start-gated"
+    );
+    assert!(!s.error_active, "no latch from an admitted session");
+
+    // A NEW session re-arms the gate.
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    let mut q = rig.snap().q;
+    q[1] += 0.2;
+    rig.handles.stream.send(&StreamSetpoint {
+        q,
+        ..Default::default()
+    });
+    for _ in 0..20 {
+        rig.tick();
+    }
+    assert!(
+        rig.snap()
+            .errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::StreamStartPose && e.joint == Some(1)),
+        "re-entering STREAM re-arms the first-setpoint check"
+    );
+}

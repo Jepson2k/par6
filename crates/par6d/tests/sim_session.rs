@@ -1260,6 +1260,12 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
         c.ok(&Command::Reset);
         teleport_home(rig, c, park_deg());
         rig.drain_status();
+        // Prime with one command and one status frame: the stream's
+        // opening setpoint has to survive in the latest-wins slot until
+        // an RT tick consumes it, and the measurement loop below would
+        // overwrite it within a tick.
+        c.send(&command());
+        rig.wait_status("the stream opened", |_| true);
         let start = park_deg()[0];
         let mut last = start;
         let until = Instant::now() + window;
@@ -1300,9 +1306,18 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
     let mut target = park_deg();
     target[0] += 90.0;
     let servo = |speed: Option<f64>| {
+        // The session's first setpoint must sit at the measured pose —
+        // the start-pose gate refuses a stream that opens 90° away — so
+        // the far target streams in from the second datagram on.
+        let mut first = true;
         move || {
+            let angles = if std::mem::take(&mut first) {
+                park_deg()
+            } else {
+                target
+            };
             Command::ServoJ(par6_proto::command::ServoJ {
-                angles: target,
+                angles,
                 speed,
                 accel: None,
             })
