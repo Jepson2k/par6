@@ -337,6 +337,35 @@ fn the_preview_runs_the_cartesian_pipeline() {
             || err.code == ErrorCode::IkPartialPath as u16,
         "{err:?}"
     );
+
+    // A cartesian jog's setpoints are TRACKED by the streaming executor,
+    // and `accel` scales how hard it tracks. A preview that stopped at
+    // the setpoints reported the same travel whatever the caller asked
+    // for, so a jog told to accelerate gently must cover less ground.
+    let mut drop_at = |accel: Option<f64>| {
+        preview.place_rad(to_rad(&park));
+        let before = preview.pose().expect("FK")[11];
+        let jogged = preview.submit(Command::JogL(JogL {
+            velocities: [0.0, 0.0, -1.0, 0.0, 0.0, 0.0],
+            duration: 0.4,
+            frame: Frame::Wrf,
+            accel,
+        }));
+        assert!(jogged.valid(), "{jogged:?}");
+        before - preview.pose().expect("FK")[11]
+    };
+    let full = drop_at(Some(1.0));
+    let gentle = drop_at(Some(0.01));
+    assert!(full > 0.01, "a -Z jog must lower the TCP: {full} m");
+    // The STREAM ceilings are loose next to jog_l's rates, so the
+    // executor tracks the setpoints closely and the gap is a few per
+    // cent rather than a fraction. The point is that there is one at
+    // all: a preview that stopped at the setpoints reported identical
+    // travel for every accel a caller could ask for.
+    assert!(
+        full - gentle > 0.01 * full,
+        "a gently accelerated jog must cover less ground: {gentle} m vs {full} m"
+    );
 }
 
 /// The server's blend hold, offline: a move asking to round its corner

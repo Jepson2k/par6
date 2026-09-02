@@ -17,15 +17,15 @@ use par6_proto::{
     NUM_JOINTS, UNATTRIBUTED,
 };
 use par6_rt::{
-    sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
-    SnapshotWriter, StateSnapshot, MAX_JOINTS,
+    hooks::StreamTracker, sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine,
+    Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
     blend_radius_mm, cmd_name, decode_error_to_wire, gate, registry_fault, validate_supported,
     write_io_fault, PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
-use crate::adapters::MotionJog;
+use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
     step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate, HOUSEKEEPING_PERIOD,
     STREAM_LOOKAHEAD_S,
@@ -162,6 +162,11 @@ pub struct Preview {
     /// outlast its own time constant; the margin covers the s-curve
     /// profile, which spends longer than the linear one reaching rest.
     jog_ramp_ticks: usize,
+    /// The RT's own streaming executor. A cartesian jog is integrated
+    /// into joint setpoints and then TRACKED by this, so a preview that
+    /// stopped at the setpoints would report a jog that starts and stops
+    /// instantly and would have nothing for `accel` to scale.
+    stream: MotionStream,
     /// The streaming collision gate, the same one the housekeeping loop
     /// runs: a jog is admitted only if its projected lookahead clears.
     gate: StreamGate,
@@ -255,6 +260,12 @@ impl Preview {
             jog_ramp_ticks: ((2.0 * robot.jog.accel_time_s / robot.robot.tick_dt_s).ceil()
                 as usize)
                 .max(1),
+            stream: MotionStream::new(
+                par6_motion::StreamingExecutor::new(robot.robot.tick_dt_s, &stream_limits)?,
+                robot.robot.tick_dt_s,
+                stream_limits,
+                robot.stream.fault_latch_s,
+            ),
             gate: StreamGate::new(stack.gate_collision, &jog_limits),
             cfg,
             _cmds_rx: cmds_rx,
@@ -555,7 +566,7 @@ impl Preview {
                 self.standing()
             }
             Command::JogJ(p) => self.preview_jog(p.speeds, p.duration, p.accel),
-            Command::JogL(p) => self.preview_jog_l(p.velocities, p.frame, p.duration),
+            Command::JogL(p) => self.preview_jog_l(p.velocities, p.frame, p.duration, p.accel),
             // A streamed target is tracked by the RT's own OTG at the
             // cadence targets arrive; offline there is no cadence, so the
             // settle onto the newest target is the planner's joint move.
@@ -803,17 +814,23 @@ impl Preview {
     /// a TRF twist rotated by the current orientation, joint rates
     /// through the damped jacobian, the target clamped to the soft
     /// window.
+    ///
+    /// What comes back is the setpoint stream the runtime feeds its
+    /// streaming executor, which is what housekeeping computes. `accel`
+    /// scales how hard that executor tracks the stream, so it is
+    /// validated here but does not move the setpoints.
     pub fn preview_jog_l(
         &mut self,
         velocities: [f64; 6],
         frame: par6_proto::Frame,
         duration_s: f64,
+        accel: Option<f64>,
     ) -> PreviewResult {
         let command = Command::JogL(cmd::JogL {
             velocities,
             duration: duration_s,
             frame,
-            accel: None,
+            accel,
         });
         if let Err(e) = command.validate() {
             return self.refuse(decode_error_to_wire(&e));
@@ -837,18 +854,34 @@ impl Preview {
         if let Some(error) = self.cart_jog_blocked(&mut state.clone()) {
             return self.refuse(error);
         }
+        // Housekeeping emits a setpoint every period and the RT tracks it
+        // at the tick — so that is what runs here, on the runtime's own
+        // executor rather than on the raw setpoints.
         let period = HOUSEKEEPING_PERIOD.as_secs_f64();
         let steps = ((duration_s / period).round() as usize).max(1);
-        let mut trajectory = Vec::with_capacity(steps);
+        let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
+        self.stream.activate(&self.snap.q);
+        self.stream.set_scale(1.0, accel.unwrap_or(1.0));
+        let mut trajectory = Vec::with_capacity(steps * ticks_per_step);
+        let mut q = self.snap.q;
         for _ in 0..steps {
-            match step_cart_jog(&mut self.cart, &mut state, period) {
+            let target = match step_cart_jog(&mut self.cart, &mut state, period) {
+                Ok((target, _)) => target,
                 // A twist the jacobian cannot resolve holds in place, as
                 // housekeeping holds on every failed solve.
-                Ok((q, _)) => trajectory.push(q),
-                Err(_) => trajectory.push(state.q),
+                Err(_) => state.q,
+            };
+            self.stream.set_target(&target);
+            for _ in 0..ticks_per_step {
+                let mut qd_out = [0.0; MAX_JOINTS];
+                self.stream.step(&mut q, &mut qd_out);
+                trajectory.push(q);
             }
         }
-        self.finish_stream(trajectory, trajectory_duration(steps, period))
+        self.finish_stream(
+            trajectory,
+            trajectory_duration(steps * ticks_per_step, self.dt),
+        )
     }
 
     /// The runtime's jog admission check: where the commanded speeds put

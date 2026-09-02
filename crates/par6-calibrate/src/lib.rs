@@ -145,6 +145,7 @@ async fn read_held(client: &Client, protocol: &Protocol) -> Result<GravitySample
         tau: [0.0; NQ],
     };
     let mut taken = 0usize;
+    let mut first: Option<[f64; NQ]> = None;
     let deadline = tokio::time::Instant::now() + protocol.pose_timeout;
     while taken < protocol.frames {
         match tokio::time::timeout_at(deadline, rx.changed()).await {
@@ -154,10 +155,14 @@ async fn read_held(client: &Client, protocol: &Protocol) -> Result<GravitySample
         let Some(s) = rx.borrow_and_update().clone() else {
             continue;
         };
-        // A torque reading is only gravity if the arm is actually holding
-        // the pose. A fault, a dropped bus, a disabled arm or a joint
-        // still moving all produce numbers that look like measurements
-        // and would be fitted as if they were.
+        // A torque reading is only gravity if the arm is actually
+        // holding the pose. A fault, a dropped bus or a disabled arm all
+        // produce numbers that look like measurements and would be
+        // fitted as if they were. Rest is NOT tested here: the position
+        // loop holds a pose in a limit cycle, so reported speeds stay
+        // nonzero while the angles sit still. What decides the move is
+        // over is the runtime's SETTLED policy, and what removes the
+        // chatter is averaging over `frames`.
         if let Some(e) = &s.error {
             return Err(format!(
                 "the arm faulted while sampling: {} ({})",
@@ -170,11 +175,24 @@ async fn read_held(client: &Client, protocol: &Protocol) -> Result<GravitySample
         if s.link_ok != 1 {
             return Err("the motor bus link went stale while sampling".into());
         }
-        if s.speeds.iter().any(|v| v.abs() > REST_RAD_S) {
-            return Err(format!(
-                "the arm was still moving while sampling: speeds {:?} rad/s",
-                s.speeds
-            ));
+        // Rest is judged on the ANGLES, not the speeds: the position
+        // loop holds a pose in a limit cycle, so reported speeds stay
+        // nonzero while the arm sits still (parol6's `wait_motion` pairs
+        // its speed threshold with an angle one for the same reason).
+        // A window the arm moved across is not one pose's torque.
+        match &first {
+            None => first = Some(std::array::from_fn(|j| s.angles[j])),
+            Some(a0) => {
+                let drift = (0..NQ)
+                    .map(|j| (s.angles[j] - a0[j]).abs())
+                    .fold(0.0, f64::max);
+                if drift > REST_DRIFT_DEG {
+                    return Err(format!(
+                        "the arm moved {drift:.3} deg while sampling this pose, so the \
+                         frames are not one pose's torque"
+                    ));
+                }
+            }
         }
         for j in 0..NQ {
             sample.q[j] += s.angles[j].to_radians();
@@ -303,10 +321,16 @@ pub fn arm_params(kin: &Kin, fitted: &[BodyParams]) -> Result<Vec<BodyParams>, S
         .collect())
 }
 
-/// Joint speed at or below which the arm counts as resting \[rad/s\].
-/// The runtime's SETTLED policy has already decided the move finished;
-/// this only catches a reading taken while something is still creeping.
-const REST_RAD_S: f64 = 5e-3;
+/// How far a joint may drift across one pose's sampling window before
+/// the frames stop describing a single pose \[deg\].
+///
+/// Sized between the two things it has to tell apart: the position
+/// loop's limit cycle, measured at about half a degree peak-to-peak
+/// across a window, and the smallest motion a calibration commands,
+/// which is the approach offset at 0.05 rad (2.9 deg). parol6 draws the
+/// same line at half a degree, but frame-to-frame rather than across a
+/// window, and pairs it with a speed threshold and a settle window.
+const REST_DRIFT_DEG: f64 = 2.0;
 
 /// An axis counts as measured when the data fixed more of it than the
 /// prior did (see `GravityFit::determined`).

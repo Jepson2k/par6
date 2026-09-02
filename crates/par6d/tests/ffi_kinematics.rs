@@ -1736,6 +1736,17 @@ fn tcp_speeds(path: &[Status]) -> Vec<([f64; 3], f64)> {
     path.windows(SPEED_WINDOW)
         .filter_map(|w| {
             let (first, last) = (&w[0], &w[SPEED_WINDOW - 1]);
+            // Only a window the test actually received every frame of.
+            // Speed here is the CHORD between the ends over the elapsed
+            // time, so a frame the socket dropped stretches the time
+            // while the chord stays straight — across a corner that
+            // reads as a slowdown that never happened. The broadcast
+            // sequence says which windows are whole, so a dropped frame
+            // costs a sample instead of corrupting one.
+            let span = last.seq.checked_sub(first.seq)?;
+            if span != (SPEED_WINDOW - 1) as u64 {
+                return None;
+            }
             let dt = last.mono_time_ns.checked_sub(first.mono_time_ns)? as f64 * 1e-9;
             (dt > 0.0).then(|| {
                 (
