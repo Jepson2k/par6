@@ -233,7 +233,7 @@ pub enum CoreError {
 }
 
 /// The pluggable seams [`RtCore`] runs on. `par6d` wires the real
-/// engines (par6-motion, pinokin FK, GPIO chips, command-plane queue);
+/// engines (par6-motion, Pinocchio FK, GPIO chips, command-plane queue);
 /// tests and the sim runtime use the built-ins from [`crate::hooks`],
 /// [`crate::gravity`], [`crate::gpio`].
 pub struct RtHooks {

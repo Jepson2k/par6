@@ -19,13 +19,10 @@
 //! | [`status`] | broadcast STATUS packet, reusable-buffer encoder |
 //! | [`chunk`] | chunked bulk envelope + [`Reassembler`] |
 //! | [`pygen`] | generator for the Python constants mirror |
-//! | [`golden`] | golden-vector definitions (cross-language conformance) |
 //!
 //! The Python constants mirror (`python/par6/protocol/constants.py`) is
 //! generated from this crate (`cargo run -p par6-proto --bin gen_python`);
-//! golden vectors under `tests/golden/protocol/` are the cross-language
-//! conformance suite (`cargo run -p par6-proto --bin gen_golden`). Tests in
-//! this crate fail if either is stale. Contract changes require a
+//! a test in this crate fails if it is stale. Contract changes require a
 //! `contracts`-labeled issue (see README workflow).
 
 #![warn(missing_docs)]
@@ -37,7 +34,6 @@ pub mod chunk;
 pub mod command;
 pub mod enums;
 pub mod error;
-pub mod golden;
 pub mod pygen;
 pub mod reply;
 pub mod status;
@@ -97,8 +93,7 @@ pub const EN_SLOTS: usize = 12;
 /// A flattened row-major 4×4 from a translation and an intrinsic-XYZ
 /// rotation `[rx, ry, rz]` in radians: `R = Rx(rx)·Ry(ry)·Rz(rz)`.
 ///
-/// This is `pinokin.se3_from_rpy`'s order, which is the convention every
-/// TCP pose on the wire uses — and NOT the extrinsic order keep-out
+/// This is the convention every TCP pose on the wire uses — and NOT the extrinsic order keep-out
 /// shapes are placed with (`par6_kin::Shape::pose`). The two agree on a
 /// single-axis rotation and diverge on any multi-axis tilt, which is why
 /// there is one builder here rather than a hand-derived matrix per

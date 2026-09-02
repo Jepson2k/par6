@@ -1,34 +1,28 @@
 """Unified PAR6 robot — waldoctl ``Robot`` backend for the par6d runtime.
 
 Identity and limits come from the packaged runtime config (see
-:mod:`par6.config`); FK/IK run through pinokin on the packaged URDF tree of
-the active tool, resolved at that tree's own TCP frame — the same file and
-the same frame ``par6d`` resolves at, so preview and runtime cannot
-disagree about where the tool is; clients are the protocol-v2 UDP clients
-from :mod:`par6.client` with the config-built tool specs bound.
+:mod:`par6.config`); FK/IK and collision checking run in the engine
+(:mod:`par6._par6`) on the packaged URDF tree of the active tool, resolved
+at that tree's own TCP frame — the same files, the same solver and the
+same frame ``par6d`` uses, so preview and runtime cannot disagree about
+where the tool is.  Clients are the protocol-v2 UDP clients from
+:mod:`par6.client` with the config-built tool specs bound.
 """
 
 from __future__ import annotations
 
-import atexit
 import logging
-import math
 import os
 import re
 import shutil
 import subprocess
-import tempfile
 import threading
 import time
-import xml.etree.ElementTree as ET
 from dataclasses import dataclass
-from functools import cache
 from typing import Any, Literal
 
 import numpy as np
 from numpy.typing import NDArray
-from pinokin import CollisionChecker, Damping, IKSolver, se3_from_rpy, so3_rpy
-from pinokin import Robot as PinokinRobot
 from waldoctl import (
     CartesianKinodynamicLimits,
     JointsSpec,
@@ -42,7 +36,14 @@ from waldoctl import (
 from waldoctl.results import IKResult
 
 from par6 import config as _cfg
-from par6._par6 import ping_blocking
+from par6._par6 import (
+    COLLISION_CLEARANCE_M,
+    CollisionWorld,
+    Kinematics,
+    compose_tool_frame,
+    ping_blocking,
+)
+from par6.client._wire import shape_to_wire
 from par6.client.async_client import AsyncRobotClient
 from par6.client.dry_run_client import DryRunRobotClient
 from par6.client.errors import RobotError
@@ -51,100 +52,16 @@ from par6.tools import build_tools
 
 logger = logging.getLogger(__name__)
 
-#: Default standoff the runtime enforces every collision pair at \[m\]
-#: (``par6d::daemon::COLLISION_CLEARANCE_M``). Client-side previews use the
-#: same value, or they call clear what the arm will brake for.
-COLLISION_CLEARANCE_M = 0.005
-
 #: "Not probed yet" marker for the cached daemon-config path (a real
 #: answer may legitimately be None).
 _UNSET: Any = object()
 
-
-# ===========================================================================
-# Collision naming and geometry
-# ===========================================================================
-
-
-def _shape_geom_name(name: str) -> str:
-    """A keep-out's geometry name — waldoctl's ``shape:`` vocabulary, which
-    is also how the runtime reports it, so a pair list needs no translation.
-
-    ``install:`` has no counterpart here: installation keep-outs live in the
-    runtime's own config and no client can apply them.
-    """
-    return f"shape:{name}"
-
-
-def _display(geom: str) -> str:
-    """The reporting name of one colliding geometry: keep-outs already carry
-    their prefix, robot geometry drops the per-link index pinocchio appends
-    (``upper_arm_0`` → ``upper_arm``) so pairs name URDF links."""
-    if geom.startswith("shape:"):
-        return geom
-    link, sep, index = geom.rpartition("_")
-    return link if sep and index.isdigit() else geom
-
-
-def _shape_world_pose(pose) -> NDArray[np.float64]:
-    """A shape's ``[x, y, z, rx, ry, rz]`` as a column-major SE3.
-
-    ``R = Rz(rz)·Ry(ry)·Rx(rx)`` — extrinsic XYZ, each angle about a fixed
-    world axis. This is NOT :func:`pinokin.se3_from_rpy`'s intrinsic order,
-    and the two diverge on any multi-axis tilt; the runtime's C++ shim
-    (``rpy_to_rotation``) and the frontend's renderer both place shapes
-    this way, so a keep-out is previewed in the orientation it was drawn in.
-    """
-    x, y, z, rx, ry, rz = (float(v) for v in pose)
-    T = np.zeros((4, 4), dtype=np.float64, order="F")
-    cx, sx, cy, sy, cz, sz = (
-        math.cos(rx),
-        math.sin(rx),
-        math.cos(ry),
-        math.sin(ry),
-        math.cos(rz),
-        math.sin(rz),
-    )
-    T[:3, :3] = np.array(
-        [
-            [cz * cy, cz * sy * sx - sz * cx, cz * sy * cx + sz * sx],
-            [sz * cy, sz * sy * sx + cz * cx, sz * sy * cx - cz * sx],
-            [-sy, cy * sx, cy * cx],
-        ]
-    )
-    T[:3, 3] = (x, y, z)
-    T[3, 3] = 1.0
-    return T
-
-
-@cache
-def _resolved_urdf_for_collision(tool_key: str) -> str:
-    """Path to *tool_key*'s URDF with its ``package://`` mesh URIs rewritten
-    absolute, so pinocchio's loader can find the meshes.
-
-    The packaged trees declare meshes under ``package://par6/`` — the name a
-    3-D view resolves through ``{backend_package: mesh_dir}`` — which maps
-    to no directory pinocchio can search. Rewriting into a temp file leaves
-    the packaged tree untouched and avoids a symlink farm. A plain absolute
-    path, not ``file://``: coal strips the scheme naively.
-    """
-    src = _cfg.urdf_path(tool_key)
-    meshes = _cfg.urdf_tree_root(tool_key) / "meshes"
-    rewritten = src.read_text(encoding="utf-8").replace(
-        "package://par6/meshes/", meshes.as_posix() + "/"
-    )
-    fd, path = tempfile.mkstemp(prefix="par6_collision_", suffix=".urdf")
-    with os.fdopen(fd, "w") as f:
-        f.write(rewritten)
-    atexit.register(lambda: _unlink_quietly(path))
-    return path
-
-
-def _unlink_quietly(path: str) -> None:
-    try:
-        os.unlink(path)
-    except OSError as e:
-        logger.debug("could not remove temp URDF %s: %s", path, e)
+_IDENTITY = (
+    1.0, 0.0, 0.0, 0.0,
+    0.0, 1.0, 0.0, 0.0,
+    0.0, 0.0, 1.0, 0.0,
+    0.0, 0.0, 0.0, 1.0,
+)  # fmt: skip
 
 
 # ===========================================================================
@@ -168,8 +85,7 @@ def _find_par6d() -> str:
     if found is None:
         raise RuntimeError(
             "par6d binary not found; set PAR6D_BIN or put it on PATH "
-            "(build with `scripts/ffi/setup.sh && source .ffi/env.sh && "
-            "cargo build -p par6d --release`)"
+            "(build with `scripts/ffi/setup.sh && cargo build -p par6d --release`)"
         )
     return found
 
@@ -307,107 +223,6 @@ def _is_panic(line: str) -> bool:
     return line.startswith("thread '") or "panicked at" in line
 
 
-# ===========================================================================
-# Kinematic model
-# ===========================================================================
-
-
-def _load_kinematic_model(
-    urdf_file: str, soft_rad: NDArray[np.float64], velocity: NDArray[np.float64]
-) -> PinokinRobot:
-    """Pinokin model of a packaged URDF tree, resolved at its TCP frame.
-
-    Every gripper tree carries its TCP as a fixed link off the flange, and
-    that link is the frame the runtime resolves FK/IK/Jacobian at
-    (``par6_kin::GripperVariant::tcp_frame``); the bare flange tree has no
-    such link and its last link is the tool point, which is what both sides
-    fall back to.
-
-    The SolidWorks export writes ``lower="0" upper="0"`` on every joint, so
-    the config's soft position limits (and velocity ceilings) are patched in
-    before loading — that is what makes ``IKSolver(enforce_limits=True)``
-    and its in-limits restarts meaningful.
-    """
-    root = ET.parse(urdf_file).getroot()
-    i = 0
-    for joint in root.iter("joint"):
-        if joint.get("type") != "revolute":
-            continue
-        limit = joint.find("limit")
-        if limit is None:
-            limit = ET.SubElement(joint, "limit")
-        limit.set("lower", repr(float(soft_rad[i, 0])))
-        limit.set("upper", repr(float(soft_rad[i, 1])))
-        limit.set("velocity", repr(float(velocity[i])))
-        i += 1
-    if i != soft_rad.shape[0]:
-        raise RuntimeError(
-            f"URDF {urdf_file!r} has {i} revolute joints, config has {soft_rad.shape[0]}"
-        )
-    model = PinokinRobot.from_urdf_string(ET.tostring(root, encoding="unicode"))
-    # Named, not inferred: the end of the chain is the TCP only by an
-    # accident of link ordering, and a tree that gained a link after it
-    # would silently move the whole cartesian surface.
-    if any(link.get("name") == _cfg.TCP_LINK for link in root.iter("link")):
-        model.set_ee_frame(_cfg.TCP_LINK)
-    return model
-
-
-def _sample_cartesian_limit(
-    model: PinokinRobot,
-    soft_rad: NDArray[np.float64],
-    home_rad: NDArray[np.float64],
-    joint_limit: NDArray[np.float64],
-    samples: int,
-    seed: int,
-    spread_deg: float = 30.0,
-) -> tuple[float, float]:
-    """Median TCP rate a per-joint limit buys, as ``(linear, angular)``.
-
-    Samples joint configurations around the park pose, and at each one solves
-    the Jacobian pseudoinverse for the joint rates that move the TCP along one
-    Cartesian axis alone, then takes the largest scaling of those rates that
-    stays inside *joint_limit*.  Ill-conditioned configurations and directions
-    that cannot be isolated (a linear axis that drags rotation with it, or the
-    reverse) are dropped.  Deterministic: *seed* fixes the sample set.
-
-    This is the derivation parol6 runs offline to produce its ``LIMITS.cart``
-    constants (``parol6/PAROL6_ROBOT.py:603-676``); par6 runs it against its
-    own model and config instead of carrying the numbers.
-    """
-    rng = np.random.default_rng(seed)
-    spread_rad = math.radians(spread_deg)
-    linear: list[float] = []
-    angular: list[float] = []
-    desired = np.zeros(6, dtype=np.float64)
-    for _ in range(samples):
-        q = np.clip(
-            home_rad + rng.normal(0.0, spread_rad, home_rad.shape[0]),
-            soft_rad[:, 0],
-            soft_rad[:, 1],
-        )
-        J = model.jacob0(q)
-        if np.linalg.cond(J) > 1e6:
-            continue
-        J_pinv = np.linalg.pinv(J)
-        for axis in range(6):
-            desired[:] = 0.0
-            desired[axis] = 1.0
-            q_dot = J_pinv @ desired
-            coupled = J[3:, :] @ q_dot if axis < 3 else J[:3, :] @ q_dot
-            if np.linalg.norm(coupled) > 0.01:
-                continue
-            rate = float(np.min(joint_limit / (np.abs(q_dot) + 1e-10)))
-            if rate > 0.001:
-                (linear if axis < 3 else angular).append(rate)
-    if not linear or not angular:
-        raise RuntimeError(
-            "Cartesian limit sampling found no isolable axis; "
-            "the kinematic model or the joint limits are degenerate"
-        )
-    return float(np.median(linear)), float(np.median(angular))
-
-
 @dataclass
 class Par6IKResult:
     """IK result — structurally satisfies the waldoctl ``IKResult`` Protocol."""
@@ -445,39 +260,31 @@ class Robot(_RobotABC):
         self._timeout = timeout
         self._manager = _Par6dManager(normalize_logs=normalize_logs)
 
-        self._config = _cfg.load_robot_config()
-        self._grippers = _cfg.load_gripper_configs()
+        self._config = _cfg.config()
         self._joints = _cfg.build_joints_spec()
         self._tools = build_tools()
-        self._soft_rad = _cfg.soft_limits_rad(self._config)
+        self._native_keys = {g["key"] for g in self._config.grippers()}
+        self._soft = [tuple(pair) for pair in self._config.soft_limits_rad()]
         self._cartesian_limits: CartesianKinodynamicLimits | None = None
 
-        # One model per packaged URDF tree, built on first use and kept:
-        # a tool change is a display action, and re-parsing a tree (and
-        # rebuilding its solver) on every one would stall the UI.
-        self._models: dict[str, PinokinRobot] = {}
-        self._solvers: dict[str, IKSolver] = {}
-        # Same caching for the collision checkers, keyed the same way.
-        # A value of None records a tree whose checker could not be built,
-        # so the failure is diagnosed once instead of every query.
-        self._checkers: dict[str, CollisionChecker | None] = {}
-        # Keep-outs applied locally, replayed into every checker built
-        # after the call so a tool change cannot silently drop the world.
+        # One solver per (URDF tree, tool frame), built on first use and
+        # kept: a tool change is a display action, and re-parsing a tree
+        # on every one would stall the UI.
+        self._solvers: dict[tuple[str, tuple[float, ...] | None], Kinematics] = {}
+        # One collision world per URDF tree, keyed the same way. A value
+        # of None records a tree whose world could not be built, so the
+        # failure is diagnosed once instead of every query.
+        self._worlds: dict[str, CollisionWorld | None] = {}
+        # Keep-outs applied locally, replayed into every world built after
+        # the call so a tool change cannot silently drop the world.
         self._shapes: tuple[Any, ...] = ()
         # The daemon-config probe for previews, sampled at most once (see
         # `_daemon_config_path`). The sentinel tells "not probed yet"
         # apart from "probed; nothing answered".
         self._preview_config: Any = _UNSET
-        # Both bound by the set_active_tool call below, which every tool
+        # Bound by the set_active_tool call below, which every tool
         # change goes through — there is no "no tool selected" state.
-        self._pinokin: PinokinRobot
-        self._solver: IKSolver
-
-        # Pre-allocated FK/IK buffers (Eigen-compatible column-major pose).
-        self._q_buf = np.zeros(self._joints.count, dtype=np.float64)
-        self._T_buf = np.asfortranarray(np.zeros((4, 4), dtype=np.float64))
-        self._rpy_buf = np.zeros(3, dtype=np.float64)
-        self._T_target_buf = np.zeros((4, 4), dtype=np.float64)
+        self._solver: Kinematics
 
         # The runtime is built around one fitted gripper and refuses
         # SELECT_TOOL for any other, so the fitted tool — not the bare
@@ -505,34 +312,26 @@ class Robot(_RobotABC):
 
     @property
     def cartesian_limits(self) -> CartesianKinodynamicLimits:
-        """Cartesian velocity/acceleration reachable at 100% jog.
+        """Cartesian velocity/acceleration at 100 % ``jog_l``.
 
-        Derived on first use from the config's JOG-mode joint limits through
-        this robot's own Jacobian (see :func:`_sample_cartesian_limit`), not
-        stored anywhere: the runtime enforces joint-space limits only, so the
-        Cartesian envelope is a consequence of them and the arm's geometry.
+        The runtime's own ceilings: ``[motion].jog_l_*_max`` is what a
+        full-scale cartesian jog commands, and the acceleration is that
+        rate over the jog ramp time — the definition the jog engine
+        ramps with.  Tool-independent, because the runtime enforces them
+        at the TCP whatever tool is fitted.
         """
         if self._cartesian_limits is None:
-            self._cartesian_limits = self._derive_cartesian_limits()
+            motion = self._config.motion()
+            accel_time = float(self._config.jog_defaults()["accel_time_s"])
+            v_lin = float(motion["jog_l_linear_max_m_s"])
+            v_ang = float(motion["jog_l_angular_max_rad_s"])
+            self._cartesian_limits = CartesianKinodynamicLimits(
+                velocity=LinearAngularLimits(linear=v_lin, angular=v_ang),
+                acceleration=LinearAngularLimits(
+                    linear=v_lin / accel_time, angular=v_ang / accel_time
+                ),
+            )
         return self._cartesian_limits
-
-    def _derive_cartesian_limits(self) -> CartesianKinodynamicLimits:
-        jog = self._joints.limits.jog
-        vel_lin, vel_ang = _sample_cartesian_limit(
-            self._pinokin, self._soft_rad, self._joints.home.rad, jog.velocity, 500, 42
-        )
-        acc_lin, acc_ang = _sample_cartesian_limit(
-            self._pinokin,
-            self._soft_rad,
-            self._joints.home.rad,
-            _cfg.jog_ramp_acceleration(),
-            200,
-            43,
-        )
-        return CartesianKinodynamicLimits(
-            velocity=LinearAngularLimits(linear=vel_lin, angular=vel_ang),
-            acceleration=LinearAngularLimits(linear=acc_lin, angular=acc_ang),
-        )
 
     # -- Unit preferences ---------------------------------------------------
 
@@ -568,13 +367,15 @@ class Robot(_RobotABC):
 
     @property
     def urdf_path(self) -> str:
-        """URDF of the tree matching the active tool (flange by default)."""
+        """URDF of the tree matching the active tool."""
         return str(_cfg.urdf_path(self._active_tool_key))
 
     @property
     def mesh_dir(self) -> str:
-        """Variant tree root — ``package://<tree>/meshes/...`` resolves here."""
-        return str(_cfg.urdf_tree_root(self._active_tool_key))
+        """The ``par6`` package directory: the packaged URDFs name their
+        meshes ``package://par6/_data/URDF/<tree>/meshes/...``, which
+        ``{backend_package: mesh_dir}`` resolves here."""
+        return str(_cfg.package_path())
 
     @property
     def joint_index_mapping(self) -> tuple[int, ...]:
@@ -588,13 +389,7 @@ class Robot(_RobotABC):
 
         ``RUCKIG`` (the runtime's startup default) is jerk-limited
         point-to-point, ``TRAPEZOID`` drops the jerk limit, and ``TOPPRA``
-        time-optimally parameterizes the path.  TOPPRA runs through the
-        C++ shim, so only a ``par6d`` built with its ``ffi`` feature
-        registers it; on a build without one ``select_profile("TOPPRA")``
-        answers ``SYS_PROFILE_INVALID`` and the active profile is
-        unchanged.  The protocol has no query that enumerates the
-        registry, so this list cannot narrow itself to the runtime it is
-        talking to.
+        time-optimally parameterizes the path.
         """
         return ("RUCKIG", "TRAPEZOID", "TOPPRA")
 
@@ -614,29 +409,24 @@ class Robot(_RobotABC):
 
     # -- Kinematics ---------------------------------------------------------
 
-    def _load_q_buf(self, q_rad: NDArray[np.float64]) -> None:
-        n = min(len(q_rad), self._pinokin.nq)
-        self._q_buf[:n] = q_rad[:n]
-        self._q_buf[n:] = 0.0
-
-    def _model_for(self, tool_key: str) -> tuple[PinokinRobot, IKSolver]:
-        """The model + solver for *tool_key*'s URDF tree, built once."""
+    def _solver_for(self, tool_key: str, tool_frame: list[float] | None) -> Kinematics:
+        """The engine solver for *tool_key*'s URDF tree resolved past
+        *tool_frame*, built once per (tree, frame)."""
         path = str(_cfg.urdf_path(tool_key))
-        model = self._models.get(path)
-        if model is None:
-            model = _load_kinematic_model(
-                path, self._soft_rad, self._joints.limits.hard.velocity
+        frame_key = (
+            None if tool_frame is None else tuple(round(v, 12) for v in tool_frame)
+        )
+        cache_key = (path, frame_key)
+        solver = self._solvers.get(cache_key)
+        if solver is None:
+            solver = Kinematics(
+                path,
+                _cfg.tcp_frame(tool_key),
+                tool_transform=tool_frame,
+                soft_limits=self._soft,
             )
-            self._models[path] = model
-            self._solvers[path] = IKSolver(
-                model,
-                damping=Damping.Sugihara,
-                tol=1e-12,
-                lm_lambda=0.0,
-                max_iter=20,
-                max_restarts=10,
-            )
-        return model, self._solvers[path]
+            self._solvers[cache_key] = solver
+        return solver
 
     def set_active_tool(
         self,
@@ -654,35 +444,23 @@ class Robot(_RobotABC):
         ``tcp_origin``/``tcp_rpy`` with variant overrides.  ``tcp_offset_m``
         composes after either, in the tool-local frame — the same
         composition the runtime applies to ``set_tcp_offset``.  The 3-D
-        view's :attr:`urdf_path`/:attr:`mesh_dir` follow the same tree.
+        view's :attr:`urdf_path` follows the same tree.
         """
         key = _cfg.canonical_tool_key(tool_key)
-        model, solver = self._model_for(key)
-
-        T_tool = np.eye(4, dtype=np.float64)
-        if key not in self._grippers:
+        origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        rpy: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        if key not in self._native_keys:
             origin, rpy = self._plugin_tool_tcp(key, variant_key)
-            T_tool = np.zeros((4, 4), dtype=np.float64)
-            se3_from_rpy(
-                origin[0], origin[1], origin[2], rpy[0], rpy[1], rpy[2], T_tool
-            )
-
-        if tcp_offset_m is not None and any(v != 0 for v in tcp_offset_m):
-            T_offset = np.eye(4)
-            T_offset[:3, 3] = tcp_offset_m
-            T_tool = T_tool @ T_offset
-
-        if np.allclose(T_tool, np.eye(4)):
-            model.clear_tool_transform()
-        else:
-            model.set_tool_transform(T_tool)
-        self._pinokin = model
-        self._solver = solver
-        if self._q_buf.shape[0] != model.nq:
-            self._q_buf = np.zeros(model.nq, dtype=np.float64)
+        offset = tcp_offset_m if tcp_offset_m is not None else (0.0, 0.0, 0.0)
+        frame = compose_tool_frame(
+            [float(v) for v in origin],
+            [float(v) for v in rpy],
+            [float(v) for v in offset],
+        )
+        if all(abs(a - b) < 1e-15 for a, b in zip(frame, _IDENTITY)):
+            frame = None
+        self._solver = self._solver_for(key, frame)
         self._active_tool_key = key
-        # The Cartesian envelope is a property of the Jacobian AT THE TCP.
-        self._cartesian_limits = None
 
     def _plugin_tool_tcp(
         self, tool_key: str, variant_key: str | None
@@ -702,118 +480,107 @@ class Robot(_RobotABC):
             spec.tcp_origin, spec.tcp_rpy, spec.variants, variant_key
         )
 
+    def _q6(self, q_rad: NDArray[np.float64]) -> list[float]:
+        return [float(v) for v in np.asarray(q_rad, dtype=np.float64)[:6]]
+
     def fk(
         self, q_rad: NDArray[np.float64], out: NDArray[np.float64]
     ) -> NDArray[np.float64]:
-        self._load_q_buf(q_rad)
-        self._pinokin.fkine_into(self._q_buf, self._T_buf)
-        so3_rpy(self._T_buf[:3, :3], self._rpy_buf)
-        out[:3] = self._T_buf[:3, 3]
-        out[3:6] = self._rpy_buf
+        out[:6] = self._solver.tcp(self._q6(q_rad))
         return out
 
     def ik(
         self, pose: NDArray[np.float64], q_seed_rad: NDArray[np.float64]
     ) -> IKResult:
-        se3_from_rpy(
-            pose[0], pose[1], pose[2], pose[3], pose[4], pose[5], self._T_target_buf
-        )
-        return self._solve_one(self._T_target_buf, q_seed_rad)
+        seed = np.asarray(q_seed_rad, dtype=np.float64)
+        solved = self._solver.ik_pose(self._q6(seed), [float(v) for v in pose[:6]])
+        return self._ik_result(solved, seed)
 
-    def _solve_one(
-        self, T_target: NDArray[np.float64], q_seed_rad: NDArray[np.float64]
+    def _ik_result(
+        self, solved: dict | None, seed: NDArray[np.float64]
     ) -> Par6IKResult:
-        self._load_q_buf(q_seed_rad)
-        success = self._solver.solve(T_target, self._q_buf)
-        q = self._solver.q.copy()
-        violations = self._limit_violations(q)
+        n = len(self._soft)
+        if solved is None:
+            return Par6IKResult(
+                q=seed[:n].copy(), success=False, violations=None, residual=np.inf
+            )
+        q = np.asarray(solved["q"], dtype=np.float64)
+        violations = self._violation_text(q, solved["violations"])
         return Par6IKResult(
             q=q,
-            success=bool(success) and violations is None,
+            success=violations is None,
             violations=violations,
-            iterations=self._solver.iterations,
-            residual=self._solver.residual,
+            iterations=1,
+            residual=float(solved["residual"]),
         )
 
-    def _limit_violations(self, q_rad: NDArray[np.float64]) -> str | None:
-        lo, hi = self._soft_rad[:, 0], self._soft_rad[:, 1]
-        bad = ~((q_rad >= lo - 1e-9) & (q_rad <= hi + 1e-9))
-        if not bad.any():
+    def _violation_text(self, q: NDArray[np.float64], joints: list[int]) -> str | None:
+        if not joints:
             return None
         names = self._joints.names
         return "; ".join(
-            f"{names[i]}: {q_rad[i]:.4f} rad outside [{lo[i]:.4f}, {hi[i]:.4f}]"
-            for i in np.flatnonzero(bad)
+            f"{names[i]}: {q[i]:.4f} rad outside [{self._soft[i][0]:.4f}, "
+            f"{self._soft[i][1]:.4f}]"
+            for i in joints
         )
 
     def check_limits(self, q_rad: NDArray[np.float64]) -> bool:
-        if len(q_rad) != self._soft_rad.shape[0]:
+        if len(q_rad) != len(self._soft):
             return False
-        return self._limit_violations(np.asarray(q_rad, dtype=np.float64)) is None
+        return not self._solver.violations(self._q6(q_rad))
 
     def jacobian(self, q_rad: NDArray[np.float64]) -> NDArray[np.float64]:
-        """World-frame Jacobian at the active tool's TCP, ``(6, num_joints)``.
-
-        Maps joint rates to a TCP twist ``[vx, vy, vz, wx, wy, wz]``; its
-        pseudo-inverse is what turns a Cartesian jog twist into joint rates,
-        the same way the runtime's ``step_cart_jog`` does.
-        """
-        return self._pinokin.jacob0(np.asarray(q_rad, dtype=np.float64))
+        """World-axes Jacobian at the active tool's TCP, ``(6, num_joints)``:
+        rows ``[vx, vy, vz, wx, wy, wz]`` per unit joint rate."""
+        return np.asarray(self._solver.jacobian(self._q6(q_rad)), dtype=np.float64)
 
     def fk_batch(self, joint_path_rad: NDArray[np.float64]) -> NDArray[np.float64]:
-        transforms = self._pinokin.batch_fk(
-            np.ascontiguousarray(joint_path_rad, dtype=np.float64)
-        )
-        result = np.empty((len(transforms), 6), dtype=np.float64)
-        rpy = self._rpy_buf
-        for i, T in enumerate(transforms):
-            result[i, :3] = T[:3, 3]
-            so3_rpy(T[:3, :3], rpy)
-            result[i, 3:] = rpy
-        return result
+        rows = [self._q6(row) for row in np.asarray(joint_path_rad, dtype=np.float64)]
+        return np.asarray(self._solver.fk_batch(rows), dtype=np.float64).reshape(-1, 6)
 
     def ik_batch(
         self,
         poses: NDArray[np.float64],
         q_start_rad: NDArray[np.float64],
     ) -> list[IKResult]:
+        seed = np.asarray(q_start_rad, dtype=np.float64)
+        rows = [[float(v) for v in p[:6]] for p in np.asarray(poses, dtype=np.float64)]
         results: list[IKResult] = []
-        q_current = np.asarray(q_start_rad, dtype=np.float64).copy()
-        for i in range(poses.shape[0]):
-            p = poses[i]
-            se3_from_rpy(p[0], p[1], p[2], p[3], p[4], p[5], self._T_target_buf)
-            result = self._solve_one(self._T_target_buf, q_current)
+        current = seed
+        for solved in self._solver.ik_batch(rows, self._q6(seed)):
+            result = self._ik_result(solved, current)
             results.append(result)
             if result.success:
-                q_current[:] = result.q
+                current = result.q
         return results
 
     # -- Collision ----------------------------------------------------------
 
     @property
-    def _collision_checker(self) -> CollisionChecker | None:
-        """The active tool's checker, built on first use; ``None`` when it
-        could not be built.
+    def _world(self) -> CollisionWorld | None:
+        """The active tool's collision world, built on first use; ``None``
+        when it could not be built.
 
-        One checker per URDF tree, on the tree the runtime is fitted with,
+        One world per URDF tree, on the tree the runtime is fitted with,
         so tool geometry and the SRDF's disabled pairs come from the same
-        model both sides enforce. Passive gripper jaws are fixed in the
-        packaged trees, which holds them closed — what
-        ``par6_kin::Collision`` does with the live model's jaw columns.
+        model both sides enforce, and the config's installation keep-outs
+        are applied as the runtime applies them at startup.
         """
         path = str(_cfg.urdf_path(self._active_tool_key))
-        if path not in self._checkers:
-            self._checkers[path] = self._build_checker(self._active_tool_key, path)
-        return self._checkers[path]
+        if path not in self._worlds:
+            self._worlds[path] = self._build_world(self._active_tool_key, path)
+        return self._worlds[path]
 
-    def _build_checker(self, tool_key: str, path: str) -> CollisionChecker | None:
+    def _build_world(self, tool_key: str, path: str) -> CollisionWorld | None:
         try:
-            checker = CollisionChecker(
-                self._model_for(tool_key)[0],
-                _resolved_urdf_for_collision(tool_key),
-                clearance_margin=COLLISION_CLEARANCE_M,
+            world = CollisionWorld(
+                path,
+                str(_cfg.package_search_dir()),
+                str(_cfg.srdf_path(tool_key)),
+                COLLISION_CLEARANCE_M,
             )
-            checker.load_srdf(str(_cfg.srdf_path(tool_key)))
+            world.set_layer("installation", self._config.installation_shapes())
+            world.set_layer("program", [shape_to_wire(s) for s in self._shapes])
         except (OSError, ValueError, RuntimeError) as e:
             logger.warning(
                 "Collision checking unavailable for tool %r (%s): %s",
@@ -822,70 +589,53 @@ class Robot(_RobotABC):
                 e,
             )
             return None
-        self._load_shapes_into(checker, ())
-        return checker
-
-    def _load_shapes_into(self, checker: CollisionChecker, previous: tuple) -> None:
-        """Replace *previous*'s keep-outs in *checker* with :attr:`_shapes`."""
-        for shape in previous:
-            checker.remove_geometry_by_name(_shape_geom_name(shape.name))
-        for shape in self._shapes:
-            if not getattr(shape, "collision", True):
-                continue
-            checker.add_obstacle(
-                _shape_geom_name(shape.name),
-                shape.kind,
-                shape.params(),
-                _shape_world_pose(shape.pose),
-                shape.margin,
-            )
+        return world
 
     @property
     def has_collision_checking(self) -> bool:
-        return self._collision_checker is not None
+        return self._world is not None
 
     def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
-        c = self._collision_checker
-        if c is None:
+        w = self._world
+        if w is None:
             return False
-        self._load_q_buf(q_rad)
-        return c.in_collision(self._q_buf)
+        return w.in_collision(self._q6(q_rad))
 
     def colliding_pairs(self, q_rad: NDArray[np.float64]) -> list[tuple[str, str]]:
         """Colliding pairs at *q_rad*, in the runtime's own reporting
         vocabulary: URDF link names for arm and tool geometry,
         ``shape:<name>`` for a keep-out applied through
-        :meth:`apply_shapes`."""
-        c = self._collision_checker
-        if c is None:
+        :meth:`apply_shapes`, ``install:<name>`` for a configured one."""
+        w = self._world
+        if w is None:
             return []
-        self._load_q_buf(q_rad)
-        return [(_display(a), _display(b)) for a, b in c.colliding_pairs(self._q_buf)]
+        return [tuple(pair) for pair in w.pairs(self._q6(q_rad))]
 
     def check_trajectory(self, q_path_rad: NDArray[np.float64]) -> int:
-        c = self._collision_checker
-        if c is None:
+        w = self._world
+        if w is None:
             return -1
-        return c.check_path(np.ascontiguousarray(q_path_rad, dtype=np.float64))
+        rows = [self._q6(row) for row in np.asarray(q_path_rad, dtype=np.float64)]
+        return w.check_path(rows)
 
     def min_distance(self, q_rad: NDArray[np.float64]) -> float:
-        c = self._collision_checker
-        if c is None:
+        w = self._world
+        if w is None:
             return float("inf")
-        self._load_q_buf(q_rad)
-        return c.min_distance(self._q_buf)
+        return w.min_distance(self._q6(q_rad))
 
     def apply_shapes(self, shapes: list) -> None:
         """Replace this process's keep-outs — the local twin of the
         client's ``set_shapes``, which replaces the *runtime's*.
 
-        Applied to every checker already built, not just the active one, so
+        Applied to every world already built, not just the active one, so
         a later tool change previews against the same world.
         """
-        previous, self._shapes = self._shapes, tuple(shapes)
-        for checker in self._checkers.values():
-            if checker is not None:
-                self._load_shapes_into(checker, previous)
+        self._shapes = tuple(shapes)
+        wire = [shape_to_wire(s) for s in self._shapes]
+        for world in self._worlds.values():
+            if world is not None:
+                world.set_layer("program", wire)
 
     # -- Lifecycle ----------------------------------------------------------
 

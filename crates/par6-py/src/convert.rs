@@ -7,8 +7,12 @@ use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use par6_client::ClientError;
-use par6_proto::command::ToolParam;
-use par6_proto::{QueryResult, Shape, Status, ToolStatusWire, WireError};
+use par6_proto::command::{self as cmd, ToolParam};
+use par6_proto::{
+    Command, CompletionPolicy, FlashingAssertion, Frame, QueryResult, Shape, Status,
+    ToolStatusWire, WireError,
+};
+use par6_server::ShapeLayer;
 
 pyo3::create_exception!(
     _par6,
@@ -358,4 +362,240 @@ pub fn tool_param_from_py(v: &Bound<'_, PyAny>) -> PyResult<ToolParam> {
     Err(PyRuntimeError::new_err(
         "tool parameters must be bool, int, float, or str",
     ))
+}
+
+pub fn frame_of(v: u8) -> PyResult<Frame> {
+    Frame::from_wire(i64::from(v))
+        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
+}
+
+pub fn layer_of(name: &str) -> PyResult<ShapeLayer> {
+    match name {
+        "installation" => Ok(ShapeLayer::Installation),
+        "program" => Ok(ShapeLayer::Program),
+        other => Err(PyRuntimeError::new_err(format!(
+            "unknown shape layer '{other}' (installation, program)"
+        ))),
+    }
+}
+
+fn get<'py, T: pyo3::FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<T> {
+    d.get_item(k)?
+        .ok_or_else(|| PyRuntimeError::new_err(format!("command is missing '{k}'")))?
+        .extract()
+}
+
+fn opt<'py, T: pyo3::FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Option<T>> {
+    match d.get_item(k)? {
+        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
+        _ => Ok(None),
+    }
+}
+
+fn frame_key(d: &Bound<'_, PyDict>) -> PyResult<Frame> {
+    frame_of(opt(d, "frame")?.unwrap_or(0))
+}
+
+/// One command dict → wire command. `type` is the wire name of the
+/// family; the other keys mirror the wire fields (wire units: mm, deg,
+/// fractions). Every family a client can send is accepted, so the
+/// preview sees the same stream the runtime would.
+pub fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
+    let kind: String = get(d, "type")?;
+    let c = match kind.as_str() {
+        "home" => Command::Home(cmd::Home { key: 0 }),
+        "move_j" => Command::MoveJ(cmd::MoveJ {
+            key: 0,
+            angles: get(d, "angles")?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            blend_radius: opt(d, "blend_radius")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
+        }),
+        "move_j_pose" => Command::MoveJPose(cmd::MoveJPose {
+            key: 0,
+            pose: get(d, "pose")?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            blend_radius: opt(d, "blend_radius")?,
+        }),
+        "move_l" => Command::MoveL(cmd::MoveL {
+            key: 0,
+            pose: get(d, "pose")?,
+            frame: frame_key(d)?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            blend_radius: opt(d, "blend_radius")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
+        }),
+        "move_c" => Command::MoveC(cmd::MoveC {
+            key: 0,
+            via: get(d, "via")?,
+            end: get(d, "end")?,
+            frame: frame_key(d)?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            blend_radius: opt(d, "blend_radius")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
+        }),
+        "move_s" => Command::MoveS(cmd::MoveS {
+            key: 0,
+            waypoints: get(d, "waypoints")?,
+            frame: frame_key(d)?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
+        }),
+        "move_p" => Command::MoveP(cmd::MoveP {
+            key: 0,
+            waypoints: get(d, "waypoints")?,
+            frame: frame_key(d)?,
+            duration: opt(d, "duration")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
+        }),
+        "delay" => Command::Delay(cmd::Delay {
+            key: 0,
+            seconds: get(d, "seconds")?,
+        }),
+        "checkpoint" => Command::Checkpoint(cmd::Checkpoint {
+            key: 0,
+            label: get(d, "label")?,
+        }),
+        "select_tool" => Command::SelectTool(cmd::SelectTool {
+            key: 0,
+            tool_name: get(d, "tool_name")?,
+            variant_key: opt(d, "variant_key")?,
+        }),
+        "tool_action" => {
+            let params: Vec<Bound<'_, PyAny>> = opt(d, "params")?.unwrap_or_default();
+            Command::ToolAction(cmd::ToolAction {
+                key: 0,
+                tool_key: get(d, "tool_key")?,
+                action: get(d, "action")?,
+                params: params
+                    .iter()
+                    .map(tool_param_from_py)
+                    .collect::<PyResult<Vec<_>>>()?,
+            })
+        }
+        "servo_j" => Command::ServoJ(cmd::ServoJ {
+            angles: get(d, "angles")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+        }),
+        "servo_j_pose" => Command::ServoJPose(cmd::ServoJPose {
+            pose: get(d, "pose")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+        }),
+        "servo_l" => Command::ServoL(cmd::ServoL {
+            pose: get(d, "pose")?,
+            speed: opt(d, "speed")?,
+            accel: opt(d, "accel")?,
+        }),
+        "jog_j" => Command::JogJ(cmd::JogJ {
+            speeds: get(d, "speeds")?,
+            duration: get(d, "duration")?,
+            accel: opt(d, "accel")?,
+        }),
+        "jog_l" => Command::JogL(cmd::JogL {
+            velocities: get(d, "velocities")?,
+            duration: get(d, "duration")?,
+            frame: frame_key(d)?,
+            accel: opt(d, "accel")?,
+        }),
+        "teleport" => Command::Teleport(cmd::Teleport {
+            angles: get(d, "angles")?,
+            tool_positions: opt(d, "tool_positions")?,
+        }),
+        "stop" => Command::Stop(cmd::Stop {
+            clear_queue: opt(d, "clear_queue")?.unwrap_or(true),
+        }),
+        "estop" => Command::Estop,
+        "reset" => Command::Reset,
+        "reset_state" => Command::ResetState,
+        "pause" => Command::Pause(cmd::Pause { on: get(d, "on")? }),
+        "set_gravity_comp" => Command::SetGravityComp(cmd::SetGravityComp { on: get(d, "on")? }),
+        "write_io" => Command::WriteIo(cmd::WriteIo {
+            port: get(d, "port")?,
+            value: get(d, "value")?,
+        }),
+        "simulator" => Command::Simulator(cmd::Simulator { on: get(d, "on")? }),
+        "connect_hardware" => Command::ConnectHardware(cmd::ConnectHardware {
+            port: get(d, "port")?,
+        }),
+        "select_profile" => Command::SelectProfile(cmd::SelectProfile {
+            profile: get(d, "profile")?,
+        }),
+        "set_tcp_offset" => Command::SetTcpOffset(cmd::SetTcpOffset {
+            x: get(d, "x")?,
+            y: get(d, "y")?,
+            z: get(d, "z")?,
+        }),
+        "set_payload" => Command::SetPayload(cmd::SetPayload {
+            mass: get(d, "mass")?,
+            com: get(d, "com")?,
+            inertia: opt(d, "inertia")?,
+        }),
+        "set_shapes" => {
+            let shapes: Vec<Bound<'_, PyDict>> = get(d, "shapes")?;
+            Command::SetShapes(cmd::SetShapes {
+                shapes: shapes
+                    .iter()
+                    .map(shape_from_py)
+                    .collect::<PyResult<Vec<_>>>()?,
+            })
+        }
+        "set_pid_gains" => Command::SetPidGains(cmd::SetPidGains {
+            node: get(d, "node")?,
+            kpp: get(d, "kpp")?,
+            kpv: get(d, "kpv")?,
+            kiv: get(d, "kiv")?,
+            kpiq: get(d, "kpiq")?,
+            kiiq: get(d, "kiiq")?,
+            kp: get(d, "kp")?,
+            kd: get(d, "kd")?,
+            ilim_ma: get(d, "ilim_ma")?,
+            velocity_limit_ticks_s: get(d, "velocity_limit_ticks_s")?,
+            voltage_limit_mv: get(d, "voltage_limit_mv")?,
+        }),
+        "set_completion_policy" => {
+            let raw: u8 = get(d, "policy")?;
+            let policy = CompletionPolicy::from_wire(i64::from(raw)).ok_or_else(|| {
+                PyRuntimeError::new_err(format!("unknown completion policy {raw}"))
+            })?;
+            Command::SetCompletionPolicy(cmd::SetCompletionPolicy { policy })
+        }
+        "set_recipe" => Command::SetRecipe(cmd::SetRecipe {
+            name: get(d, "name")?,
+        }),
+        "enter_flashing" => Command::EnterFlashing(cmd::EnterFlashing {
+            assertion: flashing_assertion(&get::<String>(d, "assertion")?)?,
+        }),
+        "exit_flashing" => Command::ExitFlashing,
+        other => {
+            return Err(PyRuntimeError::new_err(format!(
+                "unknown command type '{other}'"
+            )))
+        }
+    };
+    Ok(c)
+}
+
+/// `"parked"` or `"force"` — the operator's vouching, no default.
+pub fn flashing_assertion(assertion: &str) -> PyResult<FlashingAssertion> {
+    match assertion.to_ascii_lowercase().as_str() {
+        "parked" => Ok(FlashingAssertion::Parked),
+        "force" => Ok(FlashingAssertion::Force),
+        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
+            "flashing assertion must be 'parked' or 'force', got {other:?}"
+        ))),
+    }
 }

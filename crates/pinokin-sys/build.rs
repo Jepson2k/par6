@@ -1,9 +1,10 @@
 //! Links the `par6_shim` C++ library when the `ffi` feature is enabled.
 //!
 //! Consumes:
-//! - `PAR6_SHIM_LIB_DIR` (required with `ffi`): directory holding
-//!   `libpar6_shim.so` / `libpar6_shim.a` — `scripts/ffi/setup.sh` installs it
-//!   and writes a sourceable `.ffi/env.sh` exporting these.
+//! - `PAR6_SHIM_LIB_DIR`: directory holding `libpar6_shim.so` /
+//!   `libpar6_shim.a`. When unset, the shim `scripts/ffi/setup.sh` installs
+//!   into the repo's own `.ffi/shim/lib` is used, so a checkout that has run
+//!   `setup.sh` builds without sourcing `.ffi/env.sh`.
 //! - `PAR6_SHIM_INCLUDE_DIR` (optional): directory holding `par6_shim.h`;
 //!   only sanity-checked here (declarations are hand-written, no bindgen),
 //!   and the place a future bindgen step would point at.
@@ -24,14 +25,17 @@ fn main() {
         return; // stub build: no C++ toolchain required
     }
 
-    let lib_dir = env::var("PAR6_SHIM_LIB_DIR").unwrap_or_else(|_| {
-        panic!(
-            "pinokin-sys was built with the `ffi` feature but PAR6_SHIM_LIB_DIR \
-             is not set.\nRun scripts/ffi/setup.sh, then `source .ffi/env.sh` \
-             (or export PAR6_SHIM_LIB_DIR to the directory containing \
-             libpar6_shim.so)."
-        )
-    });
+    let lib_dir = env::var("PAR6_SHIM_LIB_DIR")
+        .ok()
+        .or_else(|| repo_shim_dir("lib"))
+        .unwrap_or_else(|| {
+            panic!(
+                "pinokin-sys was built with the `ffi` feature but no shim was found: \
+                 PAR6_SHIM_LIB_DIR is not set and the repo has no .ffi/shim/lib.\n\
+                 Run scripts/ffi/setup.sh (or export PAR6_SHIM_LIB_DIR to the \
+                 directory containing libpar6_shim.so)."
+            )
+        });
 
     let link = env::var("PAR6_SHIM_LINK").unwrap_or_else(|_| "dylib".into());
     let lib_file = match link.as_str() {
@@ -48,7 +52,10 @@ fn main() {
         );
     }
 
-    if let Ok(include_dir) = env::var("PAR6_SHIM_INCLUDE_DIR") {
+    if let Some(include_dir) = env::var("PAR6_SHIM_INCLUDE_DIR")
+        .ok()
+        .or_else(|| repo_shim_dir("include"))
+    {
         let header = Path::new(&include_dir).join("par6_shim.h");
         if !header.exists() {
             panic!(
@@ -88,4 +95,14 @@ fn main() {
         }
         _ => unreachable!(),
     }
+}
+
+/// `<repo>/.ffi/shim/<sub>` when `scripts/ffi/setup.sh` has populated it.
+fn repo_shim_dir(sub: &str) -> Option<String> {
+    let dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../.ffi/shim")
+        .join(sub);
+    std::fs::canonicalize(dir)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
 }

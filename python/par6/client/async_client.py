@@ -19,15 +19,12 @@ import atexit
 import contextlib
 import copy
 import logging
-import math
-import os
 import time
 import weakref
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
 from typing import Any
 
-import numpy as np
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
@@ -40,110 +37,33 @@ from waldoctl.status import (
     ToolResult,
 )
 from waldoctl.tools import ToolSpec, ToolStatus
-from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
 from par6._par6 import CoreClient, RobotWireError
 
 from ..config import canonical_tool_key, io_line_names
-from ..protocol.constants import (
-    NUM_JOINTS,
-    CompletionPolicy,
-    Frame,
-)
+from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ._wire import blend as _blend
+from ._wire import f6 as _f6
+from ._wire import jog_j_speeds, jog_l_velocities, shape_to_wire
+from ._wire import timing as _timing
+from ._wire import tool_status_from_dict as _tool_status_from_dict
+from ._wire import wire_frame as _wire_frame
 from .errors import RobotError
 
 logger = logging.getLogger(__name__)
-
-_AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
-_FRAMES: dict[str, Frame] = {"WRF": Frame.WRF, "TRF": Frame.TRF}
 
 #: How long one status_after poll blocks in the pump before re-checking
 #: for shutdown. Frames arrive far faster than this whenever a runtime is
 #: broadcasting; the value only bounds close() latency on a silent link.
 _STATUS_POLL_S = 0.5
 
-
-def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, default)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    return int(raw) if raw else default
-
-
-def _wire_frame(frame: WFrame) -> int:
-    try:
-        return int(_FRAMES[frame])
-    except KeyError:
-        raise ValueError(
-            f"unknown frame {frame!r} (par6 supports WRF and TRF)"
-        ) from None
-
-
-def _f6(values: Sequence[float], name: str) -> list[float]:
-    if len(values) != NUM_JOINTS:
-        raise ValueError(f"{name} requires {NUM_JOINTS} values, got {len(values)}")
-    return [float(v) for v in values]
-
-
-def _timing(
-    duration: float | None, speed: float | None
-) -> tuple[float | None, float | None]:
-    """Map the waldoctl duration/speed pair (0/None = unset) onto the wire's
-    exactly-one-of convention.  Neither set means full profile speed."""
-    d = float(duration) if duration else None
-    s = float(speed) if speed else None
-    if d is not None and s is not None:
-        raise ValueError("duration and speed are mutually exclusive")
-    if d is None and s is None:
-        s = 1.0
-    return d, s
-
-
-def _blend(r: float | None) -> float | None:
-    return float(r) if r else None
-
-
-def _matrix_to_pose(m: Sequence[float]) -> list[float]:
-    """Flattened row-major 4x4 (translation in mm) -> [x, y, z, rx, ry, rz] deg.
-
-    RPY convention: R = Rx(rx) @ Ry(ry) @ Rz(rz) (intrinsic XYZ), the
-    decomposition ``pinokin.so3_rpy`` performs -- so a pose read here is the
-    pose :meth:`par6.robot.Robot.fk` reports, the pose :meth:`move_l` re-encodes
-    and the pose a frontend decoding the STATUS matrix itself sees.
-    """
-    x, y, z = m[3], m[7], m[11]
-    r00, r01, r02 = m[0], m[1], m[2]
-    r10, r11, r12 = m[4], m[5], m[6]
-    r22 = m[10]
-    cp = math.hypot(r12, r22)
-    if cp > 1e-9:
-        roll = math.atan2(-r12, r22)
-        yaw = math.atan2(-r01, r00)
-    else:  # gimbal lock (ry = +/-90 deg): only roll -/+ yaw is observable
-        roll = math.atan2(math.copysign(1.0, r02) * r10, r11)
-        yaw = 0.0
-    pitch = math.atan2(r02, cp)
-    return [x, y, z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
-
-
-def _tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
-    if raw is None:
-        return None
-    return ToolStatus(
-        key=canonical_tool_key(raw["key"]),
-        variant_key=raw["variant_key"],
-        state=WToolState(raw["state"]),
-        engaged=raw["engaged"],
-        part_detected=raw["part_detected"],
-        fault_code=raw["fault_code"],
-        positions=tuple(raw["positions"]),
-        channels=tuple(raw["channels"]),
-    )
+#: The shipped command endpoint, reported by :attr:`AsyncRobotClient.host`
+#: / ``port`` before the engine has resolved its own defaults.
+_DEFAULT_HOST = "127.0.0.1"
+_DEFAULT_PORT = 6001
 
 
 def copy_status(buf: StatusBuffer) -> StatusBuffer:
@@ -241,26 +161,18 @@ class AsyncRobotClient(_RobotClientABC):
         mtu: int | None = None,
         tool_specs: Iterable[ToolSpec] | None = None,
     ) -> None:
-        self._host = host or _env_str("PAR6_HOST", "127.0.0.1")
-        self._port = port if port is not None else _env_int("PAR6_COMMAND_PORT", 6001)
+        # Every None falls through to the engine client's own ladder
+        # (``PAR6_*`` environment, then the shipped defaults).
+        self._host = host
+        self._port = port
         self.timeout = timeout
         self.retries = retries
-        self._status_transport_kind = (
-            status_transport or _env_str("PAR6_STATUS_TRANSPORT", "MULTICAST")
-        ).upper()
-        self._status_port = (
-            status_port
-            if status_port is not None
-            else _env_int("PAR6_STATUS_PORT", 6002)
-        )
-        self._mcast_group = mcast_group or _env_str(
-            "PAR6_STATUS_MCAST_GROUP", "239.255.0.71"
-        )
-        self._mcast_iface = mcast_iface or _env_str("PAR6_STATUS_MCAST_IF", "127.0.0.1")
-        self._status_unicast_host = status_unicast_host or _env_str(
-            "PAR6_STATUS_UNICAST_HOST", "127.0.0.1"
-        )
-        self.mtu = mtu if mtu is not None else _env_int("PAR6_MTU", 1400)
+        self._status_transport_kind = status_transport
+        self._status_port = status_port
+        self._mcast_group = mcast_group
+        self._mcast_iface = mcast_iface
+        self._status_unicast_host = status_unicast_host
+        self.mtu = mtu
 
         self._core: CoreClient | None = None
         self._core_lock = asyncio.Lock()
@@ -296,11 +208,15 @@ class AsyncRobotClient(_RobotClientABC):
 
     @property
     def host(self) -> str:
-        return self._host
+        if self._host is not None:
+            return self._host
+        return self._core.endpoint()[0] if self._core is not None else _DEFAULT_HOST
 
     @property
     def port(self) -> int:
-        return self._port
+        if self._port is not None:
+            return self._port
+        return self._core.endpoint()[1] if self._core is not None else _DEFAULT_PORT
 
     @property
     def status_seq_gaps(self) -> int:
@@ -319,25 +235,27 @@ class AsyncRobotClient(_RobotClientABC):
             if self._core is not None:
                 return self._core
             core = await CoreClient.connect(
-                self._host,
-                self._port,
-                self.timeout,
-                self.retries,
-                self._status_transport_kind,
-                self._status_port,
-                self._mcast_group,
-                self._mcast_iface,
-                self._status_unicast_host,
-                self.mtu,
+                host=self._host,
+                port=self._port,
+                timeout=self.timeout,
+                retries=self.retries,
+                status_transport=self._status_transport_kind,
+                status_port=self._status_port,
+                mcast_group=self._mcast_group,
+                mcast_iface=self._mcast_iface,
+                status_unicast_host=self._status_unicast_host,
+                mtu=self.mtu,
             )
             self._core = core
             self._status_task = asyncio.create_task(self._status_pump())
+            host, port = core.endpoint()
+            kind, status_port = core.status_endpoint()
             logger.info(
                 "par6 client endpoint: %s:%s (status %s @ port %s)",
-                self._host,
-                self._port,
-                self._status_transport_kind,
-                self._status_port,
+                host,
+                port,
+                kind,
+                status_port,
             )
             return core
 
@@ -552,9 +470,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_checkpoint("pick_done")
         """
-        return await self.wait_status(
-            lambda s: s.last_checkpoint == label, timeout=timeout
-        )
+        core = await self._ensure_core()
+        return await core.wait_checkpoint(label, timeout)
 
     async def wait_motion(
         self,
@@ -576,44 +493,18 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_motion()
         """
-        await self._ensure_core()
-        last_angles: np.ndarray | None = None
-        settle_start: float | None = None
-        motion_started = False
-        start = time.monotonic()
-        try:
-            async with asyncio.timeout(timeout):
-                async for status in self.stream_status_shared():
-                    max_speed = float(np.abs(status.speeds).max())
-                    if last_angles is None:
-                        last_angles = status.angles.copy()
-                        max_delta = 0.0
-                    else:
-                        max_delta = float(np.abs(status.angles - last_angles).max())
-                        last_angles[:] = status.angles
-                    now = time.monotonic()
-                    moving = (
-                        max_speed >= speed_threshold or max_delta >= angle_threshold
-                    )
-                    if not motion_started:
-                        if moving or now - start > motion_start_timeout:
-                            motion_started = True
-                            settle_start = None
-                        if moving:
-                            continue
-                    if motion_started:
-                        if moving:
-                            settle_start = None
-                        elif settle_start is None:
-                            settle_start = now
-                        elif now - settle_start > settle_window:
-                            return True
-        except TimeoutError:
-            return False
-        return False
+        core = await self._ensure_core()
+        return await core.wait_motion(
+            float(timeout),
+            float(settle_window),
+            float(speed_threshold),
+            float(angle_threshold),
+            float(motion_start_timeout),
+        )
 
     async def wait_ready(self, timeout: float = 5.0, interval: float = 0.05) -> bool:
-        """Poll ping() until the runtime responds or *timeout* expires."""
+        """Poll ping() every *interval* seconds until the runtime responds
+        or *timeout* expires."""
         deadline = time.monotonic() + timeout
         while True:
             if await self.ping() is not None:
@@ -945,32 +836,14 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.jog_j(<joint_index>, speed=0.5, duration=1.0)
         """
-        speed_arr = [0.0] * NUM_JOINTS
-        if joints is not None and speeds is not None:
-            if len(joints) != len(speeds):
-                raise ValueError(
-                    f"jog_j got {len(joints)} joints and {len(speeds)} speeds"
-                )
-            for j, s in zip(joints, speeds):
-                # An out-of-range index must not reach the array: a
-                # negative one lands on a different physical joint through
-                # Python's wrap-around, and the arm moves the wrong axis
-                # with nothing raised.
-                if not 0 <= j < NUM_JOINTS:
-                    raise ValueError(
-                        f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}"
-                    )
-                speed_arr[j] = float(s)
-        elif joint >= 0:
-            if joint >= NUM_JOINTS:
-                raise ValueError(
-                    f"jog_j joint {joint} out of range 0..{NUM_JOINTS - 1}"
-                )
-            speed_arr[joint] = float(speed)
-        else:
-            raise ValueError("jog_j requires either joint= or joints=/speeds=")
         core = await self._ensure_core()
-        return await self._call(core.jog_j(speed_arr, float(duration), float(accel)))
+        return await self._call(
+            core.jog_j(
+                jog_j_speeds(joint, speed, joints, speeds),
+                float(duration),
+                float(accel),
+            )
+        )
 
     async def jog_l(
         self,
@@ -994,17 +867,14 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.jog_l("WRF", "X", speed=0.5, duration=1.0)
         """
-        velocities = [0.0] * NUM_JOINTS
-        if axes is not None and speeds_list is not None:
-            for a, s in zip(axes, speeds_list):
-                velocities[_AXIS_INDEX[a]] = float(s)
-        elif axis is not None:
-            velocities[_AXIS_INDEX[axis]] = float(speed)
-        else:
-            raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
         core = await self._ensure_core()
         return await self._call(
-            core.jog_l(velocities, float(duration), _wire_frame(frame), float(accel))
+            core.jog_l(
+                jog_l_velocities(axis, speed, axes, speeds_list),
+                float(duration),
+                _wire_frame(frame),
+                float(accel),
+            )
         )
 
     async def teleport(
@@ -1177,9 +1047,8 @@ class AsyncRobotClient(_RobotClientABC):
 
         Category: Control
         """
-        if self._status_generation == 0:
-            await self.wait_status(lambda _s: True, timeout=timeout)
-        return self._shared_status.freedrive
+        core = await self._ensure_core()
+        return await core.is_freedrive(float(timeout))
 
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.
@@ -1341,21 +1210,8 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_shapes([Box(name="table", x=0.6, y=0.4, z=0.02,
                                 pose=(0.3, 0, -0.01, 0, 0, 0))])
         """
-        wire_shapes = []
-        for shape in shapes:
-            kind, params, pose, collision, margin, name = shape.to_wire()
-            wire_shapes.append(
-                {
-                    "kind": kind,
-                    "params": [float(p) for p in params],
-                    "pose": [float(p) for p in pose],
-                    "collision": bool(collision),
-                    "margin": float(margin) if margin is not None else None,
-                    "name": name,
-                }
-            )
         core = await self._ensure_core()
-        return await self._call(core.set_shapes(wire_shapes))
+        return await self._call(core.set_shapes([shape_to_wire(s) for s in shapes]))
 
     async def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion
@@ -1516,10 +1372,7 @@ class AsyncRobotClient(_RobotClientABC):
             pose = rbt.pose()
         """
         core = await self._ensure_core()
-        matrix = await self._call(core.pose(_wire_frame(frame)))
-        if matrix is None:
-            return None
-        return _matrix_to_pose(matrix)
+        return await self._call(core.pose_xyzrpy(_wire_frame(frame)))
 
     async def io(self) -> list[int] | None:
         """Digital I/O state [in1, in2, out1, out2, estop].
@@ -1689,12 +1542,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             pressed = rbt.is_estop_pressed()
         """
-        io_status = await self.io()
-        if not io_status:
-            return False
-        # The e-stop is the LAST slot whatever the box declares, and it
-        # carries the LINE, which reads low while pressed.
-        return io_status[-1] == 0
+        core = await self._ensure_core()
+        return await self._call(core.is_estop_pressed())
 
     async def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
         """Whether every joint is below *threshold_speed* (rad/s).
@@ -1708,10 +1557,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             stopped = rbt.is_robot_stopped()
         """
-        speeds = await self.joint_speeds()
-        if not speeds:
-            return False
-        return max(abs(s) for s in speeds) < threshold_speed
+        core = await self._ensure_core()
+        return await self._call(core.is_robot_stopped(float(threshold_speed)))
 
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].

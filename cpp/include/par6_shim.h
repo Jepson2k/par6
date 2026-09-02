@@ -128,7 +128,8 @@ int32_t par6_kin_ik_step(par6_kin *h,
 /* --- toppra-cpp time-optimal path parameterization (par6_traj_*) ----------
  *
  * Implemented over toppra-cpp (github.com/hungpham2511/toppra, MIT) with its
- * bundled Seidel LP solver — see cpp/README.md for the source pin.
+ * bundled Seidel LP solver — see README.md (The Pinocchio shim) for the
+ * source pin.
  *
  * Planner-side API: par6_traj_create heap-allocates freely while solving.
  * The finished handle is immutable and par6_traj_sample writes into caller

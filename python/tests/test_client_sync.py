@@ -30,7 +30,7 @@ def daemon(tmp_path):
 
 
 def park_deg() -> list[float]:
-    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
+    return [math.degrees(v) for v in _cfg.config().park_pose_rad()]
 
 
 def settle_at(

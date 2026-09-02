@@ -161,8 +161,8 @@ impl CommandSource for NoCommands {
 // ---------------------------------------------------------------- kinematics
 
 /// TCP forward kinematics for the snapshot's `tcp*` fields. `par6d`
-/// adapts the pinokin FK onto this; the calls run on the RT thread every
-/// tick and must be allocation-free.
+/// adapts the Pinocchio FK (`par6_kin::Kin`) onto this; the calls run on
+/// the RT thread every tick and must be allocation-free.
 pub trait ForwardKin: Send {
     /// TCP pose `[x y z m, r p y rad]` of joint pose `q`. NaN inputs
     /// (channels a mode did not command) may produce NaN outputs.

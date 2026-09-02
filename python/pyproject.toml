@@ -4,31 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.1.0"
+version = "0.2.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
   "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.10.0",
-  # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
-  # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-macosx_15_0_arm64.whl ; python_version == '3.11' and platform_system == 'Darwin' and platform_machine == 'arm64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-macosx_15_0_arm64.whl ; python_version == '3.12' and platform_system == 'Darwin' and platform_machine == 'arm64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-macosx_15_0_arm64.whl ; python_version == '3.13' and platform_system == 'Darwin' and platform_machine == 'arm64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-macosx_15_0_arm64.whl ; python_version == '3.14' and platform_system == 'Darwin' and platform_machine == 'arm64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-win_amd64.whl ; python_version == '3.11' and platform_system == 'Windows' and platform_machine == 'AMD64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-win_amd64.whl ; python_version == '3.12' and platform_system == 'Windows' and platform_machine == 'AMD64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-win_amd64.whl ; python_version == '3.13' and platform_system == 'Windows' and platform_machine == 'AMD64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-win_amd64.whl ; python_version == '3.14' and platform_system == 'Windows' and platform_machine == 'AMD64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-manylinux_2_39_x86_64.whl ; python_version == '3.11' and platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-manylinux_2_39_x86_64.whl ; python_version == '3.12' and platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-manylinux_2_39_x86_64.whl ; python_version == '3.13' and platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-manylinux_2_39_x86_64.whl ; python_version == '3.14' and platform_system == 'Linux' and platform_machine == 'x86_64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-manylinux_2_39_aarch64.whl ; python_version == '3.11' and platform_system == 'Linux' and platform_machine == 'aarch64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp312-cp312-manylinux_2_39_aarch64.whl ; python_version == '3.12' and platform_system == 'Linux' and platform_machine == 'aarch64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp313-cp313-manylinux_2_39_aarch64.whl ; python_version == '3.13' and platform_system == 'Linux' and platform_machine == 'aarch64'",
-  "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp314-cp314-manylinux_2_39_aarch64.whl ; python_version == '3.14' and platform_system == 'Linux' and platform_machine == 'aarch64'",
 ]
 
 [project.scripts]
@@ -39,10 +21,7 @@ par6 = "par6.cli:main"
 # was newest and linted against that version's default rule set while devs ran
 # an older one — every push was red on rules the code had never been checked
 # against. The pin and the explicit `select` below are what make the two agree.
-# ty pinned: 0.0.74 regressed ParamSpec-typed calls (numba's Dispatcher
-# stubs) — every 2-arg call of a jitted pinokin function reports
-# invalid-argument-type. Unpin once a fixed release lands.
-dev = ["ruff==0.15.8", "ty==0.0.73", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout"]
+dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"

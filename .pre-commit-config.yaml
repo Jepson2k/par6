@@ -20,18 +20,18 @@ repos:
         files: ^python/
         pass_filenames: false
 
-  # Built-in hooks for file quality. Golden wire vectors are byte-exact
-  # fixtures and the asset trees are vendored — neither may be "fixed".
+  # Built-in hooks for file quality. The asset trees and the packaged data
+  # are vendored copies — they may not be "fixed".
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(assets/|tests/golden/|python/par6/_data/|crates/par6-bus/sim-assets/)
+        exclude: ^(assets/|python/par6/_data/|crates/par6-bus/sim-assets/)
       - id: end-of-file-fixer
-        exclude: ^(assets/|tests/golden/|python/par6/_data/|crates/par6-bus/sim-assets/)
+        exclude: ^(assets/|python/par6/_data/|crates/par6-bus/sim-assets/)
       - id: check-yaml
       - id: check-json
       - id: check-added-large-files
         args: [--maxkb=1024]
-        exclude: ^(assets/|tests/golden/|Cargo\.lock)
+        exclude: ^(assets/|Cargo\.lock)
       - id: check-merge-conflict

@@ -13,6 +13,7 @@ mod sockets;
 mod sync;
 pub mod telemetry;
 
+pub use crate::api::{freedrive, MotionWait};
 pub use crate::core::{Ack, Client, ClientConfig, Completion, StatusTransport};
 pub use crate::error::ClientError;
 pub use crate::sync::SyncClient;

@@ -54,8 +54,21 @@ TARGET_SUBDIR="$(conda_subdir "$TARGET_ARCH")"
 CROSS=0
 [[ "$TARGET_ARCH" != "$HOST_ARCH" ]] && CROSS=1
 
-# Pinned package set. pin (pip) and pinocchio (conda-forge) versions must
-# match so scripts/ffi/gen_fixtures.py validates against identical numerics.
+# RSS one compile job of the Pinocchio/coal translation units needs: 3.9 GB
+# measured on the control box (cgroup memory.peak, -j1, 2026-09). Overcommitting
+# this on a swapless host livelocks it, so the default parallelism is what
+# MemAvailable can hold; an explicit CMAKE_BUILD_PARALLEL_LEVEL still wins.
+JOB_MEM_GB="${PAR6_JOB_MEM_GB:-4}"
+if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+  mem_jobs=$(awk -v g="$JOB_MEM_GB" '/MemAvailable/ { print int($2 / (g * 1024 * 1024)) }' /proc/meminfo 2>/dev/null || true)
+  cpu_jobs="$(nproc)"
+  jobs=$(( ${mem_jobs:-$cpu_jobs} < cpu_jobs ? ${mem_jobs:-$cpu_jobs} : cpu_jobs ))
+  (( jobs >= 1 )) || jobs=1
+  export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+  echo ">>> build parallelism: $jobs jobs (RAM-capped; override with CMAKE_BUILD_PARALLEL_LEVEL)"
+fi
+
+# Pinned package set.
 PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
 # toppra-cpp source pin (v0.6.9 release commit). MIT; built with the bundled
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
@@ -304,6 +317,22 @@ fi
 {
   echo "export PAR6_SHIM_LIB_DIR=\"$SHIM_PREFIX/lib\""
   echo "export PAR6_SHIM_INCLUDE_DIR=\"$SHIM_PREFIX/include\""
+  sed "s/JOB_MEM_GB_PLACEHOLDER/$JOB_MEM_GB/" <<'JOBS'
+# RAM-capped default build parallelism, computed each time this file is
+# sourced, at JOB_MEM_GB per job (the measured peak of one shim compile;
+# rustc stays well under it). A swapless small-RAM host that overcommits
+# this livelocks in reclaim instead of OOM-killing. Explicit values win.
+if [ -z "${CARGO_BUILD_JOBS:-}" ] || [ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
+  _par6_cores="$(nproc 2>/dev/null || echo 1)"
+  _par6_jobs="$(awk -v g="${PAR6_JOB_MEM_GB:-JOB_MEM_GB_PLACEHOLDER}" '/MemAvailable/ { print int($2 / (g * 1024 * 1024)) }' /proc/meminfo 2>/dev/null || true)"
+  [ -n "${_par6_jobs:-}" ] || _par6_jobs="$_par6_cores"
+  [ "$_par6_jobs" -ge 1 ] || _par6_jobs=1
+  [ "$_par6_jobs" -le "$_par6_cores" ] || _par6_jobs="$_par6_cores"
+  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$_par6_jobs}"
+  export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$_par6_jobs}"
+  unset _par6_jobs _par6_cores
+fi
+JOBS
   if [[ $CROSS -eq 0 ]]; then
     echo "# libmujoco lives in the env prefix (par6-bus feature sim-mujoco)."
     echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""

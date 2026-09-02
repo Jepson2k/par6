@@ -16,6 +16,15 @@ All notable changes to this model will be documented in this file.
   model at mapped configurations. Config angle values (`config/PAR6.toml`)
   now apply to this model verbatim.
 
+## [2-9-2026]
+- `par6_msg_gripper` and `par6_ssg48_gripper`: the six arm joint origins now
+  carry the same full-precision values as `par6_flange` (they had been
+  exported with angles rounded to 1.5708 / 3.1416, skewing the J2 axis by
+  3.7 µrad off perpendicular to J1). The three trees describe one arm and
+  the analytic IK derivation (`par6-kin::opw`) refuses a tree that is not
+  exactly OPW, which is how the rounding surfaced. Golden fixtures
+  regenerated.
+
 ## [13-8-2026]
 - Replaced the moving-link inertials (`shoulder` … `wrist`) in all three URDF
   variants with the vendor runtime's dynamics table (Source Robotics
@@ -33,8 +42,6 @@ All notable changes to this model will be documented in this file.
   tool's inertials from the gripper config instead, so tool mass has exactly
   one source. MSG/SSG48 tool-side links keep their CAD inertials — they are
   visual/self-consistency data, not the gravity source.
-- Reference check: `crates/par6-kin/tests/golden/gravity/vendor_reference.json`
-  pins G(q) on these URDFs to the vendor table independently of any URDF.
 
 ## [10-2-2025]
 - Added the initial files:

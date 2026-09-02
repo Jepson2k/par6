@@ -235,6 +235,11 @@ impl Client {
         }
     }
 
+    /// The configuration this client connected with.
+    pub fn config(&self) -> &ClientConfig {
+        &self.inner.cfg
+    }
+
     /// Whether [`Client::close`] has been called.
     pub fn is_closed(&self) -> bool {
         self.inner.closed.load(Ordering::SeqCst)

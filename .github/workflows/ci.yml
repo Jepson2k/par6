@@ -115,20 +115,20 @@ jobs:
         run: |
           source .ffi/env.sh
           cargo clippy -p par6-kin --all-targets --features ffi -- -D warnings
-      - name: test par6-kin (golden kinematics fixtures)
+      - name: test par6-kin
         run: |
           source .ffi/env.sh
           cargo test -p par6-kin --features ffi
-      # The collision golden suite runs in the step above; this one reruns
-      # just its timing case optimized and uncaptured, so the measured
+      # The collision suite runs in the step above; this one reruns just
+      # its timing case optimized and uncaptured, so the measured
       # per-waypoint cost the planner budgets against is visible in the log.
       # The test only fails on catastrophe, never on runner noise.
       - name: report collision check cost (par6-kin)
         run: |
           source .ffi/env.sh
           cargo test -p par6-kin --release --features ffi \
-            --test golden_collision per_waypoint_check_cost_is_reported -- --nocapture
-      - name: test pinokin-sys (shim conformance)
+            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
+      - name: test pinokin-sys (C boundary)
         run: |
           source .ffi/env.sh
           cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi

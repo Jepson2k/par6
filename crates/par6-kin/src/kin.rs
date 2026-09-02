@@ -8,10 +8,10 @@
 
 use std::path::Path;
 
+use crate::opw::{Opw, OpwError};
 use crate::{GripperVariant, NQ};
 
-/// Row-major 4x4 homogeneous transform, the pose format shared with the
-/// shim and the golden fixtures.
+/// Row-major 4x4 homogeneous transform, the shim's pose format.
 pub type Pose = [f64; 16];
 
 /// Errors from model construction or a kinematics call.
@@ -29,39 +29,24 @@ pub enum KinError {
     /// The shim rejected a call (unexpected C++ exception).
     #[error(transparent)]
     Ffi(#[from] pinokin_sys::Error),
+    /// The URDF yielded no analytic IK model; FK and dynamics still work.
+    #[error("analytic IK unavailable: {0}")]
+    NoAnalyticIk(OpwError),
 }
 
-/// Damped-least-squares IK parameters. Defaults spell out the shim's
-/// own defaults: 100 iterations, converged when `|e|^2 < 1e-10`
-/// (`e = [p_err; log3(R_err)]`), damping 1e-3.
-#[derive(Debug, Clone, Copy)]
-pub struct IkOptions {
-    /// Iteration budget before reporting [`IkOutcome::MaxIters`].
-    pub max_iters: i32,
-    /// Convergence threshold on the squared pose-error norm.
-    pub tol: f64,
-    /// DLS damping factor λ (`J^T (J J^T + λ² I)^{-1}`).
-    pub damping: f64,
-}
-
-impl Default for IkOptions {
-    fn default() -> Self {
-        IkOptions {
-            max_iters: 100,
-            tol: 1e-10,
-            damping: 1e-3,
-        }
-    }
-}
+/// Largest pose-element mismatch a reported IK solution may have against
+/// the FK. The closed form is exact, so a real solution lands ~1e-12;
+/// this only guards against a target rs-opw accepted but the model does
+/// not reproduce.
+pub const IK_POSE_TOL: f64 = 1e-6;
 
 /// Result of a completed (non-erroring) IK solve.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IkOutcome {
-    /// Squared pose-error norm went below `tol`; `out_q` is the solution.
+    /// `out_q` reproduces the target pose (checked through the FK).
     Converged,
-    /// Iteration budget exhausted — NOT a solution. `out_q` holds the last
-    /// iterate so callers can inspect or re-seed.
-    MaxIters,
+    /// No joint configuration reaches the pose; `out_q` is untouched.
+    Unreachable,
 }
 
 /// A PAR6 kinematics/dynamics model: Pinocchio model + data preallocated
@@ -74,9 +59,10 @@ pub enum IkOutcome {
 /// they never affect FK/Jacobian/IK.
 pub struct Kin {
     model: pinokin_sys::Model,
+    /// Analytic IK derived from the same URDF at load ([`Opw`]).
+    opw: Result<Opw, OpwError>,
     nq_full: usize,
     q_full: Vec<f64>,
-    q_scratch: Vec<f64>,
     jac_full: Vec<f64>,
     tau_full: Vec<f64>,
     v_full: Vec<f64>,
@@ -190,6 +176,25 @@ impl Kin {
         Self::from_urdf_with_tool(urdf, ee_frame, None)
     }
 
+    /// [`Kin::from_urdf`] resolved at the fixed frame `ee_to_tcp` past
+    /// `ee_frame`: FK, Jacobian and IK all answer at that frame — a tool
+    /// (or an operator's TCP offset) composed onto the tree's own end
+    /// effector, with nothing walked back by the caller. Massless: the
+    /// frame moves the kinematics, not the gravity model.
+    pub fn from_urdf_with_frame(
+        urdf: &Path,
+        ee_frame: Option<&str>,
+        ee_to_tcp: &Pose,
+    ) -> Result<Self, KinError> {
+        let tool = pinokin_sys::ToolParams {
+            transform: *ee_to_tcp,
+            mass: 0.0,
+            com: [0.0; 3],
+            inertia: [0.0; 6],
+        };
+        Self::from_urdf_with_tool(urdf, ee_frame, Some(&tool))
+    }
+
     /// [`Kin::from_urdf`] with an optional rigid tool whose inertials load
     /// gravity (see [`pinokin_sys::ToolParams`]).
     pub fn from_urdf_with_tool(
@@ -205,17 +210,24 @@ impl Kin {
         if nq_full < NQ {
             return Err(KinError::ArmJoints { got: nq_full });
         }
-        Ok(Kin {
+        let mut kin = Kin {
             model,
+            opw: Err(OpwError::JointCount(0)),
             nq_full,
             q_full: vec![0.0; nq_full],
-            q_scratch: vec![0.0; nq_full],
             jac_full: vec![0.0; 6 * nq_full],
             tau_full: vec![0.0; nq_full],
             v_full: vec![0.0; nq_full],
             a_full: vec![0.0; nq_full],
             g_full: vec![0.0; nq_full],
-        })
+        };
+        kin.opw = Opw::derive(urdf, &mut kin);
+        Ok(kin)
+    }
+
+    /// The analytic IK model, or why this URDF has none.
+    pub fn opw(&self) -> Result<&Opw, &OpwError> {
+        self.opw.as_ref()
     }
 
     /// Total position variables in the loaded URDF (arm + passive jaws).
@@ -255,8 +267,8 @@ impl Kin {
 
     /// TCP pose `[x y z m, r p y rad]` — the shape the RT snapshot and the
     /// `ForwardKin` seam consume. RPY is intrinsic XYZ
-    /// (`R = Rx(r)·Ry(p)·Rz(y)`), matching the Python client's
-    /// `pinokin.se3_rpy`. Fills `out` with NaN when the pose cannot be
+    /// (`R = Rx(r)·Ry(p)·Rz(y)`), the wire convention. Fills `out` with
+    /// NaN when the pose cannot be
     /// computed ("pose unknown" — never a fabricated pose); NaN inputs
     /// propagate to NaN outputs. Never panics.
     pub fn tcp(&mut self, q: &[f64; NQ], out: &mut [f64; 6]) {
@@ -330,35 +342,35 @@ impl Kin {
         Ok(())
     }
 
-    /// Seeded damped-least-squares IK toward `target` (same frame and
-    /// layout as [`Kin::fk`] output). Writes the final iterate into
-    /// `out_q` either way; non-convergence is reported explicitly as
-    /// [`IkOutcome::MaxIters`], never a panic. Jaw joints are pinned at
-    /// zero and cannot drift (their Jacobian columns are zero).
+    /// Closed-form IK for `target` (same frame and layout as [`Kin::fk`]
+    /// output), taking the solution branch nearest `seed`. The result is
+    /// proven through the FK before it is reported: `out_q` is written
+    /// only on [`IkOutcome::Converged`]. Non-finite inputs are
+    /// [`IkOutcome::Unreachable`], never a panic.
     pub fn ik(
         &mut self,
         seed: &[f64; NQ],
         target: &Pose,
         out_q: &mut [f64; NQ],
-        opts: IkOptions,
     ) -> Result<IkOutcome, KinError> {
-        self.set_q(seed);
-        // Split-borrow: q_full is the seed buffer, q_scratch the output.
-        let converged = self.model.ik_step(
-            &self.q_full,
-            target,
-            &mut self.q_scratch,
-            pinokin_sys::IkOptions {
-                max_iters: opts.max_iters,
-                tol: opts.tol,
-                damping: opts.damping,
-            },
-        )?;
-        out_q.copy_from_slice(&self.q_scratch[..NQ]);
-        Ok(if converged {
-            IkOutcome::Converged
-        } else {
-            IkOutcome::MaxIters
-        })
+        let opw = match &self.opw {
+            Ok(opw) => opw,
+            Err(e) => return Err(KinError::NoAnalyticIk(e.clone())),
+        };
+        let Some(q) = opw.solve(seed, target) else {
+            return Ok(IkOutcome::Unreachable);
+        };
+        self.set_q(&q);
+        let pose = self.model.fk(&self.q_full)?;
+        let err = pose
+            .iter()
+            .zip(target.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        if err > IK_POSE_TOL {
+            return Ok(IkOutcome::Unreachable);
+        }
+        *out_q = q;
+        Ok(IkOutcome::Converged)
     }
 }

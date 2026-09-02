@@ -153,8 +153,8 @@
     name="upper_arm_JOINT"
     type="revolute">
     <origin
-      xyz="0.023421 0 0.1105"
-      rpy="-3.14159265352934 1.57079265358979 -1.57079632673445" />
+      xyz="0.0234207210610365 0 0.1105"
+      rpy="-3.07917384359384 1.57079632679489 -1.50837751679894" />
     <parent
       link="shoulder" />
     <child
@@ -213,7 +213,7 @@
     type="revolute">
     <origin
       xyz="0 -0.18 0"
-      rpy="3.14158530717959 0 1.57079265358979" />
+      rpy="-3.14159265358979 0 1.57079632679489" />
     <parent
       link="upper_arm" />
     <child
@@ -271,8 +271,8 @@
     name="lower_arm_JOINT"
     type="revolute">
     <origin
-      xyz="0.0435 0 0"
-      rpy="1.5708 0 -3.1416" />
+      xyz="0.0434999999999984 0 0"
+      rpy="1.5707963267949 0 -3.14159265358979" />
     <parent
       link="elbow" />
     <child
@@ -330,7 +330,7 @@
     name="wrist_JOINT"
     type="revolute">
     <origin
-      xyz="0 0 -0.176999999999995"
+      xyz="0 0 -0.177000000000002"
       rpy="-1.57079632679489 0 0" />
     <parent
       link="lower_arm" />
@@ -389,7 +389,7 @@
     type="revolute">
     <origin
       xyz="0 0 0"
-      rpy="1.5708 0 0" />
+      rpy="1.5707963267949 0 0" />
     <parent
       link="wrist" />
     <child

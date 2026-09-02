@@ -13,7 +13,7 @@
 //! on how close the arm is to contact.
 //!
 //! Measured per-waypoint cost against the vendor collision meshes
-//! (`tests/golden_collision.rs::per_waypoint_check_cost_is_reported`
+//! (`tests/collision_world.rs::per_waypoint_check_cost_is_reported`
 //! reprints these on every run): self-collision only, 17 µs for the flange
 //! and 180 µs for the gripper variants; with a box keep-out, 28 µs / 224 µs;
 //! with a per-shape margin, which costs coal its early exit, ~300 µs / 730 µs.

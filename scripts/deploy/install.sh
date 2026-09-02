@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Install par6d + its config + the systemd unit onto the PAR6 control box.
 #
-#   # from a dev machine (needs ssh/scp access; sudo on the box):
+#   # on the box, from a native build (the normal path — see README):
+#   scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
+#   sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
+#
+#   # from another machine (optional; needs ssh/scp access; sudo on the box):
 #   scripts/deploy/build-aarch64.sh
 #   scripts/deploy/install.sh --host pi@par6-box
-#
-#   # on the box itself, from an unpacked bundle:
-#   sudo scripts/deploy/install.sh --local --bundle /tmp/par6-deploy-<ts>
 #
 #   # just build the bundle (what CI checks; no ssh, no box):
 #   scripts/deploy/install.sh --stage-only /tmp/bundle
@@ -122,7 +123,7 @@ install_local() {
     die "the bundled binary does not run on this host
   (wrong architecture, a glibc older than the cross toolchain's, or a runtime
    library missing from $LIBS_DEST — run \`ldd $BIN_DEST.new\` and see
-   scripts/deploy/README.md)"
+   README.md, \"Deploying to the control box\")"
   fi
   mv -f "$BIN_DEST.new" "$BIN_DEST"
   say "installed $BIN_DEST"

@@ -554,25 +554,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // own 0..=7 bound is not the answer here: a port past the
             // end names no line, and acking it would report a level the
             // arm never drove.
-            C::WriteIo(p) => match self.cfg.digital_outputs.get(usize::from(p.port)) {
-                Some(name) => {
-                    log::debug!("write_io {name} (port {}) = {}", p.port, p.value);
+            C::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
+                None => {
+                    log::debug!(
+                        "write_io {} (port {}) = {}",
+                        self.cfg.digital_outputs[usize::from(p.port)],
+                        p.port,
+                        p.value
+                    );
                     self.runtime.rt.write_io(p.port, p.value);
                     Ok(())
                 }
-                None => Err(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        &format!(
-                            "write_io port {} does not exist: this box declares {} digital \
-                             output(s)",
-                            p.port,
-                            self.cfg.digital_outputs.len()
-                        ),
-                    )],
-                )),
+                Some(e) => Err(e),
             },
             C::Simulator(p) => {
                 let dropped = self.cancel_all_motion();
@@ -1033,37 +1026,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Tool keys are matched case-insensitively: the registry spells them
     /// as the config does, clients as their own tool tables do.
     fn validate_registries(&self, cmd: &Command) -> Option<WireError> {
-        let name = match cmd {
-            Command::SelectTool(p) => &p.tool_name,
-            Command::ToolAction(p) => &p.tool_key,
-            _ => return None,
-        };
-        let detail = if !self
-            .cfg
-            .tools
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(name.as_str()))
-        {
-            format!(
-                "unknown tool '{name}'; this runtime knows {:?}",
-                self.cfg.tools
-            )
-        } else if !self.cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
-            // Selecting a tool swaps the kinematic and gravity models,
-            // which are built at startup from the configured tool.
-            format!(
-                "tool '{name}' is not fitted; this runtime is running '{}' \
-                 (change robot.active_gripper and restart par6d)",
-                self.cfg.fitted_tool
-            )
-        } else {
-            return None;
-        };
-        Some(make_error(
-            ErrorCode::CommValidationError,
-            UNATTRIBUTED,
-            &[("detail", &detail)],
-        ))
+        registry_fault(cmd, &self.cfg)
     }
 
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
@@ -2148,7 +2111,7 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
 /// The first `teleport` angle the runtime cannot honour, described in
 /// the terms a client can act on: which joint, what it asked for, and
 /// the window it has. `None` = every angle is placeable.
-fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Option<String> {
+pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Option<String> {
     // Finiteness belongs to the codec (`par6-proto` rejects NaN/inf at
     // decode), so only the travel window is left to check here.
     for (i, (&a, &(lo, hi))) in angles
@@ -2165,6 +2128,59 @@ fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Optio
         }
     }
     None
+}
+
+/// The server-layer name check the codec leaves to config: a tool
+/// command must name a tool this runtime knows, and only the fitted one
+/// can be selected or driven (the kinematic and gravity models are built
+/// around it at startup). Keys match case-insensitively.
+pub fn registry_fault(cmd: &Command, cfg: &ServerConfig) -> Option<WireError> {
+    let name = match cmd {
+        Command::SelectTool(p) => &p.tool_name,
+        Command::ToolAction(p) => &p.tool_key,
+        _ => return None,
+    };
+    let detail = if !cfg
+        .tools
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(name.as_str()))
+    {
+        format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
+    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+        format!(
+            "tool '{name}' is not fitted; this runtime is running '{}' \
+             (change robot.active_gripper and restart par6d)",
+            cfg.fitted_tool
+        )
+    } else {
+        return None;
+    };
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", &detail)],
+    ))
+}
+
+/// Why `write_io` on `port` is refused: the port indexes the box's
+/// DECLARED outputs, so the wire's own `0..=7` bound is not the answer —
+/// a port past the end names no line, and acking it would report a
+/// level the arm never drove. `None` = the port exists.
+pub fn write_io_fault(port: u8, cfg: &ServerConfig) -> Option<WireError> {
+    if usize::from(port) < cfg.digital_outputs.len() {
+        return None;
+    }
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!(
+                "write_io port {port} does not exist: this box declares {} digital output(s)",
+                cfg.digital_outputs.len()
+            ),
+        )],
+    ))
 }
 
 fn post_effect(cmd: &Command) -> PostEffect {
@@ -2188,7 +2204,7 @@ fn params_summary(cmd: &Command) -> String {
 }
 
 /// Wire name of a command (STATUS `action_current`, QUEUE listing).
-fn cmd_name(tag: CmdType) -> &'static str {
+pub fn cmd_name(tag: CmdType) -> &'static str {
     use CmdType as T;
     match tag {
         T::Reset => "reset",

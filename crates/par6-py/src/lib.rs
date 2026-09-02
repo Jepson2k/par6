@@ -1,9 +1,13 @@
-//! Python binding for the par6 engine: the async wire client and the
-//! offline preview, both thin faces over the Rust crates. The Python
-//! package (`par6`) keeps its public API as a shim over this module.
+//! Python binding for the par6 engine: the wire client, the offline
+//! preview, kinematics, the collision world and the config loader — thin
+//! faces over the Rust crates. The Python package (`par6`) keeps its
+//! public API as a shim over this module and holds no numerics of its own.
 
 mod client;
+mod collision;
+mod config;
 mod convert;
+mod kinematics;
 mod preview;
 mod telemetry;
 
@@ -88,9 +92,17 @@ fn make_wire_error(
 fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::CoreClient>()?;
     m.add_class::<preview::Preview>()?;
+    m.add_class::<kinematics::Kinematics>()?;
+    m.add_class::<collision::CollisionWorld>()?;
+    m.add_class::<config::Config>()?;
     m.add_class::<telemetry::TelemetryReader>()?;
     m.add_function(wrap_pyfunction!(ping_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(make_wire_error, m)?)?;
+    m.add_function(wrap_pyfunction!(kinematics::matrix_to_xyzrpy_py, m)?)?;
+    m.add_function(wrap_pyfunction!(kinematics::pose_matrix_py, m)?)?;
+    m.add_function(wrap_pyfunction!(kinematics::compose_tool_frame, m)?)?;
+    m.add_function(wrap_pyfunction!(kinematics::frame_offset, m)?)?;
+    m.add("COLLISION_CLEARANCE_M", par6d::COLLISION_CLEARANCE_M)?;
     m.add("RobotWireError", py.get_type::<convert::RobotWireError>())?;
     m.add("NUM_JOINTS", par6_proto::NUM_JOINTS)?;
     m.add(

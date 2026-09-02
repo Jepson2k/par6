@@ -31,7 +31,7 @@ pub(crate) fn is_world_name(name: &str) -> bool {
 /// The first name two shapes in one layer share, if any. A duplicate
 /// makes a colliding-pair report ambiguous about which shape it means,
 /// and shadows one of them in a frontend's highlight mapping.
-pub(crate) fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
+pub fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
     shapes.iter().enumerate().find_map(|(i, s)| {
         shapes[..i]
             .iter()
@@ -47,7 +47,7 @@ pub(crate) fn first_duplicate(shapes: &[par6_kin::Shape]) -> Option<&str> {
 /// query: the enablement probe renders tens of pairs per probed
 /// configuration and must not allocate to do it.
 #[derive(Default)]
-pub(crate) struct ShapeNames {
+pub struct ShapeNames {
     /// Per layer, `(geometry name, reporting name)` for the shapes that
     /// actually entered the world. Index 0 is installation, 1 program.
     layers: [Vec<(String, String)>; 2],
@@ -59,7 +59,7 @@ impl ShapeNames {
     /// Record the names of one applied layer, replacing what it held.
     /// Non-colliding shapes are visualization-only and never appear in a
     /// pair, so they are not recorded.
-    pub(crate) fn set_layer(&mut self, layer: ShapeLayer, shapes: &[par6_kin::Shape]) {
+    pub fn set_layer(&mut self, layer: ShapeLayer, shapes: &[par6_kin::Shape]) {
         let (slot, prefix) = match layer {
             ShapeLayer::Installation => (0, INSTALL_PREFIX),
             ShapeLayer::Program => (1, SHAPE_PREFIX),
@@ -76,7 +76,7 @@ impl ShapeNames {
     /// layer prefix, robot geometry drops the per-link index the model
     /// appends (`upper_arm_0` → `upper_arm`) so pairs name URDF links,
     /// not solver-internal identifiers.
-    pub(crate) fn display<'a>(&'a self, geom: &'a str) -> &'a str {
+    pub fn display<'a>(&'a self, geom: &'a str) -> &'a str {
         match self.all.iter().find(|(name, _)| name == geom) {
             Some((_, reported)) => reported,
             None => trim_geom_index(geom),
@@ -85,12 +85,12 @@ impl ShapeNames {
 
     /// [`ShapeNames::display`], owned — for pair lists that outlive the
     /// report they came from (error payloads, the STATUS latch).
-    pub(crate) fn display_owned(&self, geom: &str) -> String {
+    pub fn display_owned(&self, geom: &str) -> String {
         self.display(geom).to_owned()
     }
 
     /// A whole report's pairs, in reporting names.
-    pub(crate) fn render(&self, report: &par6_kin::CollisionReport<'_>) -> Vec<(String, String)> {
+    pub fn render(&self, report: &par6_kin::CollisionReport<'_>) -> Vec<(String, String)> {
         report
             .pairs()
             .map(|(a, b)| (self.display_owned(a), self.display_owned(b)))

@@ -28,7 +28,7 @@
 
 mod adapters;
 mod bridge;
-mod collision_world;
+pub mod collision_world;
 pub mod daemon;
 mod grant;
 mod kin;
@@ -36,5 +36,6 @@ pub mod options;
 mod planner;
 pub mod preview;
 
-pub use daemon::{Daemon, DaemonError};
+pub use daemon::{Daemon, DaemonError, COLLISION_CLEARANCE_M};
+pub use kin::{matrix_to_xyzrpy, translate_local};
 pub use options::Options;

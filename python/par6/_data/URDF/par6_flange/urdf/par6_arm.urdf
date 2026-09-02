@@ -1,0 +1,410 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Arm-only gravity chain: par6_flange.urdf with a massless tool stub on the wrist.
+     The active tool's inertials are attached at load time from the gripper config
+     (see crates/par6-kin, dh_tool_params) so tool mass has exactly one source.
+     This URDF was automatically created by SolidWorks to URDF Exporter! Originally created by Stephen Brawner (brawner@gmail.com) 
+     Commit Version: 1.6.0-4-g7f85cfe  Build Version: 1.6.7995.38578
+     For more information, please see http://wiki.ros.org/sw_urdf_exporter -->
+<!-- Joint coordinates re-based from the SolidWorks export to the vendor
+     motor convention (rcb-runtime theta): every revolute axis is +z and the
+     shoulder/elbow zero offsets are folded into the joint origins, so a
+     runtime joint vector feeds this model directly. Link frames, meshes and
+     inertials are unchanged (Jepson2k/par6 issue #24). -->
+<robot
+  name="par6_arm">
+  <link
+    name="base_link">
+    <inertial>
+      <origin
+        xyz="-0.03291842362796 -3.9760226777652E-09 0.0314011608034117"
+        rpy="0 0 0" />
+      <mass
+        value="0.998265338800333" />
+      <inertia
+        ixx="0.00118949401625524"
+        ixy="-3.53594527704034E-12"
+        ixz="-5.94924049151936E-05"
+        iyy="0.00238159101024826"
+        iyz="-6.16822652141328E-11"
+        izz="0.00282485466366564" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/base_link.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/base_link.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <link
+    name="shoulder">
+    <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 1) -->
+      <origin
+        xyz="0.00551 0.01797 0.10726"
+        rpy="0 0 0" />
+      <mass
+        value="1.99314" />
+      <inertia
+        ixx="0.01274598834"
+        ixy="-0.00247889785"
+        ixz="-5.666903e-05"
+        iyy="0.0025494801"
+        iyz="0.00026984318"
+        izz="0.01351975443" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/shoulder.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/shoulder.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="shoulder_JOINT"
+    type="revolute">
+    <origin
+      xyz="0 0 0"
+      rpy="0 0 0" />
+    <parent
+      link="base_link" />
+    <child
+      link="shoulder" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="upper_arm">
+    <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 2) -->
+      <origin
+        xyz="-0.01108 -0.07715 0.01588"
+        rpy="0 0 0" />
+      <mass
+        value="1.33224" />
+      <inertia
+        ixx="0.00644795378"
+        ixy="-9.078224e-05"
+        ixz="0.00025671953"
+        iyy="0.00322195371"
+        iyz="-0.00029855195"
+        izz="0.00382431687" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/upper_arm.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/upper_arm.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="upper_arm_JOINT"
+    type="revolute">
+    <origin
+      xyz="0.0234207210610365 0 0.1105"
+      rpy="-3.07917384359384 1.57079632679489 -1.50837751679894" />
+    <parent
+      link="shoulder" />
+    <child
+      link="upper_arm" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="elbow">
+    <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 3) -->
+      <origin
+        xyz="0.00958 -0.02219 -0.00374"
+        rpy="0 0 0" />
+      <mass
+        value="0.68511" />
+      <inertia
+        ixx="0.00061022164"
+        ixy="-6.122538e-05"
+        ixz="2.528564e-05"
+        iyy="0.00077646955"
+        iyz="-5.698924e-05"
+        izz="0.00085682016" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/elbow.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/elbow.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="elbow_JOINT"
+    type="revolute">
+    <origin
+      xyz="0 -0.18 0"
+      rpy="-3.14159265358979 0 1.57079632679489" />
+    <parent
+      link="upper_arm" />
+    <child
+      link="elbow" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="lower_arm">
+    <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 4) -->
+      <origin
+        xyz="-9e-05 -0.01713 -0.11143"
+        rpy="0 0 0" />
+      <mass
+        value="0.57956" />
+      <inertia
+        ixx="0.00117046561"
+        ixy="1.2438e-07"
+        ixz="-1.08145e-06"
+        iyy="0.00104058689"
+        iyz="0.00028745228"
+        izz="0.00035842503" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/lower_arm.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/lower_arm.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="lower_arm_JOINT"
+    type="revolute">
+    <origin
+      xyz="0.0434999999999984 0 0"
+      rpy="1.5707963267949 0 -3.14159265358979" />
+    <parent
+      link="elbow" />
+    <child
+      link="lower_arm" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="wrist">
+    <inertial>
+      <!-- mass/COM/inertia transcribed from the vendor runtime dynamics table (Source Robotics rcb-runtime, robots/PAR6.py), re-expressed in this link's frame; the SolidWorks-exported values modeled only the printed shell (~46% of the arm's mass) (vendor link 5) -->
+      <origin
+        xyz="0 -0.00355 -0.00024"
+        rpy="0 0 0" />
+      <mass
+        value="0.52381" />
+      <inertia
+        ixx="0.00041379107"
+        ixy="3.557e-08"
+        ixz="2.613e-08"
+        iyy="0.00018259111"
+        iyz="9.4593e-07"
+        izz="0.00040956068" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/wrist.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/wrist.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="wrist_JOINT"
+    type="revolute">
+    <origin
+      xyz="0 0 -0.177000000000002"
+      rpy="-1.57079632679489 0 0" />
+    <parent
+      link="lower_arm" />
+    <child
+      link="wrist" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+  <link
+    name="gripper">
+    <inertial>
+      <!-- massless stub: the gravity model attaches the active tool's inertials from the
+           gripper config (par6d) instead, so the tool's mass has exactly one source -->
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <mass
+        value="0" />
+      <inertia
+        ixx="0"
+        ixy="0"
+        ixz="0"
+        iyy="0"
+        iyz="0"
+        izz="0" />
+    </inertial>
+    <visual>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/gripper.STL" />
+      </geometry>
+      <material
+        name="">
+        <color
+          rgba="0.792156862745098 0.819607843137255 0.933333333333333 1" />
+      </material>
+    </visual>
+    <collision>
+      <origin
+        xyz="0 0 0"
+        rpy="0 0 0" />
+      <geometry>
+        <mesh
+          filename="package://par6/_data/URDF/par6_flange/meshes/gripper.STL" />
+      </geometry>
+    </collision>
+  </link>
+  <joint
+    name="gripper_JOINT"
+    type="revolute">
+    <origin
+      xyz="0 0 0"
+      rpy="1.5707963267949 0 0" />
+    <parent
+      link="wrist" />
+    <child
+      link="gripper" />
+    <axis
+      xyz="0 0 1" />
+    <limit
+      lower="0"
+      upper="0"
+      effort="0"
+      velocity="0" />
+  </joint>
+</robot>

@@ -68,7 +68,7 @@ def daemon(tmp_path):
 
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every soft window."""
-    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
+    return [math.degrees(v) for v in _cfg.config().park_pose_rad()]
 
 
 def ready_pose_deg() -> list[float]:
@@ -78,13 +78,7 @@ def ready_pose_deg() -> list[float]:
     commanded position per joint — derived from the same config the daemon
     executes, never a transcribed constant.
     """
-    final: dict[int, float] = {}
-    for step in _cfg.load_robot_config()["homing"]["sequence"]:
-        for move in step.get("move_to", []):
-            final[int(move["joint"])] = float(move["position_rad"])
-    if sorted(final) != list(range(6)):
-        raise RuntimeError(f"homing sequence leaves joints {sorted(final)} unplaced")
-    return [math.degrees(final[j]) for j in range(6)]
+    return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
 
 
 def max_deg_error(actual, expected) -> float:
@@ -669,8 +663,7 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
     lets a frontend grey the button the RT actually stopped honoring —
     ``sim_session.rs`` pins that.)
     """
-    cfg = _cfg.load_robot_config()
-    limit_deg = math.degrees(cfg["joints"][0]["limits"]["soft_max_rad"])
+    limit_deg = math.degrees(_cfg.config().soft_limits_rad()[0][1])
     park = park_deg()
     start = list(park)
     start[0] = limit_deg - 40.0
@@ -746,7 +739,7 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
     """A pose read off the wire, sent straight back, must not move the arm.
 
     This is the teach-and-replay path: Waldo Commander decodes the STATUS
-    pose matrix with pinokin, shows those scalars, and its motion recorder
+    pose matrix itself, shows those scalars, and its motion recorder
     emits them verbatim as a ``move_l``/``move_j`` target.  So the six
     numbers have to mean the same rotation in all three places -- the
     client's decode, ``Robot.fk``'s decode, and the runtime's re-encode.
@@ -771,22 +764,32 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
         angles = await client.angles()
         assert angles is not None
 
-        # The pose the waldoctl backend computes for the same
-        # configuration, decomposed by pinokin -- the decode the frontend
-        # readout uses, and an oracle that shares no code with the runtime.
-        expected = np.zeros(6)
-        Robot().fk(np.radians(angles), expected)
-        position_error_mm = float(
-            np.max(np.abs(np.asarray(taught[:3]) - expected[:3] * 1000.0))
+        # The wire convention itself: the six numbers the client decoded
+        # must re-compose (intrinsic XYZ, written out here rather than
+        # borrowed from any library) into the matrix STATUS carries.
+        status = await client.status()
+        assert status is not None
+        T_status = np.asarray(status.pose, dtype=np.float64).reshape(4, 4)
+        rx, ry, rz = np.radians(taught[3:])
+        cx, sx, cy, sy, cz, sz = (
+            math.cos(rx),
+            math.sin(rx),
+            math.cos(ry),
+            math.sin(ry),
+            math.cos(rz),
+            math.sin(rz),
         )
-        assert position_error_mm < 2.0, (
-            f"the reported TCP position disagrees with Robot.fk by "
-            f"{position_error_mm:.2f} mm: {taught[:3]} vs {expected[:3] * 1000.0}"
+        R = (
+            np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+            @ np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+            @ np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
         )
-        assert max_deg_error(taught[3:], np.degrees(expected[3:])) < 0.5, (
-            f"the reported TCP rotation disagrees with Robot.fk: {taught[3:]} vs "
-            f"{np.degrees(expected[3:])} -- the client and the kinematics backend "
-            f"are decomposing the same matrix in different conventions"
+        assert np.allclose(T_status[:3, 3], taught[:3], atol=1e-6), (
+            f"pose() and STATUS disagree on the TCP position: {taught[:3]} vs {T_status[:3, 3]}"
+        )
+        assert np.allclose(T_status[:3, :3], R, atol=1e-6), (
+            f"the client's rpy decode does not re-compose into the STATUS matrix:\n"
+            f"{taught[3:]} ->\n{R}\nvs\n{T_status[:3, :3]}"
         )
 
         # Replay it. The arm is already in this pose, so a runtime that
@@ -1463,8 +1466,8 @@ async def test_config_bundle_feeds_previews_the_daemons_numbers(tmp_path, monkey
         # (PAR6_CONFIG / repo checkout) carries.
         robot = Robot(host="127.0.0.1", port=daemon.command_port)
         dr = robot.create_dry_run_client()
-        assert dr._dt == pytest.approx(TICK_DT_S)
-        assert dr._dt != pytest.approx(0.004)
+        assert dr._preview.tick_dt_s() == pytest.approx(TICK_DT_S)
+        assert dr._preview.tick_dt_s() != pytest.approx(0.004)
     finally:
         daemon.stop()
 
@@ -1556,7 +1559,7 @@ async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaem
 
         # Re-push a joint's own configured tuning: semantically a no-op,
         # but the ack still proves the node check and the RT push ran.
-        j = _cfg.load_robot_config()["joints"][2]
+        j = _cfg.config().joints()[2]
         tune = dict(
             kpp=j["gains"]["kpp"],
             kpv=j["gains"]["kpv"],

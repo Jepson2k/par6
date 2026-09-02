@@ -45,6 +45,31 @@ pub fn shipped_config() -> PathBuf {
     repo_root().join("config/PAR6.toml")
 }
 
+/// The shipped config with `[bus].interface` renamed to `iface`, in a
+/// scratch directory with the gripper TOMLs beside it (they resolve
+/// relative to the robot file). Hardware-mode failure tests use a name
+/// no machine has, so they fail the same way on a control box with a
+/// live `can0` as in a container with no CAN support at all.
+pub fn config_with_interface(iface: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("par6-test-cfg-{}-{}", std::process::id(), iface));
+    let grippers = dir.join("grippers");
+    std::fs::create_dir_all(&grippers).expect("scratch config dir");
+    for entry in std::fs::read_dir(repo_root().join("config/grippers")).expect("grippers dir") {
+        let entry = entry.expect("gripper entry");
+        std::fs::copy(entry.path(), grippers.join(entry.file_name())).expect("copy gripper");
+    }
+    let toml = std::fs::read_to_string(shipped_config()).expect("shipped config");
+    let needle = "interface = \"can0\"";
+    assert!(toml.contains(needle), "shipped config no longer names can0");
+    let path = dir.join("PAR6.toml");
+    std::fs::write(
+        &path,
+        toml.replace(needle, &format!("interface = \"{iface}\"")),
+    )
+    .expect("write config");
+    path
+}
+
 pub fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),

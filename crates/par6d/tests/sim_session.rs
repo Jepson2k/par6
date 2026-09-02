@@ -418,20 +418,24 @@ fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
 }
 
 /// Startup failure paths are clear errors, never panics: hardware mode
-/// without a CAN interface names the interface and points at `--sim`;
-/// a missing config file names the path it tried.
+/// whose CAN interface does not exist names the interface and points at
+/// `--sim`; a missing config file names the path it tried.
 #[test]
 fn hardware_mode_and_bad_config_fail_with_clear_errors() {
     let opts = Options {
         sim: false,
-        config: Some(common::shipped_config()),
+        config: Some(common::config_with_interface("par6-no-such-can")),
+        assets: Some(common::assets_dir()),
         ..Options::default()
     };
     let err = Daemon::start(&opts)
         .err()
-        .expect("hardware mode must fail cleanly in CI");
+        .expect("hardware mode without its interface must fail cleanly");
     let msg = err.to_string();
-    assert!(msg.contains("can0"), "names the CAN interface: {msg}");
+    assert!(
+        msg.contains("par6-no-such-can"),
+        "names the CAN interface: {msg}"
+    );
     assert!(msg.contains("--sim"), "points at the simulator: {msg}");
 
     let opts = Options {
@@ -1475,15 +1479,15 @@ fn the_status_rate_override_changes_the_broadcast_and_refuses_a_bad_rate() {
 /// direction (`simulator(true)` on a runtime already simulating)
 /// succeeding — which made a categorical failure look intermittent. Now
 /// the command really tries, so what has to be pinned here is that a
-/// try that fails fails LOUDLY and changes nothing: no CAN interface
-/// exists in this container, which is the same thing an operator hits
-/// when they pick the wrong one on the box.
+/// try that fails fails LOUDLY and changes nothing: the configured
+/// interface exists on no machine, which is the same thing an operator
+/// hits when they pick the wrong one on the box.
 ///
 /// The successful direction needs a control box; the RT core's own
 /// re-boot on a swap is covered in `par6-rt` over the loopback backend.
 #[test]
 fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
-    let rig = Rig::boot(common::shipped_config());
+    let rig = Rig::boot(common::config_with_interface("par6-no-such-can-cfg"));
     let mut c = Client::new(rig.addr());
     rig.wait_status("boot", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1501,7 +1505,7 @@ fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
         on: false,
     }));
     assert!(
-        err.cause.contains("cannot open") && err.cause.contains("can0"),
+        err.cause.contains("cannot open") && err.cause.contains("par6-no-such-can-cfg"),
         "the refusal names the configured interface: {}",
         err.cause
     );

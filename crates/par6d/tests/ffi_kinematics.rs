@@ -7,7 +7,7 @@
 //!   tool's `[kinematics] mass_kg` changes the published gravity
 //!   torques,
 //! - the FK hook publishes the true TCP pose: STATUS reproduces the
-//!   golden kinematics fixture's FK matrix for a known q,
+//!   engine's own FK matrix for a known q,
 //! - `move_l` runs the cartesian pipeline (segment → seeded IK → TOPPRA
 //!   → ring) to COMPLETE, and the measured TCP stays on the line,
 //! - an out-of-workspace pose is a real IK error reply, never a no-op,
@@ -29,7 +29,7 @@ use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{is_timeout, repo_root, shipped_config, Client, Rig, BUDGET, READ_TIMEOUT};
+use common::{is_timeout, shipped_config, Client, Rig, BUDGET, READ_TIMEOUT};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
@@ -107,55 +107,46 @@ fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS])
     }
 }
 
-// ---- golden kinematics fixture ---------------------------------------------
+// ---- reference FK ----------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct Fixture {
-    cases: Vec<FixtureCase>,
-}
-
-#[derive(serde::Deserialize)]
-struct FixtureCase {
+struct ReferenceCase {
     q: [f64; NUM_JOINTS],
-    /// Row-major 4x4 TCP pose \[m\] from the Python/Pinocchio reference.
-    fk: Vec<f64>,
+    /// Row-major 4x4 TCP pose \[m\] from `par6_kin::Kin` on the same URDF
+    /// variant the daemon loads for the configured gripper.
+    fk: [f64; 16],
 }
 
-/// The golden fixture for the URDF variant the configured gripper
-/// selects — the same file `par6-kin`'s conformance test uses.
-fn golden_fixture() -> Fixture {
-    let gripper = par6_config::RobotConfig::load(&shipped_config())
-        .expect("PAR6 config")
+/// A configuration inside every hard joint window with its TCP pose as
+/// the engine computes it in-process: what the daemon's STATUS must
+/// carry once the arm is teleported there.
+fn reference_case() -> ReferenceCase {
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("PAR6 config");
+    let gripper = bundle
         .robot
-        .active_gripper;
-    let name = if gripper.eq_ignore_ascii_case("flange") {
-        "par6_flange"
-    } else if gripper.starts_with("MSG") {
-        "par6_msg"
-    } else if gripper.starts_with("SSG48") {
-        "par6_ssg48"
-    } else {
-        panic!("no golden fixture for configured gripper {gripper}");
-    };
-    let path = repo_root().join(format!("tests/golden/kinematics/{name}.json"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    serde_json::from_str(&text).expect("golden kinematics fixture")
-}
-
-/// The first golden case the arm can actually be teleported to: the
-/// fixtures sample the whole joint space, teleport clamps to the hard
-/// window, and a clamped pose would no longer match the golden FK.
-fn reachable_golden_case() -> FixtureCase {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    golden_fixture()
-        .cases
-        .into_iter()
-        .find(|c| {
-            c.q.iter()
-                .zip(cfg.joints.iter())
-                .all(|(q, j)| *q >= j.limits.hard_min_rad && *q <= j.limits.hard_max_rad)
-        })
-        .expect("at least one golden case inside the hard joint window")
+        .robot
+        .active_gripper
+        .trim()
+        .to_ascii_uppercase();
+    let variant = par6_kin::GripperVariant::resolve(
+        &gripper,
+        bundle
+            .active_gripper()
+            .and_then(|g| g.urdf_variant.as_deref()),
+    );
+    let mut kin = par6_kin::Kin::load(&common::assets_dir(), variant).expect("reference model");
+    let mut q = [0.0; NUM_JOINTS];
+    for (out, deg) in q.iter_mut().zip(HOLD_POSE_DEG.iter()) {
+        *out = deg.to_radians();
+    }
+    for (v, j) in q.iter().zip(bundle.robot.joints.iter()) {
+        assert!(
+            *v >= j.limits.hard_min_rad && *v <= j.limits.hard_max_rad,
+            "the reference pose must sit inside the hard joint window"
+        );
+    }
+    let mut fk = [0.0; 16];
+    kin.fk(&q, &mut fk).expect("reference FK");
+    ReferenceCase { q, fk }
 }
 
 // ---- cartesian geometry helpers --------------------------------------------
@@ -191,8 +182,8 @@ fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
 /// Wire pose `[x y z mm, rx ry rz deg]` from a STATUS pose matrix
 /// (row-major 4x4, mm) with the translation replaced.
 ///
-/// Decoded the way a client decodes it — `pinokin.so3_rpy`, the wire's
-/// intrinsic-XYZ convention, written out here
+/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
+/// convention, written out here
 /// rather than borrowed from the runtime so the two halves of the
 /// round trip cannot agree on the wrong thing.
 fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
@@ -241,7 +232,7 @@ const MOVE_S: f64 = 15.0;
 // ---- tests -----------------------------------------------------------------
 
 /// The whole cartesian surface over one session: the FK hook publishes
-/// the golden TCP pose, `move_l` holds the straight line where a
+/// the reference TCP pose, `move_l` holds the straight line where a
 /// joint-space `move_j_pose` to the same target bows far off it,
 /// `jog_l` drives the TCP through the jacobian, and an out-of-workspace
 /// target fails both cartesian moves with IK_TARGET_UNREACHABLE instead
@@ -253,8 +244,8 @@ fn cartesian_surface_over_protocol_v2() {
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
 
-    // --- FK hook: STATUS carries the golden TCP pose for a known q.
-    let case = reachable_golden_case();
+    // --- FK hook: STATUS carries the engine's TCP pose for a known q.
+    let case = reference_case();
     let mut case_deg = [0.0; NUM_JOINTS];
     for (out, rad) in case_deg.iter_mut().zip(case.q.iter()) {
         *out = rad.to_degrees();
@@ -262,25 +253,25 @@ fn cartesian_surface_over_protocol_v2() {
     enable_and_teleport(&rig, &mut c, case_deg);
     // The arm reports through 14-bit encoders, so it lands within a
     // quantum (~2e-5 rad) of the commanded configuration, not on it.
-    let s = rig.wait_status("pose for the golden configuration", |s| {
+    let s = rig.wait_status("pose for the reference configuration", |s| {
         s.angles
             .iter()
             .zip(case_deg.iter())
             .all(|(a, b)| (a - b).abs() < 0.01)
     });
-    for (k, golden) in case.fk.iter().enumerate() {
+    for (k, reference) in case.fk.iter().enumerate() {
         // Tolerances leave ~100x margin over that quantum, and are still
         // orders of magnitude below what any convention slip (frame, row
         // order, rpy composition) would cost.
-        // Columns 3/7/11 are the translation (golden in m, wire in mm).
+        // Columns 3/7/11 are the translation (reference in m, wire in mm).
         let (want, tol) = if k % 4 == 3 && k < 12 {
-            (golden * 1000.0, 0.05)
+            (reference * 1000.0, 0.05)
         } else {
-            (*golden, 5e-4)
+            (*reference, 5e-4)
         };
         assert!(
             (s.pose[k] - want).abs() < tol,
-            "STATUS pose element {k} = {} != golden FK {want} (whole matrix {:?})",
+            "STATUS pose element {k} = {} != reference FK {want} (whole matrix {:?})",
             s.pose[k],
             s.pose
         );

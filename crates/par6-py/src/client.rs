@@ -10,18 +10,14 @@ use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use par6_client::{Ack, Client, ClientConfig, ClientError, StatusTransport};
+use par6_client::{Ack, Client, ClientConfig, ClientError, MotionWait, StatusTransport};
 use par6_proto::command as cmd;
-use par6_proto::{Command, CompletionPolicy, Frame, NUM_JOINTS};
+use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
 
 use crate::convert::{
-    client_err, query_result_dict, shape_from_py, status_dict, tool_param_from_py, wire_error_tuple,
+    client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
+    tool_param_from_py, wire_error_tuple,
 };
-
-fn frame_of(v: u8) -> PyResult<Frame> {
-    Frame::from_wire(i64::from(v))
-        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
-}
 
 fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
@@ -75,50 +71,95 @@ impl CoreClient {
 
 #[pymethods]
 impl CoreClient {
-    /// Connect and start the reply + status listeners.
+    /// Connect and start the reply + status listeners. Every `None`
+    /// falls back to the client's own default ladder (`PAR6_*`
+    /// environment, then the shipped defaults).
     #[staticmethod]
     #[allow(clippy::too_many_arguments)]
-    #[pyo3(signature = (host, port, timeout, retries, status_transport, status_port, mcast_group, mcast_iface, status_unicast_host, mtu))]
+    #[pyo3(signature = (host=None, port=None, timeout=None, retries=None, status_transport=None, status_port=None, mcast_group=None, mcast_iface=None, status_unicast_host=None, mtu=None))]
     fn connect<'py>(
         py: Python<'py>,
-        host: String,
-        port: u16,
-        timeout: f64,
-        retries: u32,
-        status_transport: String,
-        status_port: u16,
-        mcast_group: String,
-        mcast_iface: String,
-        status_unicast_host: String,
-        mtu: usize,
+        host: Option<String>,
+        port: Option<u16>,
+        timeout: Option<f64>,
+        retries: Option<u32>,
+        status_transport: Option<String>,
+        status_port: Option<u16>,
+        mcast_group: Option<String>,
+        mcast_iface: Option<String>,
+        status_unicast_host: Option<String>,
+        mtu: Option<usize>,
     ) -> PyResult<Bound<'py, PyAny>> {
         future_into_py(py, async move {
             let parse = |s: &str, what: &str| -> Result<Ipv4Addr, PyErr> {
                 s.parse()
                     .map_err(|_| PyRuntimeError::new_err(format!("bad {what}: {s}")))
             };
-            let status = if status_transport.eq_ignore_ascii_case("UNICAST") {
-                StatusTransport::Unicast {
-                    host: parse(&status_unicast_host, "status host")?,
-                }
-            } else {
-                StatusTransport::Multicast {
-                    group: parse(&mcast_group, "multicast group")?,
-                    iface: parse(&mcast_iface, "multicast interface")?,
-                }
+            let mut cfg = ClientConfig::default();
+            if let Some(h) = host {
+                cfg.host = h;
+            }
+            if let Some(p) = port {
+                cfg.port = p;
+            }
+            if let Some(t) = timeout {
+                cfg.timeout = Duration::from_secs_f64(t);
+            }
+            if let Some(r) = retries {
+                cfg.retries = r;
+            }
+            if let Some(p) = status_port {
+                cfg.status_port = p;
+            }
+            if let Some(m) = mtu {
+                cfg.mtu = m;
+            }
+            let kind = status_transport.map(|k| k.to_ascii_uppercase());
+            let unicast = match (&kind, &cfg.status) {
+                (Some(k), _) => k == "UNICAST",
+                (None, StatusTransport::Unicast { .. }) => true,
+                (None, StatusTransport::Multicast { .. }) => false,
             };
-            let cfg = ClientConfig {
-                host,
-                port,
-                timeout: Duration::from_secs_f64(timeout),
-                retries,
-                status,
-                status_port,
-                mtu,
+            cfg.status = if unicast {
+                let host = match (&status_unicast_host, &cfg.status) {
+                    (Some(h), _) => parse(h, "status host")?,
+                    (None, StatusTransport::Unicast { host }) => *host,
+                    (None, _) => Ipv4Addr::LOCALHOST,
+                };
+                StatusTransport::Unicast { host }
+            } else {
+                let (mut group, mut iface) = match &cfg.status {
+                    StatusTransport::Multicast { group, iface } => (*group, *iface),
+                    _ => (Ipv4Addr::new(239, 255, 0, 71), Ipv4Addr::LOCALHOST),
+                };
+                if let Some(g) = &mcast_group {
+                    group = parse(g, "multicast group")?;
+                }
+                if let Some(i) = &mcast_iface {
+                    iface = parse(i, "multicast interface")?;
+                }
+                StatusTransport::Multicast { group, iface }
             };
             let client = Client::connect(cfg).await.map_err(client_err)?;
             Ok(CoreClient { client })
         })
+    }
+
+    /// The command endpoint this client talks to.
+    fn endpoint(&self) -> (String, u16) {
+        let cfg = self.client.config();
+        (cfg.host.clone(), cfg.port)
+    }
+
+    /// The status transport in use: `(kind, port)` with kind `"UNICAST"`
+    /// or `"MULTICAST"`.
+    fn status_endpoint(&self) -> (String, u16) {
+        let cfg = self.client.config();
+        let kind = match cfg.status {
+            StatusTransport::Unicast { .. } => "UNICAST",
+            StatusTransport::Multicast { .. } => "MULTICAST",
+        };
+        (kind.to_owned(), cfg.status_port)
     }
 
     /// Stop the listeners, wake every waiter, and wait for the listener
@@ -194,6 +235,82 @@ impl CoreClient {
         self.rt().command_verdict(index)
     }
 
+    /// Await the checkpoint `label`; False on timeout.
+    fn wait_checkpoint<'py>(
+        &self,
+        py: Python<'py>,
+        label: String,
+        timeout: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            Ok(client
+                .wait_checkpoint(&label, Duration::from_secs_f64(timeout))
+                .await)
+        })
+    }
+
+    /// Start-then-settle wait on the status stream (see
+    /// `par6_client::Client::wait_motion`); False on timeout.
+    #[pyo3(signature = (timeout, settle_window, speed_threshold, angle_threshold, motion_start_timeout))]
+    fn wait_motion<'py>(
+        &self,
+        py: Python<'py>,
+        timeout: f64,
+        settle_window: f64,
+        speed_threshold: f64,
+        angle_threshold: f64,
+        motion_start_timeout: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        let wait = MotionWait {
+            timeout: Duration::from_secs_f64(timeout),
+            settle_window: Duration::from_secs_f64(settle_window),
+            speed_threshold,
+            angle_threshold,
+            motion_start_timeout: Duration::from_secs_f64(motion_start_timeout),
+        };
+        future_into_py(py, async move { Ok(client.wait_motion(wait).await) })
+    }
+
+    /// Whether the e-stop line reads pressed; False when unreachable.
+    fn is_estop_pressed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            match client.is_estop_pressed().await {
+                Ok(v) => Ok(v),
+                Err(ClientError::Unreachable) => Ok(false),
+                Err(e) => Err(client_err(e)),
+            }
+        })
+    }
+
+    /// Whether every joint is below `threshold` rad/s; False when
+    /// unreachable.
+    fn is_robot_stopped<'py>(
+        &self,
+        py: Python<'py>,
+        threshold: f64,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            match client.is_robot_stopped(threshold).await {
+                Ok(v) => Ok(v),
+                Err(ClientError::Unreachable) => Ok(false),
+                Err(e) => Err(client_err(e)),
+            }
+        })
+    }
+
+    /// Whether the arm is back-driveable right now, off the latest
+    /// broadcast (waiting up to `timeout` for the first one).
+    fn is_freedrive<'py>(&self, py: Python<'py>, timeout: f64) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            Ok(client.is_freedrive(Duration::from_secs_f64(timeout)).await)
+        })
+    }
+
     // ---------------------------------------------------------- queries
 
     fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -224,6 +341,30 @@ impl CoreClient {
         future_into_py(py, async move {
             match client.pose(frame).await {
                 Ok(p) => Ok(Some(p.to_vec())),
+                Err(ClientError::Unreachable) => Ok(None),
+                Err(e) => Err(client_err(e)),
+            }
+        })
+    }
+
+    /// The TCP pose as `[x, y, z, rx, ry, rz]` in mm and degrees
+    /// (intrinsic-XYZ rpy, the wire convention); None when unreachable.
+    fn pose_xyzrpy<'py>(&self, py: Python<'py>, frame: u8) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        let frame = frame_of(frame)?;
+        future_into_py(py, async move {
+            match client.pose(frame).await {
+                Ok(m) => {
+                    let p = par6d::matrix_to_xyzrpy(&m);
+                    Ok(Some(vec![
+                        p[0],
+                        p[1],
+                        p[2],
+                        p[3].to_degrees(),
+                        p[4].to_degrees(),
+                        p[5].to_degrees(),
+                    ]))
+                }
                 Err(ClientError::Unreachable) => Ok(None),
                 Err(e) => Err(client_err(e)),
             }
@@ -437,15 +578,7 @@ impl CoreClient {
 
     /// `assertion` is "parked" or "force" (the wire refuses anything else).
     fn enter_flashing<'py>(&self, py: Python<'py>, assertion: &str) -> PyResult<Bound<'py, PyAny>> {
-        let assertion = match assertion.to_ascii_lowercase().as_str() {
-            "parked" => par6_proto::FlashingAssertion::Parked,
-            "force" => par6_proto::FlashingAssertion::Force,
-            other => {
-                return Err(pyo3::exceptions::PyValueError::new_err(format!(
-                    "flashing assertion must be 'parked' or 'force', got {other:?}"
-                )))
-            }
-        };
+        let assertion = flashing_assertion(assertion)?;
         sys_future(
             py,
             self.rt(),

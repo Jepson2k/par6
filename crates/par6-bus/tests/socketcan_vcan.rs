@@ -19,22 +19,20 @@
 //! every test observes the same wire and asserts exact frame sequences.
 //!
 //! There is no simulated driver here on purpose: a fake that answered
-//! frames would be re-implementing the protocol. RX comes from the
-//! cross-language golden vectors in `tests/golden/can/manifest.json`,
-//! written onto the bus by a second plain socket — real wire bytes from
-//! the frozen contract, no invented device behavior.
+//! frames would be re-implementing the protocol. RX is written onto the
+//! bus by a second plain socket, packed with the crate's own frame
+//! encoders — real wire bytes, no invented device behavior.
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use par6_bus::spectral::{pack_can_id, pack_f32, CommandId};
+use par6_bus::spectral::{pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32, CommandId};
 use par6_bus::{
     BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, PollKind, SocketCanBus,
 };
 use par6_config::{ConfigBundle, GripperConfig, KtSource, RobotConfig};
-use serde_json::Value;
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 
 // Per-thread so concurrently running tests in this binary cannot pollute
@@ -123,7 +121,7 @@ struct Seen {
 }
 
 /// A second socket on the same interface: sees everything the bus
-/// transmits, and injects the golden reply vectors.
+/// transmits, and injects driver replies.
 struct Wire(CanSocket);
 
 impl Wire {
@@ -170,32 +168,38 @@ fn configs(iface: &str) -> (RobotConfig, GripperConfig) {
     (robot, gripper)
 }
 
-/// Reply frames from the cross-language golden manifest, by vector name.
-fn golden(name: &str) -> (u16, Vec<u8>) {
-    let path =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden/can/manifest.json");
-    let text = std::fs::read_to_string(&path).expect("golden manifest");
-    let m: Value = serde_json::from_str(&text).expect("manifest parses");
-    let v = m["vectors"]
-        .as_array()
-        .expect("vectors")
-        .iter()
-        .find(|v| v["name"] == name)
-        .unwrap_or_else(|| panic!("golden vector {name} missing"));
-    let id = u16::from_str_radix(
-        v["id_hex"]
-            .as_str()
-            .expect("id_hex")
-            .trim_start_matches("0x"),
-        16,
+/// A driver's cmd-33 kt reply (DLC 4, f32 big-endian Nm/A) from `node`.
+fn kt_reply(node: NodeId, kt_nm_a: f32) -> (u16, Vec<u8>) {
+    (
+        pack_can_id(node, CommandId::RespondKt, false),
+        pack_f32(kt_nm_a).to_vec(),
     )
-    .expect("hex id");
-    let hex = v["data_hex"].as_str().expect("data_hex");
-    let data = (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex byte"))
-        .collect();
-    (id, data)
+}
+
+/// A driver's cmd-3 motion reply (DLC 8: i24 position ticks, i24 speed
+/// ticks/s, i16 current mA), with the arbitration-id error bit as given.
+fn motion_reply(node: NodeId, err: bool, pos: i32, spd: i32, cur_ma: i16) -> (u16, Vec<u8>) {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&pack_i24(pos));
+    data.extend_from_slice(&pack_i24(spd));
+    data.extend_from_slice(&pack_i16(cur_ma));
+    (pack_can_id(node, CommandId::RespondDataPack1, err), data)
+}
+
+/// A driver's cmd-23 temperature reply (DLC 2, i16 °C).
+fn temperature_reply(node: NodeId, deg_c: i16) -> (u16, Vec<u8>) {
+    (
+        pack_can_id(node, CommandId::Temperature, false),
+        pack_i16(deg_c).to_vec(),
+    )
+}
+
+/// A driver's cmd-28 encoder reply (DLC 8: i32 position, i32 speed).
+fn encoder_reply(node: NodeId, pos: i32, spd: i32) -> (u16, Vec<u8>) {
+    let mut data = Vec::with_capacity(8);
+    data.extend_from_slice(&pack_i32(pos));
+    data.extend_from_slice(&pack_i32(spd));
+    (pack_can_id(node, CommandId::EncoderData, false), data)
 }
 
 /// Bring a bus up with the boot phases that need a responder switched
@@ -302,10 +306,9 @@ fn boot_scan_and_kt_fetch_reach_the_first_bus_state() {
     let mut bus = SocketCanBus::open(&robot.bus).expect("open SocketCanBus");
     let _ = wire.drain();
 
-    // Queue the golden kt reply for J6 as if node 5's driver had answered
+    // Queue a kt reply for J6 as if node 5's driver had answered
     // (0.151 Nm/A). It waits in the bus socket until the fetch drains it.
-    let (kt_id, kt_data) = golden("rx_cmd33_kt");
-    assert_eq!(kt_id, pack_can_id(5, CommandId::RespondKt, false));
+    let (kt_id, kt_data) = kt_reply(5, 0.151);
     wire.send(kt_id, &kt_data);
 
     bus.boot_configure(&robot, Some(&gripper), 0)
@@ -359,7 +362,7 @@ fn boot_scan_and_kt_fetch_reach_the_first_bus_state() {
 }
 
 /// One steady-state tick end to end: the frame budget on the wire, the
-/// drain decoding golden replies into state, and the freshness ladder
+/// drain decoding driver replies into state, and the freshness ladder
 /// (warn → latched disconnect → user clear) driven by real traffic.
 #[test]
 fn tick_exchange_frame_budget_and_freshness_ladder() {
@@ -403,10 +406,11 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     assert!(seen[6].data.is_empty() && !seen[6].rtr);
     assert!(seen[7].rtr);
 
-    // Golden replies on the wire become decoded state.
-    let (motion_id, motion) = golden("rx_cmd3_motion_err_bit");
+    // Driver replies on the wire become decoded state — a motion reply
+    // carrying the live-fault bit, and a sub-zero temperature.
+    let (motion_id, motion) = motion_reply(1, true, 100_000, -50, -300);
     wire.send(motion_id, &motion);
-    let (temp_id, temp) = golden("rx_cmd23_temperature_negative");
+    let (temp_id, temp) = temperature_reply(4, -5);
     wire.send(temp_id, &temp);
     let motion_node = ((motion_id >> 7) & 0xF) as NodeId;
     bus.begin_tick(2);
@@ -471,7 +475,7 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     bus.poll_step().expect("polls are suppressed, not an error");
     assert_eq!(bus.tx_frames_this_tick(), 0);
     assert!(wire.drain().is_empty(), "a silent bus transmits nothing");
-    let (enc_id, enc) = golden("rx_cmd28_encoder");
+    let (enc_id, enc) = encoder_reply(2, -123_456, 2_000_000);
     wire.send(enc_id, &enc);
     std::thread::sleep(Duration::from_millis(2));
     let enc_node = ((enc_id >> 7) & 0xF) as usize;
@@ -605,9 +609,9 @@ fn kt_fetch_garbage_and_late_replies_are_provenance_not_re_asks() {
     let _ = wire.drain();
 
     // Queued before boot, so both replies land in the ladder's first wait
-    // window: the golden kt for node 5, and a garbage (negative) kt for
+    // window: a plausible kt for node 5, and a garbage (negative) kt for
     // node 1 — the out-of-family shape a mis-flashed driver produces.
-    let (kt_id, kt_data) = golden("rx_cmd33_kt");
+    let (kt_id, kt_data) = kt_reply(5, 0.151);
     wire.send(kt_id, &kt_data);
     wire.send(pack_can_id(1, CommandId::RespondKt, false), &pack_f32(-0.5));
 
@@ -665,7 +669,7 @@ fn steady_state_ticks_allocate_nothing() {
     let (mut bus, _robot, _gripper) = quiet_bus(&iface);
     let joints = [JointCommand::idle(); 6];
     let mut state = BusState::new();
-    let (motion_id, motion) = golden("rx_cmd3_motion_negative");
+    let (motion_id, motion) = motion_reply(0, false, -150, -187, 3047);
     let reply = socketcan::CanFrame::from_raw_id(u32::from(motion_id), &motion).expect("frame");
 
     let tick = |bus: &mut SocketCanBus, state: &mut BusState, t: u64| {

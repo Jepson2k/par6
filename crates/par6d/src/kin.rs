@@ -10,7 +10,7 @@
 //! Pose conventions on this boundary:
 //!
 //! - Wire poses are `[x, y, z (mm), rx, ry, rz (deg)]` with
-//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ — `pinokin.se3_from_rpy`,
+//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ —
 //!   `scipy` `'XYZ'`). This is the
 //!   convention `par6.robot.Robot`'s FK/IK, the dry-run client and the
 //!   frontend's STATUS-matrix decode all read the same six numbers in.
@@ -31,7 +31,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, KinError, Pose, NQ};
+use par6_kin::{GripperVariant, IkOutcome, Kin, KinError, Pose, NQ};
 use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 
 /// Map a configured gripper name onto the URDF variant whose tool the
@@ -48,16 +48,13 @@ pub(crate) fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> Gri
             ),
         }
     }
-    if gripper_name.eq_ignore_ascii_case("flange") {
-        GripperVariant::Flange
-    } else if gripper_name.starts_with("MSG") {
-        GripperVariant::Msg
-    } else if gripper_name.starts_with("SSG48") {
-        GripperVariant::Ssg48
-    } else {
+    let known = gripper_name.eq_ignore_ascii_case("flange")
+        || gripper_name.starts_with("MSG")
+        || gripper_name.starts_with("SSG48");
+    if !known {
         log::warn!("no URDF variant for gripper '{gripper_name}'; using the bare flange model");
-        GripperVariant::Flange
     }
+    GripperVariant::by_name_prefix(gripper_name)
 }
 
 /// Resolve the `assets/par6_description` tree: the explicit choice when
@@ -204,7 +201,7 @@ impl ToolOffset {
 }
 
 /// `m ← m · T(d)` — walk `d` along the pose's own axes.
-fn translate_local(m: &mut Pose, d: [f64; 3]) {
+pub fn translate_local(m: &mut Pose, d: [f64; 3]) {
     m[3] += m[0] * d[0] + m[1] * d[1] + m[2] * d[2];
     m[7] += m[4] * d[0] + m[5] * d[1] + m[6] * d[2];
     m[11] += m[8] * d[0] + m[9] * d[1] + m[10] * d[2];
@@ -213,8 +210,7 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 // ------------------------------------------------------------- pose math
 
 /// `[x y z (m), roll pitch yaw (rad)]` from a row-major 4x4, rpy in the
-/// wire's intrinsic-XYZ convention `R = Rx·Ry·Rz` — the decomposition
-/// `pinokin.so3_rpy` performs, and the exact inverse of
+/// wire's intrinsic-XYZ convention `R = Rx·Ry·Rz` — the exact inverse of
 /// [`wire_pose_to_matrix`].
 ///
 /// At gimbal lock only `roll ∓ yaw` is observable, and this decode folds
@@ -222,7 +218,7 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 /// server rebuilds the STATUS matrix from what comes out of here, and
 /// `atan2(±0, ±0)` on an exactly degenerate matrix answers 0 or ±π by
 /// sign bit — either way a rotation the arm is not in.
-pub(crate) fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
+pub fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
     let (r00, r01, r02) = (m[0], m[1], m[2]);
     let (r10, r11, r12) = (m[4], m[5], m[6]);
     let r22 = m[10];
@@ -469,45 +465,22 @@ impl CartKin {
         Ok(pose)
     }
 
-    /// Seeded damped-least-squares IK toward `target`, which is where the
-    /// OFFSET TCP must land: the solver works at the URDF's TCP frame, so
-    /// the target is walked back along its own axes by the offset first.
-    ///
-    /// A solution comes back wrap-normalized — see [`CartKin::ik_within`].
-    pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
-        self.ik_within(seed, target, IkOptions::default().max_iters)
-    }
-
-    /// [`CartKin::ik`] under a caller-chosen iteration budget.
-    ///
-    /// A budget only pays for itself where the answer is a yes/no about a
-    /// step small enough to converge in a handful of iterations: the full
-    /// budget is then spent only on targets that have no solution, and
-    /// spending it is the whole cost.
+    /// Closed-form IK toward `target`, which is where the OFFSET TCP must
+    /// land: the solver works at the URDF's TCP frame, so the target is
+    /// walked back along its own axes by the offset first.
     ///
     /// Every solved joint is normalized onto the 2π branch its soft
-    /// window admits, nearest the seed
-    /// ([`par6_kin::wrap_to_window`]) — the DLS iterate itself carries
-    /// however many turns the walk accumulated, and a limit check on
-    /// that raw number refuses reachable targets. Nearest-the-seed is
-    /// what keeps this in step with the callers' branch-flip guards:
-    /// wrapping never moves a solution further from the seed, so a
-    /// solution that is still far from it really is another posture.
-    pub(crate) fn ik_within(
-        &mut self,
-        seed: &[f64; NQ],
-        target: &Pose,
-        max_iters: i32,
-    ) -> IkResult {
+    /// window admits, nearest the seed ([`par6_kin::wrap_to_window`]).
+    /// Nearest-the-seed is what keeps this in step with the callers'
+    /// branch-flip guards: wrapping never moves a solution further from
+    /// the seed, so a solution that is still far from it really is
+    /// another posture.
+    pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
         let d = self.offset.get();
         let mut target = *target;
         translate_local(&mut target, [-d[0], -d[1], -d[2]]);
         let mut out = [0.0; NQ];
-        let opts = IkOptions {
-            max_iters,
-            ..IkOptions::default()
-        };
-        match self.kin.ik(seed, &target, &mut out, opts) {
+        match self.kin.ik(seed, &target, &mut out) {
             Ok(IkOutcome::Converged) => {
                 for (j, q) in out.iter_mut().enumerate() {
                     *q = par6_kin::wrap_to_window(
@@ -519,7 +492,7 @@ impl CartKin {
                 }
                 IkResult::Solved(out)
             }
-            Ok(IkOutcome::MaxIters) => IkResult::Unreachable,
+            Ok(IkOutcome::Unreachable) => IkResult::Unreachable,
             Err(e) => IkResult::Failed(e.to_string()),
         }
     }

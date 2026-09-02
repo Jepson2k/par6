@@ -1650,7 +1650,7 @@ impl Par6Planner {
         target: &par6_kin::Pose,
         baseline: &[(String, String)],
     ) -> bool {
-        let solved = match self.kin.ik_within(seed, target, EN_IK_ITERS) {
+        let solved = match self.kin.ik(seed, target) {
             crate::kin::IkResult::Solved(q) => q,
             crate::kin::IkResult::Unreachable => return false,
             crate::kin::IkResult::Failed(e) => {
@@ -1848,7 +1848,6 @@ const EN_STEP_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 /// converges in a handful of iterations when it converges at all, so the
 /// full planning budget would be spent only on the directions that have
 /// no answer — which is exactly where the probe must stay cheap.
-const EN_IK_ITERS: i32 = 20;
 /// Joint probe step for the collision half of the joint gate \[rad\]
 /// (parol6: 2°) — big enough that a step actually enters what it is about
 /// to enter, and clamped into the soft window so a pose past the stop
@@ -1921,13 +1920,19 @@ pub(crate) enum PlannedMotion<'a> {
     /// The homing sequence; on a referenced arm it lands at the
     /// configured home pose.
     Home,
-    /// No motion (tool actions, delays, checkpoints, null moves).
+    /// No motion, but a known wait before the command completes: a
+    /// delay, or a tool calibration's minimum settle.
+    Wait {
+        /// RT ticks the command occupies.
+        ticks: u64,
+    },
+    /// No motion (tool moves, checkpoints, null moves).
     Still,
 }
 
 impl Par6Planner {
     /// The in-flight command's planned motion, for the offline preview.
-    pub(crate) fn planned_motion(&self) -> PlannedMotion<'_> {
+    pub(crate) fn planned_motion(&mut self) -> PlannedMotion<'_> {
         match &self.inflight {
             Some(InFlight {
                 kind: InFlightKind::Exec { samples, .. },
@@ -1937,13 +1942,24 @@ impl Par6Planner {
                 kind: InFlightKind::Home { .. },
                 ..
             }) => PlannedMotion::Home,
+            Some(InFlight {
+                kind: InFlightKind::Delay { target_tick },
+                ..
+            }) => PlannedMotion::Wait {
+                ticks: target_tick.saturating_sub(self.snapshots.latest().tick),
+            },
+            Some(InFlight {
+                kind:
+                    InFlightKind::Tool {
+                        wait: ToolWait::Calibrate,
+                        ..
+                    },
+                ..
+            }) => PlannedMotion::Wait {
+                ticks: self.tool_cal_min_ticks,
+            },
             _ => PlannedMotion::Still,
         }
-    }
-
-    /// The configured home pose \[rad\].
-    pub(crate) fn home_pose(&self) -> [f64; MAX_JOINTS] {
-        self.home_pose_rad
     }
 }
 
@@ -2226,7 +2242,7 @@ impl Planner for Par6Planner {
 const MAX_REPORTED_PAIRS: usize = 4;
 
 /// Format colliding pairs the way the v2 error catalog's `{pairs}` slot
-/// and the golden status fixture spell them: `[a, b], [c, d]`.
+/// spells them: `[a, b], [c, d]`.
 fn format_pairs(pairs: &[(String, String)]) -> String {
     let mut out = pairs
         .iter()

@@ -722,7 +722,7 @@ pub(crate) struct KinStack {
     gravity: crate::kin::KinGravity,
     pub(crate) planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
-    housekeeping: crate::kin::CartKin,
+    pub(crate) housekeeping: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
     /// The streaming gate's own collision world (pinocchio `Data` is
     /// mutated by every query, so the planner's instance cannot be
@@ -738,7 +738,7 @@ pub(crate) struct KinStack {
 /// from itself and from keep-outs that absorbs model and calibration
 /// error. The value parol6 runs the same arm with; a shape that wants a
 /// wider berth carries its own `margin`.
-const COLLISION_CLEARANCE_M: f64 = 0.005;
+pub const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.

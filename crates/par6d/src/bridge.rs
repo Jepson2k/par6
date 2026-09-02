@@ -50,7 +50,7 @@ const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// rate, so retries never saturate the one-command-per-tick budget).
 const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
 /// Housekeeping loop period.
-const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+pub(crate) const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
 /// How long a FLASHING enter/exit waits for the published mode to
 /// answer. The RT decides on the next tick, so this only has to cover
 /// command-queue and snapshot latency on a loaded host.
@@ -358,15 +358,15 @@ enum StreamKind {
 }
 
 /// Live state of a cartesian jog, advanced by housekeeping each period.
-struct CartJogState {
+pub(crate) struct CartJogState {
     /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
     /// commanded frame's axes.
-    twist: [f64; 6],
-    frame: par6_proto::Frame,
+    pub(crate) twist: [f64; 6],
+    pub(crate) frame: par6_proto::Frame,
     /// Integrated joint target \[rad\] (the stream setpoint source).
-    q: [f64; MAX_JOINTS],
-    soft_min: [f64; MAX_JOINTS],
-    soft_max: [f64; MAX_JOINTS],
+    pub(crate) q: [f64; MAX_JOINTS],
+    pub(crate) soft_min: [f64; MAX_JOINTS],
+    pub(crate) soft_max: [f64; MAX_JOINTS],
 }
 
 struct ActiveStream {
@@ -1302,7 +1302,7 @@ pub(crate) fn housekeeping_loop(
 /// the joint target and clamp it inside the soft window. Returns the
 /// integrated target and the joint velocity it moved at — what the
 /// collision gate projects its lookahead with.
-fn step_cart_jog(
+pub(crate) fn step_cart_jog(
     kin: &mut crate::kin::CartKin,
     state: &mut CartJogState,
     dt_s: f64,

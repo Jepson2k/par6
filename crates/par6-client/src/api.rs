@@ -6,7 +6,7 @@ use std::time::Duration;
 
 use par6_proto::command as cmd;
 use par6_proto::{
-    Command, CompletionPolicy, Frame, LoopStatsResult, QueryResult, Shape, ToolStatusWire,
+    Command, CompletionPolicy, Frame, LoopStatsResult, QueryResult, Shape, Status, ToolStatusWire,
     WireError, NUM_JOINTS,
 };
 
@@ -147,6 +147,86 @@ impl Client {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
+    }
+
+    /// Block until the arm has stopped moving, start-then-settle: wait
+    /// for motion to START (a joint speed or per-frame angle delta above
+    /// the thresholds, bounded by `motion_start_timeout`), then for it
+    /// to stay below them for `settle_window`. False on `timeout`.
+    pub async fn wait_motion(&self, w: MotionWait) -> bool {
+        let mut rx = self.subscribe_status();
+        let start = tokio::time::Instant::now();
+        let deadline = start + w.timeout;
+        let mut last_angles: Option<[f64; NUM_JOINTS]> = None;
+        let mut settle_start: Option<tokio::time::Instant> = None;
+        let mut motion_started = false;
+        loop {
+            match tokio::time::timeout_at(deadline, rx.changed()).await {
+                Ok(Ok(())) => {}
+                _ => return false,
+            }
+            let Some(s) = rx.borrow_and_update().clone() else {
+                continue;
+            };
+            let max_speed = s.speeds.iter().fold(0.0_f64, |m, v| m.max(v.abs()));
+            let max_delta = match last_angles {
+                Some(prev) => s
+                    .angles
+                    .iter()
+                    .zip(prev.iter())
+                    .fold(0.0_f64, |m, (a, b)| m.max((a - b).abs())),
+                None => 0.0,
+            };
+            last_angles = Some(s.angles);
+            let now = tokio::time::Instant::now();
+            let moving = max_speed >= w.speed_threshold || max_delta >= w.angle_threshold;
+            if !motion_started {
+                if moving || now - start > w.motion_start_timeout {
+                    motion_started = true;
+                    settle_start = None;
+                }
+                if moving {
+                    continue;
+                }
+            }
+            if motion_started {
+                if moving {
+                    settle_start = None;
+                } else if let Some(since) = settle_start {
+                    if now - since > w.settle_window {
+                        return true;
+                    }
+                } else {
+                    settle_start = Some(now);
+                }
+            }
+        }
+    }
+
+    /// Whether the e-stop line reads pressed: the LAST io slot whatever
+    /// the box declares, carrying the line level (low while pressed).
+    pub async fn is_estop_pressed(&self) -> Result<bool, ClientError> {
+        Ok(self.io().await?.last().is_some_and(|v| *v == 0))
+    }
+
+    /// Whether every joint is below `threshold_rad_s`.
+    pub async fn is_robot_stopped(&self, threshold_rad_s: f64) -> Result<bool, ClientError> {
+        Ok(self
+            .joint_speeds()
+            .await?
+            .iter()
+            .all(|v| v.abs() < threshold_rad_s))
+    }
+
+    /// Whether the arm is back-driveable right now — the runtime's own
+    /// `gravity_applied()`: IDLE, referenced, enabled, gravity on. Read
+    /// off the latest broadcast (waiting up to `timeout` for the first
+    /// one); an arm whose state is unknown is not one to declare safe.
+    pub async fn is_freedrive(&self, timeout: Duration) -> bool {
+        if self.latest_status().is_none() && !self.wait_status(|_| true, timeout).await {
+            return false;
+        }
+        self.latest_status().is_some_and(|s| freedrive(&s))
     }
 
     // ------------------------------------------------- system commands
@@ -585,4 +665,25 @@ impl Client {
         self.wait_status(move |s| s.last_checkpoint == label, timeout)
             .await
     }
+}
+
+/// Thresholds for [`Client::wait_motion`].
+#[derive(Debug, Clone, Copy)]
+pub struct MotionWait {
+    /// Overall bound.
+    pub timeout: Duration,
+    /// How long the arm must stay still before it counts as settled.
+    pub settle_window: Duration,
+    /// Joint speed \[rad/s\] at or above which the arm counts as moving.
+    pub speed_threshold: f64,
+    /// Per-frame joint delta \[deg\] at or above which the arm counts as moving.
+    pub angle_threshold: f64,
+    /// How long to wait for motion to start before settling on a still arm.
+    pub motion_start_timeout: Duration,
+}
+
+/// The runtime's `gravity_applied()` read off a STATUS frame: the arm
+/// floats only while IDLE, referenced, enabled and gravity-compensated.
+pub fn freedrive(s: &Status) -> bool {
+    s.mode == par6_proto::ControllerMode::Idle && s.homed && s.enabled && s.gravity_comp
 }

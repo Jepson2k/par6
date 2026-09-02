@@ -26,6 +26,10 @@ Environment=RUST_LOG=info
 
 User=par6
 Group=par6
+# The 40-pin header's gpiochip is root:dialout 0660 on Raspberry Pi OS and
+# Ubuntu (udev 60-gpio.rules); without the group the e-stop line cannot be
+# opened and par6d refuses to start.
+SupplementaryGroups=dialout
 # CAP_SYS_NICE: the RT thread requests SCHED_FIFO 99. Setup
 # failure is logged DEGRADED and is not fatal, so a box without the
 # capability still runs — badly.
@@ -33,6 +37,10 @@ Group=par6
 AmbientCapabilities=CAP_SYS_NICE CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_SYS_NICE CAP_NET_ADMIN
 LimitRTPRIO=99
+# The RT thread calls mlockall(MCL_CURRENT | MCL_FUTURE): a page fault in
+# the tick is an unbounded latency spike, and on a box with swap a cold
+# page is a disk read. Without this limit the call fails DEGRADED.
+LimitMEMLOCK=infinity
 NoNewPrivileges=yes
 
 # par6d pins its own RT thread to CPU 3; do NOT constrain the process

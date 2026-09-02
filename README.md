@@ -24,8 +24,10 @@ below works on a laptop and in CI.
 - [Motion profiles](#motion-profiles)
 - [Collision world](#collision-world)
 - [Kinematics and tools](#kinematics-and-tools)
+- [The Pinocchio shim](#the-pinocchio-shim)
 - [Ports and environment variables](#ports-and-environment-variables)
 - [Development setup](#development-setup)
+- [Deploying to the control box](#deploying-to-the-control-box)
 - [Known divergences from parol6](#known-divergences-from-parol6)
 - [Safety notes](#safety-notes)
 - [License](#license)
@@ -37,18 +39,26 @@ The library crates need no C++ toolchain; only the binary does.
 
 ```bash
 scripts/ffi/setup.sh             # once — builds the shim into .ffi/
-source .ffi/env.sh               # each shell: par6d needs the shim to BUILD and to RUN
 cargo build -p par6d --release
 pip install -e "python[dev]"
 ```
 
-`source .ffi/env.sh` is not only a build step. It sets `LD_LIBRARY_PATH`, and a `par6d`
-started without it exits with `libpar6_shim.so: cannot open shared object file`.
+A checkout that has run `setup.sh` needs no environment for either step: the build
+scripts find the shim in `.ffi/shim` and bake its directory into `par6d` and the Python
+extension as an rpath, so both run from any shell. `source .ffi/env.sh` is still the way
+to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`), to cross-build, and to
+run the `sim-mujoco` feature (libmujoco lives in the env prefix, which only
+`LD_LIBRARY_PATH` reaches).
+
+`setup.sh` picks its compile parallelism from available RAM (one shim compile job
+peaks near 4 GB; a swapless small box overcommitting that livelocks rather than
+failing). Set `CMAKE_BUILD_PARALLEL_LEVEL` to override it; `.ffi/env.sh` exports the
+same figure as `CARGO_BUILD_JOBS`.
 
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
-source .ffi/env.sh   # the package compiles the par6-py extension against the shim
+export PAR6_SHIM_LIB_DIR=/path/to/.ffi/shim/lib   # a git install has no checkout to find the shim in
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
@@ -58,12 +68,13 @@ client + preview), so a source install needs the Rust toolchain and the shim fro
 That gives you the client, the offline preview and the kinematics — but **not** the
 `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
-a runtime is already listening — which is the normal case, since the runtime belongs on
-the control box and the client does not. Shipping a per-platform runtime wheel is
+a runtime is already listening — which is the normal case on the control box, where
+Waldo Commander, this client and `par6d` all run on the same machine and the runtime
+is a systemd service. Shipping a per-platform runtime wheel is
 [#33](https://github.com/Jepson2k/par6/issues/33).
 
-Deploying to a control box (Raspberry Pi 5, aarch64, PREEMPT_RT) is its own document:
-[`scripts/deploy/README.md`](scripts/deploy/README.md).
+Deploying to a control box (Raspberry Pi 5, aarch64, PREEMPT_RT) is covered in
+[Deploying to the control box](#deploying-to-the-control-box).
 
 ## Quickstart
 
@@ -91,7 +102,7 @@ The command port is **6001** — not Waldo Commander's parol6 default of 5001.
 ```python
 from par6.client import RobotClient
 
-with RobotClient(host="par6-box.local", port=6001) as rbt:
+with RobotClient(host="127.0.0.1", port=6001) as rbt:   # the box's hostname from another machine
     print(rbt.angles())
 ```
 
@@ -146,10 +157,12 @@ Waldo Commander (NiceGUI frontend, unchanged)
    bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (Pinocchio ABA)
 ```
 
-Kinematics and dynamics run on **Pinocchio through a C-ABI shim** shared with the
-Python side's [pinokin](https://github.com/Jepson2k/pinokin) — one numerics stack on
-both sides of the wire, which is what lets the offline preview agree with the runtime
-rather than approximate it.
+There is one numerics stack. Kinematics, dynamics and collision run on **Pinocchio and
+coal through the repo's C-ABI shim** (`cpp/`, see [The Pinocchio shim](#the-pinocchio-shim)),
+inverse kinematics is the analytic OPW closed form derived from the URDF at load, and
+TOPPRA retimes planned paths. The Python package holds none of it: `par6._par6` (the
+`par6-py` crate) binds the same `Kin`, `Collision`, config loader and dry-run engine the
+daemon runs, so a preview cannot disagree with the runtime — it *is* the runtime's code.
 
 ### Repository layout
 
@@ -167,7 +180,6 @@ rather than approximate it.
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
-| `tests/golden/` | golden wire vectors (encode/decode conformance for the frozen codec) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
 ### Two planes, one process
@@ -227,7 +239,7 @@ the client log, and withdraws the affected `joint_en` flags.
 
 ## Adding a new command
 
-The recipe, in the order that keeps the golden-vector guard happy:
+The recipe, in the order the codec tests expect:
 
 1. **Tag + variant** — add to `CmdType` in `crates/par6-proto/src/enums.rs` inside the
    right band, then the `Command` variant, its decode arm, its encode arm, and its
@@ -241,13 +253,14 @@ The recipe, in the order that keeps the golden-vector guard happy:
 4. **Clients** — `crates/par6-client/src/api.rs`, the `crates/par6-py` binding, and the
    Python shim (`python/par6/client/`). The preview needs nothing per-command: it drives
    the daemon's own planner.
-5. **Golden vectors** — regenerate; the manifest's coverage guard fails on a tag with no
-   vector, which is the guard working.
+5. **Codec tests** — `crates/par6-proto`'s encode/decode round trip and hostile-input
+   tests cover every tag; regenerate the Python constants mirror
+   (`cargo run -p par6-proto --bin gen_python`).
 6. **Test** — a sim e2e that drives the command through the real client against a real
    `par6d --sim`.
 
-`par6-proto` is a frozen interface: changing it needs a `contracts`-labeled issue,
-regenerated vectors on **both** sides, and a re-freeze. See `CLAUDE.md`.
+`par6-proto` is a frozen interface: changing it needs a `contracts`-labeled issue and a
+re-freeze. See `CLAUDE.md`.
 
 ## Motion profiles
 
@@ -287,9 +300,10 @@ arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
 
 The client side runs the same world. `Robot.in_collision` / `colliding_pairs` /
-`check_trajectory` / `min_distance` / `apply_shapes` build a `pinokin.CollisionChecker`
-on the active tool's own URDF tree with its SRDF loaded, so a preview and the arm agree
-about which paths are refused.
+`check_trajectory` / `min_distance` / `apply_shapes` drive the engine's `CollisionWorld`
+(`par6_kin::Collision` through `par6._par6`) on the active tool's own URDF tree with its
+SRDF and the config's installation keep-outs loaded, so a preview and the arm agree
+about which paths are refused and name the offending pairs the same way.
 
 ## Kinematics and tools
 
@@ -306,6 +320,66 @@ the frame moves.
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See
 `assets/par6_description/CHANGELOG.md` for the derivation and the equivalence check.
+
+## The Pinocchio shim
+
+`cpp/` is one C-ABI shim over the C++ dependencies the Rust crates link:
+
+- **Pinocchio** (kinematics/dynamics) — `par6_kin_*`: create/destroy, fk, jacobian,
+  gravity, aba. Consumed by `crates/pinokin-sys`, and on top of that by `par6-kin`, whose
+  analytic IK (`par6_kin::Opw`) is derived from the URDF at load and cross-checked
+  against this FK before the model is accepted.
+- **coal / hpp-fcl** (collision) — `par6_col_*`: a two-layer world (installation keep-outs
+  and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
+  parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).
+- **toppra-cpp** (time-optimal path parameterization) — `par6_traj_*`. Built from source
+  by `scripts/ffi/setup.sh` (conda-forge ships no C++ toppra), pinned to commit
+  `142456f3` (v0.6.9), with its bundled Seidel LP solver — no qpOASES, no GPL GLPK.
+
+```
+cpp/include/par6_shim.h    the frozen C ABI (PAR6_SHIM_ABI_VERSION)
+cpp/src/par6_shim.cpp      par6_kin_* (pinocchio)
+cpp/src/par6_traj.cpp      par6_traj_* (toppra-cpp)
+cpp/src/par6_col.cpp       par6_col_* (pinocchio + coal)
+crates/pinokin-sys/        raw decls + safe Model/Trajectory/CollisionModel wrappers
+scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
+```
+
+`scripts/ffi/setup.sh` puts everything under `<repo>/.ffi` (self-gitignored, override
+with `PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages + the from-source
+toppra install), `shim/` (installed lib + header), `env.sh`. Re-running is idempotent;
+`FORCE=1` rebuilds the shim. Pinned: **pinocchio 4.1.0**, **toppra 142456f3**
+(`PAR6_PINOCCHIO_VERSION` / `PAR6_TOPPRA_COMMIT` override). Builds discover the shim
+under `.ffi/shim/lib` on their own and carry it as an rpath, so `source .ffi/env.sh` is
+only needed to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`,
+`PAR6_SHIM_INCLUDE_DIR`, `PAR6_SHIM_LINK=dylib|static`, `PAR6_SHIM_DEP_LIB_DIR`).
+
+ABI conventions, frozen in `par6_shim.h`: poses are row-major 4×4; Jacobians 6×nq,
+rows `[linear; angular]`, world axes at the frame origin; gravity is RNEA at zero
+velocity/acceleration; an optional rigid tool at create shifts fk/jacobian/ik to the tool
+frame and adds its inertials to the gravity model; every `par6_kin_*` call after create
+is allocation-free (one handle per thread); `par6_traj_sample` is allocation-free and
+safe from the RT tick; `par6_col_check` allocates in coal's narrow phase and is
+planner-side only. Exceptions never cross the boundary.
+
+What the shim is held to: `crates/pinokin-sys/tests/{collision,traj}.rs` cover the C
+boundary itself (NULL/out-of-range arguments, geometry-index layout across layer
+replacement, buffer truncation, the time-optimality requirement of the retimer);
+`crates/par6-kin/tests/{kinematics,collision_world}.rs` cover the contract above the
+boundary — the Jacobian as the derivative of FK, IK landing on every FK pose, and the
+collision verdicts a preview and the runtime both depend on, placed from the model's own
+TCP on every shipped URDF variant.
+
+Mesh cost: `assets/` ships the vendor's full-resolution STLs for both `<visual>` and
+`<collision>`. Measured per-waypoint check cost is 17 µs (flange) / 180 µs (gripper
+variants) for self-collision, ~300–730 µs once a per-shape margin removes coal's early
+exit. Convex hulls were measured and rejected (the SSG48's jaw hulls overlap when closed
+and report a permanent false collision). `PAR6_SHAPE_PLANE` is the one pathological
+shape — an unbounded half-space cannot be pruned and costs ~35 ms per check — so model
+floors and walls as large boxes.
+
+conda-forge ships `linux-aarch64` Pinocchio, so the control box builds the shim natively
+with the same script; cross-compiling it from x86_64 is not supported.
 
 ## Ports and environment variables
 
@@ -370,12 +444,20 @@ The Python side reads three of its own:
 ## Development setup
 
 ```bash
-source .ffi/env.sh
+scripts/ffi/setup.sh                                                       # once: the shim
 cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # CI gate
 cargo test --workspace
+cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1           # needs vcan0
 cargo build -p par6d --release
+pip install -e "python[dev]"                                               # builds par6._par6
 cd python && PAR6D_BIN=../target/release/par6d python3 -m pytest -q
 ```
+
+The Rust tests are the whole test surface for the numerics: the kinematics contract
+(`par6-kin/tests/kinematics.rs`), the collision verdicts (`collision_world.rs`), and the
+preview ↔ runtime parity (`par6d/tests/preview.rs`) are all requirement-derived — there
+are no recorded fixtures and no second implementation to compare against. The Python
+tests cover the waldoctl contract of the shim over the engine.
 
 Use `python3 -m pytest`, not a bare `pytest` — on some setups the `pytest` on PATH
 resolves to an interpreter that does not have the package.
@@ -385,6 +467,247 @@ layer can vanish from a run unnoticed. CI sets it.
 
 The `pytest` run writes JUnit XML to `python/test-results.xml`; read that rather than
 re-running to recover console output.
+
+## Deploying to the control box
+
+Target: **Raspberry Pi 5, aarch64, PREEMPT_RT kernel**. The box runs everything —
+Waldo Commander, this Python package and one `par6d` process supervised by systemd,
+talking SocketCAN to the arm and protocol v2 (UDP) to Waldo Commander on localhost.
+
+The normal path is to build **on the box** ([Installation](#installation): the shim,
+`par6d` and the Python package build there in minutes) and install locally:
+
+```bash
+cargo build -p par6d --release --target aarch64-unknown-linux-gnu
+python3 scripts/ffi/stage_runtime_libs.py --readelf readelf --lib-dir .ffi/env/lib \
+    --dest .ffi/stage/lib .ffi/shim/lib/libpar6_shim.so      # the shim's dependency closure
+scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
+sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
+```
+
+`install.sh` reads the binary from `target/aarch64-unknown-linux-gnu/`, so the
+explicit `--target` matters even natively. Folding the staging step into
+`install.sh` itself is still to do.
+
+Cross-building from another machine is optional — for CI, or a box that should not
+carry a toolchain:
+
+```
+scripts/ffi/setup.sh --target aarch64    build the aarch64 Pinocchio shim elsewhere
+scripts/deploy/build-aarch64.sh          cross-build par6d for aarch64
+scripts/deploy/install.sh --host ...     stage + upload + install over ssh
+scripts/deploy/par6d.service             the systemd unit
+```
+
+### 1. Cross-build (optional)
+
+```bash
+scripts/ffi/setup.sh --target aarch64    # once (or after a dependency pin bump)
+source .ffi/env-aarch64.sh
+scripts/deploy/build-aarch64.sh
+# -> target/aarch64-unknown-linux-gnu/release/par6d
+```
+
+**Every par6d carries kinematics.** The Pinocchio C-ABI shim — TCP FK,
+gravity compensation, `move_l`/`move_j_pose`, the cartesian streamables,
+TOPPRA, and the coal collision world — is linked unconditionally, because a
+runtime without it would broadcast a NaN TCP pose, report zero cartesian
+freedom, refuse every cartesian command, and answer `set_shapes` with success
+against a collision world that does not exist, none of which a client can
+see. `build-aarch64.sh` therefore fails early when the aarch64 shim has not
+been built. The library crates still compile without any C++ toolchain; it is
+only the binary that requires one.
+
+#### How the aarch64 shim is produced
+
+`scripts/ffi/setup.sh --target aarch64` cross-builds it on another machine, for
+the case where the box should not carry a compiler:
+
+- conda-forge publishes `pinocchio`, `coal`, `urdfdom` and `eigen` for
+  `linux-aarch64`, so micromamba **downloads** the target's libraries with
+  `--platform linux-aarch64` — an env that is never executed on the host.
+- the compiler is conda-forge's `gxx_linux-aarch64` cross toolchain from the
+  host's own `linux-64` channel, pinned to `sysroot_linux-aarch64=2.17` (the
+  same glibc conda-forge builds its own aarch64 packages against, which is
+  what keeps the whole set at one floor).
+- `toppra-cpp` has no conda-forge package at all, so it is built from the
+  pinned commit through a generated CMake toolchain file, exactly like the
+  native path.
+- `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
+  `libpar6_shim.so` and copies the whole closure — 20 libraries, ~65 MB —
+  into the shim's own `lib/` directory. That directory is the deploy unit:
+  the shim is linked with `$ORIGIN`, `par6d` with an rpath of
+  `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
+
+The alternatives were building natively on the box (needs a Rust and C++
+toolchain on a Pi and takes the better part of an hour per change) and
+vendoring prebuilt binaries (unpinned, unreproducible, and a licence
+question). Cross-building keeps a single reproducible command and the same
+pins as the x86_64 path.
+
+**glibc floor.** The staged closure and the shim require at most
+`GLIBC_2.17`; the `par6d` binary linked against them requires at most
+`GLIBC_2.17` as well, because `.ffi/env-aarch64.sh` makes the conda cross
+compiler the Rust linker too. Raspberry Pi OS **bookworm ships 2.36** and
+bullseye ships 2.31, so both clear it — a change from the previous
+Debian-cross build, whose floor was `GLIBC_2.34`. `build-aarch64.sh` prints
+the measured floor after each build, `stage_runtime_libs.py` prints the
+closure's, and `install.sh` runs `par6d --help` right after copying so a
+mismatch still fails loudly at install time.
+
+**Symbol-version check.** Because nothing here can be *executed* for
+aarch64, `stage_runtime_libs.py` performs the check that would otherwise
+only surface on the box: every versioned symbol (`GLIBCXX_*`, `CXXABI_*`,
+`GCC_*`, …) demanded of a library that ships must be provided by the copy
+that ships. This is what catches a cross compiler newer than the target
+env's C++ runtime, which otherwise appears as
+`version GLIBCXX_3.4.x not found` at the first `systemctl start`.
+
+### 2. Install
+
+On the box, use the local sequence at the top of this section. From another machine
+(needs `ssh`/`scp` to the box and `sudo` on it):
+
+```bash
+scripts/deploy/install.sh --host pi@par6-box
+```
+
+It stages a bundle (binary + `lib/` — the shim and its runtime closure —
++ `config/PAR6.toml` + `config/grippers/*.toml` + `assets/par6_description`
++ the unit + a copy of itself), uploads it to `/tmp/par6-deploy-<timestamp>`,
+and re-runs itself there with `--local`. `PAR6_RUNTIME_LIB_SRC` (exported by
+`.ffi/env-aarch64.sh`) says where the staged libraries come from; pass
+`--runtime-libs DIR` to override it. `--stage-only DIR` builds the bundle
+without uploading anything, which is what CI checks.
+
+On the box itself:
+
+```bash
+sudo scripts/deploy/install.sh --local --bundle /tmp/par6-deploy-<timestamp>
+```
+
+Layout after install:
+
+| Path | Contents |
+|---|---|
+| `/usr/local/bin/par6d` | the runtime binary |
+| `/usr/local/lib/par6/*.so` | the Pinocchio shim + its runtime closure (rpath target) |
+| `/etc/par6/PAR6.toml` | robot config (`PAR6_CONFIG` in the unit) |
+| `/etc/par6/grippers/*.toml` | gripper configs |
+| `/usr/share/par6/par6_description` | URDF/meshes — the kinematics and collision models |
+| `/etc/systemd/system/par6d.service` | the unit |
+| `/var/lib/par6` | `StateDirectory`, the working directory |
+
+An existing `/etc/par6/*.toml` is **kept** on re-install (tuning survives
+upgrades); pass `--force-config` to overwrite. `--no-restart` installs without
+touching the running service.
+
+> Restarting `par6d` stops the arm and clears the queue. `install.sh` stops the
+> service before swapping the binary unless `--no-restart` is given.
+
+### 3. The unit
+
+`par6d.service` runs as the unprivileged system user `par6` with two ambient
+capabilities:
+
+- **`CAP_SYS_NICE`** — the RT thread asks for `SCHED_FIFO` priority 99 and pins
+  itself to CPU 3. Failure is logged `DEGRADED` and is *not*
+  fatal, so a misconfigured box runs badly instead of not at all — check the
+  journal for `RT thread: SCHED_FIFO priority 99` to confirm it took.
+  `LimitRTPRIO=99` is set as well for boxes without the capability path.
+- **`CAP_NET_ADMIN`** — `par6d` brings `can0` up at the configured bitrate when
+  it finds it down, and sets its txqueuelen through the `SIOCSIFTXQLEN` ioctl —
+  the sysfs file is root-owned and refuses an unprivileged writer regardless
+  of capabilities.
+
+It also carries `SupplementaryGroups=dialout`: Raspberry Pi OS and Ubuntu
+hand the header's gpiochip to that group (udev `60-gpio.rules`), and without
+it the e-stop line cannot be opened, which is a refusal to start. And
+`LimitMEMLOCK=infinity`, because the RT thread calls `mlockall` — a page
+fault inside the tick is an unbounded latency spike, and on a box with swap
+a cold page is a disk read (logged `DEGRADED` if the call fails).
+
+The unit deliberately sets **no `CPUAffinity=`**: `par6d` pins its own RT
+thread, and a process-wide mask would trap the tokio command plane on the same
+core. Isolate the RT core in the kernel cmdline instead
+(`/boot/firmware/cmdline.txt` on RPi OS):
+
+```
+isolcpus=3 nohz_full=3 rcu_nocbs=3 irqaffinity=0-2
+```
+
+Logging goes to journald (`SyslogIdentifier=par6d`, `RUST_LOG=info`):
+
+```bash
+journalctl -u par6d -f
+systemctl status par6d
+```
+
+`Restart=always` with `RestartSec=2`, bounded by `StartLimitBurst=5` per
+`StartLimitIntervalSec=60` so a genuinely broken install stops flapping.
+
+#### Simulator on the box
+
+```bash
+sudo systemctl edit par6d      # drop-in
+[Service]
+ExecStart=
+ExecStart=/usr/local/bin/par6d --sim
+```
+
+`--sim` runs unprivileged with no SCHED_FIFO and no CPU pin.
+
+### 4. Post-install check
+
+```bash
+journalctl -u par6d -n 30
+#   loaded PAR6 (6 joints, tick 250 Hz) from /etc/par6/PAR6.toml
+#   command plane on 0.0.0.0:6001 (SocketCAN backend)
+#   RT thread: SCHED_FIFO priority 99
+#   RT thread pinned to CPU 3
+```
+
+On the box (pass `host=` for another machine on the network):
+
+```python
+from par6 import Robot
+robot = Robot()   # PINGs the running runtime, spawns nothing
+robot.start()
+print(robot.create_sync_client().angles())
+```
+
+#### If it does not start
+
+- **`can0` cannot be opened.** The unit's `RestrictAddressFamilies` must
+  include `AF_CAN`; relax it and confirm the bus opens before looking
+  anywhere else.
+- **Starts by hand but not under systemd.** `ProtectSystem=strict` leaves
+  `/usr` readable, so the rpath into `/usr/local/lib/par6` should resolve —
+  run `ldd /usr/local/bin/par6d` from inside the unit's namespace to see
+  which library the sandbox is hiding.
+
+### 5. Network posture
+
+The protocol-v2 command plane is deliberately unauthenticated: Waldo
+Commander and `par6d` run on the same Raspberry Pi, so the 50 Hz
+client↔daemon traffic is loopback. Anyone who can send UDP to port 6001
+can move the arm — treat reachability as authorization, the way UR and
+Franka deployments do:
+
+- **Keep the robot off routable networks.** Put the box on a dedicated
+  NIC, VLAN or physically separate segment shared only with the machines
+  that operate it. Do not port-forward 6001 or the status/telemetry
+  ports.
+- **Remote access goes through the OS, not the protocol.** For operating
+  the arm from elsewhere, terminate a WireGuard (or SSH) tunnel on the
+  box and keep the command plane bound behind it.
+- A firewall rule that pins 6001 to the operator hosts is a fine belt —
+  but it is a reachability control, not authentication, and it does not
+  make the plane safe to expose.
+
+Message authentication (HMAC-tagged datagrams with a pre-shared key) is
+planned for when the frontend and the runtime split across machines;
+until then the isolation above is the security boundary.
 
 ## Known divergences from parol6
 
