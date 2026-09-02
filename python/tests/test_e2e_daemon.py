@@ -35,7 +35,7 @@ from waldoctl.shapes import Box
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, ErrorCode
+from par6.protocol.constants import ActionState, ControllerMode, ErrorCode
 from par6.robot import Robot
 from par6.telemetry import TelemetryReader
 
@@ -1044,25 +1044,41 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
     keep-out, which must stop them.
     """
 
+    class Streamer:
+        """UI-style streaming: each datagram advances the COMMANDED target
+        a few mm, the way a 50 Hz frontend integrates a gesture. Stepping
+        from the measurement instead feeds the plant's tracking lag back
+        into the target and limit-cycles the arm. A session's first
+        setpoint must sit inside the runtime's start-pose tolerance, and
+        the daemon ends a session left silent — so after a stall the
+        target re-seeds from where the arm is."""
+
+        RESUME_GAP_S = 0.2
+
+        def __init__(self, target):
+            self.target = target
+            self.last_send = -1.0
+
+        async def step(self, client, goal, send):
+            now = time.monotonic()
+            if now - self.last_send > self.RESUME_GAP_S:
+                self.target[:3] = (await pose_now(client))[:3]
+            for i in range(3):
+                self.target[i] += max(-5.0, min(5.0, goal[i] - self.target[i]))
+            await send(self.target)
+            self.last_send = time.monotonic()
+
     async def stream_toward(client, goal, send, budget=STEP_BUDGET_S):
-        """UI-style pose streaming: each datagram commands at most a few
-        mm beyond the MEASURED pose, the way a 50 Hz frontend tracks a
-        gesture. The runtime's start-pose gate refuses a session whose
-        first setpoint is far from the arm, and the daemon self-ends
-        quiet sessions, so a re-opened session must always start where
-        the arm actually is — stepping from the measurement guarantees
-        that by construction."""
+        """Stream the target to *goal* and keep it there until the arm has
+        settled on it, so the next phase opens its session on a resting
+        arm."""
+        streamer = Streamer(list(goal))
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
-            here = await client.pose()
-            assert here is not None
-            step = list(goal)
-            for i in range(3):
-                d = goal[i] - here[i]
-                step[i] = here[i] + max(-5.0, min(5.0, d))
-            await send(step)
+            await streamer.step(client, goal, send)
             if await client.wait_status(
-                lambda s: abs(s.pose[11] - goal[2]) < 5.0, timeout=0.05
+                lambda s: abs(s.pose[11] - goal[2]) < 5.0 and s.tcp_speed < 5.0,
+                timeout=0.05,
             ):
                 return True
         return False
@@ -1106,16 +1122,14 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         )
         assert await client.set_shapes([keepout])
 
+        # A refused datagram cancels the session and latches the collision
+        # until an ADMITTED datagram clears it; every later step lands
+        # deeper in the shape, so the latch outlives a missed status frame.
+        streamer = Streamer(list(here))
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
-            here = await client.pose()
-            assert here is not None
-            step = list(below)
-            for i in range(3):
-                d = below[i] - here[i]
-                step[i] = here[i] + max(-5.0, min(5.0, d))
-            await client.servo_l(step, speed=0.6)
+            await streamer.step(client, below, lambda p: client.servo_l(p, speed=0.6))
             blocked = await client.wait_status(
                 lambda s: bool(s.collision_active), timeout=0.05
             )
@@ -1123,11 +1137,15 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             "a servo_l streamed into a keep-out was never gated: the stream "
             "gate let the arm drive at the shape"
         )
-        rest = await client.pose()
-        assert rest is not None
-        assert rest[2] > below[2] + 20.0, (
-            f"the gated stream carried the TCP into the keep-out: "
-            f"z={rest[2]:.1f} vs shape centre {below[2]:.1f}"
+        # The refusal ends the session, so the arm stops short of the
+        # shape instead of carrying on to the streamed goal at its centre.
+        assert await client.wait_status(
+            lambda s: s.mode == ControllerMode.IDLE, timeout=STEP_BUDGET_S
+        ), "the gate refused the datagram but never cancelled the session"
+        floor = below[2] + 20.0
+        dipped = await client.wait_status(lambda s: s.pose[11] < floor, timeout=1.0)
+        assert not dipped, (
+            f"the gated stream carried the TCP into the keep-out, below z={floor:.1f}"
         )
         assert await client.set_shapes([])
 
