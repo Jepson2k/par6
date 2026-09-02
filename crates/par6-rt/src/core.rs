@@ -1171,7 +1171,10 @@ impl<B: DriverBus> RtCore<B> {
     fn enter_mode(&mut self, target: Mode) {
         self.leave_mode(target);
         match target {
-            Mode::Homing => self.homing.start(&mut self.bus),
+            Mode::Homing => {
+                self.homed = false;
+                self.homing.start(&mut self.bus);
+            }
             Mode::Jog => {
                 self.jog.activate(&self.q);
                 self.jog_active = false;

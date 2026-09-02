@@ -652,6 +652,15 @@ pub fn vectors() -> Vec<Vector> {
         70,
         Command::Home(Home {
             key: 0x0123_4567_89AB_CDEF,
+            calibrate: false,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_home_calibrate",
+        301,
+        Command::Home(Home {
+            key: 0x0123_4567_89AB_CDF0,
+            calibrate: true,
         }),
     ));
     v.push(cmd_vec(

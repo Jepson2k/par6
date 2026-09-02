@@ -38,7 +38,10 @@ fn opt<'py, T: pyo3::FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str) -> PyRe
 fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
     let kind: String = get(d, "type")?;
     let c = match kind.as_str() {
-        "home" => Command::Home(cmd::Home { key: 0 }),
+        "home" => Command::Home(cmd::Home {
+            key: 0,
+            calibrate: opt(d, "calibrate")?.unwrap_or(false),
+        }),
         "move_j" => Command::MoveJ(cmd::MoveJ {
             key: 0,
             angles: get(d, "angles")?,

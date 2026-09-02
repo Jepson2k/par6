@@ -271,10 +271,11 @@ impl Client {
 
     // ------------------------------------------------- queued commands
 
-    /// Run the homing sequence.
-    pub async fn home(&self) -> Result<Option<u64>, ClientError> {
+    /// Home the arm: the referencing seek when un-referenced (or when
+    /// `calibrate` is set), otherwise a planned return to the home pose.
+    pub async fn home(&self, calibrate: bool) -> Result<Option<u64>, ClientError> {
         let key = self.fresh_key();
-        self.queued(Command::Home(cmd::Home { key })).await
+        self.queued(Command::Home(cmd::Home { key, calibrate })).await
     }
 
     /// Joint move to six absolute angles \[deg\] (or deltas when `rel`).

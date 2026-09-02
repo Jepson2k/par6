@@ -778,7 +778,7 @@ async fn gating_rejections_carry_specific_codes() {
     let err = c.expect_error(&move_j(301)).await;
     assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
     let home_idx = c
-        .ok_index(&Command::Home(par6_proto::command::Home { key: 302 }))
+        .ok_index(&Command::Home(par6_proto::command::Home { key: 302, calibrate: false }))
         .await;
     assert!(home_idx >= 1);
 
