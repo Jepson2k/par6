@@ -250,7 +250,6 @@ class ErrorCode(IntEnum):
     SYS_LINK_ERROR_PASSIVE = 62
     SYS_TORQUE_ENVELOPE = 63
     SYS_STREAM_FAULT = 64
-    SYS_STREAM_START_POSE = 65
 
 
 # The ack taxonomy: one table, both sides consult it.

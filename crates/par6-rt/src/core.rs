@@ -478,11 +478,6 @@ pub struct RtCore<B: DriverBus> {
     stream_sent: Arc<AtomicU64>,
     stream_last_rx_tick: u64,
     stream_timeout_ticks: u32,
-    /// True until the session's first setpoint passes the start-pose
-    /// gate; re-armed by every STREAM entry.
-    stream_first_rx: bool,
-    /// Worst-joint gap allowed on that first setpoint \[rad\].
-    stream_start_tol_rad: f64,
     stream_window_ticks: u32,
     stream_window_pos: u32,
     stream_window_applied: u32,
@@ -659,8 +654,6 @@ impl<B: DriverBus> RtCore<B> {
             // window exactly; only rates whose tick period approaches
             // the window itself are raised.
             stream_timeout_ticks: robot.ticks(robot.stream.command_timeout_s).max(2),
-            stream_first_rx: true,
-            stream_start_tol_rad: robot.stream.start_pose_tol_rad,
             stream_window_ticks: robot.ticks(robot.stream.success_window_s).max(1),
             stream_window_pos: 0,
             stream_window_applied: 0,
@@ -1247,7 +1240,6 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 self.stream.activate(&self.q);
                 self.stream_last_rx_tick = self.tick;
-                self.stream_first_rx = true;
                 self.stream_window_pos = 0;
                 self.stream_window_applied = 0;
                 self.stream_sent_base = self.stream_sent.load(Ordering::Relaxed);
@@ -1771,29 +1763,23 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 let mut applied = false;
                 if let Some(sp) = self.stream_rx.take() {
-                    if self.stream_first_rx && !self.stream_admit(&sp) {
-                        // Dropped un-applied; the latch's reaction lands
-                        // on the next error pass.
-                    } else {
-                        self.stream_first_rx = false;
-                        // Scale first: the limits have to be in force for
-                        // the tick that consumes this target, not the one
-                        // after. Only on a change — `set_limits` rewrites
-                        // the OTG's whole input block and most streams
-                        // never move the sliders at all.
-                        if self.stream_scale != (sp.speed, sp.accel) {
-                            self.stream.set_scale(sp.speed, sp.accel);
-                            self.stream_scale = (sp.speed, sp.accel);
-                        }
-                        // `q_target` carries the raw request; the filter
-                        // sits between it and the executor, so the pair
-                        // makes the smoothing visible.
-                        self.q_target = sp.q;
-                        let target = self.filtered_target(&sp.q);
-                        self.stream.set_target(&target);
-                        self.stream_last_rx_tick = self.tick;
-                        applied = true;
+                    // Scale first: the limits have to be in force for
+                    // the tick that consumes this target, not the one
+                    // after. Only on a change — `set_limits` rewrites
+                    // the OTG's whole input block and most streams
+                    // never move the sliders at all.
+                    if self.stream_scale != (sp.speed, sp.accel) {
+                        self.stream.set_scale(sp.speed, sp.accel);
+                        self.stream_scale = (sp.speed, sp.accel);
                     }
+                    // `q_target` carries the raw request; the filter
+                    // sits between it and the executor, so the pair
+                    // makes the smoothing visible.
+                    self.q_target = sp.q;
+                    let target = self.filtered_target(&sp.q);
+                    self.stream.set_target(&target);
+                    self.stream_last_rx_tick = self.tick;
+                    applied = true;
                 }
                 self.stream_window(applied);
                 self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
@@ -1891,35 +1877,6 @@ impl<B: DriverBus> RtCore<B> {
             *y += self.stream_lp_alpha * (x - *y);
         }
         self.stream_filt
-    }
-
-    /// The start-pose gate on a session's first setpoint: worst-joint
-    /// gap to the measured pose within `stream.start_pose_tol_rad`, or
-    /// the setpoint is refused and the hard `StreamStartPose` key
-    /// latches on the worst joint — the executor would otherwise ramp
-    /// the arm to wherever the client happened to start publishing.
-    fn stream_admit(&mut self, sp: &StreamSetpoint) -> bool {
-        let mut worst = 0usize;
-        let mut gap = 0.0f64;
-        for i in 0..MAX_JOINTS {
-            let d = (sp.q[i] - self.q[i]).abs();
-            if d > gap {
-                gap = d;
-                worst = i;
-            }
-        }
-        if gap <= self.stream_start_tol_rad {
-            return true;
-        }
-        // Refusal path: runs at most a tick or two before ACTIVE_ERROR.
-        log::warn!(
-            "stream refused: first setpoint {gap:.3} rad from the measured pose on J{worst} \
-             (tolerance {:.3})",
-            self.stream_start_tol_rad
-        );
-        self.errors
-            .latch(ErrorCode::StreamStartPose, Some(worst as u8));
-        false
     }
 
     fn stream_window(&mut self, applied: bool) {

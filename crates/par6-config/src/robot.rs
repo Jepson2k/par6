@@ -407,12 +407,6 @@ pub struct StreamDefaults {
     pub lowpass_cutoff_hz: f64,
     /// Moving success-rate window \[s\] (0.4 s = 100 ticks at 250 Hz).
     pub success_window_s: f64,
-    /// Worst-joint gap allowed between a session's FIRST setpoint and
-    /// the measured pose \[rad\]. A first setpoint farther than this is
-    /// dropped un-applied and the runtime latches `STREAM_START_POSE`
-    /// (hard): the executor would otherwise ramp the arm to wherever the
-    /// client happened to start publishing (vendor value 0.1).
-    pub start_pose_tol_rad: f64,
     /// Consecutive rate-limiter step failures tolerated before the
     /// runtime hard-latches `STREAM_FAULT` \[s\] — a failing limiter
     /// holds in place, and a stream that silently holds instead of
@@ -426,7 +420,6 @@ impl Default for StreamDefaults {
             command_timeout_s: 0.040,
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
-            start_pose_tol_rad: 0.1,
             fault_latch_s: 0.5,
         }
     }
@@ -943,7 +936,6 @@ impl RobotConfig {
         for (v, name) in [
             (s.command_timeout_s, "stream.command_timeout_s"),
             (s.success_window_s, "stream.success_window_s"),
-            (s.start_pose_tol_rad, "stream.start_pose_tol_rad"),
             (s.fault_latch_s, "stream.fault_latch_s"),
         ] {
             if !is_positive(v) {

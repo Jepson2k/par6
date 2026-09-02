@@ -879,17 +879,6 @@ pub fn vectors() -> Vec<Vector> {
         },
     ));
     v.push(reply_vec(
-        "reply_error_stream_start_pose",
-        Reply::Error {
-            req_id: 45,
-            error: make_error(
-                ErrorCode::SysStreamStartPose,
-                UNATTRIBUTED,
-                &[("joint", "3")],
-            ),
-        },
-    ));
-    v.push(reply_vec(
         "reply_complete_ok",
         Reply::Complete {
             index: 7,

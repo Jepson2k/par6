@@ -97,9 +97,6 @@ wire_enum! {
         /// sustained interval (hard latch — the stream was silently
         /// holding, not tracking).
         SysStreamFault = 64,
-        /// A streaming session's first setpoint was beyond the
-        /// start-pose tolerance; the setpoint never applied (hard latch).
-        SysStreamStartPose = 65,
     }
 }
 
@@ -378,12 +375,6 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Joint {joint}'s external torque stayed beyond the configured margin.",
             effect: "Controller DISABLED; error latched.",
             remedy: "Remove the obstruction or update the payload model, then send reset.",
-        },
-        E::SysStreamStartPose => ErrorTemplate {
-            title: "Stream start pose mismatch",
-            cause: "The session's first setpoint was beyond the start-pose tolerance on joint {joint}.",
-            effect: "Setpoint dropped; controller DISABLED; error latched.",
-            remedy: "Start the stream at the arm's measured pose, then send reset.",
         },
         E::MotnHomingFailed => ErrorTemplate {
             title: "Homing failed",

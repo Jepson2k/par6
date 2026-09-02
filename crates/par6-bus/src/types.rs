@@ -426,9 +426,8 @@ pub struct BusState {
     pub frame_age_max_ticks: u64,
     /// Min frame age observed in the last drain \[ticks\].
     pub frame_age_min_ticks: u64,
-    /// Bitmask of nodes whose stale→fresh edge happened during the last
-    /// drain — the RT loop re-sends those nodes' config
-    /// ([`super::DriverBus::resend_node_config`]).
+    /// Nodes whose reconnect edge landed in the last drain; the RT loop
+    /// re-sends their config.
     pub reconnected_mask: u16,
 }
 
@@ -455,7 +454,7 @@ impl BusState {
 /// Data-age classification for one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
-    /// No frame seen since boot / last re-base.
+    /// No frame seen since boot.
     Unknown,
     /// Data younger than the stale threshold.
     Fresh,

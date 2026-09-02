@@ -568,7 +568,6 @@ motor_tc_nm = 0.02
 command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4      # 100 ticks @ 250 Hz
-start_pose_tol_rad = 0.1    # worst-joint gap allowed on a session's first setpoint
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
 
 [motion]

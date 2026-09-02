@@ -1048,34 +1048,29 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         """UI-style streaming: each datagram advances the COMMANDED target
         a few mm, the way a 50 Hz frontend integrates a gesture. Stepping
         from the measurement instead feeds the plant's tracking lag back
-        into the target and limit-cycles the arm. A session's first
-        setpoint must sit inside the runtime's start-pose tolerance, and
-        the daemon ends a session left silent — so after a stall the
-        target re-seeds from where the arm is."""
+        into the target and limit-cycles the arm."""
 
-        RESUME_GAP_S = 0.2
+        def __init__(self, client, goal, send):
+            self.client = client
+            self.goal = goal
+            self.send = send
+            self.target: list[float] | None = None
 
-        def __init__(self, target):
-            self.target = target
-            self.last_send = -1.0
-
-        async def step(self, client, goal, send):
-            now = time.monotonic()
-            if now - self.last_send > self.RESUME_GAP_S:
-                self.target[:3] = (await pose_now(client))[:3]
+        async def step(self):
+            if self.target is None:
+                self.target = list(await pose_now(self.client))
             for i in range(3):
-                self.target[i] += max(-5.0, min(5.0, goal[i] - self.target[i]))
-            await send(self.target)
-            self.last_send = time.monotonic()
+                self.target[i] += max(-5.0, min(5.0, self.goal[i] - self.target[i]))
+            await self.send(self.target)
 
     async def stream_toward(client, goal, send, budget=STEP_BUDGET_S):
         """Stream the target to *goal* and keep it there until the arm has
         settled on it, so the next phase opens its session on a resting
         arm."""
-        streamer = Streamer(list(goal))
+        streamer = Streamer(client, goal, send)
         deadline = time.monotonic() + budget
         while time.monotonic() < deadline:
-            await streamer.step(client, goal, send)
+            await streamer.step()
             if await client.wait_status(
                 lambda s: abs(s.pose[11] - goal[2]) < 5.0 and s.tcp_speed < 5.0,
                 timeout=0.05,
@@ -1125,27 +1120,39 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # A refused datagram cancels the session and latches the collision
         # until an ADMITTED datagram clears it; every later step lands
         # deeper in the shape, so the latch outlives a missed status frame.
-        streamer = Streamer(list(here))
+        # Every frame's height is kept so an excursion into the shape cannot
+        # hide between assertions.
+        floor = below[2] + 20.0
+        z_seen: list[float] = []
+
+        def gated(s) -> bool:
+            z_seen.append(float(s.pose[11]))
+            return bool(s.collision_active)
+
+        streamer = Streamer(client, below, lambda p: client.servo_l(p, speed=0.6))
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
-            await streamer.step(client, below, lambda p: client.servo_l(p, speed=0.6))
-            blocked = await client.wait_status(
-                lambda s: bool(s.collision_active), timeout=0.05
-            )
+            await streamer.step()
+            blocked = await client.wait_status(gated, timeout=0.05)
         assert blocked, (
             "a servo_l streamed into a keep-out was never gated: the stream "
             "gate let the arm drive at the shape"
         )
-        # The refusal ends the session, so the arm stops short of the
-        # shape instead of carrying on to the streamed goal at its centre.
-        assert await client.wait_status(
-            lambda s: s.mode == ControllerMode.IDLE, timeout=STEP_BUDGET_S
-        ), "the gate refused the datagram but never cancelled the session"
-        floor = below[2] + 20.0
-        dipped = await client.wait_status(lambda s: s.pose[11] < floor, timeout=1.0)
-        assert not dipped, (
-            f"the gated stream carried the TCP into the keep-out, below z={floor:.1f}"
+
+        # The refusal ends the session, so the arm brakes to rest in IDLE
+        # instead of carrying on to the streamed goal at the shape's centre.
+        def at_rest(s) -> bool:
+            z_seen.append(float(s.pose[11]))
+            resting = max(abs(v) for v in s.speeds) < 0.05
+            return s.mode == ControllerMode.IDLE and resting
+
+        assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
+            "the gate refused the datagram but never cancelled the session"
+        )
+        assert min(z_seen) > floor, (
+            f"the gated stream carried the TCP into the keep-out: "
+            f"min z {min(z_seen):.1f} vs floor {floor:.1f}"
         )
         assert await client.set_shapes([])
 

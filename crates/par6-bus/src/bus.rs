@@ -57,9 +57,7 @@ pub trait DriverBus {
     ///
     /// Per frame: the arbitration id's err bit is harvested into
     /// `live_error_bit` BEFORE payload dispatch; wrong-DLC frames are
-    /// discarded whole (never partially applied). Stale→fresh edges are
-    /// reported in `state.reconnected_mask`; the caller re-sends config
-    /// for those nodes via [`resend_node_config`](Self::resend_node_config).
+    /// discarded whole (never partially applied).
     fn drain_rx(&mut self, state: &mut BusState) -> Result<usize, BusError>;
 
     /// Send one motion frame per arm joint. `commands[i]` targets the
@@ -146,12 +144,10 @@ pub trait DriverBus {
     fn freshness(&self, node: NodeId) -> Freshness;
 
     /// Clear one node's latched `Lost` state (user clear-errors path).
-    /// The node returns to `Unknown` until its next frame.
     fn clear_lost_latch(&mut self, node: NodeId);
 
-    /// Re-base every node's freshness clock to "just seen" state
-    /// (`Unknown`, no latch) — required on FLASHING exit so the silent
-    /// period does not read as a mass disconnect.
+    /// Required on FLASHING exit so the silent period does not read as
+    /// a mass disconnect.
     fn rebase_freshness(&mut self);
 
     /// Bitmask of nodes that answered the boot bus scan (bit n = node n).

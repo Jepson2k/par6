@@ -62,9 +62,6 @@ pub enum ErrorCode {
     ExecSettleTimeout,
     /// Stream watchdog expired.
     RtiLinkLost,
-    /// Per-joint: a stream session's first setpoint was beyond the
-    /// start-pose tolerance (hard latch; the setpoint never applied).
-    StreamStartPose,
     /// The stream rate limiter failed for a sustained interval — the
     /// session was silently holding, not tracking (hard latch).
     StreamFault,
