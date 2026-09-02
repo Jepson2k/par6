@@ -180,9 +180,14 @@ class RobotClient:
 
     # ---------- motion ----------
 
-    def home(self, wait: bool = False, timeout: float = 60.0) -> int:
-        """Move to the home position.  Returns the command index, -1 on failure."""
-        return _run(self._inner.home(wait=wait, timeout=timeout))
+    def home(
+        self, wait: bool = False, calibrate: bool = False, timeout: float = 60.0
+    ) -> int:
+        """Move to the home position.  Returns the command index, -1 on failure.
+
+        ``calibrate=True`` raises NotImplementedError: par6d has no forced
+        re-reference command yet."""
+        return _run(self._inner.home(wait=wait, calibrate=calibrate, timeout=timeout))
 
     def move_j(
         self,
