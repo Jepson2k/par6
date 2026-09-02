@@ -30,3 +30,6 @@ urdf-rs = { version = "0.9", optional = true }
 # `#![cfg(feature = "ffi")]`-gated, and forcing ffi here would drag the C++
 # shim into every toolchain-free `--all-targets` check in the workspace.
 pinokin-sys = { path = "../pinokin-sys" }
+# The vendor gravity reference is JSON.
+serde = { workspace = true }
+serde_json = "1"

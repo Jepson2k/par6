@@ -653,6 +653,8 @@ dependencies = [
  "par6-proto",
  "pinokin-sys",
  "rs-opw-kinematics",
+ "serde",
+ "serde_json",
  "thiserror 2.0.20",
  "urdf-rs",
 ]
