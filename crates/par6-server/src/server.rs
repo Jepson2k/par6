@@ -37,7 +37,7 @@
 //!   `reset_state` resets world/tool/errors but NOT the e-stop latch and
 //!   NOT the index allocator.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -151,6 +151,12 @@ enum PostEffect {
     SelectVariant(Option<String>),
 }
 
+/// The first command index the server hands out. Nothing is index 0:
+/// `completed_index` uses -1 for "nothing finished", and a client that
+/// stores an index in an unsigned field needs a value it cannot confuse
+/// with a default.
+const FIRST_COMMAND_INDEX: u64 = 1;
+
 struct Executing {
     index: u64,
     addr: SocketAddr,
@@ -221,6 +227,11 @@ struct Core<P: Planner, R: RtCommands> {
     blend_hold: Option<Instant>,
     accepted_index: i64,
     completed_index: i64,
+    /// Indexes that finished ahead of `completed_index`. With one
+    /// execution lane this is always empty — commands finish in queue
+    /// order — but a tool action runs beside the motion queue and can
+    /// finish while a lower motion index is still executing.
+    finished: BTreeSet<u64>,
     last_checkpoint: String,
     standing_error: Option<WireError>,
     action_state: ActionState,
@@ -297,12 +308,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             start: Instant::now(),
             reassembler,
             transfer_addrs: HashMap::new(),
-            next_index: 1,
+            next_index: FIRST_COMMAND_INDEX,
             pending: VecDeque::new(),
             executing: None,
             blend_hold: None,
             accepted_index: -1,
             completed_index: -1,
+            finished: BTreeSet::new(),
             last_checkpoint: String::new(),
             standing_error: None,
             action_state: ActionState::Idle,
@@ -1006,6 +1018,31 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     // ---- gating & validation ----------------------------------------------
 
+    /// Move the high-water mark to the last index every lower one has
+    /// also finished.
+    ///
+    /// `completed_index` means "everything up to here is done", and a
+    /// client's `wait_command` falls back to it when a COMPLETE
+    /// datagram is lost. Taking a plain maximum keeps that promise only
+    /// while commands finish in order; with a tool action running
+    /// beside the queue, a tool index completing first would declare a
+    /// still-executing motion done. Each COMPLETE still goes out the
+    /// moment its own command finishes — only the aggregate waits.
+    fn advance_completed(&mut self, index: u64) {
+        self.finished.insert(index);
+        // Indexes are allocated from 1; -1 is the "nothing has finished"
+        // sentinel, so the first one the mark can reach is 1, not 0.
+        let mut next = if self.completed_index < 0 {
+            FIRST_COMMAND_INDEX
+        } else {
+            self.completed_index as u64 + 1
+        };
+        while self.finished.remove(&next) {
+            self.completed_index = next as i64;
+            next += 1;
+        }
+    }
+
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
         let g = gate(tag);
         if g.needs_enabled {
@@ -1175,7 +1212,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             let ex = self.executing.take().expect("checked above");
             match out.error {
                 None => {
-                    self.completed_index = self.completed_index.max(ex.index as i64);
+                    self.advance_completed(ex.index);
                     self.action_state = ActionState::Idle;
                     match ex.effect {
                         PostEffect::None => {}
@@ -1200,7 +1237,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     // each is completed in queue order, and the
                     // high-water mark ends on the last of them.
                     for (index, addr) in ex.blended {
-                        self.completed_index = self.completed_index.max(index as i64);
+                        self.advance_completed(index);
                         self.push_complete(addr, index, None, None).await;
                     }
                 }
@@ -1228,7 +1265,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         mut e: WireError,
     ) {
         e.command_index = index as i64;
-        self.completed_index = self.completed_index.max(index as i64);
+        self.advance_completed(index);
         self.standing_error = Some(e.clone());
         self.action_state = ActionState::Error;
         let mut dropped = blended;
@@ -1265,7 +1302,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// state — the SCOPE decides those.
     async fn complete_cancelled(&mut self, scope: &'static str, dropped: Vec<(u64, SocketAddr)>) {
         for (index, addr) in dropped {
-            self.completed_index = self.completed_index.max(index as i64);
+            self.advance_completed(index);
             let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
             self.push_complete(addr, index, Some(e), None).await;
         }
