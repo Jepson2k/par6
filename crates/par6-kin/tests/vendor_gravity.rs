@@ -1,16 +1,25 @@
-//! Does identification from measured torque recover the arm the VENDOR
-//! describes?
+//! Does the shipped model describe the real arm?
 //!
 //! Every other gravity test here is self-referential: the model against
-//! another reading of the same URDF. This one is not. The fixture is
-//! per-joint `G(q)` derived from the vendor runtime's own mass/COM table
-//! by a static-torque computation over the vendor DH chain, touching no
-//! URDF at all — so it says what the real arm's gravity load is,
-//! independently of what our model believes.
+//! another reading of the same URDF, so a URDF whose inertials drift
+//! from the arm passes all of them — which is how a SolidWorks export
+//! carrying 2.375 kg of moving mass shipped against the vendor's
+//! 5.114 kg and nothing noticed.
 //!
-//! Feeding those torques to `gravity::fit` as if they had been measured
-//! on the arm answers the question the calibration exists to answer: run
-//! on real hardware, does it land on the vendor's arm?
+//! The fixture is per-joint `G(q)` derived from the vendor runtime's own
+//! mass/COM table by a static-torque computation over the vendor DH
+//! chain, touching no URDF at all. It is the authority for the arm's
+//! link inertials, and it is the only thing here that can fail when the
+//! model stops describing the arm.
+//!
+//! It cannot be replaced by measuring the arm. Gravity does not observe
+//! every inertial parameter — nothing about the first body of a
+//! vertical-axis arm, nor the component of a first moment along its own
+//! joint axis — so an identification run would correct the observable
+//! directions, leave the rest wrong, and report a good residual either
+//! way. Anything that physically changes a link needs new nominal data,
+//! not a measurement. What identification IS for is the load at the
+//! tool, which no table can describe: `par6_kin::gravity::fit_payload`.
 #![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
@@ -32,22 +41,6 @@ struct Case {
     tau_arm: [f64; NQ],
 }
 
-/// `par6-calibrate-gravity --prior-weight`'s default.
-const PRIOR_WEIGHT: f64 = 0.01;
-
-/// The arm's travel, as the calibration's own pose planner sees it.
-const WINDOW: [(f64, f64); NQ] = [
-    (-2.5, 2.5),
-    (-1.5, 0.3),
-    (1.5, 4.5),
-    (-2.5, 2.5),
-    (-1.4, 1.4),
-    (-3.0, 3.0),
-];
-
-/// How far each centre of mass is moved to make a wrong arm \[m\].
-const SHIFT_M: f64 = 0.02;
-
 fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../assets/par6_description")
@@ -63,10 +56,9 @@ fn fixture() -> Fixture {
 }
 
 #[test]
-fn identification_from_measured_torque_lands_on_the_vendors_arm() {
+fn the_shipped_arm_model_is_the_vendors_arm() {
     let fx = fixture();
     assert!(fx.provenance.contains("vendor"), "{}", fx.provenance);
-    assert!(fx.cases.len() >= 6, "too few vendor poses to split");
 
     let mut kin = Kin::from_urdf(
         &assets_dir().join(Kin::ARM_URDF_RELPATH),
@@ -82,99 +74,32 @@ fn identification_from_measured_torque_lands_on_the_vendors_arm() {
             tau: c.tau_arm,
         })
         .collect();
-    let holdout = samples.len() / 3;
-    let (train, held) = samples.split_at(samples.len() - holdout);
 
-    let truth = gravity::model_params(&kin).expect("model parameters");
-    let theta_truth = gravity::flatten(&truth);
-    let shipped = gravity::rms(&mut kin, &theta_truth, held).expect("rms");
-    println!(
-        "vendor poses: {} train, {} held out",
-        train.len(),
-        held.len()
-    );
-    println!("shipped URDF vs vendor, held-out poses: {shipped:.2e} Nm");
-
-    // Start from an arm whose centres of mass are wrong by 2 cm — the
-    // scale of a real modelling error, and far more than the shipped
-    // model is out by. This is the arm a calibration would be run on.
-    let wrong: Vec<gravity::BodyParams> = truth
-        .iter()
-        .enumerate()
-        .map(|(i, b)| {
-            let c = b.com();
-            let s = if i % 2 == 0 { 1.0 } else { -1.0 };
-            gravity::BodyParams {
-                joint: b.joint.clone(),
-                mass: b.mass,
-                first_moment: [
-                    b.mass * (c[0] + s * SHIFT_M),
-                    b.mass * (c[1] - s * SHIFT_M),
-                    b.mass * (c[2] + s * SHIFT_M),
-                ],
-            }
-        })
-        .collect();
-    let theta_wrong = gravity::flatten(&wrong);
-    let before = gravity::rms(&mut kin, &theta_wrong, held).expect("rms");
-
-    // The ridge pulls toward the model the arm is CARRYING, which in a
-    // real run is the wrong one — that is the honest starting point.
-    let fit = gravity::fit(&mut kin, train, &wrong, PRIOR_WEIGHT).expect("fit");
-    let theta = gravity::flatten(&fit.bodies);
-    let after = gravity::rms(&mut kin, &theta, held).expect("rms");
-
-    println!("held-out RMS vs vendor: wrong model {before:.4} Nm -> identified {after:.4} Nm");
-    for ((w, f), t) in wrong.iter().zip(&fit.bodies).zip(&truth) {
-        let (cw, cf, ct) = (w.com(), f.com(), t.com());
-        let was = (0..3).map(|k| (cw[k] - ct[k]).abs()).fold(0.0, f64::max);
-        let now = (0..3).map(|k| (cf[k] - ct[k]).abs()).fold(0.0, f64::max);
-        println!("  {:<16} com error {was:.4} m -> {now:.4} m", t.joint);
-    }
-    for (i, s) in held.iter().enumerate() {
-        let p = gravity::predict(&mut kin, &theta, &s.q).expect("predict");
-        let worst = (0..NQ).map(|j| (p[j] - s.tau[j]).abs()).fold(0.0, f64::max);
-        println!("  held-out pose {i}: worst joint error {worst:.4} Nm");
-    }
-
-    // The COMs it did not recover: do they cost anything? Gravity torque
-    // is a linear map of the first moments with a null space — some
-    // directions produce zero torque at EVERY configuration — so a
-    // component the fit left alone is either one it corrected or one
-    // that contributes nothing to compensate. Swept across the whole
-    // joint window rather than the vendor's ten poses, which is the
-    // difference between "predicts the training set" and "describes the
-    // arm".
-    let sweep = gravity::calibration_poses(&WINDOW, 500, 20260902);
-    let mut worst_fit = 0.0f64;
-    let mut worst_wrong = 0.0f64;
-    for q in &sweep {
-        let truth_tau = gravity::predict(&mut kin, &theta_truth, q).expect("predict");
-        let fit_tau = gravity::predict(&mut kin, &theta, q).expect("predict");
-        let wrong_tau = gravity::predict(&mut kin, &theta_wrong, q).expect("predict");
-        for j in 0..NQ {
-            worst_fit = worst_fit.max((fit_tau[j] - truth_tau[j]).abs());
-            worst_wrong = worst_wrong.max((wrong_tau[j] - truth_tau[j]).abs());
+    let theta = gravity::flatten(&gravity::model_params(&kin).expect("model parameters"));
+    let mut worst = 0.0f64;
+    for s in &samples {
+        let tau = gravity::predict(&mut kin, &theta, &s.q).expect("predict");
+        for (got, want) in tau.iter().zip(&s.tau) {
+            worst = worst.max((got - want).abs());
         }
     }
+    let residual = gravity::rms(&mut kin, &theta, &samples).expect("rms");
     println!(
-        "across {} poses spanning the joint window: wrong model is out by up to \
-         {worst_wrong:.4} Nm, the identified one by {worst_fit:.4} Nm",
-        sweep.len()
+        "shipped arm model vs the vendor over {} poses: {residual:.3e} Nm rms, \
+         worst joint {worst:.3e} Nm",
+        samples.len()
     );
 
+    // Agreement at generation time is fixture rounding. The defects this
+    // guards against start at ~1e-2 Nm (a tool mass slip) and reach Nm
+    // scale (a simplified URDF), so this leaves orders of margin on both
+    // sides while still failing the moment the model stops being the
+    // vendor's arm.
     assert!(
-        worst_fit < 0.05 * worst_wrong,
-        "identification must hold across the workspace, not just the fitted poses: \
-         {worst_fit:.4} Nm against {worst_wrong:.4} Nm"
-    );
-    assert!(
-        shipped < 1e-3,
-        "the shipped URDF should already agree with the vendor: {shipped:.4} Nm"
-    );
-    assert!(
-        after < 0.1 * before,
-        "identification from vendor torques must recover the vendor's arm: \
-         {after:.4} Nm against {before:.4} Nm before"
+        worst < 1e-6,
+        "the shipped URDF no longer describes the vendor's arm: worst joint {worst:.4e} Nm \
+         over {} poses. The link inertials are nominal data — fix them from CAD or the \
+         vendor table, not by measuring the arm.",
+        samples.len()
     );
 }

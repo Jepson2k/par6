@@ -23,7 +23,7 @@ import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
@@ -33,6 +33,7 @@ from waldoctl.status import (
 from waldoctl.status import (
     ActivityResult,
     LoopStatsResult,
+    PayloadResult,
     PingResult,
     ToolResult,
 )
@@ -978,9 +979,11 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
         )
 
-    async def payload(self) -> dict | None:
-        """The effective runtime payload: ``mass``, ``com``, ``inertia``
-        (zeros = none).  Returns None if unreachable.
+    async def payload(self) -> PayloadResult | None:
+        """The effective runtime payload.
+
+        Zeros mean the arm is carrying nothing.  Returns None if
+        unreachable.
 
         Category: Query
 
@@ -988,7 +991,16 @@ class AsyncRobotClient(_RobotClientABC):
             info = rbt.payload()
         """
         core = await self._ensure_core()
-        return await self._call(core.payload())
+        raw = await self._call(core.payload())
+        if raw is None:
+            return None
+        com = tuple(float(v) for v in raw["com"])
+        inertia = tuple(float(v) for v in raw["inertia"])
+        return PayloadResult(
+            mass=float(raw["mass"]),
+            com=cast("tuple[float, float, float]", com),
+            inertia=cast("tuple[float, float, float, float, float, float]", inertia),
+        )
 
     async def pause(self) -> int:
         """Hold the executing trajectory where it is.
@@ -1282,7 +1294,19 @@ class AsyncRobotClient(_RobotClientABC):
         # at hardware that is not on the arm.
         self._active_tool_key = key
         self._active_variant_key = variant_key
-        return await self._finish_queued(index, False, 0.0)
+        result = await self._finish_queued(index, False, 0.0)
+        # A tool that describes its own mass is one the runtime does not
+        # model: par6 is built around a fitted gripper and carries that
+        # gripper's inertials in its own config, so a spec declaring a
+        # payload is a third-party tool nobody's config knows about.
+        # Declaring it is the whole point of ToolSpec.payload — a gravity
+        # model that has never heard of the thing bolted to the flange
+        # holds the arm against a load it cannot see.
+        spec = self._bound_tools.get(key)
+        load = spec.payload if spec is not None else None
+        if load is not None:
+            await self.set_payload(load.mass_kg, load.com_m, load.inertia_kg_m2)
+        return result
 
     async def checkpoint(self, label: str) -> int:
         """Insert a checkpoint marker in the command queue.

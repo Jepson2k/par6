@@ -15,7 +15,7 @@ from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
 from waldoctl.shapes import Shape, ShapeWorld
-from waldoctl.status import ActivityResult, PingResult, ToolResult
+from waldoctl.status import ActivityResult, PayloadResult, PingResult, ToolResult
 from waldoctl.sync_tools import make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
@@ -430,7 +430,7 @@ class RobotClient:
         """Declare the payload the arm is carrying at the TCP."""
         return _run(self._inner.set_payload(mass, com, inertia))
 
-    def payload(self) -> dict | None:
+    def payload(self) -> PayloadResult | None:
         """The effective runtime payload (zeros = none)."""
         return _run(self._inner.payload())
 

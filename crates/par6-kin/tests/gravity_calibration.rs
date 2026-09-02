@@ -1,7 +1,6 @@
-//! The gravity identification contract: the regressor is the
-//! linear-in-parameters form of the model's own G(q), a fit from static
-//! torques predicts the torques at poses it never saw, and what the
-//! writer puts in the URDF is what a model loaded from it computes.
+//! The payload identification contract: the regressor is the
+//! linear-in-parameters form of the model's own G(q), and a fit from
+//! static torques recovers a load the model was not carrying.
 #![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
@@ -24,16 +23,6 @@ const CASES: [[f64; NQ]; 5] = [
     [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416],
     [0.5, -1.0, 2.6, 0.3, 0.8, 2.5],
     [-0.8, -1.3, 3.3, -0.6, -0.7, 3.6],
-];
-
-/// A conservative slice of the arm's travel for sampling poses.
-const WINDOW: [(f64, f64); NQ] = [
-    (-2.5, 2.5),
-    (-1.5, 0.3),
-    (1.5, 4.5),
-    (-2.5, 2.5),
-    (-1.4, 1.4),
-    (-3.0, 3.0),
 ];
 
 /// A heavier tool than any shipped gripper, so the tool's share of the
@@ -99,244 +88,137 @@ fn the_regressor_is_the_linear_form_of_the_gravity_model() {
 /// predicts the torques at held-out poses; the prior does not. Bodies the
 /// pose set cannot excite are reported as such and keep the prior instead
 /// of drifting.
-#[test]
-fn a_fit_from_static_torques_predicts_held_out_poses() {
-    const SHIFT_M: f64 = 0.03;
-    let tool = heavy_tool();
-    let mut kin = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
-    let truth = gravity::model_params(&kin).unwrap();
-    let theta_true = gravity::flatten(&truth);
-    let poses = gravity::calibration_poses(&WINDOW, 40, 7);
-    let samples: Vec<GravitySample> = poses
-        .iter()
-        .map(|q| GravitySample {
-            q: *q,
-            tau: gravity::predict(&mut kin, &theta_true, q).unwrap(),
-        })
-        .collect();
-    let (train, held) = samples.split_at(30);
-
-    // Masses are not fitted, so the prior keeps them and moves only where
-    // each centre of mass sits.
-    let prior: Vec<_> = truth
-        .iter()
-        .map(|b| gravity::BodyParams {
-            joint: b.joint.clone(),
-            mass: b.mass,
-            first_moment: [
-                b.first_moment[0] + b.mass * SHIFT_M,
-                b.first_moment[1] - b.mass * SHIFT_M,
-                b.first_moment[2] + b.mass * SHIFT_M,
-            ],
-        })
-        .collect();
-    let fit = gravity::fit(&mut kin, train, &prior, 1e-9).unwrap();
-    let theta = gravity::flatten(&fit.bodies);
-    let held_prior = gravity::rms(&mut kin, &gravity::flatten(&prior), held).unwrap();
-    let held_fit = gravity::rms(&mut kin, &theta, held).unwrap();
-    assert!(
-        held_prior > 0.1,
-        "centres of mass {SHIFT_M} m out must miss by more than {held_prior} Nm"
-    );
-    assert!(
-        held_fit < 1e-7,
-        "the fit must predict unseen poses: {held_fit} Nm (prior {held_prior} Nm)"
-    );
-    assert!(fit.rms_fit_nm < 1e-7 && fit.rms_prior_nm > 0.1);
-    assert_eq!(fit.bodies.len(), truth.len());
-
-    // Masses come back untouched. Whatever the DATA determined lands on
-    // the truth; whatever it did not keeps the prior. Nothing is asserted
-    // in between, because a partly-determined parameter is legitimately
-    // somewhere between the two.
-    for ((got, want), excite) in fit.bodies.iter().zip(&truth).zip(&fit.determined) {
-        assert_eq!(got.joint, want.joint);
-        assert_eq!(got.mass, want.mass, "{}: mass must be held", want.joint);
-        let prior_h = prior.iter().find(|p| p.joint == want.joint).unwrap();
-        for (axis, share) in excite.iter().enumerate() {
-            if *share > 0.99 {
-                assert!(
-                    (got.first_moment[axis] - want.first_moment[axis]).abs() < 1e-9,
-                    "{} axis {axis}: excited component must land on the truth, {} vs {}",
-                    want.joint,
-                    got.first_moment[axis],
-                    want.first_moment[axis]
-                );
-            } else if *share < 0.01 {
-                assert!(
-                    (got.first_moment[axis] - prior_h.first_moment[axis]).abs() < 1e-9,
-                    "{} axis {axis}: an undetermined component must keep the prior",
-                    want.joint
-                );
-            }
+/// The wrist poses a payload identification actually uses: the arm stays
+/// where it stands and only the last three joints swing.
+fn wrist_poses(start: [f64; NQ], spread: f64) -> Vec<[f64; NQ]> {
+    let mut out = vec![start];
+    for j in [3usize, 4, 5] {
+        for dir in [1.0, -1.0] {
+            let mut q = start;
+            q[j] += dir * spread;
+            out.push(q);
         }
     }
-    assert!(
-        fit.determined[0].iter().all(|e| *e < 0.01),
-        "the first body cannot be seen by gravity, got {:?}",
-        fit.determined[0]
-    );
+    out
 }
 
-/// The centre of mass written into the arm URDF is what a model loaded
-/// from that file then computes gravity with, and nothing else in the
-/// file moves.
 #[test]
-fn written_inertials_are_what_the_model_reads_back() {
-    let urdf_path = assets_dir().join(Kin::ARM_URDF_RELPATH);
-    let text = std::fs::read_to_string(&urdf_path).unwrap();
-    let kin = Kin::load_arm(&assets_dir(), None).unwrap();
-    let current = gravity::model_params(&kin).unwrap();
+fn a_payload_is_recovered_from_the_torque_the_arm_cannot_explain() {
+    // The model the runtime carries: the arm and its fitted gripper, and
+    // nothing in the hand.
+    let tool = heavy_tool();
+    let mut unloaded = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
+    let theta_unloaded = gravity::flatten(&gravity::model_params(&unloaded).unwrap());
 
-    // Every centre of mass shifted, so an unchanged file cannot pass. The
-    // chain ends in a massless stub, which has no centre of mass to place
-    // and is left out.
-    let changed: Vec<_> = current
-        .iter()
-        .filter(|b| b.mass > 0.0)
-        .enumerate()
-        .map(|(i, b)| {
-            let com = b.com();
-            let shift = 0.005 * (i as f64 + 1.0);
-            gravity::BodyParams {
-                joint: b.joint.clone(),
-                mass: b.mass,
-                first_moment: [
-                    b.mass * (com[0] + shift),
-                    b.mass * (com[1] - shift),
-                    b.mass * (com[2] + 2.0 * shift),
-                ],
-            }
+    // The arm as it really is with a part in the gripper: the same
+    // model with the payload's mass and first moment added to the body
+    // at the end of the chain. Its torques are what the sensors would
+    // report.
+    const MASS: f64 = 1.35;
+    const COM: [f64; 3] = [0.012, -0.028, 0.061];
+    let mut theta_loaded = theta_unloaded.clone();
+    let base = theta_loaded.len() - 4;
+    theta_loaded[base] += MASS;
+    for k in 0..3 {
+        theta_loaded[base + 1 + k] += MASS * COM[k];
+    }
+
+    for (name, start, spread) in [
+        (
+            "reaching out",
+            [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416],
+            0.5,
+        ),
+        ("folded up", [0.5, -1.0, 2.6, 0.3, 0.8, 2.5], 0.5),
+    ] {
+        let samples: Vec<GravitySample> = wrist_poses(start, spread)
+            .into_iter()
+            .map(|q| GravitySample {
+                q,
+                tau: gravity::predict(&mut unloaded, &theta_loaded, &q).unwrap(),
+            })
+            .collect();
+
+        let fit = gravity::fit_payload(&mut unloaded, &samples, 1e-6).unwrap();
+        assert!(
+            (fit.mass - MASS).abs() < 0.01,
+            "{name}: identified {:.4} kg against {MASS} kg carried",
+            fit.mass
+        );
+        assert!(
+            max_abs_diff(&fit.com, &COM) < 0.005,
+            "{name}: identified com {:?} against {COM:?} carried",
+            fit.com
+        );
+        // Not zero: the ridge biases the solution slightly even at
+        // 1e-6, and what is left is a tenth of a milli-newton-metre.
+        assert!(
+            fit.rms_nm < 1e-3,
+            "{name}: the fit must explain the torque it was given, {:.2e} Nm left",
+            fit.rms_nm
+        );
+        assert!(
+            fit.rms_unloaded_nm > 0.5,
+            "{name}: a 1.35 kg payload must be visible in the torque at all, \
+             only {:.4} Nm of it showed",
+            fit.rms_unloaded_nm
+        );
+        assert!(
+            fit.determined.iter().all(|d| *d > 0.5),
+            "{name}: swinging the wrist must measure all four parameters, got {:?}",
+            fit.determined
+        );
+    }
+}
+
+#[test]
+fn an_empty_hand_identifies_as_empty_and_a_still_wrist_says_so() {
+    let tool = heavy_tool();
+    let mut kin = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
+    let theta = gravity::flatten(&gravity::model_params(&kin).unwrap());
+    let start = [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416];
+
+    // Carrying nothing: the unloaded model already explains every
+    // torque, so there is no residual to attribute to a payload.
+    let empty: Vec<GravitySample> = wrist_poses(start, 0.5)
+        .into_iter()
+        .map(|q| GravitySample {
+            q,
+            tau: gravity::predict(&mut kin, &theta, &q).unwrap(),
         })
         .collect();
+    let fit = gravity::fit_payload(&mut kin, &empty, 1e-6).unwrap();
     assert!(
-        changed.len() + 1 == current.len(),
-        "one massless stub is skipped"
+        fit.mass.abs() < 0.01,
+        "an empty hand must identify as empty, got {:.4} kg",
+        fit.mass
     );
-    let rewritten = gravity::rewrite_inertials(&text, &changed).unwrap();
-    assert_ne!(rewritten, text);
-    assert_eq!(
-        rewritten.matches("<link").count(),
-        text.matches("<link").count(),
-        "only inertial origins change"
+
+    // A wrist that never moved gives the same lever arm every time, so
+    // the parameters are not separable — and `determined` has to say so
+    // rather than the fit inventing a split.
+    let still: Vec<GravitySample> = std::iter::repeat_n(start, 5)
+        .map(|q| GravitySample {
+            q,
+            tau: gravity::predict(&mut kin, &theta, &q).unwrap(),
+        })
+        .collect();
+    let fit = gravity::fit_payload(&mut kin, &still, 1e-3).unwrap();
+    assert!(
+        fit.determined.iter().any(|d| *d < 0.5),
+        "a wrist held still cannot measure four parameters, yet reported {:?}",
+        fit.determined
     );
-    assert_eq!(
-        rewritten.matches("<mass").count(),
-        text.matches("<mass").count()
-    );
-    for mass in text.split("<mass").skip(1) {
-        assert!(
-            rewritten.contains(&mass[..mass.find('>').unwrap()]),
-            "a mass value changed: {}",
-            &mass[..mass.find('>').unwrap()]
-        );
-    }
-
-    let dir = std::env::temp_dir().join(format!("par6-gravity-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
-    let tmp = dir.join("par6_arm.urdf");
-    std::fs::write(&tmp, &rewritten).unwrap();
-    let reloaded = Kin::from_urdf(&tmp, Some(Kin::ARM_EE_FRAME)).unwrap();
-    let back = gravity::model_params(&reloaded).unwrap();
-    for (w, r) in changed.iter().zip(&back) {
-        assert_eq!(w.joint, r.joint);
-        assert_eq!(w.mass, r.mass, "{}: mass must survive untouched", w.joint);
-        assert!(
-            max_abs_diff(&w.first_moment, &r.first_moment) < 1e-9,
-            "{}: wrote {:?}, model read back {:?}",
-            w.joint,
-            w.first_moment,
-            r.first_moment
-        );
-    }
-
-    // Gravity follows what was written.
-    let mut reloaded = reloaded;
-    let theta = gravity::flatten(&back);
-    let mut tau = [0.0; NQ];
-    for q in &CASES {
-        reloaded.gravity(q, &mut tau).unwrap();
-        let predicted = gravity::predict(&mut reloaded, &theta, q).unwrap();
-        assert!(
-            max_abs_diff(&predicted, &tau) < 1e-9,
-            "reloaded G(q) {tau:?} vs written parameters {predicted:?}"
-        );
-    }
-
-    // The writer refuses what a model could not carry.
-    let mut massless = changed.clone();
-    massless[2].mass = 0.0;
-    assert!(gravity::rewrite_inertials(&text, &massless).is_err());
-    let mut unknown = changed.clone();
-    unknown[0].joint = "no_such_joint".into();
-    assert!(gravity::rewrite_inertials(&text, &unknown).is_err());
 }
 
-/// The writer edits the link it was asked for and nothing else. A URDF
-/// carrying a self-closing link, a commented-out one, and an element
-/// whose name merely starts with "link" all used to shift the span onto
-/// a neighbour, so the wrong inertial got the new centre of mass.
 #[test]
-fn the_inertial_writer_edits_only_the_link_it_names() {
-    let urdf = r#"<?xml version="1.0"?>
-<robot name="rig">
-  <link name="decoy_before"/>
-  <!-- <link name="target">
-    <inertial>
-      <origin xyz="9 9 9" rpy="0 0 0"/>
-      <mass value="9.0"/>
-      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
-    </inertial>
-  </link> -->
-  <link name="target">
-    <inertial>
-      <origin xyz="0.1 0.2 0.3" rpy="0 0 0"/>
-      <mass value="2.0"/>
-      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
-    </inertial>
-  </link>
-  <link name="decoy_after">
-    <inertial>
-      <origin xyz="7 7 7" rpy="0 0 0"/>
-      <mass value="3.0"/>
-      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
-    </inertial>
-  </link>
-  <joint name="j" type="revolute">
-    <parent link="decoy_before"/>
-    <child link="target"/>
-    <origin xyz="0 0 0" rpy="0 0 0"/>
-    <axis xyz="0 0 1"/>
-    <limit lower="-1" upper="1" effort="1" velocity="1"/>
-  </joint>
-</robot>
-"#;
-    let mass = 2.0;
-    let com = [0.4_f64, -0.5, 0.6];
-    let written = gravity::rewrite_inertials(
-        urdf,
-        &[gravity::BodyParams {
-            joint: "j".into(),
-            mass,
-            first_moment: [mass * com[0], mass * com[1], mass * com[2]],
-        }],
-    )
-    .expect("the target link is writable");
-
-    assert!(
-        written.contains(r#"xyz="0.4 -0.5 0.6""#),
-        "the target's centre of mass was not written: {written}"
-    );
-    assert!(
-        written.contains(r#"xyz="7 7 7""#),
-        "the following link's inertial was overwritten: {written}"
-    );
-    assert!(
-        written.contains(r#"xyz="9 9 9""#),
-        "the commented-out link was edited: {written}"
-    );
-    assert!(
-        !written.contains(r#"xyz="0.1 0.2 0.3""#),
-        "the old centre of mass survived: {written}"
-    );
+fn the_payload_fit_refuses_what_it_cannot_use() {
+    let mut kin = Kin::load_arm(&assets_dir(), None).unwrap();
+    assert!(gravity::fit_payload(&mut kin, &[], 0.01).is_err());
+    let one = [GravitySample {
+        q: [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416],
+        tau: [0.0; NQ],
+    }];
+    assert!(gravity::fit_payload(&mut kin, &one, -1.0).is_err());
+    assert!(gravity::fit_payload(&mut kin, &one, f64::NAN).is_err());
 }

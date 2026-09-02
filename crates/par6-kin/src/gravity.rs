@@ -1,30 +1,25 @@
-//! Gravity-model identification: fit each link's mass and first moment
-//! to the torques the arm holds itself with, and write the result back
-//! into the URDF the runtime loads.
+//! Payload identification: what is the arm carrying?
 //!
 //! Statics is linear in `θ = [m_i, m_i c_i]` per body — `G(q) = Y(q) θ`
 //! with `Y` the model's own gravity regressor ([`Kin::gravity_regressor`])
-//! — so the fit is a regularised least squares.
+//! — so identification is a least-squares solve.
 //!
-//! Only the FIRST MOMENTS `m_i c_i` are fitted; the masses stay at the
-//! values the URDF carries. Statics pins the product far better than
-//! either factor, so a fit free to move both finds a torque-equivalent
-//! split that is physically wrong: on this arm it moved an upper-arm
-//! centre of mass 40 cm outside the link while halving nothing. Gravity
-//! would still come out right and every other consumer of the same URDF
-//! (inverse dynamics, the mass matrix, the sim plant) would be corrupted.
-//! Masses come from CAD and are trustworthy; where the centre of mass
-//! sits is what drifts, so that is what gets measured. An unknown
-//! PAYLOAD mass is a different question, answered by `SET_PAYLOAD`.
+//! The arm's OWN links are not identified here, and nothing in this
+//! module writes a URDF. Their inertials come from the vendor's table
+//! and that table is the authority: gravity cannot observe every
+//! inertial parameter (nothing about the first body of a vertical-axis
+//! arm, nor the component of a first moment along its own joint axis),
+//! so a fit that corrected the observable directions would leave the
+//! rest wrong while reporting a good residual. Anything that physically
+//! changes a link changes parameters gravity cannot see, and needs new
+//! nominal data — CAD or vendor — not a measurement.
 //!
-//! The regularisation pulls toward the model's current first moments: a
-//! serial arm cannot see every direction of them from statics (the first
-//! body of a vertical-axis arm contributes no gravity torque at all), and
-//! along those directions the URDF stays authoritative rather than
-//! drifting to noise. [`GravityFit::excitation`] says which bodies the
-//! pose set actually measured.
-
-use std::path::Path;
+//! What no table can describe, and what actually changes between one
+//! cycle and the next, is the load at the end of the chain: the tool
+//! somebody bolted on and the part it just picked up. That is four
+//! numbers — mass and the three components of `m·c` — on one body, and
+//! [`fit_payload`] solves for exactly those. A payload of KNOWN mass
+//! needs no measurement at all; declare it with `SET_PAYLOAD`.
 
 use crate::{Kin, KinError, NQ};
 
@@ -71,27 +66,6 @@ pub struct GravitySample {
     pub q: [f64; NQ],
     /// Measured joint torques \[Nm\].
     pub tau: [f64; NQ],
-}
-
-/// The outcome of [`fit`].
-#[derive(Debug, Clone)]
-pub struct GravityFit {
-    /// Identified parameters, one per body, in model order. Masses are
-    /// the prior's, unchanged; the first moments are fitted.
-    pub bodies: Vec<BodyParams>,
-    /// Per body and axis, the share of that component the DATA
-    /// determined, from zero (the number is the prior, untouched) to one
-    /// (the poses fixed it outright). This is the ridge shrinkage
-    /// factor, so it accounts for parameters that are individually well
-    /// excited but only identifiable in combination — a column norm does
-    /// not. Gravity cannot see the component of a first moment along its
-    /// own joint axis, nor anything about the first body of a
-    /// vertical-axis arm, and those come back at zero.
-    pub determined: Vec<[f64; 3]>,
-    /// RMS torque residual of the prior over the fitted samples \[Nm\].
-    pub rms_prior_nm: f64,
-    /// RMS torque residual of the fit over the same samples \[Nm\].
-    pub rms_fit_nm: f64,
 }
 
 /// The parameters the model currently carries, one per body.
@@ -152,94 +126,125 @@ pub fn rms(kin: &mut Kin, theta: &[f64], samples: &[GravitySample]) -> Result<f6
     Ok((sum / (samples.len() * NQ) as f64).sqrt())
 }
 
-/// Fit each body's first moment to `samples`, holding masses at
-/// `prior`'s and regularising toward `prior`'s first moments with
-/// `prior_weight` (relative to the regressor's own scale: 0 = pure least
-/// squares, 1 = the prior counts as much as the data). Needs at least
-/// one sample and a prior with one entry per body.
-pub fn fit(
+/// What a payload identification found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PayloadFit {
+    /// Identified mass \[kg\].
+    pub mass: f64,
+    /// Identified centre of mass in the payload body's frame \[m\].
+    /// Meaningless when `mass` is at or near zero; `determined` says so.
+    pub com: [f64; 3],
+    /// Share of each of the four parameters `(m, m·cx, m·cy, m·cz)` the
+    /// DATA fixed, from zero (the poses said nothing, the number is the
+    /// starting guess) to one (the poses fixed it outright). This is the
+    /// ridge shrinkage factor, so it accounts for parameters that are
+    /// individually excited but only identifiable in combination. A
+    /// wrist held still through the whole run leaves the first moments
+    /// at zero here.
+    pub determined: [f64; 4],
+    /// RMS residual of the fit over the samples \[Nm\].
+    pub rms_nm: f64,
+    /// RMS residual of carrying nothing over the same samples \[Nm\] —
+    /// what the arm was wrong by before the payload was identified.
+    pub rms_unloaded_nm: f64,
+}
+
+/// Identify the payload at the end of the chain from measured torque.
+///
+/// The arm's own links are NOT fitted. Their inertials come from the
+/// vendor's table and are the authority; what varies in service, and
+/// what no table can describe, is whatever is bolted to or held by the
+/// tool. So this solves for exactly the four parameters that describe
+/// it — mass and the three components of `m·c` — against the torque the
+/// arm cannot explain on its own.
+///
+/// `kin` must carry NO payload: the residual `measured − G_unloaded(q)`
+/// is what the payload has to account for. The regressor's last body is
+/// the payload body, and its four columns are already the linear form,
+/// so this is a 4×4 solve whatever the arm's size.
+///
+/// `ridge` keeps a pose set that says nothing about a parameter from
+/// running away with it (0 = pure least squares). Needs one sample.
+pub fn fit_payload(
     kin: &mut Kin,
     samples: &[GravitySample],
-    prior: &[BodyParams],
-    prior_weight: f64,
-) -> Result<GravityFit, KinError> {
-    let nb = kin.body_count();
-    let cols = 4 * nb;
-    let n = 3 * nb;
-    if samples.is_empty() || prior.len() != nb || !prior_weight.is_finite() || prior_weight < 0.0 {
+    ridge: f64,
+) -> Result<PayloadFit, KinError> {
+    if samples.is_empty() || !ridge.is_finite() || ridge < 0.0 {
         return Err(KinError::Load(format!(
-            "gravity fit needs samples, {nb} prior bodies and a non-negative weight \
-             (got {} samples, {} bodies, weight {prior_weight})",
-            samples.len(),
-            prior.len()
+            "payload fit needs samples and a non-negative ridge (got {} samples, ridge {ridge})",
+            samples.len()
         )));
     }
-    let h0: Vec<f64> = prior.iter().flat_map(|b| b.first_moment).collect();
-    // Normal equations over the first moments alone: the mass columns
-    // multiply known values, so they move to the right-hand side.
-    let mut ata = vec![0.0; n * n];
-    let mut atb = vec![0.0; n];
+    let nb = kin.body_count();
+    let cols = 4 * nb;
+    // The payload body is the last in the chain, so its parameters are
+    // the last four columns of the regressor.
+    let base = cols - 4;
+
+    let theta_unloaded = flatten(&model_params(kin)?);
+    let mut ata = [0.0; 16];
+    let mut atb = [0.0; 4];
+    let mut scale = 0.0f64;
     let mut y = vec![0.0; NQ * cols];
-    let mut row = vec![0.0; n];
     for s in samples {
         kin.gravity_regressor(&s.q, &mut y)?;
+        let unloaded = predict(kin, &theta_unloaded, &s.q)?;
         for r in 0..NQ {
-            let full = &y[r * cols..(r + 1) * cols];
-            let mut known = 0.0;
-            for b in 0..nb {
-                known += full[4 * b] * prior[b].mass;
-                row[3 * b..3 * b + 3].copy_from_slice(&full[4 * b + 1..4 * b + 4]);
-            }
-            let target = s.tau[r] - known;
-            for i in 0..n {
-                atb[i] += row[i] * target;
-                for j in 0..n {
-                    ata[i * n + j] += row[i] * row[j];
+            let row = &y[r * cols + base..r * cols + cols];
+            let residual = s.tau[r] - unloaded[r];
+            for a in 0..4 {
+                scale = scale.max(row[a].abs());
+                atb[a] += row[a] * residual;
+                for b in 0..4 {
+                    ata[a * 4 + b] += row[a] * row[b];
                 }
             }
         }
     }
-    let trace: f64 = (0..n).map(|i| ata[i * n + i]).sum();
-    let lambda = prior_weight * trace / n as f64 + f64::EPSILON;
-    for i in 0..n {
-        ata[i * n + i] += lambda;
-        atb[i] += lambda * h0[i];
+    // Scaled by the regressor's own magnitude so the ridge means the
+    // same thing on a small arm as on a large one.
+    let lambda = ridge * scale * scale * (samples.len() * NQ) as f64;
+    for a in 0..4 {
+        ata[a * 4 + a] += lambda;
     }
-    let l = cholesky_factor(&ata, n).ok_or_else(|| {
-        KinError::Load("gravity fit normal matrix is not positive definite".into())
-    })?;
-    let h = cholesky_apply(&l, &atb, n);
-    let bodies: Vec<BodyParams> = (0..nb)
-        .map(|b| BodyParams {
-            joint: prior[b].joint.clone(),
-            mass: prior[b].mass,
-            first_moment: [h[3 * b], h[3 * b + 1], h[3 * b + 2]],
-        })
-        .collect();
-    // Ridge shrinkage: with A = YᵀY + λI, the share of parameter i the
-    // data fixed is 1 - λ (A⁻¹)ᵢᵢ. Zero when the column is absent, one
-    // when the poses pin it.
-    let mut basis = vec![0.0; n];
-    let mut share = vec![0.0; n];
-    for i in 0..n {
-        basis[i] = 1.0;
-        let col = cholesky_apply(&l, &basis, n);
-        basis[i] = 0.0;
-        share[i] = (1.0 - lambda * col[i]).clamp(0.0, 1.0);
+    let l = cholesky_factor(&ata, 4)
+        .ok_or_else(|| KinError::Load("payload fit normal matrix is not solvable".into()))?;
+    let theta = cholesky_apply(&l, &atb, 4);
+
+    // Shrinkage: how much of each parameter the data fixed rather than
+    // the ridge. One minus the ridge's share of the inverse diagonal.
+    let mut determined = [0.0; 4];
+    for a in 0..4 {
+        let mut e = [0.0; 4];
+        e[a] = 1.0;
+        let col = cholesky_apply(&l, &e, 4);
+        determined[a] = (1.0 - lambda * col[a]).clamp(0.0, 1.0);
     }
-    let determined = (0..nb)
-        .map(|b| [share[3 * b], share[3 * b + 1], share[3 * b + 2]])
-        .collect();
-    Ok(GravityFit {
-        rms_prior_nm: rms(kin, &flatten(prior), samples)?,
-        rms_fit_nm: rms(kin, &flatten(&bodies), samples)?,
-        bodies,
+
+    let mass = theta[0];
+    let com = if mass.abs() > f64::EPSILON {
+        [theta[1] / mass, theta[2] / mass, theta[3] / mass]
+    } else {
+        [0.0; 3]
+    };
+
+    // `theta` is what the payload ADDS to the body it hangs off, not
+    // that body's parameters, so the loaded model is the unloaded one
+    // plus the increment.
+    let mut loaded = theta_unloaded.clone();
+    for (out, add) in loaded[base..].iter_mut().zip(&theta) {
+        *out += add;
+    }
+    Ok(PayloadFit {
+        mass,
+        com,
         determined,
+        rms_nm: rms(kin, &loaded, samples)?,
+        rms_unloaded_nm: rms(kin, &theta_unloaded, samples)?,
     })
 }
 
-/// Cholesky factor `L` of symmetric positive-definite `A` (row-major
-/// `n×n`), lower triangular; `None` when `A` is not positive definite.
 fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
     let mut l = vec![0.0; n * n];
     for i in 0..n {
@@ -282,168 +287,4 @@ fn cholesky_apply(l: &[f64], b: &[f64], n: usize) -> Vec<f64> {
         x[i] = sum / l[i * n + i];
     }
     x
-}
-
-/// The arm link's own parameters once the config tool's share is taken
-/// back out of the payload body — what belongs in the arm URDF, which
-/// the runtime loads with the tool re-attached from the gripper config.
-pub fn without_tool(composite: &BodyParams, tool: [f64; 4]) -> BodyParams {
-    BodyParams {
-        joint: composite.joint.clone(),
-        mass: composite.mass - tool[0],
-        first_moment: [
-            composite.first_moment[0] - tool[1],
-            composite.first_moment[1] - tool[2],
-            composite.first_moment[2] - tool[3],
-        ],
-    }
-}
-
-/// Deterministic configurations spread through the soft window (10 %
-/// margin on every joint), for a calibration to rest the arm in.
-pub fn calibration_poses(window: &[(f64, f64); NQ], count: usize, seed: u64) -> Vec<[f64; NQ]> {
-    let mut state = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    let mut next = || {
-        state = state
-            .wrapping_mul(6364136223846793005)
-            .wrapping_add(1442695040888963407);
-        (state >> 11) as f64 / (1u64 << 53) as f64
-    };
-    (0..count)
-        .map(|_| {
-            let mut q = [0.0; NQ];
-            for (j, out) in q.iter_mut().enumerate() {
-                let (lo, hi) = window[j];
-                let span = hi - lo;
-                *out = lo + span * (0.1 + 0.8 * next());
-            }
-            q
-        })
-        .collect()
-}
-
-/// `urdf` with each listed link's `<inertial>` centre of mass replaced by
-/// `bodies` (matched joint → child link through the URDF's own joint
-/// list). Mass and the inertia tensor are left as authored: statics
-/// identify neither, and [`fit`] does not move the mass. Everything else
-/// in the file is preserved byte-for-byte.
-pub fn rewrite_inertials(urdf: &str, bodies: &[BodyParams]) -> Result<String, String> {
-    let robot = urdf_rs::read_from_string(urdf).map_err(|e| format!("URDF parse: {e}"))?;
-    let mut out = urdf.to_owned();
-    for body in bodies {
-        if !(body.mass.is_finite() && body.mass > 0.0)
-            || body.first_moment.iter().any(|v| !v.is_finite())
-        {
-            return Err(format!(
-                "joint {}: mass {} kg / first moment {:?} gives no writable centre of mass",
-                body.joint, body.mass, body.first_moment
-            ));
-        }
-        let link = robot
-            .joints
-            .iter()
-            .find(|j| j.name == body.joint)
-            .map(|j| j.child.link.clone())
-            .ok_or_else(|| format!("joint {} is not in the URDF", body.joint))?;
-        out = rewrite_link_inertial(&out, &link, body.com())?;
-    }
-    Ok(out)
-}
-
-/// The same rewrite, read from and written to `path`.
-pub fn rewrite_inertials_file(path: &Path, bodies: &[BodyParams]) -> Result<(), String> {
-    let text = std::fs::read_to_string(path).map_err(|e| format!("{}: {e}", path.display()))?;
-    let rewritten = rewrite_inertials(&text, bodies)?;
-    std::fs::write(path, rewritten).map_err(|e| format!("{}: {e}", path.display()))
-}
-
-fn rewrite_link_inertial(text: &str, link: &str, com: [f64; 3]) -> Result<String, String> {
-    let (start, end) =
-        link_span(text, link).ok_or_else(|| format!("link {link} is not in the URDF"))?;
-    let block = &text[start..end];
-    let mut i0 = 0;
-    loop {
-        let rel = block[i0..]
-            .find("<inertial")
-            .ok_or_else(|| format!("link {link} has no <inertial> element"))?;
-        i0 += rel;
-        if !in_comment(block, i0) {
-            break;
-        }
-        i0 += "<inertial".len();
-    }
-    let i1 = block[i0..]
-        .find("</inertial>")
-        .map(|e| i0 + e)
-        .ok_or_else(|| format!("link {link}: unterminated <inertial>"))?;
-    let inertial = &block[i0..i1];
-    let mut rewritten = inertial.to_owned();
-    rewritten = replace_tag_attr(
-        &rewritten,
-        "<origin",
-        "xyz",
-        &format!("{} {} {}", com[0], com[1], com[2]),
-    )
-    .ok_or_else(|| format!("link {link}: <inertial> has no <origin xyz>"))?;
-    let mut out = String::with_capacity(text.len());
-    out.push_str(&text[..start + i0]);
-    out.push_str(&rewritten);
-    out.push_str(&text[start + i1..]);
-    Ok(out)
-}
-
-/// Byte span of `<link ... name="name" ...> … </link>`.
-fn link_span(text: &str, name: &str) -> Option<(usize, usize)> {
-    let mut from = 0;
-    while let Some(rel) = text[from..].find("<link") {
-        let start = from + rel;
-        let next = start + "<link".len();
-        // `<linkage` is not `<link`, and a link inside a comment is not
-        // in the model — either would hand back a span over somebody
-        // else's element and rewrite the wrong inertial.
-        let boundary = text[next..]
-            .chars()
-            .next()
-            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
-        if !boundary || in_comment(text, start) {
-            from = next;
-            continue;
-        }
-        let tag_end = text[start..].find('>')? + start;
-        let tag = &text[start..tag_end];
-        // A self-closing link has no body: no inertial to rewrite, and no
-        // `</link>` of its own, so searching on would return the NEXT
-        // link's close and span across it.
-        if tag.trim_end().ends_with('/') {
-            from = tag_end;
-            continue;
-        }
-        let attr = tag.find("name=\"").map(|n| &tag[n + 6..]);
-        if attr.and_then(|a| a.find('"').map(|e| &a[..e])) == Some(name) {
-            let end = text[tag_end..].find("</link>")? + tag_end + "</link>".len();
-            return Some((start, end));
-        }
-        from = tag_end;
-    }
-    None
-}
-
-/// Whether `at` falls inside an XML comment.
-fn in_comment(text: &str, at: usize) -> bool {
-    match text[..at].rfind("<!--") {
-        Some(open) => !text[open..at].contains("-->"),
-        None => false,
-    }
-}
-
-/// The first `tag` element in `text` with `attr="…"` replaced by `value`.
-fn replace_tag_attr(text: &str, tag: &str, attr: &str, value: &str) -> Option<String> {
-    let start = text.find(tag)?;
-    let tag_end = text[start..].find('>')? + start;
-    let key = format!("{attr}=\"");
-    let a0 = text[start..tag_end].find(&key)? + start + key.len();
-    let a1 = text[a0..].find('"')? + a0;
-    Some(format!("{}{}{}", &text[..a0], value, &text[a1..]))
 }

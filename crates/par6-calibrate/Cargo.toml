@@ -1,13 +1,13 @@
 [package]
 name = "par6-calibrate"
-description = "Gravity-model calibration for the PAR6 arm: rest in a pose set, fit link masses and centres of mass to the held torques, write the URDF."
+description = "Payload identification for the PAR6 arm: swing the wrist, solve for the load at the tool from the held torques."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "par6-calibrate-gravity"
+name = "par6-identify-payload"
 path = "src/main.rs"
 
 [dependencies]
