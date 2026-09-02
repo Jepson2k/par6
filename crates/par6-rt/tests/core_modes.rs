@@ -368,22 +368,27 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
         "held exactly at the soft limit"
     );
 
-    // The latch survives button release, and the opposite direction runs.
+    // Releasing ends the jog session: the ramp runs down and JOG goes
+    // with it, so the latch stands for a UI to read but the mode has to
+    // be re-entered to jog again.
     rig.cmd(RtCommand::JogRelease);
     rig.tick_n(5);
-    assert!(
-        rig.snap().jog.blocked_mask & 0b10 != 0,
-        "block survives release"
+    let s = rig.snap();
+    assert!(s.jog.blocked_mask & 0b10 != 0, "block survives release");
+    assert_eq!(s.mode, Mode::Idle, "a released jog leaves JOG at rest");
+
+    // A fresh session starts unblocked and the opposite direction runs.
+    rig.cmd(RtCommand::SetMode(Mode::Jog));
+    assert_eq!(
+        rig.snap().jog.blocked_mask & 0b10,
+        0,
+        "a new jog session starts unblocked"
     );
     rig.cmd(RtCommand::Jog {
         speeds: [-0.5, 0.0, 0.0, 0.0, 0.0, 0.0],
         accel: 1.0,
     });
     rig.tick_n(20);
-    assert!(
-        rig.snap().jog.blocked_mask & 0b10 == 0,
-        "opposite direction clears the latch"
-    );
     assert!(rig.last_joints()[0].vel.unwrap() < 0, "moving away");
 }
 

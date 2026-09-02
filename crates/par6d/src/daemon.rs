@@ -727,7 +727,7 @@ pub(crate) struct KinStack {
     /// The streaming gate's own collision world (pinocchio `Data` is
     /// mutated by every query, so the planner's instance cannot be
     /// shared across threads).
-    gate_collision: par6_kin::Collision,
+    pub(crate) gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
     pub(crate) tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,

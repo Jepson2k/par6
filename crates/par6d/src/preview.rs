@@ -21,13 +21,15 @@ use par6_rt::{
     SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    blend_radius_mm, cmd_name, decode_error_to_wire, gate, registry_fault, teleport_angle_fault,
-    validate_supported, write_io_fault, PayloadSpec, PlanContext, Planner, QueuedCommand,
-    ServerConfig, ShapeLayer,
+    blend_radius_mm, cmd_name, decode_error_to_wire, gate, registry_fault, validate_supported,
+    write_io_fault, PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::MotionJog;
-use crate::bridge::{step_cart_jog, CartJogState, CoreLink, CoreOp, HOUSEKEEPING_PERIOD};
+use crate::bridge::{
+    step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate, HOUSEKEEPING_PERIOD,
+    STREAM_LOOKAHEAD_S,
+};
 use crate::daemon::{load_kin_stack, DaemonError};
 use crate::kin::CartKin;
 use crate::options::{resolve_config_path, Options};
@@ -143,6 +145,26 @@ pub struct Preview {
     /// Commanded jaw position 0 = open … 1 = closed.
     tool_position: f64,
     flashing: bool,
+    /// Whether the simulator backend is selected: `teleport` is gated on
+    /// it, exactly as the server gates it.
+    simulator: bool,
+    /// The e-stop latch. Every command the gate table marks
+    /// `needs_enabled` is refused while this stands, until a reset.
+    estop_latched: bool,
+    /// What `error()` reports: the refusal the runtime would leave
+    /// standing after an e-stop or a queue-clearing stop.
+    standing_error: Option<WireError>,
+    /// Whether a jog stream is open. The RT ramps from rest on JOG mode
+    /// ENTRY, not per datagram, so a stream of jogs must keep ramping
+    /// rather than restart each time.
+    jog_streaming: bool,
+    /// Ticks to run the ramp down when a stream ends. The ramp cannot
+    /// outlast its own time constant; the margin covers the s-curve
+    /// profile, which spends longer than the linear one reaching rest.
+    jog_ramp_ticks: usize,
+    /// The streaming collision gate, the same one the housekeeping loop
+    /// runs: a jog is admitted only if its projected lookahead clears.
+    gate: StreamGate,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -200,6 +222,7 @@ impl Preview {
             *out = *rad;
         }
         let stream_limits = MotionLimits::from_config(robot, par6_config::LimitMode::Stream)?;
+        let jog_limits = MotionLimits::from_config(robot, par6_config::LimitMode::Jog)?;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let mut preview = Self {
@@ -225,6 +248,14 @@ impl Preview {
             io_inputs: robot.io.inputs.len(),
             tool_position: 0.0,
             flashing: false,
+            simulator: cfg.simulator,
+            estop_latched: false,
+            standing_error: None,
+            jog_streaming: false,
+            jog_ramp_ticks: ((2.0 * robot.jog.accel_time_s / robot.robot.tick_dt_s).ceil()
+                as usize)
+                .max(1),
+            gate: StreamGate::new(stack.gate_collision, &jog_limits),
             cfg,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
@@ -277,8 +308,11 @@ impl Preview {
     }
 
     /// Move the virtual arm instantly without the wire's checks — the
-    /// host seeding a session at the live arm's pose.
+    /// host seeding a session at the live arm's pose. Any open jog
+    /// stream ends: an arm that was teleported is no longer the arm the
+    /// stream was ramping, so the next jog starts from rest.
     pub fn place_rad(&mut self, q: [f64; MAX_JOINTS]) {
+        self.end_jog_stream();
         self.snap.q = q;
         self.publish();
     }
@@ -367,6 +401,9 @@ impl Preview {
         if let Err(e) = command.validate() {
             return self.refuse(decode_error_to_wire(&e));
         }
+        if !matches!(command, Command::JogJ(_)) {
+            self.end_jog_stream();
+        }
         match command_class(command.tag()) {
             CommandClass::Queued => self.submit_queued(command),
             CommandClass::FireAndForget => self.submit_stream(command),
@@ -392,12 +429,66 @@ impl Preview {
         PreviewResult::refusal(self.snap.q, error)
     }
 
+    /// The server's own gate table, applied to the virtual arm.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
         let g = gate(command.tag());
+        if g.needs_enabled {
+            if self.estop_latched {
+                return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+            }
+            // A silenced bus cannot execute. The live refusal comes from
+            // the RT's mode table rather than this gate (FLASHING has no
+            // transition to EXEC or STREAM), but the outcome a caller
+            // sees is the same: the command does not run.
+            if self.flashing {
+                return Some(make_error(
+                    ErrorCode::SysControllerDisabled,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        "The controller is in FLASHING: the bus is handed to a firmware flasher.",
+                    )],
+                ));
+            }
+        }
         if g.needs_homed && !self.snap.homed {
             return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
         }
+        if g.needs_simulator && !self.simulator {
+            return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
+        }
         None
+    }
+
+    /// The refusal the runtime would leave standing, or `None`.
+    pub fn error(&self) -> Option<&WireError> {
+        self.standing_error.as_ref()
+    }
+
+    /// End an open jog stream the way the watchdog does: housekeeping
+    /// sends `JogRelease`, which zeroes the engine's target fractions but
+    /// not its velocity, so the ramp runs down over the following ticks.
+    /// That is ground the arm actually covers, so the virtual arm covers
+    /// it too and the next command starts from where the jog came to
+    /// rest.
+    fn end_jog_stream(&mut self) {
+        if !self.jog_streaming {
+            return;
+        }
+        self.jog.release();
+        let mut q = self.snap.q;
+        for _ in 0..self.jog_ramp_ticks {
+            let mut q_out = [0.0; MAX_JOINTS];
+            let mut qd_out = [0.0; MAX_JOINTS];
+            self.jog.tick(&q, &mut q_out, &mut qd_out);
+            q = q_out;
+            if qd_out.iter().all(|v| *v == 0.0) {
+                break;
+            }
+        }
+        self.snap.q = q;
+        self.jog_streaming = false;
+        self.publish();
     }
 
     fn submit_queued(&mut self, command: Command) -> PreviewResult {
@@ -449,13 +540,8 @@ impl Preview {
         self.held.clear();
         match command {
             Command::Teleport(p) => {
-                if let Some(detail) = teleport_angle_fault(&p.angles, &self.cfg) {
-                    return self.refuse(make_error(
-                        ErrorCode::CommValidationError,
-                        UNATTRIBUTED,
-                        &[("detail", &detail)],
-                    ));
-                }
+                // The travel check already ran: `validate_supported` calls
+                // `teleport_angle_fault` above.
                 let mut q = self.snap.q;
                 for (out, deg) in q.iter_mut().zip(p.angles.iter()) {
                     *out = deg.to_radians();
@@ -520,13 +606,33 @@ impl Preview {
         match command {
             Command::Stop(p) => {
                 if p.clear_queue {
+                    // A cleared program is a fact the operator has to see;
+                    // the next accepted motion wipes it.
+                    if !self.held.is_empty() {
+                        self.standing_error = Some(make_error(
+                            ErrorCode::MotnCancelled,
+                            UNATTRIBUTED,
+                            &[("scope", "stop")],
+                        ));
+                    }
                     self.held.clear();
                 }
             }
-            Command::Estop => self.held.clear(),
-            Command::Reset | Command::Pause(_) | Command::SetGravityComp(_) => {}
+            Command::Estop => {
+                self.held.clear();
+                self.estop_latched = true;
+                self.standing_error =
+                    Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+            }
+            Command::Reset => {
+                self.estop_latched = false;
+                self.standing_error = None;
+            }
+            Command::Pause(_) | Command::SetGravityComp(_) => {}
             Command::ResetState => {
                 self.held.clear();
+                self.estop_latched = false;
+                self.standing_error = None;
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
@@ -541,7 +647,8 @@ impl Preview {
                 None => self.io_levels[usize::from(p.port)] = p.value,
                 Some(e) => return self.refuse(e),
             },
-            Command::Simulator(_) | Command::ConnectHardware(_) => {}
+            Command::Simulator(p) => self.simulator = p.on,
+            Command::ConnectHardware(_) => self.simulator = false,
             Command::SelectProfile(p) => {
                 let known = self
                     .cfg
@@ -605,17 +712,17 @@ impl Preview {
                 self.held.clear();
                 self.flashing = true;
             }
-            // Leaving the window costs the references: the runtime
-            // cannot tell a flash from a scan, so every exit re-homes.
+            // The runtime invalidates homing only when firmware was
+            // actually flashed (`RtCore::leave_mode`), which a preview
+            // never does, so the reference survives the window.
             Command::ExitFlashing => {
                 if !self.flashing {
-                    return self.refuse(detail(
-                        "exit_flashing: the controller is not in FLASHING".into(),
-                    ));
+                    return self.refuse(detail(format!(
+                        "exit_flashing while the controller mode is {:?}, not FLASHING",
+                        self.snap.mode
+                    )));
                 }
                 self.flashing = false;
-                self.snap.homed = false;
-                self.publish();
             }
             other => return self.refuse(detail(format!("{:?} cannot be previewed", other.tag()))),
         }
@@ -662,8 +769,20 @@ impl Preview {
         }
         let mut fractions = [0.0; MAX_JOINTS];
         fractions[..NUM_JOINTS].copy_from_slice(&speeds);
+        // The runtime admits a jog only if where it will be one lookahead
+        // horizon ahead clears the world (`RtBridge`'s jog admission).
+        if let Some(error) = self.jog_blocked(&fractions) {
+            return self.refuse(error);
+        }
         self.jog.set_accel_scale(accel.unwrap_or(1.0));
-        self.jog.activate(&self.snap.q);
+        // The RT ramps from rest on JOG mode ENTRY, not per datagram: a
+        // UI streaming jogs at 20 Hz gets one acceleration, not one per
+        // frame. Re-activating here would preview a fraction of the real
+        // travel and clear the soft-limit latches between frames.
+        if !self.jog_streaming {
+            self.jog.activate(&self.snap.q);
+            self.jog_streaming = true;
+        }
         self.jog.command(&fractions);
         let ticks = ((duration_s / self.dt).round() as usize).max(1);
         let mut q = self.snap.q;
@@ -675,7 +794,6 @@ impl Preview {
             q = q_out;
             trajectory.push(q);
         }
-        self.jog.release();
         self.finish_stream(trajectory, trajectory_duration(ticks, self.dt))
     }
 
@@ -691,6 +809,15 @@ impl Preview {
         frame: par6_proto::Frame,
         duration_s: f64,
     ) -> PreviewResult {
+        let command = Command::JogL(cmd::JogL {
+            velocities,
+            duration: duration_s,
+            frame,
+            accel: None,
+        });
+        if let Err(e) = command.validate() {
+            return self.refuse(decode_error_to_wire(&e));
+        }
         let mut twist = [0.0; 6];
         for (i, (out, frac)) in twist.iter_mut().zip(velocities.iter()).enumerate() {
             let full = if i < 3 {
@@ -707,6 +834,9 @@ impl Preview {
             soft_min: self.soft_min,
             soft_max: self.soft_max,
         };
+        if let Some(error) = self.cart_jog_blocked(&mut state.clone()) {
+            return self.refuse(error);
+        }
         let period = HOUSEKEEPING_PERIOD.as_secs_f64();
         let steps = ((duration_s / period).round() as usize).max(1);
         let mut trajectory = Vec::with_capacity(steps);
@@ -719,6 +849,36 @@ impl Preview {
             }
         }
         self.finish_stream(trajectory, trajectory_duration(steps, period))
+    }
+
+    /// The runtime's jog admission check: where the commanded speeds put
+    /// the arm one lookahead horizon from here must not collide, or from
+    /// inside a keep-out must not deepen it.
+    fn jog_blocked(&mut self, fractions: &[f64; MAX_JOINTS]) -> Option<WireError> {
+        let q = self.snap.q;
+        let la = self.gate.jog_lookahead(&q, fractions);
+        match self.gate.blocked(&q, &la) {
+            Ok(Some(pairs)) => Some(self.gate.refuse(pairs)),
+            Ok(None) => None,
+            Err(e) => Some(e),
+        }
+    }
+
+    /// The same admission check for a cartesian jog, projected through
+    /// the jacobian exactly as the bridge projects it.
+    fn cart_jog_blocked(&mut self, probe: &mut CartJogState) -> Option<WireError> {
+        let q = self.snap.q;
+        // A twist the jacobian cannot resolve is admitted: housekeeping
+        // holds in place on a failed solve, so nothing unchecked streams.
+        let la = match step_cart_jog(&mut self.cart, probe, STREAM_LOOKAHEAD_S) {
+            Ok((la, _)) => la,
+            Err(_) => return None,
+        };
+        match self.gate.blocked(&q, &la) {
+            Ok(Some(pairs)) => Some(self.gate.refuse(pairs)),
+            Ok(None) => None,
+            Err(e) => Some(e),
+        }
     }
 
     fn finish_stream(
@@ -802,11 +962,19 @@ impl Preview {
             self.next_index += consumed as u64;
             let folded = consumed - 1;
             let end = result.end_joints_rad;
+            let refused = result.error.is_some();
             results.push(result);
             for _ in 0..folded {
                 results.push(PreviewResult::still(end));
             }
             rest = &rest[consumed..];
+            if refused {
+                // The server drops every pending command when one fails
+                // (`fail_command` -> `drop_pending`), so nothing behind a
+                // refusal runs, and the virtual arm must not advance past
+                // it either.
+                break;
+            }
         }
         results
     }
@@ -895,7 +1063,13 @@ impl Preview {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<Option<u64>, WireError> {
-        self.planner.set_shapes(layer, shapes)
+        let epoch = self.planner.set_shapes(layer, shapes)?;
+        // The streaming gate keeps its own world, and only a set the
+        // planner accepted reaches it — the same order the server uses.
+        if epoch.is_some() {
+            self.gate.set_layer(layer, shapes)?;
+        }
+        Ok(epoch)
     }
 }
 

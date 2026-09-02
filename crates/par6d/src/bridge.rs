@@ -80,7 +80,7 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// server-side jog integrator; par6's integrator ramps on the RT thread,
 /// so the projection here uses the commanded target velocity — an upper
 /// bound on the ramping integrator's, which errs on the stopping side.
-const STREAM_LOOKAHEAD_S: f64 = 0.15;
+pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -170,7 +170,7 @@ impl StreamGate {
     /// Mirror one layer of the planner-accepted world. The conversion is
     /// the identical `Shape::from_proto` path the planner ran, so on a
     /// set the server hands over it cannot disagree.
-    fn set_layer(
+    pub(crate) fn set_layer(
         &mut self,
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
@@ -226,7 +226,7 @@ impl StreamGate {
     /// grinding deeper through the same pair, and the depth check alone
     /// cannot tell an improving start-collision from a new shallower
     /// one, so both run.
-    fn blocked(
+    pub(crate) fn blocked(
         &mut self,
         current: &[f64; MAX_JOINTS],
         target: &[f64; MAX_JOINTS],
@@ -265,7 +265,7 @@ impl StreamGate {
     /// Where a `jog_j` on `joint` at `signed_pct` will be one lookahead
     /// horizon from `q`, clamped into the soft window so a pose at the
     /// stop cannot phantom-trip the gate.
-    fn jog_lookahead(
+    pub(crate) fn jog_lookahead(
         &self,
         q: &[f64; MAX_JOINTS],
         speeds: &[f64; MAX_JOINTS],
@@ -281,7 +281,7 @@ impl StreamGate {
     /// Latch `pairs` as the streaming collision verdict and build the
     /// refusal the client reads. One checked configuration, so the error
     /// template's path slots read `0` of `1`.
-    fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
+    pub(crate) fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
         let rendered = pairs
             .iter()
             .take(4)
@@ -358,6 +358,7 @@ enum StreamKind {
 }
 
 /// Live state of a cartesian jog, advanced by housekeeping each period.
+#[derive(Clone, Copy)]
 pub(crate) struct CartJogState {
     /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
     /// commanded frame's axes.
@@ -1100,14 +1101,25 @@ pub(crate) fn housekeeping_loop(
             match &mut sh.stream {
                 Some(a) if now >= a.deadline => {
                     match a.kind {
+                        // Released rather than idled: `JogRelease` zeroes
+                        // the engine's target but not its velocity, and
+                        // the RT only ticks the engine in JOG, so cutting
+                        // to IDLE here would stop the arm dead from full
+                        // jog speed. The RT leaves JOG itself once the
+                        // ramp reaches rest.
                         StreamKind::Jog => {
                             log::debug!("jog duration elapsed; releasing");
                             link.send(RtCommand::JogRelease);
                         }
-                        StreamKind::Servo => log::debug!("servo stream went silent; stopping"),
-                        StreamKind::CartJog => log::debug!("jog_l duration elapsed; stopping"),
+                        StreamKind::Servo => {
+                            log::debug!("servo stream went silent; stopping");
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                        }
+                        StreamKind::CartJog => {
+                            log::debug!("jog_l duration elapsed; stopping");
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                        }
                     }
-                    link.send(RtCommand::SetMode(Mode::Idle));
                     sh.stream = None;
                 }
                 // The moving-jog re-check: the admission gate saw the

@@ -493,3 +493,148 @@ fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
         assert_eq!(refused.end_joints_rad, end, "a refused jog moves nothing");
     }
 }
+
+fn jog_j_cmd(speeds: [f64; NUM_JOINTS], duration: f64) -> Command {
+    Command::JogJ(par6_proto::command::JogJ {
+        speeds,
+        duration,
+        accel: None,
+    })
+}
+
+/// Two things the preview used to get wrong on its own, both checked
+/// against the runtime: an e-stop is a latch that outlives the command
+/// that set it, and a stream of jog datagrams is one acceleration rather
+/// than one per frame.
+#[test]
+fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
+    let config = test_config();
+    let rig = Rig::boot(config.clone());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+    preview.place_rad(to_rad(&park));
+
+    // -- an e-stop latches until a reset -------------------------------
+    let mut target = park;
+    target[0] += 15.0;
+    preview.submit(Command::Estop);
+    c.ok(&Command::Estop);
+    assert_eq!(
+        preview.error().map(|e| e.code),
+        Some(ErrorCode::SysEstopActive as u16),
+        "an e-stop must stand as the preview's error"
+    );
+
+    let mine = preview.submit(move_j_cmd(target, None));
+    let theirs = c.expect_error(&move_j_cmd(target, None));
+    let err = mine
+        .error
+        .as_ref()
+        .expect("a latched e-stop must refuse a move");
+    assert_eq!(err.code, theirs.code, "{err:?} vs {theirs:?}");
+    assert_eq!(err.cause, theirs.cause, "{err:?} vs {theirs:?}");
+    assert_eq!(
+        mine.end_joints_rad,
+        to_rad(&park),
+        "a refused move must not advance the virtual arm"
+    );
+
+    preview.submit(Command::Reset);
+    c.ok(&Command::Reset);
+    assert!(
+        preview.error().is_none(),
+        "a reset must clear the standing e-stop: {:?}",
+        preview.error()
+    );
+    let after = preview.submit(move_j_cmd(target, None));
+    assert!(after.valid(), "a reset must un-refuse the move: {after:?}");
+    let index = c.ok_index(&move_j_cmd(target, None));
+    let (ok, detail) = c.wait_complete(index);
+    assert!(
+        ok,
+        "the runtime must run the move after a reset: {detail:?}"
+    );
+    rig.wait_status("runtime landed", |s| {
+        max_deg_error(&s.angles, &target) < 1.5
+    });
+
+    // -- a streamed jog ramps once, not once per datagram ---------------
+    // The RT accelerates on JOG mode ENTRY, so a UI sending frames at
+    // 20 Hz gets one acceleration. Six frames of 0.15 s must therefore
+    // travel what a single 0.9 s jog travels, not six ramps' worth.
+    const FRAMES: usize = 6;
+    // A whole number of ticks per frame, so the two runs integrate the
+    // same number of them and only the ramp can separate them.
+    let frame_s = 8.0 * preview.tick_dt_s();
+    let mut speeds = [0.0; NUM_JOINTS];
+    speeds[0] = 0.5;
+
+    preview.place_rad(to_rad(&park));
+    let one = preview.submit(jog_j_cmd(speeds, FRAMES as f64 * frame_s));
+    assert!(one.valid(), "{one:?}");
+    let single_deg = to_deg(&one.end_joints_rad)[0] - park[0];
+
+    preview.place_rad(to_rad(&park));
+    for _ in 0..FRAMES {
+        let step = preview.submit(jog_j_cmd(speeds, frame_s));
+        assert!(step.valid(), "{step:?}");
+    }
+    let streamed_deg = to_deg(&preview.angles_rad())[0] - park[0];
+    assert!(
+        single_deg > 1.0,
+        "the jog must actually move joint 0: {single_deg} deg"
+    );
+    assert!(
+        (streamed_deg - single_deg).abs() < 0.01 * single_deg,
+        "a stream of jogs must travel what one long jog travels: \
+         {streamed_deg} deg streamed vs {single_deg} deg in one"
+    );
+
+    // Against the runtime, one datagram of the same total duration: the
+    // stream is already known to travel the same distance, and a single
+    // send keeps wall-clock jitter out of the comparison. The ramp down
+    // is included on both sides — releasing the jog leaves the RT in JOG
+    // until the velocity reaches rest.
+    preview.place_rad(to_rad(&park));
+    let whole = preview.submit(jog_j_cmd(speeds, FRAMES as f64 * frame_s));
+    assert!(whole.valid(), "{whole:?}");
+    preview.submit(Command::Reset);
+    let settled_deg = to_deg(&preview.angles_rad())[0] - park[0];
+    assert!(
+        settled_deg > single_deg,
+        "the ramp down must cover ground: {settled_deg} vs {single_deg} deg"
+    );
+
+    teleport_home(&rig, &mut c, park);
+    let start = rig.wait_status("runtime at rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    c.send(&jog_j_cmd(speeds, FRAMES as f64 * frame_s));
+    std::thread::sleep(Duration::from_millis(600));
+    rig.drain_status();
+    let rest = rig.wait_status("jog watchdog expired", |s| {
+        s.seq > start.seq && s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    // The jog engine integrates from the MEASURED pose, so whatever the
+    // servo loop fails to track in a tick is ground the jog never gets
+    // back. The runtime therefore lands a little short of the preview,
+    // which integrates its own output and so tracks perfectly; it never
+    // lands beyond it.
+    let runtime_deg = rest.angles[0] - start.angles[0];
+    assert!(
+        runtime_deg <= settled_deg,
+        "the runtime cannot outrun a perfect-tracking preview: \
+         {runtime_deg} deg vs {settled_deg} deg"
+    );
+    assert!(
+        settled_deg - runtime_deg < 0.06 * settled_deg,
+        "preview and runtime jogs diverge by more than the servo can lag: \
+         {settled_deg} deg vs {runtime_deg} deg"
+    );
+
+    rig.shutdown();
+}
