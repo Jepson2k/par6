@@ -17,8 +17,13 @@
 //! (`tests/collision_world.rs::per_waypoint_check_cost_is_reported`
 //! reprints these on every run): self-collision only, 14 us for the
 //! flange and 19 us for a gripper variant; with a box keep-out, 25 us
-//! either way; with a per-shape margin, 26 us and 34 us.
-//! A [`ShapeKind::Plane`] keep-out is the outlier at ~35 ms — see its docs.
+//! either way; with a per-shape margin, 26 us and 34 us; with a floor
+//! keep-out drawn as a plane, 24 us and 29 us.
+//!
+//! That last one is only in that range because a plane is converted to an
+//! equivalent box at the wire ([`Shape::from_proto`]). A raw
+//! [`ShapeKind::Plane`] built directly, which nothing on the wire can
+//! produce, costs ~35 ms — see its docs.
 //!
 //! [`ShapeKind::Plane`]: crate::ShapeKind::Plane
 
@@ -317,12 +322,10 @@ impl Collision {
     ///
     /// Passive gripper jaw joints are held at zero, matching [`check`].
     /// Costs more than a check (coal's distance query runs on every pair,
-    /// no early exit), and the [`ShapeKind::Plane`] cost note applies here
-    /// too — planner-side only.
+    /// no early exit) — planner-side only.
     ///
     /// [`check`]: Collision::check
     /// [`clearance`]: Collision::clearance
-    /// [`ShapeKind::Plane`]: crate::ShapeKind::Plane
     pub fn min_distance(&mut self, q: &[f64; NQ]) -> Result<f64, KinError> {
         self.q_full[..NQ].copy_from_slice(q);
         Ok(self.model.min_distance(&self.q_full)?)

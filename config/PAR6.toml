@@ -604,9 +604,10 @@ tau_ext_window_s = 0.1
 # extrinsic-XYZ rotation (angles about fixed world axes, R = Rz*Ry*Rx) —
 # the waldoctl Shape.pose convention, NOT the TCP-pose readback one.
 # `kind` is one of: box, sphere, cylinder, capsule, cone, ellipsoid,
-# plane (prefer a box over a plane: an unbounded half-space costs the
-# checker ~1000x per query). `params` are the primitive's constructor
-# arguments in waldoctl field order (box: [x, y, z] full side lengths).
+# plane (a wall: solid where `n.x <= offset`, converted internally to the
+# box covering the arm's reach, so it costs no more than one). `params`
+# are the primitive's constructor arguments in waldoctl field order
+# (box: [x, y, z] full side lengths).
 # Optional: `collision = false` (visual-only marker), `margin` (extra
 # standoff in metres on top of the runtime's 5 mm clearance).
 #

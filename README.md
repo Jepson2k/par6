@@ -378,12 +378,19 @@ Mesh cost: `assets/` ships the vendor's full-resolution STLs for both `<visual>`
 | self-collision only | 14 µs | 19 µs |
 | plus a box keep-out | 25 µs | 25 µs |
 | plus a keep-out carrying its own margin | 26 µs | 34 µs |
-| plus a `PAR6_SHAPE_PLANE` keep-out | 31 ms | 34 ms |
+| plus a floor keep-out drawn as a plane | 24 µs | 29 µs |
 
 Convex hulls were measured and rejected: the SSG48's jaw hulls overlap when closed and
-report a permanent false collision at the home pose. The plane is the one pathological
-shape, since an unbounded half-space has no bounding volume to prune against and coal
-scans every triangle. Model floors and walls as large boxes.
+report a permanent false collision at the home pose.
+
+A plane keep-out is a wall: "don't go past here". Sent as a raw half-space it is the one
+pathological shape, costing ~35 ms, because an unbounded solid has no bounding volume to
+prune against and coal ends up scanning every triangle. The wire therefore converts one
+into the box that covers everything the arm can reach on the solid side, which gives an
+identical verdict at every configuration the arm can physically adopt and costs 24 µs.
+The substituted box is never a cube: three equal sides leave coal's closest-feature
+search without a tie-break and cost milliseconds, while every other box shape measured
+17-22 µs regardless of size. Callers keep drawing walls as planes.
 
 conda-forge ships `linux-aarch64` Pinocchio, so the control box builds the shim natively
 with the same script; cross-compiling it from x86_64 is not supported.
