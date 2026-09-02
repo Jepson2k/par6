@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use par6_proto::command::{
     EnterFlashing, JogJ, JogL, MoveJ, MoveS, SetPayload, SetPidGains, SetRecipe, SetShapes, Shape,
-    Simulator, Stop, Teleport, WriteIo,
+    Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -43,7 +43,6 @@ enum RtEvent {
     ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
-    ToolStop,
     EnterFlashing,
     ExitFlashing,
     SetPidGains { node: u8, kpp: f64, ilim_ma: f64 },
@@ -165,9 +164,6 @@ impl RtCommands for TestRt {
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
     }
-    fn tool_stop(&mut self) {
-        self.push(RtEvent::ToolStop);
-    }
     fn write_io(&mut self, port: u8, value: u8) {
         self.push(RtEvent::WriteIo(port, value));
     }
@@ -212,6 +208,12 @@ struct PlannerState {
     inflight_duration: f64,
     /// Planner-side warnings the trait hands the STATUS builder.
     warnings: Vec<WireError>,
+    /// Tool actions the side channel was asked to start, in order.
+    tools_started: Vec<u64>,
+    tool_outcomes: VecDeque<CommandOutcome>,
+    fail_next_tool: Option<WireError>,
+    /// `cancel_tool` calls and whether each asked for a halt.
+    tool_cancels: Vec<bool>,
 }
 
 #[derive(Clone)]
@@ -233,6 +235,24 @@ impl Planner for TestPlanner {
     }
     fn cancel(&mut self) {
         self.0.lock().unwrap().cancels += 1;
+    }
+    fn start_tool(
+        &mut self,
+        index: u64,
+        _cmd: &par6_proto::command::ToolAction,
+    ) -> Result<(), WireError> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(e) = s.fail_next_tool.take() {
+            return Err(e);
+        }
+        s.tools_started.push(index);
+        Ok(())
+    }
+    fn poll_tool(&mut self) -> Option<CommandOutcome> {
+        self.0.lock().unwrap().tool_outcomes.pop_front()
+    }
+    fn cancel_tool(&mut self, halt: bool) {
+        self.0.lock().unwrap().tool_cancels.push(halt);
     }
     fn sync(&mut self, _ctx: PlanContext<'_>) {}
     fn set_shapes(
@@ -399,6 +419,19 @@ impl Harness {
         }
         f(&mut s);
         self.writer.publish(&s);
+    }
+
+    /// Settle the tool action on the side channel.
+    fn complete_tool_ok(&self, index: u64) {
+        self.planner
+            .lock()
+            .unwrap()
+            .tool_outcomes
+            .push_back(CommandOutcome {
+                index,
+                error: None,
+                verdict: None,
+            });
     }
 
     fn complete_ok(&self, index: u64) {
@@ -2271,37 +2304,37 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
 }
 
-/// A tool `stop` halts the jaws at ADMISSION, not when the queue reaches
-/// it: queued behind the very move it is meant to halt, a stop that
-/// waited its turn could only run after the jaws had finished the travel
-/// it was sent to interrupt. The queued instance still dispatches in
-/// order behind the move and carries the COMPLETE discipline; other
-/// actions get no out-of-band effect.
+/// A tool action runs BESIDE the motion queue, not in it.
+///
+/// The tool drives its own actuator and never writes a joint slot, so
+/// serialising it behind the queue bought nothing and cost the overlap
+/// that makes a pick cycle quick — a gripper closing during an approach
+/// move. It keeps its index from the same sequence, so ordering across
+/// both lanes is still one number, and that is what the completed mark
+/// has to respect: a tool action finishing first must not declare a
+/// still-running move done.
 #[tokio::test]
-async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
+async fn a_tool_action_runs_beside_the_motion_in_flight() {
     let mut h = start(|cfg| {
         cfg.tools = vec!["gripper".to_owned()];
         cfg.fitted_tool = "gripper".to_owned();
         cfg.tool_dof = 1;
     })
     .await;
-    h.publish(|_| {});
+    h.publish(|s| s.homed = true);
     let mut c = Client::new(&h).await;
 
-    let action = |key: u64, name: &str, params: &[f64]| {
-        Command::ToolAction(par6_proto::command::ToolAction {
-            key,
-            tool_key: "GRIPPER".to_owned(),
-            action: name.to_owned(),
-            params: params
-                .iter()
-                .map(|v| par6_proto::command::ToolParam::Float(*v))
-                .collect(),
+    let action = |req: u32, verb: &str, params: &[f64]| {
+        Command::ToolAction(ToolAction {
+            key: req as u64,
+            tool_key: "gripper".to_owned(),
+            action: verb.to_owned(),
+            params: params.iter().copied().map(ToolParam::Float).collect(),
         })
     };
 
-    // The move dispatches and stays in flight (no outcome yet).
-    let mv = c.ok_index(&action(801, "move", &[0.0, 0.2, 400.0])).await;
+    // A move takes the motion lane and stays there.
+    let mv = c.ok_index(&move_j(901)).await;
     let started = |p: &PlannerState| p.started.iter().map(|(i, _)| *i).collect::<Vec<_>>();
     let deadline = tokio::time::Instant::now() + BUDGET;
     while started(&h.planner.lock().unwrap()) != vec![mv] {
@@ -2312,45 +2345,112 @@ async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    // Admitting the stop fires the RT halt immediately, while the move
-    // still owns the queue head.
-    let st = c.ok_index(&action(802, "stop", &[])).await;
-    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::ToolStop)).await;
-    assert_eq!(
-        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
-        1,
-        "one admission, one halt: {ev:?}"
-    );
-    assert_eq!(
-        started(&h.planner.lock().unwrap()),
-        vec![mv],
-        "the queued stop must not jump the dispatch order"
-    );
-
-    // The halted move settles; only then does the queued stop dispatch.
-    h.complete_ok(mv);
-    c.wait_complete(mv).await;
+    // The tool action starts while it is still running — it neither
+    // waits for the move nor displaces it.
+    let tool = c.ok_index(&action(902, "move", &[1.0, 0.5, 400.0])).await;
     let deadline = tokio::time::Instant::now() + BUDGET;
-    while started(&h.planner.lock().unwrap()) != vec![mv, st] {
+    while h.planner.lock().unwrap().tools_started != vec![tool] {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the queued stop never dispatched"
+            "the tool action never started beside the move"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    h.complete_ok(st);
-    c.wait_complete(st).await;
-
-    // `idle` (or any other action) is a plain queued command: no
-    // out-of-band halt fires for it.
-    let idle = c.ok_index(&action(803, "idle", &[])).await;
-    h.complete_ok(idle);
-    c.wait_complete(idle).await;
-    let ev = h.rt_events();
     assert_eq!(
-        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
-        1,
-        "only the stop admission halts out-of-band: {ev:?}"
+        started(&h.planner.lock().unwrap()),
+        vec![mv],
+        "a tool action must not enter the motion lane"
+    );
+
+    // It settles first. Its own COMPLETE goes out at once, but the
+    // aggregate mark may not pass the move still executing under it.
+    h.complete_tool_ok(tool);
+    let (ok, detail) = c.wait_complete(tool).await;
+    assert!(ok, "the tool action must complete, got {detail:?}");
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            completed_index, ..
+        } => assert!(
+            completed_index < mv as i64,
+            "the mark passed a move that is still executing"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // The move finishes and the mark takes both.
+    h.complete_ok(mv);
+    c.wait_complete(mv).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        if let QueryResult::Queue {
+            completed_index, ..
+        } = c.query(&Command::Queue).await
+        {
+            if completed_index == tool as i64 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the mark never reached the tool action"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A hard stop takes the tool with it, and halts rather than releases:
+/// jaws still travelling are motion, and a protective stop that dropped
+/// whatever they were holding would be a worse answer than keeping it.
+/// A streamable is the exception — cancelling planned motion must leave
+/// a gripper action running, which is the overlap the side channel is
+/// for.
+#[tokio::test]
+async fn a_stop_halts_the_tool_but_a_streamable_leaves_it_alone() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    let action = |req: u32, verb: &str, params: &[f64]| {
+        Command::ToolAction(ToolAction {
+            key: req as u64,
+            tool_key: "gripper".to_owned(),
+            action: verb.to_owned(),
+            params: params.iter().copied().map(ToolParam::Float).collect(),
+        })
+    };
+
+    // A jog cancels planned motion but must not touch the tool.
+    let t1 = c.ok_index(&action(911, "move", &[1.0, 0.5, 400.0])).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while h.planner.lock().unwrap().tools_started != vec![t1] {
+        assert!(tokio::time::Instant::now() < deadline, "tool never started");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    c.send(&jog_j()).await; // fire-and-forget: success is unacked
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        h.planner.lock().unwrap().tool_cancels.is_empty(),
+        "a streamable cancelled a tool action it does not own"
+    );
+
+    // A stop takes it, asking for a halt rather than a release.
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    let (ok, detail) = c.wait_complete(t1).await;
+    assert!(!ok, "a stopped tool action must not report success");
+    assert_eq!(
+        detail.as_ref().map(|e| e.code),
+        Some(ErrorCode::MotnCancelled as u16),
+        "got {detail:?}"
+    );
+    assert_eq!(
+        h.planner.lock().unwrap().tool_cancels,
+        vec![true],
+        "the stop must halt the jaws in place, not release them"
     );
 }
 

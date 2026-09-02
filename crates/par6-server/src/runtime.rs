@@ -195,6 +195,42 @@ pub trait Planner: Send {
     /// samples. Idempotent. No outcome is expected afterwards.
     fn cancel(&mut self);
 
+    /// Begin a tool action on the side channel.
+    ///
+    /// Tool commands drive the tool's own actuator and never write the
+    /// arm's joint slots, so they cannot race motion and do not belong
+    /// in the motion lane. An implementation runs at most one at a
+    /// time; the server completes a superseded one before starting the
+    /// next.
+    ///
+    /// `Err` means nothing started — the server fails that index alone
+    /// and leaves the motion queue untouched.
+    fn start_tool(
+        &mut self,
+        _index: u64,
+        _cmd: &par6_proto::command::ToolAction,
+    ) -> Result<(), WireError> {
+        Err(par6_proto::make_error(
+            par6_proto::ErrorCode::CommValidationError,
+            par6_proto::UNATTRIBUTED,
+            &[("detail", "this runtime has no tool channel")],
+        ))
+    }
+
+    /// Poll the tool side channel; `None` while it is still running.
+    ///
+    /// This must not touch the motion lane. A tool fault is a fault of
+    /// the tool: flushing the sample ring here would stop an arm move
+    /// that has nothing to do with it.
+    fn poll_tool(&mut self) -> Option<CommandOutcome> {
+        None
+    }
+
+    /// Abandon the tool action in flight (if any). `halt` asks the tool
+    /// to stop where it is rather than release, so a stop never drops a
+    /// grasped part. Idempotent; no outcome is expected afterwards.
+    fn cancel_tool(&mut self, _halt: bool) {}
+
     /// The planning context changed (profile / tool / TCP offset /
     /// completion policy). Also called once at server startup with the
     /// initial context.
@@ -355,16 +391,6 @@ pub trait RtCommands: Send {
     /// (`SET_PID_GAINS`). The server has already validated the values
     /// (codec) and the node id (config), so this only forwards.
     fn set_pid_gains(&mut self, gains: &par6_proto::command::SetPidGains);
-
-    /// Halt the tool's jaws in place now, out-of-band of the queue.
-    ///
-    /// A queued `ToolAction("stop")` dispatches only after the very move
-    /// it is meant to halt has settled, so the server fires the physical
-    /// stop at admission; the queued instance re-applies it (idempotent
-    /// at the RT — the re-target reads the same held jaw byte) and
-    /// carries the ack/COMPLETE discipline. Like any command frame, the
-    /// halt aborts a firmware calibration sweep in progress.
-    fn tool_stop(&mut self);
 
     /// Switch the bus backend between hardware and simulator live
     /// (state re-seeded by the implementation).

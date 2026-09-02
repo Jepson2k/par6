@@ -7,6 +7,19 @@
 //! - The index allocator is monotonic and NEVER reset — not even by
 //!   `reset_state` — so a stale pre-reset status frame can never satisfy
 //!   a post-reset wait.
+//! - There are TWO execution lanes and ONE index sequence. Motion runs
+//!   from the queue; a tool action runs beside it, because the tool
+//!   drives its own actuator and never writes a joint slot, so
+//!   serialising the two bought nothing and cost the overlap that makes
+//!   a pick cycle quick. Both draw from the same allocator, so ordering
+//!   across them is still one number — which is why `completed_index`
+//!   advances contiguously rather than by maximum (see
+//!   `advance_completed`): a tool action finishing first must not
+//!   declare a still-running move done.
+//! - A hard stop takes both lanes; a streamable takes only the motion
+//!   lane, since cancelling planned motion is no reason to abandon a
+//!   grip. The tool is halted in place rather than released, so a
+//!   protective stop never drops what the jaws are holding.
 //! - Gating rejections always answer with ERROR (echoed `req_id`),
 //!   including FIRE_AND_FORGET commands whose success stays unacked. A
 //!   refused fire-and-forget additionally latches as the standing error
@@ -157,6 +170,15 @@ enum PostEffect {
 /// with a default.
 const FIRST_COMMAND_INDEX: u64 = 1;
 
+/// The tool action on the side channel. It carries the same
+/// bookkeeping as a motion — index, replier, name for STATUS — but no
+/// blend set, because a tool action is never folded into a motion.
+struct ToolExecuting {
+    index: u64,
+    addr: SocketAddr,
+    params: String,
+}
+
 struct Executing {
     index: u64,
     addr: SocketAddr,
@@ -226,6 +248,7 @@ struct Core<P: Planner, R: RtCommands> {
     /// for the successor its blend radius asks to round a corner into.
     blend_hold: Option<Instant>,
     accepted_index: i64,
+    tool_executing: Option<ToolExecuting>,
     completed_index: i64,
     /// Indexes that finished ahead of `completed_index`. With one
     /// execution lane this is always empty — commands finish in queue
@@ -313,6 +336,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             executing: None,
             blend_hold: None,
             accepted_index: -1,
+            tool_executing: None,
             completed_index: -1,
             finished: BTreeSet::new(),
             last_checkpoint: String::new(),
@@ -479,6 +503,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.settle_enable().await;
         self.settle_flashing().await;
         self.expire_chunks().await;
+        self.collect_tool_outcome().await;
         self.collect_outcomes().await;
         self.pump().await;
     }
@@ -997,12 +1022,24 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // A planned move cancels streaming.
             self.runtime.rt.cancel_stream();
         }
-        if matches!(&cmd, Command::ToolAction(p) if p.action == "stop") {
-            // Halt-in-place cannot wait its turn behind the very move it
-            // halts: the physical stop fires now, and the queued instance
-            // (idempotent at the RT) carries the COMPLETE discipline once
-            // the queue reaches it.
-            self.runtime.rt.tool_stop();
+        if let Command::ToolAction(p) = &cmd {
+            // A tool action drives the tool's own actuator and never
+            // writes a joint slot, so it runs beside the motion queue
+            // rather than in it — that is what lets a gripper open
+            // during an approach move. It still takes its index from
+            // the same sequence, so ordering across both lanes is one
+            // number.
+            let params = params_summary(&cmd);
+            self.reply(
+                addr,
+                &Reply::Ok {
+                    req_id,
+                    index: Some(index),
+                },
+            )
+            .await;
+            self.start_tool_action(index, addr, params, p.clone()).await;
+            return;
         }
         self.pending.push_back(Pending { index, cmd, addr });
         self.reply(
@@ -1014,6 +1051,77 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         )
         .await;
         self.pump().await;
+    }
+
+    /// Put a tool action on the side channel, completing whatever it
+    /// supersedes first.
+    async fn start_tool_action(
+        &mut self,
+        index: u64,
+        addr: SocketAddr,
+        params: String,
+        cmd: par6_proto::command::ToolAction,
+    ) {
+        // Depth one, as the reference runtime has it. The superseded
+        // action was acked and something may be waiting on it, so it is
+        // completed rather than dropped in silence.
+        if let Some(prev) = self.tool_executing.take() {
+            let error = make_error(
+                ErrorCode::MotnCancelled,
+                prev.index as i64,
+                &[("scope", "a superseding tool action")],
+            );
+            self.advance_completed(prev.index);
+            self.push_complete(prev.addr, prev.index, Some(error), None)
+                .await;
+        }
+        match self.runtime.planner.start_tool(index, &cmd) {
+            Ok(()) => {
+                self.tool_executing = Some(ToolExecuting {
+                    index,
+                    addr,
+                    params,
+                });
+            }
+            // A refused verb never touched the tool and never touched
+            // motion, so unlike a failed motion it must not clear the
+            // queue standing behind it.
+            Err(mut error) => {
+                error.command_index = index as i64;
+                self.standing_error = Some(error.clone());
+                self.action_state = ActionState::Error;
+                self.advance_completed(index);
+                self.push_complete(addr, index, Some(error), None).await;
+            }
+        }
+    }
+
+    /// Drain the tool side channel. Runs before the motion lane's
+    /// outcomes and before `pump`, so a finished tool action is reported
+    /// on the same tick it settles rather than behind a motion.
+    async fn collect_tool_outcome(&mut self) {
+        let Some(out) = self.runtime.planner.poll_tool() else {
+            return;
+        };
+        let Some(ex) = &self.tool_executing else {
+            return; // outcome of a cancelled action
+        };
+        if ex.index != out.index {
+            return; // stale
+        }
+        let ex = self.tool_executing.take().expect("checked above");
+        if let Some(mut error) = out.error {
+            error.command_index = ex.index as i64;
+            self.standing_error = Some(error.clone());
+            self.action_state = ActionState::Error;
+            self.advance_completed(ex.index);
+            self.push_complete(ex.addr, ex.index, Some(error), None)
+                .await;
+        } else {
+            self.advance_completed(ex.index);
+            self.push_complete(ex.addr, ex.index, None, out.verdict)
+                .await;
+        }
     }
 
     // ---- gating & validation ----------------------------------------------
@@ -1313,12 +1421,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// caller's [`Self::complete_cancelled`].
     fn cancel_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        let dropped = self.drop_active();
+        let mut dropped = self.drop_active();
+        // The tool goes with it. `stop` means halt motion, and jaws
+        // still travelling are motion — `halt()` below never reached
+        // them, so a stop used to report the action cancelled while the
+        // gripper carried on closing. The tool is halted in place, not
+        // released: dropping a grasped part is a worse answer to a
+        // protective stop than holding it.
+        dropped.extend(self.drop_tool_action(true));
         if self.active_stream.take().is_some() {
             self.runtime.rt.cancel_stream();
         }
         self.runtime.rt.halt();
         dropped
+    }
+
+    /// Take the tool action off the side channel so the caller can speak
+    /// its cancellation. `halt` asks the tool to stop where it is.
+    ///
+    /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
+    /// arriving cancels planned motion, but a gripper closing under it
+    /// is exactly the overlap the side channel exists to allow.
+    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+        self.runtime.planner.cancel_tool(halt);
+        self.tool_executing.take().map(|t| (t.index, t.addr))
     }
 
     /// estop / reset_state / simulator-toggle scope: everything.
@@ -1632,6 +1758,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             )
         } else if let Some(name) = self.stream_shown() {
             (name.to_owned(), ActionState::Executing, String::new())
+        } else if let Some(tool) = &self.tool_executing {
+            // The side channel shows only when the motion lane is idle:
+            // an operator watching a program wants to see the move, and
+            // a jaw action running under it is the tool status's job.
+            (
+                cmd_name(CmdType::ToolAction).to_owned(),
+                ActionState::Executing,
+                tool.params.clone(),
+            )
         } else if self.effective_error().is_some() {
             // Nothing is running and an error stands: the action state is
             // the error, whether a command earned it or the RT latched it.

@@ -167,12 +167,6 @@ struct ToolSpec {
 }
 
 enum InFlightKind {
-    Tool {
-        /// The settle epoch read before the command was sent. The RT
-        /// bumps it when it arms, so a verdict still carrying this
-        /// value belongs to the PREVIOUS action, not to ours.
-        epoch_at_send: u32,
-    },
     Exec {
         ring_index: u32,
         samples: Vec<RingSample>,
@@ -192,6 +186,16 @@ struct InFlight {
     server_index: u64,
     started: Instant,
     kind: InFlightKind,
+}
+
+/// The tool action on the side channel. It owns no ring samples and no
+/// planner state, which is what lets it run beside a motion.
+struct ToolInFlight {
+    server_index: u64,
+    /// The settle epoch read before the command was sent. The RT bumps
+    /// it when it arms, so a verdict still carrying this value belongs
+    /// to the PREVIOUS action, not to ours.
+    epoch_at_send: u32,
 }
 
 /// The planner's kinematics kit (feature `ffi`): its own model instance,
@@ -220,6 +224,7 @@ pub(crate) struct Par6Planner {
     profile: Profile,
     tool: Option<ToolSpec>,
     inflight: Option<InFlight>,
+    tool_inflight: Option<ToolInFlight>,
     enablement: Enablement,
     /// Latched near-singularity warning for the cart path in flight
     /// (vendor thresholds; STATUS `warnings` carries it).
@@ -295,6 +300,7 @@ impl Par6Planner {
             profile: Profile::default(),
             tool,
             inflight: None,
+            tool_inflight: None,
             // Nothing measured yet, and the wire has no "unknown": claim
             // no freedom until the first probe runs (the next poll).
             enablement: NO_FREEDOM,
@@ -755,7 +761,7 @@ impl Par6Planner {
         &mut self,
         snap: &StateSnapshot,
         cmd: &par6_proto::command::ToolAction,
-    ) -> Result<InFlightKind, WireError> {
+    ) -> Result<u32, WireError> {
         let invalid = |detail: String| {
             make_error(
                 ErrorCode::CommValidationError,
@@ -833,7 +839,7 @@ impl Par6Planner {
                 )));
             }
         }
-        Ok(InFlightKind::Tool { epoch_at_send })
+        Ok(epoch_at_send)
     }
 
     fn start_move_j(
@@ -1282,10 +1288,6 @@ impl Par6Planner {
                 }
             }
             Command::Checkpoint(_) | Command::SelectTool(_) => InFlightKind::Instant,
-            Command::ToolAction(p) => {
-                let snap = self.snapshots.latest();
-                self.start_tool_action(&snap, p)?
-            }
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -1312,9 +1314,12 @@ impl Par6Planner {
     /// corner (positive blend radius) AND the next queued command is a
     /// move of the SAME family — straight cartesian moves round corners
     /// against straight cartesian moves, joint moves against joint
-    /// moves. Anything else (an arc, a delay, a tool action, a move with
-    /// no radius) ends the chain: the arm stops at that target, which is
-    /// exactly what "no blend radius" asks for.
+    /// moves. Anything else (an arc, a delay, a move with no radius)
+    /// ends the chain: the arm stops at that target, which is exactly
+    /// what "no blend radius" asks for. A tool action cannot end one —
+    /// it runs on the side channel and never joins the queue, so a
+    /// gripper command between two blended moves no longer breaks the
+    /// corner it had no reason to break.
     ///
     /// A positive radius on the LAST move of a chain has nothing to
     /// round — there is no following segment — so that move stops at its
@@ -1381,39 +1386,6 @@ impl Par6Planner {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
-            InFlightKind::Tool { epoch_at_send } => {
-                // Whether a jaw action finished is decided against the
-                // reply stream at the tick rate (see
-                // `par6_rt::gripper_settle`), because every window in
-                // that decision counts replies and this loop polls at
-                // its own unrelated cadence.
-                if snap.tool.epoch == *epoch_at_send {
-                    return None; // the RT has not armed it yet
-                }
-                match snap.tool.verdict {
-                    ToolSettle::Running => None,
-                    ToolSettle::Done => Some(Ok(None)),
-                    ToolSettle::Settled(od) => Some(Ok(Some(od as u8))),
-                    ToolSettle::Timeout(w) => Some(Err(make_error(
-                        ErrorCode::MotnToolTimeout,
-                        UNATTRIBUTED,
-                        &[("state", w.as_str())],
-                    ))),
-                    ToolSettle::Fault(bits) => Some(Err(make_error(
-                        ErrorCode::MotnToolFault,
-                        UNATTRIBUTED,
-                        &[("fault_code", &bits.to_string())],
-                    ))),
-                    // Another owner (homing, a flashing window) took the
-                    // gripper and released it on our behalf. Nothing is
-                    // left to complete, and waiting would hang the queue.
-                    ToolSettle::Unarmed => Some(Err(make_error(
-                        ErrorCode::MotnCancelled,
-                        UNATTRIBUTED,
-                        &[("scope", "the gripper changed owner")],
-                    ))),
-                }
-            }
             InFlightKind::Exec {
                 ring_index,
                 seen_exec,
@@ -1964,6 +1936,81 @@ impl Planner for Par6Planner {
             self.discard_planned();
         }
         self.near_singularity = None;
+    }
+
+    fn start_tool(
+        &mut self,
+        index: u64,
+        cmd: &par6_proto::command::ToolAction,
+    ) -> Result<(), WireError> {
+        let snap = self.snapshots.latest();
+        let epoch_at_send = self.start_tool_action(&snap, cmd)?;
+        self.tool_inflight = Some(ToolInFlight {
+            server_index: index,
+            epoch_at_send,
+        });
+        Ok(())
+    }
+
+    /// Read the RT's settle verdict for the tool action in flight.
+    ///
+    /// Deliberately narrow: it touches `tool_inflight` and nothing else.
+    /// The motion lane's failure path flushes the sample ring and forces
+    /// IDLE, and reaching it from here would stop an arm move because a
+    /// gripper faulted.
+    fn poll_tool(&mut self) -> Option<CommandOutcome> {
+        let fl = self.tool_inflight.as_ref()?;
+        let snap = self.snapshots.latest();
+        if snap.tool.epoch == fl.epoch_at_send {
+            return None; // the RT has not armed it yet
+        }
+        let index = fl.server_index;
+        let (error, verdict) = match snap.tool.verdict {
+            ToolSettle::Running => return None,
+            ToolSettle::Done => (None, None),
+            ToolSettle::Settled(od) => (None, Some(od as u8)),
+            ToolSettle::Timeout(w) => (
+                Some(make_error(
+                    ErrorCode::MotnToolTimeout,
+                    UNATTRIBUTED,
+                    &[("state", w.as_str())],
+                )),
+                None,
+            ),
+            ToolSettle::Fault(bits) => (
+                Some(make_error(
+                    ErrorCode::MotnToolFault,
+                    UNATTRIBUTED,
+                    &[("fault_code", &bits.to_string())],
+                )),
+                None,
+            ),
+            // Another owner (homing, a flashing window) took the tool
+            // and released it on our behalf. Nothing is left to
+            // complete, and waiting would hang the client.
+            ToolSettle::Unarmed => (
+                Some(make_error(
+                    ErrorCode::MotnCancelled,
+                    UNATTRIBUTED,
+                    &[("scope", "the tool changed owner")],
+                )),
+                None,
+            ),
+        };
+        self.tool_inflight = None;
+        Some(CommandOutcome {
+            index,
+            error,
+            verdict,
+        })
+    }
+
+    fn cancel_tool(&mut self, halt: bool) {
+        if self.tool_inflight.take().is_some() && halt {
+            // Halt in place rather than release: a stop must never drop
+            // whatever the jaws are holding.
+            self.link.send(RtCommand::GripperStop);
+        }
     }
 
     fn warnings(&self) -> Vec<WireError> {
