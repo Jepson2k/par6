@@ -539,10 +539,11 @@ impl CoreClient {
 
     // --------------------------------------------------------- queued
 
-    fn home<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    #[pyo3(signature = (calibrate=false))]
+    fn home<'py>(&self, py: Python<'py>, calibrate: bool) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         future_into_py(py, async move {
-            match client.home().await {
+            match client.home(calibrate).await {
                 Ok(Some(index)) => Ok(index as i64),
                 Ok(None) => Ok(-1),
                 Err(e) => Err(client_err(e)),

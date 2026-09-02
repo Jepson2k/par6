@@ -325,6 +325,18 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
         assert await client.wait_command(home_index, timeout=HOMING_BUDGET_S) is True, (
             f"homing did not complete; daemon log:\n{daemon.log()}"
         )
+
+        # home(calibrate=True) on a referenced arm re-runs the seek instead of
+        # the planned return move: the RT core drops into HOMING mode again.
+        assert await client.wait_status(lambda s: s.homed, timeout=STEP_BUDGET_S)
+        recal_index = await client.home(calibrate=True)
+        assert recal_index >= 0
+        assert await client.wait_status(
+            lambda s: s.mode == ControllerMode.HOMING, timeout=STEP_BUDGET_S
+        ), f"calibrate=True never entered HOMING; daemon log:\n{daemon.log()}"
+        assert (
+            await client.wait_command(recal_index, timeout=HOMING_BUDGET_S) is True
+        ), f"re-referencing did not complete; daemon log:\n{daemon.log()}"
         assert await client.wait_status(lambda s: s.homed, timeout=STEP_BUDGET_S)
 
         homed = await client.angles()

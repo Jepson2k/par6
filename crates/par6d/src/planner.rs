@@ -1283,16 +1283,17 @@ impl Par6Planner {
         }
         let kind = match cmd {
             Command::MoveJ(p) => self.start_move_j(p)?,
-            Command::Home(_) => {
+            Command::Home(p) => {
                 let snap = self.snapshots.latest();
-                if snap.homed {
+                if snap.homed && !p.calibrate {
                     // An arm that already holds its references does not
                     // need them re-established: HOME is a normal planned
                     // return to the configured home pose, which is what
                     // makes a Home button press cost seconds instead of
                     // a full referencing seek (parol6 routes an
                     // already-referenced `HomeCmd` to exactly this move,
-                    // `server/motion_planner.py:239-241`).
+                    // `server/motion_planner.py:239-241`). `calibrate`
+                    // asks for the seek regardless.
                     self.start_joint_move(
                         &snap,
                         self.home_pose_rad,
@@ -1301,6 +1302,9 @@ impl Par6Planner {
                         None,
                     )?
                 } else {
+                    // The RT core only enters Homing from Idle; after a
+                    // completed planned move it is still holding in Exec.
+                    self.link.send(RtCommand::SetMode(Mode::Idle));
                     self.link.send(RtCommand::SetMode(Mode::Homing));
                     InFlightKind::Home { seen_homing: false }
                 }

@@ -640,25 +640,17 @@ class AsyncRobotClient(_RobotClientABC):
         timeout: float = 60.0,
         **wait_kwargs: Any,
     ) -> int:
-        """Move to the robot's home position (full referencing sequence when
-        unhomed).  Returns the command index (>= 0), -1 when unconfirmed.
-
-        ``calibrate=True`` asks for the referencing sequence on an already
-        referenced arm; par6d has no forced re-reference command yet, so it
-        raises NotImplementedError rather than silently homing.
+        """Move to the robot's home position: the full referencing seek when
+        unhomed or when ``calibrate=True``, otherwise a planned return to the
+        home pose.  Returns the command index (>= 0), -1 when unconfirmed.
 
         Category: Motion
 
         Example:
             rbt.home()
         """
-        if calibrate:
-            raise NotImplementedError(
-                "par6d cannot re-reference a referenced arm yet; "
-                "home(calibrate=True) needs a forced-homing command in the runtime"
-            )
         core = await self._ensure_core()
-        index = await self._call(core.home())
+        index = await self._call(core.home(calibrate))
         if index >= 0:
             self._last_command_index = index
         if wait and index >= 0 and not await self.wait_command(index, timeout=timeout):
