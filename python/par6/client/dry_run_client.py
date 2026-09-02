@@ -403,7 +403,8 @@ class DryRunRobotClient:
 
     def home(self, **kwargs: Any) -> DryRunResultData:
         """Reference the arm, or return it to the park pose when it already
-        holds its references.
+        holds its references. ``calibrate=True`` raises NotImplementedError,
+        as the live client does — par6d has no forced re-reference yet.
 
         Two different commands wear one name on the runtime
         (``Par6Planner``'s ``Command::Home``). Un-referenced, HOME runs the
@@ -415,6 +416,11 @@ class DryRunRobotClient:
         button press cost seconds instead of a full seek, and it is planned
         and collision-gated by the engine like any other move.
         """
+        if kwargs.get("calibrate"):
+            raise NotImplementedError(
+                "par6d cannot re-reference a referenced arm yet; "
+                "home(calibrate=True) needs a forced-homing command in the runtime"
+            )
         pending = self._close_chain()
         if not self._preview.homed():
             ready = _cfg.homing_ready_pose_rad()
