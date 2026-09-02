@@ -68,6 +68,8 @@ pub struct Kin {
     v_full: Vec<f64>,
     a_full: Vec<f64>,
     g_full: Vec<f64>,
+    /// Gravity regressor workspace: `nq_full` rows by `4 * bodies`.
+    regressor_full: Vec<f64>,
 }
 
 impl std::fmt::Debug for Kin {
@@ -210,6 +212,7 @@ impl Kin {
         if nq_full < NQ {
             return Err(KinError::ArmJoints { got: nq_full });
         }
+        let bodies = model.num_bodies();
         let mut kin = Kin {
             model,
             opw: Err(OpwError::JointCount(0)),
@@ -220,6 +223,7 @@ impl Kin {
             v_full: vec![0.0; nq_full],
             a_full: vec![0.0; nq_full],
             g_full: vec![0.0; nq_full],
+            regressor_full: vec![0.0; nq_full * 4 * bodies],
         };
         kin.opw = Opw::derive(urdf, &mut kin);
         Ok(kin)
@@ -309,6 +313,48 @@ impl Kin {
         self.model.gravity_into(&self.q_full, &mut self.tau_full)?;
         tau.copy_from_slice(&self.tau_full[..NQ]);
         Ok(())
+    }
+
+    /// Moving bodies in the model (one per joint after the universe).
+    pub fn body_count(&self) -> usize {
+        self.model.num_bodies()
+    }
+
+    /// Gravity regressor `Y(q)` for the arm joints, written into `out`
+    /// (`NQ` rows by `4 * body_count()` columns, row-major): the
+    /// linear-in-parameters form of [`Self::gravity`],
+    /// `G(q) = Y(q) · θ` with `θ = [m_i, m_i c_i]` per body (mass and
+    /// first moment in the body's joint frame). Jaw joints ride at zero.
+    pub fn gravity_regressor(&mut self, q: &[f64; NQ], out: &mut [f64]) -> Result<(), KinError> {
+        let cols = 4 * self.body_count();
+        if out.len() != NQ * cols {
+            return Err(KinError::Ffi(pinokin_sys::Error::Dimension {
+                expected: NQ * cols,
+                got: out.len(),
+            }));
+        }
+        self.set_q(q);
+        self.model
+            .gravity_regressor_into(&self.q_full, &mut self.regressor_full)?;
+        out.copy_from_slice(&self.regressor_full[..NQ * cols]);
+        Ok(())
+    }
+
+    /// Body `body`'s `[m, m cx, m cy, m cz]` in its joint frame, as the
+    /// model carries it (the config tool folded into the payload body).
+    pub fn body_inertial(&self, body: usize) -> Result<[f64; 4], KinError> {
+        Ok(self.model.body_inertial(body)?)
+    }
+
+    /// The config tool's `[m, m c]` share of the payload body (zeros
+    /// without a tool mass).
+    pub fn tool_inertial(&self) -> Result<[f64; 4], KinError> {
+        Ok(self.model.tool_inertial()?)
+    }
+
+    /// Name of the joint carrying body `body`.
+    pub fn joint_name(&self, body: usize) -> Result<String, KinError> {
+        Ok(self.model.joint_name(body)?)
     }
 
     /// Dynamic feedforward torque `M(q)·q̈ + C(q,q̇)·q̇` \[Nm\] for the arm

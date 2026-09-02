@@ -11,6 +11,7 @@
 #![allow(clippy::approx_constant)]
 
 use std::path::PathBuf;
+use std::time::Instant;
 
 use par6_kin::{GripperVariant, IkOutcome, Kin, NQ};
 
@@ -152,19 +153,26 @@ fn ik_recovers_fk_poses_and_reports_unreachable() {
                 kin.ik(q, &target, &mut q_out).unwrap(),
                 IkOutcome::Converged
             );
+            // At a wrist singularity the fourth and sixth axes line up,
+            // so only their sum is determined, and the whole solve is
+            // ill-conditioned: the closed form still lands on the pose
+            // (checked above, exactly) but returns joints good to
+            // microradians rather than nanoradians. A microradian is six
+            // orders of magnitude below anything the arm can resolve.
             let singular = q[4].abs() < 1e-9;
+            let tol = if singular { 1e-5 } else { 1e-9 };
             for (j, (g, w)) in q_out.iter().zip(q).enumerate() {
                 if singular && (j == 3 || j == 5) {
                     continue;
                 }
                 assert!(
-                    (g - w).abs() < 1e-9,
+                    (g - w).abs() < tol,
                     "{variant:?} case {c} joint {j}: {g} vs {w}"
                 );
             }
             if singular {
                 assert!(
-                    ((q_out[3] + q_out[5]) - (q[3] + q[5])).abs() < 1e-9,
+                    ((q_out[3] + q_out[5]) - (q[3] + q[5])).abs() < tol,
                     "{variant:?} case {c}: q4 + q6 must be preserved through the singularity"
                 );
             }
@@ -210,4 +218,82 @@ fn nan_inputs_yield_nan_pose_not_panic() {
     let mut q_out = [0.0; NQ];
     let outcome = kin.ik(&q, &target, &mut q_out).unwrap();
     assert_eq!(outcome, IkOutcome::Unreachable);
+}
+
+/// What the RT tick spends on kinematics, measured and printed.
+///
+/// The tick calls exactly two of these: forward kinematics for the pose
+/// the snapshot publishes, and gravity for the feedforward. The rest run
+/// on the planner and housekeeping threads. The guard is a catastrophe
+/// check against the tick the runtime is aiming at, not a benchmark gate:
+/// a lost preallocation or an accidental model rebuild costs orders of
+/// magnitude, runner noise costs a factor of two.
+#[test]
+fn per_tick_kinematics_cost_is_reported() {
+    /// The tick period the runtime targets past 250 Hz.
+    const TARGET_TICK_US: f64 = 1_000.0;
+    /// The share of it the RT kinematics may take.
+    const BUDGET_FRACTION: f64 = 0.2;
+
+    let n = 500;
+    for variant in [GripperVariant::Flange, GripperVariant::Ssg48] {
+        let mut kin = load(variant);
+        let mut pose = [0.0; 16];
+        let mut tau = [0.0; NQ];
+        let mut jac = [0.0; 6 * NQ];
+        let mut tcp = [0.0; 6];
+        let mut q_out = [0.0; NQ];
+        kin.fk(&CASES[0], &mut pose).unwrap();
+
+        let mut rt_us = 0.0;
+        for (name, mut call) in [
+            (
+                "fk",
+                Box::new(|k: &mut Kin, q: &[f64; NQ]| {
+                    k.fk(q, &mut pose).unwrap();
+                }) as Box<dyn FnMut(&mut Kin, &[f64; NQ])>,
+            ),
+            (
+                "gravity",
+                Box::new(|k: &mut Kin, q: &[f64; NQ]| {
+                    k.gravity(q, &mut tau).unwrap();
+                }),
+            ),
+            (
+                "tcp",
+                Box::new(|k: &mut Kin, q: &[f64; NQ]| {
+                    k.tcp(q, &mut tcp);
+                }),
+            ),
+            (
+                "jacobian",
+                Box::new(|k: &mut Kin, q: &[f64; NQ]| {
+                    k.jacobian(q, &mut jac).unwrap();
+                }),
+            ),
+            (
+                "ik",
+                Box::new(|k: &mut Kin, q: &[f64; NQ]| {
+                    let mut target = [0.0; 16];
+                    k.fk(q, &mut target).unwrap();
+                    k.ik(q, &target, &mut q_out).unwrap();
+                }),
+            ),
+        ] {
+            let t0 = Instant::now();
+            for i in 0..n {
+                call(&mut kin, &CASES[i % CASES.len()]);
+            }
+            let each = t0.elapsed().as_secs_f64() * 1e6 / n as f64;
+            println!("{variant:?} {name:<9} {each:8.2} us");
+            if name == "fk" || name == "gravity" {
+                rt_us += each;
+            }
+        }
+        assert!(
+            rt_us < TARGET_TICK_US * BUDGET_FRACTION,
+            "{variant:?}: the RT tick's kinematics take {rt_us:.1} us of a \
+             {TARGET_TICK_US:.0} us tick"
+        );
+    }
 }

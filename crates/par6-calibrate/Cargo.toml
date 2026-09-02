@@ -1,0 +1,20 @@
+[package]
+name = "par6-calibrate"
+description = "Gravity-model calibration for the PAR6 arm: rest in a pose set, fit link masses and centres of mass to the held torques, write the URDF."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "par6-calibrate-gravity"
+path = "src/main.rs"
+
+[dependencies]
+par6-client = { workspace = true }
+par6-config = { workspace = true }
+par6-kin = { workspace = true, features = ["ffi"] }
+par6-proto = { workspace = true }
+tokio = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }

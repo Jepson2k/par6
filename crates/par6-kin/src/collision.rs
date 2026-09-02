@@ -12,11 +12,12 @@
 //! single check costs tens of microseconds to a few milliseconds depending
 //! on how close the arm is to contact.
 //!
-//! Measured per-waypoint cost against the vendor collision meshes
+//! Measured per-waypoint cost against the vendor collision meshes, on
+//! the control box in release
 //! (`tests/collision_world.rs::per_waypoint_check_cost_is_reported`
-//! reprints these on every run): self-collision only, 17 µs for the flange
-//! and 180 µs for the gripper variants; with a box keep-out, 28 µs / 224 µs;
-//! with a per-shape margin, which costs coal its early exit, ~300 µs / 730 µs.
+//! reprints these on every run): self-collision only, 14 us for the
+//! flange and 19 us for a gripper variant; with a box keep-out, 25 us
+//! either way; with a per-shape margin, 26 us and 34 us.
 //! A [`ShapeKind::Plane`] keep-out is the outlier at ~35 ms — see its docs.
 //!
 //! [`ShapeKind::Plane`]: crate::ShapeKind::Plane

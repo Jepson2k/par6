@@ -9,6 +9,7 @@
 #include <pinocchio/algorithm/frames.hpp>
 #include <pinocchio/algorithm/jacobian.hpp>
 #include <pinocchio/algorithm/aba.hpp>
+#include <pinocchio/algorithm/regressor.hpp>
 #include <pinocchio/algorithm/rnea.hpp>
 #include <pinocchio/spatial/explog.hpp>
 
@@ -47,6 +48,9 @@ struct par6_kin {
     // replaceable and clearable at runtime.
     pinocchio::Inertia pristine_inertia = pinocchio::Inertia::Zero();
     pinocchio::JointIndex payload_joint = 0;
+    // The create-time tool's inertia expressed at the payload joint, kept
+    // so a calibration can separate the arm link from the tool it carries.
+    pinocchio::Inertia tool_inertia_joint = pinocchio::Inertia::Zero();
 
     // Preallocated workspace — every post-create call is allocation-free.
     Eigen::VectorXd q;
@@ -159,9 +163,10 @@ par6_kin *par6_kin_create(const char *urdf_path,
                 const pinocchio::Symmetric3 I(tool->inertia[0], tool->inertia[1],
                                               tool->inertia[2], tool->inertia[3],
                                               tool->inertia[4], tool->inertia[5]);
-                h->model.appendBodyToJoint(
-                    fr.parentJoint, pinocchio::Inertia(tool->mass, com, I),
-                    fr.placement);
+                const pinocchio::Inertia tool_inertia(tool->mass, com, I);
+                h->model.appendBodyToJoint(fr.parentJoint, tool_inertia,
+                                           fr.placement);
+                h->tool_inertia_joint = fr.placement.act(tool_inertia);
             }
         }
 
@@ -233,6 +238,80 @@ par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau) {
     } catch (const std::exception &) {
         return PAR6_ERR_EXCEPTION;
     }
+}
+
+int32_t par6_kin_num_bodies(const par6_kin *h) {
+    if (h == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    return static_cast<int32_t>(h->model.njoints) - 1;
+}
+
+par6_status par6_kin_gravity_regressor(par6_kin *h, const double *q, double *out_y) {
+    if (h == nullptr || q == nullptr || out_y == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    try {
+        h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
+        const auto &Y = pinocchio::computeJointTorqueRegressor(
+            h->model, h->data, h->q, h->v_zero, h->a_zero);
+        const int nb = static_cast<int>(h->model.njoints) - 1;
+        const int nv = static_cast<int>(h->model.nv);
+        // toDynamicParameters() order per body: m, m c (3), then the six
+        // inertia terms, which gravity never sees.
+        for (int r = 0; r < nv; ++r) {
+            for (int b = 0; b < nb; ++b) {
+                for (int k = 0; k < 4; ++k) {
+                    out_y[r * 4 * nb + b * 4 + k] = Y(r, b * 10 + k);
+                }
+            }
+        }
+        return PAR6_OK;
+    } catch (const std::exception &) {
+        return PAR6_ERR_EXCEPTION;
+    }
+}
+
+static void write_inertial4(const pinocchio::Inertia &I, double *out4) {
+    out4[0] = I.mass();
+    const Eigen::Vector3d h = I.lever() * I.mass();
+    out4[1] = h.x();
+    out4[2] = h.y();
+    out4[3] = h.z();
+}
+
+par6_status par6_kin_body_inertial(const par6_kin *h, int32_t body, double *out4) {
+    if (h == nullptr || out4 == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (body < 0 || body >= static_cast<int32_t>(h->model.njoints) - 1) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    write_inertial4(h->model.inertias[static_cast<size_t>(body) + 1], out4);
+    return PAR6_OK;
+}
+
+par6_status par6_kin_tool_inertial(const par6_kin *h, double *out4) {
+    if (h == nullptr || out4 == nullptr) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    write_inertial4(h->tool_inertia_joint, out4);
+    return PAR6_OK;
+}
+
+int32_t par6_kin_joint_name(const par6_kin *h, int32_t body, char *buf, int32_t len) {
+    if (h == nullptr || buf == nullptr || len <= 0) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    if (body < 0 || body >= static_cast<int32_t>(h->model.njoints) - 1) {
+        return PAR6_ERR_INVALID_ARG;
+    }
+    const std::string &name = h->model.names[static_cast<size_t>(body) + 1];
+    const int32_t n = static_cast<int32_t>(name.size());
+    const int32_t copy = n < len - 1 ? n : len - 1;
+    std::memcpy(buf, name.data(), static_cast<size_t>(copy));
+    buf[copy] = '\0';
+    return n;
 }
 
 par6_status par6_kin_inverse_dynamics(par6_kin *h, const double *q,

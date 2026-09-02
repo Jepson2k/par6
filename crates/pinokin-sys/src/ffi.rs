@@ -98,6 +98,26 @@ extern "C" {
 
     pub fn par6_kin_gravity(h: *mut par6_kin, q: *const f64, out_tau: *mut f64) -> par6_status;
 
+    /// Moving bodies in the model (one per joint after the universe).
+    pub fn par6_kin_num_bodies(h: *const par6_kin) -> i32;
+
+    /// Gravity regressor `Y(q)`: `nq` rows by `4 * num_bodies` columns,
+    /// row-major, with `G(q) = Y(q) * [m_i, m_i c_i]_i`.
+    pub fn par6_kin_gravity_regressor(
+        h: *mut par6_kin,
+        q: *const f64,
+        out_y: *mut f64,
+    ) -> par6_status;
+
+    /// Body `body`'s `[m, m cx, m cy, m cz]` in its joint frame.
+    pub fn par6_kin_body_inertial(h: *const par6_kin, body: i32, out4: *mut f64) -> par6_status;
+
+    /// The create-time tool's `[m, m c]` contribution to the payload joint.
+    pub fn par6_kin_tool_inertial(h: *const par6_kin, out4: *mut f64) -> par6_status;
+
+    /// Name of the joint carrying body `body`; returns its length.
+    pub fn par6_kin_joint_name(h: *const par6_kin, body: i32, buf: *mut c_char, len: i32) -> i32;
+
     /// RNEA with real velocity and acceleration: the torque that produces
     /// `a` at `q` with `v`. Gravity is included, so zero `v`/`a` reduces
     /// exactly to [`par6_kin_gravity`].

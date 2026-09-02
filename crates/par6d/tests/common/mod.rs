@@ -97,6 +97,44 @@ fn redirect_bus_grant() {
     debug_assert!(dir.is_dir());
 }
 
+/// A daemon whose STATUS broadcast is aimed at `status_port` on
+/// loopback, for a test that listens with a real `par6_client::Client`
+/// instead of the rig's own socket. The telemetry socket rides along so
+/// the daemon's telemetry port stays private to this daemon.
+pub fn boot_for_client(
+    config: PathBuf,
+    sim_dynamics: bool,
+    status_port: u16,
+) -> Result<(Daemon, UdpSocket), String> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    redirect_bus_grant();
+    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
+    let opts = Options {
+        sim: true,
+        sim_dynamics,
+        config: Some(config),
+        assets: Some(assets_dir()),
+        command_port: Some(0),
+        bind: Some("127.0.0.1".parse().unwrap()),
+        status_host: Some("127.0.0.1".parse().unwrap()),
+        status_port: Some(status_port),
+        telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
+        status_transport: Some(StatusTransport::Unicast),
+        ..Options::default()
+    };
+    let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
+    Ok((daemon, telemetry_rx))
+}
+
+/// A loopback UDP port nothing is bound to right now.
+pub fn free_udp_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .expect("probe socket")
+        .local_addr()
+        .unwrap()
+        .port()
+}
+
 /// A running daemon plus the sockets its broadcasts land on.
 pub struct Rig {
     daemon: Option<Daemon>,

@@ -1,5 +1,6 @@
 //! The `ffi` test executables run straight out of `target/`, where nothing
-//! has installed the shim beside them, so they carry the shim directory as
+//! has installed the shim beside them, so every linked target carries the
+//! shim directory as
 //! an rpath: `PAR6_SHIM_LIB_DIR` when set, else the repo's own
 //! `.ffi/shim/lib` from `scripts/ffi/setup.sh`.
 fn main() {
@@ -11,6 +12,6 @@ fn main() {
             .map(|p| p.to_string_lossy().into_owned())
     });
     if let Some(dir) = dir {
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{dir}");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
     }
 }

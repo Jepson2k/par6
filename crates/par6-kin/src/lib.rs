@@ -126,6 +126,9 @@ mod collision;
 mod shapes;
 
 #[cfg(feature = "ffi")]
+pub mod gravity;
+
+#[cfg(feature = "ffi")]
 pub use kin::{IkOutcome, Kin, KinError, Pose, IK_POSE_TOL};
 
 #[cfg(feature = "ffi")]

@@ -79,6 +79,30 @@ par6_status par6_kin_jacobian(par6_kin *h, const double *q, double *out_J);
  * tool inertia when given at create. out_tau: nq doubles. */
 par6_status par6_kin_gravity(par6_kin *h, const double *q, double *out_tau);
 
+/* Moving bodies in the model (one per joint after the universe). */
+int32_t par6_kin_num_bodies(const par6_kin *h);
+
+/** Gravity regressor Y(q): `nq` rows by `4 * num_bodies` columns,
+ *  row-major, such that G(q) = Y(q) * theta with
+ *  theta = [m_1, m_1 c_1 (3), m_2, m_2 c_2 (3), ...] — each body's mass
+ *  and first moment in its own joint frame. The linear-in-parameters
+ *  form of par6_kin_gravity(), for identification. Allocation-free. */
+par6_status par6_kin_gravity_regressor(par6_kin *h, const double *q, double *out_y);
+
+/* Body `body`'s [m, m cx, m cy, m cz] in its joint frame, as the model
+ * currently carries it (the create-time tool inertia included on the ee
+ * frame's parent joint). out4: 4 doubles. */
+par6_status par6_kin_body_inertial(const par6_kin *h, int32_t body, double *out4);
+
+/* The create-time tool's [m, m cx, m cy, m cz] contribution to the ee
+ * frame's parent joint body (zeros when no tool mass was given). */
+par6_status par6_kin_tool_inertial(const par6_kin *h, double *out4);
+
+/* NUL-terminated name of the joint that carries body `body`, written
+ * into buf (at most len bytes). Returns the name length, or a negative
+ * par6_status. */
+int32_t par6_kin_joint_name(const par6_kin *h, int32_t body, char *buf, int32_t len);
+
 /** Inverse dynamics: the joint torque that produces acceleration `a` at
  *  configuration `q` with velocity `v` (RNEA, gravity included).
  *
@@ -407,7 +431,7 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     end-effector frame). Purely additive; a stale v9 library fails to
  *     link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 10
+#define PAR6_SHIM_ABI_VERSION 11
 
 #ifdef __cplusplus
 } /* extern "C" */

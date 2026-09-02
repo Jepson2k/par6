@@ -371,12 +371,19 @@ collision verdicts a preview and the runtime both depend on, placed from the mod
 TCP on every shipped URDF variant.
 
 Mesh cost: `assets/` ships the vendor's full-resolution STLs for both `<visual>` and
-`<collision>`. Measured per-waypoint check cost is 17 µs (flange) / 180 µs (gripper
-variants) for self-collision, ~300–730 µs once a per-shape margin removes coal's early
-exit. Convex hulls were measured and rejected (the SSG48's jaw hulls overlap when closed
-and report a permanent false collision). `PAR6_SHAPE_PLANE` is the one pathological
-shape — an unbounded half-space cannot be pruned and costs ~35 ms per check — so model
-floors and walls as large boxes.
+`<collision>`. Measured per-waypoint check cost on the control box, in release:
+
+| scene | flange | gripper variant |
+|---|---|---|
+| self-collision only | 14 µs | 19 µs |
+| plus a box keep-out | 25 µs | 25 µs |
+| plus a keep-out carrying its own margin | 26 µs | 34 µs |
+| plus a `PAR6_SHAPE_PLANE` keep-out | 31 ms | 34 ms |
+
+Convex hulls were measured and rejected: the SSG48's jaw hulls overlap when closed and
+report a permanent false collision at the home pose. The plane is the one pathological
+shape, since an unbounded half-space has no bounding volume to prune against and coal
+scans every triangle. Model floors and walls as large boxes.
 
 conda-forge ships `linux-aarch64` Pinocchio, so the control box builds the shim natively
 with the same script; cross-compiling it from x86_64 is not supported.

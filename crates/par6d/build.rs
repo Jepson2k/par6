@@ -13,7 +13,9 @@ fn main() {
             .map(|p| p.to_string_lossy().into_owned())
     });
     if let Some(dir) = dir {
-        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,{dir}");
-        println!("cargo:rustc-link-arg-tests=-Wl,-rpath,{dir}");
+        // Every linked target, not just bins and the tests/ directory:
+        // the library's own unit-test harness is neither, and without the
+        // rpath it dies at startup with a missing libpar6_shim.
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
     }
 }
