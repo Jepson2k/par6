@@ -249,7 +249,9 @@ fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
                 sum -= l[i * n + k] * l[j * n + k];
             }
             if i == j {
-                if sum <= 0.0 {
+                // A NaN pivot passes `<= 0.0`, so test for a usable
+                // number rather than for an unusable one.
+                if !sum.is_finite() || sum <= 0.0 {
                     return None;
                 }
                 l[i * n + i] = sum.sqrt();
@@ -361,9 +363,17 @@ fn rewrite_link_inertial(text: &str, link: &str, com: [f64; 3]) -> Result<String
     let (start, end) =
         link_span(text, link).ok_or_else(|| format!("link {link} is not in the URDF"))?;
     let block = &text[start..end];
-    let i0 = block
-        .find("<inertial")
-        .ok_or_else(|| format!("link {link} has no <inertial> element"))?;
+    let mut i0 = 0;
+    loop {
+        let rel = block[i0..]
+            .find("<inertial")
+            .ok_or_else(|| format!("link {link} has no <inertial> element"))?;
+        i0 += rel;
+        if !in_comment(block, i0) {
+            break;
+        }
+        i0 += "<inertial".len();
+    }
     let i1 = block[i0..]
         .find("</inertial>")
         .map(|e| i0 + e)
@@ -389,8 +399,27 @@ fn link_span(text: &str, name: &str) -> Option<(usize, usize)> {
     let mut from = 0;
     while let Some(rel) = text[from..].find("<link") {
         let start = from + rel;
+        let next = start + "<link".len();
+        // `<linkage` is not `<link`, and a link inside a comment is not
+        // in the model — either would hand back a span over somebody
+        // else's element and rewrite the wrong inertial.
+        let boundary = text[next..]
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_whitespace() || c == '>' || c == '/');
+        if !boundary || in_comment(text, start) {
+            from = next;
+            continue;
+        }
         let tag_end = text[start..].find('>')? + start;
         let tag = &text[start..tag_end];
+        // A self-closing link has no body: no inertial to rewrite, and no
+        // `</link>` of its own, so searching on would return the NEXT
+        // link's close and span across it.
+        if tag.trim_end().ends_with('/') {
+            from = tag_end;
+            continue;
+        }
         let attr = tag.find("name=\"").map(|n| &tag[n + 6..]);
         if attr.and_then(|a| a.find('"').map(|e| &a[..e])) == Some(name) {
             let end = text[tag_end..].find("</link>")? + tag_end + "</link>".len();
@@ -399,6 +428,14 @@ fn link_span(text: &str, name: &str) -> Option<(usize, usize)> {
         from = tag_end;
     }
     None
+}
+
+/// Whether `at` falls inside an XML comment.
+fn in_comment(text: &str, at: usize) -> bool {
+    match text[..at].rfind("<!--") {
+        Some(open) => !text[open..at].contains("-->"),
+        None => false,
+    }
 }
 
 /// The first `tag` element in `text` with `attr="…"` replaced by `value`.

@@ -154,6 +154,28 @@ async fn read_held(client: &Client, protocol: &Protocol) -> Result<GravitySample
         let Some(s) = rx.borrow_and_update().clone() else {
             continue;
         };
+        // A torque reading is only gravity if the arm is actually holding
+        // the pose. A fault, a dropped bus, a disabled arm or a joint
+        // still moving all produce numbers that look like measurements
+        // and would be fitted as if they were.
+        if let Some(e) = &s.error {
+            return Err(format!(
+                "the arm faulted while sampling: {} ({})",
+                e.cause, e.code
+            ));
+        }
+        if !s.enabled {
+            return Err("the arm was disabled while sampling".into());
+        }
+        if s.link_ok != 1 {
+            return Err("the motor bus link went stale while sampling".into());
+        }
+        if s.speeds.iter().any(|v| v.abs() > REST_RAD_S) {
+            return Err(format!(
+                "the arm was still moving while sampling: speeds {:?} rad/s",
+                s.speeds
+            ));
+        }
         for j in 0..NQ {
             sample.q[j] += s.angles[j].to_radians();
             sample.tau[j] += s.torques[j];
@@ -280,6 +302,11 @@ pub fn arm_params(kin: &Kin, fitted: &[BodyParams]) -> Result<Vec<BodyParams>, S
         .filter(|b| b.mass > 0.0)
         .collect())
 }
+
+/// Joint speed at or below which the arm counts as resting \[rad/s\].
+/// The runtime's SETTLED policy has already decided the move finished;
+/// this only catches a reading taken while something is still creeping.
+const REST_RAD_S: f64 = 5e-3;
 
 /// An axis counts as measured when the data fixed more of it than the
 /// prior did (see `GravityFit::determined`).

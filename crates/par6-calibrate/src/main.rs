@@ -67,7 +67,12 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
             "--speed" => a.protocol.speed = num(&value(&flag, &mut argv)?, &flag)?,
             "--approach" => a.protocol.approach_rad = num(&value(&flag, &mut argv)?, &flag)?,
             "--settle" => {
-                a.protocol.settle = Duration::from_secs_f64(num(&value(&flag, &mut argv)?, &flag)?)
+                let s: f64 = num(&value(&flag, &mut argv)?, &flag)?;
+                // `from_secs_f64` panics on a negative or a NaN.
+                if !(s.is_finite() && s >= 0.0) {
+                    return Err("--settle must be finite and >= 0".into());
+                }
+                a.protocol.settle = Duration::from_secs_f64(s);
             }
             "--frames" => a.protocol.frames = num(&value(&flag, &mut argv)?, &flag)?,
             "--prior-weight" => a.prior_weight = num(&value(&flag, &mut argv)?, &flag)?,
@@ -78,6 +83,21 @@ fn parse(mut argv: impl Iterator<Item = String>) -> Result<Args, String> {
     }
     if a.poses < 2 || a.holdout >= a.poses {
         return Err("--poses must exceed --holdout, with at least two poses".into());
+    }
+    // Every one of these divides, scales or times something. A zero or a
+    // negative turns a measurement into a NaN or a panic several minutes
+    // into a run on real hardware, so they are refused up front.
+    if a.protocol.frames == 0 {
+        return Err("--frames must be at least 1".into());
+    }
+    if !(a.protocol.speed.is_finite() && a.protocol.speed > 0.0 && a.protocol.speed <= 1.0) {
+        return Err("--speed must be in (0, 1]".into());
+    }
+    if !(a.protocol.approach_rad.is_finite() && a.protocol.approach_rad > 0.0) {
+        return Err("--approach must be finite and > 0".into());
+    }
+    if !(a.prior_weight.is_finite() && a.prior_weight >= 0.0) {
+        return Err("--prior-weight must be finite and >= 0".into());
     }
     Ok(a)
 }
@@ -154,12 +174,46 @@ fn run(a: Args) -> Result<(), String> {
     print!("{}", par6_calibrate::describe(&report));
 
     if a.write {
+        // A fit that predicts held-out poses WORSE than the URDF already
+        // does is not an improvement, and this rewrites the model the
+        // daemon loads next boot. Refuse rather than make the arm worse.
+        let improved = report.holdout_rms_fit_nm.is_finite()
+            && report.holdout_rms_fit_nm < report.holdout_rms_prior_nm;
+        if !improved {
+            return Err(format!(
+                "refusing to write: the fit predicts held-out poses no better than the \
+                 current model ({:.4} Nm vs {:.4} Nm). Measure more poses, or spread them \
+                 wider, before writing.",
+                report.holdout_rms_fit_nm, report.holdout_rms_prior_nm
+            ));
+        }
         let arm = par6_calibrate::arm_params(&kin, &report.fit.bodies)?;
         let urdf = assets.join(Kin::ARM_URDF_RELPATH);
-        par6_kin::gravity::rewrite_inertials_file(&urdf, &arm)?;
-        println!("wrote {}", urdf.display());
+        let backup = write_inertials_with_backup(&urdf, &arm)?;
+        println!(
+            "wrote {} (previous model kept at {})",
+            urdf.display(),
+            backup.display()
+        );
     }
     Ok(())
+}
+
+/// Rewrite `urdf` in place, keeping the previous model beside it and
+/// swapping the new one in by rename — so an interrupted write cannot
+/// leave the daemon with half a URDF to load.
+fn write_inertials_with_backup(
+    urdf: &std::path::Path,
+    bodies: &[par6_kin::gravity::BodyParams],
+) -> Result<PathBuf, String> {
+    let text = std::fs::read_to_string(urdf).map_err(|e| format!("{}: {e}", urdf.display()))?;
+    let rewritten = par6_kin::gravity::rewrite_inertials(&text, bodies)?;
+    let backup = urdf.with_extension("urdf.bak");
+    std::fs::write(&backup, &text).map_err(|e| format!("{}: {e}", backup.display()))?;
+    let staged = urdf.with_extension("urdf.new");
+    std::fs::write(&staged, &rewritten).map_err(|e| format!("{}: {e}", staged.display()))?;
+    std::fs::rename(&staged, urdf).map_err(|e| format!("{}: {e}", urdf.display()))?;
+    Ok(backup)
 }
 
 /// The daemon's config search, so a bare run on the control box finds

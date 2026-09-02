@@ -271,3 +271,72 @@ fn written_inertials_are_what_the_model_reads_back() {
     unknown[0].joint = "no_such_joint".into();
     assert!(gravity::rewrite_inertials(&text, &unknown).is_err());
 }
+
+/// The writer edits the link it was asked for and nothing else. A URDF
+/// carrying a self-closing link, a commented-out one, and an element
+/// whose name merely starts with "link" all used to shift the span onto
+/// a neighbour, so the wrong inertial got the new centre of mass.
+#[test]
+fn the_inertial_writer_edits_only_the_link_it_names() {
+    let urdf = r#"<?xml version="1.0"?>
+<robot name="rig">
+  <link name="decoy_before"/>
+  <!-- <link name="target">
+    <inertial>
+      <origin xyz="9 9 9" rpy="0 0 0"/>
+      <mass value="9.0"/>
+      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
+    </inertial>
+  </link> -->
+  <link name="target">
+    <inertial>
+      <origin xyz="0.1 0.2 0.3" rpy="0 0 0"/>
+      <mass value="2.0"/>
+      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
+    </inertial>
+  </link>
+  <link name="decoy_after">
+    <inertial>
+      <origin xyz="7 7 7" rpy="0 0 0"/>
+      <mass value="3.0"/>
+      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>
+    </inertial>
+  </link>
+  <joint name="j" type="revolute">
+    <parent link="decoy_before"/>
+    <child link="target"/>
+    <origin xyz="0 0 0" rpy="0 0 0"/>
+    <axis xyz="0 0 1"/>
+    <limit lower="-1" upper="1" effort="1" velocity="1"/>
+  </joint>
+</robot>
+"#;
+    let mass = 2.0;
+    let com = [0.4_f64, -0.5, 0.6];
+    let written = gravity::rewrite_inertials(
+        urdf,
+        &[gravity::BodyParams {
+            joint: "j".into(),
+            mass,
+            first_moment: [mass * com[0], mass * com[1], mass * com[2]],
+        }],
+    )
+    .expect("the target link is writable");
+
+    assert!(
+        written.contains(r#"xyz="0.4 -0.5 0.6""#),
+        "the target's centre of mass was not written: {written}"
+    );
+    assert!(
+        written.contains(r#"xyz="7 7 7""#),
+        "the following link's inertial was overwritten: {written}"
+    );
+    assert!(
+        written.contains(r#"xyz="9 9 9""#),
+        "the commented-out link was edited: {written}"
+    );
+    assert!(
+        !written.contains(r#"xyz="0.1 0.2 0.3""#),
+        "the old centre of mass survived: {written}"
+    );
+}
