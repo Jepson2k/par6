@@ -42,6 +42,7 @@ use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
 use crate::gripper_gate::GripperGate;
+use crate::gripper_settle::GripperSettle;
 use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
@@ -456,6 +457,7 @@ pub struct RtCore<B: DriverBus> {
     scratch_qd: [f64; MAX_JOINTS],
     scratch_tau: [f64; MAX_JOINTS],
     gripper_gate: GripperGate,
+    gripper_settle: GripperSettle,
     calibrate_pending: bool,
     homing_gcmd: GripperCommand,
 
@@ -630,6 +632,13 @@ impl<B: DriverBus> RtCore<B> {
             scratch_qd: [0.0; MAX_JOINTS],
             scratch_tau: [0.0; MAX_JOINTS],
             gripper_gate: GripperGate::default(),
+            gripper_settle: GripperSettle::new(
+                dt,
+                &gripper
+                    .and_then(|g| g.driver.as_ref())
+                    .map(|d| d.settle)
+                    .unwrap_or_default(),
+            ),
             calibrate_pending: false,
             homing_gcmd,
             jog_active: false,
@@ -1063,13 +1072,16 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::Gripper(fw) => {
                 if self.has_can_gripper {
+                    let at = self.bus_state.gripper.reply.map_or(0, |r| r.position);
                     self.gripper_gate.set(fw);
+                    self.gripper_settle.arm_move(self.tick, fw.position, at);
                 }
             }
             RtCommand::GripperCalibrate => {
                 if self.has_can_gripper {
                     self.gripper_gate.reset_to_poll();
                     self.calibrate_pending = true;
+                    self.gripper_settle.arm_calibrate(self.tick);
                 }
             }
             RtCommand::GripperStop => {
@@ -1081,6 +1093,7 @@ impl<B: DriverBus> RtCore<B> {
                     match byte {
                         Some(b @ 1..) if self.gripper_gate.has_standing() => {
                             self.gripper_gate.stop_at(b);
+                            self.gripper_settle.arm_hold(self.tick);
                         }
                         // An uncalibrated gripper reports 0, which the
                         // firmware maps to fully open — a naive stop
@@ -1088,13 +1101,19 @@ impl<B: DriverBus> RtCore<B> {
                         // means no speed/current budget to hold with.
                         // Both degrade to a release. 255 (fully closed)
                         // is a legitimate hold target and stays above.
-                        _ => self.gripper_gate.idle(),
+                        // A degraded stop really does release, so the
+                        // action bit drops and the echo answers it.
+                        _ => {
+                            self.gripper_gate.idle();
+                            self.gripper_settle.arm_idle(self.tick);
+                        }
                     }
                 }
             }
             RtCommand::GripperIdle => {
                 if self.has_can_gripper {
                     self.gripper_gate.idle();
+                    self.gripper_settle.arm_idle(self.tick);
                 }
             }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
@@ -1272,6 +1291,7 @@ impl<B: DriverBus> RtCore<B> {
                 self.homed = false;
                 if self.has_can_gripper {
                     self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                    self.gripper_settle.disarm();
                 }
             }
             Mode::Flashing => {
@@ -1293,6 +1313,7 @@ impl<B: DriverBus> RtCore<B> {
                     // whatever its NVM state says; the announcement runs
                     // on the first non-silent ticks after exit.
                     self.gripper_gate.force_idle(None);
+                    self.gripper_settle.disarm();
                 }
             }
             Mode::Stream => {
@@ -1701,6 +1722,7 @@ impl<B: DriverBus> RtCore<B> {
                         // grip the normal path never commanded — and the
                         // watchdog polls would keep it held forever.
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                        self.gripper_settle.disarm();
                     }
                     self.mode = Mode::Idle;
                 }
@@ -1709,6 +1731,7 @@ impl<B: DriverBus> RtCore<B> {
                     self.homed = false;
                     if self.has_can_gripper {
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                        self.gripper_settle.disarm();
                     }
                     self.mode = Mode::Idle;
                 }
@@ -1830,6 +1853,13 @@ impl<B: DriverBus> RtCore<B> {
             let calibrated = self.bus_state.gripper.reply.is_some_and(|r| r.calibrated);
             self.gripper_gate.tick(calibrated)
         };
+        if self.has_can_gripper {
+            self.gripper_settle.tick(
+                self.tick,
+                self.bus_state.gripper.reply,
+                self.bus_state.gripper.live_error_bit,
+            );
+        }
         self.send_gripper(gcmd);
         let _ = self.bus.poll_step();
     }
@@ -1937,6 +1967,7 @@ impl<B: DriverBus> RtCore<B> {
         s.nodes[MAX_JOINTS] = self.bus_state.nodes[usize::from(self.gripper_node)];
         s.node_freshness[MAX_JOINTS] = self.bus.freshness(self.gripper_node);
         s.gripper = self.bus_state.gripper;
+        s.tool = self.gripper_settle.status();
         s.homing = self.homing.status();
         s.errors = *self.errors.list();
         s.error_active = self.errors.any_hard();

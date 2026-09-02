@@ -775,9 +775,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         Some(3),
         "closing on air must complete with the reached-no-object verdict"
     );
-    let s = rig.wait_status("the jaw reaches the closed command and stops", |s| {
-        jaw(s) > 0.99 && tool_status(s).state == ToolState::Idle
-    });
+    let s = rig.wait_status("the jaw reaches the closed command", |s| jaw(s) > 0.99);
     assert!(
         before < 0.95,
         "the jaw was already closed before the command; travel proves nothing"
@@ -786,11 +784,30 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         !tool_status(&s).part_detected,
         "nothing is between the jaws; no part may be reported"
     );
+    // The move completed, but the standing command is still asserted, so
+    // the jaws are still energised and holding. Only an explicit release
+    // makes a tool idle — `action_status` is the commanded action, not a
+    // motion flag, and a tool that reported Idle here would be claiming
+    // it had let go of a part it is still gripping.
+    assert_eq!(
+        tool_status(&s).state,
+        ToolState::Active,
+        "a settled move leaves the jaws holding, not released"
+    );
 
     let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 500.0]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
     rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
+
+    // ---- the release verb drops the standing command, and only then
+    // does the tool report itself idle.
+    let i = c.ok_index(&tool_action(6009, &tool, "idle", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "gripper idle must complete, got {detail:?}");
+    rig.wait_status("the released tool reports itself idle", |s| {
+        tool_status(s).state == ToolState::Idle
+    });
 
     // ---- an action the tool does not implement fails the command; it is
     // never reported as done.

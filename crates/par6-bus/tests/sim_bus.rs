@@ -1009,13 +1009,20 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     run_calibration(&mut rig).expect("re-calibration failed");
     let mut prev = rig.state.gripper.reply.unwrap().position;
     let mut saw_moving = false;
-    for _ in 0..u64::from(robot.ticks(2.5)) {
+    for tick in 0..u64::from(robot.ticks(2.5)) {
         rig.step(&cmds, &move_to(252));
         let r = rig.state.gripper.reply.unwrap();
         assert!(r.position >= prev, "close travel reversed");
-        if r.action_status {
+        // `action_status` echoes the commanded action bit, which the
+        // replay holds set for the whole move — it never reports
+        // arrival, so a completion keyed on it would wait forever.
+        // Travel is reported by `object_detection` alone. (Tick 0's
+        // reply still describes the state before the command landed.)
+        if tick > 0 {
+            assert!(r.action_status, "action_status stopped echoing the command");
+        }
+        if r.object_detection == ObjectDetection::Moving {
             saw_moving = true;
-            assert_eq!(r.object_detection, ObjectDetection::Moving);
         }
         prev = r.position;
     }
@@ -1023,7 +1030,10 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     assert!(saw_moving, "no moving phase observed");
     assert_eq!(r.position, 252);
     assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
-    assert!(!r.action_status);
+    assert!(
+        r.action_status,
+        "the standing command is still asserted after arrival"
+    );
     assert_eq!(r.current_ma, 0, "current at rest");
 
     // An object between the jaws jams the close early: detection code 1,

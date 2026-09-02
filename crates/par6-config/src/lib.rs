@@ -27,7 +27,9 @@ mod homing;
 mod io;
 mod robot;
 
-pub use gripper::{ArmJointHomeOffset, GripperConfig, GripperDriverConfig, ToolKinematics};
+pub use gripper::{
+    ArmJointHomeOffset, GripperConfig, GripperDriverConfig, SettleTimings, ToolKinematics,
+};
 pub use homing::{
     GripperHomeMode, HomeGroup, HomingConfig, HomingStrategy, JointHoming, MoveTo, PostHomeConfig,
     PreMove, ReleaseConfig, SequenceStep,

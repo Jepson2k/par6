@@ -5,6 +5,7 @@
 use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
+use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
 /// RT operating mode.
@@ -452,6 +453,10 @@ pub struct StateSnapshot {
     pub node_freshness: [Freshness; NUM_NODES],
     /// Firmware-mode gripper state.
     pub gripper: GripperState,
+    /// Whether the armed tool action has finished, and how. Decided
+    /// against the reply stream at the tick rate, because every window
+    /// in that decision counts replies.
+    pub tool: ToolStatus,
     /// Homing progress.
     pub homing: HomingStatus,
     /// The error latch list.
@@ -527,6 +532,7 @@ impl Default for StateSnapshot {
             nodes: [NodeState::default(); NUM_NODES],
             node_freshness: [Freshness::Unknown; NUM_NODES],
             gripper: GripperState::default(),
+            tool: ToolStatus::default(),
             homing: HomingStatus::default(),
             errors: ErrorList::new(),
             error_active: false,

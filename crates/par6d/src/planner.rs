@@ -52,13 +52,13 @@
 
 use std::time::{Duration, Instant};
 
-use par6_bus::ObjectDetection;
 use par6_config::ConfigBundle;
 use par6_kin::NQ;
 use par6_motion::cart::Pose;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
 use par6_proto::{make_error, Command, ErrorCode, WireError, EN_SLOTS, UNATTRIBUTED};
+use par6_rt::gripper_settle::ToolSettle;
 use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
     SnapshotReader, SpecSettle, StateSnapshot, MAX_JOINTS,
@@ -74,17 +74,6 @@ use crate::collision_world::{first_duplicate, is_world_name, kin_layer, ShapeNam
 /// How long a started command may wait for its RT mode to engage before
 /// the planner declares the start failed.
 const MODE_GRACE: Duration = Duration::from_secs(2);
-/// Settling time before a gripper reply is trusted as the answer to the
-/// command just sent \[s\]: the RT loop consumes one command per tick and
-/// the reply arrives a frame later.
-const TOOL_COMMAND_GRACE_S: f64 = 0.05;
-/// How long a gripper move may run before the planner fails it.
-const TOOL_MOVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Gripper firmware calibrate timeout (vendor: 10 s).
-const TOOL_CALIBRATE_TIMEOUT: Duration = Duration::from_secs(12);
-/// Minimum calibration wait \[s\] — the `calibrated` bit can still be set
-/// from the previous run (same rule as the homing FSM).
-const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
 /// Joint displacement below which a move has no path to time \[rad\].
 const NULL_MOVE_RAD: f64 = 1e-9;
 /// Speed fraction the return-to-home move runs at when the arm is
@@ -177,26 +166,12 @@ struct ToolSpec {
     ilim_ma: f64,
 }
 
-/// A gripper action in flight, and what finishing looks like.
-enum ToolWait {
-    /// Jaw travel: done when the firmware stops reporting motion and
-    /// reports why it stopped (target reached, or an object detected).
-    Move,
-    /// Firmware calibration sweep: done when the `calibrated` bit is set,
-    /// no earlier than the minimum wait.
-    Calibrate,
-    /// Release: done when the firmware drops its action-status bit —
-    /// the idle announcement landed and the output stage let go.
-    Idle,
-}
-
 enum InFlightKind {
     Tool {
-        wait: ToolWait,
-        /// RT tick the command was queued on; replies older than the
-        /// grace still describe the PREVIOUS command.
-        start_tick: u64,
-        timeout: Duration,
+        /// The settle epoch read before the command was sent. The RT
+        /// bumps it when it arms, so a verdict still carrying this
+        /// value belongs to the PREVIOUS action, not to ours.
+        epoch_at_send: u32,
     },
     Exec {
         ring_index: u32,
@@ -244,8 +219,6 @@ pub(crate) struct Par6Planner {
     policy: par6_proto::CompletionPolicy,
     profile: Profile,
     tool: Option<ToolSpec>,
-    tool_grace_ticks: u64,
-    tool_cal_min_ticks: u64,
     inflight: Option<InFlight>,
     enablement: Enablement,
     /// Latched near-singularity warning for the cart path in flight
@@ -295,7 +268,6 @@ impl Par6Planner {
             tool_offset,
         } = models;
         let dt = bundle.robot.robot.tick_dt_s;
-        let ticks = |s: f64| (s / dt).round() as u64;
         let tool = bundle
             .active_gripper()
             .and_then(|g| g.driver.as_ref())
@@ -322,8 +294,6 @@ impl Par6Planner {
             policy: par6_proto::CompletionPolicy::Settled,
             profile: Profile::default(),
             tool,
-            tool_grace_ticks: ticks(TOOL_COMMAND_GRACE_S).max(2),
-            tool_cal_min_ticks: ticks(TOOL_CALIBRATE_MIN_WAIT_S),
             inflight: None,
             // Nothing measured yet, and the wire has no "unknown": claim
             // no freedom until the first probe runs (the next poll).
@@ -799,7 +769,10 @@ impl Par6Planner {
                 cmd.tool_key
             )));
         };
-        let (wait, timeout) = match cmd.action.as_str() {
+        // Read before sending: the RT arms on receipt and bumps the
+        // epoch, which is how the verdict below is attributed.
+        let epoch_at_send = snap.tool.epoch;
+        match cmd.action.as_str() {
             "move" => {
                 let [position, speed, current] = scalars(&cmd.params)
                     .ok_or_else(|| invalid("move takes [position, speed, current_ma]".into()))?;
@@ -824,14 +797,12 @@ impl Par6Planner {
                 self.link.send(RtCommand::Gripper(gripper_move_command(
                     position, speed, current,
                 )));
-                (ToolWait::Move, TOOL_MOVE_TIMEOUT)
             }
             "calibrate" => {
                 if !cmd.params.is_empty() {
                     return Err(invalid("calibrate takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperCalibrate);
-                (ToolWait::Calibrate, TOOL_CALIBRATE_TIMEOUT)
             }
             // Halt in place: the RT re-targets the freshest reported jaw
             // byte with the standing command's speed/current (already in
@@ -846,7 +817,6 @@ impl Par6Planner {
                     return Err(invalid("stop takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperStop);
-                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
             }
             // Release: action = 0 — limp on spectral-bldc, velocity-0
             // hold on stepfoc.
@@ -855,7 +825,6 @@ impl Par6Planner {
                     return Err(invalid("idle takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperIdle);
-                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
             }
             other => {
                 return Err(invalid(format!(
@@ -863,12 +832,8 @@ impl Par6Planner {
                     cmd.tool_key
                 )));
             }
-        };
-        Ok(InFlightKind::Tool {
-            wait,
-            start_tick: snap.tick,
-            timeout,
-        })
+        }
+        Ok(InFlightKind::Tool { epoch_at_send })
     }
 
     fn start_move_j(
@@ -1405,45 +1370,6 @@ impl Par6Planner {
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
 
-    /// Poll-time verdict for a gripper action, read off the cmd-60 reply
-    /// in the snapshot. Replies from before the command reached the bus
-    /// describe the previous action, so nothing counts until the grace.
-    /// A settled move carries its detection code (`Ok(Some(1..=3))`) so
-    /// the completion can say whether the jaws caught anything.
-    fn tool_verdict(
-        wait: &ToolWait,
-        start_tick: u64,
-        grace_ticks: u64,
-        cal_min_ticks: u64,
-        snap: &StateSnapshot,
-    ) -> Option<Result<Option<u8>, WireError>> {
-        let elapsed = snap.tick.saturating_sub(start_tick);
-        if elapsed < grace_ticks {
-            return None;
-        }
-        let reply = snap.gripper.reply?;
-        let fault = i32::from(reply.temperature_error)
-            | (i32::from(reply.timeout_error) << 1)
-            | (i32::from(reply.estop_error) << 2)
-            | (i32::from(snap.gripper.live_error_bit) << 3);
-        if fault != 0 {
-            return Some(Err(make_error(
-                ErrorCode::MotnToolFault,
-                UNATTRIBUTED,
-                &[("fault_code", &fault.to_string())],
-            )));
-        }
-        match wait {
-            ToolWait::Move => (!reply.action_status
-                && reply.object_detection != ObjectDetection::Moving)
-                .then_some(Ok(Some(reply.object_detection as u8))),
-            ToolWait::Calibrate => {
-                (elapsed >= cal_min_ticks && reply.calibrated).then_some(Ok(None))
-            }
-            ToolWait::Idle => (!reply.action_status).then_some(Ok(None)),
-        }
-    }
-
     /// Poll-time verdict for the in-flight command; `None` = keep going,
     /// `Ok(Some(_))` = success with a tool settle verdict to report.
     fn verdict(
@@ -1455,32 +1381,37 @@ impl Par6Planner {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
-            InFlightKind::Tool {
-                wait,
-                start_tick,
-                timeout,
-            } => {
-                let verdict = Self::tool_verdict(
-                    wait,
-                    *start_tick,
-                    self.tool_grace_ticks,
-                    self.tool_cal_min_ticks,
-                    snap,
-                );
-                match verdict {
-                    None if fl.started.elapsed() > *timeout => {
-                        let state = match wait {
-                            ToolWait::Move => "move",
-                            ToolWait::Calibrate => "calibrate",
-                            ToolWait::Idle => "idle",
-                        };
-                        Some(Err(make_error(
-                            ErrorCode::MotnToolTimeout,
-                            UNATTRIBUTED,
-                            &[("state", state)],
-                        )))
-                    }
-                    other => other,
+            InFlightKind::Tool { epoch_at_send } => {
+                // Whether a jaw action finished is decided against the
+                // reply stream at the tick rate (see
+                // `par6_rt::gripper_settle`), because every window in
+                // that decision counts replies and this loop polls at
+                // its own unrelated cadence.
+                if snap.tool.epoch == *epoch_at_send {
+                    return None; // the RT has not armed it yet
+                }
+                match snap.tool.verdict {
+                    ToolSettle::Running => None,
+                    ToolSettle::Done => Some(Ok(None)),
+                    ToolSettle::Settled(od) => Some(Ok(Some(od as u8))),
+                    ToolSettle::Timeout(w) => Some(Err(make_error(
+                        ErrorCode::MotnToolTimeout,
+                        UNATTRIBUTED,
+                        &[("state", w.as_str())],
+                    ))),
+                    ToolSettle::Fault(bits) => Some(Err(make_error(
+                        ErrorCode::MotnToolFault,
+                        UNATTRIBUTED,
+                        &[("fault_code", &bits.to_string())],
+                    ))),
+                    // Another owner (homing, a flashing window) took the
+                    // gripper and released it on our behalf. Nothing is
+                    // left to complete, and waiting would hang the queue.
+                    ToolSettle::Unarmed => Some(Err(make_error(
+                        ErrorCode::MotnCancelled,
+                        UNATTRIBUTED,
+                        &[("scope", "the gripper changed owner")],
+                    ))),
                 }
             }
             InFlightKind::Exec {
