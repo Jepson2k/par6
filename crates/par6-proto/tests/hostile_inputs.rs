@@ -102,7 +102,7 @@ fn delay_bytes(seconds: f64) -> Vec<u8> {
 /// straight after the header, which is all an allocation attack needs.
 fn move_s_header(declared: u32) -> Vec<u8> {
     cat(&[
-        fixarray(8),
+        fixarray(9),
         uint(CmdType::MoveS as u64),
         uint(0),
         uint(0),
@@ -203,6 +203,7 @@ fn the_counts_a_real_program_sends_still_decode() {
             duration: Some(1.0),
             speed: None,
             accel: None,
+            rel: false,
         })
     };
     encode_command(&waypoints(MAX_WAYPOINTS), 1, &mut buf).expect("the cap itself must encode");

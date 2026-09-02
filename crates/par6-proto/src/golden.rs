@@ -14,13 +14,14 @@ use serde_json::{json, Value};
 
 use crate::chunk::{encode_chunk, split_into_chunks, Chunk};
 use crate::command::{
-    encode_command, Checkpoint, Command, ConnectHardware, Delay, Home, JogJ, JogL, MoveC, MoveJ,
-    MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ, ServoJPose,
-    ServoL, SetCompletionPolicy, SetPayload, SetRecipe, SetShapes, SetTcpOffset, Shape, Simulator,
-    Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    encode_command, Checkpoint, Command, ConnectHardware, Delay, EnterFlashing, Home, JogJ, JogL,
+    MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ,
+    ServoJPose, ServoL, SetCompletionPolicy, SetPayload, SetPidGains, SetRecipe, SetShapes,
+    SetTcpOffset, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use crate::enums::{
-    command_class, ActionState, CompletionPolicy, ControllerMode, Frame, ToolState,
+    command_class, ActionState, CompletionPolicy, ControllerMode, FlashingAssertion, Frame,
+    ToolState,
 };
 use crate::error::{make_error, ErrorCode, UNATTRIBUTED};
 use crate::pygen;
@@ -528,6 +529,38 @@ pub fn vectors() -> Vec<Vector> {
             name: "diagnostics".into(),
         }),
     ));
+    v.push(cmd_vec(
+        "cmd_enter_flashing",
+        13,
+        Command::EnterFlashing(EnterFlashing {
+            assertion: FlashingAssertion::Parked,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_enter_flashing_force",
+        14,
+        Command::EnterFlashing(EnterFlashing {
+            assertion: FlashingAssertion::Force,
+        }),
+    ));
+    v.push(cmd_vec("cmd_exit_flashing", 15, Command::ExitFlashing));
+    v.push(cmd_vec(
+        "cmd_set_pid_gains",
+        16,
+        Command::SetPidGains(SetPidGains {
+            node: 2,
+            kpp: 9.0,
+            kpv: 0.05,
+            kiv: 0.005,
+            kpiq: 1.2,
+            kiiq: 1.0,
+            kp: 0.12,
+            kd: 0.002,
+            ilim_ma: 2200.0,
+            velocity_limit_ticks_s: 150000.0,
+            voltage_limit_mv: 0,
+        }),
+    ));
 
     // -- commands: QUERY --
     v.push(cmd_vec("cmd_ping", 20, Command::Ping));
@@ -718,6 +751,22 @@ pub fn vectors() -> Vec<Vector> {
             speed: None,
             accel: None,
             blend_radius: None,
+            rel: false,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_move_c_rel",
+        79,
+        Command::MoveC(MoveC {
+            key: 109,
+            via: [10.0, 0.0, 5.0, 0.0, 0.0, 0.0],
+            end: [20.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+            frame: Frame::Wrf,
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: true,
         }),
     ));
     v.push(cmd_vec(
@@ -734,6 +783,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.6),
             accel: None,
+            rel: false,
         }),
     ));
     v.push(cmd_vec(
@@ -749,6 +799,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.3),
             accel: Some(0.4),
+            rel: false,
         }),
     ));
     v.push(cmd_vec(
@@ -833,6 +884,7 @@ pub fn vectors() -> Vec<Vector> {
             index: 7,
             ok: true,
             detail: None,
+            verdict: None,
         },
     ));
     v.push(reply_vec(
@@ -845,6 +897,47 @@ pub fn vectors() -> Vec<Vector> {
                 8,
                 &[("residual", "0.02")],
             )),
+            verdict: None,
+        },
+    ));
+    v.push(reply_vec(
+        "reply_complete_cancelled",
+        Reply::Complete {
+            index: 9,
+            ok: false,
+            detail: Some(make_error(
+                ErrorCode::MotnCancelled,
+                9,
+                &[("scope", "stop")],
+            )),
+            verdict: None,
+        },
+    ));
+    v.push(reply_vec(
+        "reply_complete_tool_verdict",
+        Reply::Complete {
+            index: 10,
+            ok: true,
+            detail: None,
+            verdict: Some(1),
+        },
+    ));
+    v.push(reply_vec(
+        "reply_error_near_singularity",
+        Reply::Error {
+            req_id: 47,
+            error: make_error(
+                ErrorCode::TrajNearSingularity,
+                UNATTRIBUTED,
+                &[("cond", "2400"), ("sigma", "0.00007")],
+            ),
+        },
+    ));
+    v.push(reply_vec(
+        "reply_error_stream_fault",
+        Reply::Error {
+            req_id: 46,
+            error: make_error(ErrorCode::SysStreamFault, UNATTRIBUTED, &[]),
         },
     ));
 
@@ -1061,6 +1154,29 @@ pub fn vectors() -> Vec<Vector> {
                     [-2.0, 2.0, 4.0, 16.0],
                     [-6.3, 6.3, 6.0, 20.0],
                 ],
+                active_recipe: Some("standard".to_owned()),
+                recipes: vec![
+                    "minimal".to_owned(),
+                    "standard".to_owned(),
+                    "full".to_owned(),
+                    "diagnostics".to_owned(),
+                ],
+            },
+        },
+    ));
+    v.push(reply_vec(
+        "response_config_info_telemetry_off",
+        Reply::Response {
+            req_id: 127,
+            result: QueryResult::ConfigInfo {
+                path: "/etc/par6/PAR6.toml".to_owned(),
+                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
+                    .to_owned(),
+                tick_dt_s: 0.004,
+                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                joints: vec![[-2.15, 2.15, 3.0, 12.0]],
+                active_recipe: None,
+                recipes: vec!["minimal".to_owned(), "standard".to_owned()],
             },
         },
     ));
@@ -1169,6 +1285,7 @@ fn chunk_vectors() -> Vec<Vector> {
         duration: None,
         speed: Some(0.5),
         accel: None,
+        rel: false,
     });
     let mut payload = Vec::new();
     encode_command(&inner, 300, &mut payload).expect("valid inner command");

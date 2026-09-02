@@ -46,6 +46,9 @@ class CmdType(IntEnum):
     SET_GRAVITY_COMP = 23
     PAUSE = 24
     SET_PAYLOAD = 25
+    ENTER_FLASHING = 26
+    EXIT_FLASHING = 27
+    SET_PID_GAINS = 28
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -161,6 +164,13 @@ class Frame(IntEnum):
     TRF = 1
 
 
+class FlashingAssertion(IntEnum):
+    """The human assertion ENTER_FLASHING must carry."""
+
+    PARKED = 1
+    FORCE = 2
+
+
 class ToolState(IntEnum):
     """State of an end-of-arm tool."""
 
@@ -209,6 +219,7 @@ class ErrorCode(IntEnum):
     IK_PARTIAL_PATH = 11
     TRAJ_EMPTY_RESULT = 20
     TRAJ_NO_STEPS = 21
+    TRAJ_NEAR_SINGULARITY = 22
     MOTN_HOME_TIMEOUT = 30
     MOTN_TOOL_TIMEOUT = 31
     MOTN_TOOL_FAULT = 32
@@ -217,6 +228,7 @@ class ErrorCode(IntEnum):
     MOTN_NOT_HOMED = 35
     MOTN_SETTLE_TIMEOUT = 36
     MOTN_HOMING_FAILED = 37
+    MOTN_CANCELLED = 38
     COMM_QUEUE_FULL = 40
     COMM_UNKNOWN_COMMAND = 41
     COMM_DECODE_ERROR = 42
@@ -237,6 +249,7 @@ class ErrorCode(IntEnum):
     SYS_BUS_OFF = 61
     SYS_LINK_ERROR_PASSIVE = 62
     SYS_TORQUE_ENVELOPE = 63
+    SYS_STREAM_FAULT = 64
 
 
 # The ack taxonomy: one table, both sides consult it.
@@ -256,6 +269,9 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
     CmdType.PAUSE: CommandClass.SYSTEM,
     CmdType.SET_PAYLOAD: CommandClass.SYSTEM,
+    CmdType.ENTER_FLASHING: CommandClass.SYSTEM,
+    CmdType.EXIT_FLASHING: CommandClass.SYSTEM,
+    CmdType.SET_PID_GAINS: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,

@@ -62,6 +62,9 @@ pub enum ErrorCode {
     ExecSettleTimeout,
     /// Stream watchdog expired.
     RtiLinkLost,
+    /// The stream rate limiter failed for a sustained interval — the
+    /// session was silently holding, not tracking (hard latch).
+    StreamFault,
     /// Loop p99 > 1.05·dt (warning, self-clears).
     LoopDegraded,
     /// Loop p99 > 1.10·dt sustained (hard latch).

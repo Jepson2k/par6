@@ -1869,6 +1869,7 @@ fn curved_moves_trace_their_geometry() {
         speed: None,
         accel: None,
         blend_radius: None,
+        rel: false,
     }));
     let arc: Vec<[f64; 3]> = rig
         .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
@@ -1926,6 +1927,36 @@ fn curved_moves_trace_their_geometry() {
         "move_c ended {end_miss:.1} mm off its end pose"
     );
 
+    // --- the same half circle as DELTAS: rel = true resolves via/end
+    // against the pose the move starts at, and the rel arc must land
+    // where its absolute twin did. (Treated as absolute, these deltas
+    // are millimetres from the world origin — far outside the arm.)
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let rel_end = [start[0] + 2.0 * R, start[1], start[2]];
+    let i = c.ok_index(&Command::MoveC(MoveC {
+        key: 4005,
+        via: [R, 0.0, -R, 0.0, 0.0, 0.0],
+        end: [2.0 * R, 0.0, 0.0, 0.0, 0.0, 0.0],
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: true,
+    }));
+    rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the rel move_c must complete ok, got {detail:?}");
+    let rel_miss = distance(
+        tcp_mm(&settled_tcp(&rig, "settled after rel move_c")),
+        rel_end,
+    );
+    assert!(
+        rel_miss < 15.0,
+        "the rel arc ended {rel_miss:.1} mm from where its absolute twin lands"
+    );
+
     // --- move_s: a wave through four waypoints.
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);
@@ -1943,6 +1974,7 @@ fn curved_moves_trace_their_geometry() {
         duration: Some(SPLINE_S),
         speed: None,
         accel: None,
+        rel: false,
     }));
     let spline: Vec<[f64; 3]> = rig
         .collect_status(Duration::from_secs_f64(SPLINE_S + 1.0))
@@ -2008,6 +2040,7 @@ fn curved_moves_trace_their_geometry() {
         duration: Some(MOVE_S),
         speed: None,
         accel: None,
+        rel: false,
     }));
     let process = rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
     let (ok, detail) = c.wait_complete(i);

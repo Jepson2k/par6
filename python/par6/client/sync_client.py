@@ -255,6 +255,7 @@ class RobotClient:
         speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -268,6 +269,7 @@ class RobotClient:
                 speed=speed,
                 accel=accel,
                 r=r,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -281,6 +283,7 @@ class RobotClient:
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -292,6 +295,7 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -305,6 +309,7 @@ class RobotClient:
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
+        rel: bool = False,
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
@@ -316,6 +321,7 @@ class RobotClient:
                 duration=duration,
                 speed=speed,
                 accel=accel,
+                rel=rel,
                 wait=wait,
                 timeout=timeout,
             )
@@ -455,6 +461,49 @@ class RobotClient:
     def select_profile(self, profile: str) -> int:
         """Set the motion profile (e.g. ``"TOPPRA"``)."""
         return _run(self._inner.select_profile(profile))
+
+    def enter_flashing(self, assertion: str) -> int:
+        """Hand the CAN bus to a firmware flasher (``"parked"`` or
+        ``"force"`` — the operator's vouching, no default)."""
+        return _run(self._inner.enter_flashing(assertion))
+
+    def exit_flashing(self) -> int:
+        """Take the CAN bus back after flashing (config re-push; homing
+        invalidated if firmware was flashed)."""
+        return _run(self._inner.exit_flashing())
+
+    def set_pid_gains(
+        self,
+        node: int,
+        *,
+        kpp: float,
+        kpv: float,
+        kiv: float,
+        kpiq: float,
+        kiiq: float,
+        kp: float,
+        kd: float,
+        ilim_ma: float,
+        velocity_limit_ticks_s: float,
+        voltage_limit_mv: int = 0,
+    ) -> int:
+        """Push one drive node's tuning live (every gain required — the
+        frame replaces the node's whole tuple)."""
+        return _run(
+            self._inner.set_pid_gains(
+                node,
+                kpp=kpp,
+                kpv=kpv,
+                kiv=kiv,
+                kpiq=kpiq,
+                kiiq=kiiq,
+                kp=kp,
+                kd=kd,
+                ilim_ma=ilim_ma,
+                velocity_limit_ticks_s=velocity_limit_ticks_s,
+                voltage_limit_mv=voltage_limit_mv,
+            )
+        )
 
     def select_tool(self, tool_name: str, variant_key: str = "") -> int:
         """Set the active end-effector tool on the controller."""
@@ -623,6 +672,12 @@ class RobotClient:
         """Wait until *command_index* completes (COMPLETE push or status
         fallback).  Raises :class:`RobotError` on failure."""
         return _run(self._inner.wait_command(command_index, timeout=timeout))
+
+    def command_verdict(self, command_index: int) -> int | None:
+        """Settle verdict from *command_index*'s completion push (gripper
+        move: 1 = object while closing, 2 = object while opening, 3 =
+        target reached, no object); None until it completes."""
+        return _run(self._inner.command_verdict(command_index))
 
     def wait_checkpoint(self, label: str, timeout: float = 30.0) -> bool:
         """Wait until the checkpoint *label* is reached."""

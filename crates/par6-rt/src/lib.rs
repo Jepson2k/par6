@@ -48,6 +48,7 @@ pub mod errors;
 pub mod exec;
 pub mod gpio;
 pub mod gravity;
+mod gripper_gate;
 pub mod homing;
 pub mod hooks;
 pub mod ring;

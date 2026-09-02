@@ -70,6 +70,9 @@ pub struct Rig {
     /// from them carries the arbitration-id err bit, as real firmware
     /// does while a fault is active.
     pub fault_nodes: u16,
+    /// The cmd-60 reply the rig injects every tick (calibrated by
+    /// default; tests reshape it for uncalibrated or mid-stroke cases).
+    pub gripper_reply: GripperReply,
     pub auto_inject: bool,
     pub dt: f64,
 }
@@ -115,6 +118,18 @@ impl Rig {
         gravity: Box<dyn GravityModel>,
         line_high: bool,
     ) -> Self {
+        Self::build_bundle_with_stream(bundle, policy, gravity, line_high, None)
+    }
+
+    /// The rig with a caller-supplied stream tracker in place of the
+    /// default [`ClampStream`] (limiter-fault seam tests).
+    pub fn build_bundle_with_stream(
+        bundle: ConfigBundle,
+        policy: CompletionPolicy,
+        gravity: Box<dyn GravityModel>,
+        line_high: bool,
+        stream: Option<Box<dyn par6_rt::hooks::StreamTracker>>,
+    ) -> Self {
         let robot = &bundle.robot;
         let dt = robot.robot.tick_dt_s;
         let (tx, rx) = mpsc::channel();
@@ -125,7 +140,7 @@ impl Rig {
         let hooks = RtHooks {
             gravity,
             jog: Box::new(RampJog::new(robot)),
-            stream: Box::new(ClampStream::new(robot)),
+            stream: stream.unwrap_or_else(|| Box::new(ClampStream::new(robot))),
             settle: Box::new(SpecSettle::new(policy, dt, robot.motion)),
             estop: Box::new(gpio),
             io: Box::new(io),
@@ -158,6 +173,10 @@ impl Rig {
             current_ma: [0; MAX_JOINTS],
             skip_nodes: 0,
             fault_nodes: 0,
+            gripper_reply: GripperReply {
+                calibrated: true,
+                ..GripperReply::default()
+            },
             auto_inject: true,
             dt,
         }
@@ -206,10 +225,7 @@ impl Rig {
             self.core.bus_mut().inject(
                 false,
                 Reply::Gripper {
-                    reply: GripperReply {
-                        calibrated: true,
-                        ..GripperReply::default()
-                    },
+                    reply: self.gripper_reply,
                 },
             );
         }

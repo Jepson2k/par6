@@ -82,6 +82,18 @@ pub enum RtCommand {
     /// to the DLC-0 empty poll, which feeds the driver watchdog for the
     /// whole sweep without overwriting it.
     GripperCalibrate,
+    /// Halt the gripper in place: re-target the freshest reported jaw
+    /// position with the standing command's speed/current, so the
+    /// firmware is already within tolerance and holds there (its only
+    /// native stop is the ESTOP bit, which latches a fault). With no
+    /// standing command, or a jaw byte of 0 (an uncalibrated gripper
+    /// reports 0, which the firmware maps to fully open), the gripper is
+    /// released instead.
+    GripperStop,
+    /// Release the gripper: `action = 0` announced with repeated DLC-5
+    /// frames, then the watchdog poll — limp on spectral-bldc,
+    /// velocity-0 hold on stepfoc.
+    GripperIdle,
     /// Enable/disable the gravity-compensation feedforward (G(q) is still
     /// computed and published every tick regardless).
     SetGravityComp(bool),
@@ -107,6 +119,16 @@ pub enum RtCommand {
         port: u8,
         /// 0 or 1; anything non-zero is high.
         value: u8,
+    },
+    /// Replace one node's stored drive tuning and push it through the
+    /// bus's boot-config path, `boot.config_repeats` passes — the RT half
+    /// of `SET_PID_GAINS`. The server validates the node and values;
+    /// a bus refusal (unknown node, bus-silent) is logged and dropped.
+    RetuneNode {
+        /// Target CAN node.
+        node: par6_bus::NodeId,
+        /// The gains/limits to store and push.
+        tune: par6_bus::DriveTune,
     },
 }
 
@@ -337,6 +359,13 @@ pub trait StreamTracker: Send {
     fn set_scale(&mut self, speed: f64, accel: f64);
     /// One tick: write the post-limiter position/velocity setpoint.
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
+    /// Whether the tracker's own machinery has been failing for a
+    /// sustained interval (a limiter that holds in place instead of
+    /// tracking). The core hard-latches `StreamFault` while this reads
+    /// true. Trackers with no failure mode report `false`.
+    fn faulted(&self) -> bool {
+        false
+    }
 }
 
 /// Built-in tracker: unconditional soft-limit clamp, no rate limiting

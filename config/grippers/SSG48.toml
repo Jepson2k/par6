@@ -1,25 +1,27 @@
 # SSG48 gripper (Spectral BLDC driver).
-# Values transcribed from vendor grippers/SSG48.xml.
+# Values transcribed from vendor grippers/SSG48.xml (arm-measured retune,
+# rcb-runtime 307477c). voltage_limit_mv = 0 means "use VBUS" and needs
+# gripper firmware with the Vlim CAN command (Spectral >= V107).
 
 name = "SSG48"
 urdf_variant = "ssg48"
 
 [driver]
 driver_type = "spectral-bldc"
-stroke_mm = 48.0
-kt_nm_a = 0.111
+stroke_mm = 47.0
+kt_nm_a = 0.3
 ilim_ma = 1700.0
-voltage_limit_mv = 6000
+voltage_limit_mv = 0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 gear_r_m = 0.006
 
 [driver.gains]
-kpp = 5.0
-kpv = 0.015
-kiv = 0.0005
-kpiq = 7.0
-kiiq = 1.0
+kpp = 11.0
+kpv = 0.03
+kiv = 0.0003
+kpiq = 3.0
+kiiq = 1.5
 kp = 0.12
 kd = 0.002
 

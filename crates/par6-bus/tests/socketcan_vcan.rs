@@ -423,7 +423,12 @@ fn tick_exchange_frame_budget_and_freshness_ladder() {
     );
     assert_eq!(state.nodes[usize::from(motion_node)].data_age_ticks, 0);
     assert_eq!(bus.freshness(motion_node), Freshness::Fresh);
-    assert_eq!(state.reconnected_mask, 0);
+    let temp_node = ((temp_id >> 7) & 0xF) as NodeId;
+    assert_eq!(
+        state.reconnected_mask,
+        (1 << motion_node) | (1 << temp_node),
+        "a node's first-ever frame is the reconnect edge that configures a late boot"
+    );
     assert!(bus.link_health().rx_frames >= 2);
 
     // Age past the stale threshold: a live, self-clearing warning.

@@ -107,3 +107,58 @@ fn a_cutoff_at_or_above_nyquist_is_reported_as_off() {
         q[0] - s.q_commanded[0]
     );
 }
+
+/// The core half of the limiter-fault contract: while the tracker
+/// reports `faulted()`, STREAM mode hard-latches `StreamFault` and the
+/// reaction lands. The counting side (round(fault_latch_s / dt)
+/// consecutive failures, one log per streak) is pinned from below by
+/// the MotionStream adapter's own tests.
+#[test]
+fn a_faulted_tracker_hard_latches_stream_fault() {
+    use par6_rt::hooks::{ClampStream, StreamTracker};
+    use par6_rt::{ErrorCode, MAX_JOINTS};
+
+    /// The real clamp tracker, reporting its limiter dead — the one-line
+    /// oracle for the core's reaction.
+    struct FaultyClamp(ClampStream);
+    impl StreamTracker for FaultyClamp {
+        fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
+            self.0.activate(q_meas);
+        }
+        fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
+            self.0.set_target(q_target);
+        }
+        fn set_scale(&mut self, speed: f64, accel: f64) {
+            self.0.set_scale(speed, accel);
+        }
+        fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
+            self.0.step(q_out, qd_out);
+        }
+        fn faulted(&self) -> bool {
+            true
+        }
+    }
+
+    let bundle = bundle_at(DT);
+    let tracker = FaultyClamp(ClampStream::new(&bundle.robot));
+    let mut rig = Rig::build_bundle_with_stream(
+        bundle,
+        CompletionPolicy::Settled,
+        Box::new(ZeroGravity),
+        true,
+        Some(Box::new(tracker)),
+    );
+    rig.ready();
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    rig.tick_n(10);
+    let s = rig.snap();
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::StreamFault),
+        "a dead limiter must latch the dedicated hard key: {:?}",
+        s.errors.as_slice()
+    );
+    assert_eq!(s.mode, Mode::ActiveError, "the hard latch reacts");
+}

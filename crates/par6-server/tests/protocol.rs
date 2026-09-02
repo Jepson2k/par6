@@ -10,12 +10,13 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    JogJ, JogL, MoveJ, MoveS, SetPayload, SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport,
-    WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SetPayload, SetPidGains, SetRecipe, SetShapes, Shape,
+    Simulator, Stop, Teleport, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
-    ActionState, CmdType, Command, ErrorCode, Frame, QueryResult, Reply, WireError, UNATTRIBUTED,
+    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply,
+    WireError, UNATTRIBUTED,
 };
 use par6_rt::{
     snapshot_channel, ArmState, ErrorCode as RtCode, ErrorEntry, Mode, SnapshotWriter,
@@ -42,6 +43,10 @@ enum RtEvent {
     ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
+    ToolStop,
+    EnterFlashing,
+    ExitFlashing,
+    SetPidGains { node: u8, kpp: f64, ilim_ma: f64 },
     WriteIo(u8, u8),
     Simulator(bool),
     ConnectHardware(String),
@@ -66,6 +71,12 @@ struct RtLog {
     /// answers `None`, the way the real core does for several ticks —
     /// which is what lets `reset` waiters pile up.
     hold_enable_outcome: bool,
+    /// What the RT answers the NEXT flashing enter/exit with. `None` =
+    /// the mode changed; `Some` = the window expired without it, the way
+    /// the real core refuses an entry from a working mode.
+    flashing_verdict: Option<WireError>,
+    /// The pending answer, collected exactly once by the server.
+    flashing_outcome: Option<Result<(), WireError>>,
 }
 
 #[derive(Clone)]
@@ -125,8 +136,37 @@ impl RtCommands for TestRt {
         }
         log.enable_outcome.take()
     }
+    fn enter_flashing(&mut self) {
+        self.push(RtEvent::EnterFlashing);
+        let mut log = self.0.lock().unwrap();
+        log.flashing_outcome = Some(match log.flashing_verdict.take() {
+            None => Ok(()),
+            Some(e) => Err(e),
+        });
+    }
+    fn exit_flashing(&mut self) {
+        self.push(RtEvent::ExitFlashing);
+        let mut log = self.0.lock().unwrap();
+        log.flashing_outcome = Some(match log.flashing_verdict.take() {
+            None => Ok(()),
+            Some(e) => Err(e),
+        });
+    }
+    fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.0.lock().unwrap().flashing_outcome.take()
+    }
+    fn set_pid_gains(&mut self, p: &par6_proto::command::SetPidGains) {
+        self.push(RtEvent::SetPidGains {
+            node: p.node,
+            kpp: p.kpp,
+            ilim_ma: p.ilim_ma,
+        });
+    }
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
+    }
+    fn tool_stop(&mut self) {
+        self.push(RtEvent::ToolStop);
     }
     fn write_io(&mut self, port: u8, value: u8) {
         self.push(RtEvent::WriteIo(port, value));
@@ -170,6 +210,8 @@ struct PlannerState {
     estimates: usize,
     /// Seconds the in-flight motion reports it has left.
     inflight_duration: f64,
+    /// Planner-side warnings the trait hands the STATUS builder.
+    warnings: Vec<WireError>,
 }
 
 #[derive(Clone)]
@@ -234,6 +276,52 @@ impl Planner for TestPlanner {
     }
     fn inflight_duration(&self, _snap: &StateSnapshot) -> f64 {
         self.0.lock().unwrap().inflight_duration
+    }
+    fn warnings(&self) -> Vec<WireError> {
+        self.0.lock().unwrap().warnings.clone()
+    }
+}
+
+/// Planner-side warnings ride the STATUS `warnings` slot alongside the
+/// RT latch's own — the path a near-singular cartesian plan takes to
+/// the operator's banner.
+#[tokio::test]
+async fn planner_warnings_reach_the_status_broadcast() {
+    let mut h = start(|_| {}).await;
+    h.planner.lock().unwrap().warnings = vec![make_error(
+        ErrorCode::TrajNearSingularity,
+        UNATTRIBUTED,
+        &[("cond", "2400"), ("sigma", "0.00007")],
+    )];
+    h.publish(|_| {});
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.warnings
+            .iter()
+            .any(|w| w.code == ErrorCode::TrajNearSingularity as u16)
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the planner warning never reached STATUS: {:?}",
+            s.warnings
+        );
+    }
+    // ...and it clears from the broadcast when the planner drops it.
+    h.planner.lock().unwrap().warnings.clear();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.warnings.is_empty() {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the cleared warning still broadcasts: {:?}",
+            s.warnings
+        );
     }
 }
 
@@ -318,7 +406,11 @@ impl Harness {
             .lock()
             .unwrap()
             .outcomes
-            .push_back(CommandOutcome { index, error: None });
+            .push_back(CommandOutcome {
+                index,
+                error: None,
+                verdict: None,
+            });
     }
 
     fn complete_err(&self, index: u64, error: WireError) {
@@ -329,6 +421,7 @@ impl Harness {
             .push_back(CommandOutcome {
                 index,
                 error: Some(error),
+                verdict: None,
             });
     }
 
@@ -427,6 +520,14 @@ impl Client {
         }
     }
 
+    /// Expect a plain OK (no queue index) — the SYSTEM ack shape.
+    async fn ok(&mut self, cmd: &Command) {
+        match self.request(cmd).await {
+            Reply::Ok { index: None, .. } => {}
+            other => panic!("expected plain OK, got {other:?}"),
+        }
+    }
+
     async fn expect_error(&mut self, cmd: &Command) -> WireError {
         match self.request(cmd).await {
             Reply::Error { error, .. } => error,
@@ -449,6 +550,7 @@ impl Client {
                 index: i,
                 ok,
                 detail,
+                ..
             } = self.recv().await
             {
                 if i == index {
@@ -554,6 +656,7 @@ fn move_s(key: u64, n: usize) -> Command {
         duration: Some(2.0),
         speed: None,
         accel: None,
+        rel: false,
     })
 }
 
@@ -765,6 +868,99 @@ async fn reset_waiter_overflow_names_itself_in_the_refusal() {
     }
 }
 
+/// FLASHING over the wire: the enter ack waits for the RT's verdict
+/// (mode changed, or the window expired), and an exit is refused up
+/// front from any mode but FLASHING — dispatching `SetMode(Idle)` from a
+/// working mode would cancel motion nobody asked to stop.
+#[tokio::test]
+async fn flashing_enter_and_exit_follow_the_rt_verdict() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.mode = Mode::Idle);
+    let mut c = Client::new(&h).await;
+
+    // Exit outside FLASHING: refused at the server, nothing reaches the RT.
+    let err = c.expect_error(&Command::ExitFlashing).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("FLASHING"),
+        "the refusal must say what mode gate failed: {}",
+        err.cause
+    );
+    assert!(!h.rt_events().contains(&RtEvent::ExitFlashing));
+
+    // Enter: acked only once the RT reports the mode changed.
+    let enter = Command::EnterFlashing(EnterFlashing {
+        assertion: FlashingAssertion::Parked,
+    });
+    c.ok(&enter).await;
+    assert!(h.rt_events().contains(&RtEvent::EnterFlashing));
+
+    // Enter refused by the RT (e.g. requested from EXEC): the ERROR
+    // carries the RT's own verdict instead of a fabricated OK.
+    h.rt.lock().unwrap().flashing_verdict = Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", "the controller mode stayed EXEC")],
+    ));
+    let err = c.expect_error(&enter).await;
+    assert!(err.cause.contains("EXEC"), "{}", err.cause);
+
+    // Exit from FLASHING: dispatched and acked on the verdict.
+    h.publish(|s| s.mode = Mode::Flashing);
+    c.ok(&Command::ExitFlashing).await;
+    assert!(h.rt_events().contains(&RtEvent::ExitFlashing));
+}
+
+/// `set_pid_gains` reaches the RT only for a node the config declares as
+/// a drive; anything else is refused with the tunable set named, and
+/// nothing is forwarded — an ack would report a tune nothing received.
+#[tokio::test]
+async fn set_pid_gains_validates_the_node_against_the_config() {
+    let mut h = start(|cfg| cfg.tunable_nodes = vec![0, 1, 2, 3, 4, 5]).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let gains = |node| {
+        Command::SetPidGains(SetPidGains {
+            node,
+            kpp: 9.0,
+            kpv: 0.05,
+            kiv: 0.005,
+            kpiq: 1.2,
+            kiiq: 1.0,
+            kp: 0.12,
+            kd: 0.002,
+            ilim_ma: 2200.0,
+            velocity_limit_ticks_s: 150_000.0,
+            voltage_limit_mv: 0,
+        })
+    };
+    c.ok(&gains(2)).await;
+    let ev = h.rt_events();
+    assert!(
+        ev.contains(&RtEvent::SetPidGains {
+            node: 2,
+            kpp: 9.0,
+            ilim_ma: 2200.0
+        }),
+        "the accepted tune must reach the RT: {ev:?}"
+    );
+
+    let err = c.expect_error(&gains(9)).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("node 9"),
+        "the refusal must name the node: {}",
+        err.cause
+    );
+    let forwarded = h
+        .rt_events()
+        .iter()
+        .filter(|e| matches!(e, RtEvent::SetPidGains { .. }))
+        .count();
+    assert_eq!(forwarded, 1, "the refused node must not be forwarded");
+}
+
 /// The gating table over the wire: un-homed, disabled, e-stop latch and
 /// simulator-only rejections carry their specific error codes; `home`
 /// is the one motion command that stays available un-homed.
@@ -909,6 +1105,152 @@ async fn stop_estop_reset_semantics() {
     // The allocator was never reset — not by estop, not by reset_state.
     let i5 = c.ok_index(&move_j(407)).await;
     assert_eq!(i5, 5);
+}
+
+/// Cancellation is spoken, not silent: every dropped command gets
+/// COMPLETE(ok=false, MOTN_CANCELLED) — the active command, the moves
+/// blended into its motion, and the pending queue when the scope clears
+/// it — so a client's `wait_command` resolves promptly instead of
+/// running out its timeout. The scope decides the standing error: a
+/// queue-clearing stop latches MOTN_CANCELLED, estop keeps its own
+/// SYS_ESTOP_ACTIVE, and a plain stop or a streamable preemption
+/// latches nothing.
+#[tokio::test]
+async fn cancellation_pushes_complete_for_every_dropped_command() {
+    let mut h = start(|cfg| {
+        cfg.blend_hold = Duration::from_millis(150);
+        cfg.blend_lookahead = 4;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    async fn standing(c: &mut Client) -> Option<WireError> {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error } => error,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // The pump dispatches asynchronously after the ack, so every scope
+    // waits for its head command to actually START before cancelling it —
+    // otherwise the scope races the dispatch and drops a still-pending
+    // command through a different path.
+    async fn started(h: &Harness, index: u64) {
+        let deadline = tokio::time::Instant::now() + BUDGET;
+        loop {
+            if h.planner
+                .lock()
+                .unwrap()
+                .started
+                .iter()
+                .any(|(i, _)| *i == index)
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "command {index} never started"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+    }
+
+    // stop {clear_queue: false}: the active command reports cancelled,
+    // the pending one survives and completes normally.
+    let i1 = c.ok_index(&move_j(901)).await;
+    let i2 = c.ok_index(&move_j(902)).await;
+    started(&h, i1).await;
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    let (ok, detail) = c.wait_complete(i1).await;
+    assert!(!ok, "a cancelled command must not read as success");
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
+    assert!(
+        standing(&mut c).await.is_none(),
+        "a plain stop leaves no standing error"
+    );
+    started(&h, i2).await;
+    h.complete_ok(i2);
+    assert!(c.wait_complete(i2).await.0, "the queue continued past i1");
+
+    // stop {clear_queue: true} against a blended motion plus a pending
+    // command: all three report cancelled and the standing error names
+    // the cancellation.
+    h.planner.lock().unwrap().consume = 2;
+    let i3 = c.ok_index(&move_j_blended(903, Some(15.0))).await;
+    let i4 = c.ok_index(&move_j_blended(904, None)).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while h.planner.lock().unwrap().started.len() < 2 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "chain never started"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    h.planner.lock().unwrap().consume = 1;
+    let i5 = c.ok_index(&move_j(905)).await;
+    c.request(&Command::Stop(Stop { clear_queue: true })).await;
+    for i in [i3, i4, i5] {
+        let (ok, detail) = c.wait_complete(i).await;
+        assert!(!ok, "index {i} must report its cancellation");
+        assert_eq!(
+            detail.expect("cancelled COMPLETE carries detail").code,
+            ErrorCode::MotnCancelled as u16,
+            "index {i}"
+        );
+    }
+    let e = standing(&mut c).await.expect("queue-clearing stop latches");
+    assert_eq!(e.code, ErrorCode::MotnCancelled as u16);
+    assert_eq!(e.command_index, UNATTRIBUTED);
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            completed_index, ..
+        } => assert_eq!(
+            completed_index, i5 as i64,
+            "the high-water mark covers every dropped index"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // estop: the drop reports cancelled; the standing error stays the
+    // e-stop latch (the truer fact about the arm).
+    let i6 = c.ok_index(&move_j(906)).await;
+    started(&h, i6).await;
+    c.request(&Command::Estop).await;
+    let (ok, detail) = c.wait_complete(i6).await;
+    assert!(!ok);
+    assert_eq!(
+        detail.expect("cancelled COMPLETE carries detail").code,
+        ErrorCode::MotnCancelled as u16
+    );
+    let e = standing(&mut c).await.expect("estop stands");
+    assert_eq!(e.code, ErrorCode::SysEstopActive as u16);
+    c.request(&Command::Reset).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::SetEnabled(true)))
+        .await;
+
+    // A streamable preempting planned motion drops it the same spoken
+    // way, with nothing latched — the preempting motion was accepted.
+    let i7 = c.ok_index(&move_j(907)).await;
+    let i8 = c.ok_index(&move_j(908)).await;
+    started(&h, i7).await;
+    c.send(&jog_j()).await;
+    for i in [i7, i8] {
+        let (ok, detail) = c.wait_complete(i).await;
+        assert!(!ok, "index {i} must report its preemption");
+        assert_eq!(
+            detail.expect("cancelled COMPLETE carries detail").code,
+            ErrorCode::MotnCancelled as u16,
+            "index {i}"
+        );
+    }
+    assert!(
+        standing(&mut c).await.is_none(),
+        "an accepted preemption latches nothing"
+    );
 }
 
 /// Streaming preemption: same-type updates in place, a different type
@@ -1924,6 +2266,89 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     h.complete_ok(i3);
     c.wait_complete(i3).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
+}
+
+/// A tool `stop` halts the jaws at ADMISSION, not when the queue reaches
+/// it: queued behind the very move it is meant to halt, a stop that
+/// waited its turn could only run after the jaws had finished the travel
+/// it was sent to interrupt. The queued instance still dispatches in
+/// order behind the move and carries the COMPLETE discipline; other
+/// actions get no out-of-band effect.
+#[tokio::test]
+async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let action = |key: u64, name: &str, params: &[f64]| {
+        Command::ToolAction(par6_proto::command::ToolAction {
+            key,
+            tool_key: "GRIPPER".to_owned(),
+            action: name.to_owned(),
+            params: params
+                .iter()
+                .map(|v| par6_proto::command::ToolParam::Float(*v))
+                .collect(),
+        })
+    };
+
+    // The move dispatches and stays in flight (no outcome yet).
+    let mv = c.ok_index(&action(801, "move", &[0.0, 0.2, 400.0])).await;
+    let started = |p: &PlannerState| p.started.iter().map(|(i, _)| *i).collect::<Vec<_>>();
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while started(&h.planner.lock().unwrap()) != vec![mv] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the move never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+
+    // Admitting the stop fires the RT halt immediately, while the move
+    // still owns the queue head.
+    let st = c.ok_index(&action(802, "stop", &[])).await;
+    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::ToolStop)).await;
+    assert_eq!(
+        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
+        1,
+        "one admission, one halt: {ev:?}"
+    );
+    assert_eq!(
+        started(&h.planner.lock().unwrap()),
+        vec![mv],
+        "the queued stop must not jump the dispatch order"
+    );
+
+    // The halted move settles; only then does the queued stop dispatch.
+    h.complete_ok(mv);
+    c.wait_complete(mv).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while started(&h.planner.lock().unwrap()) != vec![mv, st] {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the queued stop never dispatched"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    h.complete_ok(st);
+    c.wait_complete(st).await;
+
+    // `idle` (or any other action) is a plain queued command: no
+    // out-of-band halt fires for it.
+    let idle = c.ok_index(&action(803, "idle", &[])).await;
+    h.complete_ok(idle);
+    c.wait_complete(idle).await;
+    let ev = h.rt_events();
+    assert_eq!(
+        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
+        1,
+        "only the stop admission halts out-of-band: {ev:?}"
+    );
 }
 
 /// Gaps 2 + 3, together: the controller comes up ready to accept motion,

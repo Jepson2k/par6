@@ -60,6 +60,8 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         make_error(ErrorCode::SysExecLinkLost, UNATTRIBUTED, &[])
     } else if has(RtCode::RtiLinkLost) {
         make_error(ErrorCode::SysRtiLinkLost, UNATTRIBUTED, &[])
+    } else if has(RtCode::StreamFault) {
+        make_error(ErrorCode::SysStreamFault, UNATTRIBUTED, &[])
     } else if has(RtCode::ExecSettleTimeout) {
         make_error(
             ErrorCode::MotnSettleTimeout,
@@ -180,6 +182,7 @@ mod tests {
 
         let cases = [
             (RtCode::RtiLinkLost, None, ErrorCode::SysRtiLinkLost),
+            (RtCode::StreamFault, None, ErrorCode::SysStreamFault),
             (RtCode::LoopCritical, None, ErrorCode::SysLoopCritical),
             (RtCode::ExecLinkLost, None, ErrorCode::SysExecLinkLost),
             (RtCode::SwEstop, None, ErrorCode::SysEstopActive),

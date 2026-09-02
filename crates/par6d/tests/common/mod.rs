@@ -233,7 +233,7 @@ pub struct Client {
     sock: UdpSocket,
     server: SocketAddr,
     next_req: u32,
-    completes: Vec<(u64, bool, Option<WireError>)>,
+    completes: Vec<(u64, bool, Option<WireError>, Option<u8>)>,
 }
 
 impl Client {
@@ -281,8 +281,13 @@ impl Client {
                     {
                         return r;
                     }
-                    Reply::Complete { index, ok, detail } => {
-                        self.completes.push((*index, *ok, detail.clone()));
+                    Reply::Complete {
+                        index,
+                        ok,
+                        detail,
+                        verdict,
+                    } => {
+                        self.completes.push((*index, *ok, detail.clone(), *verdict));
                     }
                     _ => {}
                 }
@@ -328,9 +333,15 @@ impl Client {
 
     /// The COMPLETE push for `index`, from the stash or off the wire.
     pub fn wait_complete(&mut self, index: u64) -> (bool, Option<WireError>) {
+        let (ok, detail, _) = self.wait_complete_full(index);
+        (ok, detail)
+    }
+
+    /// As [`Self::wait_complete`], but also the success verdict element.
+    pub fn wait_complete_full(&mut self, index: u64) -> (bool, Option<WireError>, Option<u8>) {
         if let Some(pos) = self.completes.iter().position(|c| c.0 == index) {
-            let (_, ok, detail) = self.completes.remove(pos);
-            return (ok, detail);
+            let (_, ok, detail, verdict) = self.completes.remove(pos);
+            return (ok, detail, verdict);
         }
         let deadline = Instant::now() + BUDGET;
         loop {
@@ -338,12 +349,13 @@ impl Client {
                 index: i,
                 ok,
                 detail,
+                verdict,
             }) = self.try_recv()
             {
                 if i == index {
-                    return (ok, detail);
+                    return (ok, detail, verdict);
                 }
-                self.completes.push((i, ok, detail));
+                self.completes.push((i, ok, detail, verdict));
             }
             assert!(
                 Instant::now() < deadline,
@@ -361,8 +373,14 @@ impl Client {
     /// Drain whatever replies are already buffered into the stash.
     pub fn drain(&mut self) {
         while let Some(r) = self.try_recv() {
-            if let Reply::Complete { index, ok, detail } = r {
-                self.completes.push((index, ok, detail));
+            if let Reply::Complete {
+                index,
+                ok,
+                detail,
+                verdict,
+            } = r
+            {
+                self.completes.push((index, ok, detail, verdict));
             }
         }
     }

@@ -4,7 +4,9 @@
 //! - `[OK, req_id]` / `[OK, req_id, index]` (queued commands echo the index)
 //! - `[ERROR, req_id, [command_index, code, title, cause, effect, remedy]]`
 //! - `[RESPONSE, req_id, [query_tag, ...fields]]`
-//! - `[COMPLETE, 0, index, ok]` / `[COMPLETE, 0, index, ok, detail]`
+//! - `[COMPLETE, 0, index, ok]` / `[COMPLETE, 0, index, ok, fifth]` — the
+//!   fifth element's type is keyed on `ok`: a failure `detail` (the ERROR
+//!   array) when false, a tool settle `verdict` (uint 1..=3) when true
 //!
 //! `req_id` is the client-generated u32 echoed verbatim; pushes use 0.
 
@@ -278,6 +280,11 @@ pub enum QueryResult {
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
+        /// Active telemetry recipe name (`None` = telemetry off).
+        active_recipe: Option<String>,
+        /// Recipe names SET_RECIPE accepts — the discovery surface a
+        /// client selects from.
+        recipes: Vec<String>,
     },
     /// PAYLOAD result: the effective runtime payload (zeros = none).
     Payload {
@@ -378,6 +385,12 @@ pub enum Reply {
         ok: bool,
         /// Failure detail; present when `ok` is false.
         detail: Option<WireError>,
+        /// Success detail on tool-move completions (`ok` true): the
+        /// settle verdict off the gripper reply — 1 = object detected
+        /// while closing, 2 = object detected while opening, 3 = target
+        /// reached, no object. `None` on non-tool completions and from
+        /// senders of the 4-element form.
+        verdict: Option<u8>,
     },
 }
 
@@ -565,8 +578,10 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             tick_dt_s,
             motion,
             joints,
+            active_recipe,
+            recipes,
         } => {
-            w_array(buf, 6);
+            w_array(buf, 8);
             w_uint(buf, u64::from(tag));
             w_str(buf, path);
             w_str(buf, fingerprint);
@@ -581,6 +596,14 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
+            }
+            match active_recipe {
+                Some(name) => w_str(buf, name),
+                None => w_nil(buf),
+            }
+            w_array(buf, recipes.len());
+            for name in recipes {
+                w_str(buf, name);
             }
         }
         Q::ConfigBundle {
@@ -654,13 +677,30 @@ pub fn encode_reply(reply: &Reply, buf: &mut Vec<u8>) {
             w_uint(buf, u64::from(*req_id));
             encode_result(result, buf);
         }
-        Reply::Complete { index, ok, detail } => {
-            w_array(buf, if detail.is_some() { 5 } else { 4 });
+        Reply::Complete {
+            index,
+            ok,
+            detail,
+            verdict,
+        } => {
+            // The 5th element's type is keyed on `ok`: failure detail
+            // (WireError array) when false, settle verdict (uint) when
+            // true.
+            let fifth = if *ok {
+                verdict.is_some()
+            } else {
+                detail.is_some()
+            };
+            w_array(buf, if fifth { 5 } else { 4 });
             w_uint(buf, u64::from(MsgType::Complete as u8));
             w_uint(buf, 0);
             w_uint(buf, *index);
             w_bool(buf, *ok);
-            if let Some(d) = detail {
+            if *ok {
+                if let Some(v) = verdict {
+                    w_uint(buf, u64::from(*v));
+                }
+            } else if let Some(d) = detail {
                 d.encode(buf);
             }
         }
@@ -923,7 +963,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             QueryResult::IsSimulator { active: r.bool()? }
         }
         T::ConfigInfo => {
-            expect_arity("config_info result", n, 6)?;
+            expect_arity("config_info result", n, 8)?;
             let path = r.str()?.to_owned();
             let fingerprint = r.str()?.to_owned();
             let tick_dt_s = r.f64()?;
@@ -942,12 +982,21 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             for _ in 0..jn {
                 joints.push(r_f64_fixed(r, "config_info.joints[]")?);
             }
+            let active_recipe = if r.peek_nil() {
+                r.nil()?;
+                None
+            } else {
+                Some(r.str()?.to_owned())
+            };
+            let recipes = r_strings(r)?;
             QueryResult::ConfigInfo {
                 path,
                 fingerprint,
                 tick_dt_s,
                 motion,
                 joints,
+                active_recipe,
+                recipes,
             }
         }
         T::ConfigBundle => {
@@ -1061,19 +1110,30 @@ pub fn decode_reply(data: &[u8]) -> Result<Reply, DecodeError> {
                     got: n,
                 });
             }
-            Reply::Complete {
-                index: r.uint()?,
-                ok: r.bool()?,
-                detail: if n == 5 {
-                    if r.peek_nil() {
-                        r.nil()?;
-                        None
-                    } else {
-                        Some(WireError::decode(&mut r)?)
+            let index = r.uint()?;
+            let ok = r.bool()?;
+            let (mut detail, mut verdict) = (None, None);
+            if n == 5 {
+                if r.peek_nil() {
+                    r.nil()?;
+                } else if ok {
+                    let v = r.uint()?;
+                    if !(1..=3).contains(&v) {
+                        return Err(DecodeError::Validation {
+                            what: "COMPLETE verdict",
+                            why: format!("settle verdict must be 1..=3, got {v}"),
+                        });
                     }
+                    verdict = Some(v as u8);
                 } else {
-                    None
-                },
+                    detail = Some(WireError::decode(&mut r)?);
+                }
+            }
+            Reply::Complete {
+                index,
+                ok,
+                detail,
+                verdict,
             }
         }
         MsgType::Status | MsgType::Chunk => {

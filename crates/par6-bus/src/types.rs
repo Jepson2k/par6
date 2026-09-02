@@ -426,9 +426,8 @@ pub struct BusState {
     pub frame_age_max_ticks: u64,
     /// Min frame age observed in the last drain \[ticks\].
     pub frame_age_min_ticks: u64,
-    /// Bitmask of nodes whose stale→fresh edge happened during the last
-    /// drain — the RT loop re-sends those nodes' config
-    /// ([`super::DriverBus::resend_node_config`]).
+    /// Nodes whose reconnect edge landed in the last drain; the RT loop
+    /// re-sends their config.
     pub reconnected_mask: u16,
 }
 
@@ -455,7 +454,7 @@ impl BusState {
 /// Data-age classification for one node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Freshness {
-    /// No frame seen since boot / last re-base.
+    /// No frame seen since boot.
     Unknown,
     /// Data younger than the stale threshold.
     Fresh,
@@ -494,6 +493,22 @@ pub struct LinkHealth {
     pub tx_errors: u64,
     /// Total frames received.
     pub rx_frames: u64,
+}
+
+/// A live drive retune: the values `SET_PID_GAINS` replaces in one
+/// node's stored configuration before the push. The watchdog settings
+/// are deliberately absent — retuning must never touch the safety
+/// timeout.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DriveTune {
+    /// Cascade-PID and impedance-PD gains (cmds 16/22/23/24).
+    pub gains: par6_config::Gains,
+    /// Driver current limit \[mA\] (cmd 20).
+    pub ilim_ma: f64,
+    /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
+    pub velocity_limit_ticks_s: f64,
+    /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS.
+    pub voltage_limit_mv: u32,
 }
 
 /// Bus operation failure. Send errors are propagated, never swallowed

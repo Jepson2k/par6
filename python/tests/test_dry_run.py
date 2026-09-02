@@ -422,6 +422,13 @@ class TestCartesianMotion:
             dry_run.select_profile("BANG_BANG")
         assert profile.value.code == ErrorCode.SYS_PROFILE_INVALID
 
+        # The live client refuses rel on a pose-target joint move
+        # (MOVE_J_POSE is absolute on the wire) — a preview that quietly
+        # planned the absolute move would validate a program the arm
+        # then refuses with this very ValueError.
+        with pytest.raises(ValueError, match="rel=True"):
+            dry_run.move_j(pose=dry_run.pose(), rel=True)
+
         far = list(dry_run.angles())
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
         with pytest.raises(RobotError) as outside:
@@ -547,6 +554,12 @@ class TestCartesianMotion:
         assert len(client.io()) == IO_SLOTS
         assert client.error() is None
         assert client.queue() == []
+        # The mirror must report what the ENGINE plans with from the
+        # first preview: the runtime's own startup profile
+        # (par6d::planner::DEFAULT_PROFILE). A mirror that said TOPPRA
+        # while the engine ran RUCKIG timed every pre-sync preview with
+        # the wrong profile.
+        assert client.profile() == "RUCKIG"
         assert client.is_robot_stopped()
         assert not client.is_estop_pressed()
         assert client.joint_speeds() == [0.0] * NUM_JOINTS

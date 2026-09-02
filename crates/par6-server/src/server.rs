@@ -16,11 +16,17 @@
 //!   (`validate_supported`), never dropped: a command that half-executes
 //!   moves the arm somewhere the client did not ask for, and the client
 //!   has no way to find out.
-//! - Cancellation (stop/estop/reset/simulator toggle/stream preemption)
-//!   drops commands WITHOUT a COMPLETE push; clients observe it through
-//!   the status stream (queue emptied, `executing_index` = −1, and for
-//!   estop a standing `SYS_ESTOP_ACTIVE` error whose ordering fails
-//!   their waits).
+//! - Cancellation (stop/estop/reset_state/simulator toggle/stream
+//!   preemption) is SPOKEN: every dropped command — the active one, the
+//!   moves blended into its motion, and the pending queue on a
+//!   queue-clearing scope — gets `COMPLETE(ok=false, MOTN_CANCELLED)`
+//!   and advances the high-water `completed_index`, so a client's wait
+//!   resolves promptly instead of running out its timeout. (A lost
+//!   cancel push therefore reads as success through the
+//!   `completed_index` fallback — the documented cost of the simple
+//!   form.) A queue-clearing `stop` latches `MOTN_CANCELLED` as the
+//!   standing error; `estop` keeps its truer `SYS_ESTOP_ACTIVE`; a
+//!   plain stop or an accepted preemption latches nothing.
 //! - A failed queued command latches its error (attributed to its
 //!   index), pushes `COMPLETE(ok=false)`, and clears the pending queue —
 //!   later commands must not run from an unexpected position. Acceptance
@@ -228,6 +234,9 @@ struct Core<P: Planner, R: RtCommands> {
     drainbuf: Vec<u8>,
     /// Clients whose `reset` is still waiting for the RT's answer.
     reset_waiters: Vec<(u32, SocketAddr)>,
+    /// Clients whose `enter_flashing`/`exit_flashing` is still waiting
+    /// for the RT's mode change.
+    flashing_waiters: Vec<(u32, SocketAddr)>,
     /// Whether the boot-time enable has been requested yet.
     booted: bool,
 
@@ -302,6 +311,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
             reset_waiters: Vec::new(),
+            flashing_waiters: Vec::new(),
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
@@ -455,6 +465,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.refresh_snapshot();
         self.request_boot_enable();
         self.settle_enable().await;
+        self.settle_flashing().await;
         self.expire_chunks().await;
         self.collect_outcomes().await;
         self.pump().await;
@@ -498,9 +509,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.on_reset(req_id, addr).await;
             return;
         }
+        if let C::EnterFlashing(_) | C::ExitFlashing = cmd {
+            self.on_flashing(req_id, matches!(cmd, C::EnterFlashing(_)), addr)
+                .await;
+            return;
+        }
         let result: Result<(), WireError> = match cmd {
             C::Estop => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("estop", dropped).await;
                 self.estop_latched = true;
                 self.runtime.rt.set_enabled(false);
                 self.standing_error =
@@ -516,10 +533,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::Stop(p) => {
-                self.cancel_active_motion();
+                let mut dropped = self.cancel_active_motion();
                 if p.clear_queue {
-                    self.pending.clear();
-                    self.blend_hold = None;
+                    dropped.extend(self.drop_pending());
+                }
+                let latch = p.clear_queue && !dropped.is_empty();
+                self.complete_cancelled("stop", dropped).await;
+                if latch {
+                    // A cleared program is a fact the operator has to
+                    // see; the next accepted motion wipes it.
+                    self.standing_error = Some(make_error(
+                        ErrorCode::MotnCancelled,
+                        UNATTRIBUTED,
+                        &[("scope", "stop")],
+                    ));
                 }
                 Ok(())
             }
@@ -548,7 +575,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 )),
             },
             C::Simulator(p) => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("the simulator switch", dropped)
+                    .await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
                 })
@@ -576,7 +605,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::ResetState => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("reset", dropped).await;
                 self.standing_error = None;
                 self.action_state = ActionState::Idle;
                 self.last_checkpoint.clear();
@@ -597,7 +627,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
-                self.cancel_all_motion();
+                let dropped = self.cancel_all_motion();
+                self.complete_cancelled("the hardware connect", dropped)
+                    .await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
                 })
@@ -619,6 +651,28 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::SetShapes(p) => self.apply_program_shapes(p.shapes.clone()),
+            // Values are codec-validated; the node id is config
+            // knowledge, so it is checked here — an ack for a node this
+            // arm does not have would report a tune nothing received.
+            C::SetPidGains(p) => {
+                if self.cfg.tunable_nodes.contains(&p.node) {
+                    self.runtime.rt.set_pid_gains(p);
+                    Ok(())
+                } else {
+                    Err(make_error(
+                        ErrorCode::CommValidationError,
+                        UNATTRIBUTED,
+                        &[(
+                            "detail",
+                            &format!(
+                                "set_pid_gains node {} is not a configured drive \
+                                 (tunable nodes: {:?})",
+                                p.node, self.cfg.tunable_nodes
+                            ),
+                        )],
+                    ))
+                }
+            }
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -709,6 +763,73 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
+    /// `enter_flashing`/`exit_flashing`: only the RT can change the mode,
+    /// so like `reset` the ack waits for the published verdict
+    /// ([`RtCommands::take_flashing_outcome`]) instead of reporting a
+    /// mode change that may never happen (entry is refused outside
+    /// IDLE/ACTIVE_ERROR, asynchronously).
+    async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
+        self.refresh_snapshot();
+        // An exit from any mode but FLASHING is refused HERE: it would
+        // dispatch `SetMode(Idle)`, which from a working mode cancels
+        // motion the client never asked to stop.
+        if !enter && self.snap.mode != Mode::Flashing {
+            let error = make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "exit_flashing while the controller mode is {:?}, not FLASHING",
+                        self.snap.mode
+                    ),
+                )],
+            );
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        if self.flashing_waiters.len() >= MAX_RESET_WAITERS {
+            let error = make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "Too many FLASHING requests are already awaiting the \
+                     controller's verdict; stop retrying until the \
+                     outstanding one is answered.",
+                )],
+            );
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        if enter {
+            self.runtime.rt.enter_flashing();
+        } else {
+            self.runtime.rt.exit_flashing();
+        }
+        self.flashing_waiters.push((req_id, addr));
+    }
+
+    /// Hand the RT's FLASHING verdict to whoever is waiting on it.
+    async fn settle_flashing(&mut self) {
+        let Some(outcome) = self.runtime.rt.take_flashing_outcome() else {
+            return;
+        };
+        for (req_id, addr) in std::mem::take(&mut self.flashing_waiters) {
+            let reply = match &outcome {
+                Ok(()) => Reply::Ok {
+                    req_id,
+                    index: None,
+                },
+                Err(error) => Reply::Error {
+                    req_id,
+                    error: error.clone(),
+                },
+            };
+            self.reply(addr, &reply).await;
+        }
+    }
+
     /// Come up ready to accept motion, the way parol6's controller does
     /// (`server/state.py`, `enabled = True`): its `enabled` flag is a
     /// PROTECTIVE-STOP latch, and nothing is latched on a clean boot.
@@ -758,7 +879,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.cancel_stream();
                 self.drain_stream_backlog(superseded);
             }
-            self.cancel_planned();
+            let dropped = self.cancel_planned();
+            self.complete_cancelled("a streaming preemption", dropped)
+                .await;
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
@@ -788,7 +911,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.runtime.rt.cancel_stream();
                     self.drain_stream_backlog(superseded);
                 }
-                self.cancel_planned();
+                let dropped = self.cancel_planned();
+                self.complete_cancelled("a streaming preemption", dropped)
+                    .await;
                 let outcome = self.runtime.rt.stream(&cmd);
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
@@ -859,6 +984,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if self.active_stream.take().is_some() {
             // A planned move cancels streaming.
             self.runtime.rt.cancel_stream();
+        }
+        if matches!(&cmd, Command::ToolAction(p) if p.action == "stop") {
+            // Halt-in-place cannot wait its turn behind the very move it
+            // halts: the physical stop fires now, and the queued instance
+            // (idempotent at the RT) carries the COMPLETE discipline once
+            // the queue reaches it.
+            self.runtime.rt.tool_stop();
         }
         self.pending.push_back(Pending { index, cmd, addr });
         self.reply(
@@ -934,82 +1066,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         ))
     }
 
-    /// Parameters the runtime cannot honour. Refusing them is the whole
-    /// point: a silently dropped parameter makes the arm do something
-    /// other than what the client asked for, with no way to tell.
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
-        let refuse = |detail: String| {
-            Some(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &detail)],
-            ))
-        };
-        // A corner is rounded by re-planning both of its segments as one
-        // path, which needs kinematics (IK along the rounded corner, and
-        // TOPPRA to time it). A runtime without them can only stop at
-        // every waypoint, and saying so beats doing it silently.
-        let blend = |r: Option<f64>| {
-            r.filter(|r| *r > 0.0 && !self.cfg.cartesian).map(|r| {
-                format!(
-                    "blend radius {r} mm needs kinematics: this runtime has none, \
-                     so every move stops at its target; send r = nil"
-                )
-            })
-        };
-        let unsupported = match cmd {
-            Command::MoveJ(p) => blend(p.blend_radius),
-            Command::MoveJPose(p) => blend(p.blend_radius),
-            Command::MoveL(p) => blend(p.blend_radius),
-            // An arc ends where its `end` pose is: par6d rounds corners
-            // between straight segments and between joint moves, but has
-            // no arc-to-successor blend, and a radius that quietly did
-            // nothing would be the silent alteration this function
-            // exists to prevent.
-            Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
-                format!(
-                    "blend radius {r} mm is not supported on move_c: an arc stops at \
-                     its end pose; send r = nil"
-                )
-            }),
-            // A pose the runtime cannot place the arm at is refused, not
-            // clamped: clamping landed the arm tens of degrees from where
-            // the client asked and answered success, which is the silent
-            // alteration this whole function exists to prevent.
-            Command::Teleport(p) => {
-                teleport_angle_fault(&p.angles, &self.cfg).or(match p.tool_positions.as_deref() {
-                    None => None,
-                    Some(_) if self.cfg.tool_dof == 0 => Some(format!(
-                        "tool '{}' has no controllable position",
-                        self.cfg.fitted_tool
-                    )),
-                    Some(pos) if pos.len() != self.cfg.tool_dof => Some(format!(
-                        "tool '{}' has {} position(s), {} given",
-                        self.cfg.fitted_tool,
-                        self.cfg.tool_dof,
-                        pos.len()
-                    )),
-                    Some(pos) => pos
-                        .iter()
-                        .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
-                        .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
-                })
-            }
-            // A passive tool (no driver) has nothing to actuate.
-            Command::ToolAction(p) if self.cfg.tool_dof == 0 => Some(format!(
-                "tool '{}' is passive: it has no actions",
-                p.tool_key
-            )),
-            // Cartesian streamables need IK every tick; a runtime without
-            // kinematics can only drop them.
-            Command::ServoJPose(_) | Command::ServoL(_) | Command::JogL(_)
-                if !self.cfg.cartesian =>
-            {
-                Some("this runtime has no kinematics: cartesian commands are unavailable".into())
-            }
-            _ => None,
-        };
-        unsupported.and_then(refuse)
+        validate_supported(&self.cfg, cmd)
     }
 
     // ---- queue engine ------------------------------------------------------
@@ -1075,7 +1133,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     });
                 }
                 Err(e) => {
-                    self.fail_command(pc.index, pc.addr, e).await;
+                    self.fail_command(pc.index, pc.addr, Vec::new(), e).await;
                     break;
                 }
             }
@@ -1136,69 +1194,111 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                             self.sync_planner();
                         }
                     }
-                    self.push_complete(ex.addr, ex.index, None).await;
+                    self.push_complete(ex.addr, ex.index, None, out.verdict)
+                        .await;
                     // Blended-away commands finished in the same motion:
                     // each is completed in queue order, and the
                     // high-water mark ends on the last of them.
                     for (index, addr) in ex.blended {
                         self.completed_index = self.completed_index.max(index as i64);
-                        self.push_complete(addr, index, None).await;
+                        self.push_complete(addr, index, None, None).await;
                     }
                 }
                 Some(e) => {
                     // The whole blended motion failed. The error is
-                    // attributed to the command that started it, and the
-                    // ones folded into it are dropped exactly like the
-                    // pending queue behind them.
-                    self.fail_command(ex.index, ex.addr, e).await;
+                    // attributed to the command that started it; the
+                    // ones folded into it report their cancellation like
+                    // the pending queue behind them.
+                    self.fail_command(ex.index, ex.addr, ex.blended, e).await;
                 }
             }
         }
     }
 
     /// A queued command finished with an error: latch it (attributed),
-    /// clear the pending queue (later commands must not run from an
-    /// unexpected position), and push COMPLETE(ok=false).
-    async fn fail_command(&mut self, index: u64, addr: SocketAddr, mut e: WireError) {
+    /// push COMPLETE(ok=false), and clear the pending queue (later
+    /// commands must not run from an unexpected position) — with the
+    /// blended-away and drained commands each reporting their
+    /// cancellation rather than vanishing.
+    async fn fail_command(
+        &mut self,
+        index: u64,
+        addr: SocketAddr,
+        blended: Vec<(u64, SocketAddr)>,
+        mut e: WireError,
+    ) {
         e.command_index = index as i64;
         self.completed_index = self.completed_index.max(index as i64);
         self.standing_error = Some(e.clone());
         self.action_state = ActionState::Error;
-        self.pending.clear();
+        let mut dropped = blended;
+        dropped.extend(self.drop_pending());
+        self.push_complete(addr, index, Some(e), None).await;
+        self.complete_cancelled("a failed preceding command", dropped)
+            .await;
+    }
+
+    /// Take the active command and the moves blended into its motion —
+    /// the commands a cancellation of the running motion drops.
+    fn drop_active(&mut self) -> Vec<(u64, SocketAddr)> {
+        match self.executing.take() {
+            Some(ex) => {
+                self.action_state = ActionState::Idle;
+                let mut dropped = vec![(ex.index, ex.addr)];
+                dropped.extend(ex.blended);
+                dropped
+            }
+            None => Vec::new(),
+        }
+    }
+
+    /// Drain the pending queue — the commands a queue-clearing scope
+    /// drops behind the active motion.
+    fn drop_pending(&mut self) -> Vec<(u64, SocketAddr)> {
         self.blend_hold = None;
-        self.push_complete(addr, index, Some(e)).await;
+        self.pending.drain(..).map(|p| (p.index, p.addr)).collect()
+    }
+
+    /// Speak every drop: `COMPLETE(ok=false, MOTN_CANCELLED)` per
+    /// command, advancing the high-water mark so the queue readout moves
+    /// past them. Touches neither the standing error nor the action
+    /// state — the SCOPE decides those.
+    async fn complete_cancelled(&mut self, scope: &'static str, dropped: Vec<(u64, SocketAddr)>) {
+        for (index, addr) in dropped {
+            self.completed_index = self.completed_index.max(index as i64);
+            let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
+            self.push_complete(addr, index, Some(e), None).await;
+        }
     }
 
     /// stop scope: active motion (planned + streaming) halts; the
-    /// pending queue is untouched.
-    fn cancel_active_motion(&mut self) {
+    /// pending queue is untouched. Returns the dropped commands for the
+    /// caller's [`Self::complete_cancelled`].
+    fn cancel_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        if self.executing.take().is_some() {
-            self.action_state = ActionState::Idle;
-        }
+        let dropped = self.drop_active();
         if self.active_stream.take().is_some() {
             self.runtime.rt.cancel_stream();
         }
         self.runtime.rt.halt();
+        dropped
     }
 
     /// estop / reset_state / simulator-toggle scope: everything.
-    fn cancel_all_motion(&mut self) {
-        self.cancel_active_motion();
-        self.pending.clear();
-        self.blend_hold = None;
+    fn cancel_all_motion(&mut self) -> Vec<(u64, SocketAddr)> {
+        let mut dropped = self.cancel_active_motion();
+        dropped.extend(self.drop_pending());
+        dropped
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
     /// cancelled — the queued program must not resume from wherever a
     /// manual jog left the arm.
-    fn cancel_planned(&mut self) {
+    fn cancel_planned(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        if self.executing.take().is_some() {
-            self.action_state = ActionState::Idle;
-        }
-        self.pending.clear();
-        self.blend_hold = None;
+        let mut dropped = self.drop_active();
+        dropped.extend(self.drop_pending());
+        dropped
     }
 
     /// A refused fire-and-forget command answered its sender with ERROR,
@@ -1660,7 +1760,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             mode: Self::wire_mode(self.snap.mode),
             enabled: self.snap.state == ArmState::Enabled,
             gravity_comp: self.snap.gravity_comp,
-            warnings: crate::faults::rt_warnings(&self.snap),
+            warnings: {
+                let mut w = crate::faults::rt_warnings(&self.snap);
+                w.extend(self.runtime.planner.warnings());
+                w
+            },
             link_health: Self::wire_link_health(&self.snap.link),
             homing: Self::wire_homing(&self.snap.homing),
             torques_ext: {
@@ -1875,6 +1979,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
+                    active_recipe: self.recipe.clone(),
+                    recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }
             }
             C::Shapes => QueryResult::Shapes {
@@ -1905,11 +2011,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
-    async fn push_complete(&mut self, addr: SocketAddr, index: u64, detail: Option<WireError>) {
+    async fn push_complete(
+        &mut self,
+        addr: SocketAddr,
+        index: u64,
+        detail: Option<WireError>,
+        verdict: Option<u8>,
+    ) {
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
             detail,
+            verdict,
         };
         self.reply(addr, &reply).await;
     }
@@ -1952,6 +2065,84 @@ fn world_in_tool_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     }
     out[15] = 1.0;
     out
+}
+
+/// Parameters the runtime cannot honour. Refusing them is the whole
+/// point: a silently dropped parameter makes the arm do something
+/// other than what the client asked for, with no way to tell. A free
+/// function over the config so the offline preview refuses exactly what
+/// the wire refuses.
+pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError> {
+    let refuse = |detail: String| {
+        Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[("detail", &detail)],
+        ))
+    };
+    // A corner is rounded by re-planning both of its segments as one
+    // path, which needs kinematics (IK along the rounded corner, and
+    // TOPPRA to time it). A runtime without them can only stop at
+    // every waypoint, and saying so beats doing it silently.
+    let blend = |r: Option<f64>| {
+        r.filter(|r| *r > 0.0 && !cfg.cartesian).map(|r| {
+            format!(
+                "blend radius {r} mm needs kinematics: this runtime has none, \
+                 so every move stops at its target; send r = nil"
+            )
+        })
+    };
+    let unsupported = match cmd {
+        Command::MoveJ(p) => blend(p.blend_radius),
+        Command::MoveJPose(p) => blend(p.blend_radius),
+        Command::MoveL(p) => blend(p.blend_radius),
+        // An arc ends where its `end` pose is: par6d rounds corners
+        // between straight segments and between joint moves, but has
+        // no arc-to-successor blend, and a radius that quietly did
+        // nothing would be the silent alteration this function
+        // exists to prevent.
+        Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
+            format!(
+                "blend radius {r} mm is not supported on move_c: an arc stops at \
+                 its end pose; send r = nil"
+            )
+        }),
+        // A pose the runtime cannot place the arm at is refused, not
+        // clamped: clamping landed the arm tens of degrees from where
+        // the client asked and answered success, which is the silent
+        // alteration this whole function exists to prevent.
+        Command::Teleport(p) => {
+            teleport_angle_fault(&p.angles, cfg).or(match p.tool_positions.as_deref() {
+                None => None,
+                Some(_) if cfg.tool_dof == 0 => Some(format!(
+                    "tool '{}' has no controllable position",
+                    cfg.fitted_tool
+                )),
+                Some(pos) if pos.len() != cfg.tool_dof => Some(format!(
+                    "tool '{}' has {} position(s), {} given",
+                    cfg.fitted_tool,
+                    cfg.tool_dof,
+                    pos.len()
+                )),
+                Some(pos) => pos
+                    .iter()
+                    .position(|v| !v.is_finite() || !(0.0..=1.0).contains(v))
+                    .map(|i| format!("tool_positions[{i}] = {} is outside [0, 1]", pos[i])),
+            })
+        }
+        // A passive tool (no driver) has nothing to actuate.
+        Command::ToolAction(p) if cfg.tool_dof == 0 => Some(format!(
+            "tool '{}' is passive: it has no actions",
+            p.tool_key
+        )),
+        // Cartesian streamables need IK every tick; a runtime without
+        // kinematics can only drop them.
+        Command::ServoJPose(_) | Command::ServoL(_) | Command::JogL(_) if !cfg.cartesian => {
+            Some("this runtime has no kinematics: cartesian commands are unavailable".into())
+        }
+        _ => None,
+    };
+    unsupported.and_then(refuse)
 }
 
 /// The first `teleport` angle the runtime cannot honour, described in
@@ -2015,6 +2206,9 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
         T::SetRecipe => "set_recipe",
+        T::EnterFlashing => "enter_flashing",
+        T::ExitFlashing => "exit_flashing",
+        T::SetPidGains => "set_pid_gains",
         T::Ping => "ping",
         T::Status => "status",
         T::Angles => "angles",

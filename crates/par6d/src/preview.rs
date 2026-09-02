@@ -58,6 +58,10 @@ pub struct Preview {
     next_index: u64,
     dt: f64,
     motion: par6_config::MotionConfig,
+    /// The server config the live daemon would run with this bundle —
+    /// what `validate_supported` refuses against, so a parameter the
+    /// runtime cannot honour previews as the same refusal.
+    cfg: par6_server::ServerConfig,
     /// The preview's runtime payload — none today; the field keeps the
     /// planner sync honest if a payload surface is added offline.
     payload: par6_server::PayloadSpec,
@@ -111,6 +115,7 @@ impl Preview {
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let dt = robot.robot.tick_dt_s;
         let motion = robot.motion;
+        let cfg = crate::daemon::server_config(&opts, &bundle);
         let mut preview = Self {
             planner,
             jog,
@@ -119,6 +124,7 @@ impl Preview {
             next_index: 0,
             dt,
             motion,
+            cfg,
             payload: par6_server::PayloadSpec::default(),
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
@@ -293,10 +299,24 @@ impl Preview {
                 rest = &rest[1..];
                 continue;
             }
+            // ...and parameters the runtime cannot honour (a blend
+            // radius on move_c, say) — the server's own check over the
+            // same config, so the preview never accepts a command the
+            // live ack refuses.
+            if let Some(error) = par6_server::validate_supported(&self.cfg, &rest[0]) {
+                results.push(self.refusal(error));
+                rest = &rest[1..];
+                continue;
+            }
             // Only offer the leading run of wire-valid commands: a later
             // invalid one would have been refused at its own datagram, so
             // the planner must not fold it into this chain.
-            let valid = rest.iter().take_while(|c| c.validate().is_ok()).count();
+            let valid = rest
+                .iter()
+                .take_while(|c| {
+                    c.validate().is_ok() && par6_server::validate_supported(&self.cfg, c).is_none()
+                })
+                .count();
             self.publish();
             let batch: Vec<QueuedCommand<'_>> = rest[..valid]
                 .iter()

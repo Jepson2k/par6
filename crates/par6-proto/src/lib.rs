@@ -50,8 +50,9 @@ pub use chunk::{
 };
 pub use command::{decode_command, encode_command, Command, Shape, ToolParam};
 pub use enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
-    HomingJointState, HomingPhase, LinkState, MsgType, QueryType, ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
+    FlashingAssertion, Frame, HomingJointState, HomingPhase, LinkState, MsgType, QueryType,
+    ToolState,
 };
 pub use error::{make_error, template, ErrorCode, ErrorTemplate, WireError, UNATTRIBUTED};
 pub use reply::{decode_reply, encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};

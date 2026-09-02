@@ -1,5 +1,7 @@
 # CLAUDE.md - par6
 
+Nothing is added to this file without the repo owner's explicit approval.
+
 Rust real-time runtime (`par6d`) + Python waldoctl client for the PAR6 arm.
 Read `README.md` for architecture, the command system, and the collision world.
 
@@ -81,8 +83,7 @@ imports `par6` (the extension dlopens the shim).
   this with a counting allocator.
 - `Option<T>` channel semantics on the bus are load-bearing (None = omitted on the
   wire, NOT zero — the vendor firmware distinguishes them). Don't collapse them to defaults.
-- `-D warnings` clippy and rustfmt are CI gates. Public trait methods get doc comments —
-  contracts are what downstream workstreams code against.
+- `-D warnings` clippy and rustfmt are CI gates.
 
 ## Code style
 

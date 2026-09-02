@@ -8,8 +8,9 @@
 use std::fmt::Write;
 
 use crate::enums::{
-    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode, Frame,
-    HomingJointState, HomingPhase, LinkState, MsgType, QueryType, ToolState,
+    command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
+    FlashingAssertion, Frame, HomingJointState, HomingPhase, LinkState, MsgType, QueryType,
+    ToolState,
 };
 use crate::error::ErrorCode;
 use crate::status::{STATUS_HEADER_LEN, STATUS_LEN};
@@ -106,6 +107,12 @@ pub fn generate() -> String {
         "Frame",
         "Cartesian reference frame.",
         Frame::variants(),
+    );
+    emit_enum(
+        &mut out,
+        "FlashingAssertion",
+        "The human assertion ENTER_FLASHING must carry.",
+        FlashingAssertion::variants(),
     );
     emit_enum(
         &mut out,

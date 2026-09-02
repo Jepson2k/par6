@@ -11,6 +11,7 @@
 
 use std::path::Path;
 
+use par6_config::SimConfig;
 use pinokin_sys::Model;
 
 use super::driver::VirtualDriver;
@@ -29,12 +30,12 @@ const STOP_ZETA: f64 = 1.2;
 /// threshold: J2 steady approach drag ≈ 56 mA vs the 175 mA
 /// current-ratio limit; 8.0 would put it at ~225 mA and false-fire).
 const VISC_RATE: f64 = 2.0;
-/// Coulomb friction \[Nm\], smoothed near zero velocity.
-const COULOMB_NM: f64 = 0.1;
 /// Narrowest velocity scale of the Coulomb smoothing \[rad/s\]; joints
 /// too light to integrate that slope explicitly get a wider one (see
-/// [`DynamicsPlant::coulomb_eps`]).
-const COULOMB_EPS: f64 = 0.01;
+/// [`DynamicsPlant::coulomb_eps`]). Sized so a joint whose friction can
+/// hold its gravity residual creeps well under a degree over seconds —
+/// the tanh regularization has no true stiction, only slow creep.
+const COULOMB_EPS: f64 = 0.001;
 /// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
 /// shorted-phase brake of an idled driver.
 const IDLE_RATE: f64 = 40.0;
@@ -54,6 +55,19 @@ pub(crate) struct DynamicsPlant {
     /// Per-substep scratch: the driver-enforced velocity limit in joint
     /// space, captured alongside the loop output.
     vlim_joint: Vec<f64>,
+    /// Motor rotor inertia reflected to the joint side \[kg·m²\]:
+    /// G²·jm per joint (config `[sim]` + dynamics gear ratio). Applied
+    /// as a diagonal correction on the ABA accelerations — the rotor is
+    /// diagonal in joint space, and the shim exposes no armature.
+    rotor: Vec<f64>,
+    /// Motor viscous friction reflected to the joint side \[Nm·s/rad\]
+    /// (G²·b). Rides on top of the inertia-scaled `VISC_RATE` stand-in,
+    /// which models the gearbox side the motor terms do not.
+    motor_b: Vec<f64>,
+    /// Coulomb friction reflected to the joint side \[Nm\] (G·tc) — the
+    /// vendor's measured motor model, replacing the flat stand-in the
+    /// plant carried before the table existed.
+    motor_tc: Vec<f64>,
 }
 
 impl DynamicsPlant {
@@ -65,6 +79,7 @@ impl DynamicsPlant {
         tool: Option<&pinokin_sys::ToolParams>,
         maps: &[JointMap],
         q0: &[f64],
+        sim: &SimConfig,
     ) -> Self {
         let mut model = Model::from_urdf(urdf, ee_frame, tool)
             .unwrap_or_else(|e| panic!("sim-dynamics: cannot load {}: {e}", urdf.display()));
@@ -86,6 +101,21 @@ impl DynamicsPlant {
             .iter()
             .map(|i| 2.0 * STOP_ZETA * i * STOP_OMEGA)
             .collect();
+        assert_eq!(
+            sim.motor_jm_kg_m2.len(),
+            n,
+            "sim.motor_jm_kg_m2 entries != joint count (config validation regressed)"
+        );
+        let rotor: Vec<f64> = maps
+            .iter()
+            .zip(&sim.motor_jm_kg_m2)
+            .map(|(m, jm)| m.dyn_gear * m.dyn_gear * jm)
+            .collect();
+        let motor_b: Vec<f64> = maps
+            .iter()
+            .map(|m| m.dyn_gear * m.dyn_gear * sim.motor_b_nm_s)
+            .collect();
+        let motor_tc: Vec<f64> = maps.iter().map(|m| m.dyn_gear * sim.motor_tc_nm).collect();
         Self {
             model,
             q,
@@ -93,6 +123,9 @@ impl DynamicsPlant {
             tau: vec![0.0; n],
             a: vec![0.0; n],
             coulomb_eps: vec![COULOMB_EPS; n],
+            rotor,
+            motor_b,
+            motor_tc,
             inertia,
             k_stop,
             c_stop,
@@ -101,18 +134,18 @@ impl DynamicsPlant {
     }
 
     /// Smoothed Coulomb friction enters the torque vector explicitly, so
-    /// its near-zero slope `COULOMB_NM/eps` acts as a damper of rate
-    /// `COULOMB_NM/(eps·inertia)`: the substep only integrates that
-    /// stably while `rate·h ≤ 1`. The wrist joints are one to three
-    /// orders of magnitude lighter than the shoulder, so at the shared
+    /// its near-zero slope `tc/eps` acts as a damper of rate
+    /// `tc/(eps·inertia)`: the substep only integrates that stably
+    /// while `rate·h ≤ 1`. The wrist joints are one to three orders of
+    /// magnitude lighter than the shoulder, so at the shared
     /// `COULOMB_EPS` their friction oscillates instead of damping and a
     /// perfectly gravity-compensated wrist drifts degrees per second.
     /// Widening the smoothing band for the light joints keeps the
-    /// friction MAGNITUDE (`COULOMB_NM`) and only softens the regularized
+    /// friction MAGNITUDE (`tc`) and only softens the regularized
     /// `sign()` — the same per-joint inertia scaling the endstop gains
     /// already use.
-    fn coulomb_eps(inertia: f64, h: f64) -> f64 {
-        COULOMB_EPS.max(COULOMB_NM * h / inertia)
+    fn coulomb_eps(tc: f64, inertia: f64, h: f64) -> f64 {
+        COULOMB_EPS.max(tc * h / inertia)
     }
 
     /// Place the arm at `q0` \[rad\] at rest (teleport): the model, its
@@ -154,8 +187,8 @@ impl DynamicsPlant {
     ) {
         let h = dt / f64::from(SUBSTEPS);
         let fw_steps = (h / super::driver::FW_LOOP_DT).round().max(1.0);
-        for (eps, inertia) in self.coulomb_eps.iter_mut().zip(&self.inertia) {
-            *eps = Self::coulomb_eps(*inertia, h);
+        for j in 0..self.coulomb_eps.len() {
+            self.coulomb_eps[j] = Self::coulomb_eps(self.motor_tc[j], self.inertia[j], h);
         }
         for _ in 0..SUBSTEPS {
             for j in 0..self.q.len() {
@@ -166,9 +199,11 @@ impl DynamicsPlant {
                     * (std::f64::consts::TAU / f64::from(map.encoder_max_counts))
                     / map.gear_ratio;
                 let drive_nm = (cmd.current_ma - loads_ma[j]) / map.factor_ma_per_nm;
+                let smooth = (self.v[j] / self.coulomb_eps[j]).tanh();
                 let mut t = drive_nm
                     - VISC_RATE * self.inertia[j] * self.v[j]
-                    - COULOMB_NM * (self.v[j] / self.coulomb_eps[j]).tanh();
+                    - self.motor_b[j] * self.v[j]
+                    - self.motor_tc[j] * smooth;
                 if cmd.idle {
                     t -= IDLE_RATE * self.inertia[j] * self.v[j];
                 }
@@ -185,9 +220,14 @@ impl DynamicsPlant {
                 .aba_into(&self.q, &self.v, &self.tau, &mut self.a)
                 .expect("ABA step");
             for j in 0..self.q.len() {
+                // Reflected rotor inertia as a diagonal correction: the
+                // rotor is diagonal in joint space, so scaling the ABA
+                // acceleration by I/(I + G²·jm) applies it against the
+                // probed apparent inertia.
+                let scale = self.inertia[j] / (self.inertia[j] + self.rotor[j]);
                 // Driver-enforced velocity limit, already in joint space.
                 let vlim = self.vlim_joint[j];
-                self.v[j] = (self.v[j] + self.a[j] * h).clamp(-vlim, vlim);
+                self.v[j] = (self.v[j] + self.a[j] * scale * h).clamp(-vlim, vlim);
                 self.q[j] += self.v[j] * h;
             }
         }

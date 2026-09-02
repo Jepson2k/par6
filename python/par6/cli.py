@@ -18,7 +18,7 @@ import sys
 from collections.abc import Sequence
 from typing import Any
 
-from par6.client import RobotClient
+from par6.client import RobotClient, RobotError
 
 #: Exit code when no runtime answers the target address.
 EXIT_UNREACHABLE = 2
@@ -92,26 +92,41 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _unconfirmed(what: str, args: argparse.Namespace) -> int:
+    """A send nothing acknowledged must never read as success — for
+    ``estop`` especially, "the arm is stopped" printed on a lost datagram
+    is the dangerous lie."""
+    print(
+        f"{what} NOT confirmed: no runtime acknowledged it at {args.host}:{args.port}",
+        file=sys.stderr,
+    )
+    return EXIT_UNREACHABLE
+
+
 def _cmd_estop(client: RobotClient, args: argparse.Namespace) -> int:
-    client.estop()
+    if client.estop() != 1:
+        return _unconfirmed("estop", args)
     _emit("estop latched; clear it with `par6 reset`", args.json)
     return 0
 
 
 def _cmd_reset(client: RobotClient, args: argparse.Namespace) -> int:
-    client.reset()
+    if client.reset() != 1:
+        return _unconfirmed("reset", args)
     _emit("protective stop cleared", args.json)
     return 0
 
 
 def _cmd_stop(client: RobotClient, args: argparse.Namespace) -> int:
-    client.stop(clear_queue=not args.keep_queue)
+    if client.stop(clear_queue=not args.keep_queue) != 1:
+        return _unconfirmed("stop", args)
     _emit("motion stopped", args.json)
     return 0
 
 
 def _cmd_home(client: RobotClient, args: argparse.Namespace) -> int:
-    client.home(wait=args.wait, timeout=args.home_timeout)
+    if client.home(wait=args.wait, timeout=args.home_timeout) < 0:
+        return _unconfirmed("home", args)
     _emit("homed" if args.wait else "homing started", args.json)
     return 0
 
@@ -123,6 +138,8 @@ def _cmd_move_j(client: RobotClient, args: argparse.Namespace) -> int:
         wait=args.wait,
         timeout=args.move_timeout,
     )
+    if index < 0:
+        return _unconfirmed("move-j", args)
     _emit({"queue_index": index}, args.json)
     return 0
 
@@ -201,7 +218,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     except OSError as exc:
         print(f"cannot reach {args.host}:{args.port}: {exc}", file=sys.stderr)
         return EXIT_UNREACHABLE
-    except RuntimeError as exc:
+    except (RobotError, RuntimeError) as exc:
         print(f"{args.command} refused: {exc}", file=sys.stderr)
         return EXIT_REFUSED
 

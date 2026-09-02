@@ -35,7 +35,7 @@ from waldoctl.shapes import Box
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, ErrorCode
+from par6.protocol.constants import ActionState, ControllerMode, ErrorCode
 from par6.robot import Robot
 from par6.telemetry import TelemetryReader
 
@@ -226,8 +226,10 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
             lambda s: s.action_state == ActionState.IDLE and abs(s.speeds[0]) < 0.05,
             timeout=STEP_BUDGET_S,
         ), "the jog duration watchdog must self-terminate the motion"
-        assert await client.wait_command(preempted, timeout=1.5) is False, (
-            "a preempted command must never complete"
+        with pytest.raises(RobotError) as preempt_err:
+            await client.wait_command(preempted, timeout=STEP_BUDGET_S)
+        assert preempt_err.value.code == ErrorCode.MOTN_CANCELLED, (
+            "a preempted command must report its cancellation, not hang or succeed"
         )
 
         # -- stop {clear_queue} drops everything pending -------------------
@@ -239,7 +241,16 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
         assert state is not None
         assert state.queue == []
         assert state.executing_index == -1
-        assert await client.wait_command(queued_b, timeout=1.5) is False
+        for dropped in (queued_a, queued_b):
+            with pytest.raises(RobotError) as stop_err:
+                await client.wait_command(dropped, timeout=STEP_BUDGET_S)
+            assert stop_err.value.code == ErrorCode.MOTN_CANCELLED, (
+                f"index {dropped} must report the queue-clearing stop"
+            )
+        standing = await client.error()
+        assert standing is not None and standing.code == ErrorCode.MOTN_CANCELLED, (
+            "a queue-clearing stop leaves the cancellation standing"
+        )
 
         # -- e-stop latches DISABLED with a standing error until reset -----
         assert await client.estop() == 1
@@ -1032,6 +1043,41 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
     a real arm. Streamed at a UI-like cadence here, and then aimed into a
     keep-out, which must stop them.
     """
+
+    class Streamer:
+        """UI-style streaming: each datagram advances the COMMANDED target
+        a few mm, the way a 50 Hz frontend integrates a gesture. Stepping
+        from the measurement instead feeds the plant's tracking lag back
+        into the target and limit-cycles the arm."""
+
+        def __init__(self, client, goal, send):
+            self.client = client
+            self.goal = goal
+            self.send = send
+            self.target: list[float] | None = None
+
+        async def step(self):
+            if self.target is None:
+                self.target = list(await pose_now(self.client))
+            for i in range(3):
+                self.target[i] += max(-5.0, min(5.0, self.goal[i] - self.target[i]))
+            await self.send(self.target)
+
+    async def stream_toward(client, goal, send, budget=STEP_BUDGET_S):
+        """Stream the target to *goal* and keep it there until the arm has
+        settled on it, so the next phase opens its session on a resting
+        arm."""
+        streamer = Streamer(client, goal, send)
+        deadline = time.monotonic() + budget
+        while time.monotonic() < deadline:
+            await streamer.step()
+            if await client.wait_status(
+                lambda s: abs(s.pose[11] - goal[2]) < 5.0 and s.tcp_speed < 5.0,
+                timeout=0.05,
+            ):
+                return True
+        return False
+
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
         await settle_at(client, SWEEP_START_DEG)
@@ -1041,13 +1087,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         assert start is not None
         goal = list(start)
         goal[2] -= 40.0
-        arrived = False
-        deadline = time.monotonic() + STEP_BUDGET_S
-        while time.monotonic() < deadline and not arrived:
-            await client.servo_l(goal, speed=0.6)
-            arrived = await client.wait_status(
-                lambda s: abs(s.pose[11] - goal[2]) < 5.0, timeout=0.2
-            )
+        arrived = await stream_toward(
+            client, goal, lambda p: client.servo_l(p, speed=0.6)
+        )
         assert arrived, (
             f"servo_l never reached the streamed target: "
             f"{(await pose_now(client))[:3]} vs {goal[:3]}"
@@ -1056,13 +1098,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # --- servo_j(pose=...): the same target through the joint-space
         #     streamer, which IKs the pose rather than interpolating it.
         back = list(start)
-        arrived = False
-        deadline = time.monotonic() + STEP_BUDGET_S
-        while time.monotonic() < deadline and not arrived:
-            await client.servo_j(pose=back, speed=0.6)
-            arrived = await client.wait_status(
-                lambda s: abs(s.pose[11] - back[2]) < 5.0, timeout=0.2
-            )
+        arrived = await stream_toward(
+            client, back, lambda p: client.servo_j(pose=p, speed=0.6)
+        )
         assert arrived, "servo_j(pose=...) never reached the streamed target"
 
         # --- the collision gate refuses a stream aimed into a keep-out.
@@ -1079,22 +1117,42 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         )
         assert await client.set_shapes([keepout])
 
+        # A refused datagram cancels the session and latches the collision
+        # until an ADMITTED datagram clears it; every later step lands
+        # deeper in the shape, so the latch outlives a missed status frame.
+        # Every frame's height is kept so an excursion into the shape cannot
+        # hide between assertions.
+        floor = below[2] + 20.0
+        z_seen: list[float] = []
+
+        def gated(s) -> bool:
+            z_seen.append(float(s.pose[11]))
+            return bool(s.collision_active)
+
+        streamer = Streamer(client, below, lambda p: client.servo_l(p, speed=0.6))
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
-            await client.servo_l(below, speed=0.6)
-            blocked = await client.wait_status(
-                lambda s: bool(s.collision_active), timeout=0.2
-            )
+            await streamer.step()
+            blocked = await client.wait_status(gated, timeout=0.05)
         assert blocked, (
             "a servo_l streamed into a keep-out was never gated: the stream "
             "gate let the arm drive at the shape"
         )
-        rest = await client.pose()
-        assert rest is not None
-        assert rest[2] > below[2] + 20.0, (
+
+        # The refusal ends the session, so the arm brakes to rest in IDLE
+        # instead of carrying on to the streamed goal at the shape's centre.
+        def at_rest(s) -> bool:
+            z_seen.append(float(s.pose[11]))
+            resting = max(abs(v) for v in s.speeds) < 0.05
+            return s.mode == ControllerMode.IDLE and resting
+
+        assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
+            "the gate refused the datagram but never cancelled the session"
+        )
+        assert min(z_seen) > floor, (
             f"the gated stream carried the TCP into the keep-out: "
-            f"z={rest[2]:.1f} vs shape centre {below[2]:.1f}"
+            f"min z {min(z_seen):.1f} vs floor {floor:.1f}"
         )
         assert await client.set_shapes([])
 
@@ -1120,9 +1178,28 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         tools = await client.tools()
         assert tools is not None
         tool = tools.tool
-        # The runtime's verbs are `move` and `calibrate`; the client's
-        # open/close convenience resolves onto `move` with a position.
-        await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+
+        # A fresh sim boots uncalibrated, and the RT send gate never
+        # streams a move to an uncalibrated gripper (the firmware's own
+        # gate drops it) — so the daemon refuses the move up front
+        # instead of letting it silently move nothing.
+        with pytest.raises(RobotError) as refused:
+            await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "calibrat" in str(refused.value).lower()
+
+        await client.tool_action(tool, "calibrate", wait=True)
+
+        # The runtime's verbs are `move`, `calibrate`, `stop` and `idle`;
+        # the client's open/close convenience resolves onto `move` with a
+        # position. The completion push carries the settle verdict, so a
+        # close on air reads "target reached, no object" without racing a
+        # tool-status poll.
+        idx = await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        assert await client.command_verdict(idx) == 3, (
+            "a close with nothing between the jaws must complete with "
+            "verdict 3 (reached, no object)"
+        )
         closed = await client.wait_status(
             lambda s: bool(s.tool_status is not None and s.tool_status.positions),
             timeout=STEP_BUDGET_S,
@@ -1132,19 +1209,40 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         assert status is not None, "the STATUS query went unanswered"
         after_close = status.tool_status
         assert after_close is not None
+        assert after_close.positions[0] > 0.9, (
+            f"a full close must report jaws closed: {after_close.positions}"
+        )
 
+        # Halt an open in flight: the jaws must hold near where the stop
+        # caught them, nowhere near the abandoned fully-open target. The
+        # interrupted travel starts from a mid-stroke hold so the stop
+        # always reads a trustable jaw byte, not the 255 edge.
+        await client.tool_action(tool, "move", [0.7, 0.5, 400.0], wait=True)
+        await client.tool_action(tool, "move", [0.0, 0.15, 400.0])
+        await client.tool_action(tool, "stop", wait=True)
+        status = await client.status()
+        assert status is not None and status.tool_status is not None
+        held = status.tool_status.positions[0]
+        assert held > 0.5, (
+            f"the stop did not hold the jaws: they carried on to {held} "
+            f"after the open was abandoned"
+        )
+
+        # Release, then a fresh move must still stream — the idle
+        # handshake ends in watchdog polls, not a dead send slot.
+        await client.tool_action(tool, "idle", wait=True)
         await client.tool_action(tool, "move", [0.0, 0.5, 400.0], wait=True)
         opened = await client.wait_status(
             lambda s: bool(
                 s.tool_status is not None
                 and s.tool_status.positions
-                and s.tool_status.positions[0] < after_close.positions[0] - 0.05
+                and s.tool_status.positions[0] < 0.05
             ),
             timeout=STEP_BUDGET_S,
         )
         assert opened, (
-            f"opening the gripper did not move the jaws back: "
-            f"closed at {after_close.positions}"
+            f"opening the gripper after a release did not move the jaws "
+            f"back: closed at {after_close.positions}"
         )
 
         # WC sizes its I/O chips from these two counts, so the published
@@ -1282,7 +1380,16 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
         async with daemon.client() as client:
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
             info = await client.config_info()
-        assert info is not None
+            assert info is not None
+
+            # Recipe discovery/readback: the valid SET_RECIPE vocabulary
+            # is published, and the active name tracks what was set (the
+            # shipped config boots with telemetry off).
+            assert info["active_recipe"] is None
+            assert "standard" in info["recipes"] and "minimal" in info["recipes"]
+            await client.set_recipe("standard")
+            info2 = await client.config_info()
+            assert info2 is not None and info2["active_recipe"] == "standard"
         assert info["path"] == str(daemon.config)
 
         # The wire-contract fingerprint: sha256 over the robot TOML and
@@ -1420,6 +1527,13 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         with pytest.raises(RobotError) as indef:
             await client.set_payload(1.0, inertia=(-1.0, 0.0, 1.0, 0.0, 0.0, 1.0))
         assert indef.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        # Indefinite despite non-negative LEADING minors (zero diagonal
+        # entry, coupling hidden in a trailing minor): eigenvalue ≈ −4.5.
+        # Only checking all principal minors catches it.
+        with pytest.raises(RobotError) as hidden:
+            await client.set_payload(1.0, inertia=(0.0, 0.0, 1.0, 0.0, 5.0, 0.0))
+        assert hidden.value.code == ErrorCode.COMM_VALIDATION_ERROR
         info = await client.payload()
         assert info is not None and info["mass"] == pytest.approx(1.2), (
             "a refused set must not change the payload"
@@ -1428,3 +1542,81 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         assert await client.set_payload(0.0) == 1
         info = await client.payload()
         assert info is not None and info["mass"] == 0.0
+
+
+async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaemon):
+    """The maintenance surface end to end: SET_PID_GAINS re-pushes a
+    configured drive's tuning and refuses a node the config does not
+    declare; the FLASHING window requires the operator's spelled-out
+    assertion, opens from IDLE, and its exit invalidates homing — the
+    runtime cannot tell a flash from a scan, so every window costs a
+    re-home."""
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        # Re-push a joint's own configured tuning: semantically a no-op,
+        # but the ack still proves the node check and the RT push ran.
+        j = _cfg.load_robot_config()["joints"][2]
+        tune = dict(
+            kpp=j["gains"]["kpp"],
+            kpv=j["gains"]["kpv"],
+            kiv=j["gains"]["kiv"],
+            kpiq=j["gains"]["kpiq"],
+            kiiq=j["gains"]["kiiq"],
+            kp=j["gains"]["kp"],
+            kd=j["gains"]["kd"],
+            ilim_ma=j["ilim_ma"],
+            velocity_limit_ticks_s=j["velocity_limit_ticks_s"],
+            voltage_limit_mv=j["voltage_limit_mv"],
+        )
+        assert await client.set_pid_gains(j["node_id"], **tune) == 1
+        with pytest.raises(RobotError) as bad:
+            await client.set_pid_gains(15, **tune)
+        assert bad.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "15" in str(bad.value)
+
+        # The assertion is an argument with no default — a typo dies
+        # locally, before any datagram.
+        with pytest.raises(ValueError):
+            await client.enter_flashing("definitely")
+        # No window open: the exit is refused by the runtime.
+        with pytest.raises(RobotError) as noexit:
+            await client.exit_flashing()
+        assert noexit.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+        await client.reset()
+        await teleport_to(client, park_deg())
+        assert await client.enter_flashing("parked") == 1
+        assert await client.exit_flashing() == 1
+        assert await client.wait_status(lambda s: not s.homed, timeout=STEP_BUDGET_S), (
+            "a closed window must read un-homed until the operator re-homes"
+        )
+
+
+def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon):
+    """The ``par6`` shell exits with its documented codes for the outcomes
+    that matter from a terminal in a hurry: a runtime REFUSAL is a spoken
+    ``EXIT_REFUSED`` (not a traceback — refusals raise RobotError, which
+    main must catch), and an estop/stop/reset nothing acknowledged exits
+    ``EXIT_UNREACHABLE`` instead of printing success on a lost datagram."""
+    import socket
+
+    from par6.cli import EXIT_REFUSED, EXIT_UNREACHABLE, main
+
+    addr = ["--host", "127.0.0.1", "--port", str(daemon.command_port)]
+    deadline = time.monotonic() + STEP_BUDGET_S
+    while main([*addr, "ping"]) != 0:
+        assert time.monotonic() < deadline, "the daemon never answered ping"
+
+    # The boot arm is un-referenced (and possibly still DISABLED): a
+    # move is refused either way, and the shell speaks the refusal.
+    assert main([*addr, "move-j", "0", "0", "0", "0", "0", "0"]) == EXIT_REFUSED
+
+    # A port nothing listens on: system commands come back unconfirmed,
+    # and "estop latched" printed there would be the dangerous lie.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.bind(("127.0.0.1", 0))
+        dead_port = s.getsockname()[1]
+    dead = ["--host", "127.0.0.1", "--port", str(dead_port), "--timeout", "0.5"]
+    for verb in ("estop", "stop", "reset"):
+        assert main([*dead, verb]) == EXIT_UNREACHABLE, verb

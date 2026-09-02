@@ -5,7 +5,8 @@
 use par6_config::{GripperConfig, RobotConfig};
 
 use crate::types::{
-    BusError, BusState, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId, PollAction,
+    BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
+    PollAction,
 };
 
 /// What the RT tick loop needs from a motor bus.
@@ -56,9 +57,7 @@ pub trait DriverBus {
     ///
     /// Per frame: the arbitration id's err bit is harvested into
     /// `live_error_bit` BEFORE payload dispatch; wrong-DLC frames are
-    /// discarded whole (never partially applied). Stale→fresh edges are
-    /// reported in `state.reconnected_mask`; the caller re-sends config
-    /// for those nodes via [`resend_node_config`](Self::resend_node_config).
+    /// discarded whole (never partially applied).
     fn drain_rx(&mut self, state: &mut BusState) -> Result<usize, BusError>;
 
     /// Send one motion frame per arm joint. `commands[i]` targets the
@@ -107,6 +106,13 @@ pub trait DriverBus {
     /// [`BusState::reconnected_mask`].
     fn resend_node_config(&mut self, node: NodeId, repeats: u8) -> Result<(), BusError>;
 
+    /// Replace one node's stored drive tuning (gains + limits + voltage
+    /// limit; the watchdog is untouched) and push it now, `repeats`
+    /// passes — the live half of `SET_PID_GAINS`. Because the STORED
+    /// config changes, every later resend (reconnect, FLASHING exit)
+    /// carries the new tune too. Unknown nodes are refused.
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError>;
+
     /// Send a Limits frame (cmd 20: velocity limit ticks/s + current
     /// limit mA), `repeats` times. Homing uses this to drop a node to its
     /// homing current on FSM start and restore the normal Ilim on
@@ -138,12 +144,10 @@ pub trait DriverBus {
     fn freshness(&self, node: NodeId) -> Freshness;
 
     /// Clear one node's latched `Lost` state (user clear-errors path).
-    /// The node returns to `Unknown` until its next frame.
     fn clear_lost_latch(&mut self, node: NodeId);
 
-    /// Re-base every node's freshness clock to "just seen" state
-    /// (`Unknown`, no latch) — required on FLASHING exit so the silent
-    /// period does not read as a mass disconnect.
+    /// Required on FLASHING exit so the silent period does not read as
+    /// a mass disconnect.
     fn rebase_freshness(&mut self);
 
     /// Bitmask of nodes that answered the boot bus scan (bit n = node n).

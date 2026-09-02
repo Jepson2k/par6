@@ -34,6 +34,7 @@ mod link;
 /// The freshness clock in here is shared by every backend; the rest is
 /// SocketCAN-only (see the module doc).
 pub(crate) mod sched;
+mod xstats;
 
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime};
@@ -47,8 +48,8 @@ use crate::spectral::codec::{
     encode_poll, unpack_can_id, CanFrame, CommandId, DecodedFrame, Payload, CAN_MAX_DATA,
 };
 use crate::types::{
-    BusError, BusState, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId, PollAction,
-    PollKind, MAX_NODES,
+    BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
+    PollAction, PollKind, MAX_NODES,
 };
 
 use sched::{
@@ -707,6 +708,20 @@ impl DriverBus for SocketCanBus {
             }
         }
         Ok(())
+    }
+
+    fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) else {
+            return Err(BusError::InvalidCommand {
+                reason: "retune_node for a node with no stored configuration",
+            });
+        };
+        c.gains = tune.gains;
+        c.ilim_ma = tune.ilim_ma;
+        c.velocity_limit_ticks_s = tune.velocity_limit_ticks_s;
+        c.voltage_limit_mv = tune.voltage_limit_mv;
+        self.resend_node_config(node, repeats)
     }
 
     fn send_limits(

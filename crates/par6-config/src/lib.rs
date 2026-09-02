@@ -36,7 +36,7 @@ pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
     BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
     KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, StreamDefaults, TimingConfig,
+    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
     WatchdogAction,
 };
 
@@ -817,5 +817,65 @@ mod tests {
             "{text}\n[timing]\ncritical_factor_x = 4.0\n"
         ))
         .is_err());
+    }
+
+    /// The sim dynamics table is the vendor's motor model
+    /// (robots/PAR6.py at rcb-runtime 307477c), and J1's dynamics gear
+    /// is the 20 the vendor's dynamics were modeled with — deliberately
+    /// NOT the 25 the wire conversion uses (the vendor's own two tables
+    /// disagree; user decision 2026-09-01: follow the dynamics table,
+    /// switch to 25 if real movement proves it stale).
+    #[test]
+    fn sim_dynamics_table_matches_the_vendor_model() {
+        let robot =
+            RobotConfig::load(&config_dir().join("PAR6.toml")).expect("shipped PAR6 config");
+        assert_eq!(
+            robot.sim.motor_jm_kg_m2,
+            vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
+        );
+        assert_eq!(robot.sim.motor_b_nm_s, 1.0e-4);
+        assert_eq!(robot.sim.motor_tc_nm, 0.02);
+        assert_eq!(robot.joints[1].gear_ratio, 25.0, "wire conversion keeps 25");
+        assert_eq!(
+            robot.joints[1].dynamics_gear_ratio,
+            Some(20.0),
+            "the dynamics follow the vendor's dynamics table"
+        );
+        assert!(
+            robot
+                .joints
+                .iter()
+                .enumerate()
+                .all(|(i, j)| i == 1 || j.dynamics_gear_ratio.is_none()),
+            "every other joint's tables agree, so no override is declared"
+        );
+    }
+
+    /// The shipped SSG48 values are the vendor's arm-measured retune
+    /// (grippers/SSG48.xml at rcb-runtime 307477c); the shipped defaults
+    /// before it were copied from the MSG and never verified against the
+    /// hardware. These are transmitted at boot and on every config
+    /// re-push, so a drifted transcription drives the real output stage —
+    /// this pin makes the next vendor tune show up as a red diff instead
+    /// of a silent divergence.
+    #[test]
+    fn ssg48_driver_values_match_the_vendor_retune() {
+        let cfg = GripperConfig::load(&config_dir().join("grippers/SSG48.toml"))
+            .expect("shipped SSG48.toml must load");
+        let drv = cfg.driver.expect("SSG48 is a CAN gripper");
+        assert_eq!(drv.stroke_mm, 47.0);
+        assert_eq!(drv.kt_nm_a, 0.3);
+        assert_eq!(drv.ilim_ma, 1700.0);
+        assert_eq!(
+            drv.voltage_limit_mv, 0,
+            "0 = use VBUS (vendor removed the 6 V clamp)"
+        );
+        assert_eq!(drv.gains.kpp, 11.0);
+        assert_eq!(drv.gains.kpv, 0.03);
+        assert_eq!(drv.gains.kiv, 0.0003);
+        assert_eq!(drv.gains.kpiq, 3.0);
+        assert_eq!(drv.gains.kiiq, 1.5);
+        assert_eq!(drv.gains.kp, 0.12);
+        assert_eq!(drv.gains.kd, 0.002);
     }
 }

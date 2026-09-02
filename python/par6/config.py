@@ -45,10 +45,15 @@ def materialize_bundle(bundle: dict) -> Path:
     import shutil
     import tempfile
 
+    # The reply is an unauthenticated datagram: the fingerprint names the
+    # cache directory and the file names land inside it, so anything but
+    # a hex digest and plain leaf names would write outside the cache.
     fingerprint = str(bundle["fingerprint"])
-    robot_filename = str(bundle["robot_filename"])
-    if not fingerprint or not robot_filename:
-        raise ValueError("config bundle has no fingerprint/robot file")
+    if not fingerprint or not all(c in "0123456789abcdef" for c in fingerprint):
+        raise ValueError(
+            f"config bundle fingerprint is not a hex digest: {fingerprint!r}"
+        )
+    robot_filename = _leaf_name(bundle["robot_filename"], "robot file")
     cache_root = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache"))
     target = cache_root / "par6" / "daemon-config" / fingerprint
     robot_path = target / robot_filename
@@ -60,7 +65,7 @@ def materialize_bundle(bundle: dict) -> Path:
         (tmp / robot_filename).write_text(str(bundle["robot_toml"]))
         (tmp / "grippers").mkdir()
         for g in bundle.get("grippers", []):
-            name = Path(str(g["filename"])).name
+            name = _leaf_name(g["filename"], "gripper file")
             (tmp / "grippers" / name).write_text(str(g["content"]))
         try:
             tmp.rename(target)
@@ -72,6 +77,15 @@ def materialize_bundle(bundle: dict) -> Path:
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return robot_path
+
+
+def _leaf_name(raw: object, what: str) -> str:
+    """The basename of a daemon-supplied file name — ``..`` survives
+    ``Path.name`` and would resolve to the parent directory."""
+    name = Path(str(raw)).name
+    if name in ("", ".", ".."):
+        raise ValueError(f"config bundle {what} is not a file name: {raw!r}")
+    return name
 
 
 def data_root() -> Path:

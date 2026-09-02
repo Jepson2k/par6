@@ -41,6 +41,7 @@ use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
+use crate::gripper_gate::GripperGate;
 use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
@@ -347,6 +348,10 @@ pub struct RtCore<B: DriverBus> {
     /// Tick the ACTIVE bus was brought up at; the boot one-shots are
     /// measured from here so a live backend swap re-runs them.
     bus_booted_at: u64,
+    /// Tick the 50/150/300 config-shot schedule counts from: the bus
+    /// boot, or the last FLASHING exit (which must not reset
+    /// `bus_booted_at` — the selfcheck already ran).
+    config_repush_armed_at: u64,
     /// What `boot_configure` needs, kept so a bus swapped in later is
     /// configured exactly as the one opened at startup was.
     boot: BootConfig,
@@ -450,7 +455,8 @@ pub struct RtCore<B: DriverBus> {
     scratch_q: [f64; MAX_JOINTS],
     scratch_qd: [f64; MAX_JOINTS],
     scratch_tau: [f64; MAX_JOINTS],
-    gripper_cmd: GripperCommand,
+    gripper_gate: GripperGate,
+    calibrate_pending: bool,
     homing_gcmd: GripperCommand,
 
     // Jog live state.
@@ -538,7 +544,7 @@ impl<B: DriverBus> RtCore<B> {
         let heartbeat = Arc::new(AtomicBool::new(false));
         let stream_sent = Arc::new(AtomicU64::new(0));
         let has_can_gripper = gripper.is_some();
-        let gripper_cmd = if has_can_gripper {
+        let homing_gcmd = if has_can_gripper {
             GripperCommand::FirmwarePoll
         } else {
             GripperCommand::NoGripper
@@ -551,6 +557,7 @@ impl<B: DriverBus> RtCore<B> {
             conv,
             sector_done: [false; MAX_JOINTS],
             bus_booted_at: 0,
+            config_repush_armed_at: 0,
             boot: BootConfig {
                 robot: robot.clone(),
                 gripper: gripper.cloned(),
@@ -622,8 +629,9 @@ impl<B: DriverBus> RtCore<B> {
             scratch_q: [0.0; MAX_JOINTS],
             scratch_qd: [0.0; MAX_JOINTS],
             scratch_tau: [0.0; MAX_JOINTS],
-            gripper_cmd,
-            homing_gcmd: gripper_cmd,
+            gripper_gate: GripperGate::default(),
+            calibrate_pending: false,
+            homing_gcmd,
             jog_active: false,
             jog_joints: 0,
             jog_blocked: 0,
@@ -729,6 +737,7 @@ impl<B: DriverBus> RtCore<B> {
         self.sector_done = [false; MAX_JOINTS];
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
+        self.config_repush_armed_at = self.tick;
         self.homed = false;
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
@@ -918,13 +927,28 @@ impl<B: DriverBus> RtCore<B> {
                 let _ = self.request_mode(Mode::Idle);
             }
         }
-        if BOOT_CONFIG_RESEND_TICKS.contains(&since_boot) && !self.bus.is_silent() {
-            for i in 0..MAX_JOINTS {
-                let _ = self.bus.resend_node_config(self.node_of[i], 1);
-            }
-            if self.has_can_gripper {
-                let _ = self.bus.resend_node_config(self.gripper_node, 1);
-            }
+        // The scheduled shots ride their own arm point, not the bus
+        // boot: a FLASHING exit re-arms them without re-running the
+        // selfcheck above.
+        let since_armed = self.tick - self.config_repush_armed_at;
+        if BOOT_CONFIG_RESEND_TICKS.contains(&since_armed) && !self.bus.is_silent() {
+            self.config_repush();
+        }
+    }
+
+    /// One full stored-config shot: `bus.boot_config_repeats` passes to
+    /// every arm node and the CAN gripper motor (the vendor pushes 4 per
+    /// shot; the config key governs the redundancy).
+    fn config_repush(&mut self) {
+        for i in 0..MAX_JOINTS {
+            let _ = self
+                .bus
+                .resend_node_config(self.node_of[i], self.boot.config_repeats);
+        }
+        if self.has_can_gripper {
+            let _ = self
+                .bus
+                .resend_node_config(self.gripper_node, self.boot.config_repeats);
         }
     }
 
@@ -1039,12 +1063,38 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::Gripper(fw) => {
                 if self.has_can_gripper {
-                    self.gripper_cmd = GripperCommand::Firmware(fw);
+                    self.gripper_gate.set(fw);
                 }
             }
             RtCommand::GripperCalibrate => {
                 if self.has_can_gripper {
-                    self.gripper_cmd = GripperCommand::Calibrate;
+                    self.gripper_gate.reset_to_poll();
+                    self.calibrate_pending = true;
+                }
+            }
+            RtCommand::GripperStop => {
+                if self.has_can_gripper {
+                    // The freshest jaw byte is read RT-side: routing a
+                    // snapshot byte back through the command plane would
+                    // race the reply stream and stop at a stale position.
+                    let byte = self.bus_state.gripper.reply.map(|r| r.position);
+                    match byte {
+                        Some(b @ 1..) if self.gripper_gate.has_standing() => {
+                            self.gripper_gate.stop_at(b);
+                        }
+                        // An uncalibrated gripper reports 0, which the
+                        // firmware maps to fully open — a naive stop
+                        // would fling the jaws open. No standing command
+                        // means no speed/current budget to hold with.
+                        // Both degrade to a release. 255 (fully closed)
+                        // is a legitimate hold target and stays above.
+                        _ => self.gripper_gate.idle(),
+                    }
+                }
+            }
+            RtCommand::GripperIdle => {
+                if self.has_can_gripper {
+                    self.gripper_gate.idle();
                 }
             }
             RtCommand::SetGravityComp(on) => self.gravity_comp = on,
@@ -1052,6 +1102,12 @@ impl<B: DriverBus> RtCore<B> {
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
+            RtCommand::RetuneNode { node, tune } => {
+                match self.bus.retune_node(node, &tune, self.boot.config_repeats) {
+                    Ok(()) => log::info!("node {node} retuned (drive gains/limits pushed)"),
+                    Err(e) => log::error!("retune of node {node} refused: {e}"),
+                }
+            }
         }
     }
 
@@ -1211,14 +1267,29 @@ impl<B: DriverBus> RtCore<B> {
                 // are partially applied, so homing is invalidated.
                 self.homing.abort(&mut self.bus);
                 self.homed = false;
+                if self.has_can_gripper {
+                    self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                }
             }
             Mode::Flashing => {
                 self.bus.set_silent(false);
                 // The silent window must not read as a mass disconnect.
                 self.bus.rebase_freshness();
+                // ... which also masks every real power-cycle or reflash
+                // that happened during it from the reconnect path, so
+                // the exit pushes the stored config itself — one pass
+                // now, then the re-armed 50/150/300 shots.
+                self.config_repush();
+                self.config_repush_armed_at = self.tick;
                 if self.flash.flashed() {
                     log::info!("firmware was flashed: homing invalidated");
                     self.homed = false;
+                }
+                if self.has_can_gripper {
+                    // A reflashed or power-cycled gripper driver may hold
+                    // whatever its NVM state says; the announcement runs
+                    // on the first non-silent ticks after exit.
+                    self.gripper_gate.force_idle(None);
                 }
             }
             Mode::Stream => {
@@ -1622,12 +1693,20 @@ impl<B: DriverBus> RtCore<B> {
                     }
                     if self.has_can_gripper {
                         let _ = self.bus.resend_node_config(self.gripper_node, 1);
+                        // Homing streamed its own DLC-5 frames (its park
+                        // move included), so the firmware is holding a
+                        // grip the normal path never commanded — and the
+                        // watchdog polls would keep it held forever.
+                        self.gripper_gate.force_idle(self.homing.last_fw_cmd());
                     }
                     self.mode = Mode::Idle;
                 }
                 SeqStatus::Failed => {
                     log::warn!("homing sequence FAILED");
                     self.homed = false;
+                    if self.has_can_gripper {
+                        self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                    }
                     self.mode = Mode::Idle;
                 }
                 SeqStatus::Running | SeqStatus::Inactive => {}
@@ -1684,18 +1763,18 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 let mut applied = false;
                 if let Some(sp) = self.stream_rx.take() {
-                    // Scale first: the limits have to be in force for the
-                    // tick that consumes this target, not the one after.
-                    // Only on a change — `set_limits` rewrites the OTG's
-                    // whole input block and most streams never move the
-                    // sliders at all.
+                    // Scale first: the limits have to be in force for
+                    // the tick that consumes this target, not the one
+                    // after. Only on a change — `set_limits` rewrites
+                    // the OTG's whole input block and most streams
+                    // never move the sliders at all.
                     if self.stream_scale != (sp.speed, sp.accel) {
                         self.stream.set_scale(sp.speed, sp.accel);
                         self.stream_scale = (sp.speed, sp.accel);
                     }
-                    // `q_target` carries the raw request; the filter sits
-                    // between it and the executor, so the pair makes the
-                    // smoothing visible.
+                    // `q_target` carries the raw request; the filter
+                    // sits between it and the executor, so the pair
+                    // makes the smoothing visible.
                     self.q_target = sp.q;
                     let target = self.filtered_target(&sp.q);
                     self.stream.set_target(&target);
@@ -1704,6 +1783,12 @@ impl<B: DriverBus> RtCore<B> {
                 }
                 self.stream_window(applied);
                 self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
+                if self.stream.faulted() {
+                    // The limiter is holding in place instead of
+                    // tracking; a stream that silently stops following
+                    // its setpoints must become a visible hard error.
+                    self.errors.latch(ErrorCode::StreamFault, None);
+                }
                 dispatch::law_stream(
                     &self.scratch_q,
                     &self.scratch_qd,
@@ -1731,12 +1816,18 @@ impl<B: DriverBus> RtCore<B> {
             &mut self.mirror,
         );
         self.send_joints();
-        self.send_gripper(self.gripper_cmd);
-        if self.gripper_cmd == GripperCommand::Calibrate {
-            // cmd 62 goes out once; the empty poll then carries the
-            // sweep (a repeated cmd 62 would restart it every tick).
-            self.gripper_cmd = GripperCommand::FirmwarePoll;
-        }
+        let gcmd = if !self.has_can_gripper {
+            GripperCommand::NoGripper
+        } else if std::mem::take(&mut self.calibrate_pending) {
+            // cmd 62 goes out once; the gate then carries the sweep on
+            // DLC-0 polls (a repeated cmd 62 would restart it every
+            // tick, and any DLC-5 frame would disturb it).
+            GripperCommand::Calibrate
+        } else {
+            let calibrated = self.bus_state.gripper.reply.is_some_and(|r| r.calibrated);
+            self.gripper_gate.tick(calibrated)
+        };
+        self.send_gripper(gcmd);
         let _ = self.bus.poll_step();
     }
 

@@ -56,6 +56,10 @@ logger = logging.getLogger(__name__)
 #: same value, or they call clear what the arm will brake for.
 COLLISION_CLEARANCE_M = 0.005
 
+#: "Not probed yet" marker for the cached daemon-config path (a real
+#: answer may legitimately be None).
+_UNSET: Any = object()
+
 
 # ===========================================================================
 # Collision naming and geometry
@@ -460,6 +464,10 @@ class Robot(_RobotABC):
         # Keep-outs applied locally, replayed into every checker built
         # after the call so a tool change cannot silently drop the world.
         self._shapes: tuple[Any, ...] = ()
+        # The daemon-config probe for previews, sampled at most once (see
+        # `_daemon_config_path`). The sentinel tells "not probed yet"
+        # apart from "probed; nothing answered".
+        self._preview_config: Any = _UNSET
         # Both bound by the set_active_tool call below, which every tool
         # change goes through — there is no "no tool selected" state.
         self._pinokin: PinokinRobot
@@ -985,16 +993,25 @@ class Robot(_RobotABC):
         When a runtime answers at the target address its config is
         fetched and the preview runs the daemon's numbers; otherwise the
         local resolution (``PAR6_CONFIG``, then the repo checkout)
-        applies.
+        applies. The probe is sampled once per :class:`Robot` — the
+        first creation pays the round trip (bounded by the ping timeout
+        when nothing answers), later ones reuse the answer, so a host
+        creating a preview per run does not block on every one.
         """
         if kwargs.get("config_path") is None:
             kwargs["config_path"] = self._daemon_config_path()
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:
-        """The reachable daemon's config, materialized locally."""
+        """The reachable daemon's config, materialized locally (cached —
+        the materialized path is fingerprint-keyed and a config change
+        requires a daemon restart, so one probe per Robot is the honest
+        sample rate)."""
         from concurrent.futures import ThreadPoolExecutor
 
+        if self._preview_config is not _UNSET:
+            return self._preview_config
+        self._preview_config = None
         if not _ping_runtime(self._host, self._port, timeout=0.5):
             return None
 
@@ -1010,12 +1027,11 @@ class Robot(_RobotABC):
             # loop, and this factory is called from async hosts too.
             with ThreadPoolExecutor(max_workers=1) as ex:
                 bundle = ex.submit(fetch).result()
-            if not bundle:
-                return None
-            return str(_cfg.materialize_bundle(bundle))
+            if bundle:
+                self._preview_config = str(_cfg.materialize_bundle(bundle))
         except (OSError, ValueError, KeyError, RobotError) as e:
             logger.debug("daemon config fetch failed; preview uses local config: %s", e)
-            return None
+        return self._preview_config
 
 
 __all__ = ["Par6IKResult", "Robot"]

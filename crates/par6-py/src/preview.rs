@@ -75,6 +75,7 @@ fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
             speed: opt(d, "speed")?,
             accel: opt(d, "accel")?,
             blend_radius: opt(d, "blend_radius")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
         }),
         "move_s" => Command::MoveS(cmd::MoveS {
             key: 0,
@@ -83,6 +84,7 @@ fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
             duration: opt(d, "duration")?,
             speed: opt(d, "speed")?,
             accel: opt(d, "accel")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
         }),
         "move_p" => Command::MoveP(cmd::MoveP {
             key: 0,
@@ -91,6 +93,7 @@ fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
             duration: opt(d, "duration")?,
             speed: opt(d, "speed")?,
             accel: opt(d, "accel")?,
+            rel: opt(d, "rel")?.unwrap_or(false),
         }),
         "delay" => Command::Delay(cmd::Delay {
             key: 0,

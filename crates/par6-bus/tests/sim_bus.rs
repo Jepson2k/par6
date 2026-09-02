@@ -1332,6 +1332,72 @@ mod dynamics {
         );
     }
 
+    /// The motor-referred rotor dynamics are live in the plant: with the
+    /// config's friction terms zeroed the same current spins J0 (the
+    /// gravity-neutral base axis) measurably farther, and a rotor
+    /// inertia scaled far up spins it up measurably slower — G²·b and
+    /// G·tc oppose the motion, G²·jm resists the acceleration.
+    #[test]
+    fn motor_referred_dynamics_slow_the_spin_and_the_spin_up() {
+        fn travel(robot: &RobotConfig, ticks: u64) -> i64 {
+            let mut rig = boot(robot, None);
+            let mut cmds = vec![JointCommand::default(); rig.joints];
+            cmds[0] = JointCommand::current(400);
+            let start = loop {
+                rig.step(&cmds, &GripperCommand::NoGripper);
+                rig.bus.queue_poll_override(
+                    PollAction::Poll {
+                        node: 0,
+                        kind: PollKind::Encoder,
+                    },
+                    1,
+                );
+                if let Some(p) = rig.state.nodes[0].position_ticks {
+                    break p;
+                }
+            };
+            for _ in 0..ticks {
+                rig.step(&cmds, &GripperCommand::NoGripper);
+                rig.bus.queue_poll_override(
+                    PollAction::Poll {
+                        node: 0,
+                        kind: PollKind::Encoder,
+                    },
+                    1,
+                );
+            }
+            i64::from(rig.state.nodes[0].position_ticks.unwrap()) - i64::from(start)
+        }
+
+        let robot = par6();
+        let ticks = u64::from(robot.ticks(0.25));
+        let with_motor_model = travel(&robot, ticks);
+
+        let mut frictionless = par6();
+        frictionless.sim.motor_b_nm_s = 0.0;
+        frictionless.sim.motor_tc_nm = 0.0;
+        let without_friction = travel(&frictionless, ticks);
+
+        let mut heavy = par6();
+        heavy.sim.motor_jm_kg_m2[0] *= 1000.0;
+        let heavy_rotor = travel(&heavy, ticks);
+
+        assert!(
+            with_motor_model > 500,
+            "the drive current must actually spin J0 ({with_motor_model} ticks)"
+        );
+        assert!(
+            without_friction > (with_motor_model as f64 * 1.05) as i64,
+            "zeroed motor friction must spin measurably farther: \
+             {without_friction} vs {with_motor_model} ticks"
+        );
+        assert!(
+            heavy_rotor < (with_motor_model as f64 * 0.7) as i64,
+            "a rotor scaled 1000x must spin up measurably slower: \
+             {heavy_rotor} vs {with_motor_model} ticks"
+        );
+    }
+
     /// The endstop stall signatures the homing sequence requires hold on the
     /// dynamics plant too (J0: vertical axis, gravity-neutral).
     #[test]

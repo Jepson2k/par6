@@ -1,5 +1,9 @@
 # par6
 
+> **Alpha.** APIs, wire protocol, and configs all still move between minor
+> versions, and hardware bring-up is in progress
+> ([#31](https://github.com/Jepson2k/par6/issues/31)).
+
 PAR6 robot backend for [Waldo Commander](https://github.com/Jepson2k/Waldo-Commander):
 a **Rust real-time runtime** (`par6d`) that replaces Source Robotics' RCB-Runtime on the
 control box, a **Rust client library** (`par6-client`), and a **Python package**

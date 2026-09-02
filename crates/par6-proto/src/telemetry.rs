@@ -63,11 +63,21 @@ pub enum TelemetryField {
     LoopP99S,
     /// RT deadline overruns since start/reset (u64).
     LoopOverruns,
+    /// Gripper jaw position, 0 = open … 1 = closed (NaN = no reply yet).
+    GripperPosition,
+    /// Gripper motor current \[mA\] (NaN = no reply yet).
+    GripperCurrentMa,
+    /// Gripper object-detection code (0 moving, 1 detected closing,
+    /// 2 detected opening, 3 reached with no object; NaN = no reply).
+    GripperObjectDetection,
+    /// Gripper fault bitfield (bit 0 temperature, 1 timeout, 2 e-stop,
+    /// 3 live fault bit; 0 = healthy).
+    GripperFault,
 }
 
 impl TelemetryField {
     /// All fields, in the canonical order used by the `full` recipe.
-    pub const ALL: [TelemetryField; 20] = [
+    pub const ALL: [TelemetryField; 24] = [
         TelemetryField::Tick,
         TelemetryField::MeasuredPositions,
         TelemetryField::MeasuredVelocities,
@@ -88,6 +98,10 @@ impl TelemetryField {
         TelemetryField::LoopPeriodEmaS,
         TelemetryField::LoopP99S,
         TelemetryField::LoopOverruns,
+        TelemetryField::GripperPosition,
+        TelemetryField::GripperCurrentMa,
+        TelemetryField::GripperObjectDetection,
+        TelemetryField::GripperFault,
     ];
 
     /// Stable snake_case key — the name a consumer indexes decoded
@@ -115,6 +129,10 @@ impl TelemetryField {
             F::LoopPeriodEmaS => "loop_period_ema_s",
             F::LoopP99S => "loop_p99_s",
             F::LoopOverruns => "loop_overruns",
+            F::GripperPosition => "gripper_position",
+            F::GripperCurrentMa => "gripper_current_ma",
+            F::GripperObjectDetection => "gripper_object_detection",
+            F::GripperFault => "gripper_fault",
         }
     }
 }
@@ -173,6 +191,7 @@ impl TelemetryRecipe {
                     F::LoopPeriodEmaS,
                     F::LoopP99S,
                     F::LoopOverruns,
+                    F::GripperFault,
                 ],
             ),
             recipe("full", TelemetryField::ALL.to_vec()),

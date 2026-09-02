@@ -119,9 +119,13 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     An explicit *config* (a daemon-fetched bundle materialized by
     :func:`par6.config.materialize_bundle`) wins; then ``PAR6_CONFIG``.
     ``PAR6_ASSETS`` takes precedence for the assets tree; otherwise the
-    repo tree around an editable install is used (the packaged ``_data``
-    URDFs carry rewritten mesh URIs the engine's loader cannot resolve,
-    so they cannot feed it yet).
+    repo tree around an editable install, then the deploy bundle's
+    install locations (``/etc/par6`` + ``/usr/share/par6``, what
+    ``scripts/deploy/install.sh`` stages on a control box) — so a wheel
+    installed next to a deployed daemon previews with the exact files
+    the daemon runs. The packaged ``_data`` URDFs carry rewritten mesh
+    URIs the engine's loader cannot resolve, so they cannot feed it yet;
+    a wheel with no daemon, repo, or env vars raises with that remedy.
     """
     import os
     from pathlib import Path
@@ -131,13 +135,19 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     if config and assets:
         return config, assets
     root = Path(__file__).resolve().parents[3]
-    repo_config = root / "config" / "PAR6.toml"
-    repo_assets = root / "assets" / "par6_description"
-    if repo_assets.is_dir() and (config or repo_config.is_file()):
-        return (config or str(repo_config)), (assets or str(repo_assets))
+    for cfg_probe, assets_probe in (
+        (root / "config" / "PAR6.toml", root / "assets" / "par6_description"),
+        (
+            Path("/etc/par6/PAR6.toml"),
+            Path("/usr/share/par6/par6_description"),
+        ),
+    ):
+        if (assets or assets_probe.is_dir()) and (config or cfg_probe.is_file()):
+            return (config or str(cfg_probe)), (assets or str(assets_probe))
     raise RuntimeError(
         "the dry-run engine needs the runtime config and assets tree; set "
-        "PAR6_CONFIG and PAR6_ASSETS (no repo checkout was found near "
+        "PAR6_CONFIG and PAR6_ASSETS (no repo checkout, and no deployed "
+        f"bundle under /etc/par6 + /usr/share/par6, found near "
         f"{Path(__file__).resolve()})"
     )
 
@@ -214,8 +224,13 @@ class DryRunRobotClient:
         self._preview = Preview(config=config, assets=assets)
         self._dt = self._preview.tick_dt_s()
         self._max_points = max(2, int(max_snapshot_points))
-        self._profile = "TOPPRA"
-        self._policy = int(CompletionPolicy.COMMANDED)
+        # The runtime's own startup context (planner DEFAULT_PROFILE +
+        # the server's boot completion policy), pushed to the engine NOW:
+        # a mirror the engine never heard of would report one profile
+        # while planning with another until the first context-changing
+        # call happened to sync them.
+        self._profile = "RUCKIG"
+        self._policy = int(CompletionPolicy.SETTLED)
 
         if initial_joints_deg is not None:
             q = np.radians(np.asarray(initial_joints_deg, dtype=np.float64))
@@ -231,6 +246,7 @@ class DryRunRobotClient:
         self._held: list[dict] = []
         self._io_inputs, self._io_outputs = _cfg.io_line_names()
         self._io_levels = [0] * len(self._io_outputs)
+        self._sync_context()
 
     # ------------------------------------------------------------------
     # State
@@ -508,6 +524,16 @@ class DryRunRobotClient:
         """
         min_duration, speed_fraction = _timing(duration, speed)
         if pose is not None:
+            if rel:
+                # The live client raises exactly this (MOVE_J_POSE is
+                # absolute on the wire); a preview that quietly planned
+                # the absolute move would validate a program the arm
+                # then refuses.
+                raise ValueError(
+                    "move_j(pose=..., rel=True) is not supported: MOVE_J_POSE is "
+                    "absolute. Compose the offset with the current TCP pose, or "
+                    "use move_j(angles=..., rel=True) for a relative joint move."
+                )
             cmd = {
                 "type": "move_j_pose",
                 "pose": _f6(pose, "pose"),
@@ -573,10 +599,12 @@ class DryRunRobotClient:
         speed: float = 0.0,
         accel: float = 1.0,
         r: float = 0.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Circular arc through *via* to *end*, on the circle the three poses
         define; an *end* that repeats the start sweeps the whole circle.
+        With ``rel=True``, *via* and *end* are deltas from the start pose.
 
         A blend radius is refused: an arc stops at its end pose, and the
         runtime has no arc-to-successor blend to offer instead.
@@ -591,6 +619,7 @@ class DryRunRobotClient:
             "speed": speed_fraction,
             "accel": float(accel),
             "blend_radius": _blend(r),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 
@@ -602,10 +631,12 @@ class DryRunRobotClient:
         duration: float = 0.0,
         speed: float = 0.0,
         accel: float = 1.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Cubic spline through the waypoint list (every one is passed
-        through), starting from where the arm stands."""
+        through), starting from where the arm stands. With ``rel=True``,
+        every waypoint is a delta from the start pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_s",
@@ -614,6 +645,7 @@ class DryRunRobotClient:
             "duration": min_duration,
             "speed": speed_fraction,
             "accel": float(accel),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 
@@ -625,11 +657,13 @@ class DryRunRobotClient:
         duration: float = 0.0,
         speed: float = 0.0,
         accel: float = 1.0,
+        rel: bool = False,
         **kwargs: Any,
     ) -> DryRunResultData:
         """Process move: the waypoints as straight segments with every
         interior corner rounded by the planner's auto-blend rule, so the TCP
-        sweeps the path without stopping."""
+        sweeps the path without stopping. With ``rel=True``, every waypoint
+        is a delta from the start pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_p",
@@ -638,6 +672,7 @@ class DryRunRobotClient:
             "duration": min_duration,
             "speed": speed_fraction,
             "accel": float(accel),
+            "rel": bool(rel),
         }
         return self._emit_batch(cmd)
 
@@ -927,17 +962,20 @@ class DryRunRobotClient:
 
         Duration is only what the config supports.  A ``move`` finishes when
         the driver reports it did — the config carries no jaw speed model to
-        predict that from, so it contributes no time.  A ``calibrate`` runs
-        the driver's homing sequence, which the runtime holds for at least
+        predict that from, so it contributes no time; ``stop`` and ``idle``
+        settle the same way.  A ``calibrate`` runs the driver's homing
+        sequence, which the runtime holds for at least
         ``TOOL_CALIBRATE_MIN_WAIT_S`` (``crates/par6d/src/planner.rs``).
         """
         verb = action.strip().lower()
         if verb in ("open", "close", "set_position"):
             verb = "move"
-        if verb not in ("move", "calibrate"):
+        if verb not in ("move", "calibrate", "stop", "idle"):
             raise make_error(
                 ErrorCode.COMM_VALIDATION_ERROR,
-                detail=f"unknown tool action {action!r} (move, calibrate)",
+                detail=(
+                    f"unknown tool action {action!r} (move, calibrate, stop, idle)"
+                ),
             )
         pending = self._close_chain()
         result = DryRunResultData(
@@ -989,6 +1027,12 @@ class DryRunRobotClient:
     def wait_command(self, command_index: int = -1, **kwargs: Any) -> bool:
         return True
 
+    def command_verdict(self, command_index: int = -1, **kwargs: Any) -> int | None:
+        """Always None: a dry run has no jaw physics to produce a settle
+        verdict, so a preview never claims an object was (or wasn't)
+        caught."""
+        return None
+
     def wait_checkpoint(self, label: str = "", **kwargs: Any) -> bool:
         return True
 
@@ -1023,6 +1067,19 @@ class DryRunRobotClient:
 
     def connect_hardware(self, port_str: str = "", **kwargs: Any) -> int:
         """A preview has no bus to connect."""
+        return 1
+
+    def enter_flashing(self, assertion: str = "", **kwargs: Any) -> int:
+        """A preview has no bus to silence."""
+        return 1
+
+    def exit_flashing(self, **kwargs: Any) -> int:
+        """A preview has no bus to wake."""
+        return 1
+
+    def set_pid_gains(self, node: int = 0, **kwargs: Any) -> int:
+        """Drive tuning changes how the real arm tracks, not where the
+        planner sends it, so a preview plans the same path."""
         return 1
 
     def set_completion_policy(self, policy: Any = 0, **kwargs: Any) -> int:

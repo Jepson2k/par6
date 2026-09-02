@@ -427,3 +427,77 @@ fn several_joints_jog_together_with_independent_ramps_and_blocks() {
     engine.command(&other).unwrap();
     assert_eq!(engine.blocked_direction(0), None);
 }
+
+/// (a) A latch belongs to its joint: a joint JOINING the driven set
+/// must not wipe a still-driven joint's block — only leaving the set
+/// (or the opposite command) clears a joint's own latch. Wiping every
+/// block on any set change let a limit-parked joint drive further out
+/// for a whole lookahead the moment a second axis joined the jog.
+/// (b) The lookahead's remaining distance is the MEASURED pose, not the
+/// integrated target: a stalled joint whose integrator ran ahead to the
+/// soft limit must not latch its whole direction while the arm itself
+/// is still far away.
+#[test]
+fn latches_are_per_joint_and_the_lookahead_reads_the_measured_pose() {
+    let cfg = par6_config();
+    let dt = cfg.robot.tick_dt_s;
+    let a = jog_accels(&cfg);
+    let max_dv: [f64; NUM_JOINTS] = std::array::from_fn(|j| a[j] * dt);
+
+    // (a) Latch J0 at its soft limit, then ADD J3 to the driven set.
+    let mut engine = JogEngine::new(&cfg).unwrap();
+    engine.activate(&HOME);
+    let mut plant = LagPlant::new(&HOME, dt);
+    engine.command(&one(0, 1.0)).unwrap();
+    run_tracked(&mut engine, &mut plant, 3000, &max_dv);
+    assert_eq!(engine.blocked_direction(0), Some(JogDirection::Positive));
+    let stopped_at = plant.q[0];
+
+    let mut both = one(0, 1.0);
+    both[3] = 0.2;
+    engine.command(&both).unwrap();
+    assert_eq!(
+        engine.blocked_direction(0),
+        Some(JogDirection::Positive),
+        "a joint still driven the same way keeps its latch when the set grows"
+    );
+    run_tracked(&mut engine, &mut plant, 300, &max_dv);
+    assert!(
+        (plant.q[0] - stopped_at).abs() < 1e-3,
+        "the latched joint must stay put while its neighbour jogs: {} -> {}",
+        stopped_at,
+        plant.q[0]
+    );
+    assert!(plant.q[3] > HOME[3] + 1e-3, "the joining joint must jog");
+
+    // Leaving the driven set is what clears the latch.
+    engine.command(&one(3, 0.2)).unwrap();
+    assert_eq!(
+        engine.blocked_direction(0),
+        None,
+        "a joint leaving the driven set gets a fresh start"
+    );
+
+    // (b) A stalled plant: the measured pose never moves while the
+    // integrated target runs all the way to the soft limit (where the
+    // never-cross clamp parks it). The direction must stay un-latched —
+    // the ARM is nowhere near the limit.
+    // A fraction whose stopping distance is well inside the soft range
+    // (the shipped jog ramp cannot stop a FULL-speed J0 within it, so a
+    // full-speed latch is honest even from the measured pose).
+    let mut engine = JogEngine::new(&cfg).unwrap();
+    engine.activate(&HOME);
+    engine.command(&one(0, 0.2)).unwrap();
+    for _ in 0..3000 {
+        let out = engine.tick(&HOME);
+        assert!(
+            out.q[0] <= cfg.joints[0].limits.soft_max_rad,
+            "the integrated target still never crosses the soft limit"
+        );
+    }
+    assert_eq!(
+        engine.blocked_direction(0),
+        None,
+        "a stalled joint far from its limit must not latch the direction"
+    );
+}

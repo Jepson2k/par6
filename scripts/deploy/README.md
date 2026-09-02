@@ -187,3 +187,26 @@ print(robot.create_sync_client().angles())
   `/usr` readable, so the rpath into `/usr/local/lib/par6` should resolve —
   run `ldd /usr/local/bin/par6d` from inside the unit's namespace to see
   which library the sandbox is hiding.
+
+## 5. Network posture
+
+The protocol-v2 command plane is deliberately unauthenticated: Waldo
+Commander and `par6d` are designed to run on the same Raspberry Pi, so
+the 50 Hz client↔daemon traffic is loopback. Anyone who can send UDP to
+port 6001 can move the arm — treat reachability as authorization, the
+way UR and Franka deployments do:
+
+- **Keep the robot off routable networks.** Put the box on a dedicated
+  NIC, VLAN or physically separate segment shared only with the machines
+  that operate it. Do not port-forward 6001 or the status/telemetry
+  ports.
+- **Remote access goes through the OS, not the protocol.** For operating
+  the arm from elsewhere, terminate a WireGuard (or SSH) tunnel on the
+  box and keep the command plane bound behind it.
+- A firewall rule that pins 6001 to the operator hosts is a fine belt —
+  but it is a reachability control, not authentication, and it does not
+  make the plane safe to expose.
+
+Message authentication (HMAC-tagged datagrams with a pre-shared key) is
+planned for when the frontend and the runtime split across machines;
+until then the isolation above is the security boundary.
