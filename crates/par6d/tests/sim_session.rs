@@ -923,7 +923,10 @@ fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
     teleport_home(&rig, &mut c, away);
 
     let started = Instant::now();
-    let index = c.ok_index(&Command::Home(par6_proto::command::Home { key: 7401 }));
+    let index = c.ok_index(&Command::Home(par6_proto::command::Home {
+        key: 7401,
+        calibrate: false,
+    }));
     let (ok, detail) = c.wait_complete(index);
     let elapsed = started.elapsed();
     assert!(ok, "home on a referenced arm must complete, got {detail:?}");

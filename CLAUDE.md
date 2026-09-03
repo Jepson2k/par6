@@ -28,9 +28,6 @@ imports `par6` (the extension dlopens the shim).
 
 ## Contract discipline (multi-agent repo)
 
-- `crates/par6-proto` and the trait contracts (`DriverBus`, sample ring, config schema)
-  are **frozen interfaces**. Changing them requires a `contracts`-labeled issue — never
-  drive-by edits from a feature branch.
 - `crates/par6-proto`'s own tests are the codec suite (encode + decode +
   hostile inputs). A contract change without updated, passing tests is
   incomplete.

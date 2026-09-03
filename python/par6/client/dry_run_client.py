@@ -245,16 +245,20 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def home(self, **kwargs: Any) -> DryRunResultData | None:
-        """Reference the arm (the configured seek, un-referenced) or return
-        it to the park pose (already referenced) — the runtime's two
-        meanings of HOME, decided by the engine.  ``calibrate=True`` raises
-        NotImplementedError, as the live client does."""
-        if kwargs.get("calibrate"):
-            raise NotImplementedError(
-                "par6d cannot re-reference a referenced arm yet; "
-                "home(calibrate=True) needs a forced-homing command in the runtime"
-            )
-        return self._submit({"type": "home"})
+        """Reference the arm, return it to the park pose when it already
+        holds its references, or re-run the seek with ``calibrate=True``.
+
+        Which of the three happens is the engine's decision, not this
+        method's: HOME un-referenced runs the configured seek and ends
+        where that sequence's ``move_to`` steps leave the arm, with a
+        wall-clock duration belonging to the physical seek rather than to
+        a plan; already referenced it is an ordinary planned joint move
+        to ``[robot].park_pose_rad``, planned and collision-gated like
+        any other. ``calibrate=True`` asks for the seek either way.
+        """
+        return self._submit(
+            {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))}
+        )
 
     def teleport(
         self, angles_deg: list[float], tool_positions: list[float] | None = None

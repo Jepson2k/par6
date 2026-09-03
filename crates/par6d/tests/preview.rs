@@ -474,13 +474,19 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
         "planned motion is refused un-referenced: {gated:?}"
     );
 
-    let seek = preview.submit(Command::Home(Home { key: 1 }));
+    let seek = preview.submit(Command::Home(Home {
+        key: 1,
+        calibrate: false,
+    }));
     assert!(seek.valid(), "{seek:?}");
     assert_eq!(seek.end_joints_rad, ready);
     assert_eq!(seek.duration_s, 0.0);
     assert!(preview.homed());
 
-    let ret = preview.submit(Command::Home(Home { key: 2 }));
+    let ret = preview.submit(Command::Home(Home {
+        key: 2,
+        calibrate: false,
+    }));
     assert!(ret.valid(), "{ret:?}");
     assert!(
         ret.duration_s > 0.1,
@@ -666,4 +672,48 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
     );
 
     rig.shutdown();
+}
+
+/// `home(calibrate=True)` asks for the referencing seek on an arm that
+/// already holds its references — a different motion from the planned
+/// park return HOME otherwise means. The flag crosses the Python dict,
+/// the wire conversion and the planner before anything can act on it, so
+/// what is checked here is that it survives the trip.
+#[test]
+fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let park = park_deg();
+    preview.place_rad(to_rad(&park));
+    preview.set_homed(true);
+
+    // Referenced: a plain HOME is a planned move back to park, which
+    // takes time and traces a path.
+    let plain = preview.submit(Command::Home(Home {
+        key: 10,
+        calibrate: false,
+    }));
+    assert!(plain.valid(), "{plain:?}");
+
+    // Referenced, but asked to calibrate: the seek runs instead, ending
+    // where the homing sequence leaves the arm rather than at park.
+    let mut off = park;
+    off[0] += 20.0;
+    preview.place_rad(to_rad(&off));
+    let seek = preview.submit(Command::Home(Home {
+        key: 11,
+        calibrate: true,
+    }));
+    assert!(seek.valid(), "{seek:?}");
+    let ready = to_deg(&preview.homing_ready_pose_rad());
+    assert!(
+        max_deg_error(&to_deg(&seek.end_joints_rad), &ready) < 1e-6,
+        "a calibrating home must end where the seek ends: {:?} vs {ready:?}",
+        to_deg(&seek.end_joints_rad)
+    );
+    assert!(
+        seek.duration_s == 0.0,
+        "the seek's duration belongs to the physical sequence, not to a plan: {}",
+        seek.duration_s
+    );
 }

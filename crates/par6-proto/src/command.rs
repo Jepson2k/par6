@@ -317,6 +317,9 @@ pub struct Teleport {
 pub struct Home {
     /// Idempotency key (client-generated uuid64).
     pub key: u64,
+    /// Run the referencing seek even when the arm already holds its
+    /// references; otherwise a referenced arm gets a planned return move.
+    pub calibrate: bool,
 }
 
 /// MOVE_J: joint-space move to target angles.
@@ -1018,7 +1021,7 @@ fn arity(tag: CmdType) -> usize {
         T::JogJ => 5,
         T::JogL => 6,
         T::Teleport => 4,
-        T::Home => 3,
+        T::Home => 4,
         T::MoveJ => 9,
         T::MoveJPose => 8,
         T::MoveL => 10,
@@ -1186,7 +1189,10 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
                 None => w_nil(buf),
             }
         }
-        C::Home(p) => w_uint(buf, p.key),
+        C::Home(p) => {
+            w_uint(buf, p.key);
+            w_bool(buf, p.calibrate);
+        }
         C::MoveJ(p) => {
             w_uint(buf, p.key);
             w_fixed(buf, &p.angles);
@@ -1580,7 +1586,10 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             },
         }),
         T::ResetLoopStats => Command::ResetLoopStats,
-        T::Home => Command::Home(Home { key: r.uint()? }),
+        T::Home => Command::Home(Home {
+            key: r.uint()?,
+            calibrate: r.bool()?,
+        }),
         T::MoveJ => Command::MoveJ(MoveJ {
             key: r.uint()?,
             angles: r_fixed6(&mut r, "move_j.angles")?,
