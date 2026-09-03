@@ -4,7 +4,7 @@
 //! `move_j` is planned from the latest measured pose under the selected
 //! [`Profile`] (EXEC limits), converted sample-for-sample into the RT
 //! ring format, and fed into the SPSC ring under backpressure —
-//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID, the TOPPRA path parameterizer
+//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID/QUINTIC, the TOPPRA path parameterizer
 //! for TOPPRA. Completion is observed through the RT snapshot: the
 //! EXEC playback publishes a high-water `completed_index` over the
 //! per-command ring indexes this planner allocates, and the settle
@@ -133,6 +133,9 @@ pub(crate) enum Profile {
     Ruckig,
     /// Trapezoid on the path coordinate; no jerk limiting.
     Trapezoid,
+    /// Quintic on the path coordinate: zero velocity AND acceleration at
+    /// both ends, no cruise, no jerk limiting, point-to-point only.
+    Quintic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
     /// acceleration limits bind, nothing else.
     Toppra,
@@ -143,6 +146,7 @@ impl Profile {
         match name {
             "RUCKIG" => Some(Self::Ruckig),
             "TRAPEZOID" => Some(Self::Trapezoid),
+            "QUINTIC" => Some(Self::Quintic),
             "TOPPRA" => Some(Self::Toppra),
             _ => None,
         }
@@ -152,7 +156,11 @@ impl Profile {
 /// The profile registry the command plane advertises and validates
 /// `select_profile` against.
 pub(crate) fn profile_names() -> Vec<String> {
-    let mut names = vec!["RUCKIG".to_owned(), "TRAPEZOID".to_owned()];
+    let mut names = vec![
+        "RUCKIG".to_owned(),
+        "TRAPEZOID".to_owned(),
+        "QUINTIC".to_owned(),
+    ];
     names.push("TOPPRA".to_owned());
     names
 }
@@ -632,6 +640,7 @@ impl Par6Planner {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid => ProfileKind::Trapezoid,
+            Profile::Quintic => ProfileKind::Quintic,
             // TOPPRA times the straight joint-space path instead of
             // shaping a point-to-point profile: same waypoints, a
             // different (time-optimal) parameterization.

@@ -255,6 +255,7 @@ regenerated vectors on **both** sides, and a re-freeze. See `CLAUDE.md`.
 |---|---|
 | `RUCKIG` (default) | jerk-limited point-to-point and streaming; the profile blends are built on |
 | `TRAPEZOID` | velocity-limited point-to-point |
+| `QUINTIC` | point-to-point with zero velocity **and** acceleration at both ends; no cruise, does not blend |
 | `TOPPRA` | time-optimal retiming of a cartesian waypoint path |
 
 Every cartesian move rides one pipeline: the geometry produces a pose list, seeded IK

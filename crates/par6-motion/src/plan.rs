@@ -43,6 +43,12 @@ pub enum ProfileKind {
     /// Trapezoidal velocity profile on the path coordinate (accel–cruise–
     /// decel; no jerk limiting).
     Trapezoid,
+    /// Quintic polynomial on the path coordinate: velocity AND
+    /// acceleration are zero at both ends, so the move starts and stops
+    /// without a step in either. No cruise phase and no jerk limiting —
+    /// peak jerk is `60/T³` over a unit distance, bounded by nothing but
+    /// the duration. Point-to-point only: see [`MotionError::ProfileCannotBlend`].
+    Quintic,
 }
 
 /// Per-move parameters.
@@ -217,6 +223,9 @@ impl ProgramBuilder {
                 ProfileKind::Ruckig => {
                     self.emit_ruckig_chain(&mut samples, &chain_start, chain, i as u32)?;
                 }
+                ProfileKind::Quintic => {
+                    self.emit_quintic_chain(&mut samples, &chain_start, chain, i as u32)?;
+                }
             }
             chain_start = self.moves[j].target;
             i = j + 1;
@@ -307,6 +316,53 @@ impl ProgramBuilder {
             }
             consumed_head = ov_next;
         }
+    }
+
+    /// A quintic is point-to-point. The trapezoid's corner splice adds
+    /// the tail of one segment to the head of the next, and that is
+    /// limit-safe there because two complementary LINEAR ramps sum to a
+    /// constant. Two complementary quintic halves do not: their sum peaks
+    /// at `2.109/T` against the profile's own `1.875/T`, a 12.5% velocity
+    /// overshoot at the corner. So a blend request is refused rather
+    /// than honoured over the limit or silently ignored.
+    fn emit_quintic_chain(
+        &self,
+        out: &mut Vec<Sample>,
+        start: &[f64; NUM_JOINTS],
+        chain: &[MoveSpec],
+        chain_offset: u32,
+    ) -> Result<(), MotionError> {
+        if chain.len() > 1 {
+            return Err(MotionError::ProfileCannotBlend {
+                profile: "quintic",
+                first: chain_offset as usize,
+                second: chain_offset as usize + 1,
+            });
+        }
+        let mv = &chain[0];
+        let path = JointLinePath::new(*start, mv.target);
+        let mut scale = [0.0; NUM_JOINTS];
+        for (s, (a, b)) in scale.iter_mut().zip(start.iter().zip(mv.target.iter())) {
+            *s = (b - a).abs();
+        }
+        let seg = quintic_segment(
+            &path,
+            &scale,
+            &self.limits,
+            mv.params.speed_fraction,
+            mv.params.min_duration_s,
+            self.dt,
+        );
+        let meta = self.meta_for(chain, chain_offset, 0);
+        for t in 0..seg.q.len() {
+            out.push(Sample {
+                q: seg.q[t],
+                qd: seg.qd[t],
+                qdd: seg.qdd[t],
+                meta,
+            });
+        }
+        Ok(())
     }
 
     fn emit_ruckig_chain(
@@ -488,6 +544,127 @@ impl STrapezoid {
                 -self.a_out,
             )
         }
+    }
+}
+
+/// Peak `ds/dt` of the unit quintic `10τ³ − 15τ⁴ + 6τ⁵`, at `τ = 1/2`:
+/// exactly `15/8`.
+const QUINTIC_PEAK_VEL: f64 = 1.875;
+/// Peak `d²s/dt²` of the unit quintic, at `τ = (3 ∓ √3)/6`: exactly
+/// `10/√3`. Written out rather than as `5.77` — the truncation lands
+/// the acceleration-bound duration 0.03% short, which is small, and
+/// wrong in the direction that matters.
+const QUINTIC_PEAK_ACC: f64 = 5.773_502_691_896_258;
+
+/// Scalar quintic over a unit distance: `s(τ) = 10τ³ − 15τ⁴ + 6τ⁵`
+/// with `τ = t/T`. Velocity and acceleration are zero at both ends;
+/// there is no cruise, so the whole move is one smooth swell.
+struct SQuintic {
+    t_total: f64,
+}
+
+impl SQuintic {
+    /// The shortest `T` that keeps the peak velocity under `v_max` and
+    /// the peak acceleration under `a_max`, stretched to `min_duration`
+    /// when that is longer, and never under `floor`.
+    fn new(v_max: f64, a_max: f64, min_duration: Option<f64>, floor: f64) -> Self {
+        let t_v = QUINTIC_PEAK_VEL / v_max;
+        let t_a = (QUINTIC_PEAK_ACC / a_max).sqrt();
+        let mut t = t_v.max(t_a).max(floor);
+        if let Some(td) = min_duration {
+            t = t.max(td);
+        }
+        Self { t_total: t }
+    }
+
+    /// `(s, ds/dt, d²s/dt²)` at time `t`, clamped to the profile ends.
+    fn sample(&self, t: f64) -> (f64, f64, f64) {
+        if t <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+        if t >= self.t_total {
+            return (1.0, 0.0, 0.0);
+        }
+        let tt = self.t_total;
+        let u = t / tt;
+        let w = 1.0 - u;
+        let s = u * u * u * (10.0 - 15.0 * u + 6.0 * u * u);
+        let s_dot = 30.0 * u * u * w * w / tt;
+        let s_ddot = 60.0 * u * w * (1.0 - 2.0 * u) / (tt * tt);
+        (s, s_dot, s_ddot)
+    }
+}
+
+/// One quintic move along `path`, scaled per joint exactly as
+/// [`trapezoid_segment`] scales the trapezoid: the scalar caps are the
+/// tightest `limit_j / scale_j` across the joints that move, so one
+/// duration serves every joint and they all start and stop together.
+///
+/// That reduction makes the duration `max_j` of the per-joint closed
+/// forms `1.875·Δ_j / v_j` and `√(10/√3 · Δ_j / a_j)` — the two peaks
+/// of the unit quintic, each scaled by that joint's displacement.
+fn quintic_segment(
+    path: &dyn PathSampler,
+    scale: &[f64; NUM_JOINTS],
+    limits: &MotionLimits,
+    speed_fraction: f64,
+    min_duration_s: Option<f64>,
+    dt: f64,
+) -> SegSamples {
+    let mut v_s = f64::INFINITY;
+    let mut a_s = f64::INFINITY;
+    for (j, &sc) in scale.iter().enumerate() {
+        if sc > ZERO_DELTA {
+            v_s = v_s.min(limits.velocity[j] * speed_fraction / sc);
+            a_s = a_s.min(limits.acceleration[j] / sc);
+        }
+    }
+    if !v_s.is_finite() {
+        // Nothing moves: a single hold sample keeps the command's
+        // checkpoint boundary observable in the stream.
+        let mut q = [0.0; NUM_JOINTS];
+        path.sample(1.0, &mut q);
+        return SegSamples {
+            q: vec![q],
+            qd: vec![[0.0; NUM_JOINTS]],
+            qdd: vec![[0.0; NUM_JOINTS]],
+            entry_ticks: 0,
+            exit_ticks: 0,
+        };
+    }
+    let prof = SQuintic::new(v_s, a_s, min_duration_s, 2.0 * dt);
+    let n = ((prof.t_total / dt).ceil() as usize).max(1);
+    let mut qs = Vec::with_capacity(n);
+    let mut qds = Vec::with_capacity(n);
+    let mut qdds = Vec::with_capacity(n);
+    let mut dq_ds = [0.0; NUM_JOINTS];
+    for k in 1..=n {
+        let (s, s_dot, s_ddot) = prof.sample(k as f64 * dt);
+        let mut q = [0.0; NUM_JOINTS];
+        let mut qd = [0.0; NUM_JOINTS];
+        let mut qdd = [0.0; NUM_JOINTS];
+        path.sample(s, &mut q);
+        path.derivative(s, &mut dq_ds);
+        for j in 0..NUM_JOINTS {
+            qd[j] = dq_ds[j] * s_dot;
+            // Straight joint line: q(s) is affine, so no curvature term.
+            qdd[j] = dq_ds[j] * s_ddot;
+        }
+        qs.push(q);
+        qds.push(qd);
+        qdds.push(qdd);
+    }
+    // Land exactly on the segment target, at rest.
+    let last = n - 1;
+    path.sample(1.0, &mut qs[last]);
+    qds[last] = [0.0; NUM_JOINTS];
+    qdds[last] = [0.0; NUM_JOINTS];
+    SegSamples {
+        q: qs,
+        qd: qds,
+        qdd: qdds,
+        entry_ticks: 0,
+        exit_ticks: 0,
     }
 }
 

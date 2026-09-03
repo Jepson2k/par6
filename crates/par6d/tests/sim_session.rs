@@ -713,6 +713,16 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "the selected profile did not change the trajectory: \
          TRAPEZOID {trapezoid:?} vs RUCKIG {ruckig:?}"
     );
+    // Same proof for QUINTIC: unlimited jerk, so jerk-limited ruckig
+    // cannot beat it either. (It plans ~20% slower than the trapezoid
+    // over this move, but that gap is inside the ack-to-COMPLETE
+    // measurement noise, so the ruckig ratio is the observable.)
+    let quintic = timed_move_under(&rig, &mut c, "QUINTIC", 5103);
+    assert!(
+        ruckig > quintic.mul_f64(1.4),
+        "the QUINTIC selection did not reach the planner: \
+         QUINTIC {quintic:?} vs RUCKIG {ruckig:?}"
+    );
     let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
         toppra < ruckig,

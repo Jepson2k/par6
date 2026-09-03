@@ -587,7 +587,9 @@ class Robot(_RobotABC):
         """Profile names ``par6d`` plans queued moves with.
 
         ``RUCKIG`` (the runtime's startup default) is jerk-limited
-        point-to-point, ``TRAPEZOID`` drops the jerk limit, and ``TOPPRA``
+        point-to-point, ``TRAPEZOID`` drops the jerk limit, ``QUINTIC``
+        starts and stops with zero acceleration as well as zero velocity
+        (point-to-point only; it refuses to blend), and ``TOPPRA``
         time-optimally parameterizes the path.  TOPPRA runs through the
         C++ shim, so only a ``par6d`` built with its ``ffi`` feature
         registers it; on a build without one ``select_profile("TOPPRA")``
@@ -596,7 +598,7 @@ class Robot(_RobotABC):
         registry, so this list cannot narrow itself to the runtime it is
         talking to.
         """
-        return ("RUCKIG", "TRAPEZOID", "TOPPRA")
+        return ("RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA")
 
     # -- Backend injection --------------------------------------------------
 
