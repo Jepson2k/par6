@@ -407,6 +407,8 @@ pub struct RtCore<B: DriverBus> {
     bus_rx_failures: u32,
     /// Stored-config re-sends the bus refused; see `resend_config`.
     config_resend_failures: u32,
+    /// The residual of the last strict-settle fault (`ExecSettleTimeout`).
+    settle_residual_rad: f64,
     /// Nodes whose last config re-send was refused, retried one per tick.
     config_resend_pending: u16,
     /// Ticks after arming at which the full stored-config shots run
@@ -603,6 +605,7 @@ impl<B: DriverBus> RtCore<B> {
             self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
             config_resend_failures: 0,
+            settle_residual_rad: 0.0,
             config_resend_pending: 0,
             config_resend_ticks: robot
                 .bus
@@ -1796,10 +1799,16 @@ impl<B: DriverBus> RtCore<B> {
                     &mut self.scratch_qd,
                     &mut self.scratch_tau,
                 );
-                if outcome == ExecTick::Fault {
-                    // Strict-policy settle timeout: hard error; playback
-                    // froze in a hold, the reaction lands next tick.
-                    self.errors.latch(ErrorCode::ExecSettleTimeout, None);
+                if let ExecTick::Fault {
+                    joint,
+                    residual_rad,
+                } = outcome
+                {
+                    // Strict-policy settle timeout: hard error on the joint
+                    // that missed; playback froze in a hold, the reaction
+                    // lands next tick.
+                    self.settle_residual_rad = residual_rad;
+                    self.errors.latch(ErrorCode::ExecSettleTimeout, Some(joint));
                 }
                 self.q_target = self.scratch_q;
                 self.qd_target = self.scratch_qd;
@@ -2006,6 +2015,7 @@ impl<B: DriverBus> RtCore<B> {
         s.loop_stats.bus_tx_failures = self.bus_tx_failures;
         s.loop_stats.bus_rx_failures = self.bus_rx_failures;
         s.loop_stats.config_resend_failures = self.config_resend_failures;
+        s.settle_residual_rad = self.settle_residual_rad;
         s.link = self.bus.link_health();
         s.exec = self.exec.status();
         s.jog = JogStatus {

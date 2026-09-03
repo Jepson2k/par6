@@ -427,6 +427,9 @@ pub struct StateSnapshot {
     pub tau_filtered: [f64; MAX_JOINTS],
     /// The gravity feedforward is being applied this tick.
     pub gravity_comp: bool,
+    /// Residual \[rad\] of the joint that missed the last strict settle
+    /// window (`ExecSettleTimeout` names the joint).
+    pub settle_residual_rad: f64,
     /// Commanded joint positions \[rad\] (post-limiter, what went on the bus).
     pub q_commanded: [f64; MAX_JOINTS],
     /// Commanded joint velocities \[rad/s\].
@@ -515,6 +518,7 @@ impl Default for StateSnapshot {
             qd_filtered: [0.0; MAX_JOINTS],
             tau_filtered: [0.0; MAX_JOINTS],
             gravity_comp: false,
+            settle_residual_rad: 0.0,
             q_commanded: [0.0; MAX_JOINTS],
             qd_commanded: [0.0; MAX_JOINTS],
             tau_commanded: [0.0; MAX_JOINTS],

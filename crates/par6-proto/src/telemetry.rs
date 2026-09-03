@@ -231,6 +231,28 @@ pub struct TelemetryFrame {
 const MAX_VALUES: usize = 64;
 const MAX_ARR: usize = 64;
 
+/// One value of a telemetry packet, borrowed: what a sender that keeps
+/// its readings in pre-allocated buffers encodes from.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum TelemetryValueRef<'a> {
+    /// Unsigned scalar (tick counters).
+    U64(u64),
+    /// Float scalar.
+    F64(f64),
+    /// Float array (per-joint / per-node readings; NaN = unavailable).
+    Arr(&'a [f64]),
+}
+
+impl<'a> From<&'a TelemetryValue> for TelemetryValueRef<'a> {
+    fn from(v: &'a TelemetryValue) -> Self {
+        match v {
+            TelemetryValue::U64(x) => TelemetryValueRef::U64(*x),
+            TelemetryValue::F64(x) => TelemetryValueRef::F64(*x),
+            TelemetryValue::Arr(a) => TelemetryValueRef::Arr(a),
+        }
+    }
+}
+
 /// Encode one telemetry packet.
 pub fn encode_telemetry(
     recipe: &str,
@@ -238,24 +260,38 @@ pub fn encode_telemetry(
     mono_time_ns: u64,
     values: &[TelemetryValue],
 ) -> Vec<u8> {
+    let refs: Vec<TelemetryValueRef<'_>> = values.iter().map(TelemetryValueRef::from).collect();
     let mut buf = Vec::with_capacity(64 + values.len() * 56);
-    w_array(&mut buf, 3 + values.len());
-    w_str(&mut buf, recipe);
-    w_uint(&mut buf, seq);
-    w_uint(&mut buf, mono_time_ns);
+    encode_telemetry_into(&mut buf, recipe, seq, mono_time_ns, &refs);
+    buf
+}
+
+/// Encode one telemetry packet into `buf` (cleared first) from borrowed
+/// values; once `buf` has grown to a packet, nothing is allocated.
+pub fn encode_telemetry_into(
+    buf: &mut Vec<u8>,
+    recipe: &str,
+    seq: u64,
+    mono_time_ns: u64,
+    values: &[TelemetryValueRef<'_>],
+) {
+    buf.clear();
+    w_array(buf, 3 + values.len());
+    w_str(buf, recipe);
+    w_uint(buf, seq);
+    w_uint(buf, mono_time_ns);
     for v in values {
         match v {
-            TelemetryValue::U64(x) => w_uint(&mut buf, *x),
-            TelemetryValue::F64(x) => w_f64(&mut buf, *x),
-            TelemetryValue::Arr(a) => {
-                w_array(&mut buf, a.len());
-                for x in a {
-                    w_f64(&mut buf, *x);
+            TelemetryValueRef::U64(x) => w_uint(buf, *x),
+            TelemetryValueRef::F64(x) => w_f64(buf, *x),
+            TelemetryValueRef::Arr(a) => {
+                w_array(buf, a.len());
+                for x in a.iter() {
+                    w_f64(buf, *x);
                 }
             }
         }
     }
-    buf
 }
 
 /// Decode one telemetry packet.

@@ -62,11 +62,14 @@ pub fn rt_standing_error(snap: &StateSnapshot) -> Option<WireError> {
         make_error(ErrorCode::SysRtiLinkLost, UNATTRIBUTED, &[])
     } else if has(RtCode::StreamFault) {
         make_error(ErrorCode::SysStreamFault, UNATTRIBUTED, &[])
-    } else if has(RtCode::ExecSettleTimeout) {
+    } else if let Some(e) = errs.iter().find(|e| e.code == RtCode::ExecSettleTimeout) {
         make_error(
             ErrorCode::MotnSettleTimeout,
             UNATTRIBUTED,
-            &[("residual", "unknown")],
+            &[
+                ("joint", &e.joint.map(|j| j.to_string()).unwrap_or_default()),
+                ("residual_rad", &format!("{:.4}", snap.settle_residual_rad)),
+            ],
         )
     } else if has(RtCode::GripperFault) || has(RtCode::GripperCalibrationFailed) {
         make_error(
@@ -114,40 +117,42 @@ pub fn rt_warnings(snap: &StateSnapshot) -> Vec<WireError> {
     snap.errors
         .as_slice()
         .iter()
-        .filter(|e| e.code.is_warning())
         .filter_map(|e| {
-            let joint = e.joint.map(|j| j.to_string()).unwrap_or_default();
-            Some(match e.code {
-                RtCode::CanStale => {
-                    make_error(ErrorCode::SysCanStale, UNATTRIBUTED, &[("joint", &joint)])
-                }
-                RtCode::LoopDegraded => make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
-                RtCode::NotHomed => make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]),
-                RtCode::LinkErrorPassive => {
-                    make_error(ErrorCode::SysLinkErrorPassive, UNATTRIBUTED, &[])
-                }
-                RtCode::HomingFailed => {
-                    let phase = e
-                        .joint
-                        .and_then(|j| snap.homing.phase.get(usize::from(j)).copied())
-                        .unwrap_or(RtHomingPhase::Idle);
-                    make_error(
-                        ErrorCode::MotnHomingFailed,
-                        UNATTRIBUTED,
-                        &[("joint", &joint), ("phase", &format!("{phase:?}"))],
-                    )
-                }
-                // is_warning() and this match are maintained together; a
-                // new warning key must get a wire rendering here or it
-                // never reaches a client.
-                other => {
-                    debug_assert!(false, "warning key {other:?} has no wire rendering");
-                    log::warn!("warning key {other:?} has no wire rendering; dropped");
-                    return None;
-                }
-            })
+            let rendered = wire_warning(e, snap);
+            debug_assert_eq!(
+                rendered.is_some(),
+                e.code.is_warning(),
+                "warning key {:?} disagrees with its wire rendering",
+                e.code
+            );
+            rendered
         })
         .collect()
+}
+
+/// The wire rendering of one RT latch entry when it is a warning-class
+/// key — the one table the STATUS `warnings` slot is built from; a hard
+/// latch renders as `None` here and through [`rt_standing_error`] instead.
+pub fn wire_warning(e: &par6_rt::ErrorEntry, snap: &StateSnapshot) -> Option<WireError> {
+    let joint = e.joint.map(|j| j.to_string()).unwrap_or_default();
+    Some(match e.code {
+        RtCode::CanStale => make_error(ErrorCode::SysCanStale, UNATTRIBUTED, &[("joint", &joint)]),
+        RtCode::LoopDegraded => make_error(ErrorCode::SysLoopDegraded, UNATTRIBUTED, &[]),
+        RtCode::NotHomed => make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]),
+        RtCode::LinkErrorPassive => make_error(ErrorCode::SysLinkErrorPassive, UNATTRIBUTED, &[]),
+        RtCode::HomingFailed => {
+            let phase = e
+                .joint
+                .and_then(|j| snap.homing.phase.get(usize::from(j)).copied())
+                .unwrap_or(RtHomingPhase::Idle);
+            make_error(
+                ErrorCode::MotnHomingFailed,
+                UNATTRIBUTED,
+                &[("joint", &joint), ("phase", &format!("{phase:?}"))],
+            )
+        }
+        _ => return None,
+    })
 }
 
 #[cfg(test)]

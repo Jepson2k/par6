@@ -10,7 +10,7 @@ use pyo3::types::{PyDict, PyList};
 
 use par6_proto::command as cmd;
 use par6_proto::{Command, CompletionPolicy, Frame, NUM_JOINTS};
-use par6_server::ShapeLayer;
+use par6_server::{PayloadSpec, ShapeLayer};
 use par6d::preview::{Preview as EnginePreview, PreviewResult};
 
 use crate::convert::{robot_err, shape_from_py, tool_param_from_py, wire_error_tuple};
@@ -280,6 +280,41 @@ impl Preview {
             .unwrap()
             .preview_jog(speeds, duration, accel);
         result_dict(py, &r)
+    }
+
+    /// Preview a cartesian velocity jog: signed fractions per axis (xyz
+    /// then rotation about xyz) held for `duration` seconds in `frame`
+    /// (0 = WRF, 1 = TRF) — the runtime's own twist integration through
+    /// the same kinematics and soft window, gated on the collision
+    /// world. Wire-invalid parameters come back as the result's `error`.
+    #[pyo3(signature = (velocities, duration, frame=0, accel=None))]
+    fn preview_jog_l(
+        &self,
+        py: Python<'_>,
+        velocities: [f64; 6],
+        duration: f64,
+        frame: u8,
+        accel: Option<f64>,
+    ) -> PyResult<PyObject> {
+        let frame = frame_of(frame)?;
+        let r = self
+            .inner
+            .lock()
+            .unwrap()
+            .preview_jog_l(velocities, frame, duration, accel);
+        result_dict(py, &r)
+    }
+
+    /// The payload the preview plans with, as the live `set_payload`
+    /// pushes it: mass \[kg\], COM \[m\] in the end-effector frame, and
+    /// the inertia `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` or None for a point
+    /// mass.
+    #[pyo3(signature = (mass, com, inertia=None))]
+    fn set_payload(&self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_payload(PayloadSpec { mass, com, inertia });
     }
 
     /// Preview a queued program (list of command dicts, see

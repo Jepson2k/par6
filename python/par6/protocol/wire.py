@@ -109,6 +109,8 @@ class StatusBuffer:
     tcp_speed: float = 0.0
     simulator_active: bool = False
     collision_active: bool = False
+    paused: bool = False
+    """EXEC playback is holding in place with its sample ring untouched."""
     collision_pairs: list[tuple[str, str]] = field(default_factory=list)
     scene_epoch: int = 0
     accepted_index: int = -1
@@ -212,6 +214,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.tcp_speed = d["tcp_speed"]
     buf.simulator_active = d["simulator_active"]
     buf.collision_active = d["collision_active"]
+    buf.paused = d["paused"]
     buf.collision_pairs = [tuple(p) for p in d["collision_pairs"]]
     buf.scene_epoch = d["scene_epoch"]
     buf.accepted_index = d["accepted_index"]

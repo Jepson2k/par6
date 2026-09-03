@@ -42,20 +42,7 @@ fn boot_tagged(tag: &str, sim_dynamics: bool) -> Rig {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    let src = shipped_config();
-    let dir = std::env::temp_dir().join(format!("par6d-ffi-{tag}-{}", std::process::id()));
-    let grippers = dir.join("grippers");
-    std::fs::create_dir_all(&grippers).expect("test config dir");
-    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
-    let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
-    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
-        let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
-    }
-    dst
+    common::retimed_config(&format!("ffi-{tag}"), 0.02)
 }
 
 /// [`test_config`] with the active (MSG) gripper's `[kinematics] mass_kg`
@@ -862,12 +849,7 @@ fn shapes_readback(c: &mut Client) -> (Vec<Shape>, u64) {
 
 /// The configured park pose in wire units — where every program ends.
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
+    common::park_deg()
 }
 
 fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> bool {

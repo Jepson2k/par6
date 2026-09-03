@@ -61,8 +61,8 @@ pub use status::{
     STATUS_HEADER_LEN, STATUS_LEN,
 };
 pub use telemetry::{
-    decode_telemetry, encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe,
-    TelemetryValue,
+    decode_telemetry, encode_telemetry, encode_telemetry_into, TelemetryField, TelemetryFrame,
+    TelemetryRecipe, TelemetryValue, TelemetryValueRef,
 };
 
 /// Protocol version carried in the STATUS header.

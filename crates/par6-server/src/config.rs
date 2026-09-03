@@ -112,11 +112,11 @@ pub struct ServerConfig {
     /// naming the line count the box actually has. Empty = a box that
     /// drives no outputs, and every `write_io` is refused.
     pub digital_outputs: Vec<String>,
-    /// CAN node ids `set_pid_gains` may target (the configured joint
-    /// nodes plus the CAN gripper node when one is fitted). Empty = a
-    /// runtime with no tunable drives, and every `set_pid_gains` is
-    /// refused.
-    pub tunable_nodes: Vec<u8>,
+    /// The drives `set_pid_gains` may target (the configured joint nodes
+    /// plus the CAN gripper node when one is fitted), each with the
+    /// ceilings its configuration declares. Empty = a runtime with no
+    /// tunable drives, and every `set_pid_gains` is refused.
+    pub tunable_nodes: Vec<TunableNode>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -164,6 +164,22 @@ pub struct ConfigInfoData {
     /// Gripper TOMLs as `(file name, content)`, sorted by file name,
     /// served by CONFIG_BUNDLE.
     pub grippers: Vec<(String, String)>,
+}
+
+/// A drive `set_pid_gains` may retune, with the limits its configured
+/// joint declares. A tune is stored and re-pushed on every reconnect, so
+/// a limit above the joint's own is refused before it reaches the drive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TunableNode {
+    /// CAN node id.
+    pub node: u8,
+    /// Highest current limit accepted \[mA\].
+    pub ilim_ma: f64,
+    /// Highest velocity limit accepted \[encoder ticks/s\].
+    pub velocity_limit_ticks_s: f64,
+    /// Highest voltage limit accepted \[mV\]; 0 = the drive uses VBUS and
+    /// no explicit limit is ceilinged.
+    pub voltage_limit_mv: u32,
 }
 
 impl Default for ServerConfig {

@@ -439,15 +439,20 @@ impl StreamTracker for ClampStream {
 // ---------------------------------------------------------------- completion
 
 /// Verdict of one settling tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettleVerdict {
     /// Still settling — EXEC keeps holding at the boundary target.
     Settling,
     /// The command is complete; playback resumes.
     Complete,
     /// The settle failed (strict policy timeout) — the tick loop latches
-    /// a hard error.
-    Fault,
+    /// a hard error attributed to the joint furthest from its target.
+    Fault {
+        /// Joint furthest from its target when the window closed.
+        joint: u8,
+        /// That joint's residual \[rad\].
+        residual_rad: f64,
+    },
 }
 
 /// EXEC completion policy.
@@ -509,18 +514,25 @@ impl SettlePolicy for SpecSettle {
     }
 
     fn tick(&mut self, q_meas: &[f64; MAX_JOINTS], q_target: &[f64; MAX_JOINTS]) -> SettleVerdict {
-        let max_err = q_meas
+        let (worst, max_err) = q_meas
             .iter()
             .zip(q_target)
             .map(|(m, t)| (m - t).abs())
-            .fold(0.0f64, f64::max);
+            .enumerate()
+            .fold(
+                (0usize, 0.0f64),
+                |acc, (j, e)| if e > acc.1 { (j, e) } else { acc },
+            );
         if max_err <= self.tolerance_rad {
             return SettleVerdict::Complete;
         }
         self.elapsed += 1;
         if self.elapsed >= self.timeout_ticks {
             return match self.policy {
-                CompletionPolicy::Strict => SettleVerdict::Fault,
+                CompletionPolicy::Strict => SettleVerdict::Fault {
+                    joint: worst as u8,
+                    residual_rad: max_err,
+                },
                 _ => SettleVerdict::Complete,
             };
         }

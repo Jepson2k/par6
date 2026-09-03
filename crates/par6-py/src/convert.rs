@@ -133,6 +133,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     homing.set_item("joints", s.homing.joints.clone())?;
     d.set_item("homing", homing)?;
     d.set_item("torques_ext", s.torques_ext.to_vec())?;
+    d.set_item("paused", s.paused)?;
     Ok(d.into_any().unbind())
 }
 

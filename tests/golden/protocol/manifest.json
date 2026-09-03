@@ -1160,7 +1160,7 @@
         null,
         0.3,
         0.4,
-        false
+        true
       ]
     },
     {
@@ -1317,7 +1317,7 @@
           8,
           36,
           "Settle timeout",
-          "Measured position did not settle on target within the window (max residual 0.02 rad).",
+          "Measured position did not settle on target within the window: J3 was 0.0200 rad off.",
           "Command completed with error under the strict policy.",
           "Check for mechanical obstruction, or relax the completion policy."
         ]
@@ -2186,6 +2186,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -2482,7 +2483,8 @@
           -0.0625,
           0.03125,
           -0.015625
-        ]
+        ],
+        true
       ]
     },
     {
@@ -2579,6 +2581,7 @@
         "link_ok": 0,
         "mode": 0,
         "mono_time_ns": 0,
+        "paused": false,
         "pose": [
           0.0,
           0.0,
@@ -2778,7 +2781,8 @@
           0.0,
           0.0,
           0.0
-        ]
+        ],
+        false
       ]
     },
     {
@@ -2910,6 +2914,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -3207,6 +3212,7 @@
           0.03125,
           -0.015625
         ],
+        true,
         "future-field",
         1.25
       ]
@@ -3346,6 +3352,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -3648,7 +3655,8 @@
           -0.0625,
           0.03125,
           -0.015625
-        ]
+        ],
+        true
       ]
     },
     {

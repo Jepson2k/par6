@@ -362,6 +362,7 @@ fn status_fields(s: &Status) -> Value {
         "link_health": link_health,
         "homing": homing,
         "torques_ext": s.torques_ext.to_vec(),
+        "paused": s.paused,
     })
 }
 
@@ -507,6 +508,7 @@ fn status_full_fixture() -> Status {
             ],
         },
         torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
+        paused: true,
     }
 }
 
@@ -871,7 +873,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.3),
             accel: Some(0.4),
-            rel: false,
+            rel: true,
         }),
     ));
     v.push(cmd_vec(
@@ -967,7 +969,7 @@ pub fn vectors() -> Vec<Vector> {
             detail: Some(make_error(
                 ErrorCode::MotnSettleTimeout,
                 8,
-                &[("residual", "0.02")],
+                &[("joint", "3"), ("residual_rad", "0.0200")],
             )),
             verdict: None,
         },

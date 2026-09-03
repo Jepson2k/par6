@@ -446,7 +446,7 @@ fn default_config_resend_offsets_s() -> Vec<f64> {
 
 /// Longest bus-open retry window accepted \[s\]; the daemon derives a
 /// per-second attempt count from it.
-const MAX_OPEN_RETRY_S: f64 = 3600.0;
+pub const MAX_OPEN_RETRY_S: f64 = 3600.0;
 
 /// Torque-level sim plant parameters (feature `sim-dynamics`): the
 /// motor-referred rotor dynamics the vendor models

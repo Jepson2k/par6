@@ -355,15 +355,15 @@ enum StreamKind {
 }
 
 /// Live state of a cartesian jog, advanced by housekeeping each period.
-struct CartJogState {
+pub(crate) struct CartJogState {
     /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
     /// commanded frame's axes.
-    twist: [f64; 6],
-    frame: par6_proto::Frame,
+    pub(crate) twist: [f64; 6],
+    pub(crate) frame: par6_proto::Frame,
     /// Integrated joint target \[rad\] (the stream setpoint source).
-    q: [f64; MAX_JOINTS],
-    soft_min: [f64; MAX_JOINTS],
-    soft_max: [f64; MAX_JOINTS],
+    pub(crate) q: [f64; MAX_JOINTS],
+    pub(crate) soft_min: [f64; MAX_JOINTS],
+    pub(crate) soft_max: [f64; MAX_JOINTS],
 }
 
 struct ActiveStream {
@@ -1050,7 +1050,15 @@ impl RtBridge {
     fn swap_to_hardware(&mut self, interface: &str) -> Result<(), WireError> {
         let mut cfg = self.bundle.robot.bus.clone();
         interface.clone_into(&mut cfg.interface);
-        let hw = SocketCanBus::open(&cfg).map_err(|e| {
+        // The same opener as boot: a driver power-cycle leaves the
+        // interface enumerating for a moment, and the retry window absorbs
+        // it here too. The server task blocks for at most the window.
+        let hw = crate::daemon::open_with_retry(
+            cfg.open_retry_s,
+            || SocketCanBus::open(&cfg),
+            std::thread::sleep,
+        )
+        .map_err(|e| {
             make_error(
                 ErrorCode::MotnSetupFailed,
                 UNATTRIBUTED,
@@ -1271,7 +1279,12 @@ pub(crate) fn housekeeping_loop(
                 }
             }
             if let Some(req) = &sh.flashing {
-                if snap.mode == req.want {
+                // An exit lands wherever the RT settles: a still-latched
+                // hard error re-drives a FLASHING exit to ACTIVE_ERROR, and
+                // that is a successful exit, not a timeout.
+                let arrived = snap.mode == req.want
+                    || (req.want == Mode::Idle && snap.mode != Mode::Flashing);
+                if arrived {
                     sh.flashing = None;
                     sh.flashing_outcome = Some(Ok(()));
                 } else if now >= req.deadline {
@@ -1305,7 +1318,7 @@ pub(crate) fn housekeeping_loop(
 /// the joint target and clamp it inside the soft window. Returns the
 /// integrated target and the joint velocity it moved at — what the
 /// collision gate projects its lookahead with.
-fn step_cart_jog(
+pub(crate) fn step_cart_jog(
     kin: &mut crate::kin::CartKin,
     state: &mut CartJogState,
     dt_s: f64,

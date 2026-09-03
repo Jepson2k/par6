@@ -252,7 +252,7 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
         },
         E::MotnSettleTimeout => ErrorTemplate {
             title: "Settle timeout",
-            cause: "Measured position did not settle on target within the window (max residual {residual} rad).",
+            cause: "Measured position did not settle on target within the window: J{joint} was {residual_rad} rad off.",
             effect: "Command completed with error under the strict policy.",
             remedy: "Check for mechanical obstruction, or relax the completion policy.",
         },

@@ -25,6 +25,7 @@ use par6_rt::{
 use par6_server::{
     spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
     RtCommands, RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
+    TunableNode,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -916,7 +917,17 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
 /// nothing is forwarded — an ack would report a tune nothing received.
 #[tokio::test]
 async fn set_pid_gains_validates_the_node_against_the_config() {
-    let mut h = start(|cfg| cfg.tunable_nodes = vec![0, 1, 2, 3, 4, 5]).await;
+    let mut h = start(|cfg| {
+        cfg.tunable_nodes = (0..6)
+            .map(|node| TunableNode {
+                node,
+                ilim_ma: 2500.0,
+                velocity_limit_ticks_s: 200_000.0,
+                voltage_limit_mv: 0,
+            })
+            .collect();
+    })
+    .await;
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
@@ -951,6 +962,20 @@ async fn set_pid_gains_validates_the_node_against_the_config() {
     assert!(
         err.cause.contains("node 9"),
         "the refusal must name the node: {}",
+        err.cause
+    );
+
+    // Above the joint's configured current ceiling: refused before it is
+    // stored, since a stored tune is re-pushed on every reconnect.
+    let mut over = gains(2);
+    if let Command::SetPidGains(p) = &mut over {
+        p.ilim_ma = 2600.0;
+    }
+    let err = c.expect_error(&over).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("ilim_ma") && err.cause.contains("2500"),
+        "the refusal names the field and the ceiling: {}",
         err.cause
     );
     let forwarded = h
@@ -2499,11 +2524,16 @@ async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
     // A move that wants to blend is NOT started on its own: there is no
     // corner until the next move arrives.
     let i1 = c.ok_index(&move_j_blended(201, Some(15.0))).await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    assert!(
-        h.planner.lock().unwrap().started.is_empty(),
-        "a blended move must wait for the successor it is meant to blend into"
-    );
+    // Poll through half the configured hold: the lone blended move must
+    // not start anywhere inside it (the hold itself expires at 150 ms).
+    let watch_until = tokio::time::Instant::now() + Duration::from_millis(75);
+    while tokio::time::Instant::now() < watch_until {
+        assert!(
+            h.planner.lock().unwrap().started.is_empty(),
+            "a blended move must wait for the successor it is meant to blend into"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 
     // Its successor arrives, and the pair starts as one batch.
     let i2 = c.ok_index(&move_j_blended(202, None)).await;
@@ -2795,5 +2825,144 @@ async fn set_payload_applies_reads_back_and_refuses_garbage() {
             ..
         } => assert_eq!(mass, 0.0),
         other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+}
+
+/// A tool `stop` carrying parameters is refused at admission, before the
+/// out-of-band halt fires: the old order halted the jaws, acked, and
+/// then dropped the whole queue when dispatch refused the shape.
+#[tokio::test]
+async fn a_tool_stop_with_parameters_is_refused_before_it_halts_anything() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let stop = Command::ToolAction(par6_proto::command::ToolAction {
+        key: 9101,
+        tool_key: "gripper".to_owned(),
+        action: "stop".to_owned(),
+        params: vec![par6_proto::command::ToolParam::Float(1.0)],
+    });
+    let err = c.expect_error(&stop).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(err.cause.contains("takes no parameters"), "{}", err.cause);
+    assert!(
+        !h.rt_events().contains(&RtEvent::ToolStop),
+        "a refused stop must not have halted the gripper"
+    );
+}
+
+/// CONFIG_BUNDLE is one un-chunked datagram: a bundle past the reply
+/// ceiling answers with a structured error instead of a send that fails
+/// at debug level and a client that times out.
+#[tokio::test]
+async fn an_oversized_config_bundle_is_refused_with_a_structured_error() {
+    let mut h = start(|cfg| cfg.config_info.robot_toml = "#".repeat(70_000)).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    match c.request(&Command::ConfigBundle).await {
+        Reply::Error { error, .. } => {
+            assert_eq!(error.code, ErrorCode::CommValidationError as u16);
+            assert!(error.cause.contains("ceiling"), "{}", error.cause);
+        }
+        other => panic!("expected a structured refusal, got {other:?}"),
+    }
+}
+
+/// The idempotency window covers every command that can be live: a
+/// window smaller than the queue evicted a pending command's key, and a
+/// retransmitted OK then re-enqueued the same motion.
+#[tokio::test]
+async fn the_dedup_window_outlives_every_live_command() {
+    let mut h = start(|cfg| {
+        cfg.queue_capacity = 8;
+        cfg.dedup_window = 2;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let first = c.ok_index(&move_j(801)).await;
+    for key in 802..=805 {
+        c.ok_index(&move_j(key)).await;
+    }
+    assert_eq!(
+        c.ok_index(&move_j(801)).await,
+        first,
+        "a retransmission of a live command must answer its original index"
+    );
+}
+
+/// A cartesian jog integrates from an absolute pose through the
+/// kinematics and rides STREAM, which the RT refuses without a
+/// reference; the gate refuses it with a structured error instead of
+/// letting the fire-and-forget datagram vanish.
+#[tokio::test]
+async fn a_cartesian_jog_is_refused_while_unreferenced() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.homed = false);
+    let mut c = Client::new(&h).await;
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
+    h.publish(|s| s.homed = true);
+    // Stream acceptance is unacked: the proof is the RT receiving it.
+    c.send(&jog_l()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogL)))
+        .await;
+}
+
+/// An RT hard latch outranks the server's own standing note: a
+/// cancellation left by a queue-clearing stop must not hide a hardware
+/// e-stop from STATUS and the ERROR query.
+#[tokio::test]
+async fn an_rt_hard_latch_outranks_the_servers_cancellation_note() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    c.ok_index(&move_j(901)).await;
+    c.ok_index(&move_j(902)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::MotnCancelled as u16)
+        }
+        other => panic!("the stop leaves a standing note, got {other:?}"),
+    }
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.state = ArmState::Disabled;
+        s.errors.insert(ErrorEntry {
+            code: RtCode::SwEstop,
+            joint: None,
+        });
+        s.error_active = true;
+    });
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysEstopActive as u16, "{}", e.cause)
+        }
+        other => panic!("the hardware e-stop must show, got {other:?}"),
+    }
+}
+
+/// STATUS carries the pause, so a paused arm reads differently from a
+/// stalled one.
+#[tokio::test]
+async fn status_reports_a_paused_playback() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.exec.paused = true);
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.paused {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "STATUS never reported the pause"
+        );
     }
 }

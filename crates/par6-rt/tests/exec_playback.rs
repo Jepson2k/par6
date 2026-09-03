@@ -158,12 +158,19 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
     rig.tick_n(4 + 500 + 5);
     let s = rig.snap();
+    let latched = s
+        .errors
+        .as_slice()
+        .iter()
+        .find(|e| e.code == ErrorCode::ExecSettleTimeout)
+        .expect("strict timeout latches");
+    // The latch names the joint that missed and the snapshot carries how
+    // far off it was, so the wire error can say more than "unknown".
+    assert_eq!(latched.joint, Some(0), "J1 is the joint that never settled");
     assert!(
-        s.errors
-            .as_slice()
-            .iter()
-            .any(|e| e.code == ErrorCode::ExecSettleTimeout),
-        "strict timeout latches"
+        s.settle_residual_rad > 0.01,
+        "the residual is the 0.05 rad J1 never closed: {}",
+        s.settle_residual_rad
     );
     assert!(s.error_active);
     assert_eq!(s.mode, Mode::ActiveError);
@@ -273,4 +280,35 @@ fn exec_link_watchdog_latches_after_heartbeat_silence_with_samples_pending() {
     );
     assert!(s.error_active);
     assert_eq!(s.mode, Mode::ActiveError);
+}
+
+/// A pause requested before a program starts stands: the operator who
+/// paused an idle arm expects the next program to begin held, not to
+/// run because EXEC entry wiped the request.
+#[test]
+fn a_pause_requested_while_idle_holds_the_next_program() {
+    let mut rig = Rig::new();
+    rig.ready();
+    rig.cmd(RtCommand::ExecSetPaused(true));
+    rig.cmd(RtCommand::SetMode(Mode::Exec));
+    rig.tick();
+    assert_eq!(rig.snap().mode, Mode::Exec);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0, 0.001, 100, false, false);
+    rig.tick();
+    let before = rig.snap().exec.samples_remaining;
+    rig.tick_n(30);
+    let s = rig.snap();
+    assert!(s.exec.paused, "the standing pause survives EXEC entry");
+    assert_eq!(
+        s.exec.samples_remaining, before,
+        "playback must not consume the ring while paused"
+    );
+
+    rig.cmd(RtCommand::ExecSetPaused(false));
+    rig.tick_n(5);
+    assert!(
+        rig.snap().exec.samples_remaining < before,
+        "un-pausing resumes playback"
+    );
 }

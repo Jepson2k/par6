@@ -790,21 +790,25 @@ impl Command {
                 blend("move_j_pose.r", p.blend_radius)
             }
             C::MoveL(p) => {
+                frame_rel("move_l.frame", p.frame, p.rel)?;
                 finite_all("move_l.pose", &p.pose)?;
                 motion_timing("move_l", p.duration, p.speed, p.accel)?;
                 blend("move_l.r", p.blend_radius)
             }
             C::MoveC(p) => {
+                frame_rel("move_c.frame", p.frame, p.rel)?;
                 finite_all("move_c.via", &p.via)?;
                 finite_all("move_c.end", &p.end)?;
                 motion_timing("move_c", p.duration, p.speed, p.accel)?;
                 blend("move_c.r", p.blend_radius)
             }
             C::MoveS(p) => {
+                frame_rel("move_s.frame", p.frame, p.rel)?;
                 waypoints("move_s.waypoints", &p.waypoints)?;
                 motion_timing("move_s", p.duration, p.speed, p.accel)
             }
             C::MoveP(p) => {
+                frame_rel("move_p.frame", p.frame, p.rel)?;
                 waypoints("move_p.waypoints", &p.waypoints)?;
                 motion_timing("move_p", p.duration, p.speed, p.accel)
             }
@@ -887,6 +891,17 @@ fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
         && ixx * izz - ixz * ixz >= -eps2
         && iyy * izz - iyz * iyz >= -eps2
         && det >= -eps3
+}
+
+/// A tool-frame pose is inherently relative to the tool frame the move
+/// starts in, so `rel = false` with TRF has no meaning; refusing it keeps
+/// a caller from believing an absolute move was made.
+fn frame_rel(what: &'static str, frame: Frame, rel: bool) -> Result<(), DecodeError> {
+    check(
+        frame != Frame::Trf || rel,
+        what,
+        "a TRF pose is relative to the starting tool frame; send rel = true",
+    )
 }
 
 fn frac(what: &'static str, v: f64) -> Result<(), DecodeError> {
