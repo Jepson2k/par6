@@ -1,8 +1,8 @@
 //! Offline dry-run preview: the daemon's OWN planner, driven through the
 //! server's `Planner` trait against a fabricated harness instead of a
 //! running RT core. A previewed command is planned by exactly the code
-//! that would drive the arm — same profiles, same IK, same TOPPRA
-//! timing, same collision gate — and then discarded instead of
+//! that would drive the arm — same profiles, same IK, same timing lanes,
+//! same collision and acceleration gates — and then discarded instead of
 //! dispatched, so a preview can never drift from the runtime.
 
 use std::path::{Path, PathBuf};

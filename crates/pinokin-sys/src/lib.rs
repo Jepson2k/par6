@@ -42,7 +42,7 @@ mod collision;
 pub use model::{Error, IkOptions, Model, ToolParams};
 
 #[cfg(feature = "ffi")]
-pub use traj::Trajectory;
+pub use traj::{PathDegree, Trajectory};
 
 #[cfg(feature = "ffi")]
 pub use collision::{CollisionModel, Layer, ShapeDesc};

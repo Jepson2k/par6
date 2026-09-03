@@ -193,7 +193,12 @@ wire_enum! {
         MoveC = 84,
         /// Cubic spline through waypoints (bulk; may be chunked).
         MoveS = 85,
-        /// Process move: constant TCP speed, auto-blended corners (bulk).
+        /// Process move: auto-blended corners, timed so the TCP holds a
+        /// constant speed along the path rather than running as fast as
+        /// the joints allow (bulk). `speed` is a fraction of the fastest
+        /// constant speed those joints permit on this path — the whole
+        /// path pays its steepest stretch, which is what makes the rate
+        /// constant.
         MoveP = 86,
         /// Select the active end-of-arm tool.
         SelectTool = 87,

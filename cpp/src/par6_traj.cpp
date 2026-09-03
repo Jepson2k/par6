@@ -75,6 +75,8 @@ extern "C" {
 par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq, const double *vel_limit,
                             const double *acc_limit, int32_t n_gridpoints,
+                            const double *knots, int32_t degree,
+                            double max_path_speed,
                             char *err_buf, int32_t err_len) {
     if (waypoints == nullptr || vel_limit == nullptr || acc_limit == nullptr) {
         write_err(err_buf, err_len, "waypoints/vel_limit/acc_limit is NULL");
@@ -92,6 +94,24 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
         write_err(err_buf, err_len,
                   "n_gridpoints must be <= 0 (automatic) or >= 2");
         return nullptr;
+    }
+    if (degree != 1 && degree != 3) {
+        write_err(err_buf, err_len, "degree must be 1 (linear) or 3 (cubic)");
+        return nullptr;
+    }
+    if (max_path_speed > 0.0 && !std::isfinite(max_path_speed)) {
+        write_err(err_buf, err_len, "max_path_speed must be finite");
+        return nullptr;
+    }
+    if (knots != nullptr) {
+        for (int32_t i = 0; i < n_waypoints; ++i) {
+            if (!std::isfinite(knots[i]) ||
+                (i > 0 && knots[i] <= knots[i - 1])) {
+                write_err(err_buf, err_len,
+                          "knots must be finite and strictly increasing");
+                return nullptr;
+            }
+        }
     }
     const std::ptrdiff_t n_way = n_waypoints;
     const std::ptrdiff_t dof = nq;
@@ -122,17 +142,57 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
             positions[static_cast<size_t>(i)] =
                 Eigen::Map<const Eigen::VectorXd>(waypoints + i * dof, dof);
         }
-        const toppra::Vector times =
-            toppra::Vector::LinSpaced(n_way, 0.0, 1.0);
-        toppra::BoundaryCondFull bc{toppra::BoundaryCond("natural"),
-                                    toppra::BoundaryCond("natural")};
-        auto path = std::make_shared<toppra::PiecewisePolyPath>(
-            toppra::PiecewisePolyPath::CubicSpline(positions, times, bc));
+        /* Knots default to even parameter spacing. A caller that spaces
+         * them by true path length instead gets a path parameter that IS
+         * arc length, which is what makes a constant ds/dt a constant
+         * tool speed. */
+        toppra::Vector times(n_way);
+        if (knots == nullptr) {
+            times = toppra::Vector::LinSpaced(n_way, 0.0, 1.0);
+        } else {
+            times = Eigen::Map<const Eigen::VectorXd>(knots, n_way);
+        }
+
+        /* Degree 1 keeps the geometry EXACTLY as solved: straight lines
+         * between the waypoints, zero curvature within a segment, all the
+         * turning at the knots. A cubic spline instead bows away from the
+         * solved chain between waypoints, and that invented curvature is
+         * acceleration TOPPRA must then be dense enough to catch. */
+        std::shared_ptr<toppra::PiecewisePolyPath> path;
+        if (degree == 1) {
+            toppra::Matrices lin(static_cast<size_t>(n_way - 1));
+            for (std::ptrdiff_t i = 0; i < n_way - 1; ++i) {
+                const double dx = times[i + 1] - times[i];
+                Eigen::MatrixXd c(2, dof);
+                c.row(0) = (positions[static_cast<size_t>(i + 1)] -
+                            positions[static_cast<size_t>(i)])
+                               .transpose() /
+                           dx;
+                c.row(1) = positions[static_cast<size_t>(i)].transpose();
+                lin[static_cast<size_t>(i)] = c;
+            }
+            std::vector<toppra::value_type> breaks(times.data(),
+                                                   times.data() + n_way);
+            path = std::make_shared<toppra::PiecewisePolyPath>(lin, breaks);
+        } else {
+            toppra::BoundaryCondFull bc{toppra::BoundaryCond("natural"),
+                                        toppra::BoundaryCond("natural")};
+            path = std::make_shared<toppra::PiecewisePolyPath>(
+                toppra::PiecewisePolyPath::CubicSpline(positions, times, bc));
+        }
 
         const Eigen::Map<const Eigen::VectorXd> vlim(vel_limit, dof);
         const Eigen::Map<const Eigen::VectorXd> alim(acc_limit, dof);
         auto vc = std::make_shared<toppra::constraint::LinearJointVelocity>(
             -vlim, vlim);
+        /* A ceiling on ds/dt itself. With knots spaced by true path
+         * length the parameter IS arc length, so this caps the speed the
+         * TOOL crosses the path at — the thing a process move asks for —
+         * rather than capping each joint and letting the fastest stretch
+         * of the path run away. */
+        if (max_path_speed > 0.0) {
+            vc->maxSDot(max_path_speed);
+        }
         auto ac = std::make_shared<toppra::constraint::LinearJointAcceleration>(
             -alim, alim);
         /* Interpolation discretization bounds the constraints over each grid
@@ -141,7 +201,19 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
         ac->discretizationType(toppra::DiscretizationType::Interpolation);
 
         toppra::algorithm::TOPPRA algo({vc, ac}, path);
-        algo.setN(n_gridpoints <= 0 ? 0 : n_gridpoints - 1);
+        if (n_gridpoints <= 0) {
+            /* Where the solver checks its limits. Spread evenly, a tight
+             * corner can fall entirely BETWEEN two gridpoints: the solver
+             * never sees the curvature there, does not slow for it, and
+             * returns a trajectory that breaks the acceleration limit it
+             * was given. toppra sizes the grid from the path's own second
+             * derivative instead, splitting where the shape actually
+             * bends, which is the library's default in its Python API and
+             * the only safe choice here. */
+            algo.setGridpoints(path->proposeGridpoints());
+        } else {
+            algo.setN(n_gridpoints - 1);
+        }
         const toppra::ReturnCode rc =
             algo.computePathParametrization(0.0, 0.0);
         if (rc != toppra::ReturnCode::OK) {
@@ -188,13 +260,25 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
         h->breaks = Eigen::Map<const Eigen::VectorXd>(
             poly.breakpoints().data(),
             static_cast<Eigen::Index>(poly.breakpoints().size()));
-        h->coeffs.assign(poly.coefficients().begin(),
-                         poly.coefficients().end());
-        for (const Eigen::MatrixXd &c : h->coeffs) {
-            if (c.rows() != 4 || c.cols() != dof) {
+        /* Sampling runs a fixed cubic Horner, so a degree-1 segment is
+         * widened to four rows with zero cubic and quadratic terms —
+         * the same polynomial, and qdd then carries no curvature term
+         * within a segment, which is exactly right for a straight line. */
+        h->coeffs.clear();
+        h->coeffs.reserve(poly.coefficients().size());
+        for (const Eigen::MatrixXd &c : poly.coefficients()) {
+            if (c.cols() != dof || (c.rows() != 4 && c.rows() != 2)) {
                 write_err(err_buf, err_len,
                           "unexpected spline coefficient layout from toppra");
                 return nullptr;
+            }
+            if (c.rows() == 4) {
+                h->coeffs.push_back(c);
+            } else {
+                Eigen::MatrixXd wide = Eigen::MatrixXd::Zero(4, dof);
+                wide.row(2) = c.row(0);
+                wide.row(3) = c.row(1);
+                h->coeffs.push_back(wide);
             }
         }
         return h.release();

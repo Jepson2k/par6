@@ -1742,13 +1742,18 @@ const SPLINE_S: f64 = 25.0;
 /// snapshot, and a frame pair that straddles one would read as a
 /// standstill.
 fn tcp_speeds(path: &[Status]) -> Vec<([f64; 3], f64)> {
-    path.windows(SPEED_WINDOW)
+    tcp_speeds_over(path, SPEED_WINDOW)
+}
+
+/// [`tcp_speeds`] over a caller-chosen window width.
+fn tcp_speeds_over(path: &[Status], window: usize) -> Vec<([f64; 3], f64)> {
+    path.windows(window)
         .filter_map(|w| {
-            let (first, last) = (&w[0], &w[SPEED_WINDOW - 1]);
+            let (first, last) = (&w[0], &w[window - 1]);
             let dt = last.mono_time_ns.checked_sub(first.mono_time_ns)? as f64 * 1e-9;
             (dt > 0.0).then(|| {
                 (
-                    tcp_mm(&w[SPEED_WINDOW / 2]),
+                    tcp_mm(&w[window / 2]),
                     distance(tcp_mm(first), tcp_mm(last)) / dt,
                 )
             })
@@ -2059,10 +2064,105 @@ fn curved_moves_trace_their_geometry() {
         "move_p slowed to {at_corner:.2} mm/s at the corner against a mean of {mean:.2} mm/s: \
          a blend that stops is not a blend"
     );
+
+    // The promise the command is named for: the TCP holds ONE speed
+    // along the path. Sampled across the cruise, away from the ramps at
+    // either end, the spread has to stay small — a time-optimal timing
+    // runs fast on the straights and drops through the corner, which is
+    // the behaviour this replaced. Measured here: 1.18 spread with the
+    // arc-length timing against 2.76 with the time-optimal one.
+    //
+    // The window is four times the corner test's, because a five-frame
+    // one carries a ±20% read error of its own: the broadcast repeats a
+    // snapshot whenever the status rate and the tick rate beat against
+    // each other, and a repeat at a window edge reads as a slow patch
+    // that is not in the motion. ~0.4 s averages that out while still
+    // resolving the corner, which takes about two seconds to cross at
+    // this speed — the time-optimal dip is fully visible at this width.
+    const CRUISE_WINDOW: usize = 21;
+    let cruise: Vec<f64> = {
+        let all = tcp_speeds_over(&process, CRUISE_WINDOW);
+        let moving: Vec<f64> = all.iter().map(|(_, v)| *v).filter(|v| *v > 0.5).collect();
+        let skip = moving.len() / 5; // drop the accelerate/decelerate ends
+        moving[skip..moving.len().saturating_sub(skip).max(skip + 1)].to_vec()
+    };
+    assert!(
+        cruise.len() > 100,
+        "expected a sampled cruise, got {} windows",
+        cruise.len()
+    );
+    let fastest = cruise.iter().copied().fold(0.0f64, f64::max);
+    let slowest = cruise.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        fastest <= slowest * 1.35,
+        "move_p's TCP speed swung from {slowest:.1} to {fastest:.1} mm/s across its cruise: \
+         a process move that changes speed mid-path is not holding one"
+    );
     let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_p")), finish);
     assert!(
         end_miss < 15.0,
         "move_p ended {end_miss:.1} mm off its last waypoint"
+    );
+
+    // --- the same corner asked for at FULL speed, which is the case
+    // the timing has to price rather than assume away. Free to run as
+    // fast as the joints allow ALONG the path, it would take the corner
+    // far faster than the joints can turn through it — and the stream
+    // it emits is checked against the joint acceleration limits before
+    // anything is queued. So the two ways to fail here are a refusal
+    // and a queued over-limit stream, and the move has to come back at
+    // a speed it can actually turn at instead.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + 100.0, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let i = c.ok_index(&Command::MoveP(MoveP {
+        key: 4004,
+        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        rel: false,
+    }));
+    let fast = rig.collect_status(Duration::from_secs_f64(MOVE_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a full-speed move_p must run at a speed it can turn at, not be refused: {detail:?}"
+    );
+    // Travel time off the broadcast's own clock: first frame away from
+    // the start to last frame short of the finish.
+    let left = fast
+        .iter()
+        .position(|st| distance(tcp_mm(st), start) > 3.0)
+        .expect("the arm has to leave the start pose");
+    let arrived = fast
+        .iter()
+        .rposition(|st| distance(tcp_mm(st), finish) > 3.0)
+        .expect("the arm has to approach the finish pose");
+    let took = fast[arrived]
+        .mono_time_ns
+        .saturating_sub(fast[left].mono_time_ns) as f64
+        * 1e-9;
+    assert!(
+        took < 0.5 * MOVE_S,
+        "the full-speed move crossed the corner in {took:.1} s against the {MOVE_S:.0} s the \
+         parameterised one took: pricing the corner must slow the move, not stop it"
+    );
+    let fast_points: Vec<[f64; 3]> = fast.iter().map(tcp_mm).collect();
+    let corner_miss = path_misses(&fast_points, corner);
+    assert!(
+        (2.0..25.0).contains(&corner_miss),
+        "the fast move_p left its blend zone: closest approach {corner_miss:.2} mm"
+    );
+    let end_miss = distance(
+        tcp_mm(&settled_tcp(&rig, "settled after the fast move_p")),
+        finish,
+    );
+    assert!(
+        end_miss < 15.0,
+        "the fast move_p ended {end_miss:.1} mm off its last waypoint"
     );
 
     rig.shutdown();

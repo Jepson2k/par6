@@ -54,6 +54,23 @@ pub enum MotionError {
     /// rsruckig rejected the trajectory input or failed to solve.
     #[error("ruckig: {0}")]
     Ruckig(String),
+    /// The finished sample stream steps its commanded velocity harder
+    /// than the acceleration limits allow. Raised by
+    /// [`crate::gate::check_commanded_accel`], which refuses the move
+    /// rather than reshaping it.
+    #[error(
+        "the planned stream commands {commanded} rad/s^2 on joint {joint} at sample {sample}, past its {limit} rad/s^2 limit"
+    )]
+    CommandedAccelExceeded {
+        /// Joint index (0-based).
+        joint: usize,
+        /// Index of the sample the step lands on.
+        sample: usize,
+        /// Commanded acceleration across that tick \[rad/s^2\].
+        commanded: f64,
+        /// That joint's acceleration limit \[rad/s^2\].
+        limit: f64,
+    },
     /// Strict completion policy: the arm did not settle within the timeout.
     #[error(
         "settle timeout: joint {worst_joint} error {error_rad} rad still above tolerance {tolerance_rad} rad"

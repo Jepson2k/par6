@@ -36,18 +36,65 @@ impl fmt::Debug for Trajectory {
 unsafe impl Send for Trajectory {}
 unsafe impl Sync for Trajectory {}
 
+/// How the waypoints are joined into a geometric path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PathDegree {
+    /// Straight lines between the waypoints. The geometry stays exactly
+    /// the chain that was solved: no curvature within a segment, all the
+    /// turning at the knots.
+    Linear = 1,
+    /// Natural cubic spline through the waypoints. Smooth, but it bows
+    /// away from the solved chain between them, and that curvature is
+    /// acceleration the grid has to be dense enough to see.
+    Cubic = 3,
+}
+
 impl Trajectory {
-    /// Parameterize `waypoints` (`n_waypoints * nq` values, waypoint-major)
-    /// under symmetric per-joint velocity/acceleration limits (`nq` values
-    /// each, finite and > 0). `n_gridpoints = None` selects toppra's
-    /// automatic path discretization (recommended); `Some(n)` forces `n`
-    /// gridpoints (>= 2).
+    /// Parameterize `waypoints` through a natural cubic spline at even
+    /// parameter spacing — see [`Trajectory::parameterize_with`].
     pub fn parameterize(
         waypoints: &[f64],
         nq: usize,
         vel_limit: &[f64],
         acc_limit: &[f64],
         n_gridpoints: Option<u32>,
+    ) -> Result<Self, Error> {
+        Self::parameterize_with(
+            waypoints,
+            nq,
+            vel_limit,
+            acc_limit,
+            n_gridpoints,
+            None,
+            PathDegree::Cubic,
+            None,
+        )
+    }
+
+    /// Parameterize `waypoints` (`n_waypoints * nq` values, waypoint-major)
+    /// under symmetric per-joint velocity/acceleration limits (`nq` values
+    /// each, finite and > 0). `n_gridpoints = None` selects toppra's
+    /// automatic path discretization (recommended); `Some(n)` forces `n`
+    /// gridpoints (>= 2).
+    ///
+    /// `knots` places each waypoint on the path parameter (finite and
+    /// strictly increasing); `None` spaces them evenly. Spacing them by
+    /// true path length makes the parameter arc length, so a constant
+    /// `ds/dt` is a constant tool speed.
+    ///
+    /// `max_path_speed` caps `ds/dt`. Against arc-length knots that is a
+    /// ceiling on the speed the tool crosses the path at, which is what
+    /// holds a process move to one speed instead of letting it run away
+    /// wherever the joints happen to have room.
+    pub fn parameterize_with(
+        waypoints: &[f64],
+        nq: usize,
+        vel_limit: &[f64],
+        acc_limit: &[f64],
+        n_gridpoints: Option<u32>,
+        knots: Option<&[f64]>,
+        degree: PathDegree,
+        max_path_speed: Option<f64>,
     ) -> Result<Self, Error> {
         if vel_limit.len() != nq {
             return Err(Error::Dimension {
@@ -90,6 +137,15 @@ impl Trajectory {
             })?,
         };
 
+        if let Some(k) = knots {
+            if k.len() != n_waypoints {
+                return Err(Error::Dimension {
+                    expected: n_waypoints,
+                    got: k.len(),
+                });
+            }
+        }
+
         let mut err_buf = [0u8; 512];
         let raw = unsafe {
             ffi::par6_traj_create(
@@ -99,6 +155,9 @@ impl Trajectory {
                 vel_limit.as_ptr(),
                 acc_limit.as_ptr(),
                 c_grid,
+                knots.map_or(std::ptr::null(), <[f64]>::as_ptr),
+                degree as i32,
+                max_path_speed.unwrap_or(0.0),
                 err_buf.as_mut_ptr().cast(),
                 err_buf.len() as i32,
             )

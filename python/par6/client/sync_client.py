@@ -311,7 +311,11 @@ class RobotClient:
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
-        """Process move with auto-blending (blocking by default)."""
+        """Process move at a constant TCP speed, auto-blended (blocking by default).
+
+        See :meth:`par6.AsyncRobot.move_p` for what ``speed`` means on a
+        move that holds one rate along the path.
+        """
         return _run(
             self._inner.move_p(
                 waypoints,

@@ -434,6 +434,11 @@ pub struct MoveP {
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    ///
+    /// Unlike the other cartesian moves this is a fraction of the
+    /// fastest CONSTANT tool speed the joints allow along this path, not
+    /// of the joint budget moment to moment: holding one rate means the
+    /// whole path runs at the rate its steepest stretch permits.
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
     pub accel: Option<f64>,

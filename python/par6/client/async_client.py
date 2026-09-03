@@ -850,6 +850,15 @@ class AsyncRobotClient(_RobotClientABC):
     ) -> int:
         """Process move with auto-blending through waypoints (auto-chunked).
 
+        The TCP holds ONE speed along the whole path rather than running
+        as fast as the joints allow moment to moment — which is what
+        separates this from a ``move_s`` through the same waypoints, and
+        what a process like dispensing or welding needs. ``speed`` is
+        therefore a fraction of the fastest constant speed the joints
+        permit on this path: the whole path runs at the rate its
+        steepest stretch allows. A corner too sharp to turn at that rate
+        slows the move down; it does not fail it.
+
         With ``rel=True``, every waypoint is a delta from the pose the
         move starts at (each against the start, not chained).
 

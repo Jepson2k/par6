@@ -419,7 +419,13 @@ impl Client {
         .await
     }
 
-    /// Piecewise-linear path through cartesian waypoints with auto-blends.
+    /// Piecewise-linear path through cartesian waypoints with auto-blends,
+    /// timed so the TCP holds one speed along the whole path.
+    ///
+    /// `speed` is therefore a fraction of the fastest constant speed the
+    /// joints allow on this path, not of the joint budget moment to
+    /// moment; a corner too sharp to turn at that rate slows the move
+    /// rather than failing it.
     pub async fn move_p(
         &self,
         waypoints: Vec<[f64; 6]>,

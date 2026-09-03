@@ -542,8 +542,10 @@ fn trapezoid_segment(
         path.derivative(s, &mut dq_ds);
         for j in 0..NUM_JOINTS {
             qd[j] = dq_ds[j] * s_dot;
-            // q(s) is affine in s for every path this profile times, so
-            // the chain rule's curvature term dq²/ds²·ṡ² is zero.
+            // q(s) is affine in s for every path this profile times —
+            // a joint line, and the arc-length cartesian path, which is
+            // piecewise affine for exactly this reason — so the chain
+            // rule's curvature term dq²/ds²·ṡ² is zero.
             qdd[j] = dq_ds[j] * s_ddot;
         }
         qs.push(q);

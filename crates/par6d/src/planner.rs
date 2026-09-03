@@ -198,6 +198,17 @@ struct ToolInFlight {
     epoch_at_send: u32,
 }
 
+/// Which coordinate a cartesian path is timed against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CartTiming {
+    /// As fast as the joint limits allow (TOPPRA). What `move_l`,
+    /// `move_c` and `move_s` promise.
+    TimeOptimal,
+    /// At a constant tool speed along the path. What `move_p` promises,
+    /// and the reason it is a separate command.
+    ConstantToolSpeed,
+}
+
 /// The planner's kinematics kit (feature `ffi`): its own model instance,
 /// the enforced collision world, and the shared TCP-offset cell it
 /// publishes into.
@@ -506,13 +517,29 @@ impl Par6Planner {
 
     /// Wrap fully-timed tick-dt samples as the next EXEC in-flight
     /// command: allocate a ring index, stamp the metadata, request EXEC.
-    /// The collision gate runs first: nothing is queued, and no mode
-    /// change is requested, for a path that would collide.
+    ///
+    /// Two gates run first, and nothing is queued — no mode change is
+    /// even requested — unless both pass: the path must not collide, and
+    /// its commanded velocity steps must stay inside the acceleration
+    /// limits. The second one guards every planner equally, because
+    /// every planner can be internally consistent and still emit a
+    /// stream the arm must not follow; see [`par6_motion::gate`].
     fn start_exec(
         &mut self,
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
+        par6_motion::gate::check_commanded_accel(
+            samples.iter().map(|qqa| {
+                let mut qd = [0.0; MAX_JOINTS];
+                qd.copy_from_slice(&qqa[MAX_JOINTS..2 * MAX_JOINTS]);
+                qd
+            }),
+            &self.exec_limits.acceleration,
+            self.dt,
+            par6_motion::gate::ACCEL_TOLERANCE,
+        )
+        .map_err(planning_error)?;
         self.gate_collisions(&samples, 0)?;
         // A fresh fill generation: a flush already queued for an earlier
         // command can no longer reach these samples, however far behind
@@ -694,6 +721,36 @@ impl Par6Planner {
         accel: Option<f64>,
         min_duration: Option<f64>,
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
+        self.toppra_samples_with(
+            waypoints,
+            speed,
+            accel,
+            min_duration,
+            None,
+            pinokin_sys::PathDegree::Cubic,
+            None,
+        )
+    }
+
+    /// The one solver call both cartesian lanes go through.
+    ///
+    /// `knots` places each waypoint on the path parameter (`None` spaces
+    /// them evenly) and `max_path_speed` caps `ds/dt`. The path is
+    /// degree-1 by default: the poses are already spaced a couple of
+    /// millimetres apart by the resampler, and a spline through them
+    /// would bow off the chain IK actually solved — inventing curvature,
+    /// which is acceleration, between the samples that were checked.
+    #[allow(clippy::too_many_arguments)]
+    fn toppra_samples_with(
+        &self,
+        waypoints: &[f64],
+        speed: Option<f64>,
+        accel: Option<f64>,
+        min_duration: Option<f64>,
+        knots: Option<&[f64]>,
+        degree: pinokin_sys::PathDegree,
+        max_path_speed: Option<f64>,
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let speed_frac = speed.unwrap_or(1.0);
         let accel_frac = accel.unwrap_or(1.0);
         let vel: Vec<f64> = self
@@ -708,8 +765,17 @@ impl Par6Planner {
             .iter()
             .map(|a| a * accel_frac)
             .collect();
-        let traj = pinokin_sys::Trajectory::parameterize(waypoints, MAX_JOINTS, &vel, &acc, None)
-            .map_err(|e| {
+        let traj = pinokin_sys::Trajectory::parameterize_with(
+            waypoints,
+            MAX_JOINTS,
+            &vel,
+            &acc,
+            None,
+            knots,
+            degree,
+            max_path_speed,
+        )
+        .map_err(|e| {
             make_error(
                 ErrorCode::TrajNoSteps,
                 UNATTRIBUTED,
@@ -916,44 +982,22 @@ impl Par6Planner {
         }
     }
 
-    /// The shared cartesian pipeline every cartesian move rides:
-    /// pose list → seeded IK per pose → TOPPRA timing → ring samples at
-    /// tick dt. Every failure (IK, branch flip, soft limits, timing) is
-    /// a command error; nothing falls back to a joint-space move, and no
-    /// second timing path exists.
+    /// Seeded IK along a pose chain, with the cartesian failure
+    /// vocabulary and the per-sample soft-limit and branch-flip checks.
     ///
-    /// `poses[0]` is where the arm already is, so it contributes the
-    /// measured configuration rather than an IK solution.
-    fn start_cart_path(
+    /// Returns the joint waypoints row-major, plus the worst singularity
+    /// measures seen along the way. `poses[0]` is where the arm already
+    /// is, so it contributes the measured configuration rather than an
+    /// IK solution.
+    fn ik_path(
         &mut self,
-        snap: &StateSnapshot,
+        start_q: &[f64; MAX_JOINTS],
         poses: &[Pose],
-        speed: Option<f64>,
-        accel: Option<f64>,
-        duration: Option<f64>,
-    ) -> Result<InFlightKind, WireError> {
-        use par6_motion::cart::LineSegment;
-
-        let start_q = snap.q;
-        let Some(target_pose) = poses.last() else {
-            return Ok(InFlightKind::Instant);
-        };
-        let moved = poses.windows(2).any(|w| {
-            let seg = LineSegment::new(&w[0], &w[1]);
-            seg.length_m() >= MOVE_L_NULL_M || seg.angle_rad() >= MOVE_L_NULL_M
-        });
-        if !moved {
-            return Ok(InFlightKind::Instant);
-        }
-
-        // The endpoint decides reachable-at-all before the path decides
-        // reachable-along-the-way.
-        self.ik_pose(&start_q, target_pose)?;
-
+    ) -> Result<(Vec<f64>, f64, f64), WireError> {
         let total = poses.len();
         let mut waypoints = Vec::with_capacity(total * MAX_JOINTS);
-        waypoints.extend_from_slice(&start_q);
-        let mut seed = start_q;
+        waypoints.extend_from_slice(start_q);
+        let mut seed = *start_q;
         let (mut worst_sigma, mut worst_cond) = (f64::INFINITY, 0.0f64);
         for (k, pose) in poses.iter().enumerate().skip(1) {
             let partial = || {
@@ -998,6 +1042,48 @@ impl Par6Planner {
             waypoints.extend_from_slice(&q);
             seed = q;
         }
+        Ok((waypoints, worst_sigma, worst_cond))
+    }
+
+    /// The shared cartesian pipeline every cartesian move rides:
+    /// pose list → seeded IK per pose → timing → ring samples at tick
+    /// dt. Every failure (IK, branch flip, soft limits, timing) is a
+    /// command error; nothing falls back to a joint-space move.
+    ///
+    /// `timing` picks which coordinate the path is timed against, and
+    /// that is the only thing that differs between the cartesian moves:
+    /// everything up to it is shared.
+    ///
+    /// `poses[0]` is where the arm already is, so it contributes the
+    /// measured configuration rather than an IK solution.
+    fn start_cart_path(
+        &mut self,
+        snap: &StateSnapshot,
+        poses: &[Pose],
+        speed: Option<f64>,
+        accel: Option<f64>,
+        duration: Option<f64>,
+        timing: CartTiming,
+    ) -> Result<InFlightKind, WireError> {
+        use par6_motion::cart::LineSegment;
+
+        let start_q = snap.q;
+        let Some(target_pose) = poses.last() else {
+            return Ok(InFlightKind::Instant);
+        };
+        let moved = poses.windows(2).any(|w| {
+            let seg = LineSegment::new(&w[0], &w[1]);
+            seg.length_m() >= MOVE_L_NULL_M || seg.angle_rad() >= MOVE_L_NULL_M
+        });
+        if !moved {
+            return Ok(InFlightKind::Instant);
+        }
+
+        // The endpoint decides reachable-at-all before the path decides
+        // reachable-along-the-way.
+        self.ik_pose(&start_q, target_pose)?;
+
+        let (waypoints, worst_sigma, worst_cond) = self.ik_path(&start_q, poses)?;
 
         // Every sample solved: the path runs — but a pass near a
         // singular configuration degrades cartesian accuracy, and the
@@ -1006,7 +1092,12 @@ impl Par6Planner {
         // collision refusal below runs nothing, and a warning standing
         // in STATUS with nothing in flight would be attributed to
         // whatever move runs next.
-        let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
+        let samples = match timing {
+            CartTiming::TimeOptimal => self.toppra_samples(&waypoints, speed, accel, duration)?,
+            CartTiming::ConstantToolSpeed => {
+                self.arclen_samples(&waypoints, poses, speed, accel, duration)?
+            }
+        };
         let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
         self.near_singularity = singularity_verdict(worst_sigma, worst_cond);
         Ok(kind)
@@ -1021,7 +1112,14 @@ impl Par6Planner {
         let start_pose = self.current_pose(&snap.q)?;
         let target = target_pose(&start_pose, &cmd.pose, cmd.frame, cmd.rel);
         let poses = par6_motion::cart::line(&start_pose, &target, line_sampling(&self.motion));
-        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+        self.start_cart_path(
+            &snap,
+            &poses,
+            cmd.speed,
+            cmd.accel,
+            cmd.duration,
+            CartTiming::TimeOptimal,
+        )
     }
 
     /// MOVE_C: circular arc through the via pose to the end pose, with
@@ -1036,7 +1134,14 @@ impl Par6Planner {
         let end = target_pose(&start_pose, &cmd.end, cmd.frame, cmd.rel);
         let poses = par6_motion::cart::arc(&start_pose, &via, &end, path_sampling(&self.motion))
             .map_err(planning_error)?;
-        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+        self.start_cart_path(
+            &snap,
+            &poses,
+            cmd.speed,
+            cmd.accel,
+            cmd.duration,
+            CartTiming::TimeOptimal,
+        )
     }
 
     /// MOVE_S: cubic spline through the waypoint list.
@@ -1049,7 +1154,14 @@ impl Par6Planner {
         let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame, cmd.rel);
         let poses = par6_motion::cart::spline(&waypoints, path_sampling(&self.motion))
             .map_err(planning_error)?;
-        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+        self.start_cart_path(
+            &snap,
+            &poses,
+            cmd.speed,
+            cmd.accel,
+            cmd.duration,
+            CartTiming::TimeOptimal,
+        )
     }
 
     /// MOVE_P: process move — the waypoint list as straight segments
@@ -1071,10 +1183,83 @@ impl Par6Planner {
             .windows(2)
             .map(|w| MOVE_P_AUTO_BLEND_FRAC * w[0].min(w[1]))
             .collect();
+
         let poses =
             par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
                 .map_err(planning_error)?;
-        self.start_cart_path(&snap, &poses, cmd.speed, cmd.accel, cmd.duration)
+        self.start_cart_path(
+            &snap,
+            &poses,
+            cmd.speed,
+            cmd.accel,
+            cmd.duration,
+            CartTiming::ConstantToolSpeed,
+        )
+    }
+
+    /// Time a cartesian path so the TOOL crosses it at a constant
+    /// speed, rather than as fast as the joints allow.
+    ///
+    /// Same solver as every other cartesian move; two things differ.
+    /// The knots sit at cumulative tool distance rather than at even
+    /// spacing, so the path parameter IS tool distance — and `ds/dt` is
+    /// then capped at one value for the whole path, which is what holds
+    /// the tool to a single speed instead of letting it run away over
+    /// the stretches where the joints have room. That cap is the
+    /// fastest constant the steepest part of the path allows, so this is
+    /// never faster than the time-optimal answer and usually slower.
+    /// That is what MOVE_P promises and what the others do not.
+    fn arclen_samples(
+        &self,
+        waypoints: &[f64],
+        poses: &[Pose],
+        speed: Option<f64>,
+        accel: Option<f64>,
+        duration: Option<f64>,
+    ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
+        use par6_motion::cart::LineSegment;
+        let steps: Vec<(f64, f64)> = poses
+            .windows(2)
+            .map(|w| {
+                let seg = LineSegment::new(&w[0], &w[1]);
+                (seg.length_m(), seg.angle_rad())
+            })
+            .collect();
+        let cart_s = par6_motion::arclen::tool_arc_lengths(&steps, PATH_ROT_WEIGHT_M_PER_RAD);
+        let q: Vec<[f64; MAX_JOINTS]> = waypoints
+            .chunks_exact(MAX_JOINTS)
+            .map(|c| {
+                let mut a = [0.0; MAX_JOINTS];
+                a.copy_from_slice(c);
+                a
+            })
+            .collect();
+        let no_extent = || {
+            make_error(
+                ErrorCode::TrajNoSteps,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "the path covers no tool distance to hold a speed along",
+                )],
+            )
+        };
+        let knots = par6_motion::arclen::ArcKnots::new(&q, &cart_s).ok_or_else(no_extent)?;
+        let cap = par6_motion::arclen::max_path_speed(
+            &knots.max_slope(),
+            &self.exec_limits,
+            speed.unwrap_or(1.0),
+        )
+        .ok_or_else(no_extent)?;
+        self.toppra_samples_with(
+            &knots.waypoints_flat(),
+            speed,
+            accel,
+            duration,
+            Some(knots.knots()),
+            pinokin_sys::PathDegree::Cubic,
+            Some(cap),
+        )
     }
 
     /// A chain of `move_l`s linked by blend radii, planned as ONE
@@ -1134,7 +1319,14 @@ impl Par6Planner {
                 .sum::<f64>()
                 * 1e3
         );
-        self.start_cart_path(&snap, &poses, speed, accel, duration)
+        self.start_cart_path(
+            &snap,
+            &poses,
+            speed,
+            accel,
+            duration,
+            CartTiming::TimeOptimal,
+        )
     }
 
     /// A chain of joint-space moves (`move_j` / `move_j_pose`) linked by

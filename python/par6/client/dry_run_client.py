@@ -656,8 +656,10 @@ class DryRunRobotClient:
     ) -> DryRunResultData:
         """Process move: the waypoints as straight segments with every
         interior corner rounded by the planner's auto-blend rule, so the TCP
-        sweeps the path without stopping. With ``rel=True``, every waypoint
-        is a delta from the start pose."""
+        sweeps the path at ONE speed without stopping. ``speed`` is a
+        fraction of the fastest constant speed the joints allow on this
+        path. With ``rel=True``, every waypoint is a delta from the start
+        pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_p",

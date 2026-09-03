@@ -142,10 +142,14 @@ extern "C" {
     ) -> i32;
 
     /// Time-optimal rest-to-rest parameterization of a joint-space path
-    /// (TOPPRA over toppra-cpp): natural cubic spline through `waypoints`
+    /// (TOPPRA over toppra-cpp): a path through `waypoints`
     /// (`n_waypoints` x `nq`, row-major), re-timed under symmetric
     /// `vel_limit` / `acc_limit` (`nq` each, finite and > 0).
     /// `n_gridpoints <= 0` selects the automatic grid; otherwise >= 2.
+    /// `degree` is 1 (straight lines between waypoints) or 3 (natural
+    /// cubic spline); `knots` gives the path parameter each waypoint sits
+    /// at (finite, strictly increasing) or NULL for even spacing.
+    /// `max_path_speed > 0` caps `ds/dt`; <= 0 leaves it unbounded.
     /// Returns NULL on failure with a message in `err_buf`.
     pub fn par6_traj_create(
         waypoints: *const f64,
@@ -154,6 +158,9 @@ extern "C" {
         vel_limit: *const f64,
         acc_limit: *const f64,
         n_gridpoints: i32,
+        knots: *const f64,
+        degree: i32,
+        max_path_speed: f64,
         err_buf: *mut c_char,
         err_len: i32,
     ) -> *mut par6_traj;
