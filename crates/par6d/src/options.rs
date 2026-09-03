@@ -43,6 +43,10 @@ OPTIONS:
     --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
                                exactly [env: PAR6_STATUS_RATE_HZ]
                                [config: protocol.status_rate_hz]
+    --log-dir <DIR>            Also write the activity logs there: rt.log (the RT
+                               thread, 2 MiB x5) and commands.log (command plane,
+                               daemon, host vitals, 20 MiB x5). stderr is unchanged.
+                               [env: PAR6_LOG_DIR]
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
     -h, --help                 Print this help
@@ -74,6 +78,9 @@ pub struct Options {
     pub status_transport: Option<StatusTransport>,
     /// STATUS broadcast rate override \[Hz\].
     pub status_rate_hz: Option<u32>,
+    /// Directory for the rotating activity logs (`--log-dir` /
+    /// `PAR6_LOG_DIR`); `None` = stderr only.
+    pub log_dir: Option<PathBuf>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
     /// `--help` was requested.
@@ -111,6 +118,7 @@ impl Options {
                 "--status-rate" => {
                     o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
                 }
+                "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
                 "--check-config" => o.check_config = true,
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
@@ -169,6 +177,11 @@ impl Options {
         if self.status_rate_hz.is_none() {
             if let Some(v) = env_var("PAR6_STATUS_RATE_HZ") {
                 self.status_rate_hz = Some(parse_rate(&v, "PAR6_STATUS_RATE_HZ")?);
+            }
+        }
+        if self.log_dir.is_none() {
+            if let Some(v) = env_var("PAR6_LOG_DIR") {
+                self.log_dir = Some(PathBuf::from(v));
             }
         }
         Ok(())
@@ -243,5 +256,28 @@ fn parse_transport(v: &str) -> Result<StatusTransport, String> {
         other => Err(format!(
             "--status-transport: `{other}` is not auto|multicast|unicast"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_dir_comes_from_the_flag_or_the_environment() {
+        let o = Options::parse(
+            ["--sim", "--log-dir", "/var/log/par6"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            o.log_dir.as_deref(),
+            Some(std::path::Path::new("/var/log/par6"))
+        );
+        assert!(
+            Options::parse(["--log-dir"].map(String::from).into_iter()).is_err(),
+            "a bare --log-dir is a usage error"
+        );
     }
 }

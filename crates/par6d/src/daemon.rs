@@ -84,6 +84,7 @@ pub struct Daemon {
     shutdown: Arc<AtomicBool>,
     rt_break: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    vitals: Arc<Mutex<crate::vitals::Vitals>>,
 }
 
 impl Daemon {
@@ -101,6 +102,11 @@ impl Daemon {
     /// Telemetry stream destination port.
     pub fn telemetry_port(&self) -> u16 {
         self.telemetry_port
+    }
+
+    /// The freshest host vitals sample (1 Hz).
+    pub fn vitals(&self) -> crate::vitals::Vitals {
+        self.vitals.lock().map(|v| *v).unwrap_or_default()
     }
 
     /// Boot the full runtime: load config, build the RT core over the
@@ -401,6 +407,15 @@ impl Daemon {
             );
         }
 
+        let vitals = Arc::new(Mutex::new(crate::vitals::Vitals::default()));
+        threads.push(crate::vitals::spawn(
+            opts.log_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            vitals.clone(),
+            shutdown.clone(),
+        )?);
+
         Ok(Self {
             command_addr,
             status_port,
@@ -410,6 +425,7 @@ impl Daemon {
             shutdown,
             rt_break,
             threads,
+            vitals,
         })
     }
 

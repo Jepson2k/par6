@@ -342,8 +342,23 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_STATUS_TRANSPORT` | `auto` \| `multicast` \| `unicast` (`--status-transport`) |
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
+| `PAR6_LOG_DIR` | also write the rotating activity logs there (`--log-dir`) — see below |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
+
+### Activity logs
+
+stderr carries every log line, as always (`RUST_LOG` filters it, default `info`).
+With `--log-dir` the daemon also keeps two size-rotated files there, routed by the
+record's module target: `rt.log` (2 MiB, five copies) holds what the RT thread
+itself says — mode transitions, latches, degraded-scheduling notices — and
+`commands.log` (20 MiB, five copies) holds the command plane and the daemon: one
+line per accepted, completed, refused or cancelled command keyed by its index, with
+the error catalog's cause and remedy on failure, the RT latch on its edges, and a
+host-vitals line (load, memory, CPU temperature, disk, uptime) at start and every
+minute. The RT tick never writes a file: its only log calls sit on throttled
+failure paths, so the sink costs the tick nothing, and a write that fails is
+dropped rather than allowed to stall the daemon.
 
 ### The bus-grant signal
 

@@ -8,8 +8,9 @@
 //! PAR6D_READY command_port=<n> status_port=<n> telemetry_port=<n> sim=<bool>
 //! ```
 //!
-//! Logs go to stderr. SIGINT/SIGTERM shut down cleanly (server task
-//! notified, worker threads joined).
+//! Logs go to stderr, and with `--log-dir` also to two rotating files
+//! (see [`par6d::logging`]). SIGINT/SIGTERM shut down cleanly (server
+//! task notified, worker threads joined).
 
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -25,7 +26,6 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 }
 
 fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let opts = match Options::parse(std::env::args().skip(1)) {
         Ok(o) => o,
         Err(e) => {
@@ -33,6 +33,10 @@ fn main() {
             std::process::exit(2);
         }
     };
+    if let Err(e) = par6d::logging::install(opts.log_dir.as_deref()) {
+        eprintln!("par6d: cannot open the activity logs: {e}");
+        std::process::exit(1);
+    }
     if opts.help {
         print!("{USAGE}");
         return;

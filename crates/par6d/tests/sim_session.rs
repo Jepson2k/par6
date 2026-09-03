@@ -397,26 +397,48 @@ fn full_sim_session_over_protocol_v2() {
 /// python `Robot.start()` bootstrap relies on.
 #[test]
 fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
+    let (mut child, port, _sinks) = spawn_par6d(&[]);
+    assert_ne!(port, 0, "ephemeral port must be resolved");
+
+    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
+    match c.query(&Command::Ping) {
+        QueryResult::Ping { .. } => {}
+        other => panic!("unexpected ping result {other:?}"),
+    }
+
+    let status = sigterm_and_wait(&mut child);
+    assert!(status.success(), "clean exit expected, got {status:?}");
+}
+
+/// The binary on `--sim` with ephemeral/unicast ports plus `extra`
+/// arguments: the child, the command port from its ready line, and the
+/// status/telemetry sinks it was pointed at (kept open for its lifetime).
+fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, (UdpSocket, UdpSocket)) {
     let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status sink");
     let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry sink");
+    let status_port = status_rx.local_addr().unwrap().port().to_string();
+    let telemetry_port = telemetry_rx.local_addr().unwrap().port().to_string();
+    let config = common::shipped_config();
+    let mut args = vec![
+        "--sim",
+        "--config",
+        config.to_str().expect("utf-8 path"),
+        "--port",
+        "0",
+        "--bind",
+        "127.0.0.1",
+        "--status-transport",
+        "unicast",
+        "--status-host",
+        "127.0.0.1",
+        "--status-port",
+        &status_port,
+        "--telemetry-port",
+        &telemetry_port,
+    ];
+    args.extend_from_slice(extra);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
-        .args([
-            "--sim",
-            "--config",
-            common::shipped_config().to_str().expect("utf-8 path"),
-            "--port",
-            "0",
-            "--bind",
-            "127.0.0.1",
-            "--status-transport",
-            "unicast",
-            "--status-host",
-            "127.0.0.1",
-            "--status-port",
-            &status_rx.local_addr().unwrap().port().to_string(),
-            "--telemetry-port",
-            &telemetry_rx.local_addr().unwrap().port().to_string(),
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn par6d");
@@ -439,28 +461,89 @@ fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
         .expect("command_port key in ready line")
         .parse()
         .expect("numeric port");
-    assert_ne!(port, 0, "ephemeral port must be resolved");
+    (child, port, (status_rx, telemetry_rx))
+}
 
-    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
-    match c.query(&Command::Ping) {
-        QueryResult::Ping { .. } => {}
-        other => panic!("unexpected ping result {other:?}"),
-    }
-
+fn sigterm_and_wait(child: &mut std::process::Child) -> std::process::ExitStatus {
     // SAFETY: plain kill(2) on our own child with a standard signal.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let deadline = Instant::now() + BUDGET;
-    let status = loop {
+    loop {
         if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
+            return st;
         }
         assert!(
             Instant::now() < deadline,
             "par6d did not exit after SIGTERM"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--log-dir` gives the deployment the two activity logs: the command
+/// plane's lines (every system command, every refusal, the RT latch on
+/// its edges, the host vitals) in `commands.log`, and the RT thread's
+/// own transitions in `rt.log` — routed by module target, so the RT
+/// latch that an e-stop raises shows up in BOTH, each from its side.
+/// stderr keeps the same lines; a run without `--log-dir` writes no file.
+#[test]
+fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
+    let dir = std::env::temp_dir().join(format!("par6d-logs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut child, port, _sinks) = spawn_par6d(&["--log-dir", dir.to_str().unwrap()]);
+    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
+    match c.query(&Command::Ping) {
+        QueryResult::Ping { .. } => {}
+        other => panic!("unexpected ping result {other:?}"),
+    }
+    // A move on an unhomed arm is refused; the e-stop latches the RT.
+    c.expect_error(&Command::MoveJ(MoveJ {
+        key: 1,
+        angles: park_deg(),
+        duration: Some(1.0),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    c.ok(&Command::Estop);
+    let deadline = Instant::now() + BUDGET;
+    let commands = loop {
+        let text = std::fs::read_to_string(dir.join("commands.log")).unwrap_or_default();
+        if text.contains("rt latched") {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the RT latch never reached commands.log:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     };
+    let status = sigterm_and_wait(&mut child);
     assert!(status.success(), "clean exit expected, got {status:?}");
+
+    for needle in [
+        "system name=estop",
+        "refused req_id=",
+        "code=",
+        "remedy=",
+        "par6d::vitals load1=",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "commands.log lacks {needle:?}:\n{commands}"
+        );
+    }
+    let rt = std::fs::read_to_string(dir.join("rt.log")).expect("rt.log exists");
+    assert!(
+        rt.contains("par6_rt::core") && rt.contains("ActiveError"),
+        "rt.log lacks the RT's own latch transition:\n{rt}"
+    );
+    assert!(
+        !commands.contains("par6_rt::"),
+        "RT records must not leak into the command log:\n{commands}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Startup failure paths are clear errors, never panics: hardware mode

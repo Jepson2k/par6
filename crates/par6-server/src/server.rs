@@ -78,6 +78,11 @@ use crate::telemetry;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
+/// Log target of the command activity log: one line per accepted,
+/// completed, refused or cancelled command and per system command, with
+/// the index that joins them. `par6d` routes this target to
+/// `commands.log`.
+const COMMAND_LOG: &str = "par6_server::commands";
 
 /// How many un-answered `reset` requests may pile up while the RT is
 /// still deciding. A client that keeps re-sending past this is not
@@ -290,6 +295,9 @@ struct Core<P: Planner, R: RtCommands> {
     collision: CollisionState,
     completion_policy: CompletionPolicy,
     recipe: Option<String>,
+    /// The RT latch last written to the activity log, so the latch is
+    /// logged on its edges and never once per poll.
+    rt_error_logged: Option<u16>,
     simulator: bool,
 
     /// Planner estimate of the pending queue, and the `(front, len)` of
@@ -325,6 +333,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             dedup: Dedup::new(cfg.dedup_window),
             profile: cfg.initial_profile.clone(),
             recipe: cfg.initial_recipe.clone(),
+            rt_error_logged: None,
             simulator: cfg.simulator,
             tool: cfg.fitted_tool.clone(),
             cfg,
@@ -504,6 +513,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.log_rt_latch_edges();
         self.request_boot_enable();
         self.settle_enable().await;
         self.settle_flashing().await;
@@ -511,6 +521,29 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.collect_tool_outcome().await;
         self.collect_outcomes().await;
         self.pump().await;
+    }
+
+    /// The RT's own latch, on its edges: latched (with the catalog's
+    /// cause and remedy) and cleared. Derived from the snapshot every
+    /// poll, written only when it changes.
+    fn log_rt_latch_edges(&mut self) {
+        let now = rt_standing_error(&self.snap);
+        let code = now.as_ref().map(|e| e.code);
+        if code == self.rt_error_logged {
+            return;
+        }
+        match &now {
+            Some(e) => log::warn!(
+                target: COMMAND_LOG,
+                "rt latched code={} title={:?} cause={:?} remedy={:?}",
+                e.code,
+                e.title,
+                e.cause,
+                e.remedy
+            ),
+            None => log::info!(target: COMMAND_LOG, "rt latch cleared"),
+        }
+        self.rt_error_logged = code;
     }
 
     async fn on_status(&mut self) {
@@ -547,6 +580,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn on_system(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
         use Command as C;
+        log::info!(
+            target: COMMAND_LOG,
+            "system name={} params={}",
+            cmd_name(cmd.tag()),
+            params_summary(cmd)
+        );
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
             return;
@@ -1017,6 +1056,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.next_index += 1;
         self.dedup.insert(key, index);
         self.accepted_index = index as i64;
+        log::info!(
+            target: COMMAND_LOG,
+            "accepted index={index} name={} params={}",
+            cmd_name(cmd.tag()),
+            params_summary(&cmd)
+        );
         self.on_motion_accepted();
         if self.active_stream.take().is_some() {
             // A planned move cancels streaming.
@@ -2186,6 +2231,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- wire I/O ----------------------------------------------------------
 
     async fn reply(&mut self, addr: SocketAddr, reply: &Reply) {
+        if let Reply::Error { req_id, error } = reply {
+            log::warn!(
+                target: COMMAND_LOG,
+                "refused req_id={req_id} code={} title={:?} cause={:?} remedy={:?}",
+                error.code,
+                error.title,
+                error.cause,
+                error.remedy
+            );
+        }
         encode_reply(reply, &mut self.txbuf);
         if let Err(e) = self.socket.send_to(&self.txbuf, addr).await {
             log::debug!("reply send to {addr} failed: {e}");
@@ -2199,6 +2254,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         detail: Option<WireError>,
         verdict: Option<u8>,
     ) {
+        match &detail {
+            None => {
+                log::info!(target: COMMAND_LOG, "complete index={index} ok verdict={verdict:?}")
+            }
+            Some(e) => log::warn!(
+                target: COMMAND_LOG,
+                "complete index={index} code={} title={:?} cause={:?} remedy={:?}",
+                e.code,
+                e.title,
+                e.cause,
+                e.remedy
+            ),
+        }
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
