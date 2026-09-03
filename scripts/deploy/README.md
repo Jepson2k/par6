@@ -9,7 +9,15 @@ scripts/ffi/setup.sh --target aarch64    build the aarch64 Pinocchio shim
 scripts/deploy/build-aarch64.sh          cross-build par6d for aarch64
 scripts/deploy/install.sh                stage + upload + install (or install locally)
 scripts/deploy/par6d.service             the systemd unit
+scripts/deploy/par6-panel.service        the front panel service (optional)
 ```
+
+The front panel (`par6-panel`, buttons/LEDs/OLED/PCB link) is a Python service
+installed from the pip package: `pip install "par6[panel]"` into a venv on
+the box, copy `panel.toml` to `/etc/par6/panel.toml`, point the unit's
+`ExecStart` at the venv's `par6-panel`, then `systemctl enable --now
+par6-panel`. Run `par6-preflight` first — it is diagnostic only and tells you
+what the box is missing. `panel.toml` carries every pin, address and baud.
 
 ## 1. Cross-build
 

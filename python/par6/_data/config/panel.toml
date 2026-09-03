@@ -1,0 +1,52 @@
+# Front panel service (`par6-panel`): the control box's two buttons, two
+# LEDs and 128x64 OLED, the UART link to the mainboard PCB, and the systemd
+# units it may restart. Nothing here is hard-coded in the service — every
+# device path, address, pin and baud comes from this file.
+#
+# Pins are BCM numbers on the 40-pin header. The vendor control box wires:
+# LED1 GPIO16, LED2 GPIO20, BUTTON1 GPIO26, BUTTON2 GPIO21, SSD1306 on I2C-1
+# at 0x3C, mainboard PCB on the primary UART at 256000 baud.
+
+[display]
+driver = "ssd1306"          # ssd1306 | none (buttons and LEDs still work)
+i2c_bus = 1
+i2c_address = 0x3C
+width = 128
+height = 64
+contrast = 255
+refresh_s = 0.08
+
+[buttons]
+button1_pin = 26
+button2_pin = 21
+pull_up = true              # pressed pulls LOW; flip on a board that reads inverted
+long_press_s = 0.6          # hold at least this long = long press, fired once, while held
+debounce_s = 0.03           # a level must be steady this long before it counts
+
+[leds]
+led1_pin = 16
+led2_pin = 20
+blink_s = 1.0               # heartbeat period: LEDs toggle anti-phase, PCB gets a heartbeat
+
+[pcb]
+port = "/dev/ttyAMA0"       # empty = no PCB link
+baud = 256000
+timeout_s = 0.5
+fields = 4                  # values per "$a b c d" line the PCB sends
+heartbeat = "heartbeat\n\r"
+
+[runtime]
+host = "127.0.0.1"
+command_port = 6001
+status_port = 6002
+status_transport = "UNICAST"
+can_interface = "can0"
+unit = "par6d"              # the systemd unit the menu may restart
+
+[loop]
+period_s = 0.02             # main loop: buttons + UART + heartbeat, ~50 Hz
+link_monitor_s = 1.0        # CAN counters and runtime liveness
+idle_return_s = 12.0        # non-Home screens fall back to Home after this
+
+[settings]
+file = "/var/lib/par6/panel-settings.json"

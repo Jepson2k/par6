@@ -169,6 +169,8 @@ rather than approximate it.
 | `python/` | the `par6` pip package (waldoctl backend) |
 | `tests/golden/` | golden wire vectors (encode/decode conformance for the frozen codec) |
 | `tools/bringup/` | the staged on-hardware bring-up kit — see its README |
+| `tools/gravity_calibration/` | gravity identification phases A–D and the sim twin evidence — see its README |
+| `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
 ### Two planes, one process
@@ -361,6 +363,22 @@ host-vitals line (load, memory, CPU temperature, disk, uptime) at start and ever
 minute. The RT tick never writes a file: its only log calls sit on throttled
 failure paths, so the sink costs the tick nothing, and a write that fails is
 dropped rather than allowed to stall the daemon.
+
+### The front panel
+
+`par6-panel` (installed with `pip install "par6[panel]"`, run by
+`scripts/deploy/par6-panel.service`) owns the control box's two buttons, two
+LEDs and 128x64 OLED and the UART link to the mainboard PCB, entirely from
+`panel.toml` (`PAR6_PANEL_CONFIG`; every device path, I²C address, pin and
+baud lives there). One rule on the buttons: tap = move, hold = select, hold
+button 1 = back; destructive actions ask for a hold to confirm and cancel on
+any tap. Once a blink period it sends the PCB its heartbeat, toggles the
+LEDs anti-phase, publishes the panel state and drives the LEDs from what it
+published. A UART that will not open disables PCB comms and nothing else.
+`par6-preflight` is the diagnostic that brings nothing up: RT kernel, CAN,
+GPIO and RT-priority permissions, cores, disk, devices and imports, each
+required or advisory, re-executed inside the package's virtualenv so it
+reflects the runtime environment.
 
 ### Commissioning a drive
 
