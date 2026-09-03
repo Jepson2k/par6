@@ -48,6 +48,7 @@ class Ledger:
     checks: list[Check] = field(default_factory=list)
 
     def add(self, name: str, ok: bool, detail: str, *, required: bool = True) -> bool:
+        ok = bool(ok)
         self.checks.append(Check(name, ok, detail, required))
         flag = "PASS" if ok else ("FAIL" if required else "WARN")
         print(f"[{flag}] {name}: {detail}", flush=True)
@@ -328,7 +329,7 @@ def fail_if_outside(
     """Refuse a planned excursion `[lo, hi]` [deg] that leaves the joint's
     soft window — with the numbers, before anything moves."""
     limits = soft_limits_deg(config)
-    inside = limits[joint, 0] <= lo and hi <= limits[joint, 1]
+    inside = bool(limits[joint, 0] <= lo and hi <= limits[joint, 1])
     return ledger.add(
         name,
         inside,

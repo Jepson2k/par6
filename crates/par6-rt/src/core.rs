@@ -1332,7 +1332,21 @@ impl<B: DriverBus> RtCore<B> {
                     self.gripper_settle.arm_idle(self.tick);
                 }
             }
-            RtCommand::SetGravityComp(on) => self.gravity_comp = on,
+            RtCommand::SetGravityComp(on) => {
+                self.gravity_comp = on;
+                // After a program finishes EXEC keeps holding the last
+                // sample under the position loop, so a compensation
+                // request would otherwise change nothing the arm can
+                // feel: the client asked to float and the arm stays
+                // rigid. Hand back to IDLE, whose law is the float. A
+                // program still playing keeps EXEC — its law adds G(q)
+                // on top of the plan.
+                if on && self.mode == Mode::Exec && self.exec.is_holding_after_completion() {
+                    if let Err(e) = self.request_mode(Mode::Idle) {
+                        log::warn!("gravity comp: EXEC hold → IDLE refused: {e:?}");
+                    }
+                }
+            }
             RtCommand::SetPayload { mass, com, inertia } => {
                 self.gravity.set_payload(mass, com, inertia);
             }

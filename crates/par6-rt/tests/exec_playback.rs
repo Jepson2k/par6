@@ -274,3 +274,55 @@ fn exec_link_watchdog_latches_after_heartbeat_silence_with_samples_pending() {
     assert!(s.error_active);
     assert_eq!(s.mode, Mode::ActiveError);
 }
+
+/// A finished program leaves EXEC holding the last sample under the
+/// position loop. Asking for gravity compensation there is asking to
+/// float, and a float under a position hold is no float at all — the
+/// core hands back to IDLE, whose law is the torque-only hold. While
+/// samples are still playing the request must NOT interrupt them.
+#[test]
+fn gravity_comp_after_a_finished_program_floats_instead_of_holding() {
+    let mut rig = Rig::with_policy(CompletionPolicy::Commanded);
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0, 0.02, 8, false, true);
+    rig.tick_n(3);
+    assert_eq!(rig.snap().mode, Mode::Exec);
+
+    // Mid-program: compensation rides along, playback continues.
+    rig.cmd(RtCommand::SetGravityComp(true));
+    rig.tick();
+    let s = rig.snap();
+    assert_eq!(
+        s.mode,
+        Mode::Exec,
+        "a playing program must not be cut short"
+    );
+    assert!(s.gravity_comp);
+    rig.cmd(RtCommand::SetGravityComp(false));
+
+    rig.tick_n(10);
+    let s = rig.snap();
+    assert_eq!(s.exec.completed_index, 1);
+    assert_eq!(s.mode, Mode::Exec, "EXEC holds after completion");
+    let last = rig.last_joints();
+    assert!(
+        last.iter().all(|f| f.pos.is_some()),
+        "the post-completion hold is a position hold"
+    );
+
+    rig.cmd(RtCommand::SetGravityComp(true));
+    rig.tick();
+    let s = rig.snap();
+    assert_eq!(
+        s.mode,
+        Mode::Idle,
+        "compensation on a finished program hands back to IDLE"
+    );
+    assert!(s.gravity_comp);
+    let frames = rig.last_joints();
+    assert!(
+        frames.iter().all(|f| f.pos.is_none() && f.vel.is_none()),
+        "IDLE under compensation is torque-only, no position hold: {frames:?}"
+    );
+}
