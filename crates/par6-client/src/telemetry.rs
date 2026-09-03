@@ -6,7 +6,7 @@
 //! multicast-with-unicast-fallback ladder as the STATUS stream) and the
 //! registry lookup that turns positional values into named fields.
 
-use std::net::{Ipv4Addr, UdpSocket};
+use std::net::UdpSocket;
 use std::time::{Duration, Instant};
 
 use par6_proto::telemetry::{decode_telemetry, TelemetryRecipe, TelemetryValue};
@@ -34,6 +34,7 @@ pub struct TelemetryReader {
     sock: UdpSocket,
     recipes: Vec<TelemetryRecipe>,
     buf: Vec<u8>,
+    skipped: u64,
 }
 
 impl TelemetryReader {
@@ -41,10 +42,12 @@ impl TelemetryReader {
     /// registry, using the same transport ladder as the STATUS stream.
     pub fn open(transport: StatusTransport, port: u16) -> Result<Self, ClientError> {
         let sock = match transport {
-            StatusTransport::Multicast { group, iface } => {
-                sockets::multicast_socket(group, port, iface)
-                    .or_else(|_| sockets::unicast_socket(Ipv4Addr::LOCALHOST, port))
-            }
+            StatusTransport::Multicast {
+                group,
+                iface,
+                fallback,
+            } => sockets::multicast_socket(group, port, iface)
+                .or_else(|_| sockets::unicast_socket(fallback, port)),
             StatusTransport::Unicast { host } => sockets::unicast_socket(host, port),
         }?;
         Ok(Self::over(sock))
@@ -56,20 +59,42 @@ impl TelemetryReader {
             sock,
             recipes: TelemetryRecipe::defaults(),
             buf: vec![0u8; 65536],
+            skipped: 0,
+        }
+    }
+
+    /// Packets dropped so far because they could not be labeled: an
+    /// undecodable frame, a recipe this registry does not know, or a
+    /// field count that disagrees with it (a daemon a version ahead).
+    pub fn skipped(&self) -> u64 {
+        self.skipped
+    }
+
+    /// Label one raw packet, counting and logging the ones this registry
+    /// cannot place instead of failing the receive.
+    fn labeled(&mut self, n: usize) -> Option<TelemetryPacket> {
+        match Self::label(&self.recipes, &self.buf[..n]) {
+            Ok(pkt) => Some(pkt),
+            Err(e) => {
+                self.skipped += 1;
+                log::warn!("skipping telemetry packet: {e}");
+                None
+            }
         }
     }
 
     /// Receive and decode the next packet, waiting up to `timeout`.
     /// `None` = nothing arrived in time (the stream may simply be
-    /// silent — no recipe active).
+    /// silent — no recipe active). A packet this registry cannot label
+    /// is skipped (see [`Self::skipped`]) and the wait continues.
     pub fn recv(&mut self, timeout: Duration) -> Result<Option<TelemetryPacket>, ClientError> {
         let deadline = Instant::now() + timeout;
         loop {
             match self.sock.recv(&mut self.buf) {
                 Ok(n) => {
-                    let raw = &self.buf[..n];
-                    let pkt = Self::label(&self.recipes, raw)?;
-                    return Ok(Some(pkt));
+                    if let Some(pkt) = self.labeled(n) {
+                        return Ok(Some(pkt));
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     let now = Instant::now();
@@ -86,14 +111,16 @@ impl TelemetryReader {
         }
     }
 
-    /// Every packet currently waiting on the socket, oldest first.
+    /// Every packet currently waiting on the socket, oldest first;
+    /// packets this registry cannot label are skipped, not fatal.
     pub fn drain(&mut self) -> Result<Vec<TelemetryPacket>, ClientError> {
         let mut out = Vec::new();
         loop {
             match self.sock.recv(&mut self.buf) {
                 Ok(n) => {
-                    let raw = &self.buf[..n];
-                    out.push(Self::label(&self.recipes, raw)?);
+                    if let Some(pkt) = self.labeled(n) {
+                        out.push(pkt);
+                    }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(out),
                 Err(e) => return Err(e.into()),

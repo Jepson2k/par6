@@ -2,7 +2,6 @@
 //! a thin face over [`par6_client::telemetry::TelemetryReader`].
 
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
@@ -11,6 +10,8 @@ use pyo3::types::PyDict;
 use par6_client::telemetry::TelemetryPacket;
 use par6_client::StatusTransport;
 use par6_proto::telemetry::TelemetryValue;
+
+use crate::convert::checked_duration;
 
 /// Blocking receiver for the daemon's telemetry stream. Each frame is a
 /// dict: `recipe`, `seq`, `mono_time_ns`, and `fields` — the recipe's
@@ -30,7 +31,7 @@ fn frame_dict(py: Python<'_>, pkt: &TelemetryPacket) -> PyResult<PyObject> {
         match value {
             TelemetryValue::U64(v) => fields.set_item(key, v)?,
             TelemetryValue::F64(v) => fields.set_item(key, v)?,
-            TelemetryValue::Arr(v) => fields.set_item(key, v.clone())?,
+            TelemetryValue::Arr(v) => fields.set_item(key, v.as_slice())?,
         }
     }
     d.set_item("fields", fields)?;
@@ -54,6 +55,7 @@ impl TelemetryReader {
                     .parse()
                     .map_err(|_| PyValueError::new_err(format!("invalid group {g:?}")))?,
                 iface: host,
+                fallback: host,
             },
             None => StatusTransport::Unicast { host },
         };
@@ -70,13 +72,15 @@ impl TelemetryReader {
             .inner
             .as_mut()
             .ok_or_else(|| PyValueError::new_err("reader is closed"))?;
+        let timeout = checked_duration(timeout, "timeout")?;
         let pkt = py
-            .allow_threads(|| reader.recv(Duration::from_secs_f64(timeout.max(0.0))))
+            .allow_threads(|| reader.recv(timeout))
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         pkt.map(|p| frame_dict(py, &p)).transpose()
     }
 
-    /// Every frame currently waiting on the socket, oldest first.
+    /// Every frame currently waiting on the socket, oldest first. Frames
+    /// this reader's registry cannot label are skipped, not raised.
     fn drain(&mut self, py: Python<'_>) -> PyResult<Vec<PyObject>> {
         let reader = self
             .inner
@@ -86,6 +90,11 @@ impl TelemetryReader {
             .drain()
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         pkts.iter().map(|p| frame_dict(py, p)).collect()
+    }
+
+    /// Frames skipped so far because this registry could not label them.
+    fn skipped(&self) -> u64 {
+        self.inner.as_ref().map_or(0, |r| r.skipped())
     }
 
     fn close(&mut self) {

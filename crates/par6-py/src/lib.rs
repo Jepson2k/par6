@@ -17,16 +17,18 @@ use pyo3::types::PyDict;
 
 use par6_proto::{decode_reply, encode_command, Command, ErrorCode, Reply, UNATTRIBUTED};
 
-/// True when a par6d runtime answers a protocol-v2 PING at `host:port`
-/// within `timeout` seconds. One blocking datagram, no retries — the
-/// availability probe `Robot` runs before spawning its own daemon.
+/// True when a par6d runtime answers a PING at `host:port` within
+/// `timeout` seconds (`ValueError` for a NaN or negative timeout). One
+/// blocking datagram, no retries — the availability probe `Robot` runs
+/// before spawning its own daemon.
 #[pyfunction]
 #[pyo3(signature = (host, port, timeout=0.5))]
-fn ping_blocking(py: Python<'_>, host: &str, port: u16, timeout: f64) -> bool {
-    py.allow_threads(|| ping_once(host, port, timeout))
+fn ping_blocking(py: Python<'_>, host: &str, port: u16, timeout: f64) -> PyResult<bool> {
+    let timeout = convert::checked_duration(timeout, "timeout")?.max(Duration::from_millis(1));
+    Ok(py.allow_threads(|| ping_once(host, port, timeout)))
 }
 
-fn ping_once(host: &str, port: u16, timeout: f64) -> bool {
+fn ping_once(host: &str, port: u16, timeout: Duration) -> bool {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.subsec_nanos())
@@ -39,11 +41,7 @@ fn ping_once(host: &str, port: u16, timeout: f64) -> bool {
     let Ok(sock) = UdpSocket::bind(("0.0.0.0", 0)) else {
         return false;
     };
-    if sock
-        .set_read_timeout(Some(Duration::from_secs_f64(timeout.max(0.001))))
-        .is_err()
-        || sock.send_to(&buf, (host, port)).is_err()
-    {
+    if sock.set_read_timeout(Some(timeout)).is_err() || sock.send_to(&buf, (host, port)).is_err() {
         return false;
     }
     let mut resp = [0u8; 4096];

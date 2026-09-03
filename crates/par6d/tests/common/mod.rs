@@ -89,7 +89,7 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
 /// test rig that wrote it would tell every CAN tool on the machine that
 /// a runtime it cannot see owns the bus — and its teardown would then
 /// take a real runtime's claim away.
-fn redirect_bus_grant() {
+pub fn redirect_bus_grant() {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let dir = ONCE.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
@@ -100,6 +100,24 @@ fn redirect_bus_grant() {
         dir
     });
     debug_assert!(dir.is_dir());
+}
+
+/// Daemon options for a simulator boot on loopback: an ephemeral command
+/// port, STATUS unicast to `127.0.0.1:status_port`, telemetry to
+/// `telemetry_port` (0 = ephemeral), the repo assets tree.
+pub fn sim_options(config: PathBuf, status_port: u16, telemetry_port: u16) -> Options {
+    Options {
+        sim: true,
+        config: Some(config),
+        assets: Some(assets_dir()),
+        command_port: Some(0),
+        bind: Some("127.0.0.1".parse().unwrap()),
+        status_host: Some("127.0.0.1".parse().unwrap()),
+        status_port: Some(status_port),
+        telemetry_port: Some(telemetry_port),
+        status_transport: Some(StatusTransport::Unicast),
+        ..Options::default()
+    }
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
@@ -149,18 +167,13 @@ impl Rig {
             .expect("timeout");
         let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
         let opts = Options {
-            sim: true,
             sim_dynamics,
-            config: Some(config),
-            assets: Some(assets_dir()),
-            command_port: Some(0),
-            bind: Some("127.0.0.1".parse().unwrap()),
-            status_host: Some("127.0.0.1".parse().unwrap()),
-            status_port: Some(status_rx.local_addr().unwrap().port()),
-            telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
-            status_transport: Some(StatusTransport::Unicast),
             status_rate_hz,
-            ..Options::default()
+            ..sim_options(
+                config,
+                status_rx.local_addr().unwrap().port(),
+                telemetry_rx.local_addr().unwrap().port(),
+            )
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
         Ok(Rig {

@@ -13,7 +13,7 @@ mod sockets;
 mod sync;
 pub mod telemetry;
 
-pub use crate::core::{Ack, Client, ClientConfig, Completion, StatusTransport};
+pub use crate::core::{Ack, Client, ClientConfig, Completion, StatusTransport, MIN_MTU};
 pub use crate::error::ClientError;
 pub use crate::sync::SyncClient;
 pub use crate::telemetry::{TelemetryPacket, TelemetryReader};

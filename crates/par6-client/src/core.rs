@@ -32,6 +32,19 @@ const COMPLETIONS_KEPT: usize = 1024;
 /// How often one error code may be logged for a reply nobody awaits.
 const UNCLAIMED_ERROR_PERIOD: Duration = Duration::from_secs(1);
 
+/// The smallest MTU the client accepts: the chunk envelope plus room for
+/// a payload.
+pub const MIN_MTU: usize = 64;
+
+/// Bytes of every chunk datagram reserved for the chunk envelope.
+const CHUNK_OVERHEAD: usize = 32;
+
+/// After STATUS reports a command finished, how long its COMPLETE push
+/// is still awaited before the verdict is declared unknown. The push is
+/// sent before the STATUS frame that reflects it, so this only covers
+/// reordering on the wire.
+const COMPLETE_GRACE: Duration = Duration::from_millis(100);
+
 /// How the STATUS broadcast is subscribed.
 #[derive(Debug, Clone)]
 pub enum StatusTransport {
@@ -41,6 +54,8 @@ pub enum StatusTransport {
         group: Ipv4Addr,
         /// Interface address to join on first.
         iface: Ipv4Addr,
+        /// Local address bound when no interface can join the group.
+        fallback: Ipv4Addr,
     },
     /// Plain unicast bind.
     Unicast {
@@ -83,14 +98,14 @@ fn env_parse<T: std::str::FromStr>(name: &str, default: T) -> T {
 impl Default for ClientConfig {
     fn default() -> Self {
         let kind = env_str("PAR6_STATUS_TRANSPORT", "MULTICAST").to_uppercase();
+        let unicast_host = env_parse("PAR6_STATUS_UNICAST_HOST", Ipv4Addr::LOCALHOST);
         let status = if kind == "UNICAST" {
-            StatusTransport::Unicast {
-                host: env_parse("PAR6_STATUS_UNICAST_HOST", Ipv4Addr::LOCALHOST),
-            }
+            StatusTransport::Unicast { host: unicast_host }
         } else {
             StatusTransport::Multicast {
                 group: env_parse("PAR6_STATUS_MCAST_GROUP", Ipv4Addr::new(239, 255, 0, 71)),
                 iface: env_parse("PAR6_STATUS_MCAST_IF", Ipv4Addr::LOCALHOST),
+                fallback: unicast_host,
             }
         };
         Self {
@@ -157,19 +172,28 @@ impl Client {
     }
 
     /// Bind the command endpoint and start the reply + status listeners.
+    /// `Invalid` for an MTU below [`MIN_MTU`].
     pub async fn connect(cfg: ClientConfig) -> Result<Self, ClientError> {
+        if cfg.mtu < MIN_MTU {
+            return Err(ClientError::Invalid(format!(
+                "mtu {} is below the {MIN_MTU}-byte minimum",
+                cfg.mtu
+            )));
+        }
         let sock = UdpSocket::bind("0.0.0.0:0").await?;
         sock.connect((cfg.host.as_str(), cfg.port)).await?;
 
         let status_std = match cfg.status {
-            StatusTransport::Multicast { group, iface } => {
-                sockets::multicast_socket(group, cfg.status_port, iface).or_else(|e| {
-                    log::warn!(
-                        "multicast status subscription failed ({e}); falling back to unicast"
-                    );
-                    sockets::unicast_socket(Ipv4Addr::LOCALHOST, cfg.status_port)
-                })?
-            }
+            StatusTransport::Multicast {
+                group,
+                iface,
+                fallback,
+            } => sockets::multicast_socket(group, cfg.status_port, iface).or_else(|e| {
+                log::warn!(
+                    "multicast status subscription failed ({e}); falling back to unicast on {fallback}"
+                );
+                sockets::unicast_socket(fallback, cfg.status_port)
+            })?,
             StatusTransport::Unicast { host } => sockets::unicast_socket(host, cfg.status_port)?,
         };
         let status_sock = UdpSocket::from_std(status_std)?;
@@ -288,7 +312,8 @@ impl Client {
             return vec![data];
         }
         let transfer_id = self.inner.transfer_id.fetch_add(1, Ordering::Relaxed);
-        split_into_chunks(req_id, transfer_id, &data, self.inner.cfg.mtu - 32)
+        let chunk = self.inner.cfg.mtu.saturating_sub(CHUNK_OVERHEAD).max(1);
+        split_into_chunks(req_id, transfer_id, &data, chunk)
             .iter()
             .map(|c| {
                 let mut buf = Vec::new();
@@ -477,10 +502,12 @@ impl Client {
     /// Block until queued command `index` completes. Satisfied by the
     /// COMPLETE push, with the status stream as fallback (completed_index
     /// high-water, or a blocking error under the stale-error rule).
-    /// `Ok(true)` on success, `Ok(false)` on timeout, `Robot` when the
-    /// command finished in error.
+    /// `Ok(true)` on success, `Robot` when the command finished in error,
+    /// `Ok(false)` on timeout — or when STATUS showed the command finished
+    /// but its COMPLETE push never arrived, so whether it succeeded or was
+    /// cancelled is unknown (logged as a warning).
     pub async fn wait_command(&self, index: u64, timeout: Duration) -> Result<bool, ClientError> {
-        let done = self
+        let logged = self
             .inner
             .completions
             .lock()
@@ -488,46 +515,17 @@ impl Client {
             .log
             .get(&index)
             .cloned();
-        let done = match done {
-            Some(done) => Some(done),
-            None => {
-                let (tx, rx) = oneshot::channel();
-                self.inner
-                    .completions
-                    .lock()
-                    .unwrap()
-                    .waiters
-                    .entry(index)
-                    .or_default()
-                    .push(tx);
-                let via_status = self.wait_status(
-                    move |s| {
-                        s.completed_index >= index as i64
-                            || Self::blocking_error(s, index).is_some()
-                    },
-                    timeout,
-                );
-                tokio::select! {
-                    got = rx => got.ok(),
-                    hit = via_status => {
-                        if hit {
-                            if let Some(s) = self.latest_status() {
-                                if let Some(err) = Self::blocking_error(&s, index) {
-                                    return Err(ClientError::Robot(err));
-                                }
-                            }
-                            Some((true, None, None))
-                        } else {
-                            return Ok(false);
-                        }
-                    }
-                }
-            }
+        let done = match logged {
+            Some(done) => done,
+            None => match self.await_completion(index, timeout).await? {
+                Some(done) => done,
+                None => return Ok(false),
+            },
         };
         match done {
-            Some((true, _, _)) => Ok(true),
-            Some((false, Some(detail), _)) => Err(ClientError::Robot(detail)),
-            Some((false, None, _)) => Err(ClientError::Robot(WireError {
+            (true, _, _) => Ok(true),
+            (false, Some(detail), _) => Err(ClientError::Robot(detail)),
+            (false, None, _) => Err(ClientError::Robot(WireError {
                 command_index: index as i64,
                 code: 0,
                 title: "Command failed".into(),
@@ -535,15 +533,82 @@ impl Client {
                 effect: String::new(),
                 remedy: String::new(),
             })),
-            None => Ok(false),
+        }
+    }
+
+    /// Register a waiter for `index` and race the COMPLETE push against
+    /// the status stream. `None` = timed out, or finished per STATUS
+    /// without the push. The waiter entry never outlives the wait.
+    async fn await_completion(
+        &self,
+        index: u64,
+        timeout: Duration,
+    ) -> Result<Option<Completion>, ClientError> {
+        let (tx, mut rx) = oneshot::channel();
+        {
+            let mut comp = self.inner.completions.lock().unwrap();
+            if let Some(done) = comp.log.get(&index) {
+                return Ok(Some(done.clone()));
+            }
+            comp.waiters.entry(index).or_default().push(tx);
+        }
+        let outcome = self.race_completion(index, &mut rx, timeout).await;
+        drop(rx);
+        let mut comp = self.inner.completions.lock().unwrap();
+        if let Some(list) = comp.waiters.get_mut(&index) {
+            list.retain(|tx| !tx.is_closed());
+            if list.is_empty() {
+                comp.waiters.remove(&index);
+            }
+        }
+        outcome
+    }
+
+    async fn race_completion(
+        &self,
+        index: u64,
+        rx: &mut oneshot::Receiver<Completion>,
+        timeout: Duration,
+    ) -> Result<Option<Completion>, ClientError> {
+        let hit = {
+            let via_status = self.wait_status(
+                move |s| {
+                    s.completed_index >= index as i64 || Self::blocking_error(s, index).is_some()
+                },
+                timeout,
+            );
+            tokio::pin!(via_status);
+            tokio::select! {
+                got = &mut *rx => return Ok(got.ok()),
+                hit = &mut via_status => hit,
+            }
+        };
+        if !hit {
+            return Ok(None);
+        }
+        if let Some(s) = self.latest_status() {
+            if let Some(err) = Self::blocking_error(&s, index) {
+                return Err(ClientError::Robot(err));
+            }
+        }
+        match tokio::time::timeout(COMPLETE_GRACE, rx).await {
+            Ok(Ok(done)) => Ok(Some(done)),
+            _ => {
+                log::warn!(
+                    "command {index} finished per STATUS but its COMPLETE push never arrived; \
+                     verdict unknown"
+                );
+                Ok(None)
+            }
         }
     }
 
     /// Settle verdict off command `index`'s COMPLETE push: 1 = object
     /// while closing, 2 = object while opening, 3 = target reached with
-    /// no object. `None` for non-tool commands, unfinished ones, and
-    /// completions that fell out of the log (last 1024 are kept) — call
-    /// after [`Self::wait_command`] returns `Ok(true)`.
+    /// no object. `None` for non-tool commands, unfinished ones, ones
+    /// whose COMPLETE push was lost, and completions that fell out of
+    /// the log (last 1024 are kept) — call after [`Self::wait_command`]
+    /// returns `Ok(true)`.
     pub fn command_verdict(&self, index: u64) -> Option<u8> {
         self.inner
             .completions
@@ -583,8 +648,13 @@ async fn reply_rx(inner: Arc<Inner>) {
                 verdict,
             } => {
                 let mut comp = inner.completions.lock().unwrap();
-                comp.log.insert(index, (ok, detail.clone(), verdict));
-                comp.order.push_back(index);
+                if comp
+                    .log
+                    .insert(index, (ok, detail.clone(), verdict))
+                    .is_none()
+                {
+                    comp.order.push_back(index);
+                }
                 while comp.order.len() > COMPLETIONS_KEPT {
                     if let Some(old) = comp.order.pop_front() {
                         comp.log.remove(&old);

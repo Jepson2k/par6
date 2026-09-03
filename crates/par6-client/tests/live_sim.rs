@@ -1,102 +1,61 @@
 //! e2e: the Rust client against an in-process `par6d --sim` — real UDP,
 //! real protocol, no fakes. Mirrors the workflows the Python suite drives
-//! through the same daemon.
+//! through the same daemon, plus the transport invariants only this
+//! client can prove: reply correlation, the idempotent re-ack, the
+//! COMPLETE contract and the STATUS fallback.
 
-use std::net::UdpSocket;
-use std::path::PathBuf;
+use std::net::{IpAddr, Ipv4Addr, UdpSocket};
 use std::time::Duration;
 
-use par6_client::{Ack, Client, ClientConfig, ClientError, Frame, StatusTransport, NUM_JOINTS};
-use par6_proto::Shape;
-use par6d::options::StatusTransport as DaemonStatusTransport;
-use par6d::{Daemon, Options};
+use par6_client::{
+    Ack, Client, ClientConfig, ClientError, Frame, StatusTransport, MIN_MTU, NUM_JOINTS,
+};
+use par6_proto::command as cmd;
+use par6_proto::{Command, ErrorCode, Shape};
+use par6d::Daemon;
+
+#[path = "../../par6d/tests/common/mod.rs"]
+mod common;
 
 const BUDGET: Duration = Duration::from_secs(20);
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
+/// A free loopback UDP port for the STATUS stream; the client binds it.
+fn free_port() -> u16 {
+    UdpSocket::bind("127.0.0.1:0")
+        .expect("probe socket")
+        .local_addr()
         .unwrap()
+        .port()
 }
 
-/// The shipped config re-ticked to 50 Hz: loaded test machines without RT
-/// scheduling miss 4 ms deadlines and would latch LOOP_CRITICAL mid-test;
-/// every RT time constant derives from config seconds, so the wiring under
-/// test is identical.
-fn test_config() -> PathBuf {
-    let src = repo_root().join("config/PAR6.toml");
-    let dir = std::env::temp_dir().join(format!("par6-client-sim-{}", std::process::id()));
-    let grippers = dir.join("grippers");
-    std::fs::create_dir_all(&grippers).expect("test config dir");
-    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
-    let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
-    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
-        let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
-    }
-    dst
-}
-
-/// Point the bus-grant segments at a scratch directory, once per test
-/// binary — a test rig must never claim the machine's real bus.
-fn redirect_bus_grant() {
-    static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    ONCE.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("par6-client-shm-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).expect("scratch shm dir");
-        std::env::set_var("PAR6_SHM_DIR", &dir);
-        dir
-    });
-}
-
-/// Boot an in-process sim daemon on ephemeral ports (the daemon owns its
-/// own tokio runtime, so this must run OUTSIDE the client's) and return
-/// the client config wired to it over unicast STATUS.
-fn boot_daemon() -> (Daemon, ClientConfig) {
+/// Boot an in-process sim daemon (it owns its own tokio runtime, so this
+/// runs OUTSIDE the client's) on a config tree private to `tag`, STATUS
+/// unicast to `status_host`; the client config is wired to it.
+fn boot_daemon(tag: &str, status_host: Ipv4Addr) -> (Daemon, ClientConfig) {
     let _ = env_logger::builder().is_test(true).try_init();
-    redirect_bus_grant();
-    // Probe a free port for the STATUS stream; the client binds it.
-    let status_port = {
-        let probe = UdpSocket::bind("127.0.0.1:0").expect("probe socket");
-        probe.local_addr().unwrap().port()
-    };
-    let opts = Options {
-        sim: true,
-        config: Some(test_config()),
-        assets: Some(repo_root().join("assets/par6_description")),
-        command_port: Some(0),
-        bind: Some("127.0.0.1".parse().unwrap()),
-        status_host: Some("127.0.0.1".parse().unwrap()),
-        status_port: Some(status_port),
-        telemetry_port: Some(0),
-        status_transport: Some(DaemonStatusTransport::Unicast),
-        ..Options::default()
-    };
+    common::redirect_bus_grant();
+    let status_port = free_port();
+    let config = common::retimed_config(&format!("client-{tag}"), 0.02);
+    let mut opts = common::sim_options(config, status_port, 0);
+    opts.status_host = Some(IpAddr::V4(status_host));
     let daemon = Daemon::start(&opts).expect("daemon boots in sim mode");
     let cfg = ClientConfig {
         host: "127.0.0.1".into(),
         port: daemon.command_addr().port(),
         timeout: Duration::from_secs(1),
         retries: 2,
-        status: StatusTransport::Unicast {
-            host: "127.0.0.1".parse().unwrap(),
-        },
+        status: StatusTransport::Unicast { host: status_host },
         status_port,
         mtu: 1400,
     };
     (daemon, cfg)
 }
 
-/// Drive one async session against a fresh daemon on a private runtime.
-fn run_session<Fut>(body: impl FnOnce(Client) -> Fut)
+/// Drive one async session against `daemon` on a private runtime.
+fn run_with<Fut>(daemon: Daemon, cfg: ClientConfig, body: impl FnOnce(Client) -> Fut)
 where
     Fut: std::future::Future<Output = ()>,
 {
-    let (daemon, cfg) = boot_daemon();
     let rt = tokio::runtime::Runtime::new().expect("client runtime");
     rt.block_on(async move {
         let client = Client::connect(cfg).await.expect("client connects");
@@ -107,14 +66,13 @@ where
     daemon.shutdown();
 }
 
-fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg =
-        par6_config::RobotConfig::load(&repo_root().join("config/PAR6.toml")).expect("config");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
+/// A fresh daemon for `tag`, and one session against it.
+fn run_session<Fut>(tag: &str, body: impl FnOnce(Client) -> Fut)
+where
+    Fut: std::future::Future<Output = ()>,
+{
+    let (daemon, cfg) = boot_daemon(tag, Ipv4Addr::LOCALHOST);
+    run_with(daemon, cfg, body);
 }
 
 fn close_deg(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol: f64) -> bool {
@@ -146,11 +104,11 @@ async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
 
 #[test]
 fn a_full_session_over_the_rust_client() {
-    run_session(|client| async move {
+    run_session("session", |client| async move {
         assert!(client.wait_ready(Duration::from_secs(15)).await);
         assert!(client.is_simulator().await.expect("is_simulator"));
 
-        let park = park_deg();
+        let park = common::park_deg();
         settle_at(&client, park).await;
         assert!(client.error().await.expect("error query").is_none());
 
@@ -236,7 +194,7 @@ fn a_full_session_over_the_rust_client() {
 
 #[test]
 fn a_refusal_is_a_structured_robot_error() {
-    run_session(|client| async move {
+    run_session("refusal", |client| async move {
         assert!(client.wait_ready(Duration::from_secs(15)).await);
         match client.select_profile("BOGUS").await {
             Err(ClientError::Robot(e)) => {
@@ -251,4 +209,164 @@ fn a_refusal_is_a_structured_robot_error() {
         let pose = client.pose(Frame::Wrf).await.expect("pose");
         assert!(pose.iter().all(|v| v.is_finite()));
     })
+}
+
+/// Replies are matched to their request by the echoed req_id, never by
+/// arrival order: six different queries in flight on one socket at once
+/// each get their own typed answer, round after round. A reply landing
+/// on the wrong waiter would decode as the wrong result variant and
+/// surface as `Unreachable`.
+#[test]
+fn replies_correlate_by_request_id_under_concurrent_queries() {
+    run_session("correlate", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        for round in 0..25 {
+            let (angles, profile, sim, stats, pose, ping) = tokio::join!(
+                client.angles(),
+                client.profile(),
+                client.is_simulator(),
+                client.loop_stats(),
+                client.pose(Frame::Wrf),
+                client.ping(),
+            );
+            let angles = angles.unwrap_or_else(|e| panic!("round {round}: angles: {e}"));
+            assert!(angles.iter().all(|v| v.is_finite()));
+            let profile = profile.unwrap_or_else(|e| panic!("round {round}: profile: {e}"));
+            assert!(!profile.is_empty());
+            assert!(sim.unwrap_or_else(|e| panic!("round {round}: is_simulator: {e}")));
+            let stats = stats.unwrap_or_else(|e| panic!("round {round}: loop_stats: {e}"));
+            assert!(stats.target_hz > 0.0);
+            let pose = pose.unwrap_or_else(|e| panic!("round {round}: pose: {e}"));
+            assert!(pose.iter().all(|v| v.is_finite()));
+            ping.unwrap_or_else(|e| panic!("round {round}: ping: {e}"));
+        }
+    })
+}
+
+/// The idempotency contract: a QUEUED command sent again under the same
+/// key (what the client's retry does when an ack is lost) is re-acked
+/// with its ORIGINAL index and not queued twice — the next fresh command
+/// takes the very next index.
+#[test]
+fn a_retransmitted_queued_command_is_re_acked_with_its_original_index() {
+    run_session("dedup", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        settle_at(&client, park).await;
+
+        let mut target = park;
+        target[0] += 5.0;
+        let keyed = Command::MoveJ(cmd::MoveJ {
+            key: client.fresh_key(),
+            angles: target,
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        });
+        let index = client
+            .queued(keyed.clone())
+            .await
+            .expect("accepted")
+            .expect("acked");
+        let again = client
+            .queued(keyed)
+            .await
+            .expect("accepted")
+            .expect("acked");
+        assert_eq!(again, index, "the retransmit re-acks the original index");
+        assert!(client.wait_command(index, BUDGET).await.expect("completes"));
+
+        let next = client
+            .move_j(park, None, Some(0.5), None, None, false)
+            .await
+            .expect("accepted")
+            .expect("acked");
+        assert_eq!(
+            next,
+            index + 1,
+            "a fresh key is the next command; the retransmit took no slot"
+        );
+        assert!(client.wait_command(next, BUDGET).await.expect("completes"));
+    })
+}
+
+/// A move cancelled mid-flight completes in error: `wait_command`
+/// surfaces the runtime's MOTN_CANCELLED as a structured refusal (never
+/// `Ok(true)`), and there is no settle verdict to read off it.
+#[test]
+fn a_cancelled_move_completes_in_error_with_no_verdict() {
+    run_session("cancel", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        settle_at(&client, park).await;
+
+        let mut far = park;
+        far[0] += 60.0;
+        let index = client
+            .move_j(far, Some(6.0), None, None, None, false)
+            .await
+            .expect("accepted")
+            .expect("acked");
+        assert!(
+            client
+                .wait_status(
+                    move |s| s.executing_index == index as i64
+                        || s.speeds.iter().any(|v| v.abs() > 0.01),
+                    BUDGET
+                )
+                .await,
+            "the move must start before it is stopped"
+        );
+        client.stop(true).await.expect("stop");
+        match client.wait_command(index, BUDGET).await {
+            Err(ClientError::Robot(e)) => {
+                assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
+            }
+            other => panic!("a cancelled move must complete in error, got {other:?}"),
+        }
+        assert_eq!(client.command_verdict(index), None);
+    })
+}
+
+/// When no interface can join the multicast group, the STATUS
+/// subscription falls back to unicast on the CONFIGURED fallback host —
+/// the one the daemon is told to send to — not to localhost.
+#[test]
+fn the_status_stream_falls_back_to_the_configured_unicast_host() {
+    let host = Ipv4Addr::new(127, 0, 0, 2);
+    let (daemon, mut cfg) = boot_daemon("fallback", host);
+    cfg.status = StatusTransport::Multicast {
+        // A unicast address is not a group any interface can join, so
+        // every rung of the multicast ladder fails and the fallback runs.
+        group: Ipv4Addr::LOCALHOST,
+        iface: Ipv4Addr::LOCALHOST,
+        fallback: host,
+    };
+    run_with(daemon, cfg, |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        assert!(
+            client.wait_status(|_| true, BUDGET).await,
+            "STATUS must reach the fallback socket bound on the configured host"
+        );
+    });
+}
+
+/// An MTU too small to carry a chunk envelope is refused at connect,
+/// never wrapped into an oversized datagram.
+#[test]
+fn a_too_small_mtu_is_refused_at_connect() {
+    let rt = tokio::runtime::Runtime::new().expect("client runtime");
+    for mtu in [0, 1, MIN_MTU - 1] {
+        let cfg = ClientConfig {
+            mtu,
+            ..ClientConfig::default()
+        };
+        match rt.block_on(Client::connect(cfg)) {
+            Err(ClientError::Invalid(msg)) => assert!(msg.contains("mtu"), "{msg}"),
+            Err(other) => panic!("mtu {mtu} must be refused as invalid, got {other}"),
+            Ok(_) => panic!("mtu {mtu} must be refused, but the client connected"),
+        }
+    }
 }

@@ -2,13 +2,40 @@
 //! plain dicts (the Python shim owns the typed surface), errors become a
 //! structured exception carrying the wire's six-tuple.
 
-use pyo3::exceptions::PyRuntimeError;
+use std::time::Duration;
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
 use par6_client::ClientError;
 use par6_proto::command::ToolParam;
-use par6_proto::{QueryResult, Shape, Status, ToolStatusWire, WireError};
+use par6_proto::{Frame, QueryResult, Shape, Status, ToolStatusWire, WireError};
+
+/// The wire frame discriminant as a [`Frame`].
+pub fn frame_of(v: u8) -> PyResult<Frame> {
+    Frame::from_wire(i64::from(v))
+        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
+}
+
+/// Seconds beyond which a wait is "forever" — tokio's own far-future
+/// horizon, so the deadline arithmetic behind every wait stays finite.
+const WAIT_FOREVER_S: u64 = 86_400 * 365 * 30;
+
+/// A Python timeout in seconds as a [`Duration`]. NaN and negative values
+/// raise `ValueError`; `inf` (Python's natural "wait forever") waits as
+/// long as the runtime can schedule.
+pub fn checked_duration(seconds: f64, what: &str) -> PyResult<Duration> {
+    if seconds.is_nan() || seconds < 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "{what} must be a non-negative number of seconds, got {seconds}"
+        )));
+    }
+    if seconds >= WAIT_FOREVER_S as f64 {
+        return Ok(Duration::from_secs(WAIT_FOREVER_S));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
 
 pyo3::create_exception!(
     _par6,

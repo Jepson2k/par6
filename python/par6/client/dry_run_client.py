@@ -304,12 +304,11 @@ class DryRunRobotClient:
     def _convert(self, r: dict) -> DryRunResultData:
         """One engine preview result as :class:`DryRunResultData`.
 
-        Trajectories are downsampled to ``max_snapshot_points`` (endpoints
-        kept); an empty trajectory (a command that moves nothing) reports
-        one sample at the pose the arm holds.
+        The engine already thinned the trajectory to ``max_snapshot_points``
+        (endpoints kept); an empty trajectory (a command that moves
+        nothing) reports one sample at the pose the arm holds.
         """
         traj = np.asarray(r["joint_trajectory_rad"], dtype=np.float64)
-        poses = r["tcp_poses"]
         if traj.size == 0:
             return DryRunResultData(
                 tcp_poses=self._si_pose_now()[np.newaxis, :],
@@ -317,19 +316,11 @@ class DryRunRobotClient:
                 duration=float(r["duration_s"]),
                 joint_trajectory_rad=self._q()[np.newaxis, :].copy(),
             )
-        stride = max(1, len(traj) // self._max_points)
-        idx = list(range(0, len(traj), stride))
-        if idx[-1] != len(traj) - 1:
-            idx.append(len(traj) - 1)
-        sampled = traj[idx]
-        sampled_poses = np.stack(
-            [_matrix_to_si_pose(poses[i]) for i in idx if i < len(poses)]
-        )
         return DryRunResultData(
-            tcp_poses=sampled_poses,
+            tcp_poses=np.stack([_matrix_to_si_pose(p) for p in r["tcp_poses"]]),
             end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
             duration=float(r["duration_s"]),
-            joint_trajectory_rad=sampled,
+            joint_trajectory_rad=traj,
         )
 
     def _error_result(self, err: RobotError) -> DryRunResultData:
@@ -347,7 +338,7 @@ class DryRunRobotClient:
         ``IK_PARTIAL_PATH`` — a preview wants to show how far a line gets,
         and the caller reads that off the result's ``error``.
         """
-        results = self._preview.preview_program(cmds)
+        results = self._preview.preview_program(cmds, self._max_points)
         out: list[DryRunResultData] = []
         for r in results:
             err = r["error"]
@@ -774,7 +765,9 @@ class DryRunRobotClient:
             fractions[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")
-        r = self._preview.preview_jog(fractions, float(duration), float(accel))
+        r = self._preview.preview_jog(
+            fractions, float(duration), float(accel), self._max_points
+        )
         if r["error"] is not None:
             raise RobotError.from_wire(r["error"])
         return self._convert(r)
