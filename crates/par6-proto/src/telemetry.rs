@@ -73,11 +73,20 @@ pub enum TelemetryField {
     /// Gripper fault bitfield (bit 0 temperature, 1 timeout, 2 e-stop,
     /// 3 live fault bit; 0 = healthy).
     GripperFault,
+    /// Streaming session substate (u64): 0 unpaired, 1 connected, 2
+    /// control active (STREAM mode, setpoints being applied).
+    StreamSubstate,
+    /// Fraction of ticks in the RT's moving window on which a streamed
+    /// setpoint was applied (0–1); 0 outside a stream.
+    StreamSuccessRate,
+    /// Percentage of received setpoints the RT discarded as superseded
+    /// over the window (0–100); 0 outside a stream.
+    StreamDiscardPct,
 }
 
 impl TelemetryField {
     /// All fields, in the canonical order used by the `full` recipe.
-    pub const ALL: [TelemetryField; 24] = [
+    pub const ALL: [TelemetryField; 27] = [
         TelemetryField::Tick,
         TelemetryField::MeasuredPositions,
         TelemetryField::MeasuredVelocities,
@@ -102,6 +111,9 @@ impl TelemetryField {
         TelemetryField::GripperCurrentMa,
         TelemetryField::GripperObjectDetection,
         TelemetryField::GripperFault,
+        TelemetryField::StreamSubstate,
+        TelemetryField::StreamSuccessRate,
+        TelemetryField::StreamDiscardPct,
     ];
 
     /// Stable snake_case key — the name a consumer indexes decoded
@@ -133,6 +145,9 @@ impl TelemetryField {
             F::GripperCurrentMa => "gripper_current_ma",
             F::GripperObjectDetection => "gripper_object_detection",
             F::GripperFault => "gripper_fault",
+            F::StreamSubstate => "stream_substate",
+            F::StreamSuccessRate => "stream_success_rate",
+            F::StreamDiscardPct => "stream_discard_pct",
         }
     }
 }
@@ -148,7 +163,7 @@ pub struct TelemetryRecipe {
 
 impl TelemetryRecipe {
     /// The stock registry: `minimal` / `standard` / `commanded` /
-    /// `diagnostics` / `full`.
+    /// `diagnostics` / `streaming` / `full`.
     pub fn defaults() -> Vec<TelemetryRecipe> {
         use TelemetryField as F;
         let recipe = |name: &str, fields: Vec<TelemetryField>| TelemetryRecipe {
@@ -192,6 +207,18 @@ impl TelemetryRecipe {
                     F::LoopP99S,
                     F::LoopOverruns,
                     F::GripperFault,
+                ],
+            ),
+            recipe(
+                "streaming",
+                vec![
+                    F::Tick,
+                    F::MeasuredPositions,
+                    F::CommandedPositions,
+                    F::TargetPositions,
+                    F::StreamSubstate,
+                    F::StreamSuccessRate,
+                    F::StreamDiscardPct,
                 ],
             ),
             recipe("full", TelemetryField::ALL.to_vec()),

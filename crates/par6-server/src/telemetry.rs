@@ -4,7 +4,7 @@
 //! [`par6_proto::telemetry`]; this module is the server half — extracting
 //! each field's value from the [`StateSnapshot`] and encoding the packet.
 
-use par6_rt::{StateSnapshot, MAX_JOINTS, NUM_NODES};
+use par6_rt::{StateSnapshot, StreamSubstate, MAX_JOINTS, NUM_NODES};
 
 use par6_proto::telemetry::{encode_telemetry, TelemetryValue};
 pub use par6_proto::telemetry::{TelemetryField, TelemetryRecipe};
@@ -59,6 +59,13 @@ fn extract(field: TelemetryField, snap: &StateSnapshot) -> TelemetryValue {
         F::GripperFault => V::U64(u64::from(
             u32::try_from(crate::faults::gripper_fault_code(snap)).unwrap_or(0),
         )),
+        F::StreamSubstate => V::U64(match snap.stream.substate {
+            StreamSubstate::Unpaired => 0,
+            StreamSubstate::Connected => 1,
+            StreamSubstate::ControlActive => 2,
+        }),
+        F::StreamSuccessRate => V::F64(f64::from(snap.stream.success_rate)),
+        F::StreamDiscardPct => V::F64(f64::from(snap.stream.discard_pct)),
     }
 }
 
