@@ -33,6 +33,7 @@ from waldoctl.status import (
 from waldoctl.status import (
     ActivityResult,
     LoopStatsResult,
+    PayloadIdentificationResult,
     PayloadResult,
     PingResult,
     ToolResult,
@@ -43,6 +44,7 @@ from waldoctl.types import Frame as WFrame
 
 from par6._par6 import CoreClient, RobotWireError
 
+from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
@@ -979,6 +981,64 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
         )
 
+    async def identify_payload(
+        self,
+        spread: float = 0.5,
+        ridge: float = 0.01,
+        declare: bool = True,
+    ) -> PayloadIdentificationResult:
+        """Work out what the arm is carrying, and tell the runtime.
+
+        Call it after closing on a part whose mass you do not know.  The
+        WRIST swings where the arm already stands — the payload's lever
+        arm about the wrist is what makes its first moment observable —
+        so nothing below moves, the pick is not disturbed, and the whole
+        thing takes seconds rather than the workspace-wide sweep a link
+        calibration would need.
+
+        The runtime's payload is cleared first: the load is identified
+        from the torque the *unloaded* model cannot account for, so a
+        payload already declared would be compensated away and come back
+        as nothing.  With *declare* (the default) the result is sent
+        straight back as the new payload, so the gravity model carries
+        the part from the next tick.
+
+        *spread* is how far each wrist joint swings either way (rad);
+        widen it when the wrist has room and the result reads noisy.
+        *ridge* holds back parameters the poses did not measure.
+
+        Raises ``RuntimeError`` if the wrist has no room to swing, or if
+        *declare* is set and the poses did not actually measure a mass.
+
+        Category: Configuration
+
+        Example:
+            found = rbt.identify_payload()
+            print(f"holding {found.mass:.3f} kg")
+        """
+        core = await self._ensure_core()
+        raw = await self._call(
+            core.identify_payload(
+                str(_cfg.data_root() / "config" / "PAR6.toml"),
+                str(_cfg.data_root()),
+                str(_cfg.package_search_dir()),
+                float(spread),
+                float(ridge),
+                bool(declare),
+            )
+        )
+        return PayloadIdentificationResult(
+            mass=float(raw["mass"]),
+            com=cast("tuple[float, float, float]", tuple(raw["com"])),
+            determined=cast(
+                "tuple[float, float, float, float]", tuple(raw["determined"])
+            ),
+            rms_nm=float(raw["rms_nm"]),
+            rms_unloaded_nm=float(raw["rms_unloaded_nm"]),
+            poses=int(raw["poses"]),
+            declared=bool(raw["declared"]),
+        )
+
     async def payload(self) -> PayloadResult | None:
         """The effective runtime payload.
 
@@ -1294,19 +1354,7 @@ class AsyncRobotClient(_RobotClientABC):
         # at hardware that is not on the arm.
         self._active_tool_key = key
         self._active_variant_key = variant_key
-        result = await self._finish_queued(index, False, 0.0)
-        # A tool that describes its own mass is one the runtime does not
-        # model: par6 is built around a fitted gripper and carries that
-        # gripper's inertials in its own config, so a spec declaring a
-        # payload is a third-party tool nobody's config knows about.
-        # Declaring it is the whole point of ToolSpec.payload — a gravity
-        # model that has never heard of the thing bolted to the flange
-        # holds the arm against a load it cannot see.
-        spec = self._bound_tools.get(key)
-        load = spec.payload if spec is not None else None
-        if load is not None:
-            await self.set_payload(load.mass_kg, load.com_m, load.inertia_kg_m2)
-        return result
+        return await self._finish_queued(index, False, 0.0)
 
     async def checkpoint(self, label: str) -> int:
         """Insert a checkpoint marker in the command queue.

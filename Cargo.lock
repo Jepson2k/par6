@@ -611,10 +611,8 @@ dependencies = [
 name = "par6-calibrate"
 version = "0.1.0"
 dependencies = [
- "env_logger",
  "log",
  "par6-client",
- "par6-config",
  "par6-kin",
  "par6-proto",
  "tokio",
@@ -681,6 +679,7 @@ name = "par6-py"
 version = "0.1.0"
 dependencies = [
  "log",
+ "par6-calibrate",
  "par6-client",
  "par6-config",
  "par6-kin",

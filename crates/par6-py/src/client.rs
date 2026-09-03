@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 use pyo3_async_runtimes::tokio::future_into_py;
 
 use par6_client::{Ack, Client, ClientConfig, ClientError, MotionWait, StatusTransport};
@@ -18,6 +19,77 @@ use crate::convert::{
     client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
     tool_param_from_py, wire_error_tuple,
 };
+
+/// The model a payload identification measures against: the arm with no
+/// tool payload, its collision world, and the joint window, all from the
+/// same config the daemon runs.
+/// The model, its collision world and the joint window.
+type IdentificationModel = (par6_kin::Kin, par6_kin::Collision, [(f64, f64); NUM_JOINTS]);
+
+fn identification_model(
+    config: Option<&str>,
+    assets: Option<&str>,
+    package_dir: Option<&str>,
+) -> PyResult<IdentificationModel> {
+    let config_path = match config {
+        Some(p) => std::path::PathBuf::from(p),
+        None => par6d::preview::Preview::default_config_path().map_err(PyRuntimeError::new_err)?,
+    };
+    let bundle = par6_config::ConfigBundle::load(&config_path)
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    let robot = &bundle.robot;
+    let assets_dir = match assets {
+        Some(p) => std::path::PathBuf::from(p),
+        None => config_path
+            .parent()
+            .map(|d| d.join("../assets/par6_description"))
+            .unwrap_or_else(|| std::path::PathBuf::from("assets/par6_description")),
+    };
+    let gripper = bundle.active_gripper();
+    let variant = par6_kin::GripperVariant::resolve(
+        &robot.robot.active_gripper.to_ascii_uppercase(),
+        gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
+    // No tool payload: what the fit explains is torque this model cannot
+    // account for, and the fitted gripper is already part of the arm.
+    let tool = gripper.map(|g| {
+        let k = &g.kinematics;
+        par6_kin::Kin::dh_tool_params(
+            k.d_m,
+            k.a_m,
+            k.alpha_rad,
+            k.mass_kg,
+            k.com_m,
+            k.inertia_kg_m2,
+        )
+    });
+    let kin = par6_kin::Kin::load_arm(&assets_dir, tool.as_ref())
+        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+    // The packaged tree spells its meshes `package://par6/_data/…`, which
+    // resolves under the installed package's parent rather than under the
+    // assets tree — so the caller says where, and `Collision::load`'s
+    // assets-tree assumption only applies when it does not.
+    let collision = match package_dir {
+        Some(dir) => {
+            let mut c = par6_kin::Collision::from_urdf(
+                &assets_dir.join(variant.urdf_relpath()),
+                Some(std::path::Path::new(dir)),
+                0.0,
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            c
+        }
+        None => par6_kin::Collision::load(&assets_dir, variant, 0.0)
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
+    };
+    let mut window = [(0.0, 0.0); NUM_JOINTS];
+    for (w, j) in window.iter_mut().zip(robot.joints.iter()) {
+        *w = (j.limits.soft_min_rad, j.limits.soft_max_rad);
+    }
+    Ok((kin, collision, window))
+}
 
 fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
@@ -431,6 +503,102 @@ impl CoreClient {
 
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         query_future(py, self.rt(), Command::Payload)
+    }
+
+    /// Work out what the arm is carrying and, optionally, tell the
+    /// runtime.
+    ///
+    /// Swings the WRIST where the arm already stands — the payload's
+    /// lever arm about the wrist is what makes its first moment
+    /// observable, so nothing below moves and the pick is not disturbed.
+    /// Takes seconds, which is what a program can afford between picking
+    /// a part up and moving it.
+    ///
+    /// Clears the runtime's payload first: the load is identified from
+    /// torque the UNLOADED model cannot account for, so a payload
+    /// already declared would be compensated away and come back as
+    /// nothing.
+    ///
+    /// Returns `mass` \[kg\], `com` \[m\] in the payload body's frame,
+    /// `determined` (per parameter, how much the poses fixed rather than
+    /// the ridge), and the residuals with and without the load.
+    #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
+    #[allow(clippy::too_many_arguments)]
+    fn identify_payload<'py>(
+        &self,
+        py: Python<'py>,
+        config: Option<String>,
+        assets: Option<String>,
+        package_dir: Option<String>,
+        spread: f64,
+        ridge: f64,
+        declare: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        let (kin, collision, window) =
+            identification_model(config.as_deref(), assets.as_deref(), package_dir.as_deref())?;
+        future_into_py(py, async move {
+            let (mut kin, mut collision) = (kin, collision);
+            client
+                .set_payload(0.0, [0.0; 3], None)
+                .await
+                .map_err(client_err)?;
+
+            let angles = client.angles().await.map_err(client_err)?;
+            let mut start = [0.0; NUM_JOINTS];
+            for (out, deg) in start.iter_mut().zip(angles.iter()) {
+                *out = deg.to_radians();
+            }
+
+            let protocol = par6_calibrate::Protocol::default();
+            let poses = par6_calibrate::plan_poses(
+                &mut collision,
+                &start,
+                &window,
+                spread,
+                protocol.approach_rad,
+            )
+            .map_err(PyRuntimeError::new_err)?;
+            let report = par6_calibrate::identify(&client, &mut kin, &poses, &protocol, ridge)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
+
+            if declare {
+                // Nothing measurable means nothing to declare: a wrist
+                // with no room to swing lands here, and pushing a
+                // noise-level mass would leave the gravity model worse
+                // than an empty hand.
+                if report.fit.determined[0] <= par6_calibrate::MEASURED {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "the poses did not measure the mass (determined {:.2}); \
+                         give the wrist more room or a wider spread",
+                        report.fit.determined[0]
+                    )));
+                }
+                if !(report.fit.mass.is_finite() && report.fit.mass > 0.0) {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "refusing to declare a mass of {:.4} kg",
+                        report.fit.mass
+                    )));
+                }
+                client
+                    .set_payload(report.fit.mass, report.fit.com, None)
+                    .await
+                    .map_err(client_err)?;
+            }
+
+            Python::with_gil(|py| {
+                let d = PyDict::new(py);
+                d.set_item("mass", report.fit.mass)?;
+                d.set_item("com", report.fit.com.to_vec())?;
+                d.set_item("determined", report.fit.determined.to_vec())?;
+                d.set_item("rms_nm", report.fit.rms_nm)?;
+                d.set_item("rms_unloaded_nm", report.fit.rms_unloaded_nm)?;
+                d.set_item("poses", report.samples.len())?;
+                d.set_item("declared", declare)?;
+                Ok(d.unbind())
+            })
+        })
     }
 
     #[pyo3(signature = (mass, com, inertia=None))]

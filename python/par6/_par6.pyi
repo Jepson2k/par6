@@ -273,6 +273,15 @@ class CoreClient:
     def set_payload(
         self, mass: float, com: list[float], inertia: list[float] | None = None
     ) -> Awaitable[int]: ...
+    def identify_payload(
+        self,
+        config: str | None = None,
+        assets: str | None = None,
+        package_dir: str | None = None,
+        spread: float = 0.5,
+        ridge: float = 0.01,
+        declare: bool = False,
+    ) -> Awaitable[dict[str, Any]]: ...
 
 class Preview:
     def __init__(

@@ -31,7 +31,6 @@ from live_daemon import (
     sim_config,
 )
 from waldoctl.shapes import Box
-from waldoctl.tools import PayloadSpec, ToolSpec
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -1550,29 +1549,6 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         info = await client.payload()
         assert info is not None and info.mass == 0.0
 
-        # A tool that declares its own mass declares it to the runtime on
-        # selection: par6 models the gripper it is fitted with, but a
-        # third-party tool is one nothing in its config has heard of, and
-        # a gravity model that cannot see the load holds the arm against
-        # it.
-        active = client.tool
-        carried = ToolSpec(
-            key=active.key,
-            display_name=active.display_name,
-            tool_type=active.tool_type,
-            tcp_origin=active.tcp_origin,
-            tcp_rpy=active.tcp_rpy,
-            payload=PayloadSpec(mass_kg=0.8, com_m=(0.0, 0.0, 0.03)),
-        )
-        client.bind_tools([carried])
-        assert await client.select_tool(active.key) >= 0
-        info = await client.payload()
-        assert info is not None
-        assert info.mass == pytest.approx(0.8), (
-            "selecting a tool that declares a payload must declare it"
-        )
-        assert info.com == pytest.approx((0.0, 0.0, 0.03))
-
 
 async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaemon):
     """The maintenance surface end to end: SET_PID_GAINS re-pushes a
@@ -1650,3 +1626,72 @@ def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon):
     dead = ["--host", "127.0.0.1", "--port", str(dead_port), "--timeout", "0.5"]
     for verb in ("estop", "stop", "reset"):
         assert main([*dead, verb]) == EXIT_UNREACHABLE, verb
+
+
+@pytest.mark.timeout(240)
+async def test_identify_payload_runs_from_a_program_and_only_declares_what_it_found(
+    daemon: LiveDaemon,
+):
+    """A pick routine can ask what it just picked up, in-process.
+
+    This is the shape the operation has to have: a client call between
+    closing the gripper and moving the part, not something run from a
+    terminal. What is asserted here is that contract — the wrist swings,
+    a well-formed answer comes back, and the runtime's payload changes
+    only when the answer is declared and only to what was found.
+
+    Whether the number is RIGHT is not asserted here and cannot be: this
+    fixture re-ticks the daemon for CI, and at that rate the torque plant
+    limit-cycles, so reported current is chatter rather than gravity.
+    That measurement lives against the shipped tick in
+    `par6d/tests/gravity_calibration.rs`, where the plant swings a gripper
+    the model does not know about and 0.370 kg comes back as 0.358 kg.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        async def home():
+            assert await client.home(wait=True) >= 0
+
+        assert await enable(client, home) is None
+
+        before = await client.payload()
+        assert before is not None and before.mass == 0.0
+
+        found = await client.identify_payload(declare=False)
+        assert found.poses >= 3, "the wrist must have been swung somewhere"
+        assert not found.declared
+        assert math.isfinite(found.mass)
+        assert len(found.com) == 3 and all(math.isfinite(v) for v in found.com)
+        assert len(found.determined) == 4
+        assert all(0.0 <= d <= 1.0 for d in found.determined), found.determined
+        assert found.rms_nm <= found.rms_unloaded_nm, (
+            "identifying a load cannot explain the torque worse than ignoring it: "
+            f"{found.rms_nm} vs {found.rms_unloaded_nm} Nm"
+        )
+
+        # Asking is not declaring.
+        carried = await client.payload()
+        assert carried is not None and carried.mass == 0.0, (
+            "identify_payload(declare=False) must not change what the arm carries"
+        )
+
+        # Declaring puts exactly what was found on the arm — or refuses,
+        # when the poses did not measure a mass to put there. Either way
+        # the runtime and the answer agree.
+        try:
+            declared = await client.identify_payload(declare=True)
+        except RuntimeError as refused:
+            assert "did not measure the mass" in str(refused) or "refusing" in str(
+                refused
+            ), refused
+            carried = await client.payload()
+            assert carried is not None and carried.mass == 0.0, (
+                "a refused identification must not declare anything"
+            )
+        else:
+            assert declared.declared
+            carried = await client.payload()
+            assert carried is not None
+            assert carried.mass == pytest.approx(declared.mass, rel=1e-6)
+            assert carried.com == pytest.approx(declared.com, rel=1e-6)
