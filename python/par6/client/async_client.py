@@ -33,7 +33,7 @@ from waldoctl.status import (
 from waldoctl.status import (
     ActivityResult,
     LoopStatsResult,
-    PayloadIdentificationResult,
+    PayloadEstimate,
     PayloadResult,
     PingResult,
     ToolResult,
@@ -973,22 +973,26 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
         )
 
-    async def identify_payload(
+    async def estimate_payload(
         self,
         spread: float = 0.5,
         ridge: float = 0.01,
         declare: bool = True,
-    ) -> PayloadIdentificationResult:
-        """Work out what the arm is carrying, and tell the runtime.
+    ) -> PayloadEstimate:
+        """Estimate what the arm is carrying, and tell the runtime.
+
+        Mass and centre of mass, from the torque the wrist holds.  Not
+        the inertia tensor — static poses cannot excite it — so the
+        runtime carries the result as a point mass, which is what most
+        payloads are well enough described by.
 
         Call it after closing on a part whose mass you do not know.  The
         WRIST swings where the arm already stands — the payload's lever
         arm about the wrist is what makes its first moment observable —
         so nothing below moves, the pick is not disturbed, and the whole
-        thing takes seconds rather than the workspace-wide sweep a link
-        calibration would need.
+        thing takes seconds.
 
-        The runtime's payload is cleared first: the load is identified
+        The runtime's payload is cleared first: the load is estimated
         from the torque the *unloaded* model cannot account for, so a
         payload already declared would be compensated away and come back
         as nothing.  With *declare* (the default) the result is sent
@@ -1005,12 +1009,12 @@ class AsyncRobotClient(_RobotClientABC):
         Category: Configuration
 
         Example:
-            found = rbt.identify_payload()
+            found = rbt.estimate_payload()
             print(f"holding {found.mass:.3f} kg")
         """
         core = await self._ensure_core()
         raw = await self._call(
-            core.identify_payload(
+            core.estimate_payload(
                 str(_cfg.data_root() / "config" / "PAR6.toml"),
                 str(_cfg.data_root()),
                 str(_cfg.package_search_dir()),
@@ -1019,7 +1023,7 @@ class AsyncRobotClient(_RobotClientABC):
                 bool(declare),
             )
         )
-        return PayloadIdentificationResult(
+        return PayloadEstimate(
             mass=float(raw["mass"]),
             com=cast("tuple[float, float, float]", tuple(raw["com"])),
             determined=cast(

@@ -17,7 +17,7 @@ from typing import Any, TypeVar
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import (
     ActivityResult,
-    PayloadIdentificationResult,
+    PayloadEstimate,
     PayloadResult,
     PingResult,
     ToolResult,
@@ -434,14 +434,14 @@ class RobotClient:
         """Declare the payload the arm is carrying at the TCP."""
         return _run(self._inner.set_payload(mass, com, inertia))
 
-    def identify_payload(
+    def estimate_payload(
         self,
         spread: float = 0.5,
         ridge: float = 0.01,
         declare: bool = True,
-    ) -> PayloadIdentificationResult:
-        """Work out what the arm is carrying, and tell the runtime."""
-        return _run(self._inner.identify_payload(spread, ridge, declare))
+    ) -> PayloadEstimate:
+        """Estimate the payload's mass and centre of mass, and tell the runtime."""
+        return _run(self._inner.estimate_payload(spread, ridge, declare))
 
     def payload(self) -> PayloadResult | None:
         """The effective runtime payload (zeros = none)."""

@@ -273,7 +273,7 @@ class CoreClient:
     def set_payload(
         self, mass: float, com: list[float], inertia: list[float] | None = None
     ) -> Awaitable[int]: ...
-    def identify_payload(
+    def estimate_payload(
         self,
         config: str | None = None,
         assets: str | None = None,

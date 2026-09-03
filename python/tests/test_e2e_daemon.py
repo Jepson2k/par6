@@ -1655,7 +1655,7 @@ def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon):
 
 
 @pytest.mark.timeout(240)
-async def test_identify_payload_runs_from_a_program_and_only_declares_what_it_found(
+async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_found(
     daemon: LiveDaemon,
 ):
     """A pick routine can ask what it just picked up, in-process.
@@ -1684,7 +1684,7 @@ async def test_identify_payload_runs_from_a_program_and_only_declares_what_it_fo
         before = await client.payload()
         assert before is not None and before.mass == 0.0
 
-        found = await client.identify_payload(declare=False)
+        found = await client.estimate_payload(declare=False)
         assert found.poses >= 3, "the wrist must have been swung somewhere"
         assert not found.declared
         assert math.isfinite(found.mass)
@@ -1699,14 +1699,14 @@ async def test_identify_payload_runs_from_a_program_and_only_declares_what_it_fo
         # Asking is not declaring.
         carried = await client.payload()
         assert carried is not None and carried.mass == 0.0, (
-            "identify_payload(declare=False) must not change what the arm carries"
+            "estimate_payload(declare=False) must not change what the arm carries"
         )
 
         # Declaring puts exactly what was found on the arm — or refuses,
         # when the poses did not measure a mass to put there. Either way
         # the runtime and the answer agree.
         try:
-            declared = await client.identify_payload(declare=True)
+            declared = await client.estimate_payload(declare=True)
         except RuntimeError as refused:
             assert "did not measure the mass" in str(refused) or "refusing" in str(
                 refused

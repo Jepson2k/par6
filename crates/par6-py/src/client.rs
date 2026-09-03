@@ -24,13 +24,13 @@ use crate::convert::{
 /// tool payload, its collision world, and the joint window, all from the
 /// same config the daemon runs.
 /// The model, its collision world and the joint window.
-type IdentificationModel = (par6_kin::Kin, par6_kin::Collision, [(f64, f64); NUM_JOINTS]);
+type EstimationModel = (par6_kin::Kin, par6_kin::Collision, [(f64, f64); NUM_JOINTS]);
 
-fn identification_model(
+fn estimation_model(
     config: Option<&str>,
     assets: Option<&str>,
     package_dir: Option<&str>,
-) -> PyResult<IdentificationModel> {
+) -> PyResult<EstimationModel> {
     let config_path = match config {
         Some(p) => std::path::PathBuf::from(p),
         None => par6d::preview::Preview::default_config_path().map_err(PyRuntimeError::new_err)?,
@@ -505,8 +505,9 @@ impl CoreClient {
         query_future(py, self.rt(), Command::Payload)
     }
 
-    /// Work out what the arm is carrying and, optionally, tell the
-    /// runtime.
+    /// Estimate what the arm is carrying — mass and centre of mass, never
+    /// the inertia tensor, which static poses cannot excite — and,
+    /// optionally, tell the runtime.
     ///
     /// Swings the WRIST where the arm already stands — the payload's
     /// lever arm about the wrist is what makes its first moment
@@ -524,7 +525,7 @@ impl CoreClient {
     /// the ridge), and the residuals with and without the load.
     #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
     #[allow(clippy::too_many_arguments)]
-    fn identify_payload<'py>(
+    fn estimate_payload<'py>(
         &self,
         py: Python<'py>,
         config: Option<String>,
@@ -536,7 +537,7 @@ impl CoreClient {
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         let (kin, collision, window) =
-            identification_model(config.as_deref(), assets.as_deref(), package_dir.as_deref())?;
+            estimation_model(config.as_deref(), assets.as_deref(), package_dir.as_deref())?;
         future_into_py(py, async move {
             let (mut kin, mut collision) = (kin, collision);
             client
