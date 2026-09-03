@@ -361,6 +361,26 @@ pub struct JogStatus {
     pub blocked_mask: u16,
 }
 
+/// The opt-in per-phase tick profile: wall time spent in each phase of
+/// the tick, as a running maximum since profiling was switched on, plus
+/// the phase times of the most recent tick the caller flagged as a
+/// missed deadline. All zero while profiling is off. Slots, in tick
+/// order: GPIO/inputs, loop timing, boot one-shots, command intake,
+/// RX drain and derivation, gravity, error checks, dispatch and TX,
+/// clear-settle tick, publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TickProfile {
+    /// Running maximum per phase \[ns\].
+    pub phase_max_ns: [u32; TICK_PHASES],
+    /// Per-phase times of the last overrun tick \[ns\].
+    pub overrun_ns: [u32; TICK_PHASES],
+    /// Overrun ticks traced since profiling was switched on.
+    pub overruns_traced: u32,
+}
+
+/// Number of profiled tick phases.
+pub const TICK_PHASES: usize = 10;
+
 /// Streaming session substate (lifecycle is separate from mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamSubstate {
@@ -483,6 +503,8 @@ pub struct StateSnapshot {
     pub bus_nodes: u16,
     /// Bumped once each `RescanBus` has pinged every id and settled.
     pub bus_scan_epoch: u32,
+    /// The opt-in tick profile (all zero unless switched on).
+    pub tick_profile: TickProfile,
     /// Digital I/O levels: the first `io_inputs` entries are the
     /// debounced input levels, the next `io_outputs` are the levels the
     /// tick loop is driving, both in `[io]` config order.
@@ -553,6 +575,7 @@ impl Default for StateSnapshot {
             drift_lock: DriftLockStatus::default(),
             bus_nodes: 0,
             bus_scan_epoch: 0,
+            tick_profile: TickProfile::default(),
             io_lines: [0; MAX_IO_LINES],
             io_inputs: 0,
             io_outputs: 0,

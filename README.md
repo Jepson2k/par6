@@ -168,6 +168,7 @@ rather than approximate it.
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
 | `tests/golden/` | golden wire vectors (encode/decode conformance for the frozen codec) |
+| `tools/bringup/` | the staged on-hardware bring-up kit — see its README |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
 ### Two planes, one process
@@ -343,6 +344,7 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
 | `PAR6_LOG_DIR` | also write the rotating activity logs there (`--log-dir`) — see below |
+| `PAR6_TICK_PROFILE` | per-phase RT tick profiler, logged once a second (`--tick-profile`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
 

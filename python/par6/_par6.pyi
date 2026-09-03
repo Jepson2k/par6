@@ -209,6 +209,13 @@ class Preview:
         self, speeds: list[float], duration: float, accel: float | None = None
     ) -> dict[str, Any]: ...
     def preview_program(self, cmds: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
+    def preview_servo(
+        self,
+        targets: list[list[float]],
+        hold_ticks: int,
+        speed: float | None = None,
+        accel: float | None = None,
+    ) -> dict[str, Any]: ...
 
 class TelemetryReader:
     def __init__(

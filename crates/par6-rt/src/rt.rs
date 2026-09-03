@@ -22,6 +22,9 @@ pub struct RunOptions {
     pub cpu: Option<usize>,
     /// SCHED_FIFO priority.
     pub fifo_priority: Option<u8>,
+    /// Run the per-phase tick profiler (a clock read per phase; off by
+    /// default, the tick then costs nothing extra).
+    pub tick_profile: bool,
 }
 
 impl Default for RunOptions {
@@ -29,6 +32,7 @@ impl Default for RunOptions {
         Self {
             cpu: Some(3),
             fifo_priority: Some(99),
+            tick_profile: false,
         }
     }
 }

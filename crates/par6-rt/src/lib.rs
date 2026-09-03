@@ -79,7 +79,7 @@ pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{
     ArmState, ErrorCode, ErrorEntry, ErrorList, ExecStatus, HomingJointStatus, HomingPhase,
     HomingStatus, JogStatus, LoopStats, Mode, StateSnapshot, StreamStatus, StreamSubstate,
-    MAX_ERRORS,
+    TickProfile, MAX_ERRORS, TICK_PHASES,
 };
 
 /// Compile-time arm joint count the fixed-size RT types are dimensioned

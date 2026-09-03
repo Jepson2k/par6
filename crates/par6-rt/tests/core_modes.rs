@@ -476,3 +476,44 @@ fn leaving_safety_stop_ramps_gravity_instead_of_stepping_it() {
         "the hold came back in a single tick — the slew limit is not enforced"
     );
 }
+
+/// The opt-in tick profiler: off, the snapshot carries zeros and the
+/// tick reads no clock; on, every phase's running maximum is non-zero
+/// after a few ticks and a tick flagged as an overrun leaves its own
+/// phase times behind, counted.
+#[test]
+fn the_tick_profiler_records_phase_maxima_and_traces_an_overrun() {
+    let mut rig = Rig::new();
+    rig.boot_to_idle();
+    assert_eq!(rig.snap().tick_profile, par6_rt::TickProfile::default());
+
+    rig.core.set_tick_profile(true);
+    rig.tick_n(20);
+    let p = rig.snap().tick_profile;
+    assert!(
+        p.phase_max_ns.iter().all(|&n| n > 0),
+        "every phase takes measurable time: {p:?}"
+    );
+    assert_eq!(p.overruns_traced, 0);
+    assert_eq!(p.overrun_ns, [0; par6_rt::TICK_PHASES]);
+
+    rig.inject_pose();
+    rig.core.tick(rig.dt, true);
+    let p = rig.snap().tick_profile;
+    assert_eq!(p.overruns_traced, 1);
+    assert!(
+        p.overrun_ns.iter().take(9).all(|&n| n > 0),
+        "the overrun tick's phases are traced: {p:?}"
+    );
+    for (m, o) in p.phase_max_ns.iter().zip(p.overrun_ns) {
+        assert!(*m >= o, "the running maximum covers the traced tick");
+    }
+
+    rig.core.set_tick_profile(false);
+    rig.tick_n(3);
+    assert_eq!(
+        rig.snap().tick_profile,
+        par6_rt::TickProfile::default(),
+        "switching off clears the profile"
+    );
+}

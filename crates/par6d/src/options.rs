@@ -43,6 +43,10 @@ OPTIONS:
     --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
                                exactly [env: PAR6_STATUS_RATE_HZ]
                                [config: protocol.status_rate_hz]
+    --tick-profile             Profile the RT tick per phase (one clock read per
+                               phase) and log the running maxima and the last
+                               overrun's phase times once a second.
+                               [env: PAR6_TICK_PROFILE=1]
     --log-dir <DIR>            Also write the activity logs there: rt.log (the RT
                                thread, 2 MiB x5) and commands.log (command plane,
                                daemon, host vitals, 20 MiB x5). stderr is unchanged.
@@ -64,6 +68,9 @@ pub struct Options {
     /// Run the sim on the torque-level dynamics plant (`--sim-dynamics` /
     /// `PAR6_SIM_DYNAMICS`); requires feature `ffi`.
     pub sim_dynamics: bool,
+    /// Run the RT tick's per-phase profiler (`--tick-profile` /
+    /// `PAR6_TICK_PROFILE`); the profile is logged once a second.
+    pub tick_profile: bool,
     /// Command UDP port override (0 = ephemeral).
     pub command_port: Option<u16>,
     /// Command-socket bind address override.
@@ -99,6 +106,7 @@ impl Options {
                 "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
                 "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
                 "--sim-dynamics" => o.sim_dynamics = true,
+                "--tick-profile" => o.tick_profile = true,
                 "--port" | "--command-port" => {
                     o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
                 }
@@ -137,6 +145,11 @@ impl Options {
         if self.assets.is_none() {
             if let Some(v) = env_var("PAR6_ASSETS") {
                 self.assets = Some(PathBuf::from(v));
+            }
+        }
+        if !self.tick_profile {
+            if let Some(v) = env_var("PAR6_TICK_PROFILE") {
+                self.tick_profile = v == "1" || v.eq_ignore_ascii_case("true");
             }
         }
         if !self.sim_dynamics {
@@ -278,6 +291,11 @@ mod tests {
         assert!(
             Options::parse(["--log-dir"].map(String::from).into_iter()).is_err(),
             "a bare --log-dir is a usage error"
+        );
+        assert!(
+            Options::parse(["--sim", "--tick-profile"].map(String::from).into_iter())
+                .unwrap()
+                .tick_profile
         );
     }
 }

@@ -1100,9 +1100,23 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::JogRelease);
         link.send(RtCommand::SetMode(Mode::Idle));
     };
+    let mut profile_logged = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
+        if now.duration_since(profile_logged) >= Duration::from_secs(1) {
+            profile_logged = now;
+            let p = &snap.tick_profile;
+            if p.phase_max_ns.iter().any(|&n| n > 0) {
+                log::info!(
+                    target: "par6d::profile",
+                    "tick phases max [us] {:?} last overrun [us] {:?} overruns traced {}",
+                    p.phase_max_ns.map(|n| n / 1000),
+                    p.overrun_ns.map(|n| n / 1000),
+                    p.overruns_traced
+                );
+            }
+        }
         {
             let mut sh = shared.lock().unwrap();
             match &mut sh.stream {

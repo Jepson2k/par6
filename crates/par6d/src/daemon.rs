@@ -343,6 +343,7 @@ impl Daemon {
             RunOptions {
                 cpu: None,
                 fifo_priority: None,
+                tick_profile: opts.tick_profile,
             }
         } else {
             // Hardware: SCHED_FIFO on the configured core (setup failure
@@ -352,6 +353,7 @@ impl Daemon {
             RunOptions {
                 cpu: usize::try_from(timing.cpu).ok(),
                 fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+                tick_profile: opts.tick_profile,
             }
         };
         let mut threads = Vec::new();
@@ -472,6 +474,7 @@ fn rt_loop(
     shutdown: Arc<AtomicBool>,
     run_opts: RunOptions,
 ) {
+    core.set_tick_profile(run_opts.tick_profile);
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;

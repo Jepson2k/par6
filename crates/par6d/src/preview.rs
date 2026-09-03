@@ -9,16 +9,17 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use par6_motion::JogEngine;
+use par6_config::LimitMode;
+use par6_motion::{JogEngine, MotionLimits, StreamingExecutor};
 use par6_proto::{command::JogJ, Command, CompletionPolicy, WireError, NUM_JOINTS};
 use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
     sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
-    SnapshotWriter, StateSnapshot, MAX_JOINTS,
+    SnapshotWriter, StateSnapshot, StreamTracker, MAX_JOINTS,
 };
 use par6_server::{decode_error_to_wire, gate, PlanContext, Planner, QueuedCommand, ShapeLayer};
 
-use crate::adapters::MotionJog;
+use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{CoreLink, CoreOp};
 use crate::daemon::{load_kin_stack, DaemonError};
 use crate::options::{resolve_config_path, Options};
@@ -49,10 +50,26 @@ impl PreviewResult {
     }
 }
 
+/// What the runtime's streaming limiter would command, tick by tick,
+/// for a sequence of servo targets — the offline half of a bring-up
+/// limiter check, run through the same jerk-limited executor and
+/// soft-limit clamp the RT ticks.
+#[derive(Debug, Clone)]
+pub struct ServoPreview {
+    /// Commanded joint positions per tick \[rad\] (post-clamp).
+    pub q: Vec<[f64; MAX_JOINTS]>,
+    /// Commanded joint velocities per tick \[rad/s\].
+    pub qd: Vec<[f64; MAX_JOINTS]>,
+    /// The tick the limiter first reported the LAST target reached, if
+    /// it did inside the window.
+    pub finished_tick: Option<usize>,
+}
+
 /// The offline preview session: a virtual arm pose plus the real planner.
 pub struct Preview {
     planner: Par6Planner,
     jog: MotionJog,
+    stream: MotionStream,
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
     next_index: u64,
@@ -114,11 +131,19 @@ impl Preview {
         snap.mode = Mode::Idle;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let dt = robot.robot.tick_dt_s;
+        let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        let stream = MotionStream::new(
+            StreamingExecutor::new(dt, &stream_limits)?,
+            dt,
+            stream_limits,
+            robot.stream.fault_latch_s,
+        );
         let motion = robot.motion;
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let mut preview = Self {
             planner,
             jog,
+            stream,
             snap,
             snap_w,
             next_index: 0,
@@ -219,6 +244,46 @@ impl Preview {
             duration_s: 0.0,
             error: Some(error),
         }
+    }
+
+    /// Preview a servo stream: each target in `targets` is held for
+    /// `hold_ticks` ticks (the first setpoint sits at the virtual pose,
+    /// as the RT's start-pose gate demands of a real stream), through the
+    /// same jerk-limited executor, limit fractions and soft-limit clamp
+    /// the RT core drives. The virtual arm does not move: this is a
+    /// limiter measurement, not a motion.
+    pub fn preview_servo(
+        &mut self,
+        targets: &[[f64; MAX_JOINTS]],
+        hold_ticks: usize,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> ServoPreview {
+        let hold = hold_ticks.max(1);
+        self.stream
+            .set_scale(speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        self.stream.activate(&self.snap.q);
+        let mut out = ServoPreview {
+            q: Vec::with_capacity(targets.len() * hold),
+            qd: Vec::with_capacity(targets.len() * hold),
+            finished_tick: None,
+        };
+        let last = targets.len().saturating_sub(1);
+        for (i, target) in targets.iter().enumerate() {
+            self.stream.set_target(target);
+            for _ in 0..hold {
+                let mut q = [0.0; MAX_JOINTS];
+                let mut qd = [0.0; MAX_JOINTS];
+                self.stream.step(&mut q, &mut qd);
+                if i == last && out.finished_tick.is_none() && self.stream.at_target() {
+                    out.finished_tick = Some(out.q.len());
+                }
+                out.q.push(q);
+                out.qd.push(qd);
+            }
+        }
+        self.stream.set_scale(1.0, 1.0);
+        out
     }
 
     /// Preview a velocity jog held for `duration_s`: the same

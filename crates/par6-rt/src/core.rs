@@ -28,6 +28,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
@@ -52,7 +53,7 @@ use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
     ArmState, ErrorCode, HomingJointStatus, JogStatus, Mode, StateSnapshot, StreamStatus,
-    StreamSubstate,
+    StreamSubstate, TickProfile, TICK_PHASES,
 };
 use crate::timing::{LoopHealth, LoopTiming};
 use crate::MAX_JOINTS;
@@ -121,6 +122,17 @@ impl ShutdownPark {
 /// rest for the shutdown exit path. Above encoder quantization noise,
 /// far below any commanded motion.
 const SHUTDOWN_REST_RAD_S: f64 = 0.02;
+/// One profiler lap: the time since the previous mark into `laps[i]`,
+/// saturated at `u32::MAX` ns (4.3 s — no tick phase is longer).
+#[inline]
+fn lap(mark: &mut Option<Instant>, laps: &mut [u32; TICK_PHASES], i: usize) {
+    if let Some(m) = mark {
+        let now = Instant::now();
+        laps[i] = u32::try_from(now.duration_since(*m).as_nanos()).unwrap_or(u32::MAX);
+        *m = now;
+    }
+}
+
 /// Ticks between a rescan's last ping and its epoch bump: two reply
 /// round trips at the slowest tick rate the config validator allows.
 const SCAN_SETTLE_TICKS: u8 = 4;
@@ -547,6 +559,10 @@ pub struct RtCore<B: DriverBus> {
     scan_settle: u8,
     scan_epoch: u32,
 
+    // Opt-in per-phase tick profiler (see `TickProfile`).
+    profile_on: bool,
+    profile: TickProfile,
+
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
     snap: StateSnapshot,
@@ -732,6 +748,8 @@ impl<B: DriverBus> RtCore<B> {
             scan_next: None,
             scan_settle: 0,
             scan_epoch: 0,
+            profile_on: false,
+            profile: TickProfile::default(),
             writer,
             snap: StateSnapshot::default(),
         };
@@ -1015,18 +1033,29 @@ impl<B: DriverBus> RtCore<B> {
     pub fn tick(&mut self, period_s: f64, overrun: bool) {
         self.tick += 1;
         self.bus.begin_tick(self.tick);
+        // The profiler's clock reads are the only cost of the opt-in: one
+        // vDSO `clock_gettime` per phase, none at all while it is off.
+        let mut laps = [0u32; TICK_PHASES];
+        let mut mark = if self.profile_on {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         // Phase 2: GPIO read + debounce — the e-stop (reaction in phase
         // 7) and the box's own inputs, which mean nothing to the runtime
         // and are published verbatim.
         self.hw_estop = self.estop.pressed();
         self.read_io_inputs();
+        lap(&mut mark, &mut laps, 0);
 
         // Phase 3: loop-period statistics and degradation bands.
         let health = self.timing.record(period_s, overrun);
+        lap(&mut mark, &mut laps, 1);
 
         // Phase 4: boot one-shots.
         self.boot_oneshots();
+        lap(&mut mark, &mut laps, 2);
 
         // Phase 5: at most one external command.
         if let Some(cmd) = self.commands.poll() {
@@ -1037,9 +1066,11 @@ impl<B: DriverBus> RtCore<B> {
         // in the same tick, so a client that writes and then reads the
         // next STATUS sees what it asked for.
         self.drive_io_outputs();
+        lap(&mut mark, &mut laps, 3);
 
         // Phase 6: RX drain → state pipeline (measure-then-command).
         self.drain_and_derive();
+        lap(&mut mark, &mut laps, 4);
 
         // Gravity: computed every tick, published always.
         self.gravity.gravity(&self.q, &mut self.g);
@@ -1050,18 +1081,51 @@ impl<B: DriverBus> RtCore<B> {
         for i in 0..MAX_JOINTS {
             self.tau_ext[i] = self.tau_filt[i] - self.g[i];
         }
+        lap(&mut mark, &mut laps, 5);
 
         // Phase 7: error checks and reactions.
         self.check_errors(health);
+        lap(&mut mark, &mut laps, 6);
 
         // Phase 8: mode dispatch → TX → poll slot.
         self.dispatch_and_send();
+        lap(&mut mark, &mut laps, 7);
 
         // Phase 9: clear-sequence settle countdown.
         self.errors.tick();
+        lap(&mut mark, &mut laps, 8);
+
+        // Phases 2-9 are folded in before the publish so the snapshot
+        // that leaves this tick carries this tick's trace; the publish
+        // lap itself lands in the NEXT snapshot, one tick late by
+        // construction.
+        if self.profile_on {
+            for (m, l) in self.profile.phase_max_ns.iter_mut().zip(laps) {
+                *m = (*m).max(l);
+            }
+            if overrun {
+                self.profile.overrun_ns = laps;
+                self.profile.overruns_traced = self.profile.overruns_traced.wrapping_add(1);
+            }
+        }
 
         // Phase 10: snapshot publish.
         self.publish();
+        lap(&mut mark, &mut laps, 9);
+        if self.profile_on {
+            let last = TICK_PHASES - 1;
+            self.profile.phase_max_ns[last] = self.profile.phase_max_ns[last].max(laps[last]);
+            if overrun {
+                self.profile.overrun_ns[last] = laps[last];
+            }
+        }
+    }
+
+    /// Switch the per-phase tick profiler on or off; switching it on
+    /// starts from a clean profile.
+    pub fn set_tick_profile(&mut self, on: bool) {
+        self.profile_on = on;
+        self.profile = TickProfile::default();
     }
 
     // ------------------------------------------------------------ boot
@@ -2174,6 +2238,7 @@ impl<B: DriverBus> RtCore<B> {
         s.drift_lock = *self.drift.status();
         s.bus_nodes = self.bus.connected_nodes();
         s.bus_scan_epoch = self.scan_epoch;
+        s.tick_profile = self.profile;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);

@@ -291,6 +291,38 @@ impl Preview {
         result_dict(py, &r)
     }
 
+    /// Preview a servo stream through the runtime's own limiter: each
+    /// target [rad] held for `hold_ticks` ticks; returns per-tick
+    /// commanded `q`/`qd` and the tick the last target was reached.
+    #[pyo3(signature = (targets, hold_ticks, speed=None, accel=None))]
+    fn preview_servo(
+        &self,
+        py: Python<'_>,
+        targets: Vec<[f64; NUM_JOINTS]>,
+        hold_ticks: usize,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> PyResult<PyObject> {
+        let r = self
+            .inner
+            .lock()
+            .unwrap()
+            .preview_servo(&targets, hold_ticks, speed, accel);
+        let d = PyDict::new(py);
+        let q = PyList::empty(py);
+        for row in &r.q {
+            q.append(row.to_vec())?;
+        }
+        let qd = PyList::empty(py);
+        for row in &r.qd {
+            qd.append(row.to_vec())?;
+        }
+        d.set_item("q", q)?;
+        d.set_item("qd", qd)?;
+        d.set_item("finished_tick", r.finished_tick)?;
+        Ok(d.into_any().unbind())
+    }
+
     /// Preview a queued program (list of command dicts, see
     /// `command_from_py`): one result dict per command, blend chains
     /// folded exactly as the live planner folds them.
