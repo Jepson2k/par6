@@ -49,6 +49,52 @@ fn test_config() -> PathBuf {
     dst
 }
 
+/// The 50 Hz test config with `[shutdown] safe_park` switched on.
+fn parking_config() -> PathBuf {
+    let base = test_config();
+    let text = std::fs::read_to_string(&base).expect("read test config");
+    let patched = text.replace("safe_park = false", "safe_park = true");
+    assert_ne!(patched, text, "safe_park patch point must exist");
+    let dst = base.with_file_name("PAR6-park.toml");
+    std::fs::write(&dst, patched).expect("write parking config");
+    dst
+}
+
+/// Seconds a daemon takes to shut down from a pose `delta_deg` off the
+/// rest pose on J1.
+fn shutdown_seconds(config: PathBuf, delta_deg: f64) -> f64 {
+    let rig = Rig::boot(config);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    teleport_home(&rig, &mut c, with_j0(park_deg(), delta_deg));
+    let started = Instant::now();
+    rig.shutdown();
+    started.elapsed().as_secs_f64()
+}
+
+/// `[shutdown] safe_park = true` on the real runtime: the exit drives
+/// the arm back to the rest pose through the real streaming executor
+/// under the configured velocity ceiling, so a shutdown from 30° off
+/// the pose takes the time that distance costs at 0.25 rad/s. The
+/// shipped default retreats nowhere and exits at once.
+#[test]
+fn a_shutdown_retreats_to_the_rest_pose_under_the_configured_speed() {
+    const DELTA_DEG: f64 = 30.0;
+    let retreat_floor_s = DELTA_DEG.to_radians() / 0.25 * 0.8;
+
+    let plain = shutdown_seconds(test_config(), DELTA_DEG);
+    let parked = shutdown_seconds(parking_config(), DELTA_DEG);
+    assert!(
+        parked - plain > retreat_floor_s,
+        "the retreat must take at least the distance at the velocity ceiling: \
+         parked {parked:.2} s vs plain {plain:.2} s (floor {retreat_floor_s:.2} s)"
+    );
+    assert!(
+        parked < 15.0,
+        "the retreat must arrive well inside its 15 s timeout, took {parked:.2} s"
+    );
+}
+
 /// The config park pose in wire units (degrees) — inside every joint's
 /// soft window, so it works as a teleport target and move base.
 fn park_deg() -> [f64; NUM_JOINTS] {

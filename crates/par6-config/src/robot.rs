@@ -602,6 +602,46 @@ impl Default for LimitsSection {
     }
 }
 
+/// The shutdown retreat: an opt-in slow drive to a rest pose before the
+/// drives are idled, so an arm left mid-air by a process exit does not
+/// drop from wherever it was when the terminal limp frame lands.
+///
+/// Off by default: a retreat is a motion, and a motion on shutdown must
+/// be asked for. Durations are seconds; the runtime converts with
+/// `round(s / dt)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShutdownConfig {
+    /// Drive to the rest pose on shutdown. Only a homed, enabled,
+    /// error-free arm retreats; anything else goes straight to the
+    /// existing halt-settle-limp exit.
+    pub safe_park: bool,
+    /// Per-joint distance to the rest pose that counts as arrived \[rad\].
+    pub tolerance_rad: f64,
+    /// Ceiling on the retreat \[s\]. Expiry is logged and the exit
+    /// continues from wherever the arm is — it never blocks a shutdown.
+    pub timeout_s: f64,
+    /// Joint-velocity ceiling for the retreat \[rad/s\], applied to every
+    /// joint as a fraction of the STREAM limits.
+    pub velocity_limit_rad_s: f64,
+    /// The rest pose \[rad\], one entry per joint. Omitted = the
+    /// `robot.park_pose_rad` the homing return targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_park_q: Option<Vec<f64>>,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            safe_park: false,
+            tolerance_rad: 0.03,
+            timeout_s: 15.0,
+            velocity_limit_rad_s: 0.25,
+            safe_park_q: None,
+        }
+    }
+}
+
 /// Root of a robot TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -636,6 +676,9 @@ pub struct RobotConfig {
     /// disabled.
     #[serde(default)]
     pub limits: LimitsSection,
+    /// Shutdown retreat. Omitted = no retreat.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
@@ -669,6 +712,15 @@ impl RobotConfig {
     /// Tick rate \[Hz\] derived from `robot.tick_dt_s`.
     pub fn tick_rate_hz(&self) -> f64 {
         1.0 / self.robot.tick_dt_s
+    }
+
+    /// The pose the shutdown retreat drives to \[rad\]: `shutdown.safe_park_q`
+    /// when set, else `robot.park_pose_rad`.
+    pub fn safe_park_q(&self) -> &[f64] {
+        self.shutdown
+            .safe_park_q
+            .as_deref()
+            .unwrap_or(&self.robot.park_pose_rad)
     }
 
     /// Convert a config time constant in seconds to ticks:
@@ -718,6 +770,7 @@ impl RobotConfig {
         self.validate_timing()?;
         self.validate_limits()?;
         self.validate_motion()?;
+        self.validate_shutdown()?;
         self.validate_sim()?;
         Ok(())
     }
@@ -1019,6 +1072,42 @@ impl RobotConfig {
                 "timing.fifo_priority",
                 "must be 0..=99 (0 disables SCHED_FIFO)",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_shutdown(&self) -> Result<(), ConfigError> {
+        let s = &self.shutdown;
+        for (v, name) in [
+            (s.tolerance_rad, "shutdown.tolerance_rad"),
+            (s.timeout_s, "shutdown.timeout_s"),
+            (s.velocity_limit_rad_s, "shutdown.velocity_limit_rad_s"),
+        ] {
+            if !is_positive(v) {
+                return Err(invalid(name, "must be > 0"));
+            }
+        }
+        let q = self.safe_park_q();
+        if q.len() != self.joints.len() {
+            return Err(invalid(
+                "shutdown.safe_park_q",
+                format!(
+                    "must have one entry per joint ({} joints, {} entries)",
+                    self.joints.len(),
+                    q.len()
+                ),
+            ));
+        }
+        for (i, (v, j)) in q.iter().zip(&self.joints).enumerate() {
+            if !v.is_finite() || *v < j.limits.soft_min_rad || *v > j.limits.soft_max_rad {
+                return Err(invalid(
+                    "shutdown.safe_park_q",
+                    format!(
+                        "joint {i}: {v} rad is outside the soft limits [{}, {}]",
+                        j.limits.soft_min_rad, j.limits.soft_max_rad
+                    ),
+                ));
+            }
         }
         Ok(())
     }

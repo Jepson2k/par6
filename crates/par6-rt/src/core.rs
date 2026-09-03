@@ -76,6 +76,46 @@ const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;
+/// The configured shutdown retreat, resolved to ticks and a limit
+/// fraction at boot. `Copy`, so the exit path allocates nothing.
+#[derive(Debug, Clone, Copy)]
+struct ShutdownPark {
+    enabled: bool,
+    tolerance_rad: f64,
+    timeout_ticks: u32,
+    target: [f64; MAX_JOINTS],
+    /// The fraction of the STREAM velocity limits under which no joint
+    /// exceeds the configured retreat speed: `min_j(v_park / v_j)`,
+    /// capped at 1.
+    speed_fraction: f64,
+    saved_scale: (f64, f64),
+    running: bool,
+}
+
+impl ShutdownPark {
+    fn from_config(robot: &par6_config::RobotConfig) -> Self {
+        let cfg = &robot.shutdown;
+        let mut target = [0.0; MAX_JOINTS];
+        for (t, q) in target.iter_mut().zip(robot.safe_park_q()) {
+            *t = *q;
+        }
+        let speed_fraction = robot
+            .joints
+            .iter()
+            .map(|j| cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
+            .fold(1.0, f64::min);
+        Self {
+            enabled: cfg.safe_park,
+            tolerance_rad: cfg.tolerance_rad,
+            timeout_ticks: robot.ticks(cfg.timeout_s).max(1),
+            target,
+            speed_fraction,
+            saved_scale: (1.0, 1.0),
+            running: false,
+        }
+    }
+}
+
 /// Measured-speed band \[rad/s\] under which every joint counts as at
 /// rest for the shutdown exit path. Above encoder quantization noise,
 /// far below any commanded motion.
@@ -491,6 +531,9 @@ pub struct RtCore<B: DriverBus> {
     /// Filter state, in joint space, carried across ticks.
     stream_filt: [f64; MAX_JOINTS],
 
+    // Shutdown retreat.
+    park: ShutdownPark,
+
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
     snap: StateSnapshot,
@@ -671,6 +714,7 @@ impl<B: DriverBus> RtCore<B> {
             stream_discard: 0.0,
             stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
             stream_filt: [0.0; MAX_JOINTS],
+            park: ShutdownPark::from_config(robot),
             writer,
             snap: StateSnapshot::default(),
         };
@@ -835,6 +879,97 @@ impl<B: DriverBus> RtCore<B> {
             return;
         }
         let _ = self.request_mode(Mode::Idle);
+    }
+
+    /// Ticks the shutdown retreat may run before its timeout.
+    pub fn shutdown_park_timeout_ticks(&self) -> u32 {
+        self.park.timeout_ticks
+    }
+
+    /// Shutdown phase 0: start the configured retreat to the rest pose.
+    /// Returns whether a retreat is running; `false` means the exit goes
+    /// straight to the halt.
+    ///
+    /// Only a homed, enabled, error-free arm retreats — the retreat is a
+    /// motion to an absolute pose, so it needs exactly the reference and
+    /// the enable a planned move needs, and an arm in ACTIVE_ERROR must
+    /// not be driven anywhere. The order is the reBot exit: the jaws are
+    /// held first (a stop, not a release — a grasped part stays grasped,
+    /// and a stop on a calibrated gripper re-targets the reported jaw
+    /// byte so the firmware holds where it is), then the arm goes under
+    /// position control with G(q) feed-forward through STREAM, with the
+    /// velocity ceilings scaled so no joint exceeds the configured
+    /// retreat speed; acceleration and jerk keep their STREAM ceilings,
+    /// which is what makes a slow retreat smooth rather than sluggish.
+    /// The scale is restored by [`RtCore::shutdown_park_end`] whatever
+    /// happens.
+    pub fn shutdown_park_begin(&mut self) -> bool {
+        if !self.park.enabled || self.mode == Mode::Flashing {
+            return false;
+        }
+        if !self.homed || self.state != ArmState::Enabled || self.errors.any_hard() {
+            log::info!(
+                "shutdown: no retreat (homed={}, state={:?}, hard errors={})",
+                self.homed,
+                self.state,
+                self.errors.any_hard()
+            );
+            return false;
+        }
+        if self.has_can_gripper {
+            self.apply_command(RtCommand::GripperStop);
+        }
+        if let Err(refusal) = self.request_mode(Mode::Stream) {
+            log::warn!("shutdown: retreat refused ({refusal:?}); halting in place");
+            return false;
+        }
+        self.park.saved_scale = self.stream_scale;
+        let f = self.park.speed_fraction;
+        self.stream.set_scale(f, 1.0);
+        self.stream_scale = (f, 1.0);
+        log::info!(
+            "shutdown: retreating to the rest pose at {:.3} of the STREAM limits",
+            f
+        );
+        self.park.running = true;
+        true
+    }
+
+    /// One retreat step, called before each tick while the retreat runs:
+    /// re-targets the rest pose and feeds the stream watchdog. Returns
+    /// `true` once every joint measures within tolerance of the pose,
+    /// or when the retreat can no longer run (a hard error dropped the
+    /// mode) — the caller then proceeds to the halt.
+    pub fn shutdown_park_feed(&mut self) -> bool {
+        if !self.park.running || self.mode != Mode::Stream {
+            return true;
+        }
+        let farthest = self
+            .q
+            .iter()
+            .zip(&self.park.target)
+            .map(|(q, t)| (q - t).abs())
+            .fold(0.0, f64::max);
+        if farthest < self.park.tolerance_rad {
+            log::info!("shutdown: rest pose reached (farthest joint {farthest:.4} rad)");
+            return true;
+        }
+        self.q_target = self.park.target;
+        self.stream.set_target(&self.park.target);
+        self.stream_last_rx_tick = self.tick;
+        false
+    }
+
+    /// End the retreat: restore the stream scale the retreat overrode.
+    /// Runs on every exit from the retreat, reached or not.
+    pub fn shutdown_park_end(&mut self) {
+        if !self.park.running {
+            return;
+        }
+        self.park.running = false;
+        let (v, a) = self.park.saved_scale;
+        self.stream.set_scale(v, a);
+        self.stream_scale = (v, a);
     }
 
     /// Whether every joint's measured speed is inside the shutdown rest

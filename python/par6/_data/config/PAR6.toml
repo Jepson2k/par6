@@ -570,6 +570,18 @@ lowpass_cutoff_hz = 0.0
 success_window_s = 0.4      # 100 ticks @ 250 Hz
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
 
+[shutdown]
+# Retreat to a rest pose on process exit, before the drives are idled,
+# so an arm left mid-air does not drop when the terminal limp frame
+# lands. Off by default: a motion on shutdown must be asked for. Only a
+# homed, enabled, error-free arm retreats; the timeout is logged and the
+# exit continues from wherever the arm is.
+safe_park = false
+tolerance_rad = 0.03
+timeout_s = 15.0
+velocity_limit_rad_s = 0.25
+# safe_park_q = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]   # omitted = robot.park_pose_rad
+
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog
 # full-scale rates, completion settling. The offline preview reads this
