@@ -42,6 +42,12 @@ impl GravityModel for ConstGravity {
     fn gravity(&mut self, _q: &[f64; MAX_JOINTS], out: &mut [f64; MAX_JOINTS]) {
         *out = self.0;
     }
+
+    /// A constant model has no payload to carry, so declaring one
+    /// changes nothing here. Spelled out rather than inherited: a model
+    /// that silently drops a declared payload holds the arm against a
+    /// load it does not know about.
+    fn set_payload(&mut self, _mass: f64, _com: [f64; 3], _inertia: Option<[f64; 6]>) {}
 }
 
 pub struct Rig {

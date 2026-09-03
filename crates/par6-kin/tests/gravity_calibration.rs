@@ -222,3 +222,56 @@ fn the_payload_fit_refuses_what_it_cannot_use() {
     assert!(gravity::fit_payload(&mut kin, &one, -1.0).is_err());
     assert!(gravity::fit_payload(&mut kin, &one, f64::NAN).is_err());
 }
+
+#[test]
+fn a_declared_payload_changes_the_gravity_the_arm_holds() {
+    // The wire's SET_PAYLOAD ends at `Kin::set_tool`, and everything
+    // between is plumbing that has been tested by asserting the command
+    // ARRIVED. Arriving is not the property: an arm told it is carrying
+    // 1.35 kg and still compensating for an empty hand sags under the
+    // load, with the command acked all the way back to the caller.
+    let mut kin = Kin::load_arm(&assets_dir(), None).unwrap();
+    let unloaded = gravity::flatten(&gravity::model_params(&kin).unwrap());
+
+    const MASS: f64 = 1.35;
+    const COM: [f64; 3] = [0.012, -0.028, 0.061];
+
+    // What the model SHOULD compute once it carries the load: the same
+    // parameters with the payload's mass and first moment added to the
+    // body at the end of the chain.
+    let mut loaded = unloaded.clone();
+    let base = loaded.len() - 4;
+    loaded[base] += MASS;
+    for k in 0..3 {
+        loaded[base + 1 + k] += MASS * COM[k];
+    }
+
+    for q in &CASES {
+        let want_empty = gravity::predict(&mut kin, &unloaded, q).unwrap();
+        let want_loaded = gravity::predict(&mut kin, &loaded, q).unwrap();
+
+        let mut got = [0.0; NQ];
+        kin.gravity(q, &mut got).unwrap();
+        assert!(
+            max_abs_diff(&got, &want_empty) < 1e-9,
+            "empty hand: {got:?} vs {want_empty:?}"
+        );
+
+        kin.set_tool(MASS, COM, None).unwrap();
+        kin.gravity(q, &mut got).unwrap();
+        assert!(
+            max_abs_diff(&got, &want_loaded) < 1e-9,
+            "carrying {MASS} kg at {COM:?}: gravity {got:?} against the {want_loaded:?} \
+             a model holding that load computes"
+        );
+
+        // And the load comes off again: a part put down must not keep
+        // being compensated for.
+        kin.set_tool(0.0, [0.0; 3], None).unwrap();
+        kin.gravity(q, &mut got).unwrap();
+        assert!(
+            max_abs_diff(&got, &want_empty) < 1e-9,
+            "payload cleared: {got:?} vs the empty-hand {want_empty:?}"
+        );
+    }
+}
