@@ -13,7 +13,7 @@
 use std::path::PathBuf;
 use std::time::Instant;
 
-use par6_kin::{GripperVariant, IkOutcome, Kin, NQ};
+use par6_kin::{GripperVariant, IkOutcome, Kin, IK_POSE_TOL, NQ};
 
 fn assets_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -25,6 +25,11 @@ fn assets_dir() -> PathBuf {
 /// Configurations inside every joint's travel, spread over the workspace:
 /// the park pose (a wrist singularity), the runtime's cartesian test
 /// postures, and two general poses with every joint off its home value.
+/// `CASES[0]` puts the wrist through its singularity, where q4 and q6
+/// are only determined in combination and the closed form is least
+/// conditioned.
+const WRIST_SINGULAR_CASE: usize = 0;
+
 const CASES: [[f64; NQ]; 6] = [
     [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416],
     [1.2, -1.2708, 3.7416, 0.0, 0.5, 0.0],
@@ -136,15 +141,31 @@ fn ik_recovers_fk_poses_and_reports_unreachable() {
                 "{variant:?} case {c}"
             );
             kin.fk(&q_out, &mut reached).unwrap();
-            // Sub-micron: the wrist singularity (case 0) is where the
-            // closed form is least conditioned, and a branch picked from
-            // a perturbed seed lands within numerical noise of the pose.
-            for (g, w) in reached.iter().zip(&target) {
-                assert!(
-                    (g - w).abs() < 1e-6,
-                    "{variant:?} case {c}: IK pose {g} vs {w}"
-                );
-            }
+            // `Converged` already promises the pose is within
+            // `IK_POSE_TOL`, so re-checking that bound would assert what
+            // the outcome means. What is worth pinning is that the
+            // ANALYTIC solver lands at machine precision when the arm is
+            // not singular — an implementation that started iterating,
+            // or lost a factorisation's worth of digits, would still say
+            // Converged while missing this by orders of magnitude.
+            let worst = reached
+                .iter()
+                .zip(&target)
+                .map(|(g, w)| (g - w).abs())
+                .fold(0.0, f64::max);
+            let bound = if c == WRIST_SINGULAR_CASE {
+                // Here the branch is picked from a perturbed seed and
+                // the closed form is least conditioned, so the contract
+                // tolerance is all that holds.
+                IK_POSE_TOL
+            } else {
+                1e-12
+            };
+            assert!(
+                worst < bound,
+                "{variant:?} case {c}: IK reached the pose to {worst:.3e}, \
+                 further than the {bound:.0e} an analytic solve should"
+            );
 
             // Seeded with the truth, the nearest branch IS the truth —
             // except at a wrist singularity, where q4 and q6 are only

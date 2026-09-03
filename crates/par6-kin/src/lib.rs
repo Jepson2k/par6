@@ -6,7 +6,11 @@
 //! init and exposes allocation-free `fk / tcp / jacobian / gravity / ik`
 //! calls suitable for the RT thread and planner. `tests/kinematics.rs`
 //! holds it to the contract (Jacobian = dFK/dq, IK lands on every FK
-//! pose); FK itself is cross-checked against the OPW closed form at load.
+//! pose). Deriving the OPW parameters at load also compares this FK
+//! against the closed form and refuses a model the two disagree on —
+//! but that only catches an FK the OPW parameterisation CANNOT express.
+//! A wrong link length is expressible, so the fit would follow it; the
+//! URDF's geometry is nominal data, not something this proves.
 //!
 //! Without the `ffi` feature the crate carries only the pure-data
 //! [`GripperVariant`] table, so `cargo build --workspace` needs no C++

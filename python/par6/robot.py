@@ -740,6 +740,12 @@ class Robot(_RobotABC):
         Keyword args: ``initial_joints_deg`` (defaults to home),
         ``initial_homed``, ``max_snapshot_points``, ``config_path``.
 
+        Always a client, never ``None``: par6 supports dry running, so a
+        config the engine will not load raises and says which — the ABC's
+        ``None`` means the BACKEND has no preview, and a host that got it
+        for a broken config would report "not supported" and hide the
+        real fault.
+
         When a runtime answers at the target address its config is
         fetched and the preview runs the daemon's numbers; otherwise the
         local resolution (``PAR6_CONFIG``, then the repo checkout)

@@ -136,9 +136,7 @@ class DryRunRobotClient:
             bound: Any = copy.copy(spec)
             bound._execute = self._tool_execute
             bound._get_status = self._tool_status
-            sync: Any = make_sync_tool(bound, _drive)
-            sync.status = lambda b=bound: _drive(b.status())
-            self._tools[spec.key] = sync
+            self._tools[spec.key] = make_sync_tool(bound, _drive)
 
     # ------------------------------------------------------------------
     # State
@@ -152,7 +150,20 @@ class DryRunRobotClient:
     def tool(self) -> Any:
         """The active tool, sync-wrapped: ``tool.close()`` returns the
         previewed result."""
-        return self._tools[self.active_tool_key]
+        key = self.active_tool_key
+        try:
+            return self._tools[key]
+        except KeyError:
+            # The specs come from the PACKAGED gripper TOMLs while the
+            # preview runs whatever config it was pointed at, so a config
+            # naming a gripper the package does not ship lands here. A
+            # bare KeyError on a tool key says nothing about which of the
+            # two is wrong.
+            raise RuntimeError(
+                f"the preview is fitted with tool {key!r}, which has no packaged "
+                f"gripper spec (have {sorted(self._tools)}). Its config names a "
+                "gripper this par6 build does not ship."
+            ) from None
 
     def angles(self) -> list[float]:
         """Simulated joint angles in degrees."""

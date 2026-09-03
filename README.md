@@ -327,8 +327,11 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
 
 - **Pinocchio** (kinematics/dynamics) — `par6_kin_*`: create/destroy, fk, jacobian,
   gravity, aba. Consumed by `crates/pinokin-sys`, and on top of that by `par6-kin`, whose
-  analytic IK (`par6_kin::Opw`) is derived from the URDF at load and cross-checked
-  against this FK before the model is accepted.
+  analytic IK (`par6_kin::Opw`) is derived from the URDF at load: the fit is checked
+  against this FK at pseudo-random configurations and a model the two disagree on is
+  refused. That catches an FK the OPW form cannot express, not a wrong URDF — a
+  mis-measured link length fits, so the geometry is nominal data the check does not
+  second-guess.
 - **coal / hpp-fcl** (collision) — `par6_col_*`: a two-layer world (installation keep-outs
   and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
   parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).

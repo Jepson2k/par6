@@ -87,11 +87,29 @@ def jog_l_velocities(
 ) -> list[float]:
     """Per-axis velocity fractions for ``jog_l``'s two calling forms."""
     out = [0.0] * 6
+
+    # Same care `jog_j_speeds` takes, for the same reasons: a caller who
+    # miscounts gets told, and an axis name that is not one does not
+    # arrive as a bare KeyError from inside a lookup table.
+    def index(name: str) -> int:
+        try:
+            return AXIS_INDEX[name]
+        except KeyError:
+            raise ValueError(
+                f"jog_l axis {name!r} is not one of {sorted(AXIS_INDEX)}"
+            ) from None
+
     if axes is not None and speeds_list is not None:
+        if len(axes) != len(speeds_list):
+            # `zip` would drop the tail silently and jog fewer axes than
+            # the caller listed.
+            raise ValueError(
+                f"jog_l got {len(axes)} axes and {len(speeds_list)} speeds"
+            )
         for a, s in zip(axes, speeds_list):
-            out[AXIS_INDEX[a]] = float(s)
+            out[index(a)] = float(s)
     elif axis is not None:
-        out[AXIS_INDEX[axis]] = float(speed)
+        out[index(axis)] = float(speed)
     else:
         raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
     return out
