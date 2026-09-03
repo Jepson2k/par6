@@ -43,7 +43,17 @@ def main() -> None:
     with robot as running:
         rbt = running.create_sync_client()
         rbt.reset()
+        # Teleport is unacked: the runtime applies it on its next tick and
+        # only the status broadcast says the arm landed there, referenced.
         rbt.teleport(start)
+        landed = rbt.wait_status(
+            lambda s: (
+                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, start))
+            ),
+            timeout=5.0,
+        )
+        if not landed:
+            raise SystemExit("the sim arm never landed on the start pose")
         rbt.set_shapes([keepout])
         try:
             rbt.move_j(target, speed=0.4, wait=True)
