@@ -18,16 +18,23 @@ use crate::convert::{command_from_py, layer_of, robot_err, shape_from_py, wire_e
 
 /// Sample indices that keep a trajectory under `max_points` with both
 /// endpoints retained.
+/// At most `max_points` sample indices, evenly spread, endpoints kept.
+///
+/// A stride of `len / max_points` is not a cap: it rounds DOWN, so any
+/// trajectory shorter than twice the limit came back whole — 399 samples
+/// against a limit of 200 — and one longer still overshot by the
+/// remainder plus the appended endpoint. Spacing the indices across the
+/// range instead hits the limit exactly and never passes it, which is
+/// what a caller sizing a payload asked for.
 fn sample_indices(len: usize, max_points: usize) -> Vec<usize> {
     if len == 0 {
         return Vec::new();
     }
-    let stride = (len / max_points).max(1);
-    let mut idx: Vec<usize> = (0..len).step_by(stride).collect();
-    if *idx.last().expect("non-empty") != len - 1 {
-        idx.push(len - 1);
+    let cap = max_points.max(2);
+    if len <= cap {
+        return (0..len).collect();
     }
-    idx
+    (0..cap).map(|k| k * (len - 1) / (cap - 1)).collect()
 }
 
 fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: usize) -> PyResult<PyObject> {
@@ -241,5 +248,38 @@ impl Preview {
             .unwrap()
             .set_shapes(layer, &shapes)
             .map_err(|e| robot_err(&e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_indices;
+
+    /// The limit is a limit: a caller sizing a payload gets no more than
+    /// it asked for, at any length, and always both ends of the motion.
+    #[test]
+    fn downsampling_never_exceeds_the_limit_and_keeps_the_endpoints() {
+        for len in [0usize, 1, 2, 3, 199, 200, 201, 399, 400, 601, 5000] {
+            for cap in [2usize, 3, 200, 1000] {
+                let idx = sample_indices(len, cap);
+                assert!(
+                    idx.len() <= cap.max(2),
+                    "len {len} cap {cap}: {} samples",
+                    idx.len()
+                );
+                if len == 0 {
+                    assert!(idx.is_empty());
+                    continue;
+                }
+                assert_eq!(idx[0], 0, "len {len} cap {cap}: first sample");
+                assert_eq!(idx[idx.len() - 1], len - 1, "len {len} cap {cap}: last");
+                assert!(
+                    idx.windows(2).all(|w| w[0] < w[1]),
+                    "len {len} cap {cap}: samples must advance, got {idx:?}"
+                );
+                // Nothing is dropped that did not have to be.
+                assert_eq!(idx.len(), len.min(cap.max(2)), "len {len} cap {cap}");
+            }
+        }
     }
 }

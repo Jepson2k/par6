@@ -8,8 +8,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use par6_proto::{
@@ -126,13 +128,29 @@ pub fn boot_for_client(
     Ok((daemon, telemetry_rx))
 }
 
-/// A loopback UDP port nothing is bound to right now.
+/// A loopback UDP port nothing is bound to right now, and that this
+/// process has not already handed out.
+///
+/// The probe socket has to be released before the caller can bind the
+/// port, which leaves a window. Within one test binary — where cargo
+/// runs tests in parallel threads and the window is widest — the handed
+/// out ports are remembered, so the OS re-offering one it just freed
+/// cannot give two tests the same port. Across processes the window
+/// remains, and is why a daemon that fails to bind says so rather than
+/// carrying on.
 pub fn free_udp_port() -> u16 {
-    UdpSocket::bind("127.0.0.1:0")
-        .expect("probe socket")
-        .local_addr()
-        .unwrap()
-        .port()
+    static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    for _ in 0..64 {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .expect("probe socket")
+            .local_addr()
+            .unwrap()
+            .port();
+        if HANDED_OUT.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find a loopback port this process has not already used");
 }
 
 /// A running daemon plus the sockets its broadcasts land on.

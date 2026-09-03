@@ -2192,12 +2192,28 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
          {BLEND_MM} mm zone that was asked for"
     );
     // And it is a fly-by, not a stop-and-go.
+    //
+    // Corner speed is the SLOWEST sample through the corner, so a single
+    // tick the daemon could not hold sinks it. That is a real stall, not
+    // a measurement artefact — and it says the box was too loaded to
+    // measure on, not that the blend stopped. The loop's own overrun
+    // count is what tells the two apart, so it goes in the message.
     let (blend_corner_speed, blend_mean) = corner_and_mean_speed(&blended, corner, 40.0);
+    let loop_note = match c.query(&Command::LoopStats) {
+        QueryResult::LoopStats(s) => format!(
+            "the RT loop overran {} of {} ticks (p99 {:.2} ms against a {:.2} ms budget)",
+            s.overrun_count,
+            s.loop_count,
+            s.p99_period_s * 1e3,
+            1e3 / s.target_hz
+        ),
+        other => format!("loop stats unavailable: {other:?}"),
+    };
     assert!(
         blend_corner_speed > 0.3 * blend_mean && blend_corner_speed > 5.0,
         "the blended corner slowed to {blend_corner_speed:.2} mm/s against a mean of \
          {blend_mean:.2} mm/s (unblended: {sharp_corner_speed:.2} of {sharp_mean:.2}) — \
-         a blend that stops is not a blend"
+         a blend that stops is not a blend. {loop_note}"
     );
     // Motion time from the broadcast's own monotonic clock — the
     // wall-clock of the collection loop is a fixed window and cannot

@@ -671,8 +671,41 @@ class DryRunRobotClient:
     def exit_flashing(self, **kwargs: Any) -> int:
         return self._system({"type": "exit_flashing"})
 
-    def set_pid_gains(self, node: int, **gains: Any) -> int:
-        return self._system({"type": "set_pid_gains", "node": int(node), **gains})
+    def set_pid_gains(
+        self,
+        node: int,
+        *,
+        kpp: float,
+        kpv: float,
+        kiv: float,
+        kpiq: float,
+        kiiq: float,
+        kp: float,
+        kd: float,
+        ilim_ma: float,
+        velocity_limit_ticks_s: float,
+        voltage_limit_mv: int = 0,
+    ) -> int:
+        """Preview a drive retune. Spelled out rather than taking
+        ``**gains``, so the defaults the live client fills are the same
+        ones here: a script that omits ``voltage_limit_mv`` ran on the
+        arm and failed in preview."""
+        return self._system(
+            {
+                "type": "set_pid_gains",
+                "node": int(node),
+                "kpp": float(kpp),
+                "kpv": float(kpv),
+                "kiv": float(kiv),
+                "kpiq": float(kpiq),
+                "kiiq": float(kiiq),
+                "kp": float(kp),
+                "kd": float(kd),
+                "ilim_ma": float(ilim_ma),
+                "velocity_limit_ticks_s": float(velocity_limit_ticks_s),
+                "voltage_limit_mv": int(voltage_limit_mv),
+            }
+        )
 
     def wait_motion(self, **kwargs: Any) -> bool:
         return True

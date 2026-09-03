@@ -886,3 +886,36 @@ async def _teleport_to(client, angles: list[float]) -> None:
         ):
             return
     raise AssertionError("teleport never took effect")
+
+
+def test_a_retune_previews_from_the_same_call_that_runs_live(
+    dry_run: DryRunRobotClient,
+) -> None:
+    """The point of a dry run is that the script it accepts is the script
+    the arm accepts.
+
+    `voltage_limit_mv` has a default on the live client, so a caller who
+    leaves it out sends a complete frame there. The preview took
+    `**gains` and forwarded only what it was handed, so the same call
+    reached the wire converter a field short and died — the preview
+    refusing a program that runs.
+    """
+    j = _cfg.config().joints()[2]
+    tune = dict(
+        kpp=j["gains"]["kpp"],
+        kpv=j["gains"]["kpv"],
+        kiv=j["gains"]["kiv"],
+        kpiq=j["gains"]["kpiq"],
+        kiiq=j["gains"]["kiiq"],
+        kp=j["gains"]["kp"],
+        kd=j["gains"]["kd"],
+        ilim_ma=j["ilim_ma"],
+        velocity_limit_ticks_s=j["velocity_limit_ticks_s"],
+    )
+    # No voltage_limit_mv: exactly the call the live client completes.
+    assert dry_run.set_pid_gains(j["node_id"], **tune) >= 0
+
+    # And a node the config does not declare is refused here too, so the
+    # preview catches the typo before the arm does.
+    with pytest.raises(RobotError):
+        dry_run.set_pid_gains(15, **tune)

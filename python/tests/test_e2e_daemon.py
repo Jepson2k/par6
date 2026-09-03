@@ -1153,9 +1153,23 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
             "the gate refused the datagram but never cancelled the session"
         )
+        # How deep the arm gets is the gate's reaction plus the braking
+        # distance, and housekeeping only reacts as often as it runs. A
+        # box too loaded to hold the loop period reacts later and coasts
+        # further, which is the loop failing rather than the gate — so
+        # the loop's own overrun count goes in the message to tell them
+        # apart.
+        stats = await client.loop_stats()
+        loop_note = (
+            f"the RT loop overran {stats.overrun_count} of {stats.loop_count} ticks "
+            f"(p99 {stats.p99_period_s * 1e3:.2f} ms against a "
+            f"{1e3 / stats.target_hz:.2f} ms budget)"
+            if stats is not None
+            else "loop stats unavailable"
+        )
         assert min(z_seen) > floor, (
             f"the gated stream carried the TCP into the keep-out: "
-            f"min z {min(z_seen):.1f} vs floor {floor:.1f}"
+            f"min z {min(z_seen):.1f} vs floor {floor:.1f}. {loop_note}"
         )
         assert await client.set_shapes([])
 
