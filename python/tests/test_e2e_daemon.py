@@ -1664,14 +1664,17 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
     closing the gripper and moving the part, not something run from a
     terminal. What is asserted here is that contract — the wrist swings,
     a well-formed answer comes back, and the runtime's payload changes
-    only when the answer is declared and only to what was found.
+    only when the answer is declared and only to what was found. A
+    payload declared BEFORE the call has to come back on every exit that
+    does not declare: the estimate clears it to measure against an
+    unloaded model, and an arm still holding a 1.2 kg part must not be
+    left compensating for nothing because someone was curious.
 
     Whether the number is RIGHT is not asserted here and cannot be: this
     fixture re-ticks the daemon for CI, and at that rate the torque plant
     limit-cycles, so reported current is chatter rather than gravity.
     That measurement lives against the shipped tick in
-    `par6d/tests/gravity_calibration.rs`, where the plant swings a gripper
-    the model does not know about and 0.370 kg comes back as 0.358 kg.
+    `par6d/tests/gravity_calibration.rs`.
     """
     async with daemon.client() as client:
         assert await client.wait_ready(timeout=STEP_BUDGET_S)
@@ -1681,30 +1684,31 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
 
         assert await enable(client, home) is None
 
+        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
         before = await client.payload()
-        assert before is not None and before.mass == 0.0
+        assert before is not None and before.mass == pytest.approx(1.2)
 
         found = await client.estimate_payload(declare=False)
         assert found.poses >= 3, "the wrist must have been swung somewhere"
-        assert not found.declared
         assert math.isfinite(found.mass)
         assert len(found.com) == 3 and all(math.isfinite(v) for v in found.com)
         assert len(found.determined) == 4
         assert all(0.0 <= d <= 1.0 for d in found.determined), found.determined
         assert found.rms_nm <= found.rms_unloaded_nm, (
-            "identifying a load cannot explain the torque worse than ignoring it: "
+            "estimating a load cannot explain the torque worse than ignoring it: "
             f"{found.rms_nm} vs {found.rms_unloaded_nm} Nm"
         )
 
-        # Asking is not declaring.
+        # Asking is not declaring: what was declared is what is carried.
         carried = await client.payload()
-        assert carried is not None and carried.mass == 0.0, (
-            "estimate_payload(declare=False) must not change what the arm carries"
-        )
+        assert carried is not None
+        assert carried.mass == pytest.approx(before.mass)
+        assert carried.com == pytest.approx(before.com)
 
         # Declaring puts exactly what was found on the arm — or refuses,
-        # when the poses did not measure a mass to put there. Either way
-        # the runtime and the answer agree.
+        # when the poses did not measure a mass, and then the earlier
+        # declaration still stands. Either way the runtime and the
+        # answer agree.
         try:
             declared = await client.estimate_payload(declare=True)
         except RuntimeError as refused:
@@ -1712,12 +1716,13 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
                 refused
             ), refused
             carried = await client.payload()
-            assert carried is not None and carried.mass == 0.0, (
-                "a refused identification must not declare anything"
+            assert carried is not None and carried.mass == pytest.approx(before.mass), (
+                "a refused estimate must leave the earlier declaration in place"
             )
         else:
-            assert declared.declared
             carried = await client.payload()
             assert carried is not None
             assert carried.mass == pytest.approx(declared.mass, rel=1e-6)
             assert carried.com == pytest.approx(declared.com, rel=1e-6)
+
+        assert await client.set_payload(0.0) == 1

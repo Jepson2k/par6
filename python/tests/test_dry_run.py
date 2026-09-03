@@ -919,3 +919,26 @@ def test_a_retune_previews_from_the_same_call_that_runs_live(
     # preview catches the typo before the arm does.
     with pytest.raises(RobotError):
         dry_run.set_pid_gains(15, **tune)
+
+
+def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
+    dry_run: DryRunRobotClient,
+) -> None:
+    """The ABC's own example — `found = rbt.estimate_payload()` — is a
+    valid program, and a valid program must preview. A dry run has no
+    torque to read, so the estimate is empty; what it previews is the
+    motion: the wrist swing, planned against the same keep-outs, ending
+    back where it started.
+    """
+    dry_run.set_payload(0.0)
+    start = list(dry_run.angles())
+    carried = dry_run.payload()
+    assert carried.mass == 0.0
+
+    found = dry_run.estimate_payload()
+    assert found.poses >= 3, "the wrist must have somewhere to swing from park"
+    assert found.mass == 0.0 and found.determined == (0.0, 0.0, 0.0, 0.0)
+    assert dry_run.payload().mass == 0.0, "a dry run declares nothing"
+    assert dry_run.angles() == pytest.approx(start, abs=1e-6), (
+        "the swing must end where the pick left the arm"
+    )

@@ -153,6 +153,12 @@ pub(crate) struct StreamGate {
 }
 
 impl StreamGate {
+    /// The gate's own collision world, for planning poses against the
+    /// same shapes the gate admits jogs against.
+    pub(crate) fn collision_mut(&mut self) -> &mut par6_kin::Collision {
+        &mut self.collision
+    }
+
     pub(crate) fn new(
         collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
@@ -520,6 +526,13 @@ impl RtCommands for RtBridge {
                         jog,
                         ..
                     }) => jog,
+                    // No open session — but the RT may still be in JOG
+                    // ramping the LAST one down, and bouncing it through
+                    // IDLE would stop the arm dead mid-ramp and restart it
+                    // from rest: the stop the ramp-down exists to remove.
+                    // Already in JOG, the Jog command below just becomes
+                    // the ramp's new target.
+                    _ if self.cart.snapshots.latest().mode == Mode::Jog => [0.0; MAX_JOINTS],
                     _ => {
                         self.enter_stream_mode(Mode::Jog);
                         [0.0; MAX_JOINTS]

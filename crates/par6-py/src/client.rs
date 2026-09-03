@@ -13,7 +13,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use par6_client::{Ack, Client, ClientConfig, ClientError, MotionWait, StatusTransport};
 use par6_proto::command as cmd;
-use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
+use par6_proto::{Command, CompletionPolicy, QueryResult, NUM_JOINTS};
 
 use crate::convert::{
     client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
@@ -540,29 +540,62 @@ impl CoreClient {
             estimation_model(config.as_deref(), assets.as_deref(), package_dir.as_deref())?;
         future_into_py(py, async move {
             let (mut kin, mut collision) = (kin, collision);
+            // The load is found in the torque the UNLOADED model cannot
+            // explain, so whatever is declared has to come off first —
+            // and go back on every exit that does not declare, failure
+            // included, or a curious call leaves the arm compensating
+            // for nothing while it still holds the part.
+            let previous = match client.payload().await.map_err(client_err)? {
+                QueryResult::Payload { mass, com, inertia } => (mass, com, inertia),
+                other => {
+                    return Err(PyRuntimeError::new_err(format!(
+                        "payload query answered {other:?}"
+                    )))
+                }
+            };
             client
                 .set_payload(0.0, [0.0; 3], None)
                 .await
                 .map_err(client_err)?;
 
-            let angles = client.angles().await.map_err(client_err)?;
-            let mut start = [0.0; NUM_JOINTS];
-            for (out, deg) in start.iter_mut().zip(angles.iter()) {
-                *out = deg.to_radians();
-            }
-
-            let protocol = par6_calibrate::Protocol::default();
-            let poses = par6_calibrate::plan_poses(
-                &mut collision,
-                &start,
-                &window,
-                spread,
-                protocol.approach_rad,
-            )
-            .map_err(PyRuntimeError::new_err)?;
-            let report = par6_calibrate::identify(&client, &mut kin, &poses, &protocol, ridge)
-                .await
+            let run = async {
+                let angles = client.angles().await.map_err(client_err)?;
+                let mut start = [0.0; NUM_JOINTS];
+                for (out, deg) in start.iter_mut().zip(angles.iter()) {
+                    *out = deg.to_radians();
+                }
+                let protocol = par6_calibrate::Protocol::default();
+                let poses = par6_calibrate::plan_poses(
+                    &mut collision,
+                    &start,
+                    &window,
+                    spread,
+                    protocol.approach_rad,
+                )
                 .map_err(PyRuntimeError::new_err)?;
+                par6_calibrate::identify(&client, &mut kin, start, &poses, &protocol, ridge)
+                    .await
+                    .map_err(PyRuntimeError::new_err)
+            };
+            let restore = |client: Client| async move {
+                let inertia = if previous.2 == [0.0; 6] {
+                    None
+                } else {
+                    Some(previous.2)
+                };
+                client
+                    .set_payload(previous.0, previous.1, inertia)
+                    .await
+                    .map_err(client_err)
+            };
+
+            let report = match run.await {
+                Ok(r) => r,
+                Err(e) => {
+                    restore(client.clone()).await?;
+                    return Err(e);
+                }
+            };
 
             if declare {
                 // Nothing measurable means nothing to declare: a wrist
@@ -570,6 +603,7 @@ impl CoreClient {
                 // noise-level mass would leave the gravity model worse
                 // than an empty hand.
                 if report.fit.determined[0] <= par6_calibrate::MEASURED {
+                    restore(client.clone()).await?;
                     return Err(PyRuntimeError::new_err(format!(
                         "the poses did not measure the mass (determined {:.2}); \
                          give the wrist more room or a wider spread",
@@ -577,6 +611,7 @@ impl CoreClient {
                     )));
                 }
                 if !(report.fit.mass.is_finite() && report.fit.mass > 0.0) {
+                    restore(client.clone()).await?;
                     return Err(PyRuntimeError::new_err(format!(
                         "refusing to declare a mass of {:.4} kg",
                         report.fit.mass
@@ -586,6 +621,8 @@ impl CoreClient {
                     .set_payload(report.fit.mass, report.fit.com, None)
                     .await
                     .map_err(client_err)?;
+            } else {
+                restore(client.clone()).await?;
             }
 
             Python::with_gil(|py| {
@@ -596,7 +633,6 @@ impl CoreClient {
                 d.set_item("rms_nm", report.fit.rms_nm)?;
                 d.set_item("rms_unloaded_nm", report.fit.rms_unloaded_nm)?;
                 d.set_item("poses", report.samples.len())?;
-                d.set_item("declared", declare)?;
                 Ok(d.unbind())
             })
         })

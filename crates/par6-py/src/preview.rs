@@ -230,6 +230,28 @@ impl Preview {
     }
 
     /// Where the configured homing seek leaves the arm \[rad\].
+    /// What the virtual arm carries: `mass`, `com`, `inertia` (zeros = none).
+    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.inner.lock().unwrap().payload();
+        let d = PyDict::new(py);
+        d.set_item("mass", p.mass)?;
+        d.set_item("com", p.com.to_vec())?;
+        d.set_item("inertia", p.inertia.unwrap_or([0.0; 6]).to_vec())?;
+        Ok(d)
+    }
+
+    /// The wrist poses (rad) a payload estimation would swing through
+    /// from here, or an error naming why none are reachable.
+    #[pyo3(signature = (spread=0.5, approach_rad=0.05))]
+    fn wrist_poses(&self, spread: f64, approach_rad: f64) -> PyResult<Vec<Vec<f64>>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .wrist_poses(spread, approach_rad)
+            .map(|poses| poses.iter().map(|q| q.to_vec()).collect())
+            .map_err(PyRuntimeError::new_err)
+    }
+
     fn homing_ready_pose_rad(&self) -> Vec<f64> {
         self.inner.lock().unwrap().homing_ready_pose_rad().to_vec()
     }

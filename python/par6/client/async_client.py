@@ -963,7 +963,7 @@ class AsyncRobotClient(_RobotClientABC):
         mass.  Refused (COMM_VALIDATION_ERROR) for negative mass or a
         non-positive-semidefinite inertia.
 
-        Category: Control
+        Category: Configuration
 
         Example:
             rbt.set_payload(1.2, com=(0.0, 0.0, 0.05))
@@ -1013,9 +1013,18 @@ class AsyncRobotClient(_RobotClientABC):
             print(f"holding {found.mass:.3f} kg")
         """
         core = await self._ensure_core()
+        # The unloaded model has to be the DAEMON's arm — its config, its
+        # fitted gripper — not the wheel's packaged default. A box wearing
+        # a different gripper than the package assumes would otherwise
+        # have the mass difference fitted as payload and declared on top
+        # of the tool the daemon already carries.
+        config = _cfg.data_root() / "config" / "PAR6.toml"
+        bundle = await self.config_bundle()
+        if bundle:
+            config = _cfg.materialize_bundle(bundle)
         raw = await self._call(
             core.estimate_payload(
-                str(_cfg.data_root() / "config" / "PAR6.toml"),
+                str(config),
                 str(_cfg.data_root()),
                 str(_cfg.package_search_dir()),
                 float(spread),
@@ -1032,7 +1041,6 @@ class AsyncRobotClient(_RobotClientABC):
             rms_nm=float(raw["rms_nm"]),
             rms_unloaded_nm=float(raw["rms_unloaded_nm"]),
             poses=int(raw["poses"]),
-            declared=bool(raw["declared"]),
         )
 
     async def payload(self) -> PayloadResult | None:

@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Sequence
 
 
-class RobotError(Exception):
+class RobotError(RuntimeError):
     """A KUKA-style error reported by the runtime.
 
     Carries the wire error tuple ``[command_index, code, title, cause,

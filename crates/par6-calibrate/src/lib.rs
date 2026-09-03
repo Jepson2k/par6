@@ -93,9 +93,15 @@ pub fn plan_poses(
 
     let mut out = Vec::new();
     for q in candidates {
-        let inside = (0..NQ).all(|j| {
-            let (lo, hi) = window[j];
-            q[j] >= lo && q[j] <= hi
+        // The approach moves either side of the pose have to fit too:
+        // a pose inside the window whose approach is not is refused by
+        // the daemon mid-run, after the payload has been cleared.
+        let inside = [0.0, 1.0, -1.0].iter().all(|dir| {
+            let probe = offset(&q, dir * approach_rad);
+            (0..NQ).all(|j| {
+                let (lo, hi) = window[j];
+                probe[j] >= lo && probe[j] <= hi
+            })
         });
         if !inside {
             continue;
@@ -281,7 +287,9 @@ pub async fn measure(
 }
 
 /// The whole run: swing the wrist through `poses` on the arm behind
-/// `client` and solve for what it is carrying.
+/// `client`, solve for what it is carrying, and return to `start` — the
+/// pose the caller left the arm in, which `plan_poses` may have dropped
+/// from `poses` if its approach did not clear.
 ///
 /// `kin` must carry no payload — the residual the fit explains is the
 /// torque the UNLOADED model cannot account for — so the caller clears
@@ -289,11 +297,14 @@ pub async fn measure(
 pub async fn identify(
     client: &Client,
     kin: &mut Kin,
+    start: [f64; NQ],
     poses: &[[f64; NQ]],
     protocol: &Protocol,
     ridge: f64,
 ) -> Result<Report, String> {
-    let start = poses[0];
+    if poses.is_empty() {
+        return Err("no poses to measure".into());
+    }
     let samples = measure(client, poses, protocol).await?;
     let fit = gravity::fit_payload(kin, &samples, ridge).map_err(|e| e.to_string())?;
     move_to(client, &start, protocol).await?;

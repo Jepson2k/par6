@@ -16,13 +16,15 @@ from __future__ import annotations
 
 import copy
 import logging
+import math
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld
+from waldoctl.status import PayloadEstimate, PayloadResult
 from waldoctl.sync_tools import make_sync_tool
 from waldoctl.tools import ToolState as WToolState
 from waldoctl.tools import ToolStatus
@@ -563,6 +565,51 @@ class DryRunRobotClient:
 
     def set_recipe(self, name: str = "", **kwargs: Any) -> int:
         return self._system({"type": "set_recipe", "name": name})
+
+    def payload(self) -> PayloadResult:
+        """What the virtual arm carries."""
+        raw = self._preview.payload()
+        return PayloadResult(
+            mass=float(raw["mass"]),
+            com=cast("tuple[float, float, float]", tuple(raw["com"])),
+            inertia=cast(
+                "tuple[float, float, float, float, float, float]", tuple(raw["inertia"])
+            ),
+        )
+
+    def estimate_payload(
+        self,
+        spread: float = 0.5,
+        ridge: float = 0.01,
+        declare: bool = True,
+    ) -> PayloadEstimate:
+        """Preview the wrist swing an estimation makes; measure nothing.
+
+        A dry run has no torque to read, so the estimate it returns is
+        empty — mass 0, nothing determined — and ``declare`` declares
+        nothing. What it does preview is the MOTION: the same wrist poses
+        the arm would swing through from here, planned against the same
+        keep-outs, and traced as the joint moves they are, so a program
+        that estimates mid-pick shows that swing in the preview and is
+        refused where the arm would be.
+        """
+        del ridge, declare
+        poses = self._preview.wrist_poses(float(spread))
+        start = list(self._preview.angles_deg())
+        # The live run swings at the estimation protocol's own speed.
+        for q in poses:
+            self._submit(
+                {"type": "move_j", "angles": [math.degrees(v) for v in q], "speed": 1.0}
+            )
+        self._submit({"type": "move_j", "angles": start, "speed": 1.0})
+        return PayloadEstimate(
+            mass=0.0,
+            com=(0.0, 0.0, 0.0),
+            determined=(0.0, 0.0, 0.0, 0.0),
+            rms_nm=0.0,
+            rms_unloaded_nm=0.0,
+            poses=len(poses),
+        )
 
     def set_payload(
         self,

@@ -717,3 +717,55 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
         seek.duration_s
     );
 }
+
+/// Releasing a jog ramps it down rather than stopping dead — but the
+/// ramp is still running when an operator re-presses, and the daemon
+/// used to answer a datagram with no open session by bouncing the RT
+/// through IDLE, which stops the arm from ramp speed and restarts it from
+/// rest: the very stop the ramp-down exists to remove.
+#[test]
+fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
+    let config = test_config();
+    let rig = Rig::boot(config.clone());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let accel_s = par6_config::RobotConfig::load(&config)
+        .expect("cfg")
+        .jog
+        .accel_time_s;
+    let mut speeds = [0.0; NUM_JOINTS];
+    speeds[0] = 0.5;
+
+    // Hold the jog well past the ramp so it is at cruise, then let the
+    // watchdog expire and re-press inside the ramp down.
+    let frame_s = 0.1;
+    let t0 = std::time::Instant::now();
+    while t0.elapsed().as_secs_f64() < 2.0 * accel_s {
+        c.send(&jog_j_cmd(speeds, frame_s));
+        std::thread::sleep(Duration::from_secs_f64(frame_s * 0.5));
+    }
+    let released = rig.wait_status("cruising", |s| s.speeds[0].abs() > 0.05);
+    // Inside the ramp down, before it can have reached rest.
+    std::thread::sleep(Duration::from_secs_f64(frame_s + 0.25 * accel_s));
+    rig.drain_status();
+    let mut slowest = f64::INFINITY;
+    let re_pressed = std::time::Instant::now();
+    while re_pressed.elapsed().as_secs_f64() < accel_s {
+        c.send(&jog_j_cmd(speeds, frame_s));
+        if let Some(s) = rig.recv_status() {
+            if s.seq > released.seq {
+                slowest = slowest.min(s.speeds[0].abs());
+            }
+        }
+    }
+    assert!(
+        slowest > 0.02,
+        "the arm came to rest ({slowest:.3} rad/s) between release and re-press: \
+         the re-press bounced the RT through IDLE instead of joining the ramp"
+    );
+    c.send(&jog_j_cmd([0.0; NUM_JOINTS], frame_s));
+    rig.shutdown();
+}

@@ -15,6 +15,8 @@ repository.workspace = true
 # The library crates still build without any C++ toolchain.
 
 [dependencies]
+# The preview plans a payload estimation's wrist poses with the same planner.
+par6-calibrate = { workspace = true }
 par6-config = { workspace = true }
 par6-proto = { workspace = true }
 par6-motion = { workspace = true }
@@ -34,6 +36,5 @@ libc = "0.2"
 par6-proto = { workspace = true }
 par6-config = { workspace = true }
 par6-client = { workspace = true }
-par6-calibrate = { workspace = true }
 env_logger = { workspace = true }
 libc = "0.2"

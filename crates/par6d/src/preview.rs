@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
+use par6_kin::NQ;
 use par6_motion::{JogEngine, MotionLimits};
 use par6_proto::command::{self as cmd, JogJ, ToolParam};
 use par6_proto::{
@@ -158,10 +159,15 @@ pub struct Preview {
     /// ENTRY, not per datagram, so a stream of jogs must keep ramping
     /// rather than restart each time.
     jog_streaming: bool,
-    /// Ticks to run the ramp down when a stream ends. The ramp cannot
-    /// outlast its own time constant; the margin covers the s-curve
-    /// profile, which spends longer than the linear one reaching rest.
-    jog_ramp_ticks: usize,
+    /// The configured 0-to-full ramp time, and the fraction the open
+    /// stream asked for: together they bound how long the ramp down can
+    /// take when the stream ends.
+    jog_accel_time_s: f64,
+    jog_accel_scale: f64,
+    /// Whether a cartesian jog stream is open: the RT enters STREAM once
+    /// per session and its executor carries velocity across datagrams,
+    /// so a preview must not restart the executor from rest per frame.
+    cart_streaming: bool,
     /// The RT's own streaming executor. A cartesian jog is integrated
     /// into joint setpoints and then TRACKED by this, so a preview that
     /// stopped at the setpoints would report a jog that starts and stops
@@ -257,9 +263,9 @@ impl Preview {
             estop_latched: false,
             standing_error: None,
             jog_streaming: false,
-            jog_ramp_ticks: ((2.0 * robot.jog.accel_time_s / robot.robot.tick_dt_s).ceil()
-                as usize)
-                .max(1),
+            jog_accel_time_s: robot.jog.accel_time_s,
+            jog_accel_scale: 1.0,
+            cart_streaming: false,
             stream: MotionStream::new(
                 par6_motion::StreamingExecutor::new(robot.robot.tick_dt_s, &stream_limits)?,
                 robot.robot.tick_dt_s,
@@ -276,6 +282,13 @@ impl Preview {
         preview
             .planner
             .set_shapes(ShapeLayer::Installation, &installation)
+            .map_err(|e| DaemonError::Kinematics(e.cause))?;
+        // The streaming gate keeps its own world; the server mirrors
+        // every accepted layer into it, and so must the preview or a
+        // jog is admitted through a keep-out the planner refuses.
+        preview
+            .gate
+            .set_layer(ShapeLayer::Installation, &installation)
             .map_err(|e| DaemonError::Kinematics(e.cause))?;
         preview.sync_planner();
         preview.publish();
@@ -324,6 +337,7 @@ impl Preview {
     /// stream was ramping, so the next jog starts from rest.
     pub fn place_rad(&mut self, q: [f64; MAX_JOINTS]) {
         self.end_jog_stream();
+        self.cart_streaming = false;
         self.snap.q = q;
         self.publish();
     }
@@ -415,6 +429,9 @@ impl Preview {
         if !matches!(command, Command::JogJ(_)) {
             self.end_jog_stream();
         }
+        if !matches!(command, Command::JogL(_)) {
+            self.cart_streaming = false;
+        }
         match command_class(command.tag()) {
             CommandClass::Queued => self.submit_queued(command),
             CommandClass::FireAndForget => self.submit_stream(command),
@@ -471,6 +488,35 @@ impl Preview {
         None
     }
 
+    /// The payload the virtual arm carries.
+    pub fn payload(&self) -> PayloadSpec {
+        self.payload
+    }
+
+    /// The wrist poses a payload estimation would swing through from the
+    /// virtual arm's current pose, checked against the gate's world — so
+    /// a preview traces the same motion the arm would make and refuses
+    /// where the arm would.
+    pub fn wrist_poses(
+        &mut self,
+        spread: f64,
+        approach_rad: f64,
+    ) -> Result<Vec<[f64; NQ]>, String> {
+        let mut start = [0.0; NQ];
+        start.copy_from_slice(&self.snap.q[..NQ]);
+        let mut window = [(0.0, 0.0); NQ];
+        for (w, j) in window.iter_mut().enumerate() {
+            *j = (self.soft_min[w], self.soft_max[w]);
+        }
+        par6_calibrate::plan_poses(
+            self.gate.collision_mut(),
+            &start,
+            &window,
+            spread,
+            approach_rad,
+        )
+    }
+
     /// The refusal the runtime would leave standing, or `None`.
     pub fn error(&self) -> Option<&WireError> {
         self.standing_error.as_ref()
@@ -487,15 +533,30 @@ impl Preview {
             return;
         }
         self.jog.release();
+        // The ramp runs at the scaled acceleration, and the s-curve
+        // profile adds jerk phases on top of the linear time; four times
+        // the scaled constant is beyond either. Reaching the cap means the
+        // engine never reported rest, which is worth saying, because the
+        // pose taken here is where every later preview starts from.
+        let ramp_s = self.jog_accel_time_s / self.jog_accel_scale.max(f64::EPSILON);
+        let cap = ((4.0 * ramp_s / self.dt).ceil() as usize).max(1);
         let mut q = self.snap.q;
-        for _ in 0..self.jog_ramp_ticks {
+        let mut at_rest = false;
+        for _ in 0..cap {
             let mut q_out = [0.0; MAX_JOINTS];
             let mut qd_out = [0.0; MAX_JOINTS];
             self.jog.tick(&q, &mut q_out, &mut qd_out);
             q = q_out;
             if qd_out.iter().all(|v| *v == 0.0) {
+                at_rest = true;
                 break;
             }
+        }
+        if !at_rest {
+            log::warn!(
+                "preview jog ramp did not reach rest within {cap} ticks; the virtual arm is \
+                 placed where the ramp was cut"
+            );
         }
         self.snap.q = q;
         self.jog_streaming = false;
@@ -653,6 +714,9 @@ impl Preview {
                 if let Err(e) = self.planner.set_shapes(ShapeLayer::Program, &[]) {
                     return self.refuse(e);
                 }
+                if let Err(e) = self.gate.set_layer(ShapeLayer::Program, &[]) {
+                    return self.refuse(e);
+                }
             }
             Command::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
                 None => self.io_levels[usize::from(p.port)] = p.value,
@@ -695,6 +759,9 @@ impl Preview {
             }
             Command::SetShapes(p) => {
                 if let Err(e) = self.planner.set_shapes(ShapeLayer::Program, &p.shapes) {
+                    return self.refuse(e);
+                }
+                if let Err(e) = self.gate.set_layer(ShapeLayer::Program, &p.shapes) {
                     return self.refuse(e);
                 }
             }
@@ -785,7 +852,9 @@ impl Preview {
         if let Some(error) = self.jog_blocked(&fractions) {
             return self.refuse(error);
         }
-        self.jog.set_accel_scale(accel.unwrap_or(1.0));
+        let scale = accel.unwrap_or(1.0);
+        self.jog.set_accel_scale(scale);
+        self.jog_accel_scale = scale;
         // The RT ramps from rest on JOG mode ENTRY, not per datagram: a
         // UI streaming jogs at 20 Hz gets one acceleration, not one per
         // frame. Re-activating here would preview a fraction of the real
@@ -860,7 +929,10 @@ impl Preview {
         let period = HOUSEKEEPING_PERIOD.as_secs_f64();
         let steps = ((duration_s / period).round() as usize).max(1);
         let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
-        self.stream.activate(&self.snap.q);
+        if !self.cart_streaming {
+            self.stream.activate(&self.snap.q);
+            self.cart_streaming = true;
+        }
         self.stream.set_scale(1.0, accel.unwrap_or(1.0));
         let mut trajectory = Vec::with_capacity(steps * ticks_per_step);
         let mut q = self.snap.q;
