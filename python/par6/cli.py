@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Sequence
 from typing import Any
@@ -24,6 +23,9 @@ from par6.client import RobotClient, RobotError
 EXIT_UNREACHABLE = 2
 #: Exit code when the runtime answered but refused the command.
 EXIT_REFUSED = 3
+#: Exit code when the runtime accepted the command but it did not finish
+#: within the wait.
+EXIT_TIMEOUT = 4
 
 
 def _client(args: argparse.Namespace) -> RobotClient:
@@ -45,7 +47,7 @@ def _emit(value: Any, as_json: bool) -> None:
 def _cmd_ping(client: RobotClient, args: argparse.Namespace) -> int:
     result = client.ping()
     if result is None:
-        print(f"no runtime answered {args.host}:{args.port}", file=sys.stderr)
+        print(f"no runtime answered {client.host}:{client.port}", file=sys.stderr)
         return EXIT_UNREACHABLE
     _emit({"hardware_connected": result.hardware_connected}, args.json)
     return 0
@@ -82,7 +84,8 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
             # The e-stop is always the LAST slot; the ones before it are the
             # configured inputs then outputs, so the width follows config.
             "io": list(status.io),
-            "estop": bool(status.io[-1]) if status.io else None,
+            # The slot carries the LINE, which reads low while pressed.
+            "estop": (status.io[-1] == 0) if status.io else None,
             "tool": None if tool is None else tool.key,
             "tool_positions": None if tool is None else list(tool.positions),
             "tool_engaged": None if tool is None else tool.engaged,
@@ -92,12 +95,13 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
     return 0
 
 
-def _unconfirmed(what: str, args: argparse.Namespace) -> int:
+def _unconfirmed(what: str, client: RobotClient) -> int:
     """A send nothing acknowledged must never read as success — for
     ``estop`` especially, "the arm is stopped" printed on a lost datagram
     is the dangerous lie."""
     print(
-        f"{what} NOT confirmed: no runtime acknowledged it at {args.host}:{args.port}",
+        f"{what} NOT confirmed: no runtime acknowledged it at "
+        f"{client.host}:{client.port}",
         file=sys.stderr,
     )
     return EXIT_UNREACHABLE
@@ -105,28 +109,28 @@ def _unconfirmed(what: str, args: argparse.Namespace) -> int:
 
 def _cmd_estop(client: RobotClient, args: argparse.Namespace) -> int:
     if client.estop() != 1:
-        return _unconfirmed("estop", args)
+        return _unconfirmed("estop", client)
     _emit("estop latched; clear it with `par6 reset`", args.json)
     return 0
 
 
 def _cmd_reset(client: RobotClient, args: argparse.Namespace) -> int:
     if client.reset() != 1:
-        return _unconfirmed("reset", args)
+        return _unconfirmed("reset", client)
     _emit("protective stop cleared", args.json)
     return 0
 
 
 def _cmd_stop(client: RobotClient, args: argparse.Namespace) -> int:
     if client.stop(clear_queue=not args.keep_queue) != 1:
-        return _unconfirmed("stop", args)
+        return _unconfirmed("stop", client)
     _emit("motion stopped", args.json)
     return 0
 
 
 def _cmd_home(client: RobotClient, args: argparse.Namespace) -> int:
     if client.home(wait=args.wait, timeout=args.home_timeout) < 0:
-        return _unconfirmed("home", args)
+        return _unconfirmed("home", client)
     _emit("homed" if args.wait else "homing started", args.json)
     return 0
 
@@ -139,22 +143,24 @@ def _cmd_move_j(client: RobotClient, args: argparse.Namespace) -> int:
         timeout=args.move_timeout,
     )
     if index < 0:
-        return _unconfirmed("move-j", args)
+        return _unconfirmed("move-j", client)
     _emit({"queue_index": index}, args.json)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="par6", description=__doc__.splitlines()[0])
+    # Unset here means the client's own resolution: $PAR6_HOST /
+    # $PAR6_COMMAND_PORT, then the shipped defaults.
     parser.add_argument(
         "--host",
-        default=os.environ.get("PAR6_HOST", "127.0.0.1"),
+        default=None,
         help="runtime address (default: $PAR6_HOST or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PAR6_COMMAND_PORT", "6001")),
+        default=None,
         help="command port (default: $PAR6_COMMAND_PORT or 6001)",
     )
     parser.add_argument(
@@ -212,11 +218,17 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    client = _client(args)
     try:
-        with _client(args) as client:
+        with client:
             return int(args.fn(client, args))
+    except TimeoutError as exc:
+        # An OSError subclass, and the one that means the runtime
+        # answered every datagram but the command is still running.
+        print(f"{args.command} timed out: {exc}", file=sys.stderr)
+        return EXIT_TIMEOUT
     except OSError as exc:
-        print(f"cannot reach {args.host}:{args.port}: {exc}", file=sys.stderr)
+        print(f"cannot reach {client.host}:{client.port}: {exc}", file=sys.stderr)
         return EXIT_UNREACHABLE
     except (RobotError, RuntimeError) as exc:
         print(f"{args.command} refused: {exc}", file=sys.stderr)

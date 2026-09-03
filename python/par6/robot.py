@@ -60,6 +60,10 @@ COLLISION_CLEARANCE_M = 0.005
 #: answer may legitimately be None).
 _UNSET: Any = object()
 
+#: How long :meth:`Robot.create_dry_run_client` waits for a reachable
+#: daemon's config bundle before previewing with the local config.
+_CONFIG_FETCH_TIMEOUT_S = 5.0
+
 
 # ===========================================================================
 # Collision naming and geometry
@@ -998,8 +1002,21 @@ class Robot(_RobotABC):
         when nothing answers), later ones reuse the answer, so a host
         creating a preview per run does not block on every one.
         """
-        if kwargs.get("config_path") is None:
-            kwargs["config_path"] = self._daemon_config_path()
+        if kwargs.get("config_path") is not None:
+            return DryRunRobotClient(**kwargs)
+        fetched = self._daemon_config_path()
+        if fetched is not None:
+            try:
+                return DryRunRobotClient(config_path=fetched, **kwargs)
+            except (RuntimeError, ValueError) as e:
+                # A daemon a version apart may serve a TOML this package's
+                # engine cannot load; the preview then runs local numbers
+                # rather than no preview at all.
+                logger.warning(
+                    "the daemon's config could not feed the preview engine; "
+                    "previewing with the local config instead: %s",
+                    e,
+                )
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:
@@ -1024,12 +1041,16 @@ class Robot(_RobotABC):
 
         try:
             # Own thread: the sync client refuses to run inside an event
-            # loop, and this factory is called from async hosts too.
+            # loop, and this factory is called from async hosts too. The
+            # wait is bounded: a daemon that answers PING but stalls the
+            # bundle must not hang the caller.
             with ThreadPoolExecutor(max_workers=1) as ex:
-                bundle = ex.submit(fetch).result()
+                bundle = ex.submit(fetch).result(timeout=_CONFIG_FETCH_TIMEOUT_S)
             if bundle:
                 self._preview_config = str(_cfg.materialize_bundle(bundle))
-        except (OSError, ValueError, KeyError, RobotError) as e:
+        except (OSError, ValueError, KeyError, RobotError, RuntimeError) as e:
+            # TimeoutError is an OSError; RuntimeError is what the engine
+            # client raises for a transport failure mid-fetch.
             logger.debug("daemon config fetch failed; preview uses local config: %s", e)
         return self._preview_config
 

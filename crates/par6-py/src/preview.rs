@@ -319,11 +319,56 @@ impl Preview {
     /// The payload the preview plans with, as the live `set_payload`
     /// pushes it: mass \[kg\], COM \[m\] in the end-effector frame, and
     /// the inertia `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` or None for a point
-    /// mass.
+    /// mass. Raises `RobotWireError` exactly when the runtime would refuse
+    /// the spec.
     #[pyo3(signature = (mass, com, inertia=None))]
-    fn set_payload(&self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) {
+    fn set_payload(&self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) -> PyResult<()> {
         self.engine()
-            .set_payload(PayloadSpec { mass, com, inertia });
+            .set_payload(PayloadSpec { mass, com, inertia })
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// The payload the preview plans with: `mass`, `com`, `inertia` (six
+    /// components, zeros for a point mass) — the live `payload` query's
+    /// shape.
+    fn payload(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let p = self.engine().payload();
+        let d = PyDict::new(py);
+        d.set_item("mass", p.mass)?;
+        d.set_item("com", &p.com[..])?;
+        d.set_item("inertia", &p.inertia.unwrap_or([0.0; 6])[..])?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// The planning context as last synced: `profile`, `tcp_offset_mm`,
+    /// and `policy` (wire value) — the runtime's own startup context
+    /// until a program changes it.
+    fn context(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let engine = self.engine();
+        let (profile, tcp_offset_mm, policy) = engine.context();
+        let d = PyDict::new(py);
+        d.set_item("profile", profile)?;
+        d.set_item("tcp_offset_mm", &tcp_offset_mm[..])?;
+        d.set_item("policy", policy as u8)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Whether the virtual gripper holds a calibration: a jaw move on an
+    /// uncalibrated gripper is refused as the runtime refuses it, and a
+    /// previewed `calibrate` establishes one.
+    fn set_gripper_calibrated(&self, calibrated: bool) {
+        self.engine().set_gripper_calibrated(calibrated);
+    }
+
+    /// How many blended moves the live queue holds before it plans the
+    /// chain as it stands.
+    fn blend_lookahead(&self) -> usize {
+        self.engine().blend_lookahead()
+    }
+
+    /// The config file this session was built from.
+    fn config_path(&self) -> String {
+        self.engine().config_path().display().to_string()
     }
 
     /// Preview a queued program (list of command dicts, see

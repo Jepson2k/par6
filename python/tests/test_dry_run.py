@@ -484,13 +484,12 @@ class TestCartesianMotion:
                 dry_run.jog_j(**kwargs)
             assert jog.value.code == ErrorCode.COMM_VALIDATION_ERROR, kwargs
 
-        with pytest.raises(RobotError) as short_move:
+        # A wrong-length list is refused by the live client itself, before
+        # any datagram, with ValueError — the preview raises the same.
+        with pytest.raises(ValueError, match="requires"):
             dry_run.move_j([0.0, 0.0, 0.0])
-        assert short_move.value.code == ErrorCode.COMM_VALIDATION_ERROR
-
-        with pytest.raises(RobotError) as short_teleport:
+        with pytest.raises(ValueError, match="requires"):
             dry_run.teleport([0.0, 0.0, 0.0])
-        assert short_teleport.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         # Outside a joint's travel the runtime refuses rather than clamping,
         # because clamping lands the arm somewhere else and reports success.
@@ -514,10 +513,11 @@ class TestCartesianMotion:
         dry_run.write_io(n_out - 1, 0)
         assert dry_run.io() == [0] * (n_in + n_out) + [1]
 
-        with pytest.raises(RobotError) as io:
+        # The live client bounds the port itself, with ValueError.
+        with pytest.raises(ValueError, match="Output index"):
             dry_run.write_io(n_out, 1)
-        assert io.value.code == ErrorCode.COMM_VALIDATION_ERROR
-        assert "does not exist" in io.value.cause
+        with pytest.raises(ValueError, match="0 or 1"):
+            dry_run.write_io(0, 2)
 
     def test_home_returns_to_park_once_the_arm_is_referenced(self) -> None:
         """HOME is two commands wearing one name, and the preview has to know
@@ -576,6 +576,167 @@ class TestCartesianMotion:
         client.tool.open()
         assert client.tool.is_open()
         assert client.tool.status().key == client.active_tool_key
+        assert client.tool.key == client.active_tool_key
+        with pytest.raises(AttributeError):
+            client.tool.bogus_verb
+
+
+class TestLiveParity:
+    """What a program sees offline is what the arm would do: the dry run
+    answers with the live client's methods, exception classes and
+    refusals, and its timeline carries every command's time."""
+
+    def test_a_state_only_command_keeps_a_held_chains_motion(self, dry_run) -> None:
+        """A checkpoint (or any command with no path) closes the blend hold
+        as the runtime's queue does; the motion it released is the head of
+        the next result, never dropped."""
+        dry_run.teleport(park_deg())
+        base = np.asarray(dry_run.pose())
+        corner = _offset(base, (50.0, 0.0, 0.0))
+        finish = _offset(base, (50.0, 0.0, 40.0))
+        assert dry_run.move_l(corner.tolist(), speed=0.4, r=15.0) is None
+        assert dry_run.checkpoint("corner") == 0
+        result = _planned(dry_run.move_l(finish.tolist(), speed=0.4))
+        path = result.tcp_poses[:, :3] * 1000.0
+        assert np.allclose(path[0], base[:3], atol=2.0), (
+            f"the chain the checkpoint closed must lead the result: {path[0]}"
+        )
+        assert _closest(path, corner[:3]) < 15.0
+        assert np.allclose(path[-1], finish[:3], atol=0.5)
+        assert dry_run.flush() == []
+
+    def test_the_blend_hold_fills_at_the_runtimes_lookahead(self, dry_run) -> None:
+        """The runtime's queue plans a chain once the blend lookahead is
+        full; a hold that grew without bound would fold a whole program
+        into one motion the arm runs in several."""
+        dry_run.teleport(park_deg())
+        cap = dry_run._preview.blend_lookahead()
+        start = list(dry_run.angles())
+        results = []
+        for i in range(cap):
+            target = list(start)
+            target[0] += 2.0 * ((i % 2) + 1)
+            results.append(dry_run.move_j(target, speed=0.5, r=5.0))
+        assert all(r is None for r in results[:-1]), "held until the lookahead fills"
+        assert results[-1] is not None, "the move that fills the hold runs the chain"
+        assert dry_run.flush() == []
+
+    def test_delays_and_tool_actions_carry_their_duration(self, dry_run) -> None:
+        """A delay holds the arm for its seconds and a calibration for the
+        runtime's minimum wait; both are time on the program's timeline."""
+        dry_run.teleport(park_deg())
+        with pytest.raises(ValueError, match="positive"):
+            dry_run.delay(0.0)
+        assert dry_run.delay(1.5) == 0
+        held = dry_run.flush()
+        assert len(held) == 1
+        assert held[0].duration == pytest.approx(1.5, abs=2 * dry_run._dt)
+        assert held[0].tcp_poses.shape[0] == 1, "a delay draws no path"
+
+        calibration = _planned(dry_run.tool.calibrate())
+        assert calibration.duration >= 2.0, "the runtime holds a calibration"
+        assert _planned(dry_run.tool.stop()).duration == 0.0
+
+    def test_tool_verbs_send_the_live_wire_actions(self) -> None:
+        """``release`` is the wire's ``idle`` and ``stop`` is ``stop`` — a
+        preview that sent the method name would refuse what the arm
+        accepts; and a jaw move on an uncalibrated gripper is refused
+        exactly as the runtime refuses it."""
+        client = Robot().create_dry_run_client(
+            initial_joints_deg=park_deg(), initial_gripper_calibrated=False
+        )
+        with pytest.raises(RobotError) as uncalibrated:
+            client.tool.close()
+        assert uncalibrated.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "calibrat" in uncalibrated.value.cause.lower()
+        assert client.tool.is_open(), "a refused move leaves the jaws where they were"
+
+        assert client.tool.calibrate().duration >= 2.0
+        assert client.tool.close().duration == 0.0
+        assert not client.tool.is_open()
+        assert client.tool.stop().duration == 0.0
+        assert client.tool.release().duration == 0.0
+        with pytest.raises(RobotError) as past_stroke:
+            client.tool.set_position(1.5)
+        assert past_stroke.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        with pytest.raises(RobotError) as unknown:
+            client.tool_action(client.active_tool_key, "grab")
+        assert unknown.value.code == ErrorCode.COMM_VALIDATION_ERROR
+
+    def test_servo_speed_is_refused_where_the_wire_refuses_it(self, dry_run) -> None:
+        """The live client passes the fraction through and the wire refuses
+        0 and anything past 1; a preview that rewrote them validated a
+        stream the arm rejects."""
+        dry_run.teleport(park_deg())
+        target = list(dry_run.angles())
+        target[0] += 5.0
+        for speed in (0.0, 1.5):
+            with pytest.raises(RobotError) as refused:
+                dry_run.servo_j(target, speed=speed)
+            assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR, speed
+        assert dry_run.servo_j(target, speed=0.5).duration > 0.0
+
+    def test_payload_is_validated_and_read_back(self, dry_run) -> None:
+        with pytest.raises(RobotError) as negative:
+            dry_run.set_payload(-1.0)
+        assert negative.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert dry_run.set_payload(0.5, com=(0.0, 0.0, 0.05)) == 1
+        payload = dry_run.payload()
+        assert payload["mass"] == pytest.approx(0.5)
+        assert payload["com"] == pytest.approx([0.0, 0.0, 0.05])
+        assert len(payload["inertia"]) == 6
+        assert dry_run.set_payload(0.0) == 1
+
+    def test_jog_l_previews_through_the_runtime_kinematics(self, dry_run) -> None:
+        """A +X world jog moves the TCP along +X through the runtime's own
+        twist integration; the axis vocabulary is refused like the live
+        client refuses it."""
+        # Clear of the wrist singularity park folds J5 into.
+        dry_run.teleport([0.0, -60.0, 150.0, 0.0, 45.0, 180.0])
+        start = np.asarray(dry_run.pose())
+        jog = dry_run.jog_l("WRF", "X", speed=1.0, duration=0.5)
+        end = np.asarray(dry_run.pose())
+        assert end[0] - start[0] > 20.0, "half a second of full-scale +X must travel"
+        assert abs(end[1] - start[1]) < 3.0 and abs(end[2] - start[2]) < 3.0
+        assert jog.duration == pytest.approx(0.5, abs=2 * dry_run._dt)
+        assert jog.joint_trajectory_rad.shape[1] == NUM_JOINTS
+        with pytest.raises(ValueError, match="unknown axis"):
+            dry_run.jog_l("WRF", "Q", speed=0.5, duration=0.2)
+        with pytest.raises(ValueError, match="axes and"):
+            dry_run.jog_l("WRF", axes=["X", "Y"], speeds_list=[0.5], duration=0.2)
+
+    def test_the_queries_a_live_program_reads_have_preview_answers(self) -> None:
+        client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+        assert client.ping().hardware_connected is False
+        assert client.tools().tool == client.active_tool_key
+        assert client.active_tool_key in client.tools().available
+        assert client.activity().state is client.activity().state
+        assert client.reachable().joint_en == [1] * NUM_JOINTS
+        assert client.queue_state().queue == []
+        assert client.loop_stats() is None
+        assert client.reset_loop_stats() == 1
+        assert client.wait_status(lambda s: s.homed) is True
+        assert client.wait_status(lambda s: s.last_checkpoint == "x") is False
+        client.checkpoint("x")
+        assert client.wait_status(lambda s: s.last_checkpoint == "x") is True
+        assert [s.homed for s in client.stream_status()] == [True]
+
+        info = client.config_info()
+        assert info["tick_dt_s"] == pytest.approx(client._dt)
+        assert len(info["joints"]) == NUM_JOINTS
+        bundle = client.config_bundle()
+        assert bundle["robot_filename"].endswith(".toml")
+        assert bundle["fingerprint"] == info["fingerprint"]
+        assert "[robot]" in bundle["robot_toml"]
+
+        # TRF answers as the runtime does: the world seen from the tool,
+        # the inverse of the TCP pose.
+        T = np.asarray(client.status().pose, dtype=np.float64).reshape(4, 4)
+        world_in_tool = np.linalg.inv(T)
+        assert client.pose(frame="TRF")[:3] == pytest.approx(
+            world_in_tool[:3, 3].tolist(), abs=1e-6
+        )
+        assert client.pose(frame="WRF") == pytest.approx(client.pose(), abs=1e-9)
 
 
 class TestProgramWorkflow:

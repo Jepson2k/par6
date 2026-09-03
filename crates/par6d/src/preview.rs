@@ -82,6 +82,8 @@ pub struct Preview {
     completion_policy: CompletionPolicy,
     /// The payload the preview plans with, as the live `set_payload`.
     payload: PayloadSpec,
+    /// The config file this session was built from.
+    config_path: std::path::PathBuf,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -136,6 +138,7 @@ impl Preview {
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let profile = cfg.initial_profile.clone();
         let mut preview = Self {
+            config_path,
             planner,
             jog,
             snap,
@@ -216,11 +219,54 @@ impl Preview {
     }
 
     /// Replace the payload the preview plans with — the same spec the
-    /// live `set_payload` pushes, so a program's gravity-dependent
-    /// refusals preview the way they run.
-    pub fn set_payload(&mut self, payload: PayloadSpec) {
+    /// live `set_payload` pushes, refused by the same wire validation, so
+    /// a program's gravity-dependent refusals preview the way they run.
+    pub fn set_payload(&mut self, payload: PayloadSpec) -> Result<(), WireError> {
+        Command::SetPayload(par6_proto::command::SetPayload {
+            mass: payload.mass,
+            com: payload.com,
+            inertia: payload.inertia,
+        })
+        .validate()
+        .map_err(|e| decode_error_to_wire(&e))?;
         self.payload = payload;
         self.sync_context();
+        Ok(())
+    }
+
+    /// The payload the preview plans with.
+    pub fn payload(&self) -> PayloadSpec {
+        self.payload
+    }
+
+    /// Whether the virtual gripper holds a calibration: the runtime
+    /// refuses a jaw move on an uncalibrated gripper, and a previewed
+    /// `calibrate` action establishes one.
+    pub fn set_gripper_calibrated(&mut self, calibrated: bool) {
+        self.snap.gripper.reply = Some(par6_bus::GripperReply {
+            calibrated,
+            ..par6_bus::GripperReply::default()
+        });
+        self.snap.gripper.data_age_ticks = 0;
+        self.publish();
+    }
+
+    /// The planning context as last synced: profile, TCP offset \[mm\],
+    /// completion policy — the runtime's own startup context until a
+    /// program changes it.
+    pub fn context(&self) -> (&str, [f64; 3], CompletionPolicy) {
+        (&self.profile, self.tcp_offset_mm, self.completion_policy)
+    }
+
+    /// How many blended moves the live queue holds before it plans the
+    /// chain as it stands.
+    pub fn blend_lookahead(&self) -> usize {
+        self.cfg.blend_lookahead
+    }
+
+    /// The config file this session was built from.
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
     }
 
     fn sync_context(&mut self) {
@@ -448,22 +494,33 @@ impl Preview {
                 ),
                 Ok(consumed) => {
                     let mut homing_seek = false;
-                    let trajectory: Vec<[f64; MAX_JOINTS]> = match self.planner.planned_motion() {
-                        PlannedMotion::Exec(samples) => samples.iter().map(|s| s.q).collect(),
-                        PlannedMotion::Home => {
-                            homing_seek = true;
-                            vec![self.planner.home_pose()]
-                        }
-                        PlannedMotion::Still => Vec::new(),
-                    };
+                    let mut hold_ticks = 0u64;
+                    let trajectory: Vec<[f64; MAX_JOINTS]> =
+                        match self.planner.planned_motion(self.snap.tick) {
+                            PlannedMotion::Exec(samples) => samples.iter().map(|s| s.q).collect(),
+                            PlannedMotion::Home => {
+                                homing_seek = true;
+                                vec![self.planner.home_pose()]
+                            }
+                            PlannedMotion::Hold(ticks) => {
+                                hold_ticks = ticks;
+                                Vec::new()
+                            }
+                            PlannedMotion::Still => Vec::new(),
+                        };
                     if homing_seek {
                         // The seek establishes the references; where it
                         // ends is the configured homing-ready pose.
                         self.snap.homed = true;
                     }
+                    if let Command::ToolAction(action) = &cmds[i] {
+                        if action.action == "calibrate" {
+                            self.set_gripper_calibrated(true);
+                        }
+                    }
                     self.planner.cancel();
                     let end = trajectory.last().copied().unwrap_or(self.snap.q);
-                    let duration_s = trajectory.len() as f64 * self.dt;
+                    let duration_s = (trajectory.len() as f64 + hold_ticks as f64) * self.dt;
                     let (tcp_poses, error) = match self.tcp_poses(&trajectory) {
                         Ok(poses) => (poses, None),
                         Err(error) => (Vec::new(), Some(error)),

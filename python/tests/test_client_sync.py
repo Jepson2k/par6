@@ -90,6 +90,13 @@ def test_sync_facade_smoke(daemon):
         assert client.jog_j(1, 0.4, 0.2) == 1
         assert client.stop() == 1
 
+        # The halt verbs on the sync tool are sends, not coroutines: each
+        # comes back as the queued command's index.
+        client.select_tool(_cfg.fitted_tool_key())
+        for verb in ("stop", "release"):
+            index = getattr(client.tool, verb)()
+            assert isinstance(index, int) and index >= 0, verb
+
         # Clearing a protective stop and floating the arm under G(q)
         # alone — the control pair a synchronous script needs.
         assert client.reset() == 1

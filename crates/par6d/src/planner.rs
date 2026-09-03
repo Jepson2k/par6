@@ -1988,13 +1988,16 @@ pub(crate) enum PlannedMotion<'a> {
     /// The homing sequence; on a referenced arm it lands at the
     /// configured home pose.
     Home,
-    /// No motion (tool actions, delays, checkpoints, null moves).
+    /// The arm holds still for this many ticks: a delay, or a tool
+    /// calibration's minimum wait.
+    Hold(u64),
+    /// No motion (the other tool actions, checkpoints, null moves).
     Still,
 }
 
 impl Par6Planner {
     /// The in-flight command's planned motion, for the offline preview.
-    pub(crate) fn planned_motion(&self) -> PlannedMotion<'_> {
+    pub(crate) fn planned_motion(&self, now_tick: u64) -> PlannedMotion<'_> {
         match &self.inflight {
             Some(InFlight {
                 kind: InFlightKind::Exec { samples, .. },
@@ -2004,6 +2007,18 @@ impl Par6Planner {
                 kind: InFlightKind::Home { .. },
                 ..
             }) => PlannedMotion::Home,
+            Some(InFlight {
+                kind: InFlightKind::Delay { target_tick },
+                ..
+            }) => PlannedMotion::Hold(target_tick.saturating_sub(now_tick)),
+            Some(InFlight {
+                kind:
+                    InFlightKind::Tool {
+                        wait: ToolWait::Calibrate,
+                        ..
+                    },
+                ..
+            }) => PlannedMotion::Hold(self.tool_cal_min_ticks),
             _ => PlannedMotion::Still,
         }
     }

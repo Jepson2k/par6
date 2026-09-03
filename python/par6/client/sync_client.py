@@ -96,18 +96,20 @@ def _run(coro: Coroutine[Any, Any, T]) -> T:
 
 
 def _sync_tool(tool: ToolSpec) -> ToolSpec:
-    """waldoctl's sync wrapper for *tool*, with ``status()`` made synchronous.
+    """waldoctl's sync wrapper for *tool*, with ``status()`` synchronous.
 
-    The wrapper overrides the action verbs but not ``status()``, and a tool
-    with no action verbs is not wrapped at all — either way ``status()``
-    reaches the async implementation and hands the caller an un-awaited
-    coroutine, so ``rbt.tool.status().key`` raises on a facade whose whole
-    contract is that nothing is a coroutine.
+    The wrappers make every verb and ``status()`` synchronous; a tool with
+    no action verbs comes back unwrapped, and its ``status()`` still
+    reaches the async implementation — so only that case is patched, over
+    the async method captured first, on a facade whose whole contract is
+    that nothing is a coroutine.
     """
     sync = make_sync_tool(tool, _run)
-    # Deliberately narrowing an async method to a sync one, which is what
-    # waldoctl's own sync wrappers do to every action verb.
-    sync.status = lambda: _run(tool.status())  # ty: ignore[invalid-assignment]
+    if sync is tool:
+        async_status = tool.status
+        # Deliberately narrowing an async method to a sync one, which is
+        # what waldoctl's own sync wrappers do to every action verb.
+        sync.status = lambda: _run(async_status())  # ty: ignore[invalid-assignment]
     return sync
 
 
@@ -483,7 +485,7 @@ class RobotClient:
         kd: float,
         ilim_ma: float,
         velocity_limit_ticks_s: float,
-        voltage_limit_mv: int = 0,
+        voltage_limit_mv: int,
     ) -> int:
         """Push one drive node's tuning live (every gain required — the
         frame replaces the node's whole tuple)."""
