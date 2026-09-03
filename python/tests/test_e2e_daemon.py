@@ -1380,6 +1380,47 @@ def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
         daemon.stop()
 
 
+async def test_the_client_opens_telemetry_on_its_own_transport(tmp_path):
+    """``open_telemetry()`` hands a consumer the stream without it knowing
+    the port or transport: the reader follows the client's own status
+    ladder, and the ``diagnostics`` recipe it then selects carries the
+    per-drive fields a front end shows (six temperatures, voltages and
+    currents from the sim's nodes)."""
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client(telemetry_port=daemon.telemetry_port) as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+            reader = client.open_telemetry()
+            try:
+                await client.set_recipe("diagnostics")
+                # The drive registers are polled round-robin after boot, so
+                # the first frames carry NaN until every node has answered.
+                deadline = time.monotonic() + STEP_BUDGET_S
+                fields: dict | None = None
+                while time.monotonic() < deadline:
+                    frame = reader.recv(timeout=STEP_BUDGET_S)
+                    assert frame is not None, (
+                        f"no telemetry; daemon log:\n{daemon.log_path.read_text()}"
+                    )
+                    assert frame["recipe"] == "diagnostics"
+                    temps = frame["fields"]["motor_temperatures_c"][:6]
+                    if all(math.isfinite(t) for t in temps):
+                        fields = frame["fields"]
+                        break
+                assert fields is not None, "drive temperatures never became finite"
+                for key in (
+                    "motor_temperatures_c",
+                    "motor_voltages_mv",
+                    "motor_currents_ma",
+                ):
+                    assert len(fields[key]) >= 6, key
+                assert all(t > 0 for t in fields["motor_temperatures_c"][:6])
+            finally:
+                reader.close()
+    finally:
+        daemon.stop()
+
+
 async def test_config_info_reports_the_effective_configuration(tmp_path):
     """CONFIG_INFO answers the runtime's effective configuration, and its
     fingerprint is reproducible over the same files — the skew check a UI

@@ -44,7 +44,7 @@ from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
-from par6._par6 import CoreClient, RobotWireError
+from par6._par6 import CoreClient, RobotWireError, TelemetryReader
 
 from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import (
@@ -238,6 +238,7 @@ class AsyncRobotClient(_RobotClientABC):
         mcast_group: str | None = None,
         mcast_iface: str | None = None,
         status_unicast_host: str | None = None,
+        telemetry_port: int | None = None,
         mtu: int | None = None,
         tool_specs: Iterable[ToolSpec] | None = None,
     ) -> None:
@@ -259,6 +260,11 @@ class AsyncRobotClient(_RobotClientABC):
         self._mcast_iface = mcast_iface or _env_str("PAR6_STATUS_MCAST_IF", "127.0.0.1")
         self._status_unicast_host = status_unicast_host or _env_str(
             "PAR6_STATUS_UNICAST_HOST", "127.0.0.1"
+        )
+        self._telemetry_port = (
+            telemetry_port
+            if telemetry_port is not None
+            else _env_int("PAR6_TELEMETRY_PORT", 6003)
         )
         self.mtu = mtu if mtu is not None else _env_int("PAR6_MTU", 1400)
 
@@ -1429,6 +1435,23 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(
             core.set_completion_policy(int(CompletionPolicy(policy)))
+        )
+
+    def open_telemetry(self) -> TelemetryReader:
+        """A reader on the daemon's telemetry stream, over this client's
+        status transport (the multicast group, or the unicast host).  The
+        stream is silent until a recipe is active — see :meth:`set_recipe`.
+
+        Category: Query
+
+        Example:
+            with rbt.open_telemetry() as reader:
+                frame = reader.recv(timeout=1.0)
+        """
+        if self._status_transport_kind == "UNICAST":
+            return TelemetryReader(self._telemetry_port, host=self._status_unicast_host)
+        return TelemetryReader(
+            self._telemetry_port, host=self._mcast_iface, group=self._mcast_group
         )
 
     async def set_recipe(self, name: str) -> int:
