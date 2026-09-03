@@ -40,9 +40,6 @@ use crate::collision_world::{is_world_name, kin_layer, ShapeNames};
 /// sessions.
 pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 
-/// Servo streams self-terminate after this much client silence (the RT
-/// stream watchdog is fed by housekeeping keep-alives until then).
-pub(crate) const SERVO_GRACE: Duration = Duration::from_millis(250);
 /// How long the enable retry keeps trying after `reset` (covers the RT
 /// clear-sequence settle window with margin, even on a loaded host).
 const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -472,6 +469,12 @@ impl RtBridge {
         }
     }
 
+    /// Client silence after which a servo stream ends itself; housekeeping
+    /// keeps the RT stream watchdog fed until then.
+    fn servo_grace(&self) -> Duration {
+        Duration::from_secs_f64(self.bundle.robot.stream.servo_grace_s)
+    }
+
     /// Mode dance into a stream mode. The RT transition table only
     /// allows working-mode changes through IDLE, and `SetMode` to the
     /// current mode is a no-op, so the pair is always safe to queue.
@@ -597,7 +600,7 @@ impl RtCommands for RtBridge {
                 });
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Servo,
-                    deadline: Instant::now() + SERVO_GRACE,
+                    deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
@@ -664,7 +667,7 @@ impl RtCommands for RtBridge {
                 });
                 sh.stream = Some(ActiveStream {
                     kind: StreamKind::Servo,
-                    deadline: Instant::now() + SERVO_GRACE,
+                    deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,

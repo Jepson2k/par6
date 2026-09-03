@@ -509,7 +509,7 @@ rounds = 2
 rounds = 2
 wait_s = 0.0025
 
-# ========================================================== protocol (wire v2)
+# ========================================================== protocol (wire v3)
 # Only the :6001 command port is fixed by the wire contract; the rest are our defaults,
 # env-overridable at runtime (PAR6_* namespace).
 [protocol]
@@ -569,6 +569,7 @@ command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4      # 100 ticks @ 250 Hz
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
+servo_grace_s = 0.25        # client silence that ends a servo stream (sim floors command_timeout_s at 2x this)
 
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog
@@ -578,11 +579,14 @@ jog_l_linear_max_m_s = 0.08
 jog_l_angular_max_rad_s = 0.6
 cart_step_m = 0.01          # move_l pitch (vendor 10 mm / 2 deg)
 cart_step_rad = 0.034906585
-path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (0.15*rot)^2)
+path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (w*rot)^2)
 move_l_max_joint_step_rad = 0.35
 dls_lambda = 0.05
 settle_tolerance_rad = 0.01
 settle_timeout_s = 2.0
+path_rot_weight_m_per_rad = 0.15   # w: rotation weight in the multi-segment path metric [m/rad]
+singularity_cond_max = 1000.0      # near-singularity warning when a path sample's jacobian condition exceeds this ...
+singularity_sigma_min = 0.0001     # ... or its smallest singular value drops under this
 
 [limits]
 # External-torque envelope: hard fault when a joint's external-torque

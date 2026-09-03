@@ -66,7 +66,7 @@ pub use telemetry::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 2;
+pub const PROTO_VERSION: u8 = 3;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

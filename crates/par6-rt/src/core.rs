@@ -1907,6 +1907,7 @@ impl<B: DriverBus> RtCore<B> {
     // ------------------------------------------------------------ snapshot
 
     fn publish(&mut self) {
+        let gravity_applied = self.gravity_applied();
         let s = &mut self.snap;
         s.tick = self.tick;
         s.mode = self.mode;
@@ -1923,7 +1924,7 @@ impl<B: DriverBus> RtCore<B> {
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
-        s.gravity_comp = self.gravity_comp;
+        s.gravity_comp = gravity_applied;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);

@@ -111,8 +111,11 @@ impl Daemon {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
-        loaded.robot.stream.command_timeout_s =
-            resolve_stream_timeout(opts.sim, loaded.robot.stream.command_timeout_s);
+        loaded.robot.stream.command_timeout_s = resolve_stream_timeout(
+            opts.sim,
+            loaded.robot.stream.command_timeout_s,
+            loaded.robot.stream.servo_grace_s,
+        );
         if let Some(hz) = opts.status_rate_hz {
             // Re-validated rather than range-checked here: the STATUS
             // cadence has to divide the tick rate exactly, and running
@@ -542,9 +545,9 @@ fn resolve_loop_bands(sim: bool, declared: Option<TimingConfig>) -> TimingConfig
 /// ends a silent stream before the RT watchdog fires — actually holds
 /// there. A config asking for a LONGER window always wins, in sim and on
 /// hardware alike.
-fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
+fn resolve_stream_timeout(sim: bool, declared: f64, servo_grace_s: f64) -> f64 {
     if sim {
-        declared.max(2.0 * crate::bridge::SERVO_GRACE.as_secs_f64())
+        declared.max(2.0 * servo_grace_s)
     } else {
         declared
     }
@@ -617,16 +620,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
         path: config_path.display().to_string(),
         fingerprint: files.fingerprint,
         tick_dt_s: robot.robot.tick_dt_s,
-        motion: [
-            m.jog_l_linear_max_m_s,
-            m.jog_l_angular_max_rad_s,
-            m.cart_step_m,
-            m.cart_step_rad,
-            m.move_l_max_joint_step_rad,
-            m.dls_lambda,
-            m.settle_tolerance_rad,
-            m.settle_timeout_s,
-        ],
+        motion: m.as_array(),
         joints: robot
             .joints
             .iter()

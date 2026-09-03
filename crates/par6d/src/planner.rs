@@ -1037,7 +1037,7 @@ impl Par6Planner {
         // whatever move runs next.
         let samples = self.toppra_samples(&waypoints, speed, accel, duration)?;
         let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
-        self.near_singularity = singularity_verdict(worst_sigma, worst_cond);
+        self.near_singularity = singularity_verdict(&self.motion, worst_sigma, worst_cond);
         Ok(kind)
     }
 
@@ -1685,9 +1685,6 @@ impl Par6Planner {
     }
 }
 
-/// The vendor's rotation weight in the combined path metric \[m/rad\].
-const PATH_ROT_WEIGHT_M_PER_RAD: f64 = 0.15;
-
 /// Sampling of a single straight `move_l`.
 fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
@@ -1703,16 +1700,20 @@ fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartS
 fn path_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
         step_m: motion.path_step_m,
-        rotation: par6_motion::cart::RotationPitch::Weighted(PATH_ROT_WEIGHT_M_PER_RAD),
+        rotation: par6_motion::cart::RotationPitch::Weighted(motion.path_rot_weight_m_per_rad),
         max_points: CART_PATH_MAX_STEPS,
     }
 }
 
-/// The vendor's near-singularity thresholds: a path is flagged when its
-/// worst sample's jacobian condition exceeds 1000 or its smallest
-/// singular value drops under 1e-4 (condition capped at 1e12 upstream).
-fn singularity_verdict(worst_sigma: f64, worst_cond: f64) -> Option<WireError> {
-    if worst_cond > 1000.0 || worst_sigma < 1e-4 {
+/// A path is flagged near-singular when its worst sample's jacobian
+/// condition exceeds `motion.singularity_cond_max` or its smallest
+/// singular value drops under `motion.singularity_sigma_min`.
+fn singularity_verdict(
+    motion: &par6_config::MotionConfig,
+    worst_sigma: f64,
+    worst_cond: f64,
+) -> Option<WireError> {
+    if worst_cond > motion.singularity_cond_max || worst_sigma < motion.singularity_sigma_min {
         Some(make_error(
             ErrorCode::TrajNearSingularity,
             UNATTRIBUTED,

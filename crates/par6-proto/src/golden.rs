@@ -27,6 +27,9 @@ use crate::error::{make_error, ErrorCode, UNATTRIBUTED};
 use crate::pygen;
 use crate::reply::{encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
 use crate::status::{encode_status_into, Status, STATUS_LEN};
+use crate::telemetry::{
+    encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe, TelemetryValue,
+};
 use crate::wire::{w_array, w_f64, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, PROTO_VERSION};
 
@@ -52,6 +55,8 @@ pub enum Check {
     },
     /// Encode must reproduce the bytes; decode must yield the chunk.
     Chunk(Box<Chunk>),
+    /// Encode must reproduce the bytes; decode must yield the frame.
+    Telemetry(Box<TelemetryFrame>),
     /// `decode_command` must fail.
     MalformedCommand,
     /// `decode_reply` must fail.
@@ -195,6 +200,64 @@ fn status_vec(name: &'static str, status: Status) -> Vector {
             status: Box::new(status),
             decode_only: false,
         },
+    }
+}
+
+/// A sample value of the kind the daemon publishes for `field`: tick
+/// counters and fault codes ride as integers, per-joint and per-node
+/// readings as arrays, everything else as a float scalar.
+fn telemetry_sample(field: TelemetryField, i: usize) -> TelemetryValue {
+    use TelemetryField as F;
+    let k = i as f64;
+    match field {
+        F::Tick => TelemetryValue::U64(100_000 + i as u64),
+        F::LoopOverruns | F::GripperFault => TelemetryValue::U64(i as u64),
+        F::LoopPeriodEmaS | F::LoopP99S => TelemetryValue::F64(0.004 + 0.0001 * k),
+        F::GripperPosition | F::GripperCurrentMa | F::GripperObjectDetection => {
+            TelemetryValue::F64(0.5 * k)
+        }
+        F::MotorTemperaturesC | F::MotorVoltagesMv | F::MotorCurrentsMa => {
+            TelemetryValue::Arr((0..7).map(|n| k + 10.0 * n as f64).collect())
+        }
+        _ => TelemetryValue::Arr((0..6).map(|n| 0.1 * k + 0.01 * n as f64).collect()),
+    }
+}
+
+/// One telemetry packet under `recipe`: `[recipe, seq, mono_time_ns,
+/// ...values]`, one value per recipe field in recipe order.
+fn telemetry_vec(
+    name: &'static str,
+    recipe: &TelemetryRecipe,
+    seq: u64,
+    mono_time_ns: u64,
+) -> Vector {
+    let values: Vec<TelemetryValue> = recipe
+        .fields
+        .iter()
+        .enumerate()
+        .map(|(i, f)| telemetry_sample(*f, i))
+        .collect();
+    let bytes = encode_telemetry(&recipe.name, seq, mono_time_ns, &values);
+    let fields: Vec<Value> = recipe.fields.iter().map(|f| json!(f.key())).collect();
+    let manifest = json!({
+        "name": name,
+        "kind": "telemetry",
+        "wire": wire_json(&bytes),
+        "recipe": recipe.name,
+        "seq": seq,
+        "mono_time_ns": mono_time_ns,
+        "fields": fields,
+    });
+    Vector {
+        name,
+        bytes,
+        manifest,
+        check: Check::Telemetry(Box::new(TelemetryFrame {
+            recipe: recipe.name.clone(),
+            seq,
+            mono_time_ns,
+            values,
+        })),
     }
 }
 
@@ -1154,7 +1217,9 @@ pub fn vectors() -> Vec<Vector> {
                 fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                     .to_owned(),
                 tick_dt_s: 0.004,
-                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                motion: [
+                    0.08, 0.6, 0.005, 0.05, 0.002, 0.01, 0.35, 0.05, 0.01, 2.0, 0.15, 1000.0, 1e-4,
+                ],
                 joints: vec![
                     [-2.15, 2.15, 3.0, 12.0],
                     [-1.0, 1.9, 2.5, 10.0],
@@ -1182,7 +1247,9 @@ pub fn vectors() -> Vec<Vector> {
                 fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                     .to_owned(),
                 tick_dt_s: 0.004,
-                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                motion: [
+                    0.08, 0.6, 0.005, 0.05, 0.002, 0.01, 0.35, 0.05, 0.01, 2.0, 0.15, 1000.0, 1e-4,
+                ],
                 joints: vec![[-2.15, 2.15, 3.0, 12.0]],
                 active_recipe: None,
                 recipes: vec!["minimal".to_owned(), "standard".to_owned()],
@@ -1236,6 +1303,24 @@ pub fn vectors() -> Vec<Vector> {
 
     // -- malformed --
     v.extend(malformed_vectors());
+
+    // -- telemetry: one vector per shipped recipe --
+    for (i, recipe) in TelemetryRecipe::defaults().iter().enumerate() {
+        let name = match recipe.name.as_str() {
+            "minimal" => "telemetry_minimal",
+            "standard" => "telemetry_standard",
+            "commanded" => "telemetry_commanded",
+            "diagnostics" => "telemetry_diagnostics",
+            "full" => "telemetry_full",
+            other => unreachable!("shipped recipe {other} has no golden vector name"),
+        };
+        v.push(telemetry_vec(
+            name,
+            recipe,
+            1000 + i as u64,
+            5_000_000_000 + 4_000_000 * i as u64,
+        ));
+    }
 
     v
 }

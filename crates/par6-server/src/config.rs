@@ -152,8 +152,8 @@ pub struct ConfigInfoData {
     pub fingerprint: String,
     /// RT tick period \[s\].
     pub tick_dt_s: f64,
-    /// The `[motion]` feel constants, in declaration order.
-    pub motion: [f64; 8],
+    /// Every `[motion]` key in declaration order (`MotionConfig::KEYS`).
+    pub motion: [f64; 13],
     /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
     /// velocity_rad_s, acceleration_rad_s2]`.
     pub joints: Vec<[f64; 4]>,

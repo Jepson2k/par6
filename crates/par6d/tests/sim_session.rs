@@ -180,7 +180,7 @@ fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; NUM_JOINTS]) {
 }
 
 #[test]
-fn full_sim_session_over_protocol_v2() {
+fn full_sim_session_over_protocol_v3() {
     let rig = Rig::boot(test_config());
     let mut c = Client::new(rig.addr());
 
@@ -190,9 +190,9 @@ fn full_sim_session_over_protocol_v2() {
         other => panic!("unexpected ping result {other:?}"),
     }
 
-    // STATUS broadcast: sane v2 header, fresh RT link, un-homed at boot.
+    // STATUS broadcast: sane v3 header, fresh RT link, un-homed at boot.
     let s1 = rig.wait_status("link_ok", |s| s.link_ok == 1);
-    assert_eq!(s1.proto_version, 2);
+    assert_eq!(s1.proto_version, 3);
     assert!(s1.simulator_active);
     assert!(!s1.homed);
     assert_eq!(s1.executing_index, -1);

@@ -7,7 +7,7 @@ Source of truth: the Rust `par6-proto` crate. Regenerate with
 
 from enum import IntEnum
 
-PROTO_VERSION = 2
+PROTO_VERSION = 3
 NUM_JOINTS = 6
 POSE_ELEMS = 16
 IO_SLOTS = 11

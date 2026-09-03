@@ -222,16 +222,7 @@ impl Preview {
     /// the same file the daemon reads.
     fn motion(&self, py: Python<'_>) -> PyResult<PyObject> {
         let m = self.inner.lock().unwrap().motion();
-        let d = pyo3::types::PyDict::new(py);
-        d.set_item("jog_l_linear_max_m_s", m.jog_l_linear_max_m_s)?;
-        d.set_item("jog_l_angular_max_rad_s", m.jog_l_angular_max_rad_s)?;
-        d.set_item("cart_step_m", m.cart_step_m)?;
-        d.set_item("cart_step_rad", m.cart_step_rad)?;
-        d.set_item("move_l_max_joint_step_rad", m.move_l_max_joint_step_rad)?;
-        d.set_item("dls_lambda", m.dls_lambda)?;
-        d.set_item("settle_tolerance_rad", m.settle_tolerance_rad)?;
-        d.set_item("settle_timeout_s", m.settle_timeout_s)?;
-        Ok(d.into())
+        Ok(crate::convert::motion_dict(py, &m.as_array())?.into())
     }
 
     /// Apply planning context (profile, TCP offset \[mm\], completion

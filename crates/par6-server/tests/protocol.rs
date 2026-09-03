@@ -1496,7 +1496,7 @@ async fn chunked_move_s_roundtrip_and_timeout() {
     }
 }
 
-/// STATUS broadcast: v2 header content, seq/time monotonicity, snapshot
+/// STATUS broadcast: v3 header content, seq/time monotonicity, snapshot
 /// pass-through, planner enablement — and ALWAYS broadcasting with
 /// link_ok=0 / growing data_age once snapshots stop.
 #[tokio::test]
@@ -1517,7 +1517,7 @@ async fn status_broadcast_content_and_staleness() {
         }
         assert!(tokio::time::Instant::now() < deadline);
     };
-    assert_eq!(s1.proto_version, 2);
+    assert_eq!(s1.proto_version, 3);
     assert_eq!(s1.controller_id, 42);
     assert!((s1.angles[0] - 0.5f64.to_degrees()).abs() < 1e-9);
     assert!((s1.pose[3] - 100.0).abs() < 1e-9, "x translation in mm");

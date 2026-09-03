@@ -412,6 +412,11 @@ pub struct StreamDefaults {
     /// holds in place, and a stream that silently holds instead of
     /// tracking must become an error the operator can see.
     pub fault_latch_s: f64,
+    /// Client silence after which a servo stream ends itself \[s\]. The
+    /// daemon keeps the RT stream watchdog fed until then, so this is the
+    /// slowest publish interval a streaming client may use; in sim the RT
+    /// `command_timeout_s` is floored at twice this.
+    pub servo_grace_s: f64,
 }
 
 impl Default for StreamDefaults {
@@ -421,6 +426,7 @@ impl Default for StreamDefaults {
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
             fault_latch_s: 0.5,
+            servo_grace_s: 0.25,
         }
     }
 }
@@ -428,6 +434,10 @@ impl Default for StreamDefaults {
 fn default_open_retry_s() -> f64 {
     10.0
 }
+
+/// Longest bus-open retry window accepted \[s\]; the daemon derives a
+/// per-second attempt count from it.
+const MAX_OPEN_RETRY_S: f64 = 3600.0;
 
 /// Torque-level sim plant parameters (feature `sim-dynamics`): the
 /// motor-referred rotor dynamics the vendor models
@@ -539,7 +549,8 @@ pub struct MotionConfig {
     pub cart_step_rad: f64,
     /// Multi-segment cartesian paths (arc, spline, process move, blend
     /// chains) sample much finer, on the combined length metric
-    /// √(t² + (0.15·θ)²) \[m\] — the vendor's path pitch.
+    /// √(t² + (w·θ)²) \[m\] with `w = path_rot_weight_m_per_rad` — the
+    /// vendor's path pitch.
     pub path_step_m: f64,
     /// Joint-space blend-chain pitch \[rad\]; omitted = half the
     /// per-tick travel at the full EXEC velocity norm
@@ -558,6 +569,54 @@ pub struct MotionConfig {
     pub settle_tolerance_rad: f64,
     /// Settle timeout \[s\].
     pub settle_timeout_s: f64,
+    /// Rotation weight `w` in the multi-segment path metric
+    /// √(t² + (w·θ)²) \[m/rad\] (vendor: 0.15).
+    pub path_rot_weight_m_per_rad: f64,
+    /// A cartesian path is flagged near-singular when its worst sample's
+    /// jacobian condition number exceeds this (vendor: 1000; the
+    /// condition is capped at 1e12 upstream) …
+    pub singularity_cond_max: f64,
+    /// … or its smallest singular value drops under this (vendor: 1e-4).
+    pub singularity_sigma_min: f64,
+}
+
+impl MotionConfig {
+    /// Every key, in declaration order — the labels of [`Self::as_array`].
+    pub const KEYS: [&'static str; 13] = [
+        "jog_l_linear_max_m_s",
+        "jog_l_angular_max_rad_s",
+        "cart_step_m",
+        "cart_step_rad",
+        "path_step_m",
+        "joint_step_rad",
+        "move_l_max_joint_step_rad",
+        "dls_lambda",
+        "settle_tolerance_rad",
+        "settle_timeout_s",
+        "path_rot_weight_m_per_rad",
+        "singularity_cond_max",
+        "singularity_sigma_min",
+    ];
+
+    /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
+    /// is NaN.
+    pub fn as_array(&self) -> [f64; 13] {
+        [
+            self.jog_l_linear_max_m_s,
+            self.jog_l_angular_max_rad_s,
+            self.cart_step_m,
+            self.cart_step_rad,
+            self.path_step_m,
+            self.joint_step_rad.unwrap_or(f64::NAN),
+            self.move_l_max_joint_step_rad,
+            self.dls_lambda,
+            self.settle_tolerance_rad,
+            self.settle_timeout_s,
+            self.path_rot_weight_m_per_rad,
+            self.singularity_cond_max,
+            self.singularity_sigma_min,
+        ]
+    }
 }
 
 impl Default for MotionConfig {
@@ -573,6 +632,9 @@ impl Default for MotionConfig {
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
             settle_timeout_s: 2.0,
+            path_rot_weight_m_per_rad: 0.15,
+            singularity_cond_max: 1000.0,
+            singularity_sigma_min: 1e-4,
         }
     }
 }
@@ -791,7 +853,7 @@ impl RobotConfig {
             (l.jerk_rad_s3, "limits.jerk_rad_s3"),
             (l.torque_rate_nm_s, "limits.torque_rate_nm_s"),
         ] {
-            if v <= 0.0 {
+            if !is_positive(v) {
                 return Err(invalid(f(name), "must be > 0"));
             }
         }
@@ -868,8 +930,11 @@ impl RobotConfig {
         if b.boot_config_repeats == 0 {
             return Err(invalid("bus.boot_config_repeats", "must be >= 1"));
         }
-        if !(b.open_retry_s.is_finite() && b.open_retry_s >= 0.0) {
-            return Err(invalid("bus.open_retry_s", "must be finite and >= 0"));
+        if !(b.open_retry_s.is_finite() && (0.0..=MAX_OPEN_RETRY_S).contains(&b.open_retry_s)) {
+            return Err(invalid(
+                "bus.open_retry_s",
+                "must be finite and within 0..=3600",
+            ));
         }
         if b.config_pace_s < 0.0 {
             return Err(invalid("bus.config_pace_s", "must be >= 0"));
@@ -937,15 +1002,16 @@ impl RobotConfig {
             (s.command_timeout_s, "stream.command_timeout_s"),
             (s.success_window_s, "stream.success_window_s"),
             (s.fault_latch_s, "stream.fault_latch_s"),
+            (s.servo_grace_s, "stream.servo_grace_s"),
         ] {
             if !is_positive(v) {
                 return Err(invalid(name, "must be > 0"));
             }
         }
-        if s.lowpass_cutoff_hz < 0.0 {
+        if !s.lowpass_cutoff_hz.is_finite() || s.lowpass_cutoff_hz < 0.0 {
             return Err(invalid(
                 "stream.lowpass_cutoff_hz",
-                "must be >= 0 (0 = off)",
+                "must be finite and >= 0 (0 = off)",
             ));
         }
         Ok(())
@@ -1039,6 +1105,12 @@ impl RobotConfig {
             (m.dls_lambda, "motion.dls_lambda"),
             (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
             (m.settle_timeout_s, "motion.settle_timeout_s"),
+            (
+                m.path_rot_weight_m_per_rad,
+                "motion.path_rot_weight_m_per_rad",
+            ),
+            (m.singularity_cond_max, "motion.singularity_cond_max"),
+            (m.singularity_sigma_min, "motion.singularity_sigma_min"),
         ] {
             if !is_positive(v) || !v.is_finite() {
                 return Err(invalid(name, "must be > 0 and finite"));

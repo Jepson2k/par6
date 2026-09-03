@@ -127,21 +127,16 @@ class StatusBuffer:
 
     @property
     def freedrive(self) -> bool:
-        """Whether the arm is back-driveable right now.
+        """Whether the arm is back-driveable right now: idle with the
+        gravity feedforward applied.
 
-        Not "was freedrive requested" — the runtime applies the gravity
-        feedforward only while referenced, enabled and idle (its own
-        ``gravity_applied()``), and keeps a hold term on the joints
-        otherwise. A command that was accepted but cannot yet take effect
-        reports False here, so nobody is told an arm is safe to grab on
-        the strength of a flag.
+        ``gravity_comp`` is the runtime's own "applied this tick" flag
+        (referenced, enabled and requested), not the request, so a
+        command that was accepted but cannot yet take effect reports
+        False here and nobody is told an arm is safe to grab on the
+        strength of a flag.
         """
-        return bool(
-            self.mode == ControllerMode.IDLE
-            and self.homed
-            and self.enabled
-            and self.gravity_comp
-        )
+        return bool(self.mode == ControllerMode.IDLE and self.gravity_comp)
 
     link_health: dict = field(default_factory=dict)
     """Motor-bus link health: ``state`` (a ``LinkState`` value),

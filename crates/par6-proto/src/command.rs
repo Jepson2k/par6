@@ -872,16 +872,21 @@ fn finite_all(what: &'static str, vs: &[f64]) -> Result<(), DecodeError> {
 /// is refused at the wire.
 fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
     let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
-    const EPS: f64 = 1e-12;
+    // The tolerance scales with the matrix: a payload inertia is ~1e-7
+    // kg·m², so an absolute epsilon would wave through an indefinite one.
+    let scale = i.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let eps1 = 1e-9 * scale;
+    let eps2 = eps1 * scale;
+    let eps3 = eps2 * scale;
     let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
         + ixz * (ixy * iyz - iyy * ixz);
-    ixx >= -EPS
-        && iyy >= -EPS
-        && izz >= -EPS
-        && ixx * iyy - ixy * ixy >= -EPS
-        && ixx * izz - ixz * ixz >= -EPS
-        && iyy * izz - iyz * iyz >= -EPS
-        && det >= -EPS
+    ixx >= -eps1
+        && iyy >= -eps1
+        && izz >= -eps1
+        && ixx * iyy - ixy * ixy >= -eps2
+        && ixx * izz - ixz * ixz >= -eps2
+        && iyy * izz - iyz * iyz >= -eps2
+        && det >= -eps3
 }
 
 fn frac(what: &'static str, v: f64) -> Result<(), DecodeError> {

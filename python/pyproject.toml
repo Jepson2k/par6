@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.1.0"
+version = "0.2.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = { text = "MIT" }
 requires-python = ">=3.11"

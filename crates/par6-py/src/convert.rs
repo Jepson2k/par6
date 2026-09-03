@@ -259,23 +259,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
             d.set_item("tick_dt_s", *tick_dt_s)?;
-            let m = PyDict::new(py);
-            for (key, v) in [
-                "jog_l_linear_max_m_s",
-                "jog_l_angular_max_rad_s",
-                "cart_step_m",
-                "cart_step_rad",
-                "move_l_max_joint_step_rad",
-                "dls_lambda",
-                "settle_tolerance_rad",
-                "settle_timeout_s",
-            ]
-            .iter()
-            .zip(motion)
-            {
-                m.set_item(key, *v)?;
-            }
-            d.set_item("motion", m)?;
+            d.set_item("motion", motion_dict(py, motion)?)?;
             let js = PyList::empty(py);
             for j in joints {
                 let jd = PyDict::new(py);
@@ -358,4 +342,21 @@ pub fn tool_param_from_py(v: &Bound<'_, PyAny>) -> PyResult<ToolParam> {
     Err(PyRuntimeError::new_err(
         "tool parameters must be bool, int, float, or str",
     ))
+}
+
+/// The `[motion]` keys labelled from a wire/config array; an omitted
+/// optional key (NaN on the wire) is `None`.
+pub(crate) fn motion_dict<'py>(
+    py: Python<'py>,
+    values: &[f64; 13],
+) -> PyResult<Bound<'py, PyDict>> {
+    let m = PyDict::new(py);
+    for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {
+        if v.is_nan() {
+            m.set_item(key, py.None())?;
+        } else {
+            m.set_item(key, *v)?;
+        }
+    }
+    Ok(m)
 }

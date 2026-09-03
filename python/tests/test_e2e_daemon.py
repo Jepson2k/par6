@@ -149,7 +149,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
                 frames.append(status)
                 if len(frames) == 5:
                     break
-        assert [f.proto_version for f in frames] == [2] * 5
+        assert [f.proto_version for f in frames] == [3] * 5
         assert all(b.seq > a.seq for a, b in zip(frames, frames[1:]))
         assert all(b.mono_time_ns > a.mono_time_ns for a, b in zip(frames, frames[1:]))
         assert all(f.link_ok == 1 and f.simulator_active for f in frames)
@@ -1393,6 +1393,13 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
             info = await client.config_info()
             assert info is not None
+
+            # Every [motion] key rides along, the sampling pitches
+            # included, and an omitted optional key reads back as None.
+            motion = info["motion"]
+            assert motion["path_step_m"] == pytest.approx(0.002)
+            assert motion["joint_step_rad"] is None
+            assert motion["path_rot_weight_m_per_rad"] == pytest.approx(0.15)
 
             # Recipe discovery/readback: the valid SET_RECIPE vocabulary
             # is published, and the active name tracks what was set (the

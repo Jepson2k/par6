@@ -636,6 +636,10 @@ fn log_unclaimed(inner: &Inner, error: &WireError) {
     );
 }
 
+/// The protocol-skew warning fires once per process, not per frame.
+static VERSION_SKEW_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -656,6 +660,16 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
                 continue;
             }
         };
+        if status.proto_version != par6_proto::PROTO_VERSION
+            && !VERSION_SKEW_WARNED.swap(true, Ordering::Relaxed)
+        {
+            log::warn!(
+                "daemon speaks protocol v{} but this client was built for v{}: \
+                 messages whose layout differs will fail to decode",
+                status.proto_version,
+                par6_proto::PROTO_VERSION
+            );
+        }
         {
             let mut last = inner.last_seq.lock().unwrap();
             if let Some(prev) = *last {
