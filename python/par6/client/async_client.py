@@ -23,7 +23,7 @@ import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
@@ -48,9 +48,18 @@ from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
-from ._wire import blend as _blend
+from ._wire import (
+    blend as _blend,
+)
+from ._wire import (
+    estimate_from_dict,
+    jog_j_speeds,
+    jog_l_velocities,
+    payload_from_dict,
+    shape_to_wire,
+    tool_params,
+)
 from ._wire import f6 as _f6
-from ._wire import jog_j_speeds, jog_l_velocities, shape_to_wire, tool_params
 from ._wire import timing as _timing
 from ._wire import tool_status_from_dict as _tool_status_from_dict
 from ._wire import wire_frame as _wire_frame
@@ -193,6 +202,7 @@ class AsyncRobotClient(_RobotClientABC):
         self._active_tool_key: str | None = None
         self._active_variant_key = ""
         self._bound_tools: dict[str, ToolSpec] = {}
+        self._estimation_config: str | None = None
         if tool_specs is None:
             # A bare client (what a user script constructs) binds the packaged
             # tools itself, so ``rbt.select_tool(...); rbt.tool.close()`` works
@@ -1018,13 +1028,16 @@ class AsyncRobotClient(_RobotClientABC):
         # a different gripper than the package assumes would otherwise
         # have the mass difference fitted as payload and declared on top
         # of the tool the daemon already carries.
-        config = _cfg.data_root() / "config" / "PAR6.toml"
-        bundle = await self.config_bundle()
-        if bundle:
-            config = _cfg.materialize_bundle(bundle)
+        # Sampled once: the daemon's config cannot change without a restart.
+        if self._estimation_config is None:
+            config = _cfg.data_root() / "config" / "PAR6.toml"
+            bundle = await self.config_bundle()
+            if bundle:
+                config = _cfg.materialize_bundle(bundle)
+            self._estimation_config = str(config)
         raw = await self._call(
             core.estimate_payload(
-                str(config),
+                self._estimation_config,
                 str(_cfg.data_root()),
                 str(_cfg.package_search_dir()),
                 float(spread),
@@ -1032,16 +1045,7 @@ class AsyncRobotClient(_RobotClientABC):
                 bool(declare),
             )
         )
-        return PayloadEstimate(
-            mass=float(raw["mass"]),
-            com=cast("tuple[float, float, float]", tuple(raw["com"])),
-            determined=cast(
-                "tuple[float, float, float, float]", tuple(raw["determined"])
-            ),
-            rms_nm=float(raw["rms_nm"]),
-            rms_unloaded_nm=float(raw["rms_unloaded_nm"]),
-            poses=int(raw["poses"]),
-        )
+        return estimate_from_dict(raw)
 
     async def payload(self) -> PayloadResult | None:
         """The effective runtime payload.
@@ -1056,15 +1060,7 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         raw = await self._call(core.payload())
-        if raw is None:
-            return None
-        com = tuple(float(v) for v in raw["com"])
-        inertia = tuple(float(v) for v in raw["inertia"])
-        return PayloadResult(
-            mass=float(raw["mass"]),
-            com=cast("tuple[float, float, float]", com),
-            inertia=cast("tuple[float, float, float, float, float, float]", inertia),
-        )
+        return None if raw is None else payload_from_dict(raw)
 
     async def pause(self) -> int:
         """Hold the executing trajectory where it is.

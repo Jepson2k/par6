@@ -423,6 +423,19 @@ impl Preview {
     /// streaming preemption does live; system commands change state and
     /// move nothing.
     pub fn submit(&mut self, command: Command) -> PreviewResult {
+        let result = self.submit_inner(command);
+        self.drain_stubs();
+        result
+    }
+
+    /// The planner's RT-bound sends land in stub channels nothing reads;
+    /// left alone they grow with the program.
+    fn drain_stubs(&mut self) {
+        self._cmds_rx.try_iter().for_each(drop);
+        self._ops_rx.try_iter().for_each(drop);
+    }
+
+    fn submit_inner(&mut self, command: Command) -> PreviewResult {
         if let Err(e) = command.validate() {
             return self.refuse(decode_error_to_wire(&e));
         }
@@ -493,28 +506,53 @@ impl Preview {
         self.payload
     }
 
-    /// The wrist poses a payload estimation would swing through from the
-    /// virtual arm's current pose, checked against the gate's world — so
-    /// a preview traces the same motion the arm would make and refuses
-    /// where the arm would.
-    pub fn wrist_poses(
-        &mut self,
-        spread: f64,
-        approach_rad: f64,
-    ) -> Result<Vec<[f64; NQ]>, String> {
+    /// The motion a payload estimation makes from the virtual arm's
+    /// pose: the wrist poses `par6_calibrate` would plan, swept at its
+    /// protocol's speed and ending back where the arm stood, planned and
+    /// gated like any other move. Measures nothing — a preview has no
+    /// torque — so what comes back is the swing.
+    pub fn preview_estimation(&mut self, spread: f64) -> Result<(usize, PreviewResult), String> {
         let mut start = [0.0; NQ];
         start.copy_from_slice(&self.snap.q[..NQ]);
-        let mut window = [(0.0, 0.0); NQ];
-        for (w, j) in window.iter_mut().enumerate() {
-            *j = (self.soft_min[w], self.soft_max[w]);
-        }
-        par6_calibrate::plan_poses(
+        let window: [(f64, f64); NQ] =
+            std::array::from_fn(|j| (self.soft_min[j], self.soft_max[j]));
+        let protocol = par6_calibrate::Protocol::default();
+        let poses = par6_calibrate::plan_poses(
             self.gate.collision_mut(),
             &start,
             &window,
             spread,
-            approach_rad,
-        )
+            protocol.approach_rad,
+        )?;
+        let to_deg = |q: &[f64; NQ]| -> [f64; par6_proto::NUM_JOINTS] {
+            std::array::from_fn(|j| q[j].to_degrees())
+        };
+        let moves: Vec<Command> = poses
+            .iter()
+            .chain(std::iter::once(&start))
+            .map(|q| {
+                Command::MoveJ(cmd::MoveJ {
+                    key: 0,
+                    angles: to_deg(q),
+                    duration: None,
+                    speed: Some(protocol.speed),
+                    accel: None,
+                    blend_radius: None,
+                    rel: false,
+                })
+            })
+            .collect();
+        let results = self.plan_batch(&moves);
+        if let Some(refused) = results.iter().find(|r| r.error.is_some()) {
+            return Err(refused
+                .error
+                .as_ref()
+                .map(|e| e.cause.clone())
+                .unwrap_or_default());
+        }
+        PreviewResult::concat(results)
+            .map(|r| (poses.len(), r))
+            .ok_or_else(|| "nothing to swing".to_owned())
     }
 
     /// The refusal the runtime would leave standing, or `None`.
@@ -633,40 +671,41 @@ impl Preview {
             // A streamed target is tracked by the RT's own OTG at the
             // cadence targets arrive; offline there is no cadence, so the
             // settle onto the newest target is the planner's joint move.
-            Command::ServoJ(p) => {
-                let speed = Some(p.speed.unwrap_or(1.0));
-                self.plan_one(Command::MoveJ(cmd::MoveJ {
-                    key: 0,
-                    angles: p.angles,
-                    duration: None,
-                    speed,
-                    accel: p.accel,
-                    blend_radius: None,
-                    rel: false,
-                }))
-            }
-            Command::ServoJPose(p) => self.plan_one(Command::MoveJPose(cmd::MoveJPose {
+            Command::ServoJ(p) => self.plan_one(Command::MoveJ(cmd::MoveJ {
                 key: 0,
-                pose: p.pose,
+                angles: p.angles,
                 duration: None,
                 speed: Some(p.speed.unwrap_or(1.0)),
                 accel: p.accel,
                 blend_radius: None,
+                rel: false,
             })),
-            Command::ServoL(p) => self.plan_one(Command::MoveJPose(cmd::MoveJPose {
-                key: 0,
-                pose: p.pose,
-                duration: None,
-                speed: Some(p.speed.unwrap_or(1.0)),
-                accel: p.accel,
-                blend_radius: None,
-            })),
+            Command::ServoJPose(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
+            Command::ServoL(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
             other => self.refuse(make_error(
                 ErrorCode::CommValidationError,
                 UNATTRIBUTED,
                 &[("detail", &format!("{:?} cannot be previewed", other.tag()))],
             )),
         }
+    }
+
+    /// A streamed cartesian target settles as the planner's joint move
+    /// onto it — the same rule for every servo family.
+    fn settle_on_pose(
+        &mut self,
+        pose: [f64; 6],
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> PreviewResult {
+        self.plan_one(Command::MoveJPose(cmd::MoveJPose {
+            key: 0,
+            pose,
+            duration: None,
+            speed: Some(speed.unwrap_or(1.0)),
+            accel,
+            blend_radius: None,
+        }))
     }
 
     fn submit_system(&mut self, command: Command) -> PreviewResult {
@@ -1009,6 +1048,11 @@ impl Preview {
         duration_s: f64,
     ) -> PreviewResult {
         self.standing_error = None;
+        self.advance(trajectory, duration_s)
+    }
+
+    /// Move the virtual arm along `trajectory` and report the motion.
+    fn advance(&mut self, trajectory: Vec<[f64; MAX_JOINTS]>, duration_s: f64) -> PreviewResult {
         let end = trajectory.last().copied().unwrap_or(self.snap.q);
         let tcp_poses = self.poses_along(&trajectory);
         self.snap.q = end;
@@ -1063,9 +1107,9 @@ impl Preview {
             // the planner must not fold it into this chain.
             let valid = rest
                 .iter()
+                .take(self.cfg.blend_lookahead.max(1))
                 .take_while(|c| c.validate().is_ok() && validate_supported(&self.cfg, c).is_none())
-                .count()
-                .min(self.cfg.blend_lookahead.max(1));
+                .count();
             self.publish();
             let batch: Vec<QueuedCommand<'_>> = rest[..valid]
                 .iter()
@@ -1125,18 +1169,7 @@ impl Preview {
             };
         self.planner.cancel();
         self.note_effects(head);
-        let end = trajectory.last().copied().unwrap_or(self.snap.q);
-        let tcp_poses = self.poses_along(&trajectory);
-        self.snap.q = end;
-        self.publish();
-        let mut result = PreviewResult {
-            joint_trajectory_rad: trajectory,
-            tcp_poses,
-            end_joints_rad: end,
-            duration_s,
-            error: None,
-            pending: false,
-        };
+        let mut result = self.advance(trajectory, duration_s);
         if result.joint_trajectory_rad.is_empty() {
             result = PreviewResult {
                 duration_s,

@@ -139,7 +139,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     Ok(d.into_any().unbind())
 }
 
-fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
+pub(crate) fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
     let d = PyDict::new(py);
     d.set_item("kind", &s.kind)?;
     d.set_item("params", s.params.clone())?;
@@ -246,9 +246,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("epoch", *epoch)?;
         }
         QueryResult::Payload { mass, com, inertia } => {
-            d.set_item("mass", *mass)?;
-            d.set_item("com", com.to_vec())?;
-            d.set_item("inertia", inertia.to_vec())?;
+            fill_payload(&d, *mass, *com, *inertia)?;
         }
         QueryResult::ConfigInfo {
             path,
@@ -324,43 +322,13 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
 
 /// Python shape dict → wire shape.
 pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
-    let get = |k: &str| -> PyResult<Bound<'_, PyAny>> {
-        d.get_item(k)?
-            .ok_or_else(|| PyRuntimeError::new_err(format!("shape is missing '{k}'")))
-    };
-    Ok(Shape {
-        kind: get("kind")?.extract()?,
-        params: get("params")?.extract()?,
-        pose: get("pose")?.extract()?,
-        collision: match d.get_item("collision")? {
-            Some(v) => v.extract()?,
-            None => true,
-        },
-        margin: match d.get_item("margin")? {
-            Some(v) => v.extract()?,
-            None => None,
-        },
-        name: get("name")?.extract()?,
-    })
+    pythonize::depythonize(d).map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))
 }
 
 /// Python value → tool-action parameter.
 pub fn tool_param_from_py(v: &Bound<'_, PyAny>) -> PyResult<ToolParam> {
-    if let Ok(b) = v.downcast::<pyo3::types::PyBool>() {
-        return Ok(ToolParam::Bool(b.is_true()));
-    }
-    if let Ok(i) = v.extract::<i64>() {
-        return Ok(ToolParam::Int(i));
-    }
-    if let Ok(f) = v.extract::<f64>() {
-        return Ok(ToolParam::Float(f));
-    }
-    if let Ok(s) = v.extract::<String>() {
-        return Ok(ToolParam::Str(s));
-    }
-    Err(PyRuntimeError::new_err(
-        "tool parameters must be bool, int, float, or str",
-    ))
+    pythonize::depythonize(v)
+        .map_err(|_| PyRuntimeError::new_err("tool parameters must be bool, int, float, or str"))
 }
 
 pub fn frame_of(v: u8) -> PyResult<Frame> {
@@ -390,12 +358,38 @@ pub fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
 }
 
 /// `"parked"` or `"force"` — the operator's vouching, no default.
-pub fn flashing_assertion(assertion: &str) -> PyResult<FlashingAssertion> {
-    match assertion.to_ascii_lowercase().as_str() {
-        "parked" => Ok(FlashingAssertion::Parked),
-        "force" => Ok(FlashingAssertion::Force),
-        other => Err(pyo3::exceptions::PyValueError::new_err(format!(
-            "flashing assertion must be 'parked' or 'force', got {other:?}"
-        ))),
-    }
+/// `"parked"` or `"force"`, by the enum's own name lookup. A typo is a
+/// ValueError here, before any datagram — the operator's vouching has no
+/// default to fall back on.
+pub fn flashing_assertion(py: Python<'_>, assertion: &str) -> PyResult<FlashingAssertion> {
+    pythonize::depythonize(&pyo3::types::PyString::new(py, assertion).into_any()).map_err(|_| {
+        pyo3::exceptions::PyValueError::new_err(format!(
+            "flashing assertion must be 'parked' or 'force', got {assertion:?}"
+        ))
+    })
+}
+
+/// A payload as every reader hands it to Python: `mass`, `com`, `inertia`
+/// (zeros = point mass / none).
+pub(crate) fn fill_payload(
+    d: &Bound<'_, PyDict>,
+    mass: f64,
+    com: [f64; 3],
+    inertia: [f64; 6],
+) -> PyResult<()> {
+    d.set_item("mass", mass)?;
+    d.set_item("com", com.to_vec())?;
+    d.set_item("inertia", inertia.to_vec())
+}
+
+/// A joint vector from Python, refused with its name if it is the wrong
+/// length.
+pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
+    q.try_into().map_err(|_| {
+        PyRuntimeError::new_err(format!(
+            "{what} needs {} joint values, got {}",
+            par6_kin::NQ,
+            q.len()
+        ))
+    })
 }

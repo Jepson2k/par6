@@ -5,9 +5,10 @@ onto the wire's fields.  No numerics — only shapes and names."""
 from __future__ import annotations
 
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 from waldoctl.shapes import Shape
+from waldoctl.status import Inertia6, PayloadEstimate, PayloadResult
 from waldoctl.tools import ToolState as WToolState
 from waldoctl.tools import ToolStatus
 
@@ -162,3 +163,27 @@ def tool_params(params: list | None) -> list[bool | int | float | str]:
                 f"tool parameters must be bool, int, float or str, got {type(v).__name__}"
             )
     return out
+
+
+def payload_from_dict(raw: dict) -> PayloadResult:
+    """A runtime payload reading as the contract's dataclass."""
+    return PayloadResult(
+        mass=float(raw["mass"]),
+        com=cast("tuple[float, float, float]", tuple(float(v) for v in raw["com"])),
+        inertia=cast("Inertia6", tuple(float(v) for v in raw["inertia"])),
+    )
+
+
+def estimate_from_dict(raw: dict) -> PayloadEstimate:
+    """An estimation result as the contract's dataclass."""
+    return PayloadEstimate(
+        mass=float(raw["mass"]),
+        com=cast("tuple[float, float, float]", tuple(float(v) for v in raw["com"])),
+        determined=cast(
+            "tuple[float, float, float, float]",
+            tuple(float(v) for v in raw["determined"]),
+        ),
+        rms_nm=float(raw["rms_nm"]),
+        rms_unloaded_nm=float(raw["rms_unloaded_nm"]),
+        poses=int(raw["poses"]),
+    )

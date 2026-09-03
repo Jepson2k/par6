@@ -14,18 +14,13 @@ use par6d::matrix_to_xyzrpy;
 use par6d::preview::{Preview as EnginePreview, PreviewResult};
 
 use crate::config::motion_dict;
-use crate::convert::{command_from_py, layer_of, robot_err, shape_from_py, wire_error_tuple};
+use crate::convert::{
+    command_from_py, fill_payload, layer_of, robot_err, shape_from_py, wire_error_tuple,
+};
 
 /// Sample indices that keep a trajectory under `max_points` with both
 /// endpoints retained.
-/// At most `max_points` sample indices, evenly spread, endpoints kept.
-///
-/// A stride of `len / max_points` is not a cap: it rounds DOWN, so any
-/// trajectory shorter than twice the limit came back whole — 399 samples
-/// against a limit of 200 — and one longer still overshot by the
-/// remainder plus the appended endpoint. Spacing the indices across the
-/// range instead hits the limit exactly and never passes it, which is
-/// what a caller sizing a payload asked for.
+/// At most `max_points` sample indices, evenly spread, both endpoints kept.
 fn sample_indices(len: usize, max_points: usize) -> Vec<usize> {
     if len == 0 {
         return Vec::new();
@@ -41,17 +36,14 @@ fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: usize) -> PyResult
     let d = PyDict::new(py);
     let idx = sample_indices(r.joint_trajectory_rad.len(), max_points);
     let traj = PyList::empty(py);
-    let poses = PyList::empty(py);
     let xyzrpy = PyList::empty(py);
     for &i in &idx {
         traj.append(r.joint_trajectory_rad[i].to_vec())?;
         if let Some(p) = r.tcp_poses.get(i) {
-            poses.append(p.to_vec())?;
             xyzrpy.append(matrix_to_xyzrpy(p).to_vec())?;
         }
     }
     d.set_item("joint_trajectory_rad", traj)?;
-    d.set_item("tcp_poses", poses)?;
     d.set_item("tcp_xyzrpy", xyzrpy)?;
     d.set_item("end_joints_rad", r.end_joints_rad.to_vec())?;
     d.set_item("duration_s", r.duration_s)?;
@@ -234,22 +226,25 @@ impl Preview {
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let p = self.inner.lock().unwrap().payload();
         let d = PyDict::new(py);
-        d.set_item("mass", p.mass)?;
-        d.set_item("com", p.com.to_vec())?;
-        d.set_item("inertia", p.inertia.unwrap_or([0.0; 6]).to_vec())?;
+        fill_payload(&d, p.mass, p.com, p.inertia.unwrap_or([0.0; 6]))?;
         Ok(d)
     }
 
-    /// The wrist poses (rad) a payload estimation would swing through
-    /// from here, or an error naming why none are reachable.
-    #[pyo3(signature = (spread=0.5, approach_rad=0.05))]
-    fn wrist_poses(&self, spread: f64, approach_rad: f64) -> PyResult<Vec<Vec<f64>>> {
-        self.inner
+    /// The motion a payload estimation makes from here — the wrist swing
+    /// `par6_calibrate` plans, at its speed, ending where the arm stood —
+    /// as one result dict like any other previewed command. Measures
+    /// nothing.
+    #[pyo3(signature = (spread=0.5))]
+    fn estimate_payload(&self, py: Python<'_>, spread: f64) -> PyResult<PyObject> {
+        let (poses, r) = self
+            .inner
             .lock()
             .unwrap()
-            .wrist_poses(spread, approach_rad)
-            .map(|poses| poses.iter().map(|q| q.to_vec()).collect())
-            .map_err(PyRuntimeError::new_err)
+            .preview_estimation(spread)
+            .map_err(PyRuntimeError::new_err)?;
+        let d = result_dict(py, &r, self.max_points)?;
+        d.bind(py).downcast::<PyDict>()?.set_item("poses", poses)?;
+        Ok(d)
     }
 
     fn homing_ready_pose_rad(&self) -> Vec<f64> {

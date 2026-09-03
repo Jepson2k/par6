@@ -31,7 +31,7 @@ mod bridge;
 pub mod collision_world;
 pub mod daemon;
 mod grant;
-mod kin;
+pub mod kin;
 pub mod options;
 mod planner;
 pub mod preview;

@@ -61,8 +61,6 @@ pub struct Report {
     pub fit: PayloadFit,
     /// Every measurement taken.
     pub samples: Vec<GravitySample>,
-    /// The pose the arm started from and returned to.
-    pub start: [f64; NQ],
 }
 
 /// Wrist poses around `start` that the collision world clears, including
@@ -93,32 +91,27 @@ pub fn plan_poses(
 
     let mut out = Vec::new();
     for q in candidates {
-        // The approach moves either side of the pose have to fit too:
-        // a pose inside the window whose approach is not is refused by
-        // the daemon mid-run, after the payload has been cleared.
-        let inside = [0.0, 1.0, -1.0].iter().all(|dir| {
-            let probe = offset(&q, dir * approach_rad);
-            (0..NQ).all(|j| {
-                let (lo, hi) = window[j];
-                probe[j] >= lo && probe[j] <= hi
-            })
-        });
-        if !inside {
-            continue;
-        }
-        let mut clear = true;
+        // The pose and both approach poses either side of it have to be
+        // inside the window and clear of the world: a daemon refusing an
+        // approach mid-run has already had the payload cleared.
+        let mut usable = true;
         for dir in [0.0, 1.0, -1.0] {
             let probe = offset(&q, dir * approach_rad);
-            if collision
-                .check(&probe, true)
-                .map_err(|e| format!("collision check: {e}"))?
-                .active()
+            let inside = (0..NQ).all(|j| {
+                let (lo, hi) = window[j];
+                probe[j] >= lo && probe[j] <= hi
+            });
+            if !inside
+                || collision
+                    .check(&probe, true)
+                    .map_err(|e| format!("collision check: {e}"))?
+                    .active()
             {
-                clear = false;
+                usable = false;
                 break;
             }
         }
-        if clear {
+        if usable {
             out.push(q);
         }
     }
@@ -321,34 +314,118 @@ pub async fn identify(
     let samples = measure(client, poses, protocol).await?;
     let fit = gravity::fit_payload(kin, &samples, ridge).map_err(|e| e.to_string())?;
     move_to(client, &start, protocol).await?;
-    Ok(Report {
-        fit,
-        samples,
-        start,
-    })
+    Ok(Report { fit, samples })
 }
 
 /// A parameter counts as measured when the data fixed more of it than
 /// the ridge did (see [`PayloadFit::determined`]).
 pub const MEASURED: f64 = 0.5;
 
-/// What was found, and how much of it the poses actually said.
-pub fn describe(report: &Report) -> String {
-    let d = report.fit.determined;
-    let seen = d.iter().filter(|v| **v > MEASURED).count();
-    format!(
-        "payload {:.3} kg  com [{:+.4} {:+.4} {:+.4}] m\n\
-         residual {:.4} Nm, against {:.4} Nm carrying nothing\n\
-         {seen}/4 parameters measured (mass {:.2}, com {:.2} {:.2} {:.2})\n",
-        report.fit.mass,
-        report.fit.com[0],
-        report.fit.com[1],
-        report.fit.com[2],
-        report.fit.rms_nm,
-        report.fit.rms_unloaded_nm,
-        d[0],
-        d[1],
-        d[2],
-        d[3],
-    )
+/// What an estimation measures against: the arm with its fitted
+/// gripper, the collision world the wrist swing is planned in, and the
+/// joint window. Built by the daemon crate from its own config
+/// resolution (`par6d::kin::estimation_model`), so an estimate runs
+/// against exactly the arm the daemon models.
+pub struct EstimationModel {
+    pub kin: Kin,
+    pub collision: Collision,
+    pub window: [(f64, f64); NQ],
+}
+
+/// What the runtime is carrying, as `SET_PAYLOAD` takes it back.
+type Declared = (f64, [f64; 3], Option<[f64; 6]>);
+
+async fn declared(client: &Client) -> Result<Declared, String> {
+    match client
+        .payload()
+        .await
+        .map_err(|e| format!("payload: {e}"))?
+    {
+        par6_proto::QueryResult::Payload { mass, com, inertia } => Ok((
+            mass,
+            com,
+            if inertia == [0.0; 6] {
+                None
+            } else {
+                Some(inertia)
+            },
+        )),
+        other => Err(format!("payload query answered {other:?}")),
+    }
+}
+
+async fn declare(client: &Client, (mass, com, inertia): Declared) -> Result<(), String> {
+    client
+        .set_payload(mass, com, inertia)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("set_payload: {e}"))
+}
+
+/// The whole operation, as a program calls it: find what the arm is
+/// carrying and, if asked, tell the runtime.
+///
+/// The load is found in the torque the UNLOADED model cannot explain, so
+/// whatever is declared comes off first — and goes back on every exit
+/// that does not declare, failure included, or a curious call leaves the
+/// arm compensating for nothing while it still holds the part. With
+/// `declare`, a result the poses did not actually measure is refused
+/// rather than pushed into the gravity model as noise.
+pub async fn estimate(
+    client: &Client,
+    model: &mut EstimationModel,
+    spread: f64,
+    ridge: f64,
+    declare_result: bool,
+) -> Result<Report, String> {
+    let previous = declared(client).await?;
+    declare(client, (0.0, [0.0; 3], None)).await?;
+
+    let run = async {
+        let angles = client.angles().await.map_err(|e| format!("angles: {e}"))?;
+        let mut start = [0.0; NQ];
+        for (out, deg) in start.iter_mut().zip(angles.iter()) {
+            *out = deg.to_radians();
+        }
+        let protocol = Protocol::default();
+        let poses = plan_poses(
+            &mut model.collision,
+            &start,
+            &model.window,
+            spread,
+            protocol.approach_rad,
+        )?;
+        let report = identify(client, &mut model.kin, start, &poses, &protocol, ridge).await?;
+        if !declare_result {
+            return Ok((report, false));
+        }
+        if report.fit.determined[0] <= MEASURED {
+            return Err(format!(
+                "the poses did not measure the mass (determined {:.2}); give the wrist more \
+                 room or a wider spread",
+                report.fit.determined[0]
+            ));
+        }
+        if !(report.fit.mass.is_finite() && report.fit.mass > 0.0) {
+            return Err(format!(
+                "refusing to declare a mass of {:.4} kg",
+                report.fit.mass
+            ));
+        }
+        Ok((report, true))
+    };
+    match run.await {
+        Ok((report, true)) => {
+            declare(client, (report.fit.mass, report.fit.com, None)).await?;
+            Ok(report)
+        }
+        Ok((report, false)) => {
+            declare(client, previous).await?;
+            Ok(report)
+        }
+        Err(e) => {
+            declare(client, previous).await?;
+            Err(e)
+        }
+    }
 }

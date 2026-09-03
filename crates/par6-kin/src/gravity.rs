@@ -35,20 +35,6 @@ pub struct BodyParams {
 }
 
 impl BodyParams {
-    /// Centre of mass \[m\] in the joint frame; the origin for a
-    /// massless body, which has no centre of mass to report.
-    pub fn com(&self) -> [f64; 3] {
-        let m = self.mass;
-        if m == 0.0 {
-            return [0.0; 3];
-        }
-        [
-            self.first_moment[0] / m,
-            self.first_moment[1] / m,
-            self.first_moment[2] / m,
-        ]
-    }
-
     fn from_flat(joint: String, v: &[f64]) -> Self {
         Self {
             joint,
@@ -183,16 +169,20 @@ pub fn fit_payload(
     let base = cols - 4;
 
     let theta_unloaded = flatten(&model_params(kin)?);
+    // One regressor evaluation per sample, kept: the unloaded torque, the
+    // normal equations and both residuals are all products of it.
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
     let mut ata = [0.0; 16];
     let mut atb = [0.0; 4];
     let mut scale = 0.0f64;
-    let mut y = vec![0.0; NQ * cols];
     for s in samples {
+        let mut y = vec![0.0; NQ * cols];
         kin.gravity_regressor(&s.q, &mut y)?;
-        let unloaded = predict(kin, &theta_unloaded, &s.q)?;
         for r in 0..NQ {
-            let row = &y[r * cols + base..r * cols + cols];
-            let residual = s.tau[r] - unloaded[r];
+            let full = &y[r * cols..(r + 1) * cols];
+            let unloaded: f64 = full.iter().zip(&theta_unloaded).map(|(a, b)| a * b).sum();
+            let row = &full[base..];
+            let residual = s.tau[r] - unloaded;
             for a in 0..4 {
                 scale = scale.max(row[a].abs());
                 atb[a] += row[a] * residual;
@@ -201,6 +191,7 @@ pub fn fit_payload(
                 }
             }
         }
+        rows.push(y);
     }
     // Scaled by the regressor's own magnitude so the ridge means the
     // same thing on a small arm as on a large one.
@@ -236,12 +227,26 @@ pub fn fit_payload(
     for (out, add) in loaded[base..].iter_mut().zip(&theta) {
         *out += add;
     }
+    let rms_of = |theta: &[f64]| {
+        let mut sum = 0.0;
+        for (y, s) in rows.iter().zip(samples) {
+            for r in 0..NQ {
+                let tau: f64 = y[r * cols..(r + 1) * cols]
+                    .iter()
+                    .zip(theta)
+                    .map(|(a, b)| a * b)
+                    .sum();
+                sum += (tau - s.tau[r]) * (tau - s.tau[r]);
+            }
+        }
+        (sum / (samples.len() * NQ) as f64).sqrt()
+    };
     Ok(PayloadFit {
         mass,
         com,
         determined,
-        rms_nm: rms(kin, &loaded, samples)?,
-        rms_unloaded_nm: rms(kin, &theta_unloaded, samples)?,
+        rms_nm: rms_of(&loaded),
+        rms_unloaded_nm: rms_of(&theta_unloaded),
     })
 }
 

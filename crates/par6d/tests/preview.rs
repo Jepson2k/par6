@@ -6,15 +6,15 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use par6_proto::command::{Home, JogL, MoveJ, MoveL, SelectProfile, Stop, Teleport, WriteIo};
+use par6_proto::command::{Home, JogL, MoveJ, MoveL, SelectProfile, Stop, WriteIo};
 use par6_proto::{Command, ErrorCode, Frame, Shape, NUM_JOINTS};
 use par6_server::ShapeLayer;
 use par6d::preview::Preview;
 
 mod common;
-use common::{repo_root, Client, Rig};
-
-const BUDGET: Duration = Duration::from_secs(20);
+use common::{
+    max_deg_error, park_deg, repo_root, teleport_cmd, teleport_home, to_deg, to_rad, Client, Rig,
+};
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
 /// AND the preview so the parity below is over identical inputs.
@@ -50,64 +50,6 @@ fn test_config() -> PathBuf {
 
 fn assets() -> PathBuf {
     repo_root().join("assets/par6_description")
-}
-
-fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&repo_root().join("config/PAR6.toml")).expect("cfg");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
-}
-
-fn to_rad(deg: &[f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
-    let mut out = [0.0; NUM_JOINTS];
-    for (o, d) in out.iter_mut().zip(deg.iter()) {
-        *o = d.to_radians();
-    }
-    out
-}
-
-fn to_deg(rad: &[f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
-    let mut out = [0.0; NUM_JOINTS];
-    for (o, r) in out.iter_mut().zip(rad.iter()) {
-        *o = r.to_degrees();
-    }
-    out
-}
-
-fn max_deg_error(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS]) -> f64 {
-    a.iter()
-        .zip(b)
-        .map(|(x, y)| (x - y).abs())
-        .fold(0.0, f64::max)
-}
-
-fn teleport_cmd(angles: [f64; NUM_JOINTS]) -> Command {
-    Command::Teleport(Teleport {
-        angles,
-        tool_positions: None,
-    })
-}
-
-fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; NUM_JOINTS]) {
-    let deadline = std::time::Instant::now() + BUDGET;
-    loop {
-        c.send(&teleport_cmd(angles));
-        let window = std::time::Instant::now() + Duration::from_millis(400);
-        while std::time::Instant::now() < window {
-            if let Some(s) = rig.recv_status() {
-                if s.homed && max_deg_error(&s.angles, &angles) < 1.0 {
-                    return;
-                }
-            }
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "teleport did not take effect within budget"
-        );
-    }
 }
 
 fn move_j_cmd(angles_deg: [f64; NUM_JOINTS], blend_mm: Option<f64>) -> Command {

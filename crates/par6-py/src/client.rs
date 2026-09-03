@@ -4,6 +4,7 @@
 //! waldoctl typing; this layer is transport only.
 
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
@@ -13,7 +14,7 @@ use pyo3_async_runtimes::tokio::future_into_py;
 
 use par6_client::{Ack, Client, ClientConfig, ClientError, MotionWait, StatusTransport};
 use par6_proto::command as cmd;
-use par6_proto::{Command, CompletionPolicy, QueryResult, NUM_JOINTS};
+use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
 
 use crate::convert::{
     client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
@@ -23,74 +24,6 @@ use crate::convert::{
 /// The model a payload identification measures against: the arm with no
 /// tool payload, its collision world, and the joint window, all from the
 /// same config the daemon runs.
-/// The model, its collision world and the joint window.
-type EstimationModel = (par6_kin::Kin, par6_kin::Collision, [(f64, f64); NUM_JOINTS]);
-
-fn estimation_model(
-    config: Option<&str>,
-    assets: Option<&str>,
-    package_dir: Option<&str>,
-) -> PyResult<EstimationModel> {
-    let config_path = match config {
-        Some(p) => std::path::PathBuf::from(p),
-        None => par6d::preview::Preview::default_config_path().map_err(PyRuntimeError::new_err)?,
-    };
-    let bundle = par6_config::ConfigBundle::load(&config_path)
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    let robot = &bundle.robot;
-    let assets_dir = match assets {
-        Some(p) => std::path::PathBuf::from(p),
-        None => config_path
-            .parent()
-            .map(|d| d.join("../assets/par6_description"))
-            .unwrap_or_else(|| std::path::PathBuf::from("assets/par6_description")),
-    };
-    let gripper = bundle.active_gripper();
-    let variant = par6_kin::GripperVariant::resolve(
-        &robot.robot.active_gripper.to_ascii_uppercase(),
-        gripper.and_then(|g| g.urdf_variant.as_deref()),
-    );
-    // No tool payload: what the fit explains is torque this model cannot
-    // account for, and the fitted gripper is already part of the arm.
-    let tool = gripper.map(|g| {
-        let k = &g.kinematics;
-        par6_kin::Kin::dh_tool_params(
-            k.d_m,
-            k.a_m,
-            k.alpha_rad,
-            k.mass_kg,
-            k.com_m,
-            k.inertia_kg_m2,
-        )
-    });
-    let kin = par6_kin::Kin::load_arm(&assets_dir, tool.as_ref())
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-    // The packaged tree spells its meshes `package://par6/_data/…`, which
-    // resolves under the installed package's parent rather than under the
-    // assets tree — so the caller says where, and `Collision::load`'s
-    // assets-tree assumption only applies when it does not.
-    let collision = match package_dir {
-        Some(dir) => {
-            let mut c = par6_kin::Collision::from_urdf(
-                &assets_dir.join(variant.urdf_relpath()),
-                Some(std::path::Path::new(dir)),
-                0.0,
-            )
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))
-                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-            c
-        }
-        None => par6_kin::Collision::load(&assets_dir, variant, 0.0)
-            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?,
-    };
-    let mut window = [(0.0, 0.0); NUM_JOINTS];
-    for (w, j) in window.iter_mut().zip(robot.joints.iter()) {
-        *w = (j.limits.soft_min_rad, j.limits.soft_max_rad);
-    }
-    Ok((kin, collision, window))
-}
-
 fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
         match client.system(c).await {
@@ -101,11 +34,35 @@ fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Boun
     })
 }
 
-fn queued_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+/// A queued command's index, -1 when it went unconfirmed.
+fn index_future<'py, F>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: std::future::Future<Output = Result<Option<u64>, ClientError>> + Send + 'static,
+{
     future_into_py(py, async move {
-        match client.queued(c).await {
+        match fut.await {
             Ok(Some(index)) => Ok(index as i64),
             Ok(None) => Ok(-1),
+            Err(e) => Err(client_err(e)),
+        }
+    })
+}
+
+fn queued_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+    index_future(py, async move { client.queued(c).await })
+}
+
+/// A query's answer, `None` when the runtime is unreachable — the one
+/// error a caller polls through rather than raises on.
+fn opt_future<'py, T, F>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+where
+    T: for<'a> pyo3::IntoPyObject<'a> + Send + 'static,
+    F: std::future::Future<Output = Result<T, ClientError>> + Send + 'static,
+{
+    future_into_py(py, async move {
+        match fut.await {
+            Ok(v) => Ok(Some(v)),
+            Err(ClientError::Unreachable) => Ok(None),
             Err(e) => Err(client_err(e)),
         }
     })
@@ -133,6 +90,10 @@ fn query_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bo
 #[pyclass]
 pub struct CoreClient {
     client: Client,
+    /// The estimation model, built once per config it was asked for and
+    /// kept: the mesh worlds cost hundreds of milliseconds, and a program
+    /// that estimates after every pick asks for the same one every time.
+    estimation: Arc<tokio::sync::Mutex<Option<(String, par6_calibrate::EstimationModel)>>>,
 }
 
 impl CoreClient {
@@ -213,7 +174,10 @@ impl CoreClient {
                 StatusTransport::Multicast { group, iface }
             };
             let client = Client::connect(cfg).await.map_err(client_err)?;
-            Ok(CoreClient { client })
+            Ok(CoreClient {
+                client,
+                estimation: Arc::default(),
+            })
         })
     }
 
@@ -387,36 +351,21 @@ impl CoreClient {
 
     fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.ping().await {
-                Ok(hw) => Ok(Some(hw)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.ping().await })
     }
 
     fn angles<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.angles().await {
-                Ok(a) => Ok(Some(a.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.angles().await.map(|a| a.to_vec()) })
     }
 
     fn pose<'py>(&self, py: Python<'py>, frame: u8) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         let frame = frame_of(frame)?;
-        future_into_py(py, async move {
-            match client.pose(frame).await {
-                Ok(p) => Ok(Some(p.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(
+            py,
+            async move { client.pose(frame).await.map(|p| p.to_vec()) },
+        )
     }
 
     /// The TCP pose as `[x, y, z, rx, ry, rz]` in mm and degrees
@@ -445,23 +394,13 @@ impl CoreClient {
 
     fn io<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.io().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.io().await })
     }
 
     fn joint_speeds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.joint_speeds().await {
-                Ok(v) => Ok(Some(v.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
+        opt_future(py, async move {
+            client.joint_speeds().await.map(|v| v.to_vec())
         })
     }
 
@@ -507,22 +446,9 @@ impl CoreClient {
 
     /// Estimate what the arm is carrying — mass and centre of mass, never
     /// the inertia tensor, which static poses cannot excite — and,
-    /// optionally, tell the runtime.
-    ///
-    /// Swings the WRIST where the arm already stands — the payload's
-    /// lever arm about the wrist is what makes its first moment
-    /// observable, so nothing below moves and the pick is not disturbed.
-    /// Takes seconds, which is what a program can afford between picking
-    /// a part up and moving it.
-    ///
-    /// Clears the runtime's payload first: the load is identified from
-    /// torque the UNLOADED model cannot account for, so a payload
-    /// already declared would be compensated away and come back as
-    /// nothing.
-    ///
-    /// Returns `mass` \[kg\], `com` \[m\] in the payload body's frame,
-    /// `determined` (per parameter, how much the poses fixed rather than
-    /// the ridge), and the residuals with and without the load.
+    /// optionally, tell the runtime. The whole protocol, including the
+    /// clearing and restoring of whatever was declared, is
+    /// `par6_calibrate::estimate`'s; this only carries paths and results.
     #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
     #[allow(clippy::too_many_arguments)]
     fn estimate_payload<'py>(
@@ -536,95 +462,30 @@ impl CoreClient {
         declare: bool,
     ) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        let (kin, collision, window) =
-            estimation_model(config.as_deref(), assets.as_deref(), package_dir.as_deref())?;
+        let cache = Arc::clone(&self.estimation);
+        let key = format!("{config:?}|{assets:?}|{package_dir:?}");
         future_into_py(py, async move {
-            let (mut kin, mut collision) = (kin, collision);
-            // The load is found in the torque the UNLOADED model cannot
-            // explain, so whatever is declared has to come off first —
-            // and go back on every exit that does not declare, failure
-            // included, or a curious call leaves the arm compensating
-            // for nothing while it still holds the part.
-            let previous = match client.payload().await.map_err(client_err)? {
-                QueryResult::Payload { mass, com, inertia } => (mass, com, inertia),
-                other => {
-                    return Err(PyRuntimeError::new_err(format!(
-                        "payload query answered {other:?}"
-                    )))
-                }
-            };
-            client
-                .set_payload(0.0, [0.0; 3], None)
+            let mut slot = cache.lock().await;
+            if !matches!(&*slot, Some((k, _)) if *k == key) {
+                // Off the async thread: this parses the URDF and builds the
+                // collision meshes, which would otherwise hold the Python
+                // event loop for as long as it takes.
+                let model = tokio::task::spawn_blocking(move || {
+                    par6d::kin::estimation_model(
+                        config.as_deref().map(std::path::Path::new),
+                        assets.as_deref().map(std::path::Path::new),
+                        package_dir.as_deref().map(std::path::Path::new),
+                    )
+                })
                 .await
-                .map_err(client_err)?;
-
-            let run = async {
-                let angles = client.angles().await.map_err(client_err)?;
-                let mut start = [0.0; NUM_JOINTS];
-                for (out, deg) in start.iter_mut().zip(angles.iter()) {
-                    *out = deg.to_radians();
-                }
-                let protocol = par6_calibrate::Protocol::default();
-                let poses = par6_calibrate::plan_poses(
-                    &mut collision,
-                    &start,
-                    &window,
-                    spread,
-                    protocol.approach_rad,
-                )
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))?
                 .map_err(PyRuntimeError::new_err)?;
-                par6_calibrate::identify(&client, &mut kin, start, &poses, &protocol, ridge)
-                    .await
-                    .map_err(PyRuntimeError::new_err)
-            };
-            let restore = |client: Client| async move {
-                let inertia = if previous.2 == [0.0; 6] {
-                    None
-                } else {
-                    Some(previous.2)
-                };
-                client
-                    .set_payload(previous.0, previous.1, inertia)
-                    .await
-                    .map_err(client_err)
-            };
-
-            let report = match run.await {
-                Ok(r) => r,
-                Err(e) => {
-                    restore(client.clone()).await?;
-                    return Err(e);
-                }
-            };
-
-            if declare {
-                // Nothing measurable means nothing to declare: a wrist
-                // with no room to swing lands here, and pushing a
-                // noise-level mass would leave the gravity model worse
-                // than an empty hand.
-                if report.fit.determined[0] <= par6_calibrate::MEASURED {
-                    restore(client.clone()).await?;
-                    return Err(PyRuntimeError::new_err(format!(
-                        "the poses did not measure the mass (determined {:.2}); \
-                         give the wrist more room or a wider spread",
-                        report.fit.determined[0]
-                    )));
-                }
-                if !(report.fit.mass.is_finite() && report.fit.mass > 0.0) {
-                    restore(client.clone()).await?;
-                    return Err(PyRuntimeError::new_err(format!(
-                        "refusing to declare a mass of {:.4} kg",
-                        report.fit.mass
-                    )));
-                }
-                client
-                    .set_payload(report.fit.mass, report.fit.com, None)
-                    .await
-                    .map_err(client_err)?;
-            } else {
-                restore(client.clone()).await?;
+                *slot = Some((key, model));
             }
-
+            let (_, model) = slot.as_mut().expect("just filled");
+            let report = par6_calibrate::estimate(&client, model, spread, ridge, declare)
+                .await
+                .map_err(PyRuntimeError::new_err)?;
             Python::with_gil(|py| {
                 let d = PyDict::new(py);
                 d.set_item("mass", report.fit.mass)?;
@@ -655,13 +516,7 @@ impl CoreClient {
 
     fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.profile().await {
-                Ok(p) => Ok(Some(p)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.profile().await })
     }
 
     fn error<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -678,24 +533,15 @@ impl CoreClient {
 
     fn tcp_speed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.tcp_speed().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.tcp_speed().await })
     }
 
     fn tcp_offset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.tcp_offset().await {
-                Ok(v) => Ok(Some(v.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(
+            py,
+            async move { client.tcp_offset().await.map(|v| v.to_vec()) },
+        )
     }
 
     fn tool_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
@@ -714,13 +560,7 @@ impl CoreClient {
 
     fn is_simulator<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.is_simulator().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        opt_future(py, async move { client.is_simulator().await })
     }
 
     // --------------------------------------------------------- system
@@ -783,7 +623,7 @@ impl CoreClient {
 
     /// `assertion` is "parked" or "force" (the wire refuses anything else).
     fn enter_flashing<'py>(&self, py: Python<'py>, assertion: &str) -> PyResult<Bound<'py, PyAny>> {
-        let assertion = flashing_assertion(assertion)?;
+        let assertion = flashing_assertion(py, assertion)?;
         sys_future(
             py,
             self.rt(),
@@ -880,13 +720,7 @@ impl CoreClient {
     #[pyo3(signature = (calibrate=false))]
     fn home<'py>(&self, py: Python<'py>, calibrate: bool) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.home(calibrate).await {
-                Ok(Some(index)) => Ok(index as i64),
-                Ok(None) => Ok(-1),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        index_future(py, async move { client.home(calibrate).await })
     }
 
     #[allow(clippy::too_many_arguments)]

@@ -10,30 +10,11 @@ use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
 
-use par6_kin::{Collision, Layer, Shape, NQ};
-use par6_server::ShapeLayer;
+use par6_kin::{Collision, Shape};
 use par6d::collision_world::{first_duplicate, ShapeNames};
 
-use crate::convert::{layer_of, shape_from_py};
-
-fn joints(q: &[f64]) -> PyResult<[f64; NQ]> {
-    if q.len() < NQ {
-        return Err(PyValueError::new_err(format!(
-            "q has {} joints, need {NQ}",
-            q.len()
-        )));
-    }
-    let mut out = [0.0; NQ];
-    out.copy_from_slice(&q[..NQ]);
-    Ok(out)
-}
-
-fn kin_layer(layer: ShapeLayer) -> Layer {
-    match layer {
-        ShapeLayer::Installation => Layer::Installation,
-        ShapeLayer::Program => Layer::Program,
-    }
-}
+use crate::convert::{joints, layer_of, shape_from_py};
+use par6d::collision_world::kin_layer;
 
 struct World {
     collision: Collision,
@@ -123,7 +104,7 @@ impl CollisionWorld {
     }
 
     fn in_collision(&self, q: Vec<f64>) -> PyResult<bool> {
-        let q = joints(&q)?;
+        let q = joints(&q, "q")?;
         let mut w = self.inner.lock().unwrap();
         Ok(w.collision
             .check(&q, true)
@@ -133,7 +114,7 @@ impl CollisionWorld {
 
     /// Colliding pairs at `q` in reporting names.
     fn pairs(&self, q: Vec<f64>) -> PyResult<Vec<(String, String)>> {
-        let q = joints(&q)?;
+        let q = joints(&q, "q")?;
         let mut w = self.inner.lock().unwrap();
         let World { collision, names } = &mut *w;
         let report = collision
@@ -145,7 +126,7 @@ impl CollisionWorld {
     /// Smallest signed distance over the active pairs \[m\] (negative =
     /// penetrating).
     fn min_distance(&self, q: Vec<f64>) -> PyResult<f64> {
-        let q = joints(&q)?;
+        let q = joints(&q, "q")?;
         self.inner
             .lock()
             .unwrap()
@@ -159,7 +140,7 @@ impl CollisionWorld {
     fn check_path(&self, rows: Vec<Vec<f64>>) -> PyResult<i64> {
         let mut w = self.inner.lock().unwrap();
         for (i, row) in rows.iter().enumerate() {
-            let q = joints(row)?;
+            let q = joints(row, "q")?;
             if w.collision
                 .check(&q, true)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))?

@@ -122,10 +122,7 @@ class RobotClient:
         self._inner = AsyncRobotClient(
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
-        self._bound_tools: dict[str, ToolSpec] = {
-            key: make_sync_tool(tool, _run)
-            for key, tool in self._inner._bound_tools.items()
-        }
+        self._bound_tools = self._wrap_tools()
 
     # ---------- lifecycle ----------
 
@@ -154,13 +151,16 @@ class RobotClient:
 
     # ---------- tools ----------
 
-    def bind_tools(self, specs: Iterable[ToolSpec]) -> None:
-        """Bind tool specs; actions run through this facade's background loop."""
-        self._inner.bind_tools(specs)
-        self._bound_tools = {
+    def _wrap_tools(self) -> dict[str, ToolSpec]:
+        return {
             key: make_sync_tool(tool, _run)
             for key, tool in self._inner._bound_tools.items()
         }
+
+    def bind_tools(self, specs: Iterable[ToolSpec]) -> None:
+        """Bind tool specs; actions run through this facade's background loop."""
+        self._inner.bind_tools(specs)
+        self._bound_tools = self._wrap_tools()
 
     @property
     def tool(self) -> ToolSpec:

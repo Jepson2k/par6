@@ -175,12 +175,7 @@ pub const PLANE_BOX_REACH_M: f64 = 1.5;
 /// is the ambiguous-support-direction behaviour a perfectly symmetric
 /// box provokes in the narrow phase. Half as deep as it is wide keeps it
 /// clear of that and still covers the reachable solid.
-fn plane_as_box(
-    name: &str,
-    normal: [f64; 3],
-    offset: f64,
-    reach: f64,
-) -> Option<([f64; 4], [f64; 6])> {
+fn plane_as_box(normal: [f64; 3], offset: f64, reach: f64) -> Option<([f64; 4], [f64; 6])> {
     let len = (normal[0] * normal[0] + normal[1] * normal[1] + normal[2] * normal[2]).sqrt();
     if !len.is_finite() || len <= 0.0 || !offset.is_finite() {
         return None;
@@ -198,7 +193,6 @@ fn plane_as_box(
     // plane surface and the body extends into the solid.
     let mid = d - half / 2.0;
     let centre = [mid * n[0], mid * n[1], mid * n[2]];
-    let _ = name;
     Some((
         [2.0 * half, 2.0 * half, half, 0.0],
         [centre[0], centre[1], centre[2], rx, ry, 0.0],
@@ -242,10 +236,12 @@ impl Shape {
         // back is untouched, and the pair still reports under this name.
         if kind == ShapeKind::Plane {
             let normal = [params[0], params[1], params[2]];
-            let (params, pose) = plane_as_box(&s.name, normal, params[3], PLANE_BOX_REACH_M)
-                .ok_or_else(|| ShapeError::DegenerateNormal {
-                    name: s.name.clone(),
-                    normal,
+            let (params, pose) =
+                plane_as_box(normal, params[3], PLANE_BOX_REACH_M).ok_or_else(|| {
+                    ShapeError::DegenerateNormal {
+                        name: s.name.clone(),
+                        normal,
+                    }
                 })?;
             return Ok(Shape {
                 name: s.name.clone(),

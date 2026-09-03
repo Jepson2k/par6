@@ -466,3 +466,56 @@ impl Client {
         }
     }
 }
+
+/// The park pose in degrees, from the shipped config.
+pub fn park_deg() -> [f64; par6_proto::NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("cfg");
+    let mut a = [0.0; par6_proto::NUM_JOINTS];
+    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
+        *out = rad.to_degrees();
+    }
+    a
+}
+
+pub fn to_rad(deg: &[f64; par6_proto::NUM_JOINTS]) -> [f64; par6_proto::NUM_JOINTS] {
+    std::array::from_fn(|j| deg[j].to_radians())
+}
+
+pub fn to_deg(rad: &[f64; par6_proto::NUM_JOINTS]) -> [f64; par6_proto::NUM_JOINTS] {
+    std::array::from_fn(|j| rad[j].to_degrees())
+}
+
+pub fn max_deg_error(a: &[f64; par6_proto::NUM_JOINTS], b: &[f64; par6_proto::NUM_JOINTS]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+pub fn teleport_cmd(angles: [f64; par6_proto::NUM_JOINTS]) -> par6_proto::Command {
+    par6_proto::Command::Teleport(par6_proto::command::Teleport {
+        angles,
+        tool_positions: None,
+    })
+}
+
+/// Teleport until the arm reads referenced at `angles` — the boot enable
+/// can still be settling when the first one lands.
+pub fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; par6_proto::NUM_JOINTS]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        c.send(&teleport_cmd(angles));
+        let window = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < window {
+            if let Some(s) = rig.recv_status() {
+                if s.homed && max_deg_error(&s.angles, &angles) < 1.0 {
+                    return;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "teleport did not take effect within budget"
+        );
+    }
+}

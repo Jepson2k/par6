@@ -15,7 +15,7 @@ const INSTALL_PREFIX: &str = "install:";
 const SHAPE_PREFIX: &str = "shape:";
 
 /// The kinematics layer a wire layer applies to.
-pub(crate) fn kin_layer(layer: ShapeLayer) -> par6_kin::Layer {
+pub fn kin_layer(layer: ShapeLayer) -> par6_kin::Layer {
     match layer {
         ShapeLayer::Installation => par6_kin::Layer::Installation,
         ShapeLayer::Program => par6_kin::Layer::Program,

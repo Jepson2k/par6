@@ -16,10 +16,9 @@ from __future__ import annotations
 
 import copy
 import logging
-import math
 from collections.abc import Coroutine
 from pathlib import Path
-from typing import Any, cast
+from typing import Any
 
 import numpy as np
 from waldoctl.results import DryRunResultData
@@ -35,9 +34,11 @@ from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
 
 from ._wire import (
     blend,
+    estimate_from_dict,
     f6,
     jog_j_speeds,
     jog_l_velocities,
+    payload_from_dict,
     shape_to_wire,
     timing,
     tool_params,
@@ -569,14 +570,7 @@ class DryRunRobotClient:
 
     def payload(self) -> PayloadResult:
         """What the virtual arm carries."""
-        raw = self._preview.payload()
-        return PayloadResult(
-            mass=float(raw["mass"]),
-            com=cast("tuple[float, float, float]", tuple(raw["com"])),
-            inertia=cast(
-                "tuple[float, float, float, float, float, float]", tuple(raw["inertia"])
-            ),
-        )
+        return payload_from_dict(self._preview.payload())
 
     def estimate_payload(
         self,
@@ -586,30 +580,25 @@ class DryRunRobotClient:
     ) -> PayloadEstimate:
         """Preview the wrist swing an estimation makes; measure nothing.
 
-        A dry run has no torque to read, so the estimate it returns is
-        empty — mass 0, nothing determined — and ``declare`` declares
-        nothing. What it does preview is the MOTION: the same wrist poses
-        the arm would swing through from here, planned against the same
-        keep-outs, and traced as the joint moves they are, so a program
-        that estimates mid-pick shows that swing in the preview and is
-        refused where the arm would be.
+        A dry run has no torque to read, so the estimate is empty — mass
+        0, nothing determined — and ``declare`` declares nothing. The
+        MOTION is the engine's: the same wrist poses the arm would swing
+        through from here, at the estimation protocol's speed, planned
+        against the same keep-outs and refused where the arm would be.
         """
         del ridge, declare
-        poses = self._preview.wrist_poses(float(spread))
-        start = list(self._preview.angles_deg())
-        # The live run swings at the estimation protocol's own speed.
-        for q in poses:
-            self._submit(
-                {"type": "move_j", "angles": [math.degrees(v) for v in q], "speed": 1.0}
-            )
-        self._submit({"type": "move_j", "angles": start, "speed": 1.0})
-        return PayloadEstimate(
-            mass=0.0,
-            com=(0.0, 0.0, 0.0),
-            determined=(0.0, 0.0, 0.0, 0.0),
-            rms_nm=0.0,
-            rms_unloaded_nm=0.0,
-            poses=len(poses),
+        raw = self._preview.estimate_payload(float(spread))
+        poses = int(raw["poses"])
+        self._result(raw)
+        return estimate_from_dict(
+            {
+                "mass": 0.0,
+                "com": (0.0, 0.0, 0.0),
+                "determined": (0.0, 0.0, 0.0, 0.0),
+                "rms_nm": 0.0,
+                "rms_unloaded_nm": 0.0,
+                "poses": poses,
+            }
         )
 
     def set_payload(

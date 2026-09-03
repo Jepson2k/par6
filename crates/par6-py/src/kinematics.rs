@@ -8,6 +8,8 @@ use std::sync::Mutex;
 
 use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
+
+use crate::convert::joints;
 use pyo3::types::{PyDict, PyList};
 
 use par6_kin::{relative_pose, wrap_to_window, IkOutcome, Kin, Pose, NQ};
@@ -22,18 +24,6 @@ pub struct Kinematics {
     /// Soft window per joint; IK solutions are wrapped onto the branch
     /// inside it nearest the seed, as the runtime's solver does.
     window: Option<Vec<(f64, f64)>>,
-}
-
-fn joints(q: &[f64], what: &str) -> PyResult<[f64; NQ]> {
-    if q.len() < NQ {
-        return Err(PyValueError::new_err(format!(
-            "{what} has {} joints, need {NQ}",
-            q.len()
-        )));
-    }
-    let mut out = [0.0; NQ];
-    out.copy_from_slice(&q[..NQ]);
-    Ok(out)
 }
 
 fn pose16(m: Vec<f64>, what: &str) -> PyResult<Pose> {

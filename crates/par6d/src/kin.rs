@@ -38,32 +38,21 @@ use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 /// model must carry (mass for gravity, TCP frame for FK/IK). Unknown
 /// names fall back to the bare flange — the arm itself is always
 /// modeled — with a startup warning.
-pub(crate) fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
+pub fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
     if let Some(key) = urdf_variant {
-        match GripperVariant::from_key(key) {
-            Some(v) => return v,
-            None => log::warn!(
-                "gripper '{gripper_name}': unknown urdf_variant '{key}'; \
-                 falling back to the name-prefix rule"
-            ),
+        if GripperVariant::from_key(key).is_none() {
+            log::warn!(
+                "gripper urdf_variant {key:?} names no URDF tree; deriving one from the name"
+            );
         }
     }
-    let known = gripper_name.eq_ignore_ascii_case("flange")
-        || gripper_name.starts_with("MSG")
-        || gripper_name.starts_with("SSG48");
-    if !known {
-        log::warn!("no URDF variant for gripper '{gripper_name}'; using the bare flange model");
-    }
-    GripperVariant::by_name_prefix(gripper_name)
+    GripperVariant::resolve(&gripper_name.to_ascii_uppercase(), urdf_variant)
 }
 
 /// Resolve the `assets/par6_description` tree: the explicit choice when
 /// given, else the tree sitting next to the config directory (the repo
 /// layout: `config/PAR6.toml` ↔ `assets/par6_description`).
-pub(crate) fn resolve_assets_dir(
-    explicit: Option<&Path>,
-    config_path: &Path,
-) -> Result<PathBuf, String> {
+pub fn resolve_assets_dir(explicit: Option<&Path>, config_path: &Path) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
         return if p.is_dir() {
             Ok(p.to_path_buf())
@@ -107,7 +96,7 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
 /// variants' URDF tool links are deliberately not part of this chain,
 /// which is what makes `[kinematics] mass_kg` the knob that tunes
 /// gravity compensation instead of a parsed-and-ignored field.
-pub(crate) fn load_gravity_kin(
+pub fn load_gravity_kin(
     assets_dir: &Path,
     gripper: Option<&par6_config::GripperConfig>,
 ) -> Result<Kin, String> {
@@ -381,10 +370,15 @@ pub(crate) struct SoftWindow {
 }
 
 impl SoftWindow {
+    /// The window as `(min, max)` pairs, the shape a pose planner takes.
+    pub fn pairs(&self) -> [(f64, f64); NQ] {
+        std::array::from_fn(|j| (self.min[j], self.max[j]))
+    }
+
     /// The configured soft limits. Joints the config does not describe
     /// (a robot dimensioned smaller than [`NQ`]) get an unbounded
     /// window, which leaves their solutions untouched.
-    pub(crate) fn from_config(robot: &par6_config::RobotConfig) -> Self {
+    pub fn from_config(robot: &par6_config::RobotConfig) -> Self {
         let mut window = SoftWindow {
             min: [f64::NEG_INFINITY; NQ],
             max: [f64::INFINITY; NQ],
@@ -666,6 +660,50 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
         }
     }
     Some(x)
+}
+
+/// The model a payload estimation measures against — the arm with its
+/// fitted gripper, the collision world the wrist swing is planned in,
+/// and the joint window — from the config the daemon runs, resolved the
+/// way the daemon resolves it.
+///
+/// `package_dir` is where `package://` mesh URIs resolve when the assets
+/// tree is the installed Python package's `_data` rather than a repo
+/// checkout, whose meshes sit under `<assets>/URDF`.
+pub fn estimation_model(
+    config: Option<&Path>,
+    assets: Option<&Path>,
+    package_dir: Option<&Path>,
+) -> Result<par6_calibrate::EstimationModel, String> {
+    let config_path = crate::options::resolve_config_path(config)?;
+    let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
+    let robot = &bundle.robot;
+    let assets_dir = resolve_assets_dir(assets, &config_path)?;
+    let gripper = bundle.active_gripper();
+    let variant = variant_for(
+        &robot.robot.active_gripper,
+        gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
+    let kin = load_gravity_kin(&assets_dir, gripper)?;
+    let collision = match package_dir {
+        Some(dir) => {
+            let mut c = par6_kin::Collision::from_urdf(
+                &assets_dir.join(variant.urdf_relpath()),
+                Some(dir),
+                0.0,
+            )
+            .map_err(|e| e.to_string())?;
+            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))
+                .map_err(|e| e.to_string())?;
+            c
+        }
+        None => par6_kin::Collision::load(&assets_dir, variant, 0.0).map_err(|e| e.to_string())?,
+    };
+    Ok(par6_calibrate::EstimationModel {
+        kin,
+        collision,
+        window: SoftWindow::from_config(robot).pairs(),
+    })
 }
 
 #[cfg(test)]
