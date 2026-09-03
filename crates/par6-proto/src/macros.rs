@@ -36,5 +36,22 @@ macro_rules! wire_enum {
                 None
             }
         }
+
+        // Deserialized from the WIRE INTEGER, not the variant name: a
+        // caller that already speaks the wire (the Python binding sends
+        // the same numbers it puts on the socket) should not have to
+        // spell the names a second way.
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                let v = i64::deserialize(d)?;
+                $name::from_wire(v).ok_or_else(|| {
+                    serde::de::Error::custom(format!(
+                        "{} is not a {}",
+                        v,
+                        stringify!($name)
+                    ))
+                })
+            }
+        }
     };
 }

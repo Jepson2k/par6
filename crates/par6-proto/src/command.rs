@@ -67,7 +67,8 @@ const MAX_VEC_ELEMS: usize = 16;
 /// One workspace collision shape (mirrors waldoctl `Shape.to_wire()`).
 ///
 /// Wire form: `[kind, params, pose, collision, margin|nil, name]`.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Shape {
     /// Shape kind (`"box"`, `"sphere"`, …) — interpreted by the server layer.
     pub kind: String,
@@ -76,22 +77,33 @@ pub struct Shape {
     /// Shape pose (mm / degrees), kind-specific length.
     pub pose: Vec<f64>,
     /// Whether the shape participates in collision checking.
+    #[serde(default = "yes")]
     pub collision: bool,
     /// Optional safety margin (mm); `None` = server default.
+    #[serde(default)]
     pub margin: Option<f64>,
     /// Display name.
     pub name: String,
 }
 
+/// A shape with no `collision` key is a collision shape.
+fn yes() -> bool {
+    true
+}
+
 /// One scalar parameter of a [`Command::ToolAction`].
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Untagged: a caller sends the value itself, not a wrapper naming its
+/// type. Bool before the numbers because a Python `True` is also an int.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(untagged)]
 pub enum ToolParam {
-    /// A float parameter (position, speed, current, …).
-    Float(f64),
-    /// An integer parameter.
-    Int(i64),
     /// A flag parameter.
     Bool(bool),
+    /// An integer parameter.
+    Int(i64),
+    /// A float parameter (position, speed, current, …).
+    Float(f64),
     /// A symbolic parameter.
     Str(String),
 }
@@ -101,14 +113,17 @@ pub enum ToolParam {
 // ---------------------------------------------------------------------------
 
 /// STOP: halt motion with explicit cancel scope; controller stays ENABLED.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Stop {
     /// Also clear the pending queue (not just the active motion).
+    #[serde(default)]
     pub clear_queue: bool,
 }
 
 /// WRITE_IO: set one digital output.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WriteIo {
     /// Output port index, `0..=7`.
     pub port: u8,
@@ -117,7 +132,8 @@ pub struct WriteIo {
 }
 
 /// SIMULATOR: switch the bus backend between hardware and simulator.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Simulator {
     /// `true` = simulator backend.
     pub on: bool,
@@ -128,35 +144,40 @@ pub struct Simulator {
 /// Distinct from STOP: the sample ring is left intact, so resuming
 /// continues the move from where it paused instead of requiring the
 /// caller to re-issue it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Pause {
     /// `true` holds the executing trajectory; `false` resumes it.
     pub on: bool,
 }
 
 /// SET_GRAVITY_COMP: apply (or stop applying) the G(q) feedforward.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetGravityComp {
     /// `true` = apply the feedforward.
     pub on: bool,
 }
 
 /// SELECT_PROFILE: select the motion planner profile.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectProfile {
     /// Profile name (1–32 chars), validated against config server-side.
     pub profile: String,
 }
 
 /// CONNECT_HARDWARE: (re)connect the hardware bus.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectHardware {
     /// Bus/port identifier (1–256 chars), e.g. `"can0"`.
     pub port: String,
 }
 
 /// SET_TCP_OFFSET: offset the effective TCP in the tool-local frame (mm).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetTcpOffset {
     /// X offset (mm).
     pub x: f64,
@@ -169,7 +190,8 @@ pub struct SetTcpOffset {
 /// SET_PAYLOAD: replace the runtime payload carried at the TCP frame.
 /// An inertial update only — gravity feedforward and torque planning see
 /// it; the collision geometry is unchanged.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPayload {
     /// Payload mass \[kg\]; 0 clears the payload.
     pub mass: f64,
@@ -177,11 +199,13 @@ pub struct SetPayload {
     pub com: [f64; 3],
     /// Rotational inertia about the COM, end-effector-frame axes,
     /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\]; `None` = point mass.
+    #[serde(default)]
     pub inertia: Option<[f64; 6]>,
 }
 
 /// ENTER_FLASHING: silence the bus and hand it to a firmware flasher.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnterFlashing {
     /// The mandatory human assertion (parked, or force).
     pub assertion: FlashingAssertion,
@@ -191,7 +215,8 @@ pub struct EnterFlashing {
 /// boot-config path (the node keeps these values across its own
 /// reconnect resends). Field names match the vendor XML tags, and
 /// [`crate::CmdType::SetPidGains`]'s wire order is declaration order.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetPidGains {
     /// Target CAN node id, validated against the config server-side.
     pub node: u8,
@@ -218,79 +243,96 @@ pub struct SetPidGains {
 }
 
 /// SET_SHAPES: replace the workspace collision-world shapes.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetShapes {
     /// The new program-layer shape set.
     pub shapes: Vec<Shape>,
 }
 
 /// SET_COMPLETION_POLICY: select the controller-side completion policy.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetCompletionPolicy {
     /// The policy to apply to subsequent queued motion.
     pub policy: CompletionPolicy,
 }
 
 /// SET_RECIPE: select the telemetry recipe (unknown names are refused).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SetRecipe {
     /// Recipe name (1–64 chars), validated against config server-side.
     pub name: String,
 }
 
 /// POSE query params.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PoseQuery {
     /// Reference frame; `None` = server default (WRF).
+    #[serde(default)]
     pub frame: Option<Frame>,
 }
 
 /// SERVO_J: streaming joint position target.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServoJ {
     /// Target joint angles (degrees).
     pub angles: [f64; NUM_JOINTS],
     /// Velocity fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
 }
 
 /// SERVO_J_POSE: streaming joint position target via Cartesian pose (IK).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServoJPose {
     /// Target pose `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub pose: [f64; 6],
     /// Velocity fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
 }
 
 /// SERVO_L: streaming linear Cartesian position target.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ServoL {
     /// Target pose `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub pose: [f64; 6],
     /// Velocity fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
 }
 
 /// JOG_J: streaming joint velocity with a self-terminating watchdog.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JogJ {
     /// Signed velocity fractions per joint, each in `[-1, 1]`.
     pub speeds: [f64; NUM_JOINTS],
     /// Watchdog duration (seconds, > 0); UIs stream fresh jogs at 20–50 Hz.
     pub duration: f64,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
 }
 
 /// JOG_L: streaming Cartesian velocity with a watchdog.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct JogL {
     /// Signed velocity fractions `[vx, vy, vz, wx, wy, wz]`, each in `[-1, 1]`.
     pub velocities: [f64; 6],
@@ -299,12 +341,14 @@ pub struct JogL {
     /// Reference frame.
     pub frame: Frame,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
 }
 
 /// TELEPORT: instantly set joint angles. Simulator only — a real error
 /// (`SYS_NOT_SIMULATOR`) on hardware, never a silent no-op.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Teleport {
     /// Joint angles (degrees).
     pub angles: [f64; NUM_JOINTS],
@@ -313,76 +357,101 @@ pub struct Teleport {
 }
 
 /// HOME: run the homing sequence.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Home {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Run the referencing seek even when the arm already holds its
     /// references; otherwise a referenced arm gets a planned return move.
+    #[serde(default)]
     pub calibrate: bool,
 }
 
 /// MOVE_J: joint-space move to target angles.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveJ {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Target joint angles (degrees); relative deltas when `rel`.
     pub angles: [f64; NUM_JOINTS],
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Blend radius (mm, ≥ 0); `None` = no blending.
+    #[serde(default)]
     pub blend_radius: Option<f64>,
     /// Interpret `angles` as deltas from the current position.
+    #[serde(default)]
     pub rel: bool,
 }
 
 /// MOVE_J_POSE: joint-space move to a Cartesian pose (IK at target).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveJPose {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Target pose `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub pose: [f64; 6],
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Blend radius (mm, ≥ 0); `None` = no blending.
+    #[serde(default)]
     pub blend_radius: Option<f64>,
 }
 
 /// MOVE_L: linear Cartesian move.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveL {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Target pose `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub pose: [f64; 6],
     /// Reference frame.
     pub frame: Frame,
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Blend radius (mm, ≥ 0); `None` = no blending.
+    #[serde(default)]
     pub blend_radius: Option<f64>,
     /// Interpret `pose` as a delta from the current pose.
+    #[serde(default)]
     pub rel: bool,
 }
 
 /// MOVE_C: circular arc through current → via → end.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveC {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Via pose `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub via: [f64; 6],
@@ -391,90 +460,116 @@ pub struct MoveC {
     /// Reference frame.
     pub frame: Frame,
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Blend radius (mm, ≥ 0); `None` = no blending.
+    #[serde(default)]
     pub blend_radius: Option<f64>,
     /// Interpret `via`/`end` as deltas from the pose the move starts at.
+    #[serde(default)]
     pub rel: bool,
 }
 
 /// MOVE_S: cubic spline through waypoints (bulk; may arrive chunked).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveS {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Waypoint poses (≥ 2), each `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub waypoints: Vec<[f64; 6]>,
     /// Reference frame.
     pub frame: Frame,
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Interpret every waypoint as a delta from the pose the move
     /// starts at (each against the START, not chained).
+    #[serde(default)]
     pub rel: bool,
 }
 
 /// MOVE_P: process move — constant TCP speed, auto-blended corners (bulk).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MoveP {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Waypoint poses (≥ 2), each `[x, y, z, rx, ry, rz]` (mm / degrees).
     pub waypoints: Vec<[f64; 6]>,
     /// Reference frame.
     pub frame: Frame,
     /// Move duration (seconds, > 0). Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
+    #[serde(default)]
     pub accel: Option<f64>,
     /// Interpret every waypoint as a delta from the pose the move
     /// starts at (each against the START, not chained).
+    #[serde(default)]
     pub rel: bool,
 }
 
 /// SELECT_TOOL: select the active end-of-arm tool.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SelectTool {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Tool name (1–64 chars), validated against the registry server-side.
     pub tool_name: String,
     /// Jaw/variant key (≤ 64 chars); `None` = tool default.
+    #[serde(default)]
     pub variant_key: Option<String>,
 }
 
 /// DELAY: queued dwell.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Delay {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Dwell time (seconds, > 0).
     pub seconds: f64,
 }
 
 /// CHECKPOINT: queue marker for progress tracking.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Checkpoint {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Marker label (1–128 chars).
     pub label: String,
 }
 
 /// TOOL_ACTION: generic tool action, delegated server-side.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ToolAction {
     /// Idempotency key (client-generated uuid64).
+    #[serde(default)]
     pub key: u64,
     /// Tool key (1–64 chars), validated against the registry server-side.
     pub tool_key: String,
@@ -485,7 +580,14 @@ pub struct ToolAction {
 }
 
 /// A decoded (validated) command. See the module docs for the wire form.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// Also deserializable from a map tagged by `type`, which is the form
+/// the Python binding sends: `{"type": "move_j", "angles": [...], ...}`.
+/// The tag is the variant name in snake_case, and the remaining keys are
+/// the parameter struct's fields, so a field added to a command reaches
+/// the binding without a second description of it anywhere.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 #[allow(missing_docs)] // variants are documented via CmdType and the param structs
 pub enum Command {
     // SYSTEM

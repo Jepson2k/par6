@@ -12,6 +12,10 @@ repository.workspace = true
 # widths anyway.
 [dependencies]
 thiserror = { workspace = true }
+# Commands arrive from the Python binding as dicts; deriving the
+# deserialization keeps one description of each command instead of a
+# hand-written dict reader that has to be updated alongside it.
+serde = { workspace = true }
 
 [[bin]]
 name = "gen_python"

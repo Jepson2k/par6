@@ -671,6 +671,7 @@ dependencies = [
 name = "par6-proto"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "thiserror 2.0.20",
 ]
 
@@ -689,6 +690,8 @@ dependencies = [
  "par6d",
  "pyo3",
  "pyo3-async-runtimes",
+ "pythonize",
+ "serde",
  "tokio",
 ]
 
@@ -849,6 +852,16 @@ dependencies = [
  "pyo3-build-config",
  "quote",
  "syn 2.0.119",
+]
+
+[[package]]
+name = "pythonize"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "91a6ee7a084f913f98d70cdc3ebec07e852b735ae3059a1500db2661265da9ff"
+dependencies = [
+ "pyo3",
+ "serde",
 ]
 
 [[package]]
