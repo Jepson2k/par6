@@ -582,6 +582,21 @@ timeout_s = 15.0
 velocity_limit_rad_s = 0.25
 # safe_park_q = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]   # omitted = robot.park_pose_rad
 
+[freedrive]
+# Drift lock for freedrive (IDLE, homed, enabled, gravity comp on): once
+# the arm has been still for settle_s the pose is captured and held with
+# the drive's own impedance frame (the joints' gains.kp/kd, as the jog
+# PD pack uses) plus a slow clamped integral on the pose error, so a
+# slightly wrong gravity model no longer sags or lifts the arm. Any
+# joint moving faster than release_rad_s dissolves the lock on that tick
+# and zeroes the integral; stillness re-arms it at the new pose. Off by
+# default: it is a hold, and a hold must be asked for.
+drift_lock = false
+release_rad_s = 0.08
+settle_s = 0.3
+ki_nm_rad_s = 1.0
+integral_limit_nm = 0.3
+
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog
 # full-scale rates, completion settling. The offline preview reads this

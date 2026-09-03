@@ -193,7 +193,12 @@ One tick, in order:
    active tool's inertials attached from its gripper config so tool mass has exactly
    one source.
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
-   FLASHING produces this tick's setpoints.
+   FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
+   gravity comp on is freedrive: torque-only `G(q)`, no position hold. The opt-in
+   `[freedrive] drift_lock` re-holds the pose once the arm has been still (the
+   drive's impedance frame plus a clamped integral) and lets go the tick a joint
+   moves, so a slightly wrong gravity model stops sagging the arm without the
+   operator ever fighting a hold.
 5. **CAN TX** — one motion pack per joint, plus any queued control frame.
 6. **Snapshot** — publish state to the command plane's reader slot.
 

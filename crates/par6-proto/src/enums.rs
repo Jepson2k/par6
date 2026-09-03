@@ -36,7 +36,8 @@ wire_enum! {
         /// Bus scan and selfcheck; requests IDLE when it passes.
         Booting = 0,
         /// At rest. With gravity comp on and the arm homed and enabled this
-        /// is a torque-only hold with no position term — i.e. freedrive.
+        /// is a torque-only hold with no position term — i.e. freedrive (a
+        /// configured drift lock re-holds the pose once the arm is still).
         Idle = 1,
         /// Hard-error latch: active zero-velocity hold, drives DISABLED.
         ActiveError = 2,

@@ -62,6 +62,8 @@ pub struct Rig {
     pub gripper_node: NodeId,
     /// The measured pose the rig injects every tick.
     pub pose: [f64; MAX_JOINTS],
+    /// The measured joint speed the rig injects every tick [rad/s].
+    pub vel: [f64; MAX_JOINTS],
     /// The measured motor current the rig injects every tick [mA].
     pub current_ma: [i16; MAX_JOINTS],
     /// Bitmask of NODES whose injection is suppressed (staleness tests).
@@ -170,6 +172,7 @@ impl Rig {
             node_of,
             gripper_node,
             pose,
+            vel: [0.0; MAX_JOINTS],
             current_ma: [0; MAX_JOINTS],
             skip_nodes: 0,
             fault_nodes: 0,
@@ -216,7 +219,7 @@ impl Rig {
                 Reply::Motion {
                     node,
                     position_ticks: ticks,
-                    speed_ticks_s: 0,
+                    speed_ticks_s: self.conv[i].motor_speed_ticks_s(self.vel[i]).round() as i32,
                     current_ma: self.current_ma[i],
                 },
             );

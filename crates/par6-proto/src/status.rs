@@ -118,7 +118,11 @@ pub struct Status {
     pub enabled: bool,
     /// The gravity feedforward is being applied. With `mode` IDLE and the
     /// arm homed and enabled, this is exactly the freedrive condition:
-    /// torque-only G(q) with no position hold.
+    /// torque-only G(q) with no position hold. A configured `[freedrive]
+    /// drift_lock` holds the pose with the drive's impedance frame plus a
+    /// clamped integral once the arm has been still, released by any
+    /// motion; the integral shows up as the difference between the
+    /// commanded and gravity torques in telemetry.
     pub gravity_comp: bool,
     /// Warning-class latch entries (self-clearing conditions: stale CAN
     /// data, degraded loop, failed homing, …). The standing `error` slot

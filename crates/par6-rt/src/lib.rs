@@ -44,6 +44,7 @@
 
 pub mod core;
 pub mod dispatch;
+pub mod drift_lock;
 pub mod errors;
 pub mod exec;
 pub mod gpio;
@@ -61,6 +62,7 @@ pub mod timing;
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
 };
+pub use drift_lock::DriftLockStatus;
 pub use gpio::{
     Debouncer, DigitalIo, EstopGpio, EstopMonitor, NoDigitalIo, SharedDigitalIo, SharedIoLines,
     SharedLineGpio, DEBOUNCE_READS,

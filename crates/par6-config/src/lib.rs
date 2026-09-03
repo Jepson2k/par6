@@ -36,10 +36,10 @@ pub use homing::{
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
-    BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
-    KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
-    WatchdogAction,
+    BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
+    JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
+    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig,
+    StreamDefaults, TimingConfig, WatchdogAction,
 };
 
 use std::path::Path;

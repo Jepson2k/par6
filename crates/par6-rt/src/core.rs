@@ -37,6 +37,7 @@ use par6_bus::{
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
+use crate::drift_lock::DriftLock;
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
@@ -534,6 +535,9 @@ pub struct RtCore<B: DriverBus> {
     // Shutdown retreat.
     park: ShutdownPark,
 
+    // Freedrive drift lock.
+    drift: DriftLock,
+
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
     snap: StateSnapshot,
@@ -715,6 +719,7 @@ impl<B: DriverBus> RtCore<B> {
             stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
             stream_filt: [0.0; MAX_JOINTS],
             park: ShutdownPark::from_config(robot),
+            drift: DriftLock::from_config(robot),
             writer,
             snap: StateSnapshot::default(),
         };
@@ -1804,6 +1809,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn dispatch_and_send(&mut self) {
+        if self.mode != Mode::Idle {
+            self.drift.reset();
+        }
         if self.mode == Mode::Flashing {
             // Bus-silent: not a single frame, polls included.
             self.mirror = CommandMirror::default();
@@ -1879,7 +1887,22 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
             Mode::Idle => {
                 let hold = self.gravity_applied();
-                dispatch::law_idle(hold, &self.g, &mut self.setpoints);
+                if hold && self.drift.enabled() {
+                    if self.drift.tick(&self.q, &self.qd) {
+                        let lock = self.drift.status();
+                        dispatch::law_freedrive(
+                            &lock.hold_rad,
+                            &self.g,
+                            &lock.integral_nm,
+                            &mut self.setpoints,
+                        );
+                    } else {
+                        dispatch::law_idle(true, &self.g, &mut self.setpoints);
+                    }
+                } else {
+                    self.drift.reset();
+                    dispatch::law_idle(hold, &self.g, &mut self.setpoints);
+                }
             }
             Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
@@ -2089,6 +2112,7 @@ impl<B: DriverBus> RtCore<B> {
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
         s.gravity_comp = self.gravity_comp;
+        s.drift_lock = *self.drift.status();
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);

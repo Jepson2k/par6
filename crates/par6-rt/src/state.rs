@@ -5,6 +5,7 @@
 use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
+use crate::drift_lock::DriftLockStatus;
 use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
@@ -14,8 +15,9 @@ pub enum Mode {
     /// Startup: bus scan + selfcheck, then requests IDLE.
     #[default]
     Booting,
-    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold;
-    /// otherwise active zero-velocity/zero-current.
+    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold
+    /// (the `[freedrive]` drift lock, when configured, re-holds a still
+    /// arm's pose on top of it); otherwise active zero-velocity/zero-current.
     Idle,
     /// Hard-error latch state: active zero-velocity hold, DISABLED.
     ActiveError,
@@ -474,6 +476,8 @@ pub struct StateSnapshot {
     pub jog: JogStatus,
     /// Streaming live state.
     pub stream: StreamStatus,
+    /// Freedrive drift-lock live state (all zero unless configured on).
+    pub drift_lock: DriftLockStatus,
     /// Digital I/O levels: the first `io_inputs` entries are the
     /// debounced input levels, the next `io_outputs` are the levels the
     /// tick loop is driving, both in `[io]` config order.
@@ -541,6 +545,7 @@ impl Default for StateSnapshot {
             exec: ExecStatus::default(),
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
+            drift_lock: DriftLockStatus::default(),
             io_lines: [0; MAX_IO_LINES],
             io_inputs: 0,
             io_outputs: 0,

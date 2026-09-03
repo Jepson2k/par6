@@ -20,10 +20,10 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetRecipe, SetShapes, SetTcpOffset,
-    Shape, Stop, Teleport,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetRecipe, SetShapes,
+    SetTcpOffset, Shape, Stop, Teleport,
 };
-use par6_proto::{Command, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
+use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -79,6 +79,28 @@ fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
 }
 
 // ---- in-process rig --------------------------------------------------------
+
+/// The 50 Hz config with the `[freedrive]` drift lock switched on. The
+/// torque plant has no stiction, so a model bias that a real gearbox
+/// would turn into a slow creep moves the arm at a rate a hand push
+/// would; the release speed is raised past that, so the lock arms on the
+/// drifting arm after its settle window instead of reading the drift as
+/// an operator push.
+fn drift_lock_config(tag: &str) -> PathBuf {
+    let dst = test_config(tag);
+    let text = std::fs::read_to_string(&dst).expect("read test config");
+    let mut patched = text.clone();
+    for (from, to) in [
+        ("drift_lock = false", "drift_lock = true"),
+        ("release_rad_s = 0.08", "release_rad_s = 1.0"),
+        ("settle_s = 0.3", "settle_s = 0.2"),
+    ] {
+        assert!(patched.contains(from), "patch point {from:?} must exist");
+        patched = patched.replace(from, to);
+    }
+    std::fs::write(&dst, patched).expect("write drift-lock config");
+    dst
+}
 
 fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS]) {
     let deadline = Instant::now() + BUDGET;
@@ -556,6 +578,63 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     }
 
     rig.shutdown();
+}
+
+/// The `[freedrive]` drift lock against a biased gravity model on the
+/// torque plant. A runtime payload the plant does not carry IS that
+/// bias — the controller lifts a mass that is not there — and an IDLE
+/// arm under it rises for as long as nothing stops it. With the lock
+/// configured the same bias is caught inside the settle window and held
+/// by the drive's impedance frame plus the clamped integral.
+#[test]
+fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
+    const WINDOW: Duration = Duration::from_secs(2);
+    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
+    let payload = SetPayload {
+        mass: 0.2,
+        com: [0.0, 0.0, 0.02],
+        inertia: None,
+    };
+
+    let drift_deg = |config: PathBuf| -> [f64; NUM_JOINTS] {
+        let rig = Rig::boot_with(config, true);
+        let mut c = Client::new(rig.addr());
+        rig.wait_status("link_ok", |s| s.link_ok == 1);
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, HOLD_POSE_DEG);
+        // Held by the true model first, so the bias is the only change.
+        let start = rig
+            .collect_status(Duration::from_secs(1))
+            .last()
+            .expect("status while settling")
+            .angles;
+        c.ok(&Command::SetPayload(payload.clone()));
+        let watch = rig.collect_status(WINDOW);
+        let end = watch.last().expect("status during the drift window");
+        assert!(
+            end.mode == ControllerMode::Idle && end.enabled && end.gravity_comp,
+            "the arm must be in freedrive throughout: {end:?}"
+        );
+        assert!(end.error.is_none(), "unexpected error: {:?}", end.error);
+        let drift: [f64; NUM_JOINTS] = std::array::from_fn(|j| (end.angles[j] - start[j]).abs());
+        rig.shutdown();
+        drift
+    };
+    let worst = |d: &[f64; NUM_JOINTS]| LOADED.iter().map(|&j| d[j]).fold(0.0f64, f64::max);
+
+    let free_per_joint = drift_deg(test_config("drift-free"));
+    let locked_per_joint = drift_deg(drift_lock_config("drift-locked"));
+    let (free, locked) = (worst(&free_per_joint), worst(&locked_per_joint));
+    assert!(
+        free > 5.0,
+        "the biased model must visibly move an unlocked arm in {WINDOW:?}; \
+         drifted {free:.2}° ({free_per_joint:.2?})"
+    );
+    assert!(
+        locked < 2.0 && locked < free / 3.0,
+        "the lock must bound the drift: locked {locked:.2}° vs free {free:.2}° \
+         (per joint: locked {locked_per_joint:.2?}, free {free_per_joint:.2?})"
+    );
 }
 
 #[test]

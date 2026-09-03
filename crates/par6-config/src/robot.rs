@@ -642,6 +642,62 @@ impl Default for ShutdownConfig {
     }
 }
 
+/// The freedrive drift lock: a hold the IDLE gravity feedforward gains
+/// once the arm has been still, so an arm whose gravity model is
+/// slightly off stops drifting from wherever the operator leaves it
+/// instead of sagging or rising until something stops it.
+///
+/// After `settle_s` of stillness the pose is captured and each joint is
+/// sent the drive's impedance (PD) frame at that pose — the per-joint
+/// `gains.kp`/`gains.kd` the jog PD pack uses, closed inside the drive
+/// at its own loop rate — with `G(q)` plus a slow clamped integral
+/// (`ki_nm_rad_s`, `integral_limit_nm`) on the pose error as the
+/// feedforward. Any measured joint speed above `release_rad_s`
+/// dissolves the lock and zeroes the integral on that same tick, back to
+/// the torque-only freedrive frame, so an operator pushing the arm never
+/// fights the integral; stillness for `settle_s` re-arms it at the NEW
+/// pose. The job is "stop drifting from here", not "return to where you
+/// were": a pose the arm sagged to before the lock armed is the pose it
+/// keeps.
+///
+/// The integral is the only term the runtime adds and it is clamped per
+/// joint, so the worst case of a stale hold is the drive's configured
+/// impedance plus a bounded, known torque. The lock cannot hide a bad
+/// gravity model: a standing non-zero integral is the bias the model is
+/// missing, published on the snapshot and as the difference between the
+/// commanded and gravity torques.
+///
+/// Off by default. Durations are seconds; the runtime converts with
+/// `round(s / dt)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FreedriveConfig {
+    /// Arm the drift lock in freedrive (IDLE, homed, enabled, gravity
+    /// compensation on).
+    pub drift_lock: bool,
+    /// Measured joint speed above which the lock dissolves \[rad/s\]; the
+    /// arm must stay under it for `settle_s` to (re-)arm.
+    pub release_rad_s: f64,
+    /// Stillness required before the lock captures the pose \[s\].
+    pub settle_s: f64,
+    /// Integral gain on the pose error \[Nm/(rad·s)\].
+    pub ki_nm_rad_s: f64,
+    /// Per-joint clamp on the integral \[Nm\].
+    pub integral_limit_nm: f64,
+}
+
+impl Default for FreedriveConfig {
+    fn default() -> Self {
+        Self {
+            drift_lock: false,
+            release_rad_s: 0.08,
+            settle_s: 0.3,
+            ki_nm_rad_s: 1.0,
+            integral_limit_nm: 0.3,
+        }
+    }
+}
+
 /// Root of a robot TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -679,6 +735,9 @@ pub struct RobotConfig {
     /// Shutdown retreat. Omitted = no retreat.
     #[serde(default)]
     pub shutdown: ShutdownConfig,
+    /// Freedrive drift lock. Omitted = no lock.
+    #[serde(default)]
+    pub freedrive: FreedriveConfig,
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
@@ -771,6 +830,7 @@ impl RobotConfig {
         self.validate_limits()?;
         self.validate_motion()?;
         self.validate_shutdown()?;
+        self.validate_freedrive()?;
         self.validate_sim()?;
         Ok(())
     }
@@ -1107,6 +1167,27 @@ impl RobotConfig {
                         j.limits.soft_min_rad, j.limits.soft_max_rad
                     ),
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_freedrive(&self) -> Result<(), ConfigError> {
+        let f = &self.freedrive;
+        for (v, name) in [
+            (f.release_rad_s, "freedrive.release_rad_s"),
+            (f.integral_limit_nm, "freedrive.integral_limit_nm"),
+        ] {
+            if !is_positive(v) {
+                return Err(invalid(name, "must be > 0"));
+            }
+        }
+        for (v, name) in [
+            (f.settle_s, "freedrive.settle_s"),
+            (f.ki_nm_rad_s, "freedrive.ki_nm_rad_s"),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(invalid(name, "must be finite and >= 0"));
             }
         }
         Ok(())
