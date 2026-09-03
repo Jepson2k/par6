@@ -1740,6 +1740,8 @@ fn tcp_speeds(path: &[Status]) -> Vec<([f64; 3], f64)> {
 
 /// STATUS frames per speed measurement (~0.1 s at the 50 Hz broadcast).
 const SPEED_WINDOW: usize = 5;
+/// STATUS frames per motion-window speed read (~0.2 s).
+const MOTION_WINDOW: usize = 10;
 
 /// Teleport to the curved-move start posture and return the pose the arm
 /// actually came to rest in.
@@ -1760,19 +1762,28 @@ fn curve_start(rig: &Rig, c: &mut Client) -> Status {
     })
 }
 
-/// Seconds between the first and last TCP movement in a status stream
-/// (consecutive samples further apart than `eps_mm`): the chain's motion
-/// time, indifferent to how long the stream kept being collected after
-/// the arm stopped.
-fn motion_seconds(path: &[Status], eps_mm: f64) -> f64 {
+/// Seconds between the first and last stretch of a status stream in which
+/// the TCP moves faster than `floor_mm_s`: the chain's motion time,
+/// indifferent to how long the stream kept being collected after the arm
+/// stopped.
+///
+/// A speed over [`MOTION_WINDOW`] frames, for the reason [`tcp_speeds`]
+/// gives: the status task and the RT tick alias, so one frame can carry
+/// two ticks of travel. During the settle creep that is a tenth of a
+/// millimetre — read frame by frame it counted as movement a dozen
+/// frames after the chain had stopped, and put the chain's motion time
+/// wherever that frame happened to fall. The window is longer than the
+/// corner measurement's and the floor sits above the creep, so the ends
+/// of the window land on the ramps, where one aliased frame is noise.
+fn motion_seconds(path: &[Status], floor_mm_s: f64) -> f64 {
     let mut first = None;
     let mut last = None;
-    for w in path.windows(2) {
-        if distance(tcp_mm(&w[1]), tcp_mm(&w[0])) > eps_mm {
-            if first.is_none() {
-                first = Some(w[0].mono_time_ns);
-            }
-            last = Some(w[1].mono_time_ns);
+    for w in path.windows(MOTION_WINDOW) {
+        let (a, b) = (&w[0], &w[MOTION_WINDOW - 1]);
+        let dt = b.mono_time_ns.saturating_sub(a.mono_time_ns) as f64 * 1e-9;
+        if dt > 0.0 && distance(tcp_mm(a), tcp_mm(b)) / dt > floor_mm_s {
+            first.get_or_insert(a.mono_time_ns);
+            last = Some(b.mono_time_ns);
         }
     }
     match (first, last) {
@@ -2124,7 +2135,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
         ok,
         "the unblended second leg must complete ok, got {detail:?}"
     );
-    let sharp_time = motion_seconds(&sharp, 0.1);
+    let sharp_time = motion_seconds(&sharp, 10.0);
     let sharp_points: Vec<[f64; 3]> = sharp.iter().map(tcp_mm).collect();
     let sharp_miss = path_misses(&sharp_points, corner);
     let (sharp_corner_speed, sharp_mean) = corner_and_mean_speed(&sharp, corner, 20.0);
@@ -2152,7 +2163,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
         ok,
         "the blended second leg must complete ok, got {detail:?}"
     );
-    let blend_time = motion_seconds(&blended, 0.1);
+    let blend_time = motion_seconds(&blended, 10.0);
     let blended_points: Vec<[f64; 3]> = blended.iter().map(tcp_mm).collect();
 
     // The corner is rounded: cut by more than the tracking error, and
