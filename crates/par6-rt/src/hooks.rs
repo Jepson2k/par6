@@ -222,6 +222,9 @@ pub struct RampJog {
     target_q: [f64; MAX_JOINTS],
     vel: [f64; MAX_JOINTS],
     request: [f64; MAX_JOINTS],
+    /// Joints driven by the previous command; survives `release()` so a
+    /// joint re-entering the set after a stop still clears its blocks.
+    last_set: u8,
     blocked: u16,
 }
 
@@ -249,6 +252,7 @@ impl RampJog {
             target_q: [0.0; MAX_JOINTS],
             vel: [0.0; MAX_JOINTS],
             request: [0.0; MAX_JOINTS],
+            last_set: 0,
             blocked: 0,
         }
     }
@@ -259,20 +263,30 @@ impl JogEngine for RampJog {
         self.target_q = *q_meas;
         self.vel = [0.0; MAX_JOINTS];
         self.request = [0.0; MAX_JOINTS];
+        self.last_set = 0;
         self.blocked = 0;
     }
 
     fn command(&mut self, speeds: &[f64; MAX_JOINTS]) {
+        let mut set = 0u8;
         for (i, (want, v)) in self.request.iter_mut().zip(speeds.iter()).enumerate() {
-            if !v.is_finite() {
-                continue;
-            }
+            // A non-finite entry is a stop for that joint, never "keep
+            // whatever it was doing".
+            let v = if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
             // A joint dropping out of the driven set clears its blocks.
-            if *want != 0.0 && *v == 0.0 {
+            if self.last_set & (1 << i) != 0 && v == 0.0 {
                 self.blocked &= !(0b11 << (2 * i));
             }
-            *want = v.clamp(-1.0, 1.0);
+            if v != 0.0 {
+                set |= 1 << i;
+            }
+            *want = v;
         }
+        self.last_set = set;
     }
 
     fn set_accel_scale(&mut self, accel: f64) {

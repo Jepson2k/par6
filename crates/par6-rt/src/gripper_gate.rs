@@ -60,14 +60,27 @@ impl GripperGate {
     }
 
     /// Release: drop `action` on the standing command (keeping its bytes
-    /// for a later stop) and run the announcement.
+    /// for a later stop) and run the announcement. With nothing standing
+    /// nothing is invented — a later stop then has no force budget and
+    /// degrades to a release, as documented.
     pub(crate) fn idle(&mut self) {
+        if let Some(c) = &mut self.standing {
+            c.action = false;
+            c.activate = true;
+            c.estop = false;
+        }
+        self.idle_repeats = IDLE_PACK_REPEATS;
+    }
+
+    /// The idle announcement: the standing command's bytes (zeros with
+    /// nothing standing) with `action` dropped. This byte pattern is
+    /// load-bearing on hardware.
+    fn announcement(&self) -> FirmwareGripperCommand {
         let mut f = self.standing.unwrap_or_default();
         f.action = false;
         f.activate = true;
         f.estop = false;
-        self.standing = Some(f);
-        self.idle_repeats = IDLE_PACK_REPEATS;
+        f
     }
 
     /// Ownership hand-back (homing exit, FLASHING exit): the previous
@@ -99,11 +112,7 @@ impl GripperGate {
             GripperCommand::Firmware(self.standing.unwrap_or_default())
         } else if self.idle_repeats > 0 {
             self.idle_repeats -= 1;
-            let mut f = self.standing.unwrap_or_default();
-            f.action = false;
-            f.activate = true;
-            f.estop = false;
-            GripperCommand::Firmware(f)
+            GripperCommand::Firmware(self.announcement())
         } else {
             GripperCommand::FirmwarePoll
         }

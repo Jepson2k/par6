@@ -1868,3 +1868,39 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
         "drive did not resume after clear-error"
     );
 }
+
+/// The kinematic plant drives on the loop's own feedback share: a torque
+/// feedforward that alone saturates Ilim (shoulder gravity at homing
+/// current) must not cancel the position error out of the command.
+#[test]
+fn a_saturating_feedforward_does_not_cancel_the_position_loop() {
+    let robot = par6();
+    let mut rig = Rig::boot(&robot, None, None);
+    let node = usize::from(robot.joints[0].node_id);
+    let mut cmds = rig.idle_cmds();
+    // Polls rotate over the nodes; wait for this one's first answer.
+    let mut start = None;
+    for _ in 0..20 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+        start = rig.state.nodes[node].position_ticks;
+        if start.is_some() {
+            break;
+        }
+    }
+    let start = start.expect("the sim answers the polls");
+
+    // Position mode with the feedforward channel pinned far past Ilim.
+    let target = start + 4000;
+    cmds[0] = JointCommand::position(target, 0, i16::MAX);
+    for _ in 0..200 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let now = rig.state.nodes[node].position_ticks.expect("polled");
+    assert!(
+        now - start > 500,
+        "the joint must close on its target under a saturating feedforward: \
+         moved {} ticks of {}",
+        now - start,
+        target - start
+    );
+}

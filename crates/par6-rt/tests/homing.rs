@@ -23,9 +23,9 @@ use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, SequenceStep};
 use par6_rt::homing::{HomingSystem, SeqStatus};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
-    sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, Mode, NoFk, RtCommand,
-    RtCore, RtHandles, RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio, SpecSettle,
-    ZeroGravity, MAX_JOINTS,
+    sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, HomingPhase, Mode, NoFk,
+    RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio,
+    SpecSettle, ZeroGravity, MAX_JOINTS,
 };
 
 /// An RtCore over the closed-loop sim bus. J5's hall band is moved onto
@@ -1050,6 +1050,15 @@ fn a_gripper_calibration_timeout_clears_without_a_restart() {
     let s = rig.snap();
     assert_eq!(s.mode, Mode::ActiveError, "the calibration failure reacts");
     assert!(!s.homed);
+    // The firmware calibrates the gripper itself: no Homer ever ran for
+    // that slot, so its phase is Idle beside the Failed status, not a
+    // never-started FSM's constructor phase.
+    assert_eq!(s.homing.per_joint[MAX_JOINTS], HomingJointStatus::Failed);
+    assert_eq!(
+        s.homing.phase[MAX_JOINTS],
+        HomingPhase::Idle,
+        "a firmware-calibrated gripper reports no FSM phase"
+    );
     assert!(
         s.errors
             .as_slice()
@@ -1154,4 +1163,49 @@ fn a_hall_sensor_that_never_clears_fails_instead_of_latching() {
         "an always-triggered sensor must fail, never latch a reference"
     );
     assert_eq!(h.sys.statuses()[5], HomingJointStatus::Failed);
+}
+
+/// A live retune replaces the "normal" limits homing restores on its way
+/// out: after SET_PID_GAINS lowered J1's current ceiling, a home() must
+/// hand the drive back the tuned ceiling, not the config-time one the
+/// sequence snapshotted at construction.
+#[test]
+fn a_retune_before_homing_is_the_limit_homing_restores() {
+    let (mut core, mut handles, tx, _line) = sim_core();
+    let bundle = common::bundle();
+    let j0 = &bundle.robot.joints[0];
+    let tune = par6_bus::DriveTune {
+        gains: j0.gains,
+        ilim_ma: j0.ilim_ma * 0.75,
+        velocity_limit_ticks_s: j0.velocity_limit_ticks_s,
+        voltage_limit_mv: j0.voltage_limit_mv,
+    };
+    let dt = core.tick_dt_s();
+    for _ in 0..10 {
+        core.tick(dt, false);
+    }
+    tx.send(RtCommand::RetuneNode {
+        node: j0.node_id,
+        tune,
+    })
+    .unwrap();
+    core.tick(dt, false);
+    start_homing(&mut core, &mut handles, &tx);
+
+    let mut finished = false;
+    for _ in 0..30_000 {
+        core.tick(dt, false);
+        let s = handles.snapshots.latest();
+        if !s.homing.active && s.mode == Mode::Idle {
+            finished = true;
+            break;
+        }
+    }
+    assert!(finished, "sequence must finish within the tick budget");
+    let s = handles.snapshots.latest();
+    assert!(s.homed, "sequence success sets homed");
+    assert_eq!(
+        s.homing.effective_current_limit_ma[0], tune.ilim_ma as f32,
+        "J1 must come back to the tuned Ilim, not the config-time one"
+    );
 }

@@ -368,9 +368,14 @@ impl VirtualDriver {
             }
         };
         self.cur_out_ma = cur.clamp(-ilim, ilim);
+        // The share the kinematic plant subtracts, sized so what remains
+        // is the loop's own feedback output saturated at Ilim: clamping
+        // the two separately let a saturating feedforward cancel the
+        // whole command.
+        let feedback_ma = (cur - ff).clamp(-ilim, ilim);
         PlantCmd {
             current_ma: self.cur_out_ma,
-            ff_ma: ff.clamp(-ilim, ilim),
+            ff_ma: self.cur_out_ma - feedback_ma,
             vel_limit_ticks_s: self.vel_limit,
             idle: false,
         }

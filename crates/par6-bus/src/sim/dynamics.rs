@@ -186,7 +186,10 @@ impl DynamicsPlant {
         maps: &[JointMap],
     ) {
         let h = dt / f64::from(SUBSTEPS);
-        let fw_steps = (h / super::driver::FW_LOOP_DT).round().max(1.0);
+        // The firmware's iterations per bus tick, spread evenly over the
+        // substeps, so the velocity-loop integral winds the same total
+        // at every dt instead of matching the firmware only at 250 Hz.
+        let fw_steps = (dt / super::driver::FW_LOOP_DT).round().max(1.0) / f64::from(SUBSTEPS);
         for j in 0..self.coulomb_eps.len() {
             self.coulomb_eps[j] = Self::coulomb_eps(self.motor_tc[j], self.inertia[j], h);
         }

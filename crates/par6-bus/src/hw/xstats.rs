@@ -11,6 +11,7 @@
 //! state-only monitor.
 
 use std::io;
+use std::time::Duration;
 
 /// Cumulative controller counters, in the kernel struct's declaration
 /// order (six host-endian `u32`).
@@ -178,52 +179,109 @@ pub(super) fn ifindex(name: &str) -> io::Result<u32> {
     Ok(idx)
 }
 
-/// One RTM_GETLINK round trip for `ifindex`. Opens a throwaway netlink
-/// socket per call — this runs on the ~1 Hz monitor thread, never the
-/// RT tick.
-pub(super) fn query(ifindex: u32) -> io::Result<Option<CanDeviceStats>> {
-    let fd = unsafe {
-        libc::socket(
-            libc::AF_NETLINK,
-            libc::SOCK_RAW | libc::SOCK_CLOEXEC,
-            libc::NETLINK_ROUTE,
-        )
-    };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
+struct Fd(i32);
+
+impl Drop for Fd {
+    fn drop(&mut self) {
+        unsafe { libc::close(self.0) };
     }
-    struct Fd(i32);
-    impl Drop for Fd {
-        fn drop(&mut self) {
-            unsafe { libc::close(self.0) };
+}
+
+/// How long one RTM_GETLINK answer may take before the sample is given
+/// up: a dropped reply must not wedge the monitor thread (and the join
+/// in `Drop`) forever.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(1);
+
+/// A netlink socket held across samples on the ~1 Hz monitor thread,
+/// with its receive buffer; never touched by the RT tick.
+pub(super) struct Query {
+    fd: Fd,
+    buf: Vec<u8>,
+    seq: u32,
+}
+
+impl Query {
+    pub(super) fn open() -> io::Result<Self> {
+        let fd = unsafe {
+            libc::socket(
+                libc::AF_NETLINK,
+                libc::SOCK_RAW | libc::SOCK_CLOEXEC,
+                libc::NETLINK_ROUTE,
+            )
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let fd = Fd(fd);
+        let timeout = libc::timeval {
+            tv_sec: REPLY_TIMEOUT.as_secs() as libc::time_t,
+            tv_usec: libc::suseconds_t::from(REPLY_TIMEOUT.subsec_micros()),
+        };
+        let rc = unsafe {
+            libc::setsockopt(
+                fd.0,
+                libc::SOL_SOCKET,
+                libc::SO_RCVTIMEO,
+                (&timeout as *const libc::timeval).cast(),
+                std::mem::size_of::<libc::timeval>() as libc::socklen_t,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self {
+            fd,
+            // One link answer fits comfortably; a truncated tail would
+            // only cut trailing attributes that are not read.
+            buf: vec![0u8; 32 * 1024],
+            seq: 0,
+        })
+    }
+
+    /// One RTM_GETLINK round trip for `ifindex`. A reply carrying another
+    /// request's sequence number (the answer to a sample that timed out)
+    /// is skipped rather than parsed as this one's.
+    pub(super) fn sample(&mut self, ifindex: u32) -> io::Result<Option<CanDeviceStats>> {
+        self.seq = self.seq.wrapping_add(1);
+        // nlmsghdr + ifinfomsg, host-endian, index-addressed (no strict
+        // checking needed to filter by name).
+        const REQ_LEN: usize = NLMSG_HDRLEN + IFINFOMSG_LEN;
+        let mut req = [0u8; REQ_LEN];
+        req[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
+        req[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
+        req[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
+        req[8..12].copy_from_slice(&self.seq.to_ne_bytes());
+        // pid 0 = kernel fills in; ifinfomsg: family AF_UNSPEC, index at +4.
+        req[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
+
+        let sent = unsafe {
+            libc::send(
+                self.fd.0,
+                req.as_ptr().cast(),
+                req.len(),
+                libc::MSG_NOSIGNAL,
+            )
+        };
+        if sent != req.len() as isize {
+            return Err(io::Error::last_os_error());
+        }
+        loop {
+            let got =
+                unsafe { libc::recv(self.fd.0, self.buf.as_mut_ptr().cast(), self.buf.len(), 0) };
+            if got < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let got = got as usize;
+            if got >= NLMSG_HDRLEN {
+                let seq =
+                    u32::from_ne_bytes([self.buf[8], self.buf[9], self.buf[10], self.buf[11]]);
+                if seq != self.seq {
+                    continue;
+                }
+            }
+            return parse_response(&self.buf[..got], ifindex);
         }
     }
-    let fd = Fd(fd);
-
-    // nlmsghdr + ifinfomsg, host-endian, index-addressed (no strict
-    // checking needed to filter by name).
-    const REQ_LEN: usize = NLMSG_HDRLEN + IFINFOMSG_LEN;
-    let mut req = [0u8; REQ_LEN];
-    req[0..4].copy_from_slice(&(REQ_LEN as u32).to_ne_bytes());
-    req[4..6].copy_from_slice(&RTM_GETLINK.to_ne_bytes());
-    req[6..8].copy_from_slice(&NLM_F_REQUEST.to_ne_bytes());
-    req[8..12].copy_from_slice(&1u32.to_ne_bytes()); // seq
-                                                     // pid 0 = kernel fills in; ifinfomsg: family AF_UNSPEC, index at +4.
-    req[NLMSG_HDRLEN + 4..NLMSG_HDRLEN + 8].copy_from_slice(&ifindex.to_ne_bytes());
-
-    let sent = unsafe { libc::send(fd.0, req.as_ptr().cast(), req.len(), libc::MSG_NOSIGNAL) };
-    if sent != req.len() as isize {
-        return Err(io::Error::last_os_error());
-    }
-
-    // One link answer fits comfortably; a truncated tail would only cut
-    // trailing attributes we do not read.
-    let mut buf = vec![0u8; 32 * 1024];
-    let got = unsafe { libc::recv(fd.0, buf.as_mut_ptr().cast(), buf.len(), 0) };
-    if got < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    parse_response(&buf[..got as usize], ifindex)
 }
 
 #[cfg(test)]

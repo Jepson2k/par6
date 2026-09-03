@@ -289,6 +289,39 @@ impl Rig {
             .collect()
     }
 
+    /// Stored-config passes on the bus so far, every node.
+    pub fn config_passes(&mut self) -> usize {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, par6_bus::TxRecord::ConfigPass { .. }))
+            .count()
+    }
+
+    /// Stored-config passes on the bus so far, one node.
+    pub fn config_passes_for(&mut self, node: u8) -> usize {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, par6_bus::TxRecord::ConfigPass { node: n } if *n == node))
+            .count()
+    }
+
+    /// Every gripper-slot frame on the bus, oldest first.
+    pub fn gripper_sends(&mut self) -> Vec<par6_bus::GripperCommand> {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter_map(|(_, r)| match r {
+                par6_bus::TxRecord::Gripper(g) => Some(*g),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn clear_tx(&mut self) {
         self.core.bus_mut().tx_log.clear();
     }

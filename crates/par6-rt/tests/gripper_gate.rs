@@ -10,22 +10,9 @@
 
 mod common;
 
-use par6_bus::{FirmwareGripperCommand, GripperCommand, TxRecord};
+use par6_bus::{FirmwareGripperCommand, GripperCommand};
 use par6_config::{ConfigBundle, PreMove, SequenceStep};
 use par6_rt::{Mode, RtCommand};
-
-/// Every gripper-slot frame on the bus, oldest first.
-fn gripper_sends(rig: &mut common::Rig) -> Vec<GripperCommand> {
-    rig.core
-        .bus_mut()
-        .tx_log
-        .iter()
-        .filter_map(|(_, r)| match r {
-            TxRecord::Gripper(g) => Some(*g),
-            _ => None,
-        })
-        .collect()
-}
 
 fn close_cmd() -> FirmwareGripperCommand {
     FirmwareGripperCommand {
@@ -50,7 +37,7 @@ fn a_release_announces_three_idle_frames_then_polls() {
     rig.clear_tx();
     rig.cmd(RtCommand::Gripper(close_cmd()));
     rig.tick_n(4);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     assert_eq!(sends.len(), 5);
     for s in &sends {
         assert_eq!(
@@ -63,7 +50,7 @@ fn a_release_announces_three_idle_frames_then_polls() {
     rig.clear_tx();
     rig.cmd(RtCommand::GripperIdle);
     rig.tick_n(9);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     let idle_frame = FirmwareGripperCommand {
         action: false,
         ..close_cmd()
@@ -86,14 +73,14 @@ fn a_release_announces_three_idle_frames_then_polls() {
     rig.cmd(RtCommand::Gripper(close_cmd()));
     rig.tick_n(2);
     assert_eq!(
-        gripper_sends(&mut rig),
+        rig.gripper_sends(),
         vec![GripperCommand::Firmware(close_cmd()); 3],
         "a move after a completed release streams again"
     );
     rig.clear_tx();
     rig.cmd(RtCommand::GripperIdle);
     rig.tick_n(4);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     assert_eq!(
         &sends[..3],
         &[GripperCommand::Firmware(idle_frame); 3],
@@ -116,7 +103,7 @@ fn an_uncalibrated_gripper_gets_polls_not_dlc5_frames() {
     rig.clear_tx();
     rig.cmd(RtCommand::Gripper(close_cmd()));
     rig.tick_n(49);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     assert_eq!(sends.len(), 50);
     assert!(
         sends.iter().all(|s| *s == GripperCommand::FirmwarePoll),
@@ -127,7 +114,7 @@ fn an_uncalibrated_gripper_gets_polls_not_dlc5_frames() {
     rig.clear_tx();
     rig.tick_n(3);
     assert_eq!(
-        gripper_sends(&mut rig),
+        rig.gripper_sends(),
         vec![GripperCommand::Firmware(close_cmd()); 3],
         "the standing move starts streaming on the first calibrated reply"
     );
@@ -157,7 +144,7 @@ fn stop_retargets_the_reported_jaw_byte_or_degrades_to_release() {
             ..close_cmd()
         };
         assert_eq!(
-            gripper_sends(&mut rig),
+            rig.gripper_sends(),
             vec![GripperCommand::Firmware(held); 4],
             "stop holds at reported byte {byte} with the standing speed/current \
              — releasing at 255 would drop a part gripped at the stroke end"
@@ -174,7 +161,7 @@ fn stop_retargets_the_reported_jaw_byte_or_degrades_to_release() {
     rig.clear_tx();
     rig.cmd(RtCommand::GripperStop);
     rig.tick_n(5);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     let idle_frame = FirmwareGripperCommand {
         action: false,
         ..close_cmd()
@@ -250,13 +237,14 @@ fn homing_exit_hands_the_hold_back_as_a_release() {
     let done = rig.tick_until(1000, |s| !s.homing.active && s.mode == Mode::Idle);
     assert!(!done.error_active, "the hold-only sequence exits cleanly");
     assert!(
-        gripper_sends(&mut rig).contains(&GripperCommand::Firmware(hold)),
+        rig.gripper_sends()
+            .contains(&GripperCommand::Firmware(hold)),
         "the sequence itself streamed the hold"
     );
 
     rig.clear_tx();
     rig.tick_n(6);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     let released = FirmwareGripperCommand {
         action: false,
         ..hold
@@ -302,14 +290,15 @@ fn a_homing_abort_hands_the_hold_back_too() {
         "the long hold keeps the sequence up"
     );
     assert!(
-        gripper_sends(&mut rig).contains(&GripperCommand::Firmware(hold)),
+        rig.gripper_sends()
+            .contains(&GripperCommand::Firmware(hold)),
         "the hold reached the bus before the abort"
     );
 
     rig.clear_tx();
     rig.cmd(RtCommand::SetMode(Mode::Idle));
     rig.tick_n(5);
-    let sends = gripper_sends(&mut rig);
+    let sends = rig.gripper_sends();
     let released = FirmwareGripperCommand {
         action: false,
         ..hold
@@ -332,5 +321,44 @@ fn a_homing_abort_hands_the_hold_back_too() {
         sends.last(),
         Some(&GripperCommand::FirmwarePoll),
         "the announcement has already settled on polls: {sends:?}"
+    );
+}
+
+/// A stop holds at the reported jaw byte when the gripper is calibrated
+/// — 0 (fully open) is a legitimate hold — and degrades to a release
+/// when it is not, whatever stale byte the reply carries.
+#[test]
+fn a_stop_holds_at_any_calibrated_byte_and_releases_an_uncalibrated_one() {
+    let mut rig = common::Rig::new();
+    rig.ready();
+    rig.cmd(RtCommand::Gripper(close_cmd()));
+    rig.gripper_reply.calibrated = true;
+    rig.gripper_reply.position = 0;
+    rig.tick_n(2);
+
+    rig.clear_tx();
+    rig.cmd(RtCommand::GripperStop);
+    rig.tick();
+    let held = FirmwareGripperCommand {
+        position: 0,
+        ..close_cmd()
+    };
+    assert_eq!(
+        rig.gripper_sends(),
+        vec![GripperCommand::Firmware(held); 2],
+        "a calibrated gripper parked fully open is held there, not released"
+    );
+
+    rig.cmd(RtCommand::Gripper(close_cmd()));
+    rig.gripper_reply.calibrated = false;
+    rig.gripper_reply.position = 120;
+    rig.tick_n(2);
+
+    rig.clear_tx();
+    rig.cmd(RtCommand::GripperStop);
+    let sends = rig.gripper_sends();
+    assert!(
+        matches!(sends.first(), Some(GripperCommand::Firmware(f)) if !f.action),
+        "an uncalibrated gripper's byte is not a pose: the stop must release, got {sends:?}"
     );
 }

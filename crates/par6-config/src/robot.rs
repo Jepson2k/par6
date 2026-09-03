@@ -298,6 +298,11 @@ pub struct BusConfig {
     pub rx_frames_per_tick_cap: u32,
     /// Config passes per node during boot configuration.
     pub boot_config_repeats: u8,
+    /// When the full stored-config shots re-run after the bus arms
+    /// \[s since arming\] (vendor boot workaround: a driver that missed
+    /// the paced boot pass gets three more chances).
+    #[serde(default = "default_config_resend_offsets_s")]
+    pub config_resend_offsets_s: Vec<f64>,
     /// How long daemon startup keeps retrying a failed bus open \[s\]
     /// (1 s pacing; 0 = fail on the first attempt). Covers the boot
     /// race where par6d starts before the CAN driver has enumerated
@@ -433,6 +438,10 @@ impl Default for StreamDefaults {
 
 fn default_open_retry_s() -> f64 {
     10.0
+}
+
+fn default_config_resend_offsets_s() -> Vec<f64> {
+    vec![0.2, 0.6, 1.2]
 }
 
 /// Longest bus-open retry window accepted \[s\]; the daemon derives a
@@ -929,6 +938,16 @@ impl RobotConfig {
         }
         if b.boot_config_repeats == 0 {
             return Err(invalid("bus.boot_config_repeats", "must be >= 1"));
+        }
+        if !b
+            .config_resend_offsets_s
+            .iter()
+            .all(|s| is_positive(*s) && s.is_finite())
+        {
+            return Err(invalid(
+                "bus.config_resend_offsets_s",
+                "every offset must be > 0 and finite",
+            ));
         }
         if !(b.open_retry_s.is_finite() && (0.0..=MAX_OPEN_RETRY_S).contains(&b.open_retry_s)) {
             return Err(invalid(
