@@ -26,11 +26,24 @@ fn test_config() -> PathBuf {
     let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
     let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
     assert_ne!(patched, text, "tick_dt_s patch point must exist");
+    // Every test in this binary writes the same files into the same
+    // process-keyed directory, in parallel. A plain write truncates
+    // first, so a sibling loading the config mid-write reads an empty
+    // TOML. Written beside and renamed over: a reader sees a whole file,
+    // old or new, both of them this one.
+    let place = |path: &std::path::Path, contents: &[u8]| {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static STAGE: AtomicU64 = AtomicU64::new(0);
+        let staged = path.with_extension(format!("tmp.{}", STAGE.fetch_add(1, Ordering::Relaxed)));
+        std::fs::write(&staged, contents).expect("stage test file");
+        std::fs::rename(&staged, path).expect("place test file");
+    };
     let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
+    place(&dst, patched.as_bytes());
     for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
         let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
+        let bytes = std::fs::read(e.path()).expect("read gripper toml");
+        place(&grippers.join(e.file_name()), &bytes);
     }
     dst
 }

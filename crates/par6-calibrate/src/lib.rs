@@ -273,17 +273,30 @@ pub async fn measure(
 ) -> Result<Vec<GravitySample>, String> {
     // The readings are the torques the arm holds a FINISHED move with, so
     // the runtime has to be the one that decides a move is finished and
-    // settled — the policy is stated here rather than assumed.
+    // settled — the policy is stated here rather than assumed. It is the
+    // caller's session, though, so whatever they had is put back after:
+    // what they set, or the server's boot default if they never did.
+    let previous = client
+        .completion_policy()
+        .unwrap_or(CompletionPolicy::Settled);
     client
         .set_completion_policy(CompletionPolicy::Settled)
         .await
         .map_err(|e| format!("set_completion_policy: {e}"))?;
-    let mut samples = Vec::with_capacity(poses.len());
-    for (i, q) in poses.iter().enumerate() {
-        log::info!("pose {}/{}", i + 1, poses.len());
-        samples.push(measure_pose(client, q, protocol).await?);
-    }
-    Ok(samples)
+    let run = async {
+        let mut samples = Vec::with_capacity(poses.len());
+        for (i, q) in poses.iter().enumerate() {
+            log::info!("pose {}/{}", i + 1, poses.len());
+            samples.push(measure_pose(client, q, protocol).await?);
+        }
+        Ok::<_, String>(samples)
+    };
+    let result = run.await;
+    client
+        .set_completion_policy(previous)
+        .await
+        .map_err(|e| format!("restoring the completion policy: {e}"))?;
+    result
 }
 
 /// The whole run: swing the wrist through `poses` on the arm behind

@@ -358,10 +358,20 @@ impl Client {
         &self,
         policy: CompletionPolicy,
     ) -> Result<Ack, ClientError> {
-        self.system(Command::SetCompletionPolicy(cmd::SetCompletionPolicy {
-            policy,
-        }))
-        .await
+        let ack = self
+            .system(Command::SetCompletionPolicy(cmd::SetCompletionPolicy {
+                policy,
+            }))
+            .await?;
+        *self.inner.completion_policy.lock().unwrap() = Some(policy);
+        Ok(ack)
+    }
+
+    /// The completion policy this client last set on its session —
+    /// `None` if it never has, in which case the session runs the
+    /// server's boot default. There is no wire query for it.
+    pub fn completion_policy(&self) -> Option<CompletionPolicy> {
+        *self.inner.completion_policy.lock().unwrap()
     }
 
     /// Select the telemetry recipe by name (empty stops the stream).

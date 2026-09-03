@@ -571,6 +571,8 @@ impl Preview {
         {
             return self.refuse(error);
         }
+        // Accepted: whatever a stop or e-stop left standing is answered.
+        self.standing_error = None;
         self.held.push(command);
         if self.holding_for_blend() {
             return PreviewResult::pending(self.snap.q);
@@ -722,8 +724,23 @@ impl Preview {
                 None => self.io_levels[usize::from(p.port)] = p.value,
                 Some(e) => return self.refuse(e),
             },
-            Command::Simulator(p) => self.simulator = p.on,
-            Command::ConnectHardware(_) => self.simulator = false,
+            // A bus swap cancels every motion in flight (`Server`'s
+            // `cancel_all_motion`), the held blend chain included — and
+            // decides the references: the simulator is born referenced
+            // (`swap_to_sim` sets homed), while real hardware knows
+            // nothing until it seeks (`swap_to_hardware` un-homes).
+            Command::Simulator(p) => {
+                self.held.clear();
+                self.simulator = p.on;
+                self.snap.homed = p.on;
+                self.publish();
+            }
+            Command::ConnectHardware(_) => {
+                self.held.clear();
+                self.simulator = false;
+                self.snap.homed = false;
+                self.publish();
+            }
             Command::SelectProfile(p) => {
                 let known = self
                     .cfg
@@ -991,6 +1008,7 @@ impl Preview {
         trajectory: Vec<[f64; MAX_JOINTS]>,
         duration_s: f64,
     ) -> PreviewResult {
+        self.standing_error = None;
         let end = trajectory.last().copied().unwrap_or(self.snap.q);
         let tcp_poses = self.poses_along(&trajectory);
         self.snap.q = end;
@@ -1143,7 +1161,14 @@ impl Preview {
             }
             Command::ToolAction(p) => match p.action.as_str() {
                 "move" => {
-                    if let Some(ToolParam::Float(position)) = p.params.first() {
+                    // The planner takes an integer position as readily as
+                    // a float (a script's `move(1)` is a full close).
+                    let position = match p.params.first() {
+                        Some(ToolParam::Float(v)) => Some(*v),
+                        Some(ToolParam::Int(v)) => Some(*v as f64),
+                        _ => None,
+                    };
+                    if let Some(position) = position {
                         self.tool_position = position.clamp(0.0, 1.0);
                     }
                 }

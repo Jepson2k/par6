@@ -25,13 +25,34 @@
 use std::path::PathBuf;
 
 use par6_kin::gravity::{self, GravitySample};
-use par6_kin::{Kin, NQ};
+use par6_kin::{GripperVariant, Kin, NQ};
 use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Fixture {
     provenance: String,
+    tools: Tools,
     cases: Vec<Case>,
+}
+
+#[derive(Deserialize)]
+struct Tools {
+    #[serde(rename = "MSG")]
+    msg: ToolEntry,
+    #[serde(rename = "SSG48")]
+    ssg48: ToolEntry,
+}
+
+/// The vendor DH tool description, spelled as a gripper config's
+/// `[kinematics]` table.
+#[derive(Deserialize)]
+struct ToolEntry {
+    d_m: f64,
+    a_m: f64,
+    alpha_rad: f64,
+    mass_kg: f64,
+    com_m: [f64; 3],
+    inertia_kg_m2: [f64; 6],
 }
 
 #[derive(Deserialize)]
@@ -39,6 +60,11 @@ struct Case {
     q: [f64; NQ],
     /// Arm alone, massless tool stub — what `par6_arm.urdf` models.
     tau_arm: [f64; NQ],
+    /// The Flange VARIANT tree: arm plus the vendor flange plate.
+    tau_flange_variant: [f64; NQ],
+    /// The arm carrying each vendor gripper as a DH tool.
+    tau_arm_msg_tool: [f64; NQ],
+    tau_arm_ssg48_tool: [f64; NQ],
 }
 
 fn assets_dir() -> PathBuf {
@@ -102,4 +128,55 @@ fn the_shipped_arm_model_is_the_vendors_arm() {
          vendor table, not by measuring the arm.",
         samples.len()
     );
+}
+
+/// The tool paths: a variant tree with its plate, and a DH tool attached
+/// at load. Each is a different composition of the same arm, and the
+/// vendor computed the load for all of them — a tool mass slip lands
+/// here and nowhere else.
+#[test]
+fn the_shipped_tool_compositions_are_the_vendors_too() {
+    let fx = fixture();
+    let dh = |t: &ToolEntry| {
+        Kin::dh_tool_params(
+            t.d_m,
+            t.a_m,
+            t.alpha_rad,
+            t.mass_kg,
+            t.com_m,
+            t.inertia_kg_m2,
+        )
+    };
+    let mut flange = Kin::load(&assets_dir(), GripperVariant::Flange).expect("flange variant");
+    let mut msg = Kin::load_arm(&assets_dir(), Some(&dh(&fx.tools.msg))).expect("arm + MSG");
+    let mut ssg = Kin::load_arm(&assets_dir(), Some(&dh(&fx.tools.ssg48))).expect("arm + SSG48");
+
+    let mut worst = [
+        ("flange variant", 0.0f64),
+        ("arm + MSG tool", 0.0),
+        ("arm + SSG48 tool", 0.0),
+    ];
+    for c in &fx.cases {
+        for (slot, (kin, want)) in [
+            (&mut flange, &c.tau_flange_variant),
+            (&mut msg, &c.tau_arm_msg_tool),
+            (&mut ssg, &c.tau_arm_ssg48_tool),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut got = [0.0; NQ];
+            kin.gravity(&c.q, &mut got).expect("gravity");
+            for (g, w) in got.iter().zip(want) {
+                worst[slot].1 = worst[slot].1.max((g - w).abs());
+            }
+        }
+    }
+    for (name, err) in worst {
+        println!("{name}: worst joint {err:.3e} Nm against the vendor");
+        assert!(
+            err < 1e-6,
+            "{name} no longer matches the vendor's load: worst joint {err:.4e} Nm"
+        );
+    }
 }

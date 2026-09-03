@@ -50,7 +50,7 @@ from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
 from ._wire import blend as _blend
 from ._wire import f6 as _f6
-from ._wire import jog_j_speeds, jog_l_velocities, shape_to_wire
+from ._wire import jog_j_speeds, jog_l_velocities, shape_to_wire, tool_params
 from ._wire import timing as _timing
 from ._wire import tool_status_from_dict as _tool_status_from_dict
 from ._wire import wire_frame as _wire_frame
@@ -1405,7 +1405,9 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         index = await self._call(
             core.tool_action(
-                canonical_tool_key(tool_key), action.strip().lower(), list(params or [])
+                canonical_tool_key(tool_key),
+                action.strip().lower(),
+                tool_params(params),
             )
         )
         return await self._finish_queued(index, wait, timeout)

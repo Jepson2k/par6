@@ -140,3 +140,25 @@ def tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
         positions=tuple(raw["positions"]),
         channels=tuple(raw["channels"]),
     )
+
+
+def tool_params(params: list | None) -> list[bool | int | float | str]:
+    """Tool-action parameters as the wire's four scalar kinds.
+
+    A numpy scalar is what a script computing a grip width tends to hold;
+    the live binding extracts it as a number, and the preview has to
+    accept exactly what the arm accepts, so it is unwrapped here for
+    both rather than refused by one.
+    """
+    out: list[bool | int | float | str] = []
+    for v in params or []:
+        item = getattr(v, "item", None)
+        if callable(item) and not isinstance(v, (bool, int, float, str)):
+            v = item()
+        if isinstance(v, (bool, int, float, str)):
+            out.append(v)
+        else:
+            raise TypeError(
+                f"tool parameters must be bool, int, float or str, got {type(v).__name__}"
+            )
+    return out

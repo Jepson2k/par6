@@ -40,6 +40,7 @@ from ._wire import (
     jog_l_velocities,
     shape_to_wire,
     timing,
+    tool_params,
     wire_frame,
 )
 from .async_client import StatusResult
@@ -645,7 +646,7 @@ class DryRunRobotClient:
                 "type": "tool_action",
                 "tool_key": _cfg.canonical_tool_key(tool_key),
                 "action": action.strip().lower(),
-                "params": list(params or []),
+                "params": tool_params(params),
             }
         )
 

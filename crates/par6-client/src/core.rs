@@ -140,6 +140,10 @@ pub(crate) struct Inner {
     seq_gaps: AtomicU64,
     unclaimed: Mutex<HashMap<u16, std::time::Instant>>,
     pub(crate) last_command_index: AtomicI64,
+    /// The completion policy this client last set on its session, if
+    /// any — the wire has no query for it, and a routine that changes it
+    /// for its own run has to know what to put back.
+    pub(crate) completion_policy: Mutex<Option<par6_proto::CompletionPolicy>>,
     closed: AtomicBool,
 }
 
@@ -196,6 +200,7 @@ impl Client {
             seq_gaps: AtomicU64::new(0),
             unclaimed: Mutex::new(HashMap::new()),
             last_command_index: AtomicI64::new(-1),
+            completion_policy: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
 
