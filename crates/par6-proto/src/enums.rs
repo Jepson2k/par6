@@ -63,9 +63,10 @@ wire_enum! {
 wire_enum! {
     /// Command tags (slot 0 of every client→server payload).
     ///
-    /// Values are grouped by ack class — SYSTEM 10+, QUERY 30+,
-    /// FIRE_AND_FORGET 60+, QUEUED 80+ — but the authoritative mapping is
-    /// [`command_class`], which both sides consult.
+    /// Values are grouped by ack class — SYSTEM 10–29 (and 70–79 once
+    /// that band filled), QUERY 30–59, FIRE_AND_FORGET 60–69, QUEUED 80+
+    /// — but the authoritative mapping is [`command_class`], which both
+    /// sides consult.
     CmdType: u16 {
         // -- SYSTEM: always acked OK/ERROR --
         /// Clear a latched protective stop, re-enabling motion.
@@ -119,6 +120,18 @@ wire_enum! {
         /// Push per-node drive tuning (cascade-PID gains + limits) live,
         /// through the same stored-config path a boot pass uses.
         SetPidGains = 28,
+        /// Commissioning: rename a drive on the bus (cmd 11 to `node`,
+        /// carrying `new_id`). Accepted only on an idle or latched arm
+        /// with nothing in flight; without `force` the target must be a
+        /// configured node, with it any id (a fresh drive at its default).
+        /// The runtime keeps addressing the id the config names, so a
+        /// renamed configured node reads as lost until the config is
+        /// updated and the daemon restarted.
+        SetCanId = 29,
+        /// Commissioning: ask a drive to persist its running configuration
+        /// to NVM (cmd 13). Same gate and `force` rule as SET_CAN_ID.
+        /// Tagged in the 70s because 10–29 is full.
+        SaveConfig = 70,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -166,6 +179,11 @@ wire_enum! {
         /// the daemon serves its own config, parol6-style, so clients
         /// preview with exactly the numbers the arm enforces.
         ConfigBundle = 50,
+        /// Rescan the bus — an RTR ping to every node id, one per tick —
+        /// and report each id: configured, answering, freshness, and the
+        /// device identity of configured nodes. The RESPONSE waits for
+        /// the scan to settle (a few dozen ticks).
+        BusScan = 51,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -259,6 +277,8 @@ wire_enum! {
         Payload = 20,
         /// See [`CmdType::ConfigBundle`].
         ConfigBundle = 21,
+        /// See [`CmdType::BusScan`].
+        BusScan = 22,
     }
 }
 
@@ -417,7 +437,9 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetPayload
         | C::EnterFlashing
         | C::ExitFlashing
-        | C::SetPidGains => CommandClass::System,
+        | C::SetPidGains
+        | C::SetCanId
+        | C::SaveConfig => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -439,7 +461,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Shapes
         | C::ConfigInfo
         | C::Payload
-        | C::ConfigBundle => CommandClass::Query,
+        | C::ConfigBundle
+        | C::BusScan => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

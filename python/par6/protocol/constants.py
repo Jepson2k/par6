@@ -49,6 +49,8 @@ class CmdType(IntEnum):
     ENTER_FLASHING = 26
     EXIT_FLASHING = 27
     SET_PID_GAINS = 28
+    SET_CAN_ID = 29
+    SAVE_CONFIG = 70
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -70,6 +72,7 @@ class CmdType(IntEnum):
     CONFIG_INFO = 48
     PAYLOAD = 49
     CONFIG_BUNDLE = 50
+    BUS_SCAN = 51
     SERVO_J = 60
     SERVO_J_POSE = 61
     SERVO_L = 62
@@ -114,6 +117,7 @@ class QueryType(IntEnum):
     CONFIG_INFO = 19
     PAYLOAD = 20
     CONFIG_BUNDLE = 21
+    BUS_SCAN = 22
 
 
 class CommandClass(IntEnum):
@@ -272,6 +276,8 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.ENTER_FLASHING: CommandClass.SYSTEM,
     CmdType.EXIT_FLASHING: CommandClass.SYSTEM,
     CmdType.SET_PID_GAINS: CommandClass.SYSTEM,
+    CmdType.SET_CAN_ID: CommandClass.SYSTEM,
+    CmdType.SAVE_CONFIG: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,
@@ -293,6 +299,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.CONFIG_INFO: CommandClass.QUERY,
     CmdType.PAYLOAD: CommandClass.QUERY,
     CmdType.CONFIG_BUNDLE: CommandClass.QUERY,
+    CmdType.BUS_SCAN: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

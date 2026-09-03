@@ -862,6 +862,18 @@ impl RtCommands for RtBridge {
         });
     }
 
+    fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.link.send(RtCommand::SetCanId { node, new_id });
+    }
+
+    fn save_config(&mut self, node: u8) {
+        self.link.send(RtCommand::SaveConfig { node });
+    }
+
+    fn rescan_bus(&mut self) {
+        self.link.send(RtCommand::RescanBus);
+    }
+
     fn teleport(&mut self, angles_deg: &[f64; NUM_JOINTS], tool_positions: Option<&[f64]>) {
         if !self.sim {
             // The server gates teleport with SYS_NOT_SIMULATOR; this is

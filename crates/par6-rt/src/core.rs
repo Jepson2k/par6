@@ -121,6 +121,9 @@ impl ShutdownPark {
 /// rest for the shutdown exit path. Above encoder quantization noise,
 /// far below any commanded motion.
 const SHUTDOWN_REST_RAD_S: f64 = 0.02;
+/// Ticks between a rescan's last ping and its epoch bump: two reply
+/// round trips at the slowest tick rate the config validator allows.
+const SCAN_SETTLE_TICKS: u8 = 4;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
 /// Minimum spacing between two bus-fault log lines from the RT thread
@@ -538,6 +541,12 @@ pub struct RtCore<B: DriverBus> {
     // Freedrive drift lock.
     drift: DriftLock,
 
+    // Bus rescan (BUS_SCAN): the next id to ping, the settle countdown
+    // after the last ping, and the epoch the snapshot publishes.
+    scan_next: Option<u8>,
+    scan_settle: u8,
+    scan_epoch: u32,
+
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
     snap: StateSnapshot,
@@ -720,6 +729,9 @@ impl<B: DriverBus> RtCore<B> {
             stream_filt: [0.0; MAX_JOINTS],
             park: ShutdownPark::from_config(robot),
             drift: DriftLock::from_config(robot),
+            scan_next: None,
+            scan_settle: 0,
+            scan_epoch: 0,
             writer,
             snap: StateSnapshot::default(),
         };
@@ -1261,6 +1273,25 @@ impl<B: DriverBus> RtCore<B> {
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
+            RtCommand::SetCanId { node, new_id } => match self.bus.set_can_id(node, new_id) {
+                Ok(()) => log::warn!(
+                    "node {node} told to answer as {new_id}: the running config still \
+                     addresses {node} — update the config and restart the daemon"
+                ),
+                Err(e) => log::error!("set_can_id on node {node} refused: {e}"),
+            },
+            RtCommand::SaveConfig { node } => match self.bus.save_config(node) {
+                Ok(()) => log::info!("node {node} asked to save its configuration"),
+                Err(e) => log::error!("save_config on node {node} refused: {e}"),
+            },
+            RtCommand::RescanBus => {
+                if self.bus.is_silent() {
+                    log::warn!("bus rescan skipped: the bus is silent (FLASHING)");
+                } else {
+                    self.scan_next = Some(0);
+                    self.scan_settle = 0;
+                }
+            }
             RtCommand::RetuneNode { node, tune } => {
                 match self.bus.retune_node(node, &tune, self.boot.config_repeats) {
                     Ok(()) => log::info!("node {node} retuned (drive gains/limits pushed)"),
@@ -1804,6 +1835,32 @@ impl<B: DriverBus> RtCore<B> {
 
     // ------------------------------------------------------------ dispatch
 
+    /// One node id per tick takes the poll slot with an RTR ping while a
+    /// rescan runs; the epoch bumps a few ticks after the last ping so
+    /// the answers are in the presence mask before a reader trusts it.
+    fn step_scan(&mut self) {
+        if let Some(n) = self.scan_next {
+            self.bus.queue_poll_override(
+                PollAction::Poll {
+                    node: n,
+                    kind: par6_bus::PollKind::Ping,
+                },
+                1,
+            );
+            self.scan_next = if usize::from(n) + 1 < par6_bus::MAX_NODES {
+                Some(n + 1)
+            } else {
+                self.scan_settle = SCAN_SETTLE_TICKS;
+                None
+            };
+        } else if self.scan_settle > 0 {
+            self.scan_settle -= 1;
+            if self.scan_settle == 0 {
+                self.scan_epoch = self.scan_epoch.wrapping_add(1);
+            }
+        }
+    }
+
     fn gravity_applied(&self) -> bool {
         self.homed && self.state == ArmState::Enabled && self.gravity_comp
     }
@@ -1831,6 +1888,7 @@ impl<B: DriverBus> RtCore<B> {
             self.mirror = CommandMirror::default();
             self.send_joints();
             self.send_gripper(self.homing_gcmd);
+            self.step_scan();
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Complete => {
@@ -2019,6 +2077,7 @@ impl<B: DriverBus> RtCore<B> {
             );
         }
         self.send_gripper(gcmd);
+        self.step_scan();
         let _ = self.bus.poll_step();
     }
 
@@ -2113,6 +2172,8 @@ impl<B: DriverBus> RtCore<B> {
         s.tau_commanded = self.mirror.tau;
         s.gravity_comp = self.gravity_comp;
         s.drift_lock = *self.drift.status();
+        s.bus_nodes = self.bus.connected_nodes();
+        s.bus_scan_epoch = self.scan_epoch;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);

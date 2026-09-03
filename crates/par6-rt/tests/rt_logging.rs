@@ -118,6 +118,14 @@ impl DriverBus for FailingBus {
         self.inner.retune_node(node, tune, repeats)
     }
 
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
+        self.inner.set_can_id(node, new_id)
+    }
+
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.inner.save_config(node)
+    }
+
     fn send_limits(
         &mut self,
         node: NodeId,

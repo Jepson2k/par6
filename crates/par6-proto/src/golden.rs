@@ -613,6 +613,24 @@ pub fn vectors() -> Vec<Vector> {
         }),
     ));
     v.push(cmd_vec("cmd_payload", 42, Command::Payload));
+    v.push(cmd_vec("cmd_bus_scan", 43, Command::BusScan));
+    v.push(cmd_vec(
+        "cmd_set_can_id",
+        17,
+        Command::SetCanId(crate::command::SetCanId {
+            node: 0,
+            new_id: 9,
+            force: true,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_save_config",
+        18,
+        Command::SaveConfig(crate::command::SaveConfig {
+            node: 9,
+            force: false,
+        }),
+    ));
     v.push(cmd_vec("cmd_config_bundle", 43, Command::ConfigBundle));
 
     // -- commands: FIRE_AND_FORGET --
@@ -1198,6 +1216,35 @@ pub fn vectors() -> Vec<Vector> {
                 mass: 1.25,
                 com: [0.0, 0.01, 0.055],
                 inertia: [0.002, 0.0, 0.003, 0.0001, 0.0, 0.004],
+            },
+        },
+    ));
+
+    v.push(reply_vec(
+        "response_bus_scan",
+        Reply::Response {
+            req_id: 128,
+            result: QueryResult::BusScan {
+                nodes: vec![
+                    crate::BusNode {
+                        node: 0,
+                        configured: true,
+                        present: true,
+                        freshness: 1,
+                        hw_ver: 2,
+                        sw_ver: 7,
+                        serial: 1234567,
+                    },
+                    crate::BusNode {
+                        node: 9,
+                        configured: false,
+                        present: true,
+                        freshness: 0,
+                        hw_ver: 0,
+                        sw_ver: 0,
+                        serial: 0,
+                    },
+                ],
             },
         },
     ));

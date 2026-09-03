@@ -83,6 +83,20 @@ const MAX_PARAMS_LEN: usize = 100;
 /// the index that joins them. `par6d` routes this target to
 /// `commands.log`.
 const COMMAND_LOG: &str = "par6_server::commands";
+/// How long a BUS_SCAN waits for the RT's rescan epoch to advance before
+/// answering with whatever presence the runtime has: sixteen pings plus
+/// the settle window at the slowest configurable tick, with margin.
+const SCAN_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A BUS_SCAN query parked until its rescan settles.
+struct PendingScan {
+    req_id: u32,
+    addr: SocketAddr,
+    /// The scan epoch when the query arrived; a different one means the
+    /// rescan finished.
+    epoch: u32,
+    deadline: std::time::Instant,
+}
 
 /// How many un-answered `reset` requests may pile up while the RT is
 /// still deciding. A client that keeps re-sending past this is not
@@ -298,6 +312,8 @@ struct Core<P: Planner, R: RtCommands> {
     /// The RT latch last written to the activity log, so the latch is
     /// logged on its edges and never once per poll.
     rt_error_logged: Option<u16>,
+    /// BUS_SCAN queries waiting for their rescan to settle.
+    pending_scans: Vec<PendingScan>,
     simulator: bool,
 
     /// Planner estimate of the pending queue, and the `(front, len)` of
@@ -334,6 +350,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             profile: cfg.initial_profile.clone(),
             recipe: cfg.initial_recipe.clone(),
             rt_error_logged: None,
+            pending_scans: Vec::new(),
             simulator: cfg.simulator,
             tool: cfg.fitted_tool.clone(),
             cfg,
@@ -514,6 +531,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
         self.log_rt_latch_edges();
+        self.answer_scans().await;
         self.request_boot_enable();
         self.settle_enable().await;
         self.settle_flashing().await;
@@ -573,9 +591,123 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        if matches!(cmd, Command::BusScan) {
+            // Answered from `answer_scans` once the RT's rescan has
+            // settled (or the deadline passes): a scan is a round trip
+            // to every id, not a read of state the server already holds.
+            self.runtime.rt.rescan_bus();
+            self.pending_scans.push(PendingScan {
+                req_id,
+                addr,
+                epoch: self.snap.bus_scan_epoch,
+                deadline: std::time::Instant::now() + SCAN_REPLY_DEADLINE,
+            });
+            return;
+        }
         self.refresh_queue_estimate();
         let result = self.query_result(cmd);
         self.reply(addr, &Reply::Response { req_id, result }).await;
+    }
+
+    /// Reply to every BUS_SCAN whose rescan has settled or timed out.
+    async fn answer_scans(&mut self) {
+        if self.pending_scans.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let epoch = self.snap.bus_scan_epoch;
+        let ready: Vec<PendingScan> = {
+            let (ready, waiting): (Vec<_>, Vec<_>) = self
+                .pending_scans
+                .drain(..)
+                .partition(|p| epoch != p.epoch || now >= p.deadline);
+            self.pending_scans = waiting;
+            ready
+        };
+        for p in ready {
+            let result = self.bus_scan_result();
+            self.reply(
+                p.addr,
+                &Reply::Response {
+                    req_id: p.req_id,
+                    result,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// The bus as the runtime sees it, one row per node id.
+    fn bus_scan_result(&self) -> QueryResult {
+        let nodes = (0..16u8)
+            .map(|id| {
+                let slot = self.cfg.tunable_nodes.iter().position(|n| *n == id);
+                let (freshness, info) = match slot {
+                    Some(i) if i < self.snap.nodes.len() => (
+                        match self.snap.node_freshness[i] {
+                            par6_rt::Freshness::Unknown => 0,
+                            par6_rt::Freshness::Fresh => 1,
+                            par6_rt::Freshness::Stale => 2,
+                            par6_rt::Freshness::Lost => 3,
+                        },
+                        self.snap.nodes[i].device_info,
+                    ),
+                    _ => (0, None),
+                };
+                par6_proto::BusNode {
+                    node: id,
+                    configured: slot.is_some(),
+                    present: self.snap.bus_nodes & (1 << u16::from(id)) != 0,
+                    freshness,
+                    hw_ver: info.map_or(0, |d| d.hw_ver),
+                    sw_ver: info.map_or(0, |d| d.sw_ver),
+                    serial: info.map_or(0, |d| d.serial),
+                }
+            })
+            .collect();
+        QueryResult::BusScan { nodes }
+    }
+
+    /// Commissioning commands rename or rewrite a drive: refused while
+    /// anything could be moving (only IDLE or ACTIVE_ERROR, nothing
+    /// executing, queued or streaming), and refused for an id the config
+    /// does not list unless `force` says a fresh drive is meant.
+    fn commissioning_gate(&self, node: u8, force: bool, what: &str) -> Result<(), WireError> {
+        let busy =
+            self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        if busy || !matches!(self.snap.mode, Mode::Idle | Mode::ActiveError) {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "{what} needs an idle arm: mode {:?}, {}",
+                        self.snap.mode,
+                        if busy {
+                            "motion in flight"
+                        } else {
+                            "nothing in flight"
+                        }
+                    ),
+                )],
+            ));
+        }
+        if !force && !self.cfg.tunable_nodes.contains(&node) {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "{what} node {node} is not a configured drive (configured: {:?}); \
+                         pass force to address it anyway",
+                        self.cfg.tunable_nodes
+                    ),
+                )],
+            ));
+        }
+        Ok(())
     }
 
     async fn on_system(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
@@ -749,6 +881,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     ))
                 }
             }
+            C::SetCanId(p) => self
+                .commissioning_gate(p.node, p.force, "set_can_id")
+                .map(|()| self.runtime.rt.set_can_id(p.node, p.new_id)),
+            C::SaveConfig(p) => self
+                .commissioning_gate(p.node, p.force, "save_config")
+                .map(|()| self.runtime.rt.save_config(p.node)),
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -2192,6 +2330,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::IsSimulator => QueryResult::IsSimulator {
                 active: self.simulator,
             },
+            C::BusScan => self.bus_scan_result(),
             C::Payload => QueryResult::Payload {
                 mass: self.payload.mass,
                 com: self.payload.com,
@@ -2459,6 +2598,9 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::EnterFlashing => "enter_flashing",
         T::ExitFlashing => "exit_flashing",
         T::SetPidGains => "set_pid_gains",
+        T::SetCanId => "set_can_id",
+        T::SaveConfig => "save_config",
+        T::BusScan => "bus_scan",
         T::Ping => "ping",
         T::Status => "status",
         T::Angles => "angles",

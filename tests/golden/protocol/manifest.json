@@ -667,6 +667,53 @@
     },
     {
       "class": "QUERY",
+      "cmd": "BUS_SCAN",
+      "file": "cmd_bus_scan.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_bus_scan",
+      "req_id": 43,
+      "tag": 51,
+      "wire": [
+        51,
+        43
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_CAN_ID",
+      "file": "cmd_set_can_id.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_can_id",
+      "req_id": 17,
+      "tag": 29,
+      "wire": [
+        29,
+        17,
+        0,
+        9,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SAVE_CONFIG",
+      "file": "cmd_save_config.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_save_config",
+      "req_id": 18,
+      "tag": 70,
+      "wire": [
+        70,
+        18,
+        9,
+        false
+      ]
+    },
+    {
+      "class": "QUERY",
       "cmd": "CONFIG_BUNDLE",
       "file": "cmd_config_bundle.bin",
       "idempotency_key": null,
@@ -2017,6 +2064,39 @@
             0.0001,
             0.0,
             0.004
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_bus_scan.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/BUS_SCAN",
+      "name": "response_bus_scan",
+      "wire": [
+        4,
+        128,
+        [
+          22,
+          [
+            [
+              0,
+              true,
+              true,
+              1,
+              2,
+              7,
+              1234567
+            ],
+            [
+              9,
+              false,
+              true,
+              0,
+              0,
+              0,
+              0
+            ]
           ]
         ]
       ]

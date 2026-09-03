@@ -360,6 +360,21 @@ minute. The RT tick never writes a file: its only log calls sit on throttled
 failure paths, so the sink costs the tick nothing, and a write that fails is
 dropped rather than allowed to stall the daemon.
 
+### Commissioning a drive
+
+A fresh Spectral drive sits at its factory node id, which the config does not
+list. `par6 scan` rescans the bus (an RTR ping to every id, one per tick) and lists
+every node id with whether the config lists it, whether it answered, its freshness
+and its device identity; `par6 set-can-id OLD NEW --force` renames it (cmd 11) and
+`par6 save-config NEW --force` persists that (cmd 13) — without `--force` both
+refuse an id the config does not list. Both are refused while anything could be
+moving: only an IDLE or ACTIVE_ERROR arm with nothing executing, queued or
+streaming qualifies, so holding the e-stop while you commission is the normal
+way. The runtime keeps addressing the ids the config names, so after renaming a
+configured drive update the config and restart the daemon. `par6 set-pid-gains`
+pushes one drive's tuning live, `par6 tool` runs a tool action, and
+`par6 flashing enter|exit` hands the bus to a firmware flasher and takes it back.
+
 ### The bus-grant signal
 
 `can0` is a system-wide exclusive resource, and the vendor's CAN tools (the

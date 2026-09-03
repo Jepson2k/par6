@@ -130,6 +130,22 @@ pub enum RtCommand {
         /// The gains/limits to store and push.
         tune: par6_bus::DriveTune,
     },
+    /// Commissioning: rename a drive on the bus (one cmd-11 frame). The
+    /// server gates this on an idle arm; a bus refusal is logged.
+    SetCanId {
+        /// The node's current id.
+        node: par6_bus::NodeId,
+        /// The id it should answer to.
+        new_id: par6_bus::NodeId,
+    },
+    /// Commissioning: persist a drive's running configuration (cmd 13).
+    SaveConfig {
+        /// Target node.
+        node: par6_bus::NodeId,
+    },
+    /// Ping every node id over the next ticks and bump the published
+    /// scan epoch once the answers have had time to land.
+    RescanBus,
 }
 
 /// Where the tick loop pulls external commands from — `par6d` wires the

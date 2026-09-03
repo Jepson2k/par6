@@ -478,6 +478,11 @@ pub struct StateSnapshot {
     pub stream: StreamStatus,
     /// Freedrive drift-lock live state (all zero unless configured on).
     pub drift_lock: DriftLockStatus,
+    /// Node ids that have answered on the bus this boot (bit per id):
+    /// the boot scan plus every frame since, configured or not.
+    pub bus_nodes: u16,
+    /// Bumped once each `RescanBus` has pinged every id and settled.
+    pub bus_scan_epoch: u32,
     /// Digital I/O levels: the first `io_inputs` entries are the
     /// debounced input levels, the next `io_outputs` are the levels the
     /// tick loop is driving, both in `[io]` config order.
@@ -546,6 +551,8 @@ impl Default for StateSnapshot {
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
             drift_lock: DriftLockStatus::default(),
+            bus_nodes: 0,
+            bus_scan_epoch: 0,
             io_lines: [0; MAX_IO_LINES],
             io_inputs: 0,
             io_outputs: 0,

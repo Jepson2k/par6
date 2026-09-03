@@ -247,6 +247,21 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("com", com.to_vec())?;
             d.set_item("inertia", inertia.to_vec())?;
         }
+        QueryResult::BusScan { nodes } => {
+            let rows = PyList::empty(py);
+            for n in nodes {
+                let row = PyDict::new(py);
+                row.set_item("node", n.node)?;
+                row.set_item("configured", n.configured)?;
+                row.set_item("present", n.present)?;
+                row.set_item("freshness", n.freshness)?;
+                row.set_item("hw_ver", n.hw_ver)?;
+                row.set_item("sw_ver", n.sw_ver)?;
+                row.set_item("serial", n.serial)?;
+                rows.append(row)?;
+            }
+            d.set_item("nodes", rows)?;
+        }
         QueryResult::ConfigInfo {
             path,
             fingerprint,

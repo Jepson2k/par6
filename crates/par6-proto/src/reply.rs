@@ -138,6 +138,26 @@ pub struct LoopStatsResult {
     pub rt_pinned: bool,
 }
 
+/// One node id's row of a BUS_SCAN result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusNode {
+    /// CAN node id (0..=15).
+    pub node: u8,
+    /// The config lists this id (a joint drive or the CAN gripper).
+    pub configured: bool,
+    /// The id answered a ping (this scan or an earlier one this boot).
+    pub present: bool,
+    /// Runtime freshness of a configured node: 0 unknown, 1 fresh,
+    /// 2 stale, 3 lost. Always 0 for an unconfigured id.
+    pub freshness: u8,
+    /// Hardware version from the device-info sweep (0 = not reported).
+    pub hw_ver: u8,
+    /// Firmware version (0 = not reported).
+    pub sw_ver: u8,
+    /// Serial number (0 = not reported).
+    pub serial: i32,
+}
+
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
 /// RESPONSE reply.
 #[derive(Debug, Clone, PartialEq)]
@@ -296,6 +316,11 @@ pub enum QueryResult {
         /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\].
         inertia: [f64; 6],
     },
+    /// BUS_SCAN result: one row per node id, 0..=15 in order.
+    BusScan {
+        /// Every node id's row.
+        nodes: Vec<BusNode>,
+    },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
         /// Installation-layer shapes (persistent keep-outs).
@@ -347,6 +372,7 @@ impl QueryResult {
             Q::ConfigBundle { .. } => QueryType::ConfigBundle,
             Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
+            Q::BusScan { .. } => QueryType::BusScan,
         }
     }
 }
@@ -639,6 +665,21 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 w_f64(buf, *v);
             }
         }
+        Q::BusScan { nodes } => {
+            w_array(buf, 2);
+            w_uint(buf, u64::from(tag));
+            w_array(buf, nodes.len());
+            for n in nodes {
+                w_array(buf, 7);
+                w_uint(buf, u64::from(n.node));
+                w_bool(buf, n.configured);
+                w_bool(buf, n.present);
+                w_uint(buf, u64::from(n.freshness));
+                w_uint(buf, u64::from(n.hw_ver));
+                w_uint(buf, u64::from(n.sw_ver));
+                w_int(buf, i64::from(n.serial));
+            }
+        }
         Q::Shapes {
             installation,
             program,
@@ -770,6 +811,34 @@ fn r_u8_fixed<const N: usize>(
 /// eleven-byte datagram could ask the allocator for a hundred gigabytes
 /// and abort the client on `handle_alloc_error`.
 const MAX_REPLY_STRINGS: usize = 512;
+
+fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
+    let n = crate::command::r_len(r, "bus scan node list", 16)?;
+    let small = |v: u64, what: &'static str| {
+        u8::try_from(v).map_err(|_| DecodeError::Validation {
+            what,
+            why: "must fit a byte".into(),
+        })
+    };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let arity = r.array_len()?;
+        expect_arity("bus scan node row", arity, 7)?;
+        out.push(BusNode {
+            node: small(r.uint()?, "bus_scan.node")?,
+            configured: r.bool()?,
+            present: r.bool()?,
+            freshness: small(r.uint()?, "bus_scan.freshness")?,
+            hw_ver: small(r.uint()?, "bus_scan.hw_ver")?,
+            sw_ver: small(r.uint()?, "bus_scan.sw_ver")?,
+            serial: i32::try_from(r.int()?).map_err(|_| DecodeError::Validation {
+                what: "bus_scan.serial",
+                why: "must fit i32".into(),
+            })?,
+        });
+    }
+    Ok(out)
+}
 
 fn r_strings(r: &mut Reader<'_>) -> Result<Vec<String>, DecodeError> {
     let n = crate::command::r_len(r, "reply string list", MAX_REPLY_STRINGS)?;
@@ -1034,6 +1103,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 mass: r.f64()?,
                 com: r_f64_fixed(r, "payload.com")?,
                 inertia: r_f64_fixed(r, "payload.inertia")?,
+            }
+        }
+        T::BusScan => {
+            expect_arity("bus scan result", n, 2)?;
+            QueryResult::BusScan {
+                nodes: r_bus_nodes(r)?,
             }
         }
         T::Shapes => {

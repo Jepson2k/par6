@@ -292,6 +292,43 @@ impl CoreClient {
         query_future(py, self.rt(), Command::Payload)
     }
 
+    fn bus_scan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::BusScan)
+    }
+
+    #[pyo3(signature = (node, new_id, force=false))]
+    fn set_can_id<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        new_id: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        sys_future(
+            py,
+            self.rt(),
+            Command::SetCanId(cmd::SetCanId {
+                node,
+                new_id,
+                force,
+            }),
+        )
+    }
+
+    #[pyo3(signature = (node, force=false))]
+    fn save_config<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        sys_future(
+            py,
+            self.rt(),
+            Command::SaveConfig(cmd::SaveConfig { node, force }),
+        )
+    }
+
     #[pyo3(signature = (mass, com, inertia=None))]
     fn set_payload<'py>(
         &self,

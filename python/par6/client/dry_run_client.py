@@ -1068,6 +1068,29 @@ class DryRunRobotClient:
         """A preview has no bus to connect."""
         return 1
 
+    def bus_scan(self, **kwargs: Any) -> list[dict]:
+        """A preview has no bus: every id reads absent."""
+        return [
+            {
+                "node": n,
+                "configured": False,
+                "present": False,
+                "freshness": 0,
+                "hw_ver": 0,
+                "sw_ver": 0,
+                "serial": 0,
+            }
+            for n in range(16)
+        ]
+
+    def set_can_id(self, node: int = 0, new_id: int = 0, **kwargs: Any) -> int:
+        """A preview has no drives to rename."""
+        return 1
+
+    def save_config(self, node: int = 0, **kwargs: Any) -> int:
+        """A preview has no drives with NVM."""
+        return 1
+
     def enter_flashing(self, assertion: str = "", **kwargs: Any) -> int:
         """A preview has no bus to silence."""
         return 1

@@ -464,6 +464,19 @@ class RobotClient:
         """Set the motion profile (e.g. ``"TOPPRA"``)."""
         return _run(self._inner.select_profile(profile))
 
+    def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus; one row per node id (see the async client)."""
+        return _run(self._inner.bus_scan())
+
+    def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: rename drive *node* to *new_id* (idle arm only;
+        ``force`` for an id the config does not list)."""
+        return _run(self._inner.set_can_id(node, new_id, force=force))
+
+    def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: persist drive *node*'s running configuration."""
+        return _run(self._inner.save_config(node, force=force))
+
     def enter_flashing(self, assertion: str) -> int:
         """Hand the CAN bus to a firmware flasher (``"parked"`` or
         ``"force"`` — the operator's vouching, no default)."""

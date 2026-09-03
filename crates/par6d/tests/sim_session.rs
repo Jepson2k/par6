@@ -15,8 +15,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveC, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, SetRecipe,
-    Stop, Teleport, ToolAction, ToolParam,
+    EnterFlashing, JogJ, MoveC, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    SetCompletionPolicy, SetRecipe, Stop, Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
@@ -1700,6 +1700,97 @@ fn the_streaming_recipe_publishes_the_stream_statistics() {
             "the stop never read back as unpaired"
         );
     }
+
+    rig.shutdown();
+}
+
+/// BUS_SCAN on the simulator answers one row per node id with exactly
+/// the configured drives present and fresh; the commissioning commands
+/// are refused for an unlisted id without `force` and for any id while
+/// the arm streams; and a rename under e-stop moves a drive on the bus —
+/// the next scan finds the new id answering and the old one gone, while
+/// the runtime, still addressing the id the config names, has lost it.
+#[test]
+fn bus_scan_and_a_commissioning_rename_on_the_simulator() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let scan = |c: &mut Client| match c.query(&Command::BusScan) {
+        QueryResult::BusScan { nodes } => nodes,
+        other => panic!("unexpected bus scan result {other:?}"),
+    };
+
+    let rows = scan(&mut c);
+    assert_eq!(rows.len(), 16);
+    let configured: Vec<u8> = rows
+        .iter()
+        .filter(|r| r.configured)
+        .map(|r| r.node)
+        .collect();
+    assert!(configured.len() >= NUM_JOINTS, "{rows:?}");
+    for r in &rows {
+        assert_eq!(
+            usize::from(r.node),
+            rows.iter().position(|x| x.node == r.node).unwrap()
+        );
+        assert_eq!(
+            r.present, r.configured,
+            "the sim answers exactly its configured ids: {r:?}"
+        );
+        if r.configured {
+            assert_eq!(
+                r.freshness, 1,
+                "a configured node on a live bus is fresh: {r:?}"
+            );
+        }
+    }
+    let free_id = (0..16u8)
+        .find(|n| !configured.contains(n))
+        .expect("a free id");
+
+    let err = c.expect_error(&Command::SaveConfig(SaveConfig {
+        node: free_id,
+        force: false,
+    }));
+    assert!(err.cause.contains("force"), "{}", err.cause);
+
+    // Streaming counts as motion.
+    c.send(&Command::JogJ(JogJ {
+        speeds: [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+        duration: 2.0,
+        accel: None,
+    }));
+    rig.wait_status("jogging", |s| s.mode == ControllerMode::Jog);
+    let err = c.expect_error(&Command::SetCanId(SetCanId {
+        node: configured[5],
+        new_id: free_id,
+        force: false,
+    }));
+    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+
+    // Under e-stop the arm cannot move: the rename goes through.
+    c.ok(&Command::Estop);
+    rig.wait_status("latched", |s| s.mode == ControllerMode::ActiveError);
+    let old = configured[5];
+    c.ok(&Command::SetCanId(SetCanId {
+        node: old,
+        new_id: free_id,
+        force: false,
+    }));
+    let rows = scan(&mut c);
+    let at = |n: u8| rows.iter().find(|r| r.node == n).unwrap();
+    assert!(
+        at(free_id).present && !at(free_id).configured,
+        "the renamed drive answers at its new id: {:?}",
+        at(free_id)
+    );
+    assert!(
+        !at(old).present,
+        "nothing answers at the old id any more: {:?}",
+        at(old)
+    );
 
     rig.shutdown();
 }

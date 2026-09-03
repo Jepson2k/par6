@@ -45,7 +45,8 @@ use socketcan::{CanSocket, EmbeddedFrame, Frame as _, Socket, SocketOptions};
 use crate::bus::DriverBus;
 use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_gripper_command, encode_joint_command, encode_limits,
-    encode_poll, unpack_can_id, CanFrame, CommandId, DecodedFrame, Payload, CAN_MAX_DATA,
+    encode_poll, encode_save_config, encode_set_can_id, unpack_can_id, CanFrame, CommandId,
+    DecodedFrame, Payload, CAN_MAX_DATA,
 };
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
@@ -276,6 +277,9 @@ impl SocketCanBus {
             }
         };
         let n = usize::from(node);
+        // Every frame counts as presence, configured id or not — that is
+        // what lets a BUS_SCAN ping find a drive the config does not list.
+        self.connected |= 1 << n;
         if self.fresh.mark(node, self.tick) {
             state.reconnected_mask |= 1 << n;
         }
@@ -722,6 +726,16 @@ impl DriverBus for SocketCanBus {
         c.velocity_limit_ticks_s = tune.velocity_limit_ticks_s;
         c.voltage_limit_mv = tune.voltage_limit_mv;
         self.resend_node_config(node, repeats)
+    }
+
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.send(&encode_set_can_id(node, new_id))
+    }
+
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.send(&encode_save_config(node))
     }
 
     fn send_limits(

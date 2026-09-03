@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SetPayload, SetPidGains, SetRecipe, SetShapes, Shape,
-    Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SaveConfig, SetCanId, SetPayload, SetPidGains,
+    SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -51,6 +51,9 @@ enum RtEvent {
     ConnectHardware(String),
     ResetState,
     ResetLoopStats,
+    SetCanId { node: u8, new_id: u8 },
+    SaveConfig(u8),
+    RescanBus,
 }
 
 #[derive(Default)]
@@ -180,6 +183,18 @@ impl RtCommands for TestRt {
     }
     fn reset_loop_stats(&mut self) {
         self.push(RtEvent::ResetLoopStats);
+    }
+
+    fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.push(RtEvent::SetCanId { node, new_id });
+    }
+
+    fn save_config(&mut self, node: u8) {
+        self.push(RtEvent::SaveConfig(node));
+    }
+
+    fn rescan_bus(&mut self) {
+        self.push(RtEvent::RescanBus);
     }
 }
 
@@ -942,6 +957,88 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
     h.publish(|s| s.mode = Mode::Flashing);
     c.ok(&Command::ExitFlashing).await;
     assert!(h.rt_events().contains(&RtEvent::ExitFlashing));
+}
+
+/// The commissioning commands are gated on an arm that cannot move —
+/// IDLE or ACTIVE_ERROR with nothing executing, queued or streaming —
+/// and on a target the config lists unless `force` says a fresh drive is
+/// meant; only an accepted command reaches the RT. `BUS_SCAN` kicks a
+/// rescan and answers one row per node id once the scan settles or its
+/// deadline passes — here the double never advances the epoch, so the
+/// deadline is the path taken, and the rows still come from the
+/// published presence mask.
+#[tokio::test]
+async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_reports_every_id() {
+    let mut h = start(|cfg| cfg.tunable_nodes = vec![0, 1, 2, 3, 4, 5]).await;
+    h.publish(|s| {
+        s.mode = Mode::Idle;
+        s.bus_nodes = 0b0011_1111;
+    });
+    let mut c = Client::new(&h).await;
+
+    let rename = |node, new_id, force| {
+        Command::SetCanId(SetCanId {
+            node,
+            new_id,
+            force,
+        })
+    };
+    c.ok(&rename(2, 9, false)).await;
+    c.ok(&Command::SaveConfig(SaveConfig {
+        node: 2,
+        force: false,
+    }))
+    .await;
+    let err = c.expect_error(&rename(9, 3, false)).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("node 9") && err.cause.contains("force"),
+        "{}",
+        err.cause
+    );
+    c.ok(&rename(9, 3, true)).await;
+    let ev = h.rt_events();
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, RtEvent::SetCanId { .. } | RtEvent::SaveConfig(_)))
+            .count(),
+        3,
+        "exactly the accepted commands reach the RT: {ev:?}"
+    );
+    assert!(ev.contains(&RtEvent::SetCanId { node: 9, new_id: 3 }));
+    assert!(ev.contains(&RtEvent::SaveConfig(2)));
+
+    // A moving arm refuses both, whatever the target.
+    h.publish(|s| s.mode = Mode::Exec);
+    let err = c.expect_error(&rename(2, 9, false)).await;
+    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    let err = c
+        .expect_error(&Command::SaveConfig(SaveConfig {
+            node: 2,
+            force: false,
+        }))
+        .await;
+    assert!(err.cause.contains("Exec"), "{}", err.cause);
+    // ... and a latched one accepts them: commissioning under e-stop is
+    // the normal way to rename a drive.
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.bus_nodes = 0b0011_1111;
+    });
+    c.ok(&rename(2, 9, false)).await;
+
+    match c.query(&Command::BusScan).await {
+        QueryResult::BusScan { nodes } => {
+            assert_eq!(nodes.len(), 16);
+            for (i, n) in nodes.iter().enumerate() {
+                assert_eq!(usize::from(n.node), i);
+                assert_eq!(n.configured, i < 6, "{n:?}");
+                assert_eq!(n.present, i < 6, "{n:?}");
+            }
+        }
+        other => panic!("unexpected bus scan result {other:?}"),
+    }
+    assert!(h.rt_events().contains(&RtEvent::RescanBus));
 }
 
 /// `set_pid_gains` reaches the RT only for a node the config declares as

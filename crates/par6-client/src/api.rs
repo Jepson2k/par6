@@ -274,6 +274,31 @@ impl Client {
         self.system(Command::SetPidGains(gains)).await
     }
 
+    /// Commissioning: rename drive `node` to `new_id` (`SET_CAN_ID`).
+    /// Refused unless the arm is idle or latched with nothing in flight;
+    /// `force` allows an id the config does not list.
+    pub async fn set_can_id(&self, node: u8, new_id: u8, force: bool) -> Result<Ack, ClientError> {
+        self.system(Command::SetCanId(cmd::SetCanId {
+            node,
+            new_id,
+            force,
+        }))
+        .await
+    }
+
+    /// Commissioning: persist drive `node`'s running configuration to its
+    /// NVM (`SAVE_CONFIG`). Same gate and `force` rule as `set_can_id`.
+    pub async fn save_config(&self, node: u8, force: bool) -> Result<Ack, ClientError> {
+        self.system(Command::SaveConfig(cmd::SaveConfig { node, force }))
+            .await
+    }
+
+    /// Rescan the bus and report every node id (`BUS_SCAN`); the reply
+    /// waits for the scan to settle.
+    pub async fn bus_scan(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::BusScan).await
+    }
+
     /// Replace the program-layer collision shapes.
     pub async fn set_shapes(&self, shapes: Vec<Shape>) -> Result<Ack, ClientError> {
         self.system(Command::SetShapes(cmd::SetShapes { shapes }))

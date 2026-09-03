@@ -392,6 +392,18 @@ pub trait RtCommands: Send {
     /// (codec) and the node id (config), so this only forwards.
     fn set_pid_gains(&mut self, gains: &par6_proto::command::SetPidGains);
 
+    /// Commissioning: rename a drive on the bus (`SET_CAN_ID`). The
+    /// server has gated it on an idle arm and checked the target.
+    fn set_can_id(&mut self, node: u8, new_id: u8);
+
+    /// Commissioning: persist a drive's running configuration
+    /// (`SAVE_CONFIG`). Gated like `set_can_id`.
+    fn save_config(&mut self, node: u8);
+
+    /// Kick a bus rescan; the snapshot's `bus_scan_epoch` advances once
+    /// every id has been pinged and the answers have landed.
+    fn rescan_bus(&mut self);
+
     /// Switch the bus backend between hardware and simulator live
     /// (state re-seeded by the implementation).
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError>;
