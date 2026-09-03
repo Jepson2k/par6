@@ -22,7 +22,7 @@ from waldoctl.status import (
     PingResult,
     ToolResult,
 )
-from waldoctl.sync_tools import make_sync_tool
+from waldoctl.sync_tools import SyncTool, make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
 
@@ -151,7 +151,7 @@ class RobotClient:
 
     # ---------- tools ----------
 
-    def _wrap_tools(self) -> dict[str, ToolSpec]:
+    def _wrap_tools(self) -> dict[str, SyncTool]:
         return {
             key: make_sync_tool(tool, _run)
             for key, tool in self._inner._bound_tools.items()
@@ -163,7 +163,7 @@ class RobotClient:
         self._bound_tools = self._wrap_tools()
 
     @property
-    def tool(self) -> ToolSpec:
+    def tool(self) -> SyncTool:
         """The active bound tool.  Raises ``RuntimeError`` if no tool is set."""
         key = (self._inner._active_tool_key or "").upper()
         if not key:
