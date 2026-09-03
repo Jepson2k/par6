@@ -15,8 +15,8 @@ from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
 from waldoctl.shapes import Shape, ShapeWorld
-from waldoctl.status import ActivityResult, PingResult, ToolResult
-from waldoctl.sync_tools import make_sync_tool
+from waldoctl.status import ActivityResult, PayloadResult, PingResult, ToolResult
+from waldoctl.sync_tools import SyncTool, make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
 
@@ -95,24 +95,6 @@ def _run(coro: Coroutine[Any, Any, T]) -> T:
     )
 
 
-def _sync_tool(tool: ToolSpec) -> ToolSpec:
-    """waldoctl's sync wrapper for *tool*, with ``status()`` synchronous.
-
-    The wrappers make every verb and ``status()`` synchronous; a tool with
-    no action verbs comes back unwrapped, and its ``status()`` still
-    reaches the async implementation — so only that case is patched, over
-    the async method captured first, on a facade whose whole contract is
-    that nothing is a coroutine.
-    """
-    sync = make_sync_tool(tool, _run)
-    if sync is tool:
-        async_status = tool.status
-        # Deliberately narrowing an async method to a sync one, which is
-        # what waldoctl's own sync wrappers do to every action verb.
-        sync.status = lambda: _run(async_status())  # ty: ignore[invalid-assignment]
-    return sync
-
-
 class RobotClient:
     """Synchronous wrapper around :class:`AsyncRobotClient` — every method
     returns a concrete result, never a coroutine.
@@ -134,9 +116,7 @@ class RobotClient:
         self._inner = AsyncRobotClient(
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
-        self._bound_tools: dict[str, ToolSpec] = {
-            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
-        }
+        self._bound_tools = self._wrap_tools()
 
     # ---------- lifecycle ----------
 
@@ -165,15 +145,19 @@ class RobotClient:
 
     # ---------- tools ----------
 
+    def _wrap_tools(self) -> dict[str, SyncTool]:
+        return {
+            key: make_sync_tool(tool, _run)
+            for key, tool in self._inner._bound_tools.items()
+        }
+
     def bind_tools(self, specs: Iterable[ToolSpec]) -> None:
         """Bind tool specs; actions run through this facade's background loop."""
         self._inner.bind_tools(specs)
-        self._bound_tools = {
-            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
-        }
+        self._bound_tools = self._wrap_tools()
 
     @property
-    def tool(self) -> ToolSpec:
+    def tool(self) -> SyncTool:
         """The active bound tool.  Raises ``RuntimeError`` if no tool is set."""
         key = (self._inner._active_tool_key or "").upper()
         if not key:
@@ -430,7 +414,7 @@ class RobotClient:
         """Declare the payload the arm is carrying at the TCP."""
         return _run(self._inner.set_payload(mass, com, inertia))
 
-    def payload(self) -> dict | None:
+    def payload(self) -> PayloadResult | None:
         """The effective runtime payload (zeros = none)."""
         return _run(self._inner.payload())
 

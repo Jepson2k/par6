@@ -1578,14 +1578,17 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         assert await client.wait_ready(timeout=STEP_BUDGET_S)
 
         info = await client.payload()
-        assert info == {"mass": 0.0, "com": [0.0] * 3, "inertia": [0.0] * 6}
+        assert info is not None
+        assert info.mass == 0.0
+        assert info.com == (0.0, 0.0, 0.0)
+        assert info.inertia == (0.0,) * 6
 
         assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
         info = await client.payload()
         assert info is not None
-        assert info["mass"] == pytest.approx(1.2)
-        assert info["com"] == pytest.approx([0.0, 0.01, 0.05])
-        assert info["inertia"] == [0.0] * 6
+        assert info.mass == pytest.approx(1.2)
+        assert info.com == pytest.approx((0.0, 0.01, 0.05))
+        assert info.inertia == (0.0,) * 6
 
         with pytest.raises(RobotError) as neg:
             await client.set_payload(-1.0)
@@ -1602,13 +1605,13 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
             await client.set_payload(1.0, inertia=(0.0, 0.0, 1.0, 0.0, 5.0, 0.0))
         assert hidden.value.code == ErrorCode.COMM_VALIDATION_ERROR
         info = await client.payload()
-        assert info is not None and info["mass"] == pytest.approx(1.2), (
+        assert info is not None and info.mass == pytest.approx(1.2), (
             "a refused set must not change the payload"
         )
 
         assert await client.set_payload(0.0) == 1
         info = await client.payload()
-        assert info is not None and info["mass"] == 0.0
+        assert info is not None and info.mass == 0.0
 
 
 async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaemon):

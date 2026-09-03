@@ -48,7 +48,13 @@ from waldoctl import ElectricGripperTool, ToolSpec, ToolState, ToolStatus
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import ActionState as WActionState
-from waldoctl.status import ActivityResult, LoopStatsResult, PingResult, ToolResult
+from waldoctl.status import (
+    ActivityResult,
+    LoopStatsResult,
+    PayloadResult,
+    PingResult,
+    ToolResult,
+)
 
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, make_wire_error
@@ -63,6 +69,7 @@ from par6.client.async_client import (
     _matrix_to_pose,
     _timing,
     _wire_frame,
+    payload_from_dict,
 )
 from par6.client.errors import RobotError
 from par6.protocol.constants import (
@@ -934,10 +941,9 @@ class DryRunRobotClient:
         )
         return 1
 
-    def payload(self, **kwargs: Any) -> dict:
-        """The payload the preview plans with: ``mass``, ``com``,
-        ``inertia`` (zeros = none), the live query's shape."""
-        return dict(self._preview.payload())
+    def payload(self, **kwargs: Any) -> PayloadResult:
+        """The payload the preview plans with (zeros = none)."""
+        return payload_from_dict(dict(self._preview.payload()))
 
     def _sync_context(self) -> None:
         self._call(

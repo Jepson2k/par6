@@ -682,9 +682,9 @@ class TestLiveParity:
         assert negative.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert dry_run.set_payload(0.5, com=(0.0, 0.0, 0.05)) == 1
         payload = dry_run.payload()
-        assert payload["mass"] == pytest.approx(0.5)
-        assert payload["com"] == pytest.approx([0.0, 0.0, 0.05])
-        assert len(payload["inertia"]) == 6
+        assert payload.mass == pytest.approx(0.5)
+        assert payload.com == pytest.approx((0.0, 0.0, 0.05))
+        assert len(payload.inertia) == 6
         assert dry_run.set_payload(0.0) == 1
 
     def test_jog_l_previews_through_the_runtime_kinematics(self, dry_run) -> None:

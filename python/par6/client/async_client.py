@@ -25,7 +25,7 @@ import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
 from waldoctl import RobotClient as _RobotClientABC
@@ -35,7 +35,9 @@ from waldoctl.status import (
 )
 from waldoctl.status import (
     ActivityResult,
+    Inertia6,
     LoopStatsResult,
+    PayloadResult,
     PingResult,
     ToolResult,
 )
@@ -235,6 +237,15 @@ def _close_leftover_cores() -> None:
         client._closed = True
         if core is not None:
             core.close()
+
+
+def payload_from_dict(raw: dict[str, Any]) -> PayloadResult:
+    """A runtime payload reading as the contract's dataclass."""
+    return PayloadResult(
+        mass=float(raw["mass"]),
+        com=cast("tuple[float, float, float]", tuple(float(v) for v in raw["com"])),
+        inertia=cast("Inertia6", tuple(float(v) for v in raw["inertia"])),
+    )
 
 
 class AsyncRobotClient(_RobotClientABC):
@@ -1168,9 +1179,9 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
         )
 
-    async def payload(self) -> dict | None:
-        """The effective runtime payload: ``mass``, ``com``, ``inertia``
-        (zeros = none).  Returns None if unreachable.
+    async def payload(self) -> PayloadResult | None:
+        """The effective runtime payload (zeros = none).  Returns None if
+        unreachable.
 
         Category: Query
 
@@ -1178,7 +1189,8 @@ class AsyncRobotClient(_RobotClientABC):
             info = rbt.payload()
         """
         core = await self._ensure_core()
-        return await self._call(core.payload())
+        raw = await self._call(core.payload())
+        return None if raw is None else payload_from_dict(raw)
 
     async def pause(self) -> int:
         """Hold the executing trajectory where it is.
