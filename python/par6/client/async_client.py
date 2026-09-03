@@ -1318,9 +1318,21 @@ class AsyncRobotClient(_RobotClientABC):
             )
         )
 
-    async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
+    async def set_tcp_offset(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        wait: bool = False,
+        timeout: float = 30.0,
+    ) -> int:
         """Set TCP offset in mm, composed on top of the current tool
         transform.  (0, 0, 0) resets; changing tools resets it too.
+
+        Queued: the offset lands at its turn, after every move queued
+        before it has finished and before any move queued after it is
+        planned, so a program reads top to bottom.  Returns the command
+        index; ``TCP_OFFSET`` reports the new value once it completes.
 
         Category: Configuration
 
@@ -1328,7 +1340,8 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_tcp_offset(0, 0, -190)
         """
         core = await self._ensure_core()
-        return await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
+        index = await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
+        return await self._finish_queued(index, wait, timeout)
 
     async def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes.

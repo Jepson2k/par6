@@ -156,8 +156,12 @@ pub struct ConnectHardware {
 }
 
 /// SET_TCP_OFFSET: offset the effective TCP in the tool-local frame (mm).
+/// Queued: takes effect at its position in the queue, after every earlier
+/// command has completed and before any later one is planned.
 #[derive(Debug, Clone, PartialEq)]
 pub struct SetTcpOffset {
+    /// Idempotency key.
+    pub key: u64,
     /// X offset (mm).
     pub x: f64,
     /// Y offset (mm).
@@ -637,6 +641,7 @@ impl Command {
             C::Delay(p) => Some(p.key),
             C::Checkpoint(p) => Some(p.key),
             C::ToolAction(p) => Some(p.key),
+            C::SetTcpOffset(p) => Some(p.key),
             _ => None,
         }
     }
@@ -1019,7 +1024,7 @@ fn arity(tag: CmdType) -> usize {
         | T::EnterFlashing
         | T::Pose => 3,
         T::WriteIo => 4,
-        T::SetTcpOffset => 5,
+        T::SetTcpOffset => 6,
         T::SetPayload => 5,
         T::SetPidGains => 13,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
@@ -1111,6 +1116,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
         C::SetTcpOffset(p) => {
+            w_uint(buf, p.key);
             w_f64(buf, p.x);
             w_f64(buf, p.y);
             w_f64(buf, p.z);
@@ -1464,6 +1470,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             port: r.str()?.to_owned(),
         }),
         T::SetTcpOffset => Command::SetTcpOffset(SetTcpOffset {
+            key: r.uint()?,
             x: r.f64()?,
             y: r.f64()?,
             z: r.f64()?,

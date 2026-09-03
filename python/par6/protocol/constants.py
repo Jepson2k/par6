@@ -262,7 +262,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SELECT_PROFILE: CommandClass.SYSTEM,
     CmdType.RESET_STATE: CommandClass.SYSTEM,
     CmdType.CONNECT_HARDWARE: CommandClass.SYSTEM,
-    CmdType.SET_TCP_OFFSET: CommandClass.SYSTEM,
+    CmdType.SET_TCP_OFFSET: CommandClass.QUEUED,
     CmdType.SET_SHAPES: CommandClass.SYSTEM,
     CmdType.SET_COMPLETION_POLICY: CommandClass.SYSTEM,
     CmdType.SET_RECIPE: CommandClass.SYSTEM,

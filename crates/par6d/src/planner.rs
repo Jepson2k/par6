@@ -1488,7 +1488,9 @@ impl Par6Planner {
                     target_tick: snap.tick + ticks,
                 }
             }
-            Command::Checkpoint(_) | Command::SelectTool(_) => InFlightKind::Instant,
+            Command::Checkpoint(_) | Command::SelectTool(_) | Command::SetTcpOffset(_) => {
+                InFlightKind::Instant
+            }
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,

@@ -910,10 +910,13 @@ class DryRunRobotClient:
     def set_tcp_offset(
         self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any
     ) -> int:
-        """TCP offset in mm, composed on top of the tool transform."""
+        """TCP offset in mm, composed on top of the tool transform. Queued
+        on the runtime, so it closes the chain before it: the moves ahead
+        of it keep the old frame, the ones after it get the new one."""
+        self._flush_quietly()
         self._tcp_offset_mm = (float(x), float(y), float(z))
         self._sync_context()
-        return 1
+        return 0
 
     def select_profile(self, profile: str, **kwargs: Any) -> int:
         name = profile.strip().upper()

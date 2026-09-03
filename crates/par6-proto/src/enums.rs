@@ -83,7 +83,9 @@ wire_enum! {
         ResetState = 16,
         /// (Re)connect the hardware bus.
         ConnectHardware = 17,
-        /// Offset the effective TCP in the tool-local frame (mm).
+        /// Offset the effective TCP in the tool-local frame (mm). Queued: the
+        /// offset applies at its turn in the queue, so moves admitted before it
+        /// keep the old frame and moves after it plan against the new one.
         SetTcpOffset = 18,
         /// Replace the workspace collision-world shapes (bulk; may be chunked).
         SetShapes = 19,
@@ -408,7 +410,6 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SelectProfile
         | C::ResetState
         | C::ConnectHardware
-        | C::SetTcpOffset
         | C::SetShapes
         | C::SetCompletionPolicy
         | C::SetRecipe
@@ -457,6 +458,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SelectTool
         | C::Delay
         | C::Checkpoint
-        | C::ToolAction => CommandClass::Queued,
+        | C::ToolAction
+        | C::SetTcpOffset => CommandClass::Queued,
     }
 }

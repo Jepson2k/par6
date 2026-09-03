@@ -2275,8 +2275,8 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
             variant_key: variant.map(str::to_owned),
         })
     };
-    let offset = |x: f64, y: f64, z: f64| {
-        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { x, y, z })
+    let offset = |key: u64, x: f64, y: f64, z: f64| {
+        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { key, x, y, z })
     };
     async fn read_offset(c: &mut Client) -> [f64; 3] {
         match c.query(&Command::TcpOffset).await {
@@ -2288,7 +2288,9 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     let i1 = c.ok_index(&select(701, Some("fin_ray"))).await;
     h.complete_ok(i1);
     c.wait_complete(i1).await;
-    c.request(&offset(0.0, 0.0, -190.0)).await;
+    let io = c.ok_index(&offset(704, 0.0, 0.0, -190.0)).await;
+    h.complete_ok(io);
+    c.wait_complete(io).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
 
     // Same variant again: nothing about the tool frame moved.
@@ -2302,6 +2304,81 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     h.complete_ok(i3);
     c.wait_complete(i3).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
+}
+
+/// `set_tcp_offset` lands at its turn in the queue, not when its datagram
+/// arrives.
+///
+/// Measured before this landed: `[select_tool(A), set_tcp_offset, move_l]`
+/// raced a completion-time reset (the variant change zeroes the offset
+/// when `select_tool` COMPLETES) against an admission-time set, so the
+/// program ended with the offset it had just asked for wiped. Queued, the
+/// offset applies after the selection it follows, and a disabled arm
+/// still accepts it — it is configuration, and measuring a tool on an
+/// arm that is not enabled has to work.
+#[tokio::test]
+async fn set_tcp_offset_applies_in_queue_order_and_needs_no_enable() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let offset = |key: u64, z: f64| {
+        Command::SetTcpOffset(par6_proto::command::SetTcpOffset {
+            key,
+            x: 0.0,
+            y: 0.0,
+            z,
+        })
+    };
+    async fn read_offset(c: &mut Client) -> [f64; 3] {
+        match c.query(&Command::TcpOffset).await {
+            QueryResult::TcpOffset { x, y, z } => [x, y, z],
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // The selection is in flight; the offset queues behind it and has
+    // not touched the runtime yet.
+    let i1 = c
+        .ok_index(&Command::SelectTool(par6_proto::command::SelectTool {
+            key: 801,
+            tool_name: "GRIPPER".to_owned(),
+            variant_key: Some("fin_ray".to_owned()),
+        }))
+        .await;
+    let i2 = c.ok_index(&offset(802, -190.0)).await;
+    assert_eq!(
+        read_offset(&mut c).await,
+        [0.0; 3],
+        "an offset queued behind a running command must not apply early"
+    );
+    h.complete_ok(i1);
+    c.wait_complete(i1).await;
+    h.complete_ok(i2);
+    let (ok, _) = c.wait_complete(i2).await;
+    assert!(ok);
+    assert_eq!(
+        read_offset(&mut c).await,
+        [0.0, 0.0, -190.0],
+        "the offset set AFTER the tool change must survive it"
+    );
+
+    // Disabled arm: admitted AND applied — nothing about an offset needs
+    // the arm enabled, and holding it until enable would be a silent no-op.
+    h.publish(|s| s.state = ArmState::Disabled);
+    let i3 = c.ok_index(&offset(803, -12.5)).await;
+    h.complete_ok(i3);
+    let (ok, _) = c.wait_complete(i3).await;
+    assert!(ok);
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -12.5]);
+    h.publish(|_| {});
+
+    h.server.shutdown();
 }
 
 /// A tool action runs BESIDE the motion queue, not in it.

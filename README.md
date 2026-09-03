@@ -302,7 +302,11 @@ exactly where `par6d` does.
 
 `set_tcp_offset` composes after the tool transform, in the tool-local frame. A variant
 change clears it, because an offset measured against the old TCP describes nothing once
-the frame moves.
+the frame moves. It is a queued command: the offset lands at its turn, so moves queued
+before it keep the old frame, moves after it are planned against the new one, and a
+blend chain never folds across it. `SELECT_TOOL` and `SET_TCP_OFFSET` therefore apply in
+program order, and the `TCP_OFFSET` query reports the new value only once the command
+has completed — the same lag `TOOLS` has after `select_tool`.
 
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See

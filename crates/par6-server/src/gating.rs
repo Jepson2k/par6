@@ -68,6 +68,10 @@ pub fn gate(cmd: CmdType) -> Gate {
         // mid-move, exactly like a TCP-offset change), and clearing a
         // payload must work whatever state the controller is in.
         C::SetPayload => {}
+        // SetTcpOffset is queued so it lands in order between moves, but
+        // it is configuration, not motion: measuring a tool on a disabled
+        // arm must work, exactly as it did when the command was immediate.
+        C::SetTcpOffset => g.needs_enabled = false,
         C::ResetLoopStats => g.needs_enabled = false,
         _ => {}
     }

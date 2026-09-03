@@ -219,10 +219,17 @@ impl Client {
         .await
     }
 
-    /// Apply a TCP offset \[mm\], tool-local.
-    pub async fn set_tcp_offset(&self, x: f64, y: f64, z: f64) -> Result<Ack, ClientError> {
-        self.system(Command::SetTcpOffset(cmd::SetTcpOffset { x, y, z }))
-            .await
+    /// Queue a TCP offset \[mm\], tool-local. Applied at its turn in the
+    /// queue, so moves queued before it keep the old frame; the returned
+    /// index completes when it lands.
+    pub async fn set_tcp_offset(&self, x: f64, y: f64, z: f64) -> Result<Option<u64>, ClientError> {
+        self.queued(Command::SetTcpOffset(cmd::SetTcpOffset {
+            key: self.fresh_key(),
+            x,
+            y,
+            z,
+        }))
+        .await
     }
 
     /// Replace the runtime payload carried at the TCP (mass \[kg\], COM

@@ -511,9 +511,19 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
-    def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
-        """Set TCP offset in mm on top of the current tool transform."""
-        return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
+    def set_tcp_offset(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        wait: bool = False,
+        timeout: float = 30.0,
+    ) -> int:
+        """Queue a TCP offset in mm on top of the current tool transform;
+        it lands at its turn between the moves around it."""
+        return _run(
+            self._inner.set_tcp_offset(x=x, y=y, z=z, wait=wait, timeout=timeout)
+        )
 
     def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes."""

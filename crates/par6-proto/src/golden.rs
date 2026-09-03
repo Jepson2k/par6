@@ -503,6 +503,7 @@ pub fn vectors() -> Vec<Vector> {
         "cmd_set_tcp_offset",
         9,
         Command::SetTcpOffset(SetTcpOffset {
+            key: 113,
             x: 1.5,
             y: -2.0,
             z: 35.5,

@@ -162,6 +162,11 @@ enum PostEffect {
     /// `select_tool` can only ever name the fitted tool (validated at
     /// accept time), so the variant is the part that actually changes.
     SelectVariant(Option<String>),
+    /// `set_tcp_offset` lands at its turn in the queue: moves admitted
+    /// before it were planned against the old frame, moves after it are
+    /// planned against the new one, and a blend chain can never fold
+    /// across it.
+    TcpOffset([f64; 3]),
 }
 
 /// The first command index the server hands out. Nothing is index 0:
@@ -670,11 +675,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
                 })
-            }
-            C::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.sync_planner();
-                Ok(())
             }
             C::SetPayload(p) => {
                 let payload = PayloadSpec {
@@ -1219,14 +1219,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn pump(&mut self) {
         while self.executing.is_none() {
-            if self.estop_latched
-                || self.snap.state != ArmState::Enabled
-                || self.active_stream.is_some()
-            {
+            if self.active_stream.is_some() {
                 break;
             }
-            if self.pending.is_empty() {
+            let Some(head) = self.pending.front() else {
                 self.blend_hold = None;
+                break;
+            };
+            // The head waits for an enabled arm only if its gate says so:
+            // configuration queued for ordering (a TCP offset) lands on a
+            // disabled arm, exactly as it did when it was immediate.
+            if gate(head.cmd.tag()).needs_enabled
+                && (self.estop_latched || self.snap.state != ArmState::Enabled)
+            {
                 break;
             }
             if self.holding_for_blend() {
@@ -1336,6 +1341,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                                 self.tcp_offset_mm = [0.0; 3];
                             }
                             self.tool_variant = variant;
+                            self.sync_planner();
+                        }
+                        PostEffect::TcpOffset(mm) => {
+                            self.tcp_offset_mm = mm;
                             self.sync_planner();
                         }
                     }
@@ -2343,6 +2352,7 @@ fn post_effect(cmd: &Command) -> PostEffect {
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
+        Command::SetTcpOffset(p) => PostEffect::TcpOffset([p.x, p.y, p.z]),
         _ => PostEffect::None,
     }
 }

@@ -499,10 +499,16 @@ impl CoreClient {
         y: f64,
         z: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
+        let client = self.rt();
+        queued_future(
             py,
-            self.rt(),
-            Command::SetTcpOffset(cmd::SetTcpOffset { x, y, z }),
+            client.clone(),
+            Command::SetTcpOffset(cmd::SetTcpOffset {
+                key: client.fresh_key(),
+                x,
+                y,
+                z,
+            }),
         )
     }
 

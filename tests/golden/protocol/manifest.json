@@ -152,10 +152,10 @@
       ]
     },
     {
-      "class": "SYSTEM",
+      "class": "QUEUED",
       "cmd": "SET_TCP_OFFSET",
       "file": "cmd_set_tcp_offset.bin",
-      "idempotency_key": null,
+      "idempotency_key": 113,
       "kind": "command",
       "name": "cmd_set_tcp_offset",
       "req_id": 9,
@@ -163,6 +163,7 @@
       "wire": [
         18,
         9,
+        113,
         1.5,
         -2.0,
         35.5

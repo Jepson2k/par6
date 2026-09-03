@@ -1431,8 +1431,8 @@ fn move_j_pose(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
     })
 }
 
-fn set_tcp_offset(x: f64, y: f64, z: f64) -> Command {
-    Command::SetTcpOffset(SetTcpOffset { x, y, z })
+fn set_tcp_offset(key: u64, x: f64, y: f64, z: f64) -> Command {
+    Command::SetTcpOffset(SetTcpOffset { key, x, y, z })
 }
 
 fn tcp_offset_readback(c: &mut Client) -> [f64; 3] {
@@ -1491,7 +1491,8 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
     let d: [f64; 3] = std::array::from_fn(|j| (0..3).map(|i| flange.pose[4 * i + j] * v[i]).sum());
 
     // --- The reported point moves; the arm does not.
-    c.ok(&set_tcp_offset(d[0], d[1], d[2]));
+    let i = c.ok_index(&set_tcp_offset(1701, d[0], d[1], d[2]));
+    c.wait_complete(i);
     rig.drain_status();
     let offset = rig.wait_status("STATUS follows the offset TCP", |s| {
         distance(tcp_mm(s), p_flange) > 1.0
@@ -1551,7 +1552,8 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
     );
 
     // Where the flange actually ended up: same configuration, offset off.
-    c.ok(&set_tcp_offset(0.0, 0.0, 0.0));
+    let i = c.ok_index(&set_tcp_offset(1702, 0.0, 0.0, 0.0));
+    c.wait_complete(i);
     rig.drain_status();
     let f_with = tcp_mm(&rig.wait_status("flange of the offset run", |s| {
         distance(tcp_mm(s), reached) > 1.0
@@ -2166,6 +2168,102 @@ fn curved_moves_trace_their_geometry() {
     );
 
     rig.shutdown();
+}
+
+/// A TCP-offset change can never be folded into a blend chain.
+///
+/// Measured before this landed: `set_tcp_offset` was immediate, so it was
+/// never in `pending` and `[move_l(blend), set_tcp_offset, move_l]` folded
+/// both legs into one motion — the new frame applied to both or neither,
+/// decided by datagram arrival against the blend hold. Queued, it sits
+/// between the legs: the first runs alone against the old frame, the
+/// offset lands, and only then is the second planned.
+#[test]
+fn a_tcp_offset_between_blended_moves_breaks_the_chain() {
+    const LEG_MM: f64 = 60.0;
+    const LEG_S: f64 = 1.0;
+
+    let rig = boot_tagged("offset-chain", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let leg = |s: &Status, key: u64, xyz: [f64; 3], r: Option<f64>| {
+        Command::MoveL(MoveL {
+            key,
+            pose: wire_pose_at(&s.pose, xyz),
+            frame: Frame::Wrf,
+            duration: Some(LEG_S),
+            speed: None,
+            accel: None,
+            blend_radius: r,
+            rel: false,
+        })
+    };
+    let queue_while_executing = |c: &mut Client, head: u64| -> Vec<String> {
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            match c.query(&Command::Queue) {
+                QueryResult::Queue {
+                    queue,
+                    executing_index,
+                    ..
+                } if executing_index == head as i64 => return queue,
+                QueryResult::Queue { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "command {head} never started");
+        }
+    };
+    let read_offset = |c: &mut Client| -> [f64; 3] {
+        match c.query(&Command::TcpOffset) {
+            QueryResult::TcpOffset { x, y, z } => [x, y, z],
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+
+    // --- control: the same two legs with nothing between them fold.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + LEG_MM, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - LEG_MM];
+    let i1 = c.ok_index(&leg(&s, 5301, corner, Some(20.0)));
+    let i2 = c.ok_index(&leg(&s, 5302, finish, None));
+    assert!(
+        queue_while_executing(&mut c, i1).is_empty(),
+        "two blended legs are one motion: the second leaves the queue with the first"
+    );
+    c.wait_complete(i1);
+    c.wait_complete(i2);
+
+    // --- an offset between them keeps the legs apart and lands in order.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + LEG_MM, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - LEG_MM];
+    let i3 = c.ok_index(&leg(&s, 5303, corner, Some(20.0)));
+    let i4 = c.ok_index(&set_tcp_offset(5304, 0.0, 0.0, 25.0));
+    let i5 = c.ok_index(&leg(&s, 5305, finish, None));
+    assert_eq!(
+        queue_while_executing(&mut c, i3),
+        vec!["set_tcp_offset".to_owned(), "move_l".to_owned()],
+        "the offset must break the chain: the second leg waits behind it"
+    );
+    assert_eq!(
+        read_offset(&mut c),
+        [0.0; 3],
+        "the offset must not apply while the leg queued before it runs"
+    );
+    let (ok, detail) = c.wait_complete(i3);
+    assert!(ok, "first leg: {detail:?}");
+    let (ok, detail) = c.wait_complete(i4);
+    assert!(ok, "offset: {detail:?}");
+    assert_eq!(read_offset(&mut c), [0.0, 0.0, 25.0]);
+    let (ok, detail) = c.wait_complete(i5);
+    assert!(ok, "second leg: {detail:?}");
+
+    let i6 = c.ok_index(&set_tcp_offset(5306, 0.0, 0.0, 0.0));
+    c.wait_complete(i6);
 }
 
 /// A blend radius on a queued `move_l` really rounds the corner into the
