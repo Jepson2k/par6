@@ -2,7 +2,7 @@
 //! shim (`cpp/`, wrapped by `pinokin-sys`) — the one numerics stack the
 //! runtime plans with and the Python binding exposes.
 //!
-//! The safe wrapper ([`Kin`], feature `ffi`) preallocates model/data at
+//! The safe wrapper ([`Kin`]) preallocates model/data at
 //! init and exposes allocation-free `fk / tcp / jacobian / gravity / ik`
 //! calls suitable for the RT thread and planner. `tests/kinematics.rs`
 //! holds it to the contract (Jacobian = dFK/dq, IK lands on every FK
@@ -12,12 +12,7 @@
 //! A wrong link length is expressible, so the fit would follow it; the
 //! URDF's geometry is nominal data, not something this proves.
 //!
-//! Without the `ffi` feature the crate carries only the pure-data
-//! [`GripperVariant`] table, so `cargo build --workspace` needs no C++
-//! toolchain. Build the shim with `scripts/ffi/setup.sh`, then
-//! `source .ffi/env.sh` and add `--features ffi`.
-//!
-//! Collision ([`Collision`], same `ffi` feature) runs coal/hpp-fcl over the
+//! Collision ([`Collision`]) runs coal/hpp-fcl over the
 //! same URDF: self-collision plus the installation/program keep-out layers
 //! waldoctl defines, reporting `collision_active`, the colliding pairs and
 //! the `scene_epoch` of the applied world. It is planner-side (tens of µs to

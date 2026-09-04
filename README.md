@@ -34,8 +34,7 @@ below works on a laptop and in CI.
 
 ## Installation
 
-`par6d` links a Pinocchio C-ABI shim, so that gets built once before the runtime.
-The library crates need no C++ toolchain; only the binary does.
+par6 links a Pinocchio C-ABI shim, so that gets built once before anything else.
 
 ```bash
 scripts/ffi/setup.sh             # once — builds the shim into .ffi/

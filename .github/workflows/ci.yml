@@ -9,10 +9,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # One Rust job. The Pinocchio shim is a hard prerequisite — par6-kin is
-  # nothing without it and pinokin-sys is its raw binding — so there is no
-  # toolchain-free half of this workspace to prove anything about, and no
-  # `--exclude` or `--features` anywhere below. `cargo test --workspace` is
+  # One Rust job. The Pinocchio shim is a prerequisite, so there is no
+  # `--exclude` or `--features` anywhere below: `cargo test --workspace` is
   # the whole Rust suite, which is what a contributor runs locally too.
   rust:
     name: rust (x86_64, shim)
@@ -248,8 +246,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: e2e-${{ matrix.layer }}
-      # `--features ffi` needs the shim, so this job carries the same
-      # toolchain (and the same cache key) as the `ffi` job.
+      # par6d links the shim, so this job carries the same toolchain.
       - name: cache pinocchio toolchain
         uses: actions/cache@v4
         with:

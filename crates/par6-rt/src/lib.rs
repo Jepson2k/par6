@@ -29,8 +29,7 @@
 //!   settle).
 //! - [`gpio`]: e-stop and digital-I/O line abstractions + first-read-seeded
 //!   debounce.
-//! - [`gravity`]: the G(q) model seam ([`ZeroGravity`], Pinocchio RNEA
-//!   behind the `ffi` feature).
+//! - [`gravity`]: the G(q) model seam ([`ZeroGravity`], Pinocchio RNEA).
 //! - [`timing`]: loop-period statistics and the p99 degradation bands.
 //! - [`hooks`]: the small per-tick trait seams `par6d` wires the motion
 //!   stack onto (jog, streaming, completion, commands, FK, flash marker).

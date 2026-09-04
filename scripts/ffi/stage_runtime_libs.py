@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Stage a cross-built shim's runtime library closure and prove it loadable.
 
-The PAR6 control box gets no conda environment: `par6d --features ffi` links
+The PAR6 control box gets no conda environment: `par6d` links
 `libpar6_shim.so`, which pulls in Pinocchio, coal, toppra and their transitive
 dependencies, and all of those have to be installed alongside it. This walks
 `DT_NEEDED` from the given roots, copies every dependency found in the conda

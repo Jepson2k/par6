@@ -1,6 +1,6 @@
 //! Branch selection for solved revolute joint angles.
 //!
-//! Pure math, no model — available without the `ffi` feature.
+//! Pure math, no model.
 
 use std::f64::consts::TAU;
 

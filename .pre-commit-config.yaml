@@ -1,6 +1,25 @@
+# `pre-commit install` wires both stages: clippy is a pre-push hook because
+# it costs ~27 s warm even with nothing to do, which is not a per-commit price.
+default_install_hook_types: [pre-commit, pre-push]
+
 repos:
-  # Ruff for Python linting and formatting (the Rust side is gated by
-  # cargo fmt/clippy in the rust CI job).
+  - repo: local
+    hooks:
+      - id: cargo-fmt
+        name: cargo fmt
+        entry: cargo fmt --all --check
+        language: system
+        files: \.rs$
+        pass_filenames: false
+      - id: cargo-clippy
+        name: cargo clippy (workspace)
+        entry: bash -c 'if [ ! -f .ffi/env.sh ]; then echo "no .ffi/env.sh — run scripts/ffi/setup.sh first"; exit 1; fi; . .ffi/env.sh && cargo clippy --workspace --all-targets -- -D warnings'
+        language: system
+        files: \.(rs|toml)$
+        pass_filenames: false
+        stages: [pre-push]
+
+  # Ruff for Python linting and formatting.
   - repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.15.8
     hooks:
