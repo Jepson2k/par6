@@ -68,8 +68,14 @@ if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
   echo ">>> build parallelism: $jobs jobs (RAM-capped; override with CMAKE_BUILD_PARALLEL_LEVEL)"
 fi
 
-# Pinned package set.
+# Pinned package set. Every library the shim's numerics come from is named
+# with a version: leaving one to the solver means two machines building from
+# the same commit get different numerics, and the CI cache then holds
+# whichever solve happened first.
 PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
+EIGEN_VERSION="${PAR6_EIGEN_VERSION:-5.0.1}"
+URDFDOM_VERSION="${PAR6_URDFDOM_VERSION:-6.0.1}"
+COAL_VERSION="${PAR6_COAL_VERSION:-3.0.4}"
 # toppra-cpp source pin (v0.6.9 release commit). MIT; built with the bundled
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
@@ -89,13 +95,14 @@ CROSS_SYSROOT_VERSION="${PAR6_CROSS_SYSROOT_VERSION:-2.17}"
 # Packages the shim links against — the ones a cross target also needs.
 TARGET_SPECS=(
   "pinocchio=${PINOCCHIO_VERSION}"
-  "eigen"      # constrained by pinocchio's build (5.0.x as of 2026-08)
-  "urdfdom"    # constrained by pinocchio's build (6.0.x as of 2026-08)
+  # toppra links Eigen, so its parameterization moves with this version.
+  "eigen=${EIGEN_VERSION}"
+  "urdfdom=${URDFDOM_VERSION}"
   # coal (hpp-fcl) backs par6_col_* and already arrives as a pinocchio
   # dependency; naming it keeps the shim's link line honest and makes a
   # future pinocchio build that drops collision support fail here instead
-  # of at cmake time. Version is left to pinocchio's constraint (3.0.x).
-  "coal"
+  # of at cmake time.
+  "coal=${COAL_VERSION}"
 )
 # Build tools. Native: same env as the libraries (activation sets CC/CXX).
 # Cross: a host-platform env holding the target's cross compiler.
@@ -163,6 +170,29 @@ if [[ ! -e "$ENV_DIR/lib/libpinocchio_default.so" ]]; then
 else
   echo ">>> env exists: $ENV_DIR (delete it to force re-create)"
 fi
+
+# An env restored from a cache is trusted for everything below, so check it
+# is the env this script asks for. Nothing else notices the difference: the
+# shim links, the tests run, and a few numerical results move — which is how
+# a CI cache built from one solve keeps passing while a fresh machine
+# building from the same commit fails.
+for spec in "pinocchio=$PINOCCHIO_VERSION" "eigen=$EIGEN_VERSION" \
+            "urdfdom=$URDFDOM_VERSION" "coal=$COAL_VERSION"; do
+  pkg="${spec%%=*}"
+  want="${spec#*=}"
+  meta=("$ENV_DIR"/conda-meta/"$pkg"-[0-9]*.json)
+  got=""
+  if [[ -e "${meta[0]}" ]]; then
+    got="$(basename "${meta[0]}")"
+    got="${got#"$pkg"-}"
+    got="${got%%-*}"
+  fi
+  if [[ "$got" != "$want" ]]; then
+    echo "$ENV_DIR has $pkg ${got:-<missing>}, pinned at $want." >&2
+    echo "Delete $ENV_DIR and re-run to rebuild the env." >&2
+    exit 1
+  fi
+done
 
 # cpp/src/par6_col.cpp links coal and pinocchio's collision module; both come
 # with the pinocchio package, so a missing one means an env built before coal
