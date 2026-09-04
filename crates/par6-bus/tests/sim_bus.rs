@@ -1723,9 +1723,13 @@ mod mujoco {
             ObjectDetection::DetectedClosing,
             "no object detected while closing (reply {r:?})"
         );
+        // `action_status` echoes the COMMANDED action bit, not motion, so
+        // the grip that is being held reads as still asserted — which is
+        // the invariant that keeps the jaws clamped. Arrival and contact
+        // are `object_detection`'s to report, asserted above.
         assert!(
-            !r.action_status,
-            "still reported moving while pressing the object"
+            r.action_status,
+            "the standing grip must still be asserted while it presses"
         );
         assert!(
             r.position > 100 && r.position < 240,
