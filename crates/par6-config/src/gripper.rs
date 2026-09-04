@@ -10,6 +10,46 @@ use crate::homing::JointHoming;
 use crate::robot::{DriverType, Gains};
 use crate::{invalid, read_to_string, ConfigError};
 
+/// How long the runtime waits for a gripper action to declare itself.
+///
+/// Durations, not tick counts: every window here is a number of firmware
+/// replies, so expressing them in seconds keeps them meaning the same
+/// thing at any control rate.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SettleTimings {
+    /// Replies arriving within this window of a command still describe
+    /// the PREVIOUS action, so nothing counts until it passes. It is
+    /// load-bearing: the firmware's "at position" flag latches until a
+    /// new command clears it, so a stale one would complete the next
+    /// move the instant it was issued.
+    pub command_grace_s: f64,
+    /// How long a contact code must agree with the commanded direction
+    /// before it counts. The firmware recomputes the code every control
+    /// cycle from a filtered velocity and an instantaneous current, so
+    /// it chatters at the contact threshold.
+    pub detect_debounce_s: f64,
+    /// Ceiling on a jaw move.
+    pub move_timeout_s: f64,
+    /// Ceiling on the calibration sweep.
+    pub calibrate_timeout_s: f64,
+    /// The sweep reports `calibrated` from its previous run before the
+    /// new one starts, so a calibration is not believed before this.
+    pub calibrate_min_wait_s: f64,
+}
+
+impl Default for SettleTimings {
+    fn default() -> Self {
+        Self {
+            command_grace_s: 0.05,
+            detect_debounce_s: 0.02,
+            move_timeout_s: 5.0,
+            calibrate_timeout_s: 12.0,
+            calibrate_min_wait_s: 2.0,
+        }
+    }
+}
+
 /// CAN driver parameters for an actuated gripper. Absent for passive
 /// tools (Flange): no CAN node, no boot config, no homing.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -36,6 +76,10 @@ pub struct GripperDriverConfig {
     pub gear_r_m: f64,
     /// Controller gains pushed at boot.
     pub gains: Gains,
+    /// Completion-detection windows. Defaulted so a tool TOML only
+    /// carries them when its jaws are slower than the stock ones.
+    #[serde(default)]
+    pub settle: SettleTimings,
 }
 
 /// Home-offset override for one ARM joint, applied when that joint is
@@ -144,6 +188,32 @@ impl GripperConfig {
             }
             if d.watchdog_timeout_ms == 0 {
                 return Err(invalid("driver.watchdog_timeout_ms", "must be > 0"));
+            }
+            for (v, name) in [
+                (d.settle.command_grace_s, "driver.settle.command_grace_s"),
+                (
+                    d.settle.detect_debounce_s,
+                    "driver.settle.detect_debounce_s",
+                ),
+                (d.settle.move_timeout_s, "driver.settle.move_timeout_s"),
+                (
+                    d.settle.calibrate_timeout_s,
+                    "driver.settle.calibrate_timeout_s",
+                ),
+                (
+                    d.settle.calibrate_min_wait_s,
+                    "driver.settle.calibrate_min_wait_s",
+                ),
+            ] {
+                if !v.is_finite() || v <= 0.0 {
+                    return Err(invalid(name, "must be a finite duration > 0"));
+                }
+            }
+            if d.settle.calibrate_min_wait_s >= d.settle.calibrate_timeout_s {
+                return Err(invalid(
+                    "driver.settle.calibrate_min_wait_s",
+                    "must be shorter than calibrate_timeout_s, or a calibration can only ever time out",
+                ));
             }
         }
         if self.homing.is_some() && self.driver.is_none() {

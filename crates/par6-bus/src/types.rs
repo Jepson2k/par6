@@ -486,9 +486,14 @@ pub enum LinkState {
 pub struct LinkHealth {
     /// Last known kernel link state.
     pub state: LinkState,
-    /// Interface restarts observed (a decreased kernel counter means the
-    /// interface was re-based, not a negative delta).
+    /// Interface restarts since the daemon started (a decreased kernel
+    /// counter means the interface was re-based, not a negative delta).
     pub restarts: u32,
+    /// Bus-off events since the daemon started, counted from the device
+    /// counters: one the kernel auto-restart already recovered from
+    /// still lost frames and still shows up here, while `state` reports
+    /// the controller as it is now.
+    pub bus_off_events: u32,
     /// TX errors observed (send failures are also PROPAGATED per call).
     pub tx_errors: u64,
     /// Total frames received.

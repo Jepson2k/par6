@@ -40,9 +40,6 @@ use crate::collision_world::{is_world_name, kin_layer, ShapeNames};
 /// sessions.
 pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 
-/// Servo streams self-terminate after this much client silence (the RT
-/// stream watchdog is fed by housekeeping keep-alives until then).
-pub(crate) const SERVO_GRACE: Duration = Duration::from_millis(250);
 /// How long the enable retry keeps trying after `reset` (covers the RT
 /// clear-sequence settle window with margin, even on a loaded host).
 const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -484,6 +481,12 @@ impl RtBridge {
         }
     }
 
+    /// Client silence after which a servo stream ends itself; housekeeping
+    /// keeps the RT stream watchdog fed until then.
+    fn servo_grace(&self) -> Duration {
+        Duration::from_secs_f64(self.bundle.robot.stream.servo_grace_s)
+    }
+
     /// Mode dance into a stream mode. The RT transition table only
     /// allows working-mode changes through IDLE, and `SetMode` to the
     /// current mode is a no-op, so the pair is always safe to queue.
@@ -611,7 +614,7 @@ impl RtCommands for RtBridge {
                 sh.stream = Some(ActiveStream {
                     releasing: false,
                     kind: StreamKind::Servo,
-                    deadline: Instant::now() + SERVO_GRACE,
+                    deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
@@ -679,7 +682,7 @@ impl RtCommands for RtBridge {
                 sh.stream = Some(ActiveStream {
                     releasing: false,
                     kind: StreamKind::Servo,
-                    deadline: Instant::now() + SERVO_GRACE,
+                    deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
@@ -878,6 +881,18 @@ impl RtCommands for RtBridge {
         });
     }
 
+    fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.link.send(RtCommand::SetCanId { node, new_id });
+    }
+
+    fn save_config(&mut self, node: u8) {
+        self.link.send(RtCommand::SaveConfig { node });
+    }
+
+    fn rescan_bus(&mut self) {
+        self.link.send(RtCommand::RescanBus);
+    }
+
     fn teleport(&mut self, angles_deg: &[f64; NUM_JOINTS], tool_positions: Option<&[f64]>) {
         if !self.sim {
             // The server gates teleport with SYS_NOT_SIMULATOR; this is
@@ -939,10 +954,6 @@ impl RtCommands for RtBridge {
             core.set_homed(true);
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
-    }
-
-    fn tool_stop(&mut self) {
-        self.link.send(RtCommand::GripperStop);
     }
 
     fn write_io(&mut self, port: u8, value: u8) {
@@ -1063,7 +1074,15 @@ impl RtBridge {
     fn swap_to_hardware(&mut self, interface: &str) -> Result<(), WireError> {
         let mut cfg = self.bundle.robot.bus.clone();
         interface.clone_into(&mut cfg.interface);
-        let hw = SocketCanBus::open(&cfg).map_err(|e| {
+        // The same opener as boot: a driver power-cycle leaves the
+        // interface enumerating for a moment, and the retry window absorbs
+        // it here too. The server task blocks for at most the window.
+        let hw = crate::daemon::open_with_retry(
+            cfg.open_retry_s,
+            || SocketCanBus::open(&cfg),
+            std::thread::sleep,
+        )
+        .map_err(|e| {
             make_error(
                 ErrorCode::MotnSetupFailed,
                 UNATTRIBUTED,
@@ -1114,9 +1133,23 @@ pub(crate) fn housekeeping_loop(
     // adds jerk phases to the linear time); only reached if the RT never
     // reports rest.
     let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
+    let mut profile_logged = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
+        if now.duration_since(profile_logged) >= Duration::from_secs(1) {
+            profile_logged = now;
+            let p = &snap.tick_profile;
+            if p.phase_max_ns.iter().any(|&n| n > 0) {
+                log::info!(
+                    target: "par6d::profile",
+                    "tick phases max [us] {:?} last overrun [us] {:?} overruns traced {}",
+                    p.phase_max_ns.map(|n| n / 1000),
+                    p.overrun_ns.map(|n| n / 1000),
+                    p.overruns_traced
+                );
+            }
+        }
         {
             let mut sh = shared.lock().unwrap();
             match &mut sh.stream {
@@ -1314,7 +1347,12 @@ pub(crate) fn housekeeping_loop(
                 }
             }
             if let Some(req) = &sh.flashing {
-                if snap.mode == req.want {
+                // An exit lands wherever the RT settles: a still-latched
+                // hard error re-drives a FLASHING exit to ACTIVE_ERROR, and
+                // that is a successful exit, not a timeout.
+                let arrived = snap.mode == req.want
+                    || (req.want == Mode::Idle && snap.mode != Mode::Flashing);
+                if arrived {
                     sh.flashing = None;
                     sh.flashing_outcome = Some(Ok(()));
                 } else if now >= req.deadline {

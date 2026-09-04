@@ -5,7 +5,7 @@ mod common;
 
 use common::{ConstGravity, Rig};
 use par6_bus::spectral::{torque_to_ma_factor, trunc_to_wire};
-use par6_bus::{JointCommand, Pack, Reply, TxRecord};
+use par6_bus::{JointCommand, Pack, Reply};
 use par6_config::{KtSource, LimitMode};
 use par6_rt::{Mode, RtCommand, MAX_JOINTS};
 
@@ -398,14 +398,11 @@ fn gripper_slot_gets_exactly_one_frame_every_tick() {
     rig.boot_to_idle();
     rig.clear_tx();
     rig.tick_n(10);
-    let grips: Vec<_> = rig
-        .core
-        .bus_mut()
-        .tx_log
-        .iter()
-        .filter(|(_, r)| matches!(r, TxRecord::Gripper(_)))
-        .collect();
-    assert_eq!(grips.len(), 10, "one gripper-slot frame per tick");
+    assert_eq!(
+        rig.gripper_sends().len(),
+        10,
+        "one gripper-slot frame per tick"
+    );
 }
 
 /// Leaving a protective stop must RAMP the gravity feedforward back, not
@@ -479,5 +476,82 @@ fn leaving_safety_stop_ramps_gravity_instead_of_stepping_it() {
     assert!(
         ticks > 1,
         "the hold came back in a single tick — the slew limit is not enforced"
+    );
+}
+
+/// The opt-in tick profiler: off, the snapshot carries zeros and the
+/// tick reads no clock; on, every phase's running maximum is non-zero
+/// after a few ticks and a tick flagged as an overrun leaves its own
+/// phase times behind, counted.
+#[test]
+fn the_tick_profiler_records_phase_maxima_and_traces_an_overrun() {
+    let mut rig = Rig::new();
+    rig.boot_to_idle();
+    assert_eq!(rig.snap().tick_profile, par6_rt::TickProfile::default());
+
+    rig.core.set_tick_profile(true);
+    rig.tick_n(20);
+    let p = rig.snap().tick_profile;
+    assert!(
+        p.phase_max_ns.iter().all(|&n| n > 0),
+        "every phase takes measurable time: {p:?}"
+    );
+    assert_eq!(p.overruns_traced, 0);
+    assert_eq!(p.overrun_ns, [0; par6_rt::TICK_PHASES]);
+
+    rig.inject_pose();
+    rig.core.tick(rig.dt, true);
+    let p = rig.snap().tick_profile;
+    assert_eq!(p.overruns_traced, 1);
+    assert!(
+        p.overrun_ns.iter().take(9).all(|&n| n > 0),
+        "the overrun tick's phases are traced: {p:?}"
+    );
+    for (m, o) in p.phase_max_ns.iter().zip(p.overrun_ns) {
+        assert!(*m >= o, "the running maximum covers the traced tick");
+    }
+
+    rig.core.set_tick_profile(false);
+    rig.tick_n(3);
+    assert_eq!(
+        rig.snap().tick_profile,
+        par6_rt::TickProfile::default(),
+        "switching off clears the profile"
+    );
+}
+
+/// FLASHING sends nothing, so the torque the drives were holding before
+/// it is gone; the mode after it must ramp the feedforward back from
+/// zero, not restore the pre-FLASHING value in one tick.
+#[test]
+fn leaving_flashing_ramps_gravity_instead_of_stepping_it() {
+    const HOLD: f64 = 5.0;
+    let g = [HOLD, 0.0, 0.0, 0.0, 0.0, 0.0];
+    let mut rig = Rig::with_gravity(Box::new(ConstGravity(g)));
+    let bundle = common::bundle();
+    let dt = bundle.robot.robot.tick_dt_s;
+    let budget = bundle.robot.joints[0]
+        .limits
+        .for_mode(LimitMode::Exec)
+        .torque_rate_nm_s
+        .expect("J1 declares a torque slew ceiling")
+        * dt;
+    assert!(budget < HOLD);
+
+    rig.ready();
+    rig.tick_n(20);
+    assert!((rig.snap().tau_commanded[0] - HOLD).abs() < 1e-9);
+
+    rig.cmd(RtCommand::AssertParked);
+    rig.cmd(RtCommand::SetMode(Mode::Flashing));
+    assert_eq!(rig.snap().mode, Mode::Flashing);
+    rig.tick_n(3);
+
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
+    assert_eq!(rig.snap().mode, Mode::Idle);
+    let tau = rig.snap().tau_commanded[0];
+    assert!(
+        tau <= budget + 1e-9,
+        "the first tick back must ramp from zero: {tau:.4} Nm against a {budget:.4} Nm budget"
     );
 }

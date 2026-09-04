@@ -22,6 +22,11 @@ pub(crate) const BYTES_PER_S_PER_SPEED_UNIT: f64 = 4.0;
 const CALIBRATION_S: f64 = 1.5;
 /// Reported motor current while the jaws move freely \[mA\].
 const MOVING_CUR_MA: f64 = 100.0;
+/// Jaw-position tolerance \[bytes\] at which the firmware latches
+/// `At_position` and reports "at position" (firmware `POSITION_TOLERANCE`,
+/// in motor ticks there, a byte here — the jaw byte is the only position
+/// the firmware protocol reports).
+const POSITION_TOLERANCE: u8 = 5;
 
 /// Which drive mode owns the jaw (the two are exclusive on real hardware).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +50,11 @@ pub(crate) struct GripperSim {
     calibration_ticks_left: u64,
     calibration_total_ticks: u64,
     detection: ObjectDetection,
+    /// Firmware's `At_position` latch: set once the jaw comes within
+    /// `POSITION_TOLERANCE` of the target, cleared only by a genuinely
+    /// new command. While set, the firmware reports "at position"
+    /// regardless of where the jaw drifts to afterwards.
+    at_position: bool,
     moving: bool,
     pressing: bool,
     estop_latched: bool,
@@ -86,6 +96,7 @@ impl GripperSim {
             calibration_ticks_left: 0,
             calibration_total_ticks: cal_ticks,
             detection: ObjectDetection::Moving,
+            at_position: false,
             moving: false,
             pressing: false,
             estop_latched: false,
@@ -113,6 +124,12 @@ impl GripperSim {
     pub fn on_firmware_command(&mut self, cmd: FirmwareGripperCommand) {
         self.ctrl = Ctrl::Firmware;
         self.calibration_ticks_left = 0;
+        // Firmware clears `At_position` only when `Same_command == 0`,
+        // so a replayed identical frame keeps the latch — which is what
+        // homing's per-tick replay depends on.
+        if cmd != self.cmd {
+            self.at_position = false;
+        }
         self.cmd = cmd;
         self.estop_latched = cmd.estop;
         self.driver.feed_watchdog();
@@ -136,6 +153,7 @@ impl GripperSim {
         self.calibrated = false;
         self.calibration_ticks_left = self.calibration_total_ticks;
         self.cmd = FirmwareGripperCommand::default();
+        self.at_position = false;
         self.moving = false;
         self.pressing = false;
         self.driver.feed_watchdog();
@@ -153,6 +171,7 @@ impl GripperSim {
         self.calibration_ticks_left = 0;
         self.moving = false;
         self.pressing = false;
+        self.at_position = true;
         self.detection = ObjectDetection::ReachedNoObject;
     }
 
@@ -229,18 +248,27 @@ impl GripperSim {
             self.pos_byte = (self.pos_byte + step).clamp(0.0, 255.0);
             self.moving = (stop_at - self.pos_byte).abs() > 1e-9;
         }
-        if self.moving {
-            self.detection = ObjectDetection::Moving;
+        // `At_position` latches inside the firmware's tolerance band and
+        // is never unset until a new command, so it outranks everything
+        // below it.
+        if (target - self.pos_byte).abs() < f64::from(POSITION_TOLERANCE) {
+            self.at_position = true;
+        }
+        if self.at_position {
+            self.detection = ObjectDetection::ReachedNoObject;
             self.pressing = false;
         } else if block.is_some() {
+            // Contact: the firmware reads velocity below its threshold
+            // with current above `CURRENT_CONTACT_RATIO` of the limit.
+            // A jammed jaw is exactly that condition.
             self.detection = if closing {
                 ObjectDetection::DetectedClosing
             } else {
                 ObjectDetection::DetectedOpening
             };
             self.pressing = true;
-        } else if (target - self.pos_byte).abs() <= 1e-9 {
-            self.detection = ObjectDetection::ReachedNoObject;
+        } else {
+            self.detection = ObjectDetection::Moving;
             self.pressing = false;
         }
     }
@@ -267,7 +295,14 @@ impl GripperSim {
             cur.round() as i16,
             [
                 self.cmd.activate || self.calibration_ticks_left > 0,
-                self.moving || self.calibration_ticks_left > 0,
+                // `action_status` echoes the COMMANDED action bit
+                // (firmware assigns it straight from the received frame
+                // and documents 0 as "stopped, or activating/releasing").
+                // It is not a motion flag: reporting `moving` here made
+                // the simulator answer a question the arm never answers,
+                // and hid that a completion keyed on this bit can only
+                // ever time out on hardware.
+                self.cmd.action && self.calibration_ticks_left == 0,
                 det & 0b01 != 0,
                 det & 0b10 != 0,
                 self.driver.flags().temperature,

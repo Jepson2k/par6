@@ -90,6 +90,13 @@ def test_sync_facade_smoke(daemon):
         assert client.jog_j(1, 0.4, 0.2) == 1
         assert client.stop() == 1
 
+        # The halt verbs on the sync tool are sends, not coroutines: each
+        # comes back as the queued command's index.
+        client.select_tool(_cfg.fitted_tool_key())
+        for verb in ("stop", "release"):
+            index = getattr(client.tool, verb)()
+            assert isinstance(index, int) and index >= 0, verb
+
         # Clearing a protective stop and floating the arm under G(q)
         # alone — the control pair a synchronous script needs.
         assert client.reset() == 1
@@ -101,6 +108,27 @@ def test_sync_facade_smoke(daemon):
     # Context-manager exit closed the client; further use must fail loudly.
     with pytest.raises(RuntimeError):
         client.ping()
+
+
+def test_the_loop_teardown_releases_a_client_the_script_never_closed(daemon):
+    """A script that never closes its client must still exit cleanly.
+
+    The facade's loop is torn down at interpreter exit, and the engine's
+    futures resolve onto that loop: one completing after it has stopped
+    runs a pyo3 callback that cannot unwind, and the process aborts
+    instead of exiting — a real crash a caller earns by forgetting
+    ``close()``. The teardown releases the clients it still knows about
+    first, so nothing is left in flight to land late.
+    """
+    from par6.client import sync_client as facade
+
+    client = sync_client(daemon)
+    assert client.ping() is not None, "the engine client is live"
+
+    facade._stop_loop()
+
+    with pytest.raises(RuntimeError):
+        client.angles()
 
 
 def test_sync_facade_refuses_use_inside_a_running_loop():
@@ -172,3 +200,37 @@ def test_freedrive_reads_the_broadcast_not_the_last_command(daemon):
         assert client.set_gravity_comp(False) == 1
         assert client.wait_status(lambda s: not s.gravity_comp, timeout=10.0)
         assert client.is_freedrive() is False
+
+
+def test_cli_scan_lists_every_node_id_with_the_configured_drives_present(
+    daemon, capsys
+):
+    """``par6 scan`` is the commissioning view: a rescan of the bus, one
+    row per node id. On the simulator exactly the configured drives
+    answer, and the JSON form carries the fields a script keys on."""
+    import json
+
+    from par6.cli import main
+
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0) is True
+
+    assert (
+        main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(daemon.command_port),
+                "--json",
+                "scan",
+            ]
+        )
+        == 0
+    )
+    rows = json.loads(capsys.readouterr().out)
+    assert [r["node"] for r in rows] == list(range(16))
+    present = [r["node"] for r in rows if r["present"]]
+    assert present == [r["node"] for r in rows if r["configured"]]
+    assert len(present) >= 6
+    assert all(r["freshness"] == 1 for r in rows if r["configured"])

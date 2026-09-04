@@ -79,9 +79,16 @@ fn steady_state_ticks_allocate_nothing() {
     };
     let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(), hooks).expect("core");
 
-    // Warmup past boot one-shots, vendor config re-sends (tick 50/150/
-    // 300) and transient buffer growth anywhere in the stack.
-    for _ in 0..900 {
+    // Warmup past boot one-shots, the scheduled config re-send shots and
+    // transient buffer growth anywhere in the stack.
+    let last_shot = robot
+        .bus
+        .config_resend_offsets_s
+        .iter()
+        .map(|s| u64::from(robot.ticks(*s)))
+        .max()
+        .expect("the shipped config schedules re-send shots");
+    for _ in 0..(last_shot + 600) {
         core.tick(dt, false);
     }
     assert_eq!(handles.snapshots.latest().mode, Mode::Idle);
@@ -94,6 +101,25 @@ fn steady_state_ticks_allocate_nothing() {
             }
         },
         "IDLE",
+    );
+
+    // The config re-send shots themselves: a FLASHING exit re-arms the
+    // schedule, so the window covers every shot on a warmed-up core.
+    tx.send(RtCommand::AssertParked).unwrap();
+    core.tick(dt, false);
+    tx.send(RtCommand::SetMode(Mode::Flashing)).unwrap();
+    core.tick(dt, false);
+    assert_eq!(handles.snapshots.latest().mode, Mode::Flashing);
+    tx.send(RtCommand::SetMode(Mode::Idle)).unwrap();
+    core.tick(dt, false);
+    assert_eq!(handles.snapshots.latest().mode, Mode::Idle);
+    assert_no_allocs(
+        || {
+            for _ in 0..(last_shot + 20) {
+                core.tick(dt, false);
+            }
+        },
+        "config re-send shots",
     );
 
     // EXEC playback window: samples hold the measured pose; the ring was

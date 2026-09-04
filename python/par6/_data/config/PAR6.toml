@@ -496,6 +496,7 @@ stale_warn_s = 0.04 # 10 ticks @ 250 Hz — stale WARNING, self-clears
 lost_s = 0.2        # 50 ticks @ 250 Hz — disconnect ERROR, latched
 rx_frames_per_tick_cap = 32
 boot_config_repeats = 3
+config_resend_offsets_s = [0.2, 0.6, 1.2]  # full stored-config shots after the bus arms (vendor boot workaround)
 open_retry_s = 10.0  # startup keeps retrying a failed can0 open this long (boot race with the driver)
 config_pace_s = 0.0005 # ~0.5 ms per message-type batch (TX queue drops on overflow)
 watchdog_action = "idle"
@@ -509,17 +510,16 @@ rounds = 2
 rounds = 2
 wait_s = 0.0025
 
-# ========================================================== protocol (wire v2)
+# ========================================================== protocol (wire v3)
 # Only the :6001 command port is fixed by the wire contract; the rest are our defaults,
 # env-overridable at runtime (PAR6_* namespace).
 [protocol]
 command_port = 6001
 status_port = 6002
 status_multicast_group = "239.255.0.71"
-telemetry_port = 6003
-status_rate_hz = 50 # must divide the 250 Hz tick rate
-telemetry_rate_hz = 100
-# initial_recipe = "standard" # omitted = telemetry silent until set_recipe
+# The one broadcast every consumer subscribes to; raise it for capture
+# work. Must divide the 250 Hz tick rate exactly.
+status_rate_hz = 50
 
 # ============================================================ digital I/O lines
 # The control box's general-purpose lines, by BCM offset on the 40-pin header.
@@ -569,6 +569,34 @@ command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
 success_window_s = 0.4      # 100 ticks @ 250 Hz
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
+servo_grace_s = 0.25        # client silence that ends a servo stream (sim floors command_timeout_s at 2x this)
+
+[shutdown]
+# Retreat to a rest pose on process exit, before the drives are idled,
+# so an arm left mid-air does not drop when the terminal limp frame
+# lands. Off by default: a motion on shutdown must be asked for. Only a
+# homed, enabled, error-free arm retreats; the timeout is logged and the
+# exit continues from wherever the arm is.
+safe_park = false
+tolerance_rad = 0.03
+timeout_s = 15.0
+velocity_limit_rad_s = 0.25
+# safe_park_q = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]   # omitted = robot.park_pose_rad
+
+[freedrive]
+# Drift lock for freedrive (IDLE, homed, enabled, gravity comp on): once
+# the arm has been still for settle_s the pose is captured and held with
+# the drive's own impedance frame (the joints' gains.kp/kd, as the jog
+# PD pack uses) plus a slow clamped integral on the pose error, so a
+# slightly wrong gravity model no longer sags or lifts the arm. Any
+# joint moving faster than release_rad_s dissolves the lock on that tick
+# and zeroes the integral; stillness re-arms it at the new pose. Off by
+# default: it is a hold, and a hold must be asked for.
+drift_lock = false
+release_rad_s = 0.08
+settle_s = 0.3
+ki_nm_rad_s = 1.0
+integral_limit_nm = 0.3
 
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog
@@ -578,11 +606,14 @@ jog_l_linear_max_m_s = 0.08
 jog_l_angular_max_rad_s = 0.6
 cart_step_m = 0.01          # move_l pitch (vendor 10 mm / 2 deg)
 cart_step_rad = 0.034906585
-path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (0.15*rot)^2)
+path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (w*rot)^2)
 move_l_max_joint_step_rad = 0.35
 dls_lambda = 0.05
 settle_tolerance_rad = 0.01
 settle_timeout_s = 2.0
+path_rot_weight_m_per_rad = 0.15   # w: rotation weight in the multi-segment path metric [m/rad]
+singularity_cond_max = 1000.0      # near-singularity warning when a path sample's jacobian condition exceeds this ...
+singularity_sigma_min = 0.0001     # ... or its smallest singular value drops under this
 
 [limits]
 # External-torque envelope: hard fault when a joint's external-torque

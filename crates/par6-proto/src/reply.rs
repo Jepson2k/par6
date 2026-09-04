@@ -136,6 +136,32 @@ pub struct LoopStatsResult {
     pub rt_fifo: bool,
     /// Whether the RT thread is pinned to its configured CPU.
     pub rt_pinned: bool,
+    /// Fraction of streamed samples the executor consumed, over the
+    /// runtime's window \[0, 1\]. 0 before any stream has run.
+    pub stream_success_rate: f64,
+    /// Percentage of streamed samples discarded as too old or out of
+    /// order, over the same window.
+    pub stream_discard_pct: f64,
+}
+
+/// One node id's row of a BUS_SCAN result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BusNode {
+    /// CAN node id (0..=15).
+    pub node: u8,
+    /// The config lists this id (a joint drive or the CAN gripper).
+    pub configured: bool,
+    /// The id answered a ping (this scan or an earlier one this boot).
+    pub present: bool,
+    /// Runtime freshness of a configured node: 0 unknown, 1 fresh,
+    /// 2 stale, 3 lost. Always 0 for an unconfigured id.
+    pub freshness: u8,
+    /// Hardware version from the device-info sweep (0 = not reported).
+    pub hw_ver: u8,
+    /// Firmware version (0 = not reported).
+    pub sw_ver: u8,
+    /// Serial number (0 = not reported).
+    pub serial: i32,
 }
 
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
@@ -272,19 +298,13 @@ pub enum QueryResult {
         fingerprint: String,
         /// RT tick period \[s\].
         tick_dt_s: f64,
-        /// The `[motion]` feel constants, in declaration order:
-        /// `jog_l_linear_max_m_s, jog_l_angular_max_rad_s, cart_step_m,
-        /// cart_step_rad, move_l_max_joint_step_rad, dls_lambda,
-        /// settle_tolerance_rad, settle_timeout_s`.
-        motion: [f64; 8],
+        /// Every `[motion]` key in declaration order; the labels are
+        /// `MotionConfig::KEYS` in par6-config (13 entries), and an
+        /// omitted optional key (`joint_step_rad`) rides as NaN.
+        motion: [f64; 13],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
-        /// Active telemetry recipe name (`None` = telemetry off).
-        active_recipe: Option<String>,
-        /// Recipe names SET_RECIPE accepts — the discovery surface a
-        /// client selects from.
-        recipes: Vec<String>,
     },
     /// PAYLOAD result: the effective runtime payload (zeros = none).
     Payload {
@@ -295,6 +315,11 @@ pub enum QueryResult {
         /// Rotational inertia about the COM, ee-frame axes,
         /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\].
         inertia: [f64; 6],
+    },
+    /// BUS_SCAN result: one row per node id, 0..=15 in order.
+    BusScan {
+        /// Every node id's row.
+        nodes: Vec<BusNode>,
     },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
@@ -347,6 +372,7 @@ impl QueryResult {
             Q::ConfigBundle { .. } => QueryType::ConfigBundle,
             Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
+            Q::BusScan { .. } => QueryType::BusScan,
         }
     }
 }
@@ -507,7 +533,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_str(buf, params);
         }
         Q::LoopStats(s) => {
-            w_array(buf, 17);
+            w_array(buf, 19);
             w_uint(buf, u64::from(tag));
             w_f64(buf, s.target_hz);
             w_uint(buf, s.loop_count);
@@ -525,6 +551,8 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, s.can_frame_age_max_ticks);
             w_bool(buf, s.rt_fifo);
             w_bool(buf, s.rt_pinned);
+            w_f64(buf, s.stream_success_rate);
+            w_f64(buf, s.stream_discard_pct);
         }
         Q::Profile { profile } => {
             w_array(buf, 2);
@@ -578,10 +606,8 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             tick_dt_s,
             motion,
             joints,
-            active_recipe,
-            recipes,
         } => {
-            w_array(buf, 8);
+            w_array(buf, 6);
             w_uint(buf, u64::from(tag));
             w_str(buf, path);
             w_str(buf, fingerprint);
@@ -596,14 +622,6 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
-            }
-            match active_recipe {
-                Some(name) => w_str(buf, name),
-                None => w_nil(buf),
-            }
-            w_array(buf, recipes.len());
-            for name in recipes {
-                w_str(buf, name);
             }
         }
         Q::ConfigBundle {
@@ -637,6 +655,21 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 6);
             for v in inertia {
                 w_f64(buf, *v);
+            }
+        }
+        Q::BusScan { nodes } => {
+            w_array(buf, 2);
+            w_uint(buf, u64::from(tag));
+            w_array(buf, nodes.len());
+            for n in nodes {
+                w_array(buf, 7);
+                w_uint(buf, u64::from(n.node));
+                w_bool(buf, n.configured);
+                w_bool(buf, n.present);
+                w_uint(buf, u64::from(n.freshness));
+                w_uint(buf, u64::from(n.hw_ver));
+                w_uint(buf, u64::from(n.sw_ver));
+                w_int(buf, i64::from(n.serial));
             }
         }
         Q::Shapes {
@@ -771,6 +804,34 @@ fn r_u8_fixed<const N: usize>(
 /// and abort the client on `handle_alloc_error`.
 const MAX_REPLY_STRINGS: usize = 512;
 
+fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
+    let n = crate::command::r_len(r, "bus scan node list", 16)?;
+    let small = |v: u64, what: &'static str| {
+        u8::try_from(v).map_err(|_| DecodeError::Validation {
+            what,
+            why: "must fit a byte".into(),
+        })
+    };
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        let arity = r.array_len()?;
+        expect_arity("bus scan node row", arity, 7)?;
+        out.push(BusNode {
+            node: small(r.uint()?, "bus_scan.node")?,
+            configured: r.bool()?,
+            present: r.bool()?,
+            freshness: small(r.uint()?, "bus_scan.freshness")?,
+            hw_ver: small(r.uint()?, "bus_scan.hw_ver")?,
+            sw_ver: small(r.uint()?, "bus_scan.sw_ver")?,
+            serial: i32::try_from(r.int()?).map_err(|_| DecodeError::Validation {
+                what: "bus_scan.serial",
+                why: "must fit i32".into(),
+            })?,
+        });
+    }
+    Ok(out)
+}
+
 fn r_strings(r: &mut Reader<'_>) -> Result<Vec<String>, DecodeError> {
     let n = crate::command::r_len(r, "reply string list", MAX_REPLY_STRINGS)?;
     let mut out = Vec::with_capacity(n);
@@ -895,7 +956,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::LoopStats => {
-            expect_arity("loop_stats result", n, 17)?;
+            expect_arity("loop_stats result", n, 19)?;
             QueryResult::LoopStats(LoopStatsResult {
                 target_hz: r.f64()?,
                 loop_count: r.uint()?,
@@ -913,6 +974,8 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 can_frame_age_max_ticks: r.uint()?,
                 rt_fifo: r.bool()?,
                 rt_pinned: r.bool()?,
+                stream_success_rate: r.f64()?,
+                stream_discard_pct: r.f64()?,
             })
         }
         T::Profile => {
@@ -963,7 +1026,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             QueryResult::IsSimulator { active: r.bool()? }
         }
         T::ConfigInfo => {
-            expect_arity("config_info result", n, 8)?;
+            expect_arity("config_info result", n, 6)?;
             let path = r.str()?.to_owned();
             let fingerprint = r.str()?.to_owned();
             let tick_dt_s = r.f64()?;
@@ -982,21 +1045,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             for _ in 0..jn {
                 joints.push(r_f64_fixed(r, "config_info.joints[]")?);
             }
-            let active_recipe = if r.peek_nil() {
-                r.nil()?;
-                None
-            } else {
-                Some(r.str()?.to_owned())
-            };
-            let recipes = r_strings(r)?;
             QueryResult::ConfigInfo {
                 path,
                 fingerprint,
                 tick_dt_s,
                 motion,
                 joints,
-                active_recipe,
-                recipes,
             }
         }
         T::ConfigBundle => {
@@ -1034,6 +1088,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 mass: r.f64()?,
                 com: r_f64_fixed(r, "payload.com")?,
                 inertia: r_f64_fixed(r, "payload.inertia")?,
+            }
+        }
+        T::BusScan => {
+            expect_arity("bus scan result", n, 2)?;
+            QueryResult::BusScan {
+                nodes: r_bus_nodes(r)?,
             }
         }
         T::Shapes => {

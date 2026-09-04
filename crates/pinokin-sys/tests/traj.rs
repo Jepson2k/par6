@@ -295,6 +295,9 @@ fn rejects_degenerate_inputs_across_the_ffi() {
             vel.as_ptr(),
             acc.as_ptr(),
             0,
+            std::ptr::null(),
+            3,
+            0.0,
             err.as_mut_ptr(),
             err.len() as i32,
         );
@@ -318,4 +321,82 @@ fn rejects_degenerate_inputs_across_the_ffi() {
             ffi::PAR6_ERR_INVALID_ARG
         );
     }
+}
+
+/// Distance from `p` to the polyline through `way` (`n x nq`, row-major).
+fn distance_to_polyline(p: &[f64], way: &[f64], nq: usize) -> f64 {
+    let n = way.len() / nq;
+    let mut best = f64::INFINITY;
+    for i in 0..n - 1 {
+        let a = &way[i * nq..(i + 1) * nq];
+        let b = &way[(i + 1) * nq..(i + 2) * nq];
+        let mut num = 0.0;
+        let mut den = 0.0;
+        for j in 0..nq {
+            num += (p[j] - a[j]) * (b[j] - a[j]);
+            den += (b[j] - a[j]) * (b[j] - a[j]);
+        }
+        let t = if den > 0.0 {
+            (num / den).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let mut d = 0.0;
+        for j in 0..nq {
+            let q = a[j] + t * (b[j] - a[j]);
+            d += (p[j] - q) * (p[j] - q);
+        }
+        best = best.min(d.sqrt());
+    }
+    best
+}
+
+/// A degree-1 path stays ON the chain it was handed; a cubic spline bows
+/// off it between the waypoints. That bow is curvature nobody asked for,
+/// and curvature is acceleration — so the two must be distinguishable
+/// here, not merely differently spelled.
+#[test]
+fn linear_degree_keeps_the_path_on_the_waypoints() {
+    let nq = 6usize;
+    // A polyline with genuine corners: a cubic spline through these
+    // overshoots, a linear path cannot.
+    let way: Vec<f64> = vec![
+        0.0, 0.0, 0.0, 0.0, 0.0, 0.0, //
+        0.4, 0.1, -0.2, 0.0, 0.1, 0.0, //
+        0.2, 0.5, 0.3, 0.1, -0.2, 0.1, //
+        0.6, 0.2, 0.0, -0.1, 0.3, 0.0, //
+    ];
+    let vel = vec![1.0; nq];
+    let acc = vec![4.0; nq];
+
+    let mut worst = [0.0f64; 2];
+    for (slot, degree) in [
+        (0usize, pinokin_sys::PathDegree::Linear),
+        (1, pinokin_sys::PathDegree::Cubic),
+    ] {
+        let traj = Trajectory::parameterize_with(&way, nq, &vel, &acc, None, None, degree, None)
+            .expect("plan");
+        let duration = traj.duration();
+        let mut q = vec![0.0; nq];
+        let mut qd = vec![0.0; nq];
+        let mut qdd = vec![0.0; nq];
+        for k in 0..=400 {
+            let t = duration * k as f64 / 400.0;
+            traj.sample_into(t, &mut q, &mut qd, &mut qdd)
+                .expect("sample");
+            worst[slot] = worst[slot].max(distance_to_polyline(&q, &way, nq));
+        }
+    }
+
+    assert!(
+        worst[0] < 1e-9,
+        "a degree-1 path left the waypoint chain by {:.3e} rad",
+        worst[0]
+    );
+    assert!(
+        worst[1] > 1e-3,
+        "the cubic spline tracked the chain to {:.3e} rad — this test no \
+         longer distinguishes the two path types",
+        worst[1]
+    );
 }

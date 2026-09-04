@@ -1,87 +1,18 @@
 //! The session rules the live server and the offline preview both run:
-//! what the gate refuses, when a blend chain holds for its successor,
-//! and what a stop, an e-stop or a reset leaves standing. One
-//! implementation, so a rule changed here changes on both sides — the
-//! preview promises to reproduce the server's refusals, and it can only
-//! keep that promise by running the server's code.
+//! when a blend chain holds for its successor, and what a stop, an
+//! e-stop or a reset leaves standing. One implementation, so a rule
+//! changed here changes on both sides — the preview promises to
+//! reproduce the server's behaviour, and it can only keep that promise
+//! by running the server's code. The gate itself lives in
+//! [`crate::gating`], which both sides call the same way.
 
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
-use par6_proto::{make_error, CmdType, Command, ErrorCode, WireError, UNATTRIBUTED};
+use par6_proto::{make_error, Command, ErrorCode, WireError, UNATTRIBUTED};
 
-use crate::gating::gate;
 use crate::runtime::blend_radius_mm;
-
-/// What the gate table is checked against.
-#[derive(Debug, Clone, Copy)]
-pub struct GateInputs {
-    /// An e-stop stands until a reset.
-    pub estop_latched: bool,
-    /// The RT core's own ENABLED state. A FLASHING window reports
-    /// disabled, so a preview modelling one sets this false rather than
-    /// inventing a refusal of its own.
-    pub enabled: bool,
-    /// The arm holds its references.
-    pub homed: bool,
-    /// The simulator backend is selected.
-    pub simulator: bool,
-}
-
-/// The refusal the gate table gives `tag` under `inputs`, if any.
-pub fn check_gate(tag: CmdType, inputs: GateInputs) -> Option<WireError> {
-    let g = gate(tag);
-    if g.needs_enabled {
-        if inputs.estop_latched {
-            return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
-        }
-        if !inputs.enabled {
-            return Some(make_error(
-                ErrorCode::SysControllerDisabled,
-                UNATTRIBUTED,
-                &[("detail", "The RT core reports DISABLED.")],
-            ));
-        }
-    }
-    if g.needs_homed && !inputs.homed {
-        return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
-    }
-    if g.needs_simulator && !inputs.simulator {
-        return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
-    }
-    None
-}
-
-/// What a SYSTEM verb does to motion in flight. The server maps each
-/// onto the RT and its sockets; the preview onto its virtual arm.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MotionEffect {
-    /// Nothing planned is touched.
-    Keep,
-    /// The executing command stops; the queue is kept unless `clear`.
-    Stop {
-        /// Drop the queued commands as well as the executing one.
-        clear: bool,
-    },
-    /// Everything planned goes: e-stop, reset, a bus swap.
-    CancelAll,
-}
-
-/// The effect `cmd` has on planned motion.
-pub fn motion_effect(cmd: &Command) -> MotionEffect {
-    match cmd {
-        Command::Stop(p) => MotionEffect::Stop {
-            clear: p.clear_queue,
-        },
-        Command::Estop
-        | Command::ResetState
-        | Command::Simulator(_)
-        | Command::ConnectHardware(_)
-        | Command::EnterFlashing(_) => MotionEffect::CancelAll,
-        _ => MotionEffect::Keep,
-    }
-}
 
 /// The queued commands not yet handed to the planner, with the blend
 /// hold rule: the last one asks to round its corner into a successor

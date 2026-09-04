@@ -18,13 +18,18 @@ use crate::state::ExecStatus;
 use crate::MAX_JOINTS;
 
 /// Outcome of one playback tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ExecTick {
     /// A sample (or a hold) was emitted.
     Ok,
     /// The settle policy faulted (strict timeout) — the caller latches
     /// the hard error; playback freezes in a hold.
-    Fault,
+    Fault {
+        /// Joint furthest from its target when the window closed.
+        joint: u8,
+        /// That joint's residual \[rad\].
+        residual_rad: f64,
+    },
 }
 
 /// The EXEC playback engine. One per RT core; owns the consumer half of
@@ -62,6 +67,8 @@ impl ExecPlayback {
     }
 
     /// EXEC-mode entry: hold at the measured pose until samples arrive.
+    /// A pause requested before entry stands: the operator who paused an
+    /// idle arm expects the next program to start held, not moving.
     pub fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
         self.hold_q = *q_meas;
         self.last_meta = None;
@@ -69,7 +76,6 @@ impl ExecPlayback {
         self.settling = false;
         self.active_cmd = 0;
         self.completed = 0;
-        self.paused = false;
         self.faulted = false;
     }
 
@@ -125,10 +131,16 @@ impl ExecPlayback {
                     self.completed = self.armed_cmd;
                     // fall through: playback resumes this tick
                 }
-                SettleVerdict::Fault => {
+                SettleVerdict::Fault {
+                    joint,
+                    residual_rad,
+                } => {
                     self.faulted = true;
                     self.settling = false;
-                    return ExecTick::Fault;
+                    return ExecTick::Fault {
+                        joint,
+                        residual_rad,
+                    };
                 }
             }
         }
@@ -178,6 +190,19 @@ impl ExecPlayback {
     /// Samples currently queued in the ring.
     pub fn samples_remaining(&self) -> usize {
         self.consumer.samples_remaining()
+    }
+
+    /// Nothing left to play: the ring is drained, every boundary has
+    /// resolved and no settle is pending — the engine is emitting a
+    /// hold at the last sample, which is a position hold and nothing
+    /// more. Paused or faulted playback is NOT idle: both still own the
+    /// program.
+    pub fn is_holding_after_completion(&self) -> bool {
+        !self.paused
+            && !self.faulted
+            && !self.settling
+            && self.owe_boundary.is_none()
+            && self.consumer.samples_remaining() == 0
     }
 
     /// Live state for the snapshot.

@@ -1009,13 +1009,20 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     run_calibration(&mut rig).expect("re-calibration failed");
     let mut prev = rig.state.gripper.reply.unwrap().position;
     let mut saw_moving = false;
-    for _ in 0..u64::from(robot.ticks(2.5)) {
+    for tick in 0..u64::from(robot.ticks(2.5)) {
         rig.step(&cmds, &move_to(252));
         let r = rig.state.gripper.reply.unwrap();
         assert!(r.position >= prev, "close travel reversed");
-        if r.action_status {
+        // `action_status` echoes the commanded action bit, which the
+        // replay holds set for the whole move — it never reports
+        // arrival, so a completion keyed on it would wait forever.
+        // Travel is reported by `object_detection` alone. (Tick 0's
+        // reply still describes the state before the command landed.)
+        if tick > 0 {
+            assert!(r.action_status, "action_status stopped echoing the command");
+        }
+        if r.object_detection == ObjectDetection::Moving {
             saw_moving = true;
-            assert_eq!(r.object_detection, ObjectDetection::Moving);
         }
         prev = r.position;
     }
@@ -1023,7 +1030,10 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     assert!(saw_moving, "no moving phase observed");
     assert_eq!(r.position, 252);
     assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
-    assert!(!r.action_status);
+    assert!(
+        r.action_status,
+        "the standing command is still asserted after arrival"
+    );
     assert_eq!(r.current_ma, 0, "current at rest");
 
     // An object between the jaws jams the close early: detection code 1,
@@ -1713,9 +1723,13 @@ mod mujoco {
             ObjectDetection::DetectedClosing,
             "no object detected while closing (reply {r:?})"
         );
+        // `action_status` echoes the COMMANDED action bit, not motion, so
+        // the grip that is being held reads as still asserted — which is
+        // the invariant that keeps the jaws clamped. Arrival and contact
+        // are `object_detection`'s to report, asserted above.
         assert!(
-            !r.action_status,
-            "still reported moving while pressing the object"
+            r.action_status,
+            "the standing grip must still be asserted while it presses"
         );
         assert!(
             r.position > 100 && r.position < 240,
@@ -1866,5 +1880,41 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
     assert!(
         rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
         "drive did not resume after clear-error"
+    );
+}
+
+/// The kinematic plant drives on the loop's own feedback share: a torque
+/// feedforward that alone saturates Ilim (shoulder gravity at homing
+/// current) must not cancel the position error out of the command.
+#[test]
+fn a_saturating_feedforward_does_not_cancel_the_position_loop() {
+    let robot = par6();
+    let mut rig = Rig::boot(&robot, None, None);
+    let node = usize::from(robot.joints[0].node_id);
+    let mut cmds = rig.idle_cmds();
+    // Polls rotate over the nodes; wait for this one's first answer.
+    let mut start = None;
+    for _ in 0..20 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+        start = rig.state.nodes[node].position_ticks;
+        if start.is_some() {
+            break;
+        }
+    }
+    let start = start.expect("the sim answers the polls");
+
+    // Position mode with the feedforward channel pinned far past Ilim.
+    let target = start + 4000;
+    cmds[0] = JointCommand::position(target, 0, i16::MAX);
+    for _ in 0..200 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    let now = rig.state.nodes[node].position_ticks.expect("polled");
+    assert!(
+        now - start > 500,
+        "the joint must close on its target under a saturating feedforward: \
+         moved {} ticks of {}",
+        now - start,
+        target - start
     );
 }

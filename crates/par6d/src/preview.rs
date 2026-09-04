@@ -22,8 +22,9 @@ use par6_rt::{
     Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    cmd_name, decode_error_to_wire, registry_fault, session, validate_supported, write_io_fault,
-    PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
+    check_gate, cmd_name, decode_error_to_wire, pid_gains_fault, session, validate_registries,
+    validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext, Planner,
+    QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -31,7 +32,7 @@ use crate::bridge::{
     step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate, HOUSEKEEPING_PERIOD,
     STREAM_LOOKAHEAD_S,
 };
-use crate::daemon::{load_kin_stack, DaemonError};
+use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::CartKin;
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
@@ -110,6 +111,21 @@ impl PreviewResult {
         }
         out
     }
+}
+
+/// What the runtime's streaming limiter would command, tick by tick,
+/// for a sequence of servo targets — the offline half of a bring-up
+/// limiter check, run through the same jerk-limited executor and
+/// soft-limit clamp the RT ticks.
+#[derive(Debug, Clone)]
+pub struct ServoPreview {
+    /// Commanded joint positions per tick \[rad\] (post-clamp).
+    pub q: Vec<[f64; MAX_JOINTS]>,
+    /// Commanded joint velocities per tick \[rad/s\].
+    pub qd: Vec<[f64; MAX_JOINTS]>,
+    /// The tick the limiter first reported the LAST target reached, if
+    /// it did inside the window.
+    pub finished_tick: Option<usize>,
 }
 
 /// The offline session: a virtual arm plus the runtime's planner,
@@ -201,7 +217,7 @@ impl Preview {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
-        let stack = load_kin_stack(&opts, &config_path, robot, bundle.active_gripper())?;
+        let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -242,7 +258,7 @@ impl Preview {
         let mut preview = Self {
             planner,
             jog,
-            cart: stack.housekeeping,
+            cart: stack.cart,
             soft_min: stream_limits.soft_min,
             soft_max: stream_limits.soft_max,
             snap,
@@ -331,6 +347,11 @@ impl Preview {
     pub fn set_homed(&mut self, homed: bool) {
         self.snap.homed = homed;
         self.publish();
+    }
+    /// Move the virtual arm instantly — the preview's teleport, under
+    /// the name the wire command carries.
+    pub fn teleport_rad(&mut self, q: [f64; MAX_JOINTS]) {
+        self.place_rad(q);
     }
 
     /// Move the virtual arm instantly without the wire's checks — the
@@ -476,15 +497,67 @@ impl Preview {
     /// FLASHING window is what the RT reports it as — disabled — rather
     /// than a refusal of the preview's own wording.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
-        session::check_gate(
+        check_gate(
             command.tag(),
-            session::GateInputs {
+            &GateContext {
                 estop_latched: self.latches.estop_latched,
                 enabled: !self.flashing,
                 homed: self.snap.homed,
                 simulator: self.simulator,
             },
         )
+    }
+
+    /// Preview a servo stream: each target in `targets` is held for
+    /// `hold_ticks` ticks (the first setpoint sits at the virtual pose,
+    /// as the RT's start-pose gate demands of a real stream), through the
+    /// same jerk-limited executor, limit fractions and soft-limit clamp
+    /// the RT core drives. The virtual arm does not move: this is a
+    /// limiter measurement, not a motion.
+    pub fn preview_servo(
+        &mut self,
+        targets: &[[f64; MAX_JOINTS]],
+        hold_ticks: usize,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> ServoPreview {
+        let hold = hold_ticks.max(1);
+        self.stream
+            .set_scale(speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        self.stream.activate(&self.snap.q);
+        let mut out = ServoPreview {
+            q: Vec::with_capacity(targets.len() * hold),
+            qd: Vec::with_capacity(targets.len() * hold),
+            finished_tick: None,
+        };
+        let last = targets.len().saturating_sub(1);
+        for (i, target) in targets.iter().enumerate() {
+            self.stream.set_target(target);
+            for _ in 0..hold {
+                let mut q = [0.0; MAX_JOINTS];
+                let mut qd = [0.0; MAX_JOINTS];
+                self.stream.step(&mut q, &mut qd);
+                if i == last && out.finished_tick.is_none() && self.stream.at_target() {
+                    out.finished_tick = Some(out.q.len());
+                }
+                out.q.push(q);
+                out.qd.push(qd);
+            }
+        }
+        self.stream.set_scale(1.0, 1.0);
+        out
+    }
+
+    /// Whether the virtual gripper holds a calibration: the runtime
+    /// refuses a jaw move on an uncalibrated gripper, and a previewed
+    /// `calibrate` action establishes one.
+    pub fn set_gripper_calibrated(&mut self, calibrated: bool) {
+        self.snap.gripper.reply = Some(par6_bus::GripperReply {
+            calibrated,
+            ..par6_bus::GripperReply::default()
+        });
+        self.snap.gripper.data_age_ticks = 0;
+        self.publish();
     }
 
     /// The payload the virtual arm carries.
@@ -590,7 +663,7 @@ impl Preview {
     fn submit_queued(&mut self, command: Command) -> PreviewResult {
         if let Some(error) = self
             .check_gate(&command)
-            .or_else(|| registry_fault(&command, &self.cfg))
+            .or_else(|| validate_registries(&self.cfg, &command))
             .or_else(|| validate_supported(&self.cfg, &command))
         {
             return self.refuse(error);
@@ -789,25 +862,13 @@ impl Preview {
                 }
             }
             Command::SetPidGains(p) => {
-                if !self.cfg.tunable_nodes.contains(&p.node) {
-                    return self.refuse(detail(format!(
-                        "set_pid_gains node {} is not a configured drive (tunable nodes: {:?})",
-                        p.node, self.cfg.tunable_nodes
-                    )));
+                if let Some(error) = pid_gains_fault(&p, &self.cfg) {
+                    return self.refuse(error);
                 }
             }
             Command::SetCompletionPolicy(p) => {
                 self.policy = p.policy;
                 self.sync_planner();
-            }
-            Command::SetRecipe(p) => {
-                if !self.cfg.recipes.iter().any(|r| r.name == p.name) {
-                    return self.refuse(make_error(
-                        ErrorCode::CommUnknownRecipe,
-                        UNATTRIBUTED,
-                        &[("name", &p.name)],
-                    ));
-                }
             }
             Command::EnterFlashing(_) => {
                 self.held.clear();
@@ -1062,7 +1123,7 @@ impl Preview {
             }
             if let Some(error) = self
                 .check_gate(&rest[0])
-                .or_else(|| registry_fault(&rest[0], &self.cfg))
+                .or_else(|| validate_registries(&self.cfg, &rest[0]))
                 .or_else(|| validate_supported(&self.cfg, &rest[0]))
             {
                 results.push(self.refuse(error));
@@ -1117,7 +1178,7 @@ impl Preview {
     /// to where it ends, and cancel it (nothing executes here).
     fn collect_plan(&mut self, head: &Command) -> PreviewResult {
         let (trajectory, duration_s): (Vec<[f64; MAX_JOINTS]>, f64) =
-            match self.planner.planned_motion() {
+            match self.planner.planned_motion(self.snap.tick) {
                 PlannedMotion::Exec(samples) => {
                     let q: Vec<_> = samples.iter().map(|s| s.q).collect();
                     let duration = q.len() as f64 * self.dt;
@@ -1131,7 +1192,7 @@ impl Preview {
                     self.snap.homed = true;
                     (vec![self.ready_pose], 0.0)
                 }
-                PlannedMotion::Wait { ticks } => (Vec::new(), ticks as f64 * self.dt),
+                PlannedMotion::Hold(ticks) => (Vec::new(), ticks as f64 * self.dt),
                 PlannedMotion::Still => (Vec::new(), 0.0),
             };
         self.planner.cancel();

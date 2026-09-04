@@ -35,7 +35,6 @@ from .constants import (
 )
 from .wire import (
     MAX_JOG_DURATION_S,
-    ProtocolError,
     StatusBuffer,
     ToolStatusWire,
     update_status_from_dict,
@@ -64,7 +63,6 @@ __all__ = [
     "QueryType",
     "ToolState",
     # wire
-    "ProtocolError",
     "StatusBuffer",
     "ToolStatusWire",
     "update_status_from_dict",

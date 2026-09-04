@@ -32,9 +32,11 @@ pub mod collision_world;
 pub mod daemon;
 mod grant;
 pub mod kin;
+pub mod logging;
 pub mod options;
 mod planner;
 pub mod preview;
+pub mod vitals;
 
 pub use daemon::{Daemon, DaemonError, COLLISION_CLEARANCE_M};
 pub use kin::{matrix_to_xyzrpy, translate_local};

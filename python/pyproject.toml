@@ -15,13 +15,24 @@ dependencies = [
 
 [project.scripts]
 par6 = "par6.cli:main"
+par6-panel = "par6.panel.service:main"
+par6-preflight = "par6.panel.preflight:main"
 
 [project.optional-dependencies]
 # ruff is pinned: it was unpinned and unconfigured, so CI installed whatever
 # was newest and linted against that version's default rule set while devs ran
 # an older one — every push was red on rules the code had never been checked
 # against. The pin and the explicit `select` below are what make the two agree.
-dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout"]
+# pyserial is here so `serial` resolves for the type checker: the panel's
+# other optional imports (board, busio, adafruit, gpiozero) need real
+# hardware wheels and carry `ty: ignore`, but a muted pyserial would be an
+# ignore that is used on CI and unused on any box that has it — a gate that
+# passes or fails on what happens to be installed.
+dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout", "pillow", "pyserial"]
+# The control box front panel (`par6-panel`, `par6-preflight`): PIL draws the
+# OLED frames, gpiozero owns the buttons and LEDs, the Adafruit driver talks
+# to the SSD1306 over I2C, pyserial to the mainboard PCB.
+panel = ["pillow", "gpiozero", "adafruit-circuitpython-ssd1306", "pyserial"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"

@@ -164,8 +164,10 @@ int32_t par6_kin_ik_step(par6_kin *h,
 typedef struct par6_traj par6_traj;
 
 /* Time-optimal rest-to-rest parameterization of a joint-space path (TOPPRA).
- * The waypoints are interpolated with a natural cubic spline over a unit
- * path parameter, then re-timed to be as fast as the symmetric limits allow:
+ * The waypoints are interpolated over a path parameter (`degree` 1 for
+ * straight lines between them, 3 for a natural cubic spline; `knots` gives
+ * the parameter each waypoint sits at, NULL for even spacing), then
+ * re-timed to be as fast as the symmetric limits allow:
  * |qd| <= vel_limit and |qdd| <= acc_limit componentwise along the whole
  * trajectory, with zero start and end joint velocity.
  *
@@ -187,6 +189,8 @@ par6_traj *par6_traj_create(const double *waypoints, int32_t n_waypoints,
                             int32_t nq,
                             const double *vel_limit, const double *acc_limit,
                             int32_t n_gridpoints,
+                            const double *knots, int32_t degree,
+                            double max_path_speed,
                             char *err_buf, int32_t err_len);
 
 void par6_traj_destroy(par6_traj *h);

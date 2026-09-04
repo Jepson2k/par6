@@ -9,7 +9,6 @@ What remains Python-side is the shared client-facing state:
   keep zero-allocation reads (and stable array identities) on the hot path.
 - :func:`update_status_from_dict` — the one filler, slice-assigning a
   frame dict from the extension into a buffer.
-- :class:`ProtocolError` — the wire-contract violation exception.
 
 Constants come from the generated :mod:`par6.protocol.constants`;
 ``MAX_JOG_DURATION_S`` is re-exported from the extension (the Rust codec
@@ -39,15 +38,10 @@ from .constants import (
 
 __all__ = [
     "MAX_JOG_DURATION_S",
-    "ProtocolError",
     "StatusBuffer",
     "ToolStatusWire",
     "update_status_from_dict",
 ]
-
-
-class ProtocolError(Exception):
-    """A payload violated the wire contract (bad type, arity, or range)."""
 
 
 #: Reusable tool-status slot of a :class:`StatusBuffer`.
@@ -63,9 +57,9 @@ ToolStatusWire = ToolStatus
 class StatusBuffer:
     """Preallocated buffer for zero-allocation STATUS consumption.
 
-    Numeric arrays are numpy; :func:`update_status_from_dict` fills the
-    buffer with slice assignment, so array identities are stable across
-    frames and consumers may hold views.
+    Numeric arrays are numpy and the list/dict fields are mutated in place:
+    :func:`update_status_from_dict` never rebinds a container, so every
+    identity is stable across frames and consumers may hold views.
     """
 
     # v2 header
@@ -109,6 +103,8 @@ class StatusBuffer:
     tcp_speed: float = 0.0
     simulator_active: bool = False
     collision_active: bool = False
+    paused: bool = False
+    """EXEC playback is holding in place with its sample ring untouched."""
     collision_pairs: list[tuple[str, str]] = field(default_factory=list)
     scene_epoch: int = 0
     accepted_index: int = -1
@@ -127,21 +123,16 @@ class StatusBuffer:
 
     @property
     def freedrive(self) -> bool:
-        """Whether the arm is back-driveable right now.
+        """Whether the arm is back-driveable right now: idle with the
+        gravity feedforward applied.
 
-        Not "was freedrive requested" — the runtime applies the gravity
-        feedforward only while referenced, enabled and idle (its own
-        ``gravity_applied()``), and keeps a hold term on the joints
-        otherwise. A command that was accepted but cannot yet take effect
-        reports False here, so nobody is told an arm is safe to grab on
-        the strength of a flag.
+        ``gravity_comp`` is the runtime's own "applied this tick" flag
+        (referenced, enabled and requested), not the request, so a
+        command that was accepted but cannot yet take effect reports
+        False here and nobody is told an arm is safe to grab on the
+        strength of a flag.
         """
-        return bool(
-            self.mode == ControllerMode.IDLE
-            and self.homed
-            and self.enabled
-            and self.gravity_comp
-        )
+        return bool(self.mode == ControllerMode.IDLE and self.gravity_comp)
 
     link_health: dict = field(default_factory=dict)
     """Motor-bus link health: ``state`` (a ``LinkState`` value),
@@ -154,6 +145,13 @@ class StatusBuffer:
     )
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
+    drive_health: dict = field(default_factory=dict)
+    """Per-drive analog readings: ``temperatures_c`` and ``currents_ma``
+    (per node, arm joints first, ``NaN`` where a node has not answered
+    that register) and ``bus_voltage_v`` (the lowest any node reports,
+    None when none has)."""
+    loop_health: dict = field(default_factory=dict)
+    """Control-loop health: ``p99_period_s`` and ``overruns``."""
     # Aliases into the two enable arrays the filler mutates in place.
     cart_en: dict[str, np.ndarray] = field(init=False, repr=False, compare=False)
 
@@ -168,6 +166,12 @@ def _int_array(arr: np.ndarray, values: list) -> np.ndarray:
         arr[:] = values
         return arr
     return np.asarray(values, dtype=arr.dtype)
+
+
+def _enum(current, kind, value):
+    """*current* when it already carries *value*, else *value* re-wrapped in
+    *kind* — one enum construction per change, not per frame."""
+    return current if current == value else kind(value)
 
 
 def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
@@ -188,7 +192,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.speeds[:] = d["speeds"]
     buf.io = _int_array(buf.io, d["io"])
     buf.action_current = d["action_current"]
-    buf.action_state = ActionState(d["action_state"])
+    buf.action_state = _enum(buf.action_state, ActionState, d["action_state"])
     buf.joint_en[:] = d["joint_en"]
     buf.cart_en_wrf[:] = d["cart_en_wrf"]
     buf.cart_en_trf[:] = d["cart_en_trf"]
@@ -207,7 +211,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
         buf.tool_status_present = True
         ts = buf.tool_status
         ts.key = tool["key"]
-        ts.state = ToolState(tool["state"])
+        ts.state = _enum(ts.state, ToolState, tool["state"])
         ts.engaged = tool["engaged"]
         ts.part_detected = tool["part_detected"]
         ts.fault_code = tool["fault_code"]
@@ -217,22 +221,32 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     buf.tcp_speed = d["tcp_speed"]
     buf.simulator_active = d["simulator_active"]
     buf.collision_active = d["collision_active"]
-    buf.collision_pairs = [tuple(p) for p in d["collision_pairs"]]
+    buf.paused = d["paused"]
+    buf.collision_pairs[:] = map(tuple, d["collision_pairs"])
     buf.scene_epoch = d["scene_epoch"]
     buf.accepted_index = d["accepted_index"]
     buf.homed = d["homed"]
     buf.torques[:] = d["torques"]
-    buf.mode = ControllerMode(d["mode"])
+    buf.mode = _enum(buf.mode, ControllerMode, d["mode"])
     buf.enabled = d["enabled"]
     buf.gravity_comp = d["gravity_comp"]
-    buf.warnings = [tuple(w) for w in d["warnings"]]
-    link = dict(d["link_health"])
-    link["state"] = LinkState(link["state"])
-    buf.link_health = link
-    homing = dict(d["homing"])
-    homing["joints"] = [
-        (HomingJointState(state), HomingPhase(phase))
-        for state, phase in homing["joints"]
-    ]
-    buf.homing = homing
+    buf.warnings[:] = map(tuple, d["warnings"])
+    link = buf.link_health
+    for key, value in d["link_health"].items():
+        link[key] = _enum(link.get(key), LinkState, value) if key == "state" else value
+    homing = buf.homing
+    raw = d["homing"]
+    homing["active"] = raw["active"]
+    homing["sequence_step"] = raw["sequence_step"]
+    joints = homing.setdefault("joints", [])
+    fresh = []
+    for i, (state, phase) in enumerate(raw["joints"]):
+        prev = joints[i] if i < len(joints) else None
+        if prev is not None and prev[0] == state and prev[1] == phase:
+            fresh.append(prev)
+        else:
+            fresh.append((HomingJointState(state), HomingPhase(phase)))
+    joints[:] = fresh
     buf.torques_ext[:] = d["torques_ext"]
+    buf.drive_health = dict(d["drive_health"])
+    buf.loop_health = dict(d["loop_health"])

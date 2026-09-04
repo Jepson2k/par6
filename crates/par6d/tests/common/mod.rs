@@ -72,6 +72,57 @@ pub fn config_with_interface(iface: &str) -> PathBuf {
     path
 }
 
+/// Write `bytes` to `dst` so a concurrent reader never sees a torn file.
+///
+/// `fs::write` and `fs::copy` truncate and then fill, and a test that
+/// boots a daemon while another is in that window reads an empty config
+/// and fails with "missing field `robot`". Writing beside the target and
+/// renaming leaves a reader with either the whole old file or the whole
+/// new one — and the content is a pure function of `(tag, dt)`, so which
+/// one it gets does not matter.
+fn write_atomic(dst: &std::path::Path, bytes: &[u8]) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dst.with_extension(format!("tmp.{n}"));
+    std::fs::write(&tmp, bytes).expect("write test config");
+    std::fs::rename(&tmp, dst).expect("publish test config");
+}
+
+/// The shipped config re-timed to `dt` seconds per tick, written with its
+/// gripper files into a scratch directory named for `tag`.
+///
+/// Tests sharing a tag share the tree, which is why every file lands
+/// through [`write_atomic`]: the content is identical for a given
+/// `(tag, dt)`, so concurrent writers are harmless as long as no reader
+/// can catch one mid-write.
+pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
+    let src = shipped_config();
+    let dir = std::env::temp_dir().join(format!("par6d-{tag}-{}", std::process::id()));
+    let grippers = dir.join("grippers");
+    std::fs::create_dir_all(&grippers).expect("test config dir");
+    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
+    let patched = text.replace("tick_dt_s = 0.004", &format!("tick_dt_s = {dt}"));
+    assert_ne!(patched, text, "tick_dt_s patch point must exist");
+    let dst = dir.join("PAR6.toml");
+    write_atomic(&dst, patched.as_bytes());
+    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
+        let e = entry.expect("dir entry");
+        let body = std::fs::read(e.path()).expect("read gripper toml");
+        write_atomic(&grippers.join(e.file_name()), &body);
+    }
+    dst
+}
+
+/// The shipped park pose in degrees, the way the wire carries angles.
+pub fn park_deg() -> [f64; par6_proto::NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
+    let mut a = [0.0; par6_proto::NUM_JOINTS];
+    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
+        *out = rad.to_degrees();
+    }
+    a
+}
+
 pub fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -86,7 +137,7 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
 /// test rig that wrote it would tell every CAN tool on the machine that
 /// a runtime it cannot see owns the bus — and its teardown would then
 /// take a real runtime's claim away.
-fn redirect_bus_grant() {
+pub fn redirect_bus_grant() {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let dir = ONCE.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
@@ -99,33 +150,37 @@ fn redirect_bus_grant() {
     debug_assert!(dir.is_dir());
 }
 
-/// A daemon whose STATUS broadcast is aimed at `status_port` on
-/// loopback, for a test that listens with a real `par6_client::Client`
-/// instead of the rig's own socket. The telemetry socket rides along so
-/// the daemon's telemetry port stays private to this daemon.
-pub fn boot_for_client(
-    config: PathBuf,
-    sim_dynamics: bool,
-    status_port: u16,
-) -> Result<(Daemon, UdpSocket), String> {
-    let _ = env_logger::builder().is_test(true).try_init();
-    redirect_bus_grant();
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
-    let opts = Options {
+/// Daemon options for a simulator boot on loopback: an ephemeral command
+/// port, STATUS unicast to `127.0.0.1:status_port`, the repo assets tree.
+pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
+    Options {
         sim: true,
-        sim_dynamics,
         config: Some(config),
         assets: Some(assets_dir()),
         command_port: Some(0),
         bind: Some("127.0.0.1".parse().unwrap()),
         status_host: Some("127.0.0.1".parse().unwrap()),
         status_port: Some(status_port),
-        telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
         status_transport: Some(StatusTransport::Unicast),
         ..Options::default()
+    }
+}
+
+/// A daemon whose STATUS broadcast is aimed at `status_port` on
+/// loopback, for a test that listens with a real `par6_client::Client`
+/// instead of the rig's own socket.
+pub fn boot_for_client(
+    config: PathBuf,
+    sim_dynamics: bool,
+    status_port: u16,
+) -> Result<Daemon, String> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    redirect_bus_grant();
+    let opts = Options {
+        sim_dynamics,
+        ..sim_options(config, status_port)
     };
-    let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
-    Ok((daemon, telemetry_rx))
+    Daemon::start(&opts).map_err(|e| e.to_string())
 }
 
 /// A loopback UDP port nothing is bound to right now, and that this
@@ -157,7 +212,6 @@ pub fn free_udp_port() -> u16 {
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
-    _telemetry_rx: UdpSocket,
 }
 
 impl Rig {
@@ -198,37 +252,21 @@ impl Rig {
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
-        let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
         let opts = Options {
-            sim: true,
             sim_dynamics,
-            config: Some(config),
-            assets: Some(assets_dir()),
-            command_port: Some(0),
-            bind: Some("127.0.0.1".parse().unwrap()),
-            status_host: Some("127.0.0.1".parse().unwrap()),
-            status_port: Some(status_rx.local_addr().unwrap().port()),
-            telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
-            status_transport: Some(StatusTransport::Unicast),
             status_rate_hz,
-            ..Options::default()
+            ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
-            _telemetry_rx: telemetry_rx,
         })
     }
 
     /// The command plane's bound address.
     pub fn addr(&self) -> SocketAddr {
         self.daemon.as_ref().expect("running").command_addr()
-    }
-
-    /// The telemetry socket, for tests that decode the stream.
-    pub fn telemetry(&self) -> &UdpSocket {
-        &self._telemetry_rx
     }
 
     /// Widen the STATUS socket's read timeout past the default
@@ -510,16 +548,6 @@ impl Client {
             }
         }
     }
-}
-
-/// The park pose in degrees, from the shipped config.
-pub fn park_deg() -> [f64; par6_proto::NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("cfg");
-    let mut a = [0.0; par6_proto::NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
 }
 
 pub fn to_rad(deg: &[f64; par6_proto::NUM_JOINTS]) -> [f64; par6_proto::NUM_JOINTS] {

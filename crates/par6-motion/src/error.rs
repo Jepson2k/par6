@@ -44,6 +44,19 @@ pub enum MotionError {
         /// Index of the later move.
         second: usize,
     },
+    /// A blend was requested on a profile that is point-to-point by
+    /// construction, and honouring it would mean either running the
+    /// corner over the velocity limit or stopping there anyway while
+    /// reporting a blend. Neither is done; the program is refused.
+    #[error("moves {first} and {second} blend on the {profile} profile, which is point-to-point; use trapezoid or ruckig to blend")]
+    ProfileCannotBlend {
+        /// The profile's registry name, lower-case.
+        profile: &'static str,
+        /// Index of the earlier move in the chain.
+        first: usize,
+        /// Index of the later move.
+        second: usize,
+    },
     /// A jerk-limited profile was requested but the resolved mode limits
     /// carry no finite jerk limit for this joint.
     #[error("joint {joint} has no finite jerk limit; required by the ruckig profile")]
@@ -54,6 +67,23 @@ pub enum MotionError {
     /// rsruckig rejected the trajectory input or failed to solve.
     #[error("ruckig: {0}")]
     Ruckig(String),
+    /// The finished sample stream steps its commanded velocity harder
+    /// than the acceleration limits allow. Raised by
+    /// [`crate::gate::check_commanded_accel`], which refuses the move
+    /// rather than reshaping it.
+    #[error(
+        "the planned stream commands {commanded} rad/s^2 on joint {joint} at sample {sample}, past its {limit} rad/s^2 limit"
+    )]
+    CommandedAccelExceeded {
+        /// Joint index (0-based).
+        joint: usize,
+        /// Index of the sample the step lands on.
+        sample: usize,
+        /// Commanded acceleration across that tick \[rad/s^2\].
+        commanded: f64,
+        /// That joint's acceleration limit \[rad/s^2\].
+        limit: f64,
+    },
     /// Strict completion policy: the arm did not settle within the timeout.
     #[error(
         "settle timeout: joint {worst_joint} error {error_rad} rad still above tolerance {tolerance_rad} rad"

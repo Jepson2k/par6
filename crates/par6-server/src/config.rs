@@ -1,6 +1,6 @@
 //! Server configuration: sockets, rates, transport ladder knobs, queue
-//! sizing, and the server-layer registries (tools / profiles / telemetry
-//! recipes) the codec deliberately does not know about.
+//! sizing, and the server-layer registries (tools / profiles) the codec
+//! deliberately does not know about.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -8,9 +8,7 @@ use std::time::Duration;
 use par6_config::ProtocolConfig;
 use par6_proto::{Shape, NUM_JOINTS};
 
-use crate::telemetry::TelemetryRecipe;
-
-/// Status/telemetry transport selection.
+/// Status transport selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTransport {
     /// Multicast with a startup reachability probe; permanent unicast
@@ -48,16 +46,6 @@ pub struct ServerConfig {
     pub status_port: u16,
     /// Status broadcast rate \[Hz\].
     pub status_rate_hz: u32,
-    /// Telemetry stream port.
-    pub telemetry_port: u16,
-    /// Telemetry stream rate \[Hz\].
-    pub telemetry_rate_hz: u32,
-    /// Telemetry recipe registry; `set_recipe` refuses names not listed
-    /// here.
-    pub recipes: Vec<TelemetryRecipe>,
-    /// Recipe active at startup; `None` = telemetry off until
-    /// `set_recipe`.
-    pub initial_recipe: Option<String>,
     /// Reachability-probe reply timeout.
     pub probe_timeout: Duration,
     /// RT tick rate \[Hz\] (loop-stats reporting).
@@ -112,11 +100,11 @@ pub struct ServerConfig {
     /// naming the line count the box actually has. Empty = a box that
     /// drives no outputs, and every `write_io` is refused.
     pub digital_outputs: Vec<String>,
-    /// CAN node ids `set_pid_gains` may target (the configured joint
-    /// nodes plus the CAN gripper node when one is fitted). Empty = a
-    /// runtime with no tunable drives, and every `set_pid_gains` is
-    /// refused.
-    pub tunable_nodes: Vec<u8>,
+    /// The drives `set_pid_gains` may target (the configured joint nodes
+    /// plus the CAN gripper node when one is fitted), each with the
+    /// ceilings its configuration declares. Empty = a runtime with no
+    /// tunable drives, and every `set_pid_gains` is refused.
+    pub tunable_nodes: Vec<TunableNode>,
     /// Motion profile names (`select_profile` validation).
     pub profiles: Vec<String>,
     /// Profile active at startup (and after `reset_state`).
@@ -152,8 +140,8 @@ pub struct ConfigInfoData {
     pub fingerprint: String,
     /// RT tick period \[s\].
     pub tick_dt_s: f64,
-    /// The `[motion]` feel constants, in declaration order.
-    pub motion: [f64; 8],
+    /// Every `[motion]` key in declaration order (`MotionConfig::KEYS`).
+    pub motion: [f64; 13],
     /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
     /// velocity_rad_s, acceleration_rad_s2]`.
     pub joints: Vec<[f64; 4]>,
@@ -164,6 +152,22 @@ pub struct ConfigInfoData {
     /// Gripper TOMLs as `(file name, content)`, sorted by file name,
     /// served by CONFIG_BUNDLE.
     pub grippers: Vec<(String, String)>,
+}
+
+/// A drive `set_pid_gains` may retune, with the limits its configured
+/// joint declares. A tune is stored and re-pushed on every reconnect, so
+/// a limit above the joint's own is refused before it reaches the drive.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TunableNode {
+    /// CAN node id.
+    pub node: u8,
+    /// Highest current limit accepted \[mA\].
+    pub ilim_ma: f64,
+    /// Highest velocity limit accepted \[encoder ticks/s\].
+    pub velocity_limit_ticks_s: f64,
+    /// Highest voltage limit accepted \[mV\]; 0 = the drive uses VBUS and
+    /// no explicit limit is ceilinged.
+    pub voltage_limit_mv: u32,
 }
 
 impl Default for ServerConfig {
@@ -178,10 +182,6 @@ impl Default for ServerConfig {
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             status_port: 6002,
             status_rate_hz: 50,
-            telemetry_port: 6003,
-            telemetry_rate_hz: 100,
-            recipes: TelemetryRecipe::defaults(),
-            initial_recipe: None,
             probe_timeout: Duration::from_millis(200),
             rt_tick_rate_hz: 250.0,
             link_stale: Duration::from_millis(200),
@@ -225,9 +225,6 @@ impl ServerConfig {
             multicast_group: group,
             status_port: p.status_port,
             status_rate_hz: p.status_rate_hz,
-            telemetry_port: p.telemetry_port,
-            telemetry_rate_hz: p.telemetry_rate_hz,
-            initial_recipe: p.initial_recipe.clone(),
             ..Self::default()
         }
     }

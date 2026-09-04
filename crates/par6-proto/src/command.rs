@@ -17,9 +17,9 @@
 //!   contract is extrinsic XYZ, `R = Rz·Ry·Rx`, so that the shape the
 //!   frontend draws is the shape the checker enforces.
 //! - All floats must be finite; NaN/inf are rejected at decode.
-//! - The codec validates shape and ranges only. Joint limits, tool names and
-//!   recipe names are configuration, validated in the server layer (the codec
-//!   performs no process-global lookups).
+//! - The codec validates shape and ranges only. Joint limits and tool names
+//!   are configuration, validated in the server layer (the codec performs no
+//!   process-global lookups).
 
 use crate::enums::{CmdType, CompletionPolicy, FlashingAssertion, Frame};
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
@@ -176,9 +176,13 @@ pub struct ConnectHardware {
 }
 
 /// SET_TCP_OFFSET: offset the effective TCP in the tool-local frame (mm).
+/// Queued: takes effect at its position in the queue, after every earlier
+/// command has completed and before any later one is planned.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetTcpOffset {
+    /// Idempotency key.
+    pub key: u64,
     /// X offset (mm).
     pub x: f64,
     /// Y offset (mm).
@@ -201,6 +205,29 @@ pub struct SetPayload {
     /// `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` \[kg m²\]; `None` = point mass.
     #[serde(default)]
     pub inertia: Option<[f64; 6]>,
+}
+
+/// SET_CAN_ID: rename a drive on the bus. Commissioning only — see
+/// [`crate::CmdType::SetCanId`] for the gate.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetCanId {
+    /// The node to rename (its current id, 0..=15).
+    pub node: u8,
+    /// The id it should answer to from now on (0..=15).
+    pub new_id: u8,
+    /// Allow a `node` the config does not list.
+    pub force: bool,
+}
+
+/// SAVE_CONFIG: persist one drive's running configuration to its NVM.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SaveConfig {
+    /// Target node (0..=15).
+    pub node: u8,
+    /// Allow a `node` the config does not list.
+    pub force: bool,
 }
 
 /// ENTER_FLASHING: silence the bus and hand it to a firmware flasher.
@@ -256,14 +283,6 @@ pub struct SetShapes {
 pub struct SetCompletionPolicy {
     /// The policy to apply to subsequent queued motion.
     pub policy: CompletionPolicy,
-}
-
-/// SET_RECIPE: select the telemetry recipe (unknown names are refused).
-#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct SetRecipe {
-    /// Recipe name (1–64 chars), validated against config server-side.
-    pub name: String,
 }
 
 /// POSE query params.
@@ -517,6 +536,11 @@ pub struct MoveP {
     #[serde(default)]
     pub duration: Option<f64>,
     /// Velocity fraction `(0, 1]`. Exactly one of `duration`/`speed`.
+    ///
+    /// Unlike the other cartesian moves this is a fraction of the
+    /// fastest CONSTANT tool speed the joints allow along this path, not
+    /// of the joint budget moment to moment: holding one rate means the
+    /// whole path runs at the rate its steepest stretch permits.
     #[serde(default)]
     pub speed: Option<f64>,
     /// Acceleration fraction `(0, 1]`; `None` = server default.
@@ -606,10 +630,11 @@ pub enum Command {
     SetPayload(SetPayload),
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
-    SetRecipe(SetRecipe),
     EnterFlashing(EnterFlashing),
     ExitFlashing,
     SetPidGains(SetPidGains),
+    SetCanId(SetCanId),
+    SaveConfig(SaveConfig),
     // QUERY
     Ping,
     Status,
@@ -632,6 +657,7 @@ pub enum Command {
     ConfigInfo,
     Payload,
     ConfigBundle,
+    BusScan,
     // FIRE_AND_FORGET
     ServoJ(ServoJ),
     ServoJPose(ServoJPose),
@@ -673,10 +699,11 @@ impl Command {
             C::SetPayload(_) => CmdType::SetPayload,
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
-            C::SetRecipe(_) => CmdType::SetRecipe,
             C::EnterFlashing(_) => CmdType::EnterFlashing,
             C::ExitFlashing => CmdType::ExitFlashing,
             C::SetPidGains(_) => CmdType::SetPidGains,
+            C::SetCanId(_) => CmdType::SetCanId,
+            C::SaveConfig(_) => CmdType::SaveConfig,
             C::Ping => CmdType::Ping,
             C::Status => CmdType::Status,
             C::Angles => CmdType::Angles,
@@ -698,6 +725,7 @@ impl Command {
             C::ConfigInfo => CmdType::ConfigInfo,
             C::Payload => CmdType::Payload,
             C::ConfigBundle => CmdType::ConfigBundle,
+            C::BusScan => CmdType::BusScan,
             C::ServoJ(_) => CmdType::ServoJ,
             C::ServoJPose(_) => CmdType::ServoJPose,
             C::ServoL(_) => CmdType::ServoL,
@@ -734,6 +762,7 @@ impl Command {
             C::Delay(p) => Some(p.key),
             C::Checkpoint(p) => Some(p.key),
             C::ToolAction(p) => Some(p.key),
+            C::SetTcpOffset(p) => Some(p.key),
             _ => None,
         }
     }
@@ -772,7 +801,30 @@ impl Command {
             | C::ConfigInfo
             | C::Payload
             | C::ConfigBundle
+            | C::BusScan
             | C::ResetLoopStats => Ok(()),
+            C::SetCanId(p) => {
+                check(
+                    p.node <= 15,
+                    "set_can_id.node",
+                    "must be a CAN node id (0..=15)",
+                )?;
+                check(
+                    p.new_id <= 15,
+                    "set_can_id.new_id",
+                    "must be a CAN node id (0..=15)",
+                )?;
+                check(
+                    p.new_id != p.node,
+                    "set_can_id.new_id",
+                    "must differ from node",
+                )
+            }
+            C::SaveConfig(p) => check(
+                p.node <= 15,
+                "save_config.node",
+                "must be a CAN node id (0..=15)",
+            ),
             C::WriteIo(p) => {
                 check(p.port <= 7, "write_io.port", "must be 0..=7")?;
                 check(p.value <= 1, "write_io.value", "must be 0 or 1")
@@ -816,7 +868,6 @@ impl Command {
                 }
                 Ok(())
             }
-            C::SetRecipe(p) => str_len("set_recipe.name", &p.name, 1, 64),
             C::EnterFlashing(_) | C::ExitFlashing => Ok(()),
             C::SetPidGains(p) => {
                 for (what, v) in [
@@ -892,21 +943,25 @@ impl Command {
                 blend("move_j_pose.r", p.blend_radius)
             }
             C::MoveL(p) => {
+                frame_rel("move_l.frame", p.frame, p.rel)?;
                 finite_all("move_l.pose", &p.pose)?;
                 motion_timing("move_l", p.duration, p.speed, p.accel)?;
                 blend("move_l.r", p.blend_radius)
             }
             C::MoveC(p) => {
+                frame_rel("move_c.frame", p.frame, p.rel)?;
                 finite_all("move_c.via", &p.via)?;
                 finite_all("move_c.end", &p.end)?;
                 motion_timing("move_c", p.duration, p.speed, p.accel)?;
                 blend("move_c.r", p.blend_radius)
             }
             C::MoveS(p) => {
+                frame_rel("move_s.frame", p.frame, p.rel)?;
                 waypoints("move_s.waypoints", &p.waypoints)?;
                 motion_timing("move_s", p.duration, p.speed, p.accel)
             }
             C::MoveP(p) => {
+                frame_rel("move_p.frame", p.frame, p.rel)?;
                 waypoints("move_p.waypoints", &p.waypoints)?;
                 motion_timing("move_p", p.duration, p.speed, p.accel)
             }
@@ -974,16 +1029,32 @@ fn finite_all(what: &'static str, vs: &[f64]) -> Result<(), DecodeError> {
 /// is refused at the wire.
 fn symmetric3_is_psd(i: &[f64; 6]) -> bool {
     let (ixx, ixy, iyy, ixz, iyz, izz) = (i[0], i[1], i[2], i[3], i[4], i[5]);
-    const EPS: f64 = 1e-12;
+    // The tolerance scales with the matrix: a payload inertia is ~1e-7
+    // kg·m², so an absolute epsilon would wave through an indefinite one.
+    let scale = i.iter().fold(0.0f64, |m, v| m.max(v.abs()));
+    let eps1 = 1e-9 * scale;
+    let eps2 = eps1 * scale;
+    let eps3 = eps2 * scale;
     let det = ixx * (iyy * izz - iyz * iyz) - ixy * (ixy * izz - iyz * ixz)
         + ixz * (ixy * iyz - iyy * ixz);
-    ixx >= -EPS
-        && iyy >= -EPS
-        && izz >= -EPS
-        && ixx * iyy - ixy * ixy >= -EPS
-        && ixx * izz - ixz * ixz >= -EPS
-        && iyy * izz - iyz * iyz >= -EPS
-        && det >= -EPS
+    ixx >= -eps1
+        && iyy >= -eps1
+        && izz >= -eps1
+        && ixx * iyy - ixy * ixy >= -eps2
+        && ixx * izz - ixz * ixz >= -eps2
+        && iyy * izz - iyz * iyz >= -eps2
+        && det >= -eps3
+}
+
+/// A tool-frame pose is inherently relative to the tool frame the move
+/// starts in, so `rel = false` with TRF has no meaning; refusing it keeps
+/// a caller from believing an absolute move was made.
+fn frame_rel(what: &'static str, frame: Frame, rel: bool) -> Result<(), DecodeError> {
+    check(
+        frame != Frame::Trf || rel,
+        what,
+        "a TRF pose is relative to the starting tool frame; send rel = true",
+    )
 }
 
 fn frac(what: &'static str, v: f64) -> Result<(), DecodeError> {
@@ -1103,7 +1174,8 @@ fn arity(tag: CmdType) -> usize {
         | T::Shapes
         | T::ConfigInfo
         | T::Payload
-        | T::ConfigBundle => 2,
+        | T::ConfigBundle
+        | T::BusScan => 2,
         T::Stop
         | T::Simulator
         | T::SetGravityComp
@@ -1112,13 +1184,14 @@ fn arity(tag: CmdType) -> usize {
         | T::ConnectHardware
         | T::SetShapes
         | T::SetCompletionPolicy
-        | T::SetRecipe
         | T::EnterFlashing
         | T::Pose => 3,
         T::WriteIo => 4,
-        T::SetTcpOffset => 5,
+        T::SetTcpOffset => 6,
         T::SetPayload => 5,
         T::SetPidGains => 13,
+        T::SetCanId => 5,
+        T::SaveConfig => 4,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -1196,7 +1269,17 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Shapes
         | C::ConfigInfo
         | C::Payload
-        | C::ConfigBundle => {}
+        | C::ConfigBundle
+        | C::BusScan => {}
+        C::SetCanId(p) => {
+            w_uint(buf, u64::from(p.node));
+            w_uint(buf, u64::from(p.new_id));
+            w_bool(buf, p.force);
+        }
+        C::SaveConfig(p) => {
+            w_uint(buf, u64::from(p.node));
+            w_bool(buf, p.force);
+        }
         C::Stop(p) => w_bool(buf, p.clear_queue),
         C::WriteIo(p) => {
             w_uint(buf, u64::from(p.port));
@@ -1208,6 +1291,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
         C::SetTcpOffset(p) => {
+            w_uint(buf, p.key);
             w_f64(buf, p.x);
             w_f64(buf, p.y);
             w_f64(buf, p.z);
@@ -1235,7 +1319,6 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             }
         }
         C::SetCompletionPolicy(p) => w_uint(buf, u64::from(p.policy as u8)),
-        C::SetRecipe(p) => w_str(buf, &p.name),
         C::EnterFlashing(p) => w_uint(buf, u64::from(p.assertion as u8)),
         C::SetPidGains(p) => {
             w_uint(buf, u64::from(p.node));
@@ -1411,6 +1494,17 @@ fn r_fixed3(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 3], DecodeEr
     Ok(out)
 }
 
+/// One CAN node id slot (0..=15).
+fn r_node_id(r: &mut Reader<'_>, what: &'static str) -> Result<u8, DecodeError> {
+    match u8::try_from(r.uint()?) {
+        Ok(v) if v <= 15 => Ok(v),
+        _ => Err(DecodeError::Validation {
+            what,
+            why: "must be a CAN node id (0..=15)".into(),
+        }),
+    }
+}
+
 fn r_fixed6(r: &mut Reader<'_>, what: &'static str) -> Result<[f64; 6], DecodeError> {
     let n = r.array_len()?;
     if n != 6 {
@@ -1561,6 +1655,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             port: r.str()?.to_owned(),
         }),
         T::SetTcpOffset => Command::SetTcpOffset(SetTcpOffset {
+            key: r.uint()?,
             x: r.f64()?,
             y: r.f64()?,
             z: r.f64()?,
@@ -1591,9 +1686,6 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             })?;
             Command::SetCompletionPolicy(SetCompletionPolicy { policy })
         }
-        T::SetRecipe => Command::SetRecipe(SetRecipe {
-            name: r.str()?.to_owned(),
-        }),
         T::EnterFlashing => {
             let v = r.uint()?;
             let assertion =
@@ -1652,6 +1744,16 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::ConfigInfo => Command::ConfigInfo,
         T::Payload => Command::Payload,
         T::ConfigBundle => Command::ConfigBundle,
+        T::BusScan => Command::BusScan,
+        T::SetCanId => Command::SetCanId(SetCanId {
+            node: r_node_id(&mut r, "set_can_id.node")?,
+            new_id: r_node_id(&mut r, "set_can_id.new_id")?,
+            force: r.bool()?,
+        }),
+        T::SaveConfig => Command::SaveConfig(SaveConfig {
+            node: r_node_id(&mut r, "save_config.node")?,
+            force: r.bool()?,
+        }),
         T::ServoJ => Command::ServoJ(ServoJ {
             angles: r_fixed6(&mut r, "servo_j.angles")?,
             speed: r.opt_f64()?,

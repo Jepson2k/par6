@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SetPayload, SetPidGains, SetRecipe, SetShapes, Shape,
-    Simulator, Stop, Teleport, WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SaveConfig, SetCanId, SetPayload, SetPidGains,
+    SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -25,6 +25,7 @@ use par6_rt::{
 use par6_server::{
     spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
     RtCommands, RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
+    TunableNode,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -43,7 +44,6 @@ enum RtEvent {
     ExecPaused(bool),
     SetEnabled(bool),
     Teleport([f64; 6]),
-    ToolStop,
     EnterFlashing,
     ExitFlashing,
     SetPidGains { node: u8, kpp: f64, ilim_ma: f64 },
@@ -52,6 +52,9 @@ enum RtEvent {
     ConnectHardware(String),
     ResetState,
     ResetLoopStats,
+    SetCanId { node: u8, new_id: u8 },
+    SaveConfig(u8),
+    RescanBus,
 }
 
 #[derive(Default)]
@@ -165,9 +168,6 @@ impl RtCommands for TestRt {
     fn teleport(&mut self, angles_deg: &[f64; 6], _tool_positions: Option<&[f64]>) {
         self.push(RtEvent::Teleport(*angles_deg));
     }
-    fn tool_stop(&mut self) {
-        self.push(RtEvent::ToolStop);
-    }
     fn write_io(&mut self, port: u8, value: u8) {
         self.push(RtEvent::WriteIo(port, value));
     }
@@ -184,6 +184,18 @@ impl RtCommands for TestRt {
     }
     fn reset_loop_stats(&mut self) {
         self.push(RtEvent::ResetLoopStats);
+    }
+
+    fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.push(RtEvent::SetCanId { node, new_id });
+    }
+
+    fn save_config(&mut self, node: u8) {
+        self.push(RtEvent::SaveConfig(node));
+    }
+
+    fn rescan_bus(&mut self) {
+        self.push(RtEvent::RescanBus);
     }
 }
 
@@ -212,6 +224,12 @@ struct PlannerState {
     inflight_duration: f64,
     /// Planner-side warnings the trait hands the STATUS builder.
     warnings: Vec<WireError>,
+    /// Tool actions the side channel was asked to start, in order.
+    tools_started: Vec<u64>,
+    tool_outcomes: VecDeque<CommandOutcome>,
+    fail_next_tool: Option<WireError>,
+    /// `cancel_tool` calls and whether each asked for a halt.
+    tool_cancels: Vec<bool>,
 }
 
 #[derive(Clone)]
@@ -233,6 +251,24 @@ impl Planner for TestPlanner {
     }
     fn cancel(&mut self) {
         self.0.lock().unwrap().cancels += 1;
+    }
+    fn start_tool(
+        &mut self,
+        index: u64,
+        _cmd: &par6_proto::command::ToolAction,
+    ) -> Result<(), WireError> {
+        let mut s = self.0.lock().unwrap();
+        if let Some(e) = s.fail_next_tool.take() {
+            return Err(e);
+        }
+        s.tools_started.push(index);
+        Ok(())
+    }
+    fn poll_tool(&mut self) -> Option<CommandOutcome> {
+        self.0.lock().unwrap().tool_outcomes.pop_front()
+    }
+    fn cancel_tool(&mut self, halt: bool) {
+        self.0.lock().unwrap().tool_cancels.push(halt);
     }
     fn sync(&mut self, _ctx: PlanContext<'_>) {}
     fn set_shapes(
@@ -333,21 +369,17 @@ struct Harness {
     planner: Arc<Mutex<PlannerState>>,
     writer: SnapshotWriter<StateSnapshot>,
     status_rx: UdpSocket,
-    telemetry_rx: UdpSocket,
     tick: u64,
 }
 
 async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
     let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_transport: StatusTransport::Unicast,
         status_dest_host: "127.0.0.1".parse().unwrap(),
         status_port: status_rx.local_addr().unwrap().port(),
-        telemetry_port: telemetry_rx.local_addr().unwrap().port(),
         status_rate_hz: 100,
-        telemetry_rate_hz: 200,
         poll_interval: Duration::from_millis(1),
         link_stale: Duration::from_millis(100),
         chunk_timeout: Duration::from_millis(100),
@@ -375,7 +407,6 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
         planner,
         writer,
         status_rx,
-        telemetry_rx,
         tick: 0,
     }
 }
@@ -399,6 +430,19 @@ impl Harness {
         }
         f(&mut s);
         self.writer.publish(&s);
+    }
+
+    /// Settle the tool action on the side channel.
+    fn complete_tool_ok(&self, index: u64) {
+        self.planner
+            .lock()
+            .unwrap()
+            .tool_outcomes
+            .push_back(CommandOutcome {
+                index,
+                error: None,
+                verdict: None,
+            });
     }
 
     fn complete_ok(&self, index: u64) {
@@ -568,27 +612,6 @@ async fn recv_status(sock: &UdpSocket) -> par6_proto::Status {
         .expect("status within budget")
         .expect("recv");
     decode_status(&buf[..n]).expect("decodable status")
-}
-
-async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
-    let mut buf = [0u8; 4096];
-    let (n, _) = timeout(BUDGET, sock.recv_from(&mut buf))
-        .await
-        .expect("telemetry within budget")
-        .expect("recv");
-    let frame = par6_proto::decode_telemetry(&buf[..n]).expect("decodable telemetry");
-    let [par6_proto::TelemetryValue::U64(tick), par6_proto::TelemetryValue::Arr(q)] =
-        frame.values.as_slice()
-    else {
-        panic!("minimal recipe layout: [name, seq, mono_ns, tick, q]");
-    };
-    (
-        frame.recipe,
-        frame.seq,
-        frame.mono_time_ns,
-        *tick,
-        q.clone(),
-    )
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only
@@ -911,12 +934,114 @@ async fn flashing_enter_and_exit_follow_the_rt_verdict() {
     assert!(h.rt_events().contains(&RtEvent::ExitFlashing));
 }
 
+/// The commissioning commands are gated on an arm that cannot move —
+/// IDLE or ACTIVE_ERROR with nothing executing, queued or streaming —
+/// and on a target the config lists unless `force` says a fresh drive is
+/// meant; only an accepted command reaches the RT. `BUS_SCAN` kicks a
+/// rescan and answers one row per node id once the scan settles or its
+/// deadline passes — here the double never advances the epoch, so the
+/// deadline is the path taken, and the rows still come from the
+/// published presence mask.
+#[tokio::test]
+async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_reports_every_id() {
+    let mut h = start(|cfg| {
+        cfg.tunable_nodes = (0..6)
+            .map(|node| par6_server::TunableNode {
+                node,
+                ilim_ma: 3000.0,
+                velocity_limit_ticks_s: 1e9,
+                voltage_limit_mv: 0,
+            })
+            .collect();
+    })
+    .await;
+    h.publish(|s| {
+        s.mode = Mode::Idle;
+        s.bus_nodes = 0b0011_1111;
+    });
+    let mut c = Client::new(&h).await;
+
+    let rename = |node, new_id, force| {
+        Command::SetCanId(SetCanId {
+            node,
+            new_id,
+            force,
+        })
+    };
+    c.ok(&rename(2, 9, false)).await;
+    c.ok(&Command::SaveConfig(SaveConfig {
+        node: 2,
+        force: false,
+    }))
+    .await;
+    let err = c.expect_error(&rename(9, 3, false)).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("node 9") && err.cause.contains("force"),
+        "{}",
+        err.cause
+    );
+    c.ok(&rename(9, 3, true)).await;
+    let ev = h.rt_events();
+    assert_eq!(
+        ev.iter()
+            .filter(|e| matches!(e, RtEvent::SetCanId { .. } | RtEvent::SaveConfig(_)))
+            .count(),
+        3,
+        "exactly the accepted commands reach the RT: {ev:?}"
+    );
+    assert!(ev.contains(&RtEvent::SetCanId { node: 9, new_id: 3 }));
+    assert!(ev.contains(&RtEvent::SaveConfig(2)));
+
+    // A moving arm refuses both, whatever the target.
+    h.publish(|s| s.mode = Mode::Exec);
+    let err = c.expect_error(&rename(2, 9, false)).await;
+    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    let err = c
+        .expect_error(&Command::SaveConfig(SaveConfig {
+            node: 2,
+            force: false,
+        }))
+        .await;
+    assert!(err.cause.contains("Exec"), "{}", err.cause);
+    // ... and a latched one accepts them: commissioning under e-stop is
+    // the normal way to rename a drive.
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.bus_nodes = 0b0011_1111;
+    });
+    c.ok(&rename(2, 9, false)).await;
+
+    match c.query(&Command::BusScan).await {
+        QueryResult::BusScan { nodes } => {
+            assert_eq!(nodes.len(), 16);
+            for (i, n) in nodes.iter().enumerate() {
+                assert_eq!(usize::from(n.node), i);
+                assert_eq!(n.configured, i < 6, "{n:?}");
+                assert_eq!(n.present, i < 6, "{n:?}");
+            }
+        }
+        other => panic!("unexpected bus scan result {other:?}"),
+    }
+    assert!(h.rt_events().contains(&RtEvent::RescanBus));
+}
+
 /// `set_pid_gains` reaches the RT only for a node the config declares as
 /// a drive; anything else is refused with the tunable set named, and
 /// nothing is forwarded — an ack would report a tune nothing received.
 #[tokio::test]
 async fn set_pid_gains_validates_the_node_against_the_config() {
-    let mut h = start(|cfg| cfg.tunable_nodes = vec![0, 1, 2, 3, 4, 5]).await;
+    let mut h = start(|cfg| {
+        cfg.tunable_nodes = (0..6)
+            .map(|node| TunableNode {
+                node,
+                ilim_ma: 2500.0,
+                velocity_limit_ticks_s: 200_000.0,
+                voltage_limit_mv: 0,
+            })
+            .collect();
+    })
+    .await;
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
@@ -951,6 +1076,20 @@ async fn set_pid_gains_validates_the_node_against_the_config() {
     assert!(
         err.cause.contains("node 9"),
         "the refusal must name the node: {}",
+        err.cause
+    );
+
+    // Above the joint's configured current ceiling: refused before it is
+    // stored, since a stored tune is re-pushed on every reconnect.
+    let mut over = gains(2);
+    if let Command::SetPidGains(p) = &mut over {
+        p.ilim_ma = 2600.0;
+    }
+    let err = c.expect_error(&over).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(
+        err.cause.contains("ilim_ma") && err.cause.contains("2500"),
+        "the refusal names the field and the ceiling: {}",
         err.cause
     );
     let forwarded = h
@@ -1496,7 +1635,7 @@ async fn chunked_move_s_roundtrip_and_timeout() {
     }
 }
 
-/// STATUS broadcast: v2 header content, seq/time monotonicity, snapshot
+/// STATUS broadcast: v3 header content, seq/time monotonicity, snapshot
 /// pass-through, planner enablement — and ALWAYS broadcasting with
 /// link_ok=0 / growing data_age once snapshots stop.
 #[tokio::test]
@@ -1517,7 +1656,7 @@ async fn status_broadcast_content_and_staleness() {
         }
         assert!(tokio::time::Instant::now() < deadline);
     };
-    assert_eq!(s1.proto_version, 2);
+    assert_eq!(s1.proto_version, 3);
     assert_eq!(s1.controller_id, 42);
     assert!((s1.angles[0] - 0.5f64.to_degrees()).abs() < 1e-9);
     assert!((s1.pose[3] - 100.0).abs() < 1e-9, "x translation in mm");
@@ -1829,45 +1968,6 @@ async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
     .await;
 }
 
-/// Telemetry: unknown recipes are refused with COMM_UNKNOWN_RECIPE;
-/// a selected recipe streams binary msgpack with seq + timestamp and
-/// snapshot content.
-#[tokio::test]
-async fn telemetry_recipes_refusal_and_stream() {
-    let mut h = start(|_| {}).await;
-    h.publish(|s| {
-        s.tick = 33;
-        s.q = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    });
-    let mut c = Client::new(&h).await;
-
-    let err = c
-        .expect_error(&Command::SetRecipe(SetRecipe {
-            name: "definitely-not-a-recipe".to_owned(),
-        }))
-        .await;
-    assert_eq!(err.code, ErrorCode::CommUnknownRecipe as u16);
-    assert!(err.cause.contains("definitely-not-a-recipe"));
-
-    match c
-        .request(&Command::SetRecipe(SetRecipe {
-            name: "minimal".to_owned(),
-        }))
-        .await
-    {
-        Reply::Ok { index: None, .. } => {}
-        other => panic!("expected OK, got {other:?}"),
-    }
-
-    let (name, seq1, ns1, tick, q) = recv_telemetry(&h.telemetry_rx).await;
-    assert_eq!(name, "minimal");
-    assert_eq!(tick, 33);
-    assert_eq!(q, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let (_, seq2, ns2, _, _) = recv_telemetry(&h.telemetry_rx).await;
-    assert!(seq2 > seq1, "telemetry seq must increase");
-    assert!(ns2 >= ns1);
-}
-
 fn wire_shape(name: &str, kind: &str) -> Shape {
     Shape {
         kind: kind.to_owned(),
@@ -2038,13 +2138,11 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
 #[tokio::test]
 async fn unappliable_installation_shapes_fail_startup() {
     let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_transport: StatusTransport::Unicast,
         status_dest_host: "127.0.0.1".parse().unwrap(),
         status_port: status_rx.local_addr().unwrap().port(),
-        telemetry_port: telemetry_rx.local_addr().unwrap().port(),
         installation_shapes: vec![wire_shape("bad", "pyramid")],
         ..ServerConfig::default()
     };
@@ -2242,8 +2340,8 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
             variant_key: variant.map(str::to_owned),
         })
     };
-    let offset = |x: f64, y: f64, z: f64| {
-        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { x, y, z })
+    let offset = |key: u64, x: f64, y: f64, z: f64| {
+        Command::SetTcpOffset(par6_proto::command::SetTcpOffset { key, x, y, z })
     };
     async fn read_offset(c: &mut Client) -> [f64; 3] {
         match c.query(&Command::TcpOffset).await {
@@ -2255,7 +2353,9 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     let i1 = c.ok_index(&select(701, Some("fin_ray"))).await;
     h.complete_ok(i1);
     c.wait_complete(i1).await;
-    c.request(&offset(0.0, 0.0, -190.0)).await;
+    let io = c.ok_index(&offset(704, 0.0, 0.0, -190.0)).await;
+    h.complete_ok(io);
+    c.wait_complete(io).await;
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -190.0]);
 
     // Same variant again: nothing about the tool frame moved.
@@ -2271,14 +2371,18 @@ async fn selecting_a_different_variant_clears_the_tcp_offset() {
     assert_eq!(read_offset(&mut c).await, [0.0, 0.0, 0.0]);
 }
 
-/// A tool `stop` halts the jaws at ADMISSION, not when the queue reaches
-/// it: queued behind the very move it is meant to halt, a stop that
-/// waited its turn could only run after the jaws had finished the travel
-/// it was sent to interrupt. The queued instance still dispatches in
-/// order behind the move and carries the COMPLETE discipline; other
-/// actions get no out-of-band effect.
+/// `set_tcp_offset` lands at its turn in the queue, not when its datagram
+/// arrives.
+///
+/// Measured before this landed: `[select_tool(A), set_tcp_offset, move_l]`
+/// raced a completion-time reset (the variant change zeroes the offset
+/// when `select_tool` COMPLETES) against an admission-time set, so the
+/// program ended with the offset it had just asked for wiped. Queued, the
+/// offset applies after the selection it follows, and a disabled arm
+/// still accepts it — it is configuration, and measuring a tool on an
+/// arm that is not enabled has to work.
 #[tokio::test]
-async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
+async fn set_tcp_offset_applies_in_queue_order_and_needs_no_enable() {
     let mut h = start(|cfg| {
         cfg.tools = vec!["gripper".to_owned()];
         cfg.fitted_tool = "gripper".to_owned();
@@ -2288,20 +2392,91 @@ async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
-    let action = |key: u64, name: &str, params: &[f64]| {
-        Command::ToolAction(par6_proto::command::ToolAction {
+    let offset = |key: u64, z: f64| {
+        Command::SetTcpOffset(par6_proto::command::SetTcpOffset {
             key,
-            tool_key: "GRIPPER".to_owned(),
-            action: name.to_owned(),
-            params: params
-                .iter()
-                .map(|v| par6_proto::command::ToolParam::Float(*v))
-                .collect(),
+            x: 0.0,
+            y: 0.0,
+            z,
+        })
+    };
+    async fn read_offset(c: &mut Client) -> [f64; 3] {
+        match c.query(&Command::TcpOffset).await {
+            QueryResult::TcpOffset { x, y, z } => [x, y, z],
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    // The selection is in flight; the offset queues behind it and has
+    // not touched the runtime yet.
+    let i1 = c
+        .ok_index(&Command::SelectTool(par6_proto::command::SelectTool {
+            key: 801,
+            tool_name: "GRIPPER".to_owned(),
+            variant_key: Some("fin_ray".to_owned()),
+        }))
+        .await;
+    let i2 = c.ok_index(&offset(802, -190.0)).await;
+    assert_eq!(
+        read_offset(&mut c).await,
+        [0.0; 3],
+        "an offset queued behind a running command must not apply early"
+    );
+    h.complete_ok(i1);
+    c.wait_complete(i1).await;
+    h.complete_ok(i2);
+    let (ok, _) = c.wait_complete(i2).await;
+    assert!(ok);
+    assert_eq!(
+        read_offset(&mut c).await,
+        [0.0, 0.0, -190.0],
+        "the offset set AFTER the tool change must survive it"
+    );
+
+    // Disabled arm: admitted AND applied — nothing about an offset needs
+    // the arm enabled, and holding it until enable would be a silent no-op.
+    h.publish(|s| s.state = ArmState::Disabled);
+    let i3 = c.ok_index(&offset(803, -12.5)).await;
+    h.complete_ok(i3);
+    let (ok, _) = c.wait_complete(i3).await;
+    assert!(ok);
+    assert_eq!(read_offset(&mut c).await, [0.0, 0.0, -12.5]);
+    h.publish(|_| {});
+
+    h.server.shutdown();
+}
+
+/// A tool action runs BESIDE the motion queue, not in it.
+///
+/// The tool drives its own actuator and never writes a joint slot, so
+/// serialising it behind the queue bought nothing and cost the overlap
+/// that makes a pick cycle quick — a gripper closing during an approach
+/// move. It keeps its index from the same sequence, so ordering across
+/// both lanes is still one number, and that is what the completed mark
+/// has to respect: a tool action finishing first must not declare a
+/// still-running move done.
+#[tokio::test]
+async fn a_tool_action_runs_beside_the_motion_in_flight() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    let action = |req: u32, verb: &str, params: &[f64]| {
+        Command::ToolAction(ToolAction {
+            key: req as u64,
+            tool_key: "gripper".to_owned(),
+            action: verb.to_owned(),
+            params: params.iter().copied().map(ToolParam::Float).collect(),
         })
     };
 
-    // The move dispatches and stays in flight (no outcome yet).
-    let mv = c.ok_index(&action(801, "move", &[0.0, 0.2, 400.0])).await;
+    // A move takes the motion lane and stays there.
+    let mv = c.ok_index(&move_j(901)).await;
     let started = |p: &PlannerState| p.started.iter().map(|(i, _)| *i).collect::<Vec<_>>();
     let deadline = tokio::time::Instant::now() + BUDGET;
     while started(&h.planner.lock().unwrap()) != vec![mv] {
@@ -2312,45 +2487,112 @@ async fn a_tool_stop_halts_at_admission_not_behind_the_move_it_halts() {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
 
-    // Admitting the stop fires the RT halt immediately, while the move
-    // still owns the queue head.
-    let st = c.ok_index(&action(802, "stop", &[])).await;
-    let ev = h.wait_rt(|ev| ev.contains(&RtEvent::ToolStop)).await;
-    assert_eq!(
-        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
-        1,
-        "one admission, one halt: {ev:?}"
-    );
-    assert_eq!(
-        started(&h.planner.lock().unwrap()),
-        vec![mv],
-        "the queued stop must not jump the dispatch order"
-    );
-
-    // The halted move settles; only then does the queued stop dispatch.
-    h.complete_ok(mv);
-    c.wait_complete(mv).await;
+    // The tool action starts while it is still running — it neither
+    // waits for the move nor displaces it.
+    let tool = c.ok_index(&action(902, "move", &[1.0, 0.5, 400.0])).await;
     let deadline = tokio::time::Instant::now() + BUDGET;
-    while started(&h.planner.lock().unwrap()) != vec![mv, st] {
+    while h.planner.lock().unwrap().tools_started != vec![tool] {
         assert!(
             tokio::time::Instant::now() < deadline,
-            "the queued stop never dispatched"
+            "the tool action never started beside the move"
         );
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    h.complete_ok(st);
-    c.wait_complete(st).await;
-
-    // `idle` (or any other action) is a plain queued command: no
-    // out-of-band halt fires for it.
-    let idle = c.ok_index(&action(803, "idle", &[])).await;
-    h.complete_ok(idle);
-    c.wait_complete(idle).await;
-    let ev = h.rt_events();
     assert_eq!(
-        ev.iter().filter(|e| **e == RtEvent::ToolStop).count(),
-        1,
-        "only the stop admission halts out-of-band: {ev:?}"
+        started(&h.planner.lock().unwrap()),
+        vec![mv],
+        "a tool action must not enter the motion lane"
+    );
+
+    // It settles first. Its own COMPLETE goes out at once, but the
+    // aggregate mark may not pass the move still executing under it.
+    h.complete_tool_ok(tool);
+    let (ok, detail) = c.wait_complete(tool).await;
+    assert!(ok, "the tool action must complete, got {detail:?}");
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue {
+            completed_index, ..
+        } => assert!(
+            completed_index < mv as i64,
+            "the mark passed a move that is still executing"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    // The move finishes and the mark takes both.
+    h.complete_ok(mv);
+    c.wait_complete(mv).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        if let QueryResult::Queue {
+            completed_index, ..
+        } = c.query(&Command::Queue).await
+        {
+            if completed_index == tool as i64 {
+                break;
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the mark never reached the tool action"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+}
+
+/// A hard stop takes the tool with it, and halts rather than releases:
+/// jaws still travelling are motion, and a protective stop that dropped
+/// whatever they were holding would be a worse answer than keeping it.
+/// A streamable is the exception — cancelling planned motion must leave
+/// a gripper action running, which is the overlap the side channel is
+/// for.
+#[tokio::test]
+async fn a_stop_halts_the_tool_but_a_streamable_leaves_it_alone() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    let action = |req: u32, verb: &str, params: &[f64]| {
+        Command::ToolAction(ToolAction {
+            key: req as u64,
+            tool_key: "gripper".to_owned(),
+            action: verb.to_owned(),
+            params: params.iter().copied().map(ToolParam::Float).collect(),
+        })
+    };
+
+    // A jog cancels planned motion but must not touch the tool.
+    let t1 = c.ok_index(&action(911, "move", &[1.0, 0.5, 400.0])).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    while h.planner.lock().unwrap().tools_started != vec![t1] {
+        assert!(tokio::time::Instant::now() < deadline, "tool never started");
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    c.send(&jog_j()).await; // fire-and-forget: success is unacked
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(
+        h.planner.lock().unwrap().tool_cancels.is_empty(),
+        "a streamable cancelled a tool action it does not own"
+    );
+
+    // A stop takes it, asking for a halt rather than a release.
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    let (ok, detail) = c.wait_complete(t1).await;
+    assert!(!ok, "a stopped tool action must not report success");
+    assert_eq!(
+        detail.as_ref().map(|e| e.code),
+        Some(ErrorCode::MotnCancelled as u16),
+        "got {detail:?}"
+    );
+    assert_eq!(
+        h.planner.lock().unwrap().tool_cancels,
+        vec![true],
+        "the stop must halt the jaws in place, not release them"
     );
 }
 
@@ -2499,11 +2741,16 @@ async fn blend_lookahead_holds_the_head_and_completes_the_chain_together() {
     // A move that wants to blend is NOT started on its own: there is no
     // corner until the next move arrives.
     let i1 = c.ok_index(&move_j_blended(201, Some(15.0))).await;
-    tokio::time::sleep(Duration::from_millis(40)).await;
-    assert!(
-        h.planner.lock().unwrap().started.is_empty(),
-        "a blended move must wait for the successor it is meant to blend into"
-    );
+    // Poll through half the configured hold: the lone blended move must
+    // not start anywhere inside it (the hold itself expires at 150 ms).
+    let watch_until = tokio::time::Instant::now() + Duration::from_millis(75);
+    while tokio::time::Instant::now() < watch_until {
+        assert!(
+            h.planner.lock().unwrap().started.is_empty(),
+            "a blended move must wait for the successor it is meant to blend into"
+        );
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
 
     // Its successor arrives, and the pair starts as one batch.
     let i2 = c.ok_index(&move_j_blended(202, None)).await;
@@ -2795,5 +3042,144 @@ async fn set_payload_applies_reads_back_and_refuses_garbage() {
             ..
         } => assert_eq!(mass, 0.0),
         other => panic!("expected PAYLOAD response, got {other:?}"),
+    }
+}
+
+/// A tool `stop` carrying parameters is refused at admission, before the
+/// out-of-band halt fires: the old order halted the jaws, acked, and
+/// then dropped the whole queue when dispatch refused the shape.
+#[tokio::test]
+async fn a_tool_stop_with_parameters_is_refused_before_it_halts_anything() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let stop = Command::ToolAction(par6_proto::command::ToolAction {
+        key: 9101,
+        tool_key: "gripper".to_owned(),
+        action: "stop".to_owned(),
+        params: vec![par6_proto::command::ToolParam::Float(1.0)],
+    });
+    let err = c.expect_error(&stop).await;
+    assert_eq!(err.code, ErrorCode::CommValidationError as u16);
+    assert!(err.cause.contains("takes no parameters"), "{}", err.cause);
+    assert!(
+        h.planner.lock().unwrap().tool_cancels.is_empty(),
+        "a refused stop must not have halted the gripper"
+    );
+}
+
+/// CONFIG_BUNDLE is one un-chunked datagram: a bundle past the reply
+/// ceiling answers with a structured error instead of a send that fails
+/// at debug level and a client that times out.
+#[tokio::test]
+async fn an_oversized_config_bundle_is_refused_with_a_structured_error() {
+    let mut h = start(|cfg| cfg.config_info.robot_toml = "#".repeat(70_000)).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    match c.request(&Command::ConfigBundle).await {
+        Reply::Error { error, .. } => {
+            assert_eq!(error.code, ErrorCode::CommValidationError as u16);
+            assert!(error.cause.contains("ceiling"), "{}", error.cause);
+        }
+        other => panic!("expected a structured refusal, got {other:?}"),
+    }
+}
+
+/// The idempotency window covers every command that can be live: a
+/// window smaller than the queue evicted a pending command's key, and a
+/// retransmitted OK then re-enqueued the same motion.
+#[tokio::test]
+async fn the_dedup_window_outlives_every_live_command() {
+    let mut h = start(|cfg| {
+        cfg.queue_capacity = 8;
+        cfg.dedup_window = 2;
+    })
+    .await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let first = c.ok_index(&move_j(801)).await;
+    for key in 802..=805 {
+        c.ok_index(&move_j(key)).await;
+    }
+    assert_eq!(
+        c.ok_index(&move_j(801)).await,
+        first,
+        "a retransmission of a live command must answer its original index"
+    );
+}
+
+/// A cartesian jog integrates from an absolute pose through the
+/// kinematics and rides STREAM, which the RT refuses without a
+/// reference; the gate refuses it with a structured error instead of
+/// letting the fire-and-forget datagram vanish.
+#[tokio::test]
+async fn a_cartesian_jog_is_refused_while_unreferenced() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.homed = false);
+    let mut c = Client::new(&h).await;
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
+    h.publish(|s| s.homed = true);
+    // Stream acceptance is unacked: the proof is the RT receiving it.
+    c.send(&jog_l()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogL)))
+        .await;
+}
+
+/// An RT hard latch outranks the server's own standing note: a
+/// cancellation left by a queue-clearing stop must not hide a hardware
+/// e-stop from STATUS and the ERROR query.
+#[tokio::test]
+async fn an_rt_hard_latch_outranks_the_servers_cancellation_note() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    c.ok_index(&move_j(901)).await;
+    c.ok_index(&move_j(902)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: true })).await;
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::MotnCancelled as u16)
+        }
+        other => panic!("the stop leaves a standing note, got {other:?}"),
+    }
+    h.publish(|s| {
+        s.mode = Mode::ActiveError;
+        s.state = ArmState::Disabled;
+        s.errors.insert(ErrorEntry {
+            code: RtCode::SwEstop,
+            joint: None,
+        });
+        s.error_active = true;
+    });
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysEstopActive as u16, "{}", e.cause)
+        }
+        other => panic!("the hardware e-stop must show, got {other:?}"),
+    }
+}
+
+/// STATUS carries the pause, so a paused arm reads differently from a
+/// stalled one.
+#[tokio::test]
+async fn status_reports_a_paused_playback() {
+    let mut h = start(|_| {}).await;
+    h.publish(|s| s.exec.paused = true);
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.paused {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "STATUS never reported the pause"
+        );
     }
 }

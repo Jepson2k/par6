@@ -3,6 +3,7 @@
 //! Python shim (`par6.client.async_client`) keeps the public API and
 //! waldoctl typing; this layer is transport only.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -27,6 +28,21 @@ use crate::convert::{
 fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
     future_into_py(py, async move {
         match client.system(c).await {
+            Ok(Ack::Confirmed) => Ok(1i32),
+            Ok(Ack::Unconfirmed) => Ok(0),
+            Err(e) => Err(client_err(e)),
+        }
+    })
+}
+
+/// A SYSTEM command: 1 when the runtime acked it, 0 when unconfirmed; a
+/// refusal raises `RobotWireError`.
+fn ack_future<'py, F>(py: Python<'py>, fut: F) -> PyResult<Bound<'py, PyAny>>
+where
+    F: Future<Output = Result<Ack, ClientError>> + Send + 'static,
+{
+    future_into_py(py, async move {
+        match fut.await {
             Ok(Ack::Confirmed) => Ok(1i32),
             Ok(Ack::Unconfirmed) => Ok(0),
             Err(e) => Err(client_err(e)),
@@ -161,9 +177,15 @@ impl CoreClient {
                 };
                 StatusTransport::Unicast { host }
             } else {
-                let (mut group, mut iface) = match &cfg.status {
-                    StatusTransport::Multicast { group, iface } => (*group, *iface),
-                    _ => (Ipv4Addr::new(239, 255, 0, 71), Ipv4Addr::LOCALHOST),
+                let (mut group, mut iface, fallback) = match &cfg.status {
+                    StatusTransport::Multicast {
+                        group,
+                        iface,
+                        fallback,
+                    } => (*group, *iface, *fallback),
+                    StatusTransport::Unicast { host } => {
+                        (Ipv4Addr::new(239, 255, 0, 71), Ipv4Addr::LOCALHOST, *host)
+                    }
                 };
                 if let Some(g) = &mcast_group {
                     group = parse(g, "multicast group")?;
@@ -171,7 +193,11 @@ impl CoreClient {
                 if let Some(i) = &mcast_iface {
                     iface = parse(i, "multicast interface")?;
                 }
-                StatusTransport::Multicast { group, iface }
+                StatusTransport::Multicast {
+                    group,
+                    iface,
+                    fallback,
+                }
             };
             let client = Client::connect(cfg).await.map_err(client_err)?;
             Ok(CoreClient {
@@ -269,6 +295,43 @@ impl CoreClient {
     /// object); None for non-tool commands or ones not completed yet.
     fn command_verdict(&self, index: u64) -> Option<u8> {
         self.rt().command_verdict(index)
+    }
+
+    fn bus_scan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            match client.bus_scan().await {
+                Ok(result) => Python::with_gil(|py| query_result_dict(py, &result).map(Some)),
+                Err(ClientError::Unreachable) => Ok(None),
+                Err(e) => Err(client_err(e)),
+            }
+        })
+    }
+
+    #[pyo3(signature = (node, force=false))]
+    fn save_config<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        ack_future(py, async move { client.save_config(node, force).await })
+    }
+
+    #[pyo3(signature = (node, new_id, force=false))]
+    fn set_can_id<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        new_id: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        ack_future(
+            py,
+            async move { client.set_can_id(node, new_id, force).await },
+        )
     }
 
     /// Await the checkpoint `label`; False on timeout.
@@ -677,11 +740,8 @@ impl CoreClient {
         y: f64,
         z: f64,
     ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::SetTcpOffset(cmd::SetTcpOffset { x, y, z }),
-        )
+        let client = self.rt();
+        index_future(py, async move { client.set_tcp_offset(x, y, z).await })
     }
 
     fn set_shapes<'py>(
@@ -709,10 +769,6 @@ impl CoreClient {
             self.rt(),
             Command::SetCompletionPolicy(cmd::SetCompletionPolicy { policy }),
         )
-    }
-
-    fn set_recipe<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::SetRecipe(cmd::SetRecipe { name }))
     }
 
     // --------------------------------------------------------- queued

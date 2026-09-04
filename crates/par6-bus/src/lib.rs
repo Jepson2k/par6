@@ -35,6 +35,7 @@ mod backend;
 mod bus;
 pub mod hw;
 mod loopback;
+mod node_config;
 pub mod sim;
 pub mod spectral;
 mod types;

@@ -81,7 +81,7 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
     }
 
     let status_port = free_udp_port();
-    let (daemon, _telemetry) =
+    let daemon =
         boot_for_client(config, true, status_port).expect("daemon boots on the torque plant");
     let cmd = daemon.command_addr();
     let rt = tokio::runtime::Runtime::new().expect("runtime");

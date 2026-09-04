@@ -1,0 +1,35 @@
+[Unit]
+Description=PAR6 control box front panel (par6-panel)
+Documentation=https://github.com/Jepson2k/par6
+After=network.target
+# The panel shows the runtime's state and may restart it, but it must come
+# up without it: a box whose runtime is down is exactly when the panel is
+# needed. Wants=, not Requires=.
+Wants=par6d.service
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+# The venv the package was installed into; install.sh substitutes it.
+ExecStart=/opt/par6/venv/bin/par6-panel
+Environment=PAR6_PANEL_CONFIG=/etc/par6/panel.toml
+StateDirectory=par6
+User=par6
+Group=par6
+# gpio and i2c for the buttons, LEDs and OLED; dialout for the PCB UART.
+SupplementaryGroups=gpio i2c dialout
+Restart=always
+RestartSec=3
+KillSignal=SIGINT
+TimeoutStopSec=10
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=par6-panel
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/var/lib/par6
+PrivateTmp=yes
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

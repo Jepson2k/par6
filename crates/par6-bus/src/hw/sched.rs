@@ -11,8 +11,7 @@
 //! transport, so [`crate::sim::SimBus`] and [`crate::LoopbackBus`] run
 //! the same clock rather than each carrying a copy of it.
 
-use par6_config::{Gains, WatchdogAction};
-
+use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
     encode_current_gains, encode_limits, encode_pd_gains, encode_position_gains,
     encode_velocity_gains, encode_voltage_limit, encode_watchdog, CanFrame,
@@ -162,15 +161,18 @@ impl FreshnessClock {
 
     /// Record a frame from `node`. Returns `true` when it is a
     /// stale→fresh edge (the reconnect signal that re-sends config).
-    /// A node's FIRST-ever frame counts as an edge: one that boots
-    /// after the last scheduled config shot has missed every push it
-    /// will get, and this sighting is the only signal left to
-    /// configure it (the boot pass it did receive makes the extra
-    /// per-node pass idempotent).
-    pub(crate) fn mark(&mut self, node: NodeId, tick: u64) -> bool {
+    /// A node's FIRST-ever frame counts as an edge only when the boot
+    /// scan never saw it (`booted == false`): one that boots after the
+    /// last scheduled config shot has missed every push it will get,
+    /// and this sighting is the only signal left to configure it. A
+    /// node the paced boot pass already configured needs no extra shot
+    /// for merely answering.
+    pub(crate) fn mark(&mut self, node: NodeId, tick: u64, booted: bool) -> bool {
         let n = usize::from(node);
-        let reconnected = self.last_rx_tick[n]
-            .is_none_or(|last| tick.saturating_sub(last) >= self.stale_warn_ticks);
+        let reconnected = match self.last_rx_tick[n] {
+            None => !booted,
+            Some(last) => tick.saturating_sub(last) >= self.stale_warn_ticks,
+        };
         self.last_rx_tick[n] = Some(tick);
         reconnected
     }
@@ -242,19 +244,6 @@ impl FreshnessClock {
         self.lost_latched = [false; MAX_NODES];
         self.last_gripper_rx_tick = Some(tick);
     }
-}
-
-/// One node's stored driver configuration — what the boot passes and the
-/// reconnect resends put on the wire.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct NodeConfig {
-    pub(super) node: NodeId,
-    pub(super) watchdog_ms: u32,
-    pub(super) watchdog_action: WatchdogAction,
-    pub(super) velocity_limit_ticks_s: f64,
-    pub(super) ilim_ma: f64,
-    pub(super) voltage_limit_mv: u32,
-    pub(super) gains: Gains,
 }
 
 /// The seven configuration message types, in boot order.
@@ -337,6 +326,7 @@ pub(super) fn boot_config_plan(configs: &[NodeConfig], repeats: u8, out: &mut Ve
 mod tests {
     use super::*;
     use crate::spectral::codec::{unpack_can_id, CommandId};
+    use par6_config::{Gains, WatchdogAction};
     use std::collections::{BTreeSet, HashMap};
 
     fn node_config(node: NodeId) -> NodeConfig {
@@ -483,14 +473,14 @@ mod tests {
         assert_eq!(f.age(0, 0), u64::MAX);
 
         assert!(
-            f.mark(0, 1),
+            f.mark(0, 1, false),
             "the first-ever frame IS an edge: a node that boots after the \
              last scheduled config shot has missed every push it will get, \
              and this edge is the only signal left to configure it"
         );
         assert_eq!(f.classify(0, 1), Freshness::Fresh);
         assert!(
-            f.mark(5, 1) && !f.mark(5, 2),
+            f.mark(5, 1, false) && !f.mark(5, 2, false),
             "only the FIRST frame is the edge"
         );
         assert_eq!(f.classify(0, 1 + stale - 1), Freshness::Fresh);
@@ -498,19 +488,19 @@ mod tests {
         assert_eq!(f.age(0, 1 + stale), stale);
 
         // A frame while stale clears the warning and reports the edge.
-        assert!(f.mark(0, 1 + stale));
+        assert!(f.mark(0, 1 + stale, false));
         assert_eq!(f.classify(0, 1 + stale), Freshness::Fresh);
 
         // Reaching the lost threshold latches, and traffic does NOT clear it.
         let t = 1 + stale + lost;
         f.latch_lost(t);
         assert_eq!(f.classify(0, t), Freshness::Lost);
-        f.mark(0, t);
+        f.mark(0, t, false);
         assert_eq!(f.classify(0, t), Freshness::Lost, "lost is latched");
         // Only the user clear path resets it.
         f.clear_latch(0, t);
         assert_eq!(f.classify(0, t), Freshness::Fresh);
-        f.mark(0, t);
+        f.mark(0, t, false);
         assert_eq!(f.classify(0, t), Freshness::Fresh);
 
         // A node that was never seen never latches, however long we run.
@@ -523,7 +513,7 @@ mod tests {
         assert_eq!(f.gripper_age(t + 4), 4);
 
         // Re-base (FLASHING exit) drops the latch and stamps SEEN NOW.
-        f.mark(1, t);
+        f.mark(1, t, false);
         f.latch_lost(t + lost);
         assert_eq!(f.classify(1, t + lost), Freshness::Lost);
         f.rebase(t + lost);
@@ -544,7 +534,7 @@ mod tests {
         let (stale, lost) = (10u64, 50u64);
         let mut f = FreshnessClock::default();
         f.configure(stale, lost);
-        f.mark(2, 1);
+        f.mark(2, 1, false);
 
         // Node 2 goes silent and latches; the user clears it without
         // fixing the cable.
@@ -571,7 +561,7 @@ mod tests {
         let cleared_at = latched_at + lost;
         f.clear_latch(2, cleared_at);
         assert!(
-            f.mark(2, cleared_at + stale),
+            f.mark(2, cleared_at + stale, false),
             "a node returning after a clear is a reconnect"
         );
 

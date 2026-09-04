@@ -146,10 +146,10 @@ codes — so an editor shows the failure before the arm does.
 Waldo Commander (NiceGUI frontend, unchanged)
   └─ python/par6 — waldoctl Robot + AsyncRobotClient + sync facade + dry-run preview
        │   (a thin shim over crates/par6-client + the par6d preview, via crates/par6-py)
-       │ protocol v2: UDP msgpack commands · binary status broadcast · telemetry
+       │ protocol v3: UDP msgpack commands · binary status broadcast
   par6d (single Rust binary; `par6d --sim` runs anywhere, including CI)
    ├─ command plane (tokio): validation/gating, queue, index allocator,
-   │    push completion, status broadcaster, telemetry recipes
+   │    push completion, status broadcaster
    ├─ planner: TOPPRA (FFI) planned moves · rsruckig streaming/blending · trapezoid,
    │    plus the plan-time collision gate
    └─ RT thread (SCHED_FIFO 99, alloc-free): 250 Hz tick — CAN RX → state → gravity
@@ -168,18 +168,19 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 
 | Path | Contents |
 |---|---|
-| `crates/par6-proto` | protocol v2 codec — **single source of truth**; the Python constants are generated from it |
+| `crates/par6-proto` | protocol v3 codec — **single source of truth**; the Python constants are generated from it |
 | `crates/par6-config` | robot / gripper / homing TOML config |
 | `crates/par6-kin` | Pinocchio FFI: FK, Jacobian, gravity, IK; coal collision world (self-pairs + installation/program keep-out layers) |
 | `crates/par6-motion` | TOPPRA + rsruckig + trapezoid, jog ramps, completion policies |
 | `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + simulator backends |
 | `crates/par6-rt` | RT tick loop, mode dispatch, homing FSM, error latching, e-stop |
-| `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
+| `crates/par6-server` | UDP command plane, status broadcast, collision-world layers |
 | `crates/par6-client` | the client library: command round-trips, retries/dedup, status subscription |
 | `crates/par6d` | the runtime binary: config load, thread spawn/wiring, planner, RT bridge — plus the offline preview harness |
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
+| `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
 ### Two planes, one process
@@ -205,7 +206,12 @@ One tick, in order:
    active tool's inertials attached from its gripper config so tool mass has exactly
    one source.
 4. **Mode dispatch** — one of IDLE / HOMING / JOG / STREAM / EXEC / SAFETY_STOP /
-   FLASHING produces this tick's setpoints.
+   FLASHING produces this tick's setpoints. IDLE on a homed, enabled arm with
+   gravity comp on is freedrive: torque-only `G(q)`, no position hold. The opt-in
+   `[freedrive] drift_lock` re-holds the pose once the arm has been still (the
+   drive's impedance frame plus a clamped integral) and lets go the tick a joint
+   moves, so a slightly wrong gravity model stops sagging the arm without the
+   operator ever fighting a hold.
 5. **CAN TX** — one motion pack per joint, plus any queued control frame.
 6. **Snapshot** — publish state to the command plane's reader slot.
 
@@ -268,6 +274,7 @@ re-freeze. See `CLAUDE.md`.
 |---|---|
 | `RUCKIG` (default) | jerk-limited point-to-point and streaming; the profile blends are built on |
 | `TRAPEZOID` | velocity-limited point-to-point |
+| `QUINTIC` | point-to-point with zero velocity **and** acceleration at both ends; no cruise, does not blend |
 | `TOPPRA` | time-optimal retiming of a cartesian waypoint path |
 
 Every cartesian move rides one pipeline: the geometry produces a pose list, seeded IK
@@ -315,7 +322,11 @@ exactly where `par6d` does.
 
 `set_tcp_offset` composes after the tool transform, in the tool-local frame. A variant
 change clears it, because an offset measured against the old TCP describes nothing once
-the frame moves.
+the frame moves. It is a queued command: the offset lands at its turn, so moves queued
+before it keep the old frame, moves after it are planned against the new one, and a
+blend chain never folds across it. `SELECT_TOOL` and `SET_TCP_OFFSET` therefore apply in
+program order, and the `TCP_OFFSET` query reports the new value only once the command
+has completed — the same lag `TOOLS` has after `select_tool`.
 
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See
@@ -401,7 +412,6 @@ Only the **6001** command port is fixed by the wire contract; the rest are defau
 |---|---|
 | 6001 | command plane (UDP, msgpack) |
 | 6002 | status broadcast (binary) |
-| 6003 | telemetry stream |
 
 Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML**.
 
@@ -411,14 +421,66 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_ASSETS` | `par6_description` tree with the URDFs (`--assets`) |
 | `PAR6_COMMAND_PORT` | command UDP port; `0` = ephemeral (`--port`) |
 | `PAR6_BIND` | command-socket bind address (`--bind`) |
-| `PAR6_STATUS_HOST` | unicast status/telemetry destination (`--status-host`) |
+| `PAR6_STATUS_HOST` | unicast status destination (`--status-host`) |
 | `PAR6_STATUS_PORT` | status broadcast port (`--status-port`) |
-| `PAR6_TELEMETRY_PORT` | telemetry stream port (`--telemetry-port`) |
 | `PAR6_STATUS_TRANSPORT` | `auto` \| `multicast` \| `unicast` (`--status-transport`) |
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
+| `PAR6_LOG_DIR` | also write the rotating activity logs there (`--log-dir`) — see below |
+| `PAR6_TICK_PROFILE` | per-phase RT tick profiler, logged once a second (`--tick-profile`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
+
+### Activity logs
+
+stderr carries every log line, as always (`RUST_LOG` filters it, default `info`).
+With `--log-dir` the daemon also keeps two size-rotated files there, routed by the
+record's module target: `rt.log` (2 MiB, five copies) holds what the RT thread
+itself says — mode transitions, latches, degraded-scheduling notices — and
+`commands.log` (20 MiB, five copies) holds the command plane and the daemon: one
+line per accepted, completed, refused or cancelled command keyed by its index, with
+the error catalog's cause and remedy on failure, the RT latch on its edges, and a
+host-vitals line (load, memory, CPU temperature, disk, uptime) at start and every
+minute. The RT tick never writes a file: its only log calls sit on throttled
+failure paths, so the sink costs the tick nothing, and a write that fails is
+dropped rather than allowed to stall the daemon.
+
+### The front panel
+
+`par6-panel` (installed with `pip install "par6[panel]"`, run by
+`scripts/deploy/par6-panel.service`) owns the control box's two buttons, two
+LEDs and 128x64 OLED and the UART link to the mainboard PCB, entirely from
+`panel.toml` (`PAR6_PANEL_CONFIG`; every device path, I²C address, pin and
+baud lives there). One rule on the buttons: tap = move, hold = select, hold
+button 1 = back; destructive actions ask for a hold to confirm and cancel on
+any tap. Once a blink period it sends the PCB its heartbeat, toggles the
+LEDs anti-phase, publishes the panel state and drives the LEDs from what it
+published. A UART that will not open disables PCB comms and nothing else.
+
+Install it on the box with `pip install "par6[panel]"` into a venv, copy
+`panel.toml` to `/etc/par6/panel.toml`, point the unit's `ExecStart` at that
+venv's `par6-panel`, then `systemctl enable --now par6-panel`. Run
+`par6-preflight` first: it changes nothing and reports what the box is
+missing.
+`par6-preflight` is the diagnostic that brings nothing up: RT kernel, CAN,
+GPIO and RT-priority permissions, cores, disk, devices and imports, each
+required or advisory, re-executed inside the package's virtualenv so it
+reflects the runtime environment.
+
+### Commissioning a drive
+
+A fresh Spectral drive sits at its factory node id, which the config does not
+list. `par6 scan` rescans the bus (an RTR ping to every id, one per tick) and lists
+every node id with whether the config lists it, whether it answered, its freshness
+and its device identity; `par6 set-can-id OLD NEW --force` renames it (cmd 11) and
+`par6 save-config NEW --force` persists that (cmd 13) — without `--force` both
+refuse an id the config does not list. Both are refused while anything could be
+moving: only an IDLE or ACTIVE_ERROR arm with nothing executing, queued or
+streaming qualifies, so holding the e-stop while you commission is the normal
+way. The runtime keeps addressing the ids the config names, so after renaming a
+configured drive update the config and restart the daemon. `par6 set-pid-gains`
+pushes one drive's tuning live, `par6 tool` runs a tool action, and
+`par6 flashing enter|exit` hands the bus to a firmware flasher and takes it back.
 
 ### The bus-grant signal
 
@@ -508,6 +570,7 @@ scripts/ffi/setup.sh --target aarch64    build the aarch64 Pinocchio shim elsewh
 scripts/deploy/build-aarch64.sh          cross-build par6d for aarch64
 scripts/deploy/install.sh --host ...     stage + upload + install over ssh
 scripts/deploy/par6d.service             the systemd unit
+scripts/deploy/par6-panel.service        the front panel service (optional)
 ```
 
 ### 1. Cross-build (optional)
@@ -707,7 +770,7 @@ Franka deployments do:
 
 - **Keep the robot off routable networks.** Put the box on a dedicated
   NIC, VLAN or physically separate segment shared only with the machines
-  that operate it. Do not port-forward 6001 or the status/telemetry
+  that operate it. Do not port-forward 6001 or the status
   ports.
 - **Remote access goes through the OS, not the protocol.** For operating
   the arm from elsewhere, terminate a WireGuard (or SSH) tunnel on the

@@ -1,12 +1,25 @@
 //! The command-plane actor: one tokio task owning the UDP command
 //! socket, the motion queue, the SINGLE command-index allocator, and the
-//! status/telemetry broadcast schedule.
+//! status broadcast schedule.
 //!
 //! Decisions resolved here:
 //!
 //! - The index allocator is monotonic and NEVER reset — not even by
 //!   `reset_state` — so a stale pre-reset status frame can never satisfy
 //!   a post-reset wait.
+//! - There are TWO execution lanes and ONE index sequence. Motion runs
+//!   from the queue; a tool action runs beside it, because the tool
+//!   drives its own actuator and never writes a joint slot, so
+//!   serialising the two bought nothing and cost the overlap that makes
+//!   a pick cycle quick. Both draw from the same allocator, so ordering
+//!   across them is still one number — which is why `completed_index`
+//!   advances contiguously rather than by maximum (see
+//!   `advance_completed`): a tool action finishing first must not
+//!   declare a still-running move done.
+//! - A hard stop takes both lanes; a streamable takes only the motion
+//!   lane, since cancelling planned motion is no reason to abandon a
+//!   grip. The tool is halted in place rather than released, so a
+//!   protective stop never drops what the jaws are holding.
 //! - Gating rejections always answer with ERROR (echoed `req_id`),
 //!   including FIRE_AND_FORGET commands whose success stays unacked. A
 //!   refused fire-and-forget additionally latches as the standing error
@@ -37,7 +50,7 @@
 //!   `reset_state` resets world/tool/errors but NOT the e-stop latch and
 //!   NOT the index allocator.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -55,21 +68,45 @@ use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
 use crate::faults::{gripper_fault_code, rt_standing_error};
-use crate::gating::is_stream;
+use crate::gating::{check_gate, gate, is_stream, GateContext};
 use crate::link::BroadcastLink;
 use crate::runtime::{
-    CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand, RtCommands,
-    RuntimeHandle, ShapeLayer,
+    blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
+    RtCommands, RuntimeHandle, ShapeLayer,
 };
-use crate::telemetry;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
+/// Log target of the command activity log: one line per accepted,
+/// completed, refused or cancelled command and per system command, with
+/// the index that joins them. `par6d` routes this target to
+/// `commands.log`.
+const COMMAND_LOG: &str = "par6_server::commands";
+/// How long a BUS_SCAN waits for the RT's rescan epoch to advance before
+/// answering with whatever presence the runtime has: sixteen pings plus
+/// the settle window at the slowest configurable tick, with margin.
+const SCAN_REPLY_DEADLINE: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A BUS_SCAN query parked until its rescan settles.
+struct PendingScan {
+    req_id: u32,
+    addr: SocketAddr,
+    /// The scan epoch when the query arrived; a different one means the
+    /// rescan finished.
+    epoch: u32,
+    deadline: std::time::Instant,
+}
 
 /// How many un-answered `reset` requests may pile up while the RT is
 /// still deciding. A client that keeps re-sending past this is not
 /// waiting for an answer, and the queue must stay bounded.
 const MAX_RESET_WAITERS: usize = 16;
+/// Requests awaiting the RT's FLASHING verdict, bounded the same way.
+const MAX_FLASHING_WAITERS: usize = 16;
+/// Largest CONFIG_BUNDLE reply sent: one UDP datagram (65 507 payload
+/// bytes) with headroom for the msgpack framing and file names, since
+/// replies are not chunked.
+const MAX_CONFIG_BUNDLE_BYTES: usize = 60_000;
 
 /// How many datagrams one stream preemption may lift off the socket.
 /// Two clients streaming at 50 Hz put a handful in the queue; the cap is
@@ -108,16 +145,6 @@ where
     P: Planner + 'static,
     R: RtCommands + 'static,
 {
-    // An unknown startup recipe is a startup failure, exactly as
-    // `set_recipe` refuses it live — a silent fallback looks like a
-    // dead robot.
-    if let Some(name) = &cfg.initial_recipe {
-        if !cfg.recipes.iter().any(|r| r.name == *name) {
-            return Err(std::io::Error::other(format!(
-                "unknown initial telemetry recipe {name:?}"
-            )));
-        }
-    }
     let socket = UdpSocket::bind(cfg.bind).await?;
     let addr = socket.local_addr()?;
     let link = BroadcastLink::open(&cfg).await?;
@@ -149,6 +176,26 @@ enum PostEffect {
     /// `select_tool` can only ever name the fitted tool (validated at
     /// accept time), so the variant is the part that actually changes.
     SelectVariant(Option<String>),
+    /// `set_tcp_offset` lands at its turn in the queue: moves admitted
+    /// before it were planned against the old frame, moves after it are
+    /// planned against the new one, and a blend chain can never fold
+    /// across it.
+    TcpOffset([f64; 3]),
+}
+
+/// The first command index the server hands out. Nothing is index 0:
+/// `completed_index` uses -1 for "nothing finished", and a client that
+/// stores an index in an unsigned field needs a value it cannot confuse
+/// with a default.
+const FIRST_COMMAND_INDEX: u64 = 1;
+
+/// The tool action on the side channel. It carries the same
+/// bookkeeping as a motion — index, replier, name for STATUS — but no
+/// blend set, because a tool action is never folded into a motion.
+struct ToolExecuting {
+    index: u64,
+    addr: SocketAddr,
+    params: String,
 }
 
 struct Executing {
@@ -166,6 +213,52 @@ struct Executing {
     /// done — the arm never stops at their targets, and their samples
     /// are interleaved with the head's in one trajectory.
     blended: Vec<(u64, SocketAddr)>,
+}
+
+/// Requests parked until the RT settles one verdict (reset → the enable
+/// outcome, FLASHING enter/exit → the mode outcome), bounded so a
+/// retrying client cannot grow the list without limit.
+struct Waiters {
+    queued: Vec<(u32, SocketAddr)>,
+    cap: usize,
+    what: &'static str,
+}
+
+impl Waiters {
+    fn new(cap: usize, what: &'static str) -> Self {
+        Self {
+            queued: Vec::with_capacity(cap),
+            cap,
+            what,
+        }
+    }
+
+    fn try_push(&mut self, req_id: u32, addr: SocketAddr) -> Result<(), WireError> {
+        if self.queued.len() >= self.cap {
+            return Err(make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "Too many {} requests are already awaiting the controller's \
+                         verdict; stop retrying until the outstanding one is answered.",
+                        self.what
+                    ),
+                )],
+            ));
+        }
+        self.queued.push((req_id, addr));
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<(u32, SocketAddr)> {
+        std::mem::take(&mut self.queued)
+    }
 }
 
 /// Idempotency dedup window: last N keys → original index.
@@ -214,22 +307,23 @@ struct Core<P: Planner, R: RtCommands> {
 
     next_index: u64,
     dedup: Dedup,
-    pending: crate::session::BlendQueue<Pending>,
+    pending: VecDeque<Pending>,
     executing: Option<Executing>,
     /// Deadline the head of the queue is being held to, while it waits
     /// for the successor its blend radius asks to round a corner into.
+    blend_hold: Option<Instant>,
     accepted_index: i64,
+    tool_executing: Option<ToolExecuting>,
     completed_index: i64,
+    /// Indexes that finished ahead of `completed_index`. With one
+    /// execution lane this is always empty — commands finish in queue
+    /// order — but a tool action runs beside the motion queue and can
+    /// finish while a lower motion index is still executing.
+    finished: BTreeSet<u64>,
     last_checkpoint: String,
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
-    /// A teleport was accepted and the RT has not published the
-    /// snapshot yet. Teleporting references the arm, so the homed gate
-    /// must open for the command right behind it — a client sends
-    /// teleport and its first move in the same breath, and the snapshot
-    /// is a tick or more behind.
-    teleport_homed: bool,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -238,10 +332,10 @@ struct Core<P: Planner, R: RtCommands> {
     /// would truncate whatever it rescued).
     drainbuf: Vec<u8>,
     /// Clients whose `reset` is still waiting for the RT's answer.
-    reset_waiters: Vec<(u32, SocketAddr)>,
+    reset_waiters: Waiters,
     /// Clients whose `enter_flashing`/`exit_flashing` is still waiting
     /// for the RT's mode change.
-    flashing_waiters: Vec<(u32, SocketAddr)>,
+    flashing_waiters: Waiters,
     /// Whether the boot-time enable has been requested yet.
     booted: bool,
 
@@ -255,7 +349,11 @@ struct Core<P: Planner, R: RtCommands> {
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
-    recipe: Option<String>,
+    /// The RT latch last written to the activity log, so the latch is
+    /// logged on its edges and never once per poll.
+    rt_error_logged: Option<u16>,
+    /// BUS_SCAN queries waiting for their rescan to settle.
+    pending_scans: Vec<PendingScan>,
     simulator: bool,
 
     /// Planner estimate of the pending queue, and the `(front, len)` of
@@ -266,7 +364,6 @@ struct Core<P: Planner, R: RtCommands> {
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
-    telemetry_seq: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
 }
@@ -275,7 +372,6 @@ enum Event {
     Datagram(usize, SocketAddr),
     Poll,
     Status,
-    Telemetry,
     Shutdown,
 }
 
@@ -288,9 +384,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     ) -> Self {
         let reassembler = Reassembler::new(cfg.chunk_timeout);
         Self {
-            dedup: Dedup::new(cfg.dedup_window),
+            // A window no larger than the queue evicts a live command's
+            // key, and a retransmitted OK would then re-enqueue its motion.
+            dedup: Dedup::new(cfg.dedup_window.max(cfg.queue_capacity + 2)),
             profile: cfg.initial_profile.clone(),
-            recipe: cfg.initial_recipe.clone(),
+            rt_error_logged: None,
+            pending_scans: Vec::new(),
             simulator: cfg.simulator,
             tool: cfg.fitted_tool.clone(),
             cfg,
@@ -302,21 +401,23 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             start: Instant::now(),
             reassembler,
             transfer_addrs: HashMap::new(),
-            next_index: 1,
-            pending: crate::session::BlendQueue::default(),
+            next_index: FIRST_COMMAND_INDEX,
+            pending: VecDeque::new(),
             executing: None,
+            blend_hold: None,
             accepted_index: -1,
+            tool_executing: None,
             completed_index: -1,
+            finished: BTreeSet::new(),
             last_checkpoint: String::new(),
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
-            teleport_homed: false,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
-            reset_waiters: Vec::new(),
-            flashing_waiters: Vec::new(),
+            reset_waiters: Waiters::new(MAX_RESET_WAITERS, "reset"),
+            flashing_waiters: Waiters::new(MAX_FLASHING_WAITERS, "FLASHING"),
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
@@ -330,7 +431,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
-            telemetry_seq: 0,
             tcp_speed: 0.0,
             prev_tcp: None,
         }
@@ -340,8 +440,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let mut rxbuf = vec![0u8; 65535];
         let mut poll_iv = tokio::time::interval(self.cfg.poll_interval);
         let mut status_iv = tokio::time::interval(rate_period(self.cfg.status_rate_hz));
-        let mut telem_iv = tokio::time::interval(rate_period(self.cfg.telemetry_rate_hz));
-        for iv in [&mut poll_iv, &mut status_iv, &mut telem_iv] {
+        for iv in [&mut poll_iv, &mut status_iv] {
             iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
         self.sync_planner();
@@ -356,7 +455,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 },
                 _ = poll_iv.tick() => Event::Poll,
                 _ = status_iv.tick() => Event::Status,
-                _ = telem_iv.tick() => Event::Telemetry,
                 _ = shutdown.notified() => Event::Shutdown,
             };
             match ev {
@@ -372,7 +470,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
                 Event::Poll => self.on_poll().await,
                 Event::Status => self.on_status().await,
-                Event::Telemetry => self.on_telemetry().await,
                 Event::Shutdown => break,
             }
         }
@@ -468,12 +565,38 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.log_rt_latch_edges();
+        self.answer_scans().await;
         self.request_boot_enable();
         self.settle_enable().await;
         self.settle_flashing().await;
         self.expire_chunks().await;
+        self.collect_tool_outcome().await;
         self.collect_outcomes().await;
         self.pump().await;
+    }
+
+    /// The RT's own latch, on its edges: latched (with the catalog's
+    /// cause and remedy) and cleared. Derived from the snapshot every
+    /// poll, written only when it changes.
+    fn log_rt_latch_edges(&mut self) {
+        let now = rt_standing_error(&self.snap);
+        let code = now.as_ref().map(|e| e.code);
+        if code == self.rt_error_logged {
+            return;
+        }
+        match &now {
+            Some(e) => log::warn!(
+                target: COMMAND_LOG,
+                "rt latched code={} title={:?} cause={:?} remedy={:?}",
+                e.code,
+                e.title,
+                e.cause,
+                e.remedy
+            ),
+            None => log::info!(target: COMMAND_LOG, "rt latch cleared"),
+        }
+        self.rt_error_logged = code;
     }
 
     async fn on_status(&mut self) {
@@ -487,29 +610,159 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.link.send(self.cfg.status_port, bytes).await;
     }
 
-    async fn on_telemetry(&mut self) {
-        self.refresh_snapshot();
-        let Some(name) = self.recipe.as_deref() else {
-            return;
-        };
-        let Some(recipe) = self.cfg.recipes.iter().find(|r| r.name == name) else {
-            return;
-        };
-        let pkt = telemetry::encode_packet(recipe, self.telemetry_seq, self.mono_ns(), &self.snap);
-        self.telemetry_seq += 1;
-        self.link.send(self.cfg.telemetry_port, &pkt).await;
-    }
-
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        if matches!(cmd, Command::BusScan) {
+            // Answered from `answer_scans` once the RT's rescan has
+            // settled (or the deadline passes): a scan is a round trip
+            // to every id, not a read of state the server already holds.
+            self.runtime.rt.rescan_bus();
+            self.pending_scans.push(PendingScan {
+                req_id,
+                addr,
+                epoch: self.snap.bus_scan_epoch,
+                deadline: std::time::Instant::now() + SCAN_REPLY_DEADLINE,
+            });
+            return;
+        }
         self.refresh_queue_estimate();
+        if matches!(cmd, Command::ConfigBundle) {
+            let ci = &self.cfg.config_info;
+            let bytes = ci.robot_toml.len()
+                + ci.grippers
+                    .iter()
+                    .map(|(name, text)| name.len() + text.len())
+                    .sum::<usize>();
+            if bytes > MAX_CONFIG_BUNDLE_BYTES {
+                let error = make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        &format!(
+                            "the config bundle is {bytes} bytes, over the \
+                             {MAX_CONFIG_BUNDLE_BYTES} byte reply ceiling"
+                        ),
+                    )],
+                );
+                self.reply(addr, &Reply::Error { req_id, error }).await;
+                return;
+            }
+        }
         let result = self.query_result(cmd);
         self.reply(addr, &Reply::Response { req_id, result }).await;
     }
 
+    /// Reply to every BUS_SCAN whose rescan has settled or timed out.
+    async fn answer_scans(&mut self) {
+        if self.pending_scans.is_empty() {
+            return;
+        }
+        let now = std::time::Instant::now();
+        let epoch = self.snap.bus_scan_epoch;
+        let ready: Vec<PendingScan> = {
+            let (ready, waiting): (Vec<_>, Vec<_>) = self
+                .pending_scans
+                .drain(..)
+                .partition(|p| epoch != p.epoch || now >= p.deadline);
+            self.pending_scans = waiting;
+            ready
+        };
+        for p in ready {
+            let result = self.bus_scan_result();
+            self.reply(
+                p.addr,
+                &Reply::Response {
+                    req_id: p.req_id,
+                    result,
+                },
+            )
+            .await;
+        }
+    }
+
+    /// The bus as the runtime sees it, one row per node id.
+    fn bus_scan_result(&self) -> QueryResult {
+        let nodes = (0..16u8)
+            .map(|id| {
+                let slot = self.cfg.tunable_nodes.iter().position(|n| n.node == id);
+                let (freshness, info) = match slot {
+                    Some(i) if i < self.snap.nodes.len() => (
+                        match self.snap.node_freshness[i] {
+                            par6_rt::Freshness::Unknown => 0,
+                            par6_rt::Freshness::Fresh => 1,
+                            par6_rt::Freshness::Stale => 2,
+                            par6_rt::Freshness::Lost => 3,
+                        },
+                        self.snap.nodes[i].device_info,
+                    ),
+                    _ => (0, None),
+                };
+                par6_proto::BusNode {
+                    node: id,
+                    configured: slot.is_some(),
+                    present: self.snap.bus_nodes & (1 << u16::from(id)) != 0,
+                    freshness,
+                    hw_ver: info.map_or(0, |d| d.hw_ver),
+                    sw_ver: info.map_or(0, |d| d.sw_ver),
+                    serial: info.map_or(0, |d| d.serial),
+                }
+            })
+            .collect();
+        QueryResult::BusScan { nodes }
+    }
+
+    /// Commissioning commands rename or rewrite a drive: refused while
+    /// anything could be moving (only IDLE or ACTIVE_ERROR, nothing
+    /// executing, queued or streaming), and refused for an id the config
+    /// does not list unless `force` says a fresh drive is meant.
+    fn commissioning_gate(&self, node: u8, force: bool, what: &str) -> Result<(), WireError> {
+        let busy =
+            self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        if busy || !matches!(self.snap.mode, Mode::Idle | Mode::ActiveError) {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "{what} needs an idle arm: mode {:?}, {}",
+                        self.snap.mode,
+                        if busy {
+                            "motion in flight"
+                        } else {
+                            "nothing in flight"
+                        }
+                    ),
+                )],
+            ));
+        }
+        if !force && !self.cfg.tunable_nodes.iter().any(|t| t.node == node) {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "{what} node {node} is not a configured drive (configured: {:?}); \
+                         pass force to address it anyway",
+                        self.cfg.tunable_nodes
+                    ),
+                )],
+            ));
+        }
+        Ok(())
+    }
+
     async fn on_system(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
         use Command as C;
+        log::info!(
+            target: COMMAND_LOG,
+            "system name={} params={}",
+            cmd_name(cmd.tag()),
+            params_summary(cmd)
+        );
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
             return;
@@ -521,12 +774,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
         let result: Result<(), WireError> = match cmd {
             C::Estop => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("estop", dropped).await;
+                // Latch and disable before anything awaits: the drive
+                // disable must not wait on socket writability behind a
+                // queue's worth of COMPLETE pushes.
+                self.estop_latched = true;
                 self.runtime.rt.set_enabled(false);
-                let mut latches = self.latches();
-                latches.estop();
-                self.set_latches(latches);
+                self.standing_error =
+                    Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+                self.cancel_all_motion("estop").await;
                 Ok(())
             }
             C::Pause(p) => {
@@ -538,15 +793,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::Stop(p) => {
-                let mut dropped = self.cancel_active_motion();
-                if p.clear_queue {
-                    dropped.extend(self.drop_pending());
+                let dropped = if p.clear_queue {
+                    self.cancel_all_motion("stop").await
+                } else {
+                    self.cancel_active_motion("stop").await
+                };
+                if p.clear_queue && dropped > 0 {
+                    // A cleared program is a fact the operator has to
+                    // see; the next accepted motion wipes it.
+                    self.standing_error = Some(make_error(
+                        ErrorCode::MotnCancelled,
+                        UNATTRIBUTED,
+                        &[("scope", "stop")],
+                    ));
                 }
-                let cleared = p.clear_queue && !dropped.is_empty();
-                self.complete_cancelled("stop", dropped).await;
-                let mut latches = self.latches();
-                latches.stop(cleared);
-                self.set_latches(latches);
                 Ok(())
             }
             // `port` indexes the box's DECLARED outputs, so the wire's
@@ -554,6 +814,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // end names no line, and acking it would report a level the
             // arm never drove.
             C::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
+                Some(error) => Err(error),
                 None => {
                     log::debug!(
                         "write_io {} (port {}) = {}",
@@ -564,12 +825,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.runtime.rt.write_io(p.port, p.value);
                     Ok(())
                 }
-                Some(e) => Err(e),
             },
             C::Simulator(p) => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("the simulator switch", dropped)
-                    .await;
+                self.cancel_all_motion("the simulator switch").await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
                 })
@@ -597,8 +855,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::ResetState => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("reset", dropped).await;
+                self.cancel_all_motion("reset").await;
                 self.standing_error = None;
                 self.action_state = ActionState::Idle;
                 self.last_checkpoint.clear();
@@ -607,7 +864,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.tcp_offset_mm = [0.0; 3];
                 self.completion_policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
-                self.recipe = self.cfg.initial_recipe.clone();
                 self.runtime.rt.reset_state();
                 self.sync_planner();
                 // The program layer only: installation keep-outs are the
@@ -619,17 +875,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("the hardware connect", dropped)
-                    .await;
+                self.cancel_all_motion("the hardware connect").await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
                 })
-            }
-            C::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.sync_planner();
-                Ok(())
             }
             C::SetPayload(p) => {
                 let payload = PayloadSpec {
@@ -646,41 +895,23 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // Values are codec-validated; the node id is config
             // knowledge, so it is checked here — an ack for a node this
             // arm does not have would report a tune nothing received.
-            C::SetPidGains(p) => {
-                if self.cfg.tunable_nodes.contains(&p.node) {
+            C::SetPidGains(p) => match pid_gains_fault(p, &self.cfg) {
+                Some(error) => Err(error),
+                None => {
                     self.runtime.rt.set_pid_gains(p);
                     Ok(())
-                } else {
-                    Err(make_error(
-                        ErrorCode::CommValidationError,
-                        UNATTRIBUTED,
-                        &[(
-                            "detail",
-                            &format!(
-                                "set_pid_gains node {} is not a configured drive \
-                                 (tunable nodes: {:?})",
-                                p.node, self.cfg.tunable_nodes
-                            ),
-                        )],
-                    ))
                 }
-            }
+            },
+            C::SetCanId(p) => self
+                .commissioning_gate(p.node, p.force, "set_can_id")
+                .map(|()| self.runtime.rt.set_can_id(p.node, p.new_id)),
+            C::SaveConfig(p) => self
+                .commissioning_gate(p.node, p.force, "save_config")
+                .map(|()| self.runtime.rt.save_config(p.node)),
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
                 Ok(())
-            }
-            C::SetRecipe(p) => {
-                if self.cfg.recipes.iter().any(|r| r.name == p.name) {
-                    self.recipe = Some(p.name.clone());
-                    Ok(())
-                } else {
-                    Err(make_error(
-                        ErrorCode::CommUnknownRecipe,
-                        UNATTRIBUTED,
-                        &[("name", &p.name)],
-                    ))
-                }
             }
             _ => unreachable!("dispatch routes only SYSTEM commands here"),
         };
@@ -701,21 +932,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// contract forbids, and it is what let a `reset()` answer 1 while
     /// the very next command was still refused as DISABLED.
     async fn on_reset(&mut self, req_id: u32, addr: SocketAddr) {
-        if self.reset_waiters.len() >= MAX_RESET_WAITERS {
-            // Same code as a full motion queue, so the `{detail}` slot is
-            // what tells an operator retrying `reset` on a latched arm
-            // apart from one flooding moves — without it the template
-            // pointed at an empty motion queue.
-            let error = make_error(
-                ErrorCode::CommQueueFull,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "Too many reset requests are already awaiting the \
-                     controller's verdict; stop retrying until the \
-                     outstanding reset is answered.",
-                )],
-            );
+        if let Err(error) = self.reset_waiters.try_push(req_id, addr) {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -723,25 +940,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.standing_error = None;
         self.action_state = ActionState::Idle;
         self.runtime.rt.set_enabled(true);
-        self.reset_waiters.push((req_id, addr));
     }
 
-    /// Hand the RT's enable verdict to whoever is waiting on it.
     async fn settle_enable(&mut self) {
         let Some(outcome) = self.runtime.rt.take_enable_outcome() else {
             return;
         };
         if self.reset_waiters.is_empty() {
-            // The boot-time enable: nobody asked, so nobody is answered.
-            // A refusal is not lost — it comes from an RT latch, and that
-            // latch is what STATUS and the ERROR query now report.
             if let Err(e) = &outcome {
                 log::warn!("startup enable refused: {e}");
             }
             return;
         }
-        for (req_id, addr) in std::mem::take(&mut self.reset_waiters) {
-            let reply = match &outcome {
+        let waiting = self.reset_waiters.take();
+        self.answer_waiters(waiting, &outcome).await;
+    }
+
+    /// Answer every request that waited on one RT verdict.
+    async fn answer_waiters(
+        &mut self,
+        waiting: Vec<(u32, SocketAddr)>,
+        outcome: &Result<(), WireError>,
+    ) {
+        for (req_id, addr) in waiting {
+            let reply = match outcome {
                 Ok(()) => Reply::Ok {
                     req_id,
                     index: None,
@@ -755,11 +977,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
-    /// `enter_flashing`/`exit_flashing`: only the RT can change the mode,
-    /// so like `reset` the ack waits for the published verdict
-    /// ([`RtCommands::take_flashing_outcome`]) instead of reporting a
-    /// mode change that may never happen (entry is refused outside
-    /// IDLE/ACTIVE_ERROR, asynchronously).
     async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
         self.refresh_snapshot();
         // An exit from any mode but FLASHING is refused HERE: it would
@@ -780,17 +997,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if self.flashing_waiters.len() >= MAX_RESET_WAITERS {
-            let error = make_error(
-                ErrorCode::CommQueueFull,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "Too many FLASHING requests are already awaiting the \
-                     controller's verdict; stop retrying until the \
-                     outstanding one is answered.",
-                )],
-            );
+        if let Err(error) = self.flashing_waiters.try_push(req_id, addr) {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -799,27 +1006,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         } else {
             self.runtime.rt.exit_flashing();
         }
-        self.flashing_waiters.push((req_id, addr));
     }
 
-    /// Hand the RT's FLASHING verdict to whoever is waiting on it.
     async fn settle_flashing(&mut self) {
         let Some(outcome) = self.runtime.rt.take_flashing_outcome() else {
             return;
         };
-        for (req_id, addr) in std::mem::take(&mut self.flashing_waiters) {
-            let reply = match &outcome {
-                Ok(()) => Reply::Ok {
-                    req_id,
-                    index: None,
-                },
-                Err(error) => Reply::Error {
-                    req_id,
-                    error: error.clone(),
-                },
-            };
-            self.reply(addr, &reply).await;
-        }
+        let waiting = self.flashing_waiters.take();
+        self.answer_waiters(waiting, &outcome).await;
     }
 
     /// Come up ready to accept motion, the way parol6's controller does
@@ -871,13 +1065,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.cancel_stream();
                 self.drain_stream_backlog(superseded);
             }
-            let dropped = self.cancel_planned();
-            self.complete_cancelled("a streaming preemption", dropped)
-                .await;
+            self.cancel_planned("a streaming preemption").await;
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
-            self.teleport_homed = true;
             self.on_motion_accepted();
             return;
         }
@@ -904,13 +1095,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.runtime.rt.cancel_stream();
                     self.drain_stream_backlog(superseded);
                 }
-                let dropped = self.cancel_planned();
-                self.complete_cancelled("a streaming preemption", dropped)
-                    .await;
+                // The setpoint reaches the RT before the cancellations
+                // are spoken: an escape jog must not wait behind a
+                // queue's worth of COMPLETE writes.
+                let dropped = self.drop_planned();
                 let outcome = self.runtime.rt.stream(&cmd);
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
                 }
+                self.complete_cancelled("a streaming preemption", dropped)
+                    .await;
                 outcome
             }
         };
@@ -973,17 +1167,35 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.next_index += 1;
         self.dedup.insert(key, index);
         self.accepted_index = index as i64;
+        log::info!(
+            target: COMMAND_LOG,
+            "accepted index={index} name={} params={}",
+            cmd_name(cmd.tag()),
+            params_summary(&cmd)
+        );
         self.on_motion_accepted();
         if self.active_stream.take().is_some() {
             // A planned move cancels streaming.
             self.runtime.rt.cancel_stream();
         }
-        if matches!(&cmd, Command::ToolAction(p) if p.action == "stop") {
-            // Halt-in-place cannot wait its turn behind the very move it
-            // halts: the physical stop fires now, and the queued instance
-            // (idempotent at the RT) carries the COMPLETE discipline once
-            // the queue reaches it.
-            self.runtime.rt.tool_stop();
+        if let Command::ToolAction(p) = &cmd {
+            // A tool action drives the tool's own actuator and never
+            // writes a joint slot, so it runs beside the motion queue
+            // rather than in it — that is what lets a gripper open
+            // during an approach move. It still takes its index from
+            // the same sequence, so ordering across both lanes is one
+            // number.
+            let params = params_summary(&cmd);
+            self.reply(
+                addr,
+                &Reply::Ok {
+                    req_id,
+                    index: Some(index),
+                },
+            )
+            .await;
+            self.start_tool_action(index, addr, params, p.clone()).await;
+            return;
         }
         self.pending.push_back(Pending { index, cmd, addr });
         self.reply(
@@ -997,25 +1209,116 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.pump().await;
     }
 
-    // ---- gating & validation ----------------------------------------------
-
-    fn check_gate(&self, tag: CmdType) -> Option<WireError> {
-        crate::session::check_gate(
-            tag,
-            crate::session::GateInputs {
-                estop_latched: self.estop_latched,
-                enabled: self.snap.state == ArmState::Enabled,
-                homed: self.snap.homed || self.teleport_homed,
-                simulator: self.simulator,
-            },
-        )
+    /// Put a tool action on the side channel, completing whatever it
+    /// supersedes first.
+    async fn start_tool_action(
+        &mut self,
+        index: u64,
+        addr: SocketAddr,
+        params: String,
+        cmd: par6_proto::command::ToolAction,
+    ) {
+        // Depth one, as the reference runtime has it. The superseded
+        // action was acked and something may be waiting on it, so it is
+        // completed rather than dropped in silence.
+        if let Some(prev) = self.tool_executing.take() {
+            let error = make_error(
+                ErrorCode::MotnCancelled,
+                prev.index as i64,
+                &[("scope", "a superseding tool action")],
+            );
+            self.advance_completed(prev.index);
+            self.push_complete(prev.addr, prev.index, Some(error), None)
+                .await;
+        }
+        match self.runtime.planner.start_tool(index, &cmd) {
+            Ok(()) => {
+                self.tool_executing = Some(ToolExecuting {
+                    index,
+                    addr,
+                    params,
+                });
+            }
+            // A refused verb never touched the tool and never touched
+            // motion, so unlike a failed motion it must not clear the
+            // queue standing behind it.
+            Err(mut error) => {
+                error.command_index = index as i64;
+                self.standing_error = Some(error.clone());
+                self.action_state = ActionState::Error;
+                self.advance_completed(index);
+                self.push_complete(addr, index, Some(error), None).await;
+            }
+        }
     }
 
-    /// Server-layer name checks the codec deliberately leaves to config.
-    /// Tool keys are matched case-insensitively: the registry spells them
-    /// as the config does, clients as their own tool tables do.
+    /// Drain the tool side channel. Runs before the motion lane's
+    /// outcomes and before `pump`, so a finished tool action is reported
+    /// on the same tick it settles rather than behind a motion.
+    async fn collect_tool_outcome(&mut self) {
+        let Some(out) = self.runtime.planner.poll_tool() else {
+            return;
+        };
+        let Some(ex) = &self.tool_executing else {
+            return; // outcome of a cancelled action
+        };
+        if ex.index != out.index {
+            return; // stale
+        }
+        let ex = self.tool_executing.take().expect("checked above");
+        if let Some(mut error) = out.error {
+            error.command_index = ex.index as i64;
+            self.standing_error = Some(error.clone());
+            self.action_state = ActionState::Error;
+            self.advance_completed(ex.index);
+            self.push_complete(ex.addr, ex.index, Some(error), None)
+                .await;
+        } else {
+            self.advance_completed(ex.index);
+            self.push_complete(ex.addr, ex.index, None, out.verdict)
+                .await;
+        }
+    }
+
+    // ---- gating & validation ----------------------------------------------
+
+    /// Move the high-water mark to the last index every lower one has
+    /// also finished.
+    ///
+    /// `completed_index` means "everything up to here is done", and a
+    /// client's `wait_command` falls back to it when a COMPLETE
+    /// datagram is lost. Taking a plain maximum keeps that promise only
+    /// while commands finish in order; with a tool action running
+    /// beside the queue, a tool index completing first would declare a
+    /// still-executing motion done. Each COMPLETE still goes out the
+    /// moment its own command finishes — only the aggregate waits.
+    fn advance_completed(&mut self, index: u64) {
+        self.finished.insert(index);
+        // Indexes are allocated from 1; -1 is the "nothing has finished"
+        // sentinel, so the first one the mark can reach is 1, not 0.
+        let mut next = if self.completed_index < 0 {
+            FIRST_COMMAND_INDEX
+        } else {
+            self.completed_index as u64 + 1
+        };
+        while self.finished.remove(&next) {
+            self.completed_index = next as i64;
+            next += 1;
+        }
+    }
+
+    fn check_gate(&self, tag: CmdType) -> Option<WireError> {
+        let ctx = GateContext {
+            estop_latched: self.estop_latched,
+            enabled: self.snap.state == ArmState::Enabled,
+            homed: self.snap.homed,
+            simulator: self.simulator,
+        };
+        check_gate(tag, &ctx)
+    }
+
     fn validate_registries(&self, cmd: &Command) -> Option<WireError> {
-        registry_fault(cmd, &self.cfg)
+        validate_registries(&self.cfg, cmd)
     }
 
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
@@ -1026,20 +1329,25 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     async fn pump(&mut self) {
         while self.executing.is_none() {
-            if self.estop_latched
-                || self.snap.state != ArmState::Enabled
-                || self.active_stream.is_some()
-            {
+            if self.active_stream.is_some() {
                 break;
             }
-            if self.pending.is_empty() {
-                self.pending.release_hold();
+            let Some(head) = self.pending.front() else {
+                self.blend_hold = None;
+                break;
+            };
+            // The head waits for an enabled arm only if its gate says so:
+            // configuration queued for ordering (a TCP offset) lands on a
+            // disabled arm, exactly as it did when it was immediate.
+            if gate(head.cmd.tag()).needs_enabled
+                && (self.estop_latched || self.snap.state != ArmState::Enabled)
+            {
                 break;
             }
             if self.holding_for_blend() {
                 break;
             }
-            self.pending.release_hold();
+            self.blend_hold = None;
             // Disjoint field borrows: the queue is read to build the
             // lookahead while the planner is driven.
             let batch: Vec<QueuedCommand<'_>> = self
@@ -1100,22 +1408,20 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// planner would build is still growing, and starting now would cost
     /// the corner. It ends when a command that stops at its target
     /// arrives, when the lookahead is full, or when the hold expires.
-    fn latches(&self) -> crate::session::Latches {
-        crate::session::Latches {
-            estop_latched: self.estop_latched,
-            standing_error: self.standing_error.clone(),
-        }
-    }
-
-    fn set_latches(&mut self, l: crate::session::Latches) {
-        self.estop_latched = l.estop_latched;
-        self.standing_error = l.standing_error;
-    }
-
     fn holding_for_blend(&mut self) -> bool {
-        let (lookahead, hold) = (self.cfg.blend_lookahead, self.cfg.blend_hold);
-        self.pending
-            .holding_for_blend(lookahead, Some(hold), |p| &p.cmd)
+        let wants_more = self.pending.len() < self.cfg.blend_lookahead
+            && self
+                .pending
+                .back()
+                .and_then(|p| blend_radius_mm(&p.cmd))
+                .is_some_and(|r| r > 0.0);
+        if !wants_more {
+            return false;
+        }
+        let deadline = *self
+            .blend_hold
+            .get_or_insert_with(|| Instant::now() + self.cfg.blend_hold);
+        Instant::now() < deadline
     }
 
     async fn collect_outcomes(&mut self) {
@@ -1129,7 +1435,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             let ex = self.executing.take().expect("checked above");
             match out.error {
                 None => {
-                    self.completed_index = self.completed_index.max(ex.index as i64);
+                    self.advance_completed(ex.index);
                     self.action_state = ActionState::Idle;
                     match ex.effect {
                         PostEffect::None => {}
@@ -1147,6 +1453,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                             self.tool_variant = variant;
                             self.sync_planner();
                         }
+                        PostEffect::TcpOffset(mm) => {
+                            self.tcp_offset_mm = mm;
+                            self.sync_planner();
+                        }
                     }
                     self.push_complete(ex.addr, ex.index, None, out.verdict)
                         .await;
@@ -1154,7 +1464,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     // each is completed in queue order, and the
                     // high-water mark ends on the last of them.
                     for (index, addr) in ex.blended {
-                        self.completed_index = self.completed_index.max(index as i64);
+                        self.advance_completed(index);
                         self.push_complete(addr, index, None, None).await;
                     }
                 }
@@ -1182,7 +1492,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         mut e: WireError,
     ) {
         e.command_index = index as i64;
-        self.completed_index = self.completed_index.max(index as i64);
+        self.advance_completed(index);
         self.standing_error = Some(e.clone());
         self.action_state = ActionState::Error;
         let mut dropped = blended;
@@ -1209,7 +1519,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Drain the pending queue — the commands a queue-clearing scope
     /// drops behind the active motion.
     fn drop_pending(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.pending.release_hold();
+        self.blend_hold = None;
         self.pending.drain(..).map(|p| (p.index, p.addr)).collect()
     }
 
@@ -1217,20 +1527,35 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// command, advancing the high-water mark so the queue readout moves
     /// past them. Touches neither the standing error nor the action
     /// state — the SCOPE decides those.
-    async fn complete_cancelled(&mut self, scope: &'static str, dropped: Vec<(u64, SocketAddr)>) {
+    /// Speak one cancelled COMPLETE per dropped command; returns how many.
+    async fn complete_cancelled(
+        &mut self,
+        scope: &'static str,
+        dropped: Vec<(u64, SocketAddr)>,
+    ) -> usize {
+        let n = dropped.len();
         for (index, addr) in dropped {
-            self.completed_index = self.completed_index.max(index as i64);
+            self.advance_completed(index);
             let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
             self.push_complete(addr, index, Some(e), None).await;
         }
+        n
     }
 
     /// stop scope: active motion (planned + streaming) halts; the
-    /// pending queue is untouched. Returns the dropped commands for the
-    /// caller's [`Self::complete_cancelled`].
-    fn cancel_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
+    /// pending queue is untouched. Speaks for nothing — the `cancel_*`
+    /// wrappers pair the drop with its COMPLETE, and the one caller that
+    /// must hand the RT a setpoint in between speaks explicitly.
+    fn drop_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
-        let dropped = self.drop_active();
+        let mut dropped = self.drop_active();
+        // The tool goes with it. `stop` means halt motion, and jaws
+        // still travelling are motion — `halt()` below never reached
+        // them, so a stop used to report the action cancelled while the
+        // gripper carried on closing. The tool is halted in place, not
+        // released: dropping a grasped part is a worse answer to a
+        // protective stop than holding it.
+        dropped.extend(self.drop_tool_action(true));
         if self.active_stream.take().is_some() {
             self.runtime.rt.cancel_stream();
         }
@@ -1238,21 +1563,47 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         dropped
     }
 
-    /// estop / reset_state / simulator-toggle scope: everything.
-    fn cancel_all_motion(&mut self) -> Vec<(u64, SocketAddr)> {
-        let mut dropped = self.cancel_active_motion();
-        dropped.extend(self.drop_pending());
-        dropped
+    /// Take the tool action off the side channel so the caller can speak
+    /// its cancellation. `halt` asks the tool to stop where it is.
+    ///
+    /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
+    /// arriving cancels planned motion, but a gripper closing under it
+    /// is exactly the overlap the side channel exists to allow.
+    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+        self.runtime.planner.cancel_tool(halt);
+        self.tool_executing.take().map(|t| (t.index, t.addr))
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
-    /// cancelled — the queued program must not resume from wherever a
+    /// dropped — the queued program must not resume from wherever a
     /// manual jog left the arm.
-    fn cancel_planned(&mut self) -> Vec<(u64, SocketAddr)> {
+    fn drop_planned(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
         let mut dropped = self.drop_active();
         dropped.extend(self.drop_pending());
         dropped
+    }
+
+    /// Cancel the active motion and speak its COMPLETE; returns how many
+    /// commands were dropped.
+    async fn cancel_active_motion(&mut self, scope: &'static str) -> usize {
+        let dropped = self.drop_active_motion();
+        self.complete_cancelled(scope, dropped).await
+    }
+
+    /// estop / reset_state / simulator-toggle scope: everything, each
+    /// dropped command's COMPLETE spoken.
+    async fn cancel_all_motion(&mut self, scope: &'static str) -> usize {
+        let mut dropped = self.drop_active_motion();
+        dropped.extend(self.drop_pending());
+        self.complete_cancelled(scope, dropped).await
+    }
+
+    /// Cancel planned motion (active and pending) ahead of a stream,
+    /// speaking each one's COMPLETE.
+    async fn cancel_planned(&mut self, scope: &'static str) -> usize {
+        let dropped = self.drop_planned();
+        self.complete_cancelled(scope, dropped).await
     }
 
     /// A refused fire-and-forget command answered its sender with ERROR,
@@ -1344,9 +1695,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
-            if self.snap.homed {
-                self.teleport_homed = false;
-            }
         }
     }
 
@@ -1537,10 +1885,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// stops being reported exactly when the RT stops latching it, so
     /// accepting a new motion command cannot clear an error the arm is
     /// still bricked by.
+    /// The RT's hard latch outranks the server's own note: a cancellation
+    /// left standing by a queue-clearing stop must not hide a later
+    /// hardware e-stop.
     fn effective_error(&self) -> Option<WireError> {
-        self.standing_error
-            .clone()
-            .or_else(|| rt_standing_error(&self.snap))
+        rt_standing_error(&self.snap).or_else(|| self.standing_error.clone())
     }
 
     fn action_fields(&self) -> (String, ActionState, String) {
@@ -1552,6 +1901,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             )
         } else if let Some(name) = self.stream_shown() {
             (name.to_owned(), ActionState::Executing, String::new())
+        } else if let Some(tool) = &self.tool_executing {
+            // The side channel shows only when the motion lane is idle:
+            // an operator watching a program wants to see the move, and
+            // a jaw action running under it is the tool status's job.
+            (
+                cmd_name(CmdType::ToolAction).to_owned(),
+                ActionState::Executing,
+                tool.params.clone(),
+            )
         } else if self.effective_error().is_some() {
             // Nothing is running and an error stands: the action state is
             // the error, whether a command earned it or the RT latched it.
@@ -1717,12 +2075,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             mode: Self::wire_mode(self.snap.mode),
             enabled: self.snap.state == ArmState::Enabled,
             gravity_comp: self.snap.gravity_comp,
+            paused: self.snap.exec.paused,
             warnings: {
                 let mut w = crate::faults::rt_warnings(&self.snap);
                 w.extend(self.runtime.planner.warnings());
                 w
             },
             link_health: Self::wire_link_health(&self.snap.link),
+            drive_health: Self::wire_drive_health(&self.snap),
+            loop_health: par6_proto::LoopHealthWire {
+                p99_period_s: self.snap.loop_stats.p99_s,
+                overruns: u64::from(self.snap.loop_stats.overruns),
+            },
             homing: Self::wire_homing(&self.snap.homing),
             torques_ext: {
                 let mut out = [0.0; par6_proto::NUM_JOINTS];
@@ -1748,6 +2112,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             restarts: l.restarts,
             tx_errors: l.tx_errors,
             rx_frames: l.rx_frames,
+        }
+    }
+
+    /// The drives' analog readings, per node and arm joints first, with
+    /// `NaN` for a node that has not answered that register yet. The bus
+    /// voltage is the lowest any node reports: a sagging supply shows up
+    /// first at whichever drive is pulling on it.
+    fn wire_drive_health(snap: &par6_rt::StateSnapshot) -> par6_proto::DriveHealthWire {
+        let read = |f: fn(&par6_rt::NodeState) -> Option<f64>| -> Vec<f64> {
+            snap.nodes
+                .iter()
+                .map(|n| f(n).unwrap_or(f64::NAN))
+                .collect()
+        };
+        let bus_voltage_v = snap
+            .nodes
+            .iter()
+            .filter_map(|n| n.voltage_mv)
+            .map(|mv| f64::from(mv) / 1000.0)
+            .reduce(f64::min);
+        par6_proto::DriveHealthWire {
+            temperatures_c: read(|n| n.temperature_c.map(f64::from)),
+            currents_ma: read(|n| n.current_ma.map(f64::from)),
+            bus_voltage_v,
         }
     }
 
@@ -1893,6 +2281,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     can_frame_age_max_ticks: ls.can_frame_age_max_ticks,
                     rt_fifo: ls.rt_fifo,
                     rt_pinned: ls.rt_pinned,
+                    // The streaming path's own quality, answered beside
+                    // the loop's: a servo stream that is dropping samples
+                    // is a loop that is not being fed, and the two are
+                    // read together or not at all.
+                    stream_success_rate: f64::from(self.snap.stream.success_rate),
+                    stream_discard_pct: f64::from(self.snap.stream.discard_pct),
                 })
             }
             C::Profile => QueryResult::Profile {
@@ -1923,6 +2317,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::IsSimulator => QueryResult::IsSimulator {
                 active: self.simulator,
             },
+            C::BusScan => self.bus_scan_result(),
             C::Payload => QueryResult::Payload {
                 mass: self.payload.mass,
                 com: self.payload.com,
@@ -1936,8 +2331,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
-                    active_recipe: self.recipe.clone(),
-                    recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }
             }
             C::Shapes => QueryResult::Shapes {
@@ -1962,9 +2355,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- wire I/O ----------------------------------------------------------
 
     async fn reply(&mut self, addr: SocketAddr, reply: &Reply) {
+        if let Reply::Error { req_id, error } = reply {
+            log::warn!(
+                target: COMMAND_LOG,
+                "refused req_id={req_id} code={} title={:?} cause={:?} remedy={:?}",
+                error.code,
+                error.title,
+                error.cause,
+                error.remedy
+            );
+        }
         encode_reply(reply, &mut self.txbuf);
         if let Err(e) = self.socket.send_to(&self.txbuf, addr).await {
-            log::debug!("reply send to {addr} failed: {e}");
+            log::warn!("reply send to {addr} failed: {e}");
         }
     }
 
@@ -1975,6 +2378,19 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         detail: Option<WireError>,
         verdict: Option<u8>,
     ) {
+        match &detail {
+            None => {
+                log::info!(target: COMMAND_LOG, "complete index={index} ok verdict={verdict:?}")
+            }
+            Some(e) => log::warn!(
+                target: COMMAND_LOG,
+                "complete index={index} code={} title={:?} cause={:?} remedy={:?}",
+                e.code,
+                e.title,
+                e.cause,
+                e.remedy
+            ),
+        }
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
@@ -2022,6 +2438,37 @@ fn world_in_tool_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     }
     out[15] = 1.0;
     out
+}
+
+/// The tool registries a command names must exist and be fitted. Shared
+/// with the offline preview, so a program naming a tool this runtime does
+/// not carry previews as the same refusal.
+pub fn validate_registries(cfg: &ServerConfig, cmd: &Command) -> Option<WireError> {
+    let name = match cmd {
+        Command::SelectTool(p) => &p.tool_name,
+        Command::ToolAction(p) => &p.tool_key,
+        _ => return None,
+    };
+    let detail = if !cfg
+        .tools
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(name.as_str()))
+    {
+        format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
+    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+        format!(
+            "tool '{name}' is not fitted; this runtime is running '{}' \
+             (change robot.active_gripper and restart par6d)",
+            cfg.fitted_tool
+        )
+    } else {
+        return None;
+    };
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", &detail)],
+    ))
 }
 
 /// Parameters the runtime cannot honour. Refusing them is the whole
@@ -2088,6 +2535,14 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
             })
         }
         // A passive tool (no driver) has nothing to actuate.
+        // `stop` and `idle` take no parameters; refusing at admission
+        // keeps a malformed stop from halting the jaws and then being
+        // refused at dispatch, which drops the whole queue.
+        Command::ToolAction(p)
+            if matches!(p.action.as_str(), "stop" | "idle") && !p.params.is_empty() =>
+        {
+            Some(format!("{} takes no parameters", p.action))
+        }
         Command::ToolAction(p) if cfg.tool_dof == 0 => Some(format!(
             "tool '{}' is passive: it has no actions",
             p.tool_key
@@ -2100,6 +2555,90 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
         _ => None,
     };
     unsupported.and_then(refuse)
+}
+
+/// Whether a drive tune names a configured node and stays inside that
+/// node's configured ceilings.
+///
+/// The node id is config knowledge, so the codec cannot check it: an ack
+/// for a node this arm does not have would report a tune nothing
+/// received. The ceilings matter because the tune is stored and re-pushed
+/// on every reconnect — one datagram must not remove a current limit for
+/// the life of the process. Shared so the offline preview refuses a tune
+/// in the same words the runtime does.
+pub fn pid_gains_fault(
+    p: &par6_proto::command::SetPidGains,
+    cfg: &ServerConfig,
+) -> Option<WireError> {
+    let Some(t) = cfg.tunable_nodes.iter().find(|t| t.node == p.node) else {
+        let nodes: Vec<u8> = cfg.tunable_nodes.iter().map(|t| t.node).collect();
+        return Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[(
+                "detail",
+                &format!(
+                    "set_pid_gains node {} is not a configured drive \
+                     (tunable nodes: {nodes:?})",
+                    p.node
+                ),
+            )],
+        ));
+    };
+    let over = if p.ilim_ma > t.ilim_ma {
+        Some(("ilim_ma", p.ilim_ma, t.ilim_ma))
+    } else if p.velocity_limit_ticks_s > t.velocity_limit_ticks_s {
+        Some((
+            "velocity_limit_ticks_s",
+            p.velocity_limit_ticks_s,
+            t.velocity_limit_ticks_s,
+        ))
+    } else if t.voltage_limit_mv != 0 && p.voltage_limit_mv > t.voltage_limit_mv {
+        Some((
+            "voltage_limit_mv",
+            f64::from(p.voltage_limit_mv),
+            f64::from(t.voltage_limit_mv),
+        ))
+    } else {
+        None
+    };
+    over.map(|(field, asked, ceiling)| {
+        make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[(
+                "detail",
+                &format!(
+                    "set_pid_gains {field} = {asked} exceeds node {}'s \
+                     configured ceiling of {ceiling}",
+                    p.node
+                ),
+            )],
+        )
+    })
+}
+
+/// Whether `port` names a digital output this box declares.
+///
+/// The wire's own `0..=7` bound is not the answer: a port past the end of
+/// the declared outputs names no line, and acking it would report a level
+/// the arm never drove. Shared so the offline preview refuses it in the
+/// same words.
+pub fn write_io_fault(port: u8, cfg: &ServerConfig) -> Option<WireError> {
+    if usize::from(port) < cfg.digital_outputs.len() {
+        return None;
+    }
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!(
+                "write_io port {port} does not exist: this box declares {} digital output(s)",
+                cfg.digital_outputs.len()
+            ),
+        )],
+    ))
 }
 
 /// The first `teleport` angle the runtime cannot honour, described in
@@ -2124,63 +2663,11 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
-/// The server-layer name check the codec leaves to config: a tool
-/// command must name a tool this runtime knows, and only the fitted one
-/// can be selected or driven (the kinematic and gravity models are built
-/// around it at startup). Keys match case-insensitively.
-pub fn registry_fault(cmd: &Command, cfg: &ServerConfig) -> Option<WireError> {
-    let name = match cmd {
-        Command::SelectTool(p) => &p.tool_name,
-        Command::ToolAction(p) => &p.tool_key,
-        _ => return None,
-    };
-    let detail = if !cfg
-        .tools
-        .iter()
-        .any(|t| t.eq_ignore_ascii_case(name.as_str()))
-    {
-        format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
-    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
-        format!(
-            "tool '{name}' is not fitted; this runtime is running '{}' \
-             (change robot.active_gripper and restart par6d)",
-            cfg.fitted_tool
-        )
-    } else {
-        return None;
-    };
-    Some(make_error(
-        ErrorCode::CommValidationError,
-        UNATTRIBUTED,
-        &[("detail", &detail)],
-    ))
-}
-
-/// Why `write_io` on `port` is refused: the port indexes the box's
-/// DECLARED outputs, so the wire's own `0..=7` bound is not the answer —
-/// a port past the end names no line, and acking it would report a
-/// level the arm never drove. `None` = the port exists.
-pub fn write_io_fault(port: u8, cfg: &ServerConfig) -> Option<WireError> {
-    if usize::from(port) < cfg.digital_outputs.len() {
-        return None;
-    }
-    Some(make_error(
-        ErrorCode::CommValidationError,
-        UNATTRIBUTED,
-        &[(
-            "detail",
-            &format!(
-                "write_io port {port} does not exist: this box declares {} digital output(s)",
-                cfg.digital_outputs.len()
-            ),
-        )],
-    ))
-}
-
 fn post_effect(cmd: &Command) -> PostEffect {
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
+        Command::SetTcpOffset(p) => PostEffect::TcpOffset([p.x, p.y, p.z]),
         _ => PostEffect::None,
     }
 }
@@ -2215,10 +2702,12 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
-        T::SetRecipe => "set_recipe",
         T::EnterFlashing => "enter_flashing",
         T::ExitFlashing => "exit_flashing",
         T::SetPidGains => "set_pid_gains",
+        T::SetCanId => "set_can_id",
+        T::SaveConfig => "save_config",
+        T::BusScan => "bus_scan",
         T::Ping => "ping",
         T::Status => "status",
         T::Angles => "angles",

@@ -162,3 +162,55 @@ fn a_faulted_tracker_hard_latches_stream_fault() {
     );
     assert_eq!(s.mode, Mode::ActiveError, "the hard latch reacts");
 }
+
+/// The low-pass is a per-tick coefficient, so the command keeps
+/// converging between setpoints: a publisher slower than the tick rate
+/// gets the configured cutoff, not one scaled down by its own cadence.
+#[test]
+fn the_command_lowpass_converges_between_setpoints() {
+    let step = 0.01;
+    let cutoff = 1.0;
+    let alpha = DT / (DT + 1.0 / (2.0 * std::f64::consts::PI * cutoff));
+
+    let mut bundle = bundle_at(DT);
+    bundle.robot.stream.lowpass_cutoff_hz = cutoff;
+    // Long enough that publishing every fourth tick never trips the
+    // stream watchdog.
+    bundle.robot.stream.command_timeout_s = 1.0;
+    let mut rig = Rig::build_bundle(
+        bundle,
+        CompletionPolicy::Settled,
+        Box::new(ZeroGravity),
+        true,
+    );
+    rig.ready();
+    rig.cmd(RtCommand::SetMode(Mode::Stream));
+    let mut q = rig.pose;
+    q[0] += step;
+    let ticks: i32 = 40;
+    for t in 0..ticks {
+        if t % 4 == 0 {
+            rig.handles.stream.send(&StreamSetpoint {
+                q,
+                ..Default::default()
+            });
+        }
+        rig.tick();
+    }
+    assert_eq!(
+        rig.snap().mode,
+        Mode::Stream,
+        "the session must still be alive"
+    );
+
+    let residual = (q[0] - rig.snap().q_commanded[0]).abs();
+    // Stepping only on receipt would leave (1-α)^10 of the step; stepping
+    // every tick leaves (1-α)^40.
+    let per_tick = step * (1.0 - alpha).powi(ticks - 1);
+    let per_receipt = step * (1.0 - alpha).powi(ticks / 4);
+    assert!(
+        residual < per_tick * 2.0,
+        "residual {residual:.3e} — per-tick stepping would leave ~{per_tick:.3e}, \
+         per-receipt stepping ~{per_receipt:.3e}"
+    );
+}

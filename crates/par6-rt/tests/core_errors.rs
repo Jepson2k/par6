@@ -228,13 +228,7 @@ fn freshness_stale_warns_lost_latches_and_invalidates_homing() {
     );
 
     // Reconnect edge re-sends that node's stored config.
-    let passes = rig
-        .core
-        .bus_mut()
-        .tx_log
-        .iter()
-        .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
-        .count();
+    let passes = rig.config_passes_for(3);
     assert!(passes >= 1, "config re-sent on the stale→fresh edge");
 
     // Silence past the lost threshold: LATCHED error, homing invalidated.
@@ -323,13 +317,7 @@ fn clearing_a_still_dead_node_re_latches_and_still_resends_its_config() {
     rig.clear_tx();
     rig.skip_nodes = 0;
     rig.tick_n(3);
-    let passes = rig
-        .core
-        .bus_mut()
-        .tx_log
-        .iter()
-        .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
-        .count();
+    let passes = rig.config_passes_for(3);
     assert!(
         passes >= 1,
         "a node returning after a clear must get its config resent"
@@ -497,15 +485,9 @@ fn a_setpoint_left_unconsumed_does_not_leak_into_the_next_stream_session() {
 fn a_stale_node_gets_one_self_heal_resend_per_episode() {
     let mut rig = Rig::new();
     rig.ready();
-    let stale_ticks = 10u32;
-    let config_passes = |rig: &mut Rig| {
-        rig.core
-            .bus_mut()
-            .tx_log
-            .iter()
-            .filter(|(_, r)| matches!(r, TxRecord::ConfigPass { node: 3 }))
-            .count()
-    };
+    let bus = common::bundle().robot;
+    let stale_ticks = bus.ticks(bus.bus.stale_warn_s);
+    let config_passes = |rig: &mut Rig| rig.config_passes_for(3);
 
     rig.clear_tx();
     rig.skip_nodes = 1 << 3;

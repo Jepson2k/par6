@@ -78,12 +78,12 @@ pub enum DaemonError {
 pub struct Daemon {
     command_addr: SocketAddr,
     status_port: u16,
-    telemetry_port: u16,
     server: Option<ServerHandle>,
     runtime: Option<tokio::runtime::Runtime>,
     shutdown: Arc<AtomicBool>,
     rt_break: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    vitals: Arc<Mutex<crate::vitals::Vitals>>,
 }
 
 impl Daemon {
@@ -98,9 +98,9 @@ impl Daemon {
         self.status_port
     }
 
-    /// Telemetry stream destination port.
-    pub fn telemetry_port(&self) -> u16 {
-        self.telemetry_port
+    /// The freshest host vitals sample (1 Hz).
+    pub fn vitals(&self) -> crate::vitals::Vitals {
+        self.vitals.lock().map(|v| *v).unwrap_or_default()
     }
 
     /// Boot the full runtime: load config, build the RT core over the
@@ -111,8 +111,11 @@ impl Daemon {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
-        loaded.robot.stream.command_timeout_s =
-            resolve_stream_timeout(opts.sim, loaded.robot.stream.command_timeout_s);
+        loaded.robot.stream.command_timeout_s = resolve_stream_timeout(
+            opts.sim,
+            loaded.robot.stream.command_timeout_s,
+            loaded.robot.stream.servo_grace_s,
+        );
         if let Some(hz) = opts.status_rate_hz {
             // Re-validated rather than range-checked here: the STATUS
             // cadence has to divide the tick rate exactly, and running
@@ -315,7 +318,7 @@ impl Daemon {
         );
         let mut cfg = server_config(opts, &bundle);
         cfg.config_info = config_info(&config_path, &bundle.robot);
-        let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
+        let status_port = cfg.status_port;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -337,6 +340,7 @@ impl Daemon {
             RunOptions {
                 cpu: None,
                 fifo_priority: None,
+                tick_profile: opts.tick_profile,
             }
         } else {
             // Hardware: SCHED_FIFO on the configured core (setup failure
@@ -346,6 +350,7 @@ impl Daemon {
             RunOptions {
                 cpu: usize::try_from(timing.cpu).ok(),
                 fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+                tick_profile: opts.tick_profile,
             }
         };
         let mut threads = Vec::new();
@@ -403,15 +408,24 @@ impl Daemon {
             );
         }
 
+        let vitals = Arc::new(Mutex::new(crate::vitals::Vitals::default()));
+        threads.push(crate::vitals::spawn(
+            opts.log_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            vitals.clone(),
+            shutdown.clone(),
+        )?);
+
         Ok(Self {
             command_addr,
             status_port,
-            telemetry_port,
             server: Some(server),
             runtime: Some(runtime),
             shutdown,
             rt_break,
             threads,
+            vitals,
         })
     }
 
@@ -458,6 +472,7 @@ fn rt_loop(
     shutdown: Arc<AtomicBool>,
     run_opts: RunOptions,
 ) {
+    core.set_tick_profile(run_opts.tick_profile);
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -544,9 +559,9 @@ fn resolve_loop_bands(sim: bool, declared: Option<TimingConfig>) -> TimingConfig
 /// ends a silent stream before the RT watchdog fires — actually holds
 /// there. A config asking for a LONGER window always wins, in sim and on
 /// hardware alike.
-fn resolve_stream_timeout(sim: bool, declared: f64) -> f64 {
+fn resolve_stream_timeout(sim: bool, declared: f64, servo_grace_s: f64) -> f64 {
     if sim {
-        declared.max(2.0 * crate::bridge::SERVO_GRACE.as_secs_f64())
+        declared.max(2.0 * servo_grace_s)
     } else {
         declared
     }
@@ -619,16 +634,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
         path: config_path.display().to_string(),
         fingerprint: files.fingerprint,
         tick_dt_s: robot.robot.tick_dt_s,
-        motion: [
-            m.jog_l_linear_max_m_s,
-            m.jog_l_angular_max_rad_s,
-            m.cart_step_m,
-            m.cart_step_rad,
-            m.move_l_max_joint_step_rad,
-            m.dls_lambda,
-            m.settle_tolerance_rad,
-            m.settle_timeout_s,
-        ],
+        motion: m.as_array(),
         joints: robot
             .joints
             .iter()
@@ -663,9 +669,23 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     cfg.cartesian = true;
     // The drives `set_pid_gains` may retune: every joint node, plus the
     // gripper motor when the fitted tool drives one over CAN.
-    cfg.tunable_nodes = robot.joints.iter().map(|j| j.node_id).collect();
-    if cfg.tool_dof > 0 {
-        cfg.tunable_nodes.push(robot.bus.gripper_node);
+    cfg.tunable_nodes = robot
+        .joints
+        .iter()
+        .map(|j| par6_server::TunableNode {
+            node: j.node_id,
+            ilim_ma: j.ilim_ma,
+            velocity_limit_ticks_s: j.velocity_limit_ticks_s,
+            voltage_limit_mv: j.voltage_limit_mv,
+        })
+        .collect();
+    if let Some(d) = bundle.active_gripper().and_then(|g| g.driver.as_ref()) {
+        cfg.tunable_nodes.push(par6_server::TunableNode {
+            node: robot.bus.gripper_node,
+            ilim_ma: d.ilim_ma,
+            velocity_limit_ticks_s: d.velocity_limit_ticks_s,
+            voltage_limit_mv: d.voltage_limit_mv,
+        });
     }
     // The window `teleport` may place a joint in. Refusing outside it is
     // the server's job: the bridge is fire-and-forget and has no reply
@@ -707,9 +727,6 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     if let Some(port) = opts.status_port {
         cfg.status_port = port;
     }
-    if let Some(port) = opts.telemetry_port {
-        cfg.telemetry_port = port;
-    }
     if let Some(t) = opts.status_transport {
         cfg.status_transport = t;
     }
@@ -744,72 +761,131 @@ pub const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
+/// What every kinematics object is built from: the resolved assets
+/// directory and URDF variant, plus the config-derived solver settings.
+pub(crate) struct KinSource {
+    assets_dir: std::path::PathBuf,
+    /// Where `package://` mesh URIs resolve, when the assets tree is an
+    /// installed package rather than a repo checkout.
+    package_dir: Option<std::path::PathBuf>,
+    variant: par6_kin::GripperVariant,
+    window: crate::kin::SoftWindow,
+    dls_lambda: f64,
+}
+
+impl KinSource {
+    pub(crate) fn resolve(
+        opts: &Options,
+        config_path: &std::path::Path,
+        robot: &par6_config::RobotConfig,
+        active_gripper: Option<&par6_config::GripperConfig>,
+    ) -> Result<Self, DaemonError> {
+        use crate::kin::{resolve_assets_dir, variant_for, SoftWindow};
+        let assets_dir = resolve_assets_dir(opts.assets.as_deref(), config_path)
+            .map_err(DaemonError::Kinematics)?;
+        let variant = variant_for(
+            &robot.robot.active_gripper,
+            active_gripper.and_then(|g| g.urdf_variant.as_deref()),
+        );
+        log::info!(
+            "kinematics: {} from {}",
+            variant.urdf_relpath(),
+            assets_dir.display()
+        );
+        Ok(Self {
+            assets_dir,
+            package_dir: opts.package_dir.clone(),
+            variant,
+            window: SoftWindow::from_config(robot),
+            dls_lambda: robot.motion.dls_lambda,
+        })
+    }
+
+    fn kin(&self) -> Result<par6_kin::Kin, DaemonError> {
+        crate::kin::load_kin(&self.assets_dir, self.variant).map_err(DaemonError::Kinematics)
+    }
+
+    pub(crate) fn cart_kin(
+        &self,
+        offset: &crate::kin::ToolOffset,
+    ) -> Result<crate::kin::CartKin, DaemonError> {
+        Ok(crate::kin::CartKin::new(
+            self.kin()?,
+            offset.clone(),
+            self.window,
+            self.dls_lambda,
+        ))
+    }
+
+    pub(crate) fn collision(&self) -> Result<par6_kin::Collision, DaemonError> {
+        crate::kin::load_collision(
+            &self.assets_dir,
+            self.variant,
+            self.package_dir.as_deref(),
+            COLLISION_CLEARANCE_M,
+        )
+        .map_err(|e| {
+            DaemonError::Kinematics(format!(
+                "cannot load collision model {} from {}: {e}",
+                self.variant.urdf_relpath(),
+                self.assets_dir.display()
+            ))
+        })
+    }
+}
+
 pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
     active_gripper: Option<&par6_config::GripperConfig>,
 ) -> Result<KinStack, DaemonError> {
-    use crate::kin::{
-        load_kin, resolve_assets_dir, variant_for, CartKin, KinFk, KinGravity, SoftWindow,
-        ToolOffset,
-    };
-    let assets_dir =
-        resolve_assets_dir(opts.assets.as_deref(), config_path).map_err(DaemonError::Kinematics)?;
-    let variant = variant_for(
-        &robot.robot.active_gripper,
-        active_gripper.and_then(|g| g.urdf_variant.as_deref()),
-    );
-    log::info!(
-        "kinematics: {} from {}",
-        variant.urdf_relpath(),
-        assets_dir.display()
-    );
-    let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
-    // G(q) describes the body that actually swings: the arm-only chain
-    // plus the ACTIVE gripper's inertials from config (one source per
-    // mass — see `kin::load_gravity_kin`). The `--sim-dynamics` plant
-    // carries the same tool inertials on its wrist, so the model and the
-    // plant agree there too and an IDLE arm under the feedforward floats.
-    let gravity_kin = crate::kin::load_gravity_kin(&assets_dir, active_gripper)
+    use crate::kin::{KinFk, KinGravity, ToolOffset};
+    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
+    let gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_gripper)
         .map_err(DaemonError::Kinematics)?;
-    // The collision world models the same body the planner plans for,
-    // tool included — a keep-out the gripper enters is a collision even
-    // when the flange clears it. Two instances, one per consumer thread
-    // (planner and the streaming gate), each loaded once at startup: the
-    // vendor collision meshes cost hundreds of milliseconds to read.
-    let load_collision = || {
-        crate::kin::load_collision(
-            &assets_dir,
-            variant,
-            opts.package_dir.as_deref(),
-            COLLISION_CLEARANCE_M,
-        )
-        .map_err(|e| {
-            DaemonError::Kinematics(format!(
-                "cannot load collision model {} from {}: {e}",
-                variant.urdf_relpath(),
-                assets_dir.display()
-            ))
-        })
-    };
-    let collision = load_collision()?;
-    let gate_collision = load_collision()?;
-    // Gravity is the only model that does not carry it: the offset is a
-    // massless point, not a load.
     let tool_offset = ToolOffset::new();
-    let window = SoftWindow::from_config(robot);
-    let dls_lambda = robot.motion.dls_lambda;
     Ok(KinStack {
-        fk: KinFk::new(load()?, tool_offset.clone()),
+        fk: KinFk::new(src.kin()?, tool_offset.clone()),
         gravity: KinGravity::new(gravity_kin),
-        planner: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
-        bridge: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
-        housekeeping: CartKin::new(load()?, tool_offset.clone(), window, dls_lambda),
-        collision,
-        gate_collision,
+        planner: src.cart_kin(&tool_offset)?,
+        bridge: src.cart_kin(&tool_offset)?,
+        housekeeping: src.cart_kin(&tool_offset)?,
+        collision: src.collision()?,
+        gate_collision: src.collision()?,
         tool_offset,
-        assets_dir,
+        assets_dir: src.assets_dir,
+    })
+}
+
+/// The kinematics the offline preview needs: a planner solver, a second
+/// one for cartesian jog integration, one collision world and the
+/// TCP-offset cell they share — not the daemon's FK, gravity and gate
+/// instances, which the preview never drives.
+pub(crate) struct PreviewKin {
+    pub(crate) planner: crate::kin::CartKin,
+    pub(crate) cart: crate::kin::CartKin,
+    pub(crate) collision: par6_kin::Collision,
+    /// The streaming gate's own world: it is checked from a different
+    /// lane than the planner's and each holds mutable scratch.
+    pub(crate) gate_collision: par6_kin::Collision,
+    pub(crate) tool_offset: crate::kin::ToolOffset,
+}
+
+pub(crate) fn load_preview_kin(
+    opts: &Options,
+    config_path: &std::path::Path,
+    robot: &par6_config::RobotConfig,
+    active_gripper: Option<&par6_config::GripperConfig>,
+) -> Result<PreviewKin, DaemonError> {
+    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
+    let tool_offset = crate::kin::ToolOffset::new();
+    Ok(PreviewKin {
+        planner: src.cart_kin(&tool_offset)?,
+        cart: src.cart_kin(&tool_offset)?,
+        collision: src.collision()?,
+        gate_collision: src.collision()?,
+        tool_offset,
     })
 }
 
@@ -909,12 +985,14 @@ fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, Daemo
 /// The retry loop behind [`open_hardware_bus`], with the clock seam
 /// injectable: one attempt per second until `retry_s` is spent, the
 /// first attempt always runs, and the LAST error is the one reported.
-fn open_with_retry<T, E: std::fmt::Display>(
+pub(crate) fn open_with_retry<T, E: std::fmt::Display>(
     retry_s: f64,
     mut open: impl FnMut() -> Result<T, E>,
     mut wait: impl FnMut(std::time::Duration),
 ) -> Result<T, E> {
-    let attempts = 1 + retry_s.max(0.0).floor() as u32;
+    // The window is bounded at config load; clamping here as well keeps
+    // a hand-built value from wrapping the attempt count to zero.
+    let attempts = 1 + retry_s.clamp(0.0, par6_config::MAX_OPEN_RETRY_S).floor() as u32;
     let mut last = None;
     for attempt in 1..=attempts {
         match open() {
@@ -996,6 +1074,30 @@ mod tests {
             (1, 0),
             "0 = fail on the first attempt"
         );
+    }
+
+    /// A retry window past the config ceiling is clamped to the ceiling
+    /// (an hour of attempts, not a wrapped count of zero), and a NaN
+    /// window still runs its one attempt.
+    #[test]
+    fn an_absurd_retry_window_is_bounded_not_wrapped() {
+        let attempts_for = |window: f64| {
+            let mut calls = 0u32;
+            let failed: Result<u32, &str> = open_with_retry(
+                window,
+                || {
+                    calls += 1;
+                    Err("ENODEV")
+                },
+                |_| {},
+            );
+            assert_eq!(failed, Err("ENODEV"), "window {window}");
+            calls
+        };
+        let ceiling = 1 + par6_config::MAX_OPEN_RETRY_S as u32;
+        assert_eq!(attempts_for(1e12), ceiling);
+        assert_eq!(attempts_for(f64::INFINITY), ceiling);
+        assert_eq!(attempts_for(f64::NAN), 1);
     }
 
     /// `--sim` supplies the relaxed bands only where the config is silent;

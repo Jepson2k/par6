@@ -22,6 +22,9 @@ pub struct RunOptions {
     pub cpu: Option<usize>,
     /// SCHED_FIFO priority.
     pub fifo_priority: Option<u8>,
+    /// Run the per-phase tick profiler (a clock read per phase; off by
+    /// default, the tick then costs nothing extra).
+    pub tick_profile: bool,
 }
 
 impl Default for RunOptions {
@@ -29,6 +32,7 @@ impl Default for RunOptions {
         Self {
             cpu: Some(3),
             fifo_priority: Some(99),
+            tick_profile: false,
         }
     }
 }
@@ -76,8 +80,10 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     /// Deliberate exit path, run ONCE after the final `run()` returns on
-    /// process shutdown (not on the op-application breaks): halt to IDLE
-    /// and tick until the arm measures at rest (bounded by
+    /// process shutdown (not on the op-application breaks): the
+    /// configured retreat to the rest pose (off unless `[shutdown]
+    /// safe_park` asks for it; its timeout logs and moves on), then halt
+    /// to IDLE and tick until the arm measures at rest (bounded by
     /// [`SHUTDOWN_SETTLE_BUDGET_S`]), then one SAFETY_STOP tick so the
     /// last frame on the bus idles the drives on purpose. In FLASHING
     /// the bus is silent by contract and the whole sequence is skipped.
@@ -87,6 +93,28 @@ impl<B: DriverBus> RtCore<B> {
         }
         let dt = self.tick_dt_s();
         let dt_ns = (dt * 1e9).round() as u64;
+        if self.shutdown_park_begin() {
+            let mut deadline = monotonic_ns();
+            let mut reached = false;
+            for _ in 0..self.shutdown_park_timeout_ticks() {
+                if self.shutdown_park_feed() {
+                    reached = true;
+                    break;
+                }
+                self.tick(dt, false);
+                deadline += dt_ns;
+                let now = monotonic_ns();
+                if now < deadline {
+                    sleep_until(deadline);
+                } else {
+                    deadline = now;
+                }
+            }
+            if !reached {
+                log::warn!("shutdown: retreat timed out; halting where the arm is");
+            }
+            self.shutdown_park_end();
+        }
         let budget = (SHUTDOWN_SETTLE_BUDGET_S / dt).ceil() as u32;
         self.shutdown_halt();
         let mut deadline = monotonic_ns();

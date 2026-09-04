@@ -37,7 +37,6 @@ pub mod error;
 pub mod pygen;
 pub mod reply;
 pub mod status;
-pub mod telemetry;
 mod wire;
 
 pub use chunk::{
@@ -51,18 +50,16 @@ pub use enums::{
     ToolState,
 };
 pub use error::{make_error, template, ErrorCode, ErrorTemplate, WireError, UNATTRIBUTED};
-pub use reply::{decode_reply, encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
-pub use status::{
-    decode_status, encode_status_into, HomingWire, LinkHealthWire, Status, StatusEncoder,
-    STATUS_HEADER_LEN, STATUS_LEN,
+pub use reply::{
+    decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
 };
-pub use telemetry::{
-    decode_telemetry, encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe,
-    TelemetryValue,
+pub use status::{
+    decode_status, encode_status_into, DriveHealthWire, HomingWire, LinkHealthWire, LoopHealthWire,
+    Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 2;
+pub const PROTO_VERSION: u8 = 3;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

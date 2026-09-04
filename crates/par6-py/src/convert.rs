@@ -2,7 +2,9 @@
 //! plain dicts (the Python shim owns the typed surface), errors become a
 //! structured exception carrying the wire's six-tuple.
 
-use pyo3::exceptions::PyRuntimeError;
+use std::time::Duration;
+
+use pyo3::exceptions::{PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -12,6 +14,31 @@ use par6_proto::{
     Command, FlashingAssertion, Frame, QueryResult, Shape, Status, ToolStatusWire, WireError,
 };
 use par6_server::ShapeLayer;
+
+/// The wire frame discriminant as a [`Frame`].
+pub fn frame_of(v: u8) -> PyResult<Frame> {
+    Frame::from_wire(i64::from(v))
+        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
+}
+
+/// Seconds beyond which a wait is "forever" — tokio's own far-future
+/// horizon, so the deadline arithmetic behind every wait stays finite.
+const WAIT_FOREVER_S: u64 = 86_400 * 365 * 30;
+
+/// A Python timeout in seconds as a [`Duration`]. NaN and negative values
+/// raise `ValueError`; `inf` (Python's natural "wait forever") waits as
+/// long as the runtime can schedule.
+pub fn checked_duration(seconds: f64, what: &str) -> PyResult<Duration> {
+    if seconds.is_nan() || seconds < 0.0 {
+        return Err(PyValueError::new_err(format!(
+            "{what} must be a non-negative number of seconds, got {seconds}"
+        )));
+    }
+    if seconds >= WAIT_FOREVER_S as f64 {
+        return Ok(Duration::from_secs(WAIT_FOREVER_S));
+    }
+    Ok(Duration::from_secs_f64(seconds))
+}
 
 pyo3::create_exception!(
     _par6,
@@ -136,6 +163,16 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     homing.set_item("joints", s.homing.joints.clone())?;
     d.set_item("homing", homing)?;
     d.set_item("torques_ext", s.torques_ext.to_vec())?;
+    d.set_item("paused", s.paused)?;
+    let dh = PyDict::new(py);
+    dh.set_item("temperatures_c", s.drive_health.temperatures_c.clone())?;
+    dh.set_item("currents_ma", s.drive_health.currents_ma.clone())?;
+    dh.set_item("bus_voltage_v", s.drive_health.bus_voltage_v)?;
+    d.set_item("drive_health", dh)?;
+    let loop_health = PyDict::new(py);
+    loop_health.set_item("p99_period_s", s.loop_health.p99_period_s)?;
+    loop_health.set_item("overruns", s.loop_health.overruns)?;
+    d.set_item("loop_health", loop_health)?;
     Ok(d.into_any().unbind())
 }
 
@@ -248,35 +285,32 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
         QueryResult::Payload { mass, com, inertia } => {
             fill_payload(&d, *mass, *com, *inertia)?;
         }
+        QueryResult::BusScan { nodes } => {
+            let rows = PyList::empty(py);
+            for n in nodes {
+                let row = PyDict::new(py);
+                row.set_item("node", n.node)?;
+                row.set_item("configured", n.configured)?;
+                row.set_item("present", n.present)?;
+                row.set_item("freshness", n.freshness)?;
+                row.set_item("hw_ver", n.hw_ver)?;
+                row.set_item("sw_ver", n.sw_ver)?;
+                row.set_item("serial", n.serial)?;
+                rows.append(row)?;
+            }
+            d.set_item("nodes", rows)?;
+        }
         QueryResult::ConfigInfo {
             path,
             fingerprint,
             tick_dt_s,
             motion,
             joints,
-            active_recipe,
-            recipes,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
             d.set_item("tick_dt_s", *tick_dt_s)?;
-            let m = PyDict::new(py);
-            for (key, v) in [
-                "jog_l_linear_max_m_s",
-                "jog_l_angular_max_rad_s",
-                "cart_step_m",
-                "cart_step_rad",
-                "move_l_max_joint_step_rad",
-                "dls_lambda",
-                "settle_tolerance_rad",
-                "settle_timeout_s",
-            ]
-            .iter()
-            .zip(motion)
-            {
-                m.set_item(key, *v)?;
-            }
-            d.set_item("motion", m)?;
+            d.set_item("motion", motion_dict(py, motion)?)?;
             let js = PyList::empty(py);
             for j in joints {
                 let jd = PyDict::new(py);
@@ -287,8 +321,6 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
                 js.append(jd)?;
             }
             d.set_item("joints", js)?;
-            d.set_item("active_recipe", active_recipe.as_deref())?;
-            d.set_item("recipes", recipes.to_vec())?;
         }
         QueryResult::ConfigBundle {
             path,
@@ -329,11 +361,6 @@ pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
 pub fn tool_param_from_py(v: &Bound<'_, PyAny>) -> PyResult<ToolParam> {
     pythonize::depythonize(v)
         .map_err(|_| PyRuntimeError::new_err("tool parameters must be bool, int, float, or str"))
-}
-
-pub fn frame_of(v: u8) -> PyResult<Frame> {
-    Frame::from_wire(i64::from(v))
-        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
 }
 
 pub fn layer_of(name: &str) -> PyResult<ShapeLayer> {
@@ -392,4 +419,21 @@ pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
             q.len()
         ))
     })
+}
+
+/// The `[motion]` keys labelled from a wire/config array; an omitted
+/// optional key (NaN on the wire) is `None`.
+pub(crate) fn motion_dict<'py>(
+    py: Python<'py>,
+    values: &[f64; 13],
+) -> PyResult<Bound<'py, PyDict>> {
+    let m = PyDict::new(py);
+    for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {
+        if v.is_nan() {
+            m.set_item(key, py.None())?;
+        } else {
+            m.set_item(key, *v)?;
+        }
+    }
+    Ok(m)
 }

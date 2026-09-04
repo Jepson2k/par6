@@ -298,6 +298,11 @@ pub struct BusConfig {
     pub rx_frames_per_tick_cap: u32,
     /// Config passes per node during boot configuration.
     pub boot_config_repeats: u8,
+    /// When the full stored-config shots re-run after the bus arms
+    /// \[s since arming\] (vendor boot workaround: a driver that missed
+    /// the paced boot pass gets three more chances).
+    #[serde(default = "default_config_resend_offsets_s")]
+    pub config_resend_offsets_s: Vec<f64>,
     /// How long daemon startup keeps retrying a failed bus open \[s\]
     /// (1 s pacing; 0 = fail on the first attempt). Covers the boot
     /// race where par6d starts before the CAN driver has enumerated
@@ -315,7 +320,7 @@ pub struct BusConfig {
     pub scan: ScanConfig,
 }
 
-/// UDP command/status/telemetry plane parameters (protocol v2).
+/// UDP command/status plane parameters (protocol v2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -326,23 +331,9 @@ pub struct ProtocolConfig {
     /// Status multicast group (IPv4); unicast fallback per the transport
     /// ladder.
     pub status_multicast_group: String,
-    /// Telemetry stream port.
-    pub telemetry_port: u16,
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
     /// (validated) so the broadcaster is a clean tick decimation.
     pub status_rate_hz: u32,
-    /// Telemetry stream rate \[Hz\].
-    #[serde(default = "default_telemetry_rate_hz")]
-    pub telemetry_rate_hz: u32,
-    /// Telemetry recipe active from boot. Omitted = the stream stays
-    /// silent until a client's `set_recipe` — the shipped default. An
-    /// unknown name refuses startup, like `set_recipe` refuses it live.
-    #[serde(default)]
-    pub initial_recipe: Option<String>,
-}
-
-fn default_telemetry_rate_hz() -> u32 {
-    100
 }
 
 /// Jog profile shape.
@@ -412,6 +403,11 @@ pub struct StreamDefaults {
     /// holds in place, and a stream that silently holds instead of
     /// tracking must become an error the operator can see.
     pub fault_latch_s: f64,
+    /// Client silence after which a servo stream ends itself \[s\]. The
+    /// daemon keeps the RT stream watchdog fed until then, so this is the
+    /// slowest publish interval a streaming client may use; in sim the RT
+    /// `command_timeout_s` is floored at twice this.
+    pub servo_grace_s: f64,
 }
 
 impl Default for StreamDefaults {
@@ -421,6 +417,7 @@ impl Default for StreamDefaults {
             lowpass_cutoff_hz: 0.0,
             success_window_s: 0.4,
             fault_latch_s: 0.5,
+            servo_grace_s: 0.25,
         }
     }
 }
@@ -428,6 +425,14 @@ impl Default for StreamDefaults {
 fn default_open_retry_s() -> f64 {
     10.0
 }
+
+fn default_config_resend_offsets_s() -> Vec<f64> {
+    vec![0.2, 0.6, 1.2]
+}
+
+/// Longest bus-open retry window accepted \[s\]; the daemon derives a
+/// per-second attempt count from it.
+pub const MAX_OPEN_RETRY_S: f64 = 3600.0;
 
 /// Torque-level sim plant parameters (feature `sim-dynamics`): the
 /// motor-referred rotor dynamics the vendor models
@@ -539,7 +544,8 @@ pub struct MotionConfig {
     pub cart_step_rad: f64,
     /// Multi-segment cartesian paths (arc, spline, process move, blend
     /// chains) sample much finer, on the combined length metric
-    /// √(t² + (0.15·θ)²) \[m\] — the vendor's path pitch.
+    /// √(t² + (w·θ)²) \[m\] with `w = path_rot_weight_m_per_rad` — the
+    /// vendor's path pitch.
     pub path_step_m: f64,
     /// Joint-space blend-chain pitch \[rad\]; omitted = half the
     /// per-tick travel at the full EXEC velocity norm
@@ -558,6 +564,54 @@ pub struct MotionConfig {
     pub settle_tolerance_rad: f64,
     /// Settle timeout \[s\].
     pub settle_timeout_s: f64,
+    /// Rotation weight `w` in the multi-segment path metric
+    /// √(t² + (w·θ)²) \[m/rad\] (vendor: 0.15).
+    pub path_rot_weight_m_per_rad: f64,
+    /// A cartesian path is flagged near-singular when its worst sample's
+    /// jacobian condition number exceeds this (vendor: 1000; the
+    /// condition is capped at 1e12 upstream) …
+    pub singularity_cond_max: f64,
+    /// … or its smallest singular value drops under this (vendor: 1e-4).
+    pub singularity_sigma_min: f64,
+}
+
+impl MotionConfig {
+    /// Every key, in declaration order — the labels of [`Self::as_array`].
+    pub const KEYS: [&'static str; 13] = [
+        "jog_l_linear_max_m_s",
+        "jog_l_angular_max_rad_s",
+        "cart_step_m",
+        "cart_step_rad",
+        "path_step_m",
+        "joint_step_rad",
+        "move_l_max_joint_step_rad",
+        "dls_lambda",
+        "settle_tolerance_rad",
+        "settle_timeout_s",
+        "path_rot_weight_m_per_rad",
+        "singularity_cond_max",
+        "singularity_sigma_min",
+    ];
+
+    /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
+    /// is NaN.
+    pub fn as_array(&self) -> [f64; 13] {
+        [
+            self.jog_l_linear_max_m_s,
+            self.jog_l_angular_max_rad_s,
+            self.cart_step_m,
+            self.cart_step_rad,
+            self.path_step_m,
+            self.joint_step_rad.unwrap_or(f64::NAN),
+            self.move_l_max_joint_step_rad,
+            self.dls_lambda,
+            self.settle_tolerance_rad,
+            self.settle_timeout_s,
+            self.path_rot_weight_m_per_rad,
+            self.singularity_cond_max,
+            self.singularity_sigma_min,
+        ]
+    }
 }
 
 impl Default for MotionConfig {
@@ -573,6 +627,9 @@ impl Default for MotionConfig {
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
             settle_timeout_s: 2.0,
+            path_rot_weight_m_per_rad: 0.15,
+            singularity_cond_max: 1000.0,
+            singularity_sigma_min: 1e-4,
         }
     }
 }
@@ -598,6 +655,102 @@ impl Default for LimitsSection {
         Self {
             tau_ext_margin_nm: 0.0,
             tau_ext_window_s: 0.1,
+        }
+    }
+}
+
+/// The shutdown retreat: an opt-in slow drive to a rest pose before the
+/// drives are idled, so an arm left mid-air by a process exit does not
+/// drop from wherever it was when the terminal limp frame lands.
+///
+/// Off by default: a retreat is a motion, and a motion on shutdown must
+/// be asked for. Durations are seconds; the runtime converts with
+/// `round(s / dt)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct ShutdownConfig {
+    /// Drive to the rest pose on shutdown. Only a homed, enabled,
+    /// error-free arm retreats; anything else goes straight to the
+    /// existing halt-settle-limp exit.
+    pub safe_park: bool,
+    /// Per-joint distance to the rest pose that counts as arrived \[rad\].
+    pub tolerance_rad: f64,
+    /// Ceiling on the retreat \[s\]. Expiry is logged and the exit
+    /// continues from wherever the arm is — it never blocks a shutdown.
+    pub timeout_s: f64,
+    /// Joint-velocity ceiling for the retreat \[rad/s\], applied to every
+    /// joint as a fraction of the STREAM limits.
+    pub velocity_limit_rad_s: f64,
+    /// The rest pose \[rad\], one entry per joint. Omitted = the
+    /// `robot.park_pose_rad` the homing return targets.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub safe_park_q: Option<Vec<f64>>,
+}
+
+impl Default for ShutdownConfig {
+    fn default() -> Self {
+        Self {
+            safe_park: false,
+            tolerance_rad: 0.03,
+            timeout_s: 15.0,
+            velocity_limit_rad_s: 0.25,
+            safe_park_q: None,
+        }
+    }
+}
+
+/// The freedrive drift lock: a hold the IDLE gravity feedforward gains
+/// once the arm has been still, so an arm whose gravity model is
+/// slightly off stops drifting from wherever the operator leaves it
+/// instead of sagging or rising until something stops it.
+///
+/// After `settle_s` of stillness the pose is captured and each joint is
+/// sent the drive's impedance (PD) frame at that pose — the per-joint
+/// `gains.kp`/`gains.kd` the jog PD pack uses, closed inside the drive
+/// at its own loop rate — with `G(q)` plus a slow clamped integral
+/// (`ki_nm_rad_s`, `integral_limit_nm`) on the pose error as the
+/// feedforward. Any measured joint speed above `release_rad_s`
+/// dissolves the lock and zeroes the integral on that same tick, back to
+/// the torque-only freedrive frame, so an operator pushing the arm never
+/// fights the integral; stillness for `settle_s` re-arms it at the NEW
+/// pose. The job is "stop drifting from here", not "return to where you
+/// were": a pose the arm sagged to before the lock armed is the pose it
+/// keeps.
+///
+/// The integral is the only term the runtime adds and it is clamped per
+/// joint, so the worst case of a stale hold is the drive's configured
+/// impedance plus a bounded, known torque. The lock cannot hide a bad
+/// gravity model: a standing non-zero integral is the bias the model is
+/// missing, published on the snapshot and as the difference between the
+/// commanded and gravity torques.
+///
+/// Off by default. Durations are seconds; the runtime converts with
+/// `round(s / dt)`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FreedriveConfig {
+    /// Arm the drift lock in freedrive (IDLE, homed, enabled, gravity
+    /// compensation on).
+    pub drift_lock: bool,
+    /// Measured joint speed above which the lock dissolves \[rad/s\]; the
+    /// arm must stay under it for `settle_s` to (re-)arm.
+    pub release_rad_s: f64,
+    /// Stillness required before the lock captures the pose \[s\].
+    pub settle_s: f64,
+    /// Integral gain on the pose error \[Nm/(rad·s)\].
+    pub ki_nm_rad_s: f64,
+    /// Per-joint clamp on the integral \[Nm\].
+    pub integral_limit_nm: f64,
+}
+
+impl Default for FreedriveConfig {
+    fn default() -> Self {
+        Self {
+            drift_lock: false,
+            release_rad_s: 0.08,
+            settle_s: 0.3,
+            ki_nm_rad_s: 1.0,
+            integral_limit_nm: 0.3,
         }
     }
 }
@@ -636,6 +789,12 @@ pub struct RobotConfig {
     /// disabled.
     #[serde(default)]
     pub limits: LimitsSection,
+    /// Shutdown retreat. Omitted = no retreat.
+    #[serde(default)]
+    pub shutdown: ShutdownConfig,
+    /// Freedrive drift lock. Omitted = no lock.
+    #[serde(default)]
+    pub freedrive: FreedriveConfig,
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
@@ -669,6 +828,15 @@ impl RobotConfig {
     /// Tick rate \[Hz\] derived from `robot.tick_dt_s`.
     pub fn tick_rate_hz(&self) -> f64 {
         1.0 / self.robot.tick_dt_s
+    }
+
+    /// The pose the shutdown retreat drives to \[rad\]: `shutdown.safe_park_q`
+    /// when set, else `robot.park_pose_rad`.
+    pub fn safe_park_q(&self) -> &[f64] {
+        self.shutdown
+            .safe_park_q
+            .as_deref()
+            .unwrap_or(&self.robot.park_pose_rad)
     }
 
     /// Convert a config time constant in seconds to ticks:
@@ -718,6 +886,8 @@ impl RobotConfig {
         self.validate_timing()?;
         self.validate_limits()?;
         self.validate_motion()?;
+        self.validate_shutdown()?;
+        self.validate_freedrive()?;
         self.validate_sim()?;
         Ok(())
     }
@@ -791,7 +961,7 @@ impl RobotConfig {
             (l.jerk_rad_s3, "limits.jerk_rad_s3"),
             (l.torque_rate_nm_s, "limits.torque_rate_nm_s"),
         ] {
-            if v <= 0.0 {
+            if !is_positive(v) {
                 return Err(invalid(f(name), "must be > 0"));
             }
         }
@@ -868,8 +1038,21 @@ impl RobotConfig {
         if b.boot_config_repeats == 0 {
             return Err(invalid("bus.boot_config_repeats", "must be >= 1"));
         }
-        if !(b.open_retry_s.is_finite() && b.open_retry_s >= 0.0) {
-            return Err(invalid("bus.open_retry_s", "must be finite and >= 0"));
+        if !b
+            .config_resend_offsets_s
+            .iter()
+            .all(|s| is_positive(*s) && s.is_finite())
+        {
+            return Err(invalid(
+                "bus.config_resend_offsets_s",
+                "every offset must be > 0 and finite",
+            ));
+        }
+        if !(b.open_retry_s.is_finite() && (0.0..=MAX_OPEN_RETRY_S).contains(&b.open_retry_s)) {
+            return Err(invalid(
+                "bus.open_retry_s",
+                "must be finite and within 0..=3600",
+            ));
         }
         if b.config_pace_s < 0.0 {
             return Err(invalid("bus.config_pace_s", "must be >= 0"));
@@ -882,7 +1065,6 @@ impl RobotConfig {
         let ports = [
             (p.command_port, "protocol.command_port"),
             (p.status_port, "protocol.status_port"),
-            (p.telemetry_port, "protocol.telemetry_port"),
         ];
         for (i, (port, name)) in ports.iter().enumerate() {
             if *port == 0 {
@@ -906,9 +1088,6 @@ impl RobotConfig {
         }
         if p.status_rate_hz == 0 {
             return Err(invalid("protocol.status_rate_hz", "must be > 0"));
-        }
-        if !(1..=1000).contains(&p.telemetry_rate_hz) {
-            return Err(invalid("protocol.telemetry_rate_hz", "must be 1..=1000"));
         }
         let rate = self.tick_rate_hz();
         let per = rate / f64::from(p.status_rate_hz);
@@ -937,15 +1116,16 @@ impl RobotConfig {
             (s.command_timeout_s, "stream.command_timeout_s"),
             (s.success_window_s, "stream.success_window_s"),
             (s.fault_latch_s, "stream.fault_latch_s"),
+            (s.servo_grace_s, "stream.servo_grace_s"),
         ] {
             if !is_positive(v) {
                 return Err(invalid(name, "must be > 0"));
             }
         }
-        if s.lowpass_cutoff_hz < 0.0 {
+        if !s.lowpass_cutoff_hz.is_finite() || s.lowpass_cutoff_hz < 0.0 {
             return Err(invalid(
                 "stream.lowpass_cutoff_hz",
-                "must be >= 0 (0 = off)",
+                "must be finite and >= 0 (0 = off)",
             ));
         }
         Ok(())
@@ -1023,6 +1203,63 @@ impl RobotConfig {
         Ok(())
     }
 
+    fn validate_shutdown(&self) -> Result<(), ConfigError> {
+        let s = &self.shutdown;
+        for (v, name) in [
+            (s.tolerance_rad, "shutdown.tolerance_rad"),
+            (s.timeout_s, "shutdown.timeout_s"),
+            (s.velocity_limit_rad_s, "shutdown.velocity_limit_rad_s"),
+        ] {
+            if !is_positive(v) {
+                return Err(invalid(name, "must be > 0"));
+            }
+        }
+        let q = self.safe_park_q();
+        if q.len() != self.joints.len() {
+            return Err(invalid(
+                "shutdown.safe_park_q",
+                format!(
+                    "must have one entry per joint ({} joints, {} entries)",
+                    self.joints.len(),
+                    q.len()
+                ),
+            ));
+        }
+        for (i, (v, j)) in q.iter().zip(&self.joints).enumerate() {
+            if !v.is_finite() || *v < j.limits.soft_min_rad || *v > j.limits.soft_max_rad {
+                return Err(invalid(
+                    "shutdown.safe_park_q",
+                    format!(
+                        "joint {i}: {v} rad is outside the soft limits [{}, {}]",
+                        j.limits.soft_min_rad, j.limits.soft_max_rad
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_freedrive(&self) -> Result<(), ConfigError> {
+        let f = &self.freedrive;
+        for (v, name) in [
+            (f.release_rad_s, "freedrive.release_rad_s"),
+            (f.integral_limit_nm, "freedrive.integral_limit_nm"),
+        ] {
+            if !is_positive(v) {
+                return Err(invalid(name, "must be > 0"));
+            }
+        }
+        for (v, name) in [
+            (f.settle_s, "freedrive.settle_s"),
+            (f.ki_nm_rad_s, "freedrive.ki_nm_rad_s"),
+        ] {
+            if !v.is_finite() || v < 0.0 {
+                return Err(invalid(name, "must be finite and >= 0"));
+            }
+        }
+        Ok(())
+    }
+
     fn validate_motion(&self) -> Result<(), ConfigError> {
         let m = &self.motion;
         for (v, name) in [
@@ -1039,6 +1276,12 @@ impl RobotConfig {
             (m.dls_lambda, "motion.dls_lambda"),
             (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
             (m.settle_timeout_s, "motion.settle_timeout_s"),
+            (
+                m.path_rot_weight_m_per_rad,
+                "motion.path_rot_weight_m_per_rad",
+            ),
+            (m.singularity_cond_max, "motion.singularity_cond_max"),
+            (m.singularity_sigma_min, "motion.singularity_sigma_min"),
         ] {
             if !is_positive(v) || !v.is_finite() {
                 return Err(invalid(name, "must be > 0 and finite"));

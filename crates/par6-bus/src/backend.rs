@@ -104,6 +104,14 @@ impl DriverBus for RuntimeBus {
         dispatch!(self, retune_node(node, tune, repeats))
     }
 
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
+        dispatch!(self, set_can_id(node, new_id))
+    }
+
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
+        dispatch!(self, save_config(node))
+    }
+
     fn send_limits(
         &mut self,
         node: NodeId,

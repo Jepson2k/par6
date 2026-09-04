@@ -33,8 +33,10 @@
 //! Generation is planner-side and may allocate; only [`JogEngine::tick`]
 //! and [`StreamingExecutor::step`] are meant for the RT thread.
 
+pub mod arclen;
 pub mod cart;
 mod error;
+pub mod gate;
 mod jog;
 mod limits;
 mod path;

@@ -27,17 +27,19 @@ mod homing;
 mod io;
 mod robot;
 
-pub use gripper::{ArmJointHomeOffset, GripperConfig, GripperDriverConfig, ToolKinematics};
+pub use gripper::{
+    ArmJointHomeOffset, GripperConfig, GripperDriverConfig, SettleTimings, ToolKinematics,
+};
 pub use homing::{
     GripperHomeMode, HomeGroup, HomingConfig, HomingStrategy, JointHoming, MoveTo, PostHomeConfig,
     PreMove, ReleaseConfig, SequenceStep,
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
-    BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
-    KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
-    WatchdogAction,
+    BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
+    JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
+    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig,
+    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
 };
 
 use std::path::Path;
@@ -827,14 +829,25 @@ mod tests {
     /// switch to 25 if real movement proves it stale).
     #[test]
     fn sim_dynamics_table_matches_the_vendor_model() {
-        let robot =
-            RobotConfig::load(&config_dir().join("PAR6.toml")).expect("shipped PAR6 config");
-        assert_eq!(
-            robot.sim.motor_jm_kg_m2,
-            vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
-        );
-        assert_eq!(robot.sim.motor_b_nm_s, 1.0e-4);
-        assert_eq!(robot.sim.motor_tc_nm, 0.02);
+        // The raw table, not the loaded config: `[sim]` fills in from
+        // `Default` when absent, so only the file itself proves the
+        // shipped values are declared.
+        let path = config_dir().join("PAR6.toml");
+        let text = std::fs::read_to_string(&path).expect("shipped PAR6 config");
+        let table: toml::Table = toml::from_str(&text).expect("shipped PAR6 config parses");
+        let sim = table["sim"]
+            .as_table()
+            .expect("the shipped config declares [sim] explicitly");
+        let jm: Vec<f64> = sim["motor_jm_kg_m2"]
+            .as_array()
+            .expect("sim.motor_jm_kg_m2 is an array")
+            .iter()
+            .map(|v| v.as_float().expect("sim.motor_jm_kg_m2 holds floats"))
+            .collect();
+        assert_eq!(jm, vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]);
+        assert_eq!(sim["motor_b_nm_s"].as_float(), Some(1.0e-4));
+        assert_eq!(sim["motor_tc_nm"].as_float(), Some(0.02));
+        let robot = RobotConfig::load(&path).expect("shipped PAR6 config");
         assert_eq!(robot.joints[1].gear_ratio, 25.0, "wire conversion keeps 25");
         assert_eq!(
             robot.joints[1].dynamics_gear_ratio,

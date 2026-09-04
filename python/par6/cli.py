@@ -13,7 +13,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import os
 import sys
 from collections.abc import Sequence
 from typing import Any
@@ -24,6 +23,9 @@ from par6.client import RobotClient, RobotError
 EXIT_UNREACHABLE = 2
 #: Exit code when the runtime answered but refused the command.
 EXIT_REFUSED = 3
+#: Exit code when the runtime accepted the command but it did not finish
+#: within the wait.
+EXIT_TIMEOUT = 4
 
 
 def _client(args: argparse.Namespace) -> RobotClient:
@@ -45,7 +47,7 @@ def _emit(value: Any, as_json: bool) -> None:
 def _cmd_ping(client: RobotClient, args: argparse.Namespace) -> int:
     result = client.ping()
     if result is None:
-        print(f"no runtime answered {args.host}:{args.port}", file=sys.stderr)
+        print(f"no runtime answered {client.host}:{client.port}", file=sys.stderr)
         return EXIT_UNREACHABLE
     _emit({"hardware_connected": result.hardware_connected}, args.json)
     return 0
@@ -82,7 +84,8 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
             # The e-stop is always the LAST slot; the ones before it are the
             # configured inputs then outputs, so the width follows config.
             "io": list(status.io),
-            "estop": bool(status.io[-1]) if status.io else None,
+            # The slot carries the LINE, which reads low while pressed.
+            "estop": (status.io[-1] == 0) if status.io else None,
             "tool": None if tool is None else tool.key,
             "tool_positions": None if tool is None else list(tool.positions),
             "tool_engaged": None if tool is None else tool.engaged,
@@ -92,12 +95,13 @@ def _cmd_status(client: RobotClient, args: argparse.Namespace) -> int:
     return 0
 
 
-def _unconfirmed(what: str, args: argparse.Namespace) -> int:
+def _unconfirmed(what: str, client: RobotClient) -> int:
     """A send nothing acknowledged must never read as success — for
     ``estop`` especially, "the arm is stopped" printed on a lost datagram
     is the dangerous lie."""
     print(
-        f"{what} NOT confirmed: no runtime acknowledged it at {args.host}:{args.port}",
+        f"{what} NOT confirmed: no runtime acknowledged it at "
+        f"{client.host}:{client.port}",
         file=sys.stderr,
     )
     return EXIT_UNREACHABLE
@@ -105,28 +109,28 @@ def _unconfirmed(what: str, args: argparse.Namespace) -> int:
 
 def _cmd_estop(client: RobotClient, args: argparse.Namespace) -> int:
     if client.estop() != 1:
-        return _unconfirmed("estop", args)
+        return _unconfirmed("estop", client)
     _emit("estop latched; clear it with `par6 reset`", args.json)
     return 0
 
 
 def _cmd_reset(client: RobotClient, args: argparse.Namespace) -> int:
     if client.reset() != 1:
-        return _unconfirmed("reset", args)
+        return _unconfirmed("reset", client)
     _emit("protective stop cleared", args.json)
     return 0
 
 
 def _cmd_stop(client: RobotClient, args: argparse.Namespace) -> int:
     if client.stop(clear_queue=not args.keep_queue) != 1:
-        return _unconfirmed("stop", args)
+        return _unconfirmed("stop", client)
     _emit("motion stopped", args.json)
     return 0
 
 
 def _cmd_home(client: RobotClient, args: argparse.Namespace) -> int:
     if client.home(wait=args.wait, timeout=args.home_timeout) < 0:
-        return _unconfirmed("home", args)
+        return _unconfirmed("home", client)
     _emit("homed" if args.wait else "homing started", args.json)
     return 0
 
@@ -139,22 +143,111 @@ def _cmd_move_j(client: RobotClient, args: argparse.Namespace) -> int:
         timeout=args.move_timeout,
     )
     if index < 0:
-        return _unconfirmed("move-j", args)
+        return _unconfirmed("move-j", client)
     _emit({"queue_index": index}, args.json)
+    return 0
+
+
+def _cmd_scan(client: RobotClient, args: argparse.Namespace) -> int:
+    rows = client.bus_scan()
+    if rows is None:
+        return _unconfirmed("scan", client)
+    if args.json:
+        _emit(rows, True)
+        return 0
+    fresh = {0: "unknown", 1: "fresh", 2: "stale", 3: "lost"}
+    print("node  configured  present  freshness  hw  sw  serial")
+    for r in rows:
+        if not (r["present"] or r["configured"] or args.all):
+            continue
+        print(
+            f"{r['node']:>4}  {'yes' if r['configured'] else 'no':>10}  "
+            f"{'yes' if r['present'] else 'no':>7}  {fresh.get(r['freshness'], '?'):>9}  "
+            f"{r['hw_ver']:>2}  {r['sw_ver']:>2}  {r['serial']}"
+        )
+    return 0
+
+
+def _cmd_set_can_id(client: RobotClient, args: argparse.Namespace) -> int:
+    if client.set_can_id(args.node, args.new_id, force=args.force) != 1:
+        return _unconfirmed("set-can-id", client)
+    _emit(
+        f"node {args.node} told to answer as {args.new_id}; run `par6 save-config "
+        f"{args.new_id} --force` to keep it, then update the config and restart",
+        args.json,
+    )
+    return 0
+
+
+def _cmd_save_config(client: RobotClient, args: argparse.Namespace) -> int:
+    if client.save_config(args.node, force=args.force) != 1:
+        return _unconfirmed("save-config", client)
+    _emit(f"node {args.node} asked to save its configuration", args.json)
+    return 0
+
+
+def _cmd_set_pid_gains(client: RobotClient, args: argparse.Namespace) -> int:
+    if (
+        client.set_pid_gains(
+            args.node,
+            kpp=args.kpp,
+            kpv=args.kpv,
+            kiv=args.kiv,
+            kpiq=args.kpiq,
+            kiiq=args.kiiq,
+            kp=args.kp,
+            kd=args.kd,
+            ilim_ma=args.ilim_ma,
+            velocity_limit_ticks_s=args.velocity_limit_ticks_s,
+            voltage_limit_mv=args.voltage_limit_mv,
+        )
+        != 1
+    ):
+        return _unconfirmed("set-pid-gains", client)
+    _emit(f"node {args.node} retuned", args.json)
+    return 0
+
+
+def _cmd_tool(client: RobotClient, args: argparse.Namespace) -> int:
+    index = client.tool_action(
+        args.tool, args.action, args.params, wait=args.wait, timeout=args.tool_timeout
+    )
+    if index < 0:
+        return _unconfirmed("tool", client)
+    _emit(
+        f"{args.tool} {args.action} "
+        + ("done" if args.wait else f"queued as #{index}"),
+        args.json,
+    )
+    return 0
+
+
+def _cmd_flashing(client: RobotClient, args: argparse.Namespace) -> int:
+    if args.direction == "enter":
+        ok = client.enter_flashing(args.assertion) == 1
+        text = "FLASHING: bus silent, hand it to the flasher"
+    else:
+        ok = client.exit_flashing() == 1
+        text = "left FLASHING: bus awake, config re-pushed"
+    if not ok:
+        return _unconfirmed(f"flashing {args.direction}", client)
+    _emit(text, args.json)
     return 0
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="par6", description=__doc__.splitlines()[0])
+    # Unset here means the client's own resolution: $PAR6_HOST /
+    # $PAR6_COMMAND_PORT, then the shipped defaults.
     parser.add_argument(
         "--host",
-        default=os.environ.get("PAR6_HOST", "127.0.0.1"),
+        default=None,
         help="runtime address (default: $PAR6_HOST or 127.0.0.1)",
     )
     parser.add_argument(
         "--port",
         type=int,
-        default=int(os.environ.get("PAR6_COMMAND_PORT", "6001")),
+        default=None,
         help="command port (default: $PAR6_COMMAND_PORT or 6001)",
     )
     parser.add_argument(
@@ -207,16 +300,83 @@ def build_parser() -> argparse.ArgumentParser:
     move.add_argument("--move-timeout", type=float, default=120.0)
     move.set_defaults(fn=_cmd_move_j)
 
+    scan = sub.add_parser("scan", help="rescan the CAN bus and list every node id")
+    scan.add_argument(
+        "--all", action="store_true", help="show absent, unconfigured ids too"
+    )
+    scan.set_defaults(fn=_cmd_scan)
+
+    setid = sub.add_parser(
+        "set-can-id", help="commissioning: rename a drive (idle arm only)"
+    )
+    setid.add_argument("node", type=int, help="the drive's current id (0-15)")
+    setid.add_argument("new_id", type=int, help="the id it should answer to (0-15)")
+    setid.add_argument(
+        "--force", action="store_true", help="address an id the config does not list"
+    )
+    setid.set_defaults(fn=_cmd_set_can_id)
+
+    save = sub.add_parser(
+        "save-config", help="commissioning: persist a drive's configuration to NVM"
+    )
+    save.add_argument("node", type=int, help="target id (0-15)")
+    save.add_argument(
+        "--force", action="store_true", help="address an id the config does not list"
+    )
+    save.set_defaults(fn=_cmd_save_config)
+
+    gains = sub.add_parser(
+        "set-pid-gains", help="push one drive's tuning live (every gain required)"
+    )
+    gains.add_argument("node", type=int, help="configured drive id")
+    for name in ("kpp", "kpv", "kiv", "kpiq", "kiiq", "kp", "kd", "ilim-ma"):
+        gains.add_argument(f"--{name}", type=float, required=True)
+    gains.add_argument("--velocity-limit-ticks-s", type=float, required=True)
+    gains.add_argument("--voltage-limit-mv", type=int, default=0, help="0 = VBUS")
+    gains.set_defaults(fn=_cmd_set_pid_gains)
+
+    tool = sub.add_parser(
+        "tool", help="run a tool action, e.g. `tool ELECTRIC close 50`"
+    )
+    tool.add_argument("tool", help="tool key, e.g. ELECTRIC")
+    tool.add_argument(
+        "action", help="action name, e.g. open / close / calibrate / stop"
+    )
+    tool.add_argument("params", type=float, nargs="*", help="numeric parameters")
+    tool.add_argument(
+        "--no-wait", dest="wait", action="store_false", help="do not block"
+    )
+    tool.add_argument("--tool-timeout", type=float, default=10.0)
+    tool.set_defaults(fn=_cmd_tool)
+
+    flashing = sub.add_parser(
+        "flashing", help="hand the bus to a firmware flasher, or take it back"
+    )
+    flashing.add_argument("direction", choices=("enter", "exit"))
+    flashing.add_argument(
+        "--assertion",
+        choices=("parked", "force"),
+        default="parked",
+        help="your vouching on enter: the arm is parked, or force regardless",
+    )
+    flashing.set_defaults(fn=_cmd_flashing)
+
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    client = _client(args)
     try:
-        with _client(args) as client:
+        with client:
             return int(args.fn(client, args))
+    except TimeoutError as exc:
+        # An OSError subclass, and the one that means the runtime
+        # answered every datagram but the command is still running.
+        print(f"{args.command} timed out: {exc}", file=sys.stderr)
+        return EXIT_TIMEOUT
     except OSError as exc:
-        print(f"cannot reach {args.host}:{args.port}: {exc}", file=sys.stderr)
+        print(f"cannot reach {client.host}:{client.port}: {exc}", file=sys.stderr)
         return EXIT_UNREACHABLE
     except (RobotError, RuntimeError) as exc:
         print(f"{args.command} refused: {exc}", file=sys.stderr)

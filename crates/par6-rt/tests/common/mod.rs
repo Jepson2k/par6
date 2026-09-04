@@ -68,6 +68,8 @@ pub struct Rig {
     pub gripper_node: NodeId,
     /// The measured pose the rig injects every tick.
     pub pose: [f64; MAX_JOINTS],
+    /// The measured joint speed the rig injects every tick [rad/s].
+    pub vel: [f64; MAX_JOINTS],
     /// The measured motor current the rig injects every tick [mA].
     pub current_ma: [i16; MAX_JOINTS],
     /// Bitmask of NODES whose injection is suppressed (staleness tests).
@@ -176,6 +178,7 @@ impl Rig {
             node_of,
             gripper_node,
             pose,
+            vel: [0.0; MAX_JOINTS],
             current_ma: [0; MAX_JOINTS],
             skip_nodes: 0,
             fault_nodes: 0,
@@ -222,7 +225,7 @@ impl Rig {
                 Reply::Motion {
                     node,
                     position_ticks: ticks,
-                    speed_ticks_s: 0,
+                    speed_ticks_s: self.conv[i].motor_speed_ticks_s(self.vel[i]).round() as i32,
                     current_ma: self.current_ma[i],
                 },
             );
@@ -290,6 +293,39 @@ impl Rig {
             .iter()
             .filter_map(|(t, r)| match r {
                 TxRecord::Joints(v) if *t >= tick => Some((*t, v.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stored-config passes on the bus so far, every node.
+    pub fn config_passes(&mut self) -> usize {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, par6_bus::TxRecord::ConfigPass { .. }))
+            .count()
+    }
+
+    /// Stored-config passes on the bus so far, one node.
+    pub fn config_passes_for(&mut self, node: u8) -> usize {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter(|(_, r)| matches!(r, par6_bus::TxRecord::ConfigPass { node: n } if *n == node))
+            .count()
+    }
+
+    /// Every gripper-slot frame on the bus, oldest first.
+    pub fn gripper_sends(&mut self) -> Vec<par6_bus::GripperCommand> {
+        self.core
+            .bus_mut()
+            .tx_log
+            .iter()
+            .filter_map(|(_, r)| match r {
+                par6_bus::TxRecord::Gripper(g) => Some(*g),
                 _ => None,
             })
             .collect()

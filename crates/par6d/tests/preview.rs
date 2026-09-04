@@ -12,44 +12,23 @@ use par6_server::ShapeLayer;
 use par6d::preview::Preview;
 
 mod common;
-use common::{
-    max_deg_error, park_deg, repo_root, teleport_cmd, teleport_home, to_deg, to_rad, Client, Rig,
-};
+use common::{max_deg_error, park_deg, teleport_cmd, teleport_home, to_deg, to_rad, Client, Rig};
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
 /// AND the preview so the parity below is over identical inputs.
 fn test_config() -> PathBuf {
-    let src = repo_root().join("config/PAR6.toml");
-    let dir = std::env::temp_dir().join(format!("par6d-preview-{}", std::process::id()));
-    let grippers = dir.join("grippers");
-    std::fs::create_dir_all(&grippers).expect("test config dir");
-    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
-    // Every test in this binary writes the same files into the same
-    // process-keyed directory, in parallel. A plain write truncates
-    // first, so a sibling loading the config mid-write reads an empty
-    // TOML. Written beside and renamed over: a reader sees a whole file,
-    // old or new, both of them this one.
-    let place = |path: &std::path::Path, contents: &[u8]| {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static STAGE: AtomicU64 = AtomicU64::new(0);
-        let staged = path.with_extension(format!("tmp.{}", STAGE.fetch_add(1, Ordering::Relaxed)));
-        std::fs::write(&staged, contents).expect("stage test file");
-        std::fs::rename(&staged, path).expect("place test file");
-    };
-    let dst = dir.join("PAR6.toml");
-    place(&dst, patched.as_bytes());
-    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
-        let e = entry.expect("dir entry");
-        let bytes = std::fs::read(e.path()).expect("read gripper toml");
-        place(&grippers.join(e.file_name()), &bytes);
-    }
-    dst
+    common::retimed_config("preview", 0.02)
 }
 
 fn assets() -> PathBuf {
-    repo_root().join("assets/par6_description")
+    common::assets_dir()
+}
+
+/// A pose with the wrist clear of its singularity: park folds J5 to 0,
+/// where a rotation about world z has no IK branch and a damped
+/// least-squares jog drifts off its axis.
+fn wrist_clear_deg() -> [f64; NUM_JOINTS] {
+    [0.0, -60.0, 150.0, 0.0, 45.0, 180.0]
 }
 
 fn move_j_cmd(angles_deg: [f64; NUM_JOINTS], blend_mm: Option<f64>) -> Command {
@@ -723,4 +702,158 @@ fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
     );
     c.send(&jog_j_cmd([0.0; NUM_JOINTS], frame_s));
     rig.shutdown();
+}
+
+/// The servo preview is the runtime's limiter offline: a step target
+/// from the middle of a joint's range is reached without overshoot,
+/// the commanded velocity never exceeds the STREAM ceiling, a fraction
+/// scales that ceiling, and a target past the soft limit is clamped to
+/// it — measured on the same executor and clamp the RT core ticks.
+#[test]
+fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
+    let config = test_config();
+    let robot = par6_config::RobotConfig::load(&config).expect("config");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview");
+    let lim = &robot.joints[0].limits;
+    let mid = [
+        (lim.soft_min_rad + lim.soft_max_rad) / 2.0,
+        preview.angles_rad()[1],
+        preview.angles_rad()[2],
+        preview.angles_rad()[3],
+        preview.angles_rad()[4],
+        preview.angles_rad()[5],
+    ];
+    preview.teleport_rad(mid);
+    let v_stream = lim.for_mode(par6_config::LimitMode::Stream).velocity_rad_s;
+
+    let mut target = mid;
+    target[0] += 0.5;
+    let r = preview.preview_servo(&[target], 400, None, None);
+    assert_eq!(r.q.len(), 400);
+    let finished = r.finished_tick.expect("a 0.5 rad step settles inside 8 s");
+    assert!(
+        finished > 5,
+        "a jerk-limited step takes more than a few ticks"
+    );
+    let peak_v = r.qd.iter().map(|v| v[0].abs()).fold(0.0, f64::max);
+    assert!(
+        peak_v <= v_stream * 1.001 && peak_v > 0.2 * v_stream,
+        "peak {peak_v} rad/s must use the STREAM ceiling {v_stream} without exceeding it"
+    );
+    let overshoot = r.q.iter().map(|q| q[0] - target[0]).fold(0.0, f64::max);
+    assert!(overshoot < 1e-6, "overshoot {overshoot} rad");
+    assert!(
+        (r.q[399][0] - target[0]).abs() < 1e-6,
+        "settled at the target"
+    );
+    for q in &r.q {
+        assert_eq!(q[1..], mid[1..], "an untargeted joint never moves");
+    }
+
+    let slow = preview.preview_servo(&[target], 400, Some(0.25), None);
+    let slow_peak = slow.qd.iter().map(|v| v[0].abs()).fold(0.0, f64::max);
+    assert!(
+        slow_peak <= 0.25 * v_stream * 1.001 && slow_peak > 0.1 * v_stream,
+        "the speed fraction scales the ceiling: {slow_peak} vs {v_stream}"
+    );
+
+    let mut beyond = mid;
+    beyond[0] = lim.soft_max_rad + 1.0;
+    let r = preview.preview_servo(&[beyond], 600, None, None);
+    let end = r.q.last().unwrap()[0];
+    assert!(
+        (end - lim.soft_max_rad).abs() < 1e-6 && end < beyond[0],
+        "a target past the soft limit is clamped to it: {end} vs {}",
+        lim.soft_max_rad
+    );
+    assert_eq!(preview.angles_rad(), mid, "the virtual arm does not move");
+}
+
+/// The cartesian jog preview integrates the runtime's own twist: a +x
+/// jog in the world frame moves the TCP along +x and nothing else, and a
+/// wire-invalid request comes back as the result's error.
+#[test]
+fn the_preview_jogs_cartesian_through_the_runtime_kinematics() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+
+    let r = preview.preview_jog_l(
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        par6_proto::Frame::Wrf,
+        0.5,
+        None,
+    );
+    assert!(r.valid(), "a plain +x jog previews: {:?}", r.error);
+    assert_eq!(r.joint_trajectory_rad.len(), r.tcp_poses.len());
+    let (first, last) = (r.tcp_poses[0], r.tcp_poses[r.tcp_poses.len() - 1]);
+    let dx = last[3] - first[3];
+    let dy = (last[7] - first[7]).abs();
+    let dz = (last[11] - first[11]).abs();
+    assert!(
+        dx > 0.02,
+        "half a second of full-scale +x jog must travel: {dx} m"
+    );
+    assert!(
+        dy < 0.003 && dz < 0.003,
+        "and only along x: dy {dy} dz {dz}"
+    );
+
+    let refused = preview.preview_jog_l([f64::NAN; 6], par6_proto::Frame::Wrf, 0.5, None);
+    assert!(!refused.valid(), "a NaN twist is refused at the wire");
+}
+
+/// A first waypoint that only reorients the tool is a real segment: the
+/// path snaps it to the start only when it is within the path metric of
+/// the start, rotation weighted, not when its translation alone is small.
+#[test]
+fn a_pure_reorientation_first_waypoint_is_not_dropped() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+
+    // Relative to the current pose: first turn 20 deg about z in place,
+    // then translate 50 mm along x.
+    let r = preview.submit(Command::MoveP(par6_proto::command::MoveP {
+        key: 9901,
+        waypoints: vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 20.0],
+            [50.0, 0.0, 0.0, 0.0, 0.0, 20.0],
+        ],
+        frame: par6_proto::Frame::Wrf,
+        duration: None,
+        speed: Some(0.5),
+        accel: None,
+        rel: true,
+    }));
+    assert!(
+        r.valid(),
+        "a rotate-then-translate path previews: {:?}",
+        r.error
+    );
+    let start = r.tcp_poses[0];
+    let translation = |p: &[f64; 16]| {
+        ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
+    };
+    // Rotation angle between the start orientation and `p`.
+    let rotation = |p: &[f64; 16]| {
+        let mut trace = 0.0;
+        for r in 0..3 {
+            for k in 0..3 {
+                trace += start[r * 4 + k] * p[r * 4 + k];
+            }
+        }
+        ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+    };
+    let moving = r
+        .tcp_poses
+        .iter()
+        .find(|p| translation(p) > 0.005)
+        .expect("the path translates 50 mm");
+    assert!(
+        rotation(moving) > 15.0,
+        "the reorientation must complete before the translation starts: {:.1} deg turned \
+         when the TCP first left the start",
+        rotation(moving)
+    );
 }

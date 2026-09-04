@@ -102,6 +102,8 @@ pub struct MotionStream {
     /// never once per 250 Hz tick.
     target_refused: bool,
     scale_refused: bool,
+    /// The last step's "target reached" verdict.
+    finished: bool,
 }
 
 impl MotionStream {
@@ -126,6 +128,7 @@ impl MotionStream {
             fault_latch_ticks: (fault_latch_s / dt).round().max(1.0) as u32,
             target_refused: false,
             scale_refused: false,
+            finished: false,
         }
     }
 
@@ -134,12 +137,23 @@ impl MotionStream {
             *v = v.clamp(self.soft_min[j], self.soft_max[j]);
         }
     }
+
+    /// Whether the last `step` landed on the current target at rest —
+    /// the executor's own verdict, for the offline servo preview.
+    pub fn at_target(&self) -> bool {
+        self.finished
+    }
 }
 
 impl StreamTracker for MotionStream {
     fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
         self.hold_q = *q_meas;
         self.executor.activate(q_meas);
+        // A new session starts its fault window from zero: the streak a
+        // latched session left behind must not re-latch on tick one.
+        self.fail_streak = 0;
+        self.target_refused = false;
+        self.scale_refused = false;
     }
 
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
@@ -182,7 +196,8 @@ impl StreamTracker for MotionStream {
 
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
         match self.executor.step() {
-            Ok(StreamStep { q, qd, .. }) => {
+            Ok(StreamStep { q, qd, finished }) => {
+                self.finished = finished;
                 *q_out = q;
                 self.clamp(q_out);
                 // The velocity channel of a cmd-2 position frame is an
