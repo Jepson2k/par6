@@ -1,12 +1,13 @@
 [build-system]
-requires = ["maturin>=1.7,<2"]
+requires = ["maturin>=1.8,<2"]
 build-backend = "maturin"
 
 [project]
 name = "par6"
 version = "0.2.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
