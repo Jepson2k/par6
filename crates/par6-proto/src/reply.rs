@@ -298,11 +298,10 @@ pub enum QueryResult {
         fingerprint: String,
         /// RT tick period \[s\].
         tick_dt_s: f64,
-        /// The `[motion]` feel constants, in declaration order:
-        /// `jog_l_linear_max_m_s, jog_l_angular_max_rad_s, cart_step_m,
-        /// cart_step_rad, move_l_max_joint_step_rad, dls_lambda,
-        /// settle_tolerance_rad, settle_timeout_s`.
-        motion: [f64; 8],
+        /// Every `[motion]` key in declaration order; the labels are
+        /// `MotionConfig::KEYS` in par6-config (13 entries), and an
+        /// omitted optional key (`joint_step_rad`) rides as NaN.
+        motion: [f64; 13],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,

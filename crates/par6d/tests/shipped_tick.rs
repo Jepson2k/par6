@@ -52,12 +52,7 @@ fn p99_factor() -> f64 {
 }
 
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
+    common::park_deg()
 }
 
 /// The hard gate, applied to every STATUS this test ever decodes.

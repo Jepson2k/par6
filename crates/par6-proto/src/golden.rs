@@ -299,6 +299,7 @@ fn status_fields(s: &Status) -> Value {
         "link_health": link_health,
         "homing": homing,
         "torques_ext": s.torques_ext.to_vec(),
+        "paused": s.paused,
     })
 }
 
@@ -444,6 +445,7 @@ fn status_full_fixture() -> Status {
             ],
         },
         torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
+        paused: true,
         drive_health: crate::status::DriveHealthWire {
             temperatures_c: vec![31.0, 32.5, 33.0, 34.5, 35.0, 36.5, 28.0],
             currents_ma: vec![120.0, 340.0, 275.0, 60.0, 45.0, 30.0, 15.0],
@@ -829,7 +831,7 @@ pub fn vectors() -> Vec<Vector> {
             duration: None,
             speed: Some(0.3),
             accel: Some(0.4),
-            rel: false,
+            rel: true,
         }),
     ));
     v.push(cmd_vec(
@@ -925,7 +927,7 @@ pub fn vectors() -> Vec<Vector> {
             detail: Some(make_error(
                 ErrorCode::MotnSettleTimeout,
                 8,
-                &[("residual", "0.02")],
+                &[("joint", "3"), ("residual_rad", "0.0200")],
             )),
             verdict: None,
         },
@@ -1177,7 +1179,9 @@ pub fn vectors() -> Vec<Vector> {
                 fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
                     .to_owned(),
                 tick_dt_s: 0.004,
-                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
+                motion: [
+                    0.08, 0.6, 0.005, 0.05, 0.002, 0.01, 0.35, 0.05, 0.01, 2.0, 0.15, 1000.0, 1e-4,
+                ],
                 joints: vec![
                     [-2.15, 2.15, 3.0, 12.0],
                     [-1.0, 1.9, 2.5, 10.0],

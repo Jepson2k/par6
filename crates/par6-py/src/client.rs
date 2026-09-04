@@ -1,31 +1,36 @@
 //! The async client binding: every method returns an asyncio awaitable
 //! driving the `par6-client` core on the shared tokio runtime. The
 //! Python shim (`par6.client.async_client`) keeps the public API and
-//! waldoctl typing; this layer is transport only.
+//! waldoctl typing; this layer is transport only. Each verb is the
+//! `par6-client` API method of the same name, so no command payload is
+//! assembled here.
 
+use std::future::Future;
 use std::net::Ipv4Addr;
-use std::time::Duration;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3_async_runtimes::tokio::future_into_py;
 
-use par6_client::{Ack, Client, ClientConfig, ClientError, StatusTransport};
+use par6_client::{Ack, Client, ClientConfig, ClientError, QueryResult, StatusTransport};
 use par6_proto::command as cmd;
-use par6_proto::{Command, CompletionPolicy, Frame, NUM_JOINTS};
+use par6_proto::{CompletionPolicy, NUM_JOINTS};
 
 use crate::convert::{
-    client_err, query_result_dict, shape_from_py, status_dict, tool_param_from_py, wire_error_tuple,
+    checked_duration, client_err, frame_of, query_result_dict, shape_from_py, status_dict,
+    tool_param_from_py, wire_error_tuple,
 };
 
-fn frame_of(v: u8) -> PyResult<Frame> {
-    Frame::from_wire(i64::from(v))
-        .ok_or_else(|| PyRuntimeError::new_err(format!("unknown frame {v}")))
-}
+type Awaitable<'py> = PyResult<Bound<'py, PyAny>>;
 
-fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+/// A SYSTEM command: 1 when the runtime acked it, 0 when unconfirmed; a
+/// refusal raises `RobotWireError`.
+fn ack_future<'py, F>(py: Python<'py>, fut: F) -> Awaitable<'py>
+where
+    F: Future<Output = Result<Ack, ClientError>> + Send + 'static,
+{
     future_into_py(py, async move {
-        match client.system(c).await {
+        match fut.await {
             Ok(Ack::Confirmed) => Ok(1i32),
             Ok(Ack::Unconfirmed) => Ok(0),
             Err(e) => Err(client_err(e)),
@@ -33,9 +38,13 @@ fn sys_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Boun
     })
 }
 
-fn queued_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+/// A QUEUED command: its queue index, or -1 when unconfirmed.
+fn index_future<'py, F>(py: Python<'py>, fut: F) -> Awaitable<'py>
+where
+    F: Future<Output = Result<Option<u64>, ClientError>> + Send + 'static,
+{
     future_into_py(py, async move {
-        match client.queued(c).await {
+        match fut.await {
             Ok(Some(index)) => Ok(index as i64),
             Ok(None) => Ok(-1),
             Err(e) => Err(client_err(e)),
@@ -43,18 +52,45 @@ fn queued_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<B
     })
 }
 
-fn fire_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+/// A fire-and-forget send: 1 once the datagram is out.
+fn fire_future<'py, F>(py: Python<'py>, fut: F) -> Awaitable<'py>
+where
+    F: Future<Output = Result<(), ClientError>> + Send + 'static,
+{
     future_into_py(py, async move {
-        client.fire(c).await.map_err(client_err)?;
+        fut.await.map_err(client_err)?;
         Ok(1i32)
     })
 }
 
-/// Composite queries resolve to a dict, unreachable to `None`.
-fn query_future<'py>(py: Python<'py>, client: Client, c: Command) -> PyResult<Bound<'py, PyAny>> {
+/// A composite query as a dict; unreachable resolves to `None`.
+fn query_future<'py, F>(py: Python<'py>, fut: F) -> Awaitable<'py>
+where
+    F: Future<Output = Result<QueryResult, ClientError>> + Send + 'static,
+{
     future_into_py(py, async move {
-        match client.query(c).await {
+        match fut.await {
             Ok(result) => Python::with_gil(|py| query_result_dict(py, &result).map(Some)),
+            Err(ClientError::Unreachable) => Ok(None),
+            Err(e) => Err(client_err(e)),
+        }
+    })
+}
+
+/// A typed query mapped through `into`; unreachable resolves to `None`.
+fn value_future<'py, T, V, F>(
+    py: Python<'py>,
+    fut: F,
+    into: impl FnOnce(T) -> V + Send + 'static,
+) -> Awaitable<'py>
+where
+    F: Future<Output = Result<T, ClientError>> + Send + 'static,
+    T: Send + 'static,
+    V: for<'a> IntoPyObject<'a> + Send + 'static,
+{
+    future_into_py(py, async move {
+        match fut.await {
+            Ok(v) => Ok(Some(into(v))),
             Err(ClientError::Unreachable) => Ok(None),
             Err(e) => Err(client_err(e)),
         }
@@ -91,26 +127,27 @@ impl CoreClient {
         mcast_iface: String,
         status_unicast_host: String,
         mtu: usize,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let timeout = checked_duration(timeout, "timeout")?;
         future_into_py(py, async move {
             let parse = |s: &str, what: &str| -> Result<Ipv4Addr, PyErr> {
                 s.parse()
                     .map_err(|_| PyRuntimeError::new_err(format!("bad {what}: {s}")))
             };
+            let unicast_host = parse(&status_unicast_host, "status host")?;
             let status = if status_transport.eq_ignore_ascii_case("UNICAST") {
-                StatusTransport::Unicast {
-                    host: parse(&status_unicast_host, "status host")?,
-                }
+                StatusTransport::Unicast { host: unicast_host }
             } else {
                 StatusTransport::Multicast {
                     group: parse(&mcast_group, "multicast group")?,
                     iface: parse(&mcast_iface, "multicast interface")?,
+                    fallback: unicast_host,
                 }
             };
             let cfg = ClientConfig {
                 host,
                 port,
-                timeout: Duration::from_secs_f64(timeout),
+                timeout,
                 retries,
                 status,
                 status_port,
@@ -146,19 +183,12 @@ impl CoreClient {
 
     /// Await a STATUS frame whose seq differs from `last_seq` (pass -1
     /// for "any frame"), up to `timeout` seconds; `None` on timeout.
-    fn status_after<'py>(
-        &self,
-        py: Python<'py>,
-        last_seq: i64,
-        timeout: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn status_after<'py>(&self, py: Python<'py>, last_seq: i64, timeout: f64) -> Awaitable<'py> {
         let client = self.rt();
+        let timeout = checked_duration(timeout, "timeout")?;
         future_into_py(py, async move {
             let hit = client
-                .wait_status(
-                    |s| last_seq < 0 || s.seq as i64 != last_seq,
-                    Duration::from_secs_f64(timeout),
-                )
+                .wait_status(|s| last_seq < 0 || s.seq as i64 != last_seq, timeout)
                 .await;
             if !hit {
                 return Ok(None);
@@ -171,17 +201,15 @@ impl CoreClient {
     }
 
     /// Await completion of queued command `index`; True on success,
-    /// False on timeout; raises `RobotWireError` on a failed command.
-    fn wait_command<'py>(
-        &self,
-        py: Python<'py>,
-        index: u64,
-        timeout: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    /// False on timeout (or when STATUS showed it finished but the
+    /// COMPLETE push was lost, so the verdict is unknown); raises
+    /// `RobotWireError` on a failed command.
+    fn wait_command<'py>(&self, py: Python<'py>, index: u64, timeout: f64) -> Awaitable<'py> {
         let client = self.rt();
+        let timeout = checked_duration(timeout, "timeout")?;
         future_into_py(py, async move {
             client
-                .wait_command(index, Duration::from_secs_f64(timeout))
+                .wait_command(index, timeout)
                 .await
                 .map_err(client_err)
         })
@@ -196,104 +224,89 @@ impl CoreClient {
 
     // ---------------------------------------------------------- queries
 
-    fn ping<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn ping<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.ping().await {
-                Ok(hw) => Ok(Some(hw)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.ping().await }, |hw| hw)
     }
 
-    fn angles<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn angles<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.angles().await {
-                Ok(a) => Ok(Some(a.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.angles().await }, |a| a.to_vec())
     }
 
-    fn pose<'py>(&self, py: Python<'py>, frame: u8) -> PyResult<Bound<'py, PyAny>> {
+    fn pose<'py>(&self, py: Python<'py>, frame: u8) -> Awaitable<'py> {
         let client = self.rt();
         let frame = frame_of(frame)?;
-        future_into_py(py, async move {
-            match client.pose(frame).await {
-                Ok(p) => Ok(Some(p.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.pose(frame).await }, |p| p.to_vec())
     }
 
-    fn io<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn io<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.io().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.io().await }, |v| v)
     }
 
-    fn joint_speeds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn joint_speeds<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.joint_speeds().await {
-                Ok(v) => Ok(Some(v.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
+        value_future(py, async move { client.joint_speeds().await }, |v| {
+            v.to_vec()
         })
     }
 
-    fn status_query<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Status)
+    fn status_query<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.status_query().await })
     }
 
-    fn tools<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Tools)
+    fn tools<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.tools().await })
     }
 
-    fn queue<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Queue)
+    fn queue<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.queue().await })
     }
 
-    fn activity<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Activity)
+    fn activity<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.activity().await })
     }
 
-    fn loop_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::LoopStats)
+    fn loop_stats<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move {
+            client.loop_stats().await.map(QueryResult::LoopStats)
+        })
     }
 
-    fn reachable<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Reachable)
+    fn reachable<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.reachable().await })
     }
 
-    fn shapes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Shapes)
+    fn shapes<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.shapes().await })
     }
 
-    fn config_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::ConfigInfo)
+    fn config_info<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.config_info().await })
     }
 
-    fn config_bundle<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::ConfigBundle)
+    fn config_bundle<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.config_bundle().await })
     }
 
-    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::Payload)
+    fn payload<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.payload().await })
     }
 
-    fn bus_scan<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::BusScan)
+    fn bus_scan<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.bus_scan().await })
     }
 
     #[pyo3(signature = (node, new_id, force=false))]
@@ -303,30 +316,18 @@ impl CoreClient {
         node: u8,
         new_id: u8,
         force: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
+    ) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(
             py,
-            self.rt(),
-            Command::SetCanId(cmd::SetCanId {
-                node,
-                new_id,
-                force,
-            }),
+            async move { client.set_can_id(node, new_id, force).await },
         )
     }
 
     #[pyo3(signature = (node, force=false))]
-    fn save_config<'py>(
-        &self,
-        py: Python<'py>,
-        node: u8,
-        force: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::SaveConfig(cmd::SaveConfig { node, force }),
-        )
+    fn save_config<'py>(&self, py: Python<'py>, node: u8, force: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.save_config(node, force).await })
     }
 
     #[pyo3(signature = (mass, com, inertia=None))]
@@ -336,144 +337,118 @@ impl CoreClient {
         mass: f64,
         com: [f64; 3],
         inertia: Option<[f64; 6]>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
+    ) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(
             py,
-            self.rt(),
-            Command::SetPayload(cmd::SetPayload { mass, com, inertia }),
+            async move { client.set_payload(mass, com, inertia).await },
         )
     }
 
-    fn profile<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn profile<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.profile().await {
-                Ok(p) => Ok(Some(p)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.profile().await }, |p| p)
     }
 
-    fn error<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn error<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
         future_into_py(py, async move {
             match client.error().await {
                 Ok(Some(e)) => Python::with_gil(|py| Ok(Some(wire_error_tuple(py, &e)))),
-                Ok(None) => Ok(None),
-                Err(ClientError::Unreachable) => Ok(None),
+                Ok(None) | Err(ClientError::Unreachable) => Ok(None),
                 Err(e) => Err(client_err(e)),
             }
         })
     }
 
-    fn tcp_speed<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn tcp_speed<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.tcp_speed().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.tcp_speed().await }, |v| v)
     }
 
-    fn tcp_offset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn tcp_offset<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.tcp_offset().await {
-                Ok(v) => Ok(Some(v.to_vec())),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.tcp_offset().await }, |v| v.to_vec())
     }
 
-    fn tool_status<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn tool_status<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
         future_into_py(py, async move {
             match client.tool_status().await {
                 Ok(Some(t)) => {
                     Python::with_gil(|py| crate::convert::tool_status_dict(py, &t).map(Some))
                 }
-                Ok(None) => Ok(None),
-                Err(ClientError::Unreachable) => Ok(None),
+                Ok(None) | Err(ClientError::Unreachable) => Ok(None),
                 Err(e) => Err(client_err(e)),
             }
         })
     }
 
-    fn is_simulator<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+    fn is_simulator<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.is_simulator().await {
-                Ok(v) => Ok(Some(v)),
-                Err(ClientError::Unreachable) => Ok(None),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        value_future(py, async move { client.is_simulator().await }, |v| v)
     }
 
     // --------------------------------------------------------- system
 
-    fn reset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::Reset)
+    fn reset<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.reset().await })
     }
 
-    fn estop<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::Estop)
+    fn estop<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.estop().await })
     }
 
-    fn set_gravity_comp<'py>(&self, py: Python<'py>, on: bool) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::SetGravityComp(cmd::SetGravityComp { on }),
-        )
+    fn set_gravity_comp<'py>(&self, py: Python<'py>, on: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.set_gravity_comp(on).await })
     }
 
-    fn pause<'py>(&self, py: Python<'py>, on: bool) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::Pause(cmd::Pause { on }))
+    fn pause<'py>(&self, py: Python<'py>, on: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move {
+            if on {
+                client.pause().await
+            } else {
+                client.resume().await
+            }
+        })
     }
 
-    fn stop<'py>(&self, py: Python<'py>, clear_queue: bool) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::Stop(cmd::Stop { clear_queue }))
+    fn stop<'py>(&self, py: Python<'py>, clear_queue: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.stop(clear_queue).await })
     }
 
-    fn write_io<'py>(&self, py: Python<'py>, port: u8, value: u8) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::WriteIo(cmd::WriteIo { port, value }),
-        )
+    fn write_io<'py>(&self, py: Python<'py>, port: u8, value: u8) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.write_io(port, value).await })
     }
 
-    fn simulator<'py>(&self, py: Python<'py>, on: bool) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::Simulator(cmd::Simulator { on }))
+    fn simulator<'py>(&self, py: Python<'py>, on: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.simulator(on).await })
     }
 
-    fn select_profile<'py>(&self, py: Python<'py>, profile: String) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::SelectProfile(cmd::SelectProfile { profile }),
-        )
+    fn select_profile<'py>(&self, py: Python<'py>, profile: String) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.select_profile(&profile).await })
     }
 
-    fn reset_state<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::ResetState)
+    fn reset_state<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.reset_state().await })
     }
 
-    fn connect_hardware<'py>(&self, py: Python<'py>, port: String) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::ConnectHardware(cmd::ConnectHardware { port }),
-        )
+    fn connect_hardware<'py>(&self, py: Python<'py>, port: String) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.connect_hardware(&port).await })
     }
 
     /// `assertion` is "parked" or "force" (the wire refuses anything else).
-    fn enter_flashing<'py>(&self, py: Python<'py>, assertion: &str) -> PyResult<Bound<'py, PyAny>> {
+    fn enter_flashing<'py>(&self, py: Python<'py>, assertion: &str) -> Awaitable<'py> {
         let assertion = match assertion.to_ascii_lowercase().as_str() {
             "parked" => par6_proto::FlashingAssertion::Parked,
             "force" => par6_proto::FlashingAssertion::Force,
@@ -483,15 +458,13 @@ impl CoreClient {
                 )))
             }
         };
-        sys_future(
-            py,
-            self.rt(),
-            Command::EnterFlashing(cmd::EnterFlashing { assertion }),
-        )
+        let client = self.rt();
+        ack_future(py, async move { client.enter_flashing(assertion).await })
     }
 
-    fn exit_flashing<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::ExitFlashing)
+    fn exit_flashing<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.exit_flashing().await })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -509,85 +482,59 @@ impl CoreClient {
         ilim_ma: f64,
         velocity_limit_ticks_s: f64,
         voltage_limit_mv: u32,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(
-            py,
-            self.rt(),
-            Command::SetPidGains(cmd::SetPidGains {
-                node,
-                kpp,
-                kpv,
-                kiv,
-                kpiq,
-                kiiq,
-                kp,
-                kd,
-                ilim_ma,
-                velocity_limit_ticks_s,
-                voltage_limit_mv,
-            }),
-        )
+    ) -> Awaitable<'py> {
+        let gains = cmd::SetPidGains {
+            node,
+            kpp,
+            kpv,
+            kiv,
+            kpiq,
+            kiiq,
+            kp,
+            kd,
+            ilim_ma,
+            velocity_limit_ticks_s,
+            voltage_limit_mv,
+        };
+        let client = self.rt();
+        ack_future(py, async move { client.set_pid_gains(gains).await })
     }
 
-    fn set_tcp_offset<'py>(
-        &self,
-        py: Python<'py>,
-        x: f64,
-        y: f64,
-        z: f64,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn set_tcp_offset<'py>(&self, py: Python<'py>, x: f64, y: f64, z: f64) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::SetTcpOffset(cmd::SetTcpOffset {
-                key: client.fresh_key(),
-                x,
-                y,
-                z,
-            }),
-        )
+        index_future(py, async move { client.set_tcp_offset(x, y, z).await })
     }
 
     fn set_shapes<'py>(
         &self,
         py: Python<'py>,
         shapes: Vec<Bound<'py, pyo3::types::PyDict>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
         let shapes = shapes
             .iter()
             .map(shape_from_py)
             .collect::<PyResult<Vec<_>>>()?;
-        sys_future(py, self.rt(), Command::SetShapes(cmd::SetShapes { shapes }))
+        let client = self.rt();
+        ack_future(py, async move { client.set_shapes(shapes).await })
     }
 
-    fn set_completion_policy<'py>(
-        &self,
-        py: Python<'py>,
-        policy: u8,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    fn set_completion_policy<'py>(&self, py: Python<'py>, policy: u8) -> Awaitable<'py> {
         let policy = CompletionPolicy::from_wire(i64::from(policy)).ok_or_else(|| {
             PyRuntimeError::new_err(format!("unknown completion policy {policy}"))
         })?;
-        sys_future(
+        let client = self.rt();
+        ack_future(
             py,
-            self.rt(),
-            Command::SetCompletionPolicy(cmd::SetCompletionPolicy { policy }),
+            async move { client.set_completion_policy(policy).await },
         )
     }
 
     // --------------------------------------------------------- queued
 
     #[pyo3(signature = (calibrate=false))]
-    fn home<'py>(&self, py: Python<'py>, calibrate: bool) -> PyResult<Bound<'py, PyAny>> {
+    fn home<'py>(&self, py: Python<'py>, calibrate: bool) -> Awaitable<'py> {
         let client = self.rt();
-        future_into_py(py, async move {
-            match client.home(calibrate).await {
-                Ok(Some(index)) => Ok(index as i64),
-                Ok(None) => Ok(-1),
-                Err(e) => Err(client_err(e)),
-            }
-        })
+        index_future(py, async move { client.home(calibrate).await })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -601,21 +548,13 @@ impl CoreClient {
         accel: Option<f64>,
         blend_radius: Option<f64>,
         rel: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveJ(cmd::MoveJ {
-                key: client.fresh_key(),
-                angles,
-                duration,
-                speed,
-                accel,
-                blend_radius,
-                rel,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_j(angles, duration, speed, accel, blend_radius, rel)
+                .await
+        })
     }
 
     #[pyo3(signature = (pose, duration, speed, accel, blend_radius))]
@@ -627,20 +566,13 @@ impl CoreClient {
         speed: Option<f64>,
         accel: Option<f64>,
         blend_radius: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveJPose(cmd::MoveJPose {
-                key: client.fresh_key(),
-                pose,
-                duration,
-                speed,
-                accel,
-                blend_radius,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_j_pose(pose, duration, speed, accel, blend_radius)
+                .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -655,22 +587,14 @@ impl CoreClient {
         accel: Option<f64>,
         blend_radius: Option<f64>,
         rel: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let frame = frame_of(frame)?;
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveL(cmd::MoveL {
-                key: client.fresh_key(),
-                pose,
-                frame: frame_of(frame)?,
-                duration,
-                speed,
-                accel,
-                blend_radius,
-                rel,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_l(pose, frame, duration, speed, accel, blend_radius, rel)
+                .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -686,23 +610,14 @@ impl CoreClient {
         accel: Option<f64>,
         blend_radius: Option<f64>,
         rel: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let frame = frame_of(frame)?;
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveC(cmd::MoveC {
-                key: client.fresh_key(),
-                via,
-                end,
-                frame: frame_of(frame)?,
-                duration,
-                speed,
-                accel,
-                blend_radius,
-                rel,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_c(via, end, frame, duration, speed, accel, blend_radius, rel)
+                .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -716,21 +631,14 @@ impl CoreClient {
         speed: Option<f64>,
         accel: Option<f64>,
         rel: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let frame = frame_of(frame)?;
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveS(cmd::MoveS {
-                key: client.fresh_key(),
-                waypoints,
-                frame: frame_of(frame)?,
-                duration,
-                speed,
-                accel,
-                rel,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_s(waypoints, frame, duration, speed, accel, rel)
+                .await
+        })
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -744,21 +652,14 @@ impl CoreClient {
         speed: Option<f64>,
         accel: Option<f64>,
         rel: bool,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let frame = frame_of(frame)?;
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::MoveP(cmd::MoveP {
-                key: client.fresh_key(),
-                waypoints,
-                frame: frame_of(frame)?,
-                duration,
-                speed,
-                accel,
-                rel,
-            }),
-        )
+        index_future(py, async move {
+            client
+                .move_p(waypoints, frame, duration, speed, accel, rel)
+                .await
+        })
     }
 
     #[pyo3(signature = (tool_name, variant_key))]
@@ -767,41 +668,21 @@ impl CoreClient {
         py: Python<'py>,
         tool_name: String,
         variant_key: Option<String>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::SelectTool(cmd::SelectTool {
-                key: client.fresh_key(),
-                tool_name,
-                variant_key,
-            }),
-        )
+        index_future(py, async move {
+            client.select_tool(&tool_name, variant_key.as_deref()).await
+        })
     }
 
-    fn delay<'py>(&self, py: Python<'py>, seconds: f64) -> PyResult<Bound<'py, PyAny>> {
+    fn delay<'py>(&self, py: Python<'py>, seconds: f64) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::Delay(cmd::Delay {
-                key: client.fresh_key(),
-                seconds,
-            }),
-        )
+        index_future(py, async move { client.delay(seconds).await })
     }
 
-    fn checkpoint<'py>(&self, py: Python<'py>, label: String) -> PyResult<Bound<'py, PyAny>> {
+    fn checkpoint<'py>(&self, py: Python<'py>, label: String) -> Awaitable<'py> {
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::Checkpoint(cmd::Checkpoint {
-                key: client.fresh_key(),
-                label,
-            }),
-        )
+        index_future(py, async move { client.checkpoint(&label).await })
     }
 
     fn tool_action<'py>(
@@ -810,22 +691,15 @@ impl CoreClient {
         tool_key: String,
         action: String,
         params: Vec<Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
         let params = params
             .iter()
             .map(tool_param_from_py)
             .collect::<PyResult<Vec<_>>>()?;
         let client = self.rt();
-        queued_future(
-            py,
-            client.clone(),
-            Command::ToolAction(cmd::ToolAction {
-                key: client.fresh_key(),
-                tool_key,
-                action,
-                params,
-            }),
-        )
+        index_future(py, async move {
+            client.tool_action(&tool_key, &action, params).await
+        })
     }
 
     // -------------------------------------------------- fire-and-forget
@@ -837,15 +711,11 @@ impl CoreClient {
         angles: [f64; NUM_JOINTS],
         speed: Option<f64>,
         accel: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let client = self.rt();
         fire_future(
             py,
-            self.rt(),
-            Command::ServoJ(cmd::ServoJ {
-                angles,
-                speed,
-                accel,
-            }),
+            async move { client.servo_j(angles, speed, accel).await },
         )
     }
 
@@ -856,11 +726,11 @@ impl CoreClient {
         pose: [f64; 6],
         speed: Option<f64>,
         accel: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let client = self.rt();
         fire_future(
             py,
-            self.rt(),
-            Command::ServoJPose(cmd::ServoJPose { pose, speed, accel }),
+            async move { client.servo_j_pose(pose, speed, accel).await },
         )
     }
 
@@ -871,12 +741,9 @@ impl CoreClient {
         pose: [f64; 6],
         speed: Option<f64>,
         accel: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        fire_future(
-            py,
-            self.rt(),
-            Command::ServoL(cmd::ServoL { pose, speed, accel }),
-        )
+    ) -> Awaitable<'py> {
+        let client = self.rt();
+        fire_future(py, async move { client.servo_l(pose, speed, accel).await })
     }
 
     #[pyo3(signature = (speeds, duration, accel))]
@@ -886,15 +753,11 @@ impl CoreClient {
         speeds: [f64; NUM_JOINTS],
         duration: f64,
         accel: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let client = self.rt();
         fire_future(
             py,
-            self.rt(),
-            Command::JogJ(cmd::JogJ {
-                speeds,
-                duration,
-                accel,
-            }),
+            async move { client.jog_j(speeds, duration, accel).await },
         )
     }
 
@@ -906,17 +769,12 @@ impl CoreClient {
         duration: f64,
         frame: u8,
         accel: Option<f64>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        fire_future(
-            py,
-            self.rt(),
-            Command::JogL(cmd::JogL {
-                velocities,
-                duration,
-                frame: frame_of(frame)?,
-                accel,
-            }),
-        )
+    ) -> Awaitable<'py> {
+        let frame = frame_of(frame)?;
+        let client = self.rt();
+        fire_future(py, async move {
+            client.jog_l(velocities, duration, frame, accel).await
+        })
     }
 
     #[pyo3(signature = (angles, tool_positions))]
@@ -925,18 +783,16 @@ impl CoreClient {
         py: Python<'py>,
         angles: [f64; NUM_JOINTS],
         tool_positions: Option<Vec<f64>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
+    ) -> Awaitable<'py> {
+        let client = self.rt();
         fire_future(
             py,
-            self.rt(),
-            Command::Teleport(cmd::Teleport {
-                angles,
-                tool_positions,
-            }),
+            async move { client.teleport(angles, tool_positions).await },
         )
     }
 
-    fn reset_loop_stats<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        fire_future(py, self.rt(), Command::ResetLoopStats)
+    fn reset_loop_stats<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        fire_future(py, async move { client.reset_loop_stats().await })
     }
 }

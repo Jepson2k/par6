@@ -45,6 +45,36 @@ pub fn shipped_config() -> PathBuf {
     repo_root().join("config/PAR6.toml")
 }
 
+/// The shipped config re-timed to `dt` seconds per tick, written with its
+/// gripper files into a scratch directory tagged for the calling test, so
+/// parallel tests never share a config tree.
+pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
+    let src = shipped_config();
+    let dir = std::env::temp_dir().join(format!("par6d-{tag}-{}", std::process::id()));
+    let grippers = dir.join("grippers");
+    std::fs::create_dir_all(&grippers).expect("test config dir");
+    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
+    let patched = text.replace("tick_dt_s = 0.004", &format!("tick_dt_s = {dt}"));
+    assert_ne!(patched, text, "tick_dt_s patch point must exist");
+    let dst = dir.join("PAR6.toml");
+    std::fs::write(&dst, patched).expect("write test config");
+    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
+        let e = entry.expect("dir entry");
+        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
+    }
+    dst
+}
+
+/// The shipped park pose in degrees, the way the wire carries angles.
+pub fn park_deg() -> [f64; par6_proto::NUM_JOINTS] {
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
+    let mut a = [0.0; par6_proto::NUM_JOINTS];
+    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
+        *out = rad.to_degrees();
+    }
+    a
+}
+
 pub fn is_timeout(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
@@ -59,7 +89,7 @@ pub fn is_timeout(e: &std::io::Error) -> bool {
 /// test rig that wrote it would tell every CAN tool on the machine that
 /// a runtime it cannot see owns the bus — and its teardown would then
 /// take a real runtime's claim away.
-fn redirect_bus_grant() {
+pub fn redirect_bus_grant() {
     static ONCE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     let dir = ONCE.get_or_init(|| {
         let dir = std::env::temp_dir().join(format!("par6-test-shm-{}", std::process::id()));
@@ -70,6 +100,22 @@ fn redirect_bus_grant() {
         dir
     });
     debug_assert!(dir.is_dir());
+}
+
+/// Daemon options for a simulator boot on loopback: an ephemeral command
+/// port, STATUS unicast to `127.0.0.1:status_port`, the repo assets tree.
+pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
+    Options {
+        sim: true,
+        config: Some(config),
+        assets: Some(assets_dir()),
+        command_port: Some(0),
+        bind: Some("127.0.0.1".parse().unwrap()),
+        status_host: Some("127.0.0.1".parse().unwrap()),
+        status_port: Some(status_port),
+        status_transport: Some(StatusTransport::Unicast),
+        ..Options::default()
+    }
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
@@ -117,17 +163,9 @@ impl Rig {
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
         let opts = Options {
-            sim: true,
             sim_dynamics,
-            config: Some(config),
-            assets: Some(assets_dir()),
-            command_port: Some(0),
-            bind: Some("127.0.0.1".parse().unwrap()),
-            status_host: Some("127.0.0.1".parse().unwrap()),
-            status_port: Some(status_rx.local_addr().unwrap().port()),
-            status_transport: Some(StatusTransport::Unicast),
             status_rate_hz,
-            ..Options::default()
+            ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
         Ok(Rig {

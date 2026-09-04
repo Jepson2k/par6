@@ -135,7 +135,7 @@ codes — so an editor shows the failure before the arm does.
 Waldo Commander (NiceGUI frontend, unchanged)
   └─ python/par6 — waldoctl Robot + AsyncRobotClient + sync facade + dry-run preview
        │   (a thin shim over crates/par6-client + the par6d preview, via crates/par6-py)
-       │ protocol v2: UDP msgpack commands · binary status broadcast
+       │ protocol v3: UDP msgpack commands · binary status broadcast
   par6d (single Rust binary; `par6d --sim` runs anywhere, including CI)
    ├─ command plane (tokio): validation/gating, queue, index allocator,
    │    push completion, status broadcaster
@@ -155,7 +155,7 @@ rather than approximate it.
 
 | Path | Contents |
 |---|---|
-| `crates/par6-proto` | protocol v2 codec — **single source of truth**; the Python constants are generated from it |
+| `crates/par6-proto` | protocol v3 codec — **single source of truth**; the Python constants are generated from it |
 | `crates/par6-config` | robot / gripper / homing TOML config |
 | `crates/par6-kin` | Pinocchio FFI: FK, Jacobian, gravity, IK; coal collision world (self-pairs + installation/program keep-out layers) |
 | `crates/par6-motion` | TOPPRA + rsruckig + trapezoid, jog ramps, completion policies |

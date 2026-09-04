@@ -328,6 +328,10 @@ pub struct LoopStats {
     pub bus_tx_failures: u32,
     /// Bus RX drains the backend refused with an error, since boot.
     pub bus_rx_failures: u32,
+    /// Stored-config re-sends the bus refused (TX queue full): the node
+    /// is re-queued until its push goes through, and this counts each
+    /// refusal.
+    pub config_resend_failures: u32,
     /// Whether the RT thread runs under SCHED_FIFO (setup succeeded).
     pub rt_fifo: bool,
     /// Whether the RT thread is pinned to its configured CPU.
@@ -446,6 +450,9 @@ pub struct StateSnapshot {
     pub tau_filtered: [f64; MAX_JOINTS],
     /// The gravity feedforward is being applied this tick.
     pub gravity_comp: bool,
+    /// Residual \[rad\] of the joint that missed the last strict settle
+    /// window (`ExecSettleTimeout` names the joint).
+    pub settle_residual_rad: f64,
     /// Commanded joint positions \[rad\] (post-limiter, what went on the bus).
     pub q_commanded: [f64; MAX_JOINTS],
     /// Commanded joint velocities \[rad/s\].
@@ -472,6 +479,7 @@ pub struct StateSnapshot {
     pub nodes: [NodeState; NUM_NODES],
     /// Per-node data-age classification, same order — the backend's own
     /// verdict (thresholds and the lost latch live there, not here).
+    /// Read by the BUS_SCAN query, which answers a row per node id.
     pub node_freshness: [Freshness; NUM_NODES],
     /// Firmware-mode gripper state.
     pub gripper: GripperState,
@@ -550,6 +558,7 @@ impl Default for StateSnapshot {
             qd_filtered: [0.0; MAX_JOINTS],
             tau_filtered: [0.0; MAX_JOINTS],
             gravity_comp: false,
+            settle_residual_rad: 0.0,
             q_commanded: [0.0; MAX_JOINTS],
             qd_commanded: [0.0; MAX_JOINTS],
             tau_commanded: [0.0; MAX_JOINTS],

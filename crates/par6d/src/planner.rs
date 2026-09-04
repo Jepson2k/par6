@@ -82,6 +82,8 @@ const HOME_RETURN_SPEED_FRAC: f64 = 0.5;
 
 /// Waypoint-count ceiling for one `move_l` (bounds planning cost).
 const MOVE_L_MAX_STEPS: usize = 400;
+/// Near-singularity probes per cartesian path (plus the endpoints).
+const SINGULARITY_PROBES: usize = 64;
 /// Waypoint-count ceiling for a multi-segment cartesian path — an arc, a
 /// spline, a process move, or a blended chain of straight moves. Higher
 /// than a single `move_l`'s because the path is that much longer; the
@@ -372,17 +374,34 @@ impl Par6Planner {
     /// admission in the bridge's `StreamGate`, which applies the same
     /// two-halves rule: the jog/servo ramp is integrated on the RT
     /// thread, where a coal check cannot go.
-    fn gate_collisions<const W: usize>(
+    fn gate_collisions(
         &mut self,
-        samples: &[[f64; W]],
+        samples: impl ExactSizeIterator<Item = [f64; NQ]>,
+        from: usize,
+    ) -> Result<(), WireError> {
+        let q_now = self.snapshots.latest().q;
+        Self::gate_collisions_from(
+            &mut self.collision,
+            &self.shape_names,
+            &mut self.collision_latch,
+            q_now,
+            samples,
+            from,
+        )
+    }
+
+    /// [`gate_collisions`](Self::gate_collisions) over the fields it
+    /// touches, so a caller holding a borrow of the in-flight command
+    /// can gate its own samples.
+    fn gate_collisions_from(
+        col: &mut par6_kin::Collision,
+        names: &ShapeNames,
+        latch: &mut CollisionState,
+        q_now: [f64; NQ],
+        samples: impl ExactSizeIterator<Item = [f64; NQ]>,
         from: usize,
     ) -> Result<(), WireError> {
         let started = Instant::now();
-        let q_now = self.snapshots.latest().q;
-        // Disjoint field borrows: the name tables are read while the
-        // collision model is being driven.
-        let names = &self.shape_names;
-        let col = &mut self.collision;
         let named = |report: &par6_kin::CollisionReport<'_>| -> Vec<(String, String)> {
             names.render(report)
         };
@@ -407,9 +426,7 @@ impl Par6Planner {
         let total = samples.len();
         let mut checked = 0usize;
         let mut last: Option<[f64; NQ]> = None;
-        for (k, sample) in samples.iter().enumerate().skip(from) {
-            let mut q = [0.0; NQ];
-            q.copy_from_slice(&sample[..NQ]);
+        for (k, q) in samples.enumerate().skip(from) {
             let coarse = last.is_some_and(|prev| {
                 q.iter()
                     .zip(prev.iter())
@@ -431,7 +448,7 @@ impl Par6Planner {
             if !offending.is_empty() {
                 let pairs = format_pairs(&offending);
                 log::info!("collision gate: rejected sample {k}/{total}: {pairs}");
-                self.collision_latch = CollisionState {
+                *latch = CollisionState {
                     active: true,
                     pairs: offending,
                 };
@@ -453,7 +470,7 @@ impl Par6Planner {
                         "collision gate: rejected sample {k}/{total}: \
                          penetration deepens ({depth:.4} m < start {d0:.4} m): {pairs}"
                     );
-                    self.collision_latch = CollisionState {
+                    *latch = CollisionState {
                         active: true,
                         pairs: touching,
                     };
@@ -500,16 +517,15 @@ impl Par6Planner {
             .enumerate()
             .min_by(|(_, a), (_, b)| joint_distance(&a.q, &q).total_cmp(&joint_distance(&b.q, &q)))
             .map_or(0, |(i, _)| i);
-        let planned: Vec<[f64; 2 * MAX_JOINTS]> = samples
-            .iter()
-            .map(|s| {
-                let mut qqd = [0.0; 2 * MAX_JOINTS];
-                qqd[..MAX_JOINTS].copy_from_slice(&s.q);
-                qqd[MAX_JOINTS..].copy_from_slice(&s.qd);
-                qqd
-            })
-            .collect();
-        if let Err(error) = self.gate_collisions(&planned, nearest) {
+        let gated = Self::gate_collisions_from(
+            &mut self.collision,
+            &self.shape_names,
+            &mut self.collision_latch,
+            q,
+            samples.iter().map(|s| s.q),
+            nearest,
+        );
+        if let Err(error) = gated {
             log::warn!(
                 "command {index} invalidated by a world change: {}",
                 error.cause
@@ -548,7 +564,14 @@ impl Par6Planner {
             par6_motion::gate::ACCEL_TOLERANCE,
         )
         .map_err(planning_error)?;
-        self.gate_collisions(&samples, 0)?;
+        self.gate_collisions(
+            samples.iter().map(|s| {
+                let mut q = [0.0; NQ];
+                q.copy_from_slice(&s[..NQ]);
+                q
+            }),
+            0,
+        )?;
         // A fresh fill generation: a flush already queued for an earlier
         // command can no longer reach these samples, however far behind
         // the RT command queue is running.
@@ -964,6 +987,15 @@ impl Par6Planner {
 
     /// The TCP pose the arm is standing at — where every cartesian move
     /// starts from.
+    /// Run the collision gate over a trajectory integrated elsewhere (the
+    /// preview's jogs), with the same two-halves rule as planned motion.
+    pub(crate) fn gate_samples(
+        &mut self,
+        samples: impl ExactSizeIterator<Item = [f64; NQ]>,
+    ) -> Result<(), WireError> {
+        self.gate_collisions(samples, 0)
+    }
+
     pub(crate) fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
         self.kin
             .fk(q)
@@ -1008,6 +1040,9 @@ impl Par6Planner {
         waypoints.extend_from_slice(start_q);
         let mut seed = *start_q;
         let (mut worst_sigma, mut worst_cond) = (f64::INFINITY, 0.0f64);
+        // The probe is a second jacobian FFI call per sample feeding a
+        // warning; a stride plus the endpoints bounds it on long paths.
+        let stride = (total / SINGULARITY_PROBES).max(1);
         for (k, pose) in poses.iter().enumerate().skip(1) {
             let partial = || {
                 make_error(
@@ -1027,9 +1062,11 @@ impl Par6Planner {
                     ));
                 }
             };
-            if let Ok((sigma, cond)) = self.kin.singularity(&q) {
-                worst_sigma = worst_sigma.min(sigma);
-                worst_cond = worst_cond.max(cond);
+            if k % stride == 0 || k + 1 == total {
+                if let Ok((sigma, cond)) = self.kin.singularity(&q) {
+                    worst_sigma = worst_sigma.min(sigma);
+                    worst_cond = worst_cond.max(cond);
+                }
             }
             for j in 0..MAX_JOINTS {
                 if q[j] < self.exec_limits.soft_min[j] || q[j] > self.exec_limits.soft_max[j] {
@@ -1108,7 +1145,7 @@ impl Par6Planner {
             }
         };
         let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
-        self.near_singularity = singularity_verdict(worst_sigma, worst_cond);
+        self.near_singularity = singularity_verdict(&self.motion, worst_sigma, worst_cond);
         Ok(kind)
     }
 
@@ -1160,7 +1197,13 @@ impl Par6Planner {
     ) -> Result<InFlightKind, WireError> {
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
-        let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame, cmd.rel);
+        let waypoints = waypoint_poses(
+            &start_pose,
+            &cmd.waypoints,
+            cmd.frame,
+            cmd.rel,
+            self.motion.path_rot_weight_m_per_rad,
+        );
         let poses = par6_motion::cart::spline(&waypoints, path_sampling(&self.motion))
             .map_err(planning_error)?;
         self.start_cart_path(
@@ -1183,7 +1226,13 @@ impl Par6Planner {
         use par6_motion::cart::LineSegment;
         let snap = self.snapshots.latest();
         let start_pose = self.current_pose(&snap.q)?;
-        let waypoints = waypoint_poses(&start_pose, &cmd.waypoints, cmd.frame, cmd.rel);
+        let waypoints = waypoint_poses(
+            &start_pose,
+            &cmd.waypoints,
+            cmd.frame,
+            cmd.rel,
+            self.motion.path_rot_weight_m_per_rad,
+        );
         let lengths: Vec<f64> = waypoints
             .windows(2)
             .map(|w| LineSegment::new(&w[0], &w[1]).length_m())
@@ -1234,7 +1283,8 @@ impl Par6Planner {
                 (seg.length_m(), seg.angle_rad())
             })
             .collect();
-        let cart_s = par6_motion::arclen::tool_arc_lengths(&steps, PATH_ROT_WEIGHT_M_PER_RAD);
+        let cart_s =
+            par6_motion::arclen::tool_arc_lengths(&steps, self.motion.path_rot_weight_m_per_rad);
         let q: Vec<[f64; MAX_JOINTS]> = waypoints
             .chunks_exact(MAX_JOINTS)
             .map(|c| {
@@ -1457,6 +1507,15 @@ impl Par6Planner {
             Command::MoveJ(p) => self.start_move_j(p)?,
             Command::Home(p) => {
                 let snap = self.snapshots.latest();
+                if snap.mode == Mode::Flashing {
+                    // The seek starts with a SetMode(Idle) that would end
+                    // the bus-silent window under a flasher.
+                    return Err(make_error(
+                        ErrorCode::CommValidationError,
+                        UNATTRIBUTED,
+                        &[("detail", "home while the controller is FLASHING")],
+                    ));
+                }
                 if snap.homed && !p.calibrate {
                     // An arm that already holds its references does not
                     // need them re-established: HOME is a normal planned
@@ -1791,9 +1850,6 @@ impl Par6Planner {
     }
 }
 
-/// The vendor's rotation weight in the combined path metric \[m/rad\].
-const PATH_ROT_WEIGHT_M_PER_RAD: f64 = 0.15;
-
 /// Sampling of a single straight `move_l`.
 fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
@@ -1809,16 +1865,20 @@ fn line_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartS
 fn path_sampling(motion: &par6_config::MotionConfig) -> par6_motion::cart::CartSampling {
     par6_motion::cart::CartSampling {
         step_m: motion.path_step_m,
-        rotation: par6_motion::cart::RotationPitch::Weighted(PATH_ROT_WEIGHT_M_PER_RAD),
+        rotation: par6_motion::cart::RotationPitch::Weighted(motion.path_rot_weight_m_per_rad),
         max_points: CART_PATH_MAX_STEPS,
     }
 }
 
-/// The vendor's near-singularity thresholds: a path is flagged when its
-/// worst sample's jacobian condition exceeds 1000 or its smallest
-/// singular value drops under 1e-4 (condition capped at 1e12 upstream).
-fn singularity_verdict(worst_sigma: f64, worst_cond: f64) -> Option<WireError> {
-    if worst_cond > 1000.0 || worst_sigma < 1e-4 {
+/// A path is flagged near-singular when its worst sample's jacobian
+/// condition exceeds `motion.singularity_cond_max` or its smallest
+/// singular value drops under `motion.singularity_sigma_min`.
+fn singularity_verdict(
+    motion: &par6_config::MotionConfig,
+    worst_sigma: f64,
+    worst_cond: f64,
+) -> Option<WireError> {
+    if worst_cond > motion.singularity_cond_max || worst_sigma < motion.singularity_sigma_min {
         Some(make_error(
             ErrorCode::TrajNearSingularity,
             UNATTRIBUTED,
@@ -1872,8 +1932,9 @@ fn waypoint_poses(
     waypoints: &[[f64; 6]],
     frame: par6_proto::Frame,
     rel: bool,
+    rot_weight_m_per_rad: f64,
 ) -> Vec<Pose> {
-    use par6_motion::cart::translation;
+    use par6_motion::cart::LineSegment;
     let mut poses = Vec::with_capacity(waypoints.len() + 1);
     poses.push(*start);
     let mut wire = waypoints
@@ -1881,8 +1942,11 @@ fn waypoint_poses(
         .map(|w| target_pose(start, w, frame, rel))
         .peekable();
     if let Some(first) = wire.peek() {
-        let (a, b) = (translation(first), translation(start));
-        let far = ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+        // The path's own metric decides whether the first waypoint is
+        // the start: a pure reorientation is a real segment.
+        let seg = LineSegment::new(start, first);
+        let far = (seg.length_m().powi(2) + (rot_weight_m_per_rad * seg.angle_rad()).powi(2))
+            .sqrt()
             > WAYPOINT_SNAP_M;
         if !far {
             wire.next();
@@ -2031,13 +2095,16 @@ pub(crate) enum PlannedMotion<'a> {
     /// The homing sequence; on a referenced arm it lands at the
     /// configured home pose.
     Home,
-    /// No motion (tool actions, delays, checkpoints, null moves).
+    /// The arm holds still for this many ticks: a delay, or a tool
+    /// calibration's minimum wait.
+    Hold(u64),
+    /// No motion (the other tool actions, checkpoints, null moves).
     Still,
 }
 
 impl Par6Planner {
     /// The in-flight command's planned motion, for the offline preview.
-    pub(crate) fn planned_motion(&self) -> PlannedMotion<'_> {
+    pub(crate) fn planned_motion(&self, now_tick: u64) -> PlannedMotion<'_> {
         match &self.inflight {
             Some(InFlight {
                 kind: InFlightKind::Exec { samples, .. },
@@ -2047,6 +2114,10 @@ impl Par6Planner {
                 kind: InFlightKind::Home { .. },
                 ..
             }) => PlannedMotion::Home,
+            Some(InFlight {
+                kind: InFlightKind::Delay { target_tick },
+                ..
+            }) => PlannedMotion::Hold(target_tick.saturating_sub(now_tick)),
             _ => PlannedMotion::Still,
         }
     }

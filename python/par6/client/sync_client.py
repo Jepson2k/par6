@@ -10,13 +10,15 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import threading
+import weakref
 from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
 from waldoctl.shapes import Shape, ShapeWorld
-from waldoctl.status import ActivityResult, PingResult, ToolResult
-from waldoctl.sync_tools import make_sync_tool
+from waldoctl.status import ActivityResult, PayloadResult, PingResult, ToolResult
+from waldoctl.sync_tools import SyncTool, make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
 
@@ -36,6 +38,11 @@ T = TypeVar("T")
 _LOOP: asyncio.AbstractEventLoop | None = None
 _THREAD: threading.Thread | None = None
 _LOOP_READY = threading.Event()
+#: Facades running on the module loop, so its teardown can release
+#: their engine clients first. Weak: registering never keeps one alive.
+_CLIENTS: weakref.WeakSet[RobotClient] = weakref.WeakSet()
+#: How long the teardown waits on one client's close before moving on.
+_CLOSE_GRACE_S = 1.0
 
 
 def _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
@@ -49,6 +56,23 @@ def _stop_loop() -> None:
     loop, thread = _LOOP, _THREAD
     if loop is None:
         return
+
+    # The engine clients go before the loop does. Their in-flight
+    # futures resolve onto this loop, and one landing after it has
+    # stopped runs a pyo3 callback that cannot unwind — the interpreter
+    # aborts instead of exiting, which is what a script that never
+    # closed its client used to get. Bounded per client: a wedged one
+    # must not hold up the exit.
+    for client in list(_CLIENTS):
+        with contextlib.suppress(
+            RuntimeError,
+            TimeoutError,
+            asyncio.InvalidStateError,
+            asyncio.CancelledError,
+        ):
+            asyncio.run_coroutine_threadsafe(client._inner.close(), loop).result(
+                timeout=_CLOSE_GRACE_S
+            )
 
     async def _shutdown() -> None:
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
@@ -95,22 +119,6 @@ def _run(coro: Coroutine[Any, Any, T]) -> T:
     )
 
 
-def _sync_tool(tool: ToolSpec) -> ToolSpec:
-    """waldoctl's sync wrapper for *tool*, with ``status()`` made synchronous.
-
-    The wrapper overrides the action verbs but not ``status()``, and a tool
-    with no action verbs is not wrapped at all — either way ``status()``
-    reaches the async implementation and hands the caller an un-awaited
-    coroutine, so ``rbt.tool.status().key`` raises on a facade whose whole
-    contract is that nothing is a coroutine.
-    """
-    sync = make_sync_tool(tool, _run)
-    # Deliberately narrowing an async method to a sync one, which is what
-    # waldoctl's own sync wrappers do to every action verb.
-    sync.status = lambda: _run(tool.status())  # ty: ignore[invalid-assignment]
-    return sync
-
-
 class RobotClient:
     """Synchronous wrapper around :class:`AsyncRobotClient` — every method
     returns a concrete result, never a coroutine.
@@ -132,9 +140,8 @@ class RobotClient:
         self._inner = AsyncRobotClient(
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
-        self._bound_tools: dict[str, ToolSpec] = {
-            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
-        }
+        self._bound_tools = self._wrap_tools()
+        _CLIENTS.add(self)
 
     # ---------- lifecycle ----------
 
@@ -163,15 +170,19 @@ class RobotClient:
 
     # ---------- tools ----------
 
+    def _wrap_tools(self) -> dict[str, SyncTool]:
+        return {
+            key: make_sync_tool(tool, _run)
+            for key, tool in self._inner._bound_tools.items()
+        }
+
     def bind_tools(self, specs: Iterable[ToolSpec]) -> None:
         """Bind tool specs; actions run through this facade's background loop."""
         self._inner.bind_tools(specs)
-        self._bound_tools = {
-            key: _sync_tool(tool) for key, tool in self._inner._bound_tools.items()
-        }
+        self._bound_tools = self._wrap_tools()
 
     @property
-    def tool(self) -> ToolSpec:
+    def tool(self) -> SyncTool:
         """The active bound tool.  Raises ``RuntimeError`` if no tool is set."""
         key = (self._inner._active_tool_key or "").upper()
         if not key:
@@ -432,7 +443,7 @@ class RobotClient:
         """Declare the payload the arm is carrying at the TCP."""
         return _run(self._inner.set_payload(mass, com, inertia))
 
-    def payload(self) -> dict | None:
+    def payload(self) -> PayloadResult | None:
         """The effective runtime payload (zeros = none)."""
         return _run(self._inner.payload())
 
@@ -500,7 +511,7 @@ class RobotClient:
         kd: float,
         ilim_ma: float,
         velocity_limit_ticks_s: float,
-        voltage_limit_mv: int = 0,
+        voltage_limit_mv: int,
     ) -> int:
         """Push one drive node's tuning live (every gain required — the
         frame replaces the node's whole tuple)."""

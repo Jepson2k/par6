@@ -53,9 +53,9 @@ use crate::types::{
     PollAction, PollKind, MAX_NODES,
 };
 
+use crate::node_config::NodeConfig;
 use sched::{
-    boot_config_plan, config_frame, BootStep, FreshnessClock, NodeConfig, PollScheduler, PollStep,
-    CONFIG_ORDER,
+    boot_config_plan, config_frame, BootStep, FreshnessClock, PollScheduler, PollStep, CONFIG_ORDER,
 };
 
 pub use link::OpenError;
@@ -277,10 +277,11 @@ impl SocketCanBus {
             }
         };
         let n = usize::from(node);
+        let booted = self.connected & (1 << n) != 0;
         // Every frame counts as presence, configured id or not — that is
         // what lets a BUS_SCAN ping find a drive the config does not list.
         self.connected |= 1 << n;
-        if self.fresh.mark(node, self.tick) {
+        if self.fresh.mark(node, self.tick, booted) {
             state.reconnected_mask |= 1 << n;
         }
         let (_, raw_cmd, _) = unpack_can_id(frame.id);
@@ -335,7 +336,7 @@ impl SocketCanBus {
                     // Boot replies precede the first tick; they enter the
                     // freshness clock at tick 0 so a node that answers
                     // boot and then dies latches like any other.
-                    self.fresh.mark(node, 0);
+                    self.fresh.mark(node, 0, true);
                     if let Ok(d) = decode_frame(&frame) {
                         apply_payload(&d, &mut self.boot_state);
                         self.boot_state_pending = true;
@@ -632,29 +633,17 @@ impl DriverBus for SocketCanBus {
         self.node_configs = robot
             .joints
             .iter()
-            .map(|j| NodeConfig {
-                node: j.node_id,
-                watchdog_ms: j.watchdog_timeout_ms,
-                watchdog_action: robot.bus.watchdog_action,
-                velocity_limit_ticks_s: j.velocity_limit_ticks_s,
-                ilim_ma: j.ilim_ma,
-                voltage_limit_mv: j.voltage_limit_mv,
-                gains: j.gains,
-            })
+            .map(|j| NodeConfig::arm(j, robot.bus.watchdog_action))
             .collect();
         if has_can_gripper {
             let d = gripper
                 .and_then(|g| g.driver.as_ref())
                 .expect("has_can_gripper");
-            self.node_configs.push(NodeConfig {
-                node: self.gripper_node,
-                watchdog_ms: d.watchdog_timeout_ms,
-                watchdog_action: robot.bus.watchdog_action,
-                velocity_limit_ticks_s: d.velocity_limit_ticks_s,
-                ilim_ma: d.ilim_ma,
-                voltage_limit_mv: d.voltage_limit_mv,
-                gains: d.gains,
-            });
+            self.node_configs.push(NodeConfig::gripper(
+                self.gripper_node,
+                d,
+                robot.bus.watchdog_action,
+            ));
         }
         self.configured = true;
 
@@ -721,10 +710,7 @@ impl DriverBus for SocketCanBus {
                 reason: "retune_node for a node with no stored configuration",
             });
         };
-        c.gains = tune.gains;
-        c.ilim_ma = tune.ilim_ma;
-        c.velocity_limit_ticks_s = tune.velocity_limit_ticks_s;
-        c.voltage_limit_mv = tune.voltage_limit_mv;
+        c.apply_tune(tune);
         self.resend_node_config(node, repeats)
     }
 

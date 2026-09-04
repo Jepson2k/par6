@@ -10,8 +10,9 @@ use std::cell::Cell;
 
 use par6_config::{Gains, WatchdogAction};
 
-use super::sched::{config_frame, ConfigKind, FreshnessClock, NodeConfig, PollScheduler};
+use super::sched::{config_frame, ConfigKind, FreshnessClock, PollScheduler};
 use super::*;
+use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
     encode_gripper_command, encode_joint_command, pack_can_id, pack_f32, pack_i16, pack_i24,
     CanFrame,
@@ -265,7 +266,7 @@ fn tick_path_work_allocates_nothing() {
         drive(tick, &mut poll, &mut fresh, &configs, &commands, &gripper);
         let d = decode_frame(&reply).expect("decodable");
         apply_payload(&d, &mut state);
-        fresh.mark(d.node, tick);
+        fresh.mark(d.node, tick, false);
         for n in 0..MAX_NODES {
             state.nodes[n].data_age_ticks = fresh.age(n as NodeId, tick);
         }

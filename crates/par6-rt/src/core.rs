@@ -67,9 +67,6 @@ struct BootConfig {
 
 /// Boot one-shot: bus-scan selfcheck, then request IDLE (exit BOOTING).
 const BOOT_SELFCHECK_TICK: u64 = 8;
-/// Vendor boot workaround: full config re-sends at these ticks (may be
-/// dropped after HIL validation).
-const BOOT_CONFIG_RESEND_TICKS: [u64; 3] = [50, 150, 300];
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
 /// EXEC link watchdog: heartbeat silence while samples pending that
@@ -465,6 +462,17 @@ pub struct RtCore<B: DriverBus> {
     /// recovery.
     self_heal_armed: [bool; crate::NUM_NODES],
     bus_rx_failures: u32,
+    /// Stored-config re-sends the bus refused; see `resend_config`.
+    config_resend_failures: u32,
+    /// The residual of the last strict-settle fault (`ExecSettleTimeout`).
+    settle_residual_rad: f64,
+    /// Nodes whose last config re-send was refused, retried one per tick.
+    config_resend_pending: u16,
+    /// Ticks after arming at which the full stored-config shots run
+    /// (`bus.config_resend_offsets_s`).
+    config_resend_ticks: Vec<u64>,
+    /// Bus-off events already reacted to (`LinkHealth::bus_off_events`).
+    bus_off_events_seen: u32,
     tx_fail_streak: u32,
     gripper_tx_fail_streak: u32,
     /// Consecutive failed ticks after which a TX streak latches the
@@ -479,6 +487,9 @@ pub struct RtCore<B: DriverBus> {
     homed: bool,
     soft_estop: bool,
     hw_estop: bool,
+    /// Whether an e-stop stood on the previous tick, so the jaws are
+    /// halted once on its rising edge.
+    estop_standing: bool,
     park_asserted: bool,
     gravity_comp: bool,
     not_homed_refused: bool,
@@ -518,7 +529,6 @@ pub struct RtCore<B: DriverBus> {
     homing_gcmd: GripperCommand,
 
     // Jog live state.
-    jog_active: bool,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -671,6 +681,16 @@ impl<B: DriverBus> RtCore<B> {
             rt_pinned: false,
             self_heal_armed: [true; crate::NUM_NODES],
             bus_rx_failures: 0,
+            config_resend_failures: 0,
+            settle_residual_rad: 0.0,
+            config_resend_pending: 0,
+            config_resend_ticks: robot
+                .bus
+                .config_resend_offsets_s
+                .iter()
+                .map(|s| u64::from(robot.ticks(*s)))
+                .collect(),
+            bus_off_events_seen: 0,
             tx_fail_streak: 0,
             gripper_tx_fail_streak: 0,
             tx_fault_latch_ticks: robot.ticks(robot.bus.lost_s).max(1),
@@ -680,6 +700,7 @@ impl<B: DriverBus> RtCore<B> {
             homed: false,
             soft_estop: false,
             hw_estop: false,
+            estop_standing: false,
             park_asserted: false,
             gravity_comp: true,
             not_homed_refused: false,
@@ -713,7 +734,6 @@ impl<B: DriverBus> RtCore<B> {
             ),
             calibrate_pending: false,
             homing_gcmd,
-            jog_active: false,
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -1156,9 +1176,10 @@ impl<B: DriverBus> RtCore<B> {
         // boot: a FLASHING exit re-arms them without re-running the
         // selfcheck above.
         let since_armed = self.tick - self.config_repush_armed_at;
-        if BOOT_CONFIG_RESEND_TICKS.contains(&since_armed) && !self.bus.is_silent() {
+        if self.config_resend_ticks.contains(&since_armed) && !self.bus.is_silent() {
             self.config_repush();
         }
+        self.drain_config_resends();
     }
 
     /// One full stored-config shot: `bus.boot_config_repeats` passes to
@@ -1166,15 +1187,35 @@ impl<B: DriverBus> RtCore<B> {
     /// shot; the config key governs the redundancy).
     fn config_repush(&mut self) {
         for i in 0..MAX_JOINTS {
-            let _ = self
-                .bus
-                .resend_node_config(self.node_of[i], self.boot.config_repeats);
+            self.resend_config(self.node_of[i]);
         }
         if self.has_can_gripper {
-            let _ = self
-                .bus
-                .resend_node_config(self.gripper_node, self.boot.config_repeats);
+            self.resend_config(self.gripper_node);
         }
+    }
+
+    /// Push one node's stored config with the configured redundancy. A
+    /// refusal (TX queue full) is counted and the node queued for a
+    /// retry on a later tick: a node silently left on firmware defaults
+    /// is exactly what the shots exist to prevent.
+    fn resend_config(&mut self, node: NodeId) {
+        let bit = 1u16 << node;
+        match self.bus.resend_node_config(node, self.boot.config_repeats) {
+            Ok(()) => self.config_resend_pending &= !bit,
+            Err(_) => {
+                self.config_resend_failures = self.config_resend_failures.saturating_add(1);
+                self.config_resend_pending |= bit;
+            }
+        }
+    }
+
+    /// Retry one queued node per tick once the bus is not silent.
+    fn drain_config_resends(&mut self) {
+        if self.config_resend_pending == 0 || self.bus.is_silent() {
+            return;
+        }
+        let node = self.config_resend_pending.trailing_zeros() as NodeId;
+        self.resend_config(node);
     }
 
     /// Rebuild the torque scale around the drivers' own torque constants
@@ -1272,13 +1313,11 @@ impl<B: DriverBus> RtCore<B> {
                         self.jog_accel_scale = accel;
                     }
                     self.jog.command(&speeds);
-                    self.jog_active = true;
                     self.jog_joints = joint_mask(&speeds);
                 }
             }
             RtCommand::JogRelease => {
                 self.jog.release();
-                self.jog_active = false;
                 self.jog_joints = 0;
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
@@ -1302,28 +1341,7 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::GripperStop => {
                 if self.has_can_gripper {
-                    // The freshest jaw byte is read RT-side: routing a
-                    // snapshot byte back through the command plane would
-                    // race the reply stream and stop at a stale position.
-                    let byte = self.bus_state.gripper.reply.map(|r| r.position);
-                    match byte {
-                        Some(b @ 1..) if self.gripper_gate.has_standing() => {
-                            self.gripper_gate.stop_at(b);
-                            self.gripper_settle.arm_hold(self.tick);
-                        }
-                        // An uncalibrated gripper reports 0, which the
-                        // firmware maps to fully open — a naive stop
-                        // would fling the jaws open. No standing command
-                        // means no speed/current budget to hold with.
-                        // Both degrade to a release. 255 (fully closed)
-                        // is a legitimate hold target and stays above.
-                        // A degraded stop really does release, so the
-                        // action bit drops and the echo answers it.
-                        _ => {
-                            self.gripper_gate.idle();
-                            self.gripper_settle.arm_idle(self.tick);
-                        }
-                    }
+                    self.gripper_halt_in_place();
                 }
             }
             RtCommand::GripperIdle => {
@@ -1372,7 +1390,12 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::RetuneNode { node, tune } => {
                 match self.bus.retune_node(node, &tune, self.boot.config_repeats) {
-                    Ok(()) => log::info!("node {node} retuned (drive gains/limits pushed)"),
+                    Ok(()) => {
+                        // Homing restores "normal" limits on its way out;
+                        // those are now the tuned ones.
+                        self.homing.retune(node, &tune);
+                        log::info!("node {node} retuned (drive gains/limits pushed)");
+                    }
                     Err(e) => log::error!("retune of node {node} refused: {e}"),
                 }
             }
@@ -1501,7 +1524,7 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Jog => {
                 self.jog.activate(&self.q);
-                self.jog_active = false;
+                self.jog_joints = 0;
                 self.jog_blocked = 0;
             }
             Mode::Exec => {
@@ -1520,6 +1543,10 @@ impl<B: DriverBus> RtCore<B> {
                 // filtered session from starting with a ramp out of
                 // whatever the last session left behind.
                 self.stream_filt = self.q;
+                // The raw target starts at the pose too, so the per-tick
+                // filter step has nothing to chase before the first
+                // setpoint arrives.
+                self.q_target = self.q;
             }
             Mode::Flashing => {
                 log::info!("entering FLASHING: bus-silent maintenance window");
@@ -1670,6 +1697,39 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
+    /// Halt the jaws where they are: re-target the freshest reported jaw
+    /// byte with the standing command's speed/current, so the firmware —
+    /// already inside its own tolerance — holds instead of travelling.
+    ///
+    /// The byte is read RT-side: routing a snapshot byte back through the
+    /// command plane would race the reply stream and stop at a stale
+    /// position. An uncalibrated gripper's byte is not a pose (the
+    /// firmware maps it to fully open, so a naive stop would fling the
+    /// jaws), and no standing command means no speed/current budget to
+    /// hold with. Both degrade to a release; any calibrated byte, 0 and
+    /// 255 included, is a legitimate hold target.
+    /// Halt the jaws where they are, re-targeting the freshest jaw byte.
+    ///
+    /// The byte is read RT-side: routing a snapshot byte back through the
+    /// command plane would race the reply stream and stop at a stale
+    /// position. An uncalibrated gripper reports 0, which the firmware maps
+    /// to fully open, so a naive stop would fling the jaws open; and with
+    /// no standing command there is no speed/current budget to hold with.
+    /// Both degrade to a release, which really does let go, so the action
+    /// bit drops and the echo answers it.
+    fn gripper_halt_in_place(&mut self) {
+        match self.bus_state.gripper.reply {
+            Some(r) if r.calibrated && self.gripper_gate.has_standing() => {
+                self.gripper_gate.stop_at(r.position);
+                self.gripper_settle.arm_hold(self.tick);
+            }
+            _ => {
+                self.gripper_gate.idle();
+                self.gripper_settle.arm_idle(self.tick);
+            }
+        }
+    }
+
     // ------------------------------------------------------------ errors
 
     fn check_errors(&mut self, health: LoopHealth) {
@@ -1683,6 +1743,20 @@ impl<B: DriverBus> RtCore<B> {
         if self.soft_estop {
             self.errors.latch(ErrorCode::SwEstop, None);
         }
+        // The jaws are the one axis ACTIVE_ERROR's hold does not reach:
+        // the gate would go on driving a standing grip toward a target
+        // the arm is no longer travelling to. Either source halts them
+        // where they are — the same standstill the arm gets, and the same
+        // halt-in-place the tool's `stop` verb runs. Not a release:
+        // dropping whatever is clamped at the moment nobody is in control
+        // is its own hazard, and freeing the jaws is the operator's own
+        // act through the tool's `release` verb. Only a live grip is
+        // halted, so nothing re-arms jaws that were already let go.
+        let estop = self.estop_condition();
+        if estop && !self.estop_standing && self.has_can_gripper && self.gripper_gate.holding() {
+            self.gripper_halt_in_place();
+        }
+        self.estop_standing = estop;
 
         // Loop degradation bands.
         self.errors.condition(
@@ -1698,7 +1772,12 @@ impl<B: DriverBus> RtCore<B> {
         // reaches the drives until the kernel restarts the interface),
         // error-passive the self-clearing warning on the way there.
         let link = self.bus.link_health();
-        if link.state == par6_bus::LinkState::BusOff {
+        if link.state == par6_bus::LinkState::BusOff
+            || link.bus_off_events != self.bus_off_events_seen
+        {
+            // Frames were lost either way, whether or not the kernel's
+            // auto-restart already brought the controller back.
+            self.bus_off_events_seen = link.bus_off_events;
             self.errors.latch(ErrorCode::BusOff, None);
         }
         self.errors.condition(
@@ -1716,8 +1795,9 @@ impl<B: DriverBus> RtCore<B> {
         // `-g(q)` as "external" torque and would re-latch forever. The
         // EXEC feed-forward is subtracted so planned acceleration does
         // not count against the margin (one tick stale, matching the
-        // measurement's own lag). Hand-guiding and impedance modes are
-        // exempt: external torque is their input, not a fault.
+        // measurement's own lag). Only IDLE and the working modes are
+        // policed: the protective laws, BOOTING and FLASHING command no
+        // torque of their own, so there is nothing to compare against.
         if self.tau_env_margin_nm > 0.0 {
             let enforce = self.homed
                 && self.state == ArmState::Enabled
@@ -1775,7 +1855,7 @@ impl<B: DriverBus> RtCore<B> {
             if mask != 0 {
                 for n in 0..par6_bus::MAX_NODES {
                     if mask & (1 << n) != 0 {
-                        let _ = self.bus.resend_node_config(n as NodeId, 1);
+                        self.resend_config(n as NodeId);
                     }
                 }
             }
@@ -1839,19 +1919,22 @@ impl<B: DriverBus> RtCore<B> {
             if self.mode != Mode::Booting {
                 self.state = ArmState::Disabled;
             }
-            if !matches!(self.mode, Mode::ActiveError | Mode::Flashing) {
-                if self.mode == Mode::Homing && self.homing.active() {
-                    // Abort: un-home, zero statuses, restore limits/config.
-                    self.homing.abort(&mut self.bus);
-                    self.homed = false;
-                }
+            // SAFETY_STOP outranks the reaction: its limp law is what a
+            // hard error during a protective stop must keep ending on,
+            // not ACTIVE_ERROR's hold.
+            if !matches!(
+                self.mode,
+                Mode::ActiveError | Mode::Flashing | Mode::SafetyStop
+            ) {
                 log::warn!("hard error: mode {:?} -> ActiveError", self.mode);
-                self.mode = Mode::ActiveError;
+                // Through the transition hooks: an active homing
+                // sequence aborts and hands the gripper back idle.
+                self.enter_mode(Mode::ActiveError);
             }
         } else if self.mode == Mode::ActiveError {
             // Auto-recovery once the latch is clean (state stays DISABLED
             // until the user re-enables).
-            self.mode = Mode::Idle;
+            self.enter_mode(Mode::Idle);
         }
     }
 
@@ -1950,6 +2033,7 @@ impl<B: DriverBus> RtCore<B> {
         if self.mode == Mode::Flashing {
             // Bus-silent: not a single frame, polls included.
             self.mirror = CommandMirror::default();
+            self.torque_slew.reset();
             return;
         }
         if self.mode == Mode::Homing {
@@ -1964,6 +2048,7 @@ impl<B: DriverBus> RtCore<B> {
                 &mut self.homing_gcmd,
             );
             self.mirror = CommandMirror::default();
+            self.torque_slew.reset();
             self.send_joints();
             self.send_gripper(self.homing_gcmd);
             self.step_scan();
@@ -1991,11 +2076,8 @@ impl<B: DriverBus> RtCore<B> {
                         self.homed = false;
                     }
                     // Exit: full normal config reload for every node.
-                    for i in 0..MAX_JOINTS {
-                        let _ = self.bus.resend_node_config(self.node_of[i], 1);
-                    }
+                    self.config_repush();
                     if self.has_can_gripper {
-                        let _ = self.bus.resend_node_config(self.gripper_node, 1);
                         // Homing streamed its own DLC-5 frames (its park
                         // move included), so the firmware is holding a
                         // grip the normal path never commanded — and the
@@ -2003,7 +2085,7 @@ impl<B: DriverBus> RtCore<B> {
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
                         self.gripper_settle.disarm();
                     }
-                    self.mode = Mode::Idle;
+                    self.enter_mode(Mode::Idle);
                 }
                 SeqStatus::Failed => {
                     log::warn!("homing sequence FAILED");
@@ -2012,7 +2094,7 @@ impl<B: DriverBus> RtCore<B> {
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
                         self.gripper_settle.disarm();
                     }
-                    self.mode = Mode::Idle;
+                    self.enter_mode(Mode::Idle);
                 }
                 SeqStatus::Running | SeqStatus::Inactive => {}
             }
@@ -2064,10 +2146,16 @@ impl<B: DriverBus> RtCore<B> {
                     &mut self.scratch_qd,
                     &mut self.scratch_tau,
                 );
-                if outcome == ExecTick::Fault {
-                    // Strict-policy settle timeout: hard error; playback
-                    // froze in a hold, the reaction lands next tick.
-                    self.errors.latch(ErrorCode::ExecSettleTimeout, None);
+                if let ExecTick::Fault {
+                    joint,
+                    residual_rad,
+                } = outcome
+                {
+                    // Strict-policy settle timeout: hard error on the joint
+                    // that missed; playback froze in a hold, the reaction
+                    // lands next tick.
+                    self.settle_residual_rad = residual_rad;
+                    self.errors.latch(ErrorCode::ExecSettleTimeout, Some(joint));
                 }
                 self.q_target = self.scratch_q;
                 self.qd_target = self.scratch_qd;
@@ -2100,6 +2188,14 @@ impl<B: DriverBus> RtCore<B> {
                     self.stream.set_target(&target);
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
+                } else if self.stream_lp_alpha != 0.0 {
+                    // The filter is a per-tick coefficient: it keeps
+                    // converging on the latest request between setpoints,
+                    // so the realized cutoff does not scale with the
+                    // client's publish rate.
+                    let raw = self.q_target;
+                    let target = self.filtered_target(&raw);
+                    self.stream.set_target(&target);
                 }
                 self.stream_window(applied);
                 self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
@@ -2141,7 +2237,9 @@ impl<B: DriverBus> RtCore<B> {
         } else if std::mem::take(&mut self.calibrate_pending) {
             // cmd 62 goes out once; the gate then carries the sweep on
             // DLC-0 polls (a repeated cmd 62 would restart it every
-            // tick, and any DLC-5 frame would disturb it).
+            // tick, and any DLC-5 frame would disturb it — including an
+            // idle announcement a hand-back armed while this waited).
+            self.gripper_gate.reset_to_poll();
             GripperCommand::Calibrate
         } else {
             let calibrated = self.bus_state.gripper.reply.is_some_and(|r| r.calibrated);
@@ -2232,6 +2330,7 @@ impl<B: DriverBus> RtCore<B> {
     // ------------------------------------------------------------ snapshot
 
     fn publish(&mut self) {
+        let gravity_applied = self.gravity_applied();
         let s = &mut self.snap;
         s.tick = self.tick;
         s.mode = self.mode;
@@ -2248,7 +2347,7 @@ impl<B: DriverBus> RtCore<B> {
         s.q_commanded = self.mirror.q;
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
-        s.gravity_comp = self.gravity_comp;
+        s.gravity_comp = gravity_applied;
         s.drift_lock = *self.drift.status();
         s.bus_nodes = self.bus.connected_nodes();
         s.bus_scan_epoch = self.scan_epoch;
@@ -2277,10 +2376,12 @@ impl<B: DriverBus> RtCore<B> {
         s.loop_stats.can_frame_age_min_ticks = self.bus_state.frame_age_min_ticks;
         s.loop_stats.bus_tx_failures = self.bus_tx_failures;
         s.loop_stats.bus_rx_failures = self.bus_rx_failures;
+        s.loop_stats.config_resend_failures = self.config_resend_failures;
+        s.settle_residual_rad = self.settle_residual_rad;
         s.link = self.bus.link_health();
         s.exec = self.exec.status();
         s.jog = JogStatus {
-            active: self.jog_active,
+            active: self.jog_joints != 0,
             joints: self.jog_joints,
             blocked_mask: self.jog_blocked,
         };

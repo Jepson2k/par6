@@ -149,6 +149,11 @@ impl StreamTracker for MotionStream {
     fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
         self.hold_q = *q_meas;
         self.executor.activate(q_meas);
+        // A new session starts its fault window from zero: the streak a
+        // latched session left behind must not re-latch on tick one.
+        self.fail_streak = 0;
+        self.target_refused = false;
+        self.scale_refused = false;
     }
 
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {

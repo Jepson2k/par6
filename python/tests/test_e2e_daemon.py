@@ -13,6 +13,7 @@ Skipped, not failed, when no ``par6d`` binary is reachable — see
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import math
 import time
@@ -148,7 +149,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
                 frames.append(status)
                 if len(frames) == 5:
                     break
-        assert [f.proto_version for f in frames] == [2] * 5
+        assert [f.proto_version for f in frames] == [3] * 5
         assert all(b.seq > a.seq for a, b in zip(frames, frames[1:]))
         assert all(b.mono_time_ns > a.mono_time_ns for a, b in zip(frames, frames[1:]))
         assert all(f.link_ok == 1 and f.simulator_active for f in frames)
@@ -658,6 +659,53 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert await client.reset() == 1
         assert await client.wait_status(lambda s: s.io[-1] == 1, timeout=STEP_BUDGET_S)
         assert await client.is_estop_pressed() is False
+
+
+@pytest.mark.timeout(120)
+async def test_a_wait_that_runs_out_raises_and_the_status_buffer_keeps_its_identities(
+    daemon: LiveDaemon,
+):
+    """Two contracts of the async client over a live stream.
+
+    A ``wait=True`` motion that does not finish within its timeout raises
+    ``TimeoutError`` — the index it would otherwise return reads as
+    success while the arm is still moving.
+
+    The shared status buffer is filled in place: the containers a consumer
+    holds across frames are the same objects frame after frame.
+    """
+    park = park_deg()
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await teleport_to(client, park)
+
+        target = list(park)
+        target[0] += 20.0
+        with pytest.raises(TimeoutError):
+            await client.move_j(target, duration=6.0, wait=True, timeout=0.5)
+        await client.stop()
+
+        first = None
+        seen = 0
+        async with asyncio.timeout(STEP_BUDGET_S):
+            async for status in client.stream_status_shared():
+                held = (
+                    status.collision_pairs,
+                    status.warnings,
+                    status.link_health,
+                    status.homing,
+                    status.homing.get("joints"),
+                )
+                if first is None:
+                    first = held
+                else:
+                    assert all(a is b for a, b in zip(first, held)), (
+                        "the buffer rebound a container between frames"
+                    )
+                seen += 1
+                if seen == 5:
+                    break
+        assert seen == 5
 
 
 @pytest.mark.timeout(180)
@@ -1417,6 +1465,13 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
             info = await client.config_info()
             assert info is not None
+
+            # Every [motion] key rides along, the sampling pitches
+            # included, and an omitted optional key reads back as None.
+            motion = info["motion"]
+            assert motion["path_step_m"] == pytest.approx(0.002)
+            assert motion["joint_step_rad"] is None
+            assert motion["path_rot_weight_m_per_rad"] == pytest.approx(0.15)
         assert info["path"] == str(daemon.config)
 
         # The wire-contract fingerprint: sha256 over the robot TOML and
@@ -1538,14 +1593,17 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
         assert await client.wait_ready(timeout=STEP_BUDGET_S)
 
         info = await client.payload()
-        assert info == {"mass": 0.0, "com": [0.0] * 3, "inertia": [0.0] * 6}
+        assert info is not None
+        assert info.mass == 0.0
+        assert info.com == (0.0, 0.0, 0.0)
+        assert info.inertia == (0.0,) * 6
 
         assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
         info = await client.payload()
         assert info is not None
-        assert info["mass"] == pytest.approx(1.2)
-        assert info["com"] == pytest.approx([0.0, 0.01, 0.05])
-        assert info["inertia"] == [0.0] * 6
+        assert info.mass == pytest.approx(1.2)
+        assert info.com == pytest.approx((0.0, 0.01, 0.05))
+        assert info.inertia == (0.0,) * 6
 
         with pytest.raises(RobotError) as neg:
             await client.set_payload(-1.0)
@@ -1562,13 +1620,13 @@ async def test_set_payload_round_trips_and_refuses_garbage(daemon: LiveDaemon):
             await client.set_payload(1.0, inertia=(0.0, 0.0, 1.0, 0.0, 5.0, 0.0))
         assert hidden.value.code == ErrorCode.COMM_VALIDATION_ERROR
         info = await client.payload()
-        assert info is not None and info["mass"] == pytest.approx(1.2), (
+        assert info is not None and info.mass == pytest.approx(1.2), (
             "a refused set must not change the payload"
         )
 
         assert await client.set_payload(0.0) == 1
         info = await client.payload()
-        assert info is not None and info["mass"] == 0.0
+        assert info is not None and info.mass == 0.0
 
 
 async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaemon):
@@ -1620,24 +1678,45 @@ async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaem
         )
 
 
-def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon):
+def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon, capsys):
     """The ``par6`` shell exits with its documented codes for the outcomes
     that matter from a terminal in a hurry: a runtime REFUSAL is a spoken
     ``EXIT_REFUSED`` (not a traceback — refusals raise RobotError, which
-    main must catch), and an estop/stop/reset nothing acknowledged exits
-    ``EXIT_UNREACHABLE`` instead of printing success on a lost datagram."""
+    main must catch), a wait that runs out is ``EXIT_TIMEOUT`` rather than
+    "unreachable", an estop/stop/reset nothing acknowledged exits
+    ``EXIT_UNREACHABLE`` instead of printing success on a lost datagram,
+    and ``status`` reports the e-stop with the line's real polarity."""
     import socket
 
-    from par6.cli import EXIT_REFUSED, EXIT_UNREACHABLE, main
+    from par6.cli import EXIT_REFUSED, EXIT_TIMEOUT, EXIT_UNREACHABLE, main
 
     addr = ["--host", "127.0.0.1", "--port", str(daemon.command_port)]
     deadline = time.monotonic() + STEP_BUDGET_S
     while main([*addr, "ping"]) != 0:
         assert time.monotonic() < deadline, "the daemon never answered ping"
+    capsys.readouterr()
 
     # The boot arm is un-referenced (and possibly still DISABLED): a
     # move is refused either way, and the shell speaks the refusal.
     assert main([*addr, "move-j", "0", "0", "0", "0", "0", "0"]) == EXIT_REFUSED
+
+    # The e-stop line reads clear on a fresh boot and engaged after an
+    # estop: `status` must say so in those words, not the inverse.
+    assert main([*addr, "--json", "status"]) == 0
+    assert json.loads(capsys.readouterr().out)["estop"] is False
+    assert main([*addr, "estop"]) == 0
+    capsys.readouterr()
+    assert main([*addr, "--json", "status"]) == 0
+    assert json.loads(capsys.readouterr().out)["estop"] is True
+    assert main([*addr, "reset"]) == 0
+    capsys.readouterr()
+
+    # A homing seek takes a minute; a wait shorter than that is a timeout
+    # the shell names, not a runtime it could not reach.
+    assert main([*addr, "home", "--wait", "--home-timeout", "0.5"]) == EXIT_TIMEOUT
+    assert "timed out" in capsys.readouterr().err
+    assert main([*addr, "stop"]) == 0
+    capsys.readouterr()
 
     # A port nothing listens on: system commands come back unconfirmed,
     # and "estop latched" printed there would be the dangerous lie.

@@ -38,11 +38,13 @@ pub mod link;
 pub mod runtime;
 pub mod server;
 
-pub use config::{ConfigInfoData, ServerConfig, StatusTransport};
+pub use config::{ConfigInfoData, ServerConfig, StatusTransport, TunableNode};
 pub use faults::{gripper_fault_code, rt_standing_error};
-pub use gating::{gate, Gate};
+pub use gating::{check_gate, gate, Gate, GateContext};
 pub use runtime::{
     blend_radius_mm, CollisionState, CommandOutcome, Enablement, PayloadSpec, PlanContext, Planner,
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
-pub use server::{decode_error_to_wire, spawn, validate_supported, ServerHandle};
+pub use server::{
+    decode_error_to_wire, spawn, validate_registries, validate_supported, ServerHandle,
+};

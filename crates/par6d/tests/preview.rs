@@ -11,40 +11,29 @@ use par6_server::ShapeLayer;
 use par6d::preview::Preview;
 
 mod common;
-use common::{repo_root, Client, Rig};
+use common::{Client, Rig};
 
 const BUDGET: Duration = Duration::from_secs(20);
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
 /// AND the preview so the parity below is over identical inputs.
 fn test_config() -> PathBuf {
-    let src = repo_root().join("config/PAR6.toml");
-    let dir = std::env::temp_dir().join(format!("par6d-preview-{}", std::process::id()));
-    let grippers = dir.join("grippers");
-    std::fs::create_dir_all(&grippers).expect("test config dir");
-    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
-    let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
-    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
-        let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
-    }
-    dst
+    common::retimed_config("preview", 0.02)
 }
 
 fn assets() -> PathBuf {
-    repo_root().join("assets/par6_description")
+    common::assets_dir()
 }
 
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&repo_root().join("config/PAR6.toml")).expect("cfg");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
+    common::park_deg()
+}
+
+/// A pose with the wrist clear of its singularity: park folds J5 to 0,
+/// where a rotation about world z has no IK branch and a damped
+/// least-squares jog drifts off its axis.
+fn wrist_clear_deg() -> [f64; NUM_JOINTS] {
+    [0.0, -60.0, 150.0, 0.0, 45.0, 180.0]
 }
 
 fn to_rad(deg: &[f64; NUM_JOINTS]) -> [f64; NUM_JOINTS] {
@@ -363,4 +352,93 @@ fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
         lim.soft_max_rad
     );
     assert_eq!(preview.angles_rad(), mid, "the virtual arm does not move");
+}
+
+/// The cartesian jog preview integrates the runtime's own twist: a +x
+/// jog in the world frame moves the TCP along +x and nothing else, and a
+/// wire-invalid request comes back as the result's error.
+#[test]
+fn the_preview_jogs_cartesian_through_the_runtime_kinematics() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+
+    let r = preview.preview_jog_l(
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        par6_proto::Frame::Wrf,
+        0.5,
+        None,
+    );
+    assert!(r.valid(), "a plain +x jog previews: {:?}", r.error);
+    assert_eq!(r.joint_trajectory_rad.len(), r.tcp_poses.len());
+    let (first, last) = (r.tcp_poses[0], r.tcp_poses[r.tcp_poses.len() - 1]);
+    let dx = last[3] - first[3];
+    let dy = (last[7] - first[7]).abs();
+    let dz = (last[11] - first[11]).abs();
+    assert!(
+        dx > 0.02,
+        "half a second of full-scale +x jog must travel: {dx} m"
+    );
+    assert!(
+        dy < 0.003 && dz < 0.003,
+        "and only along x: dy {dy} dz {dz}"
+    );
+
+    let refused = preview.preview_jog_l([f64::NAN; 6], par6_proto::Frame::Wrf, 0.5, None);
+    assert!(!refused.valid(), "a NaN twist is refused at the wire");
+}
+
+/// A first waypoint that only reorients the tool is a real segment: the
+/// path snaps it to the start only when it is within the path metric of
+/// the start, rotation weighted, not when its translation alone is small.
+#[test]
+fn a_pure_reorientation_first_waypoint_is_not_dropped() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+
+    // Relative to the current pose: first turn 20 deg about z in place,
+    // then translate 50 mm along x.
+    let r = preview.preview(Command::MoveP(par6_proto::command::MoveP {
+        key: 9901,
+        waypoints: vec![
+            [0.0, 0.0, 0.0, 0.0, 0.0, 20.0],
+            [50.0, 0.0, 0.0, 0.0, 0.0, 20.0],
+        ],
+        frame: par6_proto::Frame::Wrf,
+        duration: None,
+        speed: Some(0.5),
+        accel: None,
+        rel: true,
+    }));
+    assert!(
+        r.valid(),
+        "a rotate-then-translate path previews: {:?}",
+        r.error
+    );
+    let start = r.tcp_poses[0];
+    let translation = |p: &[f64; 16]| {
+        ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
+    };
+    // Rotation angle between the start orientation and `p`.
+    let rotation = |p: &[f64; 16]| {
+        let mut trace = 0.0;
+        for r in 0..3 {
+            for k in 0..3 {
+                trace += start[r * 4 + k] * p[r * 4 + k];
+            }
+        }
+        ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+    };
+    let moving = r
+        .tcp_poses
+        .iter()
+        .find(|p| translation(p) > 0.005)
+        .expect("the path translates 50 mm");
+    assert!(
+        rotation(moving) > 15.0,
+        "the reorientation must complete before the translation starts: {:.1} deg turned \
+         when the TCP first left the start",
+        rotation(moving)
+    );
 }

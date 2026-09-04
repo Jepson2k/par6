@@ -1,7 +1,7 @@
 {
   "format": 1,
   "generator": "cargo run -p par6-proto --bin gen_golden",
-  "proto_version": 2,
+  "proto_version": 3,
   "vectors": [
     {
       "class": "SYSTEM",
@@ -1193,7 +1193,7 @@
         null,
         0.3,
         0.4,
-        false
+        true
       ]
     },
     {
@@ -1350,7 +1350,7 @@
           8,
           36,
           "Settle timeout",
-          "Measured position did not settle on target within the window (max residual 0.02 rad).",
+          "Measured position did not settle on target within the window: J3 was 0.0200 rad off.",
           "Command completed with error under the strict policy.",
           "Check for mechanical obstruction, or relax the completion policy."
         ]
@@ -1936,10 +1936,15 @@
             0.6,
             0.005,
             0.05,
+            0.002,
+            0.01,
             0.35,
             0.05,
             0.01,
-            2.0
+            2.0,
+            0.15,
+            1000.0,
+            0.0001
           ],
           [
             [
@@ -2198,6 +2203,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -2216,7 +2222,7 @@
           0.0,
           1.0
         ],
-        "proto_version": 2,
+        "proto_version": 3,
         "queued_duration": 4.75,
         "queued_segments": 3,
         "scene_epoch": 5,
@@ -2286,7 +2292,7 @@
       "name": "status_full",
       "wire": [
         3,
-        2,
+        3,
         12648430,
         123456789,
         3600000000123,
@@ -2495,6 +2501,7 @@
           0.03125,
           -0.015625
         ],
+        true,
         [
           [
             31.0,
@@ -2616,6 +2623,7 @@
         "link_ok": 0,
         "mode": 0,
         "mono_time_ns": 0,
+        "paused": false,
         "pose": [
           0.0,
           0.0,
@@ -2634,7 +2642,7 @@
           0.0,
           0.0
         ],
-        "proto_version": 2,
+        "proto_version": 3,
         "queued_duration": 0.0,
         "queued_segments": 0,
         "scene_epoch": 0,
@@ -2673,7 +2681,7 @@
       "name": "status_idle",
       "wire": [
         3,
-        2,
+        3,
         0,
         0,
         0,
@@ -2816,6 +2824,7 @@
           0.0,
           0.0
         ],
+        false,
         [
           [],
           [],
@@ -2956,6 +2965,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -2974,7 +2984,7 @@
           0.0,
           1.0
         ],
-        "proto_version": 2,
+        "proto_version": 3,
         "queued_duration": 4.75,
         "queued_segments": 3,
         "scene_epoch": 5,
@@ -3044,7 +3054,7 @@
       "name": "status_longer_tail",
       "wire": [
         3,
-        2,
+        3,
         12648430,
         123456789,
         3600000000123,
@@ -3253,6 +3263,7 @@
           0.03125,
           -0.015625
         ],
+        true,
         [
           [
             31.0,
@@ -3417,6 +3428,7 @@
         "link_ok": 1,
         "mode": 6,
         "mono_time_ns": 3600000000123,
+        "paused": true,
         "pose": [
           1.0,
           0.0,
@@ -3435,7 +3447,7 @@
           0.0,
           1.0
         ],
-        "proto_version": 2,
+        "proto_version": 3,
         "queued_duration": 4.75,
         "queued_segments": 3,
         "scene_epoch": 5,
@@ -3505,7 +3517,7 @@
       "name": "status_ten_io_lines",
       "wire": [
         3,
-        2,
+        3,
         12648430,
         123456789,
         3600000000123,
@@ -3720,6 +3732,7 @@
           0.03125,
           -0.015625
         ],
+        true,
         [
           [
             31.0,

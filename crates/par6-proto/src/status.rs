@@ -15,12 +15,12 @@
 //!  homed bool, torques f64[6], mode u8, enabled bool, gravity_comp bool,
 //!  warnings [err6], link_health [state u8, restarts u32, tx_errors u64,
 //!  rx_frames u64], homing [active bool, step u8, [[status u8, phase u8]]],
-//!  torques_ext f64[6],
+//!  torques_ext f64[6], paused bool,
 //!  drive_health [temperatures_c f64[], currents_ma f64[], bus_voltage_v nil|f64],
 //!  loop_health [p99_period_s f64, overruns u64]]
 //! ```
 //!
-//! 41 elements total. STATUS is broadcast even when the bus link is down —
+//! 42 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
@@ -34,7 +34,7 @@ use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEM
 use crate::{HomingJointState, HomingPhase, LinkState};
 
 /// Total number of elements in a v2 STATUS array (including the tag).
-pub const STATUS_LEN: usize = 41;
+pub const STATUS_LEN: usize = 42;
 /// Decode cap on the `warnings` list (the RT latch holds at most 32
 /// entries; a longer claim is hostile input).
 const MAX_WARNINGS: usize = 64;
@@ -137,13 +137,16 @@ pub struct Status {
     /// External joint torque estimate \[Nm\]: filtered measured torque
     /// minus the model's gravity torque.
     pub torques_ext: [f64; NUM_JOINTS],
+    /// EXEC playback is paused: holding in place with the sample ring
+    /// untouched, so a paused arm reads differently from a stalled one.
+    pub paused: bool,
     /// Per-drive analog readings.
     pub drive_health: DriveHealthWire,
     /// Control-loop health.
     pub loop_health: LoopHealthWire,
 }
 
-/// Per-drive analog readings as STATUS carries them (slot 39).
+/// Per-drive analog readings as STATUS carries them (slot 40).
 ///
 /// These are the trends that let an operator watch a joint climb toward a
 /// limit before it faults; the faults themselves ride `warnings` and the
@@ -162,7 +165,7 @@ pub struct DriveHealthWire {
     pub bus_voltage_v: Option<f64>,
 }
 
-/// Control-loop health as STATUS carries it (slot 40).
+/// Control-loop health as STATUS carries it (slot 41).
 ///
 /// The tail and the miss count, which are what say a loop is unwell; the
 /// mean, the rest of the distribution and the boot constants (target rate,
@@ -242,6 +245,7 @@ impl Default for Status {
             link_health: LinkHealthWire::default(),
             homing: HomingWire::default(),
             torques_ext: [0.0; NUM_JOINTS],
+            paused: false,
             drive_health: DriveHealthWire::default(),
             loop_health: LoopHealthWire::default(),
         }
@@ -341,6 +345,7 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     for v in s.torques_ext {
         w_f64(buf, v);
     }
+    w_bool(buf, s.paused);
     w_array(buf, 3);
     w_array(buf, s.drive_health.temperatures_c.len());
     for v in &s.drive_health.temperatures_c {
@@ -621,6 +626,7 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         joints: homing_joints,
     };
     let torques_ext: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.torques_ext")?;
+    let paused = r.bool()?;
     let dn = r.array_len()?;
     if dn != 3 {
         return Err(DecodeError::Arity {
@@ -707,6 +713,7 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
         link_health,
         homing,
         torques_ext,
+        paused,
         drive_health,
         loop_health,
     })

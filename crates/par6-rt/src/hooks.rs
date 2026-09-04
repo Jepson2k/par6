@@ -238,6 +238,9 @@ pub struct RampJog {
     target_q: [f64; MAX_JOINTS],
     vel: [f64; MAX_JOINTS],
     request: [f64; MAX_JOINTS],
+    /// Joints driven by the previous command; survives `release()` so a
+    /// joint re-entering the set after a stop still clears its blocks.
+    last_set: u8,
     blocked: u16,
 }
 
@@ -265,6 +268,7 @@ impl RampJog {
             target_q: [0.0; MAX_JOINTS],
             vel: [0.0; MAX_JOINTS],
             request: [0.0; MAX_JOINTS],
+            last_set: 0,
             blocked: 0,
         }
     }
@@ -275,20 +279,30 @@ impl JogEngine for RampJog {
         self.target_q = *q_meas;
         self.vel = [0.0; MAX_JOINTS];
         self.request = [0.0; MAX_JOINTS];
+        self.last_set = 0;
         self.blocked = 0;
     }
 
     fn command(&mut self, speeds: &[f64; MAX_JOINTS]) {
+        let mut set = 0u8;
         for (i, (want, v)) in self.request.iter_mut().zip(speeds.iter()).enumerate() {
-            if !v.is_finite() {
-                continue;
-            }
+            // A non-finite entry is a stop for that joint, never "keep
+            // whatever it was doing".
+            let v = if v.is_finite() {
+                v.clamp(-1.0, 1.0)
+            } else {
+                0.0
+            };
             // A joint dropping out of the driven set clears its blocks.
-            if *want != 0.0 && *v == 0.0 {
+            if self.last_set & (1 << i) != 0 && v == 0.0 {
                 self.blocked &= !(0b11 << (2 * i));
             }
-            *want = v.clamp(-1.0, 1.0);
+            if v != 0.0 {
+                set |= 1 << i;
+            }
+            *want = v;
         }
+        self.last_set = set;
     }
 
     fn set_accel_scale(&mut self, accel: f64) {
@@ -441,15 +455,20 @@ impl StreamTracker for ClampStream {
 // ---------------------------------------------------------------- completion
 
 /// Verdict of one settling tick.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum SettleVerdict {
     /// Still settling — EXEC keeps holding at the boundary target.
     Settling,
     /// The command is complete; playback resumes.
     Complete,
     /// The settle failed (strict policy timeout) — the tick loop latches
-    /// a hard error.
-    Fault,
+    /// a hard error attributed to the joint furthest from its target.
+    Fault {
+        /// Joint furthest from its target when the window closed.
+        joint: u8,
+        /// That joint's residual \[rad\].
+        residual_rad: f64,
+    },
 }
 
 /// EXEC completion policy.
@@ -511,18 +530,25 @@ impl SettlePolicy for SpecSettle {
     }
 
     fn tick(&mut self, q_meas: &[f64; MAX_JOINTS], q_target: &[f64; MAX_JOINTS]) -> SettleVerdict {
-        let max_err = q_meas
+        let (worst, max_err) = q_meas
             .iter()
             .zip(q_target)
             .map(|(m, t)| (m - t).abs())
-            .fold(0.0f64, f64::max);
+            .enumerate()
+            .fold(
+                (0usize, 0.0f64),
+                |acc, (j, e)| if e > acc.1 { (j, e) } else { acc },
+            );
         if max_err <= self.tolerance_rad {
             return SettleVerdict::Complete;
         }
         self.elapsed += 1;
         if self.elapsed >= self.timeout_ticks {
             return match self.policy {
-                CompletionPolicy::Strict => SettleVerdict::Fault,
+                CompletionPolicy::Strict => SettleVerdict::Fault {
+                    joint: worst as u8,
+                    residual_rad: max_err,
+                },
                 _ => SettleVerdict::Complete,
             };
         }

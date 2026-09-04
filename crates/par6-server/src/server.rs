@@ -68,7 +68,7 @@ use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
 use crate::faults::{gripper_fault_code, rt_standing_error};
-use crate::gating::{gate, is_stream};
+use crate::gating::{check_gate, gate, is_stream, GateContext};
 use crate::link::BroadcastLink;
 use crate::runtime::{
     blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
@@ -101,6 +101,12 @@ struct PendingScan {
 /// still deciding. A client that keeps re-sending past this is not
 /// waiting for an answer, and the queue must stay bounded.
 const MAX_RESET_WAITERS: usize = 16;
+/// Requests awaiting the RT's FLASHING verdict, bounded the same way.
+const MAX_FLASHING_WAITERS: usize = 16;
+/// Largest CONFIG_BUNDLE reply sent: one UDP datagram (65 507 payload
+/// bytes) with headroom for the msgpack framing and file names, since
+/// replies are not chunked.
+const MAX_CONFIG_BUNDLE_BYTES: usize = 60_000;
 
 /// How many datagrams one stream preemption may lift off the socket.
 /// Two clients streaming at 50 Hz put a handful in the queue; the cap is
@@ -209,6 +215,52 @@ struct Executing {
     blended: Vec<(u64, SocketAddr)>,
 }
 
+/// Requests parked until the RT settles one verdict (reset → the enable
+/// outcome, FLASHING enter/exit → the mode outcome), bounded so a
+/// retrying client cannot grow the list without limit.
+struct Waiters {
+    queued: Vec<(u32, SocketAddr)>,
+    cap: usize,
+    what: &'static str,
+}
+
+impl Waiters {
+    fn new(cap: usize, what: &'static str) -> Self {
+        Self {
+            queued: Vec::with_capacity(cap),
+            cap,
+            what,
+        }
+    }
+
+    fn try_push(&mut self, req_id: u32, addr: SocketAddr) -> Result<(), WireError> {
+        if self.queued.len() >= self.cap {
+            return Err(make_error(
+                ErrorCode::CommQueueFull,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "Too many {} requests are already awaiting the controller's \
+                         verdict; stop retrying until the outstanding one is answered.",
+                        self.what
+                    ),
+                )],
+            ));
+        }
+        self.queued.push((req_id, addr));
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.queued.is_empty()
+    }
+
+    fn take(&mut self) -> Vec<(u32, SocketAddr)> {
+        std::mem::take(&mut self.queued)
+    }
+}
+
 /// Idempotency dedup window: last N keys → original index.
 struct Dedup {
     cap: usize,
@@ -280,10 +332,10 @@ struct Core<P: Planner, R: RtCommands> {
     /// would truncate whatever it rescued).
     drainbuf: Vec<u8>,
     /// Clients whose `reset` is still waiting for the RT's answer.
-    reset_waiters: Vec<(u32, SocketAddr)>,
+    reset_waiters: Waiters,
     /// Clients whose `enter_flashing`/`exit_flashing` is still waiting
     /// for the RT's mode change.
-    flashing_waiters: Vec<(u32, SocketAddr)>,
+    flashing_waiters: Waiters,
     /// Whether the boot-time enable has been requested yet.
     booted: bool,
 
@@ -332,7 +384,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     ) -> Self {
         let reassembler = Reassembler::new(cfg.chunk_timeout);
         Self {
-            dedup: Dedup::new(cfg.dedup_window),
+            // A window no larger than the queue evicts a live command's
+            // key, and a retransmitted OK would then re-enqueue its motion.
+            dedup: Dedup::new(cfg.dedup_window.max(cfg.queue_capacity + 2)),
             profile: cfg.initial_profile.clone(),
             rt_error_logged: None,
             pending_scans: Vec::new(),
@@ -362,8 +416,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
-            reset_waiters: Vec::new(),
-            flashing_waiters: Vec::new(),
+            reset_waiters: Waiters::new(MAX_RESET_WAITERS, "reset"),
+            flashing_waiters: Waiters::new(MAX_FLASHING_WAITERS, "FLASHING"),
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
@@ -573,6 +627,29 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             return;
         }
         self.refresh_queue_estimate();
+        if matches!(cmd, Command::ConfigBundle) {
+            let ci = &self.cfg.config_info;
+            let bytes = ci.robot_toml.len()
+                + ci.grippers
+                    .iter()
+                    .map(|(name, text)| name.len() + text.len())
+                    .sum::<usize>();
+            if bytes > MAX_CONFIG_BUNDLE_BYTES {
+                let error = make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[(
+                        "detail",
+                        &format!(
+                            "the config bundle is {bytes} bytes, over the \
+                             {MAX_CONFIG_BUNDLE_BYTES} byte reply ceiling"
+                        ),
+                    )],
+                );
+                self.reply(addr, &Reply::Error { req_id, error }).await;
+                return;
+            }
+        }
         let result = self.query_result(cmd);
         self.reply(addr, &Reply::Response { req_id, result }).await;
     }
@@ -609,7 +686,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     fn bus_scan_result(&self) -> QueryResult {
         let nodes = (0..16u8)
             .map(|id| {
-                let slot = self.cfg.tunable_nodes.iter().position(|n| *n == id);
+                let slot = self.cfg.tunable_nodes.iter().position(|n| n.node == id);
                 let (freshness, info) = match slot {
                     Some(i) if i < self.snap.nodes.len() => (
                         match self.snap.node_freshness[i] {
@@ -661,7 +738,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 )],
             ));
         }
-        if !force && !self.cfg.tunable_nodes.contains(&node) {
+        if !force && !self.cfg.tunable_nodes.iter().any(|t| t.node == node) {
             return Err(make_error(
                 ErrorCode::CommValidationError,
                 UNATTRIBUTED,
@@ -697,12 +774,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
         let result: Result<(), WireError> = match cmd {
             C::Estop => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("estop", dropped).await;
+                // Latch and disable before anything awaits: the drive
+                // disable must not wait on socket writability behind a
+                // queue's worth of COMPLETE pushes.
                 self.estop_latched = true;
                 self.runtime.rt.set_enabled(false);
                 self.standing_error =
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+                self.cancel_all_motion("estop").await;
                 Ok(())
             }
             C::Pause(p) => {
@@ -714,13 +793,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 Ok(())
             }
             C::Stop(p) => {
-                let mut dropped = self.cancel_active_motion();
-                if p.clear_queue {
-                    dropped.extend(self.drop_pending());
-                }
-                let latch = p.clear_queue && !dropped.is_empty();
-                self.complete_cancelled("stop", dropped).await;
-                if latch {
+                let dropped = if p.clear_queue {
+                    self.cancel_all_motion("stop").await
+                } else {
+                    self.cancel_active_motion("stop").await
+                };
+                if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
                     self.standing_error = Some(make_error(
@@ -756,9 +834,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 )),
             },
             C::Simulator(p) => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("the simulator switch", dropped)
-                    .await;
+                self.cancel_all_motion("the simulator switch").await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
                 })
@@ -786,8 +862,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::ResetState => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("reset", dropped).await;
+                self.cancel_all_motion("reset").await;
                 self.standing_error = None;
                 self.action_state = ActionState::Idle;
                 self.last_checkpoint.clear();
@@ -807,9 +882,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
-                let dropped = self.cancel_all_motion();
-                self.complete_cancelled("the hardware connect", dropped)
-                    .await;
+                self.cancel_all_motion("the hardware connect").await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
                 })
@@ -829,11 +902,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // Values are codec-validated; the node id is config
             // knowledge, so it is checked here — an ack for a node this
             // arm does not have would report a tune nothing received.
-            C::SetPidGains(p) => {
-                if self.cfg.tunable_nodes.contains(&p.node) {
-                    self.runtime.rt.set_pid_gains(p);
-                    Ok(())
-                } else {
+            C::SetPidGains(p) => match self.cfg.tunable_nodes.iter().find(|t| t.node == p.node) {
+                None => {
+                    let nodes: Vec<u8> = self.cfg.tunable_nodes.iter().map(|t| t.node).collect();
                     Err(make_error(
                         ErrorCode::CommValidationError,
                         UNATTRIBUTED,
@@ -841,13 +912,54 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                             "detail",
                             &format!(
                                 "set_pid_gains node {} is not a configured drive \
-                                 (tunable nodes: {:?})",
-                                p.node, self.cfg.tunable_nodes
+                                 (tunable nodes: {nodes:?})",
+                                p.node
                             ),
                         )],
                     ))
                 }
-            }
+                Some(t) => {
+                    // The tune is stored and re-pushed on every reconnect,
+                    // so the joint's configured limits are the ceiling: one
+                    // datagram must not remove a current limit for the
+                    // life of the process.
+                    let over = if p.ilim_ma > t.ilim_ma {
+                        Some(("ilim_ma", p.ilim_ma, t.ilim_ma))
+                    } else if p.velocity_limit_ticks_s > t.velocity_limit_ticks_s {
+                        Some((
+                            "velocity_limit_ticks_s",
+                            p.velocity_limit_ticks_s,
+                            t.velocity_limit_ticks_s,
+                        ))
+                    } else if t.voltage_limit_mv != 0 && p.voltage_limit_mv > t.voltage_limit_mv {
+                        Some((
+                            "voltage_limit_mv",
+                            f64::from(p.voltage_limit_mv),
+                            f64::from(t.voltage_limit_mv),
+                        ))
+                    } else {
+                        None
+                    };
+                    match over {
+                        None => {
+                            self.runtime.rt.set_pid_gains(p);
+                            Ok(())
+                        }
+                        Some((field, asked, ceiling)) => Err(make_error(
+                            ErrorCode::CommValidationError,
+                            UNATTRIBUTED,
+                            &[(
+                                "detail",
+                                &format!(
+                                    "set_pid_gains {field} = {asked} exceeds node {}'s \
+                                     configured ceiling of {ceiling}",
+                                    p.node
+                                ),
+                            )],
+                        )),
+                    }
+                }
+            },
             C::SetCanId(p) => self
                 .commissioning_gate(p.node, p.force, "set_can_id")
                 .map(|()| self.runtime.rt.set_can_id(p.node, p.new_id)),
@@ -878,21 +990,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// contract forbids, and it is what let a `reset()` answer 1 while
     /// the very next command was still refused as DISABLED.
     async fn on_reset(&mut self, req_id: u32, addr: SocketAddr) {
-        if self.reset_waiters.len() >= MAX_RESET_WAITERS {
-            // Same code as a full motion queue, so the `{detail}` slot is
-            // what tells an operator retrying `reset` on a latched arm
-            // apart from one flooding moves — without it the template
-            // pointed at an empty motion queue.
-            let error = make_error(
-                ErrorCode::CommQueueFull,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "Too many reset requests are already awaiting the \
-                     controller's verdict; stop retrying until the \
-                     outstanding reset is answered.",
-                )],
-            );
+        if let Err(error) = self.reset_waiters.try_push(req_id, addr) {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -900,25 +998,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.standing_error = None;
         self.action_state = ActionState::Idle;
         self.runtime.rt.set_enabled(true);
-        self.reset_waiters.push((req_id, addr));
     }
 
-    /// Hand the RT's enable verdict to whoever is waiting on it.
     async fn settle_enable(&mut self) {
         let Some(outcome) = self.runtime.rt.take_enable_outcome() else {
             return;
         };
         if self.reset_waiters.is_empty() {
-            // The boot-time enable: nobody asked, so nobody is answered.
-            // A refusal is not lost — it comes from an RT latch, and that
-            // latch is what STATUS and the ERROR query now report.
             if let Err(e) = &outcome {
                 log::warn!("startup enable refused: {e}");
             }
             return;
         }
-        for (req_id, addr) in std::mem::take(&mut self.reset_waiters) {
-            let reply = match &outcome {
+        let waiting = self.reset_waiters.take();
+        self.answer_waiters(waiting, &outcome).await;
+    }
+
+    /// Answer every request that waited on one RT verdict.
+    async fn answer_waiters(
+        &mut self,
+        waiting: Vec<(u32, SocketAddr)>,
+        outcome: &Result<(), WireError>,
+    ) {
+        for (req_id, addr) in waiting {
+            let reply = match outcome {
                 Ok(()) => Reply::Ok {
                     req_id,
                     index: None,
@@ -932,11 +1035,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
     }
 
-    /// `enter_flashing`/`exit_flashing`: only the RT can change the mode,
-    /// so like `reset` the ack waits for the published verdict
-    /// ([`RtCommands::take_flashing_outcome`]) instead of reporting a
-    /// mode change that may never happen (entry is refused outside
-    /// IDLE/ACTIVE_ERROR, asynchronously).
     async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
         self.refresh_snapshot();
         // An exit from any mode but FLASHING is refused HERE: it would
@@ -957,17 +1055,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if self.flashing_waiters.len() >= MAX_RESET_WAITERS {
-            let error = make_error(
-                ErrorCode::CommQueueFull,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "Too many FLASHING requests are already awaiting the \
-                     controller's verdict; stop retrying until the \
-                     outstanding one is answered.",
-                )],
-            );
+        if let Err(error) = self.flashing_waiters.try_push(req_id, addr) {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
@@ -976,27 +1064,14 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         } else {
             self.runtime.rt.exit_flashing();
         }
-        self.flashing_waiters.push((req_id, addr));
     }
 
-    /// Hand the RT's FLASHING verdict to whoever is waiting on it.
     async fn settle_flashing(&mut self) {
         let Some(outcome) = self.runtime.rt.take_flashing_outcome() else {
             return;
         };
-        for (req_id, addr) in std::mem::take(&mut self.flashing_waiters) {
-            let reply = match &outcome {
-                Ok(()) => Reply::Ok {
-                    req_id,
-                    index: None,
-                },
-                Err(error) => Reply::Error {
-                    req_id,
-                    error: error.clone(),
-                },
-            };
-            self.reply(addr, &reply).await;
-        }
+        let waiting = self.flashing_waiters.take();
+        self.answer_waiters(waiting, &outcome).await;
     }
 
     /// Come up ready to accept motion, the way parol6's controller does
@@ -1048,9 +1123,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.runtime.rt.cancel_stream();
                 self.drain_stream_backlog(superseded);
             }
-            let dropped = self.cancel_planned();
-            self.complete_cancelled("a streaming preemption", dropped)
-                .await;
+            self.cancel_planned("a streaming preemption").await;
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
@@ -1080,13 +1153,16 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     self.runtime.rt.cancel_stream();
                     self.drain_stream_backlog(superseded);
                 }
-                let dropped = self.cancel_planned();
-                self.complete_cancelled("a streaming preemption", dropped)
-                    .await;
+                // The setpoint reaches the RT before the cancellations
+                // are spoken: an escape jog must not wait behind a
+                // queue's worth of COMPLETE writes.
+                let dropped = self.drop_planned();
                 let outcome = self.runtime.rt.stream(&cmd);
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
                 }
+                self.complete_cancelled("a streaming preemption", dropped)
+                    .await;
                 outcome
             }
         };
@@ -1290,63 +1366,17 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     }
 
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
-        let g = gate(tag);
-        if g.needs_enabled {
-            if self.estop_latched {
-                return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
-            }
-            if self.snap.state != ArmState::Enabled {
-                return Some(make_error(
-                    ErrorCode::SysControllerDisabled,
-                    UNATTRIBUTED,
-                    &[("detail", "The RT core reports DISABLED.")],
-                ));
-            }
-        }
-        if g.needs_homed && !self.snap.homed {
-            return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
-        }
-        if g.needs_simulator && !self.simulator {
-            return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
-        }
-        None
+        let ctx = GateContext {
+            estop_latched: self.estop_latched,
+            enabled: self.snap.state == ArmState::Enabled,
+            homed: self.snap.homed,
+            simulator: self.simulator,
+        };
+        check_gate(tag, &ctx)
     }
 
-    /// Server-layer name checks the codec deliberately leaves to config.
-    /// Tool keys are matched case-insensitively: the registry spells them
-    /// as the config does, clients as their own tool tables do.
     fn validate_registries(&self, cmd: &Command) -> Option<WireError> {
-        let name = match cmd {
-            Command::SelectTool(p) => &p.tool_name,
-            Command::ToolAction(p) => &p.tool_key,
-            _ => return None,
-        };
-        let detail = if !self
-            .cfg
-            .tools
-            .iter()
-            .any(|t| t.eq_ignore_ascii_case(name.as_str()))
-        {
-            format!(
-                "unknown tool '{name}'; this runtime knows {:?}",
-                self.cfg.tools
-            )
-        } else if !self.cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
-            // Selecting a tool swaps the kinematic and gravity models,
-            // which are built at startup from the configured tool.
-            format!(
-                "tool '{name}' is not fitted; this runtime is running '{}' \
-                 (change robot.active_gripper and restart par6d)",
-                self.cfg.fitted_tool
-            )
-        } else {
-            return None;
-        };
-        Some(make_error(
-            ErrorCode::CommValidationError,
-            UNATTRIBUTED,
-            &[("detail", &detail)],
-        ))
+        validate_registries(&self.cfg, cmd)
     }
 
     fn validate_supported(&self, cmd: &Command) -> Option<WireError> {
@@ -1555,18 +1585,26 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// command, advancing the high-water mark so the queue readout moves
     /// past them. Touches neither the standing error nor the action
     /// state — the SCOPE decides those.
-    async fn complete_cancelled(&mut self, scope: &'static str, dropped: Vec<(u64, SocketAddr)>) {
+    /// Speak one cancelled COMPLETE per dropped command; returns how many.
+    async fn complete_cancelled(
+        &mut self,
+        scope: &'static str,
+        dropped: Vec<(u64, SocketAddr)>,
+    ) -> usize {
+        let n = dropped.len();
         for (index, addr) in dropped {
             self.advance_completed(index);
             let e = make_error(ErrorCode::MotnCancelled, index as i64, &[("scope", scope)]);
             self.push_complete(addr, index, Some(e), None).await;
         }
+        n
     }
 
     /// stop scope: active motion (planned + streaming) halts; the
-    /// pending queue is untouched. Returns the dropped commands for the
-    /// caller's [`Self::complete_cancelled`].
-    fn cancel_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
+    /// pending queue is untouched. Speaks for nothing — the `cancel_*`
+    /// wrappers pair the drop with its COMPLETE, and the one caller that
+    /// must hand the RT a setpoint in between speaks explicitly.
+    fn drop_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
         let mut dropped = self.drop_active();
         // The tool goes with it. `stop` means halt motion, and jaws
@@ -1594,21 +1632,36 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.tool_executing.take().map(|t| (t.index, t.addr))
     }
 
-    /// estop / reset_state / simulator-toggle scope: everything.
-    fn cancel_all_motion(&mut self) -> Vec<(u64, SocketAddr)> {
-        let mut dropped = self.cancel_active_motion();
-        dropped.extend(self.drop_pending());
-        dropped
-    }
-
     /// A streamable arrived: planned motion (active AND pending) is
-    /// cancelled — the queued program must not resume from wherever a
+    /// dropped — the queued program must not resume from wherever a
     /// manual jog left the arm.
-    fn cancel_planned(&mut self) -> Vec<(u64, SocketAddr)> {
+    fn drop_planned(&mut self) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.cancel();
         let mut dropped = self.drop_active();
         dropped.extend(self.drop_pending());
         dropped
+    }
+
+    /// Cancel the active motion and speak its COMPLETE; returns how many
+    /// commands were dropped.
+    async fn cancel_active_motion(&mut self, scope: &'static str) -> usize {
+        let dropped = self.drop_active_motion();
+        self.complete_cancelled(scope, dropped).await
+    }
+
+    /// estop / reset_state / simulator-toggle scope: everything, each
+    /// dropped command's COMPLETE spoken.
+    async fn cancel_all_motion(&mut self, scope: &'static str) -> usize {
+        let mut dropped = self.drop_active_motion();
+        dropped.extend(self.drop_pending());
+        self.complete_cancelled(scope, dropped).await
+    }
+
+    /// Cancel planned motion (active and pending) ahead of a stream,
+    /// speaking each one's COMPLETE.
+    async fn cancel_planned(&mut self, scope: &'static str) -> usize {
+        let dropped = self.drop_planned();
+        self.complete_cancelled(scope, dropped).await
     }
 
     /// A refused fire-and-forget command answered its sender with ERROR,
@@ -1890,10 +1943,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// stops being reported exactly when the RT stops latching it, so
     /// accepting a new motion command cannot clear an error the arm is
     /// still bricked by.
+    /// The RT's hard latch outranks the server's own note: a cancellation
+    /// left standing by a queue-clearing stop must not hide a later
+    /// hardware e-stop.
     fn effective_error(&self) -> Option<WireError> {
-        self.standing_error
-            .clone()
-            .or_else(|| rt_standing_error(&self.snap))
+        rt_standing_error(&self.snap).or_else(|| self.standing_error.clone())
     }
 
     fn action_fields(&self) -> (String, ActionState, String) {
@@ -2079,6 +2133,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             mode: Self::wire_mode(self.snap.mode),
             enabled: self.snap.state == ArmState::Enabled,
             gravity_comp: self.snap.gravity_comp,
+            paused: self.snap.exec.paused,
             warnings: {
                 let mut w = crate::faults::rt_warnings(&self.snap);
                 w.extend(self.runtime.planner.warnings());
@@ -2370,7 +2425,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         }
         encode_reply(reply, &mut self.txbuf);
         if let Err(e) = self.socket.send_to(&self.txbuf, addr).await {
-            log::debug!("reply send to {addr} failed: {e}");
+            log::warn!("reply send to {addr} failed: {e}");
         }
     }
 
@@ -2443,6 +2498,37 @@ fn world_in_tool_mm(tcp: &[f64; 6]) -> [f64; POSE_ELEMS] {
     out
 }
 
+/// The tool registries a command names must exist and be fitted. Shared
+/// with the offline preview, so a program naming a tool this runtime does
+/// not carry previews as the same refusal.
+pub fn validate_registries(cfg: &ServerConfig, cmd: &Command) -> Option<WireError> {
+    let name = match cmd {
+        Command::SelectTool(p) => &p.tool_name,
+        Command::ToolAction(p) => &p.tool_key,
+        _ => return None,
+    };
+    let detail = if !cfg
+        .tools
+        .iter()
+        .any(|t| t.eq_ignore_ascii_case(name.as_str()))
+    {
+        format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
+    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+        format!(
+            "tool '{name}' is not fitted; this runtime is running '{}' \
+             (change robot.active_gripper and restart par6d)",
+            cfg.fitted_tool
+        )
+    } else {
+        return None;
+    };
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", &detail)],
+    ))
+}
+
 /// Parameters the runtime cannot honour. Refusing them is the whole
 /// point: a silently dropped parameter makes the arm do something
 /// other than what the client asked for, with no way to tell. A free
@@ -2507,6 +2593,14 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
             })
         }
         // A passive tool (no driver) has nothing to actuate.
+        // `stop` and `idle` take no parameters; refusing at admission
+        // keeps a malformed stop from halting the jaws and then being
+        // refused at dispatch, which drops the whole queue.
+        Command::ToolAction(p)
+            if matches!(p.action.as_str(), "stop" | "idle") && !p.params.is_empty() =>
+        {
+            Some(format!("{} takes no parameters", p.action))
+        }
         Command::ToolAction(p) if cfg.tool_dof == 0 => Some(format!(
             "tool '{}' is passive: it has no actions",
             p.tool_key
