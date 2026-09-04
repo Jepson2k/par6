@@ -1285,11 +1285,14 @@ impl Par6Planner {
             .collect();
         let cart_s =
             par6_motion::arclen::tool_arc_lengths(&steps, self.motion.path_rot_weight_m_per_rad);
-        let q: Vec<[f64; MAX_JOINTS]> = waypoints
-            .chunks_exact(MAX_JOINTS)
-            .map(|c| {
+        // Indexed rather than `chunks_exact`, whose fixed-size form
+        // clippy answers with `as_chunks` — stable in 1.88, above the
+        // workspace's 1.87 floor. par6d is excluded from the MSRV job
+        // because it needs the C++ shim, so nothing would catch that.
+        let q: Vec<[f64; MAX_JOINTS]> = (0..waypoints.len() / MAX_JOINTS)
+            .map(|i| {
                 let mut a = [0.0; MAX_JOINTS];
-                a.copy_from_slice(c);
+                a.copy_from_slice(&waypoints[i * MAX_JOINTS..(i + 1) * MAX_JOINTS]);
                 a
             })
             .collect();
