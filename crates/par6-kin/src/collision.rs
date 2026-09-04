@@ -17,17 +17,11 @@
 //! (`tests/collision_world.rs::per_waypoint_check_cost_is_reported`
 //! reprints these on every run): self-collision only, 14 us for the
 //! flange and 19 us for a gripper variant; with a box keep-out, 25 us
-//! either way; with a per-shape margin, 26 us and 34 us; with a floor
-//! keep-out drawn as a plane, 24 us and 29 us.
-//!
-//! That last one is only in that range because a plane is converted to an
-//! equivalent box at the wire ([`Shape::from_proto`]). A raw
-//! [`ShapeKind::Plane`] built directly, which nothing on the wire can
-//! produce, costs ~35 ms — see its docs.
-//!
-//! [`ShapeKind::Plane`]: crate::ShapeKind::Plane
+//! either way; with a per-shape margin, 26 us and 34 us.
 
 use std::path::Path;
+
+use crate::MAX_SHAPE_PARAMS;
 
 use crate::shapes::Shape;
 use crate::{GripperVariant, KinError, NQ};
@@ -246,7 +240,11 @@ impl Collision {
             .filter(|s| s.collision)
             .map(|s| pinokin_sys::ShapeDesc {
                 kind: kind_to_sys(s.kind),
-                params: s.params,
+                params: {
+                    let mut p = [0.0; 4];
+                    p[..MAX_SHAPE_PARAMS].copy_from_slice(&s.params);
+                    p
+                },
                 n_params: s.kind.n_params(),
                 pose: s.pose,
                 margin: s.margin,
@@ -402,6 +400,5 @@ fn kind_to_sys(kind: crate::shapes::ShapeKind) -> i32 {
         K::Capsule => pinokin_sys::ffi::PAR6_SHAPE_CAPSULE,
         K::Cone => pinokin_sys::ffi::PAR6_SHAPE_CONE,
         K::Ellipsoid => pinokin_sys::ffi::PAR6_SHAPE_ELLIPSOID,
-        K::Plane => pinokin_sys::ffi::PAR6_SHAPE_PLANE,
     }
 }

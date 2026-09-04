@@ -114,7 +114,7 @@ mod tests {
         par6_kin::Shape {
             name: name.to_owned(),
             kind: par6_kin::ShapeKind::Sphere,
-            params: [0.05, 0.0, 0.0, 0.0],
+            params: [0.05, 0.0, 0.0],
             pose: [0.0; 6],
             collision,
             margin: None,

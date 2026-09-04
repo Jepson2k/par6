@@ -60,7 +60,7 @@ pub const MAX_WAYPOINTS: usize = 10_000;
 pub const MAX_SHAPES: usize = 256;
 
 /// Longest bare float vector any command may carry. The widest real user
-/// is a `plane` shape's four params; `teleport.tool_positions` and
+/// is a shape's three params; `teleport.tool_positions` and
 /// `tool_action.params` are capped at 16 by [`Command::validate`].
 const MAX_VEC_ELEMS: usize = 16;
 

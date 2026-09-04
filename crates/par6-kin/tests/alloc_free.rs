@@ -91,7 +91,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
         &[Shape {
             name: "table".to_owned(),
             kind: ShapeKind::Box,
-            params: [2.0, 2.0, 0.1, 0.0],
+            params: [2.0, 2.0, 0.1],
             pose: [0.0, 0.0, -0.06, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
@@ -103,7 +103,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
         &[Shape {
             name: "keepout".to_owned(),
             kind: ShapeKind::Sphere,
-            params: [0.08, 0.0, 0.0, 0.0],
+            params: [0.08, 0.0, 0.0],
             pose: [0.25, 0.0, 0.35, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,

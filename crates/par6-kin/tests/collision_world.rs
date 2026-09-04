@@ -52,7 +52,7 @@ fn box_shape(name: &str, half: f64, at: [f64; 3], margin: Option<f64>) -> Shape 
     Shape {
         name: name.to_owned(),
         kind: ShapeKind::Box,
-        params: [2.0 * half, 2.0 * half, 2.0 * half, 0.0],
+        params: [2.0 * half, 2.0 * half, 2.0 * half],
         pose: [at[0], at[1], at[2], 0.0, 0.0, 0.0],
         collision: true,
         margin,
@@ -63,7 +63,7 @@ fn sphere(name: &str, radius: f64, at: [f64; 3], margin: Option<f64>) -> Shape {
     Shape {
         name: name.to_owned(),
         kind: ShapeKind::Sphere,
-        params: [radius, 0.0, 0.0, 0.0],
+        params: [radius, 0.0, 0.0],
         pose: [at[0], at[1], at[2], 0.0, 0.0, 0.0],
         collision: true,
         margin,
@@ -213,8 +213,8 @@ fn verdicts_follow_the_world_on_every_variant() {
         // The floor is an installation keep-out the base stands on.
         let floor = Shape {
             name: "floor".to_owned(),
-            kind: ShapeKind::Plane,
-            params: [0.0, 0.0, 1.0, 0.02],
+            kind: ShapeKind::Box,
+            params: [2.0, 2.0, 0.04],
             pose: [0.0; 6],
             collision: true,
             margin: None,
@@ -281,8 +281,8 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     // Installation keep-out: the arm's own floor, always in contact.
     let floor = Shape {
         name: "floor".to_owned(),
-        kind: ShapeKind::Plane,
-        params: [0.0, 0.0, 1.0, 0.02],
+        kind: ShapeKind::Box,
+        params: [2.0, 2.0, 0.04],
         pose: [0.0; 6],
         collision: true,
         margin: None,
@@ -452,7 +452,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         Shape {
             name: "zero_box".to_owned(),
             kind: ShapeKind::Box,
-            params: [0.1, 0.0, 0.1, 0.0],
+            params: [0.1, 0.0, 0.1],
             pose: [0.0; 6],
             collision: true,
             margin: None,
@@ -460,21 +460,13 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         Shape {
             name: "nan_box".to_owned(),
             kind: ShapeKind::Box,
-            params: [0.1, f64::NAN, 0.1, 0.0],
+            params: [0.1, f64::NAN, 0.1],
             pose: [0.0; 6],
             collision: true,
             margin: None,
         },
         sphere("inf_pose", 0.1, [f64::INFINITY, 0.0, 0.0], None),
         sphere("nan_margin", 0.1, [0.0; 3], Some(f64::NAN)),
-        Shape {
-            name: "zero_normal".to_owned(),
-            kind: ShapeKind::Plane,
-            params: [0.0, 0.0, 0.0, 1.0],
-            pose: [0.0; 6],
-            collision: true,
-            margin: None,
-        },
     ] {
         let name = bad.name.clone();
         assert!(
@@ -501,135 +493,8 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
 /// `--nocapture`; the assertion is a catastrophe guard, not a benchmark
 /// gate (CI runners are shared and noisy).
 ///
-/// The world content matters enormously, which is the point of reporting
-/// it per scene rather than as one number: an unbounded half-space has no
-/// bounding volume, so coal cannot prune it against a link's mesh BVH and
-/// falls back to scanning every triangle.
-/// A keep-out drawn as a plane has to keep meaning "everything on the far
-/// side is out of bounds" after the wire turns it into a box. Anywhere the
-/// arm can actually go, the two must return the same verdict.
-#[test]
-fn a_plane_keep_out_and_its_box_agree_wherever_the_arm_can_reach() {
-    let walls: [[f64; 4]; 6] = [
-        [0.0, 0.0, 1.0, -0.05],
-        [0.0, 0.0, -1.0, -0.35],
-        [1.0, 0.0, 0.0, 0.25],
-        [-1.0, 0.0, 0.0, 0.25],
-        [0.0, 1.0, 0.0, 0.2],
-        [0.6, -0.8, 0.3, 0.15],
-    ];
-    let mut configs = vec![HOME, REACH, SWEEP_FROM, SWEEP_TO];
-    for k in 0..10 {
-        let t = k as f64 / 9.0;
-        let mut q = [0.0; NQ];
-        for j in 0..NQ {
-            q[j] = SWEEP_FROM[j] + t * (REACH[j] - SWEEP_FROM[j]);
-        }
-        configs.push(q);
-    }
-
-    for variant in [GripperVariant::Flange, GripperVariant::Ssg48] {
-        let mut col = load(variant, 0.0);
-        for wall in walls {
-            let wire = par6_proto::Shape {
-                kind: "plane".into(),
-                params: wall.to_vec(),
-                pose: vec![0.0; 6],
-                collision: true,
-                margin: None,
-                name: "wall".into(),
-            };
-            let plane = Shape {
-                name: "wall".to_owned(),
-                kind: ShapeKind::Plane,
-                params: wall,
-                pose: [0.0; 6],
-                collision: true,
-                margin: None,
-            };
-            let converted = Shape::from_proto(&wire).unwrap();
-
-            for q in &configs {
-                col.set_layer(Layer::Program, std::slice::from_ref(&plane))
-                    .unwrap();
-                let want = col.check(q, false).unwrap().active();
-                col.set_layer(Layer::Program, std::slice::from_ref(&converted))
-                    .unwrap();
-                let got = col.check(q, false).unwrap().active();
-                assert_eq!(
-                    want, got,
-                    "{variant:?} wall {wall:?} at {q:?}: half-space says {want}, \
-                     its box says {got}"
-                );
-            }
-        }
-    }
-}
-
-/// The conversion is only worth doing if it cannot produce a cube: three
-/// equal sides leave the narrow phase's closest-feature search without a
-/// tie-break, and the check goes from ~20 us to milliseconds.
-#[test]
-fn a_converted_plane_is_never_a_cube() {
-    for normal in [
-        [0.0, 0.0, 1.0],
-        [0.0, 0.0, -1.0],
-        [1.0, 0.0, 0.0],
-        [0.0, 1.0, 0.0],
-        [0.6, -0.8, 0.0],
-        [0.0, 0.0, 4.0],
-    ] {
-        for offset in [-1.5, -0.05, 0.0, 0.4, 2.0] {
-            let shape = Shape::from_proto(&par6_proto::Shape {
-                kind: "plane".into(),
-                params: vec![normal[0], normal[1], normal[2], offset],
-                pose: vec![0.0; 6],
-                collision: true,
-                margin: None,
-                name: "wall".into(),
-            })
-            .unwrap();
-            assert_eq!(shape.kind, ShapeKind::Box);
-            let [x, y, z, _] = shape.params;
-            assert!(
-                x > 0.0 && y > 0.0 && z > 0.0,
-                "normal {normal:?} offset {offset} gave a degenerate box: {:?}",
-                shape.params
-            );
-            assert!(
-                (x - z).abs() > 1e-9 && (y - z).abs() > 1e-9,
-                "normal {normal:?} offset {offset} converted to a cube: {:?}",
-                shape.params
-            );
-        }
-    }
-}
-
-/// A plane with no direction describes no half-space, so there is nothing
-/// to convert and nothing to keep out of.
-#[test]
-fn a_plane_with_no_normal_is_refused_at_the_wire() {
-    for normal in [
-        [0.0, 0.0, 0.0],
-        [f64::NAN, 0.0, 1.0],
-        [0.0, f64::INFINITY, 0.0],
-    ] {
-        let err = Shape::from_proto(&par6_proto::Shape {
-            kind: "plane".into(),
-            params: vec![normal[0], normal[1], normal[2], 0.1],
-            pose: vec![0.0; 6],
-            collision: true,
-            margin: None,
-            name: "wall".into(),
-        })
-        .unwrap_err();
-        assert!(
-            format!("{err}").contains("wall"),
-            "normal {normal:?} refused without naming the shape: {err}"
-        );
-    }
-}
-
+/// The world content matters, which is the point of reporting it per
+/// scene rather than as one number.
 #[test]
 fn per_waypoint_check_cost_is_reported() {
     let n = 100;
@@ -644,35 +509,11 @@ fn per_waypoint_check_cost_is_reported() {
         })
         .collect();
 
-    // The raw half-space is measured for contrast but left out of the
-    // gate: it costs ~35 ms (see ShapeKind::Plane) and no longer reaches
-    // the world through the wire, so gating it would swallow a real
-    // regression in the scenes the planner does run.
     let mut worst_bounded = 0.0f64;
     let mut worst_bounded_scene = String::new();
     for variant in [GripperVariant::Flange, GripperVariant::Ssg48] {
         let mut col = load(variant, 0.0);
         let tcp = tcp_at(variant, &REACH);
-        // How a floor keep-out actually reaches the world: drawn as a
-        // plane, converted at the wire. The raw half-space it replaces is
-        // measured beside it for contrast.
-        let floor = Shape::from_proto(&par6_proto::Shape {
-            kind: "plane".into(),
-            params: vec![0.0, 0.0, 1.0, -0.05],
-            pose: vec![0.0; 6],
-            collision: true,
-            margin: None,
-            name: "floor".into(),
-        })
-        .unwrap();
-        let half_space = Shape {
-            name: "floor".to_owned(),
-            kind: ShapeKind::Plane,
-            params: [0.0, 0.0, 1.0, -0.05],
-            pose: [0.0; 6],
-            collision: true,
-            margin: None,
-        };
         let scenes: Vec<(&str, Vec<Shape>, Vec<Shape>)> = vec![
             ("self only", Vec::new(), Vec::new()),
             (
@@ -685,8 +526,6 @@ fn per_waypoint_check_cost_is_reported() {
                 Vec::new(),
                 vec![sphere("standoff", 0.05, tcp, Some(0.02))],
             ),
-            ("floor drawn as a plane", vec![floor], Vec::new()),
-            ("floor as a raw half-space", vec![half_space], Vec::new()),
         ];
 
         for (name, install, program) in scenes {
@@ -702,17 +541,13 @@ fn per_waypoint_check_cost_is_reported() {
             }
             times.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let mean = times.iter().sum::<f64>() / times.len() as f64;
-            let unbounded = install
-                .iter()
-                .chain(&program)
-                .any(|s| s.kind == ShapeKind::Plane);
-            if !unbounded && mean > worst_bounded {
+            if mean > worst_bounded {
                 worst_bounded = mean;
                 worst_bounded_scene = format!("{variant:?}/{name}");
             }
             println!(
                 "{:<8} {:<20} {:>3} pairs: mean {:>8.1} us  p50 {:>8.1}  \
-                 p99 {:>9.1}  max {:>9.1}{}",
+                 p99 {:>9.1}  max {:>9.1}",
                 format!("{variant:?}"),
                 name,
                 col.pair_count(),
@@ -720,7 +555,6 @@ fn per_waypoint_check_cost_is_reported() {
                 times[times.len() / 2],
                 times[times.len() * 99 / 100],
                 times[times.len() - 1],
-                if unbounded { "  [unbounded shape]" } else { "" },
             );
         }
     }
