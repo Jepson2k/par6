@@ -40,8 +40,10 @@ def main() -> None:
     except RobotError as e:
         print(f"preview refused: [{e.code}] {e.cause}")
 
-    with robot as running:
-        rbt = running.create_sync_client()
+    # The client is closed on the way out: it owns a background event loop
+    # and the runtime's status stream, and leaving those to interpreter
+    # shutdown races the loop's teardown.
+    with robot as running, running.create_sync_client() as rbt:
         rbt.reset()
         # Teleport is unacked: the runtime applies it on its next tick and
         # only the status broadcast says the arm landed there, referenced.
