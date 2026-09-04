@@ -987,15 +987,6 @@ impl Par6Planner {
 
     /// The TCP pose the arm is standing at — where every cartesian move
     /// starts from.
-    /// Run the collision gate over a trajectory integrated elsewhere (the
-    /// preview's jogs), with the same two-halves rule as planned motion.
-    pub(crate) fn gate_samples(
-        &mut self,
-        samples: impl ExactSizeIterator<Item = [f64; NQ]>,
-    ) -> Result<(), WireError> {
-        self.gate_collisions(samples, 0)
-    }
-
     pub(crate) fn current_pose(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Pose, WireError> {
         self.kin
             .fk(q)
@@ -1822,7 +1813,7 @@ impl Par6Planner {
         target: &par6_kin::Pose,
         baseline: &[(String, String)],
     ) -> bool {
-        let solved = match self.kin.ik_within(seed, target, EN_IK_ITERS) {
+        let solved = match self.kin.ik(seed, target) {
             crate::kin::IkResult::Solved(q) => q,
             crate::kin::IkResult::Unreachable => return false,
             crate::kin::IkResult::Failed(e) => {
@@ -2025,7 +2016,6 @@ const EN_STEP_RAD: f64 = 0.5 * std::f64::consts::PI / 180.0;
 /// converges in a handful of iterations when it converges at all, so the
 /// full planning budget would be spent only on the directions that have
 /// no answer — which is exactly where the probe must stay cheap.
-const EN_IK_ITERS: i32 = 20;
 /// Joint probe step for the collision half of the joint gate \[rad\]
 /// (parol6: 2°) — big enough that a step actually enters what it is about
 /// to enter, and clamped into the soft window so a pose past the stop
@@ -2123,11 +2113,6 @@ impl Par6Planner {
             }) => PlannedMotion::Hold(target_tick.saturating_sub(now_tick)),
             _ => PlannedMotion::Still,
         }
-    }
-
-    /// The configured home pose \[rad\].
-    pub(crate) fn home_pose(&self) -> [f64; MAX_JOINTS] {
-        self.home_pose_rad
     }
 }
 
@@ -2485,7 +2470,7 @@ impl Planner for Par6Planner {
 const MAX_REPORTED_PAIRS: usize = 4;
 
 /// Format colliding pairs the way the v2 error catalog's `{pairs}` slot
-/// and the golden status fixture spell them: `[a, b], [c, d]`.
+/// spells them: `[a, b], [c, d]`.
 fn format_pairs(pairs: &[(String, String)]) -> String {
     let mut out = pairs
         .iter()

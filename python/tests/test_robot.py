@@ -1,9 +1,9 @@
 """Behavioral tests for the par6 waldoctl ``Robot`` backend.
 
-Kinematics tests drive the real pinokin model on the packaged URDF; they
-skip cleanly when pinokin (a binary wheel) is not installed.  The freshness
-guard compares the packaged ``par6/_data`` copies against the repo-root
-sources, mirroring the generated ``protocol/constants.py`` pattern.
+Kinematics tests drive the engine's model on the packaged URDF trees.  The
+freshness guard compares the packaged ``par6/_data`` copies against the
+repo-root sources, mirroring the generated ``protocol/constants.py``
+pattern.
 
 The tool frame is checked against a live ``par6d --sim`` rather than against
 another model of itself — client and runtime agreeing about where the TCP is
@@ -27,34 +27,25 @@ import numpy as np
 import pytest
 from live_daemon import LiveDaemon, requires_par6d, settle_at
 
+from par6._par6 import CollisionWorld, Kinematics, pose_matrix
 from par6.config import (
-    _MODEL_BY_TREE,
-    load_gripper_configs,
+    config,
+    package_search_dir,
     srdf_path,
+    tcp_frame,
     urdf_path,
     urdf_tree,
 )
 
 if TYPE_CHECKING:
-    import pinokin
-
     from par6.robot import Robot
-else:
-    try:
-        import pinokin
-    except ImportError:  # binary wheel unavailable on this platform
-        pinokin = None
-
-#: Every use of `pinokin` below is inside a test carrying this marker, which
-#: is why the import above is typed as the module rather than `module | None`:
-#: the marker, not a runtime check, is what keeps the `None` case out.
-needs_pinokin = pytest.mark.skipif(
-    pinokin is None, reason="pinokin binary wheel not installed"
-)
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PKG_DIR = Path(__file__).resolve().parents[1]
 DATA_DIR = PKG_DIR / "par6" / "_data"
+
+#: The packaged URDF trees, one per fitted end-effector.
+TREES = ("par6_flange", "par6_msg_gripper", "par6_ssg48_gripper")
 
 
 @pytest.fixture(scope="module")
@@ -71,6 +62,10 @@ def _sample_q(
     return np.array([rng.uniform(lo + margin, hi - margin) for lo, hi in lim])
 
 
+def _matrix(flat: list[float]) -> np.ndarray:
+    return np.asarray(flat, dtype=np.float64).reshape(4, 4)
+
+
 # --- URDF readers, written out rather than imported from par6.config: these
 # tests are what says the packaged trees mean what the package thinks they
 # mean, so they may not lean on the package's own reader to say it. ---------
@@ -78,10 +73,6 @@ def _sample_q(
 
 def _urdf_root(tool_key: str) -> ET.Element:
     return ET.parse(urdf_path(tool_key)).getroot()
-
-
-def _has_link(tool_key: str, name: str) -> bool:
-    return any(link.get("name") == name for link in _urdf_root(tool_key).iter("link"))
 
 
 def _urdf_transform(element: ET.Element | None) -> np.ndarray:
@@ -137,7 +128,6 @@ def _link_transform(tool_key: str, link_name: str) -> np.ndarray:
     return _urdf_transform(joint.find("origin"))
 
 
-@needs_pinokin
 class TestKinematics:
     def test_fk_ik_roundtrip(self, robot: Robot) -> None:
         rng = np.random.default_rng(1234)
@@ -184,8 +174,28 @@ class TestKinematics:
         assert not robot.check_limits(np.full(6, np.inf))
         assert not robot.check_limits(np.zeros(3))  # short array
 
+    def test_jacobian_maps_joint_rates_to_tcp_velocity(self, robot: Robot) -> None:
+        """The Jacobian a jog integrates through must be the derivative of
+        the FK a readout displays — checked by finite differences of the
+        backend's own ``fk``, not by any second model."""
+        q = robot.joints.home.rad.copy() + np.radians(
+            [10.0, 15.0, -20.0, 5.0, 25.0, 0.0]
+        )
+        J = robot.jacobian(q)
+        assert J.shape == (6, robot.joints.count)
+        out = np.zeros(6)
+        h = 1e-6
+        for j in range(robot.joints.count):
+            dq = np.zeros(robot.joints.count)
+            dq[j] = h
+            plus = robot.fk(q + dq, out).copy()
+            minus = robot.fk(q - dq, out).copy()
+            slope = (plus[:3] - minus[:3]) / (2.0 * h)
+            assert np.allclose(J[:3, j], slope, atol=1e-6), (
+                f"joint {j}: {J[:3, j]} vs {slope}"
+            )
 
-@needs_pinokin
+
 class TestToolTransforms:
     def test_active_tool_selects_the_urdf_tree_that_defines_its_tcp(
         self, robot: Robot
@@ -204,15 +214,13 @@ class TestToolTransforms:
         q = np.array([rng.uniform(lo, hi) for lo, hi in lim])
         out = np.zeros(6)
         for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
-            tree = pinokin.Robot(str(urdf_path(key)))
             # Both frames off the SAME tree: the trees are separate CAD
             # exports and their arm chains are written to different
             # precisions, so a cross-tree comparison drifts by microns for
             # reasons that have nothing to do with the tool.
-            tree.set_ee_frame("gripper")
-            flange = tree.fkine(q)
-            tree.set_ee_frame("tcp" if _has_link(key, "tcp") else "gripper")
-            expected = tree.fkine(q)
+            tree = str(urdf_path(key))
+            flange = _matrix(Kinematics(tree, "gripper").fk(q.tolist()))
+            expected = _matrix(Kinematics(tree, tcp_frame(key)).fk(q.tolist()))
             robot.set_active_tool(key)
             assert np.allclose(robot.fk(q, out)[:3], expected[:3, 3], atol=1e-9), key
             spec_tcp = flange[:3, 3] + flange[:3, :3] @ np.array(
@@ -244,15 +252,14 @@ class TestToolTransforms:
         """
         rz_pi = np.eye(4)
         rz_pi[:3, :3] = np.diag([-1.0, -1.0, 1.0])
-        grippers = load_gripper_configs()
+        grippers = {g["key"]: g for g in config().grippers()}
         for key, jaw in (
             ("MSG_SMALL_MOTOR_150MM_RAIL", "joint_jaw1"),
             ("SSG48", "jaw1_JOINT"),
         ):
             kin = grippers[key]["kinematics"]
-            dh = np.zeros((4, 4))
-            pinokin.se3_from_rpy(
-                kin["a_m"], 0.0, kin["d_m"], kin["alpha_rad"], 0.0, 0.0, dh
+            dh = _matrix(
+                pose_matrix([kin["a_m"], 0.0, kin["d_m"]], [kin["alpha_rad"], 0.0, 0.0])
             )
             assert np.allclose(rz_pi @ dh, _joint_transform(key, jaw), atol=1e-4), key
             tcp = _link_transform(key, "tcp")[:3, 3]
@@ -273,16 +280,16 @@ class TestToolTransforms:
         This is the property issue #20 was the absence of, and the only one
         that decides whether a ``move_l`` preview draws where the arm goes:
         Waldo Commander reads the pose from the runtime and the preview from
-        this backend, so a frame the two model separately is a frame that
-        drifts.  Checked at several configurations against a real
-        ``par6d --sim`` fitted with each gripper in turn — the daemon's URDF
-        variant follows ``[robot].active_gripper``, so each run exercises a
-        different tool tree on both sides.
+        this backend, so a variant, frame or unit the two resolve differently
+        is a frame that drifts.  Checked at several configurations against a
+        real ``par6d --sim`` fitted with each gripper in turn — the daemon's
+        URDF variant follows ``[robot].active_gripper``, so each run
+        exercises a different tool tree on both sides.
 
         Both position and orientation, each side decoded in its own
         documented convention: STATUS carries the pose as a matrix, while
-        :meth:`Robot.fk` reports intrinsic-XYZ rpy (pinokin's), so comparing
-        the reconstructed matrices is what catches a frame that is rotated
+        :meth:`Robot.fk` reports intrinsic-XYZ rpy, so comparing the
+        reconstructed matrices is what catches a frame that is rotated
         rather than merely displaced — the 180° half of the original bug.
         """
         from par6.robot import Robot as Par6Robot
@@ -303,9 +310,7 @@ class TestToolTransforms:
 
                     out = np.zeros(6)
                     pose = client_robot.fk(np.radians(status.angles), out)
-                    T_client = np.zeros((4, 4))
-                    x, y, z, rx, ry, rz = pose
-                    pinokin.se3_from_rpy(x, y, z, rx, ry, rz, T_client)
+                    T_client = _matrix(pose_matrix(list(pose[:3]), list(pose[3:])))
 
                     assert np.allclose(
                         T_client[:3, 3] * 1000.0, T_runtime[:3, 3], atol=1e-3
@@ -332,46 +337,27 @@ class TestToolTransforms:
         assert np.linalg.norm(shifted[:3] - base[:3]) == pytest.approx(0.01, abs=1e-9)
         robot.set_active_tool("FLANGE")
 
-    def test_cartesian_limits_are_derived_from_this_arm(self, robot: Robot) -> None:
-        """``cartesian_limits`` must describe THIS arm at THIS tool.
-
-        Two checks a hand-picked constant cannot pass: the reported rates have
-        to be achievable at the pose the arm parks in, under the config's own
-        JOG joint velocity limits; and the angular rate has to move with the
-        tool, because spinning the TCP about a point further from the wrist
-        costs more joint speed (the linear rate does not — a rigid body that
-        translates without rotating translates identically everywhere).
-        """
-        robot.set_active_tool("FLANGE")
-        flange = robot.cartesian_limits
-        q = robot.joints.home.rad.copy()
-        jog = robot.joints.limits.jog.velocity
-        J = robot.jacobian(q)
-        for axis, rate in enumerate(
-            [flange.velocity.linear] * 3 + [flange.velocity.angular] * 3
-        ):
-            twist = np.zeros(6)
-            twist[axis] = rate
-            q_dot = np.linalg.pinv(J) @ twist
-            assert np.all(np.abs(q_dot) <= jog * 1.5), (
-                f"axis {axis} at {rate:.3f} needs {q_dot} rad/s, "
-                f"beyond the jog ceiling {jog}"
-            )
-        assert flange.velocity.linear > 0.0 and flange.velocity.angular > 0.0
-        assert flange.acceleration.linear > flange.velocity.linear
-
-        for key in ("MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
+    def test_cartesian_limits_are_the_runtimes_jog_ceilings(self, robot: Robot) -> None:
+        """``cartesian_limits`` is what 100 % ``jog_l`` means on the runtime:
+        the ``[motion]`` full-scale TCP rates, accelerated over the jog ramp
+        time — the same numbers whatever tool is fitted, because the runtime
+        enforces them at the TCP."""
+        motion = config().motion()
+        ramp = config().jog_defaults()["accel_time_s"]
+        for key in ("FLANGE", "MSG_SMALL_MOTOR_150MM_RAIL", "SSG48"):
             robot.set_active_tool(key)
-            with_tool = robot.cartesian_limits
-            assert with_tool.velocity.angular < flange.velocity.angular, (
-                f"{key}: the angular envelope must tighten at a TCP further out"
+            limits = robot.cartesian_limits
+            assert limits.velocity.linear == pytest.approx(
+                motion["jog_l_linear_max_m_s"]
             )
-            # Equal, to the precision the trees are written at: each tool is
-            # its own CAD export and their arm chains carry different
-            # rounding, which moves the sampled median by a few parts per
-            # hundred thousand.
-            assert with_tool.velocity.linear == pytest.approx(
-                flange.velocity.linear, rel=1e-3
+            assert limits.velocity.angular == pytest.approx(
+                motion["jog_l_angular_max_rad_s"]
+            )
+            assert limits.acceleration.linear == pytest.approx(
+                motion["jog_l_linear_max_m_s"] / ramp
+            )
+            assert limits.acceleration.angular == pytest.approx(
+                motion["jog_l_angular_max_rad_s"] / ramp
             )
         robot.set_active_tool("FLANGE")
 
@@ -379,12 +365,53 @@ class TestToolTransforms:
         robot.set_active_tool("MSG_SMALL_MOTOR_150MM_RAIL")
         assert "par6_msg_gripper" in robot.urdf_path
         assert Path(robot.urdf_path).is_file()
-        assert (Path(robot.mesh_dir) / "meshes").is_dir()
+        assert (
+            Path(robot.mesh_dir) / "_data" / "URDF" / "par6_msg_gripper" / "meshes"
+        ).is_dir()
         robot.set_active_tool("FLANGE")
         assert "par6_flange" in robot.urdf_path
 
 
-@needs_pinokin
+class TestCollision:
+    def test_keepouts_are_reported_in_the_runtimes_vocabulary(
+        self, robot: Robot
+    ) -> None:
+        """A keep-out applied locally is enforced on every query the frontend
+        makes, and the pairs it reports name the shape as the runtime names
+        it (``shape:<name>``) against a URDF link."""
+        from waldoctl.shapes import Box
+
+        robot.set_active_tool("FLANGE")
+        assert robot.has_collision_checking
+        q = robot.joints.home.rad.copy()
+        out = np.zeros(6)
+        tcp = robot.fk(q, out)[:3].copy()
+        assert not robot.in_collision(q)
+        assert robot.colliding_pairs(q) == []
+        assert robot.min_distance(q) > 0.0
+
+        robot.apply_shapes(
+            [Box(name="wall", x=0.12, y=0.12, z=0.12, pose=(*tcp, 0, 0, 0))]
+        )
+        try:
+            assert robot.in_collision(q)
+            pairs = robot.colliding_pairs(q)
+            assert pairs and all("shape:wall" in pair for pair in pairs), pairs
+            assert all(
+                any(not name.startswith("shape:") for name in pair) for pair in pairs
+            ), "every reported pair names a robot link"
+            assert robot.min_distance(q) <= 0.0
+            away = q + np.radians([90.0, 0, 0, 0, 0, 0])
+            assert not robot.in_collision(away), "a quarter turn clears the box"
+            assert robot.check_trajectory(np.stack([away, away])) == -1
+            assert robot.check_trajectory(np.stack([away, away, q])) == 2, (
+                "the first colliding row is reported"
+            )
+        finally:
+            robot.apply_shapes([])
+        assert not robot.in_collision(q)
+
+
 class TestJointsSpec:
     def test_limit_and_home_unit_conversion(self, robot: Robot) -> None:
         spec = robot.joints
@@ -443,26 +470,32 @@ class TestPackagedData:
         ), stale_msg
         packaged_bytes = _sync_script().packaged_bytes
         src_urdf = REPO_ROOT / "assets" / "par6_description" / "URDF"
-        for tree in ("par6_flange", "par6_msg_gripper", "par6_ssg48_gripper"):
-            # Only urdf/ + meshes/ are packaged (the URDFs reference nothing
-            # outside meshes/); ROS scaffolding and alternate jaw sets stay
-            # repo-only.
-            for sub, pattern in (("urdf", "*.urdf"), ("meshes", "*.STL")):
-                assert _tree_digest(DATA_DIR / "urdf" / tree / sub, (pattern,)) == (
-                    _tree_digest(src_urdf / tree / sub, (pattern,), packaged_bytes)
+        for tree in TREES:
+            # Only urdf/, srdf/ + meshes/ are packaged (the URDFs reference
+            # nothing outside meshes/); ROS scaffolding and alternate jaw
+            # sets stay repo-only.
+            for sub, pattern in (
+                ("urdf", "*.urdf"),
+                ("srdf", "*.srdf"),
+                ("meshes", "*.STL"),
+            ):
+                assert _tree_digest(DATA_DIR / "URDF" / tree / sub, (pattern,)) == (
+                    _tree_digest(
+                        src_urdf / tree / sub,
+                        (pattern,),
+                        lambda p, tree=tree: packaged_bytes(p, tree),
+                    )
                 ), f"{tree}/{sub}: {stale_msg}"
 
     def test_every_shipped_tool_resolves_to_a_packaged_model(self) -> None:
         """The tree a tool resolves to has to be the runtime's, not a fallback.
 
-        ``par6d::kin::variant_for`` matches ``MSG*`` and ``SSG48*`` by prefix
-        and falls back to the flange; this side has to agree, or the client
-        checks a collision model and renders a mesh for a different tool than
-        the one the arm is wearing. A gripper TOML added under a name either
-        rule misses is the way that goes wrong, so this walks every shipped
-        file rather than a list.
+        ``par6_kin::GripperVariant`` matches ``MSG*`` and ``SSG48*`` by prefix
+        and falls back to the flange; this side reads the same rule through
+        the engine, and every shipped gripper TOML must land on a tree that
+        is actually packaged.
         """
-        grippers = load_gripper_configs()
+        grippers = [g["key"] for g in config().grippers()]
         assert len(grippers) > 3, "the shipped tools are all here"
         seen_trees = set()
         for key in grippers:
@@ -474,17 +507,18 @@ class TestPackagedData:
                 assert tree == "par6_msg_gripper", f"{key} fell back to {tree}"
             elif key.startswith("SSG48"):
                 assert tree == "par6_ssg48_gripper", f"{key} fell back to {tree}"
-        assert seen_trees == set(_MODEL_BY_TREE), (
-            f"a packaged tree no shipped tool reaches: {set(_MODEL_BY_TREE) - seen_trees}"
+        assert seen_trees == set(TREES), (
+            f"a packaged tree no shipped tool reaches: {set(TREES) - seen_trees}"
         )
 
-    @needs_pinokin
-    def test_packaged_urdfs_are_consumable_by_a_scene(self) -> None:
-        """Every packaged tree must satisfy what a 3-D consumer needs of it:
+    def test_packaged_urdfs_are_consumable_by_a_scene_and_the_engine(self) -> None:
+        """Every packaged tree must satisfy what its two consumers need of it:
         ``package://`` names that resolve through
-        ``{robot.backend_package: robot.mesh_dir}`` onto files that exist, and
-        exactly the six actuated joints the arm has — a gripper tree that also
-        actuates its jaws is a 8-DOF model against six joint limits."""
+        ``{robot.backend_package: robot.mesh_dir}`` onto files that exist
+        (a 3-D scene), the same meshes reachable by the engine's collision
+        loader under the package search directory, and exactly the six
+        actuated joints the arm has — a gripper tree that also actuates its
+        jaws is an 8-DOF model against six joint limits."""
         from par6.robot import Robot
 
         bot = Robot()
@@ -497,15 +531,18 @@ class TestPackagedData:
             root = Path(bot.mesh_dir)
             for ref in re.findall(r'filename="package://\w+/([^"]+)"', text):
                 assert (root / ref).is_file(), f"{key}: {ref} does not exist"
-            assert pinokin.Robot(str(urdf)).nq == bot.joints.count, key
+            assert Kinematics(str(urdf)).nq_full() == bot.joints.count, key
+            world = CollisionWorld(
+                str(urdf), str(package_search_dir()), str(srdf_path(key))
+            )
+            assert world.pair_count() > 0, key
 
 
-@needs_pinokin
 class TestDiscovery:
     def test_load_robot_class_resolves_entry_point(self, tmp_path: Path) -> None:
         """`waldoctl.discovery.load_robot_class("par6")` must resolve after an
         editable install — verified in a scratch venv (system site-packages
-        supply waldoctl/numpy/pinokin; par6 itself installs with --no-deps)."""
+        supply waldoctl/numpy; par6 itself installs with --no-deps)."""
         from waldoctl.discovery import available_backends
 
         probe = (

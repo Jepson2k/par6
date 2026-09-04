@@ -43,6 +43,9 @@ pytestmark = [pytest.mark.e2e, requires_par6d]
 
 #: Wall-clock ceiling for one session step (boot, settle, a short move).
 STEP_BUDGET_S = 20.0
+
+#: Fraction of the cartesian ceiling the streamed servo_l tests drive at.
+SERVO_L_SPEED = 0.6
 #: The shipped PAR6 homing sequence takes ~60 s (its pre-moves, backoffs and
 #: release phases are config SECONDS, and the sim runs in wall-clock time).
 HOMING_BUDGET_S = 200.0
@@ -68,7 +71,7 @@ def daemon(tmp_path):
 
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every soft window."""
-    return [math.degrees(v) for v in _cfg.load_robot_config()["robot"]["park_pose_rad"]]
+    return [math.degrees(v) for v in _cfg.config().park_pose_rad()]
 
 
 def ready_pose_deg() -> list[float]:
@@ -78,13 +81,7 @@ def ready_pose_deg() -> list[float]:
     commanded position per joint — derived from the same config the daemon
     executes, never a transcribed constant.
     """
-    final: dict[int, float] = {}
-    for step in _cfg.load_robot_config()["homing"]["sequence"]:
-        for move in step.get("move_to", []):
-            final[int(move["joint"])] = float(move["position_rad"])
-    if sorted(final) != list(range(6)):
-        raise RuntimeError(f"homing sequence leaves joints {sorted(final)} unplaced")
-    return [math.degrees(final[j]) for j in range(6)]
+    return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
 
 
 def max_deg_error(actual, expected) -> float:
@@ -727,8 +724,7 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
     lets a frontend grey the button the RT actually stopped honoring —
     ``sim_session.rs`` pins that.)
     """
-    cfg = _cfg.load_robot_config()
-    limit_deg = math.degrees(cfg["joints"][0]["limits"]["soft_max_rad"])
+    limit_deg = math.degrees(_cfg.config().soft_limits_rad()[0][1])
     park = park_deg()
     start = list(park)
     start[0] = limit_deg - 40.0
@@ -804,7 +800,7 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
     """A pose read off the wire, sent straight back, must not move the arm.
 
     This is the teach-and-replay path: Waldo Commander decodes the STATUS
-    pose matrix with pinokin, shows those scalars, and its motion recorder
+    pose matrix itself, shows those scalars, and its motion recorder
     emits them verbatim as a ``move_l``/``move_j`` target.  So the six
     numbers have to mean the same rotation in all three places -- the
     client's decode, ``Robot.fk``'s decode, and the runtime's re-encode.
@@ -829,22 +825,32 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
         angles = await client.angles()
         assert angles is not None
 
-        # The pose the waldoctl backend computes for the same
-        # configuration, decomposed by pinokin -- the decode the frontend
-        # readout uses, and an oracle that shares no code with the runtime.
-        expected = np.zeros(6)
-        Robot().fk(np.radians(angles), expected)
-        position_error_mm = float(
-            np.max(np.abs(np.asarray(taught[:3]) - expected[:3] * 1000.0))
+        # The wire convention itself: the six numbers the client decoded
+        # must re-compose (intrinsic XYZ, written out here rather than
+        # borrowed from any library) into the matrix STATUS carries.
+        status = await client.status()
+        assert status is not None
+        T_status = np.asarray(status.pose, dtype=np.float64).reshape(4, 4)
+        rx, ry, rz = np.radians(taught[3:])
+        cx, sx, cy, sy, cz, sz = (
+            math.cos(rx),
+            math.sin(rx),
+            math.cos(ry),
+            math.sin(ry),
+            math.cos(rz),
+            math.sin(rz),
         )
-        assert position_error_mm < 2.0, (
-            f"the reported TCP position disagrees with Robot.fk by "
-            f"{position_error_mm:.2f} mm: {taught[:3]} vs {expected[:3] * 1000.0}"
+        R = (
+            np.array([[1.0, 0.0, 0.0], [0.0, cx, -sx], [0.0, sx, cx]])
+            @ np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
+            @ np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
         )
-        assert max_deg_error(taught[3:], np.degrees(expected[3:])) < 0.5, (
-            f"the reported TCP rotation disagrees with Robot.fk: {taught[3:]} vs "
-            f"{np.degrees(expected[3:])} -- the client and the kinematics backend "
-            f"are decomposing the same matrix in different conventions"
+        assert np.allclose(T_status[:3, 3], taught[:3], atol=1e-6), (
+            f"pose() and STATUS disagree on the TCP position: {taught[:3]} vs {T_status[:3, 3]}"
+        )
+        assert np.allclose(T_status[:3, :3], R, atol=1e-6), (
+            f"the client's rpy decode does not re-compose into the STATUS matrix:\n"
+            f"{taught[3:]} ->\n{R}\nvs\n{T_status[:3, :3]}"
         )
 
         # Replay it. The arm is already in this pose, so a runtime that
@@ -1146,7 +1152,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         goal = list(start)
         goal[2] -= 40.0
         arrived = await stream_toward(
-            client, goal, lambda p: client.servo_l(p, speed=0.6)
+            client, goal, lambda p: client.servo_l(p, speed=SERVO_L_SPEED)
         )
         assert arrived, (
             f"servo_l never reached the streamed target: "
@@ -1187,7 +1193,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             z_seen.append(float(s.pose[11]))
             return bool(s.collision_active)
 
-        streamer = Streamer(client, below, lambda p: client.servo_l(p, speed=0.6))
+        streamer = Streamer(
+            client, below, lambda p: client.servo_l(p, speed=SERVO_L_SPEED)
+        )
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
@@ -1208,9 +1216,39 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
             "the gate refused the datagram but never cancelled the session"
         )
+        # How deep the arm gets is the gate's reaction plus the braking
+        # distance, and housekeeping only reacts as often as it runs. A
+        # box that cannot hold its loop period reacts later and coasts
+        # further, which is the loop failing rather than the gate.
+        #
+        # Two different numbers say so, and only together: `overrun_count`
+        # counts ticks whose WORK ran past the next deadline, and the
+        # period is measured wake to wake, so it also carries the kernel's
+        # wake-up latency. A loaded runner shows up as a period over
+        # budget with no overruns at all — work that fits, woken late — so
+        # a message that printed only the overruns would call that box
+        # healthy. The intrusion is also given in ticks of travel, since
+        # one late tick is the smallest coast the gate can produce.
+        stats = await client.loop_stats()
+        if stats is not None:
+            budget_ms = 1e3 / stats.target_hz
+            p99_ms = stats.p99_period_s * 1e3
+            intrusion_mm = floor - min(z_seen)
+            ceiling_mm_s = 1e3 * float(_cfg.config().motion()["jog_l_linear_max_m_s"])
+            per_tick_mm = SERVO_L_SPEED * ceiling_mm_s / stats.target_hz
+            loop_note = (
+                f"the RT loop overran {stats.overrun_count} of {stats.loop_count} "
+                f"ticks and its p99 period was {p99_ms:.2f} ms against a "
+                f"{budget_ms:.2f} ms budget ({p99_ms / budget_ms:.3f}x); the arm "
+                f"went {intrusion_mm:.1f} mm past, which is "
+                f"{intrusion_mm / per_tick_mm:.1f} ticks of travel at "
+                f"{per_tick_mm:.1f} mm per tick"
+            )
+        else:
+            loop_note = "loop stats unavailable"
         assert min(z_seen) > floor, (
             f"the gated stream carried the TCP into the keep-out: "
-            f"min z {min(z_seen):.1f} vs floor {floor:.1f}"
+            f"min z {min(z_seen):.1f} vs floor {floor:.1f}. {loop_note}"
         )
         assert await client.set_shapes([])
 
@@ -1545,8 +1583,8 @@ async def test_config_bundle_feeds_previews_the_daemons_numbers(tmp_path, monkey
         # (PAR6_CONFIG / repo checkout) carries.
         robot = Robot(host="127.0.0.1", port=daemon.command_port)
         dr = robot.create_dry_run_client()
-        assert dr._dt == pytest.approx(TICK_DT_S)
-        assert dr._dt != pytest.approx(0.004)
+        assert dr._preview.tick_dt_s() == pytest.approx(TICK_DT_S)
+        assert dr._preview.tick_dt_s() != pytest.approx(0.004)
     finally:
         daemon.stop()
 
@@ -1641,7 +1679,7 @@ async def test_flashing_and_drive_retune_over_the_python_client(daemon: LiveDaem
 
         # Re-push a joint's own configured tuning: semantically a no-op,
         # but the ack still proves the node check and the RT push ran.
-        j = _cfg.load_robot_config()["joints"][2]
+        j = _cfg.config().joints()[2]
         tune = dict(
             kpp=j["gains"]["kpp"],
             kpv=j["gains"]["kpv"],
@@ -1726,3 +1764,77 @@ def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon, caps
     dead = ["--host", "127.0.0.1", "--port", str(dead_port), "--timeout", "0.5"]
     for verb in ("estop", "stop", "reset"):
         assert main([*dead, verb]) == EXIT_UNREACHABLE, verb
+
+
+@pytest.mark.timeout(240)
+async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_found(
+    daemon: LiveDaemon,
+):
+    """A pick routine can ask what it just picked up, in-process.
+
+    This is the shape the operation has to have: a client call between
+    closing the gripper and moving the part, not something run from a
+    terminal. What is asserted here is that contract — the wrist swings,
+    a well-formed answer comes back, and the runtime's payload changes
+    only when the answer is declared and only to what was found. A
+    payload declared BEFORE the call has to come back on every exit that
+    does not declare: the estimate clears it to measure against an
+    unloaded model, and an arm still holding a 1.2 kg part must not be
+    left compensating for nothing because someone was curious.
+
+    Whether the number is RIGHT is not asserted here and cannot be: this
+    fixture re-ticks the daemon for CI, and at that rate the torque plant
+    limit-cycles, so reported current is chatter rather than gravity.
+    That measurement lives against the shipped tick in
+    `par6d/tests/gravity_calibration.rs`.
+    """
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+        async def home():
+            assert await client.home(wait=True) >= 0
+
+        assert await enable(client, home) is None
+
+        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        before = await client.payload()
+        assert before is not None and before.mass == pytest.approx(1.2)
+
+        found = await client.estimate_payload(declare=False)
+        assert found.poses >= 3, "the wrist must have been swung somewhere"
+        assert math.isfinite(found.mass)
+        assert len(found.com) == 3 and all(math.isfinite(v) for v in found.com)
+        assert len(found.determined) == 4
+        assert all(0.0 <= d <= 1.0 for d in found.determined), found.determined
+        assert found.rms_nm <= found.rms_unloaded_nm, (
+            "estimating a load cannot explain the torque worse than ignoring it: "
+            f"{found.rms_nm} vs {found.rms_unloaded_nm} Nm"
+        )
+
+        # Asking is not declaring: what was declared is what is carried.
+        carried = await client.payload()
+        assert carried is not None
+        assert carried.mass == pytest.approx(before.mass)
+        assert carried.com == pytest.approx(before.com)
+
+        # Declaring puts exactly what was found on the arm — or refuses,
+        # when the poses did not measure a mass, and then the earlier
+        # declaration still stands. Either way the runtime and the
+        # answer agree.
+        try:
+            declared = await client.estimate_payload(declare=True)
+        except RuntimeError as refused:
+            assert "did not measure the mass" in str(refused) or "refusing" in str(
+                refused
+            ), refused
+            carried = await client.payload()
+            assert carried is not None and carried.mass == pytest.approx(before.mass), (
+                "a refused estimate must leave the earlier declaration in place"
+            )
+        else:
+            carried = await client.payload()
+            assert carried is not None
+            assert carried.mass == pytest.approx(declared.mass, rel=1e-6)
+            assert carried.com == pytest.approx(declared.com, rel=1e-6)
+
+        assert await client.set_payload(0.0) == 1

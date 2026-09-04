@@ -2,8 +2,8 @@
 # (crates/par6-py), one abi3 wheel per platform, installable with no Rust
 # toolchain and no shim env. maturin's bundling grafts the whole
 # Pinocchio/coal/TOPPRA closure into `par6.libs` (manylinux_2_39, the
-# same floor pinokin ships at), which is what makes `pip install par6`
-# self-contained.
+# floor conda-forge's Pinocchio builds set), which is what makes
+# `pip install par6` self-contained.
 #
 # macOS and Windows legs wait on the shim toolchain: scripts/ffi/setup.sh
 # only knows linux-64 and linux-aarch64 conda subdirs today.

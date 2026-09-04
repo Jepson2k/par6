@@ -1,12 +1,16 @@
-//! Kinematics and dynamics via Pinocchio, linked through a C-ABI shim
-//! built from the pinokin C++ core — one numerics stack shared with the
-//! Python client (which uses pinokin directly).
+//! Kinematics and dynamics via Pinocchio, linked through the repo's C-ABI
+//! shim (`cpp/`, wrapped by `pinokin-sys`) — the one numerics stack the
+//! runtime plans with and the Python binding exposes.
 //!
 //! The safe wrapper ([`Kin`], feature `ffi`) preallocates model/data at
 //! init and exposes allocation-free `fk / tcp / jacobian / gravity / ik`
-//! calls suitable for the RT thread and planner. Fixtures generated from
-//! the same numerics stack regression-test this crate
-//! (`tests/golden/kinematics/`).
+//! calls suitable for the RT thread and planner. `tests/kinematics.rs`
+//! holds it to the contract (Jacobian = dFK/dq, IK lands on every FK
+//! pose). Deriving the OPW parameters at load also compares this FK
+//! against the closed form and refuses a model the two disagree on —
+//! but that only catches an FK the OPW parameterisation CANNOT express.
+//! A wrong link length is expressible, so the fit would follow it; the
+//! URDF's geometry is nominal data, not something this proves.
 //!
 //! Without the `ffi` feature the crate carries only the pure-data
 //! [`GripperVariant`] table, so `cargo build --workspace` needs no C++
@@ -59,6 +63,26 @@ impl GripperVariant {
         }
     }
 
+    /// The variant a gripper config selects: its `urdf_variant` key when
+    /// that names one, else the vendor naming rule ([`Self::by_name_prefix`]).
+    pub fn resolve(gripper_name: &str, urdf_variant: Option<&str>) -> Self {
+        urdf_variant
+            .and_then(Self::from_key)
+            .unwrap_or_else(|| Self::by_name_prefix(gripper_name))
+    }
+
+    /// The vendor's naming rule: `MSG…` and `SSG48…` grippers carry their
+    /// own trees; everything else rides the bare flange.
+    pub fn by_name_prefix(gripper_name: &str) -> Self {
+        if gripper_name.starts_with("MSG") {
+            GripperVariant::Msg
+        } else if gripper_name.starts_with("SSG48") {
+            GripperVariant::Ssg48
+        } else {
+            GripperVariant::Flange
+        }
+    }
+
     /// URDF path relative to the repo's `assets/par6_description` tree.
     pub fn urdf_relpath(self) -> &'static str {
         match self {
@@ -97,13 +121,22 @@ pub use wrap::wrap_to_window;
 mod kin;
 
 #[cfg(feature = "ffi")]
+mod opw;
+
+#[cfg(feature = "ffi")]
 mod collision;
 
 #[cfg(feature = "ffi")]
 mod shapes;
 
 #[cfg(feature = "ffi")]
-pub use kin::{IkOptions, IkOutcome, Kin, KinError, Pose};
+pub mod gravity;
+
+#[cfg(feature = "ffi")]
+pub use kin::{IkOutcome, Kin, KinError, Pose, IK_POSE_TOL};
+
+#[cfg(feature = "ffi")]
+pub use opw::{relative_pose, Opw, OpwError, FIT_TOL};
 
 #[cfg(feature = "ffi")]
 pub use collision::{Collision, CollisionReport, Layer, MAX_REPORTED_PAIRS};

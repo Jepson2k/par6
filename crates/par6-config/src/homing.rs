@@ -260,6 +260,32 @@ impl JointHoming {
 }
 
 impl HomingConfig {
+    /// Where the sequence leaves the arm \[rad\]: the last `move_to` per
+    /// joint in sequence order — the runtime answers HOME by running the
+    /// whole referencing sequence, so its end is decided here, not by the
+    /// park pose. `Err` names the joints no step places.
+    pub fn ready_pose_rad(&self, num_joints: usize) -> Result<Vec<f64>, String> {
+        let mut last: Vec<Option<f64>> = vec![None; num_joints];
+        for step in &self.sequence {
+            for m in &step.move_to {
+                if let Some(slot) = last.get_mut(usize::from(m.joint)) {
+                    *slot = Some(m.position_rad);
+                }
+            }
+        }
+        let missing: Vec<usize> = last
+            .iter()
+            .enumerate()
+            .filter_map(|(j, v)| v.is_none().then_some(j))
+            .collect();
+        if !missing.is_empty() {
+            return Err(format!(
+                "homing sequence leaves joints {missing:?} unplaced"
+            ));
+        }
+        Ok(last.into_iter().map(|v| v.unwrap_or(0.0)).collect())
+    }
+
     pub(crate) fn validate(&self, num_joints: usize) -> Result<(), ConfigError> {
         if self.joints.len() != num_joints {
             return Err(invalid(

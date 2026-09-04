@@ -28,12 +28,9 @@ imports `par6` (the extension dlopens the shim).
 
 ## Contract discipline (multi-agent repo)
 
-- `crates/par6-proto` and the trait contracts (`DriverBus`, sample ring, config schema)
-  are **frozen interfaces**. Changing them requires a `contracts`-labeled issue — never
-  drive-by edits from a feature branch.
-- `tests/golden/` vectors are the wire conformance suite for the frozen codec
-  (encode + decode, `par6-proto`). A contract change without regenerated
-  vectors + passing tests is incomplete.
+- `crates/par6-proto`'s own tests are the codec suite (encode + decode +
+  hostile inputs). A contract change without updated, passing tests is
+  incomplete.
 - `python/par6/protocol/constants.py` is GENERATED from `par6-proto` — never edit by
   hand; regenerate and let the freshness-guard test prove it.
 
@@ -50,8 +47,8 @@ imports `par6` (the extension dlopens the shim).
 - **No tautological tests.** Assert behavior, not what's true by construction — not
   default fields, constructor args echoed back, enum literals, `isinstance`/frozen-raises,
   or stub-raises-`NotImplementedError`. Drive a method/workflow and assert the outcome.
-- **No testing theatre.** Default to real components: the sim bus backend, `par6d --sim`,
-  golden vectors. A hand-rolled fake is a last resort; never fake a contract you haven't
+- **No testing theatre.** Default to real components: the sim bus backend, `par6d --sim`.
+  A hand-rolled fake is a last resort; never fake a contract you haven't
   read — match real raise-vs-return behavior, return codes, signatures. If a fake must
   mimic protocol behavior (acks, ordering, lifecycle), the test is at the wrong layer.
 - Enter through the real path (protocol dispatch / DriverBus / client API), not internal

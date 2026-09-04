@@ -155,15 +155,50 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
 
 /// Raise the interface TX queue (the kernel drops silently once it is
 /// full). A tuning knob, not correctness: failure is logged, not fatal.
+///
+/// Set through `SIOCSIFTXQLEN` rather than sysfs: the sysfs file is
+/// root-owned, so an unprivileged service user is refused before its
+/// `CAP_NET_ADMIN` is even consulted, while the ioctl honours the
+/// capability — the same path `ifconfig txqueuelen` takes.
 fn set_txqueuelen(iface: &str, len: u32) {
-    let path = format!("/sys/class/net/{iface}/tx_queue_len");
-    match std::fs::write(&path, len.to_string()) {
+    match txqueuelen_ioctl(iface, len) {
         Ok(()) => log::info!("CAN interface '{iface}': txqueuelen {len}"),
         Err(e) => log::warn!(
             "CAN interface '{iface}': could not set txqueuelen to {len} ({e}); \
              a long config burst may be dropped by the kernel TX queue"
         ),
     }
+}
+
+fn txqueuelen_ioctl(iface: &str, len: u32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+
+    let name = iface.as_bytes();
+    // SAFETY: ifreq is plain data; a zeroed value is a valid (empty) request.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name.len() >= req.ifr_name.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    for (dst, src) in req.ifr_name.iter_mut().zip(name) {
+        *dst = *src as libc::c_char;
+    }
+    // The kernel reads `ifr_qlen` from the union's leading int, which the
+    // libc crate names `ifru_metric`.
+    req.ifr_ifru.ifru_metric = len as libc::c_int;
+
+    // Any socket carries interface ioctls; a UDP socket needs no privilege
+    // and no interface to exist.
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    // SAFETY: SIOCSIFTXQLEN takes a pointer to a fully initialised ifreq
+    // that outlives the call.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFTXQLEN, &req) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Default)]

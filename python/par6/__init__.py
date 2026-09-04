@@ -43,8 +43,8 @@ except PackageNotFoundError:  # running from a source tree
 
 
 def __getattr__(name: str) -> object:
-    # Lazy: Robot pulls in pinokin/numba, which pure protocol users of this
-    # package never need at import time.
+    # Lazy: Robot loads the kinematic model and the tool registry, which
+    # pure protocol users of this package never need at import time.
     if name == "Robot":
         from .robot import Robot
 

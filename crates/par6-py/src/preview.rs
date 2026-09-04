@@ -1,157 +1,53 @@
 //! The offline dry-run binding over `par6d::preview` — the daemon's own
-//! planner behind a virtual arm. The Python shim builds command dicts;
-//! planning, timing and collision gating all happen in the engine.
+//! planner, server rules and streaming integrator behind a virtual arm.
+//! The Python shim builds command dicts; everything that decides what
+//! the arm would do happens in the engine.
 
-use std::sync::{Mutex, MutexGuard, PoisonError};
+use std::sync::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
-use par6_proto::command as cmd;
-use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
-use par6_server::{PayloadSpec, ShapeLayer};
+use par6_proto::NUM_JOINTS;
+use par6d::matrix_to_xyzrpy;
 use par6d::preview::{Preview as EnginePreview, PreviewResult};
 
-use crate::convert::{frame_of, robot_err, shape_from_py, tool_param_from_py, wire_error_tuple};
+use crate::config::motion_dict;
+use crate::convert::{
+    command_from_py, fill_payload, layer_of, robot_err, shape_from_py, wire_error_tuple,
+};
 
-fn get<'py, T: pyo3::FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<T> {
-    d.get_item(k)?
-        .ok_or_else(|| PyRuntimeError::new_err(format!("command is missing '{k}'")))?
-        .extract()
-}
-
-fn opt<'py, T: pyo3::FromPyObject<'py>>(d: &Bound<'py, PyDict>, k: &str) -> PyResult<Option<T>> {
-    match d.get_item(k)? {
-        Some(v) if !v.is_none() => Ok(Some(v.extract()?)),
-        _ => Ok(None),
+/// Sample indices that keep a trajectory under `max_points` with both
+/// endpoints retained.
+/// At most `max_points` sample indices, evenly spread, both endpoints kept.
+fn sample_indices(len: usize, max_points: usize) -> Vec<usize> {
+    if len == 0 {
+        return Vec::new();
     }
+    let cap = max_points.max(2);
+    if len <= cap {
+        return (0..len).collect();
+    }
+    (0..cap).map(|k| k * (len - 1) / (cap - 1)).collect()
 }
 
-/// One command dict → wire command. `type` selects the family; the other
-/// keys mirror the client method arguments (wire units).
-fn command_from_py(d: &Bound<'_, PyDict>) -> PyResult<Command> {
-    let kind: String = get(d, "type")?;
-    let c = match kind.as_str() {
-        "home" => Command::Home(cmd::Home {
-            key: 0,
-            calibrate: opt(d, "calibrate")?.unwrap_or(false),
-        }),
-        "move_j" => Command::MoveJ(cmd::MoveJ {
-            key: 0,
-            angles: get(d, "angles")?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            blend_radius: opt(d, "blend_radius")?,
-            rel: opt(d, "rel")?.unwrap_or(false),
-        }),
-        "move_j_pose" => Command::MoveJPose(cmd::MoveJPose {
-            key: 0,
-            pose: get(d, "pose")?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            blend_radius: opt(d, "blend_radius")?,
-        }),
-        "move_l" => Command::MoveL(cmd::MoveL {
-            key: 0,
-            pose: get(d, "pose")?,
-            frame: frame_of(opt(d, "frame")?.unwrap_or(0))?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            blend_radius: opt(d, "blend_radius")?,
-            rel: opt(d, "rel")?.unwrap_or(false),
-        }),
-        "move_c" => Command::MoveC(cmd::MoveC {
-            key: 0,
-            via: get(d, "via")?,
-            end: get(d, "end")?,
-            frame: frame_of(opt(d, "frame")?.unwrap_or(0))?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            blend_radius: opt(d, "blend_radius")?,
-            rel: opt(d, "rel")?.unwrap_or(false),
-        }),
-        "move_s" => Command::MoveS(cmd::MoveS {
-            key: 0,
-            waypoints: get(d, "waypoints")?,
-            frame: frame_of(opt(d, "frame")?.unwrap_or(0))?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            rel: opt(d, "rel")?.unwrap_or(false),
-        }),
-        "move_p" => Command::MoveP(cmd::MoveP {
-            key: 0,
-            waypoints: get(d, "waypoints")?,
-            frame: frame_of(opt(d, "frame")?.unwrap_or(0))?,
-            duration: opt(d, "duration")?,
-            speed: opt(d, "speed")?,
-            accel: opt(d, "accel")?,
-            rel: opt(d, "rel")?.unwrap_or(false),
-        }),
-        "delay" => Command::Delay(cmd::Delay {
-            key: 0,
-            seconds: get(d, "seconds")?,
-        }),
-        "checkpoint" => Command::Checkpoint(cmd::Checkpoint {
-            key: 0,
-            label: get(d, "label")?,
-        }),
-        "select_tool" => Command::SelectTool(cmd::SelectTool {
-            key: 0,
-            tool_name: get(d, "tool_name")?,
-            variant_key: opt(d, "variant_key")?,
-        }),
-        "tool_action" => {
-            let params: Vec<Bound<'_, PyAny>> = get(d, "params")?;
-            Command::ToolAction(cmd::ToolAction {
-                key: 0,
-                tool_key: get(d, "tool_key")?,
-                action: get(d, "action")?,
-                params: params
-                    .iter()
-                    .map(tool_param_from_py)
-                    .collect::<PyResult<Vec<_>>>()?,
-            })
-        }
-        other => {
-            return Err(PyRuntimeError::new_err(format!(
-                "unknown preview command type '{other}'"
-            )))
-        }
-    };
-    Ok(c)
-}
-
-/// Which of `n` trajectory samples survive thinning to about
-/// `max_points`: every `stride`-th one plus the last, so the endpoints
-/// are always kept. `None` keeps every sample.
-fn kept(n: usize, max_points: Option<usize>) -> impl Fn(usize) -> bool {
-    let stride = max_points.map_or(1, |m| (n / m.max(2)).max(1));
-    move |k| k % stride == 0 || k + 1 == n
-}
-
-fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: Option<usize>) -> PyResult<PyObject> {
+fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: usize) -> PyResult<PyObject> {
     let d = PyDict::new(py);
-    let keep = kept(r.joint_trajectory_rad.len(), max_points);
+    let idx = sample_indices(r.joint_trajectory_rad.len(), max_points);
     let traj = PyList::empty(py);
-    let poses = PyList::empty(py);
-    for (k, q) in r.joint_trajectory_rad.iter().enumerate() {
-        if keep(k) {
-            traj.append(&q[..])?;
-            if let Some(p) = r.tcp_poses.get(k) {
-                poses.append(&p[..])?;
-            }
+    let xyzrpy = PyList::empty(py);
+    for &i in &idx {
+        traj.append(r.joint_trajectory_rad[i].to_vec())?;
+        if let Some(p) = r.tcp_poses.get(i) {
+            xyzrpy.append(matrix_to_xyzrpy(p).to_vec())?;
         }
     }
     d.set_item("joint_trajectory_rad", traj)?;
-    d.set_item("tcp_poses", poses)?;
-    d.set_item("end_joints_rad", &r.end_joints_rad[..])?;
+    d.set_item("tcp_xyzrpy", xyzrpy)?;
+    d.set_item("end_joints_rad", r.end_joints_rad.to_vec())?;
     d.set_item("duration_s", r.duration_s)?;
+    d.set_item("pending", r.pending)?;
     match &r.error {
         Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
         None => d.set_item("error", py.None())?,
@@ -160,217 +56,95 @@ fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: Option<usize>) -> 
 }
 
 /// The offline preview session (see `par6d::preview`).
-#[pyclass]
+#[pyclass(module = "par6._par6")]
 pub struct Preview {
     inner: Mutex<EnginePreview>,
-}
-
-impl Preview {
-    /// The engine, recovered from a poisoned lock: a planner panic in
-    /// one call must not take every later preview down with it.
-    fn engine(&self) -> MutexGuard<'_, EnginePreview> {
-        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
-    }
+    max_points: usize,
 }
 
 #[pymethods]
 impl Preview {
-    /// Build a session from a robot config path (default search when
-    /// `None`) and assets tree, starting at the configured park pose.
+    /// Build a session from a robot config path (the runtime's own
+    /// search when `None`), an assets tree and the directory
+    /// `package://` mesh URIs resolve under, starting referenced at the
+    /// park pose. Trajectories are downsampled to `max_points` samples
+    /// (endpoints kept) on the way out.
     #[new]
-    #[pyo3(signature = (config=None, assets=None))]
-    fn new(config: Option<String>, assets: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (config=None, assets=None, package_dir=None, max_points=200))]
+    fn new(
+        config: Option<String>,
+        assets: Option<String>,
+        package_dir: Option<String>,
+        max_points: usize,
+    ) -> PyResult<Self> {
         let inner = EnginePreview::new(
             config.map(std::path::PathBuf::from).as_deref(),
             assets.map(std::path::PathBuf::from).as_deref(),
+            package_dir.map(std::path::PathBuf::from).as_deref(),
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             inner: Mutex::new(inner),
+            max_points: max_points.max(2),
         })
+    }
+
+    /// Submit one command dict (`type` selects the family; the other
+    /// keys mirror the wire fields): the result dict, or `None` while
+    /// the command waits in the blend hold. A refusal comes back as the
+    /// result's `error` six-tuple — the runtime's own text.
+    fn submit(&self, py: Python<'_>, command: &Bound<'_, PyDict>) -> PyResult<Option<PyObject>> {
+        let cmd = command_from_py(command)?;
+        let r = self.inner.lock().unwrap().submit(cmd);
+        if r.pending {
+            return Ok(None);
+        }
+        result_dict(py, &r, self.max_points).map(Some)
+    }
+
+    /// Plan whatever the blend hold still holds; `None` when nothing waits.
+    fn flush(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
+        match self.inner.lock().unwrap().flush() {
+            Some(r) => result_dict(py, &r, self.max_points).map(Some),
+            None => Ok(None),
+        }
     }
 
     /// The virtual arm pose \[rad\].
     fn angles_rad(&self) -> Vec<f64> {
-        self.engine().angles_rad().to_vec()
+        self.inner.lock().unwrap().angles_rad().to_vec()
     }
 
-    /// Move the virtual arm instantly.
-    fn teleport_rad(&self, q: [f64; NUM_JOINTS]) {
-        self.engine().teleport_rad(q);
-    }
-
-    /// Whether the virtual arm holds its position references.
-    fn homed(&self) -> bool {
-        self.engine().homed()
-    }
-
-    /// Set the virtual arm's homed state (see the engine preview: while
-    /// unhomed, gated commands refuse with the server's own refusal).
-    fn set_homed(&self, homed: bool) {
-        self.engine().set_homed(homed);
-    }
-
-    /// FK at the virtual pose (flattened 4×4, translation in metres).
-    fn pose(&self) -> PyResult<Vec<f64>> {
-        self.engine()
-            .pose()
-            .map(|p| p.to_vec())
-            .map_err(|e| robot_err(&e))
-    }
-
-    /// Registered motion profile names.
-    #[staticmethod]
-    fn profiles() -> Vec<String> {
-        EnginePreview::profiles()
-    }
-
-    /// The tick period \[s\] trajectories are sampled at.
-    fn tick_dt_s(&self) -> f64 {
-        self.engine().tick_dt_s()
-    }
-
-    /// The effective `[motion]` feel constants, keyed by config name —
-    /// the same file the daemon reads.
-    fn motion(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let m = self.engine().motion();
-        Ok(crate::convert::motion_dict(py, &m.as_array())?.into())
-    }
-
-    /// Apply planning context (profile, TCP offset \[mm\], completion
-    /// policy) — the same sync the server pushes to the live planner.
-    fn set_context(&self, profile: &str, tcp_offset_mm: [f64; 3], policy: u8) -> PyResult<()> {
-        let policy = CompletionPolicy::from_wire(i64::from(policy)).ok_or_else(|| {
-            PyRuntimeError::new_err(format!("unknown completion policy {policy}"))
-        })?;
-        self.engine().set_context(profile, tcp_offset_mm, policy);
-        Ok(())
-    }
-
-    /// Replace one collision-world layer ("installation" or "program",
-    /// wire units); raises `RobotWireError` exactly when the runtime
-    /// would refuse the set.
-    fn set_shapes(
-        &self,
-        py: Python<'_>,
-        layer: &str,
-        shapes: Vec<Bound<'_, PyDict>>,
-    ) -> PyResult<Option<u64>> {
-        let layer = match layer {
-            "installation" => ShapeLayer::Installation,
-            "program" => ShapeLayer::Program,
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown shape layer '{other}'"
-                )))
-            }
-        };
-        let shapes = shapes
+    /// The virtual arm pose in degrees (the wire unit).
+    fn angles_deg(&self) -> Vec<f64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .angles_rad()
             .iter()
-            .map(shape_from_py)
-            .collect::<PyResult<Vec<_>>>()?;
-        py.allow_threads(|| self.engine().set_shapes(layer, &shapes))
-            .map_err(|e| robot_err(&e))
+            .map(|r| r.to_degrees())
+            .collect()
     }
 
-    /// Preview a velocity jog (signed fractions per joint) held for
-    /// `duration` seconds — the runtime's own jog ramp integrated from
-    /// the virtual pose. Wire-invalid parameters come back as the
-    /// result's `error`, exactly as the runtime would refuse them. The
-    /// trajectory is thinned to about `max_points` samples, endpoints
-    /// kept.
-    #[pyo3(signature = (speeds, duration, accel=None, max_points=None))]
-    fn preview_jog(
-        &self,
-        py: Python<'_>,
-        speeds: [f64; NUM_JOINTS],
-        duration: f64,
-        accel: Option<f64>,
-        max_points: Option<usize>,
-    ) -> PyResult<PyObject> {
-        let r = py.allow_threads(|| self.engine().preview_jog(speeds, duration, accel));
-        result_dict(py, &r, max_points)
+    /// The TCP pose as `[x, y, z, rx, ry, rz]` in mm and degrees, the
+    /// wire convention.
+    fn pose_xyzrpy(&self) -> PyResult<Vec<f64>> {
+        let m = self
+            .inner
+            .lock()
+            .unwrap()
+            .pose()
+            .map_err(|e| robot_err(&e))?;
+        let p = matrix_to_xyzrpy(&m);
+        Ok(vec![
+            p[0] * 1000.0,
+            p[1] * 1000.0,
+            p[2] * 1000.0,
+            p[3].to_degrees(),
+            p[4].to_degrees(),
+            p[5].to_degrees(),
+        ])
     }
-
-    /// Preview a cartesian velocity jog: signed fractions per axis (xyz
-    /// then rotation about xyz) held for `duration` seconds in `frame`
-    /// (0 = WRF, 1 = TRF) — the runtime's own twist integration through
-    /// the same kinematics and soft window, gated on the collision
-    /// world. Wire-invalid parameters come back as the result's `error`;
-    /// the trajectory is thinned to about `max_points` samples.
-    #[pyo3(signature = (velocities, duration, frame=0, accel=None, max_points=None))]
-    fn preview_jog_l(
-        &self,
-        py: Python<'_>,
-        velocities: [f64; 6],
-        duration: f64,
-        frame: u8,
-        accel: Option<f64>,
-        max_points: Option<usize>,
-    ) -> PyResult<PyObject> {
-        let frame = frame_of(frame)?;
-        let r = py.allow_threads(|| {
-            self.engine()
-                .preview_jog_l(velocities, frame, duration, accel)
-        });
-        result_dict(py, &r, max_points)
-    }
-
-    /// The payload the preview plans with, as the live `set_payload`
-    /// pushes it: mass \[kg\], COM \[m\] in the end-effector frame, and
-    /// the inertia `(Ixx, Ixy, Iyy, Ixz, Iyz, Izz)` or None for a point
-    /// mass. Raises `RobotWireError` exactly when the runtime would refuse
-    /// the spec.
-    #[pyo3(signature = (mass, com, inertia=None))]
-    fn set_payload(&self, mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) -> PyResult<()> {
-        self.engine()
-            .set_payload(PayloadSpec { mass, com, inertia })
-            .map_err(|e| robot_err(&e))
-    }
-
-    /// The payload the preview plans with: `mass`, `com`, `inertia` (six
-    /// components, zeros for a point mass) — the live `payload` query's
-    /// shape.
-    fn payload(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let p = self.engine().payload();
-        let d = PyDict::new(py);
-        d.set_item("mass", p.mass)?;
-        d.set_item("com", &p.com[..])?;
-        d.set_item("inertia", &p.inertia.unwrap_or([0.0; 6])[..])?;
-        Ok(d.into_any().unbind())
-    }
-
-    /// The planning context as last synced: `profile`, `tcp_offset_mm`,
-    /// and `policy` (wire value) — the runtime's own startup context
-    /// until a program changes it.
-    fn context(&self, py: Python<'_>) -> PyResult<PyObject> {
-        let engine = self.engine();
-        let (profile, tcp_offset_mm, policy) = engine.context();
-        let d = PyDict::new(py);
-        d.set_item("profile", profile)?;
-        d.set_item("tcp_offset_mm", &tcp_offset_mm[..])?;
-        d.set_item("policy", policy as u8)?;
-        Ok(d.into_any().unbind())
-    }
-
-    /// Whether the virtual gripper holds a calibration: a jaw move on an
-    /// uncalibrated gripper is refused as the runtime refuses it, and a
-    /// previewed `calibrate` establishes one.
-    fn set_gripper_calibrated(&self, calibrated: bool) {
-        self.engine().set_gripper_calibrated(calibrated);
-    }
-
-    /// How many blended moves the live queue holds before it plans the
-    /// chain as it stands.
-    fn blend_lookahead(&self) -> usize {
-        self.engine().blend_lookahead()
-    }
-
-    /// The config file this session was built from.
-    fn config_path(&self) -> String {
-        self.engine().config_path().display().to_string()
-    }
-
     /// Preview a servo stream through the runtime's own limiter: each
     /// target [rad] held for `hold_ticks` ticks; returns per-tick
     /// commanded `q`/`qd` and the tick the last target was reached.
@@ -403,25 +177,182 @@ impl Preview {
         Ok(d.into_any().unbind())
     }
 
-    /// Preview a queued program (list of command dicts, see
-    /// `command_from_py`): one result dict per command, blend chains
-    /// folded exactly as the live planner folds them. Each trajectory is
-    /// thinned to about `max_points` samples, endpoints kept.
-    #[pyo3(signature = (cmds, max_points=None))]
-    fn preview_program(
-        &self,
-        py: Python<'_>,
-        cmds: Vec<Bound<'_, PyDict>>,
-        max_points: Option<usize>,
-    ) -> PyResult<Vec<PyObject>> {
-        let commands = cmds
-            .iter()
-            .map(command_from_py)
-            .collect::<PyResult<Vec<_>>>()?;
-        let results = py.allow_threads(|| self.engine().preview_batch(&commands));
-        results
-            .iter()
-            .map(|r| result_dict(py, r, max_points))
+    /// Move the virtual arm instantly, the preview's teleport.
+    fn teleport_rad(&self, q: [f64; NUM_JOINTS]) {
+        self.place_rad(q)
+    }
+
+    /// Seed the virtual arm at `q` without the wire's checks (a host
+    /// mirroring the live arm's pose).
+    fn place_rad(&self, q: [f64; NUM_JOINTS]) {
+        self.inner.lock().unwrap().place_rad(q);
+    }
+
+    fn homed(&self) -> bool {
+        self.inner.lock().unwrap().homed()
+    }
+
+    fn set_homed(&self, homed: bool) {
+        self.inner.lock().unwrap().set_homed(homed);
+    }
+
+    /// FK at the virtual pose (flattened 4×4, translation in metres).
+    fn pose(&self) -> PyResult<Vec<f64>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .pose()
+            .map(|p| p.to_vec())
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// Registered motion profile names.
+    #[staticmethod]
+    fn profiles() -> Vec<String> {
+        EnginePreview::profiles()
+    }
+
+    /// The active profile, in the registry's spelling.
+    fn profile(&self) -> String {
+        self.inner.lock().unwrap().profile().to_owned()
+    }
+
+    fn tcp_offset_mm(&self) -> Vec<f64> {
+        self.inner.lock().unwrap().tcp_offset_mm().to_vec()
+    }
+
+    /// `(tool key, variant key or None)`.
+    fn tool(&self) -> (String, Option<String>) {
+        let p = self.inner.lock().unwrap();
+        let (key, variant) = p.tool();
+        (key.to_owned(), variant.map(str::to_owned))
+    }
+
+    /// Commanded jaw position, 0 = open … 1 = closed.
+    fn tool_position(&self) -> f64 {
+        self.inner.lock().unwrap().tool_position()
+    }
+
+    fn tool_calibrated(&self) -> bool {
+        self.inner.lock().unwrap().tool_calibrated()
+    }
+
+    /// `inputs ++ outputs ++ [estop]`, the STATUS layout.
+    fn io(&self) -> Vec<u8> {
+        self.inner.lock().unwrap().io()
+    }
+
+    /// Wire names of the commands waiting in the blend hold.
+    fn queue(&self) -> Vec<String> {
+        self.inner
+            .lock()
+            .unwrap()
+            .held_names()
+            .into_iter()
+            .map(str::to_owned)
             .collect()
+    }
+    /// How many queued commands the planner may see ahead of the one it
+    /// is about to start.
+    fn blend_lookahead(&self) -> usize {
+        self.inner.lock().unwrap().blend_lookahead()
+    }
+
+    /// Seed whether the virtual gripper holds a calibration.
+    fn set_gripper_calibrated(&self, calibrated: bool) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_gripper_calibrated(calibrated);
+    }
+
+    /// The tick period \[s\] trajectories are sampled at.
+    fn tick_dt_s(&self) -> f64 {
+        self.inner.lock().unwrap().tick_dt_s()
+    }
+
+    /// The effective `[motion]` feel constants, keyed by config name.
+    fn motion<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let m = self.inner.lock().unwrap().motion();
+        motion_dict(py, &m)
+    }
+
+    /// Where the configured homing seek leaves the arm \[rad\].
+    /// What the virtual arm carries: `mass`, `com`, `inertia` (zeros = none).
+    fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        let p = self.inner.lock().unwrap().payload();
+        let d = PyDict::new(py);
+        fill_payload(&d, p.mass, p.com, p.inertia.unwrap_or([0.0; 6]))?;
+        Ok(d)
+    }
+
+    /// The motion a payload estimation makes from here — the wrist swing
+    /// `par6_calibrate` plans, at its speed, ending where the arm stood —
+    /// as one result dict like any other previewed command. Measures
+    /// nothing.
+    #[pyo3(signature = (spread=0.5))]
+    fn estimate_payload(&self, py: Python<'_>, spread: f64) -> PyResult<PyObject> {
+        let (poses, r) = self
+            .inner
+            .lock()
+            .unwrap()
+            .preview_estimation(spread)
+            .map_err(PyRuntimeError::new_err)?;
+        let d = result_dict(py, &r, self.max_points)?;
+        d.bind(py).downcast::<PyDict>()?.set_item("poses", poses)?;
+        Ok(d)
+    }
+
+    fn homing_ready_pose_rad(&self) -> Vec<f64> {
+        self.inner.lock().unwrap().homing_ready_pose_rad().to_vec()
+    }
+
+    /// Replace one collision-world layer ("installation" or "program",
+    /// wire units); raises `RobotWireError` exactly when the runtime
+    /// would refuse the set.
+    fn set_shapes(&self, layer: &str, shapes: Vec<Bound<'_, PyDict>>) -> PyResult<Option<u64>> {
+        let layer = layer_of(layer)?;
+        let shapes = shapes
+            .iter()
+            .map(shape_from_py)
+            .collect::<PyResult<Vec<_>>>()?;
+        self.inner
+            .lock()
+            .unwrap()
+            .set_shapes(layer, &shapes)
+            .map_err(|e| robot_err(&e))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sample_indices;
+
+    /// The limit is a limit: a caller sizing a payload gets no more than
+    /// it asked for, at any length, and always both ends of the motion.
+    #[test]
+    fn downsampling_never_exceeds_the_limit_and_keeps_the_endpoints() {
+        for len in [0usize, 1, 2, 3, 199, 200, 201, 399, 400, 601, 5000] {
+            for cap in [2usize, 3, 200, 1000] {
+                let idx = sample_indices(len, cap);
+                assert!(
+                    idx.len() <= cap.max(2),
+                    "len {len} cap {cap}: {} samples",
+                    idx.len()
+                );
+                if len == 0 {
+                    assert!(idx.is_empty());
+                    continue;
+                }
+                assert_eq!(idx[0], 0, "len {len} cap {cap}: first sample");
+                assert_eq!(idx[idx.len() - 1], len - 1, "len {len} cap {cap}: last");
+                assert!(
+                    idx.windows(2).all(|w| w[0] < w[1]),
+                    "len {len} cap {cap}: samples must advance, got {idx:?}"
+                );
+                // Nothing is dropped that did not have to be.
+                assert_eq!(idx.len(), len.min(cap.max(2)), "len {len} cap {cap}");
+            }
+        }
     }
 }

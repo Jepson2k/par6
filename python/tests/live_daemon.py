@@ -128,7 +128,7 @@ def sim_config(
             "PAR6.toml patch points (tick_dt_s / status_rate_hz) missing"
         )
     if active_gripper is not None:
-        fitted = _cfg.load_robot_config()["robot"]["active_gripper"]
+        fitted = _cfg.config().active_gripper()
         swapped = patched.replace(
             f'active_gripper = "{fitted}"', f'active_gripper = "{active_gripper}"'
         )

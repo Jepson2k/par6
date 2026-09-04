@@ -287,7 +287,7 @@ fn rejects_degenerate_inputs_across_the_ffi() {
     // NULL-pointer contract, unreachable through the wrapper: create
     // reports failure (no handle), accessors on NULL handles error.
     unsafe {
-        let mut err = [0i8; 128];
+        let mut err = [0 as std::ffi::c_char; 128];
         let h = ffi::par6_traj_create(
             std::ptr::null(),
             2,

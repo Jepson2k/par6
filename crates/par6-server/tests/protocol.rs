@@ -3021,7 +3021,7 @@ async fn set_payload_applies_reads_back_and_refuses_garbage() {
     }
 
     // Refusals (negative mass, indefinite inertia) are decode-side —
-    // the malformed_payload_* golden vectors pin them, and encode_command
+    // par6-proto's hostile-input tests pin them, and encode_command
     // refuses the same inputs client-side before a byte leaves.
 
     // Clearing is mass 0.

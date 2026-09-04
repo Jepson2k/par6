@@ -525,20 +525,24 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
 }
 
 /// Startup failure paths are clear errors, never panics: hardware mode
-/// without a CAN interface names the interface and points at `--sim`;
-/// a missing config file names the path it tried.
+/// whose CAN interface does not exist names the interface and points at
+/// `--sim`; a missing config file names the path it tried.
 #[test]
 fn hardware_mode_and_bad_config_fail_with_clear_errors() {
     let opts = Options {
         sim: false,
-        config: Some(common::shipped_config()),
+        config: Some(common::config_with_interface("par6-no-such-can")),
+        assets: Some(common::assets_dir()),
         ..Options::default()
     };
     let err = Daemon::start(&opts)
         .err()
-        .expect("hardware mode must fail cleanly in CI");
+        .expect("hardware mode without its interface must fail cleanly");
     let msg = err.to_string();
-    assert!(msg.contains("can0"), "names the CAN interface: {msg}");
+    assert!(
+        msg.contains("par6-no-such-can"),
+        "names the CAN interface: {msg}"
+    );
     assert!(msg.contains("--sim"), "points at the simulator: {msg}");
 
     let opts = Options {
@@ -1773,15 +1777,15 @@ fn the_status_rate_override_changes_the_broadcast_and_refuses_a_bad_rate() {
 /// direction (`simulator(true)` on a runtime already simulating)
 /// succeeding — which made a categorical failure look intermittent. Now
 /// the command really tries, so what has to be pinned here is that a
-/// try that fails fails LOUDLY and changes nothing: no CAN interface
-/// exists in this container, which is the same thing an operator hits
-/// when they pick the wrong one on the box.
+/// try that fails fails LOUDLY and changes nothing: the configured
+/// interface exists on no machine, which is the same thing an operator
+/// hits when they pick the wrong one on the box.
 ///
 /// The successful direction needs a control box; the RT core's own
 /// re-boot on a swap is covered in `par6-rt` over the loopback backend.
 #[test]
 fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
-    let rig = Rig::boot(common::shipped_config());
+    let rig = Rig::boot(common::config_with_interface("par6-no-such-can-cfg"));
     let mut c = Client::new(rig.addr());
     rig.wait_status("boot", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1799,7 +1803,7 @@ fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
         on: false,
     }));
     assert!(
-        err.cause.contains("cannot open") && err.cause.contains("can0"),
+        err.cause.contains("cannot open") && err.cause.contains("par6-no-such-can-cfg"),
         "the refusal names the configured interface: {}",
         err.cause
     );
@@ -1957,4 +1961,29 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
         "a cleanly stopped par6d left its claim on the bus behind"
     );
     std::fs::remove_dir_all(&dir).expect("clean up");
+}
+
+/// A teleport references the arm, so the move sent right behind it must
+/// be accepted. The homed gate reads the RT snapshot, which is a tick or
+/// more behind the accepted teleport — a script that teleports and then
+/// moves, as `examples/keepout_preview.py` does, must not race the
+/// broadcast.
+#[test]
+fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    // ENABLED is reached asynchronously; the teleport itself must land
+    // before the gate under test is the homed one.
+    rig.wait_status("enabled", |s| s.enabled);
+
+    let park = park_deg();
+    c.send(&teleport(park));
+    // No wait: this is the race. The move goes out in the same breath.
+    let index = c.ok_index(&move_j(4101, with_j0(park, 5.0), 0.5));
+    let (ok, detail) = c.wait_complete(index);
+    assert!(ok, "the move behind a teleport must run, got {detail:?}");
+
+    rig.shutdown();
 }

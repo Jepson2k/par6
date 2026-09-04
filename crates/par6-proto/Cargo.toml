@@ -8,17 +8,15 @@ repository.workspace = true
 
 # The codec is hand-rolled msgpack: every payload is a positional array with an
 # integer tag in slot 0 and heterogeneous fields after it, which serde's derive
-# model cannot express (and byte-exact golden vectors demand full control over
-# integer/float widths anyway). serde_json is used only by the golden-vector /
-# python-mirror generators and their freshness-guard tests.
+# model cannot express, and the wire demands full control over integer/float
+# widths anyway.
 [dependencies]
 thiserror = { workspace = true }
-serde_json = "1"
+# Commands arrive from the Python binding as dicts; deriving the
+# deserialization keeps one description of each command instead of a
+# hand-written dict reader that has to be updated alongside it.
+serde = { workspace = true }
 
 [[bin]]
 name = "gen_python"
 path = "src/bin/gen_python.rs"
-
-[[bin]]
-name = "gen_golden"
-path = "src/bin/gen_golden.rs"

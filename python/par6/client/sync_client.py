@@ -17,7 +17,13 @@ from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
 from waldoctl.shapes import Shape, ShapeWorld
-from waldoctl.status import ActivityResult, PayloadResult, PingResult, ToolResult
+from waldoctl.status import (
+    ActivityResult,
+    PayloadEstimate,
+    PayloadResult,
+    PingResult,
+    ToolResult,
+)
 from waldoctl.sync_tools import SyncTool, make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
@@ -35,14 +41,16 @@ from .errors import RobotError
 
 T = TypeVar("T")
 
+#: Live sync clients, so the loop teardown can close their engine halves
+#: before the loop they resolve onto goes away.
+_CLIENTS: "weakref.WeakSet[RobotClient]" = weakref.WeakSet()
+
+#: How long the teardown waits on one client's close before moving on.
+_CLOSE_GRACE_S = 1.0
+
 _LOOP: asyncio.AbstractEventLoop | None = None
 _THREAD: threading.Thread | None = None
 _LOOP_READY = threading.Event()
-#: Facades running on the module loop, so its teardown can release
-#: their engine clients first. Weak: registering never keeps one alive.
-_CLIENTS: weakref.WeakSet[RobotClient] = weakref.WeakSet()
-#: How long the teardown waits on one client's close before moving on.
-_CLOSE_GRACE_S = 1.0
 
 
 def _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
@@ -57,12 +65,11 @@ def _stop_loop() -> None:
     if loop is None:
         return
 
-    # The engine clients go before the loop does. Their in-flight
-    # futures resolve onto this loop, and one landing after it has
-    # stopped runs a pyo3 callback that cannot unwind — the interpreter
-    # aborts instead of exiting, which is what a script that never
-    # closed its client used to get. Bounded per client: a wedged one
-    # must not hold up the exit.
+    # The engine clients go before the loop does. Their in-flight futures
+    # resolve onto this loop, and one landing after it has stopped runs a
+    # pyo3 callback that cannot unwind — the interpreter aborts instead of
+    # exiting, which is what a script that never closed its client used to
+    # get. Bounded per client: a wedged one must not hold up the exit.
     for client in list(_CLIENTS):
         with contextlib.suppress(
             RuntimeError,
@@ -322,11 +329,7 @@ class RobotClient:
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
-        """Process move at a constant TCP speed, auto-blended (blocking by default).
-
-        See :meth:`par6.AsyncRobot.move_p` for what ``speed`` means on a
-        move that holds one rate along the path.
-        """
+        """Process move with auto-blending (blocking by default)."""
         return _run(
             self._inner.move_p(
                 waypoints,
@@ -443,6 +446,15 @@ class RobotClient:
         """Declare the payload the arm is carrying at the TCP."""
         return _run(self._inner.set_payload(mass, com, inertia))
 
+    def estimate_payload(
+        self,
+        spread: float = 0.5,
+        ridge: float = 0.01,
+        declare: bool = True,
+    ) -> PayloadEstimate:
+        """Estimate the payload's mass and centre of mass, and tell the runtime."""
+        return _run(self._inner.estimate_payload(spread, ridge, declare))
+
     def payload(self) -> PayloadResult | None:
         """The effective runtime payload (zeros = none)."""
         return _run(self._inner.payload())
@@ -511,7 +523,7 @@ class RobotClient:
         kd: float,
         ilim_ma: float,
         velocity_limit_ticks_s: float,
-        voltage_limit_mv: int,
+        voltage_limit_mv: int = 0,
     ) -> int:
         """Push one drive node's tuning live (every gain required — the
         frame replaces the node's whole tuple)."""
@@ -535,19 +547,9 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
-    def set_tcp_offset(
-        self,
-        x: float = 0,
-        y: float = 0,
-        z: float = 0,
-        wait: bool = False,
-        timeout: float = 30.0,
-    ) -> int:
-        """Queue a TCP offset in mm on top of the current tool transform;
-        it lands at its turn between the moves around it."""
-        return _run(
-            self._inner.set_tcp_offset(x=x, y=y, z=z, wait=wait, timeout=timeout)
-        )
+    def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
+        """Set TCP offset in mm on top of the current tool transform."""
+        return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
 
     def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes."""
@@ -556,6 +558,10 @@ class RobotClient:
     def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion."""
         return _run(self._inner.set_completion_policy(policy))
+
+    def set_recipe(self, name: str) -> int:
+        """Select the telemetry recipe (unknown names are refused)."""
+        return _run(self._inner.set_recipe(name))
 
     def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin)."""

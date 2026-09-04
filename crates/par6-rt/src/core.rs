@@ -287,7 +287,7 @@ pub enum CoreError {
 }
 
 /// The pluggable seams [`RtCore`] runs on. `par6d` wires the real
-/// engines (par6-motion, pinokin FK, GPIO chips, command-plane queue);
+/// engines (par6-motion, Pinocchio FK, GPIO chips, command-plane queue);
 /// tests and the sim runtime use the built-ins from [`crate::hooks`],
 /// [`crate::gravity`], [`crate::gpio`].
 pub struct RtHooks {
@@ -529,6 +529,10 @@ pub struct RtCore<B: DriverBus> {
     homing_gcmd: GripperCommand,
 
     // Jog live state.
+    jog_active: bool,
+    /// A `JogRelease` is ramping down. JOG outlives the command until
+    /// the engine reaches rest, then the mode goes.
+    jog_released: bool,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -734,6 +738,8 @@ impl<B: DriverBus> RtCore<B> {
             ),
             calibrate_pending: false,
             homing_gcmd,
+            jog_active: false,
+            jog_released: false,
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -1313,11 +1319,15 @@ impl<B: DriverBus> RtCore<B> {
                         self.jog_accel_scale = accel;
                     }
                     self.jog.command(&speeds);
+                    self.jog_active = true;
+                    self.jog_released = false;
                     self.jog_joints = joint_mask(&speeds);
                 }
             }
             RtCommand::JogRelease => {
                 self.jog.release();
+                self.jog_active = false;
+                self.jog_released = true;
                 self.jog_joints = 0;
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
@@ -1524,6 +1534,8 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Jog => {
                 self.jog.activate(&self.q);
+                self.jog_active = false;
+                self.jog_released = false;
                 self.jog_joints = 0;
                 self.jog_blocked = 0;
             }
@@ -2138,6 +2150,12 @@ impl<B: DriverBus> RtCore<B> {
                     self.jog_pack,
                     &mut self.setpoints,
                 );
+                // A released jog ramps down instead of stopping dead,
+                // and JOG is the only mode that ticks the engine, so the
+                // mode outlives the release until the ramp is at rest.
+                if self.jog_released && self.scratch_qd.iter().all(|v| *v == 0.0) {
+                    self.mode = Mode::Idle;
+                }
             }
             Mode::Exec => {
                 let outcome = self.exec.tick(

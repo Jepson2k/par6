@@ -4,8 +4,8 @@
 //! replacement, buffer truncation, and the promise that a rejected layer
 //! leaves the previous world enforced.
 //!
-//! Semantic conformance (which configurations collide, and with what) is
-//! `par6-kin`'s golden-fixture suite; this file is about the boundary.
+//! Which configurations collide, and with what, is `par6-kin`'s
+//! `collision_world` suite; this file is about the boundary.
 #![cfg(feature = "ffi")]
 
 use std::path::PathBuf;

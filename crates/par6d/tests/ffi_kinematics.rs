@@ -7,7 +7,7 @@
 //!   tool's `[kinematics] mass_kg` changes the published gravity
 //!   torques,
 //! - the FK hook publishes the true TCP pose: STATUS reproduces the
-//!   golden kinematics fixture's FK matrix for a known q,
+//!   engine's own FK matrix for a known q,
 //! - `move_l` runs the cartesian pipeline (segment → seeded IK → TOPPRA
 //!   → ring) to COMPLETE, and the measured TCP stays on the line,
 //! - an out-of-workspace pose is a real IK error reply, never a no-op,
@@ -29,7 +29,7 @@ use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{repo_root, shipped_config, Client, Rig, BUDGET};
+use common::{shipped_config, Client, Rig, BUDGET};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
@@ -116,55 +116,46 @@ fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS])
     }
 }
 
-// ---- golden kinematics fixture ---------------------------------------------
+// ---- reference FK ----------------------------------------------------------
 
-#[derive(serde::Deserialize)]
-struct Fixture {
-    cases: Vec<FixtureCase>,
-}
-
-#[derive(serde::Deserialize)]
-struct FixtureCase {
+struct ReferenceCase {
     q: [f64; NUM_JOINTS],
-    /// Row-major 4x4 TCP pose \[m\] from the Python/Pinocchio reference.
-    fk: Vec<f64>,
+    /// Row-major 4x4 TCP pose \[m\] from `par6_kin::Kin` on the same URDF
+    /// variant the daemon loads for the configured gripper.
+    fk: [f64; 16],
 }
 
-/// The golden fixture for the URDF variant the configured gripper
-/// selects — the same file `par6-kin`'s conformance test uses.
-fn golden_fixture() -> Fixture {
-    let gripper = par6_config::RobotConfig::load(&shipped_config())
-        .expect("PAR6 config")
+/// A configuration inside every hard joint window with its TCP pose as
+/// the engine computes it in-process: what the daemon's STATUS must
+/// carry once the arm is teleported there.
+fn reference_case() -> ReferenceCase {
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("PAR6 config");
+    let gripper = bundle
         .robot
-        .active_gripper;
-    let name = if gripper.eq_ignore_ascii_case("flange") {
-        "par6_flange"
-    } else if gripper.starts_with("MSG") {
-        "par6_msg"
-    } else if gripper.starts_with("SSG48") {
-        "par6_ssg48"
-    } else {
-        panic!("no golden fixture for configured gripper {gripper}");
-    };
-    let path = repo_root().join(format!("tests/golden/kinematics/{name}.json"));
-    let text = std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display()));
-    serde_json::from_str(&text).expect("golden kinematics fixture")
-}
-
-/// The first golden case the arm can actually be teleported to: the
-/// fixtures sample the whole joint space, teleport clamps to the hard
-/// window, and a clamped pose would no longer match the golden FK.
-fn reachable_golden_case() -> FixtureCase {
-    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    golden_fixture()
-        .cases
-        .into_iter()
-        .find(|c| {
-            c.q.iter()
-                .zip(cfg.joints.iter())
-                .all(|(q, j)| *q >= j.limits.hard_min_rad && *q <= j.limits.hard_max_rad)
-        })
-        .expect("at least one golden case inside the hard joint window")
+        .robot
+        .active_gripper
+        .trim()
+        .to_ascii_uppercase();
+    let variant = par6_kin::GripperVariant::resolve(
+        &gripper,
+        bundle
+            .active_gripper()
+            .and_then(|g| g.urdf_variant.as_deref()),
+    );
+    let mut kin = par6_kin::Kin::load(&common::assets_dir(), variant).expect("reference model");
+    let mut q = [0.0; NUM_JOINTS];
+    for (out, deg) in q.iter_mut().zip(HOLD_POSE_DEG.iter()) {
+        *out = deg.to_radians();
+    }
+    for (v, j) in q.iter().zip(bundle.robot.joints.iter()) {
+        assert!(
+            *v >= j.limits.hard_min_rad && *v <= j.limits.hard_max_rad,
+            "the reference pose must sit inside the hard joint window"
+        );
+    }
+    let mut fk = [0.0; 16];
+    kin.fk(&q, &mut fk).expect("reference FK");
+    ReferenceCase { q, fk }
 }
 
 // ---- cartesian geometry helpers --------------------------------------------
@@ -200,8 +191,8 @@ fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
 /// Wire pose `[x y z mm, rx ry rz deg]` from a STATUS pose matrix
 /// (row-major 4x4, mm) with the translation replaced.
 ///
-/// Decoded the way a client decodes it — `pinokin.so3_rpy`, the wire's
-/// intrinsic-XYZ convention, written out here
+/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
+/// convention, written out here
 /// rather than borrowed from the runtime so the two halves of the
 /// round trip cannot agree on the wrong thing.
 fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
@@ -250,7 +241,7 @@ const MOVE_S: f64 = 15.0;
 // ---- tests -----------------------------------------------------------------
 
 /// The whole cartesian surface over one session: the FK hook publishes
-/// the golden TCP pose, `move_l` holds the straight line where a
+/// the reference TCP pose, `move_l` holds the straight line where a
 /// joint-space `move_j_pose` to the same target bows far off it,
 /// `jog_l` drives the TCP through the jacobian, and an out-of-workspace
 /// target fails both cartesian moves with IK_TARGET_UNREACHABLE instead
@@ -262,8 +253,8 @@ fn cartesian_surface_over_protocol_v2() {
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
 
-    // --- FK hook: STATUS carries the golden TCP pose for a known q.
-    let case = reachable_golden_case();
+    // --- FK hook: STATUS carries the engine's TCP pose for a known q.
+    let case = reference_case();
     let mut case_deg = [0.0; NUM_JOINTS];
     for (out, rad) in case_deg.iter_mut().zip(case.q.iter()) {
         *out = rad.to_degrees();
@@ -271,25 +262,25 @@ fn cartesian_surface_over_protocol_v2() {
     enable_and_teleport(&rig, &mut c, case_deg);
     // The arm reports through 14-bit encoders, so it lands within a
     // quantum (~2e-5 rad) of the commanded configuration, not on it.
-    let s = rig.wait_status("pose for the golden configuration", |s| {
+    let s = rig.wait_status("pose for the reference configuration", |s| {
         s.angles
             .iter()
             .zip(case_deg.iter())
             .all(|(a, b)| (a - b).abs() < 0.01)
     });
-    for (k, golden) in case.fk.iter().enumerate() {
+    for (k, reference) in case.fk.iter().enumerate() {
         // Tolerances leave ~100x margin over that quantum, and are still
         // orders of magnitude below what any convention slip (frame, row
         // order, rpy composition) would cost.
-        // Columns 3/7/11 are the translation (golden in m, wire in mm).
+        // Columns 3/7/11 are the translation (reference in m, wire in mm).
         let (want, tol) = if k % 4 == 3 && k < 12 {
-            (golden * 1000.0, 0.05)
+            (reference * 1000.0, 0.05)
         } else {
-            (*golden, 5e-4)
+            (*reference, 5e-4)
         };
         assert!(
             (s.pose[k] - want).abs() < tol,
-            "STATUS pose element {k} = {} != golden FK {want} (whole matrix {:?})",
+            "STATUS pose element {k} = {} != reference FK {want} (whole matrix {:?})",
             s.pose[k],
             s.pose
         );
@@ -1708,6 +1699,17 @@ fn tcp_speeds_over(path: &[Status], window: usize) -> Vec<([f64; 3], f64)> {
     path.windows(window)
         .filter_map(|w| {
             let (first, last) = (&w[0], &w[window - 1]);
+            // Only a window the test actually received every frame of.
+            // Speed here is the CHORD between the ends over the elapsed
+            // time, so a frame the socket dropped stretches the time
+            // while the chord stays straight — across a corner that
+            // reads as a slowdown that never happened. The broadcast
+            // sequence says which windows are whole, so a dropped frame
+            // costs a sample instead of corrupting one.
+            let span = last.seq.checked_sub(first.seq)?;
+            if span != (window - 1) as u64 {
+                return None;
+            }
             let dt = last.mono_time_ns.checked_sub(first.mono_time_ns)? as f64 * 1e-9;
             (dt > 0.0).then(|| {
                 (
@@ -2246,6 +2248,8 @@ fn a_tcp_offset_between_blended_moves_breaks_the_chain() {
 /// `completed_index` ends on the second of them.
 #[test]
 fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
+    /// The server's blend hold, from `ServerConfig::default`.
+    const BLEND_HOLD_MS: f64 = 100.0;
     const BLEND_MM: f64 = 60.0;
     const LEG_MM: f64 = 150.0;
     /// Duration of each leg \[s\]. Slow, for the same reason the other
@@ -2325,8 +2329,12 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     // --- the same corner, blended.
     let s = curve_start(&rig, &mut c);
     let (first, corner, finish) = leg(&s, 5003, Some(BLEND_MM));
-    let i1 = c.ok_index(&first);
-    let i2 = c.ok_index(&second(&s, 5004, finish));
+    // Both moves go out back to back: the hold the blend depends on is
+    // wall-clock, and a reply round trip between them would spend it.
+    let sent_first = Instant::now();
+    let indices = c.ok_indices(&[first.clone(), second(&s, 5004, finish)]);
+    let (i1, i2) = (indices[0], indices[1]);
+    let send_gap = sent_first.elapsed();
     let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(ok, "the blended first leg must complete ok, got {detail:?}");
@@ -2355,12 +2363,32 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
          {BLEND_MM} mm zone that was asked for"
     );
     // And it is a fly-by, not a stop-and-go.
+    //
+    // Corner speed is the SLOWEST sample through the corner, so a single
+    // tick the daemon could not hold sinks it. That is a real stall, not
+    // a measurement artefact — and it says the box was too loaded to
+    // measure on, not that the blend stopped. The loop's own overrun
+    // count is what tells the two apart, so it goes in the message.
     let (blend_corner_speed, blend_mean) = corner_and_mean_speed(&blended, corner, 40.0);
+    let loop_note = match c.query(&Command::LoopStats) {
+        QueryResult::LoopStats(s) => format!(
+            "the RT loop overran {} of {} ticks (p99 {:.2} ms against a {:.2} ms budget)",
+            s.overrun_count,
+            s.loop_count,
+            s.p99_period_s * 1e3,
+            1e3 / s.target_hz
+        ),
+        other => format!("loop stats unavailable: {other:?}"),
+    };
     assert!(
         blend_corner_speed > 0.3 * blend_mean && blend_corner_speed > 5.0,
         "the blended corner slowed to {blend_corner_speed:.2} mm/s against a mean of \
          {blend_mean:.2} mm/s (unblended: {sharp_corner_speed:.2} of {sharp_mean:.2}) — \
-         a blend that stops is not a blend"
+         a blend that stops is not a blend. The successor was sent {:.0} ms after the \
+         first against a {:.0} ms blend hold — past it, the first move runs alone and \
+         this is the test host being starved, not the blend. {loop_note}",
+        send_gap.as_secs_f64() * 1e3,
+        BLEND_HOLD_MS
     );
     // Motion time from the broadcast's own monotonic clock — the
     // wall-clock of the collection loop is a fixed window and cannot

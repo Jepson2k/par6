@@ -15,9 +15,6 @@
 //!   boot-time [`convert::JointConversion::determine_sector`], home
 //!   reference updates, and the Nm↔mA factor with `int()`-style
 //!   truncation toward zero at the encode boundary.
-//!
-//! Golden byte-exact vectors for the codec live in `tests/golden/can/`
-//! (checked by `tests/golden_can.rs`).
 
 pub mod codec;
 pub mod convert;

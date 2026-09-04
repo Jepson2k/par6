@@ -64,6 +64,10 @@ pub struct Options {
     pub config: Option<PathBuf>,
     /// Explicit `assets/par6_description` tree (`--assets` / `PAR6_ASSETS`).
     pub assets: Option<PathBuf>,
+    /// Where `package://` mesh URIs resolve. Set when the assets tree is
+    /// an installed package whose URDFs reference their meshes by package
+    /// URI rather than a repo checkout's `<assets>/URDF` layout.
+    pub package_dir: Option<PathBuf>,
     /// Run the sim on the torque-level dynamics plant (`--sim-dynamics` /
     /// `PAR6_SIM_DYNAMICS`); requires feature `ffi`.
     pub sim_dynamics: bool,
@@ -200,7 +204,15 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             Err(format!("config file not found: {}", p.display()))
         };
     }
-    let mut candidates = vec![PathBuf::from("config/PAR6.toml")];
+    // The one search order for everything that loads a config — the
+    // daemon, the Python binding, the preview: the environment, a repo
+    // checkout around the binary, then the deploy bundle's install
+    // location on a control box.
+    let mut candidates = Vec::new();
+    if let Ok(p) = std::env::var("PAR6_CONFIG") {
+        candidates.push(PathBuf::from(p));
+    }
+    candidates.push(PathBuf::from("config/PAR6.toml"));
     if let Ok(exe) = std::env::current_exe() {
         // target/{debug,release}/par6d → repo config/ two levels up.
         if let Some(dir) = exe.parent() {
@@ -208,6 +220,7 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
             candidates.push(dir.join("../../../config/PAR6.toml"));
         }
     }
+    candidates.push(PathBuf::from("/etc/par6/PAR6.toml"));
     for c in &candidates {
         if c.is_file() {
             return Ok(c.clone());

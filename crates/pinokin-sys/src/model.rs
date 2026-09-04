@@ -258,6 +258,62 @@ impl Model {
         Self::check_status(status)
     }
 
+    /// Moving bodies in the model (one per joint after the universe).
+    pub fn num_bodies(&self) -> usize {
+        let n = unsafe { ffi::par6_kin_num_bodies(self.raw.as_ptr()) };
+        usize::try_from(n).unwrap_or(0)
+    }
+
+    /// Gravity regressor `Y(q)` into `out` (`nq * 4 * num_bodies`,
+    /// row-major): the linear-in-parameters form of [`Self::gravity_into`],
+    /// `G(q) = Y(q) * [m_i, m_i c_i]_i` over each body's mass and first
+    /// moment in its joint frame.
+    pub fn gravity_regressor_into(&mut self, q: &[f64], out: &mut [f64]) -> Result<(), Error> {
+        self.check_len(q, self.nq)?;
+        self.check_len(out, self.nq * 4 * self.num_bodies())?;
+        let status = unsafe {
+            ffi::par6_kin_gravity_regressor(self.raw.as_ptr(), q.as_ptr(), out.as_mut_ptr())
+        };
+        Self::check_status(status)
+    }
+
+    /// Body `body`'s `[m, m cx, m cy, m cz]` in its joint frame, as the
+    /// model currently carries it.
+    pub fn body_inertial(&self, body: usize) -> Result<[f64; 4], Error> {
+        let mut out = [0.0; 4];
+        let body = i32::try_from(body).map_err(|_| Error::Status(ffi::PAR6_ERR_INVALID_ARG))?;
+        let status =
+            unsafe { ffi::par6_kin_body_inertial(self.raw.as_ptr(), body, out.as_mut_ptr()) };
+        Self::check_status(status).map(|()| out)
+    }
+
+    /// The create-time tool's `[m, m c]` contribution to the payload
+    /// joint's body (zeros without a tool mass).
+    pub fn tool_inertial(&self) -> Result<[f64; 4], Error> {
+        let mut out = [0.0; 4];
+        let status = unsafe { ffi::par6_kin_tool_inertial(self.raw.as_ptr(), out.as_mut_ptr()) };
+        Self::check_status(status).map(|()| out)
+    }
+
+    /// Name of the joint carrying body `body`.
+    pub fn joint_name(&self, body: usize) -> Result<String, Error> {
+        let body = i32::try_from(body).map_err(|_| Error::Status(ffi::PAR6_ERR_INVALID_ARG))?;
+        let mut buf = [0 as core::ffi::c_char; 128];
+        // The shim always NUL-terminates within the buffer and returns the
+        // full length, so a name longer than this comes back truncated
+        // rather than lost. Read as a C string: `c_char` is signed on some
+        // targets and unsigned on others, so a per-byte cast is either
+        // required or redundant depending on where this compiles.
+        let n = unsafe {
+            ffi::par6_kin_joint_name(self.raw.as_ptr(), body, buf.as_mut_ptr(), buf.len() as i32)
+        };
+        if n < 0 {
+            return Err(Error::Status(n));
+        }
+        let name = unsafe { core::ffi::CStr::from_ptr(buf.as_ptr()) };
+        Ok(name.to_string_lossy().into_owned())
+    }
+
     /// Gravity torque G(q) — RNEA at zero velocity/acceleration — into `out`.
     pub fn gravity_into(&mut self, q: &[f64], out: &mut [f64]) -> Result<(), Error> {
         self.check_len(q, self.nq)?;

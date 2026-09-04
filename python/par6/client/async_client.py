@@ -19,15 +19,12 @@ import atexit
 import contextlib
 import copy
 import logging
-import math
-import os
 import time
 import weakref
-from collections.abc import AsyncGenerator, Callable, Iterable, Sequence
+from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
-import numpy as np
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
@@ -35,136 +32,50 @@ from waldoctl.status import (
 )
 from waldoctl.status import (
     ActivityResult,
-    Inertia6,
     LoopStatsResult,
+    PayloadEstimate,
     PayloadResult,
     PingResult,
     ToolResult,
 )
 from waldoctl.tools import ToolSpec, ToolStatus
-from waldoctl.tools import ToolState as WToolState
 from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
 from par6._par6 import CoreClient, RobotWireError
 
+from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
-from ..protocol.constants import (
-    NUM_JOINTS,
-    CompletionPolicy,
-    Frame,
-)
+from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ._wire import (
+    blend as _blend,
+)
+from ._wire import (
+    estimate_from_dict,
+    jog_j_speeds,
+    jog_l_velocities,
+    payload_from_dict,
+    shape_to_wire,
+    tool_params,
+)
+from ._wire import f6 as _f6
+from ._wire import timing as _timing
+from ._wire import tool_status_from_dict as _tool_status_from_dict
+from ._wire import wire_frame as _wire_frame
 from .errors import RobotError
 
 logger = logging.getLogger(__name__)
-
-_AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
-_FRAMES: dict[str, Frame] = {"WRF": Frame.WRF, "TRF": Frame.TRF}
-
-
-def _axis_index(axis: str) -> int:
-    try:
-        return _AXIS_INDEX[axis]
-    except KeyError:
-        raise ValueError(
-            f"unknown axis {axis!r} (par6 axes: {', '.join(_AXIS_INDEX)})"
-        ) from None
-
 
 #: How long one status_after poll blocks in the pump before re-checking
 #: for shutdown. Frames arrive far faster than this whenever a runtime is
 #: broadcasting; the value only bounds close() latency on a silent link.
 _STATUS_POLL_S = 0.5
 
-
-def _env_str(name: str, default: str) -> str:
-    return os.environ.get(name, default)
-
-
-def _env_int(name: str, default: int) -> int:
-    raw = os.environ.get(name)
-    return int(raw) if raw else default
-
-
-def _wire_frame(frame: WFrame) -> int:
-    try:
-        return int(_FRAMES[frame])
-    except KeyError:
-        raise ValueError(
-            f"unknown frame {frame!r} (par6 supports WRF and TRF)"
-        ) from None
-
-
-def _f6(values: Sequence[float], name: str) -> list[float]:
-    if len(values) != NUM_JOINTS:
-        raise ValueError(f"{name} requires {NUM_JOINTS} values, got {len(values)}")
-    return [float(v) for v in values]
-
-
-def _timing(
-    duration: float | None, speed: float | None
-) -> tuple[float | None, float | None]:
-    """Map the waldoctl duration/speed pair (0/None = unset) onto the wire's
-    exactly-one-of convention.  Neither set means full profile speed."""
-    d = float(duration) if duration else None
-    s = float(speed) if speed else None
-    if d is not None and s is not None:
-        raise ValueError("duration and speed are mutually exclusive")
-    if d is None and s is None:
-        s = 1.0
-    return d, s
-
-
-def _blend(r: float | None) -> float | None:
-    return float(r) if r else None
-
-
-def _no_extra_kwargs(method: str, kwargs: dict[str, Any]) -> None:
-    """The waldoctl ABC lets a backend take extra keyword options; par6
-    takes none, so a misspelled option is refused rather than ignored."""
-    if kwargs:
-        raise TypeError(
-            f"{method}() got unexpected keyword arguments: {sorted(kwargs)}"
-        )
-
-
-def _matrix_to_pose(m: Sequence[float]) -> list[float]:
-    """Flattened row-major 4x4 (translation in mm) -> [x, y, z, rx, ry, rz] deg.
-
-    RPY convention: R = Rx(rx) @ Ry(ry) @ Rz(rz) (intrinsic XYZ), the
-    decomposition ``pinokin.so3_rpy`` performs -- so a pose read here is the
-    pose :meth:`par6.robot.Robot.fk` reports, the pose :meth:`move_l` re-encodes
-    and the pose a frontend decoding the STATUS matrix itself sees.
-    """
-    x, y, z = m[3], m[7], m[11]
-    r00, r01, r02 = m[0], m[1], m[2]
-    r10, r11, r12 = m[4], m[5], m[6]
-    r22 = m[10]
-    cp = math.hypot(r12, r22)
-    if cp > 1e-9:
-        roll = math.atan2(-r12, r22)
-        yaw = math.atan2(-r01, r00)
-    else:  # gimbal lock (ry = +/-90 deg): only roll -/+ yaw is observable
-        roll = math.atan2(math.copysign(1.0, r02) * r10, r11)
-        yaw = 0.0
-    pitch = math.atan2(r02, cp)
-    return [x, y, z, math.degrees(roll), math.degrees(pitch), math.degrees(yaw)]
-
-
-def _tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
-    if raw is None:
-        return None
-    return ToolStatus(
-        key=canonical_tool_key(raw["key"]),
-        variant_key=raw["variant_key"],
-        state=WToolState(raw["state"]),
-        engaged=raw["engaged"],
-        part_detected=raw["part_detected"],
-        fault_code=raw["fault_code"],
-        positions=tuple(raw["positions"]),
-        channels=tuple(raw["channels"]),
-    )
+#: The shipped command endpoint, reported by :attr:`AsyncRobotClient.host`
+#: / ``port`` before the engine has resolved its own defaults.
+_DEFAULT_HOST = "127.0.0.1"
+_DEFAULT_PORT = 6001
 
 
 def copy_status(buf: StatusBuffer) -> StatusBuffer:
@@ -239,15 +150,6 @@ def _close_leftover_cores() -> None:
             core.close()
 
 
-def payload_from_dict(raw: dict[str, Any]) -> PayloadResult:
-    """A runtime payload reading as the contract's dataclass."""
-    return PayloadResult(
-        mass=float(raw["mass"]),
-        com=cast("tuple[float, float, float]", tuple(float(v) for v in raw["com"])),
-        inertia=cast("Inertia6", tuple(float(v) for v in raw["inertia"])),
-    )
-
-
 class AsyncRobotClient(_RobotClientABC):
     """Async client for the par6d runtime.
 
@@ -271,26 +173,18 @@ class AsyncRobotClient(_RobotClientABC):
         mtu: int | None = None,
         tool_specs: Iterable[ToolSpec] | None = None,
     ) -> None:
-        self._host = host or _env_str("PAR6_HOST", "127.0.0.1")
-        self._port = port if port is not None else _env_int("PAR6_COMMAND_PORT", 6001)
+        # Every None falls through to the engine client's own ladder
+        # (``PAR6_*`` environment, then the shipped defaults).
+        self._host = host
+        self._port = port
         self.timeout = timeout
         self.retries = retries
-        self._status_transport_kind = (
-            status_transport or _env_str("PAR6_STATUS_TRANSPORT", "MULTICAST")
-        ).upper()
-        self._status_port = (
-            status_port
-            if status_port is not None
-            else _env_int("PAR6_STATUS_PORT", 6002)
-        )
-        self._mcast_group = mcast_group or _env_str(
-            "PAR6_STATUS_MCAST_GROUP", "239.255.0.71"
-        )
-        self._mcast_iface = mcast_iface or _env_str("PAR6_STATUS_MCAST_IF", "127.0.0.1")
-        self._status_unicast_host = status_unicast_host or _env_str(
-            "PAR6_STATUS_UNICAST_HOST", "127.0.0.1"
-        )
-        self.mtu = mtu if mtu is not None else _env_int("PAR6_MTU", 1400)
+        self._status_transport_kind = status_transport
+        self._status_port = status_port
+        self._mcast_group = mcast_group
+        self._mcast_iface = mcast_iface
+        self._status_unicast_host = status_unicast_host
+        self.mtu = mtu
 
         self._core: CoreClient | None = None
         self._core_lock = asyncio.Lock()
@@ -308,6 +202,7 @@ class AsyncRobotClient(_RobotClientABC):
         self._active_tool_key: str | None = None
         self._active_variant_key = ""
         self._bound_tools: dict[str, ToolSpec] = {}
+        self._estimation_config: str | None = None
         if tool_specs is None:
             # A bare client (what a user script constructs) binds the packaged
             # tools itself, so ``rbt.select_tool(...); rbt.tool.close()`` works
@@ -326,11 +221,15 @@ class AsyncRobotClient(_RobotClientABC):
 
     @property
     def host(self) -> str:
-        return self._host
+        if self._host is not None:
+            return self._host
+        return self._core.endpoint()[0] if self._core is not None else _DEFAULT_HOST
 
     @property
     def port(self) -> int:
-        return self._port
+        if self._port is not None:
+            return self._port
+        return self._core.endpoint()[1] if self._core is not None else _DEFAULT_PORT
 
     @property
     def status_seq_gaps(self) -> int:
@@ -349,37 +248,33 @@ class AsyncRobotClient(_RobotClientABC):
             if self._core is not None:
                 return self._core
             core = await CoreClient.connect(
-                self._host,
-                self._port,
-                self.timeout,
-                self.retries,
-                self._status_transport_kind,
-                self._status_port,
-                self._mcast_group,
-                self._mcast_iface,
-                self._status_unicast_host,
-                self.mtu,
+                host=self._host,
+                port=self._port,
+                timeout=self.timeout,
+                retries=self.retries,
+                status_transport=self._status_transport_kind,
+                status_port=self._status_port,
+                mcast_group=self._mcast_group,
+                mcast_iface=self._mcast_iface,
+                status_unicast_host=self._status_unicast_host,
+                mtu=self.mtu,
             )
             self._core = core
             self._status_task = asyncio.create_task(self._status_pump())
-            self._status_task.add_done_callback(self._pump_ended)
+            host, port = core.endpoint()
+            kind, status_port = core.status_endpoint()
             logger.info(
                 "par6 client endpoint: %s:%s (status %s @ port %s)",
-                self._host,
-                self._port,
-                self._status_transport_kind,
-                self._status_port,
+                host,
+                port,
+                kind,
+                status_port,
             )
             return core
 
     async def _status_pump(self) -> None:
         """Fill the ONE shared buffer from the engine's STATUS stream and
-        wake every waiter, preserving the generation/event contract.
-
-        A frame the buffer cannot decode (an enum value this package does
-        not know, a width it did not expect) is dropped and logged; the
-        stream carries on with the next one.
-        """
+        wake every waiter, preserving the generation/event contract."""
         core = self._core
         assert core is not None
         last_seq = -1
@@ -395,15 +290,7 @@ class AsyncRobotClient(_RobotClientABC):
             if frame is None:
                 continue
             last_seq = frame["seq"]
-            try:
-                update_status_from_dict(self._shared_status, frame)
-            except (ValueError, KeyError, TypeError, IndexError):
-                logger.warning(
-                    "dropping STATUS frame seq %s: not decodable by this package",
-                    last_seq,
-                    exc_info=True,
-                )
-                continue
+            update_status_from_dict(self._shared_status, frame)
             # The wire carries the config spelling of the tool key; every
             # consumer (and ``waldoctl.ToolSpec``, which upper-cases what it
             # is given) indexes tools by the canonical one.
@@ -411,17 +298,6 @@ class AsyncRobotClient(_RobotClientABC):
             tool_status.key = canonical_tool_key(tool_status.key)
             self._status_generation += 1
             self._status_event.set()
-
-    def _pump_ended(self, task: asyncio.Task) -> None:
-        """The status pump stopped: a cancellation at close is expected,
-        anything else is logged loudly and the waiters are woken so they
-        re-check rather than hang."""
-        if task.cancelled() or self._closed:
-            return
-        exc = task.exception()
-        if exc is not None:
-            logger.error("the STATUS pump stopped: %r", exc)
-        self._status_event.set()
 
     async def _call(self, awaitable: Any) -> Any:
         """Await an engine call, translating its structured refusals into
@@ -438,18 +314,14 @@ class AsyncRobotClient(_RobotClientABC):
             return
         self._closed = True
         self._status_event.set()
-        try:
-            if self._status_task is not None:
-                self._status_task.cancel()
-                # A pump that already died re-raises here; the engine
-                # client below is released either way.
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await self._status_task
-                self._status_task = None
-        finally:
-            if self._core is not None:
-                self._core.close()
-                self._core = None
+        if self._status_task is not None:
+            self._status_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._status_task
+            self._status_task = None
+        if self._core is not None:
+            self._core.close()
+            self._core = None
 
     async def __aenter__(self) -> "AsyncRobotClient":
         if self._closed:
@@ -616,9 +488,60 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_checkpoint("pick_done")
         """
-        return await self.wait_status(
-            lambda s: s.last_checkpoint == label, timeout=timeout
-        )
+        core = await self._ensure_core()
+        return await core.wait_checkpoint(label, timeout)
+
+    async def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus and report every node id, 0..15.
+
+        Each row carries ``node``, ``configured`` (the config lists it),
+        ``present`` (it answered a ping this boot), ``freshness`` (0
+        unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
+        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
+        runtime has swept it.  The reply waits for the scan to settle, so
+        expect a few hundred milliseconds.  Returns None if unreachable.
+
+        Category: Commissioning
+
+        Example:
+            present = [r["node"] for r in rbt.bus_scan() if r["present"]]
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.bus_scan())
+        return None if result is None else list(result["nodes"])
+
+    async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell drive *node* to answer as *new_id* from now on.
+
+        Refused unless the arm is idle or latched with nothing in flight,
+        and — unless ``force`` — unless *node* is a configured drive.  A
+        fresh drive sits at its factory id, which the config does not
+        list, so commissioning one is ``force=True``.  The runtime keeps
+        addressing the id the config names: after renaming a configured
+        node, update the config and restart the daemon.  Persist the new
+        id with :meth:`save_config` or it is lost at power-off.
+
+        Category: Commissioning
+
+        Example:
+            rbt.set_can_id(0, 3, force=True)
+            rbt.save_config(3, force=True)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
+
+    async def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: ask drive *node* to persist its running
+        configuration (id, gains, limits) to its NVM.  Same gate and
+        ``force`` rule as :meth:`set_can_id`.
+
+        Category: Commissioning
+
+        Example:
+            rbt.save_config(3)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.save_config(int(node), bool(force)))
 
     async def wait_motion(
         self,
@@ -640,44 +563,18 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_motion()
         """
-        await self._ensure_core()
-        last_angles: np.ndarray | None = None
-        settle_start: float | None = None
-        motion_started = False
-        start = time.monotonic()
-        try:
-            async with asyncio.timeout(timeout):
-                async for status in self.stream_status_shared():
-                    max_speed = float(np.abs(status.speeds).max())
-                    if last_angles is None:
-                        last_angles = status.angles.copy()
-                        max_delta = 0.0
-                    else:
-                        max_delta = float(np.abs(status.angles - last_angles).max())
-                        last_angles[:] = status.angles
-                    now = time.monotonic()
-                    moving = (
-                        max_speed >= speed_threshold or max_delta >= angle_threshold
-                    )
-                    if not motion_started:
-                        if moving or now - start > motion_start_timeout:
-                            motion_started = True
-                            settle_start = None
-                        if moving:
-                            continue
-                    if motion_started:
-                        if moving:
-                            settle_start = None
-                        elif settle_start is None:
-                            settle_start = now
-                        elif now - settle_start > settle_window:
-                            return True
-        except TimeoutError:
-            return False
-        return False
+        core = await self._ensure_core()
+        return await core.wait_motion(
+            float(timeout),
+            float(settle_window),
+            float(speed_threshold),
+            float(angle_threshold),
+            float(motion_start_timeout),
+        )
 
     async def wait_ready(self, timeout: float = 5.0, interval: float = 0.05) -> bool:
-        """Poll ping() until the runtime responds or *timeout* expires."""
+        """Poll ping() every *interval* seconds until the runtime responds
+        or *timeout* expires."""
         deadline = time.monotonic() + timeout
         while True:
             if await self.ping() is not None:
@@ -707,7 +604,7 @@ class AsyncRobotClient(_RobotClientABC):
         wait: bool = False,
         calibrate: bool = False,
         timeout: float = 60.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Move to the robot's home position: the full referencing seek when
         unhomed or when ``calibrate=True``, otherwise a planned return to the
@@ -718,7 +615,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.home()
         """
-        _no_extra_kwargs("home", kwargs)
         core = await self._ensure_core()
         index = await self._call(core.home(calibrate))
         if index >= 0:
@@ -739,7 +635,7 @@ class AsyncRobotClient(_RobotClientABC):
         rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Joint-space move.  *angles* in degrees; ``pose=`` dispatches a
         joint-interpolated move to a Cartesian target instead.
@@ -751,7 +647,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_j(<joint_angles_deg>, speed=0.5)
         """
-        _no_extra_kwargs("move_j", kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         if pose is not None:
@@ -790,7 +685,7 @@ class AsyncRobotClient(_RobotClientABC):
         rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Linear Cartesian move to [x, y, z, rx, ry, rz] (mm/deg).
 
@@ -801,7 +696,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_l(<tcp_pose_mm_deg>, speed=0.5)
         """
-        _no_extra_kwargs("move_l", kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         index = await self._call(
@@ -830,7 +724,7 @@ class AsyncRobotClient(_RobotClientABC):
         rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Circular arc through *via* to *end*.
 
@@ -842,7 +736,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_c(<via_pose>, <end_pose>, speed=0.5)
         """
-        _no_extra_kwargs("move_c", kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         index = await self._call(
@@ -892,7 +785,7 @@ class AsyncRobotClient(_RobotClientABC):
         rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Cubic spline move through waypoints (auto-chunked when large).
 
@@ -904,7 +797,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_s(<waypoints>, speed=0.5)
         """
-        _no_extra_kwargs("move_s", kwargs)
         return await self._move_multi(
             "move_s", waypoints, frame, duration, speed, accel, rel, wait, timeout
         )
@@ -920,18 +812,9 @@ class AsyncRobotClient(_RobotClientABC):
         rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
-        **kwargs: Any,
+        **wait_kwargs: Any,
     ) -> int:
         """Process move with auto-blending through waypoints (auto-chunked).
-
-        The TCP holds ONE speed along the whole path rather than running
-        as fast as the joints allow moment to moment — which is what
-        separates this from a ``move_s`` through the same waypoints, and
-        what a process like dispensing or welding needs. ``speed`` is
-        therefore a fraction of the fastest constant speed the joints
-        permit on this path: the whole path runs at the rate its
-        steepest stretch allows. A corner too sharp to turn at that rate
-        slows the move down; it does not fail it.
 
         With ``rel=True``, every waypoint is a delta from the pose the
         move starts at (each against the start, not chained).
@@ -941,7 +824,6 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.move_p(<waypoints>, speed=0.5)
         """
-        _no_extra_kwargs("move_p", kwargs)
         return await self._move_multi(
             "move_p", waypoints, frame, duration, speed, accel, rel, wait, timeout
         )
@@ -1021,32 +903,14 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.jog_j(<joint_index>, speed=0.5, duration=1.0)
         """
-        speed_arr = [0.0] * NUM_JOINTS
-        if joints is not None and speeds is not None:
-            if len(joints) != len(speeds):
-                raise ValueError(
-                    f"jog_j got {len(joints)} joints and {len(speeds)} speeds"
-                )
-            for j, s in zip(joints, speeds):
-                # An out-of-range index must not reach the array: a
-                # negative one lands on a different physical joint through
-                # Python's wrap-around, and the arm moves the wrong axis
-                # with nothing raised.
-                if not 0 <= j < NUM_JOINTS:
-                    raise ValueError(
-                        f"jog_j joint {j} out of range 0..{NUM_JOINTS - 1}"
-                    )
-                speed_arr[j] = float(s)
-        elif joint >= 0:
-            if joint >= NUM_JOINTS:
-                raise ValueError(
-                    f"jog_j joint {joint} out of range 0..{NUM_JOINTS - 1}"
-                )
-            speed_arr[joint] = float(speed)
-        else:
-            raise ValueError("jog_j requires either joint= or joints=/speeds=")
         core = await self._ensure_core()
-        return await self._call(core.jog_j(speed_arr, float(duration), float(accel)))
+        return await self._call(
+            core.jog_j(
+                jog_j_speeds(joint, speed, joints, speeds),
+                float(duration),
+                float(accel),
+            )
+        )
 
     async def jog_l(
         self,
@@ -1070,21 +934,14 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.jog_l("WRF", "X", speed=0.5, duration=1.0)
         """
-        velocities = [0.0] * NUM_JOINTS
-        if axes is not None and speeds_list is not None:
-            if len(axes) != len(speeds_list):
-                raise ValueError(
-                    f"jog_l got {len(axes)} axes and {len(speeds_list)} speeds"
-                )
-            for a, s in zip(axes, speeds_list):
-                velocities[_axis_index(a)] = float(s)
-        elif axis is not None:
-            velocities[_axis_index(axis)] = float(speed)
-        else:
-            raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
         core = await self._ensure_core()
         return await self._call(
-            core.jog_l(velocities, float(duration), _wire_frame(frame), float(accel))
+            core.jog_l(
+                jog_l_velocities(axis, speed, axes, speeds_list),
+                float(duration),
+                _wire_frame(frame),
+                float(accel),
+            )
         )
 
     async def teleport(
@@ -1178,7 +1035,7 @@ class AsyncRobotClient(_RobotClientABC):
         mass.  Refused (COMM_VALIDATION_ERROR) for negative mass or a
         non-positive-semidefinite inertia.
 
-        Category: Control
+        Category: Configuration
 
         Example:
             rbt.set_payload(1.2, com=(0.0, 0.0, 0.05))
@@ -1188,8 +1045,74 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_payload(float(mass), [float(v) for v in com], _inertia6(inertia))
         )
 
+    async def estimate_payload(
+        self,
+        spread: float = 0.5,
+        ridge: float = 0.01,
+        declare: bool = True,
+    ) -> PayloadEstimate:
+        """Estimate what the arm is carrying, and tell the runtime.
+
+        Mass and centre of mass, from the torque the wrist holds.  Not
+        the inertia tensor — static poses cannot excite it — so the
+        runtime carries the result as a point mass, which is what most
+        payloads are well enough described by.
+
+        Call it after closing on a part whose mass you do not know.  The
+        WRIST swings where the arm already stands — the payload's lever
+        arm about the wrist is what makes its first moment observable —
+        so nothing below moves, the pick is not disturbed, and the whole
+        thing takes seconds.
+
+        The runtime's payload is cleared first: the load is estimated
+        from the torque the *unloaded* model cannot account for, so a
+        payload already declared would be compensated away and come back
+        as nothing.  With *declare* (the default) the result is sent
+        straight back as the new payload, so the gravity model carries
+        the part from the next tick.
+
+        *spread* is how far each wrist joint swings either way (rad);
+        widen it when the wrist has room and the result reads noisy.
+        *ridge* holds back parameters the poses did not measure.
+
+        Raises ``RuntimeError`` if the wrist has no room to swing, or if
+        *declare* is set and the poses did not actually measure a mass.
+
+        Category: Configuration
+
+        Example:
+            found = rbt.estimate_payload()
+            print(f"holding {found.mass:.3f} kg")
+        """
+        core = await self._ensure_core()
+        # The unloaded model has to be the DAEMON's arm — its config, its
+        # fitted gripper — not the wheel's packaged default. A box wearing
+        # a different gripper than the package assumes would otherwise
+        # have the mass difference fitted as payload and declared on top
+        # of the tool the daemon already carries.
+        # Sampled once: the daemon's config cannot change without a restart.
+        if self._estimation_config is None:
+            config = _cfg.data_root() / "config" / "PAR6.toml"
+            bundle = await self.config_bundle()
+            if bundle:
+                config = _cfg.materialize_bundle(bundle)
+            self._estimation_config = str(config)
+        raw = await self._call(
+            core.estimate_payload(
+                self._estimation_config,
+                str(_cfg.data_root()),
+                str(_cfg.package_search_dir()),
+                float(spread),
+                float(ridge),
+                bool(declare),
+            )
+        )
+        return estimate_from_dict(raw)
+
     async def payload(self) -> PayloadResult | None:
-        """The effective runtime payload (zeros = none).  Returns None if
+        """The effective runtime payload.
+
+        Zeros mean the arm is carrying nothing.  Returns None if
         unreachable.
 
         Category: Query
@@ -1258,9 +1181,8 @@ class AsyncRobotClient(_RobotClientABC):
 
         Category: Control
         """
-        if self._status_generation == 0:
-            await self.wait_status(lambda _s: True, timeout=timeout)
-        return self._shared_status.freedrive
+        core = await self._ensure_core()
+        return await core.is_freedrive(float(timeout))
 
     async def reset(self) -> int:
         """Clear a latched protective stop, re-enabling motion.
@@ -1319,58 +1241,6 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.select_profile(profile.upper()))
 
-    async def bus_scan(self) -> list[dict] | None:
-        """Rescan the CAN bus and report every node id, 0..15.
-
-        Each row carries ``node``, ``configured`` (the config lists it),
-        ``present`` (it answered a ping this boot), ``freshness`` (0
-        unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
-        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
-        runtime has swept it.  The reply waits for the scan to settle, so
-        expect a few hundred milliseconds.  Returns None if unreachable.
-
-        Category: Commissioning
-
-        Example:
-            present = [r["node"] for r in rbt.bus_scan() if r["present"]]
-        """
-        core = await self._ensure_core()
-        result = await self._call(core.bus_scan())
-        return None if result is None else list(result["nodes"])
-
-    async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
-        """Commissioning: tell drive *node* to answer as *new_id* from now on.
-
-        Refused unless the arm is idle or latched with nothing in flight,
-        and — unless ``force`` — unless *node* is a configured drive.  A
-        fresh drive sits at its factory id, which the config does not
-        list, so commissioning one is ``force=True``.  The runtime keeps
-        addressing the id the config names: after renaming a configured
-        node, update the config and restart the daemon.  Persist the new
-        id with :meth:`save_config` or it is lost at power-off.
-
-        Category: Commissioning
-
-        Example:
-            rbt.set_can_id(0, 3, force=True)
-            rbt.save_config(3, force=True)
-        """
-        core = await self._ensure_core()
-        return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
-
-    async def save_config(self, node: int, *, force: bool = False) -> int:
-        """Commissioning: ask drive *node* to persist its running
-        configuration (id, gains, limits) to its NVM.  Same gate and
-        ``force`` rule as :meth:`set_can_id`.
-
-        Category: Commissioning
-
-        Example:
-            rbt.save_config(3)
-        """
-        core = await self._ensure_core()
-        return await self._call(core.save_config(int(node), bool(force)))
-
     async def enter_flashing(self, assertion: str) -> int:
         """Hand the CAN bus to a firmware flasher (bus-silent FLASHING).
 
@@ -1415,15 +1285,14 @@ class AsyncRobotClient(_RobotClientABC):
         kd: float,
         ilim_ma: float,
         velocity_limit_ticks_s: float,
-        voltage_limit_mv: int,
+        voltage_limit_mv: int = 0,
     ) -> int:
         """Push one drive node's tuning live, through the same stored
         config path a boot pass uses (so reconnect resends keep it).
 
         Every gain is required — the frame replaces the node's whole
-        tuple, so a partial call would silently zero what it omitted;
-        ``voltage_limit_mv`` included, since ``0`` there means "use VBUS"
-        and strips a joint's configured ceiling.  The node id must be a
+        tuple, so a partial call would silently zero what it omitted.
+        ``voltage_limit_mv=0`` means "use VBUS".  The node id must be a
         configured drive (a joint node, or the gripper node when a CAN
         gripper is fitted); anything else raises :class:`RobotError`.
 
@@ -1432,8 +1301,7 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.set_pid_gains(2, kpp=9.0, kpv=0.05, kiv=0.005, kpiq=1.2,
                               kiiq=1.0, kp=0.12, kd=0.002, ilim_ma=2200,
-                              velocity_limit_ticks_s=150000,
-                              voltage_limit_mv=6000)
+                              velocity_limit_ticks_s=150000)
         """
         core = await self._ensure_core()
         return await self._call(
@@ -1452,21 +1320,9 @@ class AsyncRobotClient(_RobotClientABC):
             )
         )
 
-    async def set_tcp_offset(
-        self,
-        x: float = 0,
-        y: float = 0,
-        z: float = 0,
-        wait: bool = False,
-        timeout: float = 30.0,
-    ) -> int:
+    async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm, composed on top of the current tool
         transform.  (0, 0, 0) resets; changing tools resets it too.
-
-        Queued: the offset lands at its turn, after every move queued
-        before it has finished and before any move queued after it is
-        planned, so a program reads top to bottom.  Returns the command
-        index; ``TCP_OFFSET`` reports the new value once it completes.
 
         Category: Configuration
 
@@ -1474,8 +1330,7 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_tcp_offset(0, 0, -190)
         """
         core = await self._ensure_core()
-        index = await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
-        return await self._finish_queued(index, wait, timeout)
+        return await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
 
     async def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes.
@@ -1489,21 +1344,8 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_shapes([Box(name="table", x=0.6, y=0.4, z=0.02,
                                 pose=(0.3, 0, -0.01, 0, 0, 0))])
         """
-        wire_shapes = []
-        for shape in shapes:
-            kind, params, pose, collision, margin, name = shape.to_wire()
-            wire_shapes.append(
-                {
-                    "kind": kind,
-                    "params": [float(p) for p in params],
-                    "pose": [float(p) for p in pose],
-                    "collision": bool(collision),
-                    "margin": float(margin) if margin is not None else None,
-                    "name": name,
-                }
-            )
         core = await self._ensure_core()
-        return await self._call(core.set_shapes(wire_shapes))
+        return await self._call(core.set_shapes([shape_to_wire(s) for s in shapes]))
 
     async def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion
@@ -1512,6 +1354,12 @@ class AsyncRobotClient(_RobotClientABC):
         return await self._call(
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
+
+    async def set_recipe(self, name: str) -> int:
+        """Select the telemetry recipe.  Unknown names are refused by the
+        runtime (raises :class:`RobotError`)."""
+        core = await self._ensure_core()
+        return await self._call(core.set_recipe(name))
 
     async def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin).
@@ -1615,7 +1463,9 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         index = await self._call(
             core.tool_action(
-                canonical_tool_key(tool_key), action.strip().lower(), list(params or [])
+                canonical_tool_key(tool_key),
+                action.strip().lower(),
+                tool_params(params),
             )
         )
         return await self._finish_queued(index, wait, timeout)
@@ -1658,10 +1508,7 @@ class AsyncRobotClient(_RobotClientABC):
             pose = rbt.pose()
         """
         core = await self._ensure_core()
-        matrix = await self._call(core.pose(_wire_frame(frame)))
-        if matrix is None:
-            return None
-        return _matrix_to_pose(matrix)
+        return await self._call(core.pose_xyzrpy(_wire_frame(frame)))
 
     async def io(self) -> list[int] | None:
         """Digital I/O state [in1, in2, out1, out2, estop].
@@ -1831,12 +1678,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             pressed = rbt.is_estop_pressed()
         """
-        io_status = await self.io()
-        if not io_status:
-            return False
-        # The e-stop is the LAST slot whatever the box declares, and it
-        # carries the LINE, which reads low while pressed.
-        return io_status[-1] == 0
+        core = await self._ensure_core()
+        return await self._call(core.is_estop_pressed())
 
     async def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
         """Whether every joint is below *threshold_speed* (rad/s).
@@ -1850,10 +1693,8 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             stopped = rbt.is_robot_stopped()
         """
-        speeds = await self.joint_speeds()
-        if not speeds:
-            return False
-        return max(abs(s) for s in speeds) < threshold_speed
+        core = await self._ensure_core()
+        return await self._call(core.is_robot_stopped(float(threshold_speed)))
 
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
@@ -1932,8 +1773,10 @@ class AsyncRobotClient(_RobotClientABC):
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
         ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
-        name) and ``joints`` (per-joint soft limits + EXEC
-        velocity/acceleration).  Returns None if unreachable.
+        name), ``joints`` (per-joint soft limits + EXEC
+        velocity/acceleration), ``active_recipe`` (the running telemetry
+        recipe, or None when telemetry is off) and ``recipes`` (the names
+        :meth:`set_recipe` accepts).  Returns None if unreachable.
 
         Category: Query
 

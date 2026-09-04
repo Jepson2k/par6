@@ -1,9 +1,9 @@
 """Tool specs built from the packaged gripper TOMLs.
 
 Separate from :mod:`par6.robot` so a bare :class:`par6.RobotClient` can bind
-the same tools the ``Robot`` factory does without pulling in pinokin: the
-specs are pure config (TCP transform, stroke, current ceiling) plus the
-action verbs the runtime's ``TOOL_ACTION`` accepts.
+the same tools the ``Robot`` factory does: the specs are pure config (TCP
+transform, stroke, current ceiling) plus the action verbs the runtime's
+``TOOL_ACTION`` accepts.
 
 Geometry is deliberately absent.  par6 ships one URDF tree per fitted
 end-effector (:func:`par6.config.urdf_path`), and in the vendor CAD the
@@ -132,9 +132,8 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
         )
 
 
-def _describe(cfg: dict) -> str:
+def _describe(driver: dict | None) -> str:
     """One-line tool description built from the gripper TOML's own numbers."""
-    driver = cfg.get("driver")
     if driver is None:
         return "Bare flange — passive tool, TCP offset only"
     return (
@@ -151,7 +150,7 @@ def build_tools() -> ToolsCollection:
     ``SELECT_TOOL`` accepts, so a UI that renders the default before the
     first STATUS renders the tool that is actually on the arm.
     """
-    grippers = _cfg.load_gripper_configs()
+    grippers = {g["key"]: g for g in _cfg.config().grippers()}
     fitted = _cfg.fitted_tool_key()
     if fitted not in grippers:
         raise RuntimeError(
@@ -162,17 +161,17 @@ def build_tools() -> ToolsCollection:
     tools: list[ToolSpec] = []
     for key in sorted(grippers, key=lambda k: (k != flange, k)):
         cfg = grippers[key]
-        # From the tool's URDF tree, never from the TOML's DH row — see
-        # :func:`par6.config.flange_to_tcp`.
+        # From the tool's URDF tree, never from the TOML's DH row: the
+        # tree's own ``tcp`` link is where the runtime resolves FK/IK.
         origin, rpy = _cfg.flange_to_tcp(key)
         name = str(cfg["name"])
-        driver = cfg.get("driver")
+        driver = cfg["driver"]
         if driver is None:
             tools.append(
                 PassiveTool(
                     key=key,
                     display_name=name,
-                    description=_describe(cfg),
+                    description=_describe(driver),
                     tcp_origin=origin,
                     tcp_rpy=rpy,
                     tool_type=ToolType.NONE,
@@ -184,7 +183,7 @@ def build_tools() -> ToolsCollection:
             ElectricGripper(
                 key=key,
                 display_name=name,
-                description=_describe(cfg),
+                description=_describe(driver),
                 tcp_origin=origin,
                 tcp_rpy=rpy,
                 position_range=(0.0, 1.0),

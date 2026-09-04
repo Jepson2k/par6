@@ -30,13 +30,6 @@ pub enum ShapeKind {
     Cone,
     /// `radius_x, radius_y, radius_z` \[m\].
     Ellipsoid,
-    /// Half-space `nx, ny, nz, offset`: solid where `n·x <= offset`.
-    ///
-    /// A half-space is unbounded, so coal cannot prune it against a link's
-    /// mesh BVH and scans every triangle: ~35 ms per check versus ~25 µs
-    /// for a large box covering the same region. Prefer a box for floors
-    /// and walls.
-    Plane,
 }
 
 impl ShapeKind {
@@ -49,7 +42,6 @@ impl ShapeKind {
             ShapeKind::Capsule => "capsule",
             ShapeKind::Cone => "cone",
             ShapeKind::Ellipsoid => "ellipsoid",
-            ShapeKind::Plane => "plane",
         }
     }
 
@@ -63,7 +55,6 @@ impl ShapeKind {
             "capsule" => ShapeKind::Capsule,
             "cone" => ShapeKind::Cone,
             "ellipsoid" => ShapeKind::Ellipsoid,
-            "plane" => ShapeKind::Plane,
             _ => return None,
         })
     }
@@ -74,13 +65,12 @@ impl ShapeKind {
             ShapeKind::Sphere => 1,
             ShapeKind::Cylinder | ShapeKind::Capsule | ShapeKind::Cone => 2,
             ShapeKind::Box | ShapeKind::Ellipsoid => 3,
-            ShapeKind::Plane => 4,
         }
     }
 }
 
-/// Widest `params` array any kind uses (`Plane`).
-pub const MAX_SHAPE_PARAMS: usize = 4;
+/// Widest `params` array any kind uses (`Box`, `Ellipsoid`).
+pub const MAX_SHAPE_PARAMS: usize = 3;
 
 /// One workspace shape: a named coal primitive at a world pose.
 #[derive(Debug, Clone, PartialEq)]
@@ -141,7 +131,7 @@ impl Shape {
     /// Rejects kinds waldoctl does not define and param/pose arities that
     /// do not match the kind — the codec validates ranges only, so this is
     /// where the shape vocabulary is actually enforced. Value validity
-    /// (positive dimensions, non-zero plane normal) is enforced when the
+    /// (positive dimensions) is enforced when the
     /// layer is applied, so one malformed shape cannot half-replace a world.
     pub fn from_proto(s: &par6_proto::Shape) -> Result<Self, ShapeError> {
         let kind = ShapeKind::parse(&s.kind).ok_or_else(|| ShapeError::UnknownKind {

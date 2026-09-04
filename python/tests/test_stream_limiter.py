@@ -22,7 +22,6 @@ import pytest
 
 from par6 import config as par6_config
 from par6._par6 import Preview
-from par6.client.dry_run_client import _resolve_engine_paths
 
 DEG = 180.0 / math.pi
 STEP_DEG = 20.0
@@ -31,29 +30,28 @@ WINDOW_S = 6.0
 
 @pytest.fixture(scope="module")
 def preview() -> Preview:
-    """The engine over the packaged config — the same resolution the
-    dry-run client does, so this judges the limiter the runtime ships."""
-    config, assets = _resolve_engine_paths(None)
-    return Preview(config=config, assets=assets)
-
-
-def _stream_velocity_limit(joint: dict) -> float:
-    modes = joint.get("modes", {})
-    return float(
-        modes.get("stream", {}).get("velocity_rad_s", joint["limits"]["velocity_rad_s"])
+    """The engine over the packaged model — the same files the dry-run
+    client loads, so this judges the limiter the runtime ships."""
+    return Preview(
+        config=str(par6_config.data_root() / "config" / "PAR6.toml"),
+        assets=str(par6_config.data_root()),
+        package_dir=str(par6_config.package_search_dir()),
     )
 
 
 def test_the_limiter_converges_without_overshoot_or_hunting(preview: Preview) -> None:
-    cfg = par6_config.load_robot_config()
-    joints = cfg["joints"]
+    # The STREAM limits as the runtime resolves them, per-mode overrides
+    # and hardware ceilings included — not re-derived from the TOML here.
+    cfg = par6_config.config()
+    stream = cfg.limits("stream")
+    names = cfg.joint_names()
     dt = preview.tick_dt_s()
     ticks = int(round(WINDOW_S / dt))
-    rest = [float(v) for v in cfg["robot"]["park_pose_rad"]]
+    rest = [float(v) for v in cfg.park_pose_rad()]
 
-    for j, joint in enumerate(joints):
-        lo = joint["limits"]["soft_min_rad"]
-        hi = joint["limits"]["soft_max_rad"]
+    for j, name in enumerate(names):
+        lo = stream["soft_min"][j]
+        hi = stream["soft_max"][j]
         mid = 0.5 * (lo + hi)
         start = list(rest)
         start[j] = mid
@@ -68,7 +66,6 @@ def test_the_limiter_converges_without_overshoot_or_hunting(preview: Preview) ->
         q = np.array(result["q"])[:, j]
         qd = np.array(result["qd"])[:, j]
         err = q - target[j]
-        name = joint.get("name", f"joint{j + 1}")
 
         finished = result["finished_tick"]
         final_err_deg = abs(float(err[-1])) * DEG
@@ -82,7 +79,7 @@ def test_the_limiter_converges_without_overshoot_or_hunting(preview: Preview) ->
         )
 
         peak_v = float(np.max(np.abs(qd)))
-        limit_v = _stream_velocity_limit(joint)
+        limit_v = stream["velocity"][j]
         assert peak_v <= limit_v * 1.001, (
             f"{name}: peaked at {peak_v * DEG:.2f} deg/s over the STREAM limit "
             f"{limit_v * DEG:.2f} deg/s"
@@ -98,7 +95,7 @@ def test_the_limiter_converges_without_overshoot_or_hunting(preview: Preview) ->
         )
 
         # The step is one joint's; nothing else may have been dragged along.
-        others = [k for k in range(len(joints)) if k != j]
+        others = [k for k in range(len(names)) if k != j]
         moved = float(
             np.max(np.abs(np.array(result["q"])[:, others] - np.array(start)[others]))
         )

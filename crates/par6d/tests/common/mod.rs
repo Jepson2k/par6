@@ -8,8 +8,10 @@
 
 #![allow(dead_code)]
 
+use std::collections::BTreeSet;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use par6_proto::{
@@ -43,6 +45,31 @@ pub fn assets_dir() -> PathBuf {
 /// The shipped `config/PAR6.toml`, unpatched.
 pub fn shipped_config() -> PathBuf {
     repo_root().join("config/PAR6.toml")
+}
+
+/// The shipped config with `[bus].interface` renamed to `iface`, in a
+/// scratch directory with the gripper TOMLs beside it (they resolve
+/// relative to the robot file). Hardware-mode failure tests use a name
+/// no machine has, so they fail the same way on a control box with a
+/// live `can0` as in a container with no CAN support at all.
+pub fn config_with_interface(iface: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("par6-test-cfg-{}-{}", std::process::id(), iface));
+    let grippers = dir.join("grippers");
+    std::fs::create_dir_all(&grippers).expect("scratch config dir");
+    for entry in std::fs::read_dir(repo_root().join("config/grippers")).expect("grippers dir") {
+        let entry = entry.expect("gripper entry");
+        std::fs::copy(entry.path(), grippers.join(entry.file_name())).expect("copy gripper");
+    }
+    let toml = std::fs::read_to_string(shipped_config()).expect("shipped config");
+    let needle = "interface = \"can0\"";
+    assert!(toml.contains(needle), "shipped config no longer names can0");
+    let path = dir.join("PAR6.toml");
+    std::fs::write(
+        &path,
+        toml.replace(needle, &format!("interface = \"{iface}\"")),
+    )
+    .expect("write config");
+    path
 }
 
 /// Write `bytes` to `dst` so a concurrent reader never sees a torn file.
@@ -137,6 +164,48 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
         status_transport: Some(StatusTransport::Unicast),
         ..Options::default()
     }
+}
+
+/// A daemon whose STATUS broadcast is aimed at `status_port` on
+/// loopback, for a test that listens with a real `par6_client::Client`
+/// instead of the rig's own socket.
+pub fn boot_for_client(
+    config: PathBuf,
+    sim_dynamics: bool,
+    status_port: u16,
+) -> Result<Daemon, String> {
+    let _ = env_logger::builder().is_test(true).try_init();
+    redirect_bus_grant();
+    let opts = Options {
+        sim_dynamics,
+        ..sim_options(config, status_port)
+    };
+    Daemon::start(&opts).map_err(|e| e.to_string())
+}
+
+/// A loopback UDP port nothing is bound to right now, and that this
+/// process has not already handed out.
+///
+/// The probe socket has to be released before the caller can bind the
+/// port, which leaves a window. Within one test binary — where cargo
+/// runs tests in parallel threads and the window is widest — the handed
+/// out ports are remembered, so the OS re-offering one it just freed
+/// cannot give two tests the same port. Across processes the window
+/// remains, and is why a daemon that fails to bind says so rather than
+/// carrying on.
+pub fn free_udp_port() -> u16 {
+    static HANDED_OUT: Mutex<BTreeSet<u16>> = Mutex::new(BTreeSet::new());
+    for _ in 0..64 {
+        let port = UdpSocket::bind("127.0.0.1:0")
+            .expect("probe socket")
+            .local_addr()
+            .unwrap()
+            .port();
+        if HANDED_OUT.lock().unwrap().insert(port) {
+            return port;
+        }
+    }
+    panic!("could not find a loopback port this process has not already used");
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
@@ -374,6 +443,51 @@ impl Client {
         }
     }
 
+    /// Send several queueing commands back to back, THEN collect their
+    /// indices. `ok_index` per command waits for each reply before the
+    /// next datagram leaves, and that round trip is time the server
+    /// spends holding a blended move at the head of the queue — on a
+    /// loaded host it outlives the blend hold and the pair never blends.
+    /// A real program queues moves back to back; so does this.
+    pub fn ok_indices(&mut self, cmds: &[Command]) -> Vec<u64> {
+        let ids: Vec<u32> = cmds.iter().map(|c| self.send(c)).collect();
+        let deadline = Instant::now() + BUDGET;
+        let mut out: Vec<Option<u64>> = vec![None; ids.len()];
+        while out.iter().any(Option::is_none) {
+            if let Some(r) = self.try_recv() {
+                match &r {
+                    Reply::Ok {
+                        req_id,
+                        index: Some(i),
+                    } => {
+                        if let Some(slot) = ids.iter().position(|id| id == req_id) {
+                            out[slot] = Some(*i);
+                        }
+                    }
+                    Reply::Error { req_id, error } => {
+                        if ids.contains(req_id) {
+                            panic!("expected OK with index, got {error:?}");
+                        }
+                    }
+                    Reply::Complete {
+                        index,
+                        ok,
+                        detail,
+                        verdict,
+                    } => {
+                        self.completes.push((*index, *ok, detail.clone(), *verdict));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not every queued command was acknowledged within budget"
+            );
+        }
+        out.into_iter().map(Option::unwrap).collect()
+    }
+
     pub fn expect_error(&mut self, cmd: &Command) -> WireError {
         match self.request(cmd) {
             Reply::Error { error, .. } => error,
@@ -433,5 +547,48 @@ impl Client {
                 self.completes.push((index, ok, detail, verdict));
             }
         }
+    }
+}
+
+pub fn to_rad(deg: &[f64; par6_proto::NUM_JOINTS]) -> [f64; par6_proto::NUM_JOINTS] {
+    std::array::from_fn(|j| deg[j].to_radians())
+}
+
+pub fn to_deg(rad: &[f64; par6_proto::NUM_JOINTS]) -> [f64; par6_proto::NUM_JOINTS] {
+    std::array::from_fn(|j| rad[j].to_degrees())
+}
+
+pub fn max_deg_error(a: &[f64; par6_proto::NUM_JOINTS], b: &[f64; par6_proto::NUM_JOINTS]) -> f64 {
+    a.iter()
+        .zip(b)
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0, f64::max)
+}
+
+pub fn teleport_cmd(angles: [f64; par6_proto::NUM_JOINTS]) -> par6_proto::Command {
+    par6_proto::Command::Teleport(par6_proto::command::Teleport {
+        angles,
+        tool_positions: None,
+    })
+}
+
+/// Teleport until the arm reads referenced at `angles` — the boot enable
+/// can still be settling when the first one lands.
+pub fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; par6_proto::NUM_JOINTS]) {
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        c.send(&teleport_cmd(angles));
+        let window = Instant::now() + Duration::from_millis(400);
+        while Instant::now() < window {
+            if let Some(s) = rig.recv_status() {
+                if s.homed && max_deg_error(&s.angles, &angles) < 1.0 {
+                    return;
+                }
+            }
+        }
+        assert!(
+            Instant::now() < deadline,
+            "teleport did not take effect within budget"
+        );
     }
 }

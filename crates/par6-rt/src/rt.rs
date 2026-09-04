@@ -155,6 +155,14 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
             Err(e) => log::warn!("RT thread DEGRADED: SCHED_FIFO setup failed ({e}); continuing"),
         }
     }
+    if opts.fifo_priority.is_some() {
+        // A page fault in the tick is a latency spike of unbounded size,
+        // and once the box has swap a cold page can also be a disk read.
+        match lock_memory() {
+            Ok(()) => log::info!("RT thread: process memory locked (mlockall)"),
+            Err(e) => log::warn!("RT thread DEGRADED: mlockall failed ({e}); continuing"),
+        }
+    }
     if let Some(cpu) = opts.cpu {
         match pin_to_cpu(cpu) {
             Ok(()) => {
@@ -185,6 +193,21 @@ fn set_fifo_priority(prio: u8) -> Result<(), String> {
 #[cfg(not(unix))]
 fn set_fifo_priority(_prio: u8) -> Result<(), String> {
     Err("SCHED_FIFO is unix-only".into())
+}
+
+#[cfg(target_os = "linux")]
+fn lock_memory() -> Result<(), String> {
+    // SAFETY: mlockall takes only flags and touches no caller memory.
+    if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error().to_string())
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn lock_memory() -> Result<(), String> {
+    Err("mlockall is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]

@@ -12,16 +12,16 @@
 //! single check costs tens of microseconds to a few milliseconds depending
 //! on how close the arm is to contact.
 //!
-//! Measured per-waypoint cost against the vendor collision meshes
-//! (`tests/golden_collision.rs::per_waypoint_check_cost_is_reported`
-//! reprints these on every run): self-collision only, 17 µs for the flange
-//! and 180 µs for the gripper variants; with a box keep-out, 28 µs / 224 µs;
-//! with a per-shape margin, which costs coal its early exit, ~300 µs / 730 µs.
-//! A [`ShapeKind::Plane`] keep-out is the outlier at ~35 ms — see its docs.
-//!
-//! [`ShapeKind::Plane`]: crate::ShapeKind::Plane
+//! Measured per-waypoint cost against the vendor collision meshes, on
+//! the control box in release
+//! (`tests/collision_world.rs::per_waypoint_check_cost_is_reported`
+//! reprints these on every run): self-collision only, 14 us for the
+//! flange and 19 us for a gripper variant; with a box keep-out, 25 us
+//! either way; with a per-shape margin, 26 us and 34 us.
 
 use std::path::Path;
+
+use crate::MAX_SHAPE_PARAMS;
 
 use crate::shapes::Shape;
 use crate::{GripperVariant, KinError, NQ};
@@ -240,7 +240,11 @@ impl Collision {
             .filter(|s| s.collision)
             .map(|s| pinokin_sys::ShapeDesc {
                 kind: kind_to_sys(s.kind),
-                params: s.params,
+                params: {
+                    let mut p = [0.0; 4];
+                    p[..MAX_SHAPE_PARAMS].copy_from_slice(&s.params);
+                    p
+                },
                 n_params: s.kind.n_params(),
                 pose: s.pose,
                 margin: s.margin,
@@ -316,12 +320,10 @@ impl Collision {
     ///
     /// Passive gripper jaw joints are held at zero, matching [`check`].
     /// Costs more than a check (coal's distance query runs on every pair,
-    /// no early exit), and the [`ShapeKind::Plane`] cost note applies here
-    /// too — planner-side only.
+    /// no early exit) — planner-side only.
     ///
     /// [`check`]: Collision::check
     /// [`clearance`]: Collision::clearance
-    /// [`ShapeKind::Plane`]: crate::ShapeKind::Plane
     pub fn min_distance(&mut self, q: &[f64; NQ]) -> Result<f64, KinError> {
         self.q_full[..NQ].copy_from_slice(q);
         Ok(self.model.min_distance(&self.q_full)?)
@@ -398,6 +400,5 @@ fn kind_to_sys(kind: crate::shapes::ShapeKind) -> i32 {
         K::Capsule => pinokin_sys::ffi::PAR6_SHAPE_CAPSULE,
         K::Cone => pinokin_sys::ffi::PAR6_SHAPE_CONE,
         K::Ellipsoid => pinokin_sys::ffi::PAR6_SHAPE_ELLIPSOID,
-        K::Plane => pinokin_sys::ffi::PAR6_SHAPE_PLANE,
     }
 }

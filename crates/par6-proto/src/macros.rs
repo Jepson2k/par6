@@ -36,5 +36,35 @@ macro_rules! wire_enum {
                 None
             }
         }
+
+        // Deserialized from the wire integer OR the variant name
+        // (case-insensitive): the Python binding sends the numbers it puts
+        // on the socket, while a script spells `enter_flashing("parked")`.
+        impl<'de> serde::Deserialize<'de> for $name {
+            fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+                struct V;
+                impl serde::de::Visitor<'_> for V {
+                    type Value = $name;
+                    fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                        write!(f, "a {} wire value or variant name", stringify!($name))
+                    }
+                    fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<$name, E> {
+                        $name::from_wire(v)
+                            .ok_or_else(|| E::custom(format!("{v} is not a {}", stringify!($name))))
+                    }
+                    fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<$name, E> {
+                        self.visit_i64(i64::try_from(v).map_err(E::custom)?)
+                    }
+                    fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<$name, E> {
+                        $name::variants()
+                            .iter()
+                            .find(|(n, _)| n.eq_ignore_ascii_case(v))
+                            .and_then(|(_, w)| $name::from_wire(*w))
+                            .ok_or_else(|| E::custom(format!("{v:?} is not a {}", stringify!($name))))
+                    }
+                }
+                d.deserialize_any(V)
+            }
+        }
     };
 }

@@ -17,7 +17,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;
 use std::path::PathBuf;
 
-use par6_kin::{Collision, GripperVariant, IkOptions, Kin, Layer, Shape, ShapeKind, NQ};
+use par6_kin::{Collision, GripperVariant, Kin, Layer, Shape, ShapeKind, NQ};
 
 thread_local! {
     static ALLOC_COUNT: Cell<u64> = const { Cell::new(0) };
@@ -64,7 +64,6 @@ fn kinematics_calls_are_allocation_free_after_init() {
     let mut tcp = [0.0; 6];
     let mut jac = [0.0; 6 * NQ];
     let mut tau = [0.0; NQ];
-    let mut q_out = [0.0; NQ];
 
     // Warm-up outside the measured window (lazy TLS/locale/etc. one-shots).
     kin.fk(&q, &mut pose).unwrap();
@@ -75,7 +74,6 @@ fn kinematics_calls_are_allocation_free_after_init() {
             kin.tcp(&q, &mut tcp);
             kin.jacobian(&q, &mut jac).unwrap();
             kin.gravity(&q, &mut tau).unwrap();
-            kin.ik(&q, &pose, &mut q_out, IkOptions::default()).unwrap();
         }
     });
     assert_eq!(allocs, 0, "kinematics calls allocated {allocs} times");
@@ -93,7 +91,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
         &[Shape {
             name: "table".to_owned(),
             kind: ShapeKind::Box,
-            params: [2.0, 2.0, 0.1, 0.0],
+            params: [2.0, 2.0, 0.1],
             pose: [0.0, 0.0, -0.06, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
@@ -105,7 +103,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
         &[Shape {
             name: "keepout".to_owned(),
             kind: ShapeKind::Sphere,
-            params: [0.08, 0.0, 0.0, 0.0],
+            params: [0.08, 0.0, 0.0],
             pose: [0.25, 0.0, 0.35, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,

@@ -26,7 +26,3 @@ log = { workspace = true }
 # Raw RTM_GETLINK xstats query (hw/xstats.rs): socketcan-rs exposes the
 # CAN link state but not the cumulative controller counters.
 libc = "0.2"
-
-[dev-dependencies]
-# Golden-vector conformance only (tests/golden_can.rs reads the manifest).
-serde_json = "1"

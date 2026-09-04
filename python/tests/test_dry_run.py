@@ -27,15 +27,6 @@ from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, Erro
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
 
-try:
-    import pinokin
-except ImportError:  # binary wheel unavailable on this platform
-    pinokin = None
-
-pytestmark = pytest.mark.skipif(
-    pinokin is None, reason="pinokin binary wheel not installed"
-)
-
 
 def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
@@ -127,11 +118,9 @@ class TestPlannedMotion:
         Driven through the dry-run client — the plan under test is the one
         the runtime's own planner produces — with the config as the oracle.
         """
-        config = _cfg.load_robot_config()
-        dt = float(config["robot"]["tick_dt_s"])
-        velocity = np.array(
-            [_cfg.resolve_mode_limits(j["limits"], "exec")[0] for j in config["joints"]]
-        )
+        cfg = _cfg.config()
+        dt = cfg.tick_dt_s()
+        velocity = np.array(cfg.limits("exec")["velocity"])
         start = _cfg.homing_ready_pose_rad()
         target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
         # Full-rate trajectories: the velocity check reads per-tick steps,
@@ -172,9 +161,7 @@ class TestPlannedMotion:
         dry_run.teleport(park_deg())
         slow = dry_run.move_j(target, duration=4.0)
         assert fast.duration < 1.5
-        assert slow.duration == pytest.approx(
-            4.0, abs=2 * float(_cfg.load_robot_config()["robot"]["tick_dt_s"])
-        )
+        assert slow.duration == pytest.approx(4.0, abs=2 * _cfg.config().tick_dt_s())
         np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
 
@@ -443,7 +430,7 @@ class TestCartesianMotion:
             unhomed.move_j(park_deg())
         assert gate.value.code == ErrorCode.MOTN_NOT_HOMED
         # Jogging stays available while un-homed, as it does on the runtime.
-        assert unhomed.jog_j(0, 0.2, 0.2).duration > 0.0
+        assert _planned(unhomed.jog_j(0, 0.2, 0.2)).duration > 0.0
 
     def test_the_preview_jogs_several_joints_at_once(self, dry_run) -> None:
         """A diagonal jog must preview as a diagonal.
@@ -492,9 +479,8 @@ class TestCartesianMotion:
 
         # Outside a joint's travel the runtime refuses rather than clamping,
         # because clamping lands the arm somewhere else and reports success.
-        hard = _cfg.load_robot_config()["joints"][0]["limits"]
         beyond = list(park_deg())
-        beyond[0] = math.degrees(hard["hard_max_rad"]) + 10.0
+        beyond[0] = math.degrees(_cfg.config().hard_limits_rad()[0][1]) + 10.0
         before = dry_run.angles()
         with pytest.raises(RobotError) as clamped:
             dry_run.teleport(beyond)
@@ -531,7 +517,7 @@ class TestCartesianMotion:
         cold = robot.create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False
         )
-        seek = cold.home()
+        seek = _planned(cold.home())
         assert seek.duration == 0.0
         assert seek.end_joints_rad == pytest.approx(
             _cfg.homing_ready_pose_rad(), abs=1e-6
@@ -540,7 +526,7 @@ class TestCartesianMotion:
         warm = robot.create_dry_run_client(
             initial_joints_deg=np.degrees(_cfg.homing_ready_pose_rad()).tolist()
         )
-        ret = warm.home()
+        ret = _planned(warm.home())
         assert ret.duration > 0.0, "a referenced HOME is a planned move, not a jump"
         assert ret.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-6)
         assert ret.tcp_poses.shape[0] > 1, "a planned move draws a path"
@@ -568,12 +554,23 @@ class TestCartesianMotion:
         assert status.angles == pytest.approx(client.angles(), abs=1e-9)
         assert status.pose[3:12:4] == pytest.approx(client.pose()[:3], abs=1e-6)
 
-        assert client.tool.is_open()
+        # The runtime refuses a jaw move on an uncalibrated gripper, and so
+        # does the preview; after the calibrate the jaw state follows the
+        # program.
+        with pytest.raises(RobotError) as uncalibrated:
+            client.tool.close()
+        assert uncalibrated.value.code == ErrorCode.COMM_VALIDATION_ERROR
+        assert "calibrat" in str(uncalibrated.value).lower()
+        calibrated = client.tool.calibrate()
+        assert calibrated.duration > 0.0, (
+            "a calibrate holds the arm for the driver's settle"
+        )
+        assert client.tool.is_open(client.tool.status().positions[0])
         client.tool.close()
-        assert not client.tool.is_open()
+        assert not client.tool.is_open(client.tool.status().positions[0])
         assert client.tool.status().engaged
         client.tool.open()
-        assert client.tool.is_open()
+        assert client.tool.is_open(client.tool.status().positions[0])
         assert client.tool.status().key == client.active_tool_key
         assert client.tool.key == client.active_tool_key
         with pytest.raises(AttributeError):
@@ -761,6 +758,7 @@ class TestProgramWorkflow:
         above = np.asarray(client.pose())
         above[2] += 30.0
         results.append(_planned(client.move_l(above.tolist(), speed=0.4)))
+        results.append(_planned(client.tool.calibrate()))
         results.append(_planned(client.tool.close()))
         joints = list(client.angles())
         joints[0] -= 15.0
@@ -772,93 +770,14 @@ class TestProgramWorkflow:
             np.testing.assert_allclose(
                 following.tcp_poses[0][:3], previous.tcp_poses[-1][:3], atol=2e-3
             )
-        # The tool action holds the arm still and carries no plan of its own.
-        held = results[2]
-        assert held.tcp_poses.shape[0] == 1
-        np.testing.assert_allclose(
-            held.end_joints_rad, results[1].end_joints_rad, atol=1e-12
-        )
+        # The tool actions hold the arm still and carry no plan of their own.
+        for held in (results[2], results[3]):
+            assert held.tcp_poses.shape[0] == 1
+            np.testing.assert_allclose(
+                held.end_joints_rad, results[1].end_joints_rad, atol=1e-12
+            )
         assert client.angles() == pytest.approx(np.degrees(results[-1].end_joints_rad))
         assert sum(r.duration for r in results) > 0.0
-
-
-@pytest.mark.e2e
-@requires_par6d
-@pytest.mark.timeout(300)
-async def test_prediction_matches_what_the_runtime_executes(tmp_path) -> None:
-    """The offline plan must match the motion a live ``par6d --sim`` runs.
-
-    The same ``move_j`` is planned offline and queued on the runtime, with the
-    completion policy set to ``commanded`` so the observed window is the plan's
-    own sample stream and not a settle wait.  The window is timed from the
-    enqueue to the COMPLETE the runtime pushes, which is the plan's execution
-    plus dispatch — it can run long on a loaded box but never short, so the
-    lower bound is tight and the upper one carries the overhead budget.  Two
-    timings 5 s apart are run: a preview that reported a constant, ignored
-    ``duration=``, or planned against the wrong limits fails the bounds and
-    the shrink between them.
-    """
-    daemon = LiveDaemon.start(tmp_path)
-    try:
-        async with daemon.client() as client:
-            assert await client.wait_status(lambda s: s.link_ok == 1, timeout=20.0)
-            assert await client.reset() == 1
-            park = park_deg()
-            await _teleport_to(client, park)
-            assert await client.set_completion_policy(CompletionPolicy.COMMANDED) == 1
-
-            live_start = await client.angles()
-            assert live_start is not None
-            preview = Robot().create_dry_run_client(initial_joints_deg=live_start)
-
-            observed: dict[float, tuple[float, float]] = {}
-            for requested in (8.0, 3.0):
-                target = list(live_start)
-                target[0] += 25.0
-
-                predicted = _planned(preview.move_j(target, duration=requested))
-                preview.teleport(live_start)  # re-seed for the next comparison
-
-                started = time.monotonic()
-                index = await client.move_j(target, duration=requested)
-                assert index >= 0
-                assert await client.wait_command(index, timeout=60.0) is True
-                measured = time.monotonic() - started
-                observed[requested] = (predicted.duration, measured)
-
-                assert (
-                    predicted.duration - 0.3 <= measured <= predicted.duration + 1.5
-                ), (
-                    f"duration={requested}: runtime took {measured:.3f}s, "
-                    f"preview predicted {predicted.duration:.3f}s"
-                )
-
-                # The plan stops commanding at its last sample; the closed-loop
-                # sim converges on it a little later, so let the arm settle
-                # before comparing where it ended up.
-                assert await client.wait_status(
-                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
-                    timeout=20.0,
-                )
-                landed = await client.angles()
-                assert landed is not None
-                predicted_deg = np.degrees(predicted.end_joints_rad)
-                assert float(np.abs(np.asarray(landed) - predicted_deg).max()) < 2.5, (
-                    f"duration={requested}: runtime landed at {landed}, "
-                    f"preview predicted {predicted_deg.tolist()}"
-                )
-                await _teleport_to(client, live_start)
-
-            # The measured window has to shrink by what the preview said it
-            # would — the part of the comparison the dispatch overhead cancels
-            # out of.
-            slow_predicted, slow_measured = observed[8.0]
-            fast_predicted, fast_measured = observed[3.0]
-            assert (slow_measured - fast_measured) == pytest.approx(
-                slow_predicted - fast_predicted, abs=1.0
-            ), f"execution windows {observed} do not track the prediction"
-    finally:
-        daemon.stop()
 
 
 #: An open posture the shapes below fit in: extended, clear of the collision
@@ -1168,3 +1087,59 @@ async def _teleport_to(client, angles: list[float]) -> None:
         ):
             return
     raise AssertionError("teleport never took effect")
+
+
+def test_a_retune_previews_from_the_same_call_that_runs_live(
+    dry_run: DryRunRobotClient,
+) -> None:
+    """The point of a dry run is that the script it accepts is the script
+    the arm accepts.
+
+    `voltage_limit_mv` has a default on the live client, so a caller who
+    leaves it out sends a complete frame there. The preview took
+    `**gains` and forwarded only what it was handed, so the same call
+    reached the wire converter a field short and died — the preview
+    refusing a program that runs.
+    """
+    j = _cfg.config().joints()[2]
+    tune = dict(
+        kpp=j["gains"]["kpp"],
+        kpv=j["gains"]["kpv"],
+        kiv=j["gains"]["kiv"],
+        kpiq=j["gains"]["kpiq"],
+        kiiq=j["gains"]["kiiq"],
+        kp=j["gains"]["kp"],
+        kd=j["gains"]["kd"],
+        ilim_ma=j["ilim_ma"],
+        velocity_limit_ticks_s=j["velocity_limit_ticks_s"],
+    )
+    # No voltage_limit_mv: exactly the call the live client completes.
+    assert dry_run.set_pid_gains(j["node_id"], **tune) >= 0
+
+    # And a node the config does not declare is refused here too, so the
+    # preview catches the typo before the arm does.
+    with pytest.raises(RobotError):
+        dry_run.set_pid_gains(15, **tune)
+
+
+def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
+    dry_run: DryRunRobotClient,
+) -> None:
+    """The ABC's own example — `found = rbt.estimate_payload()` — is a
+    valid program, and a valid program must preview. A dry run has no
+    torque to read, so the estimate is empty; what it previews is the
+    motion: the wrist swing, planned against the same keep-outs, ending
+    back where it started.
+    """
+    dry_run.set_payload(0.0)
+    start = list(dry_run.angles())
+    carried = dry_run.payload()
+    assert carried.mass == 0.0
+
+    found = dry_run.estimate_payload()
+    assert found.poses >= 3, "the wrist must have somewhere to swing from park"
+    assert found.mass == 0.0 and found.determined == (0.0, 0.0, 0.0, 0.0)
+    assert dry_run.payload().mass == 0.0, "a dry run declares nothing"
+    assert dry_run.angles() == pytest.approx(start, abs=1e-6), (
+        "the swing must end where the pick left the arm"
+    )

@@ -90,10 +90,9 @@ fn decode_into(frame: &CanFrame, state: &mut BusState) {
     apply_payload(&d, state);
 }
 
-/// The drain's decode→state mapping, driven with the wire bytes of the
-/// cross-language golden vectors (`tests/golden/can/manifest.json`): each
-/// reply class must land in its own field, the live fault bit rides every
-/// frame, and the gripper reply reaches the gripper slot.
+/// The drain's decode→state mapping, driven with hand-packed reply
+/// frames: each reply class must land in its own field, the live fault
+/// bit rides every frame, and the gripper reply reaches the gripper slot.
 #[test]
 fn replies_map_onto_their_own_bus_state_fields() {
     let mut state = BusState::new();

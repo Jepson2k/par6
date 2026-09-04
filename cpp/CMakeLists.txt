@@ -13,18 +13,22 @@ find_package(toppra REQUIRED)
 
 set(PAR6_SHIM_SOURCES src/par6_shim.cpp src/par6_traj.cpp src/par6_col.cpp)
 
+# One compile per translation unit: the Pinocchio/coal instantiations are
+# the expensive part (several GB of RSS each), and the shared and static
+# libraries link the same objects.
+add_library(par6_shim_objects OBJECT ${PAR6_SHIM_SOURCES})
+set_target_properties(par6_shim_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 # Shared library — what pinokin-sys links by default (Pinocchio itself is
 # only distributed as shared libs on conda-forge).
-add_library(par6_shim SHARED ${PAR6_SHIM_SOURCES})
+add_library(par6_shim SHARED $<TARGET_OBJECTS:par6_shim_objects>)
 
 # Static archive of the shim itself (Pinocchio still linked dynamically);
 # used by packaging/cross builds that want a single relocatable object.
-add_library(par6_shim_static STATIC ${PAR6_SHIM_SOURCES})
-set_target_properties(par6_shim_static PROPERTIES
-  OUTPUT_NAME par6_shim
-  POSITION_INDEPENDENT_CODE ON)
+add_library(par6_shim_static STATIC $<TARGET_OBJECTS:par6_shim_objects>)
+set_target_properties(par6_shim_static PROPERTIES OUTPUT_NAME par6_shim)
 
-foreach(tgt par6_shim par6_shim_static)
+foreach(tgt par6_shim_objects par6_shim par6_shim_static)
   target_include_directories(${tgt} PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
     $<INSTALL_INTERFACE:include>)
@@ -37,8 +41,8 @@ foreach(tgt par6_shim par6_shim_static)
     pinocchio::pinocchio_collision
     coal::coal
     toppra::toppra)
-  target_compile_options(${tgt} PRIVATE -Wall -Wextra)
 endforeach()
+target_compile_options(par6_shim_objects PRIVATE -Wall -Wextra)
 
 include(GNUInstallDirs)
 install(TARGETS par6_shim par6_shim_static

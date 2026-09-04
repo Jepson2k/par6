@@ -389,11 +389,13 @@ impl Daemon {
         }
         {
             let (link, shutdown) = (link, shutdown.clone());
+            let jog_accel_time_s = robot.jog.accel_time_s;
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         housekeeping_loop(
+                            jog_accel_time_s,
                             link,
                             stream_input,
                             shared,
@@ -739,12 +741,12 @@ pub(crate) struct KinStack {
     gravity: crate::kin::KinGravity,
     pub(crate) planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
-    housekeeping: crate::kin::CartKin,
+    pub(crate) housekeeping: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
     /// The streaming gate's own collision world (pinocchio `Data` is
     /// mutated by every query, so the planner's instance cannot be
     /// shared across threads).
-    gate_collision: par6_kin::Collision,
+    pub(crate) gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
     pub(crate) tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
@@ -755,7 +757,7 @@ pub(crate) struct KinStack {
 /// from itself and from keep-outs that absorbs model and calibration
 /// error. The value parol6 runs the same arm with; a shape that wants a
 /// wider berth carries its own `margin`.
-const COLLISION_CLEARANCE_M: f64 = 0.005;
+pub const COLLISION_CLEARANCE_M: f64 = 0.005;
 
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
@@ -763,6 +765,9 @@ const COLLISION_CLEARANCE_M: f64 = 0.005;
 /// directory and URDF variant, plus the config-derived solver settings.
 pub(crate) struct KinSource {
     assets_dir: std::path::PathBuf,
+    /// Where `package://` mesh URIs resolve, when the assets tree is an
+    /// installed package rather than a repo checkout.
+    package_dir: Option<std::path::PathBuf>,
     variant: par6_kin::GripperVariant,
     window: crate::kin::SoftWindow,
     dls_lambda: f64,
@@ -789,6 +794,7 @@ impl KinSource {
         );
         Ok(Self {
             assets_dir,
+            package_dir: opts.package_dir.clone(),
             variant,
             window: SoftWindow::from_config(robot),
             dls_lambda: robot.motion.dls_lambda,
@@ -812,15 +818,19 @@ impl KinSource {
     }
 
     pub(crate) fn collision(&self) -> Result<par6_kin::Collision, DaemonError> {
-        par6_kin::Collision::load(&self.assets_dir, self.variant, COLLISION_CLEARANCE_M).map_err(
-            |e| {
-                DaemonError::Kinematics(format!(
-                    "cannot load collision model {} from {}: {e}",
-                    self.variant.urdf_relpath(),
-                    self.assets_dir.display()
-                ))
-            },
+        crate::kin::load_collision(
+            &self.assets_dir,
+            self.variant,
+            self.package_dir.as_deref(),
+            COLLISION_CLEARANCE_M,
         )
+        .map_err(|e| {
+            DaemonError::Kinematics(format!(
+                "cannot load collision model {} from {}: {e}",
+                self.variant.urdf_relpath(),
+                self.assets_dir.display()
+            ))
+        })
     }
 }
 
@@ -856,6 +866,9 @@ pub(crate) struct PreviewKin {
     pub(crate) planner: crate::kin::CartKin,
     pub(crate) cart: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
+    /// The streaming gate's own world: it is checked from a different
+    /// lane than the planner's and each holds mutable scratch.
+    pub(crate) gate_collision: par6_kin::Collision,
     pub(crate) tool_offset: crate::kin::ToolOffset,
 }
 
@@ -871,6 +884,7 @@ pub(crate) fn load_preview_kin(
         planner: src.cart_kin(&tool_offset)?,
         cart: src.cart_kin(&tool_offset)?,
         collision: src.collision()?,
+        gate_collision: src.collision()?,
         tool_offset,
     })
 }

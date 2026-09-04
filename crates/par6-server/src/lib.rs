@@ -37,6 +37,7 @@ pub mod gating;
 pub mod link;
 pub mod runtime;
 pub mod server;
+pub mod session;
 
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport, TunableNode};
 pub use faults::{gripper_fault_code, rt_standing_error};
@@ -46,5 +47,6 @@ pub use runtime::{
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
 pub use server::{
-    decode_error_to_wire, spawn, validate_registries, validate_supported, ServerHandle,
+    cmd_name, decode_error_to_wire, pid_gains_fault, spawn, teleport_angle_fault,
+    validate_registries, validate_supported, write_io_fault, ServerHandle,
 };

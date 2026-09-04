@@ -324,6 +324,12 @@ struct Core<P: Planner, R: RtCommands> {
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
+    /// A teleport was accepted and the RT has not published the snapshot
+    /// yet. Teleporting references the arm, so the homed gate must open
+    /// for the command right behind it — a client sends a teleport and
+    /// its first move in the same breath, and the snapshot is a tick or
+    /// more behind.
+    teleport_homed: bool,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -413,6 +419,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
+            teleport_homed: false,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
@@ -813,25 +820,18 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // own 0..=7 bound is not the answer here: a port past the
             // end names no line, and acking it would report a level the
             // arm never drove.
-            C::WriteIo(p) => match self.cfg.digital_outputs.get(usize::from(p.port)) {
-                Some(name) => {
-                    log::debug!("write_io {name} (port {}) = {}", p.port, p.value);
+            C::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
+                Some(error) => Err(error),
+                None => {
+                    log::debug!(
+                        "write_io {} (port {}) = {}",
+                        self.cfg.digital_outputs[usize::from(p.port)],
+                        p.port,
+                        p.value
+                    );
                     self.runtime.rt.write_io(p.port, p.value);
                     Ok(())
                 }
-                None => Err(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        &format!(
-                            "write_io port {} does not exist: this box declares {} digital \
-                             output(s)",
-                            p.port,
-                            self.cfg.digital_outputs.len()
-                        ),
-                    )],
-                )),
             },
             C::Simulator(p) => {
                 self.cancel_all_motion("the simulator switch").await;
@@ -902,62 +902,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             // Values are codec-validated; the node id is config
             // knowledge, so it is checked here — an ack for a node this
             // arm does not have would report a tune nothing received.
-            C::SetPidGains(p) => match self.cfg.tunable_nodes.iter().find(|t| t.node == p.node) {
+            C::SetPidGains(p) => match pid_gains_fault(p, &self.cfg) {
+                Some(error) => Err(error),
                 None => {
-                    let nodes: Vec<u8> = self.cfg.tunable_nodes.iter().map(|t| t.node).collect();
-                    Err(make_error(
-                        ErrorCode::CommValidationError,
-                        UNATTRIBUTED,
-                        &[(
-                            "detail",
-                            &format!(
-                                "set_pid_gains node {} is not a configured drive \
-                                 (tunable nodes: {nodes:?})",
-                                p.node
-                            ),
-                        )],
-                    ))
-                }
-                Some(t) => {
-                    // The tune is stored and re-pushed on every reconnect,
-                    // so the joint's configured limits are the ceiling: one
-                    // datagram must not remove a current limit for the
-                    // life of the process.
-                    let over = if p.ilim_ma > t.ilim_ma {
-                        Some(("ilim_ma", p.ilim_ma, t.ilim_ma))
-                    } else if p.velocity_limit_ticks_s > t.velocity_limit_ticks_s {
-                        Some((
-                            "velocity_limit_ticks_s",
-                            p.velocity_limit_ticks_s,
-                            t.velocity_limit_ticks_s,
-                        ))
-                    } else if t.voltage_limit_mv != 0 && p.voltage_limit_mv > t.voltage_limit_mv {
-                        Some((
-                            "voltage_limit_mv",
-                            f64::from(p.voltage_limit_mv),
-                            f64::from(t.voltage_limit_mv),
-                        ))
-                    } else {
-                        None
-                    };
-                    match over {
-                        None => {
-                            self.runtime.rt.set_pid_gains(p);
-                            Ok(())
-                        }
-                        Some((field, asked, ceiling)) => Err(make_error(
-                            ErrorCode::CommValidationError,
-                            UNATTRIBUTED,
-                            &[(
-                                "detail",
-                                &format!(
-                                    "set_pid_gains {field} = {asked} exceeds node {}'s \
-                                     configured ceiling of {ceiling}",
-                                    p.node
-                                ),
-                            )],
-                        )),
-                    }
+                    self.runtime.rt.set_pid_gains(p);
+                    Ok(())
                 }
             },
             C::SetCanId(p) => self
@@ -1127,6 +1076,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
+            self.teleport_homed = true;
             self.on_motion_accepted();
             return;
         }
@@ -1369,7 +1319,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
-            homed: self.snap.homed,
+            homed: self.snap.homed || self.teleport_homed,
             simulator: self.simulator,
         };
         check_gate(tag, &ctx)
@@ -1753,6 +1703,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
+            if self.snap.homed {
+                self.teleport_homed = false;
+            }
         }
     }
 
@@ -2615,10 +2568,94 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
     unsupported.and_then(refuse)
 }
 
+/// Whether a drive tune names a configured node and stays inside that
+/// node's configured ceilings.
+///
+/// The node id is config knowledge, so the codec cannot check it: an ack
+/// for a node this arm does not have would report a tune nothing
+/// received. The ceilings matter because the tune is stored and re-pushed
+/// on every reconnect — one datagram must not remove a current limit for
+/// the life of the process. Shared so the offline preview refuses a tune
+/// in the same words the runtime does.
+pub fn pid_gains_fault(
+    p: &par6_proto::command::SetPidGains,
+    cfg: &ServerConfig,
+) -> Option<WireError> {
+    let Some(t) = cfg.tunable_nodes.iter().find(|t| t.node == p.node) else {
+        let nodes: Vec<u8> = cfg.tunable_nodes.iter().map(|t| t.node).collect();
+        return Some(make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[(
+                "detail",
+                &format!(
+                    "set_pid_gains node {} is not a configured drive \
+                     (tunable nodes: {nodes:?})",
+                    p.node
+                ),
+            )],
+        ));
+    };
+    let over = if p.ilim_ma > t.ilim_ma {
+        Some(("ilim_ma", p.ilim_ma, t.ilim_ma))
+    } else if p.velocity_limit_ticks_s > t.velocity_limit_ticks_s {
+        Some((
+            "velocity_limit_ticks_s",
+            p.velocity_limit_ticks_s,
+            t.velocity_limit_ticks_s,
+        ))
+    } else if t.voltage_limit_mv != 0 && p.voltage_limit_mv > t.voltage_limit_mv {
+        Some((
+            "voltage_limit_mv",
+            f64::from(p.voltage_limit_mv),
+            f64::from(t.voltage_limit_mv),
+        ))
+    } else {
+        None
+    };
+    over.map(|(field, asked, ceiling)| {
+        make_error(
+            ErrorCode::CommValidationError,
+            UNATTRIBUTED,
+            &[(
+                "detail",
+                &format!(
+                    "set_pid_gains {field} = {asked} exceeds node {}'s \
+                     configured ceiling of {ceiling}",
+                    p.node
+                ),
+            )],
+        )
+    })
+}
+
+/// Whether `port` names a digital output this box declares.
+///
+/// The wire's own `0..=7` bound is not the answer: a port past the end of
+/// the declared outputs names no line, and acking it would report a level
+/// the arm never drove. Shared so the offline preview refuses it in the
+/// same words.
+pub fn write_io_fault(port: u8, cfg: &ServerConfig) -> Option<WireError> {
+    if usize::from(port) < cfg.digital_outputs.len() {
+        return None;
+    }
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!(
+                "write_io port {port} does not exist: this box declares {} digital output(s)",
+                cfg.digital_outputs.len()
+            ),
+        )],
+    ))
+}
+
 /// The first `teleport` angle the runtime cannot honour, described in
 /// the terms a client can act on: which joint, what it asked for, and
 /// the window it has. `None` = every angle is placeable.
-fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Option<String> {
+pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> Option<String> {
     // Finiteness belongs to the codec (`par6-proto` rejects NaN/inf at
     // decode), so only the travel window is left to check here.
     for (i, (&a, &(lo, hi))) in angles
@@ -2659,7 +2696,7 @@ fn params_summary(cmd: &Command) -> String {
 }
 
 /// Wire name of a command (STATUS `action_current`, QUEUE listing).
-fn cmd_name(tag: CmdType) -> &'static str {
+pub fn cmd_name(tag: CmdType) -> &'static str {
     use CmdType as T;
     match tag {
         T::Reset => "reset",

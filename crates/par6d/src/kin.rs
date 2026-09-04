@@ -10,7 +10,7 @@
 //! Pose conventions on this boundary:
 //!
 //! - Wire poses are `[x, y, z (mm), rx, ry, rz (deg)]` with
-//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ — `pinokin.se3_from_rpy`,
+//!   `R = Rx(rx)·Ry(ry)·Rz(rz)` (intrinsic XYZ —
 //!   `scipy` `'XYZ'`). This is the
 //!   convention `par6.robot.Robot`'s FK/IK, the dry-run client and the
 //!   frontend's STATUS-matrix decode all read the same six numbers in.
@@ -31,42 +31,28 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use par6_kin::{GripperVariant, IkOptions, IkOutcome, Kin, KinError, Pose, NQ};
+use par6_kin::{GripperVariant, IkOutcome, Kin, KinError, Pose, NQ};
 use par6_rt::{ForwardKin, GravityModel, MAX_JOINTS};
 
 /// Map a configured gripper name onto the URDF variant whose tool the
 /// model must carry (mass for gravity, TCP frame for FK/IK). Unknown
 /// names fall back to the bare flange — the arm itself is always
 /// modeled — with a startup warning.
-pub(crate) fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
+pub fn variant_for(gripper_name: &str, urdf_variant: Option<&str>) -> GripperVariant {
     if let Some(key) = urdf_variant {
-        match GripperVariant::from_key(key) {
-            Some(v) => return v,
-            None => log::warn!(
-                "gripper '{gripper_name}': unknown urdf_variant '{key}'; \
-                 falling back to the name-prefix rule"
-            ),
+        if GripperVariant::from_key(key).is_none() {
+            log::warn!(
+                "gripper urdf_variant {key:?} names no URDF tree; deriving one from the name"
+            );
         }
     }
-    if gripper_name.eq_ignore_ascii_case("flange") {
-        GripperVariant::Flange
-    } else if gripper_name.starts_with("MSG") {
-        GripperVariant::Msg
-    } else if gripper_name.starts_with("SSG48") {
-        GripperVariant::Ssg48
-    } else {
-        log::warn!("no URDF variant for gripper '{gripper_name}'; using the bare flange model");
-        GripperVariant::Flange
-    }
+    GripperVariant::resolve(&gripper_name.to_ascii_uppercase(), urdf_variant)
 }
 
 /// Resolve the `assets/par6_description` tree: the explicit choice when
 /// given, else the tree sitting next to the config directory (the repo
 /// layout: `config/PAR6.toml` ↔ `assets/par6_description`).
-pub(crate) fn resolve_assets_dir(
-    explicit: Option<&Path>,
-    config_path: &Path,
-) -> Result<PathBuf, String> {
+pub fn resolve_assets_dir(explicit: Option<&Path>, config_path: &Path) -> Result<PathBuf, String> {
     if let Some(p) = explicit {
         return if p.is_dir() {
             Ok(p.to_path_buf())
@@ -74,17 +60,30 @@ pub(crate) fn resolve_assets_dir(
             Err(format!("assets directory not found: {}", p.display()))
         };
     }
-    let candidate = config_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("assets/par6_description"));
-    match candidate {
-        Some(c) if c.is_dir() => Ok(c),
-        _ => Err(format!(
-            "no assets/par6_description tree next to {}; set --assets or PAR6_ASSETS",
-            config_path.display()
-        )),
+    // The environment, the tree next to the config, then the deploy
+    // bundle's install location — the same order everything loads with.
+    let mut candidates = Vec::new();
+    if let Ok(p) = std::env::var("PAR6_ASSETS") {
+        candidates.push(PathBuf::from(p));
     }
+    if let Some(root) = config_path.parent().and_then(Path::parent) {
+        candidates.push(root.join("assets/par6_description"));
+    }
+    candidates.push(PathBuf::from("/usr/share/par6/par6_description"));
+    for c in &candidates {
+        if c.is_dir() {
+            return Ok(c.clone());
+        }
+    }
+    Err(format!(
+        "no assets/par6_description tree for {}; set --assets or PAR6_ASSETS (tried: {})",
+        config_path.display(),
+        candidates
+            .iter()
+            .map(|c| c.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// Load one model instance, mapping the error to a one-line message.
@@ -110,7 +109,7 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
 /// variants' URDF tool links are deliberately not part of this chain,
 /// which is what makes `[kinematics] mass_kg` the knob that tunes
 /// gravity compensation instead of a parsed-and-ignored field.
-pub(crate) fn load_gravity_kin(
+pub fn load_gravity_kin(
     assets_dir: &Path,
     gripper: Option<&par6_config::GripperConfig>,
 ) -> Result<Kin, String> {
@@ -204,7 +203,7 @@ impl ToolOffset {
 }
 
 /// `m ← m · T(d)` — walk `d` along the pose's own axes.
-fn translate_local(m: &mut Pose, d: [f64; 3]) {
+pub fn translate_local(m: &mut Pose, d: [f64; 3]) {
     m[3] += m[0] * d[0] + m[1] * d[1] + m[2] * d[2];
     m[7] += m[4] * d[0] + m[5] * d[1] + m[6] * d[2];
     m[11] += m[8] * d[0] + m[9] * d[1] + m[10] * d[2];
@@ -213,8 +212,7 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 // ------------------------------------------------------------- pose math
 
 /// `[x y z (m), roll pitch yaw (rad)]` from a row-major 4x4, rpy in the
-/// wire's intrinsic-XYZ convention `R = Rx·Ry·Rz` — the decomposition
-/// `pinokin.so3_rpy` performs, and the exact inverse of
+/// wire's intrinsic-XYZ convention `R = Rx·Ry·Rz` — the exact inverse of
 /// [`wire_pose_to_matrix`].
 ///
 /// At gimbal lock only `roll ∓ yaw` is observable, and this decode folds
@@ -222,7 +220,7 @@ fn translate_local(m: &mut Pose, d: [f64; 3]) {
 /// server rebuilds the STATUS matrix from what comes out of here, and
 /// `atan2(±0, ±0)` on an exactly degenerate matrix answers 0 or ±π by
 /// sign bit — either way a rotation the arm is not in.
-pub(crate) fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
+pub fn matrix_to_xyzrpy(m: &Pose) -> [f64; 6] {
     let (r00, r01, r02) = (m[0], m[1], m[2]);
     let (r10, r11, r12) = (m[4], m[5], m[6]);
     let r22 = m[10];
@@ -385,10 +383,15 @@ pub(crate) struct SoftWindow {
 }
 
 impl SoftWindow {
+    /// The window as `(min, max)` pairs, the shape a pose planner takes.
+    pub fn pairs(&self) -> [(f64, f64); NQ] {
+        std::array::from_fn(|j| (self.min[j], self.max[j]))
+    }
+
     /// The configured soft limits. Joints the config does not describe
     /// (a robot dimensioned smaller than [`NQ`]) get an unbounded
     /// window, which leaves their solutions untouched.
-    pub(crate) fn from_config(robot: &par6_config::RobotConfig) -> Self {
+    pub fn from_config(robot: &par6_config::RobotConfig) -> Self {
         let mut window = SoftWindow {
             min: [f64::NEG_INFINITY; NQ],
             max: [f64::INFINITY; NQ],
@@ -469,45 +472,22 @@ impl CartKin {
         Ok(pose)
     }
 
-    /// Seeded damped-least-squares IK toward `target`, which is where the
-    /// OFFSET TCP must land: the solver works at the URDF's TCP frame, so
-    /// the target is walked back along its own axes by the offset first.
-    ///
-    /// A solution comes back wrap-normalized — see [`CartKin::ik_within`].
-    pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
-        self.ik_within(seed, target, IkOptions::default().max_iters)
-    }
-
-    /// [`CartKin::ik`] under a caller-chosen iteration budget.
-    ///
-    /// A budget only pays for itself where the answer is a yes/no about a
-    /// step small enough to converge in a handful of iterations: the full
-    /// budget is then spent only on targets that have no solution, and
-    /// spending it is the whole cost.
+    /// Closed-form IK toward `target`, which is where the OFFSET TCP must
+    /// land: the solver works at the URDF's TCP frame, so the target is
+    /// walked back along its own axes by the offset first.
     ///
     /// Every solved joint is normalized onto the 2π branch its soft
-    /// window admits, nearest the seed
-    /// ([`par6_kin::wrap_to_window`]) — the DLS iterate itself carries
-    /// however many turns the walk accumulated, and a limit check on
-    /// that raw number refuses reachable targets. Nearest-the-seed is
-    /// what keeps this in step with the callers' branch-flip guards:
-    /// wrapping never moves a solution further from the seed, so a
-    /// solution that is still far from it really is another posture.
-    pub(crate) fn ik_within(
-        &mut self,
-        seed: &[f64; NQ],
-        target: &Pose,
-        max_iters: i32,
-    ) -> IkResult {
+    /// window admits, nearest the seed ([`par6_kin::wrap_to_window`]).
+    /// Nearest-the-seed is what keeps this in step with the callers'
+    /// branch-flip guards: wrapping never moves a solution further from
+    /// the seed, so a solution that is still far from it really is
+    /// another posture.
+    pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
         let d = self.offset.get();
         let mut target = *target;
         translate_local(&mut target, [-d[0], -d[1], -d[2]]);
         let mut out = [0.0; NQ];
-        let opts = IkOptions {
-            max_iters,
-            ..IkOptions::default()
-        };
-        match self.kin.ik(seed, &target, &mut out, opts) {
+        match self.kin.ik(seed, &target, &mut out) {
             Ok(IkOutcome::Converged) => {
                 for (j, q) in out.iter_mut().enumerate() {
                     *q = par6_kin::wrap_to_window(
@@ -519,7 +499,7 @@ impl CartKin {
                 }
                 IkResult::Solved(out)
             }
-            Ok(IkOutcome::MaxIters) => IkResult::Unreachable,
+            Ok(IkOutcome::Unreachable) => IkResult::Unreachable,
             Err(e) => IkResult::Failed(e.to_string()),
         }
     }
@@ -693,6 +673,64 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
         }
     }
     Some(x)
+}
+
+/// `variant`'s collision geometry from the assets tree.
+///
+/// `package_dir` is where `package://` mesh URIs resolve, for an assets
+/// tree that is an installed package rather than a repo checkout (whose
+/// meshes sit under `<assets>/URDF`, which [`par6_kin::Collision::load`]
+/// already knows).
+pub fn load_collision(
+    assets_dir: &Path,
+    variant: par6_kin::GripperVariant,
+    package_dir: Option<&Path>,
+    clearance: f64,
+) -> Result<par6_kin::Collision, par6_kin::KinError> {
+    match package_dir {
+        Some(dir) => {
+            let mut c = par6_kin::Collision::from_urdf(
+                &assets_dir.join(variant.urdf_relpath()),
+                Some(dir),
+                clearance,
+            )?;
+            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))?;
+            Ok(c)
+        }
+        None => par6_kin::Collision::load(assets_dir, variant, clearance),
+    }
+}
+
+/// The model a payload estimation measures against — the arm with its
+/// fitted gripper, the collision world the wrist swing is planned in,
+/// and the joint window — from the config the daemon runs, resolved the
+/// way the daemon resolves it.
+///
+/// `package_dir` is where `package://` mesh URIs resolve when the assets
+/// tree is the installed Python package's `_data` rather than a repo
+/// checkout, whose meshes sit under `<assets>/URDF`.
+pub fn estimation_model(
+    config: Option<&Path>,
+    assets: Option<&Path>,
+    package_dir: Option<&Path>,
+) -> Result<par6_calibrate::EstimationModel, String> {
+    let config_path = crate::options::resolve_config_path(config)?;
+    let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
+    let robot = &bundle.robot;
+    let assets_dir = resolve_assets_dir(assets, &config_path)?;
+    let gripper = bundle.active_gripper();
+    let variant = variant_for(
+        &robot.robot.active_gripper,
+        gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
+    let kin = load_gravity_kin(&assets_dir, gripper)?;
+    let collision =
+        load_collision(&assets_dir, variant, package_dir, 0.0).map_err(|e| e.to_string())?;
+    Ok(par6_calibrate::EstimationModel {
+        kin,
+        collision,
+        window: SoftWindow::from_config(robot).pairs(),
+    })
 }
 
 #[cfg(test)]

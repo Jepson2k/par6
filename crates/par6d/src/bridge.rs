@@ -47,7 +47,7 @@ const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 /// rate, so retries never saturate the one-command-per-tick budget).
 const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
 /// Housekeeping loop period.
-const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+pub(crate) const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
 /// How long a FLASHING enter/exit waits for the published mode to
 /// answer. The RT decides on the next tick, so this only has to cover
 /// command-queue and snapshot latency on a loaded host.
@@ -77,7 +77,7 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// server-side jog integrator; par6's integrator ramps on the RT thread,
 /// so the projection here uses the commanded target velocity — an upper
 /// bound on the ramping integrator's, which errs on the stopping side.
-const STREAM_LOOKAHEAD_S: f64 = 0.15;
+pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -150,6 +150,12 @@ pub(crate) struct StreamGate {
 }
 
 impl StreamGate {
+    /// The gate's own collision world, for planning poses against the
+    /// same shapes the gate admits jogs against.
+    pub(crate) fn collision_mut(&mut self) -> &mut par6_kin::Collision {
+        &mut self.collision
+    }
+
     pub(crate) fn new(
         collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
@@ -167,7 +173,7 @@ impl StreamGate {
     /// Mirror one layer of the planner-accepted world. The conversion is
     /// the identical `Shape::from_proto` path the planner ran, so on a
     /// set the server hands over it cannot disagree.
-    fn set_layer(
+    pub(crate) fn set_layer(
         &mut self,
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
@@ -223,7 +229,7 @@ impl StreamGate {
     /// grinding deeper through the same pair, and the depth check alone
     /// cannot tell an improving start-collision from a new shallower
     /// one, so both run.
-    fn blocked(
+    pub(crate) fn blocked(
         &mut self,
         current: &[f64; MAX_JOINTS],
         target: &[f64; MAX_JOINTS],
@@ -262,7 +268,7 @@ impl StreamGate {
     /// Where a `jog_j` on `joint` at `signed_pct` will be one lookahead
     /// horizon from `q`, clamped into the soft window so a pose at the
     /// stop cannot phantom-trip the gate.
-    fn jog_lookahead(
+    pub(crate) fn jog_lookahead(
         &self,
         q: &[f64; MAX_JOINTS],
         speeds: &[f64; MAX_JOINTS],
@@ -278,7 +284,7 @@ impl StreamGate {
     /// Latch `pairs` as the streaming collision verdict and build the
     /// refusal the client reads. One checked configuration, so the error
     /// template's path slots read `0` of `1`.
-    fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
+    pub(crate) fn refuse(&mut self, pairs: Vec<(String, String)>) -> WireError {
         let rendered = pairs
             .iter()
             .take(4)
@@ -355,6 +361,7 @@ enum StreamKind {
 }
 
 /// Live state of a cartesian jog, advanced by housekeeping each period.
+#[derive(Clone, Copy)]
 pub(crate) struct CartJogState {
     /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
     /// commanded frame's axes.
@@ -369,6 +376,12 @@ pub(crate) struct CartJogState {
 struct ActiveStream {
     kind: StreamKind,
     deadline: Instant,
+    /// A jog whose watchdog expired and whose engine is ramping to rest.
+    /// The session is not over — parol6's executor stays `active` until
+    /// its velocity is zero, and a datagram arriving meanwhile just
+    /// becomes the ramp's new target — so it stays open here too, until
+    /// the RT reports it left JOG, or `deadline` (the ramp cap) passes.
+    releasing: bool,
     servo_target: Option<[f64; MAX_JOINTS]>,
     /// The live `jog_j` command: per-joint signed speed fraction, all
     /// zero once the button released. What housekeeping's periodic
@@ -377,8 +390,7 @@ struct ActiveStream {
     /// `scene_epoch` of the collision world a held SERVO target was last
     /// checked against. A held target cannot move, so it only needs
     /// re-testing when the WORLD does — this is what housekeeping's
-    /// re-check keys on, so the steady state costs no collision queries
-    /// (and a pathological Plane keep-out cannot starve the keep-alive).
+    /// re-check keys on, so the steady state costs no collision queries.
     world_epoch: u64,
     cart: Option<CartJogState>,
     /// The stream's `(speed, accel)` fractions, carried so housekeeping's
@@ -553,6 +565,7 @@ impl RtCommands for RtBridge {
                     }
                 }
                 sh.stream = Some(ActiveStream {
+                    releasing: false,
                     kind: StreamKind::Jog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
@@ -599,6 +612,7 @@ impl RtCommands for RtBridge {
                     accel: scale.1,
                 });
                 sh.stream = Some(ActiveStream {
+                    releasing: false,
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
@@ -666,6 +680,7 @@ impl RtCommands for RtBridge {
                     accel: scale.1,
                 });
                 sh.stream = Some(ActiveStream {
+                    releasing: false,
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
@@ -727,6 +742,7 @@ impl RtCommands for RtBridge {
                     self.enter_stream_mode(Mode::Stream);
                 }
                 sh.stream = Some(ActiveStream {
+                    releasing: false,
                     kind: StreamKind::CartJog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
@@ -1089,7 +1105,9 @@ impl RtBridge {
 /// Timed follow-throughs that the datagram-driven bridge cannot run
 /// itself: jog duration watchdog, servo keep-alive + silence timeout,
 /// and the enable retry that resolves a `reset` into a real answer.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn housekeeping_loop(
+    jog_accel_time_s: f64,
     link: CoreLink,
     stream_input: Arc<Mutex<StreamInput>>,
     shared: Arc<Mutex<SharedState>>,
@@ -1111,6 +1129,10 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::JogRelease);
         link.send(RtCommand::SetMode(Mode::Idle));
     };
+    // Longer than any ramp the config can ask for (the s-curve profile
+    // adds jerk phases to the linear time); only reached if the RT never
+    // reports rest.
+    let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
     let mut profile_logged = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
@@ -1131,16 +1153,41 @@ pub(crate) fn housekeeping_loop(
         {
             let mut sh = shared.lock().unwrap();
             match &mut sh.stream {
+                // The ramp reached rest and the RT left JOG on its own:
+                // the session is over.
+                Some(a) if a.releasing && snap.mode != Mode::Jog => {
+                    sh.stream = None;
+                }
                 Some(a) if now >= a.deadline => {
                     match a.kind {
-                        StreamKind::Jog => {
+                        // Released rather than idled: `JogRelease` zeroes
+                        // the engine's target but not its velocity, and
+                        // the RT only ticks the engine in JOG, so cutting
+                        // to IDLE here would stop the arm dead from full
+                        // jog speed. The session stays open while the
+                        // ramp runs, so a re-press joins it instead of
+                        // bouncing the RT through IDLE.
+                        StreamKind::Jog if !a.releasing => {
                             log::debug!("jog duration elapsed; releasing");
                             link.send(RtCommand::JogRelease);
+                            a.releasing = true;
+                            a.jog = [0.0; MAX_JOINTS];
+                            a.deadline = now + jog_ramp_cap;
+                            continue;
                         }
-                        StreamKind::Servo => log::debug!("servo stream went silent; stopping"),
-                        StreamKind::CartJog => log::debug!("jog_l duration elapsed; stopping"),
+                        StreamKind::Jog => {
+                            log::warn!("jog ramp never reported rest; idling");
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                        }
+                        StreamKind::Servo => {
+                            log::debug!("servo stream went silent; stopping");
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                        }
+                        StreamKind::CartJog => {
+                            log::debug!("jog_l duration elapsed; stopping");
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                        }
                     }
-                    link.send(RtCommand::SetMode(Mode::Idle));
                     sh.stream = None;
                 }
                 // The moving-jog re-check: the admission gate saw the
@@ -1178,9 +1225,8 @@ pub(crate) fn housekeeping_loop(
                     // so it is re-tested exactly when the WORLD changes
                     // (the analogue of the planner's in-flight
                     // revalidation), never per period: the steady state
-                    // costs no collision queries, which is what keeps a
-                    // pathological Plane keep-out from starving the
-                    // keep-alive below past the RT stream watchdog.
+                    // costs no collision queries, so the keep-alive below
+                    // is never starved past the RT stream watchdog.
                     if let Some(t) = a.servo_target {
                         let epoch = gate.lock().unwrap().epoch();
                         if epoch != a.world_epoch {
