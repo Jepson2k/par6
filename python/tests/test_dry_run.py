@@ -17,7 +17,13 @@ import time
 
 import numpy as np
 import pytest
-from live_daemon import STATUS_RATE_HZ, TICK_DT_S, LiveDaemon, requires_par6d
+from live_daemon import (
+    STATUS_RATE_HZ,
+    TICK_DT_S,
+    LiveDaemon,
+    requires_par6d,
+    teleport_to,
+)
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -1000,14 +1006,17 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
             for case in ("arc", "circle", "spline", "process", "chain"):
                 # Both sides plan from the configuration the arm is measured
                 # in, so the shapes are anchored on the same place.
-                await _teleport_to(client, _OPEN_POSE_DEG)
+                await teleport_to(client, _OPEN_POSE_DEG)
                 assert await client.wait_status(
                     lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
                     timeout=20.0,
                 )
                 live_start = await client.angles()
                 assert live_start is not None
-                preview = Robot().create_dry_run_client(initial_joints_deg=live_start)
+                # The same `Robot` the anchor FK comes from: it caches the
+                # daemon's config bundle, so a fresh one per case re-pings
+                # and re-materialises it five times over.
+                preview = robot.create_dry_run_client(initial_joints_deg=live_start)
                 results = _preview_case(preview, case)
                 assert all(r is not None and r.error is None for r in results), (
                     f"{case}: the preview refused it: "
@@ -1072,21 +1081,6 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
 
     finally:
         daemon.stop()
-
-
-async def _teleport_to(client, angles: list[float]) -> None:
-    """Drive the sim to *angles*; teleport is unacked, so re-send until it lands."""
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        await client.teleport(angles)
-        if await client.wait_status(
-            lambda s: (
-                s.homed and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0
-            ),
-            timeout=0.5,
-        ):
-            return
-    raise AssertionError("teleport never took effect")
 
 
 def test_a_retune_previews_from_the_same_call_that_runs_live(

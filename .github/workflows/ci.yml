@@ -264,15 +264,41 @@ jobs:
           source .ffi/env.sh
           cd python
           pytest
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-python-${{ matrix.python }}
+          path: python/test-results.xml
 
   # End-to-end: the real python client against a real `par6d --sim` process
   # over real UDP. Needs the binary, so it builds par6d here and points
   # PAR6D_BIN at it; without that the same tests skip themselves (which is
   # what happens in the `python` job above).
+  # Two legs, because they are the two halves of the old single step and
+  # neither needs the other: `examples` spawns its own daemons on its own
+  # ephemeral ports. Splitting them takes the examples layer off the e2e
+  # leg's critical path, and — because the old step ran both under
+  # `bash -e` — stops an e2e failure from cancelling the examples run
+  # before it starts.
   e2e:
-    name: e2e (python client <-> par6d --sim)
+    name: e2e (${{ matrix.layer }})
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The rig allocates every port and grant directory per daemon, so
+          # the layer parallelises; `ubuntu-latest` is 4 vCPU on a public
+          # repo. Each worker still runs one daemon at a time, which is what
+          # keeps the 50 ms tick inside its budget.
+          - layer: e2e
+            args: -m e2e -n 4
+          # Serial on purpose: each example drives a full homing seek, and
+          # four concurrent seeks on a 4-vCPU runner miss their budgets.
+          - layer: examples
+            args: -m examples --examples
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -281,7 +307,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          key: e2e
+          key: e2e-${{ matrix.layer }}
       # `--features ffi` needs the shim, so this job carries the same
       # toolchain (and the same cache key) as the `ffi` job.
       - name: cache pinocchio toolchain
@@ -319,7 +345,7 @@ jobs:
           if [ -n "$matched" ]; then
             mv python/pyproject.toml.bak python/pyproject.toml
           fi
-      - name: pytest -m e2e
+      - name: pytest ${{ matrix.args }}
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
           # This job exists to run the e2e layer. Without the flag a
@@ -335,8 +361,14 @@ jobs:
         run: |
           source .ffi/env.sh
           cd python
-          pytest -m e2e
-          pytest -m examples --examples
+          pytest ${{ matrix.args }}
+      # `if: always()`, because the run that failed is the one worth reading.
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.layer }}
+          path: python/test-results.xml
 
   # The artifact that actually deploys: par6d cross-built for the control
   # box WITH kinematics, plus the shim and the runtime closure that ship

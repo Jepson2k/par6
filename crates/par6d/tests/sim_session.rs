@@ -1109,6 +1109,61 @@ fn home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking() {
     rig.shutdown();
 }
 
+/// `home(calibrate=true)` on an ALREADY-referenced arm runs the seek, not
+/// the planned park return the sibling test above pins.
+///
+/// The flag crosses a wire field, the server's dispatch and the RT's mode
+/// request before anything acts on it, and a runtime that dropped it
+/// anywhere on that path would return to park and report success — the
+/// operator asking to re-reference a drifted arm would be told it had
+/// happened. `preview.rs` covers the flag through the offline planner;
+/// this is the live runtime.
+///
+/// Deliberately does NOT wait for completion: the shipped sequence takes
+/// ~60 s of wall clock (the sim runs in real time) and the two facts that
+/// discriminate a seek from a return — HOMING mode, and `homed` dropping
+/// — are both true within a second of the request.
+#[test]
+fn home_calibrate_on_a_referenced_arm_reseeks_instead_of_returning_to_park() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+    let s = rig.wait_status("referenced after the teleport", |s| s.homed);
+    assert!(
+        max_deg_error(&s.angles, &park) < 1.0,
+        "the arm must start on the park pose, got {:?}",
+        s.angles
+    );
+
+    let index = c.ok_index(&Command::Home(par6_proto::command::Home {
+        key: 7402,
+        calibrate: true,
+    }));
+    assert!(index >= 0, "a calibrating home must be accepted");
+
+    // The RT drops into HOMING: a planned return never leaves EXEC, which
+    // is what `home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking`
+    // asserts for the same command with the flag clear.
+    rig.wait_status("calibrate=true re-enters HOMING", |s| {
+        s.mode == ControllerMode::Homing
+    });
+    // And un-references on the way: the seek is establishing the reference
+    // it is about to replace.
+    rig.wait_status("the seek drops the home reference", |s| !s.homed);
+
+    // Abandon the seek rather than paying its ~60 s.
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    rig.wait_status("the stop takes the RT out of HOMING", |s| {
+        s.mode != ControllerMode::Homing
+    });
+
+    rig.shutdown();
+}
+
 /// Gap 24: the queue ETA covers moves parameterised by SPEED, which is
 /// how nearly every client queues them — `duration=` is the exception.
 /// parol6 accumulates the planned duration of every buffered segment

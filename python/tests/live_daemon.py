@@ -10,7 +10,6 @@ tests instead of failing, so a checkout without a Rust build stays green.
 from __future__ import annotations
 
 import asyncio
-import functools
 import os
 import queue
 import shutil
@@ -71,33 +70,39 @@ def repo_assets_dir() -> Path | None:
     return assets if assets.is_dir() else None
 
 
-def daemon_env() -> dict[str, str]:
+def daemon_env(shm_dir: Path | None = None) -> dict[str, str]:
     """Environment for the daemon under test.
 
     The bus-ownership grant (``loop_tick`` / ``robot_mode``) is published
-    under fixed names, and a stopping daemon REMOVES them — so two test
-    runs sharing ``/dev/shm`` would delete each other's live claim. Ports
-    are already allocated per run; the grant needs the same treatment.
-    The Rust harness does this per process id; do the same here.
+    under fixed names, and a stopping daemon REMOVES them — so any two
+    daemons sharing a grant directory delete each other's live claim.
+    Per PROCESS is not enough: one pytest process can run two daemons at
+    once (the `Robot.start()` spawn test runs a second one beside the
+    fixture's), and under `-n` several processes run several more. Each
+    daemon therefore gets its own directory.
     """
     env = dict(os.environ)
     assets = repo_assets_dir()
     if "PAR6_ASSETS" not in env and assets is not None:
         env["PAR6_ASSETS"] = str(assets)
-    env.setdefault("PAR6_SHM_DIR", str(_shm_dir()))
+    env["PAR6_SHM_DIR"] = str(shm_dir if shm_dir is not None else new_shm_dir())
     return env
 
 
-@functools.lru_cache(maxsize=1)
-def _shm_dir() -> Path:
-    """A per-process scratch directory for this run's grant segments."""
-    path = Path(tempfile.gettempdir()) / f"par6-test-shm-{os.getpid()}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def new_shm_dir() -> Path:
+    """A scratch directory for one daemon's grant segments."""
+    return Path(tempfile.mkdtemp(prefix=f"par6-test-shm-{os.getpid()}-"))
 
 
 def free_udp_port() -> int:
-    """A currently-free loopback UDP port (bind, read, release)."""
+    """A currently-free loopback UDP port (bind, read, release).
+
+    Deliberately released before returning rather than held until the
+    receiver binds: in ``auto`` status transport the DAEMON binds this
+    port itself while probing multicast, so a reservation held across its
+    boot makes that probe fail and the runtime degrade silently to
+    unicast.
+    """
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
@@ -192,7 +197,7 @@ class LiveDaemon:
             stdout=subprocess.PIPE,
             stderr=log,
             text=True,
-            env=daemon_env(),
+            env=daemon_env(new_shm_dir()),
         )
         try:
             command_port = cls._read_ready_port(process, log_path)
@@ -279,23 +284,25 @@ class LiveDaemon:
         )
 
 
-async def settle_at(
-    client: AsyncRobotClient, angles_deg: list[float], budget_s: float = 20.0
+async def teleport_to(
+    client: AsyncRobotClient,
+    angles_deg: list[float],
+    budget_s: float = 20.0,
+    tol_deg: float = 1.0,
 ) -> None:
-    """Reset the controller and leave the sim arm standing at *angles_deg*.
+    """Leave the sim arm standing at *angles_deg*.
 
-    Teleport is unacked and gated on ENABLED, and the RT clear sequence
-    settles over several ticks, so both are re-sent until the broadcast
-    shows the arm there — the same loop a UI runs. Raises when the arm
-    never arrives within *budget_s*.
+    Teleport is unacked and gated on ENABLED, so it is re-sent until the
+    broadcast shows the arm there — the same loop a UI runs. Raises when
+    the arm never arrives within *budget_s*.
     """
     deadline = time.monotonic() + budget_s
-    await client.reset()
     while time.monotonic() < deadline:
         await client.teleport(angles_deg)
         arrived = await client.wait_status(
             lambda s: (
-                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg))
+                s.homed
+                and all(abs(a - b) < tol_deg for a, b in zip(s.angles, angles_deg))
             ),
             timeout=0.5,
         )
@@ -303,6 +310,18 @@ async def settle_at(
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"the sim arm never reached {angles_deg}")
+
+
+async def settle_at(
+    client: AsyncRobotClient, angles_deg: list[float], budget_s: float = 20.0
+) -> None:
+    """Reset the controller, then leave the arm standing at *angles_deg*.
+
+    The RT clear sequence settles over several ticks, so the reset has to
+    precede the teleport loop rather than race it.
+    """
+    await client.reset()
+    await teleport_to(client, angles_deg, budget_s=budget_s, tol_deg=0.5)
 
 
 async def angles_now(client: AsyncRobotClient) -> list[float]:
