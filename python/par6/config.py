@@ -11,6 +11,7 @@ waldoctl dataclasses); the pinokin-backed kinematics live in :mod:`par6.robot`.
 
 from __future__ import annotations
 
+import hashlib
 import tomllib
 import xml.etree.ElementTree as ET
 from functools import cache
@@ -94,21 +95,56 @@ def data_root() -> Path:
 
 
 @cache
-def load_robot_config() -> dict:
-    """Parsed ``config/PAR6.toml`` from the packaged data."""
-    with (data_root() / "config" / "PAR6.toml").open("rb") as f:
+def load_robot_config(path: str | None = None) -> dict:
+    """Parsed robot TOML: the packaged ``config/PAR6.toml``, or the file at
+    *path* (a daemon's materialized bundle, so a preview runs the numbers
+    the arm enforces)."""
+    file = Path(path) if path else data_root() / "config" / "PAR6.toml"
+    with file.open("rb") as f:
         return tomllib.load(f)
 
 
 @cache
-def load_gripper_configs() -> dict[str, dict]:
-    """Parsed ``config/grippers/*.toml``, keyed by canonical (upper) name."""
+def load_gripper_configs(path: str | None = None) -> dict[str, dict]:
+    """Parsed ``grippers/*.toml`` beside the robot TOML (the packaged one
+    by default), keyed by canonical (upper) name."""
+    root = Path(path).parent if path else data_root() / "config"
     configs: dict[str, dict] = {}
-    for path in sorted((data_root() / "config" / "grippers").glob("*.toml")):
-        with path.open("rb") as f:
+    for file in sorted((root / "grippers").glob("*.toml")):
+        with file.open("rb") as f:
             cfg = tomllib.load(f)
         configs[cfg["name"].strip().upper()] = cfg
     return configs
+
+
+def config_files(path: str | Path) -> dict:
+    """The robot TOML at *path* and the ``grippers/*.toml`` beside it,
+    verbatim, in the shape of the daemon's CONFIG_BUNDLE answer.
+
+    ``fingerprint`` is computed the way the daemon computes CONFIG_INFO's:
+    sha256 over each file's name, a newline and its content — the robot
+    TOML first, then the gripper files by file name — so a preview built
+    from the same files reports the same fingerprint the daemon does.
+    """
+    robot = Path(path)
+    digest = hashlib.sha256()
+
+    def read(file: Path) -> tuple[str, str]:
+        content = file.read_text()
+        digest.update(file.name.encode())
+        digest.update(b"\n")
+        digest.update(content.encode())
+        return file.name, content
+
+    robot_filename, robot_toml = read(robot)
+    grippers = [read(f) for f in sorted((robot.parent / "grippers").glob("*.toml"))]
+    return {
+        "path": str(robot),
+        "fingerprint": digest.hexdigest(),
+        "robot_filename": robot_filename,
+        "robot_toml": robot_toml,
+        "grippers": [{"filename": n, "content": c} for n, c in grippers],
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -275,18 +311,19 @@ def build_joints_spec() -> JointsSpec:
     )
 
 
-def homing_ready_pose_rad() -> np.ndarray:
+def homing_ready_pose_rad(config: dict | None = None) -> np.ndarray:
     """Where the configured homing sequence leaves the arm \\[rad\\].
 
     The runtime answers HOME by running its full referencing sequence, so the
     pose it ends at is decided by that sequence's ``move_to`` steps (the last
     one commanded per joint), not by ``[robot].park_pose_rad``.
     """
+    robot = config or load_robot_config()
     final: dict[int, float] = {}
-    for step in load_robot_config()["homing"]["sequence"]:
+    for step in robot["homing"]["sequence"]:
         for move in step.get("move_to", []):
             final[int(move["joint"])] = float(move["position_rad"])
-    joints = range(len(load_robot_config()["joints"]))
+    joints = range(len(robot["joints"]))
     missing = [j for j in joints if j not in final]
     if missing:
         raise RuntimeError(f"homing sequence leaves joints {missing} unplaced")
@@ -316,14 +353,14 @@ def jog_ramp_acceleration() -> np.ndarray:
 # ---------------------------------------------------------------------------
 
 
-def io_line_names() -> tuple[list[str], list[str]]:
+def io_line_names(config: dict | None = None) -> tuple[list[str], list[str]]:
     """``(inputs, outputs)`` from the runtime's ``[io]`` section, in order.
 
     The same order the STATUS ``io`` array uses — inputs, then outputs, then
     the e-stop, which is never declared and always last. ``write_io(port)``
     indexes the *outputs* list.
     """
-    io = load_robot_config().get("io", {})
+    io = (config or load_robot_config()).get("io", {})
     return (
         [line["name"] for line in io.get("inputs", [])],
         [line["name"] for line in io.get("outputs", [])],
@@ -345,9 +382,11 @@ def canonical_tool_key(name: str) -> str:
     return name.strip().upper()
 
 
-def fitted_tool_key() -> str:
+def fitted_tool_key(config: dict | None = None) -> str:
     """Canonical key of the gripper the runtime is configured with."""
-    return canonical_tool_key(load_robot_config()["robot"]["active_gripper"])
+    return canonical_tool_key(
+        (config or load_robot_config())["robot"]["active_gripper"]
+    )
 
 
 # ---------------------------------------------------------------------------

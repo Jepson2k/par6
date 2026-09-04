@@ -7,53 +7,81 @@ timeline) with no ``par6d`` and no hardware.
 It is not a second implementation of par6: the preview engine
 (`par6._par6.Preview`, over ``par6d::preview``) drives the daemon's OWN
 planner against a virtual arm — same profiles, same IK, same TOPPRA
-timing, same collision gate, same wire validation — so a previewed
-command is planned by exactly the code that would drive the arm.  This
-module owns only the Python-facing surface: waldoctl types, wire-unit
-conversions, the blend hold, and the previewed tool/IO readback state.
+timing, same collision gate, same wire validation, same tool-action
+checks — so a previewed command is planned by exactly the code that would
+drive the arm.  This module owns only the Python-facing surface: waldoctl
+types, wire-unit conversions, the blend hold, and the previewed tool/IO
+readback state.
 
 **Blending.**  A move whose blend radius is positive is HELD, exactly as the
 runtime's queue holds it, until the command that follows it decides what the
-corner looks like.  The held commands are offered to the planner as one
-batch, which folds them exactly as the live queue would; the whole chain's
-motion is returned by the command that closes it, or by
-:meth:`~DryRunRobotClient.flush` at the end of the program, which is where
-the runtime's blend hold expires.  A held move therefore returns ``None``.
-A streamable or a teleport cancels planned motion on the runtime, so it
-discards a held chain here too.
+corner looks like — or until the hold fills to the runtime's blend
+lookahead, where the queue plans the chain as it stands.  The held commands
+are offered to the planner as one batch, which folds them exactly as the
+live queue would; the whole chain's motion is returned by the command that
+closes it, or by :meth:`~DryRunRobotClient.flush` at the end of the program,
+which is where the runtime's blend hold expires.  A held move therefore
+returns ``None``.  A command that only reconfigures state (a checkpoint, a
+delay, a tool selection) closes the hold too; the motion it releases rides
+at the head of the next result rather than being lost.  A streamable or a
+teleport cancels planned motion on the runtime, so it discards a held chain
+here too.
 
 Refusals are the runtime's own: wire validation, the not-homed gate, the
-collision gate and the planner's refusals are all answered by the same
-code with the same error templates, so the editor shows the failure before
-the arm does.
+collision gate, the tool checks and the planner's refusals are all answered
+by the same code with the same error templates, so the editor shows the
+failure before the arm does.  Where the live client refuses a call itself
+(a wrong-length angle list, an out-of-range output index), the dry run
+raises the same ``ValueError``.
 """
 
 from __future__ import annotations
 
 import logging
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import numpy as np
 from numpy.typing import NDArray
 from pinokin import so3_rpy
-from waldoctl import ToolState, ToolStatus
+from waldoctl import ElectricGripperTool, ToolSpec, ToolState, ToolStatus
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld
+from waldoctl.status import ActionState as WActionState
+from waldoctl.status import (
+    ActivityResult,
+    LoopStatsResult,
+    PayloadResult,
+    PingResult,
+    ToolResult,
+)
 
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, make_wire_error
-from par6.client.async_client import StatusResult
+from par6.client.async_client import (
+    QueueResult,
+    ReachableResult,
+    StatusResult,
+    _axis_index,
+    _blend,
+    _f6,
+    _inertia6,
+    _matrix_to_pose,
+    _timing,
+    _wire_frame,
+    payload_from_dict,
+)
 from par6.client.errors import RobotError
-from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
+from par6.protocol.constants import (
+    NUM_JOINTS,
+    CompletionPolicy,
+    ControllerMode,
+    ErrorCode,
+    Frame,
+)
+from par6.protocol.wire import StatusBuffer
 
 logger = logging.getLogger(__name__)
-
-#: Wire axis order for ``jog_l`` / Cartesian velocity vectors.
-_AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
-
-#: Minimum time the runtime holds a gripper calibration
-#: (``crates/par6d/src/planner.rs::TOOL_CALIBRATE_MIN_WAIT_S``).
-_TOOL_CALIBRATE_MIN_WAIT_S = 2.0
 
 
 def make_error(code: ErrorCode, **params: Any) -> RobotError:
@@ -62,42 +90,6 @@ def make_error(code: ErrorCode, **params: Any) -> RobotError:
     what the runtime would say."""
     rendered = make_wire_error(int(code), {k: str(v) for k, v in params.items()})
     return RobotError.from_wire(rendered)
-
-
-def _wire_frame(frame: str) -> int:
-    if frame == "WRF":
-        return 0
-    if frame == "TRF":
-        return 1
-    raise ValueError(f"unknown frame {frame!r} (par6 supports WRF and TRF)")
-
-
-def _f6(values: Any, name: str) -> list[float]:
-    out = [float(v) for v in values]
-    if len(out) != NUM_JOINTS:
-        raise make_error(
-            ErrorCode.COMM_VALIDATION_ERROR,
-            detail=f"{name} requires {NUM_JOINTS} values, got {len(out)}",
-        )
-    return out
-
-
-def _timing(
-    duration: float | None, speed: float | None
-) -> tuple[float | None, float | None]:
-    """The waldoctl duration/speed pair (0/None = unset) as the wire's
-    exactly-one-of convention.  Neither set means full profile speed."""
-    d = float(duration) if duration else None
-    s = float(speed) if speed else None
-    if d is not None and s is not None:
-        raise ValueError("duration and speed are mutually exclusive")
-    if d is None and s is None:
-        s = 1.0
-    return d, s
-
-
-def _blend(r: float | None) -> float | None:
-    return float(r) if r else None
 
 
 def _matrix_to_si_pose(m: list[float] | NDArray[np.float64]) -> NDArray[np.float64]:
@@ -113,7 +105,7 @@ def _matrix_to_si_pose(m: list[float] | NDArray[np.float64]) -> NDArray[np.float
     return np.array([T[0, 3], T[1, 3], T[2, 3], *rpy], dtype=np.float64)
 
 
-def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
+def _resolve_engine_paths(config: str | None = None) -> tuple[str | None, str | None]:
     """The config file + assets tree the preview engine loads.
 
     An explicit *config* (a daemon-fetched bundle materialized by
@@ -123,9 +115,11 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
     install locations (``/etc/par6`` + ``/usr/share/par6``, what
     ``scripts/deploy/install.sh`` stages on a control box) — so a wheel
     installed next to a deployed daemon previews with the exact files
-    the daemon runs. The packaged ``_data`` URDFs carry rewritten mesh
-    URIs the engine's loader cannot resolve, so they cannot feed it yet;
-    a wheel with no daemon, repo, or env vars raises with that remedy.
+    the daemon runs. The engine's own resolver knows only the repo
+    checkout, so the deploy locations are searched here. The packaged
+    ``_data`` URDFs carry rewritten mesh URIs the engine's loader cannot
+    resolve, so they cannot feed it yet; a wheel with no daemon, repo, or
+    env vars raises with that remedy.
     """
     import os
     from pathlib import Path
@@ -153,21 +147,35 @@ def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
 
 
 class _DryRunTool:
-    """``client.tool`` for the preview — routes actions through the plan.
+    """``client.tool`` for the preview: the live tool's verbs, routed through
+    the plan, over the spec's own attributes.
 
-    Jaw position is tracked here rather than left at a default: a program
-    that closes the gripper and asks ``is_open()`` two lines later gets the
-    answer the arm would give.
+    Each verb sends the wire action the live tool sends (``open`` /
+    ``close`` / ``set_position`` are ``move``, ``release`` is ``idle``),
+    so the engine refuses exactly what the runtime would — an
+    uncalibrated jaw, a position past the stroke, a verb the driver does
+    not have.  Jaw position is tracked here rather than left at a
+    default: a program that closes the gripper and asks ``is_open()`` two
+    lines later gets the answer the arm would give.
     """
 
-    def __init__(self, client: "DryRunRobotClient") -> None:
+    def __init__(self, client: DryRunRobotClient) -> None:
         self._client = client
         self._position = 0.0
+
+    @property
+    def _spec(self) -> ToolSpec:
+        return self._client._tools[self._client.active_tool_key]
+
+    def __getattr__(self, name: str) -> Any:
+        if name.startswith("_"):
+            raise AttributeError(name)
+        return getattr(self._spec, name)
 
     def status(self) -> ToolStatus:
         """The previewed tool state. Not a query — the preview knows what it
         was told to do and nothing else, so nothing is faulted or detected."""
-        spec = self._client._tools[self._client.active_tool_key]
+        spec = self._spec
         return ToolStatus(
             key=spec.key,
             variant_key=self._client._variant_key,
@@ -180,27 +188,36 @@ class _DryRunTool:
         """True when the jaws are open; defaults to the previewed position."""
         return (self._position if position is None else position) < 0.5
 
-    def set_position(self, position: float, **kwargs: Any) -> DryRunResultData:
-        return self._act("set_position", [position], position)
-
-    def open(self, **kwargs: Any) -> DryRunResultData:
-        return self._act("open", [], 0.0)
-
-    def close(self, **kwargs: Any) -> DryRunResultData:
-        return self._act("close", [], 1.0)
-
-    def _act(self, verb: str, params: list[Any], position: float) -> DryRunResultData:
+    def _act(
+        self, verb: str, params: list[Any], position: float | None = None
+    ) -> DryRunResultData:
         result = self._client.tool_action(self._client.active_tool_key, verb, params)
-        self._position = min(max(float(position), 0.0), 1.0)
+        if position is not None:
+            self._position = float(position)
         return result
 
-    def __getattr__(self, name: str) -> Any:
-        def method(*args: Any, **kwargs: Any) -> DryRunResultData:
-            return self._client.tool_action(
-                self._client.active_tool_key, name, list(args), **kwargs
-            )
+    def set_position(self, position: float, **kwargs: Any) -> DryRunResultData:
+        spec = self._spec
+        if not isinstance(spec, ElectricGripperTool):
+            raise AttributeError(f"tool {spec.key!r} has no jaws to position")
+        speed = float(kwargs.get("speed", 0.5))
+        current = int(kwargs.get("current", spec.current_range[1]))
+        return self._act("move", [float(position), speed, current], position)
 
-        return method
+    def open(self, **kwargs: Any) -> DryRunResultData:
+        return self.set_position(0.0, **kwargs)
+
+    def close(self, **kwargs: Any) -> DryRunResultData:
+        return self.set_position(1.0, **kwargs)
+
+    def calibrate(self, **kwargs: Any) -> DryRunResultData:
+        return self._act("calibrate", [])
+
+    def stop(self, **kwargs: Any) -> DryRunResultData:
+        return self._act("stop", [])
+
+    def release(self, **kwargs: Any) -> DryRunResultData:
+        return self._act("idle", [])
 
 
 class DryRunRobotClient:
@@ -217,36 +234,43 @@ class DryRunRobotClient:
         max_snapshot_points: int = 200,
         initial_homed: bool = True,
         config_path: str | None = None,
+        initial_gripper_calibrated: bool = True,
     ) -> None:
         from par6.tools import build_tools
 
         config, assets = _resolve_engine_paths(config_path)
         self._preview = Preview(config=config, assets=assets)
+        # The file the engine loaded is the one every config read here uses,
+        # so a tuned deployment previews with its numbers throughout.
+        self._config_path = self._preview.config_path()
+        self._config = _cfg.load_robot_config(self._config_path)
         self._dt = self._preview.tick_dt_s()
         self._max_points = max(2, int(max_snapshot_points))
-        # The runtime's own startup context (planner DEFAULT_PROFILE +
-        # the server's boot completion policy), pushed to the engine NOW:
-        # a mirror the engine never heard of would report one profile
-        # while planning with another until the first context-changing
-        # call happened to sync them.
-        self._profile = "RUCKIG"
-        self._policy = int(CompletionPolicy.SETTLED)
+        self._blend_lookahead = max(1, int(self._preview.blend_lookahead()))
+        # The runtime's own startup context, read off the engine rather
+        # than mirrored here.
+        context = self._preview.context()
+        self._profile = str(context["profile"])
+        self._policy = int(context["policy"])
+        self._tcp_offset_mm = tuple(float(v) for v in context["tcp_offset_mm"])
 
         if initial_joints_deg is not None:
             q = np.radians(np.asarray(initial_joints_deg, dtype=np.float64))
             self._preview.teleport_rad(q.tolist())
         self._preview.set_homed(bool(initial_homed))
+        self._preview.set_gripper_calibrated(bool(initial_gripper_calibrated))
 
         self._tools = {spec.key: spec for spec in build_tools().available}
-        self._tool_key = _cfg.fitted_tool_key()
+        self._tool_key = _cfg.fitted_tool_key(self._config)
         self._variant_key = ""
-        self._tcp_offset_mm = (0.0, 0.0, 0.0)
         self._shapes: tuple[Shape, ...] = ()
         self._tool = _DryRunTool(self)
         self._held: list[dict] = []
-        self._io_inputs, self._io_outputs = _cfg.io_line_names()
+        self._pending: list[DryRunResultData] = []
+        self._io_inputs, self._io_outputs = _cfg.io_line_names(self._config)
         self._io_levels = [0] * len(self._io_outputs)
-        self._sync_context()
+        self._last_checkpoint = ""
+        self._completed = -1
 
     # ------------------------------------------------------------------
     # State
@@ -263,14 +287,26 @@ class DryRunRobotClient:
     def _q(self) -> NDArray[np.float64]:
         return np.asarray(self._preview.angles_rad(), dtype=np.float64)
 
+    def _matrix_m(self) -> NDArray[np.float64]:
+        """The TCP pose as a 4x4 matrix, translation in metres."""
+        return np.asarray(self._call(self._preview.pose), dtype=np.float64).reshape(
+            4, 4
+        )
+
     def angles(self) -> list[float]:
         """Simulated joint angles in degrees."""
         return np.degrees(self._q()).tolist()
 
-    def pose(self) -> list[float]:
-        """Simulated TCP pose ``[x, y, z, rx, ry, rz]`` in mm + degrees."""
-        si = _matrix_to_si_pose(self._call(self._preview.pose))
-        return [*(si[:3] * 1000.0), *np.degrees(si[3:])]
+    def pose(self, frame: str = "WRF") -> list[float]:
+        """Simulated TCP pose ``[x, y, z, rx, ry, rz]`` in mm + degrees, in
+        the world frame or — as the runtime answers ``TRF`` — the world
+        seen from the tool."""
+        T = self._matrix_m()
+        if _wire_frame(frame) == int(Frame.TRF):
+            T = np.linalg.inv(T)
+        T = T.copy()
+        T[:3, 3] *= 1000.0
+        return _matrix_to_pose(T.flatten().tolist())
 
     def tcp_offset(self) -> list[float]:
         """The TCP offset applied on top of the tool transform, in mm."""
@@ -304,12 +340,12 @@ class DryRunRobotClient:
     def _convert(self, r: dict) -> DryRunResultData:
         """One engine preview result as :class:`DryRunResultData`.
 
-        Trajectories are downsampled to ``max_snapshot_points`` (endpoints
-        kept); an empty trajectory (a command that moves nothing) reports
-        one sample at the pose the arm holds.
+        The engine already thinned the trajectory to ``max_snapshot_points``
+        (endpoints kept); an empty trajectory (a command that moves
+        nothing, or holds still for its duration) reports one sample at the
+        pose the arm holds.
         """
         traj = np.asarray(r["joint_trajectory_rad"], dtype=np.float64)
-        poses = r["tcp_poses"]
         if traj.size == 0:
             return DryRunResultData(
                 tcp_poses=self._si_pose_now()[np.newaxis, :],
@@ -317,19 +353,11 @@ class DryRunRobotClient:
                 duration=float(r["duration_s"]),
                 joint_trajectory_rad=self._q()[np.newaxis, :].copy(),
             )
-        stride = max(1, len(traj) // self._max_points)
-        idx = list(range(0, len(traj), stride))
-        if idx[-1] != len(traj) - 1:
-            idx.append(len(traj) - 1)
-        sampled = traj[idx]
-        sampled_poses = np.stack(
-            [_matrix_to_si_pose(poses[i]) for i in idx if i < len(poses)]
-        )
         return DryRunResultData(
-            tcp_poses=sampled_poses,
+            tcp_poses=np.stack([_matrix_to_si_pose(p) for p in r["tcp_poses"]]),
             end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
             duration=float(r["duration_s"]),
-            joint_trajectory_rad=sampled,
+            joint_trajectory_rad=traj,
         )
 
     def _error_result(self, err: RobotError) -> DryRunResultData:
@@ -347,7 +375,7 @@ class DryRunRobotClient:
         ``IK_PARTIAL_PATH`` — a preview wants to show how far a line gets,
         and the caller reads that off the result's ``error``.
         """
-        results = self._preview.preview_program(cmds)
+        results = self._preview.preview_program(cmds, self._max_points)
         out: list[DryRunResultData] = []
         for r in results:
             err = r["error"]
@@ -358,6 +386,7 @@ class DryRunRobotClient:
                     continue
                 raise robot_err
             out.append(self._convert(r))
+        self._completed += len(cmds)
         return out
 
     # ------------------------------------------------------------------
@@ -368,15 +397,14 @@ class DryRunRobotClient:
         """Hold *cmd* for blending, or run the batch it completes.
 
         The runtime's queue holds a move whose radius is positive until its
-        successor arrives; the planner folds the batch exactly as the live
-        queue would, so nothing here decides what folds — only when the
-        batch is offered.
+        successor arrives, or until the hold fills to the blend lookahead;
+        the planner folds the batch exactly as the live queue would, so
+        nothing here decides what folds — only when the batch is offered.
         """
         self._held.append(cmd)
-        if held:
+        if held and len(self._held) < self._blend_lookahead:
             return None
-        batch, self._held = self._held, []
-        results = self._run_batch(batch)
+        results = self._close_chain()
         return _merge(results) if results else None
 
     def _discard_chain(self) -> None:
@@ -389,12 +417,14 @@ class DryRunRobotClient:
         self._held = []
 
     def _close_chain(self) -> list[DryRunResultData]:
-        """Run whatever the blend hold still holds, as the runtime's hold
-        expiry would, and return its results."""
-        if not self._held:
-            return []
-        batch, self._held = self._held, []
-        return self._run_batch(batch)
+        """Everything queued motion still owes the caller: a chain a
+        state-only command closed quietly, then whatever the blend hold
+        still holds, run as the runtime's hold expiry would."""
+        owed, self._pending = self._pending, []
+        if self._held:
+            batch, self._held = self._held, []
+            owed.extend(self._run_batch(batch))
+        return owed
 
     def _emit(self, result: DryRunResultData) -> DryRunResultData:
         """*result*, behind whatever motion a chain closed ahead of it."""
@@ -433,7 +463,7 @@ class DryRunRobotClient:
         """
         pending = self._close_chain()
         if kwargs.get("calibrate") or not self._preview.homed():
-            ready = _cfg.homing_ready_pose_rad()
+            ready = _cfg.homing_ready_pose_rad(self._config)
             self._preview.teleport_rad(ready.tolist())
             self._preview.set_homed(True)
             result = DryRunResultData(
@@ -462,21 +492,15 @@ class DryRunRobotClient:
         motion, so a move still held for blending never runs.
         """
         self._discard_chain()
-        if len(angles_deg) != NUM_JOINTS:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail=f"teleport requires {NUM_JOINTS} angles, got {len(angles_deg)}",
-            )
-        config = _cfg.load_robot_config()
+        deg = np.asarray(_f6(angles_deg, "angles_deg"), dtype=np.float64)
         hard_deg = np.degrees(
             np.array(
                 [
                     [j["limits"]["hard_min_rad"], j["limits"]["hard_max_rad"]]
-                    for j in config["joints"]
+                    for j in self._config["joints"]
                 ]
             )
         )
-        deg = np.asarray(angles_deg, dtype=np.float64)
         outside = np.flatnonzero((deg < hard_deg[:, 0]) | (deg > hard_deg[:, 1]))
         if outside.size:
             i = int(outside[0])
@@ -693,9 +717,10 @@ class DryRunRobotClient:
 
         The runtime tracks the newest target with a jerk-limited OTG;
         offline there is no arrival cadence to model, so the settle to the
-        target is previewed with the planner's own joint move.  A streamable
-        cancels planned motion on the runtime, so a move held for blending
-        is dropped rather than run behind this one.
+        target is previewed with the planner's own joint move.  The speed
+        fraction rides through as sent: the wire refuses what it refuses.
+        A streamable cancels planned motion on the runtime, so a move held
+        for blending is dropped rather than run behind this one.
         """
         self._discard_chain()
         if pose is not None:
@@ -703,7 +728,7 @@ class DryRunRobotClient:
                 "type": "move_j_pose",
                 "pose": _f6(pose, "pose"),
                 "duration": None,
-                "speed": min(float(speed), 1.0) or 1.0,
+                "speed": float(speed),
                 "accel": float(accel),
                 "blend_radius": None,
             }
@@ -714,7 +739,7 @@ class DryRunRobotClient:
                 "type": "move_j",
                 "angles": _f6(angles, "angles"),
                 "duration": None,
-                "speed": min(float(speed), 1.0) or 1.0,
+                "speed": float(speed),
                 "accel": float(accel),
                 "blend_radius": None,
                 "rel": False,
@@ -774,7 +799,9 @@ class DryRunRobotClient:
             fractions[joint] = float(speed)
         else:
             raise ValueError("jog_j requires either joint= or joints=/speeds=")
-        r = self._preview.preview_jog(fractions, float(duration), float(accel))
+        r = self._preview.preview_jog(
+            fractions, float(duration), float(accel), self._max_points
+        )
         if r["error"] is not None:
             raise RobotError.from_wire(r["error"])
         return self._convert(r)
@@ -791,79 +818,33 @@ class DryRunRobotClient:
         accel: float = 1.0,
         **kwargs: Any,
     ) -> DryRunResultData:
-        """Cartesian velocity jog, integrated the way the runtime integrates it.
-
-        Port of ``step_cart_jog`` (``crates/par6d/src/bridge.rs``): the
-        velocity fractions scale the runtime's full-scale TCP rates, a
-        tool-frame twist is rotated into the world by the current
-        orientation, joint rates come from the Jacobian, and the integrated
-        target is clamped to the soft window.
-        """
+        """Cartesian velocity jog, integrated by the runtime's own twist
+        solver (``step_cart_jog``) through the same kinematics, TCP offset
+        and soft window the arm jogs with, and gated on the collision
+        world."""
         self._discard_chain()
-        velocities = np.zeros(6, dtype=np.float64)
+        velocities = [0.0] * 6
         if axes is not None and speeds_list is not None:
+            if len(axes) != len(speeds_list):
+                raise ValueError(
+                    f"jog_l got {len(axes)} axes and {len(speeds_list)} speeds"
+                )
             for a, s in zip(axes, speeds_list):
-                velocities[_AXIS_INDEX[a]] = float(s)
+                velocities[_axis_index(a)] = float(s)
         elif axis is not None:
-            velocities[_AXIS_INDEX[axis]] = float(speed)
+            velocities[_axis_index(axis)] = float(speed)
         else:
             raise ValueError("jog_l requires either axis= or axes=/speeds_list=")
-        if frame not in ("WRF", "TRF"):
-            raise ValueError(f"unknown frame {frame!r} (par6 supports WRF and TRF)")
-        if not np.isfinite(velocities).all() or np.abs(velocities).max() > 1.0:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail="jog_l.velocities: each entry must be a finite fraction in [-1, 1]",
-            )
-        from par6.protocol.wire import MAX_JOG_DURATION_S
-
-        if not 0.0 < float(duration) <= MAX_JOG_DURATION_S:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail=f"jog_l.duration: must be in (0, {MAX_JOG_DURATION_S}] s",
-            )
-
-        robot = self._kin_robot()
-        soft = _cfg.soft_limits_rad()
-        motion = self._preview.motion()
-        twist = np.concatenate(
-            [
-                velocities[:3] * motion["jog_l_linear_max_m_s"],
-                velocities[3:] * motion["jog_l_angular_max_rad_s"],
-            ]
+        r = self._preview.preview_jog_l(
+            velocities,
+            float(duration),
+            _wire_frame(frame),
+            float(accel),
+            self._max_points,
         )
-        ticks = max(int(round(float(duration) / self._dt)), 1)
-        q = self._q()
-        path = []
-        for _ in range(ticks):
-            v = twist.copy()
-            if frame == "TRF":
-                T = np.asarray(self._call(self._preview.pose), dtype=np.float64)
-                rot = T.reshape(4, 4)[:3, :3]
-                v[:3] = rot @ v[:3]
-                v[3:] = rot @ v[3:]
-            q_dot = np.linalg.pinv(robot.jacobian(q)) @ v
-            q = np.clip(q + q_dot * self._dt, soft[:, 0], soft[:, 1])
-            path.append(q.copy())
-        end = path[-1]
-        self._preview.teleport_rad(end.tolist())
-        stride = max(1, len(path) // self._max_points)
-        sampled = np.stack(path)[::stride]
-        return DryRunResultData(
-            tcp_poses=np.stack([robot.fk_vec(qk) for qk in sampled]),
-            end_joints_rad=end.copy(),
-            duration=len(path) * self._dt,
-            joint_trajectory_rad=sampled,
-        )
-
-    def _kin_robot(self):
-        """The package's pinokin model, for the two streamed-jog helpers that
-        need a Jacobian (the engine previews queued motion and joint jogs)."""
-        if not hasattr(self, "_robot_kin"):
-            from par6.robot import Robot
-
-            self._robot_kin = _KinFacade(Robot())
-        return self._robot_kin
+        if r["error"] is not None:
+            raise RobotError.from_wire(r["error"])
+        return self._convert(r)
 
     # ------------------------------------------------------------------
     # Configuration
@@ -891,18 +872,20 @@ class DryRunRobotClient:
                 tool_name,
                 variant_key,
             )
-        if key != _cfg.fitted_tool_key():
+        fitted = _cfg.fitted_tool_key(self._config)
+        if key != fitted:
             raise make_error(
                 ErrorCode.COMM_VALIDATION_ERROR,
                 detail=(
                     f"tool '{tool_name}' is not fitted: this runtime is built "
-                    f"around '{_cfg.fitted_tool_key()}'"
+                    f"around '{fitted}'"
                 ),
             )
         self._tool_key = key
         self._variant_key = variant_key
         self._tcp_offset_mm = (0.0, 0.0, 0.0)
         self._sync_context()
+        self._completed += 1
         return 0
 
     def set_tcp_offset(
@@ -941,6 +924,27 @@ class DryRunRobotClient:
         self._shapes = tuple(shapes)
         return 1
 
+    def set_payload(
+        self,
+        mass: float,
+        com: tuple[float, float, float] = (0.0, 0.0, 0.0),
+        inertia: tuple[float, float, float, float, float, float] | None = None,
+        **kwargs: Any,
+    ) -> int:
+        """Declare the payload the preview plans with — refused (as the
+        runtime refuses it) for a negative mass or a non-PSD inertia."""
+        self._call(
+            self._preview.set_payload,
+            float(mass),
+            [float(v) for v in com],
+            _inertia6(inertia),
+        )
+        return 1
+
+    def payload(self, **kwargs: Any) -> PayloadResult:
+        """The payload the preview plans with (zeros = none)."""
+        return payload_from_dict(dict(self._preview.payload()))
+
     def _sync_context(self) -> None:
         self._call(
             self._preview.set_context,
@@ -952,49 +956,45 @@ class DryRunRobotClient:
     def tool_action(
         self, tool_key: str, action: str, params: list | None = None, **kwargs: Any
     ) -> DryRunResultData:
-        """A gripper action: the arm holds still while the tool works.
-
-        Duration is only what the config supports.  A ``move`` finishes when
-        the driver reports it did — the config carries no jaw speed model to
-        predict that from, so it contributes no time; ``stop`` and ``idle``
-        settle the same way.  A ``calibrate`` runs the driver's homing
-        sequence, which the runtime holds for at least
-        ``TOOL_CALIBRATE_MIN_WAIT_S`` (``crates/par6d/src/planner.rs``).
-        """
-        verb = action.strip().lower()
-        if verb in ("open", "close", "set_position"):
-            verb = "move"
-        if verb not in ("move", "calibrate", "stop", "idle"):
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail=(
-                    f"unknown tool action {action!r} (move, calibrate, stop, idle)"
-                ),
-            )
-        pending = self._close_chain()
-        result = DryRunResultData(
-            tcp_poses=self._si_pose_now()[np.newaxis, :],
-            end_joints_rad=self._q().copy(),
-            duration=_TOOL_CALIBRATE_MIN_WAIT_S if verb == "calibrate" else 0.0,
-            joint_trajectory_rad=self._q()[np.newaxis, :].copy(),
-        )
-        return result if not pending else _merge([*pending, result])
+        """A tool action, admitted by the engine exactly as the runtime
+        admits it: the verb must be one the driver has, the parameters
+        must fit it, and a jaw move needs a calibrated gripper.  The arm
+        holds still while the tool works; a ``calibrate`` carries the
+        runtime's minimum calibration wait, the other verbs no time (the
+        config carries no jaw speed model to predict travel from)."""
+        cmd = {
+            "type": "tool_action",
+            "tool_key": _cfg.canonical_tool_key(tool_key),
+            "action": action.strip().lower(),
+            "params": list(params or []),
+        }
+        return self._emit_batch(cmd)
 
     # ------------------------------------------------------------------
-    # Commands with no effect on an offline plan
+    # Commands with no path of their own
     # ------------------------------------------------------------------
 
     def _flush_quietly(self) -> None:
         """Close the hold for a command that only reconfigures state; the
-        motion it releases is dropped (the caller asked no path back)."""
-        self._close_chain()
+        motion it releases rides at the head of the next result."""
+        owed = self._close_chain()
+        self._pending.extend(owed)
 
     def checkpoint(self, label: str, **kwargs: Any) -> int:
         self._flush_quietly()
+        self._last_checkpoint = label
+        self._completed += 1
         return 0
 
     def delay(self, seconds: float = 0.0, **kwargs: Any) -> int:
+        """A queued wait: the arm holds still for *seconds*, which the
+        preview's timeline carries at the head of the next result."""
+        if seconds <= 0:
+            raise ValueError("Delay must be positive")
         self._flush_quietly()
+        self._pending.extend(
+            self._run_batch([{"type": "delay", "seconds": float(seconds)}])
+        )
         return 0
 
     def stop(self, clear_queue: bool = True, **kwargs: Any) -> int:
@@ -1032,6 +1032,19 @@ class DryRunRobotClient:
 
     def wait_ready(self, **kwargs: Any) -> bool:
         return True
+
+    def wait_status(
+        self, predicate: Callable[[StatusBuffer], bool], timeout: float = 5.0
+    ) -> bool:
+        """*predicate* over the previewed state, in the buffer shape the live
+        stream delivers — answered at once, since nothing here changes
+        between commands."""
+        return bool(predicate(self._status_buffer()))
+
+    def stream_status(self) -> Iterator[StatusBuffer]:
+        """One snapshot of the previewed state; the stream a program iterates
+        live has no cadence here."""
+        yield self._status_buffer()
 
     def pause(self, **kwargs: Any) -> int:
         """A preview has no executing trajectory to hold."""
@@ -1100,28 +1113,33 @@ class DryRunRobotClient:
             )
         return 1
 
+    def reset_loop_stats(self, **kwargs: Any) -> int:
+        """A preview runs no control loop."""
+        return 1
+
+    def bind_tools(self, specs: Iterable[ToolSpec]) -> None:
+        """Replace the tool specs ``tool`` answers from."""
+        self._tools = {spec.key: spec for spec in specs}
+
     def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
         """Drive one declared output, and remember the level.
 
         A preview owns no pins, but it does own the readback: the level
         shows up in :meth:`io` exactly where the runtime would put it, so a
         program that sets an output and then reads it back behaves the same
-        against both."""
-        if not 0 <= int(index) <= 7 or int(value) not in (0, 1):
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail="write_io: port must be 0..=7 and value 0 or 1",
-            )
-        if not 0 <= index < len(self._io_outputs):
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail=(
-                    f"write_io port {index} does not exist: this box declares "
-                    f"{len(self._io_outputs)} digital output(s)"
-                ),
-            )
-        self._io_levels[index] = 1 if value else 0
+        against both.  The bound is the live client's own check, with its
+        exception."""
+        outputs = len(self._io_outputs)
+        if not 0 <= int(index) < outputs:
+            raise ValueError(f"Output index must be in 0..{outputs - 1}")
+        if int(value) not in (0, 1):
+            raise ValueError("I/O value must be 0 or 1")
+        self._io_levels[int(index)] = 1 if value else 0
         return 1
+
+    # ------------------------------------------------------------------
+    # Queries
+    # ------------------------------------------------------------------
 
     def io(self) -> list[int]:
         """``inputs ++ outputs ++ [estop]``, the runtime's own layout.
@@ -1137,15 +1155,76 @@ class DryRunRobotClient:
         waiting; a held blend chain is the one exception."""
         return [cmd["type"] for cmd in self._held]
 
+    def queue_state(self) -> QueueResult:
+        return QueueResult(
+            queue=self.queue(),
+            executing_index=-1,
+            completed_index=self._completed,
+            last_checkpoint=self._last_checkpoint,
+            queued_duration=0.0,
+        )
+
     def error(self) -> RobotError | None:
         """A preview RAISES its refusals rather than latching them, so there
         is never a standing error to read back."""
         return None
 
+    def ping(self, **kwargs: Any) -> PingResult:
+        """A preview always answers, and never has hardware behind it."""
+        return PingResult(hardware_connected=False)
+
+    def tools(self) -> ToolResult:
+        return ToolResult(tool=self._tool_key, available=sorted(self._tools))
+
+    def activity(self) -> ActivityResult:
+        """Between commands a preview is always idle."""
+        return ActivityResult(state=WActionState.IDLE, command="", params="", error="")
+
+    def reachable(self) -> ReachableResult:
+        """Every joint and axis is enabled: a preview enforces the soft
+        window on the path, not through a per-axis inhibit."""
+        ones = [1] * NUM_JOINTS
+        return ReachableResult(
+            joint_en=ones, cart_en_wrf=list(ones), cart_en_trf=list(ones)
+        )
+
+    def loop_stats(self) -> LoopStatsResult | None:
+        """None: a preview runs no control loop to report on."""
+        return None
+
+    def config_info(self) -> dict:
+        """The effective configuration in the live query's shape, from the
+        file the engine loaded."""
+        joints = []
+        for j in self._config["joints"]:
+            velocity, acceleration, _ = _cfg.resolve_mode_limits(j["limits"], "exec")
+            joints.append(
+                {
+                    "soft_min_rad": j["limits"]["soft_min_rad"],
+                    "soft_max_rad": j["limits"]["soft_max_rad"],
+                    "velocity_rad_s": velocity,
+                    "acceleration_rad_s2": acceleration,
+                }
+            )
+        files = _cfg.config_files(self._config_path)
+        return {
+            "path": files["path"],
+            "fingerprint": files["fingerprint"],
+            "tick_dt_s": self._dt,
+            "motion": self._preview.motion(),
+            "joints": joints,
+            "active_recipe": None,
+            "recipes": [],
+        }
+
+    def config_bundle(self) -> dict:
+        """The config files the engine loaded, verbatim, in the live
+        query's shape."""
+        return _cfg.config_files(self._config_path)
+
     def status(self) -> StatusResult:
         """The previewed state in the shape the STATUS query answers."""
-        T = np.asarray(self._call(self._preview.pose), dtype=np.float64).reshape(4, 4)
-        T = T.copy()
+        T = self._matrix_m().copy()
         T[:3, 3] *= 1000.0
         return StatusResult(
             pose=T.flatten().tolist(),
@@ -1154,6 +1233,25 @@ class DryRunRobotClient:
             io=self.io(),
             tool_status=self._tool.status(),
         )
+
+    def _status_buffer(self) -> StatusBuffer:
+        """The previewed state in the shape the STATUS stream delivers."""
+        buf = StatusBuffer()
+        status = self.status()
+        buf.pose[:] = status.pose
+        buf.angles[:] = status.angles
+        buf.io = np.asarray(status.io, dtype=np.int32)
+        buf.homed = self._preview.homed()
+        buf.mode = ControllerMode.IDLE
+        buf.enabled = True
+        buf.simulator_active = True
+        buf.last_checkpoint = self._last_checkpoint
+        buf.completed_index = self._completed
+        buf.accepted_index = self._completed
+        if status.tool_status is not None:
+            buf.tool_status = status.tool_status
+            buf.tool_status_present = True
+        return buf
 
     def is_estop_pressed(self) -> bool:
         return False
@@ -1171,21 +1269,6 @@ class DryRunRobotClient:
 
     def close(self) -> None:
         return None
-
-
-class _KinFacade:
-    """The slice of :class:`par6.robot.Robot` the cartesian jog needs."""
-
-    def __init__(self, robot: Any) -> None:
-        self._robot = robot
-
-    def jacobian(self, q: NDArray[np.float64]) -> NDArray[np.float64]:
-        return self._robot.jacobian(q)
-
-    def fk_vec(self, q: NDArray[np.float64]) -> NDArray[np.float64]:
-        out = np.zeros(6, dtype=np.float64)
-        self._robot.fk(q, out)
-        return out
 
 
 def _merge(results: list[DryRunResultData]) -> DryRunResultData:

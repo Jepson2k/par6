@@ -170,7 +170,10 @@ fn set_txqueuelen(iface: &str, len: u32) {
 struct Shared {
     /// [`LinkState`] as a discriminant (see [`state_code`]).
     state: AtomicU32,
+    /// Interface restarts since the first sample.
     restarts: AtomicU32,
+    /// Bus-off events seen through the device counters since start.
+    bus_off_events: AtomicU32,
     samples: AtomicU64,
 }
 
@@ -235,6 +238,7 @@ impl LinkMonitor {
         LinkHealth {
             state: state_from_code(self.shared.state.load(Ordering::Relaxed)),
             restarts: self.shared.restarts.load(Ordering::Relaxed),
+            bus_off_events: self.shared.bus_off_events.load(Ordering::Relaxed),
             tx_errors: 0,
             rx_frames: 0,
         }
@@ -261,6 +265,10 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
         .ok();
     let mut counters: Option<xstats::CanDeviceStats> = None;
     let mut counters_missing_logged = false;
+    // The kernel's restart counter is lifetime-absolute; what the daemon
+    // reports is relative to the first sample it took.
+    let mut restart_base: Option<u32> = None;
+    let mut query: Option<xstats::Query> = None;
     while !stop.load(Ordering::Relaxed) {
         let state = match nl.state() {
             Ok(Some(CanState::ErrorActive | CanState::ErrorWarning)) => LinkState::Up,
@@ -274,11 +282,15 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                 LinkState::Unknown
             }
         };
-        let mut state = state;
         let mut kernel_restarts = None;
         if let Some(idx) = ifidx {
-            match xstats::query(idx) {
-                Ok(Some(now)) => {
+            if query.is_none() {
+                query = xstats::Query::open()
+                    .map_err(|e| log::debug!("CAN link monitor '{iface}': netlink socket ({e})"))
+                    .ok();
+            }
+            match query.as_mut().map(|q| q.sample(idx)) {
+                Some(Ok(Some(now))) => {
                     kernel_restarts = Some(now.restarts);
                     if let Some(prev) = counters {
                         let d = xstats::counter_deltas(&prev, &now);
@@ -286,30 +298,35 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                             log::info!(
                                 "CAN interface '{iface}': counters re-based (interface re-created)"
                             );
+                            restart_base = None;
                         } else {
-                            if d.bus_off > 0 && state != LinkState::BusOff {
-                                // Report the missed event for one sample
-                                // so the RT latch sees it: frames were
-                                // lost whether or not the auto-restart
-                                // already recovered the controller.
+                            // The kernel state is reported as it is. A
+                            // bus-off the auto-restart already recovered
+                            // from is carried as an event count for the
+                            // RT latch, so it neither masquerades as the
+                            // current state nor masks a real edge seen in
+                            // the same sample.
+                            if d.bus_off > 0 {
                                 log::error!(
                                     "CAN interface '{iface}': {} bus-off event(s) between samples",
                                     d.bus_off
                                 );
-                                state = LinkState::BusOff;
-                            } else if d.error_passive > 0 && state == LinkState::Up {
+                                shared
+                                    .bus_off_events
+                                    .fetch_add(d.bus_off, Ordering::Relaxed);
+                            }
+                            if d.error_passive > 0 && state == LinkState::Up {
                                 log::warn!(
                                     "CAN interface '{iface}': {} error-passive transition(s) \
                                      between samples",
                                     d.error_passive
                                 );
-                                state = LinkState::ErrorPassive;
                             }
                         }
                     }
                     counters = Some(now);
                 }
-                Ok(None) => {
+                Some(Ok(None)) => {
                     if !counters_missing_logged {
                         log::debug!(
                             "CAN interface '{iface}': no device counters (vcan or old kernel); \
@@ -319,15 +336,25 @@ fn sample_loop(iface: &str, nl: CanInterface, shared: &Shared, stop: &AtomicBool
                     }
                     counters = None;
                 }
-                Err(e) => {
+                // A failed sample keeps the last good baseline, so an
+                // event inside the gap still shows in the next delta; the
+                // socket is re-opened for the next round.
+                Some(Err(e)) => {
                     log::debug!("CAN link monitor '{iface}': xstats query failed ({e})");
-                    counters = None;
+                    query = None;
                 }
+                None => {}
             }
         }
         match kernel_restarts {
-            // The kernel's own auto-restart counter is authoritative.
-            Some(r) => shared.restarts.store(r, Ordering::Relaxed),
+            // The kernel's own auto-restart counter is authoritative,
+            // reported relative to the daemon's first sample.
+            Some(r) => {
+                let base = *restart_base.get_or_insert(r);
+                shared
+                    .restarts
+                    .store(r.saturating_sub(base), Ordering::Relaxed);
+            }
             // Without counters a restart is counted where it is
             // observable: the bus-off -> recovered edge the 100 ms
             // auto-restart produces.

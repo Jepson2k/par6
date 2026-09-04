@@ -91,8 +91,9 @@ wire_enum! {
         SetCompletionPolicy = 20,
         /// Select the telemetry recipe. Unknown names are refused.
         SetRecipe = 21,
-        // 22 was SafetyStop: removed — limp mode is the physical e-stop's
-        // job; a digital path must not be relied on in that emergency.
+        // 22 is reserved (the retired digital safety stop): limp mode is
+        // the physical e-stop's job, and a digital path must not be relied
+        // on in that emergency.
         /// Enable or disable the gravity-compensation feedforward. G(q) is
         /// computed and published in every mode regardless; this controls
         /// only whether it is APPLIED, which is correct on hardware and on

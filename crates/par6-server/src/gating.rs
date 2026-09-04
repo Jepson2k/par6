@@ -9,7 +9,9 @@
 //! unacked. (`teleport` outside sim mode is the protocol's canonical case:
 //! "rejected with a real error", never a silent no-op.)
 
-use par6_proto::{command_class, CmdType, CommandClass};
+use par6_proto::{
+    command_class, make_error, CmdType, CommandClass, ErrorCode, WireError, UNATTRIBUTED,
+};
 
 /// Requirements a command must meet to be accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -49,13 +51,17 @@ pub fn gate(cmd: CmdType) -> Gate {
         | C::ServoL => {
             g.needs_homed = true;
         }
-        // Jog is deliberately NOT homed-gated. An arm can need jogging
-        // clear of an obstruction before it can be homed at all, and the
-        // homing sequence itself has to move joints that are by definition
-        // unreferenced. Planned motion still requires a reference, because
-        // it targets absolute coordinates; a jog only asks for a direction
+        // Joint jog is deliberately NOT homed-gated. An arm can need
+        // jogging clear of an obstruction before it can be homed at all,
+        // and the homing sequence itself has to move joints that are by
+        // definition unreferenced; a joint jog only asks for a direction
         // and a speed, and the soft-limit brake still bounds it.
-        C::JogJ | C::JogL => {}
+        C::JogJ => {}
+        // A cartesian jog integrates through the kinematics from an
+        // absolute pose and rides the STREAM mode, which the RT refuses
+        // without a reference; refusing here gives the fire-and-forget
+        // datagram a structured error instead of a silent drop.
+        C::JogL => g.needs_homed = true,
         // Pause is deliberately ungated. Holding a moving arm has to work
         // whatever state the controller is in, and an un-pause that is no
         // longer legal is refused by the RT's own mode table rather than
@@ -84,4 +90,43 @@ pub fn is_stream(cmd: CmdType) -> bool {
         cmd,
         C::ServoJ | C::ServoJPose | C::ServoL | C::JogJ | C::JogL
     )
+}
+
+/// What the gate is evaluated against: the server's view of the arm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GateContext {
+    /// A software e-stop is latched (cleared by `reset`).
+    pub estop_latched: bool,
+    /// The RT core reports ENABLED.
+    pub enabled: bool,
+    /// The arm holds its home references.
+    pub homed: bool,
+    /// The runtime drives the simulator, not hardware.
+    pub simulator: bool,
+}
+
+/// The refusal a command earns at admission, or `None` when it passes.
+/// One function for the live server and the offline preview, so the two
+/// refuse the same commands for the same reasons.
+pub fn check_gate(tag: CmdType, ctx: &GateContext) -> Option<WireError> {
+    let g = gate(tag);
+    if g.needs_enabled {
+        if ctx.estop_latched {
+            return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+        }
+        if !ctx.enabled {
+            return Some(make_error(
+                ErrorCode::SysControllerDisabled,
+                UNATTRIBUTED,
+                &[("detail", "The RT core reports DISABLED.")],
+            ));
+        }
+    }
+    if g.needs_homed && !ctx.homed {
+        return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
+    }
+    if g.needs_simulator && !ctx.simulator {
+        return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
+    }
+    None
 }

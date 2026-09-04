@@ -320,6 +320,13 @@ impl Homer {
         !matches!(self.phase, HPhase::Finished | HPhase::Failed)
     }
 
+    /// Fail in the current phase, recording it for [`Self::public_phase`].
+    fn fail(&mut self) -> (JointCommand, Option<HomerEvent>) {
+        self.failed_in = self.phase;
+        self.phase = HPhase::Failed;
+        (JointCommand::idle(), Some(HomerEvent::Failed))
+    }
+
     /// The published phase; `Failed` reports the phase the FSM failed in.
     fn public_phase(&self) -> HomingPhase {
         let map = |p: &HPhase| match p {
@@ -396,9 +403,7 @@ impl Homer {
             HPhase::Approach => {
                 self.elapsed += 1;
                 if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
-                    self.failed_in = self.phase;
-                    self.phase = HPhase::Failed;
-                    return (JointCommand::idle(), Some(HomerEvent::Failed));
+                    return self.fail();
                 }
                 if self.elapsed == 1 {
                     // `hall` is written only by a cmd-32 reply and nothing
@@ -481,9 +486,7 @@ impl Homer {
             HPhase::Preclear => {
                 self.elapsed += 1;
                 if self.spent.saturating_add(self.elapsed) > p.timeout_ticks {
-                    self.failed_in = self.phase;
-                    self.phase = HPhase::Failed;
-                    return (JointCommand::idle(), Some(HomerEvent::Failed));
+                    return self.fail();
                 }
                 // Reverse WITH the hall pack: each tick's cmd-32 reply
                 // carries the live band state, and only an off-band
@@ -548,9 +551,7 @@ impl Homer {
                     match self.latched {
                         None if self.elapsed < 2 * p.settle_ticks => {}
                         None => {
-                            self.failed_in = self.phase;
-                            self.phase = HPhase::Failed;
-                            return (JointCommand::idle(), Some(HomerEvent::Failed));
+                            return self.fail();
                         }
                         Some(latched) => {
                             if p.two_pass {
@@ -561,9 +562,7 @@ impl Homer {
                                         p.node,
                                         p.max_diff_ticks
                                     );
-                                    self.failed_in = self.phase;
-                                    self.phase = HPhase::Failed;
-                                    return (JointCommand::idle(), Some(HomerEvent::Failed));
+                                    return self.fail();
                                 }
                             }
                             self.phase = if p.post.is_some() {
@@ -713,6 +712,9 @@ struct CalRun {
 pub struct HomingSystem {
     dt: f64,
     params: [HomerParams; MAX_JOINTS],
+    /// Whether this sequence started the gripper motor's Homer (the
+    /// firmware-calibration path never does).
+    gripper_homer_started: bool,
     gripper_params: Option<HomerParams>,
     homers: Vec<Homer>,
     steps: Vec<StepPlan>,
@@ -828,6 +830,7 @@ impl HomingSystem {
         Self {
             dt,
             params,
+            gripper_homer_started: false,
             gripper_params,
             homers,
             steps,
@@ -854,6 +857,16 @@ impl HomingSystem {
     /// Whether a sequence is currently running.
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// A live retune of `node` replaces the "normal" limits the sequence
+    /// restores on its way out, so the next home() hands the drive back
+    /// the tuned ceilings rather than the config-time ones.
+    pub fn retune(&mut self, node: NodeId, tune: &par6_bus::DriveTune) {
+        for p in self.params.iter_mut().filter(|p| p.node == node) {
+            p.normal_vel_limit = tune.velocity_limit_ticks_s as f32;
+            p.normal_ilim = tune.ilim_ma as f32;
+        }
     }
 
     /// Whether the last sequence failed on the gripper firmware
@@ -886,6 +899,7 @@ impl HomingSystem {
         self.cal = None;
         self.cal_failed = false;
         self.last_fw_cmd = None;
+        self.gripper_homer_started = false;
         for h in &mut self.homers {
             h.phase = HPhase::Finished;
         }
@@ -971,6 +985,11 @@ impl HomingSystem {
         // stays at Idle).
         let mut phase = [HomingPhase::Idle; NUM_NODES];
         for (i, out) in phase.iter_mut().enumerate() {
+            // A firmware-calibrated gripper never drives a Homer: its slot
+            // has no phase, whatever its status says.
+            if i == GRIPPER_SLOT && !self.gripper_homer_started {
+                continue;
+            }
             if self.statuses[i] != HomingJointStatus::Idle {
                 if let Some(h) = self.homers.get(i) {
                     *out = h.public_phase();
@@ -1196,6 +1215,7 @@ impl HomingSystem {
                                 LIMIT_REPEATS,
                             );
                             self.homers[GRIPPER_SLOT].start();
+                            self.gripper_homer_started = true;
                             self.statuses[GRIPPER_SLOT] = HomingJointStatus::Running;
                         }
                     }

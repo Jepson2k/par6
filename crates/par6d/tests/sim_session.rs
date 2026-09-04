@@ -33,31 +33,13 @@ use common::{Client, Rig, BUDGET};
 /// from config seconds (`round(s/dt)`), so the runtime is rate-agnostic
 /// by contract and the wiring under test is identical.
 fn test_config() -> PathBuf {
-    let src = common::shipped_config();
-    let dir = std::env::temp_dir().join(format!("par6d-sim-session-{}", std::process::id()));
-    let grippers = dir.join("grippers");
-    std::fs::create_dir_all(&grippers).expect("test config dir");
-    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", "tick_dt_s = 0.02");
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
-    let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
-    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
-        let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
-    }
-    dst
+    common::retimed_config("sim-session", 0.02)
 }
 
 /// The config park pose in wire units (degrees) — inside every joint's
 /// soft window, so it works as a teleport target and move base.
 fn park_deg() -> [f64; NUM_JOINTS] {
-    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("PAR6 config");
-    let mut a = [0.0; NUM_JOINTS];
-    for (out, rad) in a.iter_mut().zip(cfg.robot.park_pose_rad.iter()) {
-        *out = rad.to_degrees();
-    }
-    a
+    common::park_deg()
 }
 
 fn with_j0(base: [f64; NUM_JOINTS], delta_deg: f64) -> [f64; NUM_JOINTS] {
@@ -180,7 +162,7 @@ fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; NUM_JOINTS]) {
 }
 
 #[test]
-fn full_sim_session_over_protocol_v2() {
+fn full_sim_session_over_protocol_v3() {
     let rig = Rig::boot(test_config());
     let mut c = Client::new(rig.addr());
 
@@ -190,9 +172,9 @@ fn full_sim_session_over_protocol_v2() {
         other => panic!("unexpected ping result {other:?}"),
     }
 
-    // STATUS broadcast: sane v2 header, fresh RT link, un-homed at boot.
+    // STATUS broadcast: sane v3 header, fresh RT link, un-homed at boot.
     let s1 = rig.wait_status("link_ok", |s| s.link_ok == 1);
-    assert_eq!(s1.proto_version, 2);
+    assert_eq!(s1.proto_version, 3);
     assert!(s1.simulator_active);
     assert!(!s1.homed);
     assert_eq!(s1.executing_index, -1);
@@ -551,6 +533,21 @@ fn flashing_window_over_protocol_v2() {
         s.mode == ControllerMode::Flashing
     });
     rig.wait_status("the silent bus reads stale", |s| s.link_ok == 0);
+
+    // A referencing seek would start by requesting IDLE, ending the
+    // bus-silent window under a flasher: refused while FLASHING.
+    let i = c.ok_index(&Command::Home(par6_proto::command::Home {
+        key: 7005,
+        calibrate: true,
+    }));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(!ok, "home must not run while FLASHING");
+    let detail = detail.expect("a structured refusal");
+    assert_eq!(detail.code, ErrorCode::CommValidationError as u16);
+    assert!(detail.cause.contains("FLASHING"), "{}", detail.cause);
+    rig.wait_status("still FLASHING after the refused home", |s| {
+        s.mode == ControllerMode::Flashing
+    });
 
     // Exit: the bus wakes (the stored-config re-push is pinned at the RT
     // layer) and homing is INVALIDATED — the daemon's flash marker
@@ -1396,18 +1393,9 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
     let mut target = park_deg();
     target[0] += 90.0;
     let servo = |speed: Option<f64>| {
-        // The session's first setpoint must sit at the measured pose —
-        // the start-pose gate refuses a stream that opens 90° away — so
-        // the far target streams in from the second datagram on.
-        let mut first = true;
         move || {
-            let angles = if std::mem::take(&mut first) {
-                park_deg()
-            } else {
-                target
-            };
             Command::ServoJ(par6_proto::command::ServoJ {
-                angles,
+                angles: target,
                 speed,
                 accel: None,
             })

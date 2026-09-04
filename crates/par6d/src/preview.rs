@@ -5,22 +5,29 @@
 //! timing, same collision gate — and then discarded instead of
 //! dispatched, so a preview can never drift from the runtime.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use par6_motion::JogEngine;
-use par6_proto::{command::JogJ, Command, CompletionPolicy, WireError, NUM_JOINTS};
+use par6_config::LimitMode;
+use par6_motion::{JogEngine, MotionLimits};
+use par6_proto::{
+    command::{JogJ, JogL},
+    Command, CompletionPolicy, Frame, WireError, NUM_JOINTS,
+};
 use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
     sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
     SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
-use par6_server::{decode_error_to_wire, gate, PlanContext, Planner, QueuedCommand, ShapeLayer};
+use par6_server::{
+    check_gate, decode_error_to_wire, validate_registries, validate_supported, GateContext,
+    PayloadSpec, PlanContext, Planner, QueuedCommand, ShapeLayer,
+};
 
 use crate::adapters::MotionJog;
-use crate::bridge::{CoreLink, CoreOp};
-use crate::daemon::{load_kin_stack, DaemonError};
+use crate::bridge::{step_cart_jog, CartJogState, CoreLink, CoreOp};
+use crate::daemon::{load_preview_kin, DaemonError};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
 
@@ -58,13 +65,25 @@ pub struct Preview {
     next_index: u64,
     dt: f64,
     motion: par6_config::MotionConfig,
+    /// Cartesian-jog integration (`preview_jog_l`): the same solver the
+    /// live bridge steps a `jog_l` with.
+    cart: crate::kin::CartKin,
+    /// STREAM-mode soft window the cartesian jog is clamped to.
+    soft_min: [f64; MAX_JOINTS],
+    soft_max: [f64; MAX_JOINTS],
     /// The server config the live daemon would run with this bundle —
     /// what `validate_supported` refuses against, so a parameter the
     /// runtime cannot honour previews as the same refusal.
     cfg: par6_server::ServerConfig,
-    /// The preview's runtime payload — none today; the field keeps the
-    /// planner sync honest if a payload surface is added offline.
-    payload: par6_server::PayloadSpec,
+    /// The planning context as last synced — what a payload change
+    /// re-syncs the planner with.
+    profile: String,
+    tcp_offset_mm: [f64; 3],
+    completion_policy: CompletionPolicy,
+    /// The payload the preview plans with, as the live `set_payload`.
+    payload: PayloadSpec,
+    /// The config file this session was built from.
+    config_path: std::path::PathBuf,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -86,7 +105,8 @@ impl Preview {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
-        let stack = load_kin_stack(&opts, &config_path, robot, bundle.active_gripper())?;
+        let kin = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
+        let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -100,9 +120,9 @@ impl Preview {
             snap_r,
             &bundle,
             PlannerKin {
-                kin: stack.planner,
-                collision: stack.collision,
-                tool_offset: stack.tool_offset,
+                kin: kin.planner,
+                collision: kin.collision,
+                tool_offset: kin.tool_offset,
             },
         )?;
 
@@ -116,7 +136,9 @@ impl Preview {
         let dt = robot.robot.tick_dt_s;
         let motion = robot.motion;
         let cfg = crate::daemon::server_config(&opts, &bundle);
+        let profile = cfg.initial_profile.clone();
         let mut preview = Self {
+            config_path,
             planner,
             jog,
             snap,
@@ -124,8 +146,14 @@ impl Preview {
             next_index: 0,
             dt,
             motion,
+            cart: kin.cart,
+            soft_min: stream_limits.soft_min,
+            soft_max: stream_limits.soft_max,
             cfg,
-            payload: par6_server::PayloadSpec::default(),
+            profile,
+            tcp_offset_mm: [0.0; 3],
+            completion_policy: CompletionPolicy::Settled,
+            payload: PayloadSpec::default(),
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
@@ -184,14 +212,83 @@ impl Preview {
         tcp_offset_mm: [f64; 3],
         policy: CompletionPolicy,
     ) {
+        self.profile = profile.to_owned();
+        self.tcp_offset_mm = tcp_offset_mm;
+        self.completion_policy = policy;
+        self.sync_context();
+    }
+
+    /// Replace the payload the preview plans with — the same spec the
+    /// live `set_payload` pushes, refused by the same wire validation, so
+    /// a program's gravity-dependent refusals preview the way they run.
+    pub fn set_payload(&mut self, payload: PayloadSpec) -> Result<(), WireError> {
+        Command::SetPayload(par6_proto::command::SetPayload {
+            mass: payload.mass,
+            com: payload.com,
+            inertia: payload.inertia,
+        })
+        .validate()
+        .map_err(|e| decode_error_to_wire(&e))?;
+        self.payload = payload;
+        self.sync_context();
+        Ok(())
+    }
+
+    /// The payload the preview plans with.
+    pub fn payload(&self) -> PayloadSpec {
+        self.payload
+    }
+
+    /// Whether the virtual gripper holds a calibration: the runtime
+    /// refuses a jaw move on an uncalibrated gripper, and a previewed
+    /// `calibrate` action establishes one.
+    pub fn set_gripper_calibrated(&mut self, calibrated: bool) {
+        self.snap.gripper.reply = Some(par6_bus::GripperReply {
+            calibrated,
+            ..par6_bus::GripperReply::default()
+        });
+        self.snap.gripper.data_age_ticks = 0;
+        self.publish();
+    }
+
+    /// The planning context as last synced: profile, TCP offset \[mm\],
+    /// completion policy — the runtime's own startup context until a
+    /// program changes it.
+    pub fn context(&self) -> (&str, [f64; 3], CompletionPolicy) {
+        (&self.profile, self.tcp_offset_mm, self.completion_policy)
+    }
+
+    /// How many blended moves the live queue holds before it plans the
+    /// chain as it stands.
+    pub fn blend_lookahead(&self) -> usize {
+        self.cfg.blend_lookahead
+    }
+
+    /// The config file this session was built from.
+    pub fn config_path(&self) -> &Path {
+        &self.config_path
+    }
+
+    fn sync_context(&mut self) {
         self.planner.sync(PlanContext {
-            profile,
+            profile: &self.profile,
             tool: "",
             tool_variant: None,
-            tcp_offset_mm,
-            completion_policy: policy,
+            tcp_offset_mm: self.tcp_offset_mm,
+            completion_policy: self.completion_policy,
             payload: self.payload,
         });
+    }
+
+    /// FK over a trajectory: every sample's pose, or the first failure
+    /// as the structured error it is — never a list shorter than the
+    /// trajectory.
+    fn tcp_poses(&mut self, trajectory: &[[f64; MAX_JOINTS]]) -> Result<Vec<[f64; 16]>, WireError> {
+        let mut out = Vec::with_capacity(trajectory.len());
+        for q in trajectory {
+            out.push(self.planner.current_pose(q)?);
+        }
+        Ok(out)
     }
 
     /// Replace one collision-world layer (wire units), exactly as the
@@ -257,22 +354,83 @@ impl Preview {
             trajectory.push(q);
         }
         self.jog.release();
-        let mut tcp_poses = Vec::with_capacity(trajectory.len());
-        for q in &trajectory {
-            match self.planner.current_pose(q) {
-                Ok(pose) => tcp_poses.push(pose),
-                Err(_) => break,
-            }
+        self.finish_jog(trajectory)
+    }
+
+    /// Gate an integrated jog trajectory on the collision world and FK
+    /// it; the virtual arm advances only for a trajectory that passes.
+    fn finish_jog(&mut self, trajectory: Vec<[f64; MAX_JOINTS]>) -> PreviewResult {
+        if let Err(error) = self.planner.gate_samples(trajectory.iter().copied()) {
+            return self.refusal(error);
         }
-        self.snap.q = q;
+        let tcp_poses = match self.tcp_poses(&trajectory) {
+            Ok(poses) => poses,
+            Err(error) => return self.refusal(error),
+        };
+        let end = trajectory.last().copied().unwrap_or(self.snap.q);
+        self.snap.q = end;
         self.publish();
         PreviewResult {
             duration_s: trajectory.len() as f64 * self.dt,
             joint_trajectory_rad: trajectory,
             tcp_poses,
-            end_joints_rad: q,
+            end_joints_rad: end,
             error: None,
         }
+    }
+
+    /// Preview a cartesian velocity jog: `velocities` are signed fractions
+    /// of the configured full-scale linear (xyz) and angular (rotation
+    /// about xyz) jog rates, held for `duration_s` in `frame` — the
+    /// runtime's own twist integration through the same kinematics and
+    /// soft window, gated on the collision world.
+    pub fn preview_jog_l(
+        &mut self,
+        velocities: [f64; 6],
+        frame: Frame,
+        duration_s: f64,
+        accel: Option<f64>,
+    ) -> PreviewResult {
+        let cmd = Command::JogL(JogL {
+            velocities,
+            duration: duration_s,
+            frame,
+            accel,
+        });
+        if let Err(e) = cmd.validate() {
+            return self.refusal(decode_error_to_wire(&e));
+        }
+        let mut twist = [0.0; 6];
+        for (i, (out, frac)) in twist.iter_mut().zip(velocities.iter()).enumerate() {
+            let full = if i < 3 {
+                self.motion.jog_l_linear_max_m_s
+            } else {
+                self.motion.jog_l_angular_max_rad_s
+            };
+            *out = frac * full;
+        }
+        let mut state = CartJogState {
+            twist,
+            frame,
+            q: self.snap.q,
+            soft_min: self.soft_min,
+            soft_max: self.soft_max,
+        };
+        let ticks = ((duration_s / self.dt).round() as usize).max(1);
+        let mut trajectory = Vec::with_capacity(ticks);
+        for _ in 0..ticks {
+            match step_cart_jog(&mut self.cart, &mut state, self.dt) {
+                Ok((q, _)) => trajectory.push(q),
+                Err(e) => {
+                    return self.refusal(make_error(
+                        ErrorCode::MotnSetupFailed,
+                        UNATTRIBUTED,
+                        &[("detail", &e)],
+                    ))
+                }
+            }
+        }
+        self.finish_jog(trajectory)
     }
 
     /// Preview a queued program: commands are offered to the planner in
@@ -281,42 +439,39 @@ impl Preview {
     /// chain return an empty trajectory with the chain's end pose.
     pub fn preview_batch(&mut self, cmds: &[Command]) -> Vec<PreviewResult> {
         let mut results = Vec::with_capacity(cmds.len());
-        let mut rest = cmds;
-        while !rest.is_empty() {
-            // The runtime validates every datagram at decode; an invalid
-            // command is refused there and never reaches the queue, so it
-            // never enters the planner here either.
-            if let Err(e) = rest[0].validate() {
-                results.push(self.refusal(decode_error_to_wire(&e)));
-                rest = &rest[1..];
+        // The runtime refuses at admission — decode validation, the gate
+        // table, the tool registries and the unsupported-parameter check,
+        // in that order — so the preview answers exactly what the live
+        // ack would, and a refused command never reaches the planner.
+        let ctx = GateContext {
+            estop_latched: false,
+            enabled: true,
+            homed: self.snap.homed,
+            simulator: true,
+        };
+        let admitted: Vec<Option<WireError>> = cmds
+            .iter()
+            .map(|c| {
+                c.validate()
+                    .err()
+                    .map(|e| decode_error_to_wire(&e))
+                    .or_else(|| check_gate(c.tag(), &ctx))
+                    .or_else(|| validate_registries(&self.cfg, c))
+                    .or_else(|| validate_supported(&self.cfg, c))
+            })
+            .collect();
+        let mut i = 0;
+        while i < cmds.len() {
+            if let Some(error) = &admitted[i] {
+                results.push(self.refusal(error.clone()));
+                i += 1;
                 continue;
             }
-            // The server refuses planned motion while unreferenced —
-            // its own gate table, applied here so the preview answers
-            // exactly what the runtime would.
-            if gate(rest[0].tag()).needs_homed && !self.snap.homed {
-                results.push(self.refusal(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[])));
-                rest = &rest[1..];
-                continue;
-            }
-            // ...and parameters the runtime cannot honour (a blend
-            // radius on move_c, say) — the server's own check over the
-            // same config, so the preview never accepts a command the
-            // live ack refuses.
-            if let Some(error) = par6_server::validate_supported(&self.cfg, &rest[0]) {
-                results.push(self.refusal(error));
-                rest = &rest[1..];
-                continue;
-            }
-            // Only offer the leading run of wire-valid commands: a later
-            // invalid one would have been refused at its own datagram, so
+            // Only offer the leading run of admissible commands: a later
+            // refused one would have been refused at its own datagram, so
             // the planner must not fold it into this chain.
-            let valid = rest
-                .iter()
-                .take_while(|c| {
-                    c.validate().is_ok() && par6_server::validate_supported(&self.cfg, c).is_none()
-                })
-                .count();
+            let valid = admitted[i..].iter().take_while(|e| e.is_none()).count();
+            let rest = &cmds[i..];
             self.publish();
             let batch: Vec<QueuedCommand<'_>> = rest[..valid]
                 .iter()
@@ -339,29 +494,37 @@ impl Preview {
                 ),
                 Ok(consumed) => {
                     let mut homing_seek = false;
-                    let trajectory: Vec<[f64; MAX_JOINTS]> = match self.planner.planned_motion() {
-                        PlannedMotion::Exec(samples) => samples.iter().map(|s| s.q).collect(),
-                        PlannedMotion::Home => {
-                            homing_seek = true;
-                            vec![self.planner.home_pose()]
-                        }
-                        PlannedMotion::Still => Vec::new(),
-                    };
+                    let mut hold_ticks = 0u64;
+                    let trajectory: Vec<[f64; MAX_JOINTS]> =
+                        match self.planner.planned_motion(self.snap.tick) {
+                            PlannedMotion::Exec(samples) => samples.iter().map(|s| s.q).collect(),
+                            PlannedMotion::Home => {
+                                homing_seek = true;
+                                vec![self.planner.home_pose()]
+                            }
+                            PlannedMotion::Hold(ticks) => {
+                                hold_ticks = ticks;
+                                Vec::new()
+                            }
+                            PlannedMotion::Still => Vec::new(),
+                        };
                     if homing_seek {
                         // The seek establishes the references; where it
                         // ends is the configured homing-ready pose.
                         self.snap.homed = true;
                     }
-                    self.planner.cancel();
-                    let end = trajectory.last().copied().unwrap_or(self.snap.q);
-                    let duration_s = trajectory.len() as f64 * self.dt;
-                    let mut tcp_poses = Vec::with_capacity(trajectory.len());
-                    for q in &trajectory {
-                        match self.planner.current_pose(q) {
-                            Ok(pose) => tcp_poses.push(pose),
-                            Err(_) => break,
+                    if let Command::ToolAction(action) = &cmds[i] {
+                        if action.action == "calibrate" {
+                            self.set_gripper_calibrated(true);
                         }
                     }
+                    self.planner.cancel();
+                    let end = trajectory.last().copied().unwrap_or(self.snap.q);
+                    let duration_s = (trajectory.len() as f64 + hold_ticks as f64) * self.dt;
+                    let (tcp_poses, error) = match self.tcp_poses(&trajectory) {
+                        Ok(poses) => (poses, None),
+                        Err(error) => (Vec::new(), Some(error)),
+                    };
                     self.snap.q = end;
                     (
                         PreviewResult {
@@ -369,7 +532,7 @@ impl Preview {
                             tcp_poses,
                             end_joints_rad: end,
                             duration_s,
-                            error: None,
+                            error,
                         },
                         consumed,
                     )
@@ -390,7 +553,7 @@ impl Preview {
                     error: None,
                 });
             }
-            rest = &rest[consumed..];
+            i += consumed;
         }
         results
     }
@@ -406,10 +569,5 @@ impl Preview {
     /// The tick period \[s\] trajectories are sampled at.
     pub fn tick_dt_s(&self) -> f64 {
         self.dt
-    }
-
-    /// The config path search used when `Preview::new` gets `None`.
-    pub fn default_config_path() -> Result<PathBuf, String> {
-        resolve_config_path(None)
     }
 }

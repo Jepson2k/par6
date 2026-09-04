@@ -203,9 +203,12 @@ impl TorqueSlew {
         }
     }
 
-    /// The torque commanded on the previous tick, per joint.
-    pub fn applied(&self) -> &[f64; MAX_JOINTS] {
-        &self.applied
+    /// Forget the previous command: the next rate-limited tick ramps from
+    /// zero. For the modes that send no torque of their own (HOMING,
+    /// FLASHING), so the mode they hand back to does not step from a
+    /// value the drives stopped holding.
+    pub fn reset(&mut self) {
+        self.applied = [0.0; MAX_JOINTS];
     }
 
     /// Rate-limit `want` toward the previous command and record the result.
@@ -272,7 +275,7 @@ pub fn commit(
         mirror.q[i] = sp.pos_rad.unwrap_or(f64::NAN);
         mirror.qd[i] = sp.vel_rad_s.unwrap_or(f64::NAN);
         // The rate-limited value, not the requested one — the mirror is
-        // what was actually sent.
-        mirror.tau[i] = torque_nm.unwrap_or(0.0);
+        // what was actually sent; an omitted channel is NaN like q/qd.
+        mirror.tau[i] = torque_nm.unwrap_or(f64::NAN);
     }
 }

@@ -61,12 +61,12 @@ pub use status::{
     STATUS_HEADER_LEN, STATUS_LEN,
 };
 pub use telemetry::{
-    decode_telemetry, encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe,
-    TelemetryValue,
+    decode_telemetry, encode_telemetry, encode_telemetry_into, TelemetryField, TelemetryFrame,
+    TelemetryRecipe, TelemetryValue, TelemetryValueRef,
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 2;
+pub const PROTO_VERSION: u8 = 3;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

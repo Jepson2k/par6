@@ -4,13 +4,13 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.1.0"
+version = "0.2.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
-  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.10.0",
+  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.11.2",
   # pinokin: Pinocchio-based FK/IK bindings (not on PyPI; wheels attached to
   # https://github.com/Jepson2k/pinokin/releases/tag/v0.1.8)
   "pinokin @ https://github.com/Jepson2k/pinokin/releases/download/v0.1.8/pinokin-0.1.8-cp311-cp311-macosx_15_0_arm64.whl ; python_version == '3.11' and platform_system == 'Darwin' and platform_machine == 'arm64'",
