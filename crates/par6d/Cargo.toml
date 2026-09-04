@@ -24,7 +24,6 @@ par6-bus = { workspace = true }
 par6-rt = { workspace = true }
 par6-server = { workspace = true }
 par6-kin = { workspace = true }
-pinokin-sys = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }

@@ -26,7 +26,7 @@ const CASES: [[f64; NQ]; 5] = [
 
 /// A heavier tool than any shipped gripper, so the tool's share of the
 /// payload body is far from zero in every check below.
-fn heavy_tool() -> pinokin_sys::ToolParams {
+fn heavy_tool() -> par6_kin::ToolParams {
     Kin::dh_tool_params(
         0.12,
         0.0,

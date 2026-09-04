@@ -5,10 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+links = "par6_shim"
+build = "build.rs"
 
 [dependencies]
 thiserror = { workspace = true }
-pinokin-sys = { workspace = true }
 # Collision only: turning decoded wire shapes into checkable ones, so the
 # server's SET_SHAPES seam is one call rather than a hand-rolled match.
 par6-proto = { workspace = true }

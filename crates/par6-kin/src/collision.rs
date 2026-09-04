@@ -41,10 +41,10 @@ pub enum Layer {
 }
 
 impl Layer {
-    fn as_sys(self) -> pinokin_sys::Layer {
+    pub(crate) fn as_raw(self) -> i32 {
         match self {
-            Layer::Installation => pinokin_sys::Layer::Installation,
-            Layer::Program => pinokin_sys::Layer::Program,
+            Layer::Installation => 0,
+            Layer::Program => 1,
         }
     }
 }
@@ -96,7 +96,7 @@ impl CollisionReport<'_> {
 /// Every world shape is checked against every robot link; world shapes are
 /// never checked against each other.
 pub struct Collision {
-    model: pinokin_sys::CollisionModel,
+    model: crate::sys::CollisionModel,
     nq_full: usize,
     scene_epoch: u64,
     clearance: f64,
@@ -157,7 +157,7 @@ impl Collision {
     /// malformed file errors and leaves the model unchanged.
     pub fn apply_srdf(&mut self, srdf: &Path) -> Result<(), KinError> {
         self.model.apply_srdf(srdf).map_err(|e| match e {
-            pinokin_sys::Error::Create(msg) => KinError::Load(msg),
+            crate::sys::Error::Create(msg) => KinError::Load(msg),
             other => KinError::Ffi(other),
         })
     }
@@ -169,13 +169,12 @@ impl Collision {
         package_dir: Option<&Path>,
         clearance: f64,
     ) -> Result<Self, KinError> {
-        let model =
-            pinokin_sys::CollisionModel::from_urdf(urdf, package_dir, clearance).map_err(|e| {
-                match e {
-                    pinokin_sys::Error::Create(msg) => KinError::Load(msg),
-                    other => KinError::Ffi(other),
-                }
-            })?;
+        let model = crate::sys::CollisionModel::from_urdf(urdf, package_dir, clearance).map_err(
+            |e| match e {
+                crate::sys::Error::Create(msg) => KinError::Load(msg),
+                other => KinError::Ffi(other),
+            },
+        )?;
         let nq_full = model.nq();
         if nq_full < NQ {
             return Err(KinError::ArmJoints { got: nq_full });
@@ -235,10 +234,10 @@ impl Collision {
     ///
     /// [`scene_epoch`]: Collision::scene_epoch
     pub fn set_layer(&mut self, layer: Layer, shapes: &[Shape]) -> Result<u64, KinError> {
-        let descs: Vec<pinokin_sys::ShapeDesc> = shapes
+        let descs: Vec<crate::sys::ShapeDesc> = shapes
             .iter()
             .filter(|s| s.collision)
-            .map(|s| pinokin_sys::ShapeDesc {
+            .map(|s| crate::sys::ShapeDesc {
                 kind: kind_to_sys(s.kind),
                 params: {
                     let mut p = [0.0; 4];
@@ -251,12 +250,10 @@ impl Collision {
             })
             .collect();
 
-        self.model
-            .set_layer(layer.as_sys(), &descs)
-            .map_err(|e| match e {
-                pinokin_sys::Error::Create(msg) => KinError::Load(msg),
-                other => KinError::Ffi(other),
-            })?;
+        self.model.set_layer(layer, &descs).map_err(|e| match e {
+            crate::sys::Error::Create(msg) => KinError::Load(msg),
+            other => KinError::Ffi(other),
+        })?;
 
         let slot = match layer {
             Layer::Installation => 0,
@@ -394,11 +391,11 @@ impl Collision {
 fn kind_to_sys(kind: crate::shapes::ShapeKind) -> i32 {
     use crate::shapes::ShapeKind as K;
     match kind {
-        K::Box => pinokin_sys::ffi::PAR6_SHAPE_BOX,
-        K::Sphere => pinokin_sys::ffi::PAR6_SHAPE_SPHERE,
-        K::Cylinder => pinokin_sys::ffi::PAR6_SHAPE_CYLINDER,
-        K::Capsule => pinokin_sys::ffi::PAR6_SHAPE_CAPSULE,
-        K::Cone => pinokin_sys::ffi::PAR6_SHAPE_CONE,
-        K::Ellipsoid => pinokin_sys::ffi::PAR6_SHAPE_ELLIPSOID,
+        K::Box => crate::sys::ffi::PAR6_SHAPE_BOX,
+        K::Sphere => crate::sys::ffi::PAR6_SHAPE_SPHERE,
+        K::Cylinder => crate::sys::ffi::PAR6_SHAPE_CYLINDER,
+        K::Capsule => crate::sys::ffi::PAR6_SHAPE_CAPSULE,
+        K::Cone => crate::sys::ffi::PAR6_SHAPE_CONE,
+        K::Ellipsoid => crate::sys::ffi::PAR6_SHAPE_ELLIPSOID,
     }
 }

@@ -37,8 +37,7 @@ fn feedforward_plus_gravity_reproduces_the_acceleration_through_aba() {
         );
 
         let urdf = assets.join(variant.urdf_relpath());
-        let mut raw =
-            pinokin_sys::Model::from_urdf(&urdf, Some(variant.tcp_frame()), None).unwrap();
+        let mut raw = par6_kin::Model::from_urdf(&urdf, Some(variant.tcp_frame()), None).unwrap();
         let nq = raw.nq();
         let mut qf = vec![0.0; nq];
         qf[..NQ].copy_from_slice(&q);

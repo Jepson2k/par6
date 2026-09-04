@@ -5,30 +5,8 @@ use std::fmt;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use crate::ffi;
-use crate::model::Error;
-
-/// Which replaceable world layer a shape set belongs to.
-///
-/// The two layers exist independently: replacing one leaves the other in
-/// place. `Installation` is the backend's persistent keep-out set (robot
-/// config); `Program` is the last-applied `SET_SHAPES` set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Layer {
-    /// Persistent keep-outs from robot config. `SET_SHAPES` cannot touch it.
-    Installation,
-    /// Last-applied program shape set (last-write-wins).
-    Program,
-}
-
-impl Layer {
-    fn as_raw(self) -> i32 {
-        match self {
-            Layer::Installation => 0,
-            Layer::Program => 1,
-        }
-    }
-}
+use super::ffi;
+use super::model::Error;
 
 /// A world collision shape: a coal primitive at a world pose.
 ///
@@ -196,7 +174,7 @@ impl CollisionModel {
     /// Replace `layer` with `shapes` wholesale; the other layer and the
     /// robot geometry are untouched. A malformed shape leaves the previous
     /// world in place. Allocates — keep it off the query path.
-    pub fn set_layer(&mut self, layer: Layer, shapes: &[ShapeDesc]) -> Result<(), Error> {
+    pub fn set_layer(&mut self, layer: crate::Layer, shapes: &[ShapeDesc]) -> Result<(), Error> {
         let raw_shapes: Vec<ffi::par6_shape> = shapes.iter().map(ShapeDesc::as_raw).collect();
         let mut err_buf = [0u8; 512];
         let status = unsafe {

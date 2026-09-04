@@ -1,5 +1,5 @@
 //! Kinematics and dynamics via Pinocchio, linked through the repo's C-ABI
-//! shim (`cpp/`, wrapped by `pinokin-sys`) — the one numerics stack the
+//! shim (`cpp/`, wrapped by [`sys`]) — the one numerics stack the
 //! runtime plans with and the Python binding exposes.
 //!
 //! The safe wrapper ([`Kin`]) preallocates model/data at
@@ -108,9 +108,14 @@ impl GripperVariant {
     }
 }
 
+pub mod sys;
 mod wrap;
 
 pub use wrap::wrap_to_window;
+
+// The generic Pinocchio layer: par6-bus drives the torque plant with it
+// and par6d/par6-motion parameterize trajectories with it.
+pub use sys::{Model, PathDegree, ToolParams, Trajectory};
 
 mod kin;
 

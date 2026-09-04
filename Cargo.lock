@@ -602,7 +602,7 @@ dependencies = [
  "libc",
  "log",
  "par6-config",
- "pinokin-sys",
+ "par6-kin",
  "socketcan",
  "thiserror 2.0.20",
 ]
@@ -649,7 +649,6 @@ version = "0.1.0"
 dependencies = [
  "glam",
  "par6-proto",
- "pinokin-sys",
  "rs-opw-kinematics",
  "serde",
  "serde_json",
@@ -737,7 +736,6 @@ dependencies = [
  "par6-proto",
  "par6-rt",
  "par6-server",
- "pinokin-sys",
  "sha2",
  "thiserror 2.0.20",
  "tokio",
@@ -748,14 +746,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pinokin-sys"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "portable-atomic"

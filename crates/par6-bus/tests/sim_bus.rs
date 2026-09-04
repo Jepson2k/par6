@@ -1482,7 +1482,7 @@ mod dynamics {
             .iter()
             .map(|j| torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir))
             .collect();
-        let mut model = pinokin_sys::Model::from_urdf(&urdf(), None, None).expect("model");
+        let mut model = par6_kin::Model::from_urdf(&urdf(), None, None).expect("model");
 
         let n = robot.joints.len();
         let mut q = q0.clone();

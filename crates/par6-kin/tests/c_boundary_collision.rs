@@ -9,7 +9,8 @@
 
 use std::path::PathBuf;
 
-use pinokin_sys::{ffi, CollisionModel, Error, Layer, ShapeDesc};
+use par6_kin::sys::{ffi, CollisionModel, Error, ShapeDesc};
+use par6_kin::Layer;
 
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))

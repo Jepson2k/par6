@@ -12,7 +12,6 @@ members = [
     "crates/par6d",
     "crates/par6-py",
     "crates/par6-calibrate",
-    "crates/pinokin-sys",
 ]
 
 [workspace.package]
@@ -35,7 +34,6 @@ par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }
 par6-client = { path = "crates/par6-client" }
-pinokin-sys = { path = "crates/pinokin-sys" }
 
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"

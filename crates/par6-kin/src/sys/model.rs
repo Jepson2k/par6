@@ -5,7 +5,7 @@ use std::fmt;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use crate::ffi;
+use super::ffi;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Error {

@@ -4,8 +4,8 @@
 use std::fmt;
 use std::ptr::NonNull;
 
-use crate::ffi;
-use crate::model::Error;
+use super::ffi;
+use super::model::Error;
 
 /// A time-optimal rest-to-rest joint-space trajectory: waypoints
 /// interpolated with a natural cubic spline and re-timed by TOPPRA so that

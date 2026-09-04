@@ -3,7 +3,7 @@
 //! everywhere AND actually saturated — with degenerate inputs rejected as
 //! errors across the FFI, never crashes.
 
-use pinokin_sys::{ffi, Error, Trajectory};
+use par6_kin::sys::{ffi, Error, Trajectory};
 
 /// Deterministic smooth 6-dof test path (sinusoid mix, non-degenerate in
 /// every joint).
@@ -370,8 +370,8 @@ fn linear_degree_keeps_the_path_on_the_waypoints() {
 
     let mut worst = [0.0f64; 2];
     for (slot, degree) in [
-        (0usize, pinokin_sys::PathDegree::Linear),
-        (1, pinokin_sys::PathDegree::Cubic),
+        (0usize, par6_kin::PathDegree::Linear),
+        (1, par6_kin::PathDegree::Cubic),
     ] {
         let traj = Trajectory::parameterize_with(&way, nq, &vel, &acc, None, None, degree, None)
             .expect("plan");
