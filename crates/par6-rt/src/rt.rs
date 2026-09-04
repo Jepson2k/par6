@@ -146,13 +146,25 @@ const SHUTDOWN_SETTLE_BUDGET_S: f64 = 2.0;
 fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
     let mut fifo = false;
     let mut pinned = false;
-    if let Some(prio) = opts.fifo_priority {
-        match set_fifo_priority(prio) {
-            Ok(()) => {
-                fifo = true;
-                log::info!("RT thread: SCHED_FIFO priority {prio}");
+    if let Some(asked) = opts.fifo_priority {
+        // A priority above the process's RLIMIT_RTPRIO is refused
+        // outright, and the arm would then run its control loop at
+        // ordinary scheduling priority — the one thing this setup exists
+        // to prevent. The ceiling the box actually allows is worth far
+        // more than the number the config named, so ask for that instead
+        // and say so.
+        let prio = permitted_priority(asked, rtprio_ceiling());
+        if prio > 0 {
+            match set_fifo_priority(prio) {
+                Ok(()) => {
+                    fifo = true;
+                    log::info!("RT thread: SCHED_FIFO priority {prio}");
+                }
+                Err(e) => log::error!(
+                    "RT thread DEGRADED: SCHED_FIFO {prio} refused ({e}); the control \
+                     loop runs at ordinary priority"
+                ),
             }
-            Err(e) => log::warn!("RT thread DEGRADED: SCHED_FIFO setup failed ({e}); continuing"),
         }
     }
     if opts.fifo_priority.is_some() {
@@ -173,6 +185,62 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
         }
     }
     (fifo, pinned)
+}
+
+/// The SCHED_FIFO priority to actually ask for, given what the config
+/// named and what this process is allowed (`None` = unknown, so the
+/// config's number stands). 0 means "do not ask": the box permits no
+/// real-time priority at all, and the request would only fail.
+///
+/// Asking above the ceiling is refused outright, and the control loop
+/// would then run at ordinary priority — the one thing this setup exists
+/// to prevent. The ceiling the box allows is worth far more than the
+/// number the config named.
+fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
+    match ceiling {
+        Some(0) => {
+            log::error!(
+                "RT thread DEGRADED: this process may not use SCHED_FIFO at all \
+                 (RLIMIT_RTPRIO is 0); the control loop runs at ordinary priority. \
+                 Grant it with a limits.d entry or CAP_SYS_NICE."
+            );
+            0
+        }
+        Some(ceiling) if ceiling < asked => {
+            log::warn!(
+                "RT thread: SCHED_FIFO {asked} is above this process's ceiling of \
+                 {ceiling} (RLIMIT_RTPRIO); asking for {ceiling} instead. Lower \
+                 [timing].fifo_priority to {ceiling} or raise the limit."
+            );
+            ceiling
+        }
+        _ => asked,
+    }
+}
+
+/// The highest SCHED_FIFO priority this process may ask for, from its
+/// soft `RLIMIT_RTPRIO`. `None` when the limit cannot be read, which is
+/// not a reason to refuse the request — it is only a reason not to lower
+/// it. An unlimited process reports the highest priority Linux has.
+#[cfg(target_os = "linux")]
+fn rtprio_ceiling() -> Option<u8> {
+    let mut lim = libc::rlimit {
+        rlim_cur: 0,
+        rlim_max: 0,
+    };
+    // SAFETY: getrlimit fills the struct it is handed and touches nothing else.
+    if unsafe { libc::getrlimit(libc::RLIMIT_RTPRIO, &mut lim) } != 0 {
+        return None;
+    }
+    if lim.rlim_cur == libc::RLIM_INFINITY {
+        return Some(99);
+    }
+    Some(u8::try_from(lim.rlim_cur).unwrap_or(99))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn rtprio_ceiling() -> Option<u8> {
+    None
 }
 
 #[cfg(unix)]
@@ -274,5 +342,24 @@ fn sleep_until(deadline_ns: u64) {
     let now = monotonic_ns();
     if deadline_ns > now {
         std::thread::sleep(std::time::Duration::from_nanos(deadline_ns - now));
+    }
+}
+
+#[cfg(test)]
+mod rt_priority_tests {
+    use super::permitted_priority;
+
+    /// The config names 99 and the box allows 98: a request for 99 is
+    /// refused outright and leaves the loop at ordinary priority, so 98
+    /// is asked for instead. Below the ceiling nothing is touched, and a
+    /// box that permits no real-time priority is not asked at all.
+    #[test]
+    fn a_priority_above_the_boxs_ceiling_is_lowered_to_it() {
+        assert_eq!(permitted_priority(99, Some(98)), 98);
+        assert_eq!(permitted_priority(80, Some(98)), 80);
+        assert_eq!(permitted_priority(98, Some(98)), 98);
+        assert_eq!(permitted_priority(99, Some(0)), 0);
+        // An unreadable limit is not a reason to lower the request.
+        assert_eq!(permitted_priority(99, None), 99);
     }
 }
