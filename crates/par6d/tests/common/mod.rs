@@ -405,6 +405,51 @@ impl Client {
         }
     }
 
+    /// Send several queueing commands back to back, THEN collect their
+    /// indices. `ok_index` per command waits for each reply before the
+    /// next datagram leaves, and that round trip is time the server
+    /// spends holding a blended move at the head of the queue — on a
+    /// loaded host it outlives the blend hold and the pair never blends.
+    /// A real program queues moves back to back; so does this.
+    pub fn ok_indices(&mut self, cmds: &[Command]) -> Vec<u64> {
+        let ids: Vec<u32> = cmds.iter().map(|c| self.send(c)).collect();
+        let deadline = Instant::now() + BUDGET;
+        let mut out: Vec<Option<u64>> = vec![None; ids.len()];
+        while out.iter().any(Option::is_none) {
+            if let Some(r) = self.try_recv() {
+                match &r {
+                    Reply::Ok {
+                        req_id,
+                        index: Some(i),
+                    } => {
+                        if let Some(slot) = ids.iter().position(|id| id == req_id) {
+                            out[slot] = Some(*i);
+                        }
+                    }
+                    Reply::Error { req_id, error } => {
+                        if ids.contains(req_id) {
+                            panic!("expected OK with index, got {error:?}");
+                        }
+                    }
+                    Reply::Complete {
+                        index,
+                        ok,
+                        detail,
+                        verdict,
+                    } => {
+                        self.completes.push((*index, *ok, detail.clone(), *verdict));
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "not every queued command was acknowledged within budget"
+            );
+        }
+        out.into_iter().map(Option::unwrap).collect()
+    }
+
     pub fn expect_error(&mut self, cmd: &Command) -> WireError {
         match self.request(cmd) {
             Reply::Error { error, .. } => error,

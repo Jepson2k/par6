@@ -29,19 +29,19 @@ jobs:
       - name: clippy
         if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          cargo clippy --workspace --exclude par6d --exclude par6-py \
+          cargo clippy --workspace --exclude par6d --exclude par6-py --exclude par6-calibrate \
             --exclude par6-client --all-targets -- -D warnings
           # par6-client's LIBRARY is toolchain-free; only its tests boot a
           # daemon in-process (covered in `ffi`).
           cargo clippy -p par6-client -- -D warnings
-      # par6d links the Pinocchio shim unconditionally, so it needs the C++
-      # toolchain and is covered by the `ffi` job below (par6-py wraps it
-      # and rides along). What this leg proves is that every LIBRARY crate
+      # par6d and par6-calibrate link the Pinocchio shim unconditionally, so
+      # they need the C++ toolchain and are covered by the `ffi` job below
+      # (par6-py wraps par6d and rides along). What this leg proves is that every LIBRARY crate
       # still builds and passes without that toolchain — which is what
       # keeps them usable on their own.
       - name: test
         if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --exclude par6d --exclude par6-py --exclude par6-client
+        run: cargo test --workspace --exclude par6d --exclude par6-py --exclude par6-calibrate --exclude par6-client
       # pinokin-sys is its OWN workspace (its ffi build needs the C++
       # toolchain), so `--workspace` above never reaches it — its
       # toolchain-free surface would otherwise be the one crate in the
@@ -115,10 +115,11 @@ jobs:
         run: |
           source .ffi/env.sh
           cargo clippy -p par6-kin --all-targets --features ffi -- -D warnings
-      - name: test par6-kin
+      - name: test par6-kin, par6-calibrate
         run: |
           source .ffi/env.sh
           cargo test -p par6-kin --features ffi
+          cargo test -p par6-calibrate
       # The collision suite runs in the step above; this one reruns just
       # its timing case optimized and uncaptured, so the measured
       # per-waypoint cost the planner budgets against is visible in the log.

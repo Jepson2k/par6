@@ -384,11 +384,13 @@ impl Daemon {
         }
         {
             let (link, shutdown) = (link, shutdown.clone());
+            let jog_accel_time_s = robot.jog.accel_time_s;
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         housekeeping_loop(
+                            jog_accel_time_s,
                             link,
                             stream_input,
                             shared,
@@ -777,7 +779,13 @@ pub(crate) fn load_kin_stack(
     // (planner and the streaming gate), each loaded once at startup: the
     // vendor collision meshes cost hundreds of milliseconds to read.
     let load_collision = || {
-        par6_kin::Collision::load(&assets_dir, variant, COLLISION_CLEARANCE_M).map_err(|e| {
+        crate::kin::load_collision(
+            &assets_dir,
+            variant,
+            opts.package_dir.as_deref(),
+            COLLISION_CLEARANCE_M,
+        )
+        .map_err(|e| {
             DaemonError::Kinematics(format!(
                 "cannot load collision model {} from {}: {e}",
                 variant.urdf_relpath(),

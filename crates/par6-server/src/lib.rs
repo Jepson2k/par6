@@ -39,6 +39,7 @@ pub mod gating;
 pub mod link;
 pub mod runtime;
 pub mod server;
+pub mod session;
 pub mod telemetry;
 
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport};

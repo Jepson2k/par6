@@ -2083,6 +2083,8 @@ fn curved_moves_trace_their_geometry() {
 /// `completed_index` ends on the second of them.
 #[test]
 fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
+    /// The server's blend hold, from `ServerConfig::default`.
+    const BLEND_HOLD_MS: f64 = 100.0;
     const BLEND_MM: f64 = 60.0;
     const LEG_MM: f64 = 150.0;
     /// Duration of each leg \[s\]. Slow, for the same reason the other
@@ -2162,8 +2164,12 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     // --- the same corner, blended.
     let s = curve_start(&rig, &mut c);
     let (first, corner, finish) = leg(&s, 5003, Some(BLEND_MM));
-    let i1 = c.ok_index(&first);
-    let i2 = c.ok_index(&second(&s, 5004, finish));
+    // Both moves go out back to back: the hold the blend depends on is
+    // wall-clock, and a reply round trip between them would spend it.
+    let sent_first = Instant::now();
+    let indices = c.ok_indices(&[first.clone(), second(&s, 5004, finish)]);
+    let (i1, i2) = (indices[0], indices[1]);
+    let send_gap = sent_first.elapsed();
     let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(ok, "the blended first leg must complete ok, got {detail:?}");
@@ -2213,7 +2219,11 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
         blend_corner_speed > 0.3 * blend_mean && blend_corner_speed > 5.0,
         "the blended corner slowed to {blend_corner_speed:.2} mm/s against a mean of \
          {blend_mean:.2} mm/s (unblended: {sharp_corner_speed:.2} of {sharp_mean:.2}) — \
-         a blend that stops is not a blend. {loop_note}"
+         a blend that stops is not a blend. The successor was sent {:.0} ms after the \
+         first against a {:.0} ms blend hold — past it, the first move runs alone and \
+         this is the test host being starved, not the blend. {loop_note}",
+        send_gap.as_secs_f64() * 1e3,
+        BLEND_HOLD_MS
     );
     // Motion time from the broadcast's own monotonic clock — the
     // wall-clock of the collection loop is a fixed window and cannot

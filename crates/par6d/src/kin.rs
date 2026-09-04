@@ -60,17 +60,30 @@ pub fn resolve_assets_dir(explicit: Option<&Path>, config_path: &Path) -> Result
             Err(format!("assets directory not found: {}", p.display()))
         };
     }
-    let candidate = config_path
-        .parent()
-        .and_then(Path::parent)
-        .map(|root| root.join("assets/par6_description"));
-    match candidate {
-        Some(c) if c.is_dir() => Ok(c),
-        _ => Err(format!(
-            "no assets/par6_description tree next to {}; set --assets or PAR6_ASSETS",
-            config_path.display()
-        )),
+    // The environment, the tree next to the config, then the deploy
+    // bundle's install location — the same order everything loads with.
+    let mut candidates = Vec::new();
+    if let Ok(p) = std::env::var("PAR6_ASSETS") {
+        candidates.push(PathBuf::from(p));
     }
+    if let Some(root) = config_path.parent().and_then(Path::parent) {
+        candidates.push(root.join("assets/par6_description"));
+    }
+    candidates.push(PathBuf::from("/usr/share/par6/par6_description"));
+    for c in &candidates {
+        if c.is_dir() {
+            return Ok(c.clone());
+        }
+    }
+    Err(format!(
+        "no assets/par6_description tree for {}; set --assets or PAR6_ASSETS (tried: {})",
+        config_path.display(),
+        candidates
+            .iter()
+            .map(|c| c.display().to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 /// Load one model instance, mapping the error to a one-line message.
@@ -662,6 +675,32 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
     Some(x)
 }
 
+/// `variant`'s collision geometry from the assets tree.
+///
+/// `package_dir` is where `package://` mesh URIs resolve, for an assets
+/// tree that is an installed package rather than a repo checkout (whose
+/// meshes sit under `<assets>/URDF`, which [`par6_kin::Collision::load`]
+/// already knows).
+pub fn load_collision(
+    assets_dir: &Path,
+    variant: par6_kin::GripperVariant,
+    package_dir: Option<&Path>,
+    clearance: f64,
+) -> Result<par6_kin::Collision, par6_kin::KinError> {
+    match package_dir {
+        Some(dir) => {
+            let mut c = par6_kin::Collision::from_urdf(
+                &assets_dir.join(variant.urdf_relpath()),
+                Some(dir),
+                clearance,
+            )?;
+            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))?;
+            Ok(c)
+        }
+        None => par6_kin::Collision::load(assets_dir, variant, clearance),
+    }
+}
+
 /// The model a payload estimation measures against — the arm with its
 /// fitted gripper, the collision world the wrist swing is planned in,
 /// and the joint window — from the config the daemon runs, resolved the
@@ -685,20 +724,8 @@ pub fn estimation_model(
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
     let kin = load_gravity_kin(&assets_dir, gripper)?;
-    let collision = match package_dir {
-        Some(dir) => {
-            let mut c = par6_kin::Collision::from_urdf(
-                &assets_dir.join(variant.urdf_relpath()),
-                Some(dir),
-                0.0,
-            )
-            .map_err(|e| e.to_string())?;
-            c.apply_srdf(&assets_dir.join(variant.srdf_relpath()))
-                .map_err(|e| e.to_string())?;
-            c
-        }
-        None => par6_kin::Collision::load(&assets_dir, variant, 0.0).map_err(|e| e.to_string())?,
-    };
+    let collision =
+        load_collision(&assets_dir, variant, package_dir, 0.0).map_err(|e| e.to_string())?;
     Ok(par6_calibrate::EstimationModel {
         kin,
         collision,

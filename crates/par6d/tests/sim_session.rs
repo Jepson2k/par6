@@ -1667,3 +1667,28 @@ fn the_shipped_binary_publishes_the_bus_grant_signal_and_takes_it_away() {
     );
     std::fs::remove_dir_all(&dir).expect("clean up");
 }
+
+/// A teleport references the arm, so the move sent right behind it must
+/// be accepted. The homed gate reads the RT snapshot, which is a tick or
+/// more behind the accepted teleport — a script that teleports and then
+/// moves, as `examples/keepout_preview.py` does, must not race the
+/// broadcast.
+#[test]
+fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    // ENABLED is reached asynchronously; the teleport itself must land
+    // before the gate under test is the homed one.
+    rig.wait_status("enabled", |s| s.enabled);
+
+    let park = park_deg();
+    c.send(&teleport(park));
+    // No wait: this is the race. The move goes out in the same breath.
+    let index = c.ok_index(&move_j(4101, with_j0(park, 5.0), 0.5));
+    let (ok, detail) = c.wait_complete(index);
+    assert!(ok, "the move behind a teleport must run, got {detail:?}");
+
+    rig.shutdown();
+}

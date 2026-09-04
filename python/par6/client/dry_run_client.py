@@ -17,7 +17,6 @@ from __future__ import annotations
 import copy
 import logging
 from collections.abc import Coroutine
-from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -48,45 +47,6 @@ from .async_client import StatusResult
 from .errors import RobotError
 
 logger = logging.getLogger(__name__)
-
-
-def _resolve_engine_paths(config: str | None = None) -> tuple[str, str]:
-    """``(robot TOML, assets tree)`` for the preview engine.
-
-    An explicit *config* (a daemon-fetched bundle materialized by
-    :func:`par6.config.materialize_bundle`) wins; then ``PAR6_CONFIG``.
-    ``PAR6_ASSETS`` takes precedence for the assets tree; otherwise the
-    repo tree around an editable install, then the deploy bundle's
-    install locations (``/etc/par6`` + ``/usr/share/par6``, what
-    ``scripts/deploy/install.sh`` stages on a control box) — so a wheel
-    installed next to a deployed daemon previews with the exact files
-    the daemon runs. The packaged ``_data`` tree names its meshes under
-    the ``par6`` package, which the engine's assets loader does not
-    search, so a wheel with no daemon, repo, or env vars raises with
-    that remedy.
-    """
-    import os
-
-    config = config or os.environ.get("PAR6_CONFIG")
-    assets = os.environ.get("PAR6_ASSETS")
-    if config and assets:
-        return config, assets
-    root = Path(__file__).resolve().parents[3]
-    for cfg_probe, assets_probe in (
-        (root / "config" / "PAR6.toml", root / "assets" / "par6_description"),
-        (
-            Path("/etc/par6/PAR6.toml"),
-            Path("/usr/share/par6/par6_description"),
-        ),
-    ):
-        if (assets or assets_probe.is_dir()) and (config or cfg_probe.is_file()):
-            return (config or str(cfg_probe)), (assets or str(assets_probe))
-    raise RuntimeError(
-        "the dry-run engine needs the runtime config and assets tree; set "
-        "PAR6_CONFIG and PAR6_ASSETS (no repo checkout, and no deployed "
-        f"bundle under /etc/par6 + /usr/share/par6, found near "
-        f"{Path(__file__).resolve()})"
-    )
 
 
 def _drive(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -121,15 +81,22 @@ class DryRunRobotClient:
     ) -> None:
         from par6.tools import build_tools
 
-        config, assets = _resolve_engine_paths(config_path)
-        self._preview = Preview(
-            config=config, assets=assets, max_points=max(2, int(max_snapshot_points))
+        # The engine is built on first use, not here: a host that only
+        # wants this class (to pickle it into a worker) must not pay for
+        # the URDF and the collision meshes on its event loop. It runs on
+        # the packaged model, never on whatever the machine happens to
+        # have installed under /usr/share.
+        self._engine_args = (
+            config_path
+            if config_path is not None
+            else str(_cfg.data_root() / "config" / "PAR6.toml"),
+            max(2, int(max_snapshot_points)),
+            None
+            if initial_joints_deg is None
+            else [float(v) for v in initial_joints_deg],
+            bool(initial_homed),
         )
-        if initial_joints_deg is not None:
-            self._preview.place_rad(
-                np.radians(np.asarray(initial_joints_deg, dtype=np.float64)).tolist()
-            )
-        self._preview.set_homed(bool(initial_homed))
+        self._engine: Preview | None = None
         self._shapes: tuple[Shape, ...] = ()
         # The packaged tool specs, bound to this preview: ``tool.close()``
         # sends the same ``move`` verb and parameters the live gripper gets.
@@ -141,6 +108,24 @@ class DryRunRobotClient:
             bound._execute = self._tool_execute
             bound._get_status = self._tool_status
             self._tools[spec.key] = make_sync_tool(bound, _drive)
+
+    @property
+    def _preview(self) -> Preview:
+        if self._engine is None:
+            config, max_points, joints_deg, homed = self._engine_args
+            engine = Preview(
+                config=config,
+                assets=str(_cfg.data_root()),
+                package_dir=str(_cfg.package_search_dir()),
+                max_points=max_points,
+            )
+            if joints_deg is not None:
+                engine.place_rad(
+                    np.radians(np.asarray(joints_deg, dtype=np.float64)).tolist()
+                )
+            engine.set_homed(homed)
+            self._engine = engine
+        return self._engine
 
     # ------------------------------------------------------------------
     # State

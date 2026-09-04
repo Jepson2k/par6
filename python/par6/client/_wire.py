@@ -83,7 +83,7 @@ def jog_j_speeds(
 def jog_l_velocities(
     axis: str | None,
     speed: float,
-    axes: list[str] | None,
+    axes: Sequence[str] | None,
     speeds_list: list[float] | None,
 ) -> list[float]:
     """Per-axis velocity fractions for ``jog_l``'s two calling forms."""

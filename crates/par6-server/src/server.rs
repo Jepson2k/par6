@@ -55,11 +55,11 @@ use tokio::time::MissedTickBehavior;
 
 use crate::config::ServerConfig;
 use crate::faults::{gripper_fault_code, rt_standing_error};
-use crate::gating::{gate, is_stream};
+use crate::gating::is_stream;
 use crate::link::BroadcastLink;
 use crate::runtime::{
-    blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
-    RtCommands, RuntimeHandle, ShapeLayer,
+    CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand, RtCommands,
+    RuntimeHandle, ShapeLayer,
 };
 use crate::telemetry;
 
@@ -214,17 +214,22 @@ struct Core<P: Planner, R: RtCommands> {
 
     next_index: u64,
     dedup: Dedup,
-    pending: VecDeque<Pending>,
+    pending: crate::session::BlendQueue<Pending>,
     executing: Option<Executing>,
     /// Deadline the head of the queue is being held to, while it waits
     /// for the successor its blend radius asks to round a corner into.
-    blend_hold: Option<Instant>,
     accepted_index: i64,
     completed_index: i64,
     last_checkpoint: String,
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
+    /// A teleport was accepted and the RT has not published the
+    /// snapshot yet. Teleporting references the arm, so the homed gate
+    /// must open for the command right behind it — a client sends
+    /// teleport and its first move in the same breath, and the snapshot
+    /// is a tick or more behind.
+    teleport_homed: bool,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -298,15 +303,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             reassembler,
             transfer_addrs: HashMap::new(),
             next_index: 1,
-            pending: VecDeque::new(),
+            pending: crate::session::BlendQueue::default(),
             executing: None,
-            blend_hold: None,
             accepted_index: -1,
             completed_index: -1,
             last_checkpoint: String::new(),
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
+            teleport_homed: false,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
@@ -518,10 +523,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             C::Estop => {
                 let dropped = self.cancel_all_motion();
                 self.complete_cancelled("estop", dropped).await;
-                self.estop_latched = true;
                 self.runtime.rt.set_enabled(false);
-                self.standing_error =
-                    Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+                let mut latches = self.latches();
+                latches.estop();
+                self.set_latches(latches);
                 Ok(())
             }
             C::Pause(p) => {
@@ -537,17 +542,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 if p.clear_queue {
                     dropped.extend(self.drop_pending());
                 }
-                let latch = p.clear_queue && !dropped.is_empty();
+                let cleared = p.clear_queue && !dropped.is_empty();
                 self.complete_cancelled("stop", dropped).await;
-                if latch {
-                    // A cleared program is a fact the operator has to
-                    // see; the next accepted motion wipes it.
-                    self.standing_error = Some(make_error(
-                        ErrorCode::MotnCancelled,
-                        UNATTRIBUTED,
-                        &[("scope", "stop")],
-                    ));
-                }
+                let mut latches = self.latches();
+                latches.stop(cleared);
+                self.set_latches(latches);
                 Ok(())
             }
             // `port` indexes the box's DECLARED outputs, so the wire's
@@ -878,6 +877,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
+            self.teleport_homed = true;
             self.on_motion_accepted();
             return;
         }
@@ -1000,26 +1000,15 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- gating & validation ----------------------------------------------
 
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
-        let g = gate(tag);
-        if g.needs_enabled {
-            if self.estop_latched {
-                return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
-            }
-            if self.snap.state != ArmState::Enabled {
-                return Some(make_error(
-                    ErrorCode::SysControllerDisabled,
-                    UNATTRIBUTED,
-                    &[("detail", "The RT core reports DISABLED.")],
-                ));
-            }
-        }
-        if g.needs_homed && !self.snap.homed {
-            return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
-        }
-        if g.needs_simulator && !self.simulator {
-            return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
-        }
-        None
+        crate::session::check_gate(
+            tag,
+            crate::session::GateInputs {
+                estop_latched: self.estop_latched,
+                enabled: self.snap.state == ArmState::Enabled,
+                homed: self.snap.homed || self.teleport_homed,
+                simulator: self.simulator,
+            },
+        )
     }
 
     /// Server-layer name checks the codec deliberately leaves to config.
@@ -1044,13 +1033,13 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 break;
             }
             if self.pending.is_empty() {
-                self.blend_hold = None;
+                self.pending.release_hold();
                 break;
             }
             if self.holding_for_blend() {
                 break;
             }
-            self.blend_hold = None;
+            self.pending.release_hold();
             // Disjoint field borrows: the queue is read to build the
             // lookahead while the planner is driven.
             let batch: Vec<QueuedCommand<'_>> = self
@@ -1111,20 +1100,22 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// planner would build is still growing, and starting now would cost
     /// the corner. It ends when a command that stops at its target
     /// arrives, when the lookahead is full, or when the hold expires.
-    fn holding_for_blend(&mut self) -> bool {
-        let wants_more = self.pending.len() < self.cfg.blend_lookahead
-            && self
-                .pending
-                .back()
-                .and_then(|p| blend_radius_mm(&p.cmd))
-                .is_some_and(|r| r > 0.0);
-        if !wants_more {
-            return false;
+    fn latches(&self) -> crate::session::Latches {
+        crate::session::Latches {
+            estop_latched: self.estop_latched,
+            standing_error: self.standing_error.clone(),
         }
-        let deadline = *self
-            .blend_hold
-            .get_or_insert_with(|| Instant::now() + self.cfg.blend_hold);
-        Instant::now() < deadline
+    }
+
+    fn set_latches(&mut self, l: crate::session::Latches) {
+        self.estop_latched = l.estop_latched;
+        self.standing_error = l.standing_error;
+    }
+
+    fn holding_for_blend(&mut self) -> bool {
+        let (lookahead, hold) = (self.cfg.blend_lookahead, self.cfg.blend_hold);
+        self.pending
+            .holding_for_blend(lookahead, Some(hold), |p| &p.cmd)
     }
 
     async fn collect_outcomes(&mut self) {
@@ -1218,7 +1209,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Drain the pending queue — the commands a queue-clearing scope
     /// drops behind the active motion.
     fn drop_pending(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.blend_hold = None;
+        self.pending.release_hold();
         self.pending.drain(..).map(|p| (p.index, p.addr)).collect()
     }
 
@@ -1353,6 +1344,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
+            if self.snap.homed {
+                self.teleport_homed = false;
+            }
         }
     }
 

@@ -82,7 +82,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
     preview.place_rad(to_rad(&park));
@@ -245,7 +245,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
 #[test]
 fn the_preview_runs_the_cartesian_pipeline() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     preview.place_rad(to_rad(&park));
 
@@ -330,7 +330,7 @@ fn the_preview_runs_the_cartesian_pipeline() {
 #[test]
 fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     preview.place_rad(to_rad(&park));
     let mut a = park;
@@ -352,7 +352,7 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
         "the chain ends at the stopping move's target"
     );
     let alone = {
-        let mut p = Preview::new(Some(&config), Some(&assets())).expect("second preview");
+        let mut p = Preview::new(Some(&config), Some(&assets()), None).expect("second preview");
         p.place_rad(to_rad(&park));
         let first = p.submit(move_j_cmd(a, None));
         let second = p.submit(move_j_cmd(b, None));
@@ -412,7 +412,7 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
 #[test]
 fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     let ready = preview.homing_ready_pose_rad();
     assert!(
@@ -458,7 +458,7 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
 #[test]
 fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview");
     let start = preview.angles_rad();
 
     let jogged = preview.preview_jog([0.4, 0.0, 0.0, -0.4, 0.0, 0.0], 0.4, None);
@@ -503,7 +503,7 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
     preview.place_rad(to_rad(&park));
@@ -637,7 +637,7 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
 #[test]
 fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     preview.place_rad(to_rad(&park));
     preview.set_homed(true);

@@ -748,14 +748,17 @@ class Robot(_RobotABC):
 
         When a runtime answers at the target address its config is
         fetched and the preview runs the daemon's numbers; otherwise the
-        local resolution (``PAR6_CONFIG``, then the repo checkout)
-        applies. The probe is sampled once per :class:`Robot` — the
+        preview runs on the packaged config, the same one this
+        :class:`Robot` plans and checks with. The probe is sampled once
+        per :class:`Robot` — the
         first creation pays the round trip (bounded by the ping timeout
         when nothing answers), later ones reuse the answer, so a host
         creating a preview per run does not block on every one.
         """
         if kwargs.get("config_path") is None:
-            kwargs["config_path"] = self._daemon_config_path()
+            kwargs["config_path"] = self._daemon_config_path() or str(
+                _cfg.data_root() / "config" / "PAR6.toml"
+            )
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:

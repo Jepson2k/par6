@@ -65,15 +65,22 @@ pub struct Preview {
 #[pymethods]
 impl Preview {
     /// Build a session from a robot config path (the runtime's own
-    /// search when `None`) and assets tree, starting referenced at the
+    /// search when `None`), an assets tree and the directory
+    /// `package://` mesh URIs resolve under, starting referenced at the
     /// park pose. Trajectories are downsampled to `max_points` samples
     /// (endpoints kept) on the way out.
     #[new]
-    #[pyo3(signature = (config=None, assets=None, max_points=200))]
-    fn new(config: Option<String>, assets: Option<String>, max_points: usize) -> PyResult<Self> {
+    #[pyo3(signature = (config=None, assets=None, package_dir=None, max_points=200))]
+    fn new(
+        config: Option<String>,
+        assets: Option<String>,
+        package_dir: Option<String>,
+        max_points: usize,
+    ) -> PyResult<Self> {
         let inner = EnginePreview::new(
             config.map(std::path::PathBuf::from).as_deref(),
             assets.map(std::path::PathBuf::from).as_deref(),
+            package_dir.map(std::path::PathBuf::from).as_deref(),
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {

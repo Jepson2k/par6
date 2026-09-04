@@ -22,8 +22,8 @@ use par6_rt::{
     Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    blend_radius_mm, cmd_name, decode_error_to_wire, gate, registry_fault, validate_supported,
-    write_io_fault, PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
+    cmd_name, decode_error_to_wire, registry_fault, session, validate_supported, write_io_fault,
+    PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -134,7 +134,7 @@ pub struct Preview {
     /// Where the configured homing seek leaves the arm.
     ready_pose: [f64; MAX_JOINTS],
     /// Queued moves waiting for the successor they blend into.
-    held: Vec<Command>,
+    held: session::BlendQueue<Command>,
     profile: String,
     tool: String,
     tool_variant: Option<String>,
@@ -149,12 +149,9 @@ pub struct Preview {
     /// Whether the simulator backend is selected: `teleport` is gated on
     /// it, exactly as the server gates it.
     simulator: bool,
-    /// The e-stop latch. Every command the gate table marks
-    /// `needs_enabled` is refused while this stands, until a reset.
-    estop_latched: bool,
-    /// What `error()` reports: the refusal the runtime would leave
-    /// standing after an e-stop or a queue-clearing stop.
-    standing_error: Option<WireError>,
+    /// The e-stop latch and the standing error, with the server's own
+    /// transitions for a stop, an e-stop, a reset and an accepted motion.
+    latches: session::Latches,
     /// Whether a jog stream is open. The RT ramps from rest on JOG mode
     /// ENTRY, not per datagram, so a stream of jogs must keep ramping
     /// rather than restart each time.
@@ -185,13 +182,19 @@ pub struct Preview {
 
 impl Preview {
     /// Build a session from the robot config (default search when
-    /// `None`) and assets tree, starting referenced at the park pose
+    /// `None`), assets tree and `package://` search dir, starting
+    /// referenced at the park pose
     /// with the runtime's startup context.
-    pub fn new(config: Option<&Path>, assets: Option<&Path>) -> Result<Self, DaemonError> {
+    pub fn new(
+        config: Option<&Path>,
+        assets: Option<&Path>,
+        package_dir: Option<&Path>,
+    ) -> Result<Self, DaemonError> {
         let opts = Options {
             sim: true,
             config: config.map(Path::to_path_buf),
             assets: assets.map(Path::to_path_buf),
+            package_dir: package_dir.map(Path::to_path_buf),
             ..Options::default()
         };
         let config_path =
@@ -248,7 +251,7 @@ impl Preview {
             dt: robot.robot.tick_dt_s,
             motion: robot.motion,
             ready_pose,
-            held: Vec::new(),
+            held: session::BlendQueue::default(),
             profile: cfg.initial_profile.clone(),
             tool: cfg.fitted_tool.clone(),
             tool_variant: None,
@@ -260,8 +263,7 @@ impl Preview {
             tool_position: 0.0,
             flashing: false,
             simulator: cfg.simulator,
-            estop_latched: false,
-            standing_error: None,
+            latches: session::Latches::default(),
             jog_streaming: false,
             jog_accel_time_s: robot.jog.accel_time_s,
             jog_accel_scale: 1.0,
@@ -470,35 +472,19 @@ impl Preview {
         PreviewResult::refusal(self.snap.q, error)
     }
 
-    /// The server's own gate table, applied to the virtual arm.
+    /// The server's gate table, through the server's own check. A
+    /// FLASHING window is what the RT reports it as — disabled — rather
+    /// than a refusal of the preview's own wording.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
-        let g = gate(command.tag());
-        if g.needs_enabled {
-            if self.estop_latched {
-                return Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
-            }
-            // A silenced bus cannot execute. The live refusal comes from
-            // the RT's mode table rather than this gate (FLASHING has no
-            // transition to EXEC or STREAM), but the outcome a caller
-            // sees is the same: the command does not run.
-            if self.flashing {
-                return Some(make_error(
-                    ErrorCode::SysControllerDisabled,
-                    UNATTRIBUTED,
-                    &[(
-                        "detail",
-                        "The controller is in FLASHING: the bus is handed to a firmware flasher.",
-                    )],
-                ));
-            }
-        }
-        if g.needs_homed && !self.snap.homed {
-            return Some(make_error(ErrorCode::MotnNotHomed, UNATTRIBUTED, &[]));
-        }
-        if g.needs_simulator && !self.simulator {
-            return Some(make_error(ErrorCode::SysNotSimulator, UNATTRIBUTED, &[]));
-        }
-        None
+        session::check_gate(
+            command.tag(),
+            session::GateInputs {
+                estop_latched: self.latches.estop_latched,
+                enabled: !self.flashing,
+                homed: self.snap.homed,
+                simulator: self.simulator,
+            },
+        )
     }
 
     /// The payload the virtual arm carries.
@@ -557,7 +543,7 @@ impl Preview {
 
     /// The refusal the runtime would leave standing, or `None`.
     pub fn error(&self) -> Option<&WireError> {
-        self.standing_error.as_ref()
+        self.latches.standing_error.as_ref()
     }
 
     /// End an open jog stream the way the watchdog does: housekeeping
@@ -609,9 +595,8 @@ impl Preview {
         {
             return self.refuse(error);
         }
-        // Accepted: whatever a stop or e-stop left standing is answered.
-        self.standing_error = None;
-        self.held.push(command);
+        self.latches.motion_accepted();
+        self.held.push_back(command);
         if self.holding_for_blend() {
             return PreviewResult::pending(self.snap.q);
         }
@@ -619,24 +604,19 @@ impl Preview {
             .unwrap_or_else(|| PreviewResult::still(self.snap.q))
     }
 
-    /// The server's hold rule: the LAST queued command asks to blend into
-    /// a successor that has not arrived, and the lookahead is not full.
-    /// Offline there is no hold expiry — the chain closes with the next
-    /// stopping command or [`Self::flush`].
-    fn holding_for_blend(&self) -> bool {
-        self.held.len() < self.cfg.blend_lookahead
-            && self
-                .held
-                .last()
-                .and_then(blend_radius_mm)
-                .is_some_and(|r| r > 0.0)
+    /// The server's hold rule, with no expiry: offline there is no clock,
+    /// so the chain closes with the next stopping command or
+    /// [`Self::flush`].
+    fn holding_for_blend(&mut self) -> bool {
+        let lookahead = self.cfg.blend_lookahead;
+        self.held.holding_for_blend(lookahead, None, |c| c)
     }
 
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
         }
-        let batch = std::mem::take(&mut self.held);
+        let batch: Vec<Command> = self.held.drain(..).collect();
         let results = self.plan_batch(&batch);
         PreviewResult::concat(results)
     }
@@ -718,34 +698,21 @@ impl Preview {
         };
         match command {
             Command::Stop(p) => {
+                let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
-                    // A cleared program is a fact the operator has to see;
-                    // the next accepted motion wipes it.
-                    if !self.held.is_empty() {
-                        self.standing_error = Some(make_error(
-                            ErrorCode::MotnCancelled,
-                            UNATTRIBUTED,
-                            &[("scope", "stop")],
-                        ));
-                    }
                     self.held.clear();
                 }
+                self.latches.stop(cleared);
             }
             Command::Estop => {
                 self.held.clear();
-                self.estop_latched = true;
-                self.standing_error =
-                    Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
+                self.latches.estop();
             }
-            Command::Reset => {
-                self.estop_latched = false;
-                self.standing_error = None;
-            }
+            Command::Reset => self.latches.reset(),
             Command::Pause(_) | Command::SetGravityComp(_) => {}
             Command::ResetState => {
                 self.held.clear();
-                self.estop_latched = false;
-                self.standing_error = None;
+                self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
@@ -1047,7 +1014,7 @@ impl Preview {
         trajectory: Vec<[f64; MAX_JOINTS]>,
         duration_s: f64,
     ) -> PreviewResult {
-        self.standing_error = None;
+        self.latches.motion_accepted();
         self.advance(trajectory, duration_s)
     }
 
