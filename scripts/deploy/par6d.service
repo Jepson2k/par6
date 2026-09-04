@@ -65,7 +65,7 @@ RestrictSUIDSGID=yes
 RestrictNamespaces=yes
 LockPersonality=yes
 # AF_CAN for the bus, AF_NETLINK for the link bring-up, AF_INET/6 for the
-# protocol-v2 command/status/telemetry planes.
+# protocol-v2 command/status planes.
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_CAN
 
 [Install]

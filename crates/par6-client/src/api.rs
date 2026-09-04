@@ -316,14 +316,6 @@ impl Client {
         .await
     }
 
-    /// Select the telemetry recipe by name (empty stops the stream).
-    pub async fn set_recipe(&self, name: &str) -> Result<Ack, ClientError> {
-        self.system(Command::SetRecipe(cmd::SetRecipe {
-            name: name.to_string(),
-        }))
-        .await
-    }
-
     // ------------------------------------------------- queued commands
 
     /// Home the arm: the referencing seek when un-referenced (or when

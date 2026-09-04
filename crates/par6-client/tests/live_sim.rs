@@ -72,7 +72,6 @@ fn boot_daemon() -> (Daemon, ClientConfig) {
         bind: Some("127.0.0.1".parse().unwrap()),
         status_host: Some("127.0.0.1".parse().unwrap()),
         status_port: Some(status_port),
-        telemetry_port: Some(0),
         status_transport: Some(DaemonStatusTransport::Unicast),
         ..Options::default()
     };

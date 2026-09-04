@@ -20,8 +20,8 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetRecipe, SetShapes,
-    SetTcpOffset, Shape, Stop, Teleport,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetShapes, SetTcpOffset,
+    Shape, Stop, Teleport,
 };
 use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
@@ -29,7 +29,7 @@ use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{is_timeout, repo_root, shipped_config, Client, Rig, BUDGET, READ_TIMEOUT};
+use common::{repo_root, shipped_config, Client, Rig, BUDGET};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
@@ -690,99 +690,18 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
 
 // ---- gravity reads the gripper config --------------------------------------
 
-/// Just enough msgpack to read a telemetry packet: arrays, strings,
-/// unsigned ints and floats — the only markers `rmp_serde` emits for the
-/// `[recipe, seq, mono_ns, ...values]` shape. Written out here rather
-/// than pulling in a decoder dependency; unknown markers panic, which in
-/// a test is the right failure.
-mod mp {
-    pub enum Val {
-        Str(String),
-        U64(u64),
-        F64(f64),
-        Arr(Vec<Val>),
-    }
-
-    pub fn read(b: &[u8], i: &mut usize) -> Val {
-        let m = b[*i];
-        *i += 1;
-        match m {
-            0x00..=0x7f => Val::U64(u64::from(m)),
-            0xa0..=0xbf => read_str(b, i, usize::from(m & 0x1f)),
-            0xd9 => {
-                let n = usize::from(b[*i]);
-                *i += 1;
-                read_str(b, i, n)
-            }
-            0xcc => {
-                let v = u64::from(b[*i]);
-                *i += 1;
-                Val::U64(v)
-            }
-            0xcd => Val::U64(u64::from(u16::from_be_bytes(take(b, i)))),
-            0xce => Val::U64(u64::from(u32::from_be_bytes(take(b, i)))),
-            0xcf => Val::U64(u64::from_be_bytes(take(b, i))),
-            0xca => Val::F64(f64::from(f32::from_be_bytes(take(b, i)))),
-            0xcb => Val::F64(f64::from_be_bytes(take(b, i))),
-            0x90..=0x9f => read_arr(b, i, usize::from(m & 0x0f)),
-            0xdc => {
-                let n = usize::from(u16::from_be_bytes(take(b, i)));
-                read_arr(b, i, n)
-            }
-            other => panic!("unexpected msgpack marker {other:#04x} at byte {}", *i - 1),
-        }
-    }
-
-    fn take<const N: usize>(b: &[u8], i: &mut usize) -> [u8; N] {
-        let out: [u8; N] = b[*i..*i + N].try_into().unwrap();
-        *i += N;
-        out
-    }
-
-    fn read_str(b: &[u8], i: &mut usize, n: usize) -> Val {
-        let s = String::from_utf8(b[*i..*i + n].to_vec()).expect("utf8 msgpack str");
-        *i += n;
-        Val::Str(s)
-    }
-
-    fn read_arr(b: &[u8], i: &mut usize, n: usize) -> Val {
-        Val::Arr((0..n).map(|_| read(b, i)).collect())
-    }
-}
-
-/// `GravityTorques` [Nm] out of one `full`-recipe telemetry packet:
-/// `[recipe, seq, mono_ns, ...fields]` with gravity at field 12 of the
-/// `full` field order.
-fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
-    let mut i = 0;
-    let mp::Val::Arr(elems) = mp::read(pkt, &mut i) else {
-        return None;
-    };
-    match elems.first() {
-        Some(mp::Val::Str(name)) if name == "full" => {}
-        _ => return None,
-    }
-    match elems.get(3 + 12) {
-        Some(mp::Val::Arr(vals)) => Some(
-            vals.iter()
-                .map(|v| match v {
-                    mp::Val::F64(x) => *x,
-                    mp::Val::U64(x) => *x as f64,
-                    _ => f64::NAN,
-                })
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
 /// The gravity model reads the gripper CONFIG, not just the URDF.
 ///
 /// Boot plain `--sim` twice; the only difference is the active gripper's
 /// `[kinematics] mass_kg` (0.37 kg stock vs 2.37 kg — a tool two kilos
-/// heavier). At the same teleported posture the published GravityTorques
-/// telemetry must shift by the extra tool weight: about 6.7 Nm at the
+/// heavier). At the same teleported posture the published external
+/// torque must shift by the extra tool weight: about 6.7 Nm at the
 /// shoulder and 0.3 Nm at the wrist pitch for these numbers.
+///
+/// STATUS publishes `torques_ext = measured − G(q)`, and the kinematic
+/// plant measures no torque, so what arrives is the model's own gravity
+/// with the sign flipped — which is why the magnitudes below are read
+/// off `torques_ext` directly.
 ///
 /// Failing before the wiring landed, twice over: par6d built its gravity
 /// model with `tool: None`, so `mass_kg` was parsed, validated and read
@@ -793,7 +712,7 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
 /// publish-only.)
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
-    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], Vec<f64>) {
+    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
         let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg), false);
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -801,34 +720,10 @@ fn gripper_config_mass_changes_published_gravity_torque() {
         enable_and_teleport(&rig, &mut c, CART_START_DEG);
         let at = rig.wait_status("at the probe posture", |s| {
             angles_close(&s.angles, &CART_START_DEG, 0.1)
+                && s.torques_ext.iter().any(|t| t.abs() > 1e-9)
         });
-        // No telemetry flows until a recipe is selected, so every packet
-        // that arrives below is from this posture.
-        c.ok(&Command::SetRecipe(SetRecipe {
-            name: "full".into(),
-        }));
-        rig.telemetry()
-            .set_read_timeout(Some(READ_TIMEOUT))
-            .expect("telemetry timeout");
-        let deadline = Instant::now() + BUDGET;
-        let mut buf = [0u8; 65535];
-        let g = loop {
-            match rig.telemetry().recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    if let Some(g) = gravity_from_telemetry(&buf[..n]) {
-                        break g;
-                    }
-                }
-                Err(e) if is_timeout(&e) => {}
-                Err(e) => panic!("telemetry recv failed: {e}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no decodable full-recipe telemetry packet within budget"
-            );
-        };
         rig.shutdown();
-        (at.angles, g)
+        (at.angles, at.torques_ext)
     }
 
     let (q_stock, g_stock) = published_gravity("grav-stock", 0.37);

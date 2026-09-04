@@ -5,7 +5,7 @@
 //! startup one machine-readable line goes to stdout:
 //!
 //! ```text
-//! PAR6D_READY command_port=<n> status_port=<n> telemetry_port=<n> sim=<bool>
+//! PAR6D_READY command_port=<n> status_port=<n> sim=<bool>
 //! ```
 //!
 //! Logs go to stderr, and with `--log-dir` also to two rotating files
@@ -74,10 +74,9 @@ fn main() {
         }
     };
     println!(
-        "PAR6D_READY command_port={} status_port={} telemetry_port={} sim={}",
+        "PAR6D_READY command_port={} status_port={} sim={}",
         daemon.command_addr().port(),
         daemon.status_port(),
-        daemon.telemetry_port(),
         opts.sim
     );
     let _ = std::io::stdout().flush();

@@ -93,8 +93,8 @@ wire_enum! {
         SetShapes = 19,
         /// Select the controller-side completion policy.
         SetCompletionPolicy = 20,
-        /// Select the telemetry recipe. Unknown names are refused.
-        SetRecipe = 21,
+        // 21 was SetRecipe: removed with the telemetry stream — the
+        // numbers it carried are on STATUS or in the LOOP_STATS query.
         // 22 was SafetyStop: removed — limp mode is the physical e-stop's
         // job; a digital path must not be relied on in that emergency.
         /// Enable or disable the gravity-compensation feedforward. G(q) is
@@ -433,7 +433,6 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::ConnectHardware
         | C::SetShapes
         | C::SetCompletionPolicy
-        | C::SetRecipe
         | C::SetPayload
         | C::EnterFlashing
         | C::ExitFlashing

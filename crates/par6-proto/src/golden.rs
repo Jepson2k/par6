@@ -16,8 +16,8 @@ use crate::chunk::{encode_chunk, split_into_chunks, Chunk};
 use crate::command::{
     encode_command, Checkpoint, Command, ConnectHardware, Delay, EnterFlashing, Home, JogJ, JogL,
     MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ,
-    ServoJPose, ServoL, SetCompletionPolicy, SetPayload, SetPidGains, SetRecipe, SetShapes,
-    SetTcpOffset, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    ServoJPose, ServoL, SetCompletionPolicy, SetPayload, SetPidGains, SetShapes, SetTcpOffset,
+    Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use crate::enums::{
     command_class, ActionState, CompletionPolicy, ControllerMode, FlashingAssertion, Frame,
@@ -530,13 +530,6 @@ pub fn vectors() -> Vec<Vector> {
         11,
         Command::SetCompletionPolicy(SetCompletionPolicy {
             policy: CompletionPolicy::Strict,
-        }),
-    ));
-    v.push(cmd_vec(
-        "cmd_set_recipe",
-        12,
-        Command::SetRecipe(SetRecipe {
-            name: "diagnostics".into(),
         }),
     ));
     v.push(cmd_vec(
@@ -1089,6 +1082,8 @@ pub fn vectors() -> Vec<Vector> {
                 can_frame_age_max_ticks: 4,
                 rt_fifo: true,
                 rt_pinned: true,
+                stream_success_rate: 0.998,
+                stream_discard_pct: 0.2,
             }),
         },
     ));
@@ -1191,29 +1186,6 @@ pub fn vectors() -> Vec<Vector> {
                     [-2.0, 2.0, 4.0, 16.0],
                     [-6.3, 6.3, 6.0, 20.0],
                 ],
-                active_recipe: Some("standard".to_owned()),
-                recipes: vec![
-                    "minimal".to_owned(),
-                    "standard".to_owned(),
-                    "full".to_owned(),
-                    "diagnostics".to_owned(),
-                ],
-            },
-        },
-    ));
-    v.push(reply_vec(
-        "response_config_info_telemetry_off",
-        Reply::Response {
-            req_id: 127,
-            result: QueryResult::ConfigInfo {
-                path: "/etc/par6/PAR6.toml".to_owned(),
-                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-                    .to_owned(),
-                tick_dt_s: 0.004,
-                motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
-                joints: vec![[-2.15, 2.15, 3.0, 12.0]],
-                active_recipe: None,
-                recipes: vec!["minimal".to_owned(), "standard".to_owned()],
             },
         },
     ));

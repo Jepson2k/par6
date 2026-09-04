@@ -1,6 +1,6 @@
 //! Server configuration: sockets, rates, transport ladder knobs, queue
-//! sizing, and the server-layer registries (tools / profiles / telemetry
-//! recipes) the codec deliberately does not know about.
+//! sizing, and the server-layer registries (tools / profiles) the codec
+//! deliberately does not know about.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
@@ -8,9 +8,7 @@ use std::time::Duration;
 use par6_config::ProtocolConfig;
 use par6_proto::{Shape, NUM_JOINTS};
 
-use crate::telemetry::TelemetryRecipe;
-
-/// Status/telemetry transport selection.
+/// Status transport selection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StatusTransport {
     /// Multicast with a startup reachability probe; permanent unicast
@@ -48,16 +46,6 @@ pub struct ServerConfig {
     pub status_port: u16,
     /// Status broadcast rate \[Hz\].
     pub status_rate_hz: u32,
-    /// Telemetry stream port.
-    pub telemetry_port: u16,
-    /// Telemetry stream rate \[Hz\].
-    pub telemetry_rate_hz: u32,
-    /// Telemetry recipe registry; `set_recipe` refuses names not listed
-    /// here.
-    pub recipes: Vec<TelemetryRecipe>,
-    /// Recipe active at startup; `None` = telemetry off until
-    /// `set_recipe`.
-    pub initial_recipe: Option<String>,
     /// Reachability-probe reply timeout.
     pub probe_timeout: Duration,
     /// RT tick rate \[Hz\] (loop-stats reporting).
@@ -178,10 +166,6 @@ impl Default for ServerConfig {
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
             status_port: 6002,
             status_rate_hz: 50,
-            telemetry_port: 6003,
-            telemetry_rate_hz: 100,
-            recipes: TelemetryRecipe::defaults(),
-            initial_recipe: None,
             probe_timeout: Duration::from_millis(200),
             rt_tick_rate_hz: 250.0,
             link_stale: Duration::from_millis(200),
@@ -225,9 +209,6 @@ impl ServerConfig {
             multicast_group: group,
             status_port: p.status_port,
             status_rate_hz: p.status_rate_hz,
-            telemetry_port: p.telemetry_port,
-            telemetry_rate_hz: p.telemetry_rate_hz,
-            initial_recipe: p.initial_recipe.clone(),
             ..Self::default()
         }
     }

@@ -17,9 +17,9 @@
 //!   contract is extrinsic XYZ, `R = Rz·Ry·Rx`, so that the shape the
 //!   frontend draws is the shape the checker enforces.
 //! - All floats must be finite; NaN/inf are rejected at decode.
-//! - The codec validates shape and ranges only. Joint limits, tool names and
-//!   recipe names are configuration, validated in the server layer (the codec
-//!   performs no process-global lookups).
+//! - The codec validates shape and ranges only. Joint limits and tool names
+//!   are configuration, validated in the server layer (the codec performs no
+//!   process-global lookups).
 
 use crate::enums::{CmdType, CompletionPolicy, FlashingAssertion, Frame};
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
@@ -254,13 +254,6 @@ pub struct SetShapes {
 pub struct SetCompletionPolicy {
     /// The policy to apply to subsequent queued motion.
     pub policy: CompletionPolicy,
-}
-
-/// SET_RECIPE: select the telemetry recipe (unknown names are refused).
-#[derive(Debug, Clone, PartialEq)]
-pub struct SetRecipe {
-    /// Recipe name (1–64 chars), validated against config server-side.
-    pub name: String,
 }
 
 /// POSE query params.
@@ -534,7 +527,6 @@ pub enum Command {
     SetPayload(SetPayload),
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
-    SetRecipe(SetRecipe),
     EnterFlashing(EnterFlashing),
     ExitFlashing,
     SetPidGains(SetPidGains),
@@ -604,7 +596,6 @@ impl Command {
             C::SetPayload(_) => CmdType::SetPayload,
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
-            C::SetRecipe(_) => CmdType::SetRecipe,
             C::EnterFlashing(_) => CmdType::EnterFlashing,
             C::ExitFlashing => CmdType::ExitFlashing,
             C::SetPidGains(_) => CmdType::SetPidGains,
@@ -774,7 +765,6 @@ impl Command {
                 }
                 Ok(())
             }
-            C::SetRecipe(p) => str_len("set_recipe.name", &p.name, 1, 64),
             C::EnterFlashing(_) | C::ExitFlashing => Ok(()),
             C::SetPidGains(p) => {
                 for (what, v) in [
@@ -1071,7 +1061,6 @@ fn arity(tag: CmdType) -> usize {
         | T::ConnectHardware
         | T::SetShapes
         | T::SetCompletionPolicy
-        | T::SetRecipe
         | T::EnterFlashing
         | T::Pose => 3,
         T::WriteIo => 4,
@@ -1207,7 +1196,6 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             }
         }
         C::SetCompletionPolicy(p) => w_uint(buf, u64::from(p.policy as u8)),
-        C::SetRecipe(p) => w_str(buf, &p.name),
         C::EnterFlashing(p) => w_uint(buf, u64::from(p.assertion as u8)),
         C::SetPidGains(p) => {
             w_uint(buf, u64::from(p.node));
@@ -1575,9 +1563,6 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             })?;
             Command::SetCompletionPolicy(SetCompletionPolicy { policy })
         }
-        T::SetRecipe => Command::SetRecipe(SetRecipe {
-            name: r.str()?.to_owned(),
-        }),
         T::EnterFlashing => {
             let v = r.uint()?;
             let assertion =

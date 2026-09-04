@@ -76,7 +76,6 @@ fn redirect_bus_grant() {
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
-    _telemetry_rx: UdpSocket,
 }
 
 impl Rig {
@@ -117,7 +116,6 @@ impl Rig {
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
-        let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
         let opts = Options {
             sim: true,
             sim_dynamics,
@@ -127,7 +125,6 @@ impl Rig {
             bind: Some("127.0.0.1".parse().unwrap()),
             status_host: Some("127.0.0.1".parse().unwrap()),
             status_port: Some(status_rx.local_addr().unwrap().port()),
-            telemetry_port: Some(telemetry_rx.local_addr().unwrap().port()),
             status_transport: Some(StatusTransport::Unicast),
             status_rate_hz,
             ..Options::default()
@@ -136,18 +133,12 @@ impl Rig {
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
-            _telemetry_rx: telemetry_rx,
         })
     }
 
     /// The command plane's bound address.
     pub fn addr(&self) -> SocketAddr {
         self.daemon.as_ref().expect("running").command_addr()
-    }
-
-    /// The telemetry socket, for tests that decode the stream.
-    pub fn telemetry(&self) -> &UdpSocket {
-        &self._telemetry_rx
     }
 
     /// Widen the STATUS socket's read timeout past the default

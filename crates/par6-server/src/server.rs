@@ -1,6 +1,6 @@
 //! The command-plane actor: one tokio task owning the UDP command
 //! socket, the motion queue, the SINGLE command-index allocator, and the
-//! status/telemetry broadcast schedule.
+//! status broadcast schedule.
 //!
 //! Decisions resolved here:
 //!
@@ -74,7 +74,6 @@ use crate::runtime::{
     blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
     RtCommands, RuntimeHandle, ShapeLayer,
 };
-use crate::telemetry;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
@@ -140,16 +139,6 @@ where
     P: Planner + 'static,
     R: RtCommands + 'static,
 {
-    // An unknown startup recipe is a startup failure, exactly as
-    // `set_recipe` refuses it live — a silent fallback looks like a
-    // dead robot.
-    if let Some(name) = &cfg.initial_recipe {
-        if !cfg.recipes.iter().any(|r| r.name == *name) {
-            return Err(std::io::Error::other(format!(
-                "unknown initial telemetry recipe {name:?}"
-            )));
-        }
-    }
     let socket = UdpSocket::bind(cfg.bind).await?;
     let addr = socket.local_addr()?;
     let link = BroadcastLink::open(&cfg).await?;
@@ -308,7 +297,6 @@ struct Core<P: Planner, R: RtCommands> {
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
-    recipe: Option<String>,
     /// The RT latch last written to the activity log, so the latch is
     /// logged on its edges and never once per poll.
     rt_error_logged: Option<u16>,
@@ -324,7 +312,6 @@ struct Core<P: Planner, R: RtCommands> {
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
-    telemetry_seq: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
 }
@@ -333,7 +320,6 @@ enum Event {
     Datagram(usize, SocketAddr),
     Poll,
     Status,
-    Telemetry,
     Shutdown,
 }
 
@@ -348,7 +334,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         Self {
             dedup: Dedup::new(cfg.dedup_window),
             profile: cfg.initial_profile.clone(),
-            recipe: cfg.initial_recipe.clone(),
             rt_error_logged: None,
             pending_scans: Vec::new(),
             simulator: cfg.simulator,
@@ -392,7 +377,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
-            telemetry_seq: 0,
             tcp_speed: 0.0,
             prev_tcp: None,
         }
@@ -402,8 +386,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let mut rxbuf = vec![0u8; 65535];
         let mut poll_iv = tokio::time::interval(self.cfg.poll_interval);
         let mut status_iv = tokio::time::interval(rate_period(self.cfg.status_rate_hz));
-        let mut telem_iv = tokio::time::interval(rate_period(self.cfg.telemetry_rate_hz));
-        for iv in [&mut poll_iv, &mut status_iv, &mut telem_iv] {
+        for iv in [&mut poll_iv, &mut status_iv] {
             iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
         self.sync_planner();
@@ -418,7 +401,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 },
                 _ = poll_iv.tick() => Event::Poll,
                 _ = status_iv.tick() => Event::Status,
-                _ = telem_iv.tick() => Event::Telemetry,
                 _ = shutdown.notified() => Event::Shutdown,
             };
             match ev {
@@ -434,7 +416,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
                 Event::Poll => self.on_poll().await,
                 Event::Status => self.on_status().await,
-                Event::Telemetry => self.on_telemetry().await,
                 Event::Shutdown => break,
             }
         }
@@ -573,19 +554,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.status_seq += 1;
         let bytes = self.encoder.encode(&status);
         self.link.send(self.cfg.status_port, bytes).await;
-    }
-
-    async fn on_telemetry(&mut self) {
-        self.refresh_snapshot();
-        let Some(name) = self.recipe.as_deref() else {
-            return;
-        };
-        let Some(recipe) = self.cfg.recipes.iter().find(|r| r.name == name) else {
-            return;
-        };
-        let pkt = telemetry::encode_packet(recipe, self.telemetry_seq, self.mono_ns(), &self.snap);
-        self.telemetry_seq += 1;
-        self.link.send(self.cfg.telemetry_port, &pkt).await;
     }
 
     // ---- command classes ---------------------------------------------------
@@ -828,7 +796,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.tcp_offset_mm = [0.0; 3];
                 self.completion_policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
-                self.recipe = self.cfg.initial_recipe.clone();
                 self.runtime.rt.reset_state();
                 self.sync_planner();
                 // The program layer only: installation keep-outs are the
@@ -891,18 +858,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.completion_policy = p.policy;
                 self.sync_planner();
                 Ok(())
-            }
-            C::SetRecipe(p) => {
-                if self.cfg.recipes.iter().any(|r| r.name == p.name) {
-                    self.recipe = Some(p.name.clone());
-                    Ok(())
-                } else {
-                    Err(make_error(
-                        ErrorCode::CommUnknownRecipe,
-                        UNATTRIBUTED,
-                        &[("name", &p.name)],
-                    ))
-                }
             }
             _ => unreachable!("dispatch routes only SYSTEM commands here"),
         };
@@ -2329,6 +2284,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     can_frame_age_max_ticks: ls.can_frame_age_max_ticks,
                     rt_fifo: ls.rt_fifo,
                     rt_pinned: ls.rt_pinned,
+                    // The streaming path's own quality, answered beside
+                    // the loop's: a servo stream that is dropping samples
+                    // is a loop that is not being fed, and the two are
+                    // read together or not at all.
+                    stream_success_rate: f64::from(self.snap.stream.success_rate),
+                    stream_discard_pct: f64::from(self.snap.stream.discard_pct),
                 })
             }
             C::Profile => QueryResult::Profile {
@@ -2373,8 +2334,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
-                    active_recipe: self.recipe.clone(),
-                    recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }
             }
             C::Shapes => QueryResult::Shapes {
@@ -2623,7 +2582,6 @@ fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
-        T::SetRecipe => "set_recipe",
         T::EnterFlashing => "enter_flashing",
         T::ExitFlashing => "exit_flashing",
         T::SetPidGains => "set_pid_gains",

@@ -315,7 +315,7 @@ pub struct BusConfig {
     pub scan: ScanConfig,
 }
 
-/// UDP command/status/telemetry plane parameters (protocol v2).
+/// UDP command/status plane parameters (protocol v2).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProtocolConfig {
@@ -326,23 +326,9 @@ pub struct ProtocolConfig {
     /// Status multicast group (IPv4); unicast fallback per the transport
     /// ladder.
     pub status_multicast_group: String,
-    /// Telemetry stream port.
-    pub telemetry_port: u16,
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
     /// (validated) so the broadcaster is a clean tick decimation.
     pub status_rate_hz: u32,
-    /// Telemetry stream rate \[Hz\].
-    #[serde(default = "default_telemetry_rate_hz")]
-    pub telemetry_rate_hz: u32,
-    /// Telemetry recipe active from boot. Omitted = the stream stays
-    /// silent until a client's `set_recipe` — the shipped default. An
-    /// unknown name refuses startup, like `set_recipe` refuses it live.
-    #[serde(default)]
-    pub initial_recipe: Option<String>,
-}
-
-fn default_telemetry_rate_hz() -> u32 {
-    100
 }
 
 /// Jog profile shape.
@@ -995,7 +981,6 @@ impl RobotConfig {
         let ports = [
             (p.command_port, "protocol.command_port"),
             (p.status_port, "protocol.status_port"),
-            (p.telemetry_port, "protocol.telemetry_port"),
         ];
         for (i, (port, name)) in ports.iter().enumerate() {
             if *port == 0 {
@@ -1019,9 +1004,6 @@ impl RobotConfig {
         }
         if p.status_rate_hz == 0 {
             return Err(invalid("protocol.status_rate_hz", "must be > 0"));
-        }
-        if !(1..=1000).contains(&p.telemetry_rate_hz) {
-            return Err(invalid("protocol.telemetry_rate_hz", "must be 1..=1000"));
         }
         let rate = self.tick_rate_hz();
         let per = rate / f64::from(p.status_rate_hz);

@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use par6_proto::command::{
     EnterFlashing, JogJ, JogL, MoveJ, MoveS, SaveConfig, SetCanId, SetPayload, SetPidGains,
-    SetRecipe, SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -368,21 +368,17 @@ struct Harness {
     planner: Arc<Mutex<PlannerState>>,
     writer: SnapshotWriter<StateSnapshot>,
     status_rx: UdpSocket,
-    telemetry_rx: UdpSocket,
     tick: u64,
 }
 
 async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
     let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let mut cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_transport: StatusTransport::Unicast,
         status_dest_host: "127.0.0.1".parse().unwrap(),
         status_port: status_rx.local_addr().unwrap().port(),
-        telemetry_port: telemetry_rx.local_addr().unwrap().port(),
         status_rate_hz: 100,
-        telemetry_rate_hz: 200,
         poll_interval: Duration::from_millis(1),
         link_stale: Duration::from_millis(100),
         chunk_timeout: Duration::from_millis(100),
@@ -410,7 +406,6 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
         planner,
         writer,
         status_rx,
-        telemetry_rx,
         tick: 0,
     }
 }
@@ -616,27 +611,6 @@ async fn recv_status(sock: &UdpSocket) -> par6_proto::Status {
         .expect("status within budget")
         .expect("recv");
     decode_status(&buf[..n]).expect("decodable status")
-}
-
-async fn recv_telemetry(sock: &UdpSocket) -> (String, u64, u64, u64, Vec<f64>) {
-    let mut buf = [0u8; 4096];
-    let (n, _) = timeout(BUDGET, sock.recv_from(&mut buf))
-        .await
-        .expect("telemetry within budget")
-        .expect("recv");
-    let frame = par6_proto::decode_telemetry(&buf[..n]).expect("decodable telemetry");
-    let [par6_proto::TelemetryValue::U64(tick), par6_proto::TelemetryValue::Arr(q)] =
-        frame.values.as_slice()
-    else {
-        panic!("minimal recipe layout: [name, seq, mono_ns, tick, q]");
-    };
-    (
-        frame.recipe,
-        frame.seq,
-        frame.mono_time_ns,
-        *tick,
-        q.clone(),
-    )
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only
@@ -1959,45 +1933,6 @@ async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
     .await;
 }
 
-/// Telemetry: unknown recipes are refused with COMM_UNKNOWN_RECIPE;
-/// a selected recipe streams binary msgpack with seq + timestamp and
-/// snapshot content.
-#[tokio::test]
-async fn telemetry_recipes_refusal_and_stream() {
-    let mut h = start(|_| {}).await;
-    h.publish(|s| {
-        s.tick = 33;
-        s.q = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
-    });
-    let mut c = Client::new(&h).await;
-
-    let err = c
-        .expect_error(&Command::SetRecipe(SetRecipe {
-            name: "definitely-not-a-recipe".to_owned(),
-        }))
-        .await;
-    assert_eq!(err.code, ErrorCode::CommUnknownRecipe as u16);
-    assert!(err.cause.contains("definitely-not-a-recipe"));
-
-    match c
-        .request(&Command::SetRecipe(SetRecipe {
-            name: "minimal".to_owned(),
-        }))
-        .await
-    {
-        Reply::Ok { index: None, .. } => {}
-        other => panic!("expected OK, got {other:?}"),
-    }
-
-    let (name, seq1, ns1, tick, q) = recv_telemetry(&h.telemetry_rx).await;
-    assert_eq!(name, "minimal");
-    assert_eq!(tick, 33);
-    assert_eq!(q, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-    let (_, seq2, ns2, _, _) = recv_telemetry(&h.telemetry_rx).await;
-    assert!(seq2 > seq1, "telemetry seq must increase");
-    assert!(ns2 >= ns1);
-}
-
 fn wire_shape(name: &str, kind: &str) -> Shape {
     Shape {
         kind: kind.to_owned(),
@@ -2168,13 +2103,11 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
 #[tokio::test]
 async fn unappliable_installation_shapes_fail_startup() {
     let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
         status_transport: StatusTransport::Unicast,
         status_dest_host: "127.0.0.1".parse().unwrap(),
         status_port: status_rx.local_addr().unwrap().port(),
-        telemetry_port: telemetry_rx.local_addr().unwrap().port(),
         installation_shapes: vec![wire_shape("bad", "pyramid")],
         ..ServerConfig::default()
     };

@@ -20,8 +20,6 @@ from waldoctl.sync_tools import make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
 
-from par6._par6 import TelemetryReader
-
 from ..protocol.constants import CompletionPolicy
 from ..protocol.wire import StatusBuffer
 from .async_client import (
@@ -548,10 +546,6 @@ class RobotClient:
         """Set the controller-side completion policy for queued motion."""
         return _run(self._inner.set_completion_policy(policy))
 
-    def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe (unknown names are refused)."""
-        return _run(self._inner.set_recipe(name))
-
     def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin)."""
         return _run(self._inner.write_io(index, value))
@@ -670,11 +664,6 @@ class RobotClient:
         """The runtime's effective configuration (path, fingerprint,
         limits, motion constants)."""
         return _run(self._inner.config_info())
-
-    def open_telemetry(self) -> TelemetryReader:
-        """A reader on the daemon's telemetry stream — see
-        ``AsyncRobotClient.open_telemetry``."""
-        return self._inner.open_telemetry()
 
     def config_bundle(self) -> dict | None:
         """The config files the runtime loaded, verbatim (robot +

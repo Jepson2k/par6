@@ -42,7 +42,6 @@ class CmdType(IntEnum):
     SET_TCP_OFFSET = 18
     SET_SHAPES = 19
     SET_COMPLETION_POLICY = 20
-    SET_RECIPE = 21
     SET_GRAVITY_COMP = 23
     PAUSE = 24
     SET_PAYLOAD = 25
@@ -269,7 +268,6 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SET_TCP_OFFSET: CommandClass.QUEUED,
     CmdType.SET_SHAPES: CommandClass.SYSTEM,
     CmdType.SET_COMPLETION_POLICY: CommandClass.SYSTEM,
-    CmdType.SET_RECIPE: CommandClass.SYSTEM,
     CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
     CmdType.PAUSE: CommandClass.SYSTEM,
     CmdType.SET_PAYLOAD: CommandClass.SYSTEM,

@@ -206,7 +206,7 @@ way UR and Franka deployments do:
 
 - **Keep the robot off routable networks.** Put the box on a dedicated
   NIC, VLAN or physically separate segment shared only with the machines
-  that operate it. Do not port-forward 6001 or the status/telemetry
+  that operate it. Do not port-forward 6001 or the status
   ports.
 - **Remote access goes through the OS, not the protocol.** For operating
   the arm from elsewhere, terminate a WireGuard (or SSH) tunnel on the

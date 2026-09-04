@@ -136,6 +136,12 @@ pub struct LoopStatsResult {
     pub rt_fifo: bool,
     /// Whether the RT thread is pinned to its configured CPU.
     pub rt_pinned: bool,
+    /// Fraction of streamed samples the executor consumed, over the
+    /// runtime's window \[0, 1\]. 0 before any stream has run.
+    pub stream_success_rate: f64,
+    /// Percentage of streamed samples discarded as too old or out of
+    /// order, over the same window.
+    pub stream_discard_pct: f64,
 }
 
 /// One node id's row of a BUS_SCAN result.
@@ -300,11 +306,6 @@ pub enum QueryResult {
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
-        /// Active telemetry recipe name (`None` = telemetry off).
-        active_recipe: Option<String>,
-        /// Recipe names SET_RECIPE accepts — the discovery surface a
-        /// client selects from.
-        recipes: Vec<String>,
     },
     /// PAYLOAD result: the effective runtime payload (zeros = none).
     Payload {
@@ -533,7 +534,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_str(buf, params);
         }
         Q::LoopStats(s) => {
-            w_array(buf, 17);
+            w_array(buf, 19);
             w_uint(buf, u64::from(tag));
             w_f64(buf, s.target_hz);
             w_uint(buf, s.loop_count);
@@ -551,6 +552,8 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, s.can_frame_age_max_ticks);
             w_bool(buf, s.rt_fifo);
             w_bool(buf, s.rt_pinned);
+            w_f64(buf, s.stream_success_rate);
+            w_f64(buf, s.stream_discard_pct);
         }
         Q::Profile { profile } => {
             w_array(buf, 2);
@@ -604,10 +607,8 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             tick_dt_s,
             motion,
             joints,
-            active_recipe,
-            recipes,
         } => {
-            w_array(buf, 8);
+            w_array(buf, 6);
             w_uint(buf, u64::from(tag));
             w_str(buf, path);
             w_str(buf, fingerprint);
@@ -622,14 +623,6 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
-            }
-            match active_recipe {
-                Some(name) => w_str(buf, name),
-                None => w_nil(buf),
-            }
-            w_array(buf, recipes.len());
-            for name in recipes {
-                w_str(buf, name);
             }
         }
         Q::ConfigBundle {
@@ -964,7 +957,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::LoopStats => {
-            expect_arity("loop_stats result", n, 17)?;
+            expect_arity("loop_stats result", n, 19)?;
             QueryResult::LoopStats(LoopStatsResult {
                 target_hz: r.f64()?,
                 loop_count: r.uint()?,
@@ -982,6 +975,8 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 can_frame_age_max_ticks: r.uint()?,
                 rt_fifo: r.bool()?,
                 rt_pinned: r.bool()?,
+                stream_success_rate: r.f64()?,
+                stream_discard_pct: r.f64()?,
             })
         }
         T::Profile => {
@@ -1032,7 +1027,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             QueryResult::IsSimulator { active: r.bool()? }
         }
         T::ConfigInfo => {
-            expect_arity("config_info result", n, 8)?;
+            expect_arity("config_info result", n, 6)?;
             let path = r.str()?.to_owned();
             let fingerprint = r.str()?.to_owned();
             let tick_dt_s = r.f64()?;
@@ -1051,21 +1046,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             for _ in 0..jn {
                 joints.push(r_f64_fixed(r, "config_info.joints[]")?);
             }
-            let active_recipe = if r.peek_nil() {
-                r.nil()?;
-                None
-            } else {
-                Some(r.str()?.to_owned())
-            };
-            let recipes = r_strings(r)?;
             QueryResult::ConfigInfo {
                 path,
                 fingerprint,
                 tick_dt_s,
                 motion,
                 joints,
-                active_recipe,
-                recipes,
             }
         }
         T::ConfigBundle => {

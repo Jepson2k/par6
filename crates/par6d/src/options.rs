@@ -35,10 +35,9 @@ OPTIONS:
                                printed on stdout as `PAR6D_READY command_port=...`.
                                [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
     --bind <IP>                Command-socket bind address [env: PAR6_BIND] [default: 0.0.0.0]
-    --status-host <IP>         Unicast status/telemetry destination
+    --status-host <IP>         Unicast status destination
                                [env: PAR6_STATUS_HOST] [default: 127.0.0.1]
     --status-port <PORT>       Status broadcast port [env: PAR6_STATUS_PORT]
-    --telemetry-port <PORT>    Telemetry stream port [env: PAR6_TELEMETRY_PORT]
     --status-transport <MODE>  auto | multicast | unicast [env: PAR6_STATUS_TRANSPORT]
     --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
                                exactly [env: PAR6_STATUS_RATE_HZ]
@@ -75,12 +74,10 @@ pub struct Options {
     pub command_port: Option<u16>,
     /// Command-socket bind address override.
     pub bind: Option<IpAddr>,
-    /// Unicast status/telemetry destination override.
+    /// Unicast status destination override.
     pub status_host: Option<IpAddr>,
     /// Status broadcast port override.
     pub status_port: Option<u16>,
-    /// Telemetry stream port override.
-    pub telemetry_port: Option<u16>,
     /// Status transport ladder override.
     pub status_transport: Option<StatusTransport>,
     /// STATUS broadcast rate override \[Hz\].
@@ -116,9 +113,6 @@ impl Options {
                 }
                 "--status-port" => {
                     o.status_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
-                }
-                "--telemetry-port" => {
-                    o.telemetry_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
                 }
                 "--status-transport" => {
                     o.status_transport = Some(parse_transport(&value(&mut args, &arg)?)?);
@@ -175,11 +169,6 @@ impl Options {
         if self.status_port.is_none() {
             if let Some(v) = env_var("PAR6_STATUS_PORT") {
                 self.status_port = Some(parse_num(&v, "PAR6_STATUS_PORT")?);
-            }
-        }
-        if self.telemetry_port.is_none() {
-            if let Some(v) = env_var("PAR6_TELEMETRY_PORT") {
-                self.telemetry_port = Some(parse_num(&v, "PAR6_TELEMETRY_PORT")?);
             }
         }
         if self.status_transport.is_none() {

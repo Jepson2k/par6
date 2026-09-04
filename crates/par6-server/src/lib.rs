@@ -12,11 +12,9 @@
 //!   briefly for the successor it rounds into, and the planner is
 //!   offered the whole runnable chain), and chunked bulk reassembly with
 //!   `COMM_CHUNK_TIMEOUT` expiry.
-//! - [`link`]: the status/telemetry broadcast transport ladder —
+//! - [`link`]: the status broadcast transport ladder —
 //!   multicast with a startup reachability probe, permanent unicast
 //!   failover on probe failure or 3 consecutive send errors.
-//! - [`telemetry`]: recipe-selected binary msgpack field streams;
-//!   unknown recipe names are refused (`COMM_UNKNOWN_RECIPE`).
 //! - [`faults`]: the RT error latch mapped onto the wire catalog, so a
 //!   hard error the RT raised on its own (stream watchdog, loop critical,
 //!   drive fault) reaches `STATUS.error`, `activity` and the ERROR query
@@ -39,7 +37,6 @@ pub mod gating;
 pub mod link;
 pub mod runtime;
 pub mod server;
-pub mod telemetry;
 
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport};
 pub use faults::{gripper_fault_code, rt_standing_error};
@@ -49,4 +46,3 @@ pub use runtime::{
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
 pub use server::{decode_error_to_wire, spawn, validate_supported, ServerHandle};
-pub use telemetry::{TelemetryField, TelemetryRecipe};

@@ -37,7 +37,6 @@ from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
 from par6.protocol.constants import ActionState, ControllerMode, ErrorCode
 from par6.robot import Robot
-from par6.telemetry import TelemetryReader
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
 
@@ -400,7 +399,6 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
     monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
     monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
-    monkeypatch.setenv("PAR6_TELEMETRY_PORT", str(free_udp_port()))
 
     logs = Robot(host="127.0.0.1", port=port, normalize_logs=True)
     assert logs.is_available() is False
@@ -606,7 +604,7 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
     """``is_estop_pressed`` / ``is_robot_stopped`` — the two palette
     entries parol6 has and par6 did not (``async_client.py:1135,1148``).
 
-    Both read live telemetry rather than a cached status, so the e-stop
+    Both read the live runtime rather than a cached status, so the e-stop
     predicate has to follow a real ``estop()`` latch and the motion
     predicate has to tell a moving arm from a parked one.
     """
@@ -1348,50 +1346,17 @@ async def test_status_arrives_on_the_shipped_transport_defaults(tmp_path):
         daemon.stop()
 
 
-def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
-    """``[protocol] initial_recipe`` makes the telemetry stream live from
-    boot — no client ever calls ``set_recipe`` — and the shipped
-    :class:`par6.telemetry.TelemetryReader` decodes what arrives. Omitting
-    the key keeps the stream silent (every other e2e test binds nothing to
-    the telemetry port and would see stray traffic fail its asserts)."""
-    daemon = LiveDaemon.start(tmp_path, initial_recipe="standard")
-    try:
-        reader = TelemetryReader(daemon.telemetry_port)
-        try:
-            frame = reader.recv(timeout=STEP_BUDGET_S)
-            assert frame is not None, (
-                f"no telemetry from boot; daemon log:\n{daemon.log_path.read_text()}"
-            )
-            assert frame["recipe"] == "standard"
-            fields = frame["fields"]
-            assert set(fields) == {
-                "tick",
-                "measured_positions",
-                "measured_velocities",
-                "measured_torques",
-            }
-            assert len(fields["measured_positions"]) == 6
-            # A second frame advances: this is a stream, not one packet.
-            later = reader.recv(timeout=STEP_BUDGET_S)
-            assert later is not None and later["seq"] > frame["seq"]
-        finally:
-            reader.close()
-    finally:
-        daemon.stop()
-
-
 async def test_status_carries_drive_and_loop_health(tmp_path):
-    """A display should not have to poll a query or open a second stream to
-    say whether the arm is well: the drives' analog trends and the loop's
-    tail ride the STATUS broadcast every subscriber already gets.
+    """A display should not have to poll a query to say whether the arm is
+    well: the drives' analog trends and the loop's tail ride the STATUS
+    broadcast every subscriber already gets.
 
-    Both are checked against the authority that owns them — the telemetry
-    stream for the drive registers, the LOOP_STATS query for the loop — so
-    this fails if STATUS ever carries an invented or stale copy rather than
-    the live snapshot."""
+    The loop's numbers are checked against the authority that owns them —
+    the LOOP_STATS query — so this fails if STATUS ever carries an invented
+    or stale copy rather than the live snapshot."""
     daemon = LiveDaemon.start(tmp_path)
     try:
-        async with daemon.client(telemetry_port=daemon.telemetry_port) as client:
+        async with daemon.client() as client:
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
 
             seen: dict = {}
@@ -1412,24 +1377,6 @@ async def test_status_carries_drive_and_loop_health(tmp_path):
             assert all(t > 0.0 for t in temps)
             assert len(drives["currents_ma"]) == len(temps)
             assert drives["bus_voltage_v"] > 0.0
-
-            # The same registers, from the stream that owns them.
-            reader = client.open_telemetry()
-            try:
-                await client.set_recipe("diagnostics")
-                streamed = None
-                deadline = time.monotonic() + STEP_BUDGET_S
-                while time.monotonic() < deadline:
-                    frame = reader.recv(timeout=STEP_BUDGET_S)
-                    assert frame is not None
-                    values = frame["fields"]["motor_temperatures_c"]
-                    if all(math.isfinite(t) for t in values):
-                        streamed = list(values)
-                        break
-            finally:
-                reader.close()
-            assert streamed is not None
-            assert temps == streamed
 
             # Loop health against LOOP_STATS. The percentile needs a full
             # sampling window before it means anything, so wait for it
@@ -1457,47 +1404,6 @@ async def test_status_carries_drive_and_loop_health(tmp_path):
         daemon.stop()
 
 
-async def test_the_client_opens_telemetry_on_its_own_transport(tmp_path):
-    """``open_telemetry()`` hands a consumer the stream without it knowing
-    the port or transport: the reader follows the client's own status
-    ladder, and the ``diagnostics`` recipe it then selects carries the
-    per-drive fields a front end shows (six temperatures, voltages and
-    currents from the sim's nodes)."""
-    daemon = LiveDaemon.start(tmp_path)
-    try:
-        async with daemon.client(telemetry_port=daemon.telemetry_port) as client:
-            assert await client.wait_ready(timeout=STEP_BUDGET_S)
-            reader = client.open_telemetry()
-            try:
-                await client.set_recipe("diagnostics")
-                # The drive registers are polled round-robin after boot, so
-                # the first frames carry NaN until every node has answered.
-                deadline = time.monotonic() + STEP_BUDGET_S
-                fields: dict | None = None
-                while time.monotonic() < deadline:
-                    frame = reader.recv(timeout=STEP_BUDGET_S)
-                    assert frame is not None, (
-                        f"no telemetry; daemon log:\n{daemon.log_path.read_text()}"
-                    )
-                    assert frame["recipe"] == "diagnostics"
-                    temps = frame["fields"]["motor_temperatures_c"][:6]
-                    if all(math.isfinite(t) for t in temps):
-                        fields = frame["fields"]
-                        break
-                assert fields is not None, "drive temperatures never became finite"
-                for key in (
-                    "motor_temperatures_c",
-                    "motor_voltages_mv",
-                    "motor_currents_ma",
-                ):
-                    assert len(fields[key]) >= 6, key
-                assert all(t > 0 for t in fields["motor_temperatures_c"][:6])
-            finally:
-                reader.close()
-    finally:
-        daemon.stop()
-
-
 async def test_config_info_reports_the_effective_configuration(tmp_path):
     """CONFIG_INFO answers the runtime's effective configuration, and its
     fingerprint is reproducible over the same files — the skew check a UI
@@ -1511,15 +1417,6 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
             assert await client.wait_ready(timeout=STEP_BUDGET_S)
             info = await client.config_info()
             assert info is not None
-
-            # Recipe discovery/readback: the valid SET_RECIPE vocabulary
-            # is published, and the active name tracks what was set (the
-            # shipped config boots with telemetry off).
-            assert info["active_recipe"] is None
-            assert "standard" in info["recipes"] and "minimal" in info["recipes"]
-            await client.set_recipe("standard")
-            info2 = await client.config_info()
-            assert info2 is not None and info2["active_recipe"] == "standard"
         assert info["path"] == str(daemon.config)
 
         # The wire-contract fingerprint: sha256 over the robot TOML and

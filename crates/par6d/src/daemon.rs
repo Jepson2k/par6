@@ -78,7 +78,6 @@ pub enum DaemonError {
 pub struct Daemon {
     command_addr: SocketAddr,
     status_port: u16,
-    telemetry_port: u16,
     server: Option<ServerHandle>,
     runtime: Option<tokio::runtime::Runtime>,
     shutdown: Arc<AtomicBool>,
@@ -97,11 +96,6 @@ impl Daemon {
     /// Status broadcast destination port.
     pub fn status_port(&self) -> u16 {
         self.status_port
-    }
-
-    /// Telemetry stream destination port.
-    pub fn telemetry_port(&self) -> u16 {
-        self.telemetry_port
     }
 
     /// The freshest host vitals sample (1 Hz).
@@ -321,7 +315,7 @@ impl Daemon {
         );
         let mut cfg = server_config(opts, &bundle);
         cfg.config_info = config_info(&config_path, &bundle.robot);
-        let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
+        let status_port = cfg.status_port;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -421,7 +415,6 @@ impl Daemon {
         Ok(Self {
             command_addr,
             status_port,
-            telemetry_port,
             server: Some(server),
             runtime: Some(runtime),
             shutdown,
@@ -723,9 +716,6 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     }
     if let Some(port) = opts.status_port {
         cfg.status_port = port;
-    }
-    if let Some(port) = opts.telemetry_port {
-        cfg.telemetry_port = port;
     }
     if let Some(t) = opts.status_transport {
         cfg.status_transport = t;

@@ -16,16 +16,16 @@ use std::time::{Duration, Instant};
 
 use par6_proto::command::{
     EnterFlashing, JogJ, MoveC, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
-    SetCompletionPolicy, SetRecipe, Stop, Teleport, ToolAction, ToolParam,
+    SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
-    QueryResult, Reply, Status, TelemetryValue, ToolState, NUM_JOINTS,
+    QueryResult, Reply, Status, ToolState, NUM_JOINTS,
 };
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{is_timeout, Client, Rig, BUDGET};
+use common::{Client, Rig, BUDGET};
 
 /// The PAR6 config re-ticked to 50 Hz for the in-process session test.
 /// Loaded CI machines without RT scheduling miss 4 ms deadlines and
@@ -397,7 +397,7 @@ fn full_sim_session_over_protocol_v2() {
 /// python `Robot.start()` bootstrap relies on.
 #[test]
 fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
-    let (mut child, port, _sinks) = spawn_par6d(&[]);
+    let (mut child, port, _status_rx) = spawn_par6d(&[]);
     assert_ne!(port, 0, "ephemeral port must be resolved");
 
     let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
@@ -412,12 +412,10 @@ fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
 
 /// The binary on `--sim` with ephemeral/unicast ports plus `extra`
 /// arguments: the child, the command port from its ready line, and the
-/// status/telemetry sinks it was pointed at (kept open for its lifetime).
-fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, (UdpSocket, UdpSocket)) {
+/// status sink it was pointed at (kept open for its lifetime).
+fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, UdpSocket) {
     let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status sink");
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry sink");
     let status_port = status_rx.local_addr().unwrap().port().to_string();
-    let telemetry_port = telemetry_rx.local_addr().unwrap().port().to_string();
     let config = common::shipped_config();
     let mut args = vec![
         "--sim",
@@ -433,8 +431,6 @@ fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, (UdpSocket, UdpSock
         "127.0.0.1",
         "--status-port",
         &status_port,
-        "--telemetry-port",
-        &telemetry_port,
     ];
     args.extend_from_slice(extra);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
@@ -461,7 +457,7 @@ fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, (UdpSocket, UdpSock
         .expect("command_port key in ready line")
         .parse()
         .expect("numeric port");
-    (child, port, (status_rx, telemetry_rx))
+    (child, port, status_rx)
 }
 
 fn sigterm_and_wait(child: &mut std::process::Child) -> std::process::ExitStatus {
@@ -490,7 +486,7 @@ fn sigterm_and_wait(child: &mut std::process::Child) -> std::process::ExitStatus
 fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
     let dir = std::env::temp_dir().join(format!("par6d-logs-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
-    let (mut child, port, _sinks) = spawn_par6d(&["--log-dir", dir.to_str().unwrap()]);
+    let (mut child, port, _status_rx) = spawn_par6d(&["--log-dir", dir.to_str().unwrap()]);
     let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
     match c.query(&Command::Ping) {
         QueryResult::Ping { .. } => {}
@@ -1585,72 +1581,31 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
     rig.shutdown();
 }
 
-/// One decoded `streaming`-recipe packet: substate code, success rate,
-/// discard percentage.
-struct StreamSample {
-    substate: u64,
-    success_rate: f64,
-    discard_pct: f64,
-}
-
-/// Read telemetry for `window`, keeping the newest `streaming` packet.
-/// Bounded by the window rather than by silence — the stream never goes
-/// quiet — so a caller feeding a 40 ms stream watchdog can poll it
-/// between setpoints.
-fn latest_stream_sample(rig: &Rig, window: Duration) -> Option<StreamSample> {
-    rig.telemetry()
-        .set_read_timeout(Some(Duration::from_millis(2)))
-        .expect("telemetry timeout");
-    let deadline = Instant::now() + window;
-    let mut buf = [0u8; 65535];
-    let mut latest = None;
-    while Instant::now() < deadline {
-        match rig.telemetry().recv_from(&mut buf) {
-            Ok((n, _)) => {
-                let frame = par6_proto::decode_telemetry(&buf[..n]).expect("decodable telemetry");
-                if frame.recipe != "streaming" {
-                    continue;
-                }
-                let [TelemetryValue::U64(_tick), TelemetryValue::Arr(_q), TelemetryValue::Arr(_cmd), TelemetryValue::Arr(_target), TelemetryValue::U64(substate), TelemetryValue::F64(success_rate), TelemetryValue::F64(discard_pct)] =
-                    frame.values.as_slice()
-                else {
-                    panic!("streaming recipe layout, got {:?}", frame.values);
-                };
-                latest = Some(StreamSample {
-                    substate: *substate,
-                    success_rate: *success_rate,
-                    discard_pct: *discard_pct,
-                });
-            }
-            Err(e) if is_timeout(&e) => {}
-            Err(e) => panic!("telemetry recv failed: {e}"),
-        }
-    }
-    latest
-}
-
-/// The RT's stream statistics reach a consumer: the `streaming` recipe
-/// carries the session substate and the moving-window success rate and
-/// discard percentage, and they move with a real servo stream — idle
-/// reads unpaired with zero rates, a live `servo_j` stream reads
-/// control-active with most ticks applied, and the stop returns it to
-/// unpaired. Before this the statistics were computed every tick and
-/// read by nobody, and a link-quality test had no pass criterion.
+/// The RT's stream statistics reach a consumer: LOOP_STATS answers the
+/// moving-window success rate and discard percentage beside the loop's
+/// own numbers, because a servo stream that is dropping samples is a
+/// loop that is not being fed. An idle arm has never applied a setpoint
+/// and reads zero; a live `servo_j` stream reads most ticks applied.
+/// Before this the statistics were computed every tick and read by
+/// nobody.
 #[test]
-fn the_streaming_recipe_publishes_the_stream_statistics() {
+fn loop_stats_carries_the_stream_statistics() {
     let rig = Rig::boot(test_config());
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
     teleport_home(&rig, &mut c, park_deg());
-    c.ok(&Command::SetRecipe(SetRecipe {
-        name: "streaming".into(),
-    }));
 
-    let idle = latest_stream_sample(&rig, Duration::from_millis(300))
-        .expect("streaming telemetry while idle");
-    assert_eq!(idle.substate, 0, "idle arm: unpaired");
-    assert_eq!((idle.success_rate, idle.discard_pct), (0.0, 0.0));
+    let stream_stats = |c: &mut Client| match c.query(&Command::LoopStats) {
+        QueryResult::LoopStats(ls) => (ls.stream_success_rate, ls.stream_discard_pct),
+        other => panic!("unexpected loop_stats result {other:?}"),
+    };
+
+    assert_eq!(
+        stream_stats(&mut c),
+        (0.0, 0.0),
+        "an arm that has never streamed has applied no setpoints"
+    );
 
     // A servo stream toward a far target: the first setpoint sits at
     // the measured pose (the start-pose gate), the rest stream the
@@ -1665,42 +1620,28 @@ fn the_streaming_recipe_publishes_the_stream_statistics() {
         })
     };
     c.send(&servo(park_deg()));
-    let mut live: Option<StreamSample> = None;
+    let mut live: Option<(f64, f64)> = None;
     let until = Instant::now() + Duration::from_millis(1500);
     while Instant::now() < until {
         c.send(&servo(target));
-        if let Some(s) = latest_stream_sample(&rig, Duration::from_millis(5)) {
-            if s.substate == 2 && s.success_rate > 0.0 {
-                live = Some(s);
-            }
+        std::thread::sleep(Duration::from_millis(5));
+        let s = stream_stats(&mut c);
+        if s.0 > 0.0 {
+            live = Some(s);
         }
     }
-    let live = live.expect("a control-active sample with a non-zero success rate");
+    let (success_rate, discard_pct) =
+        live.expect("a live stream must publish a non-zero success rate");
     assert!(
-        live.success_rate > 0.5 && live.success_rate <= 1.0,
-        "most ticks of a live stream apply a setpoint: {}",
-        live.success_rate
+        success_rate > 0.5 && success_rate <= 1.0,
+        "most ticks of a live stream apply a setpoint: {success_rate}"
     );
     assert!(
-        (0.0..=100.0).contains(&live.discard_pct),
-        "discard percentage {} out of range",
-        live.discard_pct
+        (0.0..=100.0).contains(&discard_pct),
+        "discard percentage {discard_pct} out of range"
     );
 
     c.ok(&Command::Stop(Stop { clear_queue: true }));
-    let deadline = Instant::now() + BUDGET;
-    loop {
-        if let Some(s) = latest_stream_sample(&rig, Duration::from_millis(100)) {
-            if s.substate == 0 {
-                break;
-            }
-        }
-        assert!(
-            Instant::now() < deadline,
-            "the stop never read back as unpaired"
-        );
-    }
-
     rig.shutdown();
 }
 

@@ -277,8 +277,6 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             tick_dt_s,
             motion,
             joints,
-            active_recipe,
-            recipes,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
@@ -310,8 +308,6 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
                 js.append(jd)?;
             }
             d.set_item("joints", js)?;
-            d.set_item("active_recipe", active_recipe.as_deref())?;
-            d.set_item("recipes", recipes.to_vec())?;
         }
         QueryResult::ConfigBundle {
             path,

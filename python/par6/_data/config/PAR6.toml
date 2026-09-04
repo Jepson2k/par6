@@ -516,10 +516,9 @@ wait_s = 0.0025
 command_port = 6001
 status_port = 6002
 status_multicast_group = "239.255.0.71"
-telemetry_port = 6003
-status_rate_hz = 50 # must divide the 250 Hz tick rate
-telemetry_rate_hz = 100
-# initial_recipe = "standard" # omitted = telemetry silent until set_recipe
+# The one broadcast every consumer subscribes to; raise it for capture
+# work. Must divide the 250 Hz tick rate exactly.
+status_rate_hz = 50
 
 # ============================================================ digital I/O lines
 # The control box's general-purpose lines, by BCM offset on the 40-pin header.

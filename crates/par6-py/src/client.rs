@@ -576,10 +576,6 @@ impl CoreClient {
         )
     }
 
-    fn set_recipe<'py>(&self, py: Python<'py>, name: String) -> PyResult<Bound<'py, PyAny>> {
-        sys_future(py, self.rt(), Command::SetRecipe(cmd::SetRecipe { name }))
-    }
-
     // --------------------------------------------------------- queued
 
     #[pyo3(signature = (calibrate=false))]

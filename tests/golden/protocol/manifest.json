@@ -238,21 +238,6 @@
     },
     {
       "class": "SYSTEM",
-      "cmd": "SET_RECIPE",
-      "file": "cmd_set_recipe.bin",
-      "idempotency_key": null,
-      "kind": "command",
-      "name": "cmd_set_recipe",
-      "req_id": 12,
-      "tag": 21,
-      "wire": [
-        21,
-        12,
-        "diagnostics"
-      ]
-    },
-    {
-      "class": "SYSTEM",
       "cmd": "ENTER_FLASHING",
       "file": "cmd_enter_flashing.bin",
       "idempotency_key": null,
@@ -1697,7 +1682,9 @@
           1,
           4,
           true,
-          true
+          true,
+          0.998,
+          0.2
         ]
       ]
     },
@@ -1991,52 +1978,6 @@
               6.0,
               20.0
             ]
-          ],
-          "standard",
-          [
-            "minimal",
-            "standard",
-            "full",
-            "diagnostics"
-          ]
-        ]
-      ]
-    },
-    {
-      "file": "response_config_info_telemetry_off.bin",
-      "kind": "reply",
-      "msg": "RESPONSE/CONFIG_INFO",
-      "name": "response_config_info_telemetry_off",
-      "wire": [
-        4,
-        127,
-        [
-          19,
-          "/etc/par6/PAR6.toml",
-          "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-          0.004,
-          [
-            0.08,
-            0.6,
-            0.005,
-            0.05,
-            0.35,
-            0.05,
-            0.01,
-            2.0
-          ],
-          [
-            [
-              -2.15,
-              2.15,
-              3.0,
-              12.0
-            ]
-          ],
-          null,
-          [
-            "minimal",
-            "standard"
           ]
         ]
       ]

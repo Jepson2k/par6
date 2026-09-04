@@ -1118,16 +1118,6 @@ class DryRunRobotClient:
         self._sync_context()
         return 1
 
-    def set_recipe(self, name: str = "", **kwargs: Any) -> int:
-        """Recipes name a settings bundle the runtime holds; a preview has
-        none, so it validates the name and carries on."""
-        if not 1 <= len(name) <= 64:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail="set_recipe.name: length must be in 1..=64",
-            )
-        return 1
-
     def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
         """Drive one declared output, and remember the level.
 

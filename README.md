@@ -135,10 +135,10 @@ codes — so an editor shows the failure before the arm does.
 Waldo Commander (NiceGUI frontend, unchanged)
   └─ python/par6 — waldoctl Robot + AsyncRobotClient + sync facade + dry-run preview
        │   (a thin shim over crates/par6-client + the par6d preview, via crates/par6-py)
-       │ protocol v2: UDP msgpack commands · binary status broadcast · telemetry
+       │ protocol v2: UDP msgpack commands · binary status broadcast
   par6d (single Rust binary; `par6d --sim` runs anywhere, including CI)
    ├─ command plane (tokio): validation/gating, queue, index allocator,
-   │    push completion, status broadcaster, telemetry recipes
+   │    push completion, status broadcaster
    ├─ planner: TOPPRA (FFI) planned moves · rsruckig streaming/blending · trapezoid,
    │    plus the plan-time collision gate
    └─ RT thread (SCHED_FIFO 99, alloc-free): 250 Hz tick — CAN RX → state → gravity
@@ -161,7 +161,7 @@ rather than approximate it.
 | `crates/par6-motion` | TOPPRA + rsruckig + trapezoid, jog ramps, completion policies |
 | `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + simulator backends |
 | `crates/par6-rt` | RT tick loop, mode dispatch, homing FSM, error latching, e-stop |
-| `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
+| `crates/par6-server` | UDP command plane, status broadcast, collision-world layers |
 | `crates/par6-client` | the client library: command round-trips, retries/dedup, status subscription |
 | `crates/par6d` | the runtime binary: config load, thread spawn/wiring, planner, RT bridge — plus the offline preview harness |
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
@@ -327,7 +327,6 @@ Only the **6001** command port is fixed by the wire contract; the rest are defau
 |---|---|
 | 6001 | command plane (UDP, msgpack) |
 | 6002 | status broadcast (binary) |
-| 6003 | telemetry stream |
 
 Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML**.
 
@@ -337,9 +336,8 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_ASSETS` | `par6_description` tree with the URDFs (`--assets`) |
 | `PAR6_COMMAND_PORT` | command UDP port; `0` = ephemeral (`--port`) |
 | `PAR6_BIND` | command-socket bind address (`--bind`) |
-| `PAR6_STATUS_HOST` | unicast status/telemetry destination (`--status-host`) |
+| `PAR6_STATUS_HOST` | unicast status destination (`--status-host`) |
 | `PAR6_STATUS_PORT` | status broadcast port (`--status-port`) |
-| `PAR6_TELEMETRY_PORT` | telemetry stream port (`--telemetry-port`) |
 | `PAR6_STATUS_TRANSPORT` | `auto` \| `multicast` \| `unicast` (`--status-transport`) |
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
 | `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
