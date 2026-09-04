@@ -73,7 +73,7 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         *out = *rad;
     }
     let poses =
-        par6_calibrate::plan_poses(&mut collision, &start, &window, SPREAD_RAD, APPROACH_RAD)
+        par6d::calibrate::plan_poses(&mut collision, &start, &window, SPREAD_RAD, APPROACH_RAD)
             .expect("poses");
     let mut park = [0.0; NUM_JOINTS];
     for (out, rad) in park.iter_mut().zip(robot.robot.park_pose_rad.iter()) {
@@ -119,14 +119,14 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
             );
         }
 
-        let protocol = par6_calibrate::Protocol {
+        let protocol = par6d::calibrate::Protocol {
             speed: 1.0,
             approach_rad: APPROACH_RAD,
             settle: Duration::from_millis(200),
             frames: 25,
-            ..par6_calibrate::Protocol::default()
+            ..par6d::calibrate::Protocol::default()
         };
-        let samples = par6_calibrate::measure(&client, &poses, &protocol)
+        let samples = par6d::calibrate::measure(&client, &poses, &protocol)
             .await
             .expect("every pose measured");
         client.close_joined().await;
@@ -165,8 +165,167 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         fit.mass
     );
     assert!(
-        fit.determined[0] > par6_calibrate::MEASURED,
+        fit.determined[0] > par6d::calibrate::MEASURED,
         "swinging the wrist must measure the mass, determined {:?}",
         fit.determined
     );
+}
+
+/// `plan_poses` refuses a pose whose APPROACH would leave the window,
+/// not merely one that leaves it itself.
+///
+/// Every pose is visited from both sides so joint friction cancels, so a
+/// planner that checked only the pose would hand the daemon an approach
+/// it refuses — mid-run, after `estimate` has already cleared the
+/// declared payload to measure against an unloaded model.
+#[test]
+fn planned_poses_keep_their_approach_offsets_inside_the_window() {
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
+    let robot = &bundle.robot;
+    let gripper = bundle.active_gripper();
+    let variant = GripperVariant::resolve(
+        &robot.robot.active_gripper.to_ascii_uppercase(),
+        gripper.and_then(|g| g.urdf_variant.as_deref()),
+    );
+    let mut collision = Collision::load(&assets_dir(), variant, 0.0).expect("collision world");
+
+    let mut start = [0.0; NQ];
+    for (out, rad) in start.iter_mut().zip(robot.robot.park_pose_rad.iter()) {
+        *out = *rad;
+    }
+
+    // A window pinched to exactly the span the poses need, leaving no
+    // room for the approach on either side of them.
+    let mut pinched = [(0.0, 0.0); NQ];
+    for (w, j) in pinched.iter_mut().zip(robot.joints.iter()) {
+        *w = (j.limits.soft_min_rad, j.limits.soft_max_rad);
+    }
+    for j in par6d::calibrate::WRIST_JOINTS {
+        pinched[j] = (start[j] - SPREAD_RAD, start[j] + SPREAD_RAD);
+    }
+    let err =
+        par6d::calibrate::plan_poses(&mut collision, &start, &pinched, SPREAD_RAD, APPROACH_RAD)
+            .expect_err("a window with no room for the approach must be refused");
+    assert!(
+        err.contains("reachable and clear"),
+        "the refusal must say what is wrong: {err}"
+    );
+
+    // Opened by exactly the approach, the same poses plan — and every one
+    // of them, swung both ways, stays inside.
+    let mut roomy = pinched;
+    for j in par6d::calibrate::WRIST_JOINTS {
+        roomy[j] = (
+            start[j] - SPREAD_RAD - APPROACH_RAD,
+            start[j] + SPREAD_RAD + APPROACH_RAD,
+        );
+    }
+    let poses =
+        par6d::calibrate::plan_poses(&mut collision, &start, &roomy, SPREAD_RAD, APPROACH_RAD)
+            .expect("poses");
+    assert!(
+        poses.len() >= 3,
+        "a fit needs at least three lever arms, got {}",
+        poses.len()
+    );
+    for q in &poses {
+        for dir in [0.0, 1.0, -1.0] {
+            for j in 0..NQ {
+                let probe = if par6d::calibrate::WRIST_JOINTS.contains(&j) {
+                    q[j] + dir * APPROACH_RAD
+                } else {
+                    q[j]
+                };
+                let (lo, hi) = roomy[j];
+                assert!(
+                    probe >= lo && probe <= hi,
+                    "joint {j} leaves the window at {probe} (window {lo}..{hi})"
+                );
+            }
+        }
+        // Nothing below the wrist may move: the arm's own weight is what
+        // the load is measured against, so it has to stand still.
+        for j in 0..NQ {
+            if !par6d::calibrate::WRIST_JOINTS.contains(&j) {
+                assert_eq!(q[j], start[j], "joint {j} moved; only the wrist may");
+            }
+        }
+    }
+}
+
+/// A failed estimate puts the declared payload back.
+///
+/// `estimate` clears the declaration so it measures against an unloaded
+/// model. An arm holding a declared 1.2 kg part that is asked for an
+/// estimate somewhere the wrist has no room must not be left
+/// compensating for nothing — the failure arrives at the caller, the
+/// gravity model does not change underneath it.
+#[test]
+fn a_failed_estimate_leaves_the_declared_payload_standing() {
+    let config = common::retimed_config("estimate-restore", 0.02);
+    let model_config = config.clone();
+    let status_port = free_udp_port();
+    let daemon = boot_for_client(config, false, status_port).expect("daemon boots");
+    let cmd = daemon.command_addr();
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+    let outcome = rt.block_on(async {
+        let client = Client::connect(ClientConfig {
+            host: cmd.ip().to_string(),
+            port: cmd.port(),
+            status: StatusTransport::Unicast {
+                host: "127.0.0.1".parse().unwrap(),
+            },
+            status_port,
+            ..ClientConfig::default()
+        })
+        .await
+        .expect("client connects");
+        assert!(
+            client.wait_status(|s| s.link_ok == 1, BUDGET).await,
+            "the sim bus never came up"
+        );
+        client.reset().await.expect("reset");
+
+        let declared_kg = 1.2;
+        let declared_com = [0.0, 0.01, 0.05];
+        client
+            .set_payload(declared_kg, declared_com, None)
+            .await
+            .expect("the payload is declared");
+
+        let mut model =
+            par6d::kin::estimation_model(Some(&model_config), Some(&assets_dir()), None)
+                .expect("estimation model");
+
+        // A spread no wrist has room for: the run fails in planning,
+        // before any motion, with the declaration already cleared.
+        let err = par6d::calibrate::estimate(&client, &mut model, 6.0, 1e-6, true)
+            .await
+            .expect_err("an unplannable spread must fail");
+
+        let carried = match client.payload().await.expect("payload reads back") {
+            par6_proto::QueryResult::Payload { mass, com, .. } => (mass, com),
+            other => panic!("payload query answered {other:?}"),
+        };
+        client.close_joined().await;
+        (err, carried)
+    });
+    daemon.shutdown();
+
+    let (err, (mass, com)) = outcome;
+    assert!(
+        err.contains("reachable and clear"),
+        "the failure must name the planning problem: {err}"
+    );
+    assert!(
+        (mass - 1.2).abs() < 1e-9,
+        "a failed estimate left {mass} kg declared instead of the 1.2 kg the arm carries"
+    );
+    for (got, want) in com.iter().zip([0.0, 0.01, 0.05].iter()) {
+        assert!(
+            (got - want).abs() < 1e-9,
+            "the declared centre of mass moved: {com:?}"
+        );
+    }
 }

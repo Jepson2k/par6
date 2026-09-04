@@ -11,7 +11,6 @@ members = [
     "crates/par6-client",
     "crates/par6d",
     "crates/par6-py",
-    "crates/par6-calibrate",
 ]
 
 [workspace.package]
@@ -29,7 +28,6 @@ par6-proto = { path = "crates/par6-proto" }
 par6-config = { path = "crates/par6-config" }
 par6-kin = { path = "crates/par6-kin" }
 par6-motion = { path = "crates/par6-motion" }
-par6-calibrate = { path = "crates/par6-calibrate" }
 par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }

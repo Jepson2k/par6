@@ -28,6 +28,7 @@
 
 mod adapters;
 mod bridge;
+pub mod calibrate;
 pub mod collision_world;
 pub mod daemon;
 mod grant;
