@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import threading
+import weakref
 from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
@@ -36,6 +38,11 @@ T = TypeVar("T")
 _LOOP: asyncio.AbstractEventLoop | None = None
 _THREAD: threading.Thread | None = None
 _LOOP_READY = threading.Event()
+#: Facades running on the module loop, so its teardown can release
+#: their engine clients first. Weak: registering never keeps one alive.
+_CLIENTS: weakref.WeakSet[RobotClient] = weakref.WeakSet()
+#: How long the teardown waits on one client's close before moving on.
+_CLOSE_GRACE_S = 1.0
 
 
 def _loop_worker(loop: asyncio.AbstractEventLoop) -> None:
@@ -49,6 +56,23 @@ def _stop_loop() -> None:
     loop, thread = _LOOP, _THREAD
     if loop is None:
         return
+
+    # The engine clients go before the loop does. Their in-flight
+    # futures resolve onto this loop, and one landing after it has
+    # stopped runs a pyo3 callback that cannot unwind — the interpreter
+    # aborts instead of exiting, which is what a script that never
+    # closed its client used to get. Bounded per client: a wedged one
+    # must not hold up the exit.
+    for client in list(_CLIENTS):
+        with contextlib.suppress(
+            RuntimeError,
+            TimeoutError,
+            asyncio.InvalidStateError,
+            asyncio.CancelledError,
+        ):
+            asyncio.run_coroutine_threadsafe(client._inner.close(), loop).result(
+                timeout=_CLOSE_GRACE_S
+            )
 
     async def _shutdown() -> None:
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
@@ -117,6 +141,7 @@ class RobotClient:
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
         self._bound_tools = self._wrap_tools()
+        _CLIENTS.add(self)
 
     # ---------- lifecycle ----------
 
