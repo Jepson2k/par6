@@ -68,10 +68,14 @@ def test_the_scene_carries_the_same_moving_mass_as_the_urdf() -> None:
     assert arm_mass > 0.0, f"no arm links matched {sorted(ARM_LINKS)} in {sorted(urdf)}"
 
     tool_mass = float(
-        par6_config.load_gripper_configs()
-        .get(tool, {})
-        .get("kinematics", {})
-        .get("mass_kg", 0.0)
+        next(
+            (
+                g["kinematics"]["mass_kg"]
+                for g in par6_config.config().grippers()
+                if g["key"] == tool
+            ),
+            0.0,
+        )
     )
     runtime_moving = arm_mass + tool_mass
 

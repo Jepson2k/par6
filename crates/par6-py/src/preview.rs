@@ -252,6 +252,19 @@ impl Preview {
             .map(str::to_owned)
             .collect()
     }
+    /// How many queued commands the planner may see ahead of the one it
+    /// is about to start.
+    fn blend_lookahead(&self) -> usize {
+        self.inner.lock().unwrap().blend_lookahead()
+    }
+
+    /// Seed whether the virtual gripper holds a calibration.
+    fn set_gripper_calibrated(&self, calibrated: bool) {
+        self.inner
+            .lock()
+            .unwrap()
+            .set_gripper_calibrated(calibrated);
+    }
 
     /// The tick period \[s\] trajectories are sampled at.
     fn tick_dt_s(&self) -> f64 {

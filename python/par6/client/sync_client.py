@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import asyncio
 import atexit
+import contextlib
 import threading
+import weakref
 from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
@@ -39,6 +41,13 @@ from .errors import RobotError
 
 T = TypeVar("T")
 
+#: Live sync clients, so the loop teardown can close their engine halves
+#: before the loop they resolve onto goes away.
+_CLIENTS: "weakref.WeakSet[RobotClient]" = weakref.WeakSet()
+
+#: How long the teardown waits on one client's close before moving on.
+_CLOSE_GRACE_S = 1.0
+
 _LOOP: asyncio.AbstractEventLoop | None = None
 _THREAD: threading.Thread | None = None
 _LOOP_READY = threading.Event()
@@ -55,6 +64,22 @@ def _stop_loop() -> None:
     loop, thread = _LOOP, _THREAD
     if loop is None:
         return
+
+    # The engine clients go before the loop does. Their in-flight futures
+    # resolve onto this loop, and one landing after it has stopped runs a
+    # pyo3 callback that cannot unwind — the interpreter aborts instead of
+    # exiting, which is what a script that never closed its client used to
+    # get. Bounded per client: a wedged one must not hold up the exit.
+    for client in list(_CLIENTS):
+        with contextlib.suppress(
+            RuntimeError,
+            TimeoutError,
+            asyncio.InvalidStateError,
+            asyncio.CancelledError,
+        ):
+            asyncio.run_coroutine_threadsafe(client._inner.close(), loop).result(
+                timeout=_CLOSE_GRACE_S
+            )
 
     async def _shutdown() -> None:
         tasks = [t for t in asyncio.all_tasks(loop) if t is not asyncio.current_task()]
@@ -123,6 +148,7 @@ class RobotClient:
             host=host, port=port, timeout=timeout, retries=retries, **kwargs
         )
         self._bound_tools = self._wrap_tools()
+        _CLIENTS.add(self)
 
     # ---------- lifecycle ----------
 
@@ -460,6 +486,19 @@ class RobotClient:
     def select_profile(self, profile: str) -> int:
         """Set the motion profile (e.g. ``"TOPPRA"``)."""
         return _run(self._inner.select_profile(profile))
+
+    def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus; one row per node id (see the async client)."""
+        return _run(self._inner.bus_scan())
+
+    def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: rename drive *node* to *new_id* (idle arm only;
+        ``force`` for an id the config does not list)."""
+        return _run(self._inner.set_can_id(node, new_id, force=force))
+
+    def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: persist drive *node*'s running configuration."""
+        return _run(self._inner.save_config(node, force=force))
 
     def enter_flashing(self, assertion: str) -> int:
         """Hand the CAN bus to a firmware flasher (``"parked"`` or

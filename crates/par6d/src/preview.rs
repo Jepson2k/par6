@@ -149,6 +149,11 @@ pub struct Preview {
     cfg: ServerConfig,
     /// Where the configured homing seek leaves the arm.
     ready_pose: [f64; MAX_JOINTS],
+    /// Ticks a `calibrate` holds the arm for: the runtime will not
+    /// believe the sweep before the active gripper's
+    /// `driver.settle.calibrate_min_wait_s`, and a preview that reported
+    /// zero would predict a program shorter than the arm can run it.
+    tool_calibrate_hold_ticks: u64,
     /// Queued moves waiting for the successor they blend into.
     held: session::BlendQueue<Command>,
     profile: String,
@@ -218,6 +223,12 @@ impl Preview {
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
         let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
+        let tool_calibrate_hold_ticks = bundle
+            .active_gripper()
+            .and_then(|g| g.driver.as_ref())
+            .map_or(0, |d| {
+                (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
+            });
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -267,6 +278,7 @@ impl Preview {
             dt: robot.robot.tick_dt_s,
             motion: robot.motion,
             ready_pose,
+            tool_calibrate_hold_ticks,
             held: session::BlendQueue::default(),
             profile: cfg.initial_profile.clone(),
             tool: cfg.fitted_tool.clone(),
@@ -329,6 +341,12 @@ impl Preview {
     }
 
     // ------------------------------------------------------------ state
+
+    /// How many queued commands the planner may see ahead of the one it
+    /// is about to start — what bounds a blend chain's hold.
+    pub fn blend_lookahead(&self) -> usize {
+        self.cfg.blend_lookahead
+    }
 
     /// The virtual arm pose \[rad\].
     pub fn angles_rad(&self) -> [f64; MAX_JOINTS] {
@@ -1130,6 +1148,16 @@ impl Preview {
                 rest = &rest[1..];
                 continue;
             }
+            // A tool action never enters the motion queue — it runs on
+            // the planner's own side channel — so it is offered there
+            // instead of to the batch, and it never joins a blend chain.
+            if let Command::ToolAction(action) = &rest[0] {
+                let action = action.clone();
+                results.push(self.preview_tool_action(&action));
+                self.next_index += 1;
+                rest = &rest[1..];
+                continue;
+            }
             // Only offer the leading run of wire-valid commands: a later
             // invalid one would have been refused at its own datagram, so
             // the planner must not fold it into this chain.
@@ -1205,6 +1233,29 @@ impl Preview {
             };
         }
         result
+    }
+
+    /// One tool action through the planner's tool lane — the same
+    /// admission the live daemon runs, so an unsupported verb, a missing
+    /// driver or an uncalibrated jaw move previews as the refusal the
+    /// arm would answer with. The arm holds still throughout; only a
+    /// `calibrate` takes measurable time the config can predict.
+    fn preview_tool_action(&mut self, action: &par6_proto::command::ToolAction) -> PreviewResult {
+        self.publish();
+        if let Err(error) = self.planner.start_tool(self.next_index, action) {
+            return self.refuse(error);
+        }
+        self.planner.cancel_tool(false);
+        self.note_effects(&Command::ToolAction(action.clone()));
+        let hold = if action.action == "calibrate" {
+            self.tool_calibrate_hold_ticks
+        } else {
+            0
+        };
+        PreviewResult {
+            duration_s: hold as f64 * self.dt,
+            ..self.standing()
+        }
     }
 
     /// What an accepted queued command changes besides the arm's pose —

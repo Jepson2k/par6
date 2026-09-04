@@ -452,6 +452,9 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             rbt.wait_command(<index>)
         """
+        if command_index < 0:
+            # The unconfirmed-ack sentinel names no command to wait for.
+            return False
         core = await self._ensure_core()
         return await self._call(core.wait_command(command_index, timeout))
 
@@ -472,6 +475,8 @@ class AsyncRobotClient(_RobotClientABC):
             idx = rbt.tool_action("ELECTRIC", "move", [1.0, 0.5, 600], wait=True)
             caught = rbt.command_verdict(idx) == 1
         """
+        if command_index < 0:
+            return None
         core = await self._ensure_core()
         return core.command_verdict(command_index)
 
@@ -485,6 +490,58 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         return await core.wait_checkpoint(label, timeout)
+
+    async def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus and report every node id, 0..15.
+
+        Each row carries ``node``, ``configured`` (the config lists it),
+        ``present`` (it answered a ping this boot), ``freshness`` (0
+        unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
+        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
+        runtime has swept it.  The reply waits for the scan to settle, so
+        expect a few hundred milliseconds.  Returns None if unreachable.
+
+        Category: Commissioning
+
+        Example:
+            present = [r["node"] for r in rbt.bus_scan() if r["present"]]
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.bus_scan())
+        return None if result is None else list(result["nodes"])
+
+    async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell drive *node* to answer as *new_id* from now on.
+
+        Refused unless the arm is idle or latched with nothing in flight,
+        and — unless ``force`` — unless *node* is a configured drive.  A
+        fresh drive sits at its factory id, which the config does not
+        list, so commissioning one is ``force=True``.  The runtime keeps
+        addressing the id the config names: after renaming a configured
+        node, update the config and restart the daemon.  Persist the new
+        id with :meth:`save_config` or it is lost at power-off.
+
+        Category: Commissioning
+
+        Example:
+            rbt.set_can_id(0, 3, force=True)
+            rbt.save_config(3, force=True)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
+
+    async def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: ask drive *node* to persist its running
+        configuration (id, gains, limits) to its NVM.  Same gate and
+        ``force`` rule as :meth:`set_can_id`.
+
+        Category: Commissioning
+
+        Example:
+            rbt.save_config(3)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.save_config(int(node), bool(force)))
 
     async def wait_motion(
         self,
@@ -531,10 +588,15 @@ class AsyncRobotClient(_RobotClientABC):
     # ------------------------------------------------------------------
 
     async def _finish_queued(self, index: int, wait: bool, timeout: float) -> int:
+        """Record an acked index and, with *wait*, block until it completes:
+        a wait that runs out raises rather than handing back the index as
+        if the motion had finished."""
         if index >= 0:
             self._last_command_index = index
-            if wait:
-                await self.wait_command(index, timeout=timeout)
+            if wait and not await self.wait_command(index, timeout=timeout):
+                raise TimeoutError(
+                    f"command {index} did not complete within {timeout}s"
+                )
         return index
 
     async def home(

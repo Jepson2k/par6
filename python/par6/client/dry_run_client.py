@@ -16,20 +16,36 @@ from __future__ import annotations
 
 import copy
 import logging
-from collections.abc import Coroutine
+from collections.abc import Callable, Coroutine, Iterator
 from typing import Any
 
 import numpy as np
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld
-from waldoctl.status import PayloadEstimate, PayloadResult
+from waldoctl.status import (
+    ActionState,
+    ActivityResult,
+    LoopStatsResult,
+    PayloadEstimate,
+    PayloadResult,
+    PingResult,
+    ToolResult,
+)
 from waldoctl.sync_tools import make_sync_tool
 from waldoctl.tools import ToolState as WToolState
 from waldoctl.tools import ToolStatus
 
 from par6 import config as _cfg
-from par6._par6 import Preview, RobotWireError
-from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
+from par6._par6 import Preview, RobotWireError, matrix_to_xyzrpy
+from par6.client.async_client import QueueResult, ReachableResult
+from par6.protocol.constants import (
+    NUM_JOINTS,
+    CompletionPolicy,
+    ControllerMode,
+    ErrorCode,
+    Frame,
+)
+from par6.protocol.wire import StatusBuffer
 
 from ._wire import (
     blend,
@@ -42,6 +58,9 @@ from ._wire import (
     timing,
     tool_params,
     wire_frame,
+)
+from ._wire import (
+    wire_frame as _wire_frame,
 )
 from .async_client import StatusResult
 from .errors import RobotError
@@ -77,6 +96,11 @@ class DryRunRobotClient:
         initial_joints_deg: list[float] | None = None,
         max_snapshot_points: int = 200,
         initial_homed: bool = True,
+        # False by default, as an arm reads after power-on: a jaw move
+        # before a calibrate is refused here exactly as the runtime
+        # refuses it, so a program that forgets the step finds out
+        # offline instead of on the bench.
+        initial_gripper_calibrated: bool = False,
         config_path: str | None = None,
     ) -> None:
         from par6.tools import build_tools
@@ -95,8 +119,15 @@ class DryRunRobotClient:
             if initial_joints_deg is None
             else [float(v) for v in initial_joints_deg],
             bool(initial_homed),
+            bool(initial_gripper_calibrated),
         )
         self._engine: Preview | None = None
+        # Motion a state-only command closed out of the blend hold: nobody
+        # asked for it at the time, so it rides at the head of the next
+        # result rather than being dropped.
+        self._pending: list[DryRunResultData] = []
+        self._last_checkpoint = ""
+        self._completed = -1
         self._shapes: tuple[Shape, ...] = ()
         # The packaged tool specs, bound to this preview: ``tool.close()``
         # sends the same ``move`` verb and parameters the live gripper gets.
@@ -107,12 +138,15 @@ class DryRunRobotClient:
             bound: Any = copy.copy(spec)
             bound._execute = self._tool_execute
             bound._get_status = self._tool_status
+            # The spec asks for a position; a program asks the preview.
+            if hasattr(bound, "is_open"):
+                bound.is_open = self._jaws_open
             self._tools[spec.key] = make_sync_tool(bound, _drive)
 
     @property
     def _preview(self) -> Preview:
         if self._engine is None:
-            config, max_points, joints_deg, homed = self._engine_args
+            config, max_points, joints_deg, homed, calibrated = self._engine_args
             engine = Preview(
                 config=config,
                 assets=str(_cfg.data_root()),
@@ -124,8 +158,14 @@ class DryRunRobotClient:
                     np.radians(np.asarray(joints_deg, dtype=np.float64)).tolist()
                 )
             engine.set_homed(homed)
+            engine.set_gripper_calibrated(calibrated)
             self._engine = engine
         return self._engine
+
+    @property
+    def _dt(self) -> float:
+        r"""The runtime tick the preview plans on \[s\]."""
+        return self._preview.tick_dt_s()
 
     # ------------------------------------------------------------------
     # State
@@ -158,9 +198,16 @@ class DryRunRobotClient:
         """Simulated joint angles in degrees."""
         return self._preview.angles_deg()
 
-    def pose(self) -> list[float]:
-        """Simulated TCP pose ``[x, y, z, rx, ry, rz]`` in mm + degrees."""
-        return self._call(self._preview.pose_xyzrpy)
+    def pose(self, frame: str = "WRF") -> list[float]:
+        """Simulated TCP pose ``[x, y, z, rx, ry, rz]`` in mm + degrees, in
+        the world frame or — as the runtime answers ``TRF`` — the world
+        seen from the tool."""
+        if _wire_frame(frame) == int(Frame.WRF):
+            return self._call(self._preview.pose_xyzrpy)
+        m = np.asarray(self._call(self._preview.pose), dtype=np.float64).reshape(4, 4)
+        world_in_tool = np.linalg.inv(m)
+        world_in_tool[:3, 3] *= 1000.0
+        return matrix_to_xyzrpy(world_in_tool.flatten().tolist())
 
     def tcp_offset(self) -> list[float]:
         """The TCP offset applied on top of the tool transform, in mm."""
@@ -217,6 +264,21 @@ class DryRunRobotClient:
         self._submit(cmd)
         return 1
 
+    def _emit(self, result: DryRunResultData | None) -> DryRunResultData | None:
+        """*result*, behind whatever motion a chain closed ahead of it."""
+        owed, self._pending = self._pending, []
+        if not owed:
+            return result
+        return _merge([*owed, result] if result is not None else owed)
+
+    def _quietly(self, cmd: dict[str, Any]) -> int:
+        """A queued command whose caller gets an index, not a result: the
+        motion it releases from the hold is owed to the next result."""
+        released = self._submit(cmd)
+        if released is not None:
+            self._pending.append(released)
+        return 0
+
     def flush(self) -> list[DryRunResultData]:
         """Plan whatever the blend hold is still holding.
 
@@ -226,8 +288,11 @@ class DryRunRobotClient:
         last move simply stops at its target).  Call this after the last
         command to collect that motion.
         """
-        result = self._result(self._preview.flush())
-        return [result] if result is not None else []
+        owed, self._pending = self._pending, []
+        released = self._result(self._preview.flush())
+        if released is not None:
+            owed.append(released)
+        return [_merge(owed)] if owed else []
 
     # ------------------------------------------------------------------
     # Motion
@@ -245,8 +310,10 @@ class DryRunRobotClient:
         to ``[robot].park_pose_rad``, planned and collision-gated like
         any other. ``calibrate=True`` asks for the seek either way.
         """
-        return self._submit(
-            {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))}
+        return self._emit(
+            self._submit(
+                {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))}
+            )
         )
 
     def teleport(
@@ -298,16 +365,18 @@ class DryRunRobotClient:
             )
         if angles is None:
             raise ValueError("move_j requires angles or pose=")
-        return self._submit(
-            {
-                "type": "move_j",
-                "angles": f6(angles, "angles"),
-                "duration": d,
-                "speed": s,
-                "accel": float(accel),
-                "blend_radius": blend(r),
-                "rel": bool(rel),
-            }
+        return self._emit(
+            self._submit(
+                {
+                    "type": "move_j",
+                    "angles": f6(angles, "angles"),
+                    "duration": d,
+                    "speed": s,
+                    "accel": float(accel),
+                    "blend_radius": blend(r),
+                    "rel": bool(rel),
+                }
+            )
         )
 
     def move_l(
@@ -323,17 +392,19 @@ class DryRunRobotClient:
         **kwargs: Any,
     ) -> DryRunResultData | None:
         d, s = timing(duration, speed)
-        return self._submit(
-            {
-                "type": "move_l",
-                "pose": f6(pose, "pose"),
-                "frame": wire_frame(frame),
-                "duration": d,
-                "speed": s,
-                "accel": float(accel),
-                "blend_radius": blend(r),
-                "rel": bool(rel),
-            }
+        return self._emit(
+            self._submit(
+                {
+                    "type": "move_l",
+                    "pose": f6(pose, "pose"),
+                    "frame": wire_frame(frame),
+                    "duration": d,
+                    "speed": s,
+                    "accel": float(accel),
+                    "blend_radius": blend(r),
+                    "rel": bool(rel),
+                }
+            )
         )
 
     def move_c(
@@ -350,18 +421,20 @@ class DryRunRobotClient:
         **kwargs: Any,
     ) -> DryRunResultData | None:
         d, s = timing(duration, speed)
-        return self._submit(
-            {
-                "type": "move_c",
-                "via": f6(via, "via"),
-                "end": f6(end, "end"),
-                "frame": wire_frame(frame),
-                "duration": d,
-                "speed": s,
-                "accel": float(accel),
-                "blend_radius": blend(r),
-                "rel": bool(rel),
-            }
+        return self._emit(
+            self._submit(
+                {
+                    "type": "move_c",
+                    "via": f6(via, "via"),
+                    "end": f6(end, "end"),
+                    "frame": wire_frame(frame),
+                    "duration": d,
+                    "speed": s,
+                    "accel": float(accel),
+                    "blend_radius": blend(r),
+                    "rel": bool(rel),
+                }
+            )
         )
 
     def _move_multi(
@@ -439,13 +512,15 @@ class DryRunRobotClient:
             )
         if angles is None:
             raise ValueError("servo_j requires angles or pose=")
-        return self._submit(
-            {
-                "type": "servo_j",
-                "angles": f6(angles, "angles"),
-                "speed": float(speed),
-                "accel": float(accel),
-            }
+        return self._emit(
+            self._submit(
+                {
+                    "type": "servo_j",
+                    "angles": f6(angles, "angles"),
+                    "speed": float(speed),
+                    "accel": float(accel),
+                }
+            )
         )
 
     def servo_l(
@@ -456,13 +531,15 @@ class DryRunRobotClient:
         accel: float = 1.0,
         **kwargs: Any,
     ) -> DryRunResultData | None:
-        return self._submit(
-            {
-                "type": "servo_l",
-                "pose": f6(pose, "pose"),
-                "speed": float(speed),
-                "accel": float(accel),
-            }
+        return self._emit(
+            self._submit(
+                {
+                    "type": "servo_l",
+                    "pose": f6(pose, "pose"),
+                    "speed": float(speed),
+                    "accel": float(accel),
+                }
+            )
         )
 
     def jog_j(
@@ -604,7 +681,16 @@ class DryRunRobotClient:
 
     def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
         """Drive one declared output; the level shows up in :meth:`io`
-        exactly where the runtime would put it."""
+        exactly where the runtime would put it.
+
+        The port and level are bounded here, the way the live client bounds
+        them, so a program hits the same ValueError before either one sends.
+        """
+        outputs = len(_cfg.io_line_names()[1])
+        if not 0 <= index < outputs:
+            raise ValueError(f"Output index must be in 0..{outputs - 1}")
+        if value not in (0, 1):
+            raise ValueError("I/O value must be 0 or 1")
         return self._system(
             {"type": "write_io", "port": int(index), "value": int(value)}
         )
@@ -629,6 +715,11 @@ class DryRunRobotClient:
     ) -> DryRunResultData | None:
         return self.tool_action(tool_key, action, params)
 
+    def _jaws_open(self, position: float | None = None) -> bool:
+        """True when the jaws are open; defaults to the previewed position."""
+        pos = self._preview.tool_position() if position is None else position
+        return pos < 0.5
+
     async def _tool_status(self) -> ToolStatus:
         """The previewed tool state: what the program told it to do."""
         key, variant = self._preview.tool()
@@ -648,12 +739,17 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def checkpoint(self, label: str, **kwargs: Any) -> int:
-        self._submit({"type": "checkpoint", "label": label})
-        return 0
+        index = self._quietly({"type": "checkpoint", "label": label})
+        self._last_checkpoint = label
+        self._completed += 1
+        return index
 
     def delay(self, seconds: float = 0.0, **kwargs: Any) -> int:
-        self._submit({"type": "delay", "seconds": float(seconds)})
-        return 0
+        """A queued wait: the arm holds still for *seconds*, which the
+        preview's timeline carries at the head of the next result."""
+        if seconds <= 0:
+            raise ValueError("Delay must be positive")
+        return self._quietly({"type": "delay", "seconds": float(seconds)})
 
     def stop(self, clear_queue: bool = True, **kwargs: Any) -> int:
         """Halt motion.  A held blend chain is queued motion: it is dropped
@@ -764,6 +860,103 @@ class DryRunRobotClient:
         preview ever has."""
         return self._preview.queue()
 
+    def tools(self) -> ToolResult:
+        """The fitted tool and every tool this backend can select."""
+        return ToolResult(tool=self.active_tool_key, available=sorted(self._tools))
+
+    def activity(self) -> ActivityResult:
+        """Between commands a preview is always idle."""
+        return ActivityResult(state=ActionState.IDLE, command="", params="", error="")
+
+    def wait_status(
+        self, predicate: Callable[[StatusBuffer], bool], timeout: float = 5.0
+    ) -> bool:
+        """*predicate* over the previewed state, in the buffer shape the live
+        stream delivers — answered at once, since nothing here changes
+        between commands."""
+        return bool(predicate(self._status_buffer()))
+
+    def stream_status(self) -> Iterator[StatusBuffer]:
+        """One snapshot of the previewed state; the stream a program iterates
+        live has no cadence here."""
+        yield self._status_buffer()
+
+    def queue_state(self) -> QueueResult:
+        return QueueResult(
+            queue=self.queue(),
+            executing_index=-1,
+            completed_index=self._completed,
+            last_checkpoint=self._last_checkpoint,
+            queued_duration=0.0,
+        )
+
+    def reachable(self) -> ReachableResult:
+        """Every joint and axis is enabled: a preview enforces the soft
+        window on the path, not through a per-axis inhibit."""
+        ones = [1] * NUM_JOINTS
+        return ReachableResult(
+            joint_en=ones, cart_en_wrf=list(ones), cart_en_trf=list(ones)
+        )
+
+    def loop_stats(self) -> LoopStatsResult | None:
+        """None: a preview runs no control loop to report on."""
+        return None
+
+    def reset_loop_stats(self, **kwargs: Any) -> int:
+        """A preview runs no control loop."""
+        return 1
+
+    def _status_buffer(self) -> StatusBuffer:
+        """The previewed state in the shape the STATUS stream delivers."""
+        buf = StatusBuffer()
+        status = self.status()
+        buf.pose[:] = status.pose
+        buf.angles[:] = status.angles
+        buf.io = np.asarray(status.io, dtype=np.int32)
+        buf.homed = self._preview.homed()
+        buf.mode = ControllerMode.IDLE
+        buf.enabled = True
+        buf.simulator_active = True
+        buf.last_checkpoint = self._last_checkpoint
+        buf.completed_index = self._completed
+        buf.accepted_index = self._completed
+        if status.tool_status is not None:
+            buf.tool_status = status.tool_status
+            buf.tool_status_present = True
+        return buf
+
+    def config_info(self) -> dict:
+        """The effective configuration in the live query's shape, from the
+        file the engine loaded."""
+        cfg = _cfg.config()
+        exec_limits = cfg.limits("exec")
+        joints = [
+            {
+                "soft_min_rad": exec_limits["soft_min"][j],
+                "soft_max_rad": exec_limits["soft_max"][j],
+                "velocity_rad_s": exec_limits["velocity"][j],
+                "acceleration_rad_s2": exec_limits["acceleration"][j],
+            }
+            for j in range(cfg.joint_count())
+        ]
+        files = _cfg.config_files(self._engine_args[0])
+        return {
+            "path": files["path"],
+            "fingerprint": files["fingerprint"],
+            "tick_dt_s": self._dt,
+            "motion": self._preview.motion(),
+            "joints": joints,
+        }
+
+    def config_bundle(self) -> dict:
+        """The config files the engine loaded, verbatim, in the live
+        query's shape."""
+        return _cfg.config_files(self._engine_args[0])
+
+    def ping(self, **kwargs: Any) -> PingResult:
+        """A preview always answers, and never has hardware behind it."""
+        return PingResult(hardware_connected=False)
+
     def error(self) -> RobotError | None:
         """A preview RAISES its refusals rather than latching them, so there
         is never a standing error to read back."""
@@ -799,6 +992,45 @@ class DryRunRobotClient:
 
     def close(self) -> None:
         return None
+
+
+def _merge(results: list[DryRunResultData]) -> DryRunResultData:
+    """Several motions as one result, in the order they run.
+
+    A single call can close a held chain AND run a motion of its own; the
+    caller still gets one result, so the two are concatenated — same shape as
+    parol6's ``_merge_results``.
+    """
+    drawn = [r for r in results if r.tcp_poses.shape[0] > 0]
+    error = next((r.error for r in results if r.error is not None), None)
+    if not drawn:
+        return results[-1]
+    valid = (
+        np.concatenate(
+            [
+                r.valid
+                if r.valid is not None
+                else np.ones(r.tcp_poses.shape[0], dtype=np.bool_)
+                for r in drawn
+            ]
+        )
+        if any(r.valid is not None for r in drawn)
+        else None
+    )
+    # A joint trajectory is stitched only when every leg carries one: a gap
+    # would splice non-adjacent configurations into one continuous path.
+    trajectories = [r.joint_trajectory_rad for r in drawn]
+    present = [t for t in trajectories if t is not None]
+    return DryRunResultData(
+        tcp_poses=np.vstack([r.tcp_poses for r in drawn]),
+        end_joints_rad=drawn[-1].end_joints_rad,
+        duration=sum(r.duration for r in results),
+        error=error,
+        valid=valid,
+        joint_trajectory_rad=(
+            np.vstack(present) if len(present) == len(trajectories) else None
+        ),
+    )
 
 
 __all__ = ["DryRunRobotClient"]

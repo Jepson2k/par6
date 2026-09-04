@@ -10,6 +10,7 @@ turns those values into paths and waldoctl dataclasses.
 
 from __future__ import annotations
 
+import hashlib
 from functools import cache
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -87,6 +88,55 @@ def _leaf_name(raw: object, what: str) -> str:
 # ---------------------------------------------------------------------------
 # Packaged data
 # ---------------------------------------------------------------------------
+
+
+def config_files(path: str | Path) -> dict:
+    """The robot TOML at *path* and the ``grippers/*.toml`` beside it,
+    verbatim, in the shape of the daemon's CONFIG_BUNDLE answer.
+
+    ``fingerprint`` is computed the way the daemon computes CONFIG_INFO's:
+    sha256 over each file's name, a newline and its content — the robot
+    TOML first, then the gripper files by file name — so a preview built
+    from the same files reports the same fingerprint the daemon does.
+    """
+    robot = Path(path)
+    digest = hashlib.sha256()
+
+    def read(file: Path) -> tuple[str, str]:
+        content = file.read_text()
+        digest.update(file.name.encode())
+        digest.update(b"\n")
+        digest.update(content.encode())
+        return file.name, content
+
+    robot_filename, robot_toml = read(robot)
+    grippers = [read(f) for f in sorted((robot.parent / "grippers").glob("*.toml"))]
+    return {
+        "path": str(robot),
+        "fingerprint": digest.hexdigest(),
+        "robot_filename": robot_filename,
+        "robot_toml": robot_toml,
+        "grippers": [{"filename": n, "content": c} for n, c in grippers],
+    }
+
+
+# ---------------------------------------------------------------------------
+# URDF variants — one exported tree per end-effector build
+# ---------------------------------------------------------------------------
+
+_FLANGE_TREE = "par6_flange"
+
+# Tree directory -> (model, disabled-pair list) the RUNTIME loads for it,
+# mirroring ``par6_kin::GripperVariant::urdf_relpath`` / ``srdf_relpath``.
+# Named rather than globbed: the flange tree also carries
+# ``par6_arm.urdf`` (the arm-only gravity chain the runtime attaches tool
+# inertials onto), so picking a tree's model by directory order hands
+# this side a different model than the runtime enforces against.
+_MODEL_BY_TREE: dict[str, tuple[str, str]] = {
+    "par6_flange": ("par6_flange.urdf", "par6_flange.srdf"),
+    "par6_msg_gripper": ("PAR6_MSG.urdf", "PAR6_MSG.srdf"),
+    "par6_ssg48_gripper": ("par6_ssg48_urdf.urdf", "par6_ssg48_urdf.srdf"),
+}
 
 
 def data_root() -> Path:

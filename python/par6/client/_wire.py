@@ -97,7 +97,7 @@ def jog_l_velocities(
             return AXIS_INDEX[name]
         except KeyError:
             raise ValueError(
-                f"jog_l axis {name!r} is not one of {sorted(AXIS_INDEX)}"
+                f"jog_l unknown axis {name!r} (par6 axes: {', '.join(AXIS_INDEX)})"
             ) from None
 
     if axes is not None and speeds_list is not None:
