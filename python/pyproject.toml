@@ -10,7 +10,7 @@ license = { text = "MIT" }
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
-  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.11.2",
+  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.12.0",
 ]
 
 [project.scripts]
