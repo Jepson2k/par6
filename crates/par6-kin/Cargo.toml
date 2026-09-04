@@ -6,30 +6,20 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-[features]
-# Safe wrapper over the Pinocchio C++ shim (pinokin-sys). Off by default so
-# `cargo build --workspace` needs no C++ toolchain: run scripts/ffi/setup.sh,
-# `source .ffi/env.sh`, then build/test with `--features ffi`.
-ffi = ["dep:pinokin-sys", "dep:thiserror", "dep:par6-proto", "dep:rs-opw-kinematics", "dep:glam", "dep:urdf-rs"]
-
 [dependencies]
-thiserror = { workspace = true, optional = true }
-pinokin-sys = { path = "../pinokin-sys", features = ["ffi"], optional = true }
+thiserror = { workspace = true }
+pinokin-sys = { workspace = true }
 # Collision only: turning decoded wire shapes into checkable ones, so the
 # server's SET_SHAPES seam is one call rather than a hand-rolled match.
-par6-proto = { workspace = true, optional = true }
+par6-proto = { workspace = true }
 # Analytic (OPW) inverse kinematics. Parameters are derived from the URDF at
 # load and checked against the Pinocchio FK, so IK needs no tuning and no
 # hand-entered constants.
-rs-opw-kinematics = { version = "2.0.3", default-features = false, optional = true }
-glam = { version = "=0.30.10", optional = true }
-urdf-rs = { version = "0.9", optional = true }
+rs-opw-kinematics = { version = "2.0.3", default-features = false }
+glam = "=0.30.10"
+urdf-rs = "0.9"
 
 [dev-dependencies]
-# Stub unless the crate's own `ffi` feature is on — every test file is
-# `#![cfg(feature = "ffi")]`-gated, and forcing ffi here would drag the C++
-# shim into every toolchain-free `--all-targets` check in the workspace.
-pinokin-sys = { path = "../pinokin-sys" }
 # The vendor gravity reference is JSON.
 serde = { workspace = true }
 serde_json = "1"

@@ -6,7 +6,6 @@
 //! a fabricated answer. (FK itself is cross-checked against the
 //! independent OPW closed form every time a model loads — `Opw::derive`
 //! refuses a tree whose FK it cannot reproduce.)
-#![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 

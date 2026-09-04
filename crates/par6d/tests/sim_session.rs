@@ -1139,11 +1139,12 @@ fn home_calibrate_on_a_referenced_arm_reseeks_instead_of_returning_to_park() {
         s.angles
     );
 
-    let index = c.ok_index(&Command::Home(par6_proto::command::Home {
+    // Acceptance is `ok_index`'s own contract — it panics on anything but
+    // an OK carrying an index. What the flag DID is what follows.
+    c.ok_index(&Command::Home(par6_proto::command::Home {
         key: 7402,
         calibrate: true,
     }));
-    assert!(index >= 0, "a calibrating home must be accepted");
 
     // The RT drops into HOMING: a planned return never leaves EXEC, which
     // is what `home_on_a_referenced_arm_returns_to_the_park_pose_without_reseeking`

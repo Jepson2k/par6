@@ -1,4 +1,4 @@
-//! Links the `par6_shim` C++ library when the `ffi` feature is enabled.
+//! Links the `par6_shim` C++ library.
 //!
 //! Consumes:
 //! - `PAR6_SHIM_LIB_DIR`: directory holding `libpar6_shim.so` /
@@ -21,16 +21,12 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PAR6_SHIM_LINK");
     println!("cargo:rerun-if-env-changed=PAR6_SHIM_DEP_LIB_DIR");
 
-    if env::var_os("CARGO_FEATURE_FFI").is_none() {
-        return; // stub build: no C++ toolchain required
-    }
-
     let lib_dir = env::var("PAR6_SHIM_LIB_DIR")
         .ok()
         .or_else(|| repo_shim_dir("lib"))
         .unwrap_or_else(|| {
             panic!(
-                "pinokin-sys was built with the `ffi` feature but no shim was found: \
+                "pinokin-sys found no shim to link: \
                  PAR6_SHIM_LIB_DIR is not set and the repo has no .ffi/shim/lib.\n\
                  Run scripts/ffi/setup.sh (or export PAR6_SHIM_LIB_DIR to the \
                  directory containing libpar6_shim.so)."

@@ -6,7 +6,6 @@
 //! changes nothing, and a segment sweep finds what its endpoints hide.
 //! Every shape is placed from the model's own TCP so the scenarios hold on
 //! any tree without hand-entered coordinates.
-#![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 

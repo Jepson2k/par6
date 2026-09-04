@@ -9,62 +9,57 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
+  # One Rust job. The Pinocchio shim is a hard prerequisite — par6-kin is
+  # nothing without it and pinokin-sys is its raw binding — so there is no
+  # toolchain-free half of this workspace to prove anything about, and no
+  # `--exclude` or `--features` anywhere below. `cargo test --workspace` is
+  # the whole Rust suite, which is what a contributor runs locally too.
   rust:
-    name: rust (${{ matrix.target }})
+    name: rust (x86_64, shim)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        target: [x86_64-unknown-linux-gnu, aarch64-unknown-linux-gnu]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+      - name: cache pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/env
+            .ffi/shim
+          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build shim (scripts/ffi/setup.sh)
+        run: scripts/ffi/setup.sh
       - name: fmt
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: cargo fmt --all --check
       - name: clippy
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          cargo clippy --workspace --exclude par6d --exclude par6-py --exclude par6-calibrate \
-            --exclude par6-client --all-targets -- -D warnings
-          # par6-client's LIBRARY is toolchain-free; only its tests boot a
-          # daemon in-process (covered in `ffi`).
-          cargo clippy -p par6-client -- -D warnings
-      # par6d and par6-calibrate link the Pinocchio shim unconditionally, so
-      # they need the C++ toolchain and are covered by the `ffi` job below
-      # (par6-py wraps par6d and rides along). What this leg proves is that every LIBRARY crate
-      # still builds and passes without that toolchain — which is what
-      # keeps them usable on their own.
+          source .ffi/env.sh
+          cargo clippy --workspace --all-targets -- -D warnings
       - name: test
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
-        run: cargo test --workspace --exclude par6d --exclude par6-py --exclude par6-calibrate --exclude par6-client
-      # pinokin-sys is its OWN workspace (its ffi build needs the C++
-      # toolchain), so `--workspace` above never reaches it — its
-      # toolchain-free surface would otherwise be the one crate in the
-      # tree with no fmt or clippy gate at all.
-      - name: fmt + clippy (pinokin-sys)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
         run: |
-          cargo fmt --manifest-path crates/pinokin-sys/Cargo.toml --all --check
-          cargo clippy --manifest-path crates/pinokin-sys/Cargo.toml \
-            --all-targets -- -D warnings
-      - name: install cross linker
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      # par6d's aarch64 build is the deploy build and lives in
-      # scripts/deploy/build-aarch64.sh, which supplies the cross-compiled
-      # shim; this leg only cross-checks the toolchain-free crates.
-      - name: cross check (aarch64)
-        if: matrix.target == 'aarch64-unknown-linux-gnu'
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+          source .ffi/env.sh
+          cargo test --workspace
+      # Reruns just the timing case optimized and uncaptured, so the measured
+      # per-waypoint cost the planner budgets against is visible in the log.
+      # The test only fails on catastrophe, never on runner noise.
+      - name: report collision check cost (par6-kin)
         run: |
-          cargo check --workspace --exclude par6d --exclude par6-py \
-            --exclude par6-calibrate --target aarch64-unknown-linux-gnu
+          source .ffi/env.sh
+          cargo test -p par6-kin --release \
+            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
+      # The shipped 250 Hz configuration, end to end: every other harness
+      # patches tick_dt_s up for CI headroom, so this soak is the one place
+      # the unpatched 0.004 runs before it meets the arm. Release because
+      # an unoptimized RT loop cannot hold a 4 ms period anywhere (the test
+      # skips itself in debug builds for the same reason).
+      - name: shipped 250 Hz soak (par6d, release)
+        run: |
+          source .ffi/env.sh
+          cargo test -p par6d --release --test shipped_tick -- --nocapture
 
   msrv:
     # The env context is not available to jobs.<id>.name, and a workflow
@@ -76,8 +71,7 @@ jobs:
       - uses: actions/checkout@v4
       # The declared rust-version had never been built, so nothing stopped
       # a newer-toolchain feature from landing and breaking the floor the
-      # workspace advertises. par6d is excluded for the same reason as the
-      # stable leg: it needs the C++ shim.
+      # workspace advertises.
       - name: read MSRV from Cargo.toml
         run: |
           msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
@@ -86,23 +80,6 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
-      - name: check
-        run: |
-          cargo check --workspace --exclude par6d --exclude par6-py \
-            --exclude par6-calibrate --exclude par6-client --all-targets
-          cargo check -p par6-client
-
-  ffi:
-    name: ffi (pinocchio shim, x86_64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: ffi
       - name: cache pinocchio toolchain
         uses: actions/cache@v4
         with:
@@ -113,61 +90,10 @@ jobs:
           key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
       - name: build shim (scripts/ffi/setup.sh)
         run: scripts/ffi/setup.sh
-      - name: clippy (ffi feature)
+      - name: check
         run: |
           source .ffi/env.sh
-          cargo clippy -p par6-kin --all-targets --features ffi -- -D warnings
-      - name: test par6-kin, par6-calibrate
-        run: |
-          source .ffi/env.sh
-          cargo test -p par6-kin --features ffi
-          cargo test -p par6-calibrate
-      # The collision suite runs in the step above; this one reruns just
-      # its timing case optimized and uncaptured, so the measured
-      # per-waypoint cost the planner budgets against is visible in the log.
-      # The test only fails on catastrophe, never on runner noise.
-      - name: report collision check cost (par6-kin)
-        run: |
-          source .ffi/env.sh
-          cargo test -p par6-kin --release --features ffi \
-            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
-      - name: test pinokin-sys (C boundary)
-        run: |
-          source .ffi/env.sh
-          cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
-      # sim-mujoco is off by default, so the workspace clippy/test jobs never
-      # see this code; libmujoco comes from the same .ffi env as the shim.
-      - name: test par6-bus (sim-mujoco contact plant)
-        run: |
-          source .ffi/env.sh
-          cargo clippy -p par6-bus --all-targets --features sim-mujoco -- -D warnings
-          cargo test -p par6-bus --features sim-mujoco
-      # sim-dynamics (Pinocchio ABA torque-level plant) is the other
-      # optional sim tier; it builds against the same shim as sim-mujoco
-      # but had no CI job at all, so its code only ever compiled on a
-      # developer box that happened to enable it.
-      - name: test par6-bus (sim-dynamics torque plant)
-        run: |
-          source .ffi/env.sh
-          cargo clippy -p par6-bus --all-targets --features sim-dynamics -- -D warnings
-          cargo test -p par6-bus --features sim-dynamics
-      # `ffi` is the shipped configuration, so this is where par6d's whole
-      # protocol-plane suite runs against the runtime that actually ships.
-      - name: test par6d (the shipped runtime)
-        run: |
-          source .ffi/env.sh
-          cargo clippy -p par6d -p par6-py -p par6-client --all-targets -- -D warnings
-          cargo test -p par6d
-          cargo test -p par6-client
-      # The shipped 250 Hz configuration, end to end: every other harness
-      # patches tick_dt_s up for CI headroom, so this soak is the one place
-      # the unpatched 0.004 runs before it meets the arm. Release because
-      # an unoptimized RT loop cannot hold a 4 ms period anywhere (the test
-      # skips itself in debug builds for the same reason).
-      - name: shipped 250 Hz soak (par6d, release)
-        run: |
-          source .ffi/env.sh
-          cargo test -p par6d --release --test shipped_tick -- --nocapture
+          cargo check --workspace --all-targets
 
   # The SocketCAN backend is the only bus that will ever touch the arm,
   # and its vcan suite skips itself wherever no vcan interface exists —
@@ -188,6 +114,18 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: socketcan
+      # par6-bus builds its torque plant by default now, which links the
+      # shim like everything else.
+      - name: cache pinocchio toolchain
+        uses: actions/cache@v4
+        with:
+          path: |
+            .ffi/bin
+            .ffi/env
+            .ffi/shim
+          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+      - name: build shim (scripts/ffi/setup.sh)
+        run: scripts/ffi/setup.sh
       - name: create vcan0
         run: |
           sudo apt-get update
@@ -201,7 +139,9 @@ jobs:
       - name: test par6-bus against vcan0
         env:
           PAR6_REQUIRE_VCAN: '1'
-        run: cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
+        run: |
+          source .ffi/env.sh
+          cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
 
   python:
     name: python ${{ matrix.python }}

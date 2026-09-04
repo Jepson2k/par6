@@ -1,7 +1,6 @@
 //! The payload identification contract: the regressor is the
 //! linear-in-parameters form of the model's own G(q), and a fit from
 //! static torques recovers a load the model was not carrying.
-#![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 

@@ -117,29 +117,20 @@ mod wrap;
 
 pub use wrap::wrap_to_window;
 
-#[cfg(feature = "ffi")]
 mod kin;
 
-#[cfg(feature = "ffi")]
 mod opw;
 
-#[cfg(feature = "ffi")]
 mod collision;
 
-#[cfg(feature = "ffi")]
 mod shapes;
 
-#[cfg(feature = "ffi")]
 pub mod gravity;
 
-#[cfg(feature = "ffi")]
 pub use kin::{IkOutcome, Kin, KinError, Pose, IK_POSE_TOL};
 
-#[cfg(feature = "ffi")]
 pub use opw::{relative_pose, Opw, OpwError, FIT_TOL};
 
-#[cfg(feature = "ffi")]
 pub use collision::{Collision, CollisionReport, Layer, MAX_REPORTED_PAIRS};
 
-#[cfg(feature = "ffi")]
 pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

@@ -6,7 +6,6 @@
 //!
 //! Which configurations collide, and with what, is `par6-kin`'s
 //! `collision_world` suite; this file is about the boundary.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 

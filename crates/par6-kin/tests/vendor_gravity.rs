@@ -20,7 +20,6 @@
 //! way. Anything that physically changes a link needs new nominal data,
 //! not a measurement. What identification IS for is the load at the
 //! tool, which no table can describe: `par6_kin::gravity::fit_payload`.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 

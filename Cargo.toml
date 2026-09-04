@@ -12,10 +12,8 @@ members = [
     "crates/par6d",
     "crates/par6-py",
     "crates/par6-calibrate",
+    "crates/pinokin-sys",
 ]
-# pinokin-sys stays a standalone workspace (its ffi build needs the C++
-# toolchain); par6-bus reaches it via an optional path dependency.
-exclude = ["crates/pinokin-sys"]
 
 [workspace.package]
 version = "0.1.0"
@@ -37,6 +35,7 @@ par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }
 par6-client = { path = "crates/par6-client" }
+pinokin-sys = { path = "crates/pinokin-sys" }
 
 serde = { version = "1", features = ["derive"] }
 rmp-serde = "1"
