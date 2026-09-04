@@ -57,8 +57,6 @@ wire_enum! {
         CommValidationError = 43,
         /// A chunked transfer timed out before completing.
         CommChunkTimeout = 44,
-        /// Telemetry recipe name not recognised (refused, never silent).
-        CommUnknownRecipe = 45,
 
         /// Motion command while the controller is DISABLED.
         SysControllerDisabled = 50,
@@ -285,12 +283,6 @@ pub fn template(code: ErrorCode) -> ErrorTemplate {
             cause: "Transfer {transfer_id} received {received}/{total} chunks before the timeout.",
             effect: "Partial transfer discarded; the command was not executed.",
             remedy: "Retry the command; check for datagram loss on the link.",
-        },
-        E::CommUnknownRecipe => ErrorTemplate {
-            title: "Unknown telemetry recipe",
-            cause: "No telemetry recipe named '{name}' is configured.",
-            effect: "Recipe unchanged.",
-            remedy: "Use a recipe name from the runtime configuration.",
         },
         E::SysControllerDisabled => ErrorTemplate {
             title: "Controller disabled",

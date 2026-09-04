@@ -36,6 +36,7 @@ from waldoctl.status import (
     PayloadEstimate,
     PayloadResult,
     PingResult,
+    StatusRate,
     ToolResult,
 )
 from waldoctl.tools import ToolSpec, ToolStatus
@@ -509,6 +510,40 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         result = await self._call(core.bus_scan())
         return None if result is None else list(result["nodes"])
+
+    async def set_status_rate(self, hz: float) -> int:
+        """Set the rate the runtime broadcasts STATUS at, for this session.
+
+        STATUS is emitted every Nth tick, so only divisors of the tick rate
+        can be served; anything else is refused with the achievable rates
+        named rather than rounded to a neighbour.  Raising it is how a
+        capture or a tuning run gets resolution the default cannot, and it
+        costs bandwidth and consumer CPU for as long as it is up.
+
+        Category: Configuration
+
+        Example:
+            rbt.set_status_rate(250)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_status_rate(float(hz)))
+
+    async def status_rate(self) -> StatusRate | None:
+        """Current STATUS rate and the tick rate it divides.
+
+        The tick rate is what makes the constraint computable: the rates
+        this runtime can serve are ``control_hz / N``.  None if unreachable.
+
+        Category: Query
+
+        Example:
+            rate = rbt.status_rate()
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.status_rate())
+        if result is None:
+            return None
+        return StatusRate(hz=result["hz"], control_hz=result["tick_hz"])
 
     async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
         """Commissioning: tell drive *node* to answer as *new_id* from now on.

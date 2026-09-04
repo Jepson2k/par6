@@ -230,6 +230,16 @@ pub struct SaveConfig {
     pub force: bool,
 }
 
+/// SET_STATUS_RATE: change the STATUS broadcast rate for this session.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetStatusRate {
+    /// Requested rate [Hz]. Status is emitted every Nth tick, so this must
+    /// divide the tick rate exactly; the server refuses anything else
+    /// rather than serving a neighbouring rate nobody asked for.
+    pub hz: f64,
+}
+
 /// ENTER_FLASHING: silence the bus and hand it to a firmware flasher.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -635,6 +645,7 @@ pub enum Command {
     SetPidGains(SetPidGains),
     SetCanId(SetCanId),
     SaveConfig(SaveConfig),
+    SetStatusRate(SetStatusRate),
     // QUERY
     Ping,
     Status,
@@ -658,6 +669,7 @@ pub enum Command {
     Payload,
     ConfigBundle,
     BusScan,
+    StatusRate,
     // FIRE_AND_FORGET
     ServoJ(ServoJ),
     ServoJPose(ServoJPose),
@@ -704,6 +716,7 @@ impl Command {
             C::SetPidGains(_) => CmdType::SetPidGains,
             C::SetCanId(_) => CmdType::SetCanId,
             C::SaveConfig(_) => CmdType::SaveConfig,
+            C::SetStatusRate(_) => CmdType::SetStatusRate,
             C::Ping => CmdType::Ping,
             C::Status => CmdType::Status,
             C::Angles => CmdType::Angles,
@@ -726,6 +739,7 @@ impl Command {
             C::Payload => CmdType::Payload,
             C::ConfigBundle => CmdType::ConfigBundle,
             C::BusScan => CmdType::BusScan,
+            C::StatusRate => CmdType::StatusRate,
             C::ServoJ(_) => CmdType::ServoJ,
             C::ServoJPose(_) => CmdType::ServoJPose,
             C::ServoL(_) => CmdType::ServoL,
@@ -802,6 +816,7 @@ impl Command {
             | C::Payload
             | C::ConfigBundle
             | C::BusScan
+            | C::StatusRate
             | C::ResetLoopStats => Ok(()),
             C::SetCanId(p) => {
                 check(
@@ -824,6 +839,11 @@ impl Command {
                 p.node <= 15,
                 "save_config.node",
                 "must be a CAN node id (0..=15)",
+            ),
+            C::SetStatusRate(p) => check(
+                p.hz.is_finite() && p.hz > 0.0,
+                "set_status_rate.hz",
+                "must be a positive, finite rate",
             ),
             C::WriteIo(p) => {
                 check(p.port <= 7, "write_io.port", "must be 0..=7")?;
@@ -1175,7 +1195,8 @@ fn arity(tag: CmdType) -> usize {
         | T::ConfigInfo
         | T::Payload
         | T::ConfigBundle
-        | T::BusScan => 2,
+        | T::BusScan
+        | T::StatusRate => 2,
         T::Stop
         | T::Simulator
         | T::SetGravityComp
@@ -1192,6 +1213,7 @@ fn arity(tag: CmdType) -> usize {
         T::SetPidGains => 13,
         T::SetCanId => 5,
         T::SaveConfig => 4,
+        T::SetStatusRate => 3,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -1270,7 +1292,8 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::ConfigInfo
         | C::Payload
         | C::ConfigBundle
-        | C::BusScan => {}
+        | C::BusScan
+        | C::StatusRate => {}
         C::SetCanId(p) => {
             w_uint(buf, u64::from(p.node));
             w_uint(buf, u64::from(p.new_id));
@@ -1280,6 +1303,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
             w_uint(buf, u64::from(p.node));
             w_bool(buf, p.force);
         }
+        C::SetStatusRate(p) => w_f64(buf, p.hz),
         C::Stop(p) => w_bool(buf, p.clear_queue),
         C::WriteIo(p) => {
             w_uint(buf, u64::from(p.port));
@@ -1745,6 +1769,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::Payload => Command::Payload,
         T::ConfigBundle => Command::ConfigBundle,
         T::BusScan => Command::BusScan,
+        T::StatusRate => Command::StatusRate,
         T::SetCanId => Command::SetCanId(SetCanId {
             node: r_node_id(&mut r, "set_can_id.node")?,
             new_id: r_node_id(&mut r, "set_can_id.new_id")?,
@@ -1754,6 +1779,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
             node: r_node_id(&mut r, "save_config.node")?,
             force: r.bool()?,
         }),
+        T::SetStatusRate => Command::SetStatusRate(SetStatusRate { hz: r.f64()? }),
         T::ServoJ => Command::ServoJ(ServoJ {
             angles: r_fixed6(&mut r, "servo_j.angles")?,
             speed: r.opt_f64()?,

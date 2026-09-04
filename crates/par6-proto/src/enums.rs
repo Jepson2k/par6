@@ -63,10 +63,12 @@ wire_enum! {
 wire_enum! {
     /// Command tags (slot 0 of every client→server payload).
     ///
-    /// Values are grouped by ack class — SYSTEM 10–29 (and 70–79 once
-    /// that band filled), QUERY 30–59, FIRE_AND_FORGET 60–69, QUEUED 80+
-    /// — but the authoritative mapping is [`command_class`], which both
-    /// sides consult.
+    /// Values are grouped by ack class — SYSTEM 10–39, QUERY 40–79,
+    /// FIRE_AND_FORGET 80–99, QUEUED 100+ — but the authoritative mapping
+    /// is [`command_class`], which both sides consult. The bands are sized
+    /// with room to grow: the previous layout ran SYSTEM out of numbers and
+    /// pushed SAVE_CONFIG into the 70s, which is the sort of exception that
+    /// makes the grouping stop meaning anything.
     CmdType: u16 {
         // -- SYSTEM: always acked OK/ERROR --
         /// Clear a latched protective stop, re-enabling motion.
@@ -130,105 +132,110 @@ wire_enum! {
         SetCanId = 29,
         /// Commissioning: ask a drive to persist its running configuration
         /// to NVM (cmd 13). Same gate and `force` rule as SET_CAN_ID.
-        /// Tagged in the 70s because 10–29 is full.
-        SaveConfig = 70,
+        SaveConfig = 30,
+        /// Set the STATUS broadcast rate for this session. Status is emitted
+        /// every Nth tick, so only divisors of the tick rate can be served;
+        /// anything else is refused rather than rounded to a neighbour.
+        SetStatusRate = 31,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
-        Ping = 30,
+        Ping = 40,
         /// Aggregate status snapshot.
-        Status = 31,
+        Status = 41,
         /// Joint angles (degrees).
-        Angles = 32,
+        Angles = 42,
         /// TCP pose (flattened 4×4 row-major, mm).
-        Pose = 33,
+        Pose = 43,
         /// Digital I/O states.
-        Io = 34,
+        Io = 44,
         /// Joint speeds.
-        Speeds = 35,
+        Speeds = 45,
         /// Current tool and available tool names.
-        Tools = 36,
+        Tools = 46,
         /// Queue contents + progress indexes.
-        Queue = 37,
+        Queue = 47,
         /// Current action name/state.
-        Activity = 38,
+        Activity = 48,
         /// Control-loop timing statistics.
-        LoopStats = 39,
+        LoopStats = 49,
         /// Current motion profile.
-        Profile = 40,
+        Profile = 50,
         /// Joint/Cartesian enablement flags (freedom before hitting limits).
-        Reachable = 41,
+        Reachable = 51,
         /// Standing error state, if any.
-        Error = 42,
+        Error = 52,
         /// TCP linear speed (mm/s).
-        TcpSpeed = 43,
+        TcpSpeed = 53,
         /// Current TCP offset (mm, tool-local frame).
-        TcpOffset = 44,
+        TcpOffset = 54,
         /// Full tool status.
-        ToolStatus = 45,
+        ToolStatus = 55,
         /// Whether the simulator backend is active.
-        IsSimulator = 46,
+        IsSimulator = 56,
         /// Collision-world readback (installation + program layers).
-        Shapes = 47,
+        Shapes = 57,
         /// Effective-configuration readback (path, fingerprint, limits,
         /// motion constants) — the config-skew hook.
-        ConfigInfo = 48,
+        ConfigInfo = 58,
         /// Runtime payload readback (mass/COM/inertia).
-        Payload = 49,
+        Payload = 59,
         /// The loaded config files verbatim (robot + gripper TOMLs) —
         /// the daemon serves its own config, parol6-style, so clients
         /// preview with exactly the numbers the arm enforces.
-        ConfigBundle = 50,
+        ConfigBundle = 60,
         /// Rescan the bus — an RTR ping to every node id, one per tick —
         /// and report each id: configured, answering, freshness, and the
         /// device identity of configured nodes. The RESPONSE waits for
         /// the scan to settle (a few dozen ticks).
-        BusScan = 51,
+        BusScan = 61,
+        /// Current STATUS rate, and the tick rate it divides.
+        StatusRate = 62,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
-        ServoJ = 60,
+        ServoJ = 80,
         /// Streaming joint position target via Cartesian pose (IK).
-        ServoJPose = 61,
+        ServoJPose = 81,
         /// Streaming linear Cartesian position target.
-        ServoL = 62,
+        ServoL = 82,
         /// Streaming joint velocity with a self-terminating duration watchdog.
-        JogJ = 63,
+        JogJ = 83,
         /// Streaming Cartesian velocity with a duration watchdog.
-        JogL = 64,
+        JogL = 84,
         /// Instantly set joint angles (simulator only; error otherwise).
-        Teleport = 65,
+        Teleport = 85,
         /// Reset loop timing statistics. Truly unacked (v2 fix).
-        ResetLoopStats = 66,
+        ResetLoopStats = 86,
 
         // -- QUEUED: ack carries the command index; COMPLETE push follows --
         /// Run the homing sequence.
-        Home = 80,
+        Home = 100,
         /// Joint-space move to target angles (degrees).
-        MoveJ = 81,
+        MoveJ = 101,
         /// Joint-space move to a Cartesian pose (IK at target).
-        MoveJPose = 82,
+        MoveJPose = 102,
         /// Linear Cartesian move.
-        MoveL = 83,
+        MoveL = 103,
         /// Circular arc through current → via → end.
-        MoveC = 84,
+        MoveC = 104,
         /// Cubic spline through waypoints (bulk; may be chunked).
-        MoveS = 85,
+        MoveS = 105,
         /// Process move: auto-blended corners, timed so the TCP holds a
         /// constant speed along the path rather than running as fast as
         /// the joints allow (bulk). `speed` is a fraction of the fastest
         /// constant speed those joints permit on this path — the whole
         /// path pays its steepest stretch, which is what makes the rate
         /// constant.
-        MoveP = 86,
+        MoveP = 106,
         /// Select the active end-of-arm tool.
-        SelectTool = 87,
+        SelectTool = 107,
         /// Queued dwell.
-        Delay = 88,
+        Delay = 108,
         /// Queue marker for progress tracking.
-        Checkpoint = 89,
+        Checkpoint = 109,
         /// Generic tool action (open/close/move…), validated server-side.
-        ToolAction = 90,
+        ToolAction = 110,
     }
 }
 
@@ -279,6 +286,8 @@ wire_enum! {
         ConfigBundle = 21,
         /// See [`CmdType::BusScan`].
         BusScan = 22,
+        /// See [`CmdType::StatusRate`].
+        StatusRate = 23,
     }
 }
 
@@ -438,7 +447,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::ExitFlashing
         | C::SetPidGains
         | C::SetCanId
-        | C::SaveConfig => CommandClass::System,
+        | C::SaveConfig
+        | C::SetStatusRate => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -461,7 +471,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::ConfigInfo
         | C::Payload
         | C::ConfigBundle
-        | C::BusScan => CommandClass::Query,
+        | C::BusScan
+        | C::StatusRate => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose
