@@ -168,8 +168,6 @@ rather than approximate it.
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
 | `tests/golden/` | golden wire vectors (encode/decode conformance for the frozen codec) |
-| `tools/bringup/` | the staged on-hardware bring-up kit — see its README |
-| `tools/gravity_calibration/` | gravity identification phases A–D and the sim twin evidence — see its README |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
