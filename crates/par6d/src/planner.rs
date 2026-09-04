@@ -1697,9 +1697,10 @@ impl Par6Planner {
     /// Recompute the enablement flags for STATUS and the REACHABLE query.
     ///
     /// Rate- and change-gated ([`EnablementProbe`]): the cartesian half
-    /// costs 24 seeded IK solves and a collision check per solution, which
-    /// belongs nowhere near the RT thread and not on every 500 Hz planner
-    /// poll either — and a configuration that has not moved cannot have
+    /// costs 24 seeded IK solves and a collision check per solution,
+    /// which belongs nowhere near the RT thread and not on every planner
+    /// poll either — the poll runs on the command plane's own interval,
+    /// not the tick — and a configuration that has not moved cannot have
     /// changed its answer.
     fn update_enablement(&mut self, snap: &StateSnapshot) {
         if !self.probe.due(&snap.q) {

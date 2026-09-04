@@ -72,6 +72,33 @@ pub fn config_with_interface(iface: &str) -> PathBuf {
     path
 }
 
+/// Rewrite the value of a top-level `key = value` line, anchored on the
+/// KEY.
+///
+/// Anchoring on the shipped VALUE — `text.replace("tick_dt_s = 0.004",
+/// ...)` — makes every re-ticking harness in the repo depend on a
+/// literal it does not own: change the shipped tick and they all stop
+/// re-ticking. The assert is what turns that from a silent
+/// run-at-the-wrong-rate into a failure.
+fn set_scalar(text: &str, key: &str, value: &str) -> String {
+    let mut hit = false;
+    let mut out = String::with_capacity(text.len());
+    for line in text.lines() {
+        let is_key = line
+            .split_once('=')
+            .is_some_and(|(lhs, _)| lhs.trim() == key);
+        if is_key && !hit {
+            hit = true;
+            out.push_str(&format!("{key} = {value}"));
+        } else {
+            out.push_str(line);
+        }
+        out.push('\n');
+    }
+    assert!(hit, "shipped config no longer declares `{key}`");
+    out
+}
+
 /// Write `bytes` to `dst` so a concurrent reader never sees a torn file.
 ///
 /// `fs::write` and `fs::copy` truncate and then fill, and a test that
@@ -101,8 +128,7 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     let grippers = dir.join("grippers");
     std::fs::create_dir_all(&grippers).expect("test config dir");
     let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
-    let patched = text.replace("tick_dt_s = 0.004", &format!("tick_dt_s = {dt}"));
-    assert_ne!(patched, text, "tick_dt_s patch point must exist");
+    let patched = set_scalar(&text, "tick_dt_s", &dt.to_string());
     let dst = dir.join("PAR6.toml");
     write_atomic(&dst, patched.as_bytes());
     for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {

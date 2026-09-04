@@ -332,7 +332,16 @@ pub struct ProtocolConfig {
     /// ladder.
     pub status_multicast_group: String,
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
-    /// (validated) so the broadcaster is a clean tick decimation.
+    /// (validated).
+    ///
+    /// The broadcaster runs on its own wall-clock interval but samples a
+    /// snapshot the RT republishes once per tick, so the constraint is
+    /// about the two cadences, not about counting ticks: a rate that
+    /// does not divide the tick BEATS against the snapshot — consecutive
+    /// frames straddle a varying number of ticks, some repeating a
+    /// snapshot and some skipping one. The frames still arrive on time;
+    /// what they carry stops being a uniform sampling of the arm, which
+    /// is what anything recording STATUS as a time series depends on.
     pub status_rate_hz: u32,
 }
 

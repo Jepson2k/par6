@@ -13,6 +13,7 @@ import asyncio
 import functools
 import os
 import queue
+import re
 import shutil
 import socket
 import subprocess
@@ -103,6 +104,26 @@ def free_udp_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _set_scalar(text: str, key: str, value: object) -> str:
+    """Rewrite a top-level ``key = value`` line, anchored on the KEY.
+
+    Anchoring on the shipped VALUE makes this harness depend on a literal
+    it does not own: change the tick in ``PAR6.toml`` and the rig quietly
+    stops re-ticking and runs the e2e suite at the hardware rate. The
+    raise is what turns that into a failure instead.
+    """
+    patched, n = re.subn(
+        rf"^{re.escape(key)}\s*=.*$",
+        f"{key} = {value}",
+        text,
+        count=1,
+        flags=re.MULTILINE,
+    )
+    if n != 1:
+        raise RuntimeError(f"PAR6.toml no longer declares `{key}`")
+    return patched
+
+
 def sim_config(
     dest: Path,
     active_gripper: str | None = None,
@@ -120,13 +141,8 @@ def sim_config(
     dest.mkdir(parents=True, exist_ok=True)
     (dest / "grippers").mkdir(exist_ok=True)
     text = (src / "PAR6.toml").read_text()
-    patched = text.replace("tick_dt_s = 0.004", f"tick_dt_s = {TICK_DT_S}").replace(
-        "status_rate_hz = 50", f"status_rate_hz = {STATUS_RATE_HZ}"
-    )
-    if patched == text:
-        raise RuntimeError(
-            "PAR6.toml patch points (tick_dt_s / status_rate_hz) missing"
-        )
+    patched = _set_scalar(text, "tick_dt_s", TICK_DT_S)
+    patched = _set_scalar(patched, "status_rate_hz", STATUS_RATE_HZ)
     if active_gripper is not None:
         fitted = _cfg.config().active_gripper()
         swapped = patched.replace(
