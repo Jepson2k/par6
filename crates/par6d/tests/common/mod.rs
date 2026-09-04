@@ -45,9 +45,29 @@ pub fn shipped_config() -> PathBuf {
     repo_root().join("config/PAR6.toml")
 }
 
+/// Write `bytes` to `dst` so a concurrent reader never sees a torn file.
+///
+/// `fs::write` and `fs::copy` truncate and then fill, and a test that
+/// boots a daemon while another is in that window reads an empty config
+/// and fails with "missing field `robot`". Writing beside the target and
+/// renaming leaves a reader with either the whole old file or the whole
+/// new one — and the content is a pure function of `(tag, dt)`, so which
+/// one it gets does not matter.
+fn write_atomic(dst: &std::path::Path, bytes: &[u8]) {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let tmp = dst.with_extension(format!("tmp.{n}"));
+    std::fs::write(&tmp, bytes).expect("write test config");
+    std::fs::rename(&tmp, dst).expect("publish test config");
+}
+
 /// The shipped config re-timed to `dt` seconds per tick, written with its
-/// gripper files into a scratch directory tagged for the calling test, so
-/// parallel tests never share a config tree.
+/// gripper files into a scratch directory named for `tag`.
+///
+/// Tests sharing a tag share the tree, which is why every file lands
+/// through [`write_atomic`]: the content is identical for a given
+/// `(tag, dt)`, so concurrent writers are harmless as long as no reader
+/// can catch one mid-write.
 pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     let src = shipped_config();
     let dir = std::env::temp_dir().join(format!("par6d-{tag}-{}", std::process::id()));
@@ -57,10 +77,11 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     let patched = text.replace("tick_dt_s = 0.004", &format!("tick_dt_s = {dt}"));
     assert_ne!(patched, text, "tick_dt_s patch point must exist");
     let dst = dir.join("PAR6.toml");
-    std::fs::write(&dst, patched).expect("write test config");
+    write_atomic(&dst, patched.as_bytes());
     for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
         let e = entry.expect("dir entry");
-        std::fs::copy(e.path(), grippers.join(e.file_name())).expect("copy gripper toml");
+        let body = std::fs::read(e.path()).expect("read gripper toml");
+        write_atomic(&grippers.join(e.file_name()), &body);
     }
     dst
 }
@@ -103,9 +124,8 @@ pub fn redirect_bus_grant() {
 }
 
 /// Daemon options for a simulator boot on loopback: an ephemeral command
-/// port, STATUS unicast to `127.0.0.1:status_port`, telemetry to
-/// `telemetry_port` (0 = ephemeral), the repo assets tree.
-pub fn sim_options(config: PathBuf, status_port: u16, telemetry_port: u16) -> Options {
+/// port, STATUS unicast to `127.0.0.1:status_port`, the repo assets tree.
+pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
     Options {
         sim: true,
         config: Some(config),
@@ -114,7 +134,6 @@ pub fn sim_options(config: PathBuf, status_port: u16, telemetry_port: u16) -> Op
         bind: Some("127.0.0.1".parse().unwrap()),
         status_host: Some("127.0.0.1".parse().unwrap()),
         status_port: Some(status_port),
-        telemetry_port: Some(telemetry_port),
         status_transport: Some(StatusTransport::Unicast),
         ..Options::default()
     }
@@ -124,7 +143,6 @@ pub fn sim_options(config: PathBuf, status_port: u16, telemetry_port: u16) -> Op
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
-    _telemetry_rx: UdpSocket,
 }
 
 impl Rig {
@@ -165,32 +183,21 @@ impl Rig {
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
-        let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
         let opts = Options {
             sim_dynamics,
             status_rate_hz,
-            ..sim_options(
-                config,
-                status_rx.local_addr().unwrap().port(),
-                telemetry_rx.local_addr().unwrap().port(),
-            )
+            ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
         let daemon = Daemon::start(&opts).map_err(|e| e.to_string())?;
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
-            _telemetry_rx: telemetry_rx,
         })
     }
 
     /// The command plane's bound address.
     pub fn addr(&self) -> SocketAddr {
         self.daemon.as_ref().expect("running").command_addr()
-    }
-
-    /// The telemetry socket, for tests that decode the stream.
-    pub fn telemetry(&self) -> &UdpSocket {
-        &self._telemetry_rx
     }
 
     /// Widen the STATUS socket's read timeout past the default

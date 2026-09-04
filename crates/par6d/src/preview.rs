@@ -1,8 +1,8 @@
 //! Offline dry-run preview: the daemon's OWN planner, driven through the
 //! server's `Planner` trait against a fabricated harness instead of a
 //! running RT core. A previewed command is planned by exactly the code
-//! that would drive the arm — same profiles, same IK, same TOPPRA
-//! timing, same collision gate — and then discarded instead of
+//! that would drive the arm — same profiles, same IK, same timing lanes,
+//! same collision and acceleration gates — and then discarded instead of
 //! dispatched, so a preview can never drift from the runtime.
 
 use std::path::Path;
@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
 use par6_config::LimitMode;
-use par6_motion::{JogEngine, MotionLimits};
+use par6_motion::{JogEngine, MotionLimits, StreamingExecutor};
 use par6_proto::{
     command::{JogJ, JogL},
     Command, CompletionPolicy, Frame, WireError, NUM_JOINTS,
@@ -18,14 +18,14 @@ use par6_proto::{
 use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
     sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
-    SnapshotWriter, StateSnapshot, MAX_JOINTS,
+    SnapshotWriter, StateSnapshot, StreamTracker, MAX_JOINTS,
 };
 use par6_server::{
     check_gate, decode_error_to_wire, validate_registries, validate_supported, GateContext,
     PayloadSpec, PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
-use crate::adapters::MotionJog;
+use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{step_cart_jog, CartJogState, CoreLink, CoreOp};
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::options::{resolve_config_path, Options};
@@ -56,10 +56,26 @@ impl PreviewResult {
     }
 }
 
+/// What the runtime's streaming limiter would command, tick by tick,
+/// for a sequence of servo targets — the offline half of a bring-up
+/// limiter check, run through the same jerk-limited executor and
+/// soft-limit clamp the RT ticks.
+#[derive(Debug, Clone)]
+pub struct ServoPreview {
+    /// Commanded joint positions per tick \[rad\] (post-clamp).
+    pub q: Vec<[f64; MAX_JOINTS]>,
+    /// Commanded joint velocities per tick \[rad/s\].
+    pub qd: Vec<[f64; MAX_JOINTS]>,
+    /// The tick the limiter first reported the LAST target reached, if
+    /// it did inside the window.
+    pub finished_tick: Option<usize>,
+}
+
 /// The offline preview session: a virtual arm pose plus the real planner.
 pub struct Preview {
     planner: Par6Planner,
     jog: MotionJog,
+    stream: MotionStream,
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
     next_index: u64,
@@ -82,6 +98,11 @@ pub struct Preview {
     completion_policy: CompletionPolicy,
     /// The payload the preview plans with, as the live `set_payload`.
     payload: PayloadSpec,
+    /// Ticks a `calibrate` holds the arm for: the runtime will not
+    /// believe the sweep before the active gripper's
+    /// `driver.settle.calibrate_min_wait_s`, and a preview that reported
+    /// zero would predict a program shorter than the arm can run it.
+    tool_calibrate_hold_ticks: u64,
     /// The config file this session was built from.
     config_path: std::path::PathBuf,
     // Keep the stub channel/ring ends alive so the planner's control
@@ -106,7 +127,6 @@ impl Preview {
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
         let kin = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
-        let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -134,13 +154,25 @@ impl Preview {
         snap.mode = Mode::Idle;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let dt = robot.robot.tick_dt_s;
+        let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
+        let stream = MotionStream::new(
+            StreamingExecutor::new(dt, &stream_limits)?,
+            dt,
+            stream_limits,
+            robot.stream.fault_latch_s,
+        );
         let motion = robot.motion;
+        let tool_calibrate_hold_ticks = bundle
+            .active_gripper()
+            .and_then(|g| g.driver.as_ref())
+            .map_or(0, |d| (d.settle.calibrate_min_wait_s / dt).round() as u64);
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let profile = cfg.initial_profile.clone();
         let mut preview = Self {
             config_path,
             planner,
             jog,
+            stream,
             snap,
             snap_w,
             next_index: 0,
@@ -154,6 +186,7 @@ impl Preview {
             tcp_offset_mm: [0.0; 3],
             completion_policy: CompletionPolicy::Settled,
             payload: PayloadSpec::default(),
+            tool_calibrate_hold_ticks,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
@@ -164,6 +197,38 @@ impl Preview {
 
     fn publish(&mut self) {
         self.snap_w.publish(&self.snap);
+    }
+
+    /// One tool action through the planner's tool lane — the same
+    /// admission the live daemon runs, so an unsupported verb, a missing
+    /// driver or an uncalibrated jaw move previews as the refusal the
+    /// arm would answer with. The arm holds still throughout; only a
+    /// `calibrate` takes measurable time the config can predict.
+    fn preview_tool_action(&mut self, action: &par6_proto::command::ToolAction) -> PreviewResult {
+        self.publish();
+        if let Err(error) = self.planner.start_tool(self.next_index, action) {
+            return self.refusal(error);
+        }
+        self.planner.cancel_tool(false);
+        if action.action == "calibrate" {
+            self.set_gripper_calibrated(true);
+        }
+        let hold = if action.action == "calibrate" {
+            self.tool_calibrate_hold_ticks
+        } else {
+            0
+        };
+        let (tcp_poses, error) = match self.tcp_poses(&[]) {
+            Ok(poses) => (poses, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        PreviewResult {
+            joint_trajectory_rad: Vec::new(),
+            tcp_poses,
+            end_joints_rad: self.snap.q,
+            duration_s: hold as f64 * self.dt,
+            error,
+        }
     }
 
     /// The virtual arm pose \[rad\].
@@ -318,6 +383,46 @@ impl Preview {
         }
     }
 
+    /// Preview a servo stream: each target in `targets` is held for
+    /// `hold_ticks` ticks (the first setpoint sits at the virtual pose,
+    /// as the RT's start-pose gate demands of a real stream), through the
+    /// same jerk-limited executor, limit fractions and soft-limit clamp
+    /// the RT core drives. The virtual arm does not move: this is a
+    /// limiter measurement, not a motion.
+    pub fn preview_servo(
+        &mut self,
+        targets: &[[f64; MAX_JOINTS]],
+        hold_ticks: usize,
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> ServoPreview {
+        let hold = hold_ticks.max(1);
+        self.stream
+            .set_scale(speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+        self.stream.activate(&self.snap.q);
+        let mut out = ServoPreview {
+            q: Vec::with_capacity(targets.len() * hold),
+            qd: Vec::with_capacity(targets.len() * hold),
+            finished_tick: None,
+        };
+        let last = targets.len().saturating_sub(1);
+        for (i, target) in targets.iter().enumerate() {
+            self.stream.set_target(target);
+            for _ in 0..hold {
+                let mut q = [0.0; MAX_JOINTS];
+                let mut qd = [0.0; MAX_JOINTS];
+                self.stream.step(&mut q, &mut qd);
+                if i == last && out.finished_tick.is_none() && self.stream.at_target() {
+                    out.finished_tick = Some(out.q.len());
+                }
+                out.q.push(q);
+                out.qd.push(qd);
+            }
+        }
+        self.stream.set_scale(1.0, 1.0);
+        out
+    }
+
     /// Preview a velocity jog held for `duration_s`: the same
     /// `par6-motion` jog engine the RT core ticks, integrated from the
     /// virtual pose (per-joint ramps, soft-limit direction blocking).
@@ -467,6 +572,15 @@ impl Preview {
                 i += 1;
                 continue;
             }
+            // A tool action never enters the motion queue — it runs on
+            // the planner's own side channel — so it is offered there
+            // instead of to the batch, and it never joins a blend chain.
+            if let Command::ToolAction(action) = &cmds[i] {
+                results.push(self.preview_tool_action(action));
+                i += 1;
+                self.next_index += 1;
+                continue;
+            }
             // Only offer the leading run of admissible commands: a later
             // refused one would have been refused at its own datagram, so
             // the planner must not fold it into this chain.
@@ -512,11 +626,6 @@ impl Preview {
                         // The seek establishes the references; where it
                         // ends is the configured homing-ready pose.
                         self.snap.homed = true;
-                    }
-                    if let Command::ToolAction(action) = &cmds[i] {
-                        if action.action == "calibrate" {
-                            self.set_gripper_calibrated(true);
-                        }
                     }
                     self.planner.cancel();
                     let end = trajectory.last().copied().unwrap_or(self.snap.q);

@@ -200,3 +200,37 @@ def test_freedrive_reads_the_broadcast_not_the_last_command(daemon):
         assert client.set_gravity_comp(False) == 1
         assert client.wait_status(lambda s: not s.gravity_comp, timeout=10.0)
         assert client.is_freedrive() is False
+
+
+def test_cli_scan_lists_every_node_id_with_the_configured_drives_present(
+    daemon, capsys
+):
+    """``par6 scan`` is the commissioning view: a rescan of the bus, one
+    row per node id. On the simulator exactly the configured drives
+    answer, and the JSON form carries the fields a script keys on."""
+    import json
+
+    from par6.cli import main
+
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0) is True
+
+    assert (
+        main(
+            [
+                "--host",
+                "127.0.0.1",
+                "--port",
+                str(daemon.command_port),
+                "--json",
+                "scan",
+            ]
+        )
+        == 0
+    )
+    rows = json.loads(capsys.readouterr().out)
+    assert [r["node"] for r in rows] == list(range(16))
+    present = [r["node"] for r in rows if r["present"]]
+    assert present == [r["node"] for r in rows if r["configured"]]
+    assert len(present) >= 6
+    assert all(r["freshness"] == 1 for r in rows if r["configured"])

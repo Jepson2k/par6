@@ -152,10 +152,10 @@
       ]
     },
     {
-      "class": "SYSTEM",
+      "class": "QUEUED",
       "cmd": "SET_TCP_OFFSET",
       "file": "cmd_set_tcp_offset.bin",
-      "idempotency_key": null,
+      "idempotency_key": 113,
       "kind": "command",
       "name": "cmd_set_tcp_offset",
       "req_id": 9,
@@ -163,6 +163,7 @@
       "wire": [
         18,
         9,
+        113,
         1.5,
         -2.0,
         35.5
@@ -233,21 +234,6 @@
         20,
         11,
         2
-      ]
-    },
-    {
-      "class": "SYSTEM",
-      "cmd": "SET_RECIPE",
-      "file": "cmd_set_recipe.bin",
-      "idempotency_key": null,
-      "kind": "command",
-      "name": "cmd_set_recipe",
-      "req_id": 12,
-      "tag": 21,
-      "wire": [
-        21,
-        12,
-        "diagnostics"
       ]
     },
     {
@@ -662,6 +648,53 @@
       "wire": [
         49,
         42
+      ]
+    },
+    {
+      "class": "QUERY",
+      "cmd": "BUS_SCAN",
+      "file": "cmd_bus_scan.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_bus_scan",
+      "req_id": 43,
+      "tag": 51,
+      "wire": [
+        51,
+        43
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SET_CAN_ID",
+      "file": "cmd_set_can_id.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_set_can_id",
+      "req_id": 17,
+      "tag": 29,
+      "wire": [
+        29,
+        17,
+        0,
+        9,
+        true
+      ]
+    },
+    {
+      "class": "SYSTEM",
+      "cmd": "SAVE_CONFIG",
+      "file": "cmd_save_config.bin",
+      "idempotency_key": null,
+      "kind": "command",
+      "name": "cmd_save_config",
+      "req_id": 18,
+      "tag": 70,
+      "wire": [
+        70,
+        18,
+        9,
+        false
       ]
     },
     {
@@ -1649,7 +1682,9 @@
           1,
           4,
           true,
-          true
+          true,
+          0.998,
+          0.2
         ]
       ]
     },
@@ -1948,57 +1983,6 @@
               6.0,
               20.0
             ]
-          ],
-          "standard",
-          [
-            "minimal",
-            "standard",
-            "full",
-            "diagnostics"
-          ]
-        ]
-      ]
-    },
-    {
-      "file": "response_config_info_telemetry_off.bin",
-      "kind": "reply",
-      "msg": "RESPONSE/CONFIG_INFO",
-      "name": "response_config_info_telemetry_off",
-      "wire": [
-        4,
-        127,
-        [
-          19,
-          "/etc/par6/PAR6.toml",
-          "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08",
-          0.004,
-          [
-            0.08,
-            0.6,
-            0.005,
-            0.05,
-            0.002,
-            0.01,
-            0.35,
-            0.05,
-            0.01,
-            2.0,
-            0.15,
-            1000.0,
-            0.0001
-          ],
-          [
-            [
-              -2.15,
-              2.15,
-              3.0,
-              12.0
-            ]
-          ],
-          null,
-          [
-            "minimal",
-            "standard"
           ]
         ]
       ]
@@ -2026,6 +2010,39 @@
             0.0001,
             0.0,
             0.004
+          ]
+        ]
+      ]
+    },
+    {
+      "file": "response_bus_scan.bin",
+      "kind": "reply",
+      "msg": "RESPONSE/BUS_SCAN",
+      "name": "response_bus_scan",
+      "wire": [
+        4,
+        128,
+        [
+          22,
+          [
+            [
+              0,
+              true,
+              true,
+              1,
+              2,
+              7,
+              1234567
+            ],
+            [
+              9,
+              false,
+              true,
+              0,
+              0,
+              0,
+              0
+            ]
           ]
         ]
       ]
@@ -2484,7 +2501,32 @@
           0.03125,
           -0.015625
         ],
-        true
+        true,
+        [
+          [
+            31.0,
+            32.5,
+            33.0,
+            34.5,
+            35.0,
+            36.5,
+            28.0
+          ],
+          [
+            120.0,
+            340.0,
+            275.0,
+            60.0,
+            45.0,
+            30.0,
+            15.0
+          ],
+          23.7
+        ],
+        [
+          0.00451,
+          16
+        ]
       ]
     },
     {
@@ -2782,7 +2824,16 @@
           0.0,
           0.0
         ],
-        false
+        false,
+        [
+          [],
+          [],
+          null
+        ],
+        [
+          0.0,
+          0
+        ]
       ]
     },
     {
@@ -3213,6 +3264,31 @@
           -0.015625
         ],
         true,
+        [
+          [
+            31.0,
+            32.5,
+            33.0,
+            34.5,
+            35.0,
+            36.5,
+            28.0
+          ],
+          [
+            120.0,
+            340.0,
+            275.0,
+            60.0,
+            45.0,
+            30.0,
+            15.0
+          ],
+          23.7
+        ],
+        [
+          0.00451,
+          16
+        ],
         "future-field",
         1.25
       ]
@@ -3656,7 +3732,32 @@
           0.03125,
           -0.015625
         ],
-        true
+        true,
+        [
+          [
+            31.0,
+            32.5,
+            33.0,
+            34.5,
+            35.0,
+            36.5,
+            28.0
+          ],
+          [
+            120.0,
+            340.0,
+            275.0,
+            60.0,
+            45.0,
+            30.0,
+            15.0
+          ],
+          23.7
+        ],
+        [
+          0.00451,
+          16
+        ]
       ]
     },
     {
@@ -3833,407 +3934,6 @@
       "name": "malformed_payload_indefinite_inertia",
       "reason": "payload inertia must be positive semidefinite",
       "target": "command"
-    },
-    {
-      "fields": [
-        "tick",
-        "measured_positions"
-      ],
-      "file": "telemetry_minimal.bin",
-      "kind": "telemetry",
-      "mono_time_ns": 5000000000,
-      "name": "telemetry_minimal",
-      "recipe": "minimal",
-      "seq": 1000,
-      "wire": [
-        "minimal",
-        1000,
-        5000000000,
-        100000,
-        [
-          0.1,
-          0.11,
-          0.12000000000000001,
-          0.13,
-          0.14,
-          0.15000000000000002
-        ]
-      ]
-    },
-    {
-      "fields": [
-        "tick",
-        "measured_positions",
-        "measured_velocities",
-        "measured_torques"
-      ],
-      "file": "telemetry_standard.bin",
-      "kind": "telemetry",
-      "mono_time_ns": 5004000000,
-      "name": "telemetry_standard",
-      "recipe": "standard",
-      "seq": 1001,
-      "wire": [
-        "standard",
-        1001,
-        5004000000,
-        100000,
-        [
-          0.1,
-          0.11,
-          0.12000000000000001,
-          0.13,
-          0.14,
-          0.15000000000000002
-        ],
-        [
-          0.2,
-          0.21000000000000002,
-          0.22,
-          0.23,
-          0.24000000000000002,
-          0.25
-        ],
-        [
-          0.30000000000000004,
-          0.31000000000000005,
-          0.32000000000000006,
-          0.33000000000000007,
-          0.34,
-          0.35000000000000003
-        ]
-      ]
-    },
-    {
-      "fields": [
-        "tick",
-        "measured_positions",
-        "commanded_positions",
-        "commanded_velocities",
-        "commanded_torques",
-        "target_positions",
-        "target_velocities"
-      ],
-      "file": "telemetry_commanded.bin",
-      "kind": "telemetry",
-      "mono_time_ns": 5008000000,
-      "name": "telemetry_commanded",
-      "recipe": "commanded",
-      "seq": 1002,
-      "wire": [
-        "commanded",
-        1002,
-        5008000000,
-        100000,
-        [
-          0.1,
-          0.11,
-          0.12000000000000001,
-          0.13,
-          0.14,
-          0.15000000000000002
-        ],
-        [
-          0.2,
-          0.21000000000000002,
-          0.22,
-          0.23,
-          0.24000000000000002,
-          0.25
-        ],
-        [
-          0.30000000000000004,
-          0.31000000000000005,
-          0.32000000000000006,
-          0.33000000000000007,
-          0.34,
-          0.35000000000000003
-        ],
-        [
-          0.4,
-          0.41000000000000003,
-          0.42000000000000004,
-          0.43000000000000005,
-          0.44,
-          0.45
-        ],
-        [
-          0.5,
-          0.51,
-          0.52,
-          0.53,
-          0.54,
-          0.55
-        ],
-        [
-          0.6000000000000001,
-          0.6100000000000001,
-          0.6200000000000001,
-          0.6300000000000001,
-          0.6400000000000001,
-          0.6500000000000001
-        ]
-      ]
-    },
-    {
-      "fields": [
-        "tick",
-        "measured_positions",
-        "measured_torques",
-        "external_torques",
-        "motor_temperatures_c",
-        "motor_voltages_mv",
-        "motor_currents_ma",
-        "loop_period_ema_s",
-        "loop_p99_s",
-        "loop_overruns",
-        "gripper_fault"
-      ],
-      "file": "telemetry_diagnostics.bin",
-      "kind": "telemetry",
-      "mono_time_ns": 5012000000,
-      "name": "telemetry_diagnostics",
-      "recipe": "diagnostics",
-      "seq": 1003,
-      "wire": [
-        "diagnostics",
-        1003,
-        5012000000,
-        100000,
-        [
-          0.1,
-          0.11,
-          0.12000000000000001,
-          0.13,
-          0.14,
-          0.15000000000000002
-        ],
-        [
-          0.2,
-          0.21000000000000002,
-          0.22,
-          0.23,
-          0.24000000000000002,
-          0.25
-        ],
-        [
-          0.30000000000000004,
-          0.31000000000000005,
-          0.32000000000000006,
-          0.33000000000000007,
-          0.34,
-          0.35000000000000003
-        ],
-        [
-          4.0,
-          14.0,
-          24.0,
-          34.0,
-          44.0,
-          54.0,
-          64.0
-        ],
-        [
-          5.0,
-          15.0,
-          25.0,
-          35.0,
-          45.0,
-          55.0,
-          65.0
-        ],
-        [
-          6.0,
-          16.0,
-          26.0,
-          36.0,
-          46.0,
-          56.0,
-          66.0
-        ],
-        0.0047,
-        0.0048000000000000004,
-        9,
-        10
-      ]
-    },
-    {
-      "fields": [
-        "tick",
-        "measured_positions",
-        "measured_velocities",
-        "measured_torques",
-        "filtered_positions",
-        "filtered_velocities",
-        "filtered_torques",
-        "commanded_positions",
-        "commanded_velocities",
-        "commanded_torques",
-        "target_positions",
-        "target_velocities",
-        "gravity_torques",
-        "external_torques",
-        "motor_temperatures_c",
-        "motor_voltages_mv",
-        "motor_currents_ma",
-        "loop_period_ema_s",
-        "loop_p99_s",
-        "loop_overruns",
-        "gripper_position",
-        "gripper_current_ma",
-        "gripper_object_detection",
-        "gripper_fault"
-      ],
-      "file": "telemetry_full.bin",
-      "kind": "telemetry",
-      "mono_time_ns": 5016000000,
-      "name": "telemetry_full",
-      "recipe": "full",
-      "seq": 1004,
-      "wire": [
-        "full",
-        1004,
-        5016000000,
-        100000,
-        [
-          0.1,
-          0.11,
-          0.12000000000000001,
-          0.13,
-          0.14,
-          0.15000000000000002
-        ],
-        [
-          0.2,
-          0.21000000000000002,
-          0.22,
-          0.23,
-          0.24000000000000002,
-          0.25
-        ],
-        [
-          0.30000000000000004,
-          0.31000000000000005,
-          0.32000000000000006,
-          0.33000000000000007,
-          0.34,
-          0.35000000000000003
-        ],
-        [
-          0.4,
-          0.41000000000000003,
-          0.42000000000000004,
-          0.43000000000000005,
-          0.44,
-          0.45
-        ],
-        [
-          0.5,
-          0.51,
-          0.52,
-          0.53,
-          0.54,
-          0.55
-        ],
-        [
-          0.6000000000000001,
-          0.6100000000000001,
-          0.6200000000000001,
-          0.6300000000000001,
-          0.6400000000000001,
-          0.6500000000000001
-        ],
-        [
-          0.7000000000000001,
-          0.7100000000000001,
-          0.7200000000000001,
-          0.7300000000000001,
-          0.7400000000000001,
-          0.7500000000000001
-        ],
-        [
-          0.8,
-          0.81,
-          0.8200000000000001,
-          0.8300000000000001,
-          0.8400000000000001,
-          0.8500000000000001
-        ],
-        [
-          0.9,
-          0.91,
-          0.92,
-          0.93,
-          0.9400000000000001,
-          0.9500000000000001
-        ],
-        [
-          1.0,
-          1.01,
-          1.02,
-          1.03,
-          1.04,
-          1.05
-        ],
-        [
-          1.1,
-          1.11,
-          1.12,
-          1.1300000000000001,
-          1.1400000000000001,
-          1.1500000000000001
-        ],
-        [
-          1.2000000000000002,
-          1.2100000000000002,
-          1.2200000000000002,
-          1.2300000000000002,
-          1.2400000000000002,
-          1.2500000000000002
-        ],
-        [
-          1.3,
-          1.31,
-          1.32,
-          1.33,
-          1.34,
-          1.35
-        ],
-        [
-          14.0,
-          24.0,
-          34.0,
-          44.0,
-          54.0,
-          64.0,
-          74.0
-        ],
-        [
-          15.0,
-          25.0,
-          35.0,
-          45.0,
-          55.0,
-          65.0,
-          75.0
-        ],
-        [
-          16.0,
-          26.0,
-          36.0,
-          46.0,
-          56.0,
-          66.0,
-          76.0
-        ],
-        0.0057,
-        0.0058000000000000005,
-        19,
-        10.0,
-        10.5,
-        11.0,
-        23
-      ]
     }
   ]
 }

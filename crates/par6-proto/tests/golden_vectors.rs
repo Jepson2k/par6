@@ -8,8 +8,8 @@ use std::time::{Duration, Instant};
 
 use par6_proto::golden::{manifest_string, vectors, Check};
 use par6_proto::{
-    decode_chunk, decode_command, decode_reply, decode_status, decode_telemetry, encode_chunk,
-    encode_command, encode_reply, encode_telemetry, Reassembler, StatusEncoder,
+    decode_chunk, decode_command, decode_reply, decode_status, encode_chunk, encode_command,
+    encode_reply, Reassembler, StatusEncoder,
 };
 
 fn golden_dir() -> PathBuf {
@@ -80,14 +80,6 @@ fn golden_vectors_roundtrip() {
                 let decoded = decode_chunk(&v.bytes)
                     .unwrap_or_else(|e| panic!("{}: decode failed: {e}", v.name));
                 assert_eq!(&decoded, &**chunk, "{}: decode mismatch", v.name);
-            }
-            Check::Telemetry(frame) => {
-                let enc =
-                    encode_telemetry(&frame.recipe, frame.seq, frame.mono_time_ns, &frame.values);
-                assert_eq!(enc, v.bytes, "{}: encode mismatch", v.name);
-                let decoded = decode_telemetry(&v.bytes)
-                    .unwrap_or_else(|e| panic!("{}: decode failed: {e}", v.name));
-                assert_eq!(&decoded, &**frame, "{}: decode mismatch", v.name);
             }
             Check::MalformedCommand => {
                 assert!(

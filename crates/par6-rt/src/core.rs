@@ -28,6 +28,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
@@ -37,11 +38,13 @@ use par6_bus::{
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
 
 use crate::dispatch::{self, CommandMirror, JointSetpoint};
+use crate::drift_lock::DriftLock;
 use crate::errors::ErrorManager;
 use crate::exec::{ExecPlayback, ExecTick};
 use crate::gpio::{Debouncer, DigitalIo, EstopGpio, EstopMonitor};
 use crate::gravity::GravityModel;
 use crate::gripper_gate::GripperGate;
+use crate::gripper_settle::GripperSettle;
 use crate::homing::{HomingSystem, SeqStatus};
 use crate::hooks::{
     CommandSource, FlashMarker, ForwardKin, JogEngine, RtCommand, SettlePolicy, StreamTracker,
@@ -50,7 +53,7 @@ use crate::ring::SampleConsumer;
 use crate::snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 use crate::state::{
     ArmState, ErrorCode, HomingJointStatus, JogStatus, Mode, StateSnapshot, StreamStatus,
-    StreamSubstate,
+    StreamSubstate, TickProfile, TICK_PHASES,
 };
 use crate::timing::{LoopHealth, LoopTiming};
 use crate::MAX_JOINTS;
@@ -72,10 +75,64 @@ const EXEC_HEARTBEAT_TIMEOUT_S: f64 = 0.5;
 /// First-order EMA coefficient for the `*_filtered` measured-state
 /// mirrors (light smoothing for telemetry/external-torque estimation).
 const MEAS_FILTER_ALPHA: f64 = 0.2;
+/// The configured shutdown retreat, resolved to ticks and a limit
+/// fraction at boot. `Copy`, so the exit path allocates nothing.
+#[derive(Debug, Clone, Copy)]
+struct ShutdownPark {
+    enabled: bool,
+    tolerance_rad: f64,
+    timeout_ticks: u32,
+    target: [f64; MAX_JOINTS],
+    /// The fraction of the STREAM velocity limits under which no joint
+    /// exceeds the configured retreat speed: `min_j(v_park / v_j)`,
+    /// capped at 1.
+    speed_fraction: f64,
+    saved_scale: (f64, f64),
+    running: bool,
+}
+
+impl ShutdownPark {
+    fn from_config(robot: &par6_config::RobotConfig) -> Self {
+        let cfg = &robot.shutdown;
+        let mut target = [0.0; MAX_JOINTS];
+        for (t, q) in target.iter_mut().zip(robot.safe_park_q()) {
+            *t = *q;
+        }
+        let speed_fraction = robot
+            .joints
+            .iter()
+            .map(|j| cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
+            .fold(1.0, f64::min);
+        Self {
+            enabled: cfg.safe_park,
+            tolerance_rad: cfg.tolerance_rad,
+            timeout_ticks: robot.ticks(cfg.timeout_s).max(1),
+            target,
+            speed_fraction,
+            saved_scale: (1.0, 1.0),
+            running: false,
+        }
+    }
+}
+
 /// Measured-speed band \[rad/s\] under which every joint counts as at
 /// rest for the shutdown exit path. Above encoder quantization noise,
 /// far below any commanded motion.
 const SHUTDOWN_REST_RAD_S: f64 = 0.02;
+/// One profiler lap: the time since the previous mark into `laps[i]`,
+/// saturated at `u32::MAX` ns (4.3 s — no tick phase is longer).
+#[inline]
+fn lap(mark: &mut Option<Instant>, laps: &mut [u32; TICK_PHASES], i: usize) {
+    if let Some(m) = mark {
+        let now = Instant::now();
+        laps[i] = u32::try_from(now.duration_since(*m).as_nanos()).unwrap_or(u32::MAX);
+        *m = now;
+    }
+}
+
+/// Ticks between a rescan's last ping and its epoch bump: two reply
+/// round trips at the slowest tick rate the config validator allows.
+const SCAN_SETTLE_TICKS: u8 = 4;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
 /// Minimum spacing between two bus-fault log lines from the RT thread
@@ -467,6 +524,7 @@ pub struct RtCore<B: DriverBus> {
     scratch_qd: [f64; MAX_JOINTS],
     scratch_tau: [f64; MAX_JOINTS],
     gripper_gate: GripperGate,
+    gripper_settle: GripperSettle,
     calibrate_pending: bool,
     homing_gcmd: GripperCommand,
 
@@ -498,6 +556,22 @@ pub struct RtCore<B: DriverBus> {
     stream_lp_alpha: f64,
     /// Filter state, in joint space, carried across ticks.
     stream_filt: [f64; MAX_JOINTS],
+
+    // Shutdown retreat.
+    park: ShutdownPark,
+
+    // Freedrive drift lock.
+    drift: DriftLock,
+
+    // Bus rescan (BUS_SCAN): the next id to ping, the settle countdown
+    // after the last ping, and the epoch the snapshot publishes.
+    scan_next: Option<u8>,
+    scan_settle: u8,
+    scan_epoch: u32,
+
+    // Opt-in per-phase tick profiler (see `TickProfile`).
+    profile_on: bool,
+    profile: TickProfile,
 
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
@@ -651,6 +725,13 @@ impl<B: DriverBus> RtCore<B> {
             scratch_qd: [0.0; MAX_JOINTS],
             scratch_tau: [0.0; MAX_JOINTS],
             gripper_gate: GripperGate::default(),
+            gripper_settle: GripperSettle::new(
+                dt,
+                &gripper
+                    .and_then(|g| g.driver.as_ref())
+                    .map(|d| d.settle)
+                    .unwrap_or_default(),
+            ),
             calibrate_pending: false,
             homing_gcmd,
             jog_joints: 0,
@@ -682,6 +763,13 @@ impl<B: DriverBus> RtCore<B> {
             stream_discard: 0.0,
             stream_lp_alpha: lowpass_alpha(robot.stream.lowpass_cutoff_hz, dt),
             stream_filt: [0.0; MAX_JOINTS],
+            park: ShutdownPark::from_config(robot),
+            drift: DriftLock::from_config(robot),
+            scan_next: None,
+            scan_settle: 0,
+            scan_epoch: 0,
+            profile_on: false,
+            profile: TickProfile::default(),
             writer,
             snap: StateSnapshot::default(),
         };
@@ -848,6 +936,97 @@ impl<B: DriverBus> RtCore<B> {
         let _ = self.request_mode(Mode::Idle);
     }
 
+    /// Ticks the shutdown retreat may run before its timeout.
+    pub fn shutdown_park_timeout_ticks(&self) -> u32 {
+        self.park.timeout_ticks
+    }
+
+    /// Shutdown phase 0: start the configured retreat to the rest pose.
+    /// Returns whether a retreat is running; `false` means the exit goes
+    /// straight to the halt.
+    ///
+    /// Only a homed, enabled, error-free arm retreats — the retreat is a
+    /// motion to an absolute pose, so it needs exactly the reference and
+    /// the enable a planned move needs, and an arm in ACTIVE_ERROR must
+    /// not be driven anywhere. The order is the reBot exit: the jaws are
+    /// held first (a stop, not a release — a grasped part stays grasped,
+    /// and a stop on a calibrated gripper re-targets the reported jaw
+    /// byte so the firmware holds where it is), then the arm goes under
+    /// position control with G(q) feed-forward through STREAM, with the
+    /// velocity ceilings scaled so no joint exceeds the configured
+    /// retreat speed; acceleration and jerk keep their STREAM ceilings,
+    /// which is what makes a slow retreat smooth rather than sluggish.
+    /// The scale is restored by [`RtCore::shutdown_park_end`] whatever
+    /// happens.
+    pub fn shutdown_park_begin(&mut self) -> bool {
+        if !self.park.enabled || self.mode == Mode::Flashing {
+            return false;
+        }
+        if !self.homed || self.state != ArmState::Enabled || self.errors.any_hard() {
+            log::info!(
+                "shutdown: no retreat (homed={}, state={:?}, hard errors={})",
+                self.homed,
+                self.state,
+                self.errors.any_hard()
+            );
+            return false;
+        }
+        if self.has_can_gripper {
+            self.apply_command(RtCommand::GripperStop);
+        }
+        if let Err(refusal) = self.request_mode(Mode::Stream) {
+            log::warn!("shutdown: retreat refused ({refusal:?}); halting in place");
+            return false;
+        }
+        self.park.saved_scale = self.stream_scale;
+        let f = self.park.speed_fraction;
+        self.stream.set_scale(f, 1.0);
+        self.stream_scale = (f, 1.0);
+        log::info!(
+            "shutdown: retreating to the rest pose at {:.3} of the STREAM limits",
+            f
+        );
+        self.park.running = true;
+        true
+    }
+
+    /// One retreat step, called before each tick while the retreat runs:
+    /// re-targets the rest pose and feeds the stream watchdog. Returns
+    /// `true` once every joint measures within tolerance of the pose,
+    /// or when the retreat can no longer run (a hard error dropped the
+    /// mode) — the caller then proceeds to the halt.
+    pub fn shutdown_park_feed(&mut self) -> bool {
+        if !self.park.running || self.mode != Mode::Stream {
+            return true;
+        }
+        let farthest = self
+            .q
+            .iter()
+            .zip(&self.park.target)
+            .map(|(q, t)| (q - t).abs())
+            .fold(0.0, f64::max);
+        if farthest < self.park.tolerance_rad {
+            log::info!("shutdown: rest pose reached (farthest joint {farthest:.4} rad)");
+            return true;
+        }
+        self.q_target = self.park.target;
+        self.stream.set_target(&self.park.target);
+        self.stream_last_rx_tick = self.tick;
+        false
+    }
+
+    /// End the retreat: restore the stream scale the retreat overrode.
+    /// Runs on every exit from the retreat, reached or not.
+    pub fn shutdown_park_end(&mut self) {
+        if !self.park.running {
+            return;
+        }
+        self.park.running = false;
+        let (v, a) = self.park.saved_scale;
+        self.stream.set_scale(v, a);
+        self.stream_scale = (v, a);
+    }
+
     /// Whether every joint's measured speed is inside the shutdown rest
     /// band — the condition the exit path waits on before idling the
     /// drives.
@@ -874,18 +1053,29 @@ impl<B: DriverBus> RtCore<B> {
     pub fn tick(&mut self, period_s: f64, overrun: bool) {
         self.tick += 1;
         self.bus.begin_tick(self.tick);
+        // The profiler's clock reads are the only cost of the opt-in: one
+        // vDSO `clock_gettime` per phase, none at all while it is off.
+        let mut laps = [0u32; TICK_PHASES];
+        let mut mark = if self.profile_on {
+            Some(Instant::now())
+        } else {
+            None
+        };
 
         // Phase 2: GPIO read + debounce — the e-stop (reaction in phase
         // 7) and the box's own inputs, which mean nothing to the runtime
         // and are published verbatim.
         self.hw_estop = self.estop.pressed();
         self.read_io_inputs();
+        lap(&mut mark, &mut laps, 0);
 
         // Phase 3: loop-period statistics and degradation bands.
         let health = self.timing.record(period_s, overrun);
+        lap(&mut mark, &mut laps, 1);
 
         // Phase 4: boot one-shots.
         self.boot_oneshots();
+        lap(&mut mark, &mut laps, 2);
 
         // Phase 5: at most one external command.
         if let Some(cmd) = self.commands.poll() {
@@ -896,9 +1086,11 @@ impl<B: DriverBus> RtCore<B> {
         // in the same tick, so a client that writes and then reads the
         // next STATUS sees what it asked for.
         self.drive_io_outputs();
+        lap(&mut mark, &mut laps, 3);
 
         // Phase 6: RX drain → state pipeline (measure-then-command).
         self.drain_and_derive();
+        lap(&mut mark, &mut laps, 4);
 
         // Gravity: computed every tick, published always.
         self.gravity.gravity(&self.q, &mut self.g);
@@ -909,18 +1101,51 @@ impl<B: DriverBus> RtCore<B> {
         for i in 0..MAX_JOINTS {
             self.tau_ext[i] = self.tau_filt[i] - self.g[i];
         }
+        lap(&mut mark, &mut laps, 5);
 
         // Phase 7: error checks and reactions.
         self.check_errors(health);
+        lap(&mut mark, &mut laps, 6);
 
         // Phase 8: mode dispatch → TX → poll slot.
         self.dispatch_and_send();
+        lap(&mut mark, &mut laps, 7);
 
         // Phase 9: clear-sequence settle countdown.
         self.errors.tick();
+        lap(&mut mark, &mut laps, 8);
+
+        // Phases 2-9 are folded in before the publish so the snapshot
+        // that leaves this tick carries this tick's trace; the publish
+        // lap itself lands in the NEXT snapshot, one tick late by
+        // construction.
+        if self.profile_on {
+            for (m, l) in self.profile.phase_max_ns.iter_mut().zip(laps) {
+                *m = (*m).max(l);
+            }
+            if overrun {
+                self.profile.overrun_ns = laps;
+                self.profile.overruns_traced = self.profile.overruns_traced.wrapping_add(1);
+            }
+        }
 
         // Phase 10: snapshot publish.
         self.publish();
+        lap(&mut mark, &mut laps, 9);
+        if self.profile_on {
+            let last = TICK_PHASES - 1;
+            self.profile.phase_max_ns[last] = self.profile.phase_max_ns[last].max(laps[last]);
+            if overrun {
+                self.profile.overrun_ns[last] = laps[last];
+            }
+        }
+    }
+
+    /// Switch the per-phase tick profiler on or off; switching it on
+    /// starts from a clean profile.
+    pub fn set_tick_profile(&mut self, on: bool) {
+        self.profile_on = on;
+        self.profile = TickProfile::default();
     }
 
     // ------------------------------------------------------------ boot
@@ -1102,13 +1327,16 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::Gripper(fw) => {
                 if self.has_can_gripper {
+                    let at = self.bus_state.gripper.reply.map_or(0, |r| r.position);
                     self.gripper_gate.set(fw);
+                    self.gripper_settle.arm_move(self.tick, fw.position, at);
                 }
             }
             RtCommand::GripperCalibrate => {
                 if self.has_can_gripper {
                     self.gripper_gate.reset_to_poll();
                     self.calibrate_pending = true;
+                    self.gripper_settle.arm_calibrate(self.tick);
                 }
             }
             RtCommand::GripperStop => {
@@ -1119,13 +1347,47 @@ impl<B: DriverBus> RtCore<B> {
             RtCommand::GripperIdle => {
                 if self.has_can_gripper {
                     self.gripper_gate.idle();
+                    self.gripper_settle.arm_idle(self.tick);
                 }
             }
-            RtCommand::SetGravityComp(on) => self.gravity_comp = on,
+            RtCommand::SetGravityComp(on) => {
+                self.gravity_comp = on;
+                // After a program finishes EXEC keeps holding the last
+                // sample under the position loop, so a compensation
+                // request would otherwise change nothing the arm can
+                // feel: the client asked to float and the arm stays
+                // rigid. Hand back to IDLE, whose law is the float. A
+                // program still playing keeps EXEC — its law adds G(q)
+                // on top of the plan.
+                if on && self.mode == Mode::Exec && self.exec.is_holding_after_completion() {
+                    if let Err(e) = self.request_mode(Mode::Idle) {
+                        log::warn!("gravity comp: EXEC hold → IDLE refused: {e:?}");
+                    }
+                }
+            }
             RtCommand::SetPayload { mass, com, inertia } => {
                 self.gravity.set_payload(mass, com, inertia);
             }
             RtCommand::WriteIo { port, value } => self.set_io_output(port, value),
+            RtCommand::SetCanId { node, new_id } => match self.bus.set_can_id(node, new_id) {
+                Ok(()) => log::warn!(
+                    "node {node} told to answer as {new_id}: the running config still \
+                     addresses {node} — update the config and restart the daemon"
+                ),
+                Err(e) => log::error!("set_can_id on node {node} refused: {e}"),
+            },
+            RtCommand::SaveConfig { node } => match self.bus.save_config(node) {
+                Ok(()) => log::info!("node {node} asked to save its configuration"),
+                Err(e) => log::error!("save_config on node {node} refused: {e}"),
+            },
+            RtCommand::RescanBus => {
+                if self.bus.is_silent() {
+                    log::warn!("bus rescan skipped: the bus is silent (FLASHING)");
+                } else {
+                    self.scan_next = Some(0);
+                    self.scan_settle = 0;
+                }
+            }
             RtCommand::RetuneNode { node, tune } => {
                 match self.bus.retune_node(node, &tune, self.boot.config_repeats) {
                     Ok(()) => {
@@ -1305,6 +1567,7 @@ impl<B: DriverBus> RtCore<B> {
                 self.homed = false;
                 if self.has_can_gripper {
                     self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                    self.gripper_settle.disarm();
                 }
             }
             Mode::Flashing => {
@@ -1326,6 +1589,7 @@ impl<B: DriverBus> RtCore<B> {
                     // whatever its NVM state says; the announcement runs
                     // on the first non-silent ticks after exit.
                     self.gripper_gate.force_idle(None);
+                    self.gripper_settle.disarm();
                 }
             }
             Mode::Stream => {
@@ -1444,12 +1708,25 @@ impl<B: DriverBus> RtCore<B> {
     /// jaws), and no standing command means no speed/current budget to
     /// hold with. Both degrade to a release; any calibrated byte, 0 and
     /// 255 included, is a legitimate hold target.
+    /// Halt the jaws where they are, re-targeting the freshest jaw byte.
+    ///
+    /// The byte is read RT-side: routing a snapshot byte back through the
+    /// command plane would race the reply stream and stop at a stale
+    /// position. An uncalibrated gripper reports 0, which the firmware maps
+    /// to fully open, so a naive stop would fling the jaws open; and with
+    /// no standing command there is no speed/current budget to hold with.
+    /// Both degrade to a release, which really does let go, so the action
+    /// bit drops and the echo answers it.
     fn gripper_halt_in_place(&mut self) {
         match self.bus_state.gripper.reply {
             Some(r) if r.calibrated && self.gripper_gate.has_standing() => {
                 self.gripper_gate.stop_at(r.position);
+                self.gripper_settle.arm_hold(self.tick);
             }
-            _ => self.gripper_gate.idle(),
+            _ => {
+                self.gripper_gate.idle();
+                self.gripper_settle.arm_idle(self.tick);
+            }
         }
     }
 
@@ -1719,11 +1996,40 @@ impl<B: DriverBus> RtCore<B> {
 
     // ------------------------------------------------------------ dispatch
 
+    /// One node id per tick takes the poll slot with an RTR ping while a
+    /// rescan runs; the epoch bumps a few ticks after the last ping so
+    /// the answers are in the presence mask before a reader trusts it.
+    fn step_scan(&mut self) {
+        if let Some(n) = self.scan_next {
+            self.bus.queue_poll_override(
+                PollAction::Poll {
+                    node: n,
+                    kind: par6_bus::PollKind::Ping,
+                },
+                1,
+            );
+            self.scan_next = if usize::from(n) + 1 < par6_bus::MAX_NODES {
+                Some(n + 1)
+            } else {
+                self.scan_settle = SCAN_SETTLE_TICKS;
+                None
+            };
+        } else if self.scan_settle > 0 {
+            self.scan_settle -= 1;
+            if self.scan_settle == 0 {
+                self.scan_epoch = self.scan_epoch.wrapping_add(1);
+            }
+        }
+    }
+
     fn gravity_applied(&self) -> bool {
         self.homed && self.state == ArmState::Enabled && self.gravity_comp
     }
 
     fn dispatch_and_send(&mut self) {
+        if self.mode != Mode::Idle {
+            self.drift.reset();
+        }
         if self.mode == Mode::Flashing {
             // Bus-silent: not a single frame, polls included.
             self.mirror = CommandMirror::default();
@@ -1745,6 +2051,7 @@ impl<B: DriverBus> RtCore<B> {
             self.torque_slew.reset();
             self.send_joints();
             self.send_gripper(self.homing_gcmd);
+            self.step_scan();
             let _ = self.bus.poll_step();
             match status {
                 SeqStatus::Complete => {
@@ -1776,6 +2083,7 @@ impl<B: DriverBus> RtCore<B> {
                         // grip the normal path never commanded — and the
                         // watchdog polls would keep it held forever.
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                        self.gripper_settle.disarm();
                     }
                     self.enter_mode(Mode::Idle);
                 }
@@ -1784,6 +2092,7 @@ impl<B: DriverBus> RtCore<B> {
                     self.homed = false;
                     if self.has_can_gripper {
                         self.gripper_gate.force_idle(self.homing.last_fw_cmd());
+                        self.gripper_settle.disarm();
                     }
                     self.enter_mode(Mode::Idle);
                 }
@@ -1796,7 +2105,22 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Booting => dispatch::law_booting(&mut self.setpoints),
             Mode::Idle => {
                 let hold = self.gravity_applied();
-                dispatch::law_idle(hold, &self.g, &mut self.setpoints);
+                if hold && self.drift.enabled() {
+                    if self.drift.tick(&self.q, &self.qd) {
+                        let lock = self.drift.status();
+                        dispatch::law_freedrive(
+                            &lock.hold_rad,
+                            &self.g,
+                            &lock.integral_nm,
+                            &mut self.setpoints,
+                        );
+                    } else {
+                        dispatch::law_idle(true, &self.g, &mut self.setpoints);
+                    }
+                } else {
+                    self.drift.reset();
+                    dispatch::law_idle(hold, &self.g, &mut self.setpoints);
+                }
             }
             Mode::ActiveError => dispatch::law_active_error(&mut self.setpoints),
             Mode::SafetyStop => dispatch::law_safety_stop(&mut self.setpoints),
@@ -1921,7 +2245,15 @@ impl<B: DriverBus> RtCore<B> {
             let calibrated = self.bus_state.gripper.reply.is_some_and(|r| r.calibrated);
             self.gripper_gate.tick(calibrated)
         };
+        if self.has_can_gripper {
+            self.gripper_settle.tick(
+                self.tick,
+                self.bus_state.gripper.reply,
+                self.bus_state.gripper.live_error_bit,
+            );
+        }
         self.send_gripper(gcmd);
+        self.step_scan();
         let _ = self.bus.poll_step();
     }
 
@@ -2016,6 +2348,10 @@ impl<B: DriverBus> RtCore<B> {
         s.qd_commanded = self.mirror.qd;
         s.tau_commanded = self.mirror.tau;
         s.gravity_comp = gravity_applied;
+        s.drift_lock = *self.drift.status();
+        s.bus_nodes = self.bus.connected_nodes();
+        s.bus_scan_epoch = self.scan_epoch;
+        s.tick_profile = self.profile;
         s.q_target = self.q_target;
         s.qd_target = self.qd_target;
         self.fk.tcp(&self.q, &mut s.tcp);
@@ -2024,9 +2360,12 @@ impl<B: DriverBus> RtCore<B> {
         s.gravity_torque_nm = self.g;
         for i in 0..MAX_JOINTS {
             s.nodes[i] = self.bus_state.nodes[usize::from(self.node_of[i])];
+            s.node_freshness[i] = self.bus.freshness(self.node_of[i]);
         }
         s.nodes[MAX_JOINTS] = self.bus_state.nodes[usize::from(self.gripper_node)];
+        s.node_freshness[MAX_JOINTS] = self.bus.freshness(self.gripper_node);
         s.gripper = self.bus_state.gripper;
+        s.tool = self.gripper_settle.status();
         s.homing = self.homing.status();
         s.errors = *self.errors.list();
         s.error_active = self.errors.any_hard();

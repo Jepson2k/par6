@@ -192,6 +192,19 @@ impl ExecPlayback {
         self.consumer.samples_remaining()
     }
 
+    /// Nothing left to play: the ring is drained, every boundary has
+    /// resolved and no settle is pending — the engine is emitting a
+    /// hold at the last sample, which is a position hold and nothing
+    /// more. Paused or faulted playback is NOT idle: both still own the
+    /// program.
+    pub fn is_holding_after_completion(&self) -> bool {
+        !self.paused
+            && !self.faulted
+            && !self.settling
+            && self.owe_boundary.is_none()
+            && self.consumer.samples_remaining() == 0
+    }
+
     /// Live state for the snapshot.
     pub fn status(&self) -> ExecStatus {
         ExecStatus {

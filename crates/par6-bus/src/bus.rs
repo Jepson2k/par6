@@ -113,6 +113,16 @@ pub trait DriverBus {
     /// carries the new tune too. Unknown nodes are refused.
     fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError>;
 
+    /// Commissioning: rename `node` to `new_id` (cmd 11), one frame. The
+    /// stored configuration keeps its key — the runtime goes on
+    /// addressing the id the config names until it is restarted on an
+    /// updated config, so a renamed configured node reads as lost.
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError>;
+
+    /// Commissioning: ask `node` to persist its running configuration to
+    /// NVM (cmd 13), one frame.
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError>;
+
     /// Send a Limits frame (cmd 20: velocity limit ticks/s + current
     /// limit mA), `repeats` times. Homing uses this to drop a node to its
     /// homing current on FSM start and restore the normal Ilim on

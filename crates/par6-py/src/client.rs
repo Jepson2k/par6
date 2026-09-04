@@ -304,6 +304,32 @@ impl CoreClient {
         query_future(py, async move { client.payload().await })
     }
 
+    fn bus_scan<'py>(&self, py: Python<'py>) -> Awaitable<'py> {
+        let client = self.rt();
+        query_future(py, async move { client.bus_scan().await })
+    }
+
+    #[pyo3(signature = (node, new_id, force=false))]
+    fn set_can_id<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        new_id: u8,
+        force: bool,
+    ) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(
+            py,
+            async move { client.set_can_id(node, new_id, force).await },
+        )
+    }
+
+    #[pyo3(signature = (node, force=false))]
+    fn save_config<'py>(&self, py: Python<'py>, node: u8, force: bool) -> Awaitable<'py> {
+        let client = self.rt();
+        ack_future(py, async move { client.save_config(node, force).await })
+    }
+
     #[pyo3(signature = (mass, com, inertia=None))]
     fn set_payload<'py>(
         &self,
@@ -476,7 +502,7 @@ impl CoreClient {
 
     fn set_tcp_offset<'py>(&self, py: Python<'py>, x: f64, y: f64, z: f64) -> Awaitable<'py> {
         let client = self.rt();
-        ack_future(py, async move { client.set_tcp_offset(x, y, z).await })
+        index_future(py, async move { client.set_tcp_offset(x, y, z).await })
     }
 
     fn set_shapes<'py>(
@@ -501,11 +527,6 @@ impl CoreClient {
             py,
             async move { client.set_completion_policy(policy).await },
         )
-    }
-
-    fn set_recipe<'py>(&self, py: Python<'py>, name: String) -> Awaitable<'py> {
-        let client = self.rt();
-        ack_future(py, async move { client.set_recipe(&name).await })
     }
 
     // --------------------------------------------------------- queued

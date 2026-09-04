@@ -21,6 +21,7 @@ import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Callable
 
 import pytest
 
@@ -103,7 +104,9 @@ def free_udp_port() -> int:
 
 
 def sim_config(
-    dest: Path, active_gripper: str | None = None, initial_recipe: str | None = None
+    dest: Path,
+    active_gripper: str | None = None,
+    config_patch: Callable[[str], str] | None = None,
 ) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
@@ -124,14 +127,6 @@ def sim_config(
         raise RuntimeError(
             "PAR6.toml patch points (tick_dt_s / status_rate_hz) missing"
         )
-    if initial_recipe is not None:
-        swapped = patched.replace(
-            "telemetry_rate_hz = 100",
-            f'telemetry_rate_hz = 100\ninitial_recipe = "{initial_recipe}"',
-        )
-        if swapped == patched:
-            raise RuntimeError("PAR6.toml patch point (telemetry_rate_hz) missing")
-        patched = swapped
     if active_gripper is not None:
         fitted = _cfg.load_robot_config()["robot"]["active_gripper"]
         swapped = patched.replace(
@@ -140,6 +135,8 @@ def sim_config(
         if swapped == patched and active_gripper != fitted:
             raise RuntimeError("PAR6.toml patch point (active_gripper) missing")
         patched = swapped
+    if config_patch is not None:
+        patched = config_patch(patched)
     out = dest / "PAR6.toml"
     out.write_text(patched)
     for gripper in sorted((src / "grippers").glob("*.toml")):
@@ -154,7 +151,6 @@ class LiveDaemon:
     process: subprocess.Popen
     command_port: int
     status_port: int
-    telemetry_port: int
     config: Path
     log_path: Path
     status_transport: str = "unicast"
@@ -165,14 +161,14 @@ class LiveDaemon:
         workdir: Path,
         active_gripper: str | None = None,
         status_transport: str = "unicast",
-        initial_recipe: str | None = None,
+        sim_dynamics: bool = False,
+        config_patch: Callable[[str], str] | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
-        config = sim_config(workdir / "config", active_gripper, initial_recipe)
+        config = sim_config(workdir / "config", active_gripper, config_patch)
         status_port = free_udp_port()
-        telemetry_port = free_udp_port()
         log_path = workdir / "par6d.log"
         log = log_path.open("w")
         process = subprocess.Popen(
@@ -191,8 +187,7 @@ class LiveDaemon:
                 "127.0.0.1",
                 "--status-port",
                 str(status_port),
-                "--telemetry-port",
-                str(telemetry_port),
+                *(["--sim-dynamics"] if sim_dynamics else []),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
@@ -211,7 +206,6 @@ class LiveDaemon:
             process=process,
             command_port=command_port,
             status_port=status_port,
-            telemetry_port=telemetry_port,
             config=config,
             log_path=log_path,
             status_transport=status_transport,

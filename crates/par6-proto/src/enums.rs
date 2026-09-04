@@ -36,7 +36,8 @@ wire_enum! {
         /// Bus scan and selfcheck; requests IDLE when it passes.
         Booting = 0,
         /// At rest. With gravity comp on and the arm homed and enabled this
-        /// is a torque-only hold with no position term — i.e. freedrive.
+        /// is a torque-only hold with no position term — i.e. freedrive (a
+        /// configured drift lock re-holds the pose once the arm is still).
         Idle = 1,
         /// Hard-error latch: active zero-velocity hold, drives DISABLED.
         ActiveError = 2,
@@ -62,9 +63,10 @@ wire_enum! {
 wire_enum! {
     /// Command tags (slot 0 of every client→server payload).
     ///
-    /// Values are grouped by ack class — SYSTEM 10+, QUERY 30+,
-    /// FIRE_AND_FORGET 60+, QUEUED 80+ — but the authoritative mapping is
-    /// [`command_class`], which both sides consult.
+    /// Values are grouped by ack class — SYSTEM 10–29 (and 70–79 once
+    /// that band filled), QUERY 30–59, FIRE_AND_FORGET 60–69, QUEUED 80+
+    /// — but the authoritative mapping is [`command_class`], which both
+    /// sides consult.
     CmdType: u16 {
         // -- SYSTEM: always acked OK/ERROR --
         /// Clear a latched protective stop, re-enabling motion.
@@ -83,17 +85,18 @@ wire_enum! {
         ResetState = 16,
         /// (Re)connect the hardware bus.
         ConnectHardware = 17,
-        /// Offset the effective TCP in the tool-local frame (mm).
+        /// Offset the effective TCP in the tool-local frame (mm). Queued: the
+        /// offset applies at its turn in the queue, so moves admitted before it
+        /// keep the old frame and moves after it plan against the new one.
         SetTcpOffset = 18,
         /// Replace the workspace collision-world shapes (bulk; may be chunked).
         SetShapes = 19,
         /// Select the controller-side completion policy.
         SetCompletionPolicy = 20,
-        /// Select the telemetry recipe. Unknown names are refused.
-        SetRecipe = 21,
-        // 22 is reserved (the retired digital safety stop): limp mode is
-        // the physical e-stop's job, and a digital path must not be relied
-        // on in that emergency.
+        // 21 was SetRecipe: removed with the telemetry stream — the
+        // numbers it carried are on STATUS or in the LOOP_STATS query.
+        // 22 was SafetyStop: removed — limp mode is the physical e-stop's
+        // job; a digital path must not be relied on in that emergency.
         /// Enable or disable the gravity-compensation feedforward. G(q) is
         /// computed and published in every mode regardless; this controls
         /// only whether it is APPLIED, which is correct on hardware and on
@@ -117,6 +120,18 @@ wire_enum! {
         /// Push per-node drive tuning (cascade-PID gains + limits) live,
         /// through the same stored-config path a boot pass uses.
         SetPidGains = 28,
+        /// Commissioning: rename a drive on the bus (cmd 11 to `node`,
+        /// carrying `new_id`). Accepted only on an idle or latched arm
+        /// with nothing in flight; without `force` the target must be a
+        /// configured node, with it any id (a fresh drive at its default).
+        /// The runtime keeps addressing the id the config names, so a
+        /// renamed configured node reads as lost until the config is
+        /// updated and the daemon restarted.
+        SetCanId = 29,
+        /// Commissioning: ask a drive to persist its running configuration
+        /// to NVM (cmd 13). Same gate and `force` rule as SET_CAN_ID.
+        /// Tagged in the 70s because 10–29 is full.
+        SaveConfig = 70,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -164,6 +179,11 @@ wire_enum! {
         /// the daemon serves its own config, parol6-style, so clients
         /// preview with exactly the numbers the arm enforces.
         ConfigBundle = 50,
+        /// Rescan the bus — an RTR ping to every node id, one per tick —
+        /// and report each id: configured, answering, freshness, and the
+        /// device identity of configured nodes. The RESPONSE waits for
+        /// the scan to settle (a few dozen ticks).
+        BusScan = 51,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -194,7 +214,12 @@ wire_enum! {
         MoveC = 84,
         /// Cubic spline through waypoints (bulk; may be chunked).
         MoveS = 85,
-        /// Process move: constant TCP speed, auto-blended corners (bulk).
+        /// Process move: auto-blended corners, timed so the TCP holds a
+        /// constant speed along the path rather than running as fast as
+        /// the joints allow (bulk). `speed` is a fraction of the fastest
+        /// constant speed those joints permit on this path — the whole
+        /// path pays its steepest stretch, which is what makes the rate
+        /// constant.
         MoveP = 86,
         /// Select the active end-of-arm tool.
         SelectTool = 87,
@@ -252,6 +277,8 @@ wire_enum! {
         Payload = 20,
         /// See [`CmdType::ConfigBundle`].
         ConfigBundle = 21,
+        /// See [`CmdType::BusScan`].
+        BusScan = 22,
     }
 }
 
@@ -404,14 +431,14 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SelectProfile
         | C::ResetState
         | C::ConnectHardware
-        | C::SetTcpOffset
         | C::SetShapes
         | C::SetCompletionPolicy
-        | C::SetRecipe
         | C::SetPayload
         | C::EnterFlashing
         | C::ExitFlashing
-        | C::SetPidGains => CommandClass::System,
+        | C::SetPidGains
+        | C::SetCanId
+        | C::SaveConfig => CommandClass::System,
 
         C::Ping
         | C::Status
@@ -433,7 +460,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Shapes
         | C::ConfigInfo
         | C::Payload
-        | C::ConfigBundle => CommandClass::Query,
+        | C::ConfigBundle
+        | C::BusScan => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose
@@ -453,6 +481,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SelectTool
         | C::Delay
         | C::Checkpoint
-        | C::ToolAction => CommandClass::Queued,
+        | C::ToolAction
+        | C::SetTcpOffset => CommandClass::Queued,
     }
 }

@@ -20,16 +20,16 @@ use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetRecipe, SetShapes, SetTcpOffset,
+    JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetPayload, SetShapes, SetTcpOffset,
     Shape, Stop, Teleport,
 };
-use par6_proto::{Command, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
+use par6_proto::{Command, ControllerMode, ErrorCode, Frame, QueryResult, Status, NUM_JOINTS};
 
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{is_timeout, repo_root, shipped_config, Client, Rig, BUDGET, READ_TIMEOUT};
+use common::{repo_root, shipped_config, Client, Rig, BUDGET};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
@@ -66,6 +66,28 @@ fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
 }
 
 // ---- in-process rig --------------------------------------------------------
+
+/// The 50 Hz config with the `[freedrive]` drift lock switched on. The
+/// torque plant has no stiction, so a model bias that a real gearbox
+/// would turn into a slow creep moves the arm at a rate a hand push
+/// would; the release speed is raised past that, so the lock arms on the
+/// drifting arm after its settle window instead of reading the drift as
+/// an operator push.
+fn drift_lock_config(tag: &str) -> PathBuf {
+    let dst = test_config(tag);
+    let text = std::fs::read_to_string(&dst).expect("read test config");
+    let mut patched = text.clone();
+    for (from, to) in [
+        ("drift_lock = false", "drift_lock = true"),
+        ("release_rad_s = 0.08", "release_rad_s = 1.0"),
+        ("settle_s = 0.3", "settle_s = 0.2"),
+    ] {
+        assert!(patched.contains(from), "patch point {from:?} must exist");
+        patched = patched.replace(from, to);
+    }
+    std::fs::write(&dst, patched).expect("write drift-lock config");
+    dst
+}
 
 fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS]) {
     let deadline = Instant::now() + BUDGET;
@@ -545,6 +567,63 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
     rig.shutdown();
 }
 
+/// The `[freedrive]` drift lock against a biased gravity model on the
+/// torque plant. A runtime payload the plant does not carry IS that
+/// bias — the controller lifts a mass that is not there — and an IDLE
+/// arm under it rises for as long as nothing stops it. With the lock
+/// configured the same bias is caught inside the settle window and held
+/// by the drive's impedance frame plus the clamped integral.
+#[test]
+fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
+    const WINDOW: Duration = Duration::from_secs(2);
+    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
+    let payload = SetPayload {
+        mass: 0.2,
+        com: [0.0, 0.0, 0.02],
+        inertia: None,
+    };
+
+    let drift_deg = |config: PathBuf| -> [f64; NUM_JOINTS] {
+        let rig = Rig::boot_with(config, true);
+        let mut c = Client::new(rig.addr());
+        rig.wait_status("link_ok", |s| s.link_ok == 1);
+        c.ok(&Command::Reset);
+        enable_and_teleport(&rig, &mut c, HOLD_POSE_DEG);
+        // Held by the true model first, so the bias is the only change.
+        let start = rig
+            .collect_status(Duration::from_secs(1))
+            .last()
+            .expect("status while settling")
+            .angles;
+        c.ok(&Command::SetPayload(payload.clone()));
+        let watch = rig.collect_status(WINDOW);
+        let end = watch.last().expect("status during the drift window");
+        assert!(
+            end.mode == ControllerMode::Idle && end.enabled && end.gravity_comp,
+            "the arm must be in freedrive throughout: {end:?}"
+        );
+        assert!(end.error.is_none(), "unexpected error: {:?}", end.error);
+        let drift: [f64; NUM_JOINTS] = std::array::from_fn(|j| (end.angles[j] - start[j]).abs());
+        rig.shutdown();
+        drift
+    };
+    let worst = |d: &[f64; NUM_JOINTS]| LOADED.iter().map(|&j| d[j]).fold(0.0f64, f64::max);
+
+    let free_per_joint = drift_deg(test_config("drift-free"));
+    let locked_per_joint = drift_deg(drift_lock_config("drift-locked"));
+    let (free, locked) = (worst(&free_per_joint), worst(&locked_per_joint));
+    assert!(
+        free > 5.0,
+        "the biased model must visibly move an unlocked arm in {WINDOW:?}; \
+         drifted {free:.2}° ({free_per_joint:.2?})"
+    );
+    assert!(
+        locked < 2.0 && locked < free / 3.0,
+        "the lock must bound the drift: locked {locked:.2}° vs free {free:.2}° \
+         (per joint: locked {locked_per_joint:.2?}, free {free_per_joint:.2?})"
+    );
+}
+
 #[test]
 fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
     // The planner's torque feedforward (M·q̈ + C·q̇ per sample, G(q) added
@@ -598,99 +677,18 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
 
 // ---- gravity reads the gripper config --------------------------------------
 
-/// Just enough msgpack to read a telemetry packet: arrays, strings,
-/// unsigned ints and floats — the only markers `rmp_serde` emits for the
-/// `[recipe, seq, mono_ns, ...values]` shape. Written out here rather
-/// than pulling in a decoder dependency; unknown markers panic, which in
-/// a test is the right failure.
-mod mp {
-    pub enum Val {
-        Str(String),
-        U64(u64),
-        F64(f64),
-        Arr(Vec<Val>),
-    }
-
-    pub fn read(b: &[u8], i: &mut usize) -> Val {
-        let m = b[*i];
-        *i += 1;
-        match m {
-            0x00..=0x7f => Val::U64(u64::from(m)),
-            0xa0..=0xbf => read_str(b, i, usize::from(m & 0x1f)),
-            0xd9 => {
-                let n = usize::from(b[*i]);
-                *i += 1;
-                read_str(b, i, n)
-            }
-            0xcc => {
-                let v = u64::from(b[*i]);
-                *i += 1;
-                Val::U64(v)
-            }
-            0xcd => Val::U64(u64::from(u16::from_be_bytes(take(b, i)))),
-            0xce => Val::U64(u64::from(u32::from_be_bytes(take(b, i)))),
-            0xcf => Val::U64(u64::from_be_bytes(take(b, i))),
-            0xca => Val::F64(f64::from(f32::from_be_bytes(take(b, i)))),
-            0xcb => Val::F64(f64::from_be_bytes(take(b, i))),
-            0x90..=0x9f => read_arr(b, i, usize::from(m & 0x0f)),
-            0xdc => {
-                let n = usize::from(u16::from_be_bytes(take(b, i)));
-                read_arr(b, i, n)
-            }
-            other => panic!("unexpected msgpack marker {other:#04x} at byte {}", *i - 1),
-        }
-    }
-
-    fn take<const N: usize>(b: &[u8], i: &mut usize) -> [u8; N] {
-        let out: [u8; N] = b[*i..*i + N].try_into().unwrap();
-        *i += N;
-        out
-    }
-
-    fn read_str(b: &[u8], i: &mut usize, n: usize) -> Val {
-        let s = String::from_utf8(b[*i..*i + n].to_vec()).expect("utf8 msgpack str");
-        *i += n;
-        Val::Str(s)
-    }
-
-    fn read_arr(b: &[u8], i: &mut usize, n: usize) -> Val {
-        Val::Arr((0..n).map(|_| read(b, i)).collect())
-    }
-}
-
-/// `GravityTorques` [Nm] out of one `full`-recipe telemetry packet:
-/// `[recipe, seq, mono_ns, ...fields]` with gravity at field 12 of the
-/// `full` field order.
-fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
-    let mut i = 0;
-    let mp::Val::Arr(elems) = mp::read(pkt, &mut i) else {
-        return None;
-    };
-    match elems.first() {
-        Some(mp::Val::Str(name)) if name == "full" => {}
-        _ => return None,
-    }
-    match elems.get(3 + 12) {
-        Some(mp::Val::Arr(vals)) => Some(
-            vals.iter()
-                .map(|v| match v {
-                    mp::Val::F64(x) => *x,
-                    mp::Val::U64(x) => *x as f64,
-                    _ => f64::NAN,
-                })
-                .collect(),
-        ),
-        _ => None,
-    }
-}
-
 /// The gravity model reads the gripper CONFIG, not just the URDF.
 ///
 /// Boot plain `--sim` twice; the only difference is the active gripper's
 /// `[kinematics] mass_kg` (0.37 kg stock vs 2.37 kg — a tool two kilos
-/// heavier). At the same teleported posture the published GravityTorques
-/// telemetry must shift by the extra tool weight: about 6.7 Nm at the
+/// heavier). At the same teleported posture the published external
+/// torque must shift by the extra tool weight: about 6.7 Nm at the
 /// shoulder and 0.3 Nm at the wrist pitch for these numbers.
+///
+/// STATUS publishes `torques_ext = measured − G(q)`, and the kinematic
+/// plant measures no torque, so what arrives is the model's own gravity
+/// with the sign flipped — which is why the magnitudes below are read
+/// off `torques_ext` directly.
 ///
 /// Failing before the wiring landed, twice over: par6d built its gravity
 /// model with `tool: None`, so `mass_kg` was parsed, validated and read
@@ -701,7 +699,7 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
 /// publish-only.)
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
-    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], Vec<f64>) {
+    fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
         let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg), false);
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -709,34 +707,10 @@ fn gripper_config_mass_changes_published_gravity_torque() {
         enable_and_teleport(&rig, &mut c, CART_START_DEG);
         let at = rig.wait_status("at the probe posture", |s| {
             angles_close(&s.angles, &CART_START_DEG, 0.1)
+                && s.torques_ext.iter().any(|t| t.abs() > 1e-9)
         });
-        // No telemetry flows until a recipe is selected, so every packet
-        // that arrives below is from this posture.
-        c.ok(&Command::SetRecipe(SetRecipe {
-            name: "full".into(),
-        }));
-        rig.telemetry()
-            .set_read_timeout(Some(READ_TIMEOUT))
-            .expect("telemetry timeout");
-        let deadline = Instant::now() + BUDGET;
-        let mut buf = [0u8; 65535];
-        let g = loop {
-            match rig.telemetry().recv_from(&mut buf) {
-                Ok((n, _)) => {
-                    if let Some(g) = gravity_from_telemetry(&buf[..n]) {
-                        break g;
-                    }
-                }
-                Err(e) if is_timeout(&e) => {}
-                Err(e) => panic!("telemetry recv failed: {e}"),
-            }
-            assert!(
-                Instant::now() < deadline,
-                "no decodable full-recipe telemetry packet within budget"
-            );
-        };
         rig.shutdown();
-        (at.angles, g)
+        (at.angles, at.torques_ext)
     }
 
     let (q_stock, g_stock) = published_gravity("grav-stock", 0.37);
@@ -1413,8 +1387,8 @@ fn move_j_pose(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
     })
 }
 
-fn set_tcp_offset(x: f64, y: f64, z: f64) -> Command {
-    Command::SetTcpOffset(SetTcpOffset { x, y, z })
+fn set_tcp_offset(key: u64, x: f64, y: f64, z: f64) -> Command {
+    Command::SetTcpOffset(SetTcpOffset { key, x, y, z })
 }
 
 fn tcp_offset_readback(c: &mut Client) -> [f64; 3] {
@@ -1473,7 +1447,8 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
     let d: [f64; 3] = std::array::from_fn(|j| (0..3).map(|i| flange.pose[4 * i + j] * v[i]).sum());
 
     // --- The reported point moves; the arm does not.
-    c.ok(&set_tcp_offset(d[0], d[1], d[2]));
+    let i = c.ok_index(&set_tcp_offset(1701, d[0], d[1], d[2]));
+    c.wait_complete(i);
     rig.drain_status();
     let offset = rig.wait_status("STATUS follows the offset TCP", |s| {
         distance(tcp_mm(s), p_flange) > 1.0
@@ -1533,7 +1508,8 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
     );
 
     // Where the flange actually ended up: same configuration, offset off.
-    c.ok(&set_tcp_offset(0.0, 0.0, 0.0));
+    let i = c.ok_index(&set_tcp_offset(1702, 0.0, 0.0, 0.0));
+    c.wait_complete(i);
     rig.drain_status();
     let f_with = tcp_mm(&rig.wait_status("flange of the offset run", |s| {
         distance(tcp_mm(s), reached) > 1.0
@@ -1724,13 +1700,18 @@ const SPLINE_S: f64 = 25.0;
 /// snapshot, and a frame pair that straddles one would read as a
 /// standstill.
 fn tcp_speeds(path: &[Status]) -> Vec<([f64; 3], f64)> {
-    path.windows(SPEED_WINDOW)
+    tcp_speeds_over(path, SPEED_WINDOW)
+}
+
+/// [`tcp_speeds`] over a caller-chosen window width.
+fn tcp_speeds_over(path: &[Status], window: usize) -> Vec<([f64; 3], f64)> {
+    path.windows(window)
         .filter_map(|w| {
-            let (first, last) = (&w[0], &w[SPEED_WINDOW - 1]);
+            let (first, last) = (&w[0], &w[window - 1]);
             let dt = last.mono_time_ns.checked_sub(first.mono_time_ns)? as f64 * 1e-9;
             (dt > 0.0).then(|| {
                 (
-                    tcp_mm(&w[SPEED_WINDOW / 2]),
+                    tcp_mm(&w[window / 2]),
                     distance(tcp_mm(first), tcp_mm(last)) / dt,
                 )
             })
@@ -2052,13 +2033,204 @@ fn curved_moves_trace_their_geometry() {
         "move_p slowed to {at_corner:.2} mm/s at the corner against a mean of {mean:.2} mm/s: \
          a blend that stops is not a blend"
     );
+
+    // The promise the command is named for: the TCP holds ONE speed
+    // along the path. Sampled across the cruise, away from the ramps at
+    // either end, the spread has to stay small — a time-optimal timing
+    // runs fast on the straights and drops through the corner, which is
+    // the behaviour this replaced. Measured here: 1.18 spread with the
+    // arc-length timing against 2.76 with the time-optimal one.
+    //
+    // The window is four times the corner test's, because a five-frame
+    // one carries a ±20% read error of its own: the broadcast repeats a
+    // snapshot whenever the status rate and the tick rate beat against
+    // each other, and a repeat at a window edge reads as a slow patch
+    // that is not in the motion. ~0.4 s averages that out while still
+    // resolving the corner, which takes about two seconds to cross at
+    // this speed — the time-optimal dip is fully visible at this width.
+    const CRUISE_WINDOW: usize = 21;
+    let cruise: Vec<f64> = {
+        let all = tcp_speeds_over(&process, CRUISE_WINDOW);
+        let moving: Vec<f64> = all.iter().map(|(_, v)| *v).filter(|v| *v > 0.5).collect();
+        let skip = moving.len() / 5; // drop the accelerate/decelerate ends
+        moving[skip..moving.len().saturating_sub(skip).max(skip + 1)].to_vec()
+    };
+    assert!(
+        cruise.len() > 100,
+        "expected a sampled cruise, got {} windows",
+        cruise.len()
+    );
+    let fastest = cruise.iter().copied().fold(0.0f64, f64::max);
+    let slowest = cruise.iter().copied().fold(f64::INFINITY, f64::min);
+    assert!(
+        fastest <= slowest * 1.35,
+        "move_p's TCP speed swung from {slowest:.1} to {fastest:.1} mm/s across its cruise: \
+         a process move that changes speed mid-path is not holding one"
+    );
     let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_p")), finish);
     assert!(
         end_miss < 15.0,
         "move_p ended {end_miss:.1} mm off its last waypoint"
     );
 
+    // --- the same corner asked for at FULL speed, which is the case
+    // the timing has to price rather than assume away. Free to run as
+    // fast as the joints allow ALONG the path, it would take the corner
+    // far faster than the joints can turn through it — and the stream
+    // it emits is checked against the joint acceleration limits before
+    // anything is queued. So the two ways to fail here are a refusal
+    // and a queued over-limit stream, and the move has to come back at
+    // a speed it can actually turn at instead.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + 100.0, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let i = c.ok_index(&Command::MoveP(MoveP {
+        key: 4004,
+        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        rel: false,
+    }));
+    let fast = rig.collect_status(Duration::from_secs_f64(MOVE_S));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a full-speed move_p must run at a speed it can turn at, not be refused: {detail:?}"
+    );
+    // Travel time off the broadcast's own clock: first frame away from
+    // the start to last frame short of the finish.
+    let left = fast
+        .iter()
+        .position(|st| distance(tcp_mm(st), start) > 3.0)
+        .expect("the arm has to leave the start pose");
+    let arrived = fast
+        .iter()
+        .rposition(|st| distance(tcp_mm(st), finish) > 3.0)
+        .expect("the arm has to approach the finish pose");
+    let took = fast[arrived]
+        .mono_time_ns
+        .saturating_sub(fast[left].mono_time_ns) as f64
+        * 1e-9;
+    assert!(
+        took < 0.5 * MOVE_S,
+        "the full-speed move crossed the corner in {took:.1} s against the {MOVE_S:.0} s the \
+         parameterised one took: pricing the corner must slow the move, not stop it"
+    );
+    let fast_points: Vec<[f64; 3]> = fast.iter().map(tcp_mm).collect();
+    let corner_miss = path_misses(&fast_points, corner);
+    assert!(
+        (2.0..25.0).contains(&corner_miss),
+        "the fast move_p left its blend zone: closest approach {corner_miss:.2} mm"
+    );
+    let end_miss = distance(
+        tcp_mm(&settled_tcp(&rig, "settled after the fast move_p")),
+        finish,
+    );
+    assert!(
+        end_miss < 15.0,
+        "the fast move_p ended {end_miss:.1} mm off its last waypoint"
+    );
+
     rig.shutdown();
+}
+
+/// A TCP-offset change can never be folded into a blend chain.
+///
+/// Measured before this landed: `set_tcp_offset` was immediate, so it was
+/// never in `pending` and `[move_l(blend), set_tcp_offset, move_l]` folded
+/// both legs into one motion — the new frame applied to both or neither,
+/// decided by datagram arrival against the blend hold. Queued, it sits
+/// between the legs: the first runs alone against the old frame, the
+/// offset lands, and only then is the second planned.
+#[test]
+fn a_tcp_offset_between_blended_moves_breaks_the_chain() {
+    const LEG_MM: f64 = 60.0;
+    const LEG_S: f64 = 1.0;
+
+    let rig = boot_tagged("offset-chain", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let leg = |s: &Status, key: u64, xyz: [f64; 3], r: Option<f64>| {
+        Command::MoveL(MoveL {
+            key,
+            pose: wire_pose_at(&s.pose, xyz),
+            frame: Frame::Wrf,
+            duration: Some(LEG_S),
+            speed: None,
+            accel: None,
+            blend_radius: r,
+            rel: false,
+        })
+    };
+    let queue_while_executing = |c: &mut Client, head: u64| -> Vec<String> {
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            match c.query(&Command::Queue) {
+                QueryResult::Queue {
+                    queue,
+                    executing_index,
+                    ..
+                } if executing_index == head as i64 => return queue,
+                QueryResult::Queue { .. } => {}
+                other => panic!("unexpected {other:?}"),
+            }
+            assert!(Instant::now() < deadline, "command {head} never started");
+        }
+    };
+    let read_offset = |c: &mut Client| -> [f64; 3] {
+        match c.query(&Command::TcpOffset) {
+            QueryResult::TcpOffset { x, y, z } => [x, y, z],
+            other => panic!("unexpected {other:?}"),
+        }
+    };
+
+    // --- control: the same two legs with nothing between them fold.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + LEG_MM, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - LEG_MM];
+    let i1 = c.ok_index(&leg(&s, 5301, corner, Some(20.0)));
+    let i2 = c.ok_index(&leg(&s, 5302, finish, None));
+    assert!(
+        queue_while_executing(&mut c, i1).is_empty(),
+        "two blended legs are one motion: the second leaves the queue with the first"
+    );
+    c.wait_complete(i1);
+    c.wait_complete(i2);
+
+    // --- an offset between them keeps the legs apart and lands in order.
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let corner = [start[0] + LEG_MM, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - LEG_MM];
+    let i3 = c.ok_index(&leg(&s, 5303, corner, Some(20.0)));
+    let i4 = c.ok_index(&set_tcp_offset(5304, 0.0, 0.0, 25.0));
+    let i5 = c.ok_index(&leg(&s, 5305, finish, None));
+    assert_eq!(
+        queue_while_executing(&mut c, i3),
+        vec!["set_tcp_offset".to_owned(), "move_l".to_owned()],
+        "the offset must break the chain: the second leg waits behind it"
+    );
+    assert_eq!(
+        read_offset(&mut c),
+        [0.0; 3],
+        "the offset must not apply while the leg queued before it runs"
+    );
+    let (ok, detail) = c.wait_complete(i3);
+    assert!(ok, "first leg: {detail:?}");
+    let (ok, detail) = c.wait_complete(i4);
+    assert!(ok, "offset: {detail:?}");
+    assert_eq!(read_offset(&mut c), [0.0, 0.0, 25.0]);
+    let (ok, detail) = c.wait_complete(i5);
+    assert!(ok, "second leg: {detail:?}");
+
+    let i6 = c.ok_index(&set_tcp_offset(5306, 0.0, 0.0, 0.0));
+    c.wait_complete(i6);
 }
 
 /// A blend radius on a queued `move_l` really rounds the corner into the

@@ -16,8 +16,8 @@ use crate::chunk::{encode_chunk, split_into_chunks, Chunk};
 use crate::command::{
     encode_command, Checkpoint, Command, ConnectHardware, Delay, EnterFlashing, Home, JogJ, JogL,
     MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, PoseQuery, SelectProfile, SelectTool, ServoJ,
-    ServoJPose, ServoL, SetCompletionPolicy, SetPayload, SetPidGains, SetRecipe, SetShapes,
-    SetTcpOffset, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    ServoJPose, ServoL, SetCompletionPolicy, SetPayload, SetPidGains, SetShapes, SetTcpOffset,
+    Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use crate::enums::{
     command_class, ActionState, CompletionPolicy, ControllerMode, FlashingAssertion, Frame,
@@ -27,9 +27,6 @@ use crate::error::{make_error, ErrorCode, UNATTRIBUTED};
 use crate::pygen;
 use crate::reply::{encode_reply, LoopStatsResult, QueryResult, Reply, ToolStatusWire};
 use crate::status::{encode_status_into, Status, STATUS_LEN};
-use crate::telemetry::{
-    encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe, TelemetryValue,
-};
 use crate::wire::{w_array, w_f64, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, PROTO_VERSION};
 
@@ -55,8 +52,6 @@ pub enum Check {
     },
     /// Encode must reproduce the bytes; decode must yield the chunk.
     Chunk(Box<Chunk>),
-    /// Encode must reproduce the bytes; decode must yield the frame.
-    Telemetry(Box<TelemetryFrame>),
     /// `decode_command` must fail.
     MalformedCommand,
     /// `decode_reply` must fail.
@@ -200,64 +195,6 @@ fn status_vec(name: &'static str, status: Status) -> Vector {
             status: Box::new(status),
             decode_only: false,
         },
-    }
-}
-
-/// A sample value of the kind the daemon publishes for `field`: tick
-/// counters and fault codes ride as integers, per-joint and per-node
-/// readings as arrays, everything else as a float scalar.
-fn telemetry_sample(field: TelemetryField, i: usize) -> TelemetryValue {
-    use TelemetryField as F;
-    let k = i as f64;
-    match field {
-        F::Tick => TelemetryValue::U64(100_000 + i as u64),
-        F::LoopOverruns | F::GripperFault => TelemetryValue::U64(i as u64),
-        F::LoopPeriodEmaS | F::LoopP99S => TelemetryValue::F64(0.004 + 0.0001 * k),
-        F::GripperPosition | F::GripperCurrentMa | F::GripperObjectDetection => {
-            TelemetryValue::F64(0.5 * k)
-        }
-        F::MotorTemperaturesC | F::MotorVoltagesMv | F::MotorCurrentsMa => {
-            TelemetryValue::Arr((0..7).map(|n| k + 10.0 * n as f64).collect())
-        }
-        _ => TelemetryValue::Arr((0..6).map(|n| 0.1 * k + 0.01 * n as f64).collect()),
-    }
-}
-
-/// One telemetry packet under `recipe`: `[recipe, seq, mono_time_ns,
-/// ...values]`, one value per recipe field in recipe order.
-fn telemetry_vec(
-    name: &'static str,
-    recipe: &TelemetryRecipe,
-    seq: u64,
-    mono_time_ns: u64,
-) -> Vector {
-    let values: Vec<TelemetryValue> = recipe
-        .fields
-        .iter()
-        .enumerate()
-        .map(|(i, f)| telemetry_sample(*f, i))
-        .collect();
-    let bytes = encode_telemetry(&recipe.name, seq, mono_time_ns, &values);
-    let fields: Vec<Value> = recipe.fields.iter().map(|f| json!(f.key())).collect();
-    let manifest = json!({
-        "name": name,
-        "kind": "telemetry",
-        "wire": wire_json(&bytes),
-        "recipe": recipe.name,
-        "seq": seq,
-        "mono_time_ns": mono_time_ns,
-        "fields": fields,
-    });
-    Vector {
-        name,
-        bytes,
-        manifest,
-        check: Check::Telemetry(Box::new(TelemetryFrame {
-            recipe: recipe.name.clone(),
-            seq,
-            mono_time_ns,
-            values,
-        })),
     }
 }
 
@@ -509,6 +446,15 @@ fn status_full_fixture() -> Status {
         },
         torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
         paused: true,
+        drive_health: crate::status::DriveHealthWire {
+            temperatures_c: vec![31.0, 32.5, 33.0, 34.5, 35.0, 36.5, 28.0],
+            currents_ma: vec![120.0, 340.0, 275.0, 60.0, 45.0, 30.0, 15.0],
+            bus_voltage_v: Some(23.7),
+        },
+        loop_health: crate::status::LoopHealthWire {
+            p99_period_s: 0.004_51,
+            overruns: 16,
+        },
     }
 }
 
@@ -568,6 +514,7 @@ pub fn vectors() -> Vec<Vector> {
         "cmd_set_tcp_offset",
         9,
         Command::SetTcpOffset(SetTcpOffset {
+            key: 113,
             x: 1.5,
             y: -2.0,
             z: 35.5,
@@ -585,13 +532,6 @@ pub fn vectors() -> Vec<Vector> {
         11,
         Command::SetCompletionPolicy(SetCompletionPolicy {
             policy: CompletionPolicy::Strict,
-        }),
-    ));
-    v.push(cmd_vec(
-        "cmd_set_recipe",
-        12,
-        Command::SetRecipe(SetRecipe {
-            name: "diagnostics".into(),
         }),
     ));
     v.push(cmd_vec(
@@ -677,6 +617,24 @@ pub fn vectors() -> Vec<Vector> {
         }),
     ));
     v.push(cmd_vec("cmd_payload", 42, Command::Payload));
+    v.push(cmd_vec("cmd_bus_scan", 43, Command::BusScan));
+    v.push(cmd_vec(
+        "cmd_set_can_id",
+        17,
+        Command::SetCanId(crate::command::SetCanId {
+            node: 0,
+            new_id: 9,
+            force: true,
+        }),
+    ));
+    v.push(cmd_vec(
+        "cmd_save_config",
+        18,
+        Command::SaveConfig(crate::command::SaveConfig {
+            node: 9,
+            force: false,
+        }),
+    ));
     v.push(cmd_vec("cmd_config_bundle", 43, Command::ConfigBundle));
 
     // -- commands: FIRE_AND_FORGET --
@@ -1126,6 +1084,8 @@ pub fn vectors() -> Vec<Vector> {
                 can_frame_age_max_ticks: 4,
                 rt_fifo: true,
                 rt_pinned: true,
+                stream_success_rate: 0.998,
+                stream_discard_pct: 0.2,
             }),
         },
     ));
@@ -1230,31 +1190,6 @@ pub fn vectors() -> Vec<Vector> {
                     [-2.0, 2.0, 4.0, 16.0],
                     [-6.3, 6.3, 6.0, 20.0],
                 ],
-                active_recipe: Some("standard".to_owned()),
-                recipes: vec![
-                    "minimal".to_owned(),
-                    "standard".to_owned(),
-                    "full".to_owned(),
-                    "diagnostics".to_owned(),
-                ],
-            },
-        },
-    ));
-    v.push(reply_vec(
-        "response_config_info_telemetry_off",
-        Reply::Response {
-            req_id: 127,
-            result: QueryResult::ConfigInfo {
-                path: "/etc/par6/PAR6.toml".to_owned(),
-                fingerprint: "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08"
-                    .to_owned(),
-                tick_dt_s: 0.004,
-                motion: [
-                    0.08, 0.6, 0.005, 0.05, 0.002, 0.01, 0.35, 0.05, 0.01, 2.0, 0.15, 1000.0, 1e-4,
-                ],
-                joints: vec![[-2.15, 2.15, 3.0, 12.0]],
-                active_recipe: None,
-                recipes: vec!["minimal".to_owned(), "standard".to_owned()],
             },
         },
     ));
@@ -1266,6 +1201,35 @@ pub fn vectors() -> Vec<Vector> {
                 mass: 1.25,
                 com: [0.0, 0.01, 0.055],
                 inertia: [0.002, 0.0, 0.003, 0.0001, 0.0, 0.004],
+            },
+        },
+    ));
+
+    v.push(reply_vec(
+        "response_bus_scan",
+        Reply::Response {
+            req_id: 128,
+            result: QueryResult::BusScan {
+                nodes: vec![
+                    crate::BusNode {
+                        node: 0,
+                        configured: true,
+                        present: true,
+                        freshness: 1,
+                        hw_ver: 2,
+                        sw_ver: 7,
+                        serial: 1234567,
+                    },
+                    crate::BusNode {
+                        node: 9,
+                        configured: false,
+                        present: true,
+                        freshness: 0,
+                        hw_ver: 0,
+                        sw_ver: 0,
+                        serial: 0,
+                    },
+                ],
             },
         },
     ));
@@ -1305,24 +1269,6 @@ pub fn vectors() -> Vec<Vector> {
 
     // -- malformed --
     v.extend(malformed_vectors());
-
-    // -- telemetry: one vector per shipped recipe --
-    for (i, recipe) in TelemetryRecipe::defaults().iter().enumerate() {
-        let name = match recipe.name.as_str() {
-            "minimal" => "telemetry_minimal",
-            "standard" => "telemetry_standard",
-            "commanded" => "telemetry_commanded",
-            "diagnostics" => "telemetry_diagnostics",
-            "full" => "telemetry_full",
-            other => unreachable!("shipped recipe {other} has no golden vector name"),
-        };
-        v.push(telemetry_vec(
-            name,
-            recipe,
-            1000 + i as u64,
-            5_000_000_000 + 4_000_000 * i as u64,
-        ));
-    }
 
     v
 }

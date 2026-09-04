@@ -2,9 +2,11 @@
 //! statistics, and the [`StateSnapshot`] the RT thread publishes every
 //! tick.
 
-use par6_bus::{GripperState, LinkHealth, NodeState};
+use par6_bus::{Freshness, GripperState, LinkHealth, NodeState};
 use par6_config::MAX_IO_LINES;
 
+use crate::drift_lock::DriftLockStatus;
+use crate::gripper_settle::ToolStatus;
 use crate::{MAX_JOINTS, NUM_NODES};
 
 /// RT operating mode.
@@ -13,8 +15,9 @@ pub enum Mode {
     /// Startup: bus scan + selfcheck, then requests IDLE.
     #[default]
     Booting,
-    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold;
-    /// otherwise active zero-velocity/zero-current.
+    /// At rest. Homed ∧ enabled ∧ grav-on = torque-only gravity hold
+    /// (the `[freedrive]` drift lock, when configured, re-holds a still
+    /// arm's pose on top of it); otherwise active zero-velocity/zero-current.
     Idle,
     /// Hard-error latch state: active zero-velocity hold, DISABLED.
     ActiveError,
@@ -362,6 +365,26 @@ pub struct JogStatus {
     pub blocked_mask: u16,
 }
 
+/// The opt-in per-phase tick profile: wall time spent in each phase of
+/// the tick, as a running maximum since profiling was switched on, plus
+/// the phase times of the most recent tick the caller flagged as a
+/// missed deadline. All zero while profiling is off. Slots, in tick
+/// order: GPIO/inputs, loop timing, boot one-shots, command intake,
+/// RX drain and derivation, gravity, error checks, dispatch and TX,
+/// clear-settle tick, publish.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TickProfile {
+    /// Running maximum per phase \[ns\].
+    pub phase_max_ns: [u32; TICK_PHASES],
+    /// Per-phase times of the last overrun tick \[ns\].
+    pub overrun_ns: [u32; TICK_PHASES],
+    /// Overrun ticks traced since profiling was switched on.
+    pub overruns_traced: u32,
+}
+
+/// Number of profiled tick phases.
+pub const TICK_PHASES: usize = 10;
+
 /// Streaming session substate (lifecycle is separate from mode).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StreamSubstate {
@@ -454,8 +477,16 @@ pub struct StateSnapshot {
     pub tau_ext: [f64; MAX_JOINTS],
     /// Per-node motor telemetry: arm joints 0..MAX_JOINTS, gripper last.
     pub nodes: [NodeState; NUM_NODES],
+    /// Per-node data-age classification, same order — the backend's own
+    /// verdict (thresholds and the lost latch live there, not here).
+    /// Read by the BUS_SCAN query, which answers a row per node id.
+    pub node_freshness: [Freshness; NUM_NODES],
     /// Firmware-mode gripper state.
     pub gripper: GripperState,
+    /// Whether the armed tool action has finished, and how. Decided
+    /// against the reply stream at the tick rate, because every window
+    /// in that decision counts replies.
+    pub tool: ToolStatus,
     /// Homing progress.
     pub homing: HomingStatus,
     /// The error latch list.
@@ -473,6 +504,15 @@ pub struct StateSnapshot {
     pub jog: JogStatus,
     /// Streaming live state.
     pub stream: StreamStatus,
+    /// Freedrive drift-lock live state (all zero unless configured on).
+    pub drift_lock: DriftLockStatus,
+    /// Node ids that have answered on the bus this boot (bit per id):
+    /// the boot scan plus every frame since, configured or not.
+    pub bus_nodes: u16,
+    /// Bumped once each `RescanBus` has pinged every id and settled.
+    pub bus_scan_epoch: u32,
+    /// The opt-in tick profile (all zero unless switched on).
+    pub tick_profile: TickProfile,
     /// Digital I/O levels: the first `io_inputs` entries are the
     /// debounced input levels, the next `io_outputs` are the levels the
     /// tick loop is driving, both in `[io]` config order.
@@ -530,7 +570,9 @@ impl Default for StateSnapshot {
             gravity_torque_nm: [0.0; MAX_JOINTS],
             tau_ext: [0.0; MAX_JOINTS],
             nodes: [NodeState::default(); NUM_NODES],
+            node_freshness: [Freshness::Unknown; NUM_NODES],
             gripper: GripperState::default(),
+            tool: ToolStatus::default(),
             homing: HomingStatus::default(),
             errors: ErrorList::new(),
             error_active: false,
@@ -539,6 +581,10 @@ impl Default for StateSnapshot {
             exec: ExecStatus::default(),
             jog: JogStatus::default(),
             stream: StreamStatus::default(),
+            drift_lock: DriftLockStatus::default(),
+            bus_nodes: 0,
+            bus_scan_epoch: 0,
+            tick_profile: TickProfile::default(),
             io_lines: [0; MAX_IO_LINES],
             io_inputs: 0,
             io_outputs: 0,

@@ -35,14 +35,21 @@ OPTIONS:
                                printed on stdout as `PAR6D_READY command_port=...`.
                                [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
     --bind <IP>                Command-socket bind address [env: PAR6_BIND] [default: 0.0.0.0]
-    --status-host <IP>         Unicast status/telemetry destination
+    --status-host <IP>         Unicast status destination
                                [env: PAR6_STATUS_HOST] [default: 127.0.0.1]
     --status-port <PORT>       Status broadcast port [env: PAR6_STATUS_PORT]
-    --telemetry-port <PORT>    Telemetry stream port [env: PAR6_TELEMETRY_PORT]
     --status-transport <MODE>  auto | multicast | unicast [env: PAR6_STATUS_TRANSPORT]
     --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
                                exactly [env: PAR6_STATUS_RATE_HZ]
                                [config: protocol.status_rate_hz]
+    --tick-profile             Profile the RT tick per phase (one clock read per
+                               phase) and log the running maxima and the last
+                               overrun's phase times once a second.
+                               [env: PAR6_TICK_PROFILE=1]
+    --log-dir <DIR>            Also write the activity logs there: rt.log (the RT
+                               thread, 2 MiB x5) and commands.log (command plane,
+                               daemon, host vitals, 20 MiB x5). stderr is unchanged.
+                               [env: PAR6_LOG_DIR]
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
     -h, --help                 Print this help
@@ -60,20 +67,24 @@ pub struct Options {
     /// Run the sim on the torque-level dynamics plant (`--sim-dynamics` /
     /// `PAR6_SIM_DYNAMICS`); requires feature `ffi`.
     pub sim_dynamics: bool,
+    /// Run the RT tick's per-phase profiler (`--tick-profile` /
+    /// `PAR6_TICK_PROFILE`); the profile is logged once a second.
+    pub tick_profile: bool,
     /// Command UDP port override (0 = ephemeral).
     pub command_port: Option<u16>,
     /// Command-socket bind address override.
     pub bind: Option<IpAddr>,
-    /// Unicast status/telemetry destination override.
+    /// Unicast status destination override.
     pub status_host: Option<IpAddr>,
     /// Status broadcast port override.
     pub status_port: Option<u16>,
-    /// Telemetry stream port override.
-    pub telemetry_port: Option<u16>,
     /// Status transport ladder override.
     pub status_transport: Option<StatusTransport>,
     /// STATUS broadcast rate override \[Hz\].
     pub status_rate_hz: Option<u32>,
+    /// Directory for the rotating activity logs (`--log-dir` /
+    /// `PAR6_LOG_DIR`); `None` = stderr only.
+    pub log_dir: Option<PathBuf>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
     /// `--help` was requested.
@@ -92,6 +103,7 @@ impl Options {
                 "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
                 "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
                 "--sim-dynamics" => o.sim_dynamics = true,
+                "--tick-profile" => o.tick_profile = true,
                 "--port" | "--command-port" => {
                     o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
                 }
@@ -102,15 +114,13 @@ impl Options {
                 "--status-port" => {
                     o.status_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
                 }
-                "--telemetry-port" => {
-                    o.telemetry_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
-                }
                 "--status-transport" => {
                     o.status_transport = Some(parse_transport(&value(&mut args, &arg)?)?);
                 }
                 "--status-rate" => {
                     o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
                 }
+                "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
                 "--check-config" => o.check_config = true,
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
@@ -129,6 +139,11 @@ impl Options {
         if self.assets.is_none() {
             if let Some(v) = env_var("PAR6_ASSETS") {
                 self.assets = Some(PathBuf::from(v));
+            }
+        }
+        if !self.tick_profile {
+            if let Some(v) = env_var("PAR6_TICK_PROFILE") {
+                self.tick_profile = v == "1" || v.eq_ignore_ascii_case("true");
             }
         }
         if !self.sim_dynamics {
@@ -156,11 +171,6 @@ impl Options {
                 self.status_port = Some(parse_num(&v, "PAR6_STATUS_PORT")?);
             }
         }
-        if self.telemetry_port.is_none() {
-            if let Some(v) = env_var("PAR6_TELEMETRY_PORT") {
-                self.telemetry_port = Some(parse_num(&v, "PAR6_TELEMETRY_PORT")?);
-            }
-        }
         if self.status_transport.is_none() {
             if let Some(v) = env_var("PAR6_STATUS_TRANSPORT") {
                 self.status_transport = Some(parse_transport(&v)?);
@@ -169,6 +179,11 @@ impl Options {
         if self.status_rate_hz.is_none() {
             if let Some(v) = env_var("PAR6_STATUS_RATE_HZ") {
                 self.status_rate_hz = Some(parse_rate(&v, "PAR6_STATUS_RATE_HZ")?);
+            }
+        }
+        if self.log_dir.is_none() {
+            if let Some(v) = env_var("PAR6_LOG_DIR") {
+                self.log_dir = Some(PathBuf::from(v));
             }
         }
         Ok(())
@@ -243,5 +258,33 @@ fn parse_transport(v: &str) -> Result<StatusTransport, String> {
         other => Err(format!(
             "--status-transport: `{other}` is not auto|multicast|unicast"
         )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn log_dir_comes_from_the_flag_or_the_environment() {
+        let o = Options::parse(
+            ["--sim", "--log-dir", "/var/log/par6"]
+                .map(String::from)
+                .into_iter(),
+        )
+        .unwrap();
+        assert_eq!(
+            o.log_dir.as_deref(),
+            Some(std::path::Path::new("/var/log/par6"))
+        );
+        assert!(
+            Options::parse(["--log-dir"].map(String::from).into_iter()).is_err(),
+            "a bare --log-dir is a usage error"
+        );
+        assert!(
+            Options::parse(["--sim", "--tick-profile"].map(String::from).into_iter())
+                .unwrap()
+                .tick_profile
+        );
     }
 }

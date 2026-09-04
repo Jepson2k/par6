@@ -680,8 +680,10 @@ class DryRunRobotClient:
     ) -> DryRunResultData:
         """Process move: the waypoints as straight segments with every
         interior corner rounded by the planner's auto-blend rule, so the TCP
-        sweeps the path without stopping. With ``rel=True``, every waypoint
-        is a delta from the start pose."""
+        sweeps the path at ONE speed without stopping. ``speed`` is a
+        fraction of the fastest constant speed the joints allow on this
+        path. With ``rel=True``, every waypoint is a delta from the start
+        pose."""
         min_duration, speed_fraction = _timing(duration, speed)
         cmd = {
             "type": "move_p",
@@ -891,10 +893,13 @@ class DryRunRobotClient:
     def set_tcp_offset(
         self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any
     ) -> int:
-        """TCP offset in mm, composed on top of the tool transform."""
+        """TCP offset in mm, composed on top of the tool transform. Queued
+        on the runtime, so it closes the chain before it: the moves ahead
+        of it keep the old frame, the ones after it get the new one."""
+        self._flush_quietly()
         self._tcp_offset_mm = (float(x), float(y), float(z))
         self._sync_context()
-        return 1
+        return 0
 
     def select_profile(self, profile: str, **kwargs: Any) -> int:
         name = profile.strip().upper()
@@ -1076,6 +1081,29 @@ class DryRunRobotClient:
         """A preview has no bus to connect."""
         return 1
 
+    def bus_scan(self, **kwargs: Any) -> list[dict]:
+        """A preview has no bus: every id reads absent."""
+        return [
+            {
+                "node": n,
+                "configured": False,
+                "present": False,
+                "freshness": 0,
+                "hw_ver": 0,
+                "sw_ver": 0,
+                "serial": 0,
+            }
+            for n in range(16)
+        ]
+
+    def set_can_id(self, node: int = 0, new_id: int = 0, **kwargs: Any) -> int:
+        """A preview has no drives to rename."""
+        return 1
+
+    def save_config(self, node: int = 0, **kwargs: Any) -> int:
+        """A preview has no drives with NVM."""
+        return 1
+
     def enter_flashing(self, assertion: str = "", **kwargs: Any) -> int:
         """A preview has no bus to silence."""
         return 1
@@ -1101,16 +1129,6 @@ class DryRunRobotClient:
                 detail=f"unknown completion policy {policy!r}",
             ) from None
         self._sync_context()
-        return 1
-
-    def set_recipe(self, name: str = "", **kwargs: Any) -> int:
-        """Recipes name a settings bundle the runtime holds; a preview has
-        none, so it validates the name and carries on."""
-        if not 1 <= len(name) <= 64:
-            raise make_error(
-                ErrorCode.COMM_VALIDATION_ERROR,
-                detail="set_recipe.name: length must be in 1..=64",
-            )
         return 1
 
     def reset_loop_stats(self, **kwargs: Any) -> int:

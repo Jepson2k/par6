@@ -5,7 +5,6 @@
 mod client;
 mod convert;
 mod preview;
-mod telemetry;
 
 use std::net::UdpSocket;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -86,7 +85,6 @@ fn make_wire_error(
 fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<client::CoreClient>()?;
     m.add_class::<preview::Preview>()?;
-    m.add_class::<telemetry::TelemetryReader>()?;
     m.add_function(wrap_pyfunction!(ping_blocking, m)?)?;
     m.add_function(wrap_pyfunction!(make_wire_error, m)?)?;
     m.add("RobotWireError", py.get_type::<convert::RobotWireError>())?;

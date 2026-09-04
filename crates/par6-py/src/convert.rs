@@ -161,6 +161,15 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     d.set_item("homing", homing)?;
     d.set_item("torques_ext", s.torques_ext.to_vec())?;
     d.set_item("paused", s.paused)?;
+    let dh = PyDict::new(py);
+    dh.set_item("temperatures_c", s.drive_health.temperatures_c.clone())?;
+    dh.set_item("currents_ma", s.drive_health.currents_ma.clone())?;
+    dh.set_item("bus_voltage_v", s.drive_health.bus_voltage_v)?;
+    d.set_item("drive_health", dh)?;
+    let loop_health = PyDict::new(py);
+    loop_health.set_item("p99_period_s", s.loop_health.p99_period_s)?;
+    loop_health.set_item("overruns", s.loop_health.overruns)?;
+    d.set_item("loop_health", loop_health)?;
     Ok(d.into_any().unbind())
 }
 
@@ -275,14 +284,27 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("com", com.to_vec())?;
             d.set_item("inertia", inertia.to_vec())?;
         }
+        QueryResult::BusScan { nodes } => {
+            let rows = PyList::empty(py);
+            for n in nodes {
+                let row = PyDict::new(py);
+                row.set_item("node", n.node)?;
+                row.set_item("configured", n.configured)?;
+                row.set_item("present", n.present)?;
+                row.set_item("freshness", n.freshness)?;
+                row.set_item("hw_ver", n.hw_ver)?;
+                row.set_item("sw_ver", n.sw_ver)?;
+                row.set_item("serial", n.serial)?;
+                rows.append(row)?;
+            }
+            d.set_item("nodes", rows)?;
+        }
         QueryResult::ConfigInfo {
             path,
             fingerprint,
             tick_dt_s,
             motion,
             joints,
-            active_recipe,
-            recipes,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
@@ -298,8 +320,6 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
                 js.append(jd)?;
             }
             d.set_item("joints", js)?;
-            d.set_item("active_recipe", active_recipe.as_deref())?;
-            d.set_item("recipes", recipes.to_vec())?;
         }
         QueryResult::ConfigBundle {
             path,

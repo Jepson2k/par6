@@ -13,7 +13,7 @@ POSE_ELEMS = 16
 IO_SLOTS = 11
 MAX_IO_SLOTS = 64
 EN_SLOTS = 12
-STATUS_LEN = 40
+STATUS_LEN = 42
 STATUS_HEADER_LEN = 7
 
 
@@ -42,13 +42,14 @@ class CmdType(IntEnum):
     SET_TCP_OFFSET = 18
     SET_SHAPES = 19
     SET_COMPLETION_POLICY = 20
-    SET_RECIPE = 21
     SET_GRAVITY_COMP = 23
     PAUSE = 24
     SET_PAYLOAD = 25
     ENTER_FLASHING = 26
     EXIT_FLASHING = 27
     SET_PID_GAINS = 28
+    SET_CAN_ID = 29
+    SAVE_CONFIG = 70
     PING = 30
     STATUS = 31
     ANGLES = 32
@@ -70,6 +71,7 @@ class CmdType(IntEnum):
     CONFIG_INFO = 48
     PAYLOAD = 49
     CONFIG_BUNDLE = 50
+    BUS_SCAN = 51
     SERVO_J = 60
     SERVO_J_POSE = 61
     SERVO_L = 62
@@ -114,6 +116,7 @@ class QueryType(IntEnum):
     CONFIG_INFO = 19
     PAYLOAD = 20
     CONFIG_BUNDLE = 21
+    BUS_SCAN = 22
 
 
 class CommandClass(IntEnum):
@@ -262,16 +265,17 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SELECT_PROFILE: CommandClass.SYSTEM,
     CmdType.RESET_STATE: CommandClass.SYSTEM,
     CmdType.CONNECT_HARDWARE: CommandClass.SYSTEM,
-    CmdType.SET_TCP_OFFSET: CommandClass.SYSTEM,
+    CmdType.SET_TCP_OFFSET: CommandClass.QUEUED,
     CmdType.SET_SHAPES: CommandClass.SYSTEM,
     CmdType.SET_COMPLETION_POLICY: CommandClass.SYSTEM,
-    CmdType.SET_RECIPE: CommandClass.SYSTEM,
     CmdType.SET_GRAVITY_COMP: CommandClass.SYSTEM,
     CmdType.PAUSE: CommandClass.SYSTEM,
     CmdType.SET_PAYLOAD: CommandClass.SYSTEM,
     CmdType.ENTER_FLASHING: CommandClass.SYSTEM,
     CmdType.EXIT_FLASHING: CommandClass.SYSTEM,
     CmdType.SET_PID_GAINS: CommandClass.SYSTEM,
+    CmdType.SET_CAN_ID: CommandClass.SYSTEM,
+    CmdType.SAVE_CONFIG: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,
@@ -293,6 +297,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.CONFIG_INFO: CommandClass.QUERY,
     CmdType.PAYLOAD: CommandClass.QUERY,
     CmdType.CONFIG_BUNDLE: CommandClass.QUERY,
+    CmdType.BUS_SCAN: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

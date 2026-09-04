@@ -44,11 +44,13 @@
 
 pub mod core;
 pub mod dispatch;
+pub mod drift_lock;
 pub mod errors;
 pub mod exec;
 pub mod gpio;
 pub mod gravity;
 mod gripper_gate;
+pub mod gripper_settle;
 pub mod homing;
 pub mod hooks;
 pub mod ring;
@@ -60,6 +62,7 @@ pub mod timing;
 pub use crate::core::{
     CoreError, ExecHeartbeat, GateRefusal, RtCore, RtHandles, RtHooks, StreamInput, StreamSetpoint,
 };
+pub use drift_lock::DriftLockStatus;
 pub use gpio::{
     Debouncer, DigitalIo, EstopGpio, EstopMonitor, NoDigitalIo, SharedDigitalIo, SharedIoLines,
     SharedLineGpio, DEBOUNCE_READS,
@@ -76,7 +79,7 @@ pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{
     ArmState, ErrorCode, ErrorEntry, ErrorList, ExecStatus, HomingJointStatus, HomingPhase,
     HomingStatus, JogStatus, LoopStats, Mode, StateSnapshot, StreamStatus, StreamSubstate,
-    MAX_ERRORS,
+    TickProfile, MAX_ERRORS, TICK_PHASES,
 };
 
 /// Compile-time arm joint count the fixed-size RT types are dimensioned

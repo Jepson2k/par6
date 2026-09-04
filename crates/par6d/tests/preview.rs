@@ -289,6 +289,71 @@ fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
     }
 }
 
+/// The servo preview is the runtime's limiter offline: a step target
+/// from the middle of a joint's range is reached without overshoot,
+/// the commanded velocity never exceeds the STREAM ceiling, a fraction
+/// scales that ceiling, and a target past the soft limit is clamped to
+/// it — measured on the same executor and clamp the RT core ticks.
+#[test]
+fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
+    let config = test_config();
+    let robot = par6_config::RobotConfig::load(&config).expect("config");
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview");
+    let lim = &robot.joints[0].limits;
+    let mid = [
+        (lim.soft_min_rad + lim.soft_max_rad) / 2.0,
+        preview.angles_rad()[1],
+        preview.angles_rad()[2],
+        preview.angles_rad()[3],
+        preview.angles_rad()[4],
+        preview.angles_rad()[5],
+    ];
+    preview.teleport_rad(mid);
+    let v_stream = lim.for_mode(par6_config::LimitMode::Stream).velocity_rad_s;
+
+    let mut target = mid;
+    target[0] += 0.5;
+    let r = preview.preview_servo(&[target], 400, None, None);
+    assert_eq!(r.q.len(), 400);
+    let finished = r.finished_tick.expect("a 0.5 rad step settles inside 8 s");
+    assert!(
+        finished > 5,
+        "a jerk-limited step takes more than a few ticks"
+    );
+    let peak_v = r.qd.iter().map(|v| v[0].abs()).fold(0.0, f64::max);
+    assert!(
+        peak_v <= v_stream * 1.001 && peak_v > 0.2 * v_stream,
+        "peak {peak_v} rad/s must use the STREAM ceiling {v_stream} without exceeding it"
+    );
+    let overshoot = r.q.iter().map(|q| q[0] - target[0]).fold(0.0, f64::max);
+    assert!(overshoot < 1e-6, "overshoot {overshoot} rad");
+    assert!(
+        (r.q[399][0] - target[0]).abs() < 1e-6,
+        "settled at the target"
+    );
+    for q in &r.q {
+        assert_eq!(q[1..], mid[1..], "an untargeted joint never moves");
+    }
+
+    let slow = preview.preview_servo(&[target], 400, Some(0.25), None);
+    let slow_peak = slow.qd.iter().map(|v| v[0].abs()).fold(0.0, f64::max);
+    assert!(
+        slow_peak <= 0.25 * v_stream * 1.001 && slow_peak > 0.1 * v_stream,
+        "the speed fraction scales the ceiling: {slow_peak} vs {v_stream}"
+    );
+
+    let mut beyond = mid;
+    beyond[0] = lim.soft_max_rad + 1.0;
+    let r = preview.preview_servo(&[beyond], 600, None, None);
+    let end = r.q.last().unwrap()[0];
+    assert!(
+        (end - lim.soft_max_rad).abs() < 1e-6 && end < beyond[0],
+        "a target past the soft limit is clamped to it: {end} vs {}",
+        lim.soft_max_rad
+    );
+    assert_eq!(preview.angles_rad(), mid, "the virtual arm does not move");
+}
+
 /// The cartesian jog preview integrates the runtime's own twist: a +x
 /// jog in the world frame moves the TCP along +x and nothing else, and a
 /// wire-invalid request comes back as the result's error.

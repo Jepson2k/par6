@@ -865,6 +865,18 @@ impl RtCommands for RtBridge {
         });
     }
 
+    fn set_can_id(&mut self, node: u8, new_id: u8) {
+        self.link.send(RtCommand::SetCanId { node, new_id });
+    }
+
+    fn save_config(&mut self, node: u8) {
+        self.link.send(RtCommand::SaveConfig { node });
+    }
+
+    fn rescan_bus(&mut self) {
+        self.link.send(RtCommand::RescanBus);
+    }
+
     fn teleport(&mut self, angles_deg: &[f64; NUM_JOINTS], tool_positions: Option<&[f64]>) {
         if !self.sim {
             // The server gates teleport with SYS_NOT_SIMULATOR; this is
@@ -926,10 +938,6 @@ impl RtCommands for RtBridge {
             core.set_homed(true);
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
-    }
-
-    fn tool_stop(&mut self) {
-        self.link.send(RtCommand::GripperStop);
     }
 
     fn write_io(&mut self, port: u8, value: u8) {
@@ -1103,9 +1111,23 @@ pub(crate) fn housekeeping_loop(
         link.send(RtCommand::JogRelease);
         link.send(RtCommand::SetMode(Mode::Idle));
     };
+    let mut profile_logged = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
+        if now.duration_since(profile_logged) >= Duration::from_secs(1) {
+            profile_logged = now;
+            let p = &snap.tick_profile;
+            if p.phase_max_ns.iter().any(|&n| n > 0) {
+                log::info!(
+                    target: "par6d::profile",
+                    "tick phases max [us] {:?} last overrun [us] {:?} overruns traced {}",
+                    p.phase_max_ns.map(|n| n / 1000),
+                    p.overrun_ns.map(|n| n / 1000),
+                    p.overruns_traced
+                );
+            }
+        }
         {
             let mut sh = shared.lock().unwrap();
             match &mut sh.stream {

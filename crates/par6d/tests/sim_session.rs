@@ -15,8 +15,8 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveC, MoveJ, SelectProfile, SelectTool, SetCompletionPolicy, Stop,
-    Teleport, ToolAction, ToolParam,
+    EnterFlashing, JogJ, MoveC, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
     ActionState, Command, CompletionPolicy, ControllerMode, ErrorCode, FlashingAssertion, Frame,
@@ -34,6 +34,52 @@ use common::{Client, Rig, BUDGET};
 /// by contract and the wiring under test is identical.
 fn test_config() -> PathBuf {
     common::retimed_config("sim-session", 0.02)
+}
+
+/// The 50 Hz test config with `[shutdown] safe_park` switched on.
+fn parking_config() -> PathBuf {
+    let base = test_config();
+    let text = std::fs::read_to_string(&base).expect("read test config");
+    let patched = text.replace("safe_park = false", "safe_park = true");
+    assert_ne!(patched, text, "safe_park patch point must exist");
+    let dst = base.with_file_name("PAR6-park.toml");
+    std::fs::write(&dst, patched).expect("write parking config");
+    dst
+}
+
+/// Seconds a daemon takes to shut down from a pose `delta_deg` off the
+/// rest pose on J1.
+fn shutdown_seconds(config: PathBuf, delta_deg: f64) -> f64 {
+    let rig = Rig::boot(config);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    teleport_home(&rig, &mut c, with_j0(park_deg(), delta_deg));
+    let started = Instant::now();
+    rig.shutdown();
+    started.elapsed().as_secs_f64()
+}
+
+/// `[shutdown] safe_park = true` on the real runtime: the exit drives
+/// the arm back to the rest pose through the real streaming executor
+/// under the configured velocity ceiling, so a shutdown from 30° off
+/// the pose takes the time that distance costs at 0.25 rad/s. The
+/// shipped default retreats nowhere and exits at once.
+#[test]
+fn a_shutdown_retreats_to_the_rest_pose_under_the_configured_speed() {
+    const DELTA_DEG: f64 = 30.0;
+    let retreat_floor_s = DELTA_DEG.to_radians() / 0.25 * 0.8;
+
+    let plain = shutdown_seconds(test_config(), DELTA_DEG);
+    let parked = shutdown_seconds(parking_config(), DELTA_DEG);
+    assert!(
+        parked - plain > retreat_floor_s,
+        "the retreat must take at least the distance at the velocity ceiling: \
+         parked {parked:.2} s vs plain {plain:.2} s (floor {retreat_floor_s:.2} s)"
+    );
+    assert!(
+        parked < 15.0,
+        "the retreat must arrive well inside its 15 s timeout, took {parked:.2} s"
+    );
 }
 
 /// The config park pose in wire units (degrees) — inside every joint's
@@ -333,26 +379,44 @@ fn full_sim_session_over_protocol_v3() {
 /// python `Robot.start()` bootstrap relies on.
 #[test]
 fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
+    let (mut child, port, _status_rx) = spawn_par6d(&[]);
+    assert_ne!(port, 0, "ephemeral port must be resolved");
+
+    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
+    match c.query(&Command::Ping) {
+        QueryResult::Ping { .. } => {}
+        other => panic!("unexpected ping result {other:?}"),
+    }
+
+    let status = sigterm_and_wait(&mut child);
+    assert!(status.success(), "clean exit expected, got {status:?}");
+}
+
+/// The binary on `--sim` with ephemeral/unicast ports plus `extra`
+/// arguments: the child, the command port from its ready line, and the
+/// status sink it was pointed at (kept open for its lifetime).
+fn spawn_par6d(extra: &[&str]) -> (std::process::Child, u16, UdpSocket) {
     let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status sink");
-    let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry sink");
+    let status_port = status_rx.local_addr().unwrap().port().to_string();
+    let config = common::shipped_config();
+    let mut args = vec![
+        "--sim",
+        "--config",
+        config.to_str().expect("utf-8 path"),
+        "--port",
+        "0",
+        "--bind",
+        "127.0.0.1",
+        "--status-transport",
+        "unicast",
+        "--status-host",
+        "127.0.0.1",
+        "--status-port",
+        &status_port,
+    ];
+    args.extend_from_slice(extra);
     let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_par6d"))
-        .args([
-            "--sim",
-            "--config",
-            common::shipped_config().to_str().expect("utf-8 path"),
-            "--port",
-            "0",
-            "--bind",
-            "127.0.0.1",
-            "--status-transport",
-            "unicast",
-            "--status-host",
-            "127.0.0.1",
-            "--status-port",
-            &status_rx.local_addr().unwrap().port().to_string(),
-            "--telemetry-port",
-            &telemetry_rx.local_addr().unwrap().port().to_string(),
-        ])
+        .args(&args)
         .stdout(Stdio::piped())
         .spawn()
         .expect("spawn par6d");
@@ -375,28 +439,89 @@ fn daemon_binary_ephemeral_port_ready_line_and_sigterm() {
         .expect("command_port key in ready line")
         .parse()
         .expect("numeric port");
-    assert_ne!(port, 0, "ephemeral port must be resolved");
+    (child, port, status_rx)
+}
 
-    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
-    match c.query(&Command::Ping) {
-        QueryResult::Ping { .. } => {}
-        other => panic!("unexpected ping result {other:?}"),
-    }
-
+fn sigterm_and_wait(child: &mut std::process::Child) -> std::process::ExitStatus {
     // SAFETY: plain kill(2) on our own child with a standard signal.
     unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
     let deadline = Instant::now() + BUDGET;
-    let status = loop {
+    loop {
         if let Some(st) = child.try_wait().expect("try_wait") {
-            break st;
+            return st;
         }
         assert!(
             Instant::now() < deadline,
             "par6d did not exit after SIGTERM"
         );
         std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// `--log-dir` gives the deployment the two activity logs: the command
+/// plane's lines (every system command, every refusal, the RT latch on
+/// its edges, the host vitals) in `commands.log`, and the RT thread's
+/// own transitions in `rt.log` — routed by module target, so the RT
+/// latch that an e-stop raises shows up in BOTH, each from its side.
+/// stderr keeps the same lines; a run without `--log-dir` writes no file.
+#[test]
+fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
+    let dir = std::env::temp_dir().join(format!("par6d-logs-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let (mut child, port, _status_rx) = spawn_par6d(&["--log-dir", dir.to_str().unwrap()]);
+    let mut c = Client::new(SocketAddr::from(([127, 0, 0, 1], port)));
+    match c.query(&Command::Ping) {
+        QueryResult::Ping { .. } => {}
+        other => panic!("unexpected ping result {other:?}"),
+    }
+    // A move on an unhomed arm is refused; the e-stop latches the RT.
+    c.expect_error(&Command::MoveJ(MoveJ {
+        key: 1,
+        angles: park_deg(),
+        duration: Some(1.0),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    c.ok(&Command::Estop);
+    let deadline = Instant::now() + BUDGET;
+    let commands = loop {
+        let text = std::fs::read_to_string(dir.join("commands.log")).unwrap_or_default();
+        if text.contains("rt latched") {
+            break text;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the RT latch never reached commands.log:\n{text}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
     };
+    let status = sigterm_and_wait(&mut child);
     assert!(status.success(), "clean exit expected, got {status:?}");
+
+    for needle in [
+        "system name=estop",
+        "refused req_id=",
+        "code=",
+        "remedy=",
+        "par6d::vitals load1=",
+    ] {
+        assert!(
+            commands.contains(needle),
+            "commands.log lacks {needle:?}:\n{commands}"
+        );
+    }
+    let rt = std::fs::read_to_string(dir.join("rt.log")).expect("rt.log exists");
+    assert!(
+        rt.contains("par6_rt::core") && rt.contains("ActiveError"),
+        "rt.log lacks the RT's own latch transition:\n{rt}"
+    );
+    assert!(
+        !commands.contains("par6_rt::"),
+        "RT records must not leak into the command log:\n{commands}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
 }
 
 /// Startup failure paths are clear errors, never panics: hardware mode
@@ -710,6 +835,16 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "the selected profile did not change the trajectory: \
          TRAPEZOID {trapezoid:?} vs RUCKIG {ruckig:?}"
     );
+    // Same proof for QUINTIC: unlimited jerk, so jerk-limited ruckig
+    // cannot beat it either. (It plans ~20% slower than the trapezoid
+    // over this move, but that gap is inside the ack-to-COMPLETE
+    // measurement noise, so the ruckig ratio is the observable.)
+    let quintic = timed_move_under(&rig, &mut c, "QUINTIC", 5103);
+    assert!(
+        ruckig > quintic.mul_f64(1.4),
+        "the QUINTIC selection did not reach the planner: \
+         QUINTIC {quintic:?} vs RUCKIG {ruckig:?}"
+    );
     let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
         toppra < ruckig,
@@ -772,9 +907,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         Some(3),
         "closing on air must complete with the reached-no-object verdict"
     );
-    let s = rig.wait_status("the jaw reaches the closed command and stops", |s| {
-        jaw(s) > 0.99 && tool_status(s).state == ToolState::Idle
-    });
+    let s = rig.wait_status("the jaw reaches the closed command", |s| jaw(s) > 0.99);
     assert!(
         before < 0.95,
         "the jaw was already closed before the command; travel proves nothing"
@@ -783,11 +916,30 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         !tool_status(&s).part_detected,
         "nothing is between the jaws; no part may be reported"
     );
+    // The move completed, but the standing command is still asserted, so
+    // the jaws are still energised and holding. Only an explicit release
+    // makes a tool idle — `action_status` is the commanded action, not a
+    // motion flag, and a tool that reported Idle here would be claiming
+    // it had let go of a part it is still gripping.
+    assert_eq!(
+        tool_status(&s).state,
+        ToolState::Active,
+        "a settled move leaves the jaws holding, not released"
+    );
 
     let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 500.0]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
     rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
+
+    // ---- the release verb drops the standing command, and only then
+    // does the tool report itself idle.
+    let i = c.ok_index(&tool_action(6009, &tool, "idle", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "gripper idle must complete, got {detail:?}");
+    rig.wait_status("the released tool reports itself idle", |s| {
+        tool_status(s).state == ToolState::Idle
+    });
 
     // ---- an action the tool does not implement fails the command; it is
     // never reported as done.
@@ -1412,6 +1564,161 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
         quarter < full * 0.5,
         "a quarter-speed stream must cover far less ground in {cruise:?}: \
          {quarter:.3} deg vs {full:.3} at full speed"
+    );
+
+    rig.shutdown();
+}
+
+/// The RT's stream statistics reach a consumer: LOOP_STATS answers the
+/// moving-window success rate and discard percentage beside the loop's
+/// own numbers, because a servo stream that is dropping samples is a
+/// loop that is not being fed. An idle arm has never applied a setpoint
+/// and reads zero; a live `servo_j` stream reads most ticks applied.
+/// Before this the statistics were computed every tick and read by
+/// nobody.
+#[test]
+fn loop_stats_carries_the_stream_statistics() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+
+    let stream_stats = |c: &mut Client| match c.query(&Command::LoopStats) {
+        QueryResult::LoopStats(ls) => (ls.stream_success_rate, ls.stream_discard_pct),
+        other => panic!("unexpected loop_stats result {other:?}"),
+    };
+
+    assert_eq!(
+        stream_stats(&mut c),
+        (0.0, 0.0),
+        "an arm that has never streamed has applied no setpoints"
+    );
+
+    // A servo stream toward a far target: the first setpoint sits at
+    // the measured pose (the start-pose gate), the rest stream the
+    // target at a rate the 40 ms watchdog is happy with.
+    let mut target = park_deg();
+    target[0] += 45.0;
+    let servo = |angles| {
+        Command::ServoJ(par6_proto::command::ServoJ {
+            angles,
+            speed: Some(0.3),
+            accel: None,
+        })
+    };
+    c.send(&servo(park_deg()));
+    let mut live: Option<(f64, f64)> = None;
+    let until = Instant::now() + Duration::from_millis(1500);
+    while Instant::now() < until {
+        c.send(&servo(target));
+        std::thread::sleep(Duration::from_millis(5));
+        let s = stream_stats(&mut c);
+        if s.0 > 0.0 {
+            live = Some(s);
+        }
+    }
+    let (success_rate, discard_pct) =
+        live.expect("a live stream must publish a non-zero success rate");
+    assert!(
+        success_rate > 0.5 && success_rate <= 1.0,
+        "most ticks of a live stream apply a setpoint: {success_rate}"
+    );
+    assert!(
+        (0.0..=100.0).contains(&discard_pct),
+        "discard percentage {discard_pct} out of range"
+    );
+
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    rig.shutdown();
+}
+
+/// BUS_SCAN on the simulator answers one row per node id with exactly
+/// the configured drives present and fresh; the commissioning commands
+/// are refused for an unlisted id without `force` and for any id while
+/// the arm streams; and a rename under e-stop moves a drive on the bus —
+/// the next scan finds the new id answering and the old one gone, while
+/// the runtime, still addressing the id the config names, has lost it.
+#[test]
+fn bus_scan_and_a_commissioning_rename_on_the_simulator() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let scan = |c: &mut Client| match c.query(&Command::BusScan) {
+        QueryResult::BusScan { nodes } => nodes,
+        other => panic!("unexpected bus scan result {other:?}"),
+    };
+
+    let rows = scan(&mut c);
+    assert_eq!(rows.len(), 16);
+    let configured: Vec<u8> = rows
+        .iter()
+        .filter(|r| r.configured)
+        .map(|r| r.node)
+        .collect();
+    assert!(configured.len() >= NUM_JOINTS, "{rows:?}");
+    for r in &rows {
+        assert_eq!(
+            usize::from(r.node),
+            rows.iter().position(|x| x.node == r.node).unwrap()
+        );
+        assert_eq!(
+            r.present, r.configured,
+            "the sim answers exactly its configured ids: {r:?}"
+        );
+        if r.configured {
+            assert_eq!(
+                r.freshness, 1,
+                "a configured node on a live bus is fresh: {r:?}"
+            );
+        }
+    }
+    let free_id = (0..16u8)
+        .find(|n| !configured.contains(n))
+        .expect("a free id");
+
+    let err = c.expect_error(&Command::SaveConfig(SaveConfig {
+        node: free_id,
+        force: false,
+    }));
+    assert!(err.cause.contains("force"), "{}", err.cause);
+
+    // Streaming counts as motion.
+    c.send(&Command::JogJ(JogJ {
+        speeds: [0.2, 0.0, 0.0, 0.0, 0.0, 0.0],
+        duration: 2.0,
+        accel: None,
+    }));
+    rig.wait_status("jogging", |s| s.mode == ControllerMode::Jog);
+    let err = c.expect_error(&Command::SetCanId(SetCanId {
+        node: configured[5],
+        new_id: free_id,
+        force: false,
+    }));
+    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+
+    // Under e-stop the arm cannot move: the rename goes through.
+    c.ok(&Command::Estop);
+    rig.wait_status("latched", |s| s.mode == ControllerMode::ActiveError);
+    let old = configured[5];
+    c.ok(&Command::SetCanId(SetCanId {
+        node: old,
+        new_id: free_id,
+        force: false,
+    }));
+    let rows = scan(&mut c);
+    let at = |n: u8| rows.iter().find(|r| r.node == n).unwrap();
+    assert!(
+        at(free_id).present && !at(free_id).configured,
+        "the renamed drive answers at its new id: {:?}",
+        at(free_id)
+    );
+    assert!(
+        !at(old).present,
+        "nothing answers at the old id any more: {:?}",
+        at(old)
     );
 
     rig.shutdown();

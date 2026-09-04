@@ -517,10 +517,9 @@ wait_s = 0.0025
 command_port = 6001
 status_port = 6002
 status_multicast_group = "239.255.0.71"
-telemetry_port = 6003
-status_rate_hz = 50 # must divide the 250 Hz tick rate
-telemetry_rate_hz = 100
-# initial_recipe = "standard" # omitted = telemetry silent until set_recipe
+# The one broadcast every consumer subscribes to; raise it for capture
+# work. Must divide the 250 Hz tick rate exactly.
+status_rate_hz = 50
 
 # ============================================================ digital I/O lines
 # The control box's general-purpose lines, by BCM offset on the 40-pin header.
@@ -571,6 +570,33 @@ lowpass_cutoff_hz = 0.0
 success_window_s = 0.4      # 100 ticks @ 250 Hz
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
 servo_grace_s = 0.25        # client silence that ends a servo stream (sim floors command_timeout_s at 2x this)
+
+[shutdown]
+# Retreat to a rest pose on process exit, before the drives are idled,
+# so an arm left mid-air does not drop when the terminal limp frame
+# lands. Off by default: a motion on shutdown must be asked for. Only a
+# homed, enabled, error-free arm retreats; the timeout is logged and the
+# exit continues from wherever the arm is.
+safe_park = false
+tolerance_rad = 0.03
+timeout_s = 15.0
+velocity_limit_rad_s = 0.25
+# safe_park_q = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416]   # omitted = robot.park_pose_rad
+
+[freedrive]
+# Drift lock for freedrive (IDLE, homed, enabled, gravity comp on): once
+# the arm has been still for settle_s the pose is captured and held with
+# the drive's own impedance frame (the joints' gains.kp/kd, as the jog
+# PD pack uses) plus a slow clamped integral on the pose error, so a
+# slightly wrong gravity model no longer sags or lifts the arm. Any
+# joint moving faster than release_rad_s dissolves the lock on that tick
+# and zeroes the integral; stillness re-arms it at the new pose. Off by
+# default: it is a hold, and a hold must be asked for.
+drift_lock = false
+release_rad_s = 0.08
+settle_s = 0.3
+ki_nm_rad_s = 1.0
+integral_limit_nm = 0.3
 
 [motion]
 # The runtime's motion "feel": sampling pitch, solver damping, jog

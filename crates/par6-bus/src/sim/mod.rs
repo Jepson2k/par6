@@ -1167,6 +1167,47 @@ impl DriverBus for SimBus {
         Ok(())
     }
 
+    /// The virtual driver at `node` answers to `new_id` from here on:
+    /// the joint (or gripper) routing, the stored config's key and the
+    /// presence mask all move. An id nobody answers gets the frame and
+    /// nothing happens, exactly as on hardware; an id already on the bus
+    /// is refused, which hardware would not do for you.
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let taken = self.node_to_joint[usize::from(new_id)].is_some()
+            || (new_id == self.gripper_node && self.gripper.is_some());
+        if taken {
+            return Err(BusError::InvalidCommand {
+                reason: "set_can_id: the new id is already on the bus",
+            });
+        }
+        let moved = if let Some(j) = self.node_to_joint[usize::from(node)].take() {
+            self.node_to_joint[usize::from(new_id)] = Some(j);
+            self.joint_nodes[j] = new_id;
+            true
+        } else if node == self.gripper_node && self.gripper.is_some() {
+            self.gripper_node = new_id;
+            true
+        } else {
+            false
+        };
+        if moved {
+            if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+                c.node = new_id;
+            }
+            self.connected &= !(1 << u16::from(node));
+            self.connected |= 1 << u16::from(new_id);
+        }
+        Ok(())
+    }
+
+    /// The virtual driver accepts cmd 13 and has no NVM to write.
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let _ = node;
+        Ok(())
+    }
+
     fn send_limits(
         &mut self,
         node: NodeId,

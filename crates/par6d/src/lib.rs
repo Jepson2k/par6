@@ -32,9 +32,11 @@ mod collision_world;
 pub mod daemon;
 mod grant;
 mod kin;
+pub mod logging;
 pub mod options;
 mod planner;
 pub mod preview;
+pub mod vitals;
 
 pub use daemon::{Daemon, DaemonError};
 pub use options::Options;

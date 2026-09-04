@@ -924,6 +924,15 @@ class AsyncRobotClient(_RobotClientABC):
     ) -> int:
         """Process move with auto-blending through waypoints (auto-chunked).
 
+        The TCP holds ONE speed along the whole path rather than running
+        as fast as the joints allow moment to moment — which is what
+        separates this from a ``move_s`` through the same waypoints, and
+        what a process like dispensing or welding needs. ``speed`` is
+        therefore a fraction of the fastest constant speed the joints
+        permit on this path: the whole path runs at the rate its
+        steepest stretch allows. A corner too sharp to turn at that rate
+        slows the move down; it does not fail it.
+
         With ``rel=True``, every waypoint is a delta from the pose the
         move starts at (each against the start, not chained).
 
@@ -1310,6 +1319,58 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.select_profile(profile.upper()))
 
+    async def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus and report every node id, 0..15.
+
+        Each row carries ``node``, ``configured`` (the config lists it),
+        ``present`` (it answered a ping this boot), ``freshness`` (0
+        unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
+        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
+        runtime has swept it.  The reply waits for the scan to settle, so
+        expect a few hundred milliseconds.  Returns None if unreachable.
+
+        Category: Commissioning
+
+        Example:
+            present = [r["node"] for r in rbt.bus_scan() if r["present"]]
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.bus_scan())
+        return None if result is None else list(result["nodes"])
+
+    async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell drive *node* to answer as *new_id* from now on.
+
+        Refused unless the arm is idle or latched with nothing in flight,
+        and — unless ``force`` — unless *node* is a configured drive.  A
+        fresh drive sits at its factory id, which the config does not
+        list, so commissioning one is ``force=True``.  The runtime keeps
+        addressing the id the config names: after renaming a configured
+        node, update the config and restart the daemon.  Persist the new
+        id with :meth:`save_config` or it is lost at power-off.
+
+        Category: Commissioning
+
+        Example:
+            rbt.set_can_id(0, 3, force=True)
+            rbt.save_config(3, force=True)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
+
+    async def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: ask drive *node* to persist its running
+        configuration (id, gains, limits) to its NVM.  Same gate and
+        ``force`` rule as :meth:`set_can_id`.
+
+        Category: Commissioning
+
+        Example:
+            rbt.save_config(3)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.save_config(int(node), bool(force)))
+
     async def enter_flashing(self, assertion: str) -> int:
         """Hand the CAN bus to a firmware flasher (bus-silent FLASHING).
 
@@ -1391,9 +1452,21 @@ class AsyncRobotClient(_RobotClientABC):
             )
         )
 
-    async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
+    async def set_tcp_offset(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        wait: bool = False,
+        timeout: float = 30.0,
+    ) -> int:
         """Set TCP offset in mm, composed on top of the current tool
         transform.  (0, 0, 0) resets; changing tools resets it too.
+
+        Queued: the offset lands at its turn, after every move queued
+        before it has finished and before any move queued after it is
+        planned, so a program reads top to bottom.  Returns the command
+        index; ``TCP_OFFSET`` reports the new value once it completes.
 
         Category: Configuration
 
@@ -1401,7 +1474,8 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_tcp_offset(0, 0, -190)
         """
         core = await self._ensure_core()
-        return await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
+        index = await self._call(core.set_tcp_offset(float(x), float(y), float(z)))
+        return await self._finish_queued(index, wait, timeout)
 
     async def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes.
@@ -1438,12 +1512,6 @@ class AsyncRobotClient(_RobotClientABC):
         return await self._call(
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
-
-    async def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe.  Unknown names are refused by the
-        runtime (raises :class:`RobotError`)."""
-        core = await self._ensure_core()
-        return await self._call(core.set_recipe(name))
 
     async def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin).
@@ -1864,10 +1932,8 @@ class AsyncRobotClient(_RobotClientABC):
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
         ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
-        name), ``joints`` (per-joint soft limits + EXEC
-        velocity/acceleration), ``active_recipe`` (the running telemetry
-        recipe, or None when telemetry is off) and ``recipes`` (the names
-        :meth:`set_recipe` accepts).  Returns None if unreachable.
+        name) and ``joints`` (per-joint soft limits + EXEC
+        velocity/acceleration).  Returns None if unreachable.
 
         Category: Query
 

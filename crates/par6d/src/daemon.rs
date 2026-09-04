@@ -78,12 +78,12 @@ pub enum DaemonError {
 pub struct Daemon {
     command_addr: SocketAddr,
     status_port: u16,
-    telemetry_port: u16,
     server: Option<ServerHandle>,
     runtime: Option<tokio::runtime::Runtime>,
     shutdown: Arc<AtomicBool>,
     rt_break: Arc<AtomicBool>,
     threads: Vec<JoinHandle<()>>,
+    vitals: Arc<Mutex<crate::vitals::Vitals>>,
 }
 
 impl Daemon {
@@ -98,9 +98,9 @@ impl Daemon {
         self.status_port
     }
 
-    /// Telemetry stream destination port.
-    pub fn telemetry_port(&self) -> u16 {
-        self.telemetry_port
+    /// The freshest host vitals sample (1 Hz).
+    pub fn vitals(&self) -> crate::vitals::Vitals {
+        self.vitals.lock().map(|v| *v).unwrap_or_default()
     }
 
     /// Boot the full runtime: load config, build the RT core over the
@@ -318,7 +318,7 @@ impl Daemon {
         );
         let mut cfg = server_config(opts, &bundle);
         cfg.config_info = config_info(&config_path, &bundle.robot);
-        let (status_port, telemetry_port) = (cfg.status_port, cfg.telemetry_port);
+        let status_port = cfg.status_port;
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -340,6 +340,7 @@ impl Daemon {
             RunOptions {
                 cpu: None,
                 fifo_priority: None,
+                tick_profile: opts.tick_profile,
             }
         } else {
             // Hardware: SCHED_FIFO on the configured core (setup failure
@@ -349,6 +350,7 @@ impl Daemon {
             RunOptions {
                 cpu: usize::try_from(timing.cpu).ok(),
                 fifo_priority: (timing.fifo_priority > 0).then_some(timing.fifo_priority),
+                tick_profile: opts.tick_profile,
             }
         };
         let mut threads = Vec::new();
@@ -404,15 +406,24 @@ impl Daemon {
             );
         }
 
+        let vitals = Arc::new(Mutex::new(crate::vitals::Vitals::default()));
+        threads.push(crate::vitals::spawn(
+            opts.log_dir
+                .clone()
+                .unwrap_or_else(|| std::path::PathBuf::from("/")),
+            vitals.clone(),
+            shutdown.clone(),
+        )?);
+
         Ok(Self {
             command_addr,
             status_port,
-            telemetry_port,
             server: Some(server),
             runtime: Some(runtime),
             shutdown,
             rt_break,
             threads,
+            vitals,
         })
     }
 
@@ -459,6 +470,7 @@ fn rt_loop(
     shutdown: Arc<AtomicBool>,
     run_opts: RunOptions,
 ) {
+    core.set_tick_profile(run_opts.tick_profile);
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
@@ -712,9 +724,6 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     }
     if let Some(port) = opts.status_port {
         cfg.status_port = port;
-    }
-    if let Some(port) = opts.telemetry_port {
-        cfg.telemetry_port = port;
     }
     if let Some(t) = opts.status_transport {
         cfg.status_transport = t;

@@ -27,17 +27,19 @@ mod homing;
 mod io;
 mod robot;
 
-pub use gripper::{ArmJointHomeOffset, GripperConfig, GripperDriverConfig, ToolKinematics};
+pub use gripper::{
+    ArmJointHomeOffset, GripperConfig, GripperDriverConfig, SettleTimings, ToolKinematics,
+};
 pub use homing::{
     GripperHomeMode, HomeGroup, HomingConfig, HomingStrategy, JointHoming, MoveTo, PostHomeConfig,
     PreMove, ReleaseConfig, SequenceStep,
 };
 pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
-    BusConfig, ControlMode, DriverType, Gains, JogDefaults, JogProfile, JointConfig, JointLimits,
-    KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits, MotionConfig, ProtocolConfig,
-    ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig, StreamDefaults, TimingConfig,
-    WatchdogAction, MAX_OPEN_RETRY_S,
+    BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
+    JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
+    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig,
+    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
 };
 
 use std::path::Path;

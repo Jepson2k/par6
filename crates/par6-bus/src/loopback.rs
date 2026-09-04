@@ -120,6 +120,18 @@ pub enum TxRecord {
         /// Target node.
         node: NodeId,
     },
+    /// Set_CAN_ID (cmd 11).
+    SetCanId {
+        /// Target node.
+        node: NodeId,
+        /// The id it was told to answer to.
+        new_id: NodeId,
+    },
+    /// Save_config (cmd 13).
+    SaveConfig {
+        /// Target node.
+        node: NodeId,
+    },
     /// Limits frame (cmd 20).
     Limits {
         /// Target node.
@@ -469,6 +481,21 @@ impl DriverBus for LoopbackBus {
         for _ in 0..repeats {
             self.record_config_pass(node);
         }
+        Ok(())
+    }
+
+    fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let tick = self.tick;
+        self.tx_log
+            .push((tick, TxRecord::SetCanId { node, new_id }));
+        Ok(())
+    }
+
+    fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let tick = self.tick;
+        self.tx_log.push((tick, TxRecord::SaveConfig { node }));
         Ok(())
     }
 

@@ -219,10 +219,17 @@ impl Client {
         .await
     }
 
-    /// Apply a TCP offset \[mm\], tool-local.
-    pub async fn set_tcp_offset(&self, x: f64, y: f64, z: f64) -> Result<Ack, ClientError> {
-        self.system(Command::SetTcpOffset(cmd::SetTcpOffset { x, y, z }))
-            .await
+    /// Queue a TCP offset \[mm\], tool-local. Applied at its turn in the
+    /// queue, so moves queued before it keep the old frame; the returned
+    /// index completes when it lands.
+    pub async fn set_tcp_offset(&self, x: f64, y: f64, z: f64) -> Result<Option<u64>, ClientError> {
+        self.queued(Command::SetTcpOffset(cmd::SetTcpOffset {
+            key: self.fresh_key(),
+            x,
+            y,
+            z,
+        }))
+        .await
     }
 
     /// Replace the runtime payload carried at the TCP (mass \[kg\], COM
@@ -267,6 +274,31 @@ impl Client {
         self.system(Command::SetPidGains(gains)).await
     }
 
+    /// Commissioning: rename drive `node` to `new_id` (`SET_CAN_ID`).
+    /// Refused unless the arm is idle or latched with nothing in flight;
+    /// `force` allows an id the config does not list.
+    pub async fn set_can_id(&self, node: u8, new_id: u8, force: bool) -> Result<Ack, ClientError> {
+        self.system(Command::SetCanId(cmd::SetCanId {
+            node,
+            new_id,
+            force,
+        }))
+        .await
+    }
+
+    /// Commissioning: persist drive `node`'s running configuration to its
+    /// NVM (`SAVE_CONFIG`). Same gate and `force` rule as `set_can_id`.
+    pub async fn save_config(&self, node: u8, force: bool) -> Result<Ack, ClientError> {
+        self.system(Command::SaveConfig(cmd::SaveConfig { node, force }))
+            .await
+    }
+
+    /// Rescan the bus and report every node id (`BUS_SCAN`); the reply
+    /// waits for the scan to settle.
+    pub async fn bus_scan(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::BusScan).await
+    }
+
     /// Replace the program-layer collision shapes.
     pub async fn set_shapes(&self, shapes: Vec<Shape>) -> Result<Ack, ClientError> {
         self.system(Command::SetShapes(cmd::SetShapes { shapes }))
@@ -280,14 +312,6 @@ impl Client {
     ) -> Result<Ack, ClientError> {
         self.system(Command::SetCompletionPolicy(cmd::SetCompletionPolicy {
             policy,
-        }))
-        .await
-    }
-
-    /// Select the telemetry recipe by name (empty stops the stream).
-    pub async fn set_recipe(&self, name: &str) -> Result<Ack, ClientError> {
-        self.system(Command::SetRecipe(cmd::SetRecipe {
-            name: name.to_string(),
         }))
         .await
     }
@@ -419,7 +443,13 @@ impl Client {
         .await
     }
 
-    /// Piecewise-linear path through cartesian waypoints with auto-blends.
+    /// Piecewise-linear path through cartesian waypoints with auto-blends,
+    /// timed so the TCP holds one speed along the whole path.
+    ///
+    /// `speed` is therefore a fraction of the fastest constant speed the
+    /// joints allow on this path, not of the joint budget moment to
+    /// moment; a corner too sharp to turn at that rate slows the move
+    /// rather than failing it.
     pub async fn move_p(
         &self,
         waypoints: Vec<[f64; 6]>,

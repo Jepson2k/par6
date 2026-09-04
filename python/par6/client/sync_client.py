@@ -322,7 +322,11 @@ class RobotClient:
         wait: bool = True,
         timeout: float = 10.0,
     ) -> int:
-        """Process move with auto-blending (blocking by default)."""
+        """Process move at a constant TCP speed, auto-blended (blocking by default).
+
+        See :meth:`par6.AsyncRobot.move_p` for what ``speed`` means on a
+        move that holds one rate along the path.
+        """
         return _run(
             self._inner.move_p(
                 waypoints,
@@ -471,6 +475,19 @@ class RobotClient:
         """Set the motion profile (e.g. ``"TOPPRA"``)."""
         return _run(self._inner.select_profile(profile))
 
+    def bus_scan(self) -> list[dict] | None:
+        """Rescan the CAN bus; one row per node id (see the async client)."""
+        return _run(self._inner.bus_scan())
+
+    def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
+        """Commissioning: rename drive *node* to *new_id* (idle arm only;
+        ``force`` for an id the config does not list)."""
+        return _run(self._inner.set_can_id(node, new_id, force=force))
+
+    def save_config(self, node: int, *, force: bool = False) -> int:
+        """Commissioning: persist drive *node*'s running configuration."""
+        return _run(self._inner.save_config(node, force=force))
+
     def enter_flashing(self, assertion: str) -> int:
         """Hand the CAN bus to a firmware flasher (``"parked"`` or
         ``"force"`` — the operator's vouching, no default)."""
@@ -518,9 +535,19 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
-    def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
-        """Set TCP offset in mm on top of the current tool transform."""
-        return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
+    def set_tcp_offset(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        wait: bool = False,
+        timeout: float = 30.0,
+    ) -> int:
+        """Queue a TCP offset in mm on top of the current tool transform;
+        it lands at its turn between the moves around it."""
+        return _run(
+            self._inner.set_tcp_offset(x=x, y=y, z=z, wait=wait, timeout=timeout)
+        )
 
     def set_shapes(self, shapes: list[Shape]) -> int:
         """Replace the program-layer keep-out / marker shapes."""
@@ -529,10 +556,6 @@ class RobotClient:
     def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion."""
         return _run(self._inner.set_completion_policy(policy))
-
-    def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe (unknown names are refused)."""
-        return _run(self._inner.set_recipe(name))
 
     def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin)."""

@@ -36,7 +36,7 @@ fn boot_daemon(tag: &str, status_host: Ipv4Addr) -> (Daemon, ClientConfig) {
     common::redirect_bus_grant();
     let status_port = free_port();
     let config = common::retimed_config(&format!("client-{tag}"), 0.02);
-    let mut opts = common::sim_options(config, status_port, 0);
+    let mut opts = common::sim_options(config, status_port);
     opts.status_host = Some(IpAddr::V4(status_host));
     let daemon = Daemon::start(&opts).expect("daemon boots in sim mode");
     let cfg = ClientConfig {
