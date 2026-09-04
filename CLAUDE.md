@@ -26,13 +26,10 @@ The python package builds the `par6._par6` extension, so `pip install`
 needs `source .ffi/env.sh` first, and so does running anything that
 imports `par6` (the extension dlopens the shim).
 
-## Contract discipline (multi-agent repo)
+## Generated artifacts stay in sync
 
-- `crates/par6-proto` and the trait contracts (`DriverBus`, sample ring, config schema)
-  are **frozen interfaces**. Changing them requires a `contracts`-labeled issue — never
-  drive-by edits from a feature branch.
-- `tests/golden/` vectors are the wire conformance suite for the frozen codec
-  (encode + decode, `par6-proto`). A contract change without regenerated
+- `tests/golden/` vectors are the wire conformance suite for the codec
+  (encode + decode, `par6-proto`). A wire change without regenerated
   vectors + passing tests is incomplete.
 - `python/par6/protocol/constants.py` is GENERATED from `par6-proto` — never edit by
   hand; regenerate and let the freshness-guard test prove it.

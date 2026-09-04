@@ -1,0 +1,35 @@
+[workspace]
+authors = ["jepson2k <55201008+Jepson2k@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "par6"
+platforms = ["linux-aarch64", "linux-64"]
+version = "0.1.0"
+
+# The C++ dependency closure the shim (cpp/) links against, plus the tools that
+# build it. Rust comes from rustup (rust-toolchain.toml), not from here — pixi
+# owns the system/C++ side only.
+#
+# libmujoco is NOT here: the `mujoco-rs` crate fetches it itself via its
+# `auto-download-mujoco` feature into $MUJOCO_DOWNLOAD_DIR.
+[dependencies]
+# Pinned: the Python side's `pinokin` must resolve the same major/minor, and
+# the shim's C ABI is written against this API.
+pinocchio = "4.1.*"
+# coal (hpp-fcl) backs par6_col_* and arrives as a pinocchio dependency
+# anyway; naming it keeps the shim's link line honest, so a pinocchio build
+# that drops collision support fails here rather than at cmake time.
+coal = "*"
+eigen = "*"
+urdfdom = "*"
+cmake = "*"
+ninja = "*"
+cxx-compiler = "*"
+
+[activation.env]
+PAR6_SHIM_LIB_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/lib"
+PAR6_SHIM_INCLUDE_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/include"
+# mujoco-rs requires an absolute path; it fetches the libmujoco matching
+# CARGO_CFG_TARGET_ARCH into this directory.
+MUJOCO_DOWNLOAD_DIR = "$PIXI_PROJECT_ROOT/.ffi/mujoco"
+
+[tasks]

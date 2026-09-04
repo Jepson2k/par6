@@ -246,8 +246,8 @@ The recipe, in the order that keeps the golden-vector guard happy:
 6. **Test** — a sim e2e that drives the command through the real client against a real
    `par6d --sim`.
 
-`par6-proto` is a frozen interface: changing it needs a `contracts`-labeled issue,
-regenerated vectors on **both** sides, and a re-freeze. See `CLAUDE.md`.
+Changing `par6-proto` means regenerating the golden vectors on **both** sides and the
+Python constants. See `CLAUDE.md`.
 
 ## Motion profiles
 
