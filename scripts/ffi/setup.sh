@@ -305,6 +305,14 @@ fi
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
 fi
+# Rebuild when cpp/ has moved on: cargo does not build the shim, so a stale
+# .so links silently and surfaces as wrong numbers in the kinematics tests.
+if [[ -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
+  if [[ -n "$(find "$ROOT/cpp" -type f -newer "$SHIM_PREFIX/lib/libpar6_shim.so" -print -quit)" ]]; then
+    echo ">>> cpp/ is newer than the installed shim; rebuilding"
+    rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
+  fi
+fi
 if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
   echo ">>> building par6_shim for $TARGET_ARCH"
   run_tool cmake -G Ninja -S "$ROOT/cpp" -B "$BUILD_DIR" \
@@ -316,7 +324,7 @@ if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
   run_tool cmake --build "$BUILD_DIR"
   run_tool cmake --install "$BUILD_DIR"
 else
-  echo ">>> shim exists: $SHIM_PREFIX (FORCE=1 to rebuild)"
+  echo ">>> shim exists and is newer than cpp/: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
 
 # --- 4b. drop the build machine out of the artifacts we produce --------------
