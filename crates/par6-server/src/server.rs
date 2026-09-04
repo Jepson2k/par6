@@ -324,6 +324,12 @@ struct Core<P: Planner, R: RtCommands> {
     standing_error: Option<WireError>,
     action_state: ActionState,
     estop_latched: bool,
+    /// A teleport was accepted and the RT has not published the snapshot
+    /// yet. Teleporting references the arm, so the homed gate must open
+    /// for the command right behind it — a client sends a teleport and
+    /// its first move in the same breath, and the snapshot is a tick or
+    /// more behind.
+    teleport_homed: bool,
     active_stream: Option<CmdType>,
     /// Datagrams a preemption drain took off the socket without being
     /// entitled to discard them; dispatched by the run loop, in order.
@@ -413,6 +419,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             standing_error: None,
             action_state: ActionState::Idle,
             estop_latched: false,
+            teleport_homed: false,
             active_stream: None,
             deferred: VecDeque::new(),
             drainbuf: vec![0u8; 65535],
@@ -1069,6 +1076,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.runtime
                 .rt
                 .teleport(&p.angles, p.tool_positions.as_deref());
+            self.teleport_homed = true;
             self.on_motion_accepted();
             return;
         }
@@ -1311,7 +1319,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
-            homed: self.snap.homed,
+            homed: self.snap.homed || self.teleport_homed,
             simulator: self.simulator,
         };
         check_gate(tag, &ctx)
@@ -1695,6 +1703,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
+            if self.snap.homed {
+                self.teleport_homed = false;
+            }
         }
     }
 
