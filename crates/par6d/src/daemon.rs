@@ -66,6 +66,9 @@ pub enum DaemonError {
     /// The loop-timing bands cannot be resolved at the configured tick.
     #[error("timing: {0}")]
     Timing(String),
+    /// The CAN bus cannot carry the configured tick rate.
+    #[error("bus budget: {0}")]
+    BusBudget(String),
     /// The RT core could not be constructed.
     #[error("RT core: {0}")]
     Core(#[from] par6_rt::CoreError),
@@ -146,6 +149,40 @@ impl Daemon {
                  sustain past {resolution} s or shorten the tick",
                 bands.critical_sustain_s, robot.robot.tick_dt_s,
             )));
+        }
+        // What actually caps the tick rate is the wire, not the loop: the
+        // steady-state exchange has to finish inside one tick, and on
+        // classic CAN it is the binding constraint long before compute
+        // is. Only the real bus has one — `--sim` answers in memory.
+        if !opts.sim {
+            let budget = par6_bus::budget::bus_budget(
+                robot.joints.len(),
+                bundle.active_gripper().is_some_and(|g| g.driver.is_some()),
+                robot.bus.bitrate,
+                robot.robot.tick_dt_s,
+            );
+            if !budget.fits() {
+                return Err(DaemonError::BusBudget(format!(
+                    "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
+                     {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
+                     carries at most {:.0} Hz on this bus",
+                    robot.tick_rate_hz(),
+                    budget.frames_per_tick,
+                    budget.wire_time_s * 1e3,
+                    robot.bus.bitrate,
+                    budget.utilisation * 100.0,
+                    robot.robot.tick_dt_s * 1e3,
+                    budget.max_tick_rate_hz,
+                )));
+            }
+            log::info!(
+                "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
+                budget.frames_per_tick,
+                budget.wire_time_s * 1e3,
+                robot.robot.tick_dt_s * 1e3,
+                budget.utilisation * 100.0,
+                budget.max_tick_rate_hz,
+            );
         }
         log::info!(
             "loaded {} ({} joints, tick {} Hz) from {}",

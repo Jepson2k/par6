@@ -524,6 +524,68 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tick rate the CAN bus cannot carry is refused at startup, before
+/// anything touches the interface.
+///
+/// The arm's ceiling is wire time, not compute: 6 joints plus a gripper
+/// is 8 frames out and 8 answers back, ~2.2 ms of a 1 Mbit/s bus, so a
+/// 2 ms tick is over-subscribed before the loop does anything. Nothing
+/// checked it — `tick_dt_s` was validated only as `(0, 1) s` — and the
+/// symptom on a real arm was TX queue drops and freshness latches, which
+/// look like a wiring fault rather than a config one.
+///
+/// Booted in HARDWARE mode against an interface that does not exist: the
+/// budget is what must answer, which is only true if it is checked
+/// before the bus is opened.
+#[test]
+fn a_tick_the_bus_cannot_carry_is_refused_before_the_interface_opens() {
+    let opts = Options {
+        sim: false,
+        config: Some(common::retimed_config_with_interface(
+            "budget",
+            0.002, // 500 Hz: ~108% of the wire
+            "par6-no-such-can-budget",
+        )),
+        assets: Some(common::assets_dir()),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts)
+        .err()
+        .expect("an over-subscribed bus must refuse startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bus budget"),
+        "the refusal is the budget's, not the interface's: {msg}"
+    );
+    assert!(
+        !msg.contains("par6-no-such-can-budget"),
+        "the budget must answer BEFORE the interface is opened: {msg}"
+    );
+    // It names the numbers an operator needs to pick a rate that works.
+    for needle in ["frames", "wire time", "at most"] {
+        assert!(msg.contains(needle), "refusal must name {needle:?}: {msg}");
+    }
+
+    // The shipped tick on the same (absent) interface gets past the
+    // budget and fails on the interface instead — so the gate is the
+    // rate, not hardware mode.
+    let opts = Options {
+        sim: false,
+        config: Some(common::retimed_config_with_interface(
+            "budget-ok",
+            0.004,
+            "par6-no-such-can-budget-ok",
+        )),
+        assets: Some(common::assets_dir()),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts).err().expect("no such interface");
+    assert!(
+        err.to_string().contains("par6-no-such-can-budget-ok"),
+        "the shipped rate must clear the budget: {err}"
+    );
+}
+
 /// Startup failure paths are clear errors, never panics: hardware mode
 /// whose CAN interface does not exist names the interface and points at
 /// `--sim`; a missing config file names the path it tried.

@@ -139,6 +139,27 @@ pub fn retimed_config(tag: &str, dt: f64) -> PathBuf {
     dst
 }
 
+/// The shipped config re-timed to `dt` AND pointed at `iface`, for the
+/// hardware-mode startup checks that must refuse before any interface is
+/// opened.
+pub fn retimed_config_with_interface(tag: &str, dt: f64, iface: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("par6d-{tag}-{}", std::process::id()));
+    let grippers = dir.join("grippers");
+    std::fs::create_dir_all(&grippers).expect("test config dir");
+    let src = shipped_config();
+    let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
+    let patched = set_scalar(&text, "tick_dt_s", &dt.to_string());
+    let patched = set_scalar(&patched, "interface", &format!("\"{iface}\""));
+    let dst = dir.join("PAR6.toml");
+    write_atomic(&dst, patched.as_bytes());
+    for entry in std::fs::read_dir(src.parent().unwrap().join("grippers")).expect("grippers dir") {
+        let e = entry.expect("dir entry");
+        let body = std::fs::read(e.path()).expect("read gripper toml");
+        write_atomic(&grippers.join(e.file_name()), &body);
+    }
+    dst
+}
+
 /// The shipped park pose in degrees, the way the wire carries angles.
 pub fn park_deg() -> [f64; par6_proto::NUM_JOINTS] {
     let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
