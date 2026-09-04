@@ -477,6 +477,6 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 
 ## License
 
-MIT (`LICENSE`). `assets/par6_description/` derives from Source Robotics' PAR6
+Apache-2.0 (`LICENSE`). `assets/par6_description/` derives from Source Robotics' PAR6
 repository under a licence upstream states two ways — see `assets/NOTICE`, which records
 what is verbatim, what par6 modified, and what par6 authored.
