@@ -1,0 +1,57 @@
+{
+ "start_rad": [
+  1.5707723583450859,
+  -2.516096647521544,
+  1.9133261642966293,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "end_rad": [
+  1.5707723583450859,
+  -2.516096647521544,
+  1.9133261642966293,
+  0.0,
+  0.0,
+  0.0
+ ],
+ "joints": [
+  {
+   "index": 0,
+   "name": "joint1",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  },
+  {
+   "index": 1,
+   "name": "joint2",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  },
+  {
+   "index": 2,
+   "name": "joint3",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  },
+  {
+   "index": 3,
+   "name": "joint4",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  },
+  {
+   "index": 4,
+   "name": "joint5",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  },
+  {
+   "index": 5,
+   "name": "joint6",
+   "first_motion_sign": null,
+   "delta_rad": 0.0
+  }
+ ],
+ "convention": "the runtime reports URDF q: a positive delta is positive URDF rotation about that joint's axis"
+}

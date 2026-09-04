@@ -1380,6 +1380,83 @@ def test_a_configured_initial_recipe_streams_telemetry_from_boot(tmp_path):
         daemon.stop()
 
 
+async def test_status_carries_drive_and_loop_health(tmp_path):
+    """A display should not have to poll a query or open a second stream to
+    say whether the arm is well: the drives' analog trends and the loop's
+    tail ride the STATUS broadcast every subscriber already gets.
+
+    Both are checked against the authority that owns them — the telemetry
+    stream for the drive registers, the LOOP_STATS query for the loop — so
+    this fails if STATUS ever carries an invented or stale copy rather than
+    the live snapshot."""
+    daemon = LiveDaemon.start(tmp_path)
+    try:
+        async with daemon.client(telemetry_port=daemon.telemetry_port) as client:
+            assert await client.wait_ready(timeout=STEP_BUDGET_S)
+
+            seen: dict = {}
+
+            def capture(s) -> bool:
+                temps = list(s.drive_health.get("temperatures_c") or [])
+                if not temps or not all(math.isfinite(t) for t in temps):
+                    return False
+                seen["drives"] = dict(s.drive_health)
+                return True
+
+            assert await client.wait_status(capture, timeout=STEP_BUDGET_S), (
+                f"no drive readings on STATUS; daemon log:\n"
+                f"{daemon.log_path.read_text()}"
+            )
+            drives = seen["drives"]
+            temps = list(drives["temperatures_c"])
+            assert all(t > 0.0 for t in temps)
+            assert len(drives["currents_ma"]) == len(temps)
+            assert drives["bus_voltage_v"] > 0.0
+
+            # The same registers, from the stream that owns them.
+            reader = client.open_telemetry()
+            try:
+                await client.set_recipe("diagnostics")
+                streamed = None
+                deadline = time.monotonic() + STEP_BUDGET_S
+                while time.monotonic() < deadline:
+                    frame = reader.recv(timeout=STEP_BUDGET_S)
+                    assert frame is not None
+                    values = frame["fields"]["motor_temperatures_c"]
+                    if all(math.isfinite(t) for t in values):
+                        streamed = list(values)
+                        break
+            finally:
+                reader.close()
+            assert streamed is not None
+            assert temps == streamed
+
+            # Loop health against LOOP_STATS. The percentile needs a full
+            # sampling window before it means anything, so wait for it
+            # rather than reading whichever frame arrived first.
+            loop: dict = {}
+
+            def loop_ready(s) -> bool:
+                loop.update(dict(s.loop_health))
+                return loop["p99_period_s"] > 0.0
+
+            assert await client.wait_status(loop_ready, timeout=STEP_BUDGET_S), (
+                "STATUS never reported a loop percentile"
+            )
+            stats = await client.loop_stats()
+            assert stats is not None
+            assert abs(loop["p99_period_s"] - stats.p99_period_s) < 5e-3
+            before = loop["overruns"]
+            later: dict = {}
+            assert await client.wait_status(
+                lambda s: bool(later.update(dict(s.loop_health))) or True,
+                timeout=STEP_BUDGET_S,
+            )
+            assert later["overruns"] >= before
+    finally:
+        daemon.stop()
+
+
 async def test_the_client_opens_telemetry_on_its_own_transport(tmp_path):
     """``open_telemetry()`` hands a consumer the stream without it knowing
     the port or transport: the reader follows the client's own status

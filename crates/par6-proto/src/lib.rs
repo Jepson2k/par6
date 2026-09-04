@@ -59,8 +59,8 @@ pub use reply::{
     decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
 };
 pub use status::{
-    decode_status, encode_status_into, HomingWire, LinkHealthWire, Status, StatusEncoder,
-    STATUS_HEADER_LEN, STATUS_LEN,
+    decode_status, encode_status_into, DriveHealthWire, HomingWire, LinkHealthWire, LoopHealthWire,
+    Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
 };
 pub use telemetry::{
     decode_telemetry, encode_telemetry, TelemetryField, TelemetryFrame, TelemetryRecipe,

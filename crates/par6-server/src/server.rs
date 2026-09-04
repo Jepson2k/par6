@@ -2130,6 +2130,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 w
             },
             link_health: Self::wire_link_health(&self.snap.link),
+            drive_health: Self::wire_drive_health(&self.snap),
+            loop_health: par6_proto::LoopHealthWire {
+                p99_period_s: self.snap.loop_stats.p99_s,
+                overruns: u64::from(self.snap.loop_stats.overruns),
+            },
             homing: Self::wire_homing(&self.snap.homing),
             torques_ext: {
                 let mut out = [0.0; par6_proto::NUM_JOINTS];
@@ -2155,6 +2160,30 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             restarts: l.restarts,
             tx_errors: l.tx_errors,
             rx_frames: l.rx_frames,
+        }
+    }
+
+    /// The drives' analog readings, per node and arm joints first, with
+    /// `NaN` for a node that has not answered that register yet. The bus
+    /// voltage is the lowest any node reports: a sagging supply shows up
+    /// first at whichever drive is pulling on it.
+    fn wire_drive_health(snap: &par6_rt::StateSnapshot) -> par6_proto::DriveHealthWire {
+        let read = |f: fn(&par6_rt::NodeState) -> Option<f64>| -> Vec<f64> {
+            snap.nodes
+                .iter()
+                .map(|n| f(n).unwrap_or(f64::NAN))
+                .collect()
+        };
+        let bus_voltage_v = snap
+            .nodes
+            .iter()
+            .filter_map(|n| n.voltage_mv)
+            .map(|mv| f64::from(mv) / 1000.0)
+            .reduce(f64::min);
+        par6_proto::DriveHealthWire {
+            temperatures_c: read(|n| n.temperature_c.map(f64::from)),
+            currents_ma: read(|n| n.current_ma.map(f64::from)),
+            bus_voltage_v,
         }
     }
 

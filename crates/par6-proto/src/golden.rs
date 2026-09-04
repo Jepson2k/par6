@@ -444,6 +444,15 @@ fn status_full_fixture() -> Status {
             ],
         },
         torques_ext: [0.5, -0.25, 0.125, -0.0625, 0.03125, -0.015625],
+        drive_health: crate::status::DriveHealthWire {
+            temperatures_c: vec![31.0, 32.5, 33.0, 34.5, 35.0, 36.5, 28.0],
+            currents_ma: vec![120.0, 340.0, 275.0, 60.0, 45.0, 30.0, 15.0],
+            bus_voltage_v: Some(23.7),
+        },
+        loop_health: crate::status::LoopHealthWire {
+            p99_period_s: 0.004_51,
+            overruns: 16,
+        },
     }
 }
 

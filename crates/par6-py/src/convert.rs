@@ -133,6 +133,15 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     homing.set_item("joints", s.homing.joints.clone())?;
     d.set_item("homing", homing)?;
     d.set_item("torques_ext", s.torques_ext.to_vec())?;
+    let dh = PyDict::new(py);
+    dh.set_item("temperatures_c", s.drive_health.temperatures_c.clone())?;
+    dh.set_item("currents_ma", s.drive_health.currents_ma.clone())?;
+    dh.set_item("bus_voltage_v", s.drive_health.bus_voltage_v)?;
+    d.set_item("drive_health", dh)?;
+    let loop_health = PyDict::new(py);
+    loop_health.set_item("p99_period_s", s.loop_health.p99_period_s)?;
+    loop_health.set_item("overruns", s.loop_health.overruns)?;
+    d.set_item("loop_health", loop_health)?;
     Ok(d.into_any().unbind())
 }
 
