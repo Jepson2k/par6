@@ -2971,14 +2971,45 @@ async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
         );
         h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
     }
+
+    // The gating half: a state the arm cannot plan motion from. The move
+    // establishes that this state really does refuse — without it the
+    // pause below would be asserting nothing.
+    h.publish(|s| {
+        s.state = ArmState::Disabled;
+        s.homed = false;
+    });
+    match c.request(&move_j(801)).await {
+        Reply::Error { error, .. } => assert_eq!(
+            error.code,
+            ErrorCode::SysControllerDisabled as u16,
+            "{}",
+            error.cause
+        ),
+        other => panic!("a disabled, unreferenced arm must refuse a move, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+                .await,
+            Reply::Ok { .. }
+        ),
+        "holding a moving arm must not depend on the controller being enabled"
+    );
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
 }
 
 /// SET_PAYLOAD: a valid payload reaches the RT and the planner sync, and
-/// the PAYLOAD query reads back what was set; invalid inertia and
-/// negative mass are refused at the wire and leave the readback
-/// untouched.
+/// the PAYLOAD query reads back what was set.
+///
+/// The refusals live one layer down, where they are reachable: a negative
+/// mass or an indefinite inertia never survives `decode_command`, so the
+/// server has no such case to answer. `par6-proto`'s
+/// `a_payload_that_is_not_a_rigid_body_is_refused_at_the_wire` holds that
+/// boundary.
 #[tokio::test]
-async fn set_payload_applies_reads_back_and_refuses_garbage() {
+async fn set_payload_applies_and_reads_back() {
     let h = start(|_| {}).await;
     let mut c = Client::new(&h).await;
 
@@ -3019,10 +3050,6 @@ async fn set_payload_applies_reads_back_and_refuses_garbage() {
         }
         other => panic!("expected PAYLOAD response, got {other:?}"),
     }
-
-    // Refusals (negative mass, indefinite inertia) are decode-side —
-    // par6-proto's hostile-input tests pin them, and encode_command
-    // refuses the same inputs client-side before a byte leaves.
 
     // Clearing is mass 0.
     match c

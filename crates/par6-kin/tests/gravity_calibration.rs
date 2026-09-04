@@ -103,24 +103,11 @@ fn wrist_poses(start: [f64; NQ], spread: f64) -> Vec<[f64; NQ]> {
 
 #[test]
 fn a_payload_is_recovered_from_the_torque_the_arm_cannot_explain() {
-    // The model the runtime carries: the arm and its fitted gripper, and
-    // nothing in the hand.
-    let tool = heavy_tool();
-    let mut unloaded = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
-    let theta_unloaded = gravity::flatten(&gravity::model_params(&unloaded).unwrap());
+    // The model the runtime carries: the arm, and nothing in the hand.
+    let mut unloaded = Kin::load_arm(&assets_dir(), None).unwrap();
 
-    // The arm as it really is with a part in the gripper: the same
-    // model with the payload's mass and first moment added to the body
-    // at the end of the chain. Its torques are what the sensors would
-    // report.
     const MASS: f64 = 1.35;
     const COM: [f64; 3] = [0.012, -0.028, 0.061];
-    let mut theta_loaded = theta_unloaded.clone();
-    let base = theta_loaded.len() - 4;
-    theta_loaded[base] += MASS;
-    for k in 0..3 {
-        theta_loaded[base + 1 + k] += MASS * COM[k];
-    }
 
     for (name, start, spread) in [
         (
@@ -130,13 +117,23 @@ fn a_payload_is_recovered_from_the_torque_the_arm_cannot_explain() {
         ),
         ("folded up", [0.5, -1.0, 2.6, 0.3, 0.8, 2.5], 0.5),
     ] {
+        // What the sensors report: the arm actually carrying the part,
+        // through RNEA. The identification runs on the analytic
+        // regressor, so measuring with it too would make the fit invert
+        // the very matrix that produced its input.
+        unloaded.set_tool(MASS, COM, None).unwrap();
         let samples: Vec<GravitySample> = wrist_poses(start, spread)
             .into_iter()
-            .map(|q| GravitySample {
-                q,
-                tau: gravity::predict(&mut unloaded, &theta_loaded, &q).unwrap(),
+            .map(|q| {
+                let mut tau = [0.0; NQ];
+                unloaded.gravity(&q, &mut tau).unwrap();
+                GravitySample { q, tau }
             })
             .collect();
+        // The part is put down before the fit: what it must recover is
+        // the difference between the torque it was handed and the torque
+        // the model it holds can account for.
+        unloaded.set_tool(0.0, [0.0; 3], None).unwrap();
 
         let fit = gravity::fit_payload(&mut unloaded, &samples, 1e-6).unwrap();
         assert!(
@@ -170,6 +167,23 @@ fn a_payload_is_recovered_from_the_torque_the_arm_cannot_explain() {
     }
 }
 
+/// One-milli-newton-metre-scale torque error is what a current-sense
+/// estimate carries; a fit that turns it into a payload would declare a
+/// part in an empty gripper.
+const TORQUE_NOISE_NM: f64 = 0.05;
+
+/// A deterministic sign-varying sequence in [-1, 1] — the point is a
+/// reproducible non-zero residual, not statistical realism.
+fn noise_seq() -> impl FnMut() -> f64 {
+    let mut n: u64 = 0x9E37_79B9_7F4A_7C15;
+    move || {
+        n ^= n << 13;
+        n ^= n >> 7;
+        n ^= n << 17;
+        ((n >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
+    }
+}
+
 #[test]
 fn an_empty_hand_identifies_as_empty_and_a_still_wrist_says_so() {
     let tool = heavy_tool();
@@ -177,20 +191,37 @@ fn an_empty_hand_identifies_as_empty_and_a_still_wrist_says_so() {
     let theta = gravity::flatten(&gravity::model_params(&kin).unwrap());
     let start = [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416];
 
-    // Carrying nothing: the unloaded model already explains every
-    // torque, so there is no residual to attribute to a payload.
+    // Carrying nothing, measured the way the runtime measures: RNEA for
+    // the true torque, plus the sensing error that never cancels. The
+    // sweep is the same one that recovers 1.35 kg above, so the fit has
+    // every chance to attribute the noise to a payload.
+    let mut noise = noise_seq();
     let empty: Vec<GravitySample> = wrist_poses(start, 0.5)
         .into_iter()
-        .map(|q| GravitySample {
-            q,
-            tau: gravity::predict(&mut kin, &theta, &q).unwrap(),
+        .map(|q| {
+            let mut tau = [0.0; NQ];
+            kin.gravity(&q, &mut tau).unwrap();
+            for t in tau.iter_mut() {
+                *t += TORQUE_NOISE_NM * noise();
+            }
+            GravitySample { q, tau }
         })
         .collect();
     let fit = gravity::fit_payload(&mut kin, &empty, 1e-6).unwrap();
     assert!(
-        fit.mass.abs() < 0.01,
-        "an empty hand must identify as empty, got {:.4} kg",
+        fit.mass.abs() < 0.05,
+        "an empty hand must identify as empty, got {:.4} kg out of \
+         {TORQUE_NOISE_NM} Nm of noise",
         fit.mass
+    );
+    // And it must be empty for the right reason. `calibrate::estimate`
+    // refuses on `determined[0]`, so a sweep that DID separate the four
+    // parameters and simply found no mass has to look different from one
+    // that could not measure a mass at all — the still wrist below.
+    assert!(
+        fit.determined[0] > 0.9,
+        "the swept poses must measure the mass they found to be zero, got {:?}",
+        fit.determined
     );
 
     // A wrist that never moved gives the same lever arm every time, so
