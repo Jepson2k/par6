@@ -715,6 +715,41 @@ mod tests {
         assert!(err.contains("wall"), "{err}");
     }
 
+    /// A bus freshness window that rounds away to zero ticks is refused.
+    ///
+    /// Regression: `bus.stale_warn_s` and `bus.lost_s` convert with
+    /// `round(s/dt)`, and the freshness clock tests `age >= threshold`.
+    /// Under half a tick they round to zero, which reads every node
+    /// Stale at age zero, turns every frame into a stale→fresh edge (a
+    /// stored-config resend per node per tick), and latches `CAN_LOST`
+    /// on the tick after a node's first frame — the arm cannot boot.
+    /// `tick_dt_s` was validated only as `(0, 1) s`, so nothing caught
+    /// the combination.
+    #[test]
+    fn a_freshness_window_that_rounds_away_is_refused() {
+        let path = config_dir().join("PAR6.toml");
+        let good = RobotConfig::load(&path).unwrap();
+        // Shipped: 0.04 s over a 0.004 s tick is 10 ticks.
+        good.validate().expect("the shipped config stands");
+
+        // The re-ticked harnesses still stand: at the python rig's
+        // 0.05 s tick, 0.04 s rounds UP to one tick. That is a real
+        // window, so refusing it would break a rig that works.
+        let mut cfg = good.clone();
+        cfg.robot.tick_dt_s = 0.05;
+        cfg.protocol.status_rate_hz = 20;
+        cfg.validate()
+            .expect("0.8 of a tick rounds up to a window that works");
+
+        // Past half a tick it rounds away entirely.
+        let mut cfg = good.clone();
+        cfg.robot.tick_dt_s = 0.1; // 0.04 / 0.1 = 0.4 -> 0 ticks
+        cfg.protocol.status_rate_hz = 10;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("bus.stale_warn_s"), "{err}");
+        assert!(err.contains("rounds to zero ticks"), "{err}");
+    }
+
     #[test]
     fn validation_errors_name_the_field() {
         let path = config_dir().join("PAR6.toml");

@@ -63,6 +63,9 @@ pub enum DaemonError {
     /// URDF that failed to load).
     #[error("kinematics: {0}")]
     Kinematics(String),
+    /// The loop-timing bands cannot be resolved at the configured tick.
+    #[error("timing: {0}")]
+    Timing(String),
     /// The RT core could not be constructed.
     #[error("RT core: {0}")]
     Core(#[from] par6_rt::CoreError),
@@ -128,6 +131,22 @@ impl Daemon {
         let bundle = Arc::new(loaded);
         let robot = &bundle.robot;
         let bands = robot.loop_timing();
+        // The bands are resolved by now (`--sim` widens them), so this is
+        // the first point that can judge the pair. A sustain the
+        // percentile recompute cannot resolve turns LOOP_CRITICAL from a
+        // sustained-degradation latch into a first-bad-sample one, and
+        // that latch disables the controller — a hair trigger nothing
+        // announces is worse than no guard.
+        let resolution = par6_rt::timing::sustain_resolution_s(robot.robot.tick_dt_s);
+        if bands.critical_sustain_s < resolution {
+            return Err(DaemonError::Timing(format!(
+                "critical_sustain_s = {} s is under the {resolution} s percentile \
+                 recompute at a {} s tick, so LOOP_CRITICAL would latch on the \
+                 first bad percentile instead of a sustained one; raise the \
+                 sustain past {resolution} s or shorten the tick",
+                bands.critical_sustain_s, robot.robot.tick_dt_s,
+            )));
+        }
         log::info!(
             "loaded {} ({} joints, tick {} Hz) from {}",
             robot.robot.name,

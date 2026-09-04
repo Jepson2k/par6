@@ -139,9 +139,18 @@ impl FreshnessClock {
     /// caller) and forget every observation. Boot is the one moment where
     /// "never seen" is the truth — the bus scan and the RT boot selfcheck
     /// are what catch a node that never appears at all.
+    ///
+    /// Both thresholds floor at one tick. `classify` and `latch_lost`
+    /// test `age >= threshold` and `mark` tests the same for the
+    /// stale→fresh edge, so a zero would read every node stale at age
+    /// zero, make every frame a reconnect (a stored-config resend per
+    /// node per tick), and latch `CAN_LOST` on the tick after a node's
+    /// first frame. Config validation rejects a window shorter than the
+    /// tick; this is the floor that keeps a rounding result from
+    /// reintroducing it in any backend.
     pub(crate) fn configure(&mut self, stale_warn_ticks: u64, lost_ticks: u64) {
-        self.stale_warn_ticks = stale_warn_ticks;
-        self.lost_ticks = lost_ticks;
+        self.stale_warn_ticks = stale_warn_ticks.max(1);
+        self.lost_ticks = lost_ticks.max(1);
         self.last_rx_tick = [None; MAX_NODES];
         self.lost_latched = [false; MAX_NODES];
         self.last_gripper_rx_tick = None;

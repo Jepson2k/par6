@@ -1032,6 +1032,30 @@ impl RobotConfig {
                 "must be greater than bus.stale_warn_s",
             ));
         }
+        // Both windows convert to ticks by the same `round(s/dt)` the
+        // runtime uses, and the freshness clock tests `age >= threshold`.
+        // A window that rounds to ZERO reads every node stale at age
+        // zero, makes every frame a stale→fresh edge (a stored-config
+        // resend per node per tick), and latches `CAN_LOST` on the tick
+        // after a node's first frame — the arm cannot boot. The clock
+        // floors at one tick so no backend trips on it silently; this is
+        // what tells the operator their window vanished.
+        let dt = self.robot.tick_dt_s;
+        for (v, name) in [
+            (b.stale_warn_s, "bus.stale_warn_s"),
+            (b.lost_s, "bus.lost_s"),
+        ] {
+            if (v / dt).round() < 1.0 {
+                return Err(invalid(
+                    name,
+                    format!(
+                        "rounds to zero ticks at robot.tick_dt_s = {dt} s \
+                         ({v} s is under half a tick); the freshness window \
+                         would vanish"
+                    ),
+                ));
+            }
+        }
         if b.rx_frames_per_tick_cap == 0 {
             return Err(invalid("bus.rx_frames_per_tick_cap", "must be >= 1"));
         }
