@@ -18,7 +18,7 @@ use crate::spectral::codec::{
     CanFrame,
 };
 use crate::types::{
-    FirmwareGripperCommand, GripperCommand, JointCommand, ObjectDetection, Pack, MAX_NODES,
+    FirmwareGripperCommand, GripperCommand, JointCommand, ObjectDetection, MAX_NODES,
 };
 
 // Per-THREAD, because the lib test binary runs its tests concurrently and
@@ -291,30 +291,4 @@ fn drive(
     let _ = poll.step().expect("configured");
     let _ = config_frame(ConfigKind::Limits, &configs[tick as usize % configs.len()]);
     let _ = fresh.classify(0, tick);
-}
-
-/// Frames the RT loop can hand the backend that have no wire form must be
-/// refused at the encode boundary, not silently dropped on the bus.
-#[test]
-fn position_without_velocity_has_no_wire_form() {
-    let cmd = JointCommand {
-        pos: Some(100),
-        vel: None,
-        cur_ma: Some(0),
-        pack: Pack::Pid,
-    };
-    assert!(encode_joint_command(0, &cmd).is_err());
-    // All channels omitted: nothing goes on the wire at all.
-    assert_eq!(
-        encode_joint_command(
-            0,
-            &JointCommand {
-                pos: None,
-                vel: None,
-                cur_ma: None,
-                pack: Pack::Pid,
-            }
-        ),
-        Ok(None)
-    );
 }

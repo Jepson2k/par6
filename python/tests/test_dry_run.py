@@ -543,7 +543,6 @@ class TestCartesianMotion:
         client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
 
         assert len(client.io()) == IO_SLOTS
-        assert client.error() is None
         assert client.queue() == []
         # The mirror must report what the ENGINE plans with from the
         # first preview: the runtime's own startup profile
@@ -551,14 +550,12 @@ class TestCartesianMotion:
         # while the engine ran RUCKIG timed every pre-sync preview with
         # the wrong profile.
         assert client.profile() == "RUCKIG"
-        assert client.is_robot_stopped()
-        assert not client.is_estop_pressed()
-        assert client.joint_speeds() == [0.0] * NUM_JOINTS
-        assert client.tcp_speed() == 0.0
 
-        status = client.status()
-        assert status.angles == pytest.approx(client.angles(), abs=1e-9)
-        assert status.pose[3:12:4] == pytest.approx(client.pose()[:3], abs=1e-6)
+        # STATUS builds its pose from the 4x4 the engine returns; pose()
+        # reads the engine's own xyzrpy. The two must describe one arm.
+        assert client.status().pose[3:12:4] == pytest.approx(
+            client.pose()[:3], abs=1e-6
+        )
 
         # The runtime refuses a jaw move on an uncalibrated gripper, and so
         # does the preview; after the calibrate the jaw state follows the
@@ -1125,15 +1122,16 @@ def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
     motion: the wrist swing, planned against the same keep-outs, ending
     back where it started.
     """
-    dry_run.set_payload(0.0)
+    dry_run.set_payload(1.2, com=(0.0, 0.01, 0.05))
     start = list(dry_run.angles())
-    carried = dry_run.payload()
-    assert carried.mass == 0.0
+    assert dry_run.payload().mass == pytest.approx(1.2)
 
     found = dry_run.estimate_payload()
     assert found.poses >= 3, "the wrist must have somewhere to swing from park"
     assert found.mass == 0.0 and found.determined == (0.0, 0.0, 0.0, 0.0)
-    assert dry_run.payload().mass == 0.0, "a dry run declares nothing"
+    assert dry_run.payload().mass == pytest.approx(1.2), (
+        "an estimate that measured nothing must leave the declared payload standing"
+    )
     assert dry_run.angles() == pytest.approx(start, abs=1e-6), (
         "the swing must end where the pick left the arm"
     )

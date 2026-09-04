@@ -96,16 +96,22 @@ fn a_swapped_bus_starts_every_node_from_never_seen() {
     rig.core
         .replace_bus(LoopbackBus::new())
         .expect("the loopback backend configures");
-    let silent = rig.tick_until(20, |s| s.tick > 0);
-    assert!(
-        silent.nodes.iter().all(|n| n.data_age_ticks == u64::MAX),
-        "a node kept the OLD arm's recency across the swap: {:?}",
-        silent
-            .nodes
-            .iter()
-            .map(|n| n.data_age_ticks)
-            .collect::<Vec<_>>()
-    );
+    // The hazard is a node that looks recent for a whole lost_s window, so
+    // the silence has to outlast one tick to rule it out.
+    let robot = &bundle().robot;
+    for _ in 0..robot.ticks(robot.bus.lost_s) + 1 {
+        let silent = rig.snap_after_tick();
+        assert!(
+            silent.nodes.iter().all(|n| n.data_age_ticks == u64::MAX),
+            "a node kept the OLD arm's recency across the swap at tick {}: {:?}",
+            silent.tick,
+            silent
+                .nodes
+                .iter()
+                .map(|n| n.data_age_ticks)
+                .collect::<Vec<_>>()
+        );
+    }
 
     // And it comes back the moment the new bus answers.
     rig.auto_inject = true;

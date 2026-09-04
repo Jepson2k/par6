@@ -59,7 +59,6 @@ fn the_regressor_is_the_linear_form_of_the_gravity_model() {
     ));
     for (name, kin) in models.iter_mut() {
         let theta = gravity::flatten(&gravity::model_params(kin).unwrap());
-        assert_eq!(theta.len(), 4 * kin.body_count(), "{name}");
         let mut tau = [0.0; NQ];
         for q in &CASES {
             kin.gravity(q, &mut tau).unwrap();

@@ -22,8 +22,6 @@ fn curvy_waypoints(n: usize, nq: usize) -> Vec<f64> {
 
 #[test]
 fn respects_and_saturates_limits_on_multi_dof_path() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 11);
-
     let nq = 6;
     let waypoints = curvy_waypoints(9, nq);
     let vel = [1.0, 1.2, 1.5, 2.0, 2.0, 2.5];

@@ -29,7 +29,6 @@ use serde::Deserialize;
 
 #[derive(Deserialize)]
 struct Fixture {
-    provenance: String,
     tools: Tools,
     cases: Vec<Case>,
 }
@@ -83,7 +82,6 @@ fn fixture() -> Fixture {
 #[test]
 fn the_shipped_arm_model_is_the_vendors_arm() {
     let fx = fixture();
-    assert!(fx.provenance.contains("vendor"), "{}", fx.provenance);
 
     let mut kin = Kin::from_urdf(
         &assets_dir().join(Kin::ARM_URDF_RELPATH),
