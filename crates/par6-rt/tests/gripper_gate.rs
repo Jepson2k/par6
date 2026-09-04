@@ -12,7 +12,7 @@ mod common;
 
 use par6_bus::{FirmwareGripperCommand, GripperCommand};
 use par6_config::{ConfigBundle, PreMove, SequenceStep};
-use par6_rt::{Mode, RtCommand};
+use par6_rt::{ErrorCode, Mode, RtCommand, DEBOUNCE_READS};
 
 fn close_cmd() -> FirmwareGripperCommand {
     FirmwareGripperCommand {
@@ -87,6 +87,90 @@ fn a_release_announces_three_idle_frames_then_polls() {
         "the announcement pack re-arms with the move: {sends:?}"
     );
     assert_eq!(sends[3..], [GripperCommand::FirmwarePoll; 2]);
+}
+
+/// An e-stop halts the jaws where they are, from either source. The
+/// arm's own reaction is ACTIVE_ERROR's zero-velocity hold — energized,
+/// standing still — and the jaws get the same standstill rather than
+/// going on driving a standing grip toward a target the arm is no
+/// longer travelling to. Not a release: dropping whatever is clamped at
+/// the moment nobody is in control is its own hazard, and freeing the
+/// jaws is the operator's own act through the tool's `release` verb.
+#[test]
+fn an_estop_halts_the_jaws_in_place_from_either_source() {
+    const JAW: u8 = 140;
+    let mut rig = common::Rig::new();
+    rig.gripper_reply.position = JAW;
+    rig.ready();
+    // close_cmd is still travelling toward 180 when the e-stop lands.
+    let held = FirmwareGripperCommand {
+        position: JAW,
+        ..close_cmd()
+    };
+
+    // The front end's ESTOP: the grip stops where the firmware reports
+    // it, and keeps holding.
+    rig.cmd(RtCommand::Gripper(close_cmd()));
+    rig.tick_n(2);
+    rig.clear_tx();
+    rig.cmd(RtCommand::SetSoftEstop(true));
+    rig.tick_n(5);
+    let sends = rig.gripper_sends();
+    assert_eq!(
+        sends,
+        vec![GripperCommand::Firmware(held); 6],
+        "a wire e-stop halts the jaws at the reported byte and keeps the \
+         grip, the arm's own standstill: {sends:?}"
+    );
+    assert!(
+        sends
+            .iter()
+            .all(|s| !matches!(s, GripperCommand::Firmware(f) if f.estop)),
+        "the halt re-targets; it never sets the firmware's latching ESTOP \
+         bit: {sends:?}"
+    );
+
+    // The physical line does exactly the same.
+    rig.cmd(RtCommand::SetSoftEstop(false));
+    rig.cmd(RtCommand::ClearErrors);
+    rig.tick_n(45);
+    rig.cmd(RtCommand::Gripper(close_cmd()));
+    rig.tick_n(2);
+    rig.clear_tx();
+    rig.estop_line
+        .store(false, std::sync::atomic::Ordering::Relaxed);
+    rig.tick_n(DEBOUNCE_READS + 4);
+    let sends = rig.gripper_sends();
+    assert!(
+        rig.snap()
+            .errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::Estop),
+        "the line latched the hardware e-stop"
+    );
+    assert_eq!(
+        sends.last(),
+        Some(&GripperCommand::Firmware(held)),
+        "the line halts the jaws the same way: {sends:?}"
+    );
+
+    // Jaws that were let go are not re-armed by a later e-stop: the halt
+    // holds a live grip, it never commands a new one.
+    rig.estop_line
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    rig.cmd(RtCommand::ClearErrors);
+    rig.tick_n(45);
+    rig.cmd(RtCommand::GripperIdle);
+    rig.tick_n(5);
+    rig.clear_tx();
+    rig.cmd(RtCommand::SetSoftEstop(true));
+    rig.tick_n(4);
+    let sends = rig.gripper_sends();
+    assert!(
+        sends.iter().all(|s| *s == GripperCommand::FirmwarePoll),
+        "released jaws stay released through an e-stop: {sends:?}"
+    );
 }
 
 /// The calibrated term of the gate: a standing move must not put a

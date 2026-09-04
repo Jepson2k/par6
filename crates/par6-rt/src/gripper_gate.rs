@@ -49,6 +49,13 @@ impl GripperGate {
         self.standing.is_some()
     }
 
+    /// Whether a grip is live — a standing command with `action` set,
+    /// which is what the gate streams. False once a release has dropped
+    /// the action bit, so nothing re-arms jaws that were let go.
+    pub(crate) fn holding(&self) -> bool {
+        self.standing.is_some_and(|c| c.action)
+    }
+
     /// Halt in place: re-target `jaw_byte` with the standing command's
     /// speed/current. The firmware is already within tolerance of its
     /// own reported position, so it holds there instead of travelling.

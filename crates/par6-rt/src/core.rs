@@ -430,6 +430,9 @@ pub struct RtCore<B: DriverBus> {
     homed: bool,
     soft_estop: bool,
     hw_estop: bool,
+    /// Whether an e-stop stood on the previous tick, so the jaws are
+    /// halted once on its rising edge.
+    estop_standing: bool,
     park_asserted: bool,
     gravity_comp: bool,
     not_homed_refused: bool,
@@ -623,6 +626,7 @@ impl<B: DriverBus> RtCore<B> {
             homed: false,
             soft_estop: false,
             hw_estop: false,
+            estop_standing: false,
             park_asserted: false,
             gravity_comp: true,
             not_homed_refused: false,
@@ -1109,22 +1113,7 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::GripperStop => {
                 if self.has_can_gripper {
-                    // The freshest jaw byte is read RT-side: routing a
-                    // snapshot byte back through the command plane would
-                    // race the reply stream and stop at a stale position.
-                    match self.bus_state.gripper.reply {
-                        Some(r) if r.calibrated && self.gripper_gate.has_standing() => {
-                            self.gripper_gate.stop_at(r.position);
-                        }
-                        // An uncalibrated gripper's position byte is not
-                        // a pose (the firmware maps it to fully open, so
-                        // a naive stop would fling the jaws), and no
-                        // standing command means no speed/current budget
-                        // to hold with. Both degrade to a release; any
-                        // calibrated byte, 0 and 255 included, is a
-                        // legitimate hold target.
-                        _ => self.gripper_gate.idle(),
-                    }
+                    self.gripper_halt_in_place();
                 }
             }
             RtCommand::GripperIdle => {
@@ -1444,6 +1433,26 @@ impl<B: DriverBus> RtCore<B> {
         }
     }
 
+    /// Halt the jaws where they are: re-target the freshest reported jaw
+    /// byte with the standing command's speed/current, so the firmware —
+    /// already inside its own tolerance — holds instead of travelling.
+    ///
+    /// The byte is read RT-side: routing a snapshot byte back through the
+    /// command plane would race the reply stream and stop at a stale
+    /// position. An uncalibrated gripper's byte is not a pose (the
+    /// firmware maps it to fully open, so a naive stop would fling the
+    /// jaws), and no standing command means no speed/current budget to
+    /// hold with. Both degrade to a release; any calibrated byte, 0 and
+    /// 255 included, is a legitimate hold target.
+    fn gripper_halt_in_place(&mut self) {
+        match self.bus_state.gripper.reply {
+            Some(r) if r.calibrated && self.gripper_gate.has_standing() => {
+                self.gripper_gate.stop_at(r.position);
+            }
+            _ => self.gripper_gate.idle(),
+        }
+    }
+
     // ------------------------------------------------------------ errors
 
     fn check_errors(&mut self, health: LoopHealth) {
@@ -1457,6 +1466,20 @@ impl<B: DriverBus> RtCore<B> {
         if self.soft_estop {
             self.errors.latch(ErrorCode::SwEstop, None);
         }
+        // The jaws are the one axis ACTIVE_ERROR's hold does not reach:
+        // the gate would go on driving a standing grip toward a target
+        // the arm is no longer travelling to. Either source halts them
+        // where they are — the same standstill the arm gets, and the same
+        // halt-in-place the tool's `stop` verb runs. Not a release:
+        // dropping whatever is clamped at the moment nobody is in control
+        // is its own hazard, and freeing the jaws is the operator's own
+        // act through the tool's `release` verb. Only a live grip is
+        // halted, so nothing re-arms jaws that were already let go.
+        let estop = self.estop_condition();
+        if estop && !self.estop_standing && self.has_can_gripper && self.gripper_gate.holding() {
+            self.gripper_halt_in_place();
+        }
+        self.estop_standing = estop;
 
         // Loop degradation bands.
         self.errors.condition(
