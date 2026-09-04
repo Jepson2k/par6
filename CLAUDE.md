@@ -36,11 +36,12 @@ imports `par6` (the extension dlopens the shim).
 
 ## Licensing rules
 
-- This repo is **MIT**. The vendor runtime (RCB-Runtime) is GPL: it is **behavior-only
+- This repo is **Apache-2.0**. The vendor runtime (RCB-Runtime) is GPL: it is **behavior-only
   reference — port behavior and constants, never code**.
 - parol6 (`Jepson2k/PAROL6-python-API`) is GPL-3.0: carry over code only where you hold
   authorship (self-relicensing); otherwise reimplement the semantics independently.
-- `assets/` is Apache-2.0 vendor material — keep `assets/NOTICE` accurate.
+- `assets/` is CERN-OHL-S v2 vendor material (upstream also states Apache-2.0; the
+  licence file it ships is CERN-OHL-S) — keep `assets/NOTICE` accurate.
 
 ## Testing Guidelines
 

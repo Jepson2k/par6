@@ -20,7 +20,7 @@ exclude = ["crates/pinokin-sys"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/Jepson2k/par6"
 # Verified by the `msrv` CI job, not asserted: 1.85 was declared and does
 # not build — rsruckig 3.0 calls `is_multiple_of` on an unsigned integer,
