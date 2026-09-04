@@ -409,11 +409,13 @@ impl Daemon {
         {
             let (link, shutdown) = (link, shutdown.clone());
             let jog_accel_time_s = robot.jog.accel_time_s;
+            let hk_dt = robot.robot.tick_dt_s;
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         housekeeping_loop(
+                            hk_dt,
                             jog_accel_time_s,
                             link,
                             stream_input,

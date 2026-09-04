@@ -65,8 +65,14 @@ struct BootConfig {
     config_repeats: u8,
 }
 
-/// Boot one-shot: bus-scan selfcheck, then request IDLE (exit BOOTING).
-const BOOT_SELFCHECK_TICK: u64 = 8;
+/// Boot one-shot: bus-scan selfcheck, then request IDLE (exit BOOTING)
+/// \[s\].
+///
+/// The wait is for the scan's RTR pings to have been ANSWERED, which is
+/// wire time, not loop iterations — a count would shrink it below a CAN
+/// round trip at a fast tick and latch `CAN_LOST` on drives that simply
+/// had not replied yet.
+const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
 /// EXEC link watchdog: heartbeat silence while samples pending that
@@ -130,9 +136,13 @@ fn lap(mark: &mut Option<Instant>, laps: &mut [u32; TICK_PHASES], i: usize) {
     }
 }
 
-/// Ticks between a rescan's last ping and its epoch bump: two reply
-/// round trips at the slowest tick rate the config validator allows.
-const SCAN_SETTLE_TICKS: u8 = 4;
+/// Settling time between a rescan's last ping and its epoch bump \[s\]:
+/// two reply round trips.
+///
+/// Round trips are wire time, so the binding case is the FASTEST tick,
+/// not the slowest — four fixed ticks is two round trips at 250 Hz and
+/// less than one past a kilohertz.
+const SCAN_SETTLE_S: f64 = 0.016;
 /// Gripper slot index in per-joint error keys (`J6:` = the gripper node).
 const GRIPPER_ERR_IDX: u8 = MAX_JOINTS as u8;
 /// Minimum spacing between two bus-fault log lines from the RT thread
@@ -571,7 +581,12 @@ pub struct RtCore<B: DriverBus> {
     // after the last ping, and the epoch the snapshot publishes.
     scan_next: Option<u8>,
     scan_settle: u8,
+    /// Countdown reload, from [`SCAN_SETTLE_S`] at this tick rate.
+    scan_settle_ticks: u8,
     scan_epoch: u32,
+    /// Tick after a bus comes up at which the selfcheck runs, from
+    /// [`BOOT_SELFCHECK_S`] at this tick rate.
+    boot_selfcheck_tick: u64,
 
     // Opt-in per-phase tick profiler (see `TickProfile`).
     profile_on: bool,
@@ -773,7 +788,9 @@ impl<B: DriverBus> RtCore<B> {
             drift: DriftLock::from_config(robot),
             scan_next: None,
             scan_settle: 0,
+            scan_settle_ticks: u8::try_from(robot.ticks(SCAN_SETTLE_S).max(1)).unwrap_or(u8::MAX),
             scan_epoch: 0,
+            boot_selfcheck_tick: u64::from(robot.ticks(BOOT_SELFCHECK_S).max(1)),
             profile_on: false,
             profile: TickProfile::default(),
             writer,
@@ -1161,7 +1178,7 @@ impl<B: DriverBus> RtCore<B> {
         // backend swapped in at tick 90 000 needs the same selfcheck and
         // the same config re-sends a backend opened at boot got.
         let since_boot = self.tick - self.bus_booted_at;
-        if since_boot == BOOT_SELFCHECK_TICK {
+        if since_boot == self.boot_selfcheck_tick {
             let connected = self.bus.connected_nodes();
             for i in 0..MAX_JOINTS {
                 if connected & (1 << u16::from(self.node_of[i])) == 0 {
@@ -2023,7 +2040,7 @@ impl<B: DriverBus> RtCore<B> {
             self.scan_next = if usize::from(n) + 1 < par6_bus::MAX_NODES {
                 Some(n + 1)
             } else {
-                self.scan_settle = SCAN_SETTLE_TICKS;
+                self.scan_settle = self.scan_settle_ticks;
                 None
             };
         } else if self.scan_settle > 0 {

@@ -18,8 +18,18 @@ use crate::spectral::codec::{
 };
 use crate::types::{Freshness, NodeId, PollAction, PollKind, MAX_NODES};
 
-/// Poll slots between device-info sweeps (~4 s at 250 Hz).
-pub(super) const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
+/// Poll slots between device-info sweeps.
+///
+/// One slot goes out per RT tick, so the sweep period is
+/// `DEVICE_INFO_PERIOD_SLOTS · dt` — ~4 s at the shipped 250 Hz and
+/// proportionally longer at a slower one. Left a count deliberately:
+/// this is identity/telemetry refresh cadence with no deadline riding
+/// on it, unlike the freshness windows above.
+///
+/// Shared with [`crate::sim`], which schedules its polls on the same
+/// rhythm — the same reason [`FreshnessClock`] lives here rather than in
+/// each backend.
+pub(crate) const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 
 /// What one poll slot resolves to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
