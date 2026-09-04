@@ -342,6 +342,28 @@ impl Rig {
         out
     }
 
+    /// Broadcast frames up to and including the one that reports `index`
+    /// complete, or the whole `window` if it never does.
+    ///
+    /// A window has to be sized for the slowest the motion can run, and
+    /// [`Self::collect_status`] then pays that size on every run however
+    /// fast the motion actually was. Stopping at the COMPLETE keeps the
+    /// same samples and gives the slack back.
+    pub fn collect_through(&self, index: u64, window: Duration) -> Vec<Status> {
+        let until = Instant::now() + window;
+        let mut out = Vec::new();
+        while Instant::now() < until {
+            if let Some(s) = self.recv_status() {
+                let done = s.completed_index >= index as i64;
+                out.push(s);
+                if done {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     pub fn shutdown(mut self) {
         self.daemon.take().expect("running").shutdown();
     }
@@ -591,4 +613,61 @@ pub fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; par6_proto::NUM_JO
             "teleport did not take effect within budget"
         );
     }
+}
+
+// ---- cartesian path geometry ------------------------------------------------
+// Shared by the live suite, which measures a sampled STATUS path, and the
+// preview suite, which measures the planned one.
+
+/// Distance \[mm\] from `p` to the segment `a`→`b`.
+pub fn distance_to_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let t = ((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2).clamp(0.0, 1.0);
+    let e = [w[0] - t * d[0], w[1] - t * d[1], w[2] - t * d[2]];
+    (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+}
+
+/// Euclidean distance \[mm\] between two TCP positions.
+pub fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+/// Fraction of the segment `a`→`b` covered by `p`'s projection.
+pub fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    (w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2
+}
+
+/// Closest a TCP path came to `p` \[mm\], measured against the path's
+/// segments rather than only its sampled points.
+pub fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
+    path.windows(2)
+        .map(|w| distance_to_segment(p, w[0], w[1]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Wire pose `[x y z mm, rx ry rz deg]` from a pose matrix (row-major
+/// 4x4) with the translation replaced. Only the rotation block is read,
+/// so the matrix's own translation units do not matter.
+///
+/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
+/// convention, written out here rather than borrowed from the runtime so
+/// the two halves of the round trip cannot agree on the wrong thing.
+pub fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
+    let (r00, r01, r02) = (pose[0], pose[1], pose[2]);
+    let (r12, r22) = (pose[6], pose[10]);
+    let cp = r12.hypot(r22);
+    [
+        xyz_mm[0],
+        xyz_mm[1],
+        xyz_mm[2],
+        (-r12).atan2(r22).to_degrees(),
+        r02.atan2(cp).to_degrees(),
+        (-r01).atan2(r00).to_degrees(),
+    ]
 }
