@@ -308,6 +308,22 @@ impl CoreClient {
         })
     }
 
+    fn status_rate<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        future_into_py(py, async move {
+            match client.status_rate().await {
+                Ok(result) => Python::with_gil(|py| query_result_dict(py, &result).map(Some)),
+                Err(ClientError::Unreachable) => Ok(None),
+                Err(e) => Err(client_err(e)),
+            }
+        })
+    }
+
+    fn set_status_rate<'py>(&self, py: Python<'py>, hz: f64) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        ack_future(py, async move { client.set_status_rate(hz).await })
+    }
+
     #[pyo3(signature = (node, force=false))]
     fn save_config<'py>(
         &self,

@@ -49,47 +49,49 @@ class CmdType(IntEnum):
     EXIT_FLASHING = 27
     SET_PID_GAINS = 28
     SET_CAN_ID = 29
-    SAVE_CONFIG = 70
-    PING = 30
-    STATUS = 31
-    ANGLES = 32
-    POSE = 33
-    IO = 34
-    SPEEDS = 35
-    TOOLS = 36
-    QUEUE = 37
-    ACTIVITY = 38
-    LOOP_STATS = 39
-    PROFILE = 40
-    REACHABLE = 41
-    ERROR = 42
-    TCP_SPEED = 43
-    TCP_OFFSET = 44
-    TOOL_STATUS = 45
-    IS_SIMULATOR = 46
-    SHAPES = 47
-    CONFIG_INFO = 48
-    PAYLOAD = 49
-    CONFIG_BUNDLE = 50
-    BUS_SCAN = 51
-    SERVO_J = 60
-    SERVO_J_POSE = 61
-    SERVO_L = 62
-    JOG_J = 63
-    JOG_L = 64
-    TELEPORT = 65
-    RESET_LOOP_STATS = 66
-    HOME = 80
-    MOVE_J = 81
-    MOVE_J_POSE = 82
-    MOVE_L = 83
-    MOVE_C = 84
-    MOVE_S = 85
-    MOVE_P = 86
-    SELECT_TOOL = 87
-    DELAY = 88
-    CHECKPOINT = 89
-    TOOL_ACTION = 90
+    SAVE_CONFIG = 30
+    SET_STATUS_RATE = 31
+    PING = 40
+    STATUS = 41
+    ANGLES = 42
+    POSE = 43
+    IO = 44
+    SPEEDS = 45
+    TOOLS = 46
+    QUEUE = 47
+    ACTIVITY = 48
+    LOOP_STATS = 49
+    PROFILE = 50
+    REACHABLE = 51
+    ERROR = 52
+    TCP_SPEED = 53
+    TCP_OFFSET = 54
+    TOOL_STATUS = 55
+    IS_SIMULATOR = 56
+    SHAPES = 57
+    CONFIG_INFO = 58
+    PAYLOAD = 59
+    CONFIG_BUNDLE = 60
+    BUS_SCAN = 61
+    STATUS_RATE = 62
+    SERVO_J = 80
+    SERVO_J_POSE = 81
+    SERVO_L = 82
+    JOG_J = 83
+    JOG_L = 84
+    TELEPORT = 85
+    RESET_LOOP_STATS = 86
+    HOME = 100
+    MOVE_J = 101
+    MOVE_J_POSE = 102
+    MOVE_L = 103
+    MOVE_C = 104
+    MOVE_S = 105
+    MOVE_P = 106
+    SELECT_TOOL = 107
+    DELAY = 108
+    CHECKPOINT = 109
+    TOOL_ACTION = 110
 
 
 class QueryType(IntEnum):
@@ -117,6 +119,7 @@ class QueryType(IntEnum):
     PAYLOAD = 20
     CONFIG_BUNDLE = 21
     BUS_SCAN = 22
+    STATUS_RATE = 23
 
 
 class CommandClass(IntEnum):
@@ -237,7 +240,6 @@ class ErrorCode(IntEnum):
     COMM_DECODE_ERROR = 42
     COMM_VALIDATION_ERROR = 43
     COMM_CHUNK_TIMEOUT = 44
-    COMM_UNKNOWN_RECIPE = 45
     SYS_CONTROLLER_DISABLED = 50
     SYS_ESTOP_ACTIVE = 51
     SYS_PROFILE_INVALID = 52
@@ -276,6 +278,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.SET_PID_GAINS: CommandClass.SYSTEM,
     CmdType.SET_CAN_ID: CommandClass.SYSTEM,
     CmdType.SAVE_CONFIG: CommandClass.SYSTEM,
+    CmdType.SET_STATUS_RATE: CommandClass.SYSTEM,
     CmdType.PING: CommandClass.QUERY,
     CmdType.STATUS: CommandClass.QUERY,
     CmdType.ANGLES: CommandClass.QUERY,
@@ -298,6 +301,7 @@ COMMAND_CLASS: dict[CmdType, CommandClass] = {
     CmdType.PAYLOAD: CommandClass.QUERY,
     CmdType.CONFIG_BUNDLE: CommandClass.QUERY,
     CmdType.BUS_SCAN: CommandClass.QUERY,
+    CmdType.STATUS_RATE: CommandClass.QUERY,
     CmdType.SERVO_J: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_J_POSE: CommandClass.FIRE_AND_FORGET,
     CmdType.SERVO_L: CommandClass.FIRE_AND_FORGET,

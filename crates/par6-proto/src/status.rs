@@ -146,13 +146,15 @@ pub struct Status {
     pub loop_health: LoopHealthWire,
 }
 
-/// Per-drive analog readings as STATUS carries them (slot 40).
+/// Per-drive readings and faults as STATUS carries them (slot 40).
 ///
-/// These are the trends that let an operator watch a joint climb toward a
-/// limit before it faults; the faults themselves ride `warnings` and the
-/// standing `error`, and are deliberately not duplicated here. Readings
-/// are per node, arm joints first and the tool drive last, matching
-/// `homing.joints`; `NaN` marks a node that has not answered yet.
+/// The readings are the trends that let an operator watch a joint climb
+/// toward a limit before it faults; `faults` is which drives have actually
+/// tripped and what the driver calls it, so a display can point at the
+/// joint rather than at a single standing error that names one of them.
+/// All three are per node, arm joints first and the tool drive last,
+/// matching `homing.joints`; `NaN` marks a node that has not answered a
+/// reading yet, and an empty label list is a healthy drive.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub struct DriveHealthWire {
     /// Per-node driver temperature \[°C\].
@@ -163,6 +165,10 @@ pub struct DriveHealthWire {
     /// up at the loaded drive, so the minimum is the diagnostic one.
     /// `None` when no node has reported one.
     pub bus_voltage_v: Option<f64>,
+    /// Per-node active fault labels; empty for a healthy drive. Trusted only
+    /// while the node's live error bit is set, so a stale flag register
+    /// cannot keep reporting a fault the drive has already cleared.
+    pub faults: Vec<Vec<String>>,
 }
 
 /// Control-loop health as STATUS carries it (slot 41).
@@ -346,7 +352,7 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
         w_f64(buf, v);
     }
     w_bool(buf, s.paused);
-    w_array(buf, 3);
+    w_array(buf, 4);
     w_array(buf, s.drive_health.temperatures_c.len());
     for v in &s.drive_health.temperatures_c {
         w_f64(buf, *v);
@@ -358,6 +364,13 @@ pub fn encode_status_into(s: &Status, buf: &mut Vec<u8>) {
     match s.drive_health.bus_voltage_v {
         Some(v) => w_f64(buf, v),
         None => w_nil(buf),
+    }
+    w_array(buf, s.drive_health.faults.len());
+    for labels in &s.drive_health.faults {
+        w_array(buf, labels.len());
+        for label in labels {
+            w_str(buf, label);
+        }
     }
     w_array(buf, 2);
     w_f64(buf, s.loop_health.p99_period_s);
@@ -628,10 +641,10 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     let torques_ext: [f64; NUM_JOINTS] = r_f64_fixed(&mut r, "status.torques_ext")?;
     let paused = r.bool()?;
     let dn = r.array_len()?;
-    if dn != 3 {
+    if dn != 4 {
         return Err(DecodeError::Arity {
             what: "status.drive_health",
-            expected: 3,
+            expected: 4,
             got: dn,
         });
     }
@@ -645,15 +658,27 @@ pub fn decode_status(data: &[u8]) -> Result<Status, DecodeError> {
     for _ in 0..n_curr {
         currents_ma.push(r.f64()?);
     }
+    let bus_voltage_v = if r.peek_nil() {
+        r.nil()?;
+        None
+    } else {
+        Some(r.f64()?)
+    };
+    let n_faults = r_len(&mut r, "status.drive_health.faults", MAX_NODE_SLOTS)?;
+    let mut faults = Vec::with_capacity(n_faults);
+    for _ in 0..n_faults {
+        let n_labels = r_len(&mut r, "status.drive_health.faults[]", MAX_NODE_SLOTS)?;
+        let mut labels = Vec::with_capacity(n_labels);
+        for _ in 0..n_labels {
+            labels.push(r.str()?.to_owned());
+        }
+        faults.push(labels);
+    }
     let drive_health = DriveHealthWire {
         temperatures_c,
         currents_ma,
-        bus_voltage_v: if r.peek_nil() {
-            r.nil()?;
-            None
-        } else {
-            Some(r.f64()?)
-        },
+        bus_voltage_v,
+        faults,
     };
     let ln = r.array_len()?;
     if ln != 2 {

@@ -168,6 +168,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     dh.set_item("temperatures_c", s.drive_health.temperatures_c.clone())?;
     dh.set_item("currents_ma", s.drive_health.currents_ma.clone())?;
     dh.set_item("bus_voltage_v", s.drive_health.bus_voltage_v)?;
+    dh.set_item("faults", s.drive_health.faults.clone())?;
     d.set_item("drive_health", dh)?;
     let loop_health = PyDict::new(py);
     loop_health.set_item("p99_period_s", s.loop_health.p99_period_s)?;
@@ -237,6 +238,10 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("state", *state as u8)?;
             d.set_item("next", next)?;
             d.set_item("params", params)?;
+        }
+        QueryResult::StatusRate { hz, tick_hz } => {
+            d.set_item("hz", hz)?;
+            d.set_item("tick_hz", tick_hz)?;
         }
         QueryResult::LoopStats(s) => {
             d.set_item("target_hz", s.target_hz)?;

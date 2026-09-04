@@ -22,6 +22,7 @@ from waldoctl.status import (
     PayloadEstimate,
     PayloadResult,
     PingResult,
+    StatusRate,
     ToolResult,
 )
 from waldoctl.sync_tools import SyncTool, make_sync_tool
@@ -495,6 +496,14 @@ class RobotClient:
         """Commissioning: rename drive *node* to *new_id* (idle arm only;
         ``force`` for an id the config does not list)."""
         return _run(self._inner.set_can_id(node, new_id, force=force))
+
+    def set_status_rate(self, hz: float) -> int:
+        """Set the rate the runtime broadcasts STATUS at, for this session."""
+        return _run(self._inner.set_status_rate(hz))
+
+    def status_rate(self) -> StatusRate | None:
+        """Current STATUS rate and the tick rate it divides."""
+        return _run(self._inner.status_rate())
 
     def save_config(self, node: int, *, force: bool = False) -> int:
         """Commissioning: persist drive *node*'s running configuration."""
