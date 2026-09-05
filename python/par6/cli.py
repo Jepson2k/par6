@@ -18,6 +18,7 @@ from collections.abc import Sequence
 from typing import Any
 
 from par6.client import RobotClient, RobotError
+from par6.firmware.releases import PRODUCTS as _FLASH_PRODUCTS
 
 #: Exit code when no runtime answers the target address.
 EXIT_UNREACHABLE = 2
@@ -26,6 +27,11 @@ EXIT_REFUSED = 3
 #: Exit code when the runtime accepted the command but it did not finish
 #: within the wait.
 EXIT_TIMEOUT = 4
+#: Exit code when a firmware image could not be obtained or trusted.
+EXIT_SOURCE = 5
+#: Exit code when the flash itself failed. Distinct from EXIT_SOURCE
+#: because only this one may have left a drive holding a partial image.
+EXIT_FLASH = 6
 
 
 def _client(args: argparse.Namespace) -> RobotClient:
@@ -235,6 +241,90 @@ def _cmd_flashing(client: RobotClient, args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_flash(client: RobotClient, args: argparse.Namespace) -> int:
+    """Flash one drive, holding the bus for exactly as long as it takes.
+
+    Everything that can refuse the image does so before the runtime is
+    asked to go quiet, so a bad download costs nothing but the download.
+    """
+    from par6.firmware import releases
+    from par6.firmware.flasher import BootloaderError, flash_image
+    from par6.firmware.session import FlashBusy, flash_lock, granted_bus
+
+    def log(line: str) -> None:
+        if not args.json:
+            print(line, file=sys.stderr)
+
+    try:
+        if args.file:
+            image = releases.load_file(args.file)
+        else:
+            image = releases.fetch_release(
+                args.product, args.tag, refresh=args.refresh, on_log=log
+            )
+    except releases.FirmwareFetchError as err:
+        print(f"flash: {err}", file=sys.stderr)
+        return EXIT_SOURCE
+    if not image.checksum_verified:
+        log("integrity unverified: nothing vouches for these bytes.")
+
+    if args.dry_run:
+        _emit(
+            {
+                "product": image.product,
+                "tag": image.tag,
+                "path": str(image.path),
+                "bytes": len(image.data),
+                "sha256": image.sha256,
+                "checksum_verified": image.checksum_verified,
+            },
+            args.json,
+        )
+        return 0
+
+    try:
+        with flash_lock(), granted_bus(client, args.assertion, channel=args.can) as bus:
+            report = flash_image(
+                bus,
+                args.node,
+                image.data,
+                erase=not args.no_erase,
+                reset_stalled_app=not args.no_reset,
+                check=image.check,
+                on_log=log,
+            )
+    except FlashBusy as err:
+        print(f"flash: {err}", file=sys.stderr)
+        return EXIT_REFUSED
+    except ImportError:
+        print(
+            "flash: python-can is not installed. Install par6 with the "
+            "'flash' extra on the machine holding the CAN interface.",
+            file=sys.stderr,
+        )
+        return EXIT_SOURCE
+    except (BootloaderError, ValueError) as err:
+        print(f"flash: {err}", file=sys.stderr)
+        return EXIT_FLASH
+
+    _emit(
+        {
+            "node": report.board_id,
+            "tag": image.tag,
+            "pages": report.pages,
+            "app_crc": f"0x{report.app_crc:08X}",
+            "elapsed_s": round(report.elapsed_s, 1),
+            "page_retries": report.stats.page_retries,
+            "chunk_retries": report.stats.chunk_retries,
+            "booted": report.booted,
+        }
+        if args.json
+        else report.summary(),
+        args.json,
+    )
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="par6", description=__doc__.splitlines()[0])
     # Unset here means the client's own resolution: $PAR6_HOST /
@@ -360,6 +450,64 @@ def build_parser() -> argparse.ArgumentParser:
         help="your vouching on enter: the arm is parked, or force regardless",
     )
     flashing.set_defaults(fn=_cmd_flashing)
+
+    flash = sub.add_parser(
+        "flash",
+        help="update one drive's firmware over CAN",
+        description=(
+            "Takes the bus from the runtime, writes the image, holds the bus "
+            "silent until the drive has rebooted into it, and gives the bus "
+            "back. The drive validates what it received and reboots on its "
+            "own once the bus falls silent, which is why the last seconds of "
+            "a flash look like nothing happening."
+        ),
+    )
+    flash.add_argument("--node", type=int, required=True, help="drive CAN id")
+    flash.add_argument(
+        "--product",
+        choices=sorted(_FLASH_PRODUCTS),
+        default="stepfoc",
+        help="which drive's firmware repository to pull from",
+    )
+    flash.add_argument(
+        "--tag", default=None, help="release tag (default: the latest release)"
+    )
+    flash.add_argument(
+        "--file", default=None, help="flash this .bin instead of a release"
+    )
+    flash.add_argument(
+        "--refresh", action="store_true", help="re-download even if cached"
+    )
+    flash.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="fetch and check the image, then stop without touching the bus",
+    )
+    flash.add_argument(
+        "--assertion",
+        choices=("parked", "force"),
+        default="parked",
+        help="your vouching for taking the bus: the arm is parked, or force",
+    )
+    flash.add_argument(
+        "--can",
+        default=None,
+        help="SocketCAN interface (default: the one the runtime names)",
+    )
+    flash.add_argument(
+        "--no-erase",
+        action="store_true",
+        help="skip the erase, for resuming a run that already erased",
+    )
+    flash.add_argument(
+        "--no-reset",
+        action="store_true",
+        help=(
+            "do not reset a running application into its bootloader; use when "
+            "catching a power-cycled board's startup window"
+        ),
+    )
+    flash.set_defaults(fn=_cmd_flash)
 
     return parser
 

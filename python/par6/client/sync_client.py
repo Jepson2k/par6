@@ -22,6 +22,7 @@ from waldoctl.status import (
     PayloadEstimate,
     PayloadResult,
     PingResult,
+    StatusRate,
     ToolResult,
 )
 from waldoctl.sync_tools import SyncTool, make_sync_tool
@@ -496,6 +497,14 @@ class RobotClient:
         ``force`` for an id the config does not list)."""
         return _run(self._inner.set_can_id(node, new_id, force=force))
 
+    def set_status_rate(self, hz: float) -> int:
+        """Set the rate the runtime broadcasts STATUS at, for this session."""
+        return _run(self._inner.set_status_rate(hz))
+
+    def status_rate(self) -> StatusRate | None:
+        """Current STATUS rate and the tick rate it divides."""
+        return _run(self._inner.status_rate())
+
     def save_config(self, node: int, *, force: bool = False) -> int:
         """Commissioning: persist drive *node*'s running configuration."""
         return _run(self._inner.save_config(node, force=force))
@@ -558,10 +567,6 @@ class RobotClient:
     def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion."""
         return _run(self._inner.set_completion_policy(policy))
-
-    def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe (unknown names are refused)."""
-        return _run(self._inner.set_recipe(name))
 
     def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin)."""

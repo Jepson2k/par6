@@ -146,10 +146,11 @@ class StatusBuffer:
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
     drive_health: dict = field(default_factory=dict)
-    """Per-drive analog readings: ``temperatures_c`` and ``currents_ma``
+    """Per-drive readings and faults: ``temperatures_c`` and ``currents_ma``
     (per node, arm joints first, ``NaN`` where a node has not answered
-    that register) and ``bus_voltage_v`` (the lowest any node reports,
-    None when none has)."""
+    that register), ``bus_voltage_v`` (the lowest any node reports, None
+    when none has), and ``faults`` — per node, the labels for the fault
+    bits it currently asserts, empty for a healthy drive."""
     loop_health: dict = field(default_factory=dict)
     """Control-loop health: ``p99_period_s`` and ``overruns``."""
     # Aliases into the two enable arrays the filler mutates in place.

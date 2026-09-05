@@ -379,6 +379,11 @@ struct Core<R: RtCommands> {
     status_seq: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
+    /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
+    /// stays the boot value: SET_STATUS_RATE moves this one for a session.
+    status_rate_hz: u32,
+    /// Set when the rate moved, so the run loop rebuilds its interval.
+    status_rate_dirty: bool,
 }
 
 enum Event {
@@ -409,6 +414,7 @@ impl<R: RtCommands> Core<R> {
             pending_scans: Vec::new(),
             simulator: cfg.simulator,
             tool: cfg.fitted_tool.clone(),
+            status_rate_hz: cfg.status_rate_hz,
             cfg,
             runtime,
             socket,
@@ -453,18 +459,26 @@ impl<R: RtCommands> Core<R> {
             status_seq: 0,
             tcp_speed: 0.0,
             prev_tcp: None,
+            status_rate_dirty: false,
         }
     }
 
     async fn run(mut self, shutdown: Arc<Notify>) {
         let mut rxbuf = vec![0u8; 65535];
         let mut poll_iv = tokio::time::interval(self.cfg.poll_interval);
-        let mut status_iv = tokio::time::interval(rate_period(self.cfg.status_rate_hz));
+        let mut status_iv = tokio::time::interval(rate_period(self.status_rate_hz));
         for iv in [&mut poll_iv, &mut status_iv] {
             iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
         self.sync_planner();
         loop {
+            // Rebuilt rather than reconfigured: a tokio interval's period is
+            // fixed at construction, so a rate change has to make a new one.
+            if self.status_rate_dirty {
+                self.status_rate_dirty = false;
+                status_iv = tokio::time::interval(rate_period(self.status_rate_hz));
+                status_iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            }
             let ev = tokio::select! {
                 r = self.socket.recv_from(&mut rxbuf) => match r {
                     Ok((n, addr)) => Event::Datagram(n, addr),
@@ -927,6 +941,16 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetStatusRate(p) => {
+                match status_rate_fault(1.0 / self.cfg.config_info.tick_dt_s, p.hz) {
+                    Some(error) => Err(error),
+                    None => {
+                        self.status_rate_hz = p.hz as u32;
+                        self.status_rate_dirty = true;
+                        Ok(())
+                    }
+                }
+            }
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -2264,10 +2288,17 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// The drives' analog readings, per node and arm joints first, with
+    /// The drives' readings and faults, per node and arm joints first, with
     /// `NaN` for a node that has not answered that register yet. The bus
     /// voltage is the lowest any node reports: a sagging supply shows up
     /// first at whichever drive is pulling on it.
+    ///
+    /// Faults are gated on the node's live error bit, which every reply
+    /// carries while a fault is active; the flag register itself is only
+    /// refreshed on the round-robin poll, so trusting it alone would keep
+    /// reporting a fault the drive has already cleared. Which bits those
+    /// are and what each is called is [`par6_bus::ErrorFlags::faults`],
+    /// the same list the RT core latches from.
     fn wire_drive_health(snap: &par6_rt::StateSnapshot) -> par6_proto::DriveHealthWire {
         let read = |f: fn(&par6_rt::NodeState) -> Option<f64>| -> Vec<f64> {
             snap.nodes
@@ -2281,10 +2312,21 @@ impl<R: RtCommands> Core<R> {
             .filter_map(|n| n.voltage_mv)
             .map(|mv| f64::from(mv) / 1000.0)
             .reduce(f64::min);
+        let faults = snap
+            .nodes
+            .iter()
+            .map(|n| match n.error_flags {
+                Some(f) if n.live_error_bit => {
+                    f.faults().map(|fault| fault.name().to_owned()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
         par6_proto::DriveHealthWire {
             temperatures_c: read(|n| n.temperature_c.map(f64::from)),
             currents_ma: read(|n| n.current_ma.map(f64::from)),
             bus_voltage_v,
+            faults,
         }
     }
 
@@ -2471,6 +2513,10 @@ impl<R: RtCommands> Core<R> {
                 mass: self.payload.mass,
                 com: self.payload.com,
                 inertia: self.payload.inertia.unwrap_or_default(),
+            },
+            C::StatusRate => QueryResult::StatusRate {
+                hz: f64::from(self.status_rate_hz),
+                tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
             },
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
@@ -2706,6 +2752,40 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
     unsupported.and_then(refuse)
 }
 
+/// Whether a requested STATUS rate can be served, and why not if it cannot.
+///
+/// STATUS is emitted every Nth tick and the rate is held as a whole
+/// number of Hz, so the servable rates are the whole divisors of the tick
+/// rate and nothing else. A near miss is refused rather than rounded to
+/// the nearest one: a capture taken at a rate nobody asked for is wrong in
+/// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
+/// set is built once and both answered from and printed, so what is
+/// accepted and what the remedy offers cannot disagree.
+fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+    let ticks = tick_hz.round() as u32;
+    let allowed: Vec<u32> = (1..=ticks)
+        .filter(|d| ticks.is_multiple_of(*d))
+        .map(|d| ticks / d)
+        .collect();
+    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
+        return None;
+    }
+    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!(
+                "set_status_rate {hz} Hz is not one of the whole-Hz rates the \
+                 {tick_hz} Hz tick rate divides into; STATUS is emitted every \
+                 Nth tick, so the achievable rates are: {}",
+                listed.join(", ")
+            ),
+        )],
+    ))
+}
+
 /// Whether a drive tune names a configured node and stays inside that
 /// node's configured ceilings.
 ///
@@ -2856,6 +2936,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPidGains => "set_pid_gains",
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
+        T::SetStatusRate => "set_status_rate",
+        T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",
         T::Ping => "ping",
         T::Status => "status",
