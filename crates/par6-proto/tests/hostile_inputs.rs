@@ -19,7 +19,8 @@
 
 use par6_proto::command::{MAX_DURATION_S, MAX_JOG_DURATION_S, MAX_SHAPES, MAX_WAYPOINTS};
 use par6_proto::{
-    decode_command, decode_reply, decode_status, encode_command, CmdType, Command, DecodeError,
+    decode_command, decode_reply, decode_status, encode_command, encode_status_into, CmdType,
+    Command, DecodeError, Status,
 };
 
 // ---- a minimal msgpack writer (the wire, not the codec) --------------------
@@ -54,17 +55,22 @@ fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.concat()
 }
 
+/// A fixarray of big-endian f64s.
+fn f64_array(vals: &[f64]) -> Vec<u8> {
+    let mut out = fixarray(vals.len());
+    for v in vals {
+        out.extend(f64be(*v));
+    }
+    out
+}
+
 /// `[JOG_J, req_id, speeds[6], duration, nil]`.
 fn jog_j_bytes(duration: f64) -> Vec<u8> {
-    let mut speeds = fixarray(6);
-    for i in 0..6 {
-        speeds.extend(f64be(if i == 0 { 0.2 } else { 0.0 }));
-    }
     cat(&[
         fixarray(5),
         uint(CmdType::JogJ as u64),
         uint(7),
-        speeds,
+        f64_array(&[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
         f64be(duration),
         nil(),
     ])
@@ -72,15 +78,11 @@ fn jog_j_bytes(duration: f64) -> Vec<u8> {
 
 /// `[JOG_L, req_id, velocities[6], duration, frame, nil]`.
 fn jog_l_bytes(duration: f64) -> Vec<u8> {
-    let mut vels = fixarray(6);
-    for i in 0..6 {
-        vels.extend(f64be(if i == 0 { 0.2 } else { 0.0 }));
-    }
     cat(&[
         fixarray(6),
         uint(CmdType::JogL as u64),
         uint(7),
-        vels,
+        f64_array(&[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
         f64be(duration),
         uint(0), // WRF
         nil(),
@@ -318,9 +320,135 @@ fn reply_and_status_length_headers_are_bounded_before_reserving() {
     );
 
     // The same shape reaching the status decoder's collision-pair list.
-    let mut hostile_status = vec![0xDD, 0xFF, 0xFF, 0xFF, 0xFF];
-    hostile_status.insert(0, 0x91);
-    // The status decoder refuses this well before the pair list — the
-    // point is that it refuses at all rather than reserving on the word.
-    decode_status(&hostile_status).expect_err("a malformed status must be refused");
+    // A short datagram cannot: STATUS carries STATUS_LEN elements and the
+    // decoder rejects the arity long before the pair list, so the packet
+    // has to be a real one with that one field replaced.
+    let clear = Status::default();
+    let one = Status {
+        collision_pairs: vec![("a".to_owned(), "b".to_owned())],
+        ..Status::default()
+    };
+
+    let mut buf_clear = Vec::new();
+    encode_status_into(&clear, &mut buf_clear);
+    let mut buf_one = Vec::new();
+    encode_status_into(&one, &mut buf_one);
+    // The two differ in exactly one place: the pair-count header.
+    let at = buf_clear
+        .iter()
+        .zip(buf_one.iter())
+        .position(|(a, b)| a != b)
+        .expect("the two encodings must differ at the pair count");
+
+    let mut hostile_status = buf_clear[..at].to_vec();
+    hostile_status.extend_from_slice(&array32(u32::MAX));
+    hostile_status.extend_from_slice(&buf_clear[at + 1..]);
+
+    let err = decode_status(&hostile_status)
+        .expect_err("a 4-billion collision-pair list must be refused");
+    assert!(
+        matches!(err, DecodeError::Validation { .. }),
+        "the pair count must be refused on its own terms, not by running out \
+         of bytes after reserving: {err:?}"
+    );
+}
+
+/// `[SET_PAYLOAD, req_id, mass, com[3], inertia|nil]`.
+fn set_payload_bytes(mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) -> Vec<u8> {
+    cat(&[
+        fixarray(5),
+        uint(CmdType::SetPayload as u64),
+        uint(7),
+        f64be(mass),
+        f64_array(&com),
+        inertia.map_or_else(nil, |i| f64_array(&i)),
+    ])
+}
+
+/// A declared payload the arm could not be carrying must not reach the
+/// gravity model.
+///
+/// SET_PAYLOAD writes straight into `Kin::set_tool`, so the numbers here
+/// become the torque the RT thread holds the arm up with. A negative mass
+/// inverts the compensation — the arm drives INTO gravity — and an
+/// inertia that is not positive semidefinite is not a rigid body at all.
+/// `encode_command` refuses both, so a first-party client cannot send
+/// them; the command port takes datagrams from anywhere, so the decoder
+/// has to refuse them too.
+#[test]
+fn a_payload_that_is_not_a_rigid_body_is_refused_at_the_wire() {
+    const COM: [f64; 3] = [0.0, 0.01, 0.055];
+    // Ixx·Iyy < Ixy²: symmetric, but with a negative eigenvalue.
+    const INDEFINITE: [f64; 6] = [1e-3, 1e-2, 1e-3, 0.0, 0.0, 1e-3];
+    const SANE: [f64; 6] = [2e-3, 0.0, 3e-3, 0.0, 0.0, 4e-3];
+
+    for (what, bytes, field) in [
+        (
+            "a negative mass",
+            set_payload_bytes(-1.25, COM, None),
+            "set_payload.mass",
+        ),
+        (
+            "a NaN mass",
+            set_payload_bytes(f64::NAN, COM, None),
+            "set_payload.mass",
+        ),
+        (
+            "an infinite mass",
+            set_payload_bytes(f64::INFINITY, COM, None),
+            "set_payload.mass",
+        ),
+        (
+            "a NaN centre of mass",
+            set_payload_bytes(1.25, [0.0, f64::NAN, 0.055], None),
+            "set_payload.com",
+        ),
+        (
+            "a negative moment of inertia",
+            set_payload_bytes(1.25, COM, Some([-1e-3, 0.0, 3e-3, 0.0, 0.0, 4e-3])),
+            "set_payload.inertia",
+        ),
+        (
+            "an indefinite inertia tensor",
+            set_payload_bytes(1.25, COM, Some(INDEFINITE)),
+            "set_payload.inertia",
+        ),
+        (
+            "an infinite moment of inertia",
+            set_payload_bytes(1.25, COM, Some([2e-3, 0.0, 3e-3, 0.0, 0.0, f64::INFINITY])),
+            "set_payload.inertia",
+        ),
+    ] {
+        match decode_command(&bytes) {
+            Err(DecodeError::Validation { what: w, .. }) => {
+                assert_eq!(w, field, "{what}: refused, but blamed the wrong field")
+            }
+            Ok((_, cmd)) => panic!("{what} must be refused, but decoded to {cmd:?}"),
+            Err(other) => panic!("{what}: expected a validation refusal, got {other:?}"),
+        }
+    }
+
+    // The same shape with numbers a real part has must still arrive, or
+    // the checks above would be satisfied by refusing everything.
+    let (_, cmd) = decode_command(&set_payload_bytes(1.25, COM, Some(SANE)))
+        .expect("a physically possible payload must decode");
+    assert_eq!(
+        cmd,
+        Command::SetPayload(par6_proto::command::SetPayload {
+            mass: 1.25,
+            com: COM,
+            inertia: Some(SANE),
+        })
+    );
+    // And clearing it: mass 0, no inertia.
+    let (_, cleared) =
+        decode_command(&set_payload_bytes(0.0, [0.0; 3], None)).expect("clearing must decode");
+    assert_eq!(
+        cleared,
+        Command::SetPayload(par6_proto::command::SetPayload {
+            mass: 0.0,
+            com: [0.0; 3],
+            inertia: None,
+        })
+    );
 }

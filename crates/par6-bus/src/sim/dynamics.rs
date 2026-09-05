@@ -12,7 +12,7 @@
 use std::path::Path;
 
 use par6_config::SimConfig;
-use pinokin_sys::Model;
+use par6_kin::Model;
 
 use super::driver::VirtualDriver;
 use super::plant::JointMap;
@@ -76,7 +76,7 @@ impl DynamicsPlant {
     pub fn new(
         urdf: &Path,
         ee_frame: Option<&str>,
-        tool: Option<&pinokin_sys::ToolParams>,
+        tool: Option<&par6_kin::ToolParams>,
         maps: &[JointMap],
         q0: &[f64],
         sim: &SimConfig,

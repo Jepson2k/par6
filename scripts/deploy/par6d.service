@@ -20,7 +20,7 @@ StateDirectory=par6
 # Config discovery: par6d reads PAR6_CONFIG before falling back to
 # ./config/PAR6.toml and <exe>/../../config/PAR6.toml. Pin it explicitly.
 Environment=PAR6_CONFIG=/etc/par6/PAR6.toml
-# Only consumed by builds with the `ffi` feature (kinematics stack).
+# The kinematics stack's model tree.
 Environment=PAR6_ASSETS=/usr/share/par6/par6_description
 Environment=RUST_LOG=info
 

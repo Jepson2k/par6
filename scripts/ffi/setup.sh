@@ -5,7 +5,7 @@
 #   3. builds + installs toppra-cpp (pinned commit; no conda-forge package)
 #      from source into the same env prefix
 #   4. builds + installs cpp/ (the par6_shim C-ABI library) against both
-#   5. prints/persists the env vars pinokin-sys's build.rs consumes
+#   5. prints/persists the env vars par6-kin's build.rs consumes
 #
 # Everything lands under $PAR6_FFI_DIR (default: <repo>/.ffi, self-gitignored).
 # Idempotent: re-running skips completed steps; FORCE=1 rebuilds the shim.
@@ -13,7 +13,7 @@
 # Usage:
 #   scripts/ffi/setup.sh                    # for this machine
 #   source .ffi/env.sh   # exports PAR6_SHIM_LIB_DIR / PAR6_SHIM_INCLUDE_DIR
-#   cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+#   cargo test --workspace
 #
 #   scripts/ffi/setup.sh --target aarch64   # for the control box (RPi 5)
 #   source .ffi/env-aarch64.sh
@@ -24,9 +24,10 @@
 # linux-aarch64 and the matching aarch64 cross compiler for linux-64, so
 # nothing has to run on the target to produce its shim: the target env is
 # downloaded (never executed) and the compiler comes from the host env.
-# `stage_runtime_libs.py` then copies the shim's runtime closure next to
-# it and proves the result is loadable on the target's glibc, which is the
-# only check available without target hardware.
+# `stage_runtime_libs.py` then copies the runtime closure of the shim and
+# libmujoco next to the shim and proves the result is loadable on the
+# target's glibc, which is the only check available without target
+# hardware.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -68,8 +69,14 @@ if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
   echo ">>> build parallelism: $jobs jobs (RAM-capped; override with CMAKE_BUILD_PARALLEL_LEVEL)"
 fi
 
-# Pinned package set.
+# Pinned package set. Every library the shim's numerics come from is named
+# with a version: leaving one to the solver means two machines building from
+# the same commit get different numerics, and the CI cache then holds
+# whichever solve happened first.
 PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
+EIGEN_VERSION="${PAR6_EIGEN_VERSION:-5.0.1}"
+URDFDOM_VERSION="${PAR6_URDFDOM_VERSION:-6.0.1}"
+COAL_VERSION="${PAR6_COAL_VERSION:-3.0.4}"
 # toppra-cpp source pin (v0.6.9 release commit). MIT; built with the bundled
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
@@ -89,13 +96,14 @@ CROSS_SYSROOT_VERSION="${PAR6_CROSS_SYSROOT_VERSION:-2.17}"
 # Packages the shim links against — the ones a cross target also needs.
 TARGET_SPECS=(
   "pinocchio=${PINOCCHIO_VERSION}"
-  "eigen"      # constrained by pinocchio's build (5.0.x as of 2026-08)
-  "urdfdom"    # constrained by pinocchio's build (6.0.x as of 2026-08)
+  # toppra links Eigen, so its parameterization moves with this version.
+  "eigen=${EIGEN_VERSION}"
+  "urdfdom=${URDFDOM_VERSION}"
   # coal (hpp-fcl) backs par6_col_* and already arrives as a pinocchio
   # dependency; naming it keeps the shim's link line honest and makes a
   # future pinocchio build that drops collision support fail here instead
-  # of at cmake time. Version is left to pinocchio's constraint (3.0.x).
-  "coal"
+  # of at cmake time.
+  "coal=${COAL_VERSION}"
 )
 # Build tools. Native: same env as the libraries (activation sets CC/CXX).
 # Cross: a host-platform env holding the target's cross compiler.
@@ -163,6 +171,29 @@ if [[ ! -e "$ENV_DIR/lib/libpinocchio_default.so" ]]; then
 else
   echo ">>> env exists: $ENV_DIR (delete it to force re-create)"
 fi
+
+# An env restored from a cache is trusted for everything below, so check it
+# is the env this script asks for. Nothing else notices the difference: the
+# shim links, the tests run, and a few numerical results move — which is how
+# a CI cache built from one solve keeps passing while a fresh machine
+# building from the same commit fails.
+for spec in "${TARGET_SPECS[@]}"; do
+  [[ $spec == *=* ]] || continue
+  pkg="${spec%%=*}"
+  want="${spec#*=}"
+  meta=("$ENV_DIR"/conda-meta/"$pkg"-[0-9]*.json)
+  got=""
+  if [[ -e "${meta[0]}" ]]; then
+    got="$(basename "${meta[0]}")"
+    got="${got#"$pkg"-}"
+    got="${got%%-*}"
+  fi
+  if [[ "$got" != "$want" ]]; then
+    echo "$ENV_DIR has $pkg ${got:-<missing>}, pinned at $want." >&2
+    echo "Delete $ENV_DIR and re-run to rebuild the env." >&2
+    exit 1
+  fi
+done
 
 # cpp/src/par6_col.cpp links coal and pinocchio's collision module; both come
 # with the pinocchio package, so a missing one means an env built before coal
@@ -259,21 +290,35 @@ fi
 
 # --- 3b. libmujoco into the same env prefix ----------------------------------
 # Additive to the pinocchio/toppra env; delete $ENV_DIR/lib/libmujoco.so (or
-# bump the pin) to force a re-install. `sim-mujoco` is a host-side simulator
-# plant, never deployed, so a cross target skips it.
-if [[ $CROSS -eq 0 ]]; then
-  if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
-    echo ">>> installing libmujoco=${MUJOCO_VERSION}"
-    "$MAMBA" install -y -p "$ENV_DIR" -c conda-forge --override-channels \
-      "libmujoco=${MUJOCO_VERSION}"
-  else
-    echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
-  fi
+# bump the pin) to force a re-install. par6-bus links it on every target:
+# the MuJoCo plant ships in par6d, so a cross build stages it with the shim.
+if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
+  echo ">>> installing libmujoco=${MUJOCO_VERSION}"
+  "$MAMBA" install -y -p "$ENV_DIR" --platform "$TARGET_SUBDIR" \
+    -c conda-forge --override-channels "libmujoco=${MUJOCO_VERSION}"
+else
+  echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
 fi
 
 # --- 4. build + install the shim ---------------------------------------------
+# The identity of the sources a shim was built from: a digest of cpp/**,
+# recorded beside the install so a rebuild is decided on content rather
+# than on timestamps (a checkout or a cache restore rewrites those without
+# changing a byte). crates/par6-kin/build.rs computes the same digest and
+# refuses to link a shim whose record disagrees.
+cpp_digest() {
+  (cd "$ROOT" && find cpp -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+}
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
+fi
+# Rebuild when cpp/ has moved on: cargo does not build the shim, so a stale
+# .so links silently and surfaces as wrong numbers in the kinematics tests.
+if [[ -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
+  if [[ "$(cat "$SHIM_PREFIX/cpp.sha256" 2>/dev/null)" != "$(cpp_digest)" ]]; then
+    echo ">>> the installed shim was not built from this cpp/; rebuilding"
+    rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
+  fi
 fi
 if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
   echo ">>> building par6_shim for $TARGET_ARCH"
@@ -285,8 +330,9 @@ if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
     -DCMAKE_INSTALL_RPATH="$DEP_RPATH"
   run_tool cmake --build "$BUILD_DIR"
   run_tool cmake --install "$BUILD_DIR"
+  cpp_digest > "$SHIM_PREFIX/cpp.sha256"
 else
-  echo ">>> shim exists: $SHIM_PREFIX (FORCE=1 to rebuild)"
+  echo ">>> shim exists and matches cpp/: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
 
 # --- 4b. drop the build machine out of the artifacts we produce --------------
@@ -300,20 +346,21 @@ if [[ $CROSS -eq 1 ]]; then
 fi
 
 # --- 4c. stage the runtime closure next to the cross shim --------------------
-# The control box gets no conda env, so everything the shim dlopens has to
-# ship with it. Staging into the shim's own lib dir makes the link-time
-# layout and the on-box layout the same directory, which is what makes a
-# plain `$ORIGIN` rpath correct in both places.
+# The control box gets no conda env, so everything the shim and libmujoco
+# dlopen has to ship with them. Staging into the shim's own lib dir makes
+# the link-time layout and the on-box layout the same directory, which is
+# what makes a plain `$ORIGIN` rpath correct in both places.
 if [[ $CROSS -eq 1 ]]; then
   echo ">>> staging runtime closure"
   python3 "$ROOT/scripts/ffi/stage_runtime_libs.py" \
     --readelf "$TOOLCHAIN_DIR/bin/$CROSS_PREFIX-readelf" \
     --lib-dir "$ENV_DIR/lib" \
     --dest "$SHIM_PREFIX/lib" \
-    "$SHIM_PREFIX/lib/libpar6_shim.so"
+    "$SHIM_PREFIX/lib/libpar6_shim.so" \
+    "$ENV_DIR/lib/libmujoco.so"
 fi
 
-# --- 5. env vars for pinokin-sys / par6-bus ----------------------------------
+# --- 5. env vars for par6-kin / par6-bus ----------------------------------
 {
   echo "export PAR6_SHIM_LIB_DIR=\"$SHIM_PREFIX/lib\""
   echo "export PAR6_SHIM_INCLUDE_DIR=\"$SHIM_PREFIX/include\""
@@ -333,9 +380,9 @@ if [ -z "${CARGO_BUILD_JOBS:-}" ] || [ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; t
   unset _par6_jobs _par6_cores
 fi
 JOBS
+  echo "# libmujoco lives in the env prefix (par6-bus links it)."
+  echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
   if [[ $CROSS -eq 0 ]]; then
-    echo "# libmujoco lives in the env prefix (par6-bus feature sim-mujoco)."
-    echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
     echo "# Runtime loading for binaries whose package did not embed an rpath"
     echo "# (link-args don't propagate across cargo packages). Covers the shim AND"
     echo "# libmujoco + its conda deps."
@@ -355,9 +402,9 @@ JOBS
 
 echo
 if [[ $CROSS -eq 0 ]]; then
-  echo ">>> done. To build/test the Rust FFI crate:"
+  echo ">>> done. To build and test the workspace:"
   echo "    source $ENV_FILE"
-  echo "    cargo test --manifest-path $ROOT/crates/pinokin-sys/Cargo.toml --features ffi"
+  echo "    cargo test --workspace"
 else
   echo ">>> done. To build the runtime for the control box:"
   echo "    source $ENV_FILE"

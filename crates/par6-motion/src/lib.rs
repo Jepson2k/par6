@@ -22,7 +22,7 @@
 //! # TOPPRA
 //!
 //! Time-optimal path parameterization lives in C++ toppra behind the
-//! shared FFI shim (`par6_traj_*`, safe wrapper `pinokin_sys::Trajectory`)
+//! shared FFI shim (`par6_traj_*`, safe wrapper `par6_kin::Trajectory`)
 //! and is driven by `par6d`'s planner, which owns the geometry it times:
 //! cartesian `move_l` waypoint chains, and joint-space paths under the
 //! TOPPRA motion profile. It is deliberately NOT a [`ProfileKind`] —

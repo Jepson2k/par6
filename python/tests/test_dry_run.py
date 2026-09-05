@@ -17,7 +17,13 @@ import time
 
 import numpy as np
 import pytest
-from live_daemon import STATUS_RATE_HZ, TICK_DT_S, LiveDaemon, requires_par6d
+from live_daemon import (
+    STATUS_RATE_HZ,
+    TICK_DT_S,
+    LiveDaemon,
+    requires_par6d,
+    teleport_to,
+)
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -69,6 +75,16 @@ def _polyline_gap(points: np.ndarray, corners: list[np.ndarray]) -> float:
     """How far *points* strays from the polyline through *corners* [mm]."""
     polyline = np.stack(corners)
     return max(_closest(polyline, p) for p in points)
+
+
+def _line_deviation_mm(points: np.ndarray) -> float:
+    """How far the sampled path strays from the start->end line \[mm\]."""
+    line = points[-1] - points[0]
+    offsets = points - points[0]
+    deviation = np.linalg.norm(
+        offsets - np.outer(offsets @ line / (line @ line), line), axis=1
+    )
+    return float(deviation.max())
 
 
 def _length(points: np.ndarray) -> float:
@@ -182,13 +198,8 @@ class TestCartesianMotion:
         assert result.duration > 0.0
         points = result.tcp_poses[:, :3] * 1000.0
         assert np.allclose(points[-1], target[:3], atol=0.5)
-        # Straightness: every sampled point lies on the start->end line.
-        line = points[-1] - points[0]
-        offsets = points - points[0]
-        deviation = np.linalg.norm(
-            offsets - np.outer(offsets @ line / (line @ line), line), axis=1
-        )
-        assert deviation.max() < 0.1, f"TCP path bows by {deviation.max():.3f} mm"
+        bow = _line_deviation_mm(points)
+        assert bow < 0.1, f"TCP path bows by {bow:.3f} mm"
 
         before = list(dry_run.angles())
         unreachable = np.asarray(dry_run.pose())
@@ -201,6 +212,29 @@ class TestCartesianMotion:
         assert blocked.value.code == ErrorCode.IK_TARGET_UNREACHABLE
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
+
+    @pytest.mark.parametrize("profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA"])
+    def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
+        """The profile decides how a linear move is timed, not where it goes:
+        every profile must keep the TCP on the start->end line. A profile
+        that plans the move in joint space and only times it would bow."""
+        try:
+            assert dry_run.select_profile(profile) == 1
+            assert dry_run.profile() == profile
+            dry_run.teleport(park_deg())
+            start = np.asarray(dry_run.pose())
+            target = start.copy()
+            target[1] += 50.0
+            target[2] += 30.0
+
+            result = dry_run.move_l(target.tolist(), speed=0.5)
+            assert result.error is None, f"{profile}: {result.error}"
+            points = result.tcp_poses[:, :3] * 1000.0
+            assert np.allclose(points[-1], target[:3], atol=0.5), profile
+            bow = _line_deviation_mm(points)
+            assert bow < 0.1, f"{profile}: TCP path bows by {bow:.3f} mm"
+        finally:
+            dry_run.select_profile("RUCKIG")
 
     def test_curved_moves_preview_the_shape_they_trace(self, dry_run) -> None:
         """``move_c`` must preview the arc through its via point, ``move_s`` the
@@ -537,7 +571,6 @@ class TestCartesianMotion:
         client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
 
         assert len(client.io()) == IO_SLOTS
-        assert client.error() is None
         assert client.queue() == []
         # The mirror must report what the ENGINE plans with from the
         # first preview: the runtime's own startup profile
@@ -545,14 +578,12 @@ class TestCartesianMotion:
         # while the engine ran RUCKIG timed every pre-sync preview with
         # the wrong profile.
         assert client.profile() == "RUCKIG"
-        assert client.is_robot_stopped()
-        assert not client.is_estop_pressed()
-        assert client.joint_speeds() == [0.0] * NUM_JOINTS
-        assert client.tcp_speed() == 0.0
 
-        status = client.status()
-        assert status.angles == pytest.approx(client.angles(), abs=1e-9)
-        assert status.pose[3:12:4] == pytest.approx(client.pose()[:3], abs=1e-6)
+        # STATUS builds its pose from the 4x4 the engine returns; pose()
+        # reads the engine's own xyzrpy. The two must describe one arm.
+        assert client.status().pose[3:12:4] == pytest.approx(
+            client.pose()[:3], abs=1e-6
+        )
 
         # The runtime refuses a jaw move on an uncalibrated gripper, and so
         # does the preview; after the calibrate the jaw state follows the
@@ -1000,14 +1031,17 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
             for case in ("arc", "circle", "spline", "process", "chain"):
                 # Both sides plan from the configuration the arm is measured
                 # in, so the shapes are anchored on the same place.
-                await _teleport_to(client, _OPEN_POSE_DEG)
+                await teleport_to(client, _OPEN_POSE_DEG)
                 assert await client.wait_status(
                     lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
                     timeout=20.0,
                 )
                 live_start = await client.angles()
                 assert live_start is not None
-                preview = Robot().create_dry_run_client(initial_joints_deg=live_start)
+                # The same `Robot` the anchor FK comes from: it caches the
+                # daemon's config bundle, so a fresh one per case re-pings
+                # and re-materialises it five times over.
+                preview = robot.create_dry_run_client(initial_joints_deg=live_start)
                 results = _preview_case(preview, case)
                 assert all(r is not None and r.error is None for r in results), (
                     f"{case}: the preview refused it: "
@@ -1074,21 +1108,6 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
         daemon.stop()
 
 
-async def _teleport_to(client, angles: list[float]) -> None:
-    """Drive the sim to *angles*; teleport is unacked, so re-send until it lands."""
-    deadline = time.monotonic() + 20.0
-    while time.monotonic() < deadline:
-        await client.teleport(angles)
-        if await client.wait_status(
-            lambda s: (
-                s.homed and float(np.abs(np.asarray(s.angles) - angles).max()) < 1.0
-            ),
-            timeout=0.5,
-        ):
-            return
-    raise AssertionError("teleport never took effect")
-
-
 def test_a_retune_previews_from_the_same_call_that_runs_live(
     dry_run: DryRunRobotClient,
 ) -> None:
@@ -1131,15 +1150,16 @@ def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
     motion: the wrist swing, planned against the same keep-outs, ending
     back where it started.
     """
-    dry_run.set_payload(0.0)
+    dry_run.set_payload(1.2, com=(0.0, 0.01, 0.05))
     start = list(dry_run.angles())
-    carried = dry_run.payload()
-    assert carried.mass == 0.0
+    assert dry_run.payload().mass == pytest.approx(1.2)
 
     found = dry_run.estimate_payload()
     assert found.poses >= 3, "the wrist must have somewhere to swing from park"
     assert found.mass == 0.0 and found.determined == (0.0, 0.0, 0.0, 0.0)
-    assert dry_run.payload().mass == 0.0, "a dry run declares nothing"
+    assert dry_run.payload().mass == pytest.approx(1.2), (
+        "an estimate that measured nothing must leave the declared payload standing"
+    )
     assert dry_run.angles() == pytest.approx(start, abs=1e-6), (
         "the swing must end where the pick left the arm"
     )

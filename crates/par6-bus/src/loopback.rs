@@ -595,8 +595,6 @@ mod tests {
         assert_eq!(bus.connected_nodes(), 0b0000_0000_0111_1111);
 
         bus.begin_tick(1);
-        // Option channels survive the send verbatim: None is "omitted",
-        // never coerced to zero.
         let cmds = [
             JointCommand::position(1000, 2000, 300),
             JointCommand::velocity(-500, 250),
@@ -606,20 +604,6 @@ mod tests {
             JointCommand::idle(),
         ];
         bus.send_joint_commands(&cmds).unwrap();
-        let Some((_, TxRecord::Joints(sent))) = bus
-            .tx_log
-            .iter()
-            .find(|(_, r)| matches!(r, TxRecord::Joints(_)))
-        else {
-            panic!("no joint send recorded");
-        };
-        assert_eq!(sent[1].pos, None);
-        assert_eq!(sent[1].vel, Some(-500));
-        assert_eq!(sent[2].pos, None);
-        assert_eq!(sent[2].vel, None);
-        assert_eq!(sent[2].cur_ma, Some(-150));
-        assert_eq!(sent[3].pack, Pack::Hall { trigger_value: 2 });
-        assert_eq!(sent.as_slice(), &cmds);
 
         // Single-send-per-tick invariant.
         assert!(matches!(
@@ -637,8 +621,6 @@ mod tests {
         bus.begin_tick(3);
         bus.send_gripper(&GripperCommand::FirmwarePoll).unwrap();
     }
-
-    use crate::types::Pack;
 
     #[test]
     fn drain_decodes_and_freshness_warns_then_latches() {

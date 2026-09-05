@@ -362,6 +362,7 @@ impl Daemon {
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
+            robot.robot.tick_dt_s,
         )));
         let bridge = RtBridge::new(
             link.clone(),
@@ -861,13 +862,6 @@ pub(crate) struct KinStack {
     assets_dir: std::path::PathBuf,
 }
 
-/// Standoff \[m\] every collision pair is checked with: geometry within
-/// this distance counts as colliding, so the arm keeps a near-miss buffer
-/// from itself and from keep-outs that absorbs model and calibration
-/// error. The value parol6 runs the same arm with; a shape that wants a
-/// wider berth carries its own `margin`.
-pub const COLLISION_CLEARANCE_M: f64 = 0.005;
-
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
 /// What every kinematics object is built from: the resolved assets
@@ -931,7 +925,7 @@ impl KinSource {
             &self.assets_dir,
             self.variant,
             self.package_dir.as_deref(),
-            COLLISION_CLEARANCE_M,
+            par6_kin::COLLISION_CLEARANCE_M,
         )
         .map_err(|e| {
             DaemonError::Kinematics(format!(

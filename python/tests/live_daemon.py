@@ -10,9 +10,9 @@ tests instead of failing, so a checkout without a Rust build stays green.
 from __future__ import annotations
 
 import asyncio
-import functools
 import os
 import queue
+import random
 import re
 import shutil
 import socket
@@ -72,36 +72,66 @@ def repo_assets_dir() -> Path | None:
     return assets if assets.is_dir() else None
 
 
-def daemon_env() -> dict[str, str]:
-    """Environment for the daemon under test.
+def daemon_env(shm_dir: Path) -> dict[str, str]:
+    """Environment for the daemon under test, with ``shm_dir`` as its own
+    grant directory.
 
     The bus-ownership grant (``loop_tick`` / ``robot_mode``) is published
-    under fixed names, and a stopping daemon REMOVES them — so two test
-    runs sharing ``/dev/shm`` would delete each other's live claim. Ports
-    are already allocated per run; the grant needs the same treatment.
-    The Rust harness does this per process id; do the same here.
+    under fixed names, and a stopping daemon REMOVES them — so any two
+    daemons sharing a grant directory delete each other's live claim.
+    Per PROCESS is not enough: one pytest process can run two daemons at
+    once (the `Robot.start()` spawn test runs a second one beside the
+    fixture's), and under `-n` several processes run several more. Each
+    daemon therefore gets its own directory, under the test's own tmp
+    tree so it goes with the run.
     """
+    shm_dir.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ)
     assets = repo_assets_dir()
     if "PAR6_ASSETS" not in env and assets is not None:
         env["PAR6_ASSETS"] = str(assets)
-    env.setdefault("PAR6_SHM_DIR", str(_shm_dir()))
+    env["PAR6_SHM_DIR"] = str(shm_dir)
     return env
 
 
-@functools.lru_cache(maxsize=1)
-def _shm_dir() -> Path:
-    """A per-process scratch directory for this run's grant segments."""
-    path = Path(tempfile.gettempdir()) / f"par6-test-shm-{os.getpid()}"
-    path.mkdir(parents=True, exist_ok=True)
-    return path
+def _port_range() -> range:
+    """The loopback ports this pytest process may hand out.
+
+    Under xdist every worker probes for ports concurrently, and a port
+    probed free here is bindable by a sibling until the receiver claims
+    it a boot later — and the client binds its status socket with
+    ``SO_REUSEPORT``, so two daemons landing on one port would not fail,
+    they would split the STATUS stream between them. Disjoint per-worker
+    ranges make that collision impossible rather than unlikely. Below the
+    kernel's ephemeral range, so a socket bound to port 0 (the daemon's
+    own command socket) never lands in them either.
+    """
+    worker = os.environ.get("PYTEST_XDIST_WORKER", "gw0")
+    index = int(worker[2:]) if worker[2:].isdigit() else 0
+    base = 20000 + index * 1000
+    return range(base, base + 1000)
 
 
 def free_udp_port() -> int:
-    """A currently-free loopback UDP port (bind, read, release)."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
+    """A currently-free loopback UDP port from this worker's range (bind,
+    read, release).
+
+    Deliberately released before returning rather than held until the
+    receiver binds: in ``auto`` status transport the DAEMON binds this
+    port itself while probing multicast, so a reservation held across its
+    boot makes that probe fail and the runtime degrade silently to
+    unicast.
+    """
+    ports = list(_port_range())
+    random.shuffle(ports)
+    for port in ports:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            try:
+                sock.bind(("127.0.0.1", port))
+            except OSError:
+                continue
+            return port
+    raise RuntimeError(f"no free UDP port in {ports[0]}-{ports[-1]}")
 
 
 def _set_scalar(text: str, key: str, value: object) -> str:
@@ -183,8 +213,10 @@ class LiveDaemon:
         binary = par6d_binary()
         if binary is None:
             raise RuntimeError("par6d binary not available")
+        workdir.mkdir(parents=True, exist_ok=True)
         config = sim_config(workdir / "config", active_gripper, config_patch)
         status_port = free_udp_port()
+        shm_dir = Path(tempfile.mkdtemp(prefix="shm-", dir=workdir))
         log_path = workdir / "par6d.log"
         log = log_path.open("w")
         process = subprocess.Popen(
@@ -203,12 +235,16 @@ class LiveDaemon:
                 "127.0.0.1",
                 "--status-port",
                 str(status_port),
+                # Dies with this worker: a SIGKILLed pytest process must not
+                # leave a daemon holding its ports and grant.
+                "--parent-pid",
+                str(os.getpid()),
                 *(["--sim-dynamics"] if sim_dynamics else []),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
             text=True,
-            env=daemon_env(),
+            env=daemon_env(shm_dir),
         )
         try:
             command_port = cls._read_ready_port(process, log_path)
@@ -295,23 +331,25 @@ class LiveDaemon:
         )
 
 
-async def settle_at(
-    client: AsyncRobotClient, angles_deg: list[float], budget_s: float = 20.0
+async def teleport_to(
+    client: AsyncRobotClient,
+    angles_deg: list[float],
+    budget_s: float = 20.0,
+    tol_deg: float = 1.0,
 ) -> None:
-    """Reset the controller and leave the sim arm standing at *angles_deg*.
+    """Leave the sim arm standing at *angles_deg*.
 
-    Teleport is unacked and gated on ENABLED, and the RT clear sequence
-    settles over several ticks, so both are re-sent until the broadcast
-    shows the arm there — the same loop a UI runs. Raises when the arm
-    never arrives within *budget_s*.
+    Teleport is unacked and gated on ENABLED, so it is re-sent until the
+    broadcast shows the arm there — the same loop a UI runs. Raises when
+    the arm never arrives within *budget_s*.
     """
     deadline = time.monotonic() + budget_s
-    await client.reset()
     while time.monotonic() < deadline:
         await client.teleport(angles_deg)
         arrived = await client.wait_status(
             lambda s: (
-                s.homed and all(abs(a - b) < 0.5 for a, b in zip(s.angles, angles_deg))
+                s.homed
+                and all(abs(a - b) < tol_deg for a, b in zip(s.angles, angles_deg))
             ),
             timeout=0.5,
         )
@@ -319,6 +357,18 @@ async def settle_at(
             return
         await asyncio.sleep(0.05)
     raise AssertionError(f"the sim arm never reached {angles_deg}")
+
+
+async def settle_at(
+    client: AsyncRobotClient, angles_deg: list[float], budget_s: float = 20.0
+) -> None:
+    """Reset the controller, then leave the arm standing at *angles_deg*.
+
+    The RT clear sequence settles over several ticks, so the reset has to
+    precede the teleport loop rather than race it.
+    """
+    await client.reset()
+    await teleport_to(client, angles_deg, budget_s=budget_s, tol_deg=0.5)
 
 
 async def angles_now(client: AsyncRobotClient) -> list[float]:

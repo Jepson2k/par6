@@ -370,3 +370,91 @@ fn a_too_small_mtu_is_refused_at_connect() {
         }
     }
 }
+
+/// A program keep-out on the wire, metres/radians.
+fn program_box(name: &str) -> Shape {
+    Shape {
+        kind: "box".to_owned(),
+        params: vec![0.6, 0.4, 0.02],
+        pose: vec![0.9, 0.9, -0.01, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: name.to_owned(),
+    }
+}
+
+async fn program_layer(client: &Client) -> Vec<Shape> {
+    match client.query(Command::Shapes).await.expect("SHAPES answers") {
+        par6_proto::QueryResult::Shapes { program, .. } => program,
+        other => panic!("expected SHAPES, got {other:?}"),
+    }
+}
+
+/// `set_shapes` answers one of three ways and never a fake success:
+/// confirmed when the runtime applied the world, a structured refusal
+/// when it would not, and UNCONFIRMED when nothing answered at all.
+///
+/// The third is the one a client gets wrong: a send with no reply is
+/// not "applied", and a program that took it for one would run against
+/// a world its keep-outs never reached.
+#[test]
+fn set_shapes_is_confirmed_refused_or_unconfirmed_never_a_fake_success() {
+    let (daemon, cfg) = boot_daemon("shapes-ack", Ipv4Addr::LOCALHOST);
+    // Nothing listens here: a port the kernel just handed out and released.
+    let mut dead = cfg.clone();
+    dead.port = free_port();
+    dead.status_port = free_port();
+    dead.timeout = Duration::from_millis(300);
+    dead.retries = 0;
+
+    run_with(daemon, cfg, |client| async move {
+        let table = program_box("table");
+        let ack = client
+            .system(Command::SetShapes(cmd::SetShapes {
+                shapes: vec![table.clone()],
+            }))
+            .await
+            .expect("a valid world is not refused");
+        assert_eq!(ack, Ack::Confirmed);
+        assert_eq!(program_layer(&client).await, vec![table.clone()]);
+
+        // Refused: two shapes with one name. The applied world survives it.
+        match client
+            .system(Command::SetShapes(cmd::SetShapes {
+                shapes: vec![table.clone(), program_box("table")],
+            }))
+            .await
+        {
+            Err(ClientError::Robot(e)) => assert_eq!(
+                e.code,
+                ErrorCode::CommValidationError as u16,
+                "a duplicate name is a validation refusal: {e:?}"
+            ),
+            other => panic!("a duplicate name must be refused, got {other:?}"),
+        }
+        assert_eq!(
+            program_layer(&client).await,
+            vec![table.clone()],
+            "a refused set must leave the applied world standing"
+        );
+
+        // Unreachable: no reply is no confirmation, and the readback is
+        // unreachable too rather than an empty world.
+        let silent = Client::connect(dead).await.expect("sockets bind");
+        let ack = silent
+            .system(Command::SetShapes(cmd::SetShapes {
+                shapes: vec![table.clone()],
+            }))
+            .await
+            .expect("no reply is not an error, it is an unconfirmed send");
+        assert_eq!(ack, Ack::Unconfirmed);
+        assert!(
+            matches!(
+                silent.query(Command::Shapes).await,
+                Err(ClientError::Unreachable)
+            ),
+            "a readback from nowhere must say so, not answer with an empty world"
+        );
+        silent.close();
+    });
+}

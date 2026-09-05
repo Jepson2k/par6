@@ -36,6 +36,10 @@ command -v cargo >/dev/null || die "cargo not found"
   Source .ffi/env-aarch64.sh (not .ffi/env.sh)."
 [ -e "$PAR6_SHIM_LIB_DIR/libpar6_shim.so" ] \
   || die "no libpar6_shim.so in PAR6_SHIM_LIB_DIR ($PAR6_SHIM_LIB_DIR)"
+[ -e "${PAR6_MUJOCO_LIB_DIR:-}/libmujoco.so" ] \
+  || die "no libmujoco.so in PAR6_MUJOCO_LIB_DIR (${PAR6_MUJOCO_LIB_DIR:-unset}) — re-run
+    scripts/ffi/setup.sh --target aarch64
+    source .ffi/env-aarch64.sh"
 
 LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-}"
 [ -n "$LINKER" ] || die "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER is not set

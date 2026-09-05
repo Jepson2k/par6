@@ -638,6 +638,10 @@ impl<R: RtCommands> Core<R> {
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, Command::BusScan) {
             // Answered from `answer_scans` once the RT's rescan has
             // settled (or the deadline passes): a scan is a round trip
@@ -788,6 +792,10 @@ impl<R: RtCommands> Core<R> {
             cmd_name(cmd.tag()),
             params_summary(cmd)
         );
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
             return;

@@ -132,7 +132,7 @@ pub(crate) struct MujocoPlant {
 }
 
 // Raw pointers to uniquely-owned mjModel/mjData; no aliasing outside
-// &mut self methods (same justification as pinokin_sys::Model).
+// &mut self methods (same justification as par6_kin::Model).
 unsafe impl Send for MujocoPlant {}
 
 impl Drop for MujocoPlant {

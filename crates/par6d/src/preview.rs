@@ -302,7 +302,7 @@ impl Preview {
                 stream_limits,
                 robot.stream.fault_latch_s,
             ),
-            gate: StreamGate::new(stack.gate_collision, &jog_limits),
+            gate: StreamGate::new(stack.gate_collision, &jog_limits, robot.robot.tick_dt_s),
             cfg,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
@@ -584,7 +584,7 @@ impl Preview {
     }
 
     /// The motion a payload estimation makes from the virtual arm's
-    /// pose: the wrist poses `par6_calibrate` would plan, swept at its
+    /// pose: the wrist poses `calibrate` would plan, swept at its
     /// protocol's speed and ending back where the arm stood, planned and
     /// gated like any other move. Measures nothing — a preview has no
     /// torque — so what comes back is the swing.
@@ -593,8 +593,8 @@ impl Preview {
         start.copy_from_slice(&self.snap.q[..NQ]);
         let window: [(f64, f64); NQ] =
             std::array::from_fn(|j| (self.soft_min[j], self.soft_max[j]));
-        let protocol = par6_calibrate::Protocol::default();
-        let poses = par6_calibrate::plan_poses(
+        let protocol = crate::calibrate::Protocol::default();
+        let poses = crate::calibrate::plan_poses(
             self.gate.collision_mut(),
             &start,
             &window,

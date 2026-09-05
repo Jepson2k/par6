@@ -12,7 +12,10 @@ use par6_server::ShapeLayer;
 use par6d::preview::Preview;
 
 mod common;
-use common::{max_deg_error, park_deg, teleport_cmd, teleport_home, to_deg, to_rad, Client, Rig};
+use common::{
+    max_deg_error, park_deg, rotation_angle_deg, teleport_cmd, teleport_home, to_deg, to_rad,
+    Client, Rig,
+};
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
 /// AND the preview so the parity below is over identical inputs.
@@ -835,16 +838,7 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
     let translation = |p: &[f64; 16]| {
         ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
     };
-    // Rotation angle between the start orientation and `p`.
-    let rotation = |p: &[f64; 16]| {
-        let mut trace = 0.0;
-        for r in 0..3 {
-            for k in 0..3 {
-                trace += start[r * 4 + k] * p[r * 4 + k];
-            }
-        }
-        ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
-    };
+    let rotation = |p: &[f64; 16]| rotation_angle_deg(&start, p);
     let moving = r
         .tcp_poses
         .iter()
