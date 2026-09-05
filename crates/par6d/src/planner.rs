@@ -116,13 +116,13 @@ const WAYPOINT_SNAP_M: f64 = 5e-3;
 /// corner could take.
 const MOVE_P_AUTO_BLEND_FRAC: f64 = 0.25;
 
-/// Joint-space pitch of the collision gate \[rad\]: consecutive checked
-/// configurations along a planned path never differ by more than this on
-/// any joint. At PAR6's ~0.45 m reach a 0.02 rad shoulder step sweeps the
+/// Joint-space pitch of the collision gate \[rad\], shared with the
+/// streaming gate's segment sweep: consecutive checked configurations
+/// along a planned path never differ by more than this on any joint. At PAR6's ~0.45 m reach a 0.02 rad shoulder step sweeps the
 /// wrist under 10 mm, so a keep-out thicker than that cannot be tunneled
 /// through; the cost is bounded by the path's joint-space length rather
 /// than by the sample count (a 90° single-joint move costs ~79 checks).
-const COLLISION_STEP_RAD: f64 = 0.02;
+pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 
 /// The planned-move profiles this planner really implements, in the
 /// upper-case spelling clients use on the wire. The server refuses any

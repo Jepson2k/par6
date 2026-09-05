@@ -99,18 +99,16 @@ pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
 /// is 37 ticks and this never binds; at a 20 Hz test rate the floor is
 /// three ticks, less than the reaction itself.
 const STREAM_LOOKAHEAD_TICKS: f64 = 8.0;
-/// Joint-space spacing \[rad\] of the configurations checked along a
-/// projection or a servo hop, so a keep-out cannot fit between two
-/// samples: the endpoint alone lets a long projection step over one.
-const PROJECTION_STEP_RAD: f64 = 0.04;
-/// Cap on the samples one check spends, for a projection long enough to
-/// need more than this at the spacing above.
-const PROJECTION_MAX_SAMPLES: usize = 16;
 
 /// Joint speed above which a stream counts as MOVING and is re-tested
 /// against its projection every period \[rad/s\]. Below it the arm is
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
+
+/// Whether measured joint motion counts as MOVING for the gate.
+fn moving(qd: &[f64; MAX_JOINTS]) -> bool {
+    qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S)
+}
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -183,6 +181,11 @@ pub(crate) struct StreamGate {
     /// The projection horizon \[s\]: [`STREAM_LOOKAHEAD_S`] or
     /// [`STREAM_LOOKAHEAD_TICKS`] of the tick, whichever is longer.
     lookahead_s: f64,
+    /// Sample budget of one segment sweep: the soft window's widest joint
+    /// at the planner's pitch. Every sweep starts at a measured pose and
+    /// ends inside the window, so the budget binds only on a span no
+    /// admissible pair has (a non-finite input).
+    max_steps: usize,
 }
 
 impl StreamGate {
@@ -197,6 +200,13 @@ impl StreamGate {
         jog_limits: &par6_motion::MotionLimits,
         tick_dt_s: f64,
     ) -> Self {
+        let widest = jog_limits
+            .soft_max
+            .iter()
+            .zip(jog_limits.soft_min.iter())
+            .map(|(hi, lo)| hi - lo)
+            .fold(0.0_f64, f64::max);
+        let max_steps = ((widest / crate::planner::COLLISION_STEP_RAD).ceil() as usize).max(1);
         Self {
             collision,
             shape_names: ShapeNames::default(),
@@ -205,6 +215,7 @@ impl StreamGate {
             soft_max: jog_limits.soft_max,
             latch: CollisionState::default(),
             lookahead_s: STREAM_LOOKAHEAD_S.max(STREAM_LOOKAHEAD_TICKS * tick_dt_s),
+            max_steps,
         }
     }
 
@@ -266,42 +277,66 @@ impl StreamGate {
     ///
     /// parol6's `collision_blocked` rule. Approaching: blocked when any
     /// configuration on the straight joint-space segment to the target
-    /// collides, sampled every [`PROJECTION_STEP_RAD`]. Already
-    /// colliding: blocked when the target contacts a pair the arm is not
-    /// already in, or when the deepest world penetration grows (the
-    /// hull-vs-world `world_distance` drops by more than
-    /// [`ESCAPE_TOL_M`]) — a pair-set check alone cannot tell an
-    /// escaping move from one grinding deeper through the same pair, and
-    /// the depth check alone cannot tell an improving start-collision
-    /// from a new shallower one, so both run.
+    /// collides, swept at the planner's pitch
+    /// ([`crate::planner::COLLISION_STEP_RAD`]) so the gate cannot tunnel
+    /// a keep-out the planner would catch. Already colliding: blocked
+    /// when the target contacts a pair the arm is not already in, or when
+    /// the deepest world penetration grows (the hull-vs-world
+    /// `world_distance` drops by more than [`STREAM_ESCAPE_TOL_M`]) — a
+    /// pair-set check alone cannot tell an escaping move from one
+    /// grinding deeper through the same pair, and the depth check alone
+    /// cannot tell an improving start-collision from a new shallower one,
+    /// so both run.
+    ///
+    /// The target is clamped into the soft window first: the RT clamps
+    /// every stream target the same way, so the segment checked is the
+    /// one the arm can actually traverse.
     pub(crate) fn blocked(
         &mut self,
         current: &[f64; MAX_JOINTS],
         target: &[f64; MAX_JOINTS],
     ) -> Result<Option<Vec<(String, String)>>, WireError> {
         let cur = self.offending(current)?;
+        self.blocked_from(&cur, current, target)
+    }
+
+    /// [`Self::blocked`] with the current pose's own verdict in hand, so
+    /// a caller testing two projections from one pose pays that check
+    /// once.
+    fn blocked_from(
+        &mut self,
+        cur: &[(String, String)],
+        current: &[f64; MAX_JOINTS],
+        target: &[f64; MAX_JOINTS],
+    ) -> Result<Option<Vec<(String, String)>>, WireError> {
+        let target = self.clamped(target);
         if cur.is_empty() {
-            let span = current
+            let mut from = [0.0; par6_kin::NQ];
+            let mut to = [0.0; par6_kin::NQ];
+            from.copy_from_slice(&current[..par6_kin::NQ]);
+            to.copy_from_slice(&target[..par6_kin::NQ]);
+            let span = from
                 .iter()
-                .zip(target.iter())
+                .zip(to.iter())
                 .map(|(a, b)| (b - a).abs())
                 .fold(0.0_f64, f64::max);
-            let samples =
-                ((span / PROJECTION_STEP_RAD).ceil() as usize).clamp(1, PROJECTION_MAX_SAMPLES);
-            let mut q = [0.0; MAX_JOINTS];
-            for i in 1..=samples {
-                let t = i as f64 / samples as f64;
-                for (j, v) in q.iter_mut().enumerate() {
-                    *v = current[j] + (target[j] - current[j]) * t;
-                }
-                let hit = self.offending(&q)?;
-                if !hit.is_empty() {
-                    return Ok(Some(hit));
-                }
+            let steps = ((span / crate::planner::COLLISION_STEP_RAD).ceil() as usize)
+                .clamp(1, self.max_steps);
+            let Some(i) = self
+                .collision
+                .check_segment(&from, &to, steps - 1)
+                .map_err(gate_error)?
+            else {
+                return Ok(None);
+            };
+            let t = i as f64 / steps as f64;
+            let mut hit = *current;
+            for (j, v) in hit.iter_mut().enumerate() {
+                *v += (target[j] - current[j]) * t;
             }
-            return Ok(None);
+            return Ok(Some(self.offending(&hit)?));
         }
-        let tgt = self.offending(target)?;
+        let tgt = self.offending(&target)?;
         let new: Vec<(String, String)> = tgt.iter().filter(|p| !cur.contains(p)).cloned().collect();
         if !new.is_empty() {
             return Ok(Some(new));
@@ -315,11 +350,59 @@ impl StreamGate {
             .iter()
             .any(|p| is_world_name(&p.0) || is_world_name(&p.1));
         if world_pair
-            && self.world_distance(target)? < self.world_distance(current)? - STREAM_ESCAPE_TOL_M
+            && self.world_distance(&target)? < self.world_distance(current)? - STREAM_ESCAPE_TOL_M
         {
-            return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
+            return Ok(Some(if tgt.is_empty() { cur.to_vec() } else { tgt }));
         }
         Ok(None)
+    }
+
+    /// `q` clamped into the soft window, joint by joint.
+    fn clamped(&self, q: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+        let mut out = *q;
+        for (j, v) in out.iter_mut().enumerate() {
+            *v = v.clamp(self.soft_min[j], self.soft_max[j]);
+        }
+        out
+    }
+
+    /// The servo admission verdict from `q` moving at `qd` toward
+    /// `target`: the target configuration itself, and, while the arm is
+    /// MOVING, where the measured motion carries it within one lookahead
+    /// horizon — a target admitted just outside a keep-out is entered
+    /// anyway on the braking distance, and an arm that has outrun its
+    /// previous target is already past where the target alone says it
+    /// is.
+    pub(crate) fn servo_blocked(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+        target: &[f64; MAX_JOINTS],
+    ) -> Result<Option<Vec<(String, String)>>, WireError> {
+        let cur = self.offending(q)?;
+        if let Some(pairs) = self.blocked_from(&cur, q, target)? {
+            return Ok(Some(pairs));
+        }
+        if !moving(qd) {
+            return Ok(None);
+        }
+        let la = self.motion_lookahead(q, qd);
+        self.blocked_from(&cur, q, &la)
+    }
+
+    /// Whether the motion under way at `qd` from `q` must stop: the
+    /// measured motion projected one lookahead horizon, or nothing while
+    /// the arm is not MOVING.
+    pub(crate) fn motion_blocked(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+    ) -> Result<Option<Vec<(String, String)>>, WireError> {
+        if !moving(qd) {
+            return Ok(None);
+        }
+        let la = self.motion_lookahead(q, qd);
+        self.blocked(q, &la)
     }
 
     /// Epoch of the applied collision world (the model's `scene_epoch`);
@@ -532,27 +615,17 @@ pub(crate) struct CartStream {
 }
 
 impl CartStream {
-    /// Admit one servo target against the world: the target configuration
-    /// itself, and, while the arm is moving, where the measured motion
-    /// carries it within one lookahead horizon — a target admitted just
-    /// outside a keep-out is entered anyway on the braking distance, and
-    /// an arm that has outrun its previous target is already past where
-    /// the target alone says it is. Housekeeping runs the same projection
-    /// between datagrams; running it here too makes the verdict a property
-    /// of every datagram rather than of when housekeeping last sampled a
-    /// moving tick. Returns the epoch of the world the target was admitted
-    /// against.
+    /// Admit one servo target against the world ([`StreamGate::servo_blocked`]
+    /// from the measured pose and motion). Housekeeping runs the same
+    /// projection between datagrams; running it here too makes the
+    /// verdict a property of every datagram rather than of when
+    /// housekeeping last sampled a moving tick. Returns the epoch of the
+    /// world the target was admitted against.
     fn admit_servo_target(&mut self, target: &[f64; MAX_JOINTS]) -> Result<u64, WireError> {
         let snap = self.snapshots.latest();
         let mut gate = self.gate.lock().unwrap();
-        if let Some(pairs) = gate.blocked(&snap.q, target)? {
+        if let Some(pairs) = gate.servo_blocked(&snap.q, &snap.qd, target)? {
             return Err(gate.refuse(pairs));
-        }
-        if snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) {
-            let la = gate.motion_lookahead(&snap.q, &snap.qd);
-            if let Some(pairs) = gate.blocked(&snap.q, &la)? {
-                return Err(gate.refuse(pairs));
-            }
         }
         Ok(gate.epoch())
     }
@@ -820,13 +893,15 @@ impl RtCommands for RtBridge {
                     soft_min: self.cart.soft_min,
                     soft_max: self.cart.soft_max,
                 };
-                let horizon = self.cart.gate.lock().unwrap().lookahead_s();
-                if let Ok((la, _)) = step_cart_jog(&mut self.cart.kin, &mut probe, horizon) {
-                    let mut gate = self.cart.gate.lock().unwrap();
+                let mut gate = self.cart.gate.lock().unwrap();
+                if let Ok((la, _)) =
+                    step_cart_jog(&mut self.cart.kin, &mut probe, gate.lookahead_s())
+                {
                     if let Some(pairs) = gate.blocked(&q, &la)? {
                         return Err(gate.refuse(pairs));
                     }
                 }
+                drop(gate);
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -1330,13 +1405,9 @@ pub(crate) fn housekeeping_loop(
                 // stop dead — so the measured motion is projected one
                 // lookahead horizon and re-tested every period, the same
                 // promise the jog path already makes.
-                Some(a)
-                    if a.kind == StreamKind::Servo
-                        && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
-                {
+                Some(a) if a.kind == StreamKind::Servo && moving(&snap.qd) => {
                     let mut g = gate.lock().unwrap();
-                    let la = g.motion_lookahead(&snap.q, &snap.qd);
-                    match g.blocked(&snap.q, &la) {
+                    match g.motion_blocked(&snap.q, &snap.qd) {
                         Ok(None) => {}
                         Ok(Some(pairs)) => {
                             drop(g);
@@ -1405,11 +1476,7 @@ pub(crate) fn housekeeping_loop(
                                 // The velocity-scaled horizon, projected
                                 // past the step just integrated.
                                 let mut g = gate.lock().unwrap();
-                                let mut la = target;
-                                for (j, v) in la.iter_mut().enumerate() {
-                                    *v = (*v + qd[j] * g.lookahead_s())
-                                        .clamp(state.soft_min[j], state.soft_max[j]);
-                                }
+                                let la = g.motion_lookahead(&target, &qd);
                                 let verdict = g.blocked(&before, &la);
                                 drop(g);
                                 match verdict {
