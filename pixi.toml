@@ -32,8 +32,10 @@ cxx-compiler = "*"
 PAR6_SHIM_LIB_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/lib"
 PAR6_SHIM_INCLUDE_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/include"
 # Runtime loading for binaries whose package did not embed an rpath — link
-# args do not propagate across cargo packages.
-LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.ffi/shim/lib:$PIXI_PROJECT_ROOT/.ffi/toppra/lib:$CONDA_PREFIX/lib"
+# args do not propagate across cargo packages (par6-bus's libmujoco rpath
+# covers its own test binaries only; par6-rt, par6d and par6-py load it
+# from here). The mujoco directory follows the workspace mujoco-rs pin.
+LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.ffi/shim/lib:$PIXI_PROJECT_ROOT/.ffi/toppra/lib:$PIXI_PROJECT_ROOT/.ffi/mujoco/mujoco-3.12.0/lib:$CONDA_PREFIX/lib"
 # mujoco-rs requires an absolute path; it fetches the libmujoco matching
 # CARGO_CFG_TARGET_ARCH into this directory.
 MUJOCO_DOWNLOAD_DIR = "$PIXI_PROJECT_ROOT/.ffi/mujoco"

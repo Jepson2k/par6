@@ -23,6 +23,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::{ConfigBundle, ConfigError, LimitMode, TimingConfig};
@@ -143,11 +144,6 @@ impl Daemon {
             robot.stream.command_timeout_s
         );
 
-        if opts.sim_dynamics && !opts.sim {
-            return Err(DaemonError::Hardware(
-                "--sim-dynamics is a simulator plant; add --sim or drop it".into(),
-            ));
-        }
         let KinStack {
             fk: kin_fk,
             gravity: kin_gravity,
@@ -158,7 +154,13 @@ impl Daemon {
             gate_collision,
             tool_offset,
             assets_dir,
+            variant,
         } = load_kin_stack(opts, &config_path, robot, bundle.active_gripper())?;
+        // The sim scene carries the same tool the kinematics model does.
+        let sim_scene = Scene {
+            tool: scene_tool(variant),
+            assets: assets_dir.clone(),
+        };
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
@@ -182,67 +184,15 @@ impl Daemon {
         // Hardware prerequisites, in the order an operator fixes them:
         // the CAN interface, then the e-stop line. Both are startup
         // refusals — nothing has been spawned yet.
-        let sim_bus = if opts.sim_dynamics {
-            // The plant swings exactly the body G(q) describes: the
-            // arm-only chain plus the ACTIVE tool's inertials on the
-            // wrist (the same DH conversion the gravity model uses).
-            // Loading a variant URDF here would double-count whatever
-            // its final link already fuses in.
-            let urdf = assets_dir.join(par6_kin::Kin::ARM_URDF_RELPATH);
-            if !urdf.is_file() {
-                return Err(DaemonError::Kinematics(format!(
-                    "sim-dynamics URDF missing: {}",
-                    urdf.display()
-                )));
-            }
-            let tool = bundle.active_gripper().map(|g| {
-                let k = &g.kinematics;
-                par6_kin::Kin::dh_tool_params(
-                    k.d_m,
-                    k.a_m,
-                    k.alpha_rad,
-                    k.mass_kg,
-                    k.com_m,
-                    k.inertia_kg_m2,
-                )
-            });
-            log::info!(
-                "sim plant: torque-level dynamics ({}, tool inertials: {})",
-                urdf.display(),
-                if tool.is_some() {
-                    "active gripper"
-                } else {
-                    "none"
-                },
-            );
-            SimBus::with_dynamics(urdf, Some(par6_kin::Kin::ARM_EE_FRAME.to_owned()), tool)
-        } else {
-            SimBus::new()
-        };
         let bus = if opts.sim {
-            RuntimeBus::from(sim_bus)
+            RuntimeBus::from(SimBus::new(sim_scene.clone()))
         } else {
             RuntimeBus::from(open_hardware_bus(&robot.bus)?)
         };
         let estop = estop_source(opts)?;
         let io = io_source(opts, &robot.io)?;
 
-        // The real gravity model always runs, so `gravity_torque_nm`
-        // publishes the arm's true G(q) in every mode. APPLYING it as a
-        // feedforward is a different matter: it cancels weight that must
-        // actually exist in the plant, which is true on hardware and on
-        // the torque-level plant, and false on the kinematic plant (it
-        // integrates commanded current and models no gravity, so an
-        // applied G(q) would accelerate an IDLE arm off its pose). Plain
-        // `--sim` therefore disables the comp feedforward at boot —
-        // publish-only. `set_gravity_comp` turns it back on for a client
-        // that knows its plant models weight.
         let gravity_hook: Box<dyn GravityModel> = Box::new(kin_gravity);
-        if opts.sim && !opts.sim_dynamics {
-            cmds_tx
-                .send(par6_rt::RtCommand::SetGravityComp(false))
-                .expect("receiver outlives startup");
-        }
         let fk_hook: Box<dyn ForwardKin> = Box::new(kin_fk);
         let hooks = RtHooks {
             gravity: gravity_hook,
@@ -305,6 +255,7 @@ impl Daemon {
             flush_marker,
             bundle.clone(),
             opts.sim,
+            sim_scene,
             crate::bridge::CartStream {
                 kin: kin_bridge,
                 snapshots: bridge_snapshots,
@@ -720,6 +671,17 @@ pub(crate) struct KinStack {
     /// The one TCP-offset cell all of the above read.
     pub(crate) tool_offset: crate::kin::ToolOffset,
     assets_dir: std::path::PathBuf,
+    /// The URDF variant the models were built for.
+    variant: par6_kin::GripperVariant,
+}
+
+/// The sim scene tool matching a kinematics variant.
+fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
+    match variant {
+        par6_kin::GripperVariant::Flange => Tool::Flange,
+        par6_kin::GripperVariant::Msg => Tool::Msg,
+        par6_kin::GripperVariant::Ssg48 => Tool::Ssg48,
+    }
 }
 
 /// Standoff \[m\] every collision pair is checked with: geometry within
@@ -755,9 +717,7 @@ pub(crate) fn load_kin_stack(
     let load = || load_kin(&assets_dir, variant).map_err(DaemonError::Kinematics);
     // G(q) describes the body that actually swings: the arm-only chain
     // plus the ACTIVE gripper's inertials from config (one source per
-    // mass — see `kin::load_gravity_kin`). The `--sim-dynamics` plant
-    // carries the same tool inertials on its wrist, so the model and the
-    // plant agree there too and an IDLE arm under the feedforward floats.
+    // mass — see `kin::load_gravity_kin`).
     let gravity_kin = crate::kin::load_gravity_kin(&assets_dir, active_gripper)
         .map_err(DaemonError::Kinematics)?;
     // The collision world models the same body the planner plans for,
@@ -791,6 +751,7 @@ pub(crate) fn load_kin_stack(
         gate_collision,
         tool_offset,
         assets_dir,
+        variant,
     })
 }
 

@@ -222,6 +222,15 @@ impl TorqueSlew {
         self.applied[i] = want;
         want
     }
+
+    /// Adopt `applied` as the torque in force on every joint — the
+    /// teleport re-seed, where the drive's torque is discontinuous by
+    /// construction and ramping toward the landed pose's hold from the
+    /// old pose's torque would leave a loaded joint under-held for the
+    /// length of the ramp.
+    pub fn reseed(&mut self, applied: [f64; MAX_JOINTS]) {
+        self.applied = applied;
+    }
 }
 
 /// Convert joint-space setpoints to wire commands: motor ticks via each

@@ -2,10 +2,14 @@
 //! objects — lives in one MuJoCo model (built by [`super::scene`] from the
 //! vendor MJCF) and every DOF is driven through `qfrc_applied`:
 //!
-//! - arm joints get the motor torques from the driver current loops
-//!   (config torque↔current factor) plus idle-brake damping. The config
-//!   hard limits are MuJoCo joint limits, and the drivetrain friction is
-//!   MuJoCo `frictionloss`, set every substep by the law below;
+//! - arm joints get the motor torques from the driver current loops,
+//!   closed at the physics substep rate on the substep's own measured
+//!   state (the firmware's loops run at ~1 kHz; a current held over a
+//!   whole bus tick spins a light wrist joint into a tick-rate limit
+//!   cycle), through the config torque↔current factor, plus idle-brake
+//!   damping. The config hard limits are MuJoCo joint limits, and the
+//!   drivetrain friction is MuJoCo `frictionloss`, set every substep by
+//!   the law below;
 //! - the jaw DOF runs a stiff PD servo. In firmware mode the plant
 //!   rate-limits its own approach to the RAW cmd-61 target (mirroring the
 //!   front end's byte kinematics) and reports physical obstructions from
@@ -43,13 +47,19 @@
 
 use mujoco_rs::prelude::{MjData, MjModel, MjtObj};
 
-use super::driver::PlantCmd;
-use super::plant::JointMap;
+use super::driver::{PlantCmd, VirtualDriver, FW_LOOP_DT};
+use super::map::JointMap;
 
 /// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
 /// shorted-phase brake of an idled driver. Free-motion viscous/Coulomb
 /// friction lives in the MJCF joint defaults, not here.
 const IDLE_RATE: f64 = 40.0;
+/// Drivetrain friction limit \[N·m\] that clamps a joint outright: applied
+/// to the arm between a teleport and the runtime's next command frames,
+/// so the arm appears at rest, already held, instead of spending the gap
+/// limp — a wrist loaded past its holding friction back-drove a degree
+/// in that gap, and a cold position hold still sags a milliradian.
+const LANDING_CLAMP_NM: f64 = 1.0e3;
 
 /// Full jaw travel \[m\] — `jaw1_JOINT`'s slide range in the scene
 /// (0 = fully open, −`JAW_TRAVEL_M` = fully closed).
@@ -101,6 +111,8 @@ pub(crate) struct MujocoPlant {
     hold: Vec<f64>,
     /// This substep's drivetrain friction per arm joint \[N·m\].
     friction: Vec<f64>,
+    /// This substep's driver loop outputs per arm joint.
+    cmds: Vec<PlantCmd>,
     /// Last substep's bias torques (gravity + velocity terms), all DOFs.
     bias: Vec<f64>,
     /// The servo's commanded jaw byte (the front end's kinematic jaw).
@@ -224,6 +236,15 @@ impl MujocoPlant {
             coulomb,
             hold: holding_nm.to_vec(),
             friction: vec![0.0; n],
+            cmds: vec![
+                PlantCmd {
+                    current_ma: 0.0,
+                    ff_ma: 0.0,
+                    vel_limit_ticks_s: 0.0,
+                    idle: true,
+                };
+                n
+            ],
             bias: vec![0.0; nv],
             jaw_cmd_byte: JAW_INIT_BYTE,
             close_at: None,
@@ -259,18 +280,25 @@ impl MujocoPlant {
         (self.close_at, self.open_at)
     }
 
-    /// Advance one bus tick: loop currents (minus injected loads) become
+    /// Advance one bus tick: per substep the drivers close their loops on
+    /// the measured state, loop currents (minus injected loads) become
     /// joint torques + idle damping, the drivetrain friction follows the
-    /// motor torque, the jaw servo tracks its drive, MuJoCo integrates
-    /// `round(dt/ts)` steps with contacts and limits, and the jaw
-    /// obstruction state updates.
+    /// motor torque, the jaw servo tracks its drive and MuJoCo integrates
+    /// one step with contacts and limits; then the jaw obstruction state
+    /// updates. Watchdog aging is per bus tick and stays with the caller.
+    /// `clamp_arm` holds every arm joint outright (see
+    /// [`LANDING_CLAMP_NM`]).
+    // One index walks the drivers, their maps, the injected loads and four
+    // state vectors in lockstep; zip chains would bury the torque law.
+    #[allow(clippy::needless_range_loop)]
     pub fn step(
         &mut self,
         dt: f64,
-        cmds: &[PlantCmd],
+        drivers: &mut [VirtualDriver],
         loads_ma: &[f64],
         maps: &[JointMap],
         jaw: Option<JawDrive>,
+        clamp_arm: bool,
     ) {
         let substeps = (dt / self.ts).round();
         assert!(
@@ -282,10 +310,14 @@ impl MujocoPlant {
             self.jaw_cmd_byte = byte;
         }
         let h = self.ts;
+        let fw_steps = (h / FW_LOOP_DT).round().max(1.0);
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {
                 let map = &maps[j];
+                let (pos, vel) = self.motor_state(j, map);
+                self.cmds[j] = drivers[j].loop_step(pos + map.report_offset, vel, fw_steps);
+                let cmds = &self.cmds;
                 let v = self.qvel[j];
                 let motor = cmds[j].current_ma / map.factor_ma_per_nm;
                 let external = -loads_ma[j] / map.factor_ma_per_nm;
@@ -298,7 +330,12 @@ impl MujocoPlant {
                 // MuJoCo's bias (its sign is the force that cancels it)
                 // and the injected external load.
                 let load = external - self.bias[j];
-                self.friction[j] = drivetrain_friction(self.coulomb[j], self.hold[j], motor, load);
+                let hold = if clamp_arm {
+                    LANDING_CLAMP_NM
+                } else {
+                    self.hold[j]
+                };
+                self.friction[j] = drivetrain_friction(self.coulomb[j], hold, motor, load);
             }
             // SAFETY: only per-DOF friction values change; the model's
             // sizes and layout are untouched, so the data stays valid.
@@ -327,7 +364,7 @@ impl MujocoPlant {
             // Driver-enforced velocity limit, converted to joint space.
             let mut clamped = false;
             for j in 0..self.n {
-                let vlim = cmds[j].vel_limit_ticks_s.abs()
+                let vlim = self.cmds[j].vel_limit_ticks_s.abs()
                     * (std::f64::consts::TAU / f64::from(maps[j].encoder_max_counts))
                     / maps[j].gear_ratio;
                 if self.qvel[j].abs() > vlim {

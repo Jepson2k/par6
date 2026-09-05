@@ -499,12 +499,8 @@ fn stop_then_move_completes_without_losing_samples() {
 /// Move size for the profile probe: short enough that the whole move is
 /// ramping, where a jerk limit costs the most against a profile without
 /// one (long moves are cruise-dominated and converge).
-const PROFILE_PROBE_DEG: f64 = 4.0;
+const PROFILE_PROBE_DEG: f64 = 40.0;
 
-/// Time one `move_j` under `profile`, from a fixed start pose, measured
-/// ack → COMPLETE. The profile is what shapes the trajectory, so its
-/// duration is the observable that proves the selection reached the
-/// planner rather than being stored and ignored.
 /// The FLASHING maintenance window over the wire: entry carries the
 /// human park assertion and is acked only once the mode really changed;
 /// the window is genuinely bus-silent (the link reads stale); the exit
@@ -572,9 +568,21 @@ fn flashing_window_over_protocol_v2() {
     assert!(ok, "motion after a re-home must complete, got {detail:?}");
 }
 
+/// Wall-clock from ack to COMPLETE of one `move_j` under `profile`, from a
+/// fixed start pose with nothing else queued, under the settled completion
+/// policy: COMPLETE once the arm has arrived and held, so the measurement
+/// is the executed trajectory plus a settle that is the same for every
+/// profile. The probe swings the base through [`PROFILE_PROBE_DEG`]: long
+/// enough that the jerk ramps cost the jerk-limited profile hundreds of
+/// milliseconds, far above datagram and settle jitter. The trajectory's
+/// length is what the profile shapes, and what proves the selection
+/// reached the planner rather than being stored and ignored.
 fn timed_move_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> Duration {
     let park = park_deg();
     teleport_home(rig, c, park);
+    rig.wait_status("queue drained", |s| {
+        s.queued_duration == 0.0 && s.executing_index < 0
+    });
     c.ok(&select_profile(profile));
     match c.query(&Command::Profile) {
         QueryResult::Profile { profile: p } => assert_eq!(p, profile),
@@ -700,22 +708,29 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // the same move under the same limits).
     let err = c.expect_error(&select_profile("BOGUS"));
     assert_eq!(err.code, ErrorCode::SysProfileInvalid as u16);
-    // Time the trajectory, not the servo: under `commanded` a move
-    // finishes when its last sample has been issued, so the measurement
-    // is the planned duration plus a datagram.
+    // Time the executed trajectory: COMPLETE under the settled policy
+    // arrives when the arm has landed and held, the same settle for every
+    // profile.
     c.ok(&Command::SetCompletionPolicy(SetCompletionPolicy {
-        policy: CompletionPolicy::Commanded,
+        policy: CompletionPolicy::Settled,
     }));
     let trapezoid = timed_move_under(&rig, &mut c, "TRAPEZOID", 5100);
     let ruckig = timed_move_under(&rig, &mut c, "RUCKIG", 5101);
+    // Jerk limiting adds its ramps at both ends of the move — hundreds of
+    // milliseconds at the config jerk factor over this swing — on top of
+    // the trapezoid's time.
     assert!(
-        ruckig > trapezoid.mul_f64(1.4),
+        ruckig >= trapezoid + Duration::from_millis(150),
         "the selected profile did not change the trajectory: \
          TRAPEZOID {trapezoid:?} vs RUCKIG {ruckig:?}"
     );
     let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
+    // TOPPRA is time-optimal under the joint velocity, acceleration and
+    // torque limits with no jerk limit, so it cannot be materially slower
+    // than jerk-limited RUCKIG over the same swing; the margin is the
+    // settle policy's jitter, not a profile difference.
     assert!(
-        toppra < ruckig,
+        toppra <= ruckig + Duration::from_millis(100),
         "TOPPRA (time-optimal, no jerk limit) must not be slower than \
          jerk-limited RUCKIG: {toppra:?} vs {ruckig:?}"
     );

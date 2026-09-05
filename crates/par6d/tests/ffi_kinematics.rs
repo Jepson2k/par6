@@ -19,6 +19,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
+use par6_bus::spectral::convert::torque_to_ma_factor;
 use par6_proto::command::{
     JogJ, JogL, MoveC, MoveJ, MoveJPose, MoveL, MoveP, MoveS, SetRecipe, SetShapes, SetTcpOffset,
     Shape, Stop, Teleport,
@@ -33,8 +34,8 @@ use common::{is_timeout, repo_root, shipped_config, Client, Rig, BUDGET, READ_TI
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
-fn boot_tagged(tag: &str, sim_dynamics: bool) -> Rig {
-    Rig::boot_with(test_config(tag), sim_dynamics)
+fn boot_tagged(tag: &str) -> Rig {
+    Rig::boot(test_config(tag))
 }
 
 /// The PAR6 config re-ticked to 50 Hz, like the sim-session test: loaded
@@ -82,6 +83,7 @@ fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
 
 fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS]) {
     let deadline = Instant::now() + BUDGET;
+    let mut last = None;
     loop {
         c.send(&Command::Teleport(Teleport {
             angles: angles_deg,
@@ -98,12 +100,41 @@ fn enable_and_teleport(rig: &Rig, c: &mut Client, angles_deg: [f64; NUM_JOINTS])
                 if s.homed && close {
                     return;
                 }
+                last = Some((s.homed, s.angles, s.error.clone()));
             }
         }
         assert!(
             Instant::now() < deadline,
-            "teleport did not take effect within budget"
+            "teleport to {angles_deg:?} did not take effect within budget; last status: {last:?}"
         );
+    }
+}
+
+/// The next STATUS after the arm has stopped moving: half a second of
+/// consecutive reports within a hundredth of a degree on every joint.
+/// The plant settles into its stiction band after a teleport; reading a
+/// pose mid-settle puts millimetres of arm motion into what should be a
+/// pure kinematics comparison.
+fn wait_still(rig: &Rig) -> Status {
+    let deadline = Instant::now() + BUDGET;
+    let mut prev: Option<Status> = None;
+    let mut still_since = Instant::now();
+    loop {
+        let s = rig.wait_status("a status while settling", |_| true);
+        if let Some(p) = &prev {
+            let still = s
+                .angles
+                .iter()
+                .zip(p.angles.iter())
+                .all(|(a, b)| (a - b).abs() < 0.01);
+            if !still {
+                still_since = Instant::now();
+            } else if still_since.elapsed() > Duration::from_millis(500) {
+                return s;
+            }
+        }
+        prev = Some(s);
+        assert!(Instant::now() < deadline, "the arm never came to rest");
     }
 }
 
@@ -145,17 +176,31 @@ fn golden_fixture() -> Fixture {
 /// The first golden case the arm can actually be teleported to: the
 /// fixtures sample the whole joint space, teleport clamps to the hard
 /// window, and a clamped pose would no longer match the golden FK.
+/// The first golden case the arm can be placed at, with each joint angle
+/// wrapped by whole turns into the hard joint window (FK is periodic in
+/// every joint, so the golden pose still holds) and the TCP clear of the
+/// simulator's floor: the fixture is pure kinematics, and the sim refuses
+/// a pose that puts the jaws through the floor by throwing the arm off it.
 fn reachable_golden_case() -> FixtureCase {
+    /// TCP height above the floor \[m\] that keeps the jaws clear of it.
+    const FLOOR_CLEARANCE_M: f64 = 0.08;
     let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
+    let into_window = |q: f64, j: &par6_config::JointConfig| {
+        [q, q + std::f64::consts::TAU, q - std::f64::consts::TAU]
+            .into_iter()
+            .find(|q| *q >= j.limits.hard_min_rad && *q <= j.limits.hard_max_rad)
+    };
     golden_fixture()
         .cases
         .into_iter()
-        .find(|c| {
-            c.q.iter()
-                .zip(cfg.joints.iter())
-                .all(|(q, j)| *q >= j.limits.hard_min_rad && *q <= j.limits.hard_max_rad)
+        .filter(|c| c.fk[11] >= FLOOR_CLEARANCE_M)
+        .find_map(|mut c| {
+            for (q, j) in c.q.iter_mut().zip(cfg.joints.iter()) {
+                *q = into_window(*q, j)?;
+            }
+            Some(c)
         })
-        .expect("at least one golden case inside the hard joint window")
+        .expect("at least one golden case placeable inside the hard joint window above the floor")
 }
 
 // ---- cartesian geometry helpers --------------------------------------------
@@ -248,7 +293,7 @@ const MOVE_S: f64 = 15.0;
 /// of moving the arm.
 #[test]
 fn cartesian_surface_over_protocol_v2() {
-    let rig = boot_tagged("cart", false);
+    let rig = boot_tagged("cart");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -260,8 +305,8 @@ fn cartesian_surface_over_protocol_v2() {
         *out = rad.to_degrees();
     }
     enable_and_teleport(&rig, &mut c, case_deg);
-    // The arm reports through 14-bit encoders, so it lands within a
-    // quantum (~2e-5 rad) of the commanded configuration, not on it.
+    // The plant settles into its stiction band, so the arm rests within
+    // a hundredth of a degree of the commanded configuration, not on it.
     let s = rig.wait_status("pose for the golden configuration", |s| {
         s.angles
             .iter()
@@ -269,14 +314,15 @@ fn cartesian_surface_over_protocol_v2() {
             .all(|(a, b)| (a - b).abs() < 0.01)
     });
     for (k, golden) in case.fk.iter().enumerate() {
-        // Tolerances leave ~100x margin over that quantum, and are still
+        // Tolerances cover what that hundredth of a degree costs at the
+        // arm's reach (0.2 mm, 2e-4 in the rotation block), and are still
         // orders of magnitude below what any convention slip (frame, row
         // order, rpy composition) would cost.
         // Columns 3/7/11 are the translation (golden in m, wire in mm).
         let (want, tol) = if k % 4 == 3 && k < 12 {
-            (golden * 1000.0, 0.05)
+            (golden * 1000.0, 0.2)
         } else {
-            (*golden, 5e-4)
+            (*golden, 1e-3)
         };
         assert!(
             (s.pose[k] - want).abs() < tol,
@@ -481,57 +527,79 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
-/// The gravity hook is wired, signed right, and survives the Nm→mA→Nm
-/// round trip. On the torque-level plant (`--sim-dynamics`) an IDLE arm
-/// is held by nothing but the G(q) feedforward: every loaded joint,
-/// wrist included, stays where the sim placed it. With the `ZeroGravity`
-/// placeholder the same rig collapses — measured here, the shoulder is
-/// 69° down and the elbow 108° over inside one second — so this bound
-/// cannot pass without the hook.
+/// The gravity hook is wired, signed right and scaled right, end to end.
+/// With comp on — the simulator's default — an IDLE arm's motor currents
+/// are G(q) through the config torque↔current factor: the feedforward
+/// carries the arm's weight, so the gearbox carries none, and the arm
+/// holds the pose it was placed at. A wrong-sign hook drives every loaded
+/// joint down (the gearbox absorbs an assisting load, so nothing stops
+/// it) and fails the hold; `ZeroGravity` publishes zero currents and
+/// fails the current bound.
 ///
-/// What this does NOT establish is physical truth: the plant is built
-/// from the same URDF the gravity model reads, so it measures internal
-/// consistency and would pass unchanged with every link mass halved.
-/// The external half of the claim lives in
-/// `par6-kin/tests/gravity_reference.rs`, which pins G(q) on these URDFs
-/// to the VENDOR's dynamics table, independent of any URDF — the pair
-/// together is the whole statement.
+/// The Nm→mA path is the RT's own `torque_to_ma_factor`, so this pins
+/// the wiring and the sign, not the physics: the model's G(q) is pinned
+/// to the vendor table in `par6-kin/tests/gravity_reference.rs` and the
+/// scene's to the same table in `par6-bus/tests/scene_conformance.rs`.
 #[test]
-fn gravity_hook_holds_the_arm_on_the_torque_plant() {
+fn gravity_hook_holds_the_arm() {
     /// Hold tolerance \[deg\] for every joint.
     const HOLD_TOL: f64 = 2.5;
-    /// Every joint with a gravity load: the shoulder and elbow carry
-    /// essentially the whole arm, the wrist joints carry a residual
-    /// small enough that only a faithful torque↔current path holds
-    /// them (J0 is on the vertical axis and carries nothing).
-    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
-
-    let rig = boot_tagged("gravity", true);
+    /// Loaded-joint threshold \[Nm\]: below it the current is tens of mA
+    /// and the wire's whole-mA truncation dominates the comparison.
+    const LOADED_NM: f64 = 0.5;
+    let rig = boot_tagged("gravity");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
-
-    let placed = HOLD_POSE_DEG;
     c.ok(&Command::Reset);
-    enable_and_teleport(&rig, &mut c, placed);
-
-    // The loaded joints give way slightly before the feedforward
-    // catches them; the hold is what happens after that.
-    let settle = rig.collect_status(Duration::from_secs(1));
-    let held = settle.last().expect("status while settling").clone();
-    let give = LOADED
-        .iter()
-        .map(|&j| (held.angles[j] - placed[j]).abs())
-        .fold(0.0f64, f64::max);
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let held = wait_still(&rig);
+    c.ok(&Command::SetRecipe(SetRecipe {
+        name: "full".into(),
+    }));
+    rig.telemetry()
+        .set_read_timeout(Some(READ_TIMEOUT))
+        .expect("telemetry timeout");
+    let deadline = Instant::now() + BUDGET;
+    let mut buf = [0u8; 65535];
+    let (g, i) = loop {
+        match rig.telemetry().recv_from(&mut buf) {
+            Ok((n, _)) => {
+                if let (Some(g), Some(i)) = (
+                    telemetry_field(&buf[..n], GRAVITY_FIELD),
+                    telemetry_field(&buf[..n], CURRENTS_FIELD),
+                ) {
+                    break (g, i);
+                }
+            }
+            Err(e) if is_timeout(&e) => {}
+            Err(e) => panic!("telemetry recv failed: {e}"),
+        }
+        assert!(
+            Instant::now() < deadline,
+            "no decodable full-recipe telemetry packet within budget"
+        );
+    };
+    let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
+    let mut loaded = 0;
+    for (j, jc) in cfg.joints.iter().enumerate() {
+        if g[j].abs() < LOADED_NM {
+            continue;
+        }
+        loaded += 1;
+        let factor = torque_to_ma_factor(jc.gear_ratio, jc.gear_efficiency, jc.kt_nm_a, jc.dir);
+        let want = g[j] * factor;
+        assert!(
+            (i[j] - want).abs() <= 0.15 * want.abs() + 20.0,
+            "joint {j}: motor current {} mA vs G(q) {:.3} Nm × {factor:.1} mA/Nm = {want:.0} mA \
+             — the feedforward is not carrying the weight (currents {i:?}, G {g:?})",
+            i[j],
+            g[j]
+        );
+    }
     assert!(
-        give > 0.05,
-        "the plant never loaded the arm ({give:.3}°) — gravity is not being simulated"
+        loaded >= 2,
+        "the pose must load at least the shoulder and the elbow: G = {g:?}"
     );
-    assert!(
-        give < 10.0,
-        "the arm left the pose it was placed at ({give:.2}°): {placed:?} -> {:?}",
-        held.angles
-    );
-
     let watch = rig.collect_status(Duration::from_secs(4));
     assert!(
         watch.len() > 40,
@@ -544,7 +612,7 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
             "unexpected error while holding: {:?}",
             s.error
         );
-        for &j in &LOADED {
+        for j in 0..NUM_JOINTS {
             assert!(
                 (s.angles[j] - held.angles[j]).abs() < HOLD_TOL,
                 "joint {j} moved {:.2}° off the held pose while IDLE ({:?} -> {:?})",
@@ -554,12 +622,11 @@ fn gravity_hook_holds_the_arm_on_the_torque_plant() {
             );
         }
     }
-
     rig.shutdown();
 }
 
 #[test]
-fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
+fn a_full_speed_move_lands_cleanly() {
     // The planner's torque feedforward (M·q̈ + C·q̇ per sample, G(q) added
     // by the law) is applied for real on this tier: the plant integrates
     // rigid-body dynamics from the commanded current. This pins the tier
@@ -571,7 +638,7 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
     // swing stays on the gravity-free axes (base and wrist): the
     // shoulder lift saturates this plant's drive current against
     // gravity, feedforward or not.
-    let rig = boot_tagged("tauff", true);
+    let rig = boot_tagged("tauff");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
@@ -593,10 +660,10 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
     }));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the full-speed move must complete: {detail:?}");
-    // This tier holds with degrees of steady-state give (see the hold
-    // test above), so the landing tolerance asks "did the trajectory
-    // arrive", not "did the servo null out" — a feedforward with the
-    // wrong sign or scale misses by tens of degrees or latches an error.
+    // The plant settles into its stiction band, so the landing tolerance
+    // asks "did the trajectory arrive", not "did the servo null out" — a
+    // feedforward with the wrong sign or scale misses by tens of degrees
+    // or latches an error.
     let s = rig.wait_status("landed on the target", |s| {
         angles_close(&s.angles, &target, 8.0)
     });
@@ -674,7 +741,16 @@ mod mp {
 /// `GravityTorques` [Nm] out of one `full`-recipe telemetry packet:
 /// `[recipe, seq, mono_ns, ...fields]` with gravity at field 12 of the
 /// `full` field order.
+/// Position of a field in the `full` recipe (`TelemetryField::ALL`).
+const GRAVITY_FIELD: usize = 12;
+const CURRENTS_FIELD: usize = 16;
+
 fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
+    telemetry_field(pkt, GRAVITY_FIELD)
+}
+
+/// A per-joint field of a `full`-recipe telemetry packet.
+fn telemetry_field(pkt: &[u8], field: usize) -> Option<Vec<f64>> {
     let mut i = 0;
     let mp::Val::Arr(elems) = mp::read(pkt, &mut i) else {
         return None;
@@ -683,7 +759,7 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
         Some(mp::Val::Str(name)) if name == "full" => {}
         _ => return None,
     }
-    match elems.get(3 + 12) {
+    match elems.get(3 + field) {
         Some(mp::Val::Arr(vals)) => Some(
             vals.iter()
                 .map(|v| match v {
@@ -709,13 +785,11 @@ fn gravity_from_telemetry(pkt: &[u8]) -> Option<Vec<f64>> {
 /// model with `tool: None`, so `mass_kg` was parsed, validated and read
 /// by nothing — the promised "masses/COM/inertia from config" was false —
 /// and plain `--sim` installed `ZeroGravity`, so the same field
-/// published all-zero torques no matter the model. (The feedforward is
-/// still never APPLIED on the kinematic plant: comp is disabled at boot,
-/// publish-only.)
+/// published all-zero torques no matter the model.
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
     fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], Vec<f64>) {
-        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg), false);
+        let rig = Rig::boot(test_config_with_tool_mass(tag, mass_kg));
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
@@ -895,7 +969,7 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
 ///   the program layer.
 #[test]
 fn collision_world_is_enforced_over_protocol_v2() {
-    let rig = boot_tagged("collision", false);
+    let rig = boot_tagged("collision");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1170,7 +1244,7 @@ fn j0_jog_velocity() -> f64 {
 ///   it), while the outward jog from the same spot runs.
 #[test]
 fn streaming_is_gated_by_the_collision_world() {
-    let rig = boot_tagged("streamgate", false);
+    let rig = boot_tagged("streamgate");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1301,7 +1375,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
         ),
     )
     .expect("write config");
-    let rig = Rig::boot_with(config, false);
+    let rig = Rig::boot(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1472,14 +1546,14 @@ fn settled_tcp(rig: &Rig, what: &str) -> Status {
 /// runs parked the arm in the same configuration.
 #[test]
 fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
-    let rig = boot_tagged("tcpoffset", false);
+    let rig = boot_tagged("tcpoffset");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
 
     enable_and_teleport(&rig, &mut c, CART_START_DEG);
     rig.drain_status();
-    let flange = rig.wait_status("start pose", |_| true);
+    let flange = wait_still(&rig);
     let p_flange = tcp_mm(&flange);
 
     // The world displacement the offset must produce, and the tool-local
@@ -1637,7 +1711,7 @@ fn move_l_to(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
 /// a jog button for a motion the runtime would refuse.
 #[test]
 fn cartesian_enablement_measures_the_real_workspace() {
-    let rig = boot_tagged("enablement", false);
+    let rig = boot_tagged("enablement");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1848,7 +1922,7 @@ fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
 ///   when it goes through.
 #[test]
 fn curved_moves_trace_their_geometry() {
-    let rig = boot_tagged("curved", false);
+    let rig = boot_tagged("curved");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2089,7 +2163,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     /// with speed and the corner geometry is what is being measured.
     const LEG_S: f64 = 8.0;
 
-    let rig = boot_tagged("blend", false);
+    let rig = boot_tagged("blend");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2242,7 +2316,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     const BLEND_MM: f64 = 30.0;
     const LEG_S: f64 = 4.0;
 
-    let rig = boot_tagged("jointblend", false);
+    let rig = boot_tagged("jointblend");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2400,7 +2474,7 @@ const BEYOND_SOFT_J5_RAD: f64 = 1.9;
 /// way past the limits.
 #[test]
 fn ik_solutions_are_wrapped_into_their_soft_window() {
-    let rig = boot_tagged("ikwrap", false);
+    let rig = boot_tagged("ikwrap");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);

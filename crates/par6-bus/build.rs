@@ -1,35 +1,20 @@
-//! With feature `sim-dynamics`, embeds an rpath to the par6_shim install
-//! directory so this crate's own test binaries load `libpar6_shim.so`
-//! without `LD_LIBRARY_PATH`. Link-args do not propagate across packages,
-//! so pinokin-sys's identical rpath only covers ITS test binaries.
-//!
-//! With feature `sim-mujoco`, embeds an rpath to the libmujoco that
-//! mujoco-rs downloaded into `MUJOCO_DOWNLOAD_DIR`: the binding emits the
-//! link search path and the link line but no rpath, so without this every
-//! binary linking it needs `LD_LIBRARY_PATH` to start.
+//! Embeds an rpath to the libmujoco that mujoco-rs downloaded into
+//! `MUJOCO_DOWNLOAD_DIR`: the binding emits the link search path and the
+//! link line but no rpath, so without this every binary linking it needs
+//! `LD_LIBRARY_PATH` to start.
 
 use std::env;
 use std::path::PathBuf;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_LIB_DIR");
     println!("cargo:rerun-if-env-changed=MUJOCO_DOWNLOAD_DIR");
-    if env::var_os("CARGO_FEATURE_SIM_DYNAMICS").is_some() {
-        // pinokin-sys's build script errors out with guidance when this is
-        // missing; no need to duplicate the message here.
-        if let Ok(lib_dir) = env::var("PAR6_SHIM_LIB_DIR") {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
-        }
-    }
-    if env::var_os("CARGO_FEATURE_SIM_MUJOCO").is_some() {
-        // mujoco-rs's own build script already failed loudly if the variable
-        // is unset; here it is set, and the download has happened.
-        let Ok(download_dir) = env::var("MUJOCO_DOWNLOAD_DIR") else {
-            return;
-        };
-        let lib_dir = mujoco_lib_dir(PathBuf::from(download_dir));
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
-    }
+    // mujoco-rs's own build script already failed loudly if the variable
+    // is unset; here it is set, and the download has happened.
+    let Ok(download_dir) = env::var("MUJOCO_DOWNLOAD_DIR") else {
+        return;
+    };
+    let lib_dir = mujoco_lib_dir(PathBuf::from(download_dir));
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
 }
 
 /// The MuJoCo release mujoco-rs downloads (its `+mj-<version>` metadata).

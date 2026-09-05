@@ -80,15 +80,9 @@ pub struct Rig {
 }
 
 impl Rig {
-    /// Boot the simulator on `config`, with the kinematic plant.
+    /// Boot the simulator on `config`.
     pub fn boot(config: PathBuf) -> Rig {
-        Rig::boot_with(config, false)
-    }
-
-    /// Boot the simulator on `config`; `sim_dynamics` selects the
-    /// torque-level plant over the kinematic one.
-    pub fn boot_with(config: PathBuf, sim_dynamics: bool) -> Rig {
-        Rig::boot_opts(config, sim_dynamics, None)
+        Rig::boot_opts(config, None)
     }
 
     /// Boot the simulator with the STATUS broadcast rate overridden, as
@@ -99,18 +93,14 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, false, Some(hz))
+        Rig::try_boot_opts(config, Some(hz))
     }
 
-    fn boot_opts(config: PathBuf, sim_dynamics: bool, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, sim_dynamics, status_rate_hz).expect("daemon boots in sim mode")
+    fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
+        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(
-        config: PathBuf,
-        sim_dynamics: bool,
-        status_rate_hz: Option<u32>,
-    ) -> Result<Rig, String> {
+    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
         let _ = env_logger::builder().is_test(true).try_init();
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
@@ -120,7 +110,6 @@ impl Rig {
         let telemetry_rx = UdpSocket::bind("127.0.0.1:0").expect("telemetry socket");
         let opts = Options {
             sim: true,
-            sim_dynamics,
             config: Some(config),
             assets: Some(assets_dir()),
             command_port: Some(0),

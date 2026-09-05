@@ -26,7 +26,7 @@ use mujoco_rs::prelude::{MjModel, MjSpec, MjtGeom, MjtJoint, SpecItem, SpecObjec
 use mujoco_rs::wrappers::mj_editing::MjsGeom;
 use par6_config::SimConfig;
 
-use super::plant::JointMap;
+use super::map::JointMap;
 
 /// MJCF joint names of the six arm joints, in config order.
 pub const ARM_JOINTS: [&str; 6] = [
@@ -106,6 +106,43 @@ impl JointTuning {
     }
 }
 
+/// The active tool's inertials as the runtime's gravity model carries
+/// them — the config `[kinematics]` table: a DH tool frame off the
+/// flange, and the tool's mass, COM and inertia (`[ixx, iyy, izz, ixy,
+/// iyz, ixz]`) in that frame. Applied to the scene, the tool the arm
+/// swings is the tool G(q) describes, whatever the variant URDF's links
+/// weigh: one source per mass.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ToolInertial {
+    pub d_m: f64,
+    pub a_m: f64,
+    pub alpha_rad: f64,
+    pub mass_kg: f64,
+    pub com_m: [f64; 3],
+    pub inertia_kg_m2: [f64; 6],
+}
+
+impl ToolInertial {
+    /// COM and inertia (`[ixx, iyy, izz, ixy, ixz, iyz]`) in the flange
+    /// frame — the DH tool frame is `Rx(alpha)` rotated and `[a, 0, d]`
+    /// translated off it, as `par6_kin::Kin::dh_tool_params` composes it.
+    fn in_flange_frame(&self) -> ([f64; 3], [f64; 6]) {
+        let (s, c) = self.alpha_rad.sin_cos();
+        let rot = |v: [f64; 3]| [v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]];
+        let r = rot(self.com_m);
+        let com = [r[0] + self.a_m, r[1], r[2] + self.d_m];
+        let [ixx, iyy, izz, ixy, iyz, ixz] = self.inertia_kg_m2;
+        let rows = [
+            rot([ixx, ixy, ixz]),
+            rot([ixy, iyy, iyz]),
+            rot([ixz, iyz, izz]),
+        ];
+        let col = |k: usize| rot([rows[0][k], rows[1][k], rows[2][k]]);
+        let (c0, c1, c2) = (col(0), col(1), col(2));
+        (com, [c0[0], c1[1], c2[2], c1[0], c2[0], c2[1]])
+    }
+}
+
 /// Why a scene could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum SceneError {
@@ -133,6 +170,9 @@ pub enum SceneError {
         /// Element name.
         name: String,
     },
+    /// The config tool cannot be placed on the scene.
+    #[error("tool: {0}")]
+    Tool(String),
 }
 
 /// The XML parser keeps global "last XML" state and is not thread-safe;
@@ -169,8 +209,15 @@ impl Scene {
         self.assets.join("assets")
     }
 
-    /// The edited spec: vendor base plus every par6 delta.
-    pub fn spec(&self, timestep: f64, joints: &[JointTuning]) -> Result<MjSpec, SceneError> {
+    /// The edited spec: vendor base plus every par6 delta. With `tool`,
+    /// the tool bodies carry the config inertials instead of the variant
+    /// URDF's.
+    pub fn spec(
+        &self,
+        timestep: f64,
+        joints: &[JointTuning],
+        tool: Option<&ToolInertial>,
+    ) -> Result<MjSpec, SceneError> {
         let path = self.vendor_mjcf();
         let mjcf = |detail: String| SceneError::Mjcf {
             path: path.clone(),
@@ -299,6 +346,9 @@ impl Scene {
         pad_contact(geom);
 
         apply_urdf_inertials(&mut spec, &self.urdf())?;
+        if let Some(tool) = tool {
+            apply_tool_inertial(&mut spec, tool, self.tool.has_jaws())?;
+        }
         // The vendor's debug bodies — a camera frame and a 1 m TCP marker
         // capsule (alpha 0) — have no <inertial>, so MuJoCo would weigh
         // them by volume: ~0.3 kg hanging 0.22 m below the wrist, 0.4 Nm
@@ -315,8 +365,13 @@ impl Scene {
     }
 
     /// The compiled model.
-    pub fn model(&self, timestep: f64, joints: &[JointTuning]) -> Result<MjModel, SceneError> {
-        let mut spec = self.spec(timestep, joints)?;
+    pub fn model(
+        &self,
+        timestep: f64,
+        joints: &[JointTuning],
+        tool: Option<&ToolInertial>,
+    ) -> Result<MjModel, SceneError> {
+        let mut spec = self.spec(timestep, joints, tool)?;
         let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         spec.compile().map_err(|e| SceneError::Mjcf {
             path: self.vendor_mjcf(),
@@ -479,6 +534,78 @@ fn apply_urdf_inertials(spec: &mut MjSpec, urdf: &Path) -> Result<(), SceneError
         body.with_inertia(moments);
         body.set_explicitinertial(true);
     }
+    Ok(())
+}
+
+/// Rotate `v` by the unit quaternion `q = [w, x, y, z]`.
+fn rotate(q: [f64; 4], v: [f64; 3]) -> [f64; 3] {
+    let [w, x, y, z] = q;
+    let t = [
+        2.0 * (y * v[2] - z * v[1]),
+        2.0 * (z * v[0] - x * v[2]),
+        2.0 * (x * v[1] - y * v[0]),
+    ];
+    [
+        v[0] + w * t[0] + (y * t[2] - z * t[1]),
+        v[1] + w * t[1] + (z * t[0] - x * t[2]),
+        v[2] + w * t[2] + (x * t[1] - y * t[0]),
+    ]
+}
+
+/// Put the config tool on the `gripper` body (the flange-attached tool
+/// body, whose frame is the flange frame): the tool's total mass and COM
+/// become the config's, with the jaws keeping their URDF share of both.
+/// The body's inertia is the config tensor about the config COM; the
+/// jaws' own inertia stays with them, so the tool's inertia is
+/// over-counted by that share — dynamics, not gravity.
+fn apply_tool_inertial(
+    spec: &mut MjSpec,
+    tool: &ToolInertial,
+    jaws: bool,
+) -> Result<(), SceneError> {
+    let (com, inertia) = tool.in_flange_frame();
+    let mut jaw_mass = 0.0;
+    let mut jaw_moment = [0.0; 3];
+    if jaws {
+        for name in ["jaw1", "jaw2"] {
+            let body = spec.body_mut(name).ok_or_else(|| SceneError::Missing {
+                kind: "body",
+                name: name.to_owned(),
+            })?;
+            let m = body.mass();
+            let r = rotate(*body.quat(), *body.ipos());
+            let c = [
+                body.pos()[0] + r[0],
+                body.pos()[1] + r[1],
+                body.pos()[2] + r[2],
+            ];
+            jaw_mass += m;
+            for k in 0..3 {
+                jaw_moment[k] += m * c[k];
+            }
+        }
+    }
+    let mass = tool.mass_kg - jaw_mass;
+    if mass <= 0.0 {
+        return Err(SceneError::Tool(format!(
+            "the config tool mass {} kg is not heavier than the scene's jaws ({jaw_mass} kg)",
+            tool.mass_kg
+        )));
+    }
+    let body_com: [f64; 3] =
+        std::array::from_fn(|k| (tool.mass_kg * com[k] - jaw_moment[k]) / mass);
+    let (moments, iquat) = principal_axes(inertia);
+    let body = spec
+        .body_mut("gripper")
+        .ok_or_else(|| SceneError::Missing {
+            kind: "body",
+            name: "gripper".to_owned(),
+        })?;
+    body.set_mass(mass);
+    body.with_ipos(body_com);
+    body.with_iquat(iquat);
+    body.with_inertia(moments);
+    body.set_explicitinertial(true);
     Ok(())
 }
 

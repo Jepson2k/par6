@@ -17,14 +17,15 @@
 //!   through the gear (0.25–1.6 rad depending on the joint), which is
 //!   why the sweep includes shifted boot poses.
 //!
-//! Tolerances are NOT one encoder tick, deliberately: the kinematic
-//! plant's gearbox-windup model leaves up to ~400 motor ticks of preload
-//! in the latched reference of the no-release joints (J0/J3) and of J4
+//! Tolerances are NOT one encoder tick, deliberately: the latched
+//! reference carries the scene's joint-limit penetration at the homing
+//! current (under a milliradian, measured by the sim_bus stall table)
+//! plus the release-phase relaxation the no-release joints (J0/J3) and J4
 //! (whose shipped release current presses INTO its stop in the sim's
-//! sign convention), and the config's `home_offset_rad` differs from the
-//! hard-limit angle the plant's endstop sits at by up to 15 mrad. The
-//! expected per-joint frame delta absorbs the config part; 500 motor
-//! ticks absorb the windup. Both are an order of magnitude below every
+//! sign convention) never get, and the config's `home_offset_rad` differs
+//! from the hard-limit angle the plant's endstop sits at by up to 15 mrad.
+//! The expected per-joint frame delta absorbs the config part; 500 motor
+//! ticks absorb the seat. Both are an order of magnitude below every
 //! failure class above.
 
 mod common;
@@ -73,7 +74,7 @@ fn boot_core(
         fk: Box::new(NoFk),
         samples: consumer,
     };
-    let mut bus = SimBus::new();
+    let mut bus = SimBus::new(common::scene(&bundle));
     bus.set_initial_joint_rad(q0);
     let (mut core, handles) = RtCore::new(&bundle, bus, hooks).expect("sim core");
     core.bus_mut()
@@ -177,7 +178,7 @@ fn the_latched_reference_matches_plant_ground_truth_from_any_boot_pose() {
     for (name, delta) in &runs {
         for i in 0..MAX_JOINTS {
             // Absolute: the runtime frame anchors the plant's physical
-            // stop at the effective home offset, within windup.
+            // stop at the effective home offset, within the seat tolerance.
             assert!(
                 (delta[i] - expected[i]).abs() <= tol[i],
                 "J{i} ({name}): q − truth = {:.5} rad, expected {:.5} ± {:.5} — \

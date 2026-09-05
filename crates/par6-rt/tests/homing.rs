@@ -58,7 +58,8 @@ fn sim_core() -> (
         fk: Box::new(NoFk),
         samples: consumer,
     };
-    let (mut core, handles) = RtCore::new(&bundle, SimBus::new(), hooks).expect("sim core");
+    let (mut core, handles) =
+        RtCore::new(&bundle, SimBus::new(common::scene(&bundle)), hooks).expect("sim core");
     core.bus_mut().set_hall_trigger(5, -0.3, 0.02);
     (core, handles, tx, line)
 }
@@ -834,7 +835,7 @@ impl SimHomingHarness {
         center: f64,
         half: f64,
     ) -> Self {
-        let mut bus = SimBus::new();
+        let mut bus = SimBus::new(common::scene(bundle));
         bus.set_initial_joint_rad(q0);
         bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
             .expect("sim boot");

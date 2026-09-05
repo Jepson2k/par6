@@ -779,17 +779,30 @@ impl<B: DriverBus> RtCore<B> {
 
     /// Simulator/teleport path: re-aim every motion hold at the landed
     /// pose, after the [`set_joint_reference`](Self::set_joint_reference)
-    /// calls have moved `q`. The mode laws hold position by re-sending
-    /// their last target every tick — EXEC's starved-ring hold, STREAM's
+    /// calls have moved `q` and [`set_homed`](Self::set_homed) has declared
+    /// the reference. The mode laws hold position by re-sending their
+    /// last target every tick — EXEC's starved-ring hold, STREAM's
     /// tracker state, JOG's integrated target — and the wire speed
     /// channel is only a feedforward, so a hold left aimed at the
-    /// pre-teleport pose would actively drag the arm back to it.
+    /// pre-teleport pose would actively drag the arm back to it. The
+    /// torque slew is re-seeded to the landed pose's gravity hold too: a
+    /// teleport is a discontinuity, and ramping the feedforward there
+    /// from the old pose's torque leaves a loaded joint under-held for
+    /// the ramp — long enough for a wrist past its gearbox's holding
+    /// friction to back-drive.
     pub fn reseed_motion_targets(&mut self) {
         let q = self.q;
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
         self.jog.activate(&q);
         self.q_target = q;
+        self.gravity.gravity(&q, &mut self.g);
+        let hold = if self.gravity_applied() {
+            self.g
+        } else {
+            [0.0; MAX_JOINTS]
+        };
+        self.torque_slew.reseed(hold);
     }
 
     /// Replace the EXEC completion policy (takes effect at the next

@@ -644,7 +644,7 @@ pub struct RobotConfig {
     /// Motion feel constants. Omitted = the shipped defaults.
     #[serde(default)]
     pub motion: MotionConfig,
-    /// Torque-level sim plant parameters. Omitted = the vendor table.
+    /// Simulator drivetrain parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
 }

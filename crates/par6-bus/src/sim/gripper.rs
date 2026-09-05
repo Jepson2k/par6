@@ -12,7 +12,7 @@ use crate::spectral::codec::CommandId;
 use crate::types::{FirmwareGripperCommand, NodeId, ObjectDetection};
 
 use super::driver::{ReplyKind, VirtualDriver};
-use super::plant::KinJoint;
+use super::jaw::JawJoint;
 
 /// Firmware jaw speed \[position bytes per second per speed-byte unit\]
 /// (the MuJoCo plant's jaw approach uses the same rate).
@@ -34,7 +34,7 @@ pub(crate) struct GripperSim {
     pub driver: VirtualDriver,
     /// Jaw plant in motor-tick space: 0 = fully closed, `stroke_ticks` =
     /// fully open (`ticks_per_meter = 2^14 / (4π · gear_r)`).
-    pub joint: KinJoint,
+    pub joint: JawJoint,
     stroke_ticks: f64,
     ctrl: Ctrl,
     // -- firmware-mode state --
@@ -70,7 +70,7 @@ impl GripperSim {
         let cal_ticks = (CALIBRATION_S / dt).round() as u64;
         Self {
             driver: VirtualDriver::new(dt, node, d.velocity_limit_ticks_s, d.ilim_ma, d.kt_nm_a),
-            joint: KinJoint::new(
+            joint: JawJoint::new(
                 dt,
                 stroke_ticks / 2.0,
                 0.0,

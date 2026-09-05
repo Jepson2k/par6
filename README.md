@@ -11,7 +11,13 @@ control box, a **Rust client library** (`par6-client`), and a **Python package**
 [waldoctl](https://github.com/Jepson2k/waldoctl) backend contracts.
 
 `par6d --sim` runs anywhere — no hardware, no CAN interface, no root — so everything
-below works on a laptop and in CI.
+below works on a laptop and in CI. The simulator is physics, not playback: the arm is
+a MuJoCo scene built at boot from the vendor MJCF, with mass properties from the URDF,
+the active tool's inertials from config, the drivetrain reflected from the robot config
+(rotor inertia, viscous and Coulomb losses, a self-locking gearbox that holds an
+unpowered arm), the config hard limits as joint limits, and contacts between the jaws,
+the floor and graspable objects — so homing stalls, gravity, grasps and an idle arm
+behave the way the controller has to be right about.
 
 ## Table of contents
 
@@ -145,13 +151,15 @@ Waldo Commander (NiceGUI frontend, unchanged)
    │    plus the plan-time collision gate
    └─ RT thread (SCHED_FIFO 99, alloc-free): 250 Hz tick — CAN RX → state → gravity
         comp G(q) → mode dispatch → CAN TX → state snapshot
-   bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (Pinocchio ABA)
+   bus backends: SocketCAN (Spectral/STEPFOC) | MuJoCo simulator (vendor scene, config drivetrain)
 ```
 
-Kinematics and dynamics run on **Pinocchio through a C-ABI shim** shared with the
-Python side's [pinokin](https://github.com/Jepson2k/pinokin) — one numerics stack on
-both sides of the wire, which is what lets the offline preview agree with the runtime
-rather than approximate it.
+Kinematics, gravity and collision run on **Pinocchio and coal through a C-ABI shim**
+shared with the Python side's [pinokin](https://github.com/Jepson2k/pinokin) — one
+numerics stack on both sides of the wire, which is what lets the offline preview agree
+with the runtime rather than approximate it. The simulator's dynamics run on **MuJoCo**
+(`mujoco-rs`): Pinocchio is what the controller believes, MuJoCo is what is actually
+true, and the gap between them is what the simulator is for.
 
 ### Repository layout
 
@@ -161,7 +169,7 @@ rather than approximate it.
 | `crates/par6-config` | robot / gripper / homing TOML config |
 | `crates/par6-kin` | Pinocchio FFI: FK, Jacobian, gravity, IK; coal collision world (self-pairs + installation/program keep-out layers) |
 | `crates/par6-motion` | TOPPRA + rsruckig + trapezoid, jog ramps, completion policies |
-| `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + simulator backends |
+| `crates/par6-bus` | `DriverBus` trait, Spectral CAN codec, SocketCAN + MuJoCo simulator backends (scene built from the vendor MJCF) |
 | `crates/par6-rt` | RT tick loop, mode dispatch, homing FSM, error latching, e-stop |
 | `crates/par6-server` | UDP command plane, status/telemetry broadcast, collision-world layers |
 | `crates/par6-client` | the client library: command round-trips, retries/dedup, status subscription |
@@ -333,7 +341,6 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_TELEMETRY_PORT` | telemetry stream port (`--telemetry-port`) |
 | `PAR6_STATUS_TRANSPORT` | `auto` \| `multicast` \| `unicast` (`--status-transport`) |
 | `PAR6_STATUS_RATE_HZ` | STATUS broadcast rate; must divide the tick rate (`--status-rate`) |
-| `PAR6_SIM_DYNAMICS` | with `--sim`, use the torque-level plant (`--sim-dynamics`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
 

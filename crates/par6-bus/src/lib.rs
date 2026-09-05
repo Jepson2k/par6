@@ -23,13 +23,11 @@
 //!   (vendor swallowed them — known production bug class).
 //! - Sim backend ([`sim::SimBus`], closed loop): virtual Spectral drivers
 //!   (cascade PID/PD from real config gains, current saturation, kt,
-//!   watchdog) in front of a rate-limited kinematic plant with endstop /
-//!   windup / hall emulation — or, behind feature `sim-dynamics`,
-//!   Pinocchio ABA forward dynamics + friction + endstop torques, or,
-//!   behind feature `sim-mujoco`, a full MuJoCo contact scene (gravity,
-//!   endstops, physical grasps surfacing through the gripper status
-//!   bits) — → encoder ticks at fixed dt. Homing stall/current detection
-//!   works for real in CI.
+//!   watchdog) in front of a MuJoCo scene built from the vendor MJCF
+//!   (gravity, config-reflected drivetrain with a self-locking gearbox,
+//!   joint limits, physical grasps surfacing through the gripper status
+//!   bits, hall emulation) → encoder ticks at fixed dt. Homing
+//!   stall/current detection works for real in CI.
 
 mod backend;
 mod bus;

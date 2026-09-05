@@ -831,7 +831,7 @@ mod tests {
     /// disagree; user decision 2026-09-01: follow the dynamics table,
     /// switch to 25 if real movement proves it stale).
     #[test]
-    fn sim_dynamics_table_matches_the_vendor_model() {
+    fn sim_drivetrain_table_matches_the_vendor_model() {
         let robot =
             RobotConfig::load(&config_dir().join("PAR6.toml")).expect("shipped PAR6 config");
         assert_eq!(

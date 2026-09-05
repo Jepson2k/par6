@@ -9,6 +9,7 @@ use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
+use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::spectral::JointConversion;
 use par6_bus::{GripperReply, JointCommand, LoopbackBus, NodeId, Reply, TxRecord};
 use par6_config::ConfigBundle;
@@ -22,6 +23,19 @@ use par6_rt::{
 pub fn bundle() -> ConfigBundle {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
     ConfigBundle::load(&path).expect("PAR6 config bundle")
+}
+
+/// The sim scene for `bundle`'s active tool.
+pub fn scene(bundle: &ConfigBundle) -> Scene {
+    let tool = bundle
+        .active_gripper()
+        .and_then(|g| g.urdf_variant.as_deref())
+        .and_then(Tool::from_urdf_variant)
+        .unwrap_or(Tool::Flange);
+    Scene {
+        tool,
+        assets: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description"),
+    }
 }
 
 /// The PAR6 bundle re-ticked to `dt` seconds. Every RT time constant is

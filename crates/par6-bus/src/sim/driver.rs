@@ -43,12 +43,11 @@ pub(crate) struct PlantCmd {
     /// Loop output current \[mA\], already Ilim-saturated.
     pub current_ma: f64,
     /// The additive torque-feedforward share of `current_ma` (the loop
-    /// modes' `cur_ff` channel). The kinematic plant subtracts it: its
+    /// modes' `cur_ff` channel). The jaw model subtracts it: its
     /// current→acceleration gain is a synthetic Ilim mapping, not a
     /// torque model, so current calibrated for the real drives' Kt and
-    /// gearing would fabricate acceleration there — the kinematic tier
-    /// treats feedforward as exactly absorbed by the physics it does not
-    /// model. The dynamics tier integrates the full current for real.
+    /// gearing would fabricate acceleration there. The scene integrates
+    /// the full current for real.
     pub ff_ma: f64,
     /// Driver velocity limit \[ticks/s\] the plant must respect.
     pub vel_limit_ticks_s: f64,
@@ -376,7 +375,7 @@ impl VirtualDriver {
         }
     }
 
-    /// Discard motion-transient controller state (teleport re-seed).
+    /// Re-aim the driver at a re-seeded pose (teleport).
     ///
     /// The velocity-loop integral is charge accumulated against the
     /// plant's PREVIOUS motion — after a jog-release brake it holds
@@ -384,15 +383,19 @@ impl VirtualDriver {
     /// letting the stale integral discharge there shoves the arm off the
     /// teleported pose (about a thousand ticks after a fast jog) and
     /// rings, violating the teleport contract that the arm lands exactly
-    /// where the client asked. The latched motion command goes with it:
-    /// it names a target in the PRE-teleport report frame, and the
-    /// position loop would drive toward it at full authority until the
-    /// next host frame re-latches — the arm visibly lurches off the
-    /// landing pose. One tick of Idle instead; config survives.
-    pub fn reset_motion_transients(&mut self) {
+    /// where the client asked. The latched motion command goes with it,
+    /// replaced by a position hold at the new wire reading `pos_ticks`:
+    /// until the runtime's next frame re-commands the joint it stays
+    /// held — a limp tick lets a wrist loaded past its gearbox's holding
+    /// friction back-drive a degree before the feedforward arrives.
+    pub fn reseed_hold(&mut self, pos_ticks: f64) {
         self.integral_ma = 0.0;
         self.cur_out_ma = 0.0;
-        self.mode = Mode::Idle;
+        self.mode = Mode::Position {
+            pos: pos_ticks,
+            speed: 0.0,
+            cur_ff: 0.0,
+        };
     }
 
     /// Reset the command-silence counter (a valid data frame arrived).

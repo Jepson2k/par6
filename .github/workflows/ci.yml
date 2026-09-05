@@ -61,16 +61,6 @@ jobs:
         run: |
           pixi run cargo test -p par6-kin --release --features ffi \
             --test golden_collision per_waypoint_check_cost_is_reported -- --nocapture
-      # sim-mujoco / sim-dynamics are off by default, so the workspace legs
-      # never see them.
-      - name: test par6-bus (sim-mujoco contact plant)
-        run: |
-          pixi run cargo clippy -p par6-bus --all-targets --features sim-mujoco -- -D warnings
-          pixi run cargo test -p par6-bus --features sim-mujoco
-      - name: test par6-bus (sim-dynamics torque plant)
-        run: |
-          pixi run cargo clippy -p par6-bus --all-targets --features sim-dynamics -- -D warnings
-          pixi run cargo test -p par6-bus --features sim-dynamics
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
       # the unpatched 0.004 runs before it meets the arm. Release because an

@@ -752,7 +752,6 @@ dependencies = [
  "log",
  "mujoco-rs",
  "par6-config",
- "pinokin-sys",
  "roxmltree",
  "serde",
  "serde_json",

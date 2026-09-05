@@ -12,6 +12,7 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::{FaultKind, SimBus};
 use par6_bus::spectral::codec::{pack_can_id, CanFrame, CommandId};
 use par6_bus::spectral::convert::{ticks_per_radian, JointConversion};
@@ -30,6 +31,14 @@ fn msg_gripper() -> GripperConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
     GripperConfig::load(&path).expect("MSG gripper TOML")
+}
+
+/// The MSG scene (the shipped default gripper).
+fn scene() -> Scene {
+    Scene {
+        tool: Tool::Msg,
+        assets: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description"),
+    }
 }
 
 /// True boot pose with every joint at its config calibration pose (what
@@ -52,7 +61,7 @@ struct Rig {
 
 impl Rig {
     fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Self {
-        let mut bus = SimBus::new();
+        let mut bus = SimBus::new(scene());
         if let Some(q) = q0 {
             bus.set_initial_joint_rad(q);
         }
@@ -330,22 +339,24 @@ fn stall_endstop_signatures_and_release_preload() {
         }
     }
     let sampled = sampled.expect("release sample point inside the phase");
-    // Relaxation moves the encoder BACK toward the stop (opposite the
-    // approach direction) by the accumulated windup...
+    // The release current pulls AWAY from the stop, against the joint's
+    // load: the self-locking gearbox keeps the joint seated — it relaxes
+    // by at most the limit penetration and never leaves the stop...
     let relaxed = f64::from(sampled - rest) * -sign;
     assert!(
-        relaxed >= 80.0,
-        "release relaxed only {relaxed} ticks of preload"
+        (0.0..=50.0).contains(&relaxed),
+        "release moved the reported position {relaxed} ticks (toward-stop positive)"
     );
-    // ...without detaching the joint from the endstop...
+    let seated = rig.bus.true_joint_rad()[j];
     assert!(
-        relaxed <= 400.0,
-        "release detached the joint ({relaxed} ticks of travel)"
+        (seated - jc.limits.hard_min_rad).abs() < 0.005,
+        "release detached the joint: {seated:.4} rad vs the stop at {:.4}",
+        jc.limits.hard_min_rad
     );
     // ...and has settled by the configured sample point.
     assert!(
         (end_pos - sampled).abs() <= 5,
-        "windup still relaxing at the {}% sample point ({} → {})",
+        "still moving at the {}% sample point ({} → {})",
         rel.sample_pct * 100.0,
         sampled,
         end_pos
@@ -372,10 +383,14 @@ fn hall_joint_trigger_edge_and_latched_position() {
     // there with the DEFAULT config: direction 0 (positive motor, dir=1
     // joint) moves the joint DOWN, away from `home_offset` itself — the
     // physical sensor is met at its circular alias `home_offset − 2π`.
-    // Boot in the sequence's approach region to prove the default band
-    // is reachable exactly as the vendor sequence drives it.
+    // Boot in the sequence's approach region — J1/J2 at the mid pose the
+    // sequence moves them to before the wrist homes, so the gripper sweeps
+    // clear of the pedestal — to prove the default band is reachable
+    // exactly as the vendor sequence drives it.
     let sensor_alias = h.home_offset_rad - tau;
     let mut q0 = calibration_pose(&robot);
+    q0[1] = -1.85;
+    q0[2] = 2.85;
     q0[j] = 0.6;
     let mut rig = Rig::boot(&robot, None, Some(&q0));
     let true0 = conv.motor_ticks(q0[j]);
@@ -1273,615 +1288,284 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
 }
 
 // ---------------------------------------------------------------------------
-// Dynamics plant (feature sim-dynamics): same DriverBus surface, torque-
-// level physics. Gated: needs the C++ shim from scripts/ffi/setup.sh.
+// Contact physics: gravity hold, grasp detection through the status path
 // ---------------------------------------------------------------------------
 
-#[cfg(feature = "sim-dynamics")]
-mod dynamics {
-    use super::*;
-    use par6_bus::spectral::convert::{torque_to_ma_factor, trunc_to_wire};
+/// Reach-down pose over the scene's grasp object (config frame).
+const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
-    fn urdf() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../assets/par6_description/URDF/par6_flange/urdf/par6_flange.urdf")
-    }
-
-    fn boot(robot: &RobotConfig, q0: Option<&[f64]>) -> Rig {
-        let mut bus = SimBus::with_dynamics(urdf(), None, None);
-        if let Some(q) = q0 {
-            bus.set_initial_joint_rad(q);
-        }
-        bus.boot_configure(robot, None, robot.bus.boot_config_repeats)
-            .expect("boot_configure (dynamics)");
-        Rig {
-            bus,
-            state: BusState::new(),
-            tick: 0,
-            joints: robot.joints.len(),
-        }
-    }
-
-    /// Idle drivers + gravity: the arm sags, so reported positions drift
-    /// — torque-level physics is live behind the same DriverBus surface.
-    #[test]
-    fn gravity_sags_idle_arm() {
-        let robot = par6();
-        let mut q0 = calibration_pose(&robot);
-        q0[1] = -1.5; // shoulder off vertical → nonzero gravity torque
-        let mut rig = boot(&robot, Some(&q0));
-        let cmds: Vec<JointCommand> = vec![JointCommand::default(); rig.joints];
+/// The drivetrain holds: with every driver IDLE the arm keeps its pose
+/// under gravity (the gearboxes do not back-drive), and a load past
+/// the configured holding friction back-drives the joint — the hold is
+/// finite, not a weld.
+#[test]
+fn unpowered_arm_holds_until_the_holding_friction_is_exceeded() {
+    /// Reported drift an unpowered joint may show \[ticks\].
+    const HOLD_TOL_TICKS: i32 = 20;
+    let robot = par6();
+    let j = 1usize;
+    let node = usize::from(robot.joints[j].node_id);
+    // Arm stretched out, nothing in contact: ~5 Nm of gravity on J1.
+    let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    // cmd-12 Idle frames: the drivers go limp (a velocity-0 frame
+    // would be a hold).
+    let idle: Vec<JointCommand> = vec![JointCommand::drop_to_idle(); rig.joints];
+    let sample = |rig: &mut Rig, ticks: u64| -> (i32, i32) {
         let mut first = None;
-        for _ in 0..u64::from(robot.ticks(0.5)) {
-            rig.step(&cmds, &GripperCommand::NoGripper);
+        for _ in 0..ticks {
+            rig.step(&idle, &GripperCommand::NoGripper);
             rig.bus.queue_poll_override(
                 PollAction::Poll {
-                    node: 1,
+                    node: node as u8,
                     kind: PollKind::Encoder,
                 },
                 1,
             );
             if first.is_none() {
-                first = rig.state.nodes[1].position_ticks;
+                first = rig.state.nodes[node].position_ticks;
             }
         }
-        let first = first.expect("no shoulder position");
-        let last = rig.state.nodes[1].position_ticks.unwrap();
-        assert!(
-            (last - first).abs() > 200,
-            "idle arm did not sag under gravity ({first} → {last})"
-        );
-    }
-
-    /// The motor-referred rotor dynamics are live in the plant: with the
-    /// config's friction terms zeroed the same current spins J0 (the
-    /// gravity-neutral base axis) measurably farther, and a rotor
-    /// inertia scaled far up spins it up measurably slower — G²·b and
-    /// G·tc oppose the motion, G²·jm resists the acceleration.
-    #[test]
-    fn motor_referred_dynamics_slow_the_spin_and_the_spin_up() {
-        fn travel(robot: &RobotConfig, ticks: u64) -> i64 {
-            let mut rig = boot(robot, None);
-            let mut cmds = vec![JointCommand::default(); rig.joints];
-            cmds[0] = JointCommand::current(400);
-            let start = loop {
-                rig.step(&cmds, &GripperCommand::NoGripper);
-                rig.bus.queue_poll_override(
-                    PollAction::Poll {
-                        node: 0,
-                        kind: PollKind::Encoder,
-                    },
-                    1,
-                );
-                if let Some(p) = rig.state.nodes[0].position_ticks {
-                    break p;
-                }
-            };
-            for _ in 0..ticks {
-                rig.step(&cmds, &GripperCommand::NoGripper);
-                rig.bus.queue_poll_override(
-                    PollAction::Poll {
-                        node: 0,
-                        kind: PollKind::Encoder,
-                    },
-                    1,
-                );
-            }
-            i64::from(rig.state.nodes[0].position_ticks.unwrap()) - i64::from(start)
-        }
-
-        let robot = par6();
-        let ticks = u64::from(robot.ticks(0.25));
-        let with_motor_model = travel(&robot, ticks);
-
-        let mut frictionless = par6();
-        frictionless.sim.motor_b_nm_s = 0.0;
-        frictionless.sim.motor_tc_nm = 0.0;
-        let without_friction = travel(&frictionless, ticks);
-
-        let mut heavy = par6();
-        heavy.sim.motor_jm_kg_m2[0] *= 1000.0;
-        let heavy_rotor = travel(&heavy, ticks);
-
-        assert!(
-            with_motor_model > 500,
-            "the drive current must actually spin J0 ({with_motor_model} ticks)"
-        );
-        assert!(
-            without_friction > (with_motor_model as f64 * 1.05) as i64,
-            "zeroed motor friction must spin measurably farther: \
-             {without_friction} vs {with_motor_model} ticks"
-        );
-        assert!(
-            heavy_rotor < (with_motor_model as f64 * 0.7) as i64,
-            "a rotor scaled 1000x must spin up measurably slower: \
-             {heavy_rotor} vs {with_motor_model} ticks"
-        );
-    }
-
-    /// The endstop stall signatures the homing sequence requires hold on the
-    /// dynamics plant too (J0: vertical axis, gravity-neutral).
-    #[test]
-    fn dynamics_endstop_stall_signatures() {
-        let robot = par6();
-        let dt = robot.robot.tick_dt_s;
-        let j = 0usize;
-        let jc = &robot.joints[j];
-        let h = &robot.homing.joints[j];
-        let mut q0 = calibration_pose(&robot);
-        q0[j] = jc.limits.hard_max_rad - 0.08; // short approach to the stop
-        let mut rig = boot(&robot, Some(&q0));
-        rig.bus
-            .send_limits(
-                jc.node_id,
-                jc.velocity_limit_ticks_s as f32,
-                h.current_ma as f32,
-                4,
-            )
-            .unwrap();
-        let sign = if h.direction == 1 { -1.0 } else { 1.0 };
-        let drive = JointCommand::velocity((sign * h.speed_ticks_s) as i32, 0);
-        let mut cmds = rig.idle_cmds();
-        let (_, _, peak_cur, _) = run_stall_approach(
-            &mut rig,
-            &mut cmds,
-            &GripperCommand::NoGripper,
-            Some(j),
-            usize::from(jc.node_id),
-            drive,
-            h.speed_ticks_s,
-            h.current_ma,
-            u64::from(robot.ticks(h.timeout_s)),
-            dt,
-        );
-        assert!(
-            f64::from(peak_cur) >= 0.9 * h.current_ma,
-            "dynamics stall current peaked at {peak_cur} mA (limit {} mA)",
-            h.current_ma
-        );
-    }
-
-    /// Every joint held by its own gravity torque stays put — the wrist
-    /// included. The drive is the REAL controller path: G(q) from the
-    /// same model the plant integrates, through the config
-    /// torque↔current factor, truncated to whole mA like the RT's
-    /// commit, sent as cmd-2 current frames. The light wrist joints are
-    /// the ones this can fail on: their smoothed Coulomb friction is a
-    /// stiff explicit damper next to their inertia, and at the shared
-    /// smoothing width they oscillate instead of damping and the joint
-    /// drifts degrees per second under perfect compensation.
-    #[test]
-    fn gravity_compensated_joints_hold_including_the_wrist() {
-        /// Hold tolerance \[deg\] over the watch window.
-        const HOLD_TOL_DEG: f64 = 1.0;
-        let robot = par6();
-        // Inside every soft window with gravity on every joint that can
-        // carry it: G ~ [0, -5.5, 1.4, -0.05, 0.013, 0] Nm — the wrist
-        // value is the physical ceiling for the flange-tipped arm.
-        let q0: Vec<f64> = [-40.0f64, -15.0, 195.0, 0.0, 60.0, 90.0]
-            .iter()
-            .map(|d| d.to_radians())
-            .collect();
-        let mut rig = boot(&robot, Some(&q0));
-        let conv: Vec<JointConversion> = robot
-            .joints
-            .iter()
-            .map(JointConversion::from_config)
-            .collect();
-        let factor: Vec<f64> = robot
-            .joints
-            .iter()
-            .map(|j| torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir))
-            .collect();
-        let mut model = pinokin_sys::Model::from_urdf(&urdf(), None, None).expect("model");
-
-        let n = robot.joints.len();
-        let mut q = q0.clone();
-        let mut g = vec![0.0; n];
-        let mut cmds = rig.idle_cmds();
-        let mut offset = vec![0i32; n];
-        let mut seeded = false;
-        let mut drift_deg = vec![0.0f64; n];
-        for _ in 0..u64::from(robot.ticks(4.0)) {
-            // Measured pose off the real reply frames (the sim reports a
-            // wrapped boot reading, so the first one fixes the offset the
-            // RT would install as its home reference).
-            let mut have = true;
-            for (j, jc) in robot.joints.iter().enumerate() {
-                match rig.state.nodes[usize::from(jc.node_id)].position_ticks {
-                    Some(t) => {
-                        if !seeded {
-                            offset[j] = t - conv[j].motor_ticks(q0[j]);
-                        }
-                        q[j] = conv[j].joint_rad(t - offset[j]);
-                    }
-                    None => have = false,
-                }
-            }
-            seeded |= have;
-            model.gravity_into(&q, &mut g).expect("G(q)");
-            for j in 0..n {
-                cmds[j] = JointCommand::current(trunc_to_wire(g[j] * factor[j]) as i16);
-            }
-            rig.step(&cmds, &GripperCommand::NoGripper);
-            if seeded {
-                for j in 0..n {
-                    drift_deg[j] = drift_deg[j].max((q[j] - q0[j]).abs().to_degrees());
-                }
-            }
-        }
-        assert!(seeded, "no measured pose ever arrived");
-        for j in 0..n {
-            assert!(
-                drift_deg[j] < HOLD_TOL_DEG,
-                "joint {j} drifted {:.2}° under its own gravity torque \
-                 (all joints: {drift_deg:?})",
-                drift_deg[j]
-            );
-        }
-    }
-
-    #[test]
-    fn dynamics_streams_are_bit_identical() {
-        fn run() -> Vec<BusState> {
-            let robot = par6();
-            let mut rig = boot(&robot, None);
-            let mut states = Vec::new();
-            for t in 1..=200u64 {
-                let mut cmds = rig.idle_cmds();
-                if t > 20 {
-                    cmds[0] = JointCommand::velocity(3000, 0);
-                    cmds[2] = JointCommand::position(2000, 15000, 0);
-                }
-                rig.step(&cmds, &GripperCommand::NoGripper);
-                states.push(rig.state.clone());
-            }
-            states
-        }
-        let a = run();
-        let b = run();
-        for (t, (sa, sb)) in a.iter().zip(&b).enumerate() {
-            assert!(sa == sb, "dynamics streams diverge at tick {}", t + 1);
-        }
-    }
+        (
+            first.expect("shoulder position"),
+            rig.state.nodes[node].position_ticks.unwrap(),
+        )
+    };
+    let (first, last) = sample(&mut rig, u64::from(robot.ticks(1.0)));
+    assert!(
+        (last - first).abs() <= HOLD_TOL_TICKS,
+        "unpowered shoulder drifted under gravity ({first} → {last})"
+    );
+    // A load far past the holding friction (plus gravity) back-drives it.
+    rig.bus.set_joint_load_ma(robot.joints[j].node_id, 3000.0);
+    let (first, last) = sample(&mut rig, u64::from(robot.ticks(0.5)));
+    assert!(
+        (last - first).abs() > 200,
+        "an overload did not back-drive the shoulder ({first} → {last})"
+    );
 }
 
-// ---------------------------------------------------------------------------
-// MuJoCo plant (feature sim-mujoco): same DriverBus surface, contact-level
-// physics in a full scene (floor + graspable object). Gated on the
-// `sim-mujoco` feature.
-// ---------------------------------------------------------------------------
-
-#[cfg(feature = "sim-mujoco")]
-mod mujoco {
-    use super::*;
-
-    /// Reach-down pose over the scene's grasp object (config frame).
-    const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
-
-    fn scene() -> par6_bus::sim::scene::Scene {
-        par6_bus::sim::scene::Scene {
-            tool: par6_bus::sim::scene::Tool::Msg,
-            assets: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description"),
-        }
-    }
-
-    fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Rig {
-        let mut bus = SimBus::with_mujoco(scene());
-        if let Some(q) = q0 {
-            bus.set_initial_joint_rad(q);
-        }
-        bus.boot_configure(robot, gripper, robot.bus.boot_config_repeats)
-            .expect("boot_configure (mujoco)");
-        Rig {
-            bus,
-            state: BusState::new(),
-            tick: 0,
-            joints: robot.joints.len(),
-        }
-    }
-
-    /// The drivetrain holds: with every driver IDLE the arm keeps its pose
-    /// under gravity (the gearboxes do not back-drive), and a load past
-    /// the configured holding friction back-drives the joint — the hold is
-    /// finite, not a weld.
-    #[test]
-    fn mujoco_unpowered_arm_holds_until_the_holding_friction_is_exceeded() {
-        /// Reported drift an unpowered joint may show \[ticks\].
-        const HOLD_TOL_TICKS: i32 = 20;
-        let robot = par6();
-        let j = 1usize;
-        let node = usize::from(robot.joints[j].node_id);
-        // Arm stretched out, nothing in contact: ~5 Nm of gravity on J1.
-        let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
-        let mut rig = boot(&robot, None, Some(&q0));
-        // cmd-12 Idle frames: the drivers go limp (a velocity-0 frame
-        // would be a hold).
-        let idle: Vec<JointCommand> = vec![JointCommand::drop_to_idle(); rig.joints];
-        let sample = |rig: &mut Rig, ticks: u64| -> (i32, i32) {
-            let mut first = None;
-            for _ in 0..ticks {
-                rig.step(&idle, &GripperCommand::NoGripper);
-                rig.bus.queue_poll_override(
-                    PollAction::Poll {
-                        node: node as u8,
-                        kind: PollKind::Encoder,
-                    },
-                    1,
-                );
-                if first.is_none() {
-                    first = rig.state.nodes[node].position_ticks;
-                }
-            }
-            (
-                first.expect("shoulder position"),
-                rig.state.nodes[node].position_ticks.unwrap(),
-            )
-        };
-        let (first, last) = sample(&mut rig, u64::from(robot.ticks(1.0)));
-        assert!(
-            (last - first).abs() <= HOLD_TOL_TICKS,
-            "unpowered shoulder drifted under gravity ({first} → {last})"
-        );
-        // A load far past the holding friction (plus gravity) back-drives it.
-        rig.bus.set_joint_load_ma(robot.joints[j].node_id, 3000.0);
-        let (first, last) = sample(&mut rig, u64::from(robot.ticks(0.5)));
-        assert!(
-            (last - first).abs() > 200,
-            "an overload did not back-drive the shoulder ({first} → {last})"
-        );
-    }
-
-    /// Position-hold commands for every arm joint at its current wire
-    /// position (two velocity-0 ticks first, so the boot replies exist).
-    fn hold_all(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
-        let zero: Vec<JointCommand> = vec![JointCommand::velocity(0, 0); rig.joints];
-        rig.step(&zero, &GripperCommand::NoGripper);
-        rig.step(&zero, &GripperCommand::NoGripper);
-        robot
-            .joints
-            .iter()
-            .map(|jc| {
-                let pos = rig.state.nodes[usize::from(jc.node_id)]
-                    .position_ticks
-                    .expect("boot position");
-                JointCommand::position(pos, 0, 0)
-            })
-            .collect()
-    }
-
-    /// The two homing detection conditions fire at every stall-homed joint's
-    /// endstop and nowhere else on the MuJoCo plant — on the long first
-    /// approach and on the short post-backoff re-approach alike — and the
-    /// joint ends up seated on the REAL stop (ground truth, not the wire).
-    /// The drive is capped at the homing current exactly as the FSM caps it,
-    /// so for the shoulder joints this measures whether the modelled
-    /// drivetrain carries the arm against gravity on that budget. Every
-    /// joint is measured before anything is asserted, so a failure reports
-    /// the whole table.
-    #[test]
-    fn mujoco_endstop_stall_signatures_hold_for_every_joint() {
-        use std::panic::{catch_unwind, AssertUnwindSafe};
-
-        /// Approach lengths \[rad\]: the post-backoff re-approach and a long
-        /// first approach.
-        const APPROACHES_RAD: [f64; 2] = [0.08, 0.5];
-        /// How far off the true stop the seated joint may rest \[rad\].
-        const SEAT_TOL_RAD: f64 = 0.03;
-
-        let robot = par6();
-        let dt = robot.robot.tick_dt_s;
-        let mut rows = Vec::new();
-        let mut failures = Vec::new();
-        for (j, jc) in robot.joints.iter().enumerate() {
-            let h = &robot.homing.joints[j];
-            if h.strategy != HomingStrategy::Stall {
-                continue;
-            }
-            let conv = JointConversion::from_config(jc);
-            let sign = if h.direction == 1 { -1.0 } else { 1.0 };
-            let (lo, hi) = (jc.limits.hard_min_rad, jc.limits.hard_max_rad);
-            let ticks_rise = conv.motor_ticks(hi) > conv.motor_ticks(lo);
-            let stop_rad = if (sign > 0.0) == ticks_rise { hi } else { lo };
-            let into = if stop_rad == hi { -1.0 } else { 1.0 };
-            for approach in APPROACHES_RAD {
-                let mut q0 = calibration_pose(&robot);
-                q0[j] = (stop_rad + into * approach).clamp(lo + 0.01, hi - 0.01);
-                let mut rig = boot(&robot, None, Some(&q0));
-                rig.bus
-                    .send_limits(
-                        jc.node_id,
-                        jc.velocity_limit_ticks_s as f32,
-                        h.current_ma as f32,
-                        4,
-                    )
-                    .unwrap();
-                let drive = JointCommand::velocity((sign * h.speed_ticks_s) as i32, 0);
-                let mut cmds = hold_all(&mut rig, &robot);
-                let outcome = catch_unwind(AssertUnwindSafe(|| {
-                    run_stall_approach(
-                        &mut rig,
-                        &mut cmds,
-                        &GripperCommand::NoGripper,
-                        Some(j),
-                        usize::from(jc.node_id),
-                        drive,
-                        h.speed_ticks_s,
-                        h.current_ma,
-                        u64::from(robot.ticks(h.timeout_s)),
-                        dt,
-                    )
-                }));
-                let seated = rig.bus.true_joint_rad()[j];
-                let off_stop = seated - stop_rad;
-                let (currents, detail) = match outcome {
-                    Ok((_, _, peak, free)) => {
-                        (Some((peak, free)), String::from("detected at the stop"))
-                    }
-                    Err(e) => (
-                        None,
-                        e.downcast_ref::<String>()
-                            .cloned()
-                            .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
-                            .unwrap_or_else(|| String::from("panic")),
-                    ),
-                };
-                let peak_ok = currents.is_some_and(|(p, _)| f64::from(p) >= 0.9 * h.current_ma);
-                let seat_ok = off_stop.abs() <= SEAT_TOL_RAD;
-                let ma = |c: Option<i32>| c.map_or_else(|| String::from("—"), |c| c.to_string());
-                rows.push(format!(
-                    "J{j} approach {approach:.2} rad toward {stop_rad:+.3}: peak {} mA \
-                     (need {:.0}), free travel {} mA ({:.0}% of the detection threshold), \
-                     seated {off_stop:+.4} rad off the stop — {detail}",
-                    ma(currents.map(|(p, _)| p)),
-                    0.9 * h.current_ma,
-                    ma(currents.map(|(_, f)| f)),
-                    currents.map_or(0.0, |(_, f)| 100.0 * f64::from(f) / (0.7 * h.current_ma)),
-                ));
-                if !(peak_ok && seat_ok) {
-                    failures.push(rows.len() - 1);
-                }
-            }
-        }
-        for r in &rows {
-            eprintln!("{r}");
-        }
-        assert!(
-            failures.is_empty(),
-            "endstop stall table failed on {} of {} approaches:\n{}",
-            failures.len(),
-            rows.len(),
-            failures
-                .iter()
-                .map(|&i| rows[i].as_str())
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
-    }
-
-    fn close_cmd(position: u8) -> GripperCommand {
-        GripperCommand::Firmware(FirmwareGripperCommand {
-            position,
-            speed: 150,
-            current_ma: 600,
-            activate: true,
-            action: true,
-            estop: false,
-            release_dir: false,
+/// Position-hold commands for every arm joint at its current wire
+/// position (two velocity-0 ticks first, so the boot replies exist).
+fn hold_all(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
+    let zero: Vec<JointCommand> = vec![JointCommand::velocity(0, 0); rig.joints];
+    rig.step(&zero, &GripperCommand::NoGripper);
+    rig.step(&zero, &GripperCommand::NoGripper);
+    robot
+        .joints
+        .iter()
+        .map(|jc| {
+            let pos = rig.state.nodes[usize::from(jc.node_id)]
+                .position_ticks
+                .expect("boot position");
+            JointCommand::position(pos, 0, 0)
         })
-    }
+        .collect()
+}
 
-    /// Read the boot wire positions (one velocity-0 tick produces motion
-    /// replies), then return position-hold commands for them.
-    fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
-        let zero: Vec<JointCommand> = vec![JointCommand::velocity(0, 0); rig.joints];
-        rig.step(&zero, &GripperCommand::FirmwarePoll);
-        rig.step(&zero, &GripperCommand::FirmwarePoll);
-        robot
-            .joints
-            .iter()
-            .map(|jc| {
-                let pos = rig.state.nodes[usize::from(jc.node_id)]
-                    .position_ticks
-                    .expect("boot position");
-                // The hold shape: speed 0 — the channel is a velocity
-                // feedforward, and a standing one would drive the joint
-                // off the held pose.
-                JointCommand::position(pos, 0, 0)
-            })
-            .collect()
-    }
+/// The two homing detection conditions fire at every stall-homed joint's
+/// endstop and nowhere else on the MuJoCo plant — on the long first
+/// approach and on the short post-backoff re-approach alike — and the
+/// joint ends up seated on the REAL stop (ground truth, not the wire).
+/// The drive is capped at the homing current exactly as the FSM caps it,
+/// so for the shoulder joints this measures whether the modelled
+/// drivetrain carries the arm against gravity on that budget. Every
+/// joint is measured before anything is asserted, so a failure reports
+/// the whole table.
+#[test]
+fn endstop_stall_signatures_hold_for_every_joint() {
+    use std::panic::{catch_unwind, AssertUnwindSafe};
 
-    /// The grasp scenario end to end through the REAL status path:
-    /// closing on the scene's free object jams the jaws mid-travel and
-    /// the cmd-60 reply reports DetectedClosing at the commanded pressing
-    /// current; opening away reports ReachedNoObject. No MuJoCo state is
-    /// inspected — only decoded bus replies.
-    #[test]
-    fn mujoco_grasp_detected_through_status_bits() {
-        let robot = par6();
-        let gripper = msg_gripper();
-        let mut rig = boot(&robot, Some(&gripper), Some(&GRASP_POSE));
-        let cmds = hold_commands(&mut rig, &robot);
+    /// Approach lengths \[rad\]: the post-backoff re-approach and a long
+    /// first approach.
+    const APPROACHES_RAD: [f64; 2] = [0.08, 0.5];
+    /// How far off the true stop the seated joint may rest \[rad\].
+    const SEAT_TOL_RAD: f64 = 0.03;
 
-        // Ring down the boot transient with the jaws held open: engaging
-        // the position hold from a cold start wobbles the wrist enough to
-        // sweep the jaws centimetres, which would bat the object off its
-        // pedestal if the close ran through it.
-        for _ in 0..u64::from(robot.ticks(1.5)) {
-            rig.step(&cmds, &close_cmd(20));
+    let robot = par6();
+    let dt = robot.robot.tick_dt_s;
+    let mut rows = Vec::new();
+    let mut failures = Vec::new();
+    for (j, jc) in robot.joints.iter().enumerate() {
+        let h = &robot.homing.joints[j];
+        if h.strategy != HomingStrategy::Stall {
+            continue;
         }
-
-        // Close on the object (per-tick replay, homing-style).
-        for _ in 0..u64::from(robot.ticks(2.0)) {
-            rig.step(&cmds, &close_cmd(252));
-        }
-        let r = rig.state.gripper.reply.expect("no gripper reply");
-        assert_eq!(
-            r.object_detection,
-            ObjectDetection::DetectedClosing,
-            "no object detected while closing (reply {r:?})"
-        );
-        assert!(
-            !r.action_status,
-            "still reported moving while pressing the object"
-        );
-        assert!(
-            r.position > 100 && r.position < 240,
-            "jam position byte {} not in mid-travel — jaws passed through or \
-             never reached the object",
-            r.position
-        );
-        assert_eq!(r.current_ma, 600, "pressing current is the commanded limit");
-        // Pressing is stable: the jam position holds under continued replay.
-        let jam = r.position;
-        for _ in 0..u64::from(robot.ticks(0.5)) {
-            rig.step(&cmds, &close_cmd(252));
-        }
-        let r = rig.state.gripper.reply.unwrap();
-        assert_eq!(r.object_detection, ObjectDetection::DetectedClosing);
-        assert!(
-            (i16::from(r.position) - i16::from(jam)).abs() <= 2,
-            "jam position drifted while pressing ({jam} → {})",
-            r.position
-        );
-
-        // Open away from the object: free travel completes, no detection.
-        for _ in 0..u64::from(robot.ticks(2.0)) {
-            rig.step(&cmds, &close_cmd(20));
-        }
-        let r = rig.state.gripper.reply.unwrap();
-        assert_eq!(r.position, 20, "open move did not complete");
-        assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
-    }
-
-    /// Identical tick/command streams — including a contact grasp — must
-    /// produce bit-identical state streams.
-    #[test]
-    fn mujoco_streams_are_bit_identical() {
-        fn run() -> Vec<BusState> {
-            let robot = par6();
-            let gripper = msg_gripper();
-            let mut rig = boot(&robot, Some(&gripper), Some(&GRASP_POSE));
-            let cmds = hold_commands(&mut rig, &robot);
-            let mut states = Vec::new();
-            for t in 1..=300u64 {
-                let g = if t < 20 {
-                    GripperCommand::FirmwarePoll
-                } else {
-                    close_cmd(252)
-                };
-                rig.step(&cmds, &g);
-                states.push(rig.state.clone());
+        let conv = JointConversion::from_config(jc);
+        let sign = if h.direction == 1 { -1.0 } else { 1.0 };
+        let (lo, hi) = (jc.limits.hard_min_rad, jc.limits.hard_max_rad);
+        let ticks_rise = conv.motor_ticks(hi) > conv.motor_ticks(lo);
+        let stop_rad = if (sign > 0.0) == ticks_rise { hi } else { lo };
+        let into = if stop_rad == hi { -1.0 } else { 1.0 };
+        for approach in APPROACHES_RAD {
+            let mut q0 = calibration_pose(&robot);
+            q0[j] = (stop_rad + into * approach).clamp(lo + 0.01, hi - 0.01);
+            let mut rig = Rig::boot(&robot, None, Some(&q0));
+            rig.bus
+                .send_limits(
+                    jc.node_id,
+                    jc.velocity_limit_ticks_s as f32,
+                    h.current_ma as f32,
+                    4,
+                )
+                .unwrap();
+            let drive = JointCommand::velocity((sign * h.speed_ticks_s) as i32, 0);
+            let mut cmds = hold_all(&mut rig, &robot);
+            let outcome = catch_unwind(AssertUnwindSafe(|| {
+                run_stall_approach(
+                    &mut rig,
+                    &mut cmds,
+                    &GripperCommand::NoGripper,
+                    Some(j),
+                    usize::from(jc.node_id),
+                    drive,
+                    h.speed_ticks_s,
+                    h.current_ma,
+                    u64::from(robot.ticks(h.timeout_s)),
+                    dt,
+                )
+            }));
+            let seated = rig.bus.true_joint_rad()[j];
+            let off_stop = seated - stop_rad;
+            let (currents, detail) = match outcome {
+                Ok((_, _, peak, free)) => {
+                    (Some((peak, free)), String::from("detected at the stop"))
+                }
+                Err(e) => (
+                    None,
+                    e.downcast_ref::<String>()
+                        .cloned()
+                        .or_else(|| e.downcast_ref::<&str>().map(|s| (*s).to_owned()))
+                        .unwrap_or_else(|| String::from("panic")),
+                ),
+            };
+            let peak_ok = currents.is_some_and(|(p, _)| f64::from(p) >= 0.9 * h.current_ma);
+            let seat_ok = off_stop.abs() <= SEAT_TOL_RAD;
+            let ma = |c: Option<i32>| c.map_or_else(|| String::from("—"), |c| c.to_string());
+            rows.push(format!(
+                "J{j} approach {approach:.2} rad toward {stop_rad:+.3}: peak {} mA \
+                 (need {:.0}), free travel {} mA ({:.0}% of the detection threshold), \
+                 seated {off_stop:+.4} rad off the stop — {detail}",
+                ma(currents.map(|(p, _)| p)),
+                0.9 * h.current_ma,
+                ma(currents.map(|(_, f)| f)),
+                currents.map_or(0.0, |(_, f)| 100.0 * f64::from(f) / (0.7 * h.current_ma)),
+            ));
+            if !(peak_ok && seat_ok) {
+                failures.push(rows.len() - 1);
             }
-            states
-        }
-        let a = run();
-        let b = run();
-        for (t, (sa, sb)) in a.iter().zip(&b).enumerate() {
-            assert!(sa == sb, "mujoco streams diverge at tick {}", t + 1);
         }
     }
+    for r in &rows {
+        eprintln!("{r}");
+    }
+    assert!(
+        failures.is_empty(),
+        "endstop stall table failed on {} of {} approaches:\n{}",
+        failures.len(),
+        rows.len(),
+        failures
+            .iter()
+            .map(|&i| rows[i].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+fn close_cmd(position: u8) -> GripperCommand {
+    GripperCommand::Firmware(FirmwareGripperCommand {
+        position,
+        speed: 150,
+        current_ma: 600,
+        activate: true,
+        action: true,
+        estop: false,
+        release_dir: false,
+    })
+}
+
+/// Read the boot wire positions (one velocity-0 tick produces motion
+/// replies), then return position-hold commands for them.
+fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
+    let zero: Vec<JointCommand> = vec![JointCommand::velocity(0, 0); rig.joints];
+    rig.step(&zero, &GripperCommand::FirmwarePoll);
+    rig.step(&zero, &GripperCommand::FirmwarePoll);
+    robot
+        .joints
+        .iter()
+        .map(|jc| {
+            let pos = rig.state.nodes[usize::from(jc.node_id)]
+                .position_ticks
+                .expect("boot position");
+            // The hold shape: speed 0 — the channel is a velocity
+            // feedforward, and a standing one would drive the joint
+            // off the held pose.
+            JointCommand::position(pos, 0, 0)
+        })
+        .collect()
+}
+
+/// The grasp scenario end to end through the REAL status path:
+/// closing on the scene's free object jams the jaws mid-travel and
+/// the cmd-60 reply reports DetectedClosing at the commanded pressing
+/// current; opening away reports ReachedNoObject. No MuJoCo state is
+/// inspected — only decoded bus replies.
+#[test]
+fn grasp_detected_through_status_bits() {
+    let robot = par6();
+    let gripper = msg_gripper();
+    let mut rig = Rig::boot(&robot, Some(&gripper), Some(&GRASP_POSE));
+    let cmds = hold_commands(&mut rig, &robot);
+
+    // Ring down the boot transient with the jaws held open: engaging
+    // the position hold from a cold start wobbles the wrist enough to
+    // sweep the jaws centimetres, which would bat the object off its
+    // pedestal if the close ran through it.
+    for _ in 0..u64::from(robot.ticks(1.5)) {
+        rig.step(&cmds, &close_cmd(20));
+    }
+
+    // Close on the object (per-tick replay, homing-style).
+    for _ in 0..u64::from(robot.ticks(2.0)) {
+        rig.step(&cmds, &close_cmd(252));
+    }
+    let r = rig.state.gripper.reply.expect("no gripper reply");
+    assert_eq!(
+        r.object_detection,
+        ObjectDetection::DetectedClosing,
+        "no object detected while closing (reply {r:?})"
+    );
+    assert!(
+        !r.action_status,
+        "still reported moving while pressing the object"
+    );
+    assert!(
+        r.position > 100 && r.position < 240,
+        "jam position byte {} not in mid-travel — jaws passed through or \
+         never reached the object",
+        r.position
+    );
+    assert_eq!(r.current_ma, 600, "pressing current is the commanded limit");
+    // Pressing is stable: the jam position holds under continued replay.
+    let jam = r.position;
+    for _ in 0..u64::from(robot.ticks(0.5)) {
+        rig.step(&cmds, &close_cmd(252));
+    }
+    let r = rig.state.gripper.reply.unwrap();
+    assert_eq!(r.object_detection, ObjectDetection::DetectedClosing);
+    assert!(
+        (i16::from(r.position) - i16::from(jam)).abs() <= 2,
+        "jam position drifted while pressing ({jam} → {})",
+        r.position
+    );
+
+    // Open away from the object: free travel completes, no detection.
+    for _ in 0..u64::from(robot.ticks(2.0)) {
+        rig.step(&cmds, &close_cmd(20));
+    }
+    let r = rig.state.gripper.reply.unwrap();
+    assert_eq!(r.position, 20, "open move did not complete");
+    assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
 }
 
 /// Which frames feed the driver watchdog, stated against the firmware.

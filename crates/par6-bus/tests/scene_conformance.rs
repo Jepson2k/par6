@@ -4,12 +4,10 @@
 //! for every tool variant — so a stale vendor inertial, a mis-rotated
 //! tensor or a frame drift in the MJCF chain fails here and not in a grasp
 //! test's tolerance.
-#![cfg(feature = "sim-mujoco")]
-
 use std::path::PathBuf;
 
 use mujoco_rs::prelude::*;
-use par6_bus::sim::scene::{urdf_inertials, JointTuning, Scene, Tool, ARM_JOINTS};
+use par6_bus::sim::scene::{urdf_inertials, JointTuning, Scene, Tool, ToolInertial, ARM_JOINTS};
 use serde::Deserialize;
 
 fn assets() -> PathBuf {
@@ -27,7 +25,7 @@ fn tuning() -> Vec<JointTuning> {
             armature: 4e-3,
             damping: 0.04,
             frictionloss: 0.4,
-            range: [-6.28, 6.28],
+            range: [-std::f64::consts::TAU, std::f64::consts::TAU],
         };
         6
     ]
@@ -42,7 +40,7 @@ fn scene(tool: Tool) -> Scene {
 
 fn model(tool: Tool) -> MjModel {
     scene(tool)
-        .model(0.001, &tuning())
+        .model(0.001, &tuning(), None)
         .unwrap_or_else(|e| panic!("{tool:?}: {e}"))
 }
 
@@ -76,7 +74,7 @@ fn every_variant_compiles_with_the_expected_joints_and_decimated_meshes() {
             "{tool:?}: grasp scene present"
         );
 
-        let spec = scene(tool).spec(0.001, &tuning()).expect("spec");
+        let spec = scene(tool).spec(0.001, &tuning(), None).expect("spec");
         for mesh in spec.mesh_iter() {
             assert!(
                 mesh.file().ends_with("_simplified.stl"),
@@ -91,7 +89,7 @@ fn every_variant_compiles_with_the_expected_joints_and_decimated_meshes() {
 fn bodies_carry_the_urdf_mass_properties() {
     for tool in [Tool::Msg, Tool::Ssg48, Tool::Flange] {
         let sc = scene(tool);
-        let m = sc.model(0.001, &tuning()).expect("model");
+        let m = sc.model(0.001, &tuning(), None).expect("model");
         let inertials = urdf_inertials(&sc.urdf()).expect("urdf");
         let mut matched = 0;
         for want in &inertials {
@@ -223,6 +221,65 @@ fn holding_friction_covers_gravity_across_the_reachable_envelope() {
         assert!(
             *h >= MARGIN * w,
             "J{j}: holding friction {h} Nm does not cover {w:.3} Nm of gravity with a {MARGIN}x margin"
+        );
+    }
+}
+
+/// With the config tool applied, the tool the scene swings is the one the
+/// runtime's gravity model carries: the tool subtree's mass and COM are
+/// the config `[kinematics]` values (composed through the same DH tool
+/// frame), jaws included. A scene weighing the URDF's gripper links
+/// instead disagrees with G(q) by a tenth of a newton-metre at the
+/// wrist, which a feedforward-held joint creeps on.
+#[test]
+fn the_tool_subtree_carries_the_config_inertials() {
+    let cfg = par6_config::GripperConfig::load(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/grippers/MSG_small_motor_150mm_rail.toml"),
+    )
+    .expect("MSG gripper TOML");
+    let k = &cfg.kinematics;
+    let tool = ToolInertial {
+        d_m: k.d_m,
+        a_m: k.a_m,
+        alpha_rad: k.alpha_rad,
+        mass_kg: k.mass_kg,
+        com_m: k.com_m,
+        inertia_kg_m2: k.inertia_kg_m2,
+    };
+    let m = scene(Tool::Msg)
+        .model(0.001, &tuning(), Some(&tool))
+        .expect("MSG scene with the config tool");
+    let gripper = m
+        .name_to_id(MjtObj::mjOBJ_BODY, "gripper")
+        .expect("gripper body");
+    let mut data = m.make_data();
+    data.forward();
+    assert!(
+        (m.body_subtreemass()[gripper] - k.mass_kg).abs() < 1e-9,
+        "tool subtree mass {} kg vs config {} kg",
+        m.body_subtreemass()[gripper],
+        k.mass_kg
+    );
+    // The config COM, DH-composed into the flange frame, then into the
+    // world through the gripper body's pose.
+    let (s, c) = k.alpha_rad.sin_cos();
+    let r = [
+        k.com_m[0],
+        c * k.com_m[1] - s * k.com_m[2],
+        s * k.com_m[1] + c * k.com_m[2],
+    ];
+    let com_flange = [r[0] + k.a_m, r[1], r[2] + k.d_m];
+    let xpos = data.xpos()[gripper];
+    let xmat = data.xmat()[gripper];
+    let want: [f64; 3] = std::array::from_fn(|i| {
+        xpos[i] + (0..3).map(|j| xmat[3 * i + j] * com_flange[j]).sum::<f64>()
+    });
+    let got = data.subtree_com()[gripper];
+    for i in 0..3 {
+        assert!(
+            (got[i] - want[i]).abs() < 1e-6,
+            "tool subtree COM {got:?} vs config {want:?} (axis {i})"
         );
     }
 }

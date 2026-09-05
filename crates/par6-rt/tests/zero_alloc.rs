@@ -44,6 +44,8 @@ unsafe impl GlobalAlloc for CountingAlloc {
 #[global_allocator]
 static A: CountingAlloc = CountingAlloc;
 
+mod common;
+
 fn assert_no_allocs<F: FnMut()>(mut window: F, ctx: &str) {
     let before = ALLOCS.load(Ordering::Relaxed);
     window();
@@ -77,7 +79,8 @@ fn steady_state_ticks_allocate_nothing() {
         fk: Box::new(NoFk),
         samples: consumer,
     };
-    let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(), hooks).expect("core");
+    let (mut core, mut handles) =
+        RtCore::new(&bundle, SimBus::new(common::scene(&bundle)), hooks).expect("core");
 
     // Warmup past boot one-shots, vendor config re-sends (tick 50/150/
     // 300) and transient buffer growth anywhere in the stack.

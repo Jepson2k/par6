@@ -22,6 +22,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use par6_bus::sim::scene::Scene;
 use par6_bus::sim::SimBus;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::ConfigBundle;
@@ -444,10 +445,15 @@ pub(crate) struct RtBridge {
     flush: FlushMarker,
     bundle: Arc<ConfigBundle>,
     sim: bool,
+    /// The scene a simulator swap boots on.
+    scene: Scene,
     cart: CartStream,
 }
 
 impl RtBridge {
+    // The daemon wires every shared handle through here once; a struct of
+    // the handles would only move the same list one level out.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         link: CoreLink,
         stream_input: Arc<Mutex<StreamInput>>,
@@ -455,6 +461,7 @@ impl RtBridge {
         flush: FlushMarker,
         bundle: Arc<ConfigBundle>,
         sim: bool,
+        scene: Scene,
         cart: CartStream,
     ) -> Self {
         Self {
@@ -464,6 +471,7 @@ impl RtBridge {
             flush,
             bundle,
             sim,
+            scene,
             cart,
         }
     }
@@ -915,8 +923,8 @@ impl RtCommands for RtBridge {
                 let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
                 core.set_joint_reference(i, wrapped0, q[i]);
             }
-            core.reseed_motion_targets();
             core.set_homed(true);
+            core.reseed_motion_targets();
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
     }
@@ -997,7 +1005,7 @@ impl RtBridge {
     /// (`bus.watchdog_action`), so on hardware this is a way to stop
     /// LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
-        let sim = SimBus::new();
+        let sim = SimBus::new(self.scene.clone());
         let bundle = self.bundle.clone();
         self.sim = true;
         self.link.op(Box::new(move |core| {

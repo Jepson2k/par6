@@ -645,11 +645,10 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         # `is_robot_stopped` reports the arm, not the latch — it counts
         # as stopped only when it holds across consecutive polls.
         #
-        # Note what this does NOT establish: on hardware, a limp arm
-        # sags under gravity, where parol6's steppers hold. The default
-        # kinematic plant does not model that (the arm here halts where
-        # the latch caught it), so no CI tier currently exercises
-        # e-stop sag.
+        # Note what this does NOT establish: e-stop sag. The scene's
+        # self-locking drivetrain holds a limp arm up to its holding
+        # friction (as parol6's steppers do), so the arm here halts where
+        # the latch caught it; only a load past that friction would sag.
         deadline = asyncio.get_running_loop().time() + STEP_BUDGET_S
         streak = 0
         while asyncio.get_running_loop().time() < deadline and streak < 3:

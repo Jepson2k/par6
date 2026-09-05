@@ -13,6 +13,7 @@
 mod common;
 
 use par6_bus::sim::SimBus;
+use par6_bus::spectral::convert::torque_to_ma_factor;
 use par6_bus::spectral::JointConversion;
 use par6_bus::{BusState, DriverBus, GripperCommand, JointCommand, LoopbackBus, Pack};
 use par6_config::{PreMove, SequenceStep};
@@ -95,19 +96,26 @@ fn step(bus: &mut SimBus, state: &mut BusState, t: &mut u64, cmds: &[JointComman
 
 /// Through the real codec and the closed-loop sim: a loaded joint held
 /// by the armed velocity loop stays put; the same joint dropped with
-/// cmd 12 yields to the load (limp — the point of the idle pre-move),
-/// while the encoder polls keep its position reported and its freshness
-/// green the whole time.
+/// cmd 12 has no holding torque of its own and yields to the load (limp
+/// — the point of the idle pre-move), while the encoder polls keep its
+/// position reported and its freshness green the whole time. The load
+/// exceeds the gearbox's holding friction (below it a self-locking
+/// drivetrain holds an unpowered joint whatever the driver does) and
+/// stays inside the loop's current authority; the base joint is where
+/// that window is wide, and gravity plays no part on its vertical axis.
 #[test]
 fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
     let bundle = common::bundle();
     let robot = &bundle.robot;
-    let mut bus = SimBus::new();
+    let mut bus = SimBus::new(common::scene(&bundle));
     bus.boot_configure(robot, bundle.active_gripper(), 1)
         .unwrap();
-    let node1 = robot.joints[1].node_id;
+    let jc = &robot.joints[0];
+    let node1 = jc.node_id;
     let n1 = usize::from(node1);
-    bus.set_joint_load_ma(node1, 300.0);
+    let ma_per_nm =
+        torque_to_ma_factor(jc.gear_ratio, jc.gear_efficiency, jc.kt_nm_a, jc.dir).abs();
+    bus.set_joint_load_ma(node1, 1.5 * robot.sim.holding_friction_nm[0] * ma_per_nm);
     let mut state = BusState::new();
     let mut t = 0u64;
 
@@ -130,11 +138,11 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
 
     // Drop to idle (twice, the pre-move cadence), then poll.
     let mut cmds = hold;
-    cmds[1] = JointCommand::drop_to_idle();
+    cmds[0] = JointCommand::drop_to_idle();
     for _ in 0..2 {
         step(&mut bus, &mut state, &mut t, &cmds);
     }
-    cmds[1] = JointCommand::encoder_poll();
+    cmds[0] = JointCommand::encoder_poll();
     let idle_start = i64::from(state.nodes[n1].position_ticks.unwrap());
     let mut max_age = 0u64;
     for _ in 0..200 {
@@ -142,14 +150,11 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
         max_age = max_age.max(state.nodes[n1].data_age_ticks);
     }
     let idle_end = i64::from(state.nodes[n1].position_ticks.unwrap());
-    // The plant hangs to its gear-spring equilibrium under the load
-    // (about -615 ticks at 300 mA), not into free fall: the windup
-    // spring balances the load once deflected. The discriminator is the
-    // order of magnitude — an armed loop drifts tens of ticks (and the
-    // pre-fix vel-0 keep-alive would keep holding here), a limp joint
-    // hangs hundreds.
+    // The discriminator is the order of magnitude — an armed loop drifts
+    // tens of ticks (and the pre-fix vel-0 keep-alive would keep holding
+    // here), a limp joint hangs hundreds before its hard stop catches it.
     assert!(
-        idle_end - idle_start <= -400,
+        (idle_end - idle_start).abs() >= 400,
         "an idled driver must yield to the load (moved {})",
         idle_end - idle_start
     );
