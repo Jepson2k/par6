@@ -92,7 +92,7 @@ class DrivesPanel(Panel):
     min_width = 460
     min_height = 340
     default_width = 620
-    default_height = 620
+    default_height = 480
     resizable = True
 
     def __init__(self) -> None:
