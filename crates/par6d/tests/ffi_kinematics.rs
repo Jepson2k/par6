@@ -2573,3 +2573,113 @@ fn move_p_tracks_its_corner_without_stopping_in_it() {
     );
     rig.shutdown();
 }
+
+/// A far-away box, for a world change that must not touch the path.
+fn far_box(name: &str) -> Shape {
+    keepout_at(name, [900.0, 900.0, 900.0])
+}
+
+/// A world change during a move does not manufacture a failure: a
+/// keep-out that stays clear of the remaining path leaves the move to
+/// complete, with no verdict and no standing error.
+///
+/// The control for the mid-flight re-guard beside it: without this, a
+/// runtime that failed every running move on ANY world change would
+/// pass the keep-out-on-the-path test just the same.
+#[test]
+fn an_off_path_world_change_leaves_a_running_move_alone() {
+    let rig = boot_tagged("collision-offpath", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(8101, end_deg, SWEEP_S));
+    rig.drain_status();
+    rig.wait_status("the sweep is under way", |s| {
+        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+    });
+    c.ok(&set_shapes(vec![far_box("far")]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
+
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a world change clear of the path must not stop the move, got {detail:?}"
+    );
+    rig.drain_status();
+    let s = rig.wait_status("the arm at rest at the end of the sweep", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    assert!(
+        angles_close(&s.angles, &end_deg, 1.0),
+        "the move must run to its target: {:?}",
+        s.angles
+    );
+    assert!(
+        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
+        "an off-path change must leave no verdict behind: active={} pairs={:?} error={:?}",
+        s.collision_active,
+        s.collision_pairs,
+        s.error
+    );
+    rig.shutdown();
+}
+
+/// A move queued behind another is re-guarded when it ACTIVATES, not
+/// only when it was accepted.
+///
+/// The first move runs clear; the keep-out lands on the second's path
+/// while the first is still under way. Accepted against an empty world,
+/// the second must still be refused where it would have started, and
+/// the arm must stay where the first move left it.
+#[test]
+fn a_queued_move_is_re_guarded_against_the_world_when_it_activates() {
+    let rig = boot_tagged("collision-queued", false);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let quarter_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 4.0);
+    let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+
+    enable_and_teleport(&rig, &mut c, mid_deg);
+    let mid_tcp =
+        tcp_mm(&rig.wait_status("midpoint pose", |s| angles_close(&s.angles, &mid_deg, 0.5)));
+
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i1 = c.ok_index(&move_j(8201, quarter_deg, SWEEP_S / 2.0));
+    let i2 = c.ok_index(&move_j(8202, end_deg, SWEEP_S));
+    rig.drain_status();
+    rig.wait_status("the first move is under way", |s| {
+        s.executing_index == i1 as i64 && s.angles[0] > SWEEP_START_DEG[0] + 2.0
+    });
+    c.ok(&set_shapes(vec![keepout_at("late-wall", mid_tcp)]));
+
+    let (ok, detail) = c.wait_complete(i1);
+    assert!(ok, "the clear first move must complete, got {detail:?}");
+    let (ok, detail) = c.wait_complete(i2);
+    assert!(
+        !ok,
+        "the second move was accepted against an empty world and must be refused \
+         against the one it starts in"
+    );
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(e.code, ErrorCode::SysSelfCollision as u16, "{e:?}");
+    assert!(
+        e.cause.contains("late-wall"),
+        "the refusal must name the keep-out that arrived late: {e:?}"
+    );
+    rig.drain_status();
+    let s = rig.wait_status("the arm at rest", |s| {
+        s.speeds.iter().all(|v| v.abs() < 0.05)
+    });
+    assert!(
+        angles_close(&s.angles, &quarter_deg, 1.0),
+        "the arm must stay where the first move left it, not stream the second: {:?}",
+        s.angles
+    );
+    rig.shutdown();
+}

@@ -208,6 +208,35 @@ class TestCartesianMotion:
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
+    @pytest.mark.parametrize("profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA"])
+    def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
+        """The profile decides how a linear move is timed, not where it goes:
+        every profile must keep the TCP on the start->end line. A profile
+        that plans the move in joint space and only times it would bow."""
+        try:
+            assert dry_run.select_profile(profile) == 1
+            assert dry_run.profile() == profile
+            dry_run.teleport(park_deg())
+            start = np.asarray(dry_run.pose())
+            target = start.copy()
+            target[1] += 50.0
+            target[2] += 30.0
+
+            result = dry_run.move_l(target.tolist(), speed=0.5)
+            assert result.error is None, f"{profile}: {result.error}"
+            points = result.tcp_poses[:, :3] * 1000.0
+            assert np.allclose(points[-1], target[:3], atol=0.5), profile
+            line = points[-1] - points[0]
+            offsets = points - points[0]
+            deviation = np.linalg.norm(
+                offsets - np.outer(offsets @ line / (line @ line), line), axis=1
+            )
+            assert deviation.max() < 0.1, (
+                f"{profile}: TCP path bows by {deviation.max():.3f} mm"
+            )
+        finally:
+            assert dry_run.select_profile("RUCKIG") == 1
+
     def test_curved_moves_preview_the_shape_they_trace(self, dry_run) -> None:
         """``move_c`` must preview the arc through its via point, ``move_s`` the
         spline through every waypoint, and ``move_p`` the same waypoints with

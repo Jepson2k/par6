@@ -16,6 +16,10 @@ import asyncio
 import json
 import logging
 import math
+import os
+import signal
+import subprocess
+import sys
 import time
 
 import numpy as np
@@ -428,6 +432,89 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     while logs.is_available() and time.monotonic() < deadline:
         time.sleep(0.1)
     assert logs.is_available() is False, "Robot.stop() must reap what it spawned"
+
+
+def _par6d_pids_serving(port: int) -> list[int]:
+    """Every live par6d whose command line binds *port*."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if argv and argv[0].endswith(b"par6d") and str(port).encode() in argv:
+            found.append(int(entry))
+    return found
+
+
+def test_a_spawned_runtime_dies_with_the_process_that_spawned_it(monkeypatch, tmp_path):
+    """A runtime ``Robot.start()`` spawned must not outlive the program.
+
+    parol6 pins this with ``set_pdeathsig`` (``tests/unit/test_pdeathsig.py``).
+    Without it a script that is SIGKILLed — a crashed GUI, a terminal
+    closed on it — leaves ``par6d`` running: it keeps the command port,
+    keeps the bus, and the next ``start()`` on that port refuses with
+    "already running" for a runtime nobody can reach to stop.
+    """
+    port = free_udp_port()
+    assets = repo_assets_dir()
+    if assets is not None:
+        monkeypatch.setenv("PAR6_ASSETS", str(assets))
+    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "orphan")))
+    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
+    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
+    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
+    shm = tmp_path / "orphan-shm"
+    shm.mkdir()
+    monkeypatch.setenv("PAR6_SHM_DIR", str(shm))
+
+    # The spawner is a real separate process, so killing it is the dirty
+    # exit under test and not something the test runner itself survives.
+    script = tmp_path / "spawner.py"
+    script.write_text(
+        "import sys, time\n"
+        "from par6 import Robot\n"
+        f"Robot(host='127.0.0.1', port={port}).start(timeout=60.0)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(3600)\n"
+    )
+    spawner = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=os.environ.copy(),
+    )
+    try:
+        assert spawner.stdout is not None
+        assert spawner.stdout.readline().strip() == "READY", (
+            spawner.stderr.read() if spawner.stderr else ""
+        )
+        probe = Robot(host="127.0.0.1", port=port)
+        assert probe.is_available() is True
+        assert _par6d_pids_serving(port), "the spawner's runtime must be visible"
+
+        os.kill(spawner.pid, signal.SIGKILL)
+        spawner.wait(timeout=STEP_BUDGET_S)
+
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline:
+            if not probe.is_available() and not _par6d_pids_serving(port):
+                break
+            time.sleep(0.1)
+        assert not _par6d_pids_serving(port), (
+            "par6d outlived the process that spawned it"
+        )
+        assert probe.is_available() is False
+    finally:
+        for pid in _par6d_pids_serving(port):
+            os.kill(pid, signal.SIGKILL)
+        if spawner.poll() is None:
+            spawner.kill()
+        spawner.wait(timeout=STEP_BUDGET_S)
 
 
 def _await_records(caplog, logger_name: str, budget_s: float) -> list:

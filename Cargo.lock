@@ -637,6 +637,7 @@ name = "par6-kin"
 version = "0.1.0"
 dependencies = [
  "glam",
+ "par6-config",
  "par6-proto",
  "rs-opw-kinematics",
  "serde",

@@ -12,7 +12,7 @@
 //! What it CANNOT show is that the arm follows the plan; `ffi_kinematics`
 //! keeps one live motion per family for that.
 
-use par6_proto::command::{MoveC, MoveP, MoveS};
+use par6_proto::command::{MoveC, MoveL, MoveP, MoveS};
 use par6_proto::{Command, Frame, NUM_JOINTS};
 use par6d::preview::{Preview, PreviewResult};
 
@@ -351,5 +351,94 @@ fn a_full_speed_move_p_prices_its_corner_instead_of_refusing() {
     assert!(
         (1.0..25.0).contains(&corner_miss),
         "the fast move_p left its blend zone: closest approach {corner_miss:.2} mm"
+    );
+}
+
+/// Angle \[deg\] between the rotation blocks of two pose matrices.
+fn rotation_angle_deg(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+    // trace(Rᵃᵀ Rᵇ) = 1 + 2 cos θ
+    let mut trace = 0.0;
+    for col in 0..3 {
+        for row in 0..3 {
+            trace += a[row * 4 + col] * b[row * 4 + col];
+        }
+    }
+    ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// A chain of blended `move_l`s holds the tool's orientation through
+/// every rounded corner.
+///
+/// One corner is covered elsewhere; what a program actually sends is a
+/// closed contour of them, and orientation error is the kind that
+/// accumulates: a blend that lets the tool nod a fraction of a degree
+/// at each corner ends a square visibly off. Four right-angle corners
+/// in one chain, orientation read at every tick of the whole motion.
+#[test]
+fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
+    const SIDE_MM: f64 = 40.0;
+    const BLEND_MM: f64 = 8.0;
+    let mut p = planned("curve-square");
+    let at = |dy: f64, dz: f64| [p.start[0], p.start[1] + dy, p.start[2] - dz];
+    // Right, down, left, half a side up — four blended right-angle
+    // corners, none of them the start pose — then into the middle of
+    // the square with no radius, which closes the chain the runtime's
+    // way and ends clear of every corner it rounded.
+    let corners = [
+        at(SIDE_MM, 0.0),
+        at(SIDE_MM, SIDE_MM),
+        at(0.0, SIDE_MM),
+        at(0.0, SIDE_MM / 2.0),
+        at(SIDE_MM / 2.0, SIDE_MM / 2.0),
+    ];
+    let mut results = Vec::new();
+    for (k, xyz) in corners.iter().enumerate() {
+        let last = k + 1 == corners.len();
+        let r = p.preview.submit(Command::MoveL(MoveL {
+            key: 4100 + k as u64,
+            pose: wire_pose_at(&p.pose, *xyz),
+            frame: Frame::Wrf,
+            duration: Some(2.0),
+            speed: None,
+            accel: None,
+            blend_radius: if last { None } else { Some(BLEND_MM) },
+            rel: false,
+        }));
+        assert!(r.error.is_none(), "leg {k} refused: {:?}", r.error);
+        results.push(r);
+    }
+    results.extend(p.preview.flush());
+    let motion = PreviewResult::concat(results.into_iter().filter(|r| !r.pending).collect())
+        .expect("the closed chain plans a motion");
+    assert!(
+        motion.tcp_poses.len() > 100,
+        "expected a sampled contour, got {} poses",
+        motion.tcp_poses.len()
+    );
+
+    // Every corner rounded: the path passes near each one but not
+    // through it, and lands on the last.
+    let path: Vec<[f64; 3]> = motion.tcp_poses.iter().map(tcp_mm).collect();
+    for (k, c) in corners[..4].iter().enumerate() {
+        let miss = path_misses(&path, *c);
+        assert!(
+            (0.5..BLEND_MM).contains(&miss),
+            "corner {k} was not rounded into its blend zone: closest approach {miss:.2} mm"
+        );
+    }
+    let end_miss = distance(*path.last().expect("path"), corners[4]);
+    assert!(
+        end_miss < PLAN_TOL_MM,
+        "the chain planned to end {end_miss:.3} mm off its last pose"
+    );
+
+    let drift = motion
+        .tcp_poses
+        .iter()
+        .map(|pose| rotation_angle_deg(&p.pose, pose))
+        .fold(0.0f64, f64::max);
+    assert!(
+        drift < 1.0,
+        "the tool tilted {drift:.3}° somewhere along four blended corners"
     );
 }

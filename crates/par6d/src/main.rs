@@ -66,6 +66,26 @@ fn main() {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
     }
+    if let Some(pid) = opts.parent_pid {
+        // SAFETY: prctl with PR_SET_PDEATHSIG takes an int signal number
+        // and has no memory arguments.
+        let rc = unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) };
+        if rc != 0 {
+            eprintln!(
+                "par6d: PR_SET_PDEATHSIG failed: {}",
+                std::io::Error::last_os_error()
+            );
+            std::process::exit(1);
+        }
+        // The signal is only armed from here on; a parent that died in
+        // the gap between the spawn and this line is already gone.
+        // SAFETY: getppid has no arguments and cannot fail.
+        let ppid = unsafe { libc::getppid() };
+        if ppid != pid as libc::pid_t {
+            eprintln!("par6d: parent {pid} is gone (current parent {ppid}); exiting");
+            std::process::exit(0);
+        }
+    }
     let daemon = match Daemon::start(&opts) {
         Ok(d) => d,
         Err(e) => {

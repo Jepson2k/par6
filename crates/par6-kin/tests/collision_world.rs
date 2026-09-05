@@ -567,3 +567,149 @@ fn per_waypoint_check_cost_is_reported() {
          bounded keep-outs must stay in the sub-millisecond range"
     );
 }
+
+/// `gen_srdf.py`'s rule for what an SRDF may silence — rest contact at
+/// the park pose, and pairs the meshes hold in overlap through the whole
+/// soft window — and the corresponding rule for what it may not. Both
+/// mirrored from the script, which cannot be imported here.
+const ALWAYS_FRAC: f64 = 0.99;
+/// The runtime's self-pair standoff (`par6d`'s `COLLISION_CLEARANCE_M`),
+/// which the SRDF was sampled at.
+const RUNTIME_CLEARANCE_M: f64 = 0.005;
+/// Soft-window samples per variant. Enough that a pair the meshes hold
+/// in permanent overlap cannot hide below `ALWAYS_FRAC`, cheap enough
+/// (tens of µs a check) to run every time.
+const SAMPLES: usize = 400;
+
+/// The link a geometry name belongs to: `lower_arm_0` → `lower_arm`.
+fn link_of(geom: &str) -> String {
+    match geom.rsplit_once('_') {
+        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
+            link.to_owned()
+        }
+        _ => geom.to_owned(),
+    }
+}
+
+/// Colliding LINK pairs at `q`, sorted within the pair.
+fn link_pairs(col: &mut Collision, q: &[f64; NQ]) -> BTreeSet<(String, String)> {
+    pair_set(col, q)
+        .into_iter()
+        .map(|(a, b)| {
+            let (a, b) = (link_of(&a), link_of(&b));
+            if a <= b {
+                (a, b)
+            } else {
+                (b, a)
+            }
+        })
+        .collect()
+}
+
+/// The `<disable_collisions>` pairs an SRDF declares, sorted within the pair.
+fn srdf_pairs(variant: GripperVariant) -> BTreeSet<(String, String)> {
+    let text = std::fs::read_to_string(assets_dir().join(variant.srdf_relpath())).unwrap();
+    let attr = |tag: &str, name: &str| -> String {
+        let key = format!("{name}=\"");
+        let at = tag
+            .find(&key)
+            .unwrap_or_else(|| panic!("{variant:?} SRDF: {tag} lacks {name}"));
+        let rest = &tag[at + key.len()..];
+        rest[..rest.find('"').unwrap()].to_owned()
+    };
+    let mut out = BTreeSet::new();
+    let mut rest = text.as_str();
+    while let Some(i) = rest.find("<disable_collisions") {
+        let end = rest[i..].find('>').map(|e| i + e).unwrap_or(rest.len());
+        let tag = &rest[i..end];
+        let (a, b) = (attr(tag, "link1"), attr(tag, "link2"));
+        out.insert(if a <= b { (a, b) } else { (b, a) });
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// The SRDF silences rest contact and permanent overlap, and nothing else.
+///
+/// The joint window is NOT self-collision-free: the elbow closes fully,
+/// the wrist folds ±129°, and at those limits the meshes really do
+/// touch — sweeping the joint-limit hypercube finds 68 of 97 corners in
+/// contact, every one of them a fold. Those verdicts are the checker
+/// doing its job, and `gen_srdf.py`'s rule keeps them enabled. What the
+/// SRDF may silence is the contact the arm cannot help: pairs touching in
+/// the park pose it is declared valid in, and pairs the coarse meshes
+/// hold in overlap across the whole soft window. Miss one and the
+/// runtime refuses its own park pose or every pose; silence one more and
+/// a real contact goes unreported. Both halves are measured here on the
+/// raw meshes, the way the script measured them.
+#[test]
+fn the_srdf_silences_rest_contact_and_permanent_overlap_and_nothing_else() {
+    let robot = par6_config::RobotConfig::load(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml"),
+    )
+    .expect("PAR6.toml");
+    let lo: [f64; NQ] = std::array::from_fn(|j| robot.joints[j].limits.soft_min_rad);
+    let hi: [f64; NQ] = std::array::from_fn(|j| robot.joints[j].limits.soft_max_rad);
+
+    for variant in GripperVariant::ALL {
+        // The meshes on their own: the checker before its SRDF.
+        let mut raw = Collision::from_urdf(
+            &assets_dir().join(variant.urdf_relpath()),
+            Some(&assets_dir().join("URDF")),
+            RUNTIME_CLEARANCE_M,
+        )
+        .unwrap_or_else(|e| panic!("{variant:?} raw load failed: {e}"));
+        let rest = link_pairs(&mut raw, &HOME);
+
+        let mut seed: u64 = 0xC011_5EED ^ (variant as u64 + 1);
+        let mut unit = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 11) as f64 / (1u64 << 53) as f64
+        };
+        let mut freq: std::collections::BTreeMap<(String, String), usize> = Default::default();
+        for _ in 0..SAMPLES {
+            let q: [f64; NQ] = std::array::from_fn(|j| lo[j] + (hi[j] - lo[j]) * unit());
+            for pair in link_pairs(&mut raw, &q) {
+                *freq.entry(pair).or_default() += 1;
+            }
+        }
+        let always: BTreeSet<(String, String)> = freq
+            .iter()
+            .filter(|(_, n)| **n as f64 >= ALWAYS_FRAC * SAMPLES as f64)
+            .map(|(p, _)| p.clone())
+            .collect();
+        let ever: BTreeSet<(String, String)> =
+            freq.keys().cloned().chain(rest.iter().cloned()).collect();
+
+        let srdf = srdf_pairs(variant);
+        let missing: Vec<_> = rest.union(&always).filter(|p| !srdf.contains(p)).collect();
+        assert!(
+            missing.is_empty(),
+            "{variant:?}: the SRDF must silence what the arm cannot avoid, and does not \
+             silence {missing:?} (rest contact at park: {rest:?}; overlap in ≥{:.0}% of \
+             {SAMPLES} soft-window samples: {always:?}). Regenerate it: scripts/gen_srdf.py",
+            ALWAYS_FRAC * 100.0
+        );
+        // The arm-only check API holds the jaws still, so a pair the jaw
+        // sweep put in rest contact cannot be reproduced here; every
+        // other silenced pair has to be one the meshes actually touch.
+        let over: Vec<_> = srdf
+            .iter()
+            .filter(|(a, b)| !a.contains("jaw") && !b.contains("jaw"))
+            .filter(|p| !ever.contains(p))
+            .collect();
+        assert!(
+            over.is_empty(),
+            "{variant:?}: the SRDF silences {over:?}, which never touched in {SAMPLES} \
+             soft-window samples or at park: a real contact there would go unreported"
+        );
+
+        // And the consequence the runtime depends on: with the SRDF
+        // applied, the pose the config declares valid checks clean.
+        let mut with_srdf = load(variant, RUNTIME_CLEARANCE_M);
+        let park = link_pairs(&mut with_srdf, &HOME);
+        assert!(park.is_empty(), "{variant:?} park self-collides: {park:?}");
+    }
+}

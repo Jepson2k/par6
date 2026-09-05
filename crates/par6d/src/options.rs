@@ -52,6 +52,9 @@ OPTIONS:
                                [env: PAR6_LOG_DIR]
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
+    --parent-pid <PID>         Exit when the process with this pid dies (the
+                               spawner's own pid; SIGTERM via PR_SET_PDEATHSIG),
+                               so a runtime a client spawned never outlives it.
     -h, --help                 Print this help
 ";
 
@@ -91,6 +94,10 @@ pub struct Options {
     pub log_dir: Option<PathBuf>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
+    /// Die with this process (`--parent-pid`): the spawner's pid, so the
+    /// death-signal request can be checked against the parent that is
+    /// actually there once it is armed.
+    pub parent_pid: Option<u32>,
     /// `--help` was requested.
     pub help: bool,
 }
@@ -126,6 +133,15 @@ impl Options {
                 }
                 "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
                 "--check-config" => o.check_config = true,
+                "--parent-pid" => {
+                    let raw = value(&mut args, &arg)?;
+                    let pid: u32 = raw
+                        .parse()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or_else(|| format!("--parent-pid: `{raw}` is not a process id"))?;
+                    o.parent_pid = Some(pid);
+                }
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
             }
