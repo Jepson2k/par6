@@ -43,11 +43,25 @@ pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 /// How long the enable retry keeps trying after `reset` (covers the RT
 /// clear-sequence settle window with margin, even on a loaded host).
 const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
-/// Spacing between enable retries (a few RT ticks at any supported
-/// rate, so retries never saturate the one-command-per-tick budget).
-const ENABLE_RETRY_PERIOD: Duration = Duration::from_millis(60);
-/// Housekeeping loop period.
-pub(crate) const HOUSEKEEPING_PERIOD: Duration = Duration::from_millis(4);
+/// Housekeeping loop period: one RT tick.
+///
+/// Housekeeping is the soft-real-time plane — it has to keep up with the
+/// tick on average, and a miss costs one late cart-jog ramp step. The
+/// period is also the dt it integrates the cartesian jog twist over, so
+/// pinning it to anything but the tick would integrate the twist on a
+/// different clock than the loop consuming the result, and publish
+/// setpoints the RT's latest-wins slot then throws away.
+pub(crate) fn housekeeping_period(dt: f64) -> Duration {
+    Duration::from_secs_f64(dt)
+}
+
+/// Spacing between enable retries, in RT ticks.
+///
+/// The budget it must not saturate is the RT's one-command-per-tick
+/// drain, so the spacing is counted in ticks and converted at the tick
+/// rate in force — as a fixed 60 ms it was "a few ticks" only at 250 Hz
+/// and 1.2 ticks at the rate the python rig runs.
+const ENABLE_RETRY_TICKS: u32 = 15;
 /// How long a FLASHING enter/exit waits for the published mode to
 /// answer. The RT decides on the next tick, so this only has to cover
 /// command-queue and snapshot latency on a loaded host.
@@ -796,6 +810,15 @@ impl RtCommands for RtBridge {
         self.stop_stream_commands();
     }
 
+    fn discard_exec(&mut self) {
+        // Marked before it is queued, for the reason `halt` gives: the
+        // mark is pinned to what is in the ring now, so a move accepted
+        // behind this keeps its own fill.
+        self.flush.mark();
+        self.link.send(RtCommand::ExecFlush);
+        self.link.send(RtCommand::SetMode(Mode::Idle));
+    }
+
     fn halt(&mut self) {
         self.shared.lock().unwrap().stream = None;
         self.link.send(RtCommand::JogRelease);
@@ -1132,6 +1155,7 @@ impl RtBridge {
 /// and the enable retry that resolves a `reset` into a real answer.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn housekeeping_loop(
+    dt: f64,
     jog_accel_time_s: f64,
     link: CoreLink,
     stream_input: Arc<Mutex<StreamInput>>,
@@ -1322,7 +1346,7 @@ pub(crate) fn housekeeping_loop(
                 Some(a) if a.kind == StreamKind::CartJog => {
                     if let Some(state) = &mut a.cart {
                         let before = state.q;
-                        match step_cart_jog(&mut kin, state, HOUSEKEEPING_PERIOD.as_secs_f64()) {
+                        match step_cart_jog(&mut kin, state, dt) {
                             Ok((target, qd)) => {
                                 // The velocity-scaled horizon, projected
                                 // past the step just integrated.
@@ -1393,10 +1417,9 @@ pub(crate) fn housekeeping_loop(
                              or a hard error is latched.",
                         )],
                     )));
-                } else if req
-                    .last_sent
-                    .is_none_or(|t| now.duration_since(t) >= ENABLE_RETRY_PERIOD)
-                {
+                } else if req.last_sent.is_none_or(|t| {
+                    now.duration_since(t) >= housekeeping_period(dt) * ENABLE_RETRY_TICKS
+                }) {
                     req.sent_at_seq = Some(snap.enable_seq);
                     req.last_sent = Some(now);
                     link.send(RtCommand::Enable);
@@ -1433,7 +1456,7 @@ pub(crate) fn housekeeping_loop(
                 }
             }
         }
-        std::thread::sleep(HOUSEKEEPING_PERIOD);
+        std::thread::sleep(housekeeping_period(dt));
     }
 }
 

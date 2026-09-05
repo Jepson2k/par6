@@ -23,9 +23,9 @@ use par6_rt::{
     StateSnapshot,
 };
 use par6_server::{
-    spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
-    RtCommands, RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
-    TunableNode,
+    planner_plane, spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner,
+    PlannerHandle, QueuedCommand, RtCommands, RuntimeHandle, ServerConfig, ServerHandle,
+    ShapeLayer, StatusTransport, TunableNode,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -64,6 +64,10 @@ struct RtLog {
     /// is forwarded; `Some` = refused, the way the real bridge refuses a
     /// jog its collision gate blocks.
     stream_verdict: Option<WireError>,
+    /// What the streaming gate answers the NEXT shape set with. `None` =
+    /// mirrored; `Some` = refused, the way the real gate refuses a set
+    /// it cannot convert.
+    gate_shapes_verdict: Option<WireError>,
     /// What the RT answers the NEXT enable request with. `None` = it came
     /// up ENABLED; `Some` = it refused, the way the real core does while
     /// the e-stop line is engaged or a hard error is latched.
@@ -92,6 +96,12 @@ impl TestRt {
 }
 
 impl RtCommands for TestRt {
+    fn set_shapes(&mut self, _layer: ShapeLayer, _shapes: &[Shape]) -> Result<(), WireError> {
+        match self.0.lock().unwrap().gate_shapes_verdict.take() {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
     fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
         if let Some(e) = self.0.lock().unwrap().stream_verdict.take() {
             return Err(e);
@@ -246,8 +256,22 @@ impl Planner for TestPlanner {
         s.started.push((head.index, head.cmd.clone()));
         Ok(s.consume.clamp(1, batch.len()))
     }
+    /// An outcome only exists for a command this planner was actually
+    /// asked to start.
+    ///
+    /// The real planner cannot do otherwise — it reports on the motion
+    /// it is running — and the difference is load-bearing now that the
+    /// plane is a thread away: a test queues a command and stages its
+    /// outcome in the same breath, and a double that handed that outcome
+    /// over before the `start` it belongs to would have the server drop
+    /// it as belonging to a command it has not been told about.
     fn poll(&mut self) -> Option<CommandOutcome> {
-        self.0.lock().unwrap().outcomes.pop_front()
+        let mut s = self.0.lock().unwrap();
+        let next = s.outcomes.front()?.index;
+        if !s.started.iter().any(|(i, _)| *i == next) {
+            return None;
+        }
+        s.outcomes.pop_front()
     }
     fn cancel(&mut self) {
         self.0.lock().unwrap().cancels += 1;
@@ -370,6 +394,47 @@ struct Harness {
     writer: SnapshotWriter<StateSnapshot>,
     status_rx: UdpSocket,
     tick: u64,
+    plan_stop: Arc<std::sync::atomic::AtomicBool>,
+    plan_thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for Harness {
+    fn drop(&mut self) {
+        self.plan_stop
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(t) = self.plan_thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Put `planner` on its own thread the way `par6d` does, and hand back
+/// the command plane's end of it.
+///
+/// The tests drive the real plane rather than a stand-in for it: the
+/// deferral, the generation guard and the report are the behaviour under
+/// test as much as anything the planner computes.
+///
+/// [`TestPlanner`] ignores the snapshot it is priced against, so the
+/// loop gets a channel of its own that nothing writes.
+fn spawn_test_plane(
+    planner: TestPlanner,
+) -> (
+    PlannerHandle,
+    Arc<std::sync::atomic::AtomicBool>,
+    std::thread::JoinHandle<()>,
+) {
+    let (_w, plan_snaps) = snapshot_channel::<StateSnapshot>();
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (handle, run) = planner_plane(planner, plan_snaps, Duration::from_millis(1), stop.clone());
+    // The writer half goes with the loop: dropping it here would leave
+    // the reader on a dead channel, which reads as a torn snapshot
+    // rather than an absent one.
+    let thread = std::thread::spawn(move || {
+        let _keep = _w;
+        run();
+    });
+    (handle, stop, thread)
 }
 
 async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
@@ -391,10 +456,21 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
     let (writer, snapshots) = snapshot_channel::<StateSnapshot>();
     let rt = Arc::new(Mutex::new(RtLog::default()));
     let planner = Arc::new(Mutex::new(PlannerState::default()));
+    // Mirror `par6d`: the installation layer is applied while the planner
+    // is still in hand, before it moves to its own thread — it is
+    // immutable from the wire, and a layer it refuses must fail startup.
+    let installation_epoch = {
+        let mut p = TestPlanner(planner.clone());
+        p.set_shapes(ShapeLayer::Installation, &cfg.installation_shapes)
+            .expect("installation layer applies")
+            .unwrap_or(0)
+    };
+    let (plan, plan_stop, plan_thread) = spawn_test_plane(TestPlanner(planner.clone()));
     let server = spawn(
         cfg,
         RuntimeHandle {
-            planner: TestPlanner(planner.clone()),
+            planner: plan,
+            installation_epoch,
             rt: TestRt(rt.clone()),
             snapshots,
         },
@@ -408,10 +484,59 @@ async fn start(tweak: impl FnOnce(&mut ServerConfig)) -> Harness {
         writer,
         status_rx,
         tick: 0,
+        plan_stop,
+        plan_thread: Some(plan_thread),
+    }
+}
+
+/// Poll `cmd` until the answer satisfies `pred`.
+///
+/// What the planner knows reaches the server as a publication, so a test
+/// that sets the double's state and reads it in the next breath is
+/// racing a thread. Waiting for the answer is the honest form of that
+/// read — the lag is bounded by one planner pass, not unbounded.
+async fn wait_query(
+    c: &mut Client,
+    cmd: &Command,
+    what: &str,
+    pred: impl Fn(&QueryResult) -> bool,
+) -> QueryResult {
+    let deadline = std::time::Instant::now() + BUDGET;
+    loop {
+        let got = c.query(cmd).await;
+        if pred(&got) {
+            return got;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "query condition `{what}` not met within budget; last: {got:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
 impl Harness {
+    /// Wait until the planner double reflects `pred`.
+    ///
+    /// The planner is a thread away now, so anything the server sends it
+    /// — a cancel, a start, a shape set — lands a moment later, and what
+    /// it publishes back is at most one pass old. Tests that used to read
+    /// the double straight after a command have to wait for it instead;
+    /// that lag is the design, not a flake.
+    async fn wait_planner(&self, what: &str, pred: impl Fn(&PlannerState) -> bool) {
+        let deadline = std::time::Instant::now() + BUDGET;
+        loop {
+            if pred(&self.planner.lock().unwrap()) {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "planner condition `{what}` not met within budget"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     /// Publish a fresh snapshot (enabled + homed + a live motor bus
     /// unless overridden — the default `NodeState` means "never heard",
     /// which reads as a dead link). The server re-reads the snapshot
@@ -805,7 +930,13 @@ async fn queued_ack_dedup_complete_and_error_latch() {
         other => panic!("unexpected {other:?}"),
     }
 
-    // A start-time rejection also completes with an error.
+    // A start-time rejection also completes with an error. The arming
+    // waits for i3 to be under way: `start` is a round trip now, so a
+    // refusal armed before it lands would be spent on i3 itself.
+    h.wait_planner("i3 is under way", |p| {
+        p.started.iter().any(|(i, _)| *i == i3)
+    })
+    .await;
     h.planner.lock().unwrap().fail_next_start = Some(make_error(
         ErrorCode::IkTargetUnreachable,
         UNATTRIBUTED,
@@ -2132,11 +2263,17 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     }
 }
 
-/// A configured installation keep-out the runtime cannot apply is a
-/// startup failure: coming up with an unenforceable world would silently
-/// under-enforce, and no client is connected yet to be told.
+/// A configured installation keep-out the STREAMING GATE cannot mirror
+/// is a startup failure: coming up with a world only half the runtime
+/// enforces would let a jog run against keep-outs planned motion
+/// respects, and no client is connected yet to be told.
+///
+/// The planner's half of the installation layer is applied before the
+/// planner moves to its own thread — a refusal there fails the daemon's
+/// startup, which is where the rest of that decision now lives. What
+/// the server still owns, and what this pins, is the mirror.
 #[tokio::test]
-async fn unappliable_installation_shapes_fail_startup() {
+async fn an_installation_layer_the_gate_cannot_mirror_fails_startup() {
     let status_rx = UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let cfg = ServerConfig {
         bind: "127.0.0.1:0".parse().unwrap(),
@@ -2147,23 +2284,28 @@ async fn unappliable_installation_shapes_fail_startup() {
         ..ServerConfig::default()
     };
     let (_writer, snapshots) = snapshot_channel::<StateSnapshot>();
-    let planner = Arc::new(Mutex::new(PlannerState {
-        fail_next_shapes: Some(make_error(
+    let planner = Arc::new(Mutex::new(PlannerState::default()));
+    let (plan, plan_stop, plan_thread) = spawn_test_plane(TestPlanner(planner.clone()));
+    let rt = Arc::new(Mutex::new(RtLog {
+        gate_shapes_verdict: Some(make_error(
             ErrorCode::CommValidationError,
             UNATTRIBUTED,
             &[("detail", "shape \"bad\": unknown kind \"pyramid\"")],
         )),
-        ..PlannerState::default()
+        ..RtLog::default()
     }));
     let started = spawn(
         cfg,
         RuntimeHandle {
-            planner: TestPlanner(planner.clone()),
-            rt: TestRt(Arc::new(Mutex::new(RtLog::default()))),
+            planner: plan,
+            installation_epoch: 0,
+            rt: TestRt(rt),
             snapshots,
         },
     )
     .await;
+    plan_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = plan_thread.join();
     let err = match started {
         Err(e) => e,
         Ok(_) => panic!("a refused installation layer must fail startup"),
@@ -2271,7 +2413,14 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
     let err = c.expect_error(&jog_l()).await;
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
 
-    match c.query(&Command::Reachable).await {
+    let reachable = wait_query(
+        &mut c,
+        &Command::Reachable,
+        "the planner's joint freedom reaches the wire",
+        |r| matches!(r, QueryResult::Reachable { joint_en, .. } if *joint_en == joints),
+    )
+    .await;
+    match reachable {
         QueryResult::Reachable {
             joint_en,
             cart_en_wrf,
@@ -2303,7 +2452,14 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
     }
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
-    match c.query(&Command::Reachable).await {
+    let reachable = wait_query(
+        &mut c,
+        &Command::Reachable,
+        "the planner's cartesian freedom reaches the wire",
+        |r| matches!(r, QueryResult::Reachable { cart_en_wrf, .. } if *cart_en_wrf == wrf),
+    )
+    .await;
+    match reachable {
         QueryResult::Reachable {
             cart_en_wrf,
             cart_en_trf,
@@ -2589,6 +2745,8 @@ async fn a_stop_halts_the_tool_but_a_streamable_leaves_it_alone() {
         Some(ErrorCode::MotnCancelled as u16),
         "got {detail:?}"
     );
+    h.wait_planner("the stop reached the tool", |p| !p.tool_cancels.is_empty())
+        .await;
     assert_eq!(
         h.planner.lock().unwrap().tool_cancels,
         vec![true],
@@ -2860,8 +3018,17 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     h.planner.lock().unwrap().inflight_duration = 2.0;
     let mut c = Client::new(&h).await;
 
-    // Nothing queued: the ETA is whatever is still running.
-    let idle = match c.query(&Command::Queue).await {
+    // Nothing queued: the ETA is whatever is still running. Waited for
+    // rather than read straight off, because the in-flight duration
+    // reaches the server in the planner's next publication.
+    let idle = match wait_query(
+        &mut c,
+        &Command::Queue,
+        "the in-flight duration reaches the wire",
+        |r| matches!(r, QueryResult::Queue { queued_duration, .. } if (queued_duration - 2.0).abs() < 1e-9),
+    )
+    .await
+    {
         QueryResult::Queue {
             queued_duration, ..
         } => queued_duration,
@@ -2874,7 +3041,23 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     for key in 1..=3u64 {
         c.ok_index(&move_j(key)).await;
     }
-    let queued = match c.query(&Command::Queue).await {
+    // Two waits in one: the head leaves the queue when the planner
+    // answers the start, and the estimate is re-priced on the pass after
+    // that — so the settled reading is the first that reflects both.
+    let settled = wait_query(
+        &mut c,
+        &Command::Queue,
+        "the head started and the estimate caught up with it",
+        |r| {
+            matches!(
+                r,
+                QueryResult::Queue { queue, queued_duration, .. }
+                    if queue.len() == 2 && (queued_duration - 3.0).abs() < 1e-9
+            )
+        },
+    )
+    .await;
+    let queued = match settled {
         QueryResult::Queue {
             queued_duration,
             queue,

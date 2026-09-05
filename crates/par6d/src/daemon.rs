@@ -11,7 +11,10 @@
 //!    single-reader by construction).
 //! 3. **Housekeeping** — jog/servo watchdogs and enable retries
 //!    (see [`crate::bridge`]).
-//! 4. **Tokio runtime** — the `par6-server` command-plane task.
+//! 4. **Planner** — the [`Par6Planner`] behind `par6-server`'s planner
+//!    plane: planning, the ring pump and the completion reports, off
+//!    the command plane so no plan can stall a datagram or a STATUS.
+//! 5. **Tokio runtime** — the `par6-server` command-plane task.
 //!
 //! Shutdown (SIGINT/SIGTERM → [`Daemon::shutdown`]): notify the server
 //! task and give it a grace period, then flag the worker threads and
@@ -63,6 +66,12 @@ pub enum DaemonError {
     /// URDF that failed to load).
     #[error("kinematics: {0}")]
     Kinematics(String),
+    /// The loop-timing bands cannot be resolved at the configured tick.
+    #[error("timing: {0}")]
+    Timing(String),
+    /// The CAN bus cannot carry the configured tick rate.
+    #[error("bus budget: {0}")]
+    BusBudget(String),
     /// The RT core could not be constructed.
     #[error("RT core: {0}")]
     Core(#[from] par6_rt::CoreError),
@@ -128,6 +137,56 @@ impl Daemon {
         let bundle = Arc::new(loaded);
         let robot = &bundle.robot;
         let bands = robot.loop_timing();
+        // The bands are resolved by now (`--sim` widens them), so this is
+        // the first point that can judge the pair. A sustain the
+        // percentile recompute cannot resolve turns LOOP_CRITICAL from a
+        // sustained-degradation latch into a first-bad-sample one, and
+        // that latch disables the controller — a hair trigger nothing
+        // announces is worse than no guard.
+        let resolution = par6_rt::timing::sustain_resolution_s(robot.robot.tick_dt_s);
+        if bands.critical_sustain_s < resolution {
+            return Err(DaemonError::Timing(format!(
+                "critical_sustain_s = {} s is under the {resolution} s percentile \
+                 recompute at a {} s tick, so LOOP_CRITICAL would latch on the \
+                 first bad percentile instead of a sustained one; raise the \
+                 sustain past {resolution} s or shorten the tick",
+                bands.critical_sustain_s, robot.robot.tick_dt_s,
+            )));
+        }
+        // What actually caps the tick rate is the wire, not the loop: the
+        // steady-state exchange has to finish inside one tick, and on
+        // classic CAN it is the binding constraint long before compute
+        // is. Only the real bus has one — `--sim` answers in memory.
+        if !opts.sim {
+            let budget = par6_bus::budget::bus_budget(
+                robot.joints.len(),
+                bundle.active_gripper().is_some_and(|g| g.driver.is_some()),
+                robot.bus.bitrate,
+                robot.robot.tick_dt_s,
+            );
+            if !budget.fits() {
+                return Err(DaemonError::BusBudget(format!(
+                    "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
+                     {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
+                     carries at most {:.0} Hz on this bus",
+                    robot.tick_rate_hz(),
+                    budget.frames_per_tick,
+                    budget.wire_time_s * 1e3,
+                    robot.bus.bitrate,
+                    budget.utilisation * 100.0,
+                    robot.robot.tick_dt_s * 1e3,
+                    budget.max_tick_rate_hz,
+                )));
+            }
+            log::info!(
+                "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
+                budget.frames_per_tick,
+                budget.wire_time_s * 1e3,
+                robot.robot.tick_dt_s * 1e3,
+                budget.utilisation * 100.0,
+                budget.max_tick_rate_hz,
+            );
+        }
         log::info!(
             "loaded {} ({} joints, tick {} Hz) from {}",
             robot.robot.name,
@@ -269,9 +328,12 @@ impl Daemon {
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
         let (plan_w, plan_r) = snapshot_channel::<StateSnapshot>();
         let (hk_w, hk_r) = snapshot_channel::<StateSnapshot>();
+        // The planner LOOP needs its own view: it prices the motion in
+        // flight against the RT's published state, on its own thread.
+        let (loop_w, loop_r) = snapshot_channel::<StateSnapshot>();
         // The bridge only needs its own tap with feature `ffi` (seeding
         // cartesian streams from the measured pose).
-        let mut tee_writers = vec![srv_w, plan_w, hk_w];
+        let mut tee_writers = vec![srv_w, plan_w, hk_w, loop_w];
         let bridge_snapshots = {
             let (br_w, br_r) = snapshot_channel::<StateSnapshot>();
             tee_writers.push(br_w);
@@ -323,10 +385,31 @@ impl Daemon {
             .worker_threads(2)
             .enable_all()
             .build()?;
+        let mut threads: Vec<JoinHandle<()>> = Vec::new();
+        // The installation layer is applied here, while the planner is
+        // still in hand: it is immutable from the wire, and a keep-out
+        // the runtime cannot enforce has to stop the boot rather than
+        // reach an arm that would under-enforce it.
+        let mut planner = planner;
+        let installation_epoch = install_layer(&mut planner, &cfg.installation_shapes)?;
+        // The command plane's own poll interval, not the tick: this loop
+        // is where `Planner::poll` moved to, and that is what keeps the
+        // RT's sample ring fed and the EXEC heartbeat alive. Pacing it
+        // off the tick would pump the ring an order of magnitude less
+        // often than the plane used to and starve playback.
+        let plan_period = cfg.poll_interval;
+        let (plan_handle, plan_run) =
+            par6_server::planner_plane(planner, loop_r, plan_period, shutdown.clone());
+        threads.push(
+            std::thread::Builder::new()
+                .name("par6d-planner".into())
+                .spawn(plan_run)?,
+        );
         let server = runtime.block_on(par6_server::spawn(
             cfg,
             par6_server::RuntimeHandle {
-                planner,
+                planner: plan_handle,
+                installation_epoch,
                 rt: bridge,
                 snapshots: srv_r,
             },
@@ -353,7 +436,6 @@ impl Daemon {
                 tick_profile: opts.tick_profile,
             }
         };
-        let mut threads = Vec::new();
         {
             let (rt_break, shutdown) = (rt_break.clone(), shutdown.clone());
             threads.push(
@@ -390,11 +472,13 @@ impl Daemon {
         {
             let (link, shutdown) = (link, shutdown.clone());
             let jog_accel_time_s = robot.jog.accel_time_s;
+            let hk_dt = robot.robot.tick_dt_s;
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         housekeeping_loop(
+                            hk_dt,
                             jog_accel_time_s,
                             link,
                             stream_input,
@@ -526,6 +610,31 @@ fn tee_loop(
             }
             None => std::thread::sleep(Duration::from_millis(1)),
         }
+    }
+}
+
+/// Apply the configured installation keep-outs to `planner`, returning
+/// the epoch of the world it ended up enforcing.
+///
+/// Runs before the planner moves to its own thread. The layer is
+/// immutable from the wire, so this is the only chance to refuse it, and
+/// a keep-out the runtime cannot enforce must stop the boot: coming up
+/// anyway would under-enforce a world the operator configured, with
+/// nobody connected yet to be told.
+fn install_layer(
+    planner: &mut Par6Planner,
+    shapes: &[par6_proto::Shape],
+) -> Result<u64, DaemonError> {
+    use par6_server::Planner as _;
+    if shapes.is_empty() {
+        return Ok(0);
+    }
+    match planner.set_shapes(par6_server::ShapeLayer::Installation, shapes) {
+        Ok(epoch) => Ok(epoch.unwrap_or(0)),
+        Err(e) => Err(DaemonError::Kinematics(format!(
+            "installation shapes refused: {}",
+            e.cause
+        ))),
     }
 }
 

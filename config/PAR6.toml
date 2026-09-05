@@ -492,8 +492,8 @@ sndbuf_bytes = 4194304
 gripper_node = 6
 timing_dummy_node = 13
 host_node = 14
-stale_warn_s = 0.04 # 10 ticks @ 250 Hz — stale WARNING, self-clears
-lost_s = 0.2        # 50 ticks @ 250 Hz — disconnect ERROR, latched
+stale_warn_s = 0.04 # stale WARNING, self-clears (round(s/dt) ticks: 10 at the shipped rate)
+lost_s = 0.2        # disconnect ERROR, latched (round(s/dt): 50 at the shipped rate)
 rx_frames_per_tick_cap = 32
 boot_config_repeats = 3
 config_resend_offsets_s = [0.2, 0.6, 1.2]  # full stored-config shots after the bus arms (vendor boot workaround)
@@ -518,7 +518,8 @@ command_port = 6001
 status_port = 6002
 status_multicast_group = "239.255.0.71"
 # The one broadcast every consumer subscribes to; raise it for capture
-# work. Must divide the 250 Hz tick rate exactly.
+# work. Must divide the tick rate exactly, or the broadcast beats against
+# the once-per-tick snapshot it samples instead of tracking it.
 status_rate_hz = 50
 
 # ============================================================ digital I/O lines
@@ -567,7 +568,7 @@ motor_tc_nm = 0.02
 [stream]
 command_timeout_s = 0.04
 lowpass_cutoff_hz = 0.0
-success_window_s = 0.4      # 100 ticks @ 250 Hz
+success_window_s = 0.4      # round(s/dt) ticks: 100 at the shipped rate
 fault_latch_s = 0.5         # consecutive limiter failures before STREAM_FAULT latches
 servo_grace_s = 0.25        # client silence that ends a servo stream (sim floors command_timeout_s at 2x this)
 

@@ -524,6 +524,68 @@ fn the_activity_logs_record_commands_refusals_and_the_rt_latch() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// A tick rate the CAN bus cannot carry is refused at startup, before
+/// anything touches the interface.
+///
+/// The arm's ceiling is wire time, not compute: 6 joints plus a gripper
+/// is 8 frames out and 8 answers back, ~2.2 ms of a 1 Mbit/s bus, so a
+/// 2 ms tick is over-subscribed before the loop does anything. Nothing
+/// checked it — `tick_dt_s` was validated only as `(0, 1) s` — and the
+/// symptom on a real arm was TX queue drops and freshness latches, which
+/// look like a wiring fault rather than a config one.
+///
+/// Booted in HARDWARE mode against an interface that does not exist: the
+/// budget is what must answer, which is only true if it is checked
+/// before the bus is opened.
+#[test]
+fn a_tick_the_bus_cannot_carry_is_refused_before_the_interface_opens() {
+    let opts = Options {
+        sim: false,
+        config: Some(common::retimed_config_with_interface(
+            "budget",
+            0.002, // 500 Hz: ~108% of the wire
+            "par6-no-such-can-budget",
+        )),
+        assets: Some(common::assets_dir()),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts)
+        .err()
+        .expect("an over-subscribed bus must refuse startup");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("bus budget"),
+        "the refusal is the budget's, not the interface's: {msg}"
+    );
+    assert!(
+        !msg.contains("par6-no-such-can-budget"),
+        "the budget must answer BEFORE the interface is opened: {msg}"
+    );
+    // It names the numbers an operator needs to pick a rate that works.
+    for needle in ["frames", "wire time", "at most"] {
+        assert!(msg.contains(needle), "refusal must name {needle:?}: {msg}");
+    }
+
+    // The shipped tick on the same (absent) interface gets past the
+    // budget and fails on the interface instead — so the gate is the
+    // rate, not hardware mode.
+    let opts = Options {
+        sim: false,
+        config: Some(common::retimed_config_with_interface(
+            "budget-ok",
+            0.004,
+            "par6-no-such-can-budget-ok",
+        )),
+        assets: Some(common::assets_dir()),
+        ..Options::default()
+    };
+    let err = Daemon::start(&opts).err().expect("no such interface");
+    assert!(
+        err.to_string().contains("par6-no-such-can-budget-ok"),
+        "the shipped rate must clear the budget: {err}"
+    );
+}
+
 /// Startup failure paths are clear errors, never panics: hardware mode
 /// whose CAN interface does not exist names the interface and points at
 /// `--sim`; a missing config file names the path it tried.
@@ -1145,7 +1207,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // One move in flight: the ETA is that move's planned duration.
     let index = c.ok_index(&sweep(7411, 20.0, 0.10));
     let started = Instant::now();
-    let fast = queued_duration(&mut c);
+    let fast = priced_duration(&mut c);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move must complete, got {detail:?}");
     let wall = started.elapsed().as_secs_f64();
@@ -1173,7 +1235,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // up to twice as long, less the ramps, which the acceleration limit
     // fixes independently of the speed fraction.
     let index = c.ok_index(&sweep(7412, -20.0, 0.05));
-    let slow = queued_duration(&mut c);
+    let slow = priced_duration(&mut c);
     let ratio = slow / fast;
     assert!(
         (1.4..=2.05).contains(&ratio),
@@ -1186,7 +1248,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // not just the motion in flight.
     let a = c.ok_index(&sweep(7413, 20.0, 0.05));
     let b = c.ok_index(&sweep(7414, -20.0, 0.05));
-    let two = queued_duration(&mut c);
+    let two = priced_duration(&mut c);
     let ratio = two / slow;
     assert!(
         (1.8..2.2).contains(&ratio),
@@ -1198,6 +1260,32 @@ fn queue_eta_counts_speed_parameterised_moves() {
 }
 
 /// The QUEUE query's `queued_duration`.
+/// The queue ETA once the planner has priced everything now queued.
+///
+/// The ack says a command was accepted; the ETA is the planner's answer
+/// about it, and that arrives in a publication a pass later — so a read
+/// straight through the ack sees the queue as it was before. Settled
+/// means non-zero and unchanged across two reads, which is what "the
+/// planner has caught up" looks like from here: the estimate is
+/// recomputed only when the queue changes, so it stops moving once the
+/// change has been priced.
+fn priced_duration(c: &mut Client) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = f64::NAN;
+    loop {
+        let eta = queued_duration(c);
+        if eta > 0.0 && (eta - last).abs() < 1e-9 {
+            return eta;
+        }
+        last = eta;
+        assert!(
+            Instant::now() < deadline,
+            "the planner never settled on a price for the queue"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn queued_duration(c: &mut Client) -> f64 {
     match c.query(&Command::Queue) {
         QueryResult::Queue {

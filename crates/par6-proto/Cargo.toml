@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 # The codec is hand-rolled msgpack: every payload is a positional array with an
 # integer tag in slot 0 and heterogeneous fields after it, which serde's derive

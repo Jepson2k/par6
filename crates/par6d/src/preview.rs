@@ -29,7 +29,7 @@ use par6_server::{
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
-    step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate, HOUSEKEEPING_PERIOD,
+    housekeeping_period, step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate,
     STREAM_LOOKAHEAD_S,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
@@ -1028,7 +1028,7 @@ impl Preview {
         // Housekeeping emits a setpoint every period and the RT tracks it
         // at the tick — so that is what runs here, on the runtime's own
         // executor rather than on the raw setpoints.
-        let period = HOUSEKEEPING_PERIOD.as_secs_f64();
+        let period = housekeeping_period(self.dt).as_secs_f64();
         let steps = ((duration_s / period).round() as usize).max(1);
         let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
         if !self.cart_streaming {

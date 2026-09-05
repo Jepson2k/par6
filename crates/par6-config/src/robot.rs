@@ -332,7 +332,16 @@ pub struct ProtocolConfig {
     /// ladder.
     pub status_multicast_group: String,
     /// Status broadcast rate \[Hz\]. Must divide the tick rate exactly
-    /// (validated) so the broadcaster is a clean tick decimation.
+    /// (validated).
+    ///
+    /// The broadcaster runs on its own wall-clock interval but samples a
+    /// snapshot the RT republishes once per tick, so the constraint is
+    /// about the two cadences, not about counting ticks: a rate that
+    /// does not divide the tick BEATS against the snapshot — consecutive
+    /// frames straddle a varying number of ticks, some repeating a
+    /// snapshot and some skipping one. The frames still arrive on time;
+    /// what they carry stops being a uniform sampling of the arm, which
+    /// is what anything recording STATUS as a time series depends on.
     pub status_rate_hz: u32,
 }
 
@@ -1031,6 +1040,30 @@ impl RobotConfig {
                 "bus.lost_s",
                 "must be greater than bus.stale_warn_s",
             ));
+        }
+        // Both windows convert to ticks by the same `round(s/dt)` the
+        // runtime uses, and the freshness clock tests `age >= threshold`.
+        // A window that rounds to ZERO reads every node stale at age
+        // zero, makes every frame a stale→fresh edge (a stored-config
+        // resend per node per tick), and latches `CAN_LOST` on the tick
+        // after a node's first frame — the arm cannot boot. The clock
+        // floors at one tick so no backend trips on it silently; this is
+        // what tells the operator their window vanished.
+        let dt = self.robot.tick_dt_s;
+        for (v, name) in [
+            (b.stale_warn_s, "bus.stale_warn_s"),
+            (b.lost_s, "bus.lost_s"),
+        ] {
+            if (v / dt).round() < 1.0 {
+                return Err(invalid(
+                    name,
+                    format!(
+                        "rounds to zero ticks at robot.tick_dt_s = {dt} s \
+                         ({v} s is under half a tick); the freshness window \
+                         would vanish"
+                    ),
+                ));
+            }
         }
         if b.rx_frames_per_tick_cap == 0 {
             return Err(invalid("bus.rx_frames_per_tick_cap", "must be >= 1"));

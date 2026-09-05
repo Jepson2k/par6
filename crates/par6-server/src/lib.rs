@@ -35,6 +35,7 @@ pub mod config;
 pub mod faults;
 pub mod gating;
 pub mod link;
+pub mod plane;
 pub mod runtime;
 pub mod server;
 pub mod session;
@@ -42,6 +43,10 @@ pub mod session;
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport, TunableNode};
 pub use faults::{gripper_fault_code, rt_standing_error};
 pub use gating::{check_gate, gate, Gate, GateContext};
+pub use plane::{
+    planner_plane, OwnedPlanContext, OwnedQueued, PlanEvent, PlanReport, PlanRequest,
+    PlannerHandle, ReplyTag,
+};
 pub use runtime::{
     blend_radius_mm, CollisionState, CommandOutcome, Enablement, PayloadSpec, PlanContext, Planner,
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,

@@ -32,6 +32,7 @@
 //!   works for real in CI.
 
 mod backend;
+pub mod budget;
 mod bus;
 pub mod hw;
 mod loopback;

@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+rust-version.workspace = true
 
 # Kinematics is not optional here. Without the Pinocchio C-ABI shim the
 # TCP pose reads NaN, every cartesian command is refused, and the
