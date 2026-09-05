@@ -1096,12 +1096,11 @@ async def test_the_installation_layer_is_one_world_for_runtime_and_preview(tmp_p
 
             runtime_world = await client.shapes()
             assert runtime_world is not None
-            assert runtime_world.installation == (cage,)
+            # The shipped config declares the floor; this one adds the cage.
+            assert [x.name for x in runtime_world.installation] == ["floor", "cage"]
+            assert cage in runtime_world.installation
             assert preview.shapes().installation == runtime_world.installation
             assert preview.shapes().program == runtime_world.program == ()
-            # The floor rides the same readback: config, not a shape, so a
-            # display learns where the ground is from the world it draws.
-            assert runtime_world.floor_z_m == preview.shapes().floor_z_m == 0.0
 
             target = list(SWEEP_START_DEG)
             target[0] += 80.0
@@ -1120,8 +1119,8 @@ async def test_the_installation_layer_is_one_world_for_runtime_and_preview(tmp_p
             assert preview.set_shapes([])
             runtime_world = await client.shapes()
             assert runtime_world is not None
-            assert runtime_world.installation == (cage,)
-            assert preview.shapes().installation == (cage,)
+            assert cage in runtime_world.installation
+            assert preview.shapes().installation == runtime_world.installation
     finally:
         live.stop()
 
@@ -1500,9 +1499,6 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
 
         cfg = tomllib.loads(daemon.config.read_text())
         assert info["tick_dt_s"] == pytest.approx(cfg["robot"]["tick_dt_s"])
-        # The installation floor: config height, published so a client can
-        # draw the floor the collision world enforces.
-        assert info["floor_z_m"] == pytest.approx(cfg["installation"]["floor_z_m"])
         assert info["motion"]["jog_l_linear_max_m_s"] == pytest.approx(
             cfg["motion"]["jog_l_linear_max_m_s"]
         )

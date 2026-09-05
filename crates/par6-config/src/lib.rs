@@ -125,7 +125,8 @@ impl ConfigBundle {
     /// directory, drop the sequence steps the active tool cannot run,
     /// then cross-validate.
     pub fn load(robot_toml: &Path) -> Result<Self, ConfigError> {
-        let (robot, installation_shapes) = load_robot_with_shapes(robot_toml)?;
+        let robot = RobotConfig::load(robot_toml)?;
+        let installation_shapes = robot.installation_shapes.clone();
         let dir = robot_toml
             .parent()
             .map(|p| p.join("grippers"))
@@ -236,54 +237,26 @@ impl ConfigBundle {
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
+        // Every consumer keys a shape by its name — the collision report,
+        // the readback, the simulator's scene — so two shapes cannot
+        // share one.
+        let mut seen: Vec<&str> = Vec::with_capacity(self.installation_shapes.len());
         for (i, s) in self.installation_shapes.iter().enumerate() {
-            if s.pose.len() != 6 {
+            if seen.contains(&s.name.as_str()) {
                 return Err(invalid(
-                    format!("installation_shapes[{i}].pose"),
-                    format!(
-                        "shape `{}`: must be [x, y, z, rx, ry, rz] (length 6), got {}",
-                        s.name,
-                        s.pose.len()
-                    ),
+                    format!("installation_shapes[{i}].name"),
+                    format!("shape `{}`: declared twice", s.name),
                 ));
             }
-            let friction = s.physics.as_ref().map(|p| p.friction.as_slice());
-            for (what, values) in [
-                ("params", Some(s.params.as_slice())),
-                ("pose", Some(s.pose.as_slice())),
-                ("physics.friction", friction),
-            ] {
-                if let Some(v) = values.into_iter().flatten().find(|v| !v.is_finite()) {
-                    return Err(invalid(
-                        format!("installation_shapes[{i}].{what}"),
-                        format!("shape `{}`: {v} is not a finite number", s.name),
-                    ));
-                }
-            }
-            if let Some(physics) = &s.physics {
-                if !s.collision {
-                    return Err(invalid(
-                        format!("installation_shapes[{i}].physics"),
-                        format!(
-                            "shape `{}`: a collision = false marker cannot declare physics",
-                            s.name
-                        ),
-                    ));
-                }
-                if let Some(m) = physics.mass {
-                    if !(m.is_finite() && m > 0.0) {
-                        return Err(invalid(
-                            format!("installation_shapes[{i}].physics.mass"),
-                            format!("shape `{}`: mass must be finite and > 0, got {m}", s.name),
-                        ));
-                    }
-                }
-                if physics.friction.iter().any(|f| *f < 0.0) {
-                    return Err(invalid(
-                        format!("installation_shapes[{i}].physics.friction"),
-                        format!("shape `{}`: friction coefficients must be >= 0", s.name),
-                    ));
-                }
+            seen.push(&s.name);
+            // The rest is the same contract SET_SHAPES enforces on the
+            // wire, reported under this section rather than under `shape.`.
+            if let Err((what, why)) = par6_proto::validate_shape(s) {
+                let leaf = what.strip_prefix("shape.").unwrap_or(what);
+                return Err(invalid(
+                    format!("installation_shapes[{i}].{leaf}"),
+                    format!("shape `{}`: {why}", s.name),
+                ));
             }
         }
         let Some(active) = self.active_gripper() else {
@@ -316,45 +289,6 @@ impl ConfigBundle {
         }
         Ok(())
     }
-}
-
-/// Parse the robot TOML, splitting the `[[installation_shapes]]` array
-/// off before the strict `RobotConfig` schema sees the text.
-///
-/// The shapes ride in the robot file (the parol6 arrangement: keep-outs
-/// are installation config, next to the other installation limits), but
-/// they are a server-layer vocabulary, not a robot parameter — so
-/// `RobotConfig` keeps its own schema and its `deny_unknown_fields` typo
-/// protection, and the split hands it exactly the document minus this one
-/// key. A file without the key takes the plain [`RobotConfig::load`]
-/// path, byte for byte.
-fn load_robot_with_shapes(path: &Path) -> Result<(RobotConfig, Vec<Shape>), ConfigError> {
-    let text = read_to_string(path)?;
-    let parse_err = |source: toml::de::Error| ConfigError::Parse {
-        path: path.display().to_string(),
-        source: Box::new(source),
-    };
-    let mut table: toml::Table = toml::from_str(&text).map_err(parse_err)?;
-    let Some(value) = table.remove("installation_shapes") else {
-        return Ok((RobotConfig::load(path)?, Vec::new()));
-    };
-    let shapes: Vec<Shape> = value.try_into().map_err(parse_err)?;
-    let rest = toml::to_string(&table).map_err(|e| {
-        invalid(
-            "installation_shapes",
-            format!("cannot re-serialize the remaining config: {e}"),
-        )
-    })?;
-    let robot = RobotConfig::from_toml_str(&rest).map_err(|e| match e {
-        // Re-attach the real path: the round-trip through a string names
-        // `<string>` otherwise, which is useless in a startup error.
-        ConfigError::Parse { source, .. } => ConfigError::Parse {
-            path: path.display().to_string(),
-            source,
-        },
-        other => other,
-    })?;
-    Ok((robot, shapes))
 }
 
 #[cfg(test)]
@@ -617,16 +551,30 @@ mod tests {
     }
 
     /// `[[installation_shapes]]` rides in the robot TOML and comes out of
-    /// `ConfigBundle::load` as typed shapes, without costing `RobotConfig`
-    /// its strict schema: the same file's robot half still validates, and
-    /// a file WITHOUT the section still loads to an empty list.
+    /// `ConfigBundle::load` as typed shapes. The shipped config declares
+    /// the floor there — it is a fixture like any other, not a number the
+    /// runtime turns into one — and a config may add to it.
     #[test]
     fn installation_shapes_load_from_the_robot_toml() {
         let stock = ConfigBundle::load(&config_dir().join("PAR6.toml")).expect("stock bundle");
-        assert!(
-            stock.installation_shapes.is_empty(),
-            "the shipped config declares no keep-outs"
-        );
+        let [floor] = &stock.installation_shapes[..] else {
+            panic!(
+                "the shipped config declares the floor and nothing else, got {:?}",
+                stock
+                    .installation_shapes
+                    .iter()
+                    .map(|s| &s.name)
+                    .collect::<Vec<_>>()
+            )
+        };
+        assert_eq!(floor.name, "floor");
+        assert_eq!(floor.kind, "box");
+        // A static fixture: solid, welded where it is declared, and its
+        // top face is the plane the robot stands on.
+        let physics = floor.physics.as_ref().expect("the floor is physical");
+        assert!(physics.mass.is_none(), "the floor does not fall");
+        assert!(floor.collision, "the floor is enforced");
+        assert_eq!(floor.pose[2] + floor.params[2] / 2.0, 0.0);
 
         let with_shapes = TempConfig::new(|file, text| {
             if file == "PAR6.toml" {
@@ -646,8 +594,8 @@ mod tests {
         });
         let bundle = ConfigBundle::load(&with_shapes.robot()).expect("shapes must load");
         assert_eq!(
-            bundle.installation_shapes,
-            vec![
+            bundle.installation_shapes[1..],
+            [
                 Shape {
                     name: "table".into(),
                     kind: "box".into(),
@@ -668,9 +616,13 @@ mod tests {
                 },
             ]
         );
-        // The robot half of the same file went through its normal
-        // parse-and-validate path.
-        assert_eq!(bundle.robot, stock.robot);
+        // The rest of the same file went through its normal
+        // parse-and-validate path; the shapes ride on the robot config now,
+        // so compare what the added keep-outs did not touch.
+        let (mut loaded, mut shipped) = (bundle.robot.clone(), stock.robot.clone());
+        loaded.installation_shapes.clear();
+        shipped.installation_shapes.clear();
+        assert_eq!(loaded, shipped);
     }
 
     /// Malformed `[[installation_shapes]]` entries fail the LOAD with a
@@ -689,6 +641,7 @@ mod tests {
             ConfigBundle::load(&cfg.robot())
         };
 
+        // Indices count from the shipped floor, which every config has.
         // A pose that is not [x, y, z, rx, ry, rz].
         let err = load_with(
             "name = \"wall\"\nkind = \"box\"\nparams = [1.0, 0.02, 1.0]\n\
@@ -714,8 +667,19 @@ mod tests {
         )
         .expect_err("a NaN dimension must be refused")
         .to_string();
-        assert!(err.contains("installation_shapes[0].params"), "{err}");
+        assert!(err.contains("installation_shapes[1].params"), "{err}");
         assert!(err.contains("wall"), "{err}");
+
+        // Two shapes under one name: every consumer keys on it.
+        let err = load_with(
+            "name = \"wall\"\nkind = \"box\"\nparams = [1.0, 0.02, 1.0]\n\
+             pose = [0.4, 0.0, 0.3, 0.0, 0.0, 0.0]\n\
+             \n[[installation_shapes]]\nname = \"wall\"\nkind = \"sphere\"\n\
+             params = [0.1]\npose = [0.0, 0.5, 0.3, 0.0, 0.0, 0.0]",
+        )
+        .expect_err("a duplicate shape name must be refused")
+        .to_string();
+        assert!(err.contains("declared twice"), "{err}");
     }
 
     #[test]

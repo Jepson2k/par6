@@ -1560,6 +1560,8 @@ fn grasp_detected_through_status_bits() {
     let robot = par6();
     let gripper = msg_gripper();
     let mut rig = Rig::boot(&robot, Some(&gripper), Some(&GRASP_POSE));
+    rig.bus
+        .set_world(Layer::Installation, &robot.installation_shapes);
     rig.bus.set_world(Layer::Program, &grasp_world());
     let cmds = hold_commands(&mut rig, &robot);
 
@@ -1729,6 +1731,10 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
         rig.bus.world_object_pose("block").is_none(),
         "no block before it is declared"
     );
+    // The installation layer the shipped config declares — the floor is a
+    // shape like any other, so the scene only has one once it is applied.
+    rig.bus
+        .set_world(Layer::Installation, &robot.installation_shapes);
 
     // A free block in the air over the floor, plus a keep-out and a marker
     // that must not become bodies — all beyond the arm's reach, so nothing

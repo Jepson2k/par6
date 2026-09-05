@@ -47,7 +47,9 @@ pub use chunk::{
     decode_chunk, encode_chunk, split_into_chunks, Assembled, Chunk, ChunkError, Expired,
     Reassembler,
 };
-pub use command::{decode_command, encode_command, Command, Layer, Physical, Shape, ToolParam};
+pub use command::{
+    decode_command, encode_command, validate_shape, Command, Layer, Physical, Shape, ToolParam,
+};
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
     FlashingAssertion, Frame, HomingJointState, HomingPhase, LinkState, MsgType, QueryType,

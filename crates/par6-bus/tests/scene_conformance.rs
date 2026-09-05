@@ -42,13 +42,13 @@ fn scene(tool: Tool) -> Scene {
     }
 }
 
-/// A build with the shipped floor height and no config tool.
+/// A build with no config tool. The installation floor is a world shape
+/// now, so it arrives through `inject_world` like anything else.
 fn build(joints: &[JointTuning]) -> Build<'_> {
     Build {
         timestep: 0.001,
         joints,
         tool: None,
-        floor_z_m: Some(0.0),
     }
 }
 

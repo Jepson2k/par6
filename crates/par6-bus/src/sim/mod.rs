@@ -81,9 +81,13 @@ impl WorldMailbox {
         slot[layer_index(layer)] = Some(shapes);
     }
 
-    fn take(&self) -> Option<[Option<Vec<Shape>>; 2]> {
-        let mut slot = self.0.try_lock().ok()?;
-        (slot.iter().any(Option::is_some)).then(|| std::mem::take(&mut *slot))
+    /// Take whatever is posted, leaving the slots empty. All-`None` when
+    /// nothing was posted or the lock is contended — the next tick retries.
+    fn take(&self) -> [Option<Vec<Shape>>; 2] {
+        match self.0.try_lock() {
+            Ok(mut slot) => std::mem::take(&mut *slot),
+            Err(_) => [None, None],
+        }
     }
 }
 
@@ -145,8 +149,6 @@ pub struct SimBus {
     scene: scene::Scene,
     /// The active tool's config inertials (`None` = the variant URDF's).
     tool: Option<scene::ToolInertial>,
-    /// Installation floor height from the robot config.
-    floor_z_m: Option<f64>,
     /// The compiled-once base spec (arm, tool, floor — no world objects);
     /// every world change injects into a clone of it.
     base_spec: Option<scene::BaseSpec>,
@@ -204,7 +206,6 @@ impl SimBus {
             initial_q: None,
             scene,
             tool: None,
-            floor_z_m: None,
             base_spec: None,
             world: [Vec::new(), Vec::new()],
             world_dirty: false,
@@ -360,6 +361,15 @@ impl SimBus {
         self.plant.as_ref()?.object_pose(name)
     }
 
+    /// The scene's own gravity torque on the arm joints at `q` \[Nm\], at
+    /// rest. The controller derives the same quantity from the URDF through
+    /// Pinocchio, and the two must agree — see par6d's
+    /// `dynamics_conformance` suite. `None` before the bus is configured.
+    /// Leaves the plant at `q`, at rest.
+    pub fn gravity_at(&mut self, q: &[f64]) -> Option<Vec<f64>> {
+        Some(self.plant.as_mut()?.gravity_at(q))
+    }
+
     /// Frames dropped because the RX queue was full.
     pub fn dropped_rx_frames(&self) -> u64 {
         self.dropped_rx
@@ -460,12 +470,10 @@ impl SimBus {
     /// boot wrap offset) — firmware's accumulated encoder count is the
     /// same value it reports, and host position commands echo it back.
     fn step_once(&mut self) {
-        if let Some(posted) = self.mailbox.take() {
-            for (layer, shapes) in self.world.iter_mut().zip(posted) {
-                if let Some(shapes) = shapes {
-                    *layer = shapes;
-                    self.world_dirty = true;
-                }
+        for (layer, posted) in self.world.iter_mut().zip(self.mailbox.take()) {
+            if let Some(shapes) = posted {
+                *layer = shapes;
+                self.world_dirty = true;
             }
         }
         if self.world_dirty {
@@ -1109,7 +1117,6 @@ impl DriverBus for SimBus {
             })
             .collect();
 
-        self.floor_z_m = robot.installation.floor_z_m;
         self.tool = gripper.map(|g| scene::ToolInertial {
             d_m: g.kinematics.d_m,
             a_m: g.kinematics.a_m,
@@ -1266,7 +1273,6 @@ impl SimBus {
             timestep: scene::timestep_for(self.dt),
             joints: &tuning,
             tool: self.tool.as_ref(),
-            floor_z_m: self.floor_z_m,
         };
         let mut spec = self
             .scene

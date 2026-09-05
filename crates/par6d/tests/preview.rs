@@ -330,12 +330,17 @@ fn the_preview_enforces_the_configured_installation_layer() {
 
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let world = preview.world();
+    // The shipped config declares the floor; this one adds the cage.
+    let names: Vec<&str> = world
+        .installation()
+        .iter()
+        .map(|s| s.name.as_str())
+        .collect();
     assert_eq!(
-        world.installation().len(),
-        1,
+        names,
+        ["floor", "cage"],
         "the config's layer is applied at boot"
     );
-    assert_eq!(world.installation()[0].name, "cage");
     assert!(world.program().is_empty());
     assert_eq!(world.epoch(), 1, "one accepted apply");
     preview.teleport_rad(to_rad(&target));

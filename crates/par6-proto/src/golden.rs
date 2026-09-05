@@ -1169,7 +1169,6 @@ pub fn vectors() -> Vec<Vector> {
                     [-2.0, 2.0, 4.0, 16.0],
                     [-6.3, 6.3, 6.0, 20.0],
                 ],
-                floor_z_m: Some(0.0),
                 active_recipe: Some("standard".to_owned()),
                 recipes: vec![
                     "minimal".to_owned(),
@@ -1191,7 +1190,6 @@ pub fn vectors() -> Vec<Vector> {
                 tick_dt_s: 0.004,
                 motion: [0.08, 0.6, 0.005, 0.05, 0.35, 0.05, 0.01, 2.0],
                 joints: vec![[-2.15, 2.15, 3.0, 12.0]],
-                floor_z_m: None,
                 active_recipe: None,
                 recipes: vec!["minimal".to_owned(), "standard".to_owned()],
             },

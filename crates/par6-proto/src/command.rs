@@ -69,6 +69,66 @@ const MAX_VEC_ELEMS: usize = 16;
 /// Wire form: `[kind, params, pose, collision, margin|nil, name, physics|nil]`;
 /// decoders also accept the older 6-element form without `physics`.
 ///
+/// The rules a shape must satisfy wherever it is declared.
+///
+/// `SET_SHAPES` on the wire and a robot config's `[[installation_shapes]]`
+/// are the same contract, so it is written once, here. The field is the
+/// wire's own path; a config reports the leaf under its own section.
+pub fn validate_shape(s: &Shape) -> Result<(), (&'static str, String)> {
+    if s.pose.len() != 6 {
+        return Err((
+            "shape.pose",
+            format!(
+                "must be [x, y, z, rx, ry, rz] (length 6), got {}",
+                s.pose.len()
+            ),
+        ));
+    }
+    for (what, values) in [("shape.params", &s.params), ("shape.pose", &s.pose)] {
+        if let Some(v) = values.iter().find(|v| !v.is_finite()) {
+            return Err((what, format!("{v} is not a finite number")));
+        }
+    }
+    if let Some(m) = s.margin {
+        if !(m.is_finite() && m >= 0.0) {
+            return Err(("shape.margin", format!("must be finite and >= 0, got {m}")));
+        }
+    }
+    let Some(physics) = &s.physics else {
+        return Ok(());
+    };
+    // Refused, not filtered: every other path strips a collision=false
+    // shape, and stripping here would yield a massed body with no contact
+    // — falling through the world forever.
+    if !s.collision {
+        return Err((
+            "shape.physics",
+            "a collision = false marker cannot declare physics".to_owned(),
+        ));
+    }
+    if let Some(m) = physics.mass {
+        if !(m.is_finite() && m > 0.0) {
+            return Err((
+                "shape.physics.mass",
+                format!("mass must be finite and > 0, got {m}"),
+            ));
+        }
+    }
+    if let Some(f) = physics.friction.iter().find(|f| !f.is_finite()) {
+        return Err((
+            "shape.physics.friction",
+            format!("{f} is not a finite number"),
+        ));
+    }
+    if physics.friction.iter().any(|f| *f < 0.0) {
+        return Err((
+            "shape.physics.friction",
+            "friction coefficients must be >= 0".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
 /// **Units are metres and radians** — waldoctl's, put on the wire unconverted.
 #[derive(Debug, Clone, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -770,32 +830,8 @@ impl Command {
                 for s in &p.shapes {
                     str_len("shape.kind", &s.kind, 1, 32)?;
                     str_len("shape.name", &s.name, 0, 128)?;
-                    finite_all("shape.params", &s.params)?;
-                    finite_all("shape.pose", &s.pose)?;
-                    if let Some(m) = s.margin {
-                        finite("shape.margin", m)?;
-                        check(m >= 0.0, "shape.margin", "must be >= 0")?;
-                    }
-                    if let Some(ph) = &s.physics {
-                        // Refused, not filtered: every other path strips a
-                        // collision=false shape, and stripping here would
-                        // yield a massed body with no contact — falling
-                        // through the world forever.
-                        check(
-                            s.collision,
-                            "shape.physics",
-                            "a collision=false marker cannot declare physics",
-                        )?;
-                        if let Some(m) = ph.mass {
-                            finite("shape.physics.mass", m)?;
-                            check(m > 0.0, "shape.physics.mass", "must be > 0")?;
-                        }
-                        finite_all("shape.physics.friction", &ph.friction)?;
-                        check(
-                            ph.friction.iter().all(|f| *f >= 0.0),
-                            "shape.physics.friction",
-                            "must be >= 0",
-                        )?;
+                    if let Err((what, why)) = validate_shape(s) {
+                        return Err(DecodeError::Validation { what, why });
                     }
                 }
                 Ok(())

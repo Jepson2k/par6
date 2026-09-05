@@ -54,6 +54,16 @@ impl GripperVariant {
         }
     }
 
+    /// The config's `urdf_variant` key for this variant — what
+    /// [`Self::from_key`] parses.
+    pub fn key(self) -> &'static str {
+        match self {
+            GripperVariant::Flange => "flange",
+            GripperVariant::Msg => "msg",
+            GripperVariant::Ssg48 => "ssg48",
+        }
+    }
+
     /// URDF path relative to the repo's `assets/par6_description` tree.
     pub fn urdf_relpath(self) -> &'static str {
         match self {

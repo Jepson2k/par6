@@ -295,7 +295,6 @@ impl Preview {
         d.set_item("installation", layer(world.installation())?)?;
         d.set_item("program", layer(world.program())?)?;
         d.set_item("epoch", world.epoch())?;
-        d.set_item("floor_z_m", world.floor_z_m())?;
         Ok(d.into_any().unbind())
     }
 
@@ -337,11 +336,6 @@ impl Preview {
             .map_err(|e| robot_err(&e))
     }
 
-    /// Default standoff \[m\] applied to pairs without a shape override.
-    fn clearance(&self) -> f64 {
-        self.inner.lock().unwrap().clearance()
-    }
-
     /// Preview a velocity jog (signed fractions per joint) held for
     /// `duration` seconds — the runtime's own jog ramp integrated from
     /// the virtual pose. Wire-invalid parameters come back as the
@@ -362,9 +356,6 @@ impl Preview {
         result_dict(py, &r)
     }
 
-    /// Preview a queued program (list of command dicts, see
-    /// `command_from_py`): one result dict per command, blend chains
-    /// folded exactly as the live planner folds them.
     /// Preview a tool action: the jaws to `closed` (0 = open, 1 = closed)
     /// while the arm holds, stepped in the simulator scene; the free world
     /// objects' tracks come back with the result.
@@ -373,6 +364,9 @@ impl Preview {
         result_dict(py, &r)
     }
 
+    /// Preview a queued program (list of command dicts, see
+    /// `command_from_py`): one result dict per command, blend chains
+    /// folded exactly as the live planner folds them.
     fn preview_program(
         &self,
         py: Python<'_>,

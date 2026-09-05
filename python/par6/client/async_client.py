@@ -45,6 +45,7 @@ from waldoctl.types import Axis
 from waldoctl.types import Frame as WFrame
 
 from par6._par6 import CoreClient, RobotWireError
+from par6.client._shapes import shapes_to_wire
 
 from ..config import canonical_tool_key, io_line_names
 from ..protocol.constants import (
@@ -1350,22 +1351,8 @@ class AsyncRobotClient(_RobotClientABC):
             rbt.set_shapes([Box(name="table", x=0.6, y=0.4, z=0.02,
                                 pose=(0.3, 0, -0.01, 0, 0, 0))])
         """
-        wire_shapes = []
-        for shape in shapes:
-            kind, params, pose, collision, margin, name, physics = shape.to_wire()
-            wire_shapes.append(
-                {
-                    "kind": kind,
-                    "params": [float(p) for p in params],
-                    "pose": [float(p) for p in pose],
-                    "collision": bool(collision),
-                    "margin": float(margin) if margin is not None else None,
-                    "name": name,
-                    "physics": physics,
-                }
-            )
         core = await self._ensure_core()
-        return await self._call(core.set_shapes(wire_shapes))
+        return await self._call(core.set_shapes(shapes_to_wire(shapes)))
 
     async def set_completion_policy(self, policy: CompletionPolicy | int) -> int:
         """Set the controller-side completion policy for queued motion
@@ -1778,9 +1765,6 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._call(core.shapes())
         if result is None:
             return None
-        # The floor is config, not a layer: SHAPES carries the layers and
-        # CONFIG_INFO the height, and the world a display draws needs both.
-        info = await self._call(core.config_info())
 
         def _shape(w: dict) -> Shape:
             return shape_from_wire(**w)
@@ -1788,7 +1772,6 @@ class AsyncRobotClient(_RobotClientABC):
         return ShapeWorld(
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
-            floor_z_m=None if info is None else info.get("floor_z_m"),
         )
 
     async def config_info(self) -> dict | None:
@@ -1796,8 +1779,7 @@ class AsyncRobotClient(_RobotClientABC):
 
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
-        ``tick_dt_s``, ``floor_z_m`` (the installation floor height in
-        metres, None when none is modelled), ``motion`` (the ``[motion]`` feel constants by
+        ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
         name), ``joints`` (per-joint soft limits + EXEC
         velocity/acceleration), ``active_recipe`` (the running telemetry
         recipe, or None when telemetry is off) and ``recipes`` (the names

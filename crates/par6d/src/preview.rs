@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
 use par6_bus::sim::rollout::Rollout;
-use par6_bus::sim::scene::Scene;
+use par6_bus::sim::scene::{quat_from_matrix, quat_from_rpy, Scene};
 use par6_config::{GripperConfig, RobotConfig};
 use par6_motion::JogEngine;
 use par6_proto::Layer;
@@ -244,34 +244,28 @@ impl Preview {
         const GRASP_REACH_M: f64 = 0.15;
         let closed = closed.clamp(0.0, 1.0);
         let q = self.snap.q;
-        let still = |this: &mut Self, tracks: Vec<ObjectTrack>| PreviewResult {
-            joint_trajectory_rad: Vec::new(),
-            tcp_poses: Vec::new(),
-            end_joints_rad: this.snap.q,
-            duration_s: 0.0,
-            error: None,
-            object_tracks: tracks,
-        };
+        // Which way the jaws are travelling, read before the new target
+        // replaces the old — then every path below leaves them where they
+        // were asked to go.
+        let closing = closed > self.jaw_closed;
+        self.jaw_closed = closed;
         let names = Rollout::free_object_names(&self.world_refs());
         if names.is_empty() {
-            self.jaw_closed = closed;
-            return still(self, Vec::new());
+            return still(q, Vec::new());
         }
         let Ok(tcp) = self.planner.current_pose(&q) else {
-            self.jaw_closed = closed;
-            return still(self, self.standing_tracks(&names));
+            return still(q, self.standing_tracks(&names));
         };
         let n = self.robot.joints.len();
         let target = closed * 255.0;
-        let closing = closed > self.jaw_closed;
         if !closing {
             // Opening releases whatever the jaws held.
             self.carried.clear();
         }
-        let Some(roll) = self.ensure_rollout() else {
-            self.jaw_closed = closed;
-            return still(self, self.standing_tracks(&names));
-        };
+        if self.ensure_rollout().is_none() {
+            return still(q, self.standing_tracks(&names));
+        }
+        let roll = self.rollout.as_mut().expect("just ensured");
         roll.place_arm(&q[..n]);
         let dt = roll.dt();
         let budget = (BUDGET_S / dt).round() as usize;
@@ -318,7 +312,7 @@ impl Preview {
                 .filter(|(_, _, d)| *d < GRASP_REACH_M)
                 .min_by(|a, b| a.2.total_cmp(&b.2));
             if let Some((name, p, _)) = nearest {
-                let grasp = mat_mul(&mat_inv_rigid(&tcp), &pose7_to_mat(&p));
+                let grasp = crate::kin::mat_mul(&mat_inv_rigid(&tcp), &pose7_to_mat(&p));
                 self.carried.retain(|c| c.name != *name);
                 self.carried.push(Carried {
                     name: name.clone(),
@@ -346,11 +340,6 @@ impl Preview {
             error: None,
             object_tracks,
         }
-    }
-
-    /// The previewed jaw position (0 = open, 1 = closed).
-    pub fn jaw_closed(&self) -> f64 {
-        self.jaw_closed
     }
 
     fn world_refs(&self) -> [&[Shape]; 2] {
@@ -390,12 +379,9 @@ impl Preview {
     fn sync_rollout_world(&mut self) {
         let names = Rollout::free_object_names(&self.world_refs());
         self.carried.retain(|c| names.contains(&c.name));
-        let world = [
-            self.world.installation().to_vec(),
-            self.world.program().to_vec(),
-        ];
-        if let Some(roll) = self.rollout.as_mut() {
-            if let Err(e) = roll.set_world(&[&world[0], &world[1]]) {
+        let (world, rollout) = (&self.world, &mut self.rollout);
+        if let Some(roll) = rollout.as_mut() {
+            if let Err(e) = roll.set_world(&[world.installation(), world.program()]) {
                 log::warn!("preview scene rebuild refused, rebuilding from scratch: {e}");
                 self.rollout = None;
             }
@@ -448,7 +434,7 @@ impl Preview {
                     name: name.clone(),
                     poses: tcp_poses
                         .iter()
-                        .map(|tcp| mat_to_pose7(&mat_mul(tcp, &c.grasp)))
+                        .map(|tcp| mat_to_pose7(&crate::kin::mat_mul(tcp, &c.grasp)))
                         .collect(),
                     carried: true,
                     physics: true,
@@ -585,11 +571,6 @@ impl Preview {
         path: &[[f64; MAX_JOINTS]],
     ) -> Result<Option<usize>, WireError> {
         self.planner.first_collision(path)
-    }
-
-    /// Default standoff \[m\] applied to pairs without a shape override.
-    pub fn clearance(&self) -> f64 {
-        self.planner.clearance()
     }
 
     /// Preview one command: plan it with the runtime's planner from the
@@ -809,17 +790,6 @@ impl Preview {
     }
 }
 
-/// Row-major 4×4 product `a · b`.
-fn mat_mul(a: &[f64; 16], b: &[f64; 16]) -> [f64; 16] {
-    let mut out = [0.0; 16];
-    for r in 0..4 {
-        for c in 0..4 {
-            out[4 * r + c] = (0..4).map(|k| a[4 * r + k] * b[4 * k + c]).sum();
-        }
-    }
-    out
-}
-
 /// Inverse of a rigid transform: `Rᵀ`, `−Rᵀ·t`.
 fn mat_inv_rigid(m: &[f64; 16]) -> [f64; 16] {
     let mut out = [0.0; 16];
@@ -833,25 +803,22 @@ fn mat_inv_rigid(m: &[f64; 16]) -> [f64; 16] {
     out
 }
 
-/// `[x, y, z, qw, qx, qy, qz]` of a rigid transform (Shepperd's method).
+/// The result of a tool action that moved nothing: the arm holds, and the
+/// objects are wherever `tracks` says they stand.
+fn still(q: [f64; MAX_JOINTS], tracks: Vec<ObjectTrack>) -> PreviewResult {
+    PreviewResult {
+        joint_trajectory_rad: Vec::new(),
+        tcp_poses: Vec::new(),
+        end_joints_rad: q,
+        duration_s: 0.0,
+        error: None,
+        object_tracks: tracks,
+    }
+}
+
+/// `[x, y, z, qw, qx, qy, qz]` of a rigid transform.
 fn mat_to_pose7(m: &[f64; 16]) -> [f64; 7] {
-    let (r00, r01, r02) = (m[0], m[1], m[2]);
-    let (r10, r11, r12) = (m[4], m[5], m[6]);
-    let (r20, r21, r22) = (m[8], m[9], m[10]);
-    let trace = r00 + r11 + r22;
-    let q = if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        [s / 4.0, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s]
-    } else if r00 > r11 && r00 > r22 {
-        let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
-        [(r21 - r12) / s, s / 4.0, (r01 + r10) / s, (r02 + r20) / s]
-    } else if r11 > r22 {
-        let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
-        [(r02 - r20) / s, (r01 + r10) / s, s / 4.0, (r12 + r21) / s]
-    } else {
-        let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
-        [(r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, s / 4.0]
-    };
+    let q = quat_from_matrix([[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]]);
     [m[3], m[7], m[11], q[0], q[1], q[2], q[3]]
 }
 
@@ -878,23 +845,10 @@ fn pose7_to_mat(p: &[f64; 7]) -> [f64; 16] {
     ]
 }
 
-/// `[x, y, z, qw, qx, qy, qz]` of a wire pose `[x, y, z, rx, ry, rz]`
-/// (`R = Rz·Ry·Rx`).
+/// `[x, y, z, qw, qx, qy, qz]` of a wire pose `[x, y, z, rx, ry, rz]`.
+/// The rotation is the scene builder's, so the grasp transform is taken
+/// against the orientation MuJoCo actually gave the geom.
 fn pose6_to_pose7(pose: &[f64]) -> [f64; 7] {
-    let (sx, cx) = (pose[3] / 2.0).sin_cos();
-    let (sy, cy) = (pose[4] / 2.0).sin_cos();
-    let (sz, cz) = (pose[5] / 2.0).sin_cos();
-    let mul = |a: [f64; 4], b: [f64; 4]| {
-        [
-            a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
-            a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
-            a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
-            a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
-        ]
-    };
-    let q = mul(
-        mul([cz, 0.0, 0.0, sz], [cy, 0.0, sy, 0.0]),
-        [cx, sx, 0.0, 0.0],
-    );
+    let q = quat_from_rpy(pose[3], pose[4], pose[5]);
     [pose[0], pose[1], pose[2], q[0], q[1], q[2], q[3]]
 }

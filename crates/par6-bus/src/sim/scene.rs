@@ -66,6 +66,18 @@ impl Tool {
         })
     }
 
+    /// URDF path relative to the assets tree. Must equal
+    /// `par6_kin::GripperVariant::urdf_relpath` for the same variant — the
+    /// kinematics and the scene have to be built from one file; pinned by
+    /// `par6d/tests/scene_variants.rs`, the one crate that sees both.
+    pub fn urdf_relpath(self) -> &'static str {
+        match self {
+            Tool::Flange => "URDF/par6_flange/urdf/par6_flange.urdf",
+            Tool::Msg => "URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf",
+            Tool::Ssg48 => "URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf",
+        }
+    }
+
     fn has_jaws(self) -> bool {
         !matches!(self, Tool::Flange)
     }
@@ -153,8 +165,6 @@ pub struct Build<'a> {
     pub joints: &'a [JointTuning],
     /// The active tool's config inertials (`None` = the variant URDF's).
     pub tool: Option<&'a ToolInertial>,
-    /// Installation floor height \[m\] (`None` = no floor).
-    pub floor_z_m: Option<f64>,
 }
 
 /// The world objects, installation layer then program layer.
@@ -190,7 +200,7 @@ impl BaseSpec {
 /// Compile `spec` under the load lock (MuJoCo's compiler is not
 /// re-entrant across threads).
 pub(crate) fn compile(spec: &mut MjSpec) -> Result<MjModel, String> {
-    let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _guard = load_lock();
     spec.compile().map_err(|e| e.to_string())
 }
 
@@ -352,7 +362,7 @@ fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
 }
 
 /// Hamilton product `a ⊗ b` of `[w, x, y, z]` quaternions.
-fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+pub fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
     [
         a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
         a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
@@ -362,8 +372,9 @@ fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
 }
 
 /// `[w, x, y, z]` of `R = Rz(rz)·Ry(ry)·Rx(rx)` — waldoctl's extrinsic
-/// XYZ pose rotation.
-fn quat_from_rpy(rx: f64, ry: f64, rz: f64) -> [f64; 4] {
+/// XYZ pose rotation. The one place this convention is written down: a
+/// consumer that re-derives it can disagree with the geom MuJoCo was given.
+pub fn quat_from_rpy(rx: f64, ry: f64, rz: f64) -> [f64; 4] {
     let (sx, cx) = (rx / 2.0).sin_cos();
     let (sy, cy) = (ry / 2.0).sin_cos();
     let (sz, cz) = (rz / 2.0).sin_cos();
@@ -371,6 +382,52 @@ fn quat_from_rpy(rx: f64, ry: f64, rz: f64) -> [f64; 4] {
         quat_mul([cz, 0.0, 0.0, sz], [cy, 0.0, sy, 0.0]),
         [cx, sx, 0.0, 0.0],
     )
+}
+
+/// Whether a shape is a free body in the contact world — the arm can push
+/// it and it can fall. The classification [`WorldGeom::from_shape`] makes,
+/// as a predicate for callers that only need this one arm of it.
+pub fn is_free_body(shape: &Shape) -> bool {
+    shape.collision && shape.physics.as_ref().is_some_and(|p| p.mass.is_some())
+}
+
+/// `[w, x, y, z]` of a rotation matrix (rows), Shepperd's method.
+pub fn quat_from_matrix(m: [[f64; 3]; 3]) -> [f64; 4] {
+    let (r00, r11, r22) = (m[0][0], m[1][1], m[2][2]);
+    let trace = r00 + r11 + r22;
+    if trace > 0.0 {
+        let s = (trace + 1.0).sqrt() * 2.0;
+        [
+            0.25 * s,
+            (m[2][1] - m[1][2]) / s,
+            (m[0][2] - m[2][0]) / s,
+            (m[1][0] - m[0][1]) / s,
+        ]
+    } else if r00 > r11 && r00 > r22 {
+        let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
+        [
+            (m[2][1] - m[1][2]) / s,
+            0.25 * s,
+            (m[0][1] + m[1][0]) / s,
+            (m[0][2] + m[2][0]) / s,
+        ]
+    } else if r11 > r22 {
+        let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
+        [
+            (m[0][2] - m[2][0]) / s,
+            (m[0][1] + m[1][0]) / s,
+            0.25 * s,
+            (m[1][2] + m[2][1]) / s,
+        ]
+    } else {
+        let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
+        [
+            (m[1][0] - m[0][1]) / s,
+            (m[0][2] + m[2][0]) / s,
+            (m[1][2] + m[2][1]) / s,
+            0.25 * s,
+        ]
+    }
 }
 
 /// The rotation taking local +z onto the unit vector `n`.
@@ -447,12 +504,7 @@ impl Scene {
 
     /// The URDF whose inertials the bodies take.
     pub fn urdf(&self) -> PathBuf {
-        let rel = match self.tool {
-            Tool::Flange => "URDF/par6_flange/urdf/par6_flange.urdf",
-            Tool::Msg => "URDF/par6_msg_gripper/urdf/PAR6_MSG.urdf",
-            Tool::Ssg48 => "URDF/par6_ssg48_gripper/urdf/par6_ssg48_urdf.urdf",
-        };
-        self.assets.join(rel)
+        self.assets.join(self.tool.urdf_relpath())
     }
 
     /// The mesh directory (vendor STLs and their `_simplified` variants).
@@ -463,7 +515,7 @@ impl Scene {
     /// The base spec: vendor scene plus every par6 delta, without world
     /// objects — what [`inject_world`] adds to a clone of it on every
     /// world change. With `build.tool` the tool bodies carry the config
-    /// inertials instead of the variant URDF's; with `build.floor_z_m` the
+    /// inertials instead of the variant URDF's; the installation floor and
     /// installation floor is a contact plane.
     pub fn spec(&self, build: &Build) -> Result<MjSpec, SceneError> {
         let timestep = build.timestep;
@@ -475,7 +527,7 @@ impl Scene {
             detail,
         };
         let mut spec = {
-            let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let _guard = load_lock();
             MjSpec::from_xml(&path).map_err(|e| mjcf(e.to_string()))?
         };
         let meshdir = self.meshes();
@@ -555,21 +607,6 @@ impl Scene {
             exclude.with_name("jaw1_jaw2");
             exclude.set_bodyname1("jaw1");
             exclude.set_bodyname2("jaw2");
-        }
-
-        // The installation floor: the plane objects rest on (contacts on),
-        // an unbounded half-space below `floor_z_m`. Everything else in the
-        // world arrives through `inject_world`.
-        if let Some(z) = build.floor_z_m {
-            spec.world_body_mut()
-                .add_geom()
-                .with_name("floor")
-                .with_type(MjtGeom::mjGEOM_PLANE)
-                .with_pos([0.0, 0.0, z])
-                .with_size([0.0, 0.0, 0.05])
-                .with_rgba([0.3, 0.35, 0.4, 1.0])
-                .with_contype(1)
-                .with_conaffinity(1);
         }
 
         apply_urdf_inertials(&mut spec, &self.urdf())?;
@@ -891,42 +928,7 @@ fn principal_axes(i: [f64; 6]) -> ([f64; 3], [f64; 4]) {
         }
     }
     let moments = [a[0][0], a[1][1], a[2][2]];
-    // Rotation matrix (columns = axes) → quaternion, Shepperd's method.
-    let (r00, r11, r22) = (v[0][0], v[1][1], v[2][2]);
-    let trace = r00 + r11 + r22;
-    let q = if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        [
-            0.25 * s,
-            (v[2][1] - v[1][2]) / s,
-            (v[0][2] - v[2][0]) / s,
-            (v[1][0] - v[0][1]) / s,
-        ]
-    } else if r00 > r11 && r00 > r22 {
-        let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
-        [
-            (v[2][1] - v[1][2]) / s,
-            0.25 * s,
-            (v[0][1] + v[1][0]) / s,
-            (v[0][2] + v[2][0]) / s,
-        ]
-    } else if r11 > r22 {
-        let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
-        [
-            (v[0][2] - v[2][0]) / s,
-            (v[0][1] + v[1][0]) / s,
-            0.25 * s,
-            (v[1][2] + v[2][1]) / s,
-        ]
-    } else {
-        let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
-        [
-            (v[1][0] - v[0][1]) / s,
-            (v[0][2] + v[2][0]) / s,
-            (v[1][2] + v[2][1]) / s,
-            0.25 * s,
-        ]
-    };
+    let q = quat_from_matrix(v);
     let norm = q.iter().map(|x| x * x).sum::<f64>().sqrt();
     (moments, q.map(|x| x / norm))
 }

@@ -699,6 +699,88 @@ fn solve6(a: &mut [[f64; 6]; 6], b: &[f64; 6]) -> Option<[f64; 6]> {
 mod tests {
     use super::*;
 
+    /// The controller's model and the simulator's model must be the same
+    /// robot.
+    ///
+    /// Gravity compensation is trimmed from [`load_gravity_kin`] — the
+    /// arm URDF plus the gripper config's inertials — while the arm it
+    /// holds up is a MuJoCo scene built from the same URDF and the same
+    /// config block. Nothing else checks that those two agree, and the
+    /// failure is quiet: the arm sags or lifts and every torque-derived
+    /// quantity is off by an amount nobody can see.
+    ///
+    /// With every velocity zero MuJoCo's `qfrc_bias` is gravity alone,
+    /// which is what Pinocchio's RNEA at zero velocity and acceleration
+    /// returns, so the two are directly comparable.
+    #[test]
+    fn the_gravity_model_and_the_simulator_scene_are_the_same_robot() {
+        use par6_bus::sim::scene::{Scene, Tool};
+        use par6_bus::sim::SimBus;
+        use par6_bus::DriverBus;
+
+        // The park pose, a grasp pose, and three extended poses where the
+        // gravity torques are largest.
+        use std::f64::consts::{FRAC_PI_2, PI};
+        let poses: [[f64; par6_kin::NQ]; 5] = [
+            [0.0, -FRAC_PI_2, PI, 0.0, 0.0, PI],
+            [0.0, -0.25, 4.35, 0.0, -1.28, 0.0],
+            [1.2, -0.6, 2.6, 0.5, -0.9, 1.9],
+            [-0.9, -2.2, 2.1, -1.1, 0.7, 0.4],
+            [0.3, -1.2, 5.0, 1.4, 1.2, -0.5],
+        ];
+
+        let config =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let assets = resolve_assets_dir(None, &config).expect("assets tree");
+        let bundle = par6_config::ConfigBundle::load(&config).expect("bundle");
+        let gripper = bundle.active_gripper().expect("shipped active gripper");
+        let variant = gripper
+            .urdf_variant
+            .as_deref()
+            .and_then(GripperVariant::from_key)
+            .expect("the shipped gripper names a known URDF variant");
+
+        let mut kin = load_gravity_kin(&assets, Some(gripper)).expect("gravity model");
+        let mut bus = SimBus::new(Scene {
+            tool: Tool::from_urdf_variant(variant.key()).expect("the scene has this tool"),
+            assets: assets.clone(),
+        });
+        bus.boot_configure(
+            &bundle.robot,
+            Some(gripper),
+            bundle.robot.bus.boot_config_repeats,
+        )
+        .expect("the simulator scene boots");
+
+        for q in poses {
+            let mut pinocchio = [0.0; par6_kin::NQ];
+            kin.gravity(&q, &mut pinocchio).expect("pinocchio gravity");
+            let mujoco = bus.gravity_at(&q).expect("the plant is configured");
+            // Agreeing on zeros everywhere would pass the comparison below
+            // while proving nothing.
+            let worst = pinocchio.iter().fold(0.0_f64, |a, t| a.max(t.abs()));
+            assert!(worst > 0.5, "no gravity to compare at {q:?}: {pinocchio:?}");
+            // Scaled by the largest torque at this pose, not each joint's
+            // own: the round-trip error originates in the heavy links and
+            // propagates down the chain, so a wrist joint carrying
+            // milli-newton-metres inherits the shoulder's absolute error.
+            let tol = 1e-6 + 1e-5 * worst;
+
+            for (j, (p, m)) in pinocchio.iter().zip(&mujoco).enumerate() {
+                // Tolerant of parts per million because MJCF stores inertia
+                // as principal moments plus an orientation quaternion, so the
+                // URDF tensor round-trips through an eigendecomposition on the
+                // way in. A real disagreement about which robot is being
+                // simulated is percent-level: swapping this gravity model for
+                // the variant URDF's own tool links moves J1 by 17%.
+                assert!(
+                    (p - m).abs() <= tol,
+                    "joint {j} at {q:?}: gravity model {p:.9} Nm, scene {m:.9} Nm",
+                );
+            }
+        }
+    }
+
     /// The jacobian singularity metrics on the REAL arm model: the
     /// straight-wrist configuration (q5 = 0 aligns the J4/J6 axes) must
     /// cross the vendor's warning thresholds, and a healthy working

@@ -284,7 +284,6 @@ class DryRunRobotClient:
         return ShapeWorld(
             installation=tuple(shape_from_wire(**w) for w in world["installation"]),
             program=tuple(shape_from_wire(**w) for w in world["program"]),
-            floor_z_m=world["floor_z_m"],
         )
 
     def profile(self) -> str:

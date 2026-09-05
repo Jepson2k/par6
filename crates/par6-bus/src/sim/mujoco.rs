@@ -45,6 +45,7 @@
 //! copies through `mj_getState`/`mj_setState`, and no allocation once the
 //! model is loaded.
 
+use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr;
 
@@ -123,6 +124,9 @@ pub(crate) struct MujocoPlant {
     cmds: Vec<PlantCmd>,
     /// Last substep's bias torques (gravity + velocity terms), all DOFs.
     bias: Vec<f64>,
+    /// Free world objects by shape name: `(joint id, qpos address, dof
+    /// address)`, re-indexed whenever the model is compiled.
+    objects: BTreeMap<String, (usize, usize, usize)>,
     /// The servo's commanded jaw byte (the front end's kinematic jaw).
     jaw_cmd_byte: f64,
     close_at: Option<u8>,
@@ -218,7 +222,7 @@ impl MujocoPlant {
 
         data.reset();
         data.qpos_mut().copy_from_slice(&qpos);
-        Self {
+        let mut plant = Self {
             data,
             n,
             jaw,
@@ -240,10 +244,13 @@ impl MujocoPlant {
                 n
             ],
             bias: vec![0.0; nv],
+            objects: BTreeMap::new(),
             jaw_cmd_byte: JAW_INIT_BYTE,
             close_at: None,
             open_at: None,
-        }
+        };
+        plant.index_objects();
+        plant
     }
 
     /// Place the arm at `q0` \[rad\] at rest (teleport): only the arm's
@@ -323,6 +330,7 @@ impl MujocoPlant {
         self.qvel.copy_from_slice(self.data.qvel());
         self.qfrc.fill(0.0);
         self.bias.copy_from_slice(self.data.qfrc_bias());
+        self.index_objects();
         Ok(())
     }
 
@@ -358,17 +366,25 @@ impl MujocoPlant {
 
     /// The free joint of the world object `name` (its shape name):
     /// `(joint id, qpos address, dof address)`.
+    ///
+    /// Read from the map built when the model was compiled: a rollout asks
+    /// per object per tick, and re-deriving it there would be a `format!`
+    /// and a name-hash lookup a few hundred times a grasp for an answer
+    /// that only changes when the model does.
     fn object_joint(&self, name: &str) -> Option<(usize, usize, usize)> {
-        let model = self.data.model();
-        let joint = model.name_to_id(MjtObj::mjOBJ_JOINT, &format!("{WORLD_PREFIX}{name}"))?;
-        if model.jnt_type()[joint] != MjtJoint::mjJNT_FREE {
-            return None;
-        }
-        Some((
-            joint,
-            model.jnt_qposadr()[joint] as usize,
-            model.jnt_dofadr()[joint] as usize,
-        ))
+        self.objects.get(name).copied()
+    }
+
+    /// Index the free world objects of the current model by shape name.
+    fn index_objects(&mut self) {
+        self.objects = self
+            .joints()
+            .enumerate()
+            .filter(|(_, (name, _, nq, _, _))| *nq == 7 && name.starts_with(WORLD_PREFIX))
+            .map(|(joint, (name, qadr, _, dadr, _))| {
+                (name[WORLD_PREFIX.len()..].to_owned(), (joint, qadr, dadr))
+            })
+            .collect();
     }
 
     /// Pose `[x, y, z, qw, qx, qy, qz]` of the free world object `name`
@@ -407,10 +423,19 @@ impl MujocoPlant {
 
     /// Names of the free world objects in the scene.
     pub fn object_names(&self) -> Vec<String> {
-        self.joints()
-            .filter(|(name, _, nq, _, _)| *nq == 7 && name.starts_with(WORLD_PREFIX))
-            .map(|(name, ..)| name[WORLD_PREFIX.len()..].to_owned())
-            .collect()
+        self.objects.keys().cloned().collect()
+    }
+
+    /// The scene's own gravity torque on the arm joints at `q` \[Nm\],
+    /// at rest: `qfrc_bias` with every velocity zero, which leaves only
+    /// gravity. The controller computes the same quantity from the URDF
+    /// through Pinocchio, and the two models must agree — see par6d's
+    /// `dynamics_conformance` suite. Leaves the plant at `q`, at rest.
+    pub fn gravity_at(&mut self, q: &[f64]) -> Vec<f64> {
+        self.reseed(q);
+        self.data.qvel_mut().fill(0.0);
+        self.data.forward();
+        self.data.qfrc_bias()[..self.n].to_vec()
     }
 
     /// The jaws' measured position byte (0 = open, 255 = closed), `None`

@@ -594,7 +594,6 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
                 ]
             })
             .collect(),
-        floor_z_m: robot.installation.floor_z_m,
         robot_filename: files.robot_filename,
         robot_toml: files.robot_toml,
         grippers: files.grippers,
@@ -637,7 +636,6 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     // dimension, duplicate name) is a startup failure that names the
     // shape — never a keep-out that silently isn't there.
     cfg.installation_shapes = bundle.installation_shapes.clone();
-    cfg.floor_z_m = bundle.robot.installation.floor_z_m;
     if let Some(ip) = opts.bind {
         cfg.bind.set_ip(ip);
     }

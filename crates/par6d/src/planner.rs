@@ -1674,11 +1674,6 @@ impl Par6Planner {
         Ok(None)
     }
 
-    /// Default standoff \[m\] applied to pairs without a shape override.
-    pub(crate) fn clearance(&self) -> f64 {
-        self.collision.clearance()
-    }
-
     /// The colliding pairs the arm is ALREADY in — the ones a probed
     /// direction may keep without being blocked for them. Same escape rule
     /// as the planner's collision gate: a direction may not CREATE a

@@ -68,7 +68,6 @@ impl Rollout {
             timestep: scene::timestep_for(dt),
             joints: &tuning,
             tool: tool.as_ref(),
-            floor_z_m: robot.installation.floor_z_m,
         };
         let mut spec = scene.spec(&build)?;
         let base = scene::BaseSpec::new(&spec)?;
@@ -184,7 +183,7 @@ impl Rollout {
         world
             .iter()
             .flat_map(|layer| layer.iter())
-            .filter(|s| s.collision && s.physics.as_ref().is_some_and(|p| p.mass.is_some()))
+            .filter(|s| scene::is_free_body(s))
             .map(|s: &Shape| s.name.clone())
             .collect()
     }

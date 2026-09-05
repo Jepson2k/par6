@@ -1957,7 +1957,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
-                    floor_z_m: ci.floor_z_m,
                     active_recipe: self.recipe.clone(),
                     recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }

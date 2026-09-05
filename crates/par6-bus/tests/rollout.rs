@@ -46,6 +46,22 @@ fn shape(name: &str, params: &[f64], pose: [f64; 6], mass: Option<f64>) -> Shape
 /// the vendor scene used to hard-code.
 const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
+/// The installation layer the shipped config declares: the floor, a wide
+/// static box whose top face is z = 0.
+fn installation() -> Vec<Shape> {
+    let mut floor = shape(
+        "floor",
+        &[6.0, 6.0, 0.2],
+        [0.0, 0.0, -0.1, 0.0, 0.0, 0.0],
+        None,
+    );
+    floor.physics = Some(Physical {
+        mass: None,
+        friction: [1.0, 0.005, 0.0001],
+    });
+    vec![floor]
+}
+
 fn grasp_world() -> Vec<Shape> {
     vec![
         shape(
@@ -68,17 +84,18 @@ fn a_rollout_grasps_releases_and_drops_what_the_simulator_would() {
     let robot = par6();
     let gripper = msg_gripper();
     let world = grasp_world();
+    let install = installation();
     let mut roll = Rollout::new(
         &scene(),
         &robot,
         Some(&gripper),
-        &[&[], &world],
+        &[&install, &world],
         &GRASP_POSE,
     )
     .expect("rollout scene");
     assert_eq!(roll.object_names(), vec!["block".to_owned()]);
     assert_eq!(
-        Rollout::free_object_names(&[&[], &world]),
+        Rollout::free_object_names(&[&install, &world]),
         vec!["block".to_owned()]
     );
     let dt = roll.dt();

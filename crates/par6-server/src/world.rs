@@ -5,11 +5,6 @@ use par6_proto::{Layer, Shape, WireError};
 use crate::config::ServerConfig;
 use crate::runtime::{Planner, RtCommands};
 
-/// Side of the installation floor's keep-out box \[m\].
-const FLOOR_SPAN_M: f64 = 6.0;
-/// Thickness of the installation floor's keep-out box \[m\].
-const FLOOR_THICKNESS_M: f64 = 0.2;
-
 /// Where an accepted layer goes besides the planner: the runtime's
 /// streaming gate (which answers with its epoch) and the simulator's
 /// scene (which has no epoch to answer with). `()` enforces nothing —
@@ -39,22 +34,6 @@ impl WorldMirror for () {
     fn sim(&mut self, _layer: Layer, _shapes: &[Shape]) {}
 }
 
-/// The installation floor as the collision world enforces it: a wide box
-/// whose top face is the floor. A coal half-space would be exact but costs
-/// a full mesh scan per check; the simulator gets the true plane from the
-/// same height.
-fn floor_box(floor_z_m: f64) -> Shape {
-    Shape {
-        kind: "box".into(),
-        params: vec![FLOOR_SPAN_M, FLOOR_SPAN_M, FLOOR_THICKNESS_M],
-        pose: vec![0.0, 0.0, floor_z_m - FLOOR_THICKNESS_M / 2.0, 0.0, 0.0, 0.0],
-        collision: true,
-        margin: None,
-        name: "floor".into(),
-        physics: None,
-    }
-}
-
 /// Both layers of the applied world and the one epoch that names it.
 ///
 /// Every planner host — the runtime server, the offline preview — applies
@@ -72,18 +51,12 @@ pub struct WorldState {
     installation: Vec<Shape>,
     program: Vec<Shape>,
     epoch: u64,
-    floor_z_m: Option<f64>,
 }
 
 impl WorldState {
     /// Epoch of the applied world; 0 until the first accepted apply.
     pub fn epoch(&self) -> u64 {
         self.epoch
-    }
-
-    /// The installation floor height the gates enforce, if one is declared.
-    pub fn floor_z_m(&self) -> Option<f64> {
-        self.floor_z_m
     }
 
     /// The applied installation layer.
@@ -97,11 +70,10 @@ impl WorldState {
     }
 
     /// Apply the config's installation layer and floor, if it declares
-    /// either. Called once at startup by every planner host; a refusal is
-    /// a startup failure. The floor is enforced by both collision gates as
-    /// a keep-out box but is not a shape: it is absent from the applied
-    /// layer this reports, and the simulator builds its own plane from the
-    /// config height.
+    /// Called once at startup by every planner host; a refusal is a
+    /// startup failure. Every consumer gets the same list — the planner,
+    /// the streaming gate, the simulator's scene and the readback — because
+    /// the robot's environment is shapes, floor included.
     pub fn install<P, M>(
         &mut self,
         planner: &mut P,
@@ -112,17 +84,13 @@ impl WorldState {
         P: Planner + ?Sized,
         M: WorldMirror,
     {
-        let mut enforced = cfg.installation_shapes.clone();
-        self.floor_z_m = cfg.floor_z_m;
-        if let Some(z) = cfg.floor_z_m {
-            enforced.push(floor_box(z));
-        }
+        let enforced = &cfg.installation_shapes;
         if enforced.is_empty() {
             return Ok(());
         }
-        let planner_epoch = planner.set_shapes(Layer::Installation, &enforced)?;
-        let gate_epoch = mirror.gate(Layer::Installation, &enforced)?;
-        mirror.sim(Layer::Installation, &cfg.installation_shapes);
+        let planner_epoch = planner.set_shapes(Layer::Installation, enforced)?;
+        let gate_epoch = mirror.gate(Layer::Installation, enforced)?;
+        mirror.sim(Layer::Installation, enforced);
         self.commit(
             Layer::Installation,
             cfg.installation_shapes.clone(),

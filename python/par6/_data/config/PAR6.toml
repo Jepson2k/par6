@@ -556,11 +556,19 @@ profile = "scurve"
 jerk_factor = 3.0
 control_mode = "pid"
 
-[installation]
-# The floor the robot stands on [m, base frame]. Enforced by the collision
-# world as a keep-out under every moving link, modelled by the simulator as
-# the contact plane objects rest on, and drawn by clients at this height.
-floor_z_m = 0.0
+# The floor the robot stands on: a static fixture, so it is a keep-out under
+# every moving link, a surface objects rest on in the simulator, and drawn by
+# any client that draws the installation layer. A wide flat box rather than a
+# half-space — coal has no bounding volume to prune an infinite plane with and
+# scans every triangle against it.
+[[installation_shapes]]
+name = "floor"
+kind = "box"
+params = [6.0, 6.0, 0.2]
+pose = [0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+
+# No mass: welded where it is declared, and solid.
+[installation_shapes.physics]
 
 [sim]
 # Simulator drivetrain. Motor-referred rotor dynamics from the vendor

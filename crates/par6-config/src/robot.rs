@@ -450,18 +450,6 @@ pub struct SimConfig {
     pub holding_friction_nm: Vec<f64>,
 }
 
-/// Installation infrastructure declared once and rendered three ways: the
-/// collision world gets a keep-out box, the simulator a contact plane,
-/// clients the height to draw.
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, default)]
-pub struct InstallationConfig {
-    /// Height of the floor the robot stands on \[m, base frame\]; `None`
-    /// = no floor is modelled.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub floor_z_m: Option<f64>,
-}
-
 impl Default for SimConfig {
     fn default() -> Self {
         Self {
@@ -659,9 +647,13 @@ pub struct RobotConfig {
     /// Simulator drivetrain parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
-    /// The installation's fixed infrastructure that is not a shape.
+    /// This installation's standing collision restrictions — the floor,
+    /// cage walls, the table, fixtures. Enforced from boot in the
+    /// planner's gate, the streaming gate and the simulator's scene;
+    /// `set_shapes` replaces the program layer only, so nothing on the
+    /// wire can remove them. Omitted = none.
     #[serde(default)]
-    pub installation: InstallationConfig,
+    pub installation_shapes: Vec<par6_proto::Shape>,
 }
 
 impl RobotConfig {
@@ -739,11 +731,6 @@ impl RobotConfig {
         self.validate_limits()?;
         self.validate_motion()?;
         self.validate_sim()?;
-        if let Some(z) = self.installation.floor_z_m {
-            if !z.is_finite() {
-                return Err(invalid("installation.floor_z_m", "must be finite"));
-            }
-        }
         Ok(())
     }
 

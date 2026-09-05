@@ -138,8 +138,6 @@ pub struct ServerConfig {
     /// `[installation] floor_z_m`. Enforced by both collision gates as a
     /// keep-out box under every moving link (not a shape: absent from the
     /// SHAPES readback) and modelled by the simulator as its contact
-    /// plane.
-    pub floor_z_m: Option<f64>,
     /// Effective-configuration readback served for the CONFIG_INFO
     /// query. The daemon fills it from the loaded bundle at startup.
     pub config_info: ConfigInfoData,
@@ -163,8 +161,6 @@ pub struct ConfigInfoData {
     /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
     /// velocity_rad_s, acceleration_rad_s2]`.
     pub joints: Vec<[f64; 4]>,
-    /// Installation floor height \[m\] (`None` = no floor is modelled).
-    pub floor_z_m: Option<f64>,
     /// Robot TOML file name (base name), served by CONFIG_BUNDLE.
     pub robot_filename: String,
     /// Robot TOML content verbatim, served by CONFIG_BUNDLE.
@@ -215,7 +211,6 @@ impl Default for ServerConfig {
             initial_profile: "default".to_owned(),
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
             installation_shapes: Vec::new(),
-            floor_z_m: None,
             config_info: ConfigInfoData::default(),
         }
     }
