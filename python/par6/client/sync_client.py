@@ -568,10 +568,6 @@ class RobotClient:
         """Set the controller-side completion policy for queued motion."""
         return _run(self._inner.set_completion_policy(policy))
 
-    def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe (unknown names are refused)."""
-        return _run(self._inner.set_recipe(name))
-
     def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin)."""
         return _run(self._inner.write_io(index, value))

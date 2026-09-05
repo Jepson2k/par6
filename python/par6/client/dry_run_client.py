@@ -627,9 +627,6 @@ class DryRunRobotClient:
             }
         )
 
-    def set_recipe(self, name: str = "", **kwargs: Any) -> int:
-        return self._system({"type": "set_recipe", "name": name})
-
     def payload(self) -> PayloadResult:
         """What the virtual arm carries."""
         return payload_from_dict(self._preview.payload())
