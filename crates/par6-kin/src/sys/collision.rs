@@ -45,6 +45,29 @@ impl ShapeDesc {
 /// replaceable world shape layers, answering "is `q` in collision, and
 /// which geometry pairs?".
 ///
+/// Which replaceable world layer a shape set belongs to.
+///
+/// The layers are independent: replacing one leaves the other in place.
+/// [`Layer::Installation`] is the backend's persistent keep-out set from
+/// robot config — `SET_SHAPES` cannot change it; [`Layer::Program`] is the
+/// last-applied `SET_SHAPES` set (last-write-wins, survives program end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// Persistent keep-outs from robot config.
+    Installation,
+    /// Program shapes, replaced wholesale by `SET_SHAPES`.
+    Program,
+}
+
+impl Layer {
+    fn as_raw(self) -> i32 {
+        match self {
+            Layer::Installation => 0,
+            Layer::Program => 1,
+        }
+    }
+}
+
 /// `&mut self` because the underlying `pinocchio::GeometryData` is mutated
 /// by every check (not thread-safe).
 pub struct CollisionModel {
@@ -174,7 +197,7 @@ impl CollisionModel {
     /// Replace `layer` with `shapes` wholesale; the other layer and the
     /// robot geometry are untouched. A malformed shape leaves the previous
     /// world in place. Allocates — keep it off the query path.
-    pub fn set_layer(&mut self, layer: crate::Layer, shapes: &[ShapeDesc]) -> Result<(), Error> {
+    pub fn set_layer(&mut self, layer: Layer, shapes: &[ShapeDesc]) -> Result<(), Error> {
         let raw_shapes: Vec<ffi::par6_shape> = shapes.iter().map(ShapeDesc::as_raw).collect();
         let mut err_buf = [0u8; 512];
         let status = unsafe {

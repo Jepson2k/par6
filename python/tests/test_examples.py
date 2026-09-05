@@ -50,13 +50,13 @@ def test_every_example_declares_what_it_must_print() -> None:
 
 @pytest.mark.timeout(400)
 @pytest.mark.parametrize("script", EXAMPLES, ids=example_ids())
-def test_example_runs(script: Path) -> None:
+def test_example_runs(script: Path, tmp_path: Path) -> None:
     """The script must exit 0 having done what it advertises.
 
     Each example spawns its own `par6d --sim`, so the assertion is the one
     a reader cares about: copy this file, run it, and it works.
     """
-    env = daemon_env()
+    env = daemon_env(tmp_path / "shm")
     env["PATH"] = os.environ.get("PATH", "")
     binary = par6d_binary()
     assert binary is not None

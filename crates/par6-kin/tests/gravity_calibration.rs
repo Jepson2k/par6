@@ -4,17 +4,11 @@
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 
-use std::path::PathBuf;
-
 use par6_kin::gravity::{self, GravitySample};
 use par6_kin::{GripperVariant, Kin, NQ};
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/par6_description")
-        .canonicalize()
-        .unwrap()
-}
+mod common;
+use common::assets_dir;
 
 const CASES: [[f64; NQ]; 5] = [
     [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416],
@@ -174,13 +168,8 @@ const TORQUE_NOISE_NM: f64 = 0.05;
 /// A deterministic sign-varying sequence in [-1, 1] — the point is a
 /// reproducible non-zero residual, not statistical realism.
 fn noise_seq() -> impl FnMut() -> f64 {
-    let mut n: u64 = 0x9E37_79B9_7F4A_7C15;
-    move || {
-        n ^= n << 13;
-        n ^= n >> 7;
-        n ^= n << 17;
-        ((n >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
-    }
+    let mut unit = common::xorshift(0x9E37_79B9_7F4A_7C15);
+    move || unit() * 2.0 - 1.0
 }
 
 #[test]

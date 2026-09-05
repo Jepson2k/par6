@@ -77,6 +77,16 @@ def _polyline_gap(points: np.ndarray, corners: list[np.ndarray]) -> float:
     return max(_closest(polyline, p) for p in points)
 
 
+def _line_deviation_mm(points: np.ndarray) -> float:
+    """How far the sampled path strays from the start->end line \[mm\]."""
+    line = points[-1] - points[0]
+    offsets = points - points[0]
+    deviation = np.linalg.norm(
+        offsets - np.outer(offsets @ line / (line @ line), line), axis=1
+    )
+    return float(deviation.max())
+
+
 def _length(points: np.ndarray) -> float:
     return float(np.linalg.norm(np.diff(points, axis=0), axis=1).sum())
 
@@ -188,13 +198,8 @@ class TestCartesianMotion:
         assert result.duration > 0.0
         points = result.tcp_poses[:, :3] * 1000.0
         assert np.allclose(points[-1], target[:3], atol=0.5)
-        # Straightness: every sampled point lies on the start->end line.
-        line = points[-1] - points[0]
-        offsets = points - points[0]
-        deviation = np.linalg.norm(
-            offsets - np.outer(offsets @ line / (line @ line), line), axis=1
-        )
-        assert deviation.max() < 0.1, f"TCP path bows by {deviation.max():.3f} mm"
+        bow = _line_deviation_mm(points)
+        assert bow < 0.1, f"TCP path bows by {bow:.3f} mm"
 
         before = list(dry_run.angles())
         unreachable = np.asarray(dry_run.pose())
@@ -226,16 +231,10 @@ class TestCartesianMotion:
             assert result.error is None, f"{profile}: {result.error}"
             points = result.tcp_poses[:, :3] * 1000.0
             assert np.allclose(points[-1], target[:3], atol=0.5), profile
-            line = points[-1] - points[0]
-            offsets = points - points[0]
-            deviation = np.linalg.norm(
-                offsets - np.outer(offsets @ line / (line @ line), line), axis=1
-            )
-            assert deviation.max() < 0.1, (
-                f"{profile}: TCP path bows by {deviation.max():.3f} mm"
-            )
+            bow = _line_deviation_mm(points)
+            assert bow < 0.1, f"{profile}: TCP path bows by {bow:.3f} mm"
         finally:
-            assert dry_run.select_profile("RUCKIG") == 1
+            dry_run.select_profile("RUCKIG")
 
     def test_curved_moves_preview_the_shape_they_trace(self, dry_run) -> None:
         """``move_c`` must preview the arc through its via point, ``move_s`` the

@@ -9,6 +9,7 @@
 use std::path::Path;
 
 use crate::opw::{Opw, OpwError};
+use crate::sys;
 use crate::{GripperVariant, NQ};
 
 /// Row-major 4x4 homogeneous transform, the shim's pose format.
@@ -28,7 +29,7 @@ pub enum KinError {
     },
     /// The shim rejected a call (unexpected C++ exception).
     #[error(transparent)]
-    Ffi(#[from] crate::sys::Error),
+    Ffi(#[from] sys::Error),
     /// The URDF yielded no analytic IK model; FK and dynamics still work.
     #[error("analytic IK unavailable: {0}")]
     NoAnalyticIk(OpwError),
@@ -58,7 +59,7 @@ pub enum IkOutcome {
 /// gravity correctly, and the `tcp` frame rides the last arm link so
 /// they never affect FK/Jacobian/IK.
 pub struct Kin {
-    model: crate::sys::Model,
+    model: sys::Model,
     /// Analytic IK derived from the same URDF at load ([`Opw`]).
     opw: Result<Opw, OpwError>,
     nq_full: usize,
@@ -99,7 +100,7 @@ impl Kin {
     /// the vendor DH chain when the gravity reference fixture was
     /// generated), so the fixed frame between them is exactly
     /// `Tz(d)·Tx(a)·Rx(alpha)` and the conversion into end-effector-frame
-    /// [`crate::sys::ToolParams`] coordinates is a rotation by
+    /// [`sys::ToolParams`] coordinates is a rotation by
     /// `Rx(alpha)` plus the `(a, 0, d)` offset.
     ///
     /// `inertia_kg_m2` uses the config/vendor order
@@ -115,7 +116,7 @@ impl Kin {
         mass_kg: f64,
         com_m: [f64; 3],
         inertia_kg_m2: [f64; 6],
-    ) -> crate::sys::ToolParams {
+    ) -> sys::ToolParams {
         let (s, c) = alpha_rad.sin_cos();
         // R = Rx(alpha); v' = R·v.
         let rot = |v: [f64; 3]| [v[0], c * v[1] - s * v[2], s * v[1] + c * v[2]];
@@ -132,7 +133,7 @@ impl Kin {
         ];
         let col = |k: usize| rot([rows[0][k], rows[1][k], rows[2][k]]);
         let (c0, c1, c2) = (col(0), col(1), col(2));
-        crate::sys::ToolParams {
+        sys::ToolParams {
             transform: [
                 1.0, 0.0, 0.0, 0.0, //
                 0.0, 1.0, 0.0, 0.0, //
@@ -160,10 +161,7 @@ impl Kin {
     /// runs outside the
     /// torque-level simulator: arm links from the URDF, tool from config,
     /// each mass with exactly one source.
-    pub fn load_arm(
-        assets_dir: &Path,
-        tool: Option<&crate::sys::ToolParams>,
-    ) -> Result<Self, KinError> {
+    pub fn load_arm(assets_dir: &Path, tool: Option<&sys::ToolParams>) -> Result<Self, KinError> {
         Self::from_urdf_with_tool(
             &assets_dir.join(Self::ARM_URDF_RELPATH),
             Some(Self::ARM_EE_FRAME),
@@ -188,7 +186,7 @@ impl Kin {
         ee_frame: Option<&str>,
         ee_to_tcp: &Pose,
     ) -> Result<Self, KinError> {
-        let tool = crate::sys::ToolParams {
+        let tool = sys::ToolParams {
             transform: *ee_to_tcp,
             mass: 0.0,
             com: [0.0; 3],
@@ -198,14 +196,14 @@ impl Kin {
     }
 
     /// [`Kin::from_urdf`] with an optional rigid tool whose inertials load
-    /// gravity (see [`crate::sys::ToolParams`]).
+    /// gravity (see [`sys::ToolParams`]).
     pub fn from_urdf_with_tool(
         urdf: &Path,
         ee_frame: Option<&str>,
-        tool: Option<&crate::sys::ToolParams>,
+        tool: Option<&sys::ToolParams>,
     ) -> Result<Self, KinError> {
-        let model = crate::sys::Model::from_urdf(urdf, ee_frame, tool).map_err(|e| match e {
-            crate::sys::Error::Create(msg) => KinError::Load(msg),
+        let model = sys::Model::from_urdf(urdf, ee_frame, tool).map_err(|e| match e {
+            sys::Error::Create(msg) => KinError::Load(msg),
             other => KinError::Ffi(other),
         })?;
         let nq_full = model.nq();
@@ -328,7 +326,7 @@ impl Kin {
     pub fn gravity_regressor(&mut self, q: &[f64; NQ], out: &mut [f64]) -> Result<(), KinError> {
         let cols = 4 * self.body_count();
         if out.len() != NQ * cols {
-            return Err(KinError::Ffi(crate::sys::Error::Dimension {
+            return Err(KinError::Ffi(sys::Error::Dimension {
                 expected: NQ * cols,
                 got: out.len(),
             }));

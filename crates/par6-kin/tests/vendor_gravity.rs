@@ -27,6 +27,9 @@ use par6_kin::gravity::{self, GravitySample};
 use par6_kin::{GripperVariant, Kin, NQ};
 use serde::Deserialize;
 
+mod common;
+use common::assets_dir;
+
 #[derive(Deserialize)]
 struct Fixture {
     tools: Tools,
@@ -63,13 +66,6 @@ struct Case {
     /// The arm carrying each vendor gripper as a DH tool.
     tau_arm_msg_tool: [f64; NQ],
     tau_arm_ssg48_tool: [f64; NQ],
-}
-
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/par6_description")
-        .canonicalize()
-        .unwrap()
 }
 
 fn fixture() -> Fixture {

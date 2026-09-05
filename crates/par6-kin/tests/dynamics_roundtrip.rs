@@ -5,17 +5,10 @@
 //! acceleration. A sign flip, a missed gravity subtraction, a slot
 //! offset, or mishandled jaw joints all land degrees-per-second² away.
 
-use std::path::PathBuf;
-
 use par6_kin::{GripperVariant, Kin, NQ};
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-        .join("assets/par6_description")
-}
+mod common;
+use common::assets_dir;
 
 #[test]
 fn feedforward_plus_gravity_reproduces_the_acceleration_through_aba() {

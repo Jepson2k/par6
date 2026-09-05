@@ -30,8 +30,8 @@ use par6d::{Daemon, Options};
 
 mod common;
 use common::{
-    distance, distance_to_segment, path_misses, progress_along, shipped_config, wire_pose_at,
-    Client, Rig, BUDGET,
+    distance, distance_to_segment, path_misses, process_corner, progress_along, shipped_config,
+    spline_waypoints, wire_pose_at, Client, Rig, ARC_RADIUS_MM, BUDGET, CURVE_START_DEG,
 };
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
@@ -1637,13 +1637,6 @@ fn cartesian_enablement_measures_the_real_workspace() {
 
 // ---- curved and blended moves ----------------------------------------------
 
-/// Start posture for the curved and blended moves: the same kind of
-/// well-conditioned pose as [`CART_START_DEG`], chosen (by the same
-/// soft-limit-box sweep) for room around it — 120 mm of straight-line
-/// travel is IK-feasible in every axis direction and along the diagonals
-/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
-/// soft window.
-const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
 /// Duration of the spline move \[s\]. Slower than [`MOVE_S`] because the
 /// sim's tracking lag is proportional to speed AND to path curvature,
 /// and a wave has far more of the second than a straight line does.
@@ -2448,9 +2441,10 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
         mid_m,
         deg_per_m,
     };
-    const STEP_MM: f64 = 5.0;
-    let crawl = approach(&rig, &mut c, &scene, 1.0, Some(0.02));
-    let streamed = approach(&rig, &mut c, &scene, STEP_MM, None);
+    const CRAWL_STEP_MM: f64 = 1.0;
+    const STREAM_STEP_MM: f64 = 5.0;
+    let crawl = approach(&rig, &mut c, &scene, CRAWL_STEP_MM, Some(0.02));
+    let streamed = approach(&rig, &mut c, &scene, STREAM_STEP_MM, None);
     println!(
         "closest approach: crawl {:.1} mm, streamed {:.1} mm",
         crawl.closest_m * 1e3,
@@ -2487,7 +2481,7 @@ const TRACK_TOL_MM: f64 = 12.0;
 /// `move_c` drives the arm around the circle it planned.
 #[test]
 fn move_c_tracks_its_planned_arc() {
-    const R: f64 = 60.0;
+    const R: f64 = ARC_RADIUS_MM;
     let rig = boot_tagged("curved-arc", false);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -2558,10 +2552,7 @@ fn move_s_tracks_its_planned_spline() {
 
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);
-    let waypoints: Vec<[f64; 3]> = [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
-        .iter()
-        .map(|d| [start[0] + d[0], start[1] + d[1], start[2] + d[2]])
-        .collect();
+    let waypoints = spline_waypoints(start);
     let i = c.ok_index(&Command::MoveS(MoveS {
         key: 4002,
         waypoints: waypoints
@@ -2610,8 +2601,7 @@ fn move_p_tracks_its_corner_without_stopping_in_it() {
 
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);
-    let corner = [start[0] + 100.0, start[1], start[2]];
-    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let (corner, finish) = process_corner(start);
     let i = c.ok_index(&Command::MoveP(MoveP {
         key: 4003,
         waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
@@ -2646,11 +2636,6 @@ fn move_p_tracks_its_corner_without_stopping_in_it() {
     rig.shutdown();
 }
 
-/// A far-away box, for a world change that must not touch the path.
-fn far_box(name: &str) -> Shape {
-    keepout_at(name, [900.0, 900.0, 900.0])
-}
-
 /// A world change during a move does not manufacture a failure: a
 /// keep-out that stays clear of the remaining path leaves the move to
 /// complete, with no verdict and no standing error.
@@ -2672,7 +2657,7 @@ fn an_off_path_world_change_leaves_a_running_move_alone() {
     rig.wait_status("the sweep is under way", |s| {
         s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
     });
-    c.ok(&set_shapes(vec![far_box("far")]));
+    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
     let (program, _) = shapes_readback(&mut c);
     assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
 
@@ -2681,10 +2666,7 @@ fn an_off_path_world_change_leaves_a_running_move_alone() {
         ok,
         "a world change clear of the path must not stop the move, got {detail:?}"
     );
-    rig.drain_status();
-    let s = rig.wait_status("the arm at rest at the end of the sweep", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
+    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
     assert!(
         angles_close(&s.angles, &end_deg, 1.0),
         "the move must run to its target: {:?}",
@@ -2717,9 +2699,8 @@ fn a_queued_move_is_re_guarded_against_the_world_when_it_activates() {
     let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
     let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
 
-    enable_and_teleport(&rig, &mut c, mid_deg);
-    let mid_tcp =
-        tcp_mm(&rig.wait_status("midpoint pose", |s| angles_close(&s.angles, &mid_deg, 0.5)));
+    let mid_m = tcp_at_m(mid_deg);
+    let mid_tcp = [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3];
 
     enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
     let i1 = c.ok_index(&move_j(8201, quarter_deg, SWEEP_S / 2.0));
@@ -2744,10 +2725,7 @@ fn a_queued_move_is_re_guarded_against_the_world_when_it_activates() {
         e.cause.contains("late-wall"),
         "the refusal must name the keep-out that arrived late: {e:?}"
     );
-    rig.drain_status();
-    let s = rig.wait_status("the arm at rest", |s| {
-        s.speeds.iter().all(|v| v.abs() < 0.05)
-    });
+    let s = settled_tcp(&rig, "the arm at rest");
     assert!(
         angles_close(&s.angles, &quarter_deg, 1.0),
         "the arm must stay where the first move left it, not stream the second: {:?}",

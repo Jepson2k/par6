@@ -182,12 +182,10 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
 fn planned_poses_keep_their_approach_offsets_inside_the_window() {
     let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("config");
     let robot = &bundle.robot;
-    let gripper = bundle.active_gripper();
-    let variant = GripperVariant::resolve(
-        &robot.robot.active_gripper.to_ascii_uppercase(),
-        gripper.and_then(|g| g.urdf_variant.as_deref()),
-    );
-    let mut collision = Collision::load(&assets_dir(), variant, 0.0).expect("collision world");
+    let mut collision =
+        par6d::kin::estimation_model(Some(&shipped_config()), Some(&assets_dir()), None)
+            .expect("estimation model")
+            .collision;
 
     let mut start = [0.0; NQ];
     for (out, rad) in start.iter_mut().zip(robot.robot.park_pose_rad.iter()) {
@@ -262,6 +260,8 @@ fn planned_poses_keep_their_approach_offsets_inside_the_window() {
 /// gravity model does not change underneath it.
 #[test]
 fn a_failed_estimate_leaves_the_declared_payload_standing() {
+    const DECLARED_KG: f64 = 1.2;
+    const DECLARED_COM: [f64; 3] = [0.0, 0.01, 0.05];
     let config = common::retimed_config("estimate-restore", 0.02);
     let model_config = config.clone();
     let status_port = free_udp_port();
@@ -287,10 +287,8 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
         );
         client.reset().await.expect("reset");
 
-        let declared_kg = 1.2;
-        let declared_com = [0.0, 0.01, 0.05];
         client
-            .set_payload(declared_kg, declared_com, None)
+            .set_payload(DECLARED_KG, DECLARED_COM, None)
             .await
             .expect("the payload is declared");
 
@@ -319,10 +317,10 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
         "the failure must name the planning problem: {err}"
     );
     assert!(
-        (mass - 1.2).abs() < 1e-9,
-        "a failed estimate left {mass} kg declared instead of the 1.2 kg the arm carries"
+        (mass - DECLARED_KG).abs() < 1e-9,
+        "a failed estimate left {mass} kg declared instead of the {DECLARED_KG} kg the arm carries"
     );
-    for (got, want) in com.iter().zip([0.0, 0.01, 0.05].iter()) {
+    for (got, want) in com.iter().zip(DECLARED_COM.iter()) {
         assert!(
             (got - want).abs() < 1e-9,
             "the declared centre of mass moved: {com:?}"

@@ -55,17 +55,22 @@ fn cat(parts: &[Vec<u8>]) -> Vec<u8> {
     parts.concat()
 }
 
+/// A fixarray of big-endian f64s.
+fn f64_array(vals: &[f64]) -> Vec<u8> {
+    let mut out = fixarray(vals.len());
+    for v in vals {
+        out.extend(f64be(*v));
+    }
+    out
+}
+
 /// `[JOG_J, req_id, speeds[6], duration, nil]`.
 fn jog_j_bytes(duration: f64) -> Vec<u8> {
-    let mut speeds = fixarray(6);
-    for i in 0..6 {
-        speeds.extend(f64be(if i == 0 { 0.2 } else { 0.0 }));
-    }
     cat(&[
         fixarray(5),
         uint(CmdType::JogJ as u64),
         uint(7),
-        speeds,
+        f64_array(&[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
         f64be(duration),
         nil(),
     ])
@@ -73,15 +78,11 @@ fn jog_j_bytes(duration: f64) -> Vec<u8> {
 
 /// `[JOG_L, req_id, velocities[6], duration, frame, nil]`.
 fn jog_l_bytes(duration: f64) -> Vec<u8> {
-    let mut vels = fixarray(6);
-    for i in 0..6 {
-        vels.extend(f64be(if i == 0 { 0.2 } else { 0.0 }));
-    }
     cat(&[
         fixarray(6),
         uint(CmdType::JogL as u64),
         uint(7),
-        vels,
+        f64_array(&[0.2, 0.0, 0.0, 0.0, 0.0, 0.0]),
         f64be(duration),
         uint(0), // WRF
         nil(),
@@ -354,27 +355,13 @@ fn reply_and_status_length_headers_are_bounded_before_reserving() {
 
 /// `[SET_PAYLOAD, req_id, mass, com[3], inertia|nil]`.
 fn set_payload_bytes(mass: f64, com: [f64; 3], inertia: Option<[f64; 6]>) -> Vec<u8> {
-    let mut com_arr = fixarray(3);
-    for v in com {
-        com_arr.extend(f64be(v));
-    }
-    let inertia_arr = match inertia {
-        None => nil(),
-        Some(i) => {
-            let mut a = fixarray(6);
-            for v in i {
-                a.extend(f64be(v));
-            }
-            a
-        }
-    };
     cat(&[
         fixarray(5),
         uint(CmdType::SetPayload as u64),
         uint(7),
         f64be(mass),
-        com_arr,
-        inertia_arr,
+        f64_array(&com),
+        inertia.map_or_else(nil, |i| f64_array(&i)),
     ])
 }
 

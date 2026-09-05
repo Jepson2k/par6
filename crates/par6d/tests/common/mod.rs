@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use par6_proto::{
     decode_reply, decode_status, encode_command, Command, QueryResult, Reply, Status, WireError,
+    NUM_JOINTS,
 };
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -736,4 +737,46 @@ pub fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
         r02.atan2(cp).to_degrees(),
         (-r01).atan2(r00).to_degrees(),
     ]
+}
+
+/// Angle \[deg\] between the rotation blocks of two pose matrices.
+pub fn rotation_angle_deg(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+    // trace(Rᵃᵀ Rᵇ) = 1 + 2 cos θ
+    let mut trace = 0.0;
+    for col in 0..3 {
+        for row in 0..3 {
+            trace += a[row * 4 + col] * b[row * 4 + col];
+        }
+    }
+    ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// The start posture of the curved-move scenes, plan-side and live: clear
+/// of the wrist-aligned park singularity and comfortably inside every
+/// soft window, so a refusal means the geometry, not the pose. Chosen by
+/// the soft-limit-box sweep for room around it — 120 mm of straight-line
+/// travel is IK-feasible in every axis direction and along the diagonals
+/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
+/// soft window.
+pub const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
+
+/// Radius of the half circle the `move_c` scene traces \[mm\].
+pub const ARC_RADIUS_MM: f64 = 60.0;
+
+/// The `move_s` scene: three waypoints \[mm\] climbing away from `start`
+/// with a dip between them, so a polyline through them would be visibly
+/// different from the spline.
+pub fn spline_waypoints(start: [f64; 3]) -> Vec<[f64; 3]> {
+    [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
+        .iter()
+        .map(|d| [start[0] + d[0], start[1] + d[1], start[2] + d[2]])
+        .collect()
+}
+
+/// The `move_p` scene: one right-angle corner \[mm\] 100 mm out from
+/// `start`, then 100 mm down — returned as `(corner, finish)`.
+pub fn process_corner(start: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let corner = [start[0] + 100.0, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    (corner, finish)
 }

@@ -13,14 +13,12 @@ use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
-use par6_kin::{Collision, GripperVariant, Kin, Layer, Shape, ShapeKind, NQ};
+use par6_kin::{
+    link_of, Collision, GripperVariant, Kin, Layer, Shape, ShapeKind, COLLISION_CLEARANCE_M, NQ,
+};
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/par6_description")
-        .canonicalize()
-        .unwrap()
-}
+mod common;
+use common::assets_dir;
 
 /// The park pose (`[robot].park_pose_rad`), which every variant rests in.
 const HOME: [f64; NQ] = [0.0, -1.5708, 3.1416, 0.0, 0.0, 3.1416];
@@ -573,30 +571,17 @@ fn per_waypoint_check_cost_is_reported() {
 /// soft window — and the corresponding rule for what it may not. Both
 /// mirrored from the script, which cannot be imported here.
 const ALWAYS_FRAC: f64 = 0.99;
-/// The runtime's self-pair standoff (`par6d`'s `COLLISION_CLEARANCE_M`),
-/// which the SRDF was sampled at.
-const RUNTIME_CLEARANCE_M: f64 = 0.005;
 /// Soft-window samples per variant. Enough that a pair the meshes hold
 /// in permanent overlap cannot hide below `ALWAYS_FRAC`, cheap enough
 /// (tens of µs a check) to run every time.
 const SAMPLES: usize = 400;
-
-/// The link a geometry name belongs to: `lower_arm_0` → `lower_arm`.
-fn link_of(geom: &str) -> String {
-    match geom.rsplit_once('_') {
-        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => {
-            link.to_owned()
-        }
-        _ => geom.to_owned(),
-    }
-}
 
 /// Colliding LINK pairs at `q`, sorted within the pair.
 fn link_pairs(col: &mut Collision, q: &[f64; NQ]) -> BTreeSet<(String, String)> {
     pair_set(col, q)
         .into_iter()
         .map(|(a, b)| {
-            let (a, b) = (link_of(&a), link_of(&b));
+            let (a, b) = (link_of(&a).to_owned(), link_of(&b).to_owned());
             if a <= b {
                 (a, b)
             } else {
@@ -656,18 +641,12 @@ fn the_srdf_silences_rest_contact_and_permanent_overlap_and_nothing_else() {
         let mut raw = Collision::from_urdf(
             &assets_dir().join(variant.urdf_relpath()),
             Some(&assets_dir().join("URDF")),
-            RUNTIME_CLEARANCE_M,
+            COLLISION_CLEARANCE_M,
         )
         .unwrap_or_else(|e| panic!("{variant:?} raw load failed: {e}"));
         let rest = link_pairs(&mut raw, &HOME);
 
-        let mut seed: u64 = 0xC011_5EED ^ (variant as u64 + 1);
-        let mut unit = move || {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed >> 11) as f64 / (1u64 << 53) as f64
-        };
+        let mut unit = common::xorshift(0xC011_5EED ^ (variant as u64 + 1));
         let mut freq: std::collections::BTreeMap<(String, String), usize> = Default::default();
         for _ in 0..SAMPLES {
             let q: [f64; NQ] = std::array::from_fn(|j| lo[j] + (hi[j] - lo[j]) * unit());
@@ -708,8 +687,9 @@ fn the_srdf_silences_rest_contact_and_permanent_overlap_and_nothing_else() {
 
         // And the consequence the runtime depends on: with the SRDF
         // applied, the pose the config declares valid checks clean.
-        let mut with_srdf = load(variant, RUNTIME_CLEARANCE_M);
-        let park = link_pairs(&mut with_srdf, &HOME);
+        raw.apply_srdf(&assets_dir().join(variant.srdf_relpath()))
+            .unwrap_or_else(|e| panic!("{variant:?} SRDF failed to apply: {e}"));
+        let park = link_pairs(&mut raw, &HOME);
         assert!(park.is_empty(), "{variant:?} park self-collides: {park:?}");
     }
 }

@@ -16,6 +16,6 @@ pub mod ffi;
 mod model;
 mod traj;
 
-pub use collision::{CollisionModel, ShapeDesc};
+pub use collision::{CollisionModel, Layer, ShapeDesc};
 pub use model::{Error, IkOptions, Model, ToolParams};
 pub use traj::{PathDegree, Trajectory};

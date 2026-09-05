@@ -21,6 +21,7 @@ import signal
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -28,9 +29,9 @@ from live_daemon import (
     TICK_DT_S,
     LiveDaemon,
     angles_now,
+    daemon_env,
     free_udp_port,
     pose_now,
-    repo_assets_dir,
     requires_par6d,
     settle_at,
     sim_config,
@@ -381,23 +382,7 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     assert robot.is_available() is True, "a runtime it never started must survive"
 
     # -- spawn one of its own --------------------------------------------
-    port = free_udp_port()
-    assets = repo_assets_dir()
-    if assets is not None:
-        # The spawned runtime's config lives in a tmp dir; an ffi build looks
-        # for its kinematics assets next to the config unless told otherwise.
-        monkeypatch.setenv("PAR6_ASSETS", str(assets))
-    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "spawned")))
-    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
-    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
-    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
-    # This daemon runs beside the fixture's. Without its own grant
-    # directory it publishes `loop_tick` / `robot_mode` under the shipped
-    # names in the default location, and stopping it removes the claim
-    # every other daemon on the box is holding.
-    shm = tmp_path / "spawned-shm"
-    shm.mkdir()
-    monkeypatch.setenv("PAR6_SHM_DIR", str(shm))
+    port = _spawn_env(monkeypatch, tmp_path, "spawned")
 
     logs = Robot(host="127.0.0.1", port=port, normalize_logs=True)
     assert logs.is_available() is False
@@ -434,6 +419,26 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     assert logs.is_available() is False, "Robot.stop() must reap what it spawned"
 
 
+def _spawn_env(monkeypatch, tmp_path: Path, tag: str) -> int:
+    """Give a ``Robot.start()`` spawn a config, ports and a grant directory of
+    its own, and return the command port it will serve on.
+
+    The spawned runtime runs beside the fixture's: without its own grant
+    directory it publishes ``loop_tick`` / ``robot_mode`` under the shipped
+    names in the default location, and stopping it removes the claim every
+    other daemon on the box is holding. An ffi build also looks for its
+    kinematics assets next to the config unless told otherwise.
+    """
+    for key, value in daemon_env(tmp_path / f"{tag}-shm").items():
+        if key.startswith("PAR6_"):
+            monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / tag)))
+    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
+    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
+    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
+    return free_udp_port()
+
+
 def _par6d_pids_serving(port: int) -> list[int]:
     """Every live par6d whose command line binds *port*."""
     found = []
@@ -445,7 +450,13 @@ def _par6d_pids_serving(port: int) -> list[int]:
                 argv = f.read().split(b"\0")
         except OSError:
             continue
-        if argv and argv[0].endswith(b"par6d") and str(port).encode() in argv:
+        if not argv or not argv[0].endswith(b"par6d"):
+            continue
+        try:
+            served = argv[argv.index(b"--port") + 1]
+        except (ValueError, IndexError):
+            continue
+        if served == str(port).encode():
             found.append(int(entry))
     return found
 
@@ -459,17 +470,7 @@ def test_a_spawned_runtime_dies_with_the_process_that_spawned_it(monkeypatch, tm
     keeps the bus, and the next ``start()`` on that port refuses with
     "already running" for a runtime nobody can reach to stop.
     """
-    port = free_udp_port()
-    assets = repo_assets_dir()
-    if assets is not None:
-        monkeypatch.setenv("PAR6_ASSETS", str(assets))
-    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "orphan")))
-    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
-    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
-    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
-    shm = tmp_path / "orphan-shm"
-    shm.mkdir()
-    monkeypatch.setenv("PAR6_SHM_DIR", str(shm))
+    port = _spawn_env(monkeypatch, tmp_path, "orphan")
 
     # The spawner is a real separate process, so killing it is the dirty
     # exit under test and not something the test runner itself survives.
@@ -486,7 +487,6 @@ def test_a_spawned_runtime_dies_with_the_process_that_spawned_it(monkeypatch, tm
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        env=os.environ.copy(),
     )
     try:
         assert spawner.stdout is not None

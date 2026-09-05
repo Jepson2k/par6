@@ -13,22 +13,15 @@
 //! keeps one live motion per family for that.
 
 use par6_proto::command::{MoveC, MoveL, MoveP, MoveS};
-use par6_proto::{Command, Frame, NUM_JOINTS};
+use par6_proto::{Command, Frame};
 use par6d::preview::{Preview, PreviewResult};
 
 mod common;
 use common::{
-    assets_dir, distance, distance_to_segment, path_misses, progress_along, retimed_config, to_rad,
-    wire_pose_at,
+    assets_dir, distance, distance_to_segment, path_misses, process_corner, progress_along,
+    retimed_config, rotation_angle_deg, spline_waypoints, to_rad, wire_pose_at, ARC_RADIUS_MM,
+    CURVE_START_DEG,
 };
-
-/// The same start posture the live suite uses: clear of the wrist-aligned
-/// park singularity and comfortably inside every soft window, so a
-/// refusal here means the geometry, not the pose.
-const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
-
-/// Radius of the half circle `move_c` traces \[mm\].
-const R: f64 = 60.0;
 
 /// The planner's own path error. Two orders tighter than the live suite's
 /// bound, which has to absorb the simulated arm's tracking lag.
@@ -87,9 +80,9 @@ fn path_of(r: &PreviewResult) -> Vec<[f64; 3]> {
 #[test]
 fn move_c_traces_the_circle_through_its_via_point() {
     let mut p = planned("curve-arc");
-    let center = [p.start[0] + R, p.start[1], p.start[2]];
-    let via = [center[0], center[1], center[2] - R];
-    let end = [center[0] + R, center[1], center[2]];
+    let center = [p.start[0] + ARC_RADIUS_MM, p.start[1], p.start[2]];
+    let via = [center[0], center[1], center[2] - ARC_RADIUS_MM];
+    let end = [center[0] + ARC_RADIUS_MM, center[1], center[2]];
 
     let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
         key: 4001,
@@ -105,11 +98,11 @@ fn move_c_traces_the_circle_through_its_via_point() {
 
     let radial = path
         .iter()
-        .map(|q| (distance(*q, center) - R).abs())
+        .map(|q| (distance(*q, center) - ARC_RADIUS_MM).abs())
         .fold(0.0f64, f64::max);
     assert!(
         radial < PLAN_TOL_MM,
-        "move_c left its circle by {radial:.3} mm (radius {R} mm about {center:?})"
+        "move_c left its circle by {radial:.3} mm (radius {ARC_RADIUS_MM} mm about {center:?})"
     );
     let out_of_plane = path
         .iter()
@@ -131,7 +124,7 @@ fn move_c_traces_the_circle_through_its_via_point() {
         .map(|q| distance_to_segment(*q, p.start, end))
         .fold(0.0f64, f64::max);
     assert!(
-        chord_dev > R / 2.0,
+        chord_dev > ARC_RADIUS_MM / 2.0,
         "move_c hugged the straight chord ({chord_dev:.2} mm off it): that is a move_l, not an arc"
     );
     let end_miss = distance(*path.last().expect("path"), end);
@@ -149,12 +142,12 @@ fn move_c_traces_the_circle_through_its_via_point() {
 #[test]
 fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
     let mut p = planned("curve-arc-rel");
-    let end = [p.start[0] + 2.0 * R, p.start[1], p.start[2]];
+    let end = [p.start[0] + 2.0 * ARC_RADIUS_MM, p.start[1], p.start[2]];
 
     let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
         key: 4005,
-        via: [R, 0.0, -R, 0.0, 0.0, 0.0],
-        end: [2.0 * R, 0.0, 0.0, 0.0, 0.0, 0.0],
+        via: [ARC_RADIUS_MM, 0.0, -ARC_RADIUS_MM, 0.0, 0.0, 0.0],
+        end: [2.0 * ARC_RADIUS_MM, 0.0, 0.0, 0.0, 0.0, 0.0],
         frame: Frame::Wrf,
         duration: Some(4.0),
         speed: None,
@@ -168,10 +161,10 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
         miss < PLAN_TOL_MM,
         "the rel arc planned to end {miss:.3} mm from where its absolute twin lands"
     );
-    let center = [p.start[0] + R, p.start[1], p.start[2]];
+    let center = [p.start[0] + ARC_RADIUS_MM, p.start[1], p.start[2]];
     let radial = path
         .iter()
-        .map(|q| (distance(*q, center) - R).abs())
+        .map(|q| (distance(*q, center) - ARC_RADIUS_MM).abs())
         .fold(0.0f64, f64::max);
     assert!(
         radial < PLAN_TOL_MM,
@@ -184,10 +177,7 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
 #[test]
 fn move_s_passes_through_every_waypoint_and_curves_between_them() {
     let mut p = planned("curve-spline");
-    let waypoints: Vec<[f64; 3]> = [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
-        .iter()
-        .map(|d| [p.start[0] + d[0], p.start[1] + d[1], p.start[2] + d[2]])
-        .collect();
+    let waypoints = spline_waypoints(p.start);
 
     let path = path_of(
         &p.preview.submit(Command::MoveS(MoveS {
@@ -249,8 +239,7 @@ fn move_s_passes_through_every_waypoint_and_curves_between_them() {
 #[test]
 fn move_p_rounds_its_corner_and_holds_one_tool_speed() {
     let mut p = planned("curve-process");
-    let corner = [p.start[0] + 100.0, p.start[1], p.start[2]];
-    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let (corner, finish) = process_corner(p.start);
 
     let result = p.preview.submit(Command::MoveP(MoveP {
         key: 4003,
@@ -309,8 +298,7 @@ fn move_p_rounds_its_corner_and_holds_one_tool_speed() {
 #[test]
 fn a_full_speed_move_p_prices_its_corner_instead_of_refusing() {
     let mut p = planned("curve-process-fast");
-    let corner = [p.start[0] + 100.0, p.start[1], p.start[2]];
-    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    let (corner, finish) = process_corner(p.start);
     let waypoints = vec![wire_pose_at(&p.pose, corner), wire_pose_at(&p.pose, finish)];
 
     let paced = p.preview.submit(Command::MoveP(MoveP {
@@ -352,18 +340,6 @@ fn a_full_speed_move_p_prices_its_corner_instead_of_refusing() {
         (1.0..25.0).contains(&corner_miss),
         "the fast move_p left its blend zone: closest approach {corner_miss:.2} mm"
     );
-}
-
-/// Angle \[deg\] between the rotation blocks of two pose matrices.
-fn rotation_angle_deg(a: &[f64; 16], b: &[f64; 16]) -> f64 {
-    // trace(Rᵃᵀ Rᵇ) = 1 + 2 cos θ
-    let mut trace = 0.0;
-    for col in 0..3 {
-        for row in 0..3 {
-            trace += a[row * 4 + col] * b[row * 4 + col];
-        }
-    }
-    ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
 }
 
 /// A chain of blended `move_l`s holds the tool's orientation through
