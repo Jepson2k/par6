@@ -735,6 +735,13 @@ class Robot(_RobotABC):
     def has_collision_checking(self) -> bool:
         return self._preview is not None
 
+    @property
+    def has_physics_simulation(self) -> bool:
+        """par6's dry run drives the same control loop and the same MuJoCo
+        plant the simulator does, so it reports what the arm did and not
+        only what it was told."""
+        return True
+
     def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
         p = self._preview
         return p is not None and p.in_collision(_q6(q_rad))

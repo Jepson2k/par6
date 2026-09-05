@@ -30,6 +30,7 @@ the arm does.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any
 
@@ -39,6 +40,7 @@ from pinokin import so3_rpy
 from waldoctl import ToolState, ToolStatus
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
+from waldoctl.ticks import ObjectTicks, TickBlock, TickIndex
 
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, make_wire_error
@@ -395,7 +397,17 @@ class DryRunRobotClient:
     # The second pass: what the arm would actually do
     # ------------------------------------------------------------------
 
-    def simulate(self, max_seconds: float | None = None) -> dict:
+    @property
+    def program_length(self) -> int:
+        """How many commands have been recorded so far.
+
+        A host mapping a simulated row back to a source line reads this
+        after each call it makes and attributes whatever appeared to the
+        line it was on; this client cannot know the line itself.
+        """
+        return len(self._program)
+
+    def simulate(self, max_seconds: float | None = None) -> TickIndex:
         """Run everything planned so far through the engine and return the
         tick record of what the arm did.
 
@@ -419,7 +431,8 @@ class DryRunRobotClient:
         here = list(self._preview.angles_rad())
         self._preview.teleport_rad(self._start_joints_rad)
         try:
-            return self._call(self._preview.run_program, self._program, max_seconds)
+            raw = self._call(self._preview.run_program, self._program, max_seconds)
+            return _tick_index(raw)
         finally:
             # The planning session goes on from where it was; a run is a
             # question about the program, not a move.
@@ -1254,6 +1267,81 @@ class _KinFacade:
         out = np.zeros(6, dtype=np.float64)
         self._robot.fk(q, out)
         return out
+
+
+def _tick_index(raw: dict) -> TickIndex:
+    """The engine's column buffers as the shared record type.
+
+    ``frombuffer`` is a view, not a copy: the engine wrote native-order
+    bytes precisely so a minute of program does not become a million
+    Python floats on the way here.
+    """
+    rows, joints = raw["rows"], raw["joints"]
+
+    def f32(key: str) -> np.ndarray:
+        return np.frombuffer(raw[key], dtype=np.float32)
+
+    contact_starts = np.frombuffer(raw["contact_starts"], dtype=np.uint32)
+    return TickIndex(
+        row_dt_s=float(raw["row_dt_s"]),
+        joints_rad=f32("q_rad").reshape(rows, joints),
+        commanded_rad=f32("q_commanded_rad").reshape(rows, joints),
+        tcp=f32("tcp").reshape(rows, 6),
+        tool_closed=f32("tool_closed"),
+        tool_gripping=np.frombuffer(raw["tool_gripping"], dtype=np.bool_),
+        blocks=tuple(
+            TickBlock(
+                command=b["command"],
+                start_row=b["start_row"],
+                rows=b["rows"],
+                error=RobotError.from_wire(b["error"]) if b["error"] else None,
+            )
+            for b in raw["commands"]
+        ),
+        objects=tuple(
+            ObjectTicks(
+                name=o["name"],
+                poses=np.frombuffer(o["poses"], dtype=np.float32).reshape(o["rows"], 7),
+            )
+            for o in raw["objects"]
+        ),
+        stop=str(raw["stop"]),
+        digest=_digest(raw),
+        channels={
+            # Per-row, sharing the record's row axis.
+            "com": f32("com").reshape(-1, 3),
+            # The RT mode as spans: `mode_starts[i]` is the first row
+            # `mode_names[i]` holds from. Two arrays rather than pairs
+            # because every channel is a buffer.
+            "mode_starts": np.asarray([r for r, _ in raw["modes"]], dtype=np.uint32),
+            "mode_names": np.asarray([m for _, m in raw["modes"]], dtype=np.str_),
+            # Ragged: row r owns contacts [starts[r]:starts[r + 1]].
+            "contact_pos": f32("contact_pos").reshape(-1, 3),
+            "contact_force": f32("contact_force").reshape(-1, 3),
+            "contact_starts": contact_starts,
+        },
+    )
+
+
+def _digest(raw: dict) -> bytes:
+    """Identity of a run, over the columns that reach the screen.
+
+    Quantised below what a display can resolve — a tenth of a milliradian
+    at the joints, ten microns at the TCP and at objects — so two runs
+    that would paint the same picture hash the same and the host can skip
+    the redraw.  The engine is deterministic, so this only ever differs
+    when something visible did.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(raw["rows"]).encode())
+    for key, scale in (("q_rad", 1e4), ("tcp", 1e5)):
+        q = np.rint(np.nan_to_num(np.frombuffer(raw[key], dtype=np.float32)) * scale)
+        h.update(q.astype(np.int32).tobytes())
+    for o in raw["objects"]:
+        h.update(o["name"].encode())
+        p = np.rint(np.frombuffer(o["poses"], dtype=np.float32) * 1e5)
+        h.update(p.astype(np.int32).tobytes())
+    return h.digest()
 
 
 def _merge(results: list[DryRunResultData]) -> DryRunResultData:
