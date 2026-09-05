@@ -40,11 +40,14 @@ mod gripper;
 #[cfg(feature = "sim-mujoco")]
 mod mujoco;
 mod plant;
+#[cfg(feature = "sim-mujoco")]
+pub mod scene;
 
 pub use driver::FaultKind;
 
 use std::collections::VecDeque;
 #[cfg(any(feature = "sim-dynamics", feature = "sim-mujoco"))]
+#[cfg(feature = "sim-dynamics")]
 use std::path::PathBuf;
 
 use par6_config::{Gains, GripperConfig, KtSource, RobotConfig, WatchdogAction};
@@ -136,7 +139,7 @@ pub struct SimBus {
     #[cfg(feature = "sim-dynamics")]
     dyn_ee_frame: Option<String>,
     #[cfg(feature = "sim-mujoco")]
-    mjcf_scene: Option<PathBuf>,
+    scene: Option<scene::Scene>,
     /// Mirror of the gripper front end's latched firmware command, used
     /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
     #[cfg(feature = "sim-mujoco")]
@@ -182,7 +185,7 @@ impl SimBus {
             #[cfg(feature = "sim-dynamics")]
             dyn_ee_frame: None,
             #[cfg(feature = "sim-mujoco")]
-            mjcf_scene: None,
+            scene: None,
             #[cfg(feature = "sim-mujoco")]
             mj_jaw_cmd: None,
         }
@@ -209,19 +212,18 @@ impl SimBus {
         bus
     }
 
-    /// A sim bus whose arm plant is the MuJoCo scene at `scene` (arm +
-    /// gripper jaws + graspable objects, see
-    /// `sim-assets/PAR6_MSG_scene.xml`), built at
-    /// [`DriverBus::boot_configure`] time. With this plant the gripper's
-    /// object positions are owned by the scene physics —
+    /// A sim bus whose arm plant is the MuJoCo scene built from `scene`
+    /// (arm + gripper jaws + graspable objects, see [`scene`]) at
+    /// [`DriverBus::boot_configure`] time, with the joint physics reflected
+    /// from the robot config. With this plant the gripper's object
+    /// positions are owned by the scene physics —
     /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)
     /// values are overwritten every tick. Panics at boot if the scene
-    /// cannot be loaded or its joint layout does not match the robot
-    /// config.
+    /// cannot be built or its joint layout does not match the robot config.
     #[cfg(feature = "sim-mujoco")]
-    pub fn with_mujoco(scene: impl Into<PathBuf>) -> Self {
+    pub fn with_mujoco(scene: scene::Scene) -> Self {
         let mut bus = Self::new();
-        bus.mjcf_scene = Some(scene.into());
+        bus.scene = Some(scene);
         bus
     }
 
@@ -1245,8 +1247,17 @@ impl DriverBus for SimBus {
 impl SimBus {
     fn make_arm_plant(&self, robot: &RobotConfig, q0: &[f64]) -> ArmPlant {
         #[cfg(feature = "sim-mujoco")]
-        if let Some(scene) = &self.mjcf_scene {
-            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(scene, &self.maps, q0));
+        if let Some(scene) = &self.scene {
+            let tuning: Vec<scene::JointTuning> = self
+                .maps
+                .iter()
+                .zip(&robot.sim.motor_jm_kg_m2)
+                .map(|(map, jm)| scene::JointTuning::from_config(map, *jm, &robot.sim))
+                .collect();
+            let model = scene
+                .model(scene::timestep_for(self.dt), &tuning)
+                .unwrap_or_else(|e| panic!("sim-mujoco: {e}"));
+            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(model, &self.maps, q0));
         }
         #[cfg(feature = "sim-dynamics")]
         if let Some(urdf) = &self.urdf {

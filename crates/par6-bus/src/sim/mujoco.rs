@@ -1,7 +1,7 @@
 //! Contact-level arm plant (feature `sim-mujoco`): the whole scene —
 //! arm, gripper jaws, floor and graspable objects — lives in one MuJoCo
-//! model (`sim-assets/PAR6_MSG_scene.xml`) and every DOF is driven
-//! through `qfrc_applied`:
+//! model (built by [`super::scene`] from the vendor MJCF) and every DOF
+//! is driven through `qfrc_applied`:
 //!
 //! - arm joints get the motor torques from the driver current loops
 //!   (config torque↔current factor), idle-brake damping and config-limit
@@ -25,9 +25,6 @@
 //! its `qpos`/`qvel`/`qfrc_applied` slice views — no per-tick state
 //! copies through `mj_getState`/`mj_setState`, and no allocation once the
 //! model is loaded.
-
-use std::path::Path;
-use std::sync::Mutex;
 
 use mujoco_rs::prelude::{MjData, MjModel, MjtObj};
 
@@ -107,20 +104,13 @@ fn m_to_byte(x: f64) -> f64 {
 }
 
 impl MujocoPlant {
-    /// Load the scene and place the arm at `q0` (config joint frame ==
-    /// scene qpos, jaws at the front end's boot byte, everything else at
-    /// the scene's default pose). Panics with a descriptive message on
-    /// load/layout failure (a sim construction bug, not a runtime error).
-    pub fn new(scene: &Path, maps: &[JointMap], q0: &[f64]) -> Self {
+    /// Take the compiled scene and place the arm at `q0` (config joint
+    /// frame == scene qpos, jaws at the front end's boot byte, everything
+    /// else at the scene's default pose). Panics with a descriptive message
+    /// on a layout the plant cannot drive (a sim construction bug, not a
+    /// runtime error).
+    pub fn new(model: MjModel, maps: &[JointMap], q0: &[f64]) -> Self {
         let n = maps.len();
-        // The XML loader keeps global "last XML" parser state and is not
-        // thread-safe; stepping per-instance data is.
-        static LOAD_LOCK: Mutex<()> = Mutex::new(());
-        let model = {
-            let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            MjModel::from_xml(scene)
-                .unwrap_or_else(|e| panic!("sim-mujoco: cannot load {}: {e}", scene.display()))
-        };
         let nq = model.ffi().nq as usize;
         let nv = model.ffi().nv as usize;
         let ts = model.ffi().opt.timestep;
@@ -128,7 +118,8 @@ impl MujocoPlant {
             ts > 0.0 && ts < 0.1,
             "implausible model timestep {ts} — broken model?"
         );
-        let joint_id = |name: &str| -> Option<usize> { model.name_to_id(MjtObj::mjOBJ_JOINT, name) };
+        let joint_id =
+            |name: &str| -> Option<usize> { model.name_to_id(MjtObj::mjOBJ_JOINT, name) };
         // The qpos/qvel address of scene joint i equals i only while every
         // joint up to it is a 1-DOF hinge/slide — the plant indexes state
         // by joint number, so the scene must keep arm + jaws first.

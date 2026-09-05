@@ -1547,8 +1547,8 @@ mod dynamics {
 
 // ---------------------------------------------------------------------------
 // MuJoCo plant (feature sim-mujoco): same DriverBus surface, contact-level
-// physics in a full scene (floor + graspable object). Gated: needs
-// libmujoco from scripts/ffi/setup.sh.
+// physics in a full scene (floor + graspable object). Gated on the
+// `sim-mujoco` feature.
 // ---------------------------------------------------------------------------
 
 #[cfg(feature = "sim-mujoco")]
@@ -1558,8 +1558,11 @@ mod mujoco {
     /// Reach-down pose over the scene's grasp object (config frame).
     const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
-    fn scene() -> PathBuf {
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("sim-assets/PAR6_MSG_scene.xml")
+    fn scene() -> par6_bus::sim::scene::Scene {
+        par6_bus::sim::scene::Scene {
+            tool: par6_bus::sim::scene::Tool::Msg,
+            assets: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description"),
+        }
     }
 
     fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Rig {
