@@ -42,6 +42,7 @@ from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, make_wire_error
+from par6.client._shapes import shapes_to_wire
 from par6.client.async_client import StatusResult
 from par6.client.errors import RobotError
 from par6.protocol.constants import NUM_JOINTS, CompletionPolicy, ErrorCode
@@ -931,21 +932,7 @@ class DryRunRobotClient:
     def set_shapes(self, shapes: list[Shape], **kwargs: Any) -> int:
         """Replace the preview's keep-outs — and enforce them, as the
         runtime enforces the set the live client sends."""
-        wire = []
-        for shape in shapes:
-            kind, params, pose, collision, margin, name, physics = shape.to_wire()
-            wire.append(
-                {
-                    "kind": kind,
-                    "params": [float(p) for p in params],
-                    "pose": [float(p) for p in pose],
-                    "collision": bool(collision),
-                    "margin": float(margin) if margin is not None else None,
-                    "name": name,
-                    "physics": physics,
-                }
-            )
-        self._call(self._preview.set_shapes, wire)
+        self._call(self._preview.set_shapes, shapes_to_wire(shapes))
         return 1
 
     def _sync_context(self) -> None:

@@ -175,13 +175,19 @@ pub struct Preview {
 #[pymethods]
 impl Preview {
     /// Build a session from a robot config path (default search when
-    /// `None`) and assets tree, starting at the configured park pose.
+    /// `None`) and assets tree, starting at the configured park pose;
+    /// `gripper` names the bundle gripper to model instead of the active one.
     #[new]
-    #[pyo3(signature = (config=None, assets=None))]
-    fn new(config: Option<String>, assets: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (config=None, assets=None, gripper=None))]
+    fn new(
+        config: Option<String>,
+        assets: Option<String>,
+        gripper: Option<String>,
+    ) -> PyResult<Self> {
         let inner = EnginePreview::new(
             config.map(std::path::PathBuf::from).as_deref(),
             assets.map(std::path::PathBuf::from).as_deref(),
+            gripper.as_deref(),
         )
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {

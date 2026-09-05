@@ -119,7 +119,14 @@ pub struct Preview {
 impl Preview {
     /// Build a preview session from the robot config (default search when
     /// `None`) and assets tree, starting at the configured park pose.
-    pub fn new(config: Option<&Path>, assets: Option<&Path>) -> Result<Self, DaemonError> {
+    /// `gripper` names the bundle's gripper to model instead of the
+    /// config's active one — the tool a client is displaying — matched
+    /// case-insensitively; an unknown name is a config error.
+    pub fn new(
+        config: Option<&Path>,
+        assets: Option<&Path>,
+        gripper: Option<&str>,
+    ) -> Result<Self, DaemonError> {
         let opts = Options {
             sim: true,
             config: config.map(Path::to_path_buf),
@@ -130,7 +137,22 @@ impl Preview {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
-        let stack = load_kin_stack(&opts, &config_path, robot, bundle.active_gripper())?;
+        let gripper = match gripper {
+            Some(name) => Some(
+                bundle
+                    .grippers
+                    .iter()
+                    .find(|g| g.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        DaemonError::Config(par6_config::ConfigError::Invalid {
+                            field: "gripper".into(),
+                            reason: format!("no gripper `{name}` in the config bundle"),
+                        })
+                    })?,
+            ),
+            None => bundle.active_gripper(),
+        };
+        let stack = load_kin_stack(&opts, &config_path, robot, gripper)?;
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -176,7 +198,7 @@ impl Preview {
             world: par6_server::WorldState::default(),
             scene,
             robot: robot.clone(),
-            gripper: bundle.active_gripper().cloned(),
+            gripper: gripper.cloned(),
             rollout: None,
             carried: Vec::new(),
             jaw_closed: 0.5,

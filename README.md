@@ -296,10 +296,13 @@ Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names fo
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
 
-The client side runs the same world. `Robot.in_collision` / `colliding_pairs` /
-`check_trajectory` / `min_distance` / `apply_shapes` build a `pinokin.CollisionChecker`
-on the active tool's own URDF tree with its SRDF loaded, so a preview and the arm agree
-about which paths are refused.
+The client side asks the same world. `Robot.in_collision` / `colliding_pairs` /
+`check_trajectory` / `min_distance` / `apply_shapes` route to `par6._par6.Preview`, the
+daemon's own collision world run in-process: booted from the bundle the daemon boots
+from (fetched from a reachable runtime, else resolved locally), with the installation
+layer and the floor applied as the runtime applies them and the caller's program shapes
+on top. A preview and the arm therefore agree about which poses are refused, floor
+included, and the client carries no second copy of the world to fall out of step.
 
 ## Kinematics and tools
 

@@ -102,7 +102,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
     preview.teleport_rad(to_rad(&park));
@@ -216,7 +216,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
 #[test]
 fn the_preview_runs_the_cartesian_pipeline() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let park = park_deg();
     preview.teleport_rad(to_rad(&park));
 
@@ -272,7 +272,7 @@ fn the_preview_runs_the_cartesian_pipeline() {
 #[test]
 fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview");
     let start = preview.angles_rad();
 
     let jogged = preview.preview_jog([0.4, 0.0, 0.0, -0.4, 0.0, 0.0], 0.4, None);
@@ -314,7 +314,7 @@ fn the_preview_enforces_the_configured_installation_layer() {
     // Where the TCP passes half way along the sweep, read off the
     // preview's own FK.
     let center_m = {
-        let mut scout = Preview::new(Some(&base), Some(&assets())).expect("preview boots");
+        let mut scout = Preview::new(Some(&base), Some(&assets()), None).expect("preview boots");
         scout.teleport_rad(to_rad(&mid));
         let pose = scout.pose().expect("preview FK");
         [pose[3], pose[7], pose[11]]
@@ -328,7 +328,7 @@ fn the_preview_enforces_the_configured_installation_layer() {
     ));
     std::fs::write(&config, text).expect("write caged config");
 
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     let world = preview.world();
     assert_eq!(
         world.installation().len(),
@@ -381,7 +381,7 @@ fn the_preview_enforces_the_configured_installation_layer() {
 #[test]
 fn the_preview_grasps_carries_and_releases_a_world_object() {
     let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     // Reach-down pose over the stand (config frame), as in the bus tests.
     let grasp = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
     preview.teleport_rad(grasp);

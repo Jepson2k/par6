@@ -822,6 +822,9 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
 #: around J0 so the mid-sweep TCP sits in open workspace where a keep-out
 #: can be parked.
 SWEEP_START_DEG = [-40.0, -20.0, 235.0, 0.0, 15.0, 180.0]
+#: The sweep start with the forearm swung down: the gripper ends 11 cm below
+#: the installation floor and touches nothing else on the way.
+FLOOR_DIVE_DEG = [-40.0, -17.0, 181.0, 0.0, 15.0, 180.0]
 
 
 @pytest.mark.timeout(180)
@@ -944,7 +947,9 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
     arm then refused. Both sides get the same shape and the same move here,
     and both must reject it, name the same colliding pair, and leave the
     arm where it stood. The same move with the keep-out cleared must run on
-    both, so the refusal is the shape's doing and not the move's.
+    both, so the refusal is the shape's doing and not the move's. The
+    client-side checker must also enforce what nobody sent it — the
+    config's installation floor.
     """
     async with daemon.client() as client:
         assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
@@ -1030,6 +1035,20 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         assert robot.check_trajectory(np.radians([SWEEP_START_DEG, mid])) == 1, (
             "check_trajectory must find the keep-out at the second waypoint"
         )
+
+        # The installation layer is the client-side checker's world too.
+        # Nobody sends the floor: the config declares it and the runtime
+        # enforces it, so a local answer that lets the tool through it is
+        # a preview the arm will contradict.
+        with pytest.raises(RobotError) as floor_refusal:
+            preview.move_j(angles=FLOOR_DIVE_DEG)
+        assert "install:floor" in floor_refusal.value.cause
+        dive = np.radians(FLOOR_DIVE_DEG)
+        assert robot.in_collision(dive), (
+            "the local checker let the tool through the floor"
+        )
+        assert any("install:floor" in p for p in robot.colliding_pairs(dive))
+        assert robot.min_distance(dive) < 0.0
 
         # Same move, no keep-out: both sides run it.
         assert preview.set_shapes([])

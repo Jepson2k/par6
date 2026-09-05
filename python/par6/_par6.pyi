@@ -187,7 +187,10 @@ class CoreClient:
 
 class Preview:
     def __init__(
-        self, config: str | None = None, assets: str | None = None
+        self,
+        config: str | None = None,
+        assets: str | None = None,
+        gripper: str | None = None,
     ) -> None: ...
     def angles_rad(self) -> list[float]: ...
     def teleport_rad(self, q: list[float]) -> None: ...
