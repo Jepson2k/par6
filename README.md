@@ -295,6 +295,17 @@ Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names fo
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
 
+A shape that declares `physics` is also a body in the simulator's contact world — a
+fixture without `mass`, a free object with one — and a keep-out like any other to the
+gates; a marker (`collision = false`) is drawn and never enforced. The installation
+floor is infrastructure rather than a shape: `[installation] floor_z_m` in the robot
+TOML is enforced by both gates as a wide keep-out box reported as `install:floor` (a
+half-space would cost coal a full mesh scan per check), rests simulated objects on a
+MuJoCo plane, and rides the world readback (`shapes().floor_z_m`, from `CONFIG_INFO`)
+so a display draws the ground where it is enforced. The base link pairs with no world
+shape: fixed to the world, it can never move into or out of one, and the floor under it
+would otherwise be a permanent collision.
+
 The client side asks the same world. `Robot.in_collision` / `colliding_pairs` /
 `check_trajectory` / `min_distance` / `apply_shapes` route to `par6._par6.Preview`, the
 daemon's own collision world run in-process: booted from the bundle the daemon boots
