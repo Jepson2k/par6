@@ -14,7 +14,6 @@
 //! which sit well clear of the contact boundary — the keep-out box swallows
 //! the TCP by 60 mm, the standoff sphere clears it by ~110 mm, so a
 //! convention slip or unit error flips the verdict rather than grazing it.
-#![cfg(feature = "ffi")]
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -117,11 +116,27 @@ fn pair_set(report_pairs: impl Iterator<Item = (String, String)>) -> BTreeSet<(S
         .collect()
 }
 
-fn expected_pairs(case: &Case) -> BTreeSet<(String, String)> {
-    pair_set(case.pairs.iter().map(|p| (p[0].clone(), p[1].clone())))
+/// The base link's collision geometry: fixed to the world, so it can
+/// never move into or out of a world shape.
+const BASE_GEOM: &str = "base_link_0";
+
+/// The reference pairs the engine must reproduce. The Python reference
+/// pairs every robot geometry with every world shape; the engine leaves the
+/// base out of that (a floor under the base would otherwise be a permanent
+/// collision no motion can clear), so base-to-shape pairs are not expected.
+fn expected_pairs(case: &Case, robot_geoms: &[String]) -> BTreeSet<(String, String)> {
+    let is_robot = |n: &String| robot_geoms.contains(n);
+    pair_set(
+        case.pairs
+            .iter()
+            .filter(|p| {
+                !(p.contains(&BASE_GEOM.to_owned()) && !(is_robot(&p[0]) && is_robot(&p[1])))
+            })
+            .map(|p| (p[0].clone(), p[1].clone())),
+    )
 }
 
-fn assert_case(label: &str, col: &mut Collision, case: &Case) {
+fn assert_case(label: &str, col: &mut Collision, case: &Case, robot_geoms: &[String]) {
     let report = col.check(&case.q, false).unwrap();
     let got = pair_set(
         report
@@ -130,10 +145,16 @@ fn assert_case(label: &str, col: &mut Collision, case: &Case) {
             .collect::<Vec<_>>()
             .into_iter(),
     );
-    let want = expected_pairs(case);
+    let want = expected_pairs(case, robot_geoms);
+    let want_active = !want.is_empty();
+    assert!(
+        case.active == !case.pairs.is_empty(),
+        "{label}/{}: fixture verdict disagrees with its own pairs",
+        case.name
+    );
     assert_eq!(
         report.active(),
-        case.active,
+        want_active,
         "{label}/{}: verdict (got pairs {got:?})",
         case.name
     );
@@ -144,11 +165,11 @@ fn assert_case(label: &str, col: &mut Collision, case: &Case) {
     let quick = col.check(&case.q, true).unwrap();
     assert_eq!(
         quick.active(),
-        case.active,
+        want_active,
         "{label}/{}: stop_at_first verdict disagrees with the full check",
         case.name
     );
-    if case.active {
+    if want_active {
         assert_eq!(
             quick.pair_count(),
             1,
@@ -177,9 +198,15 @@ fn matches_python_reference_on_all_variants() {
             "{label} self-collision pair set drift"
         );
 
+        assert_eq!(
+            fx.robot_geoms.iter().filter(|g| *g == BASE_GEOM).count(),
+            1,
+            "{label}: the base must contribute exactly one collision geometry"
+        );
+
         // Self-collision, no world shapes.
         for case in &fx.robot_only {
-            assert_case(label, &mut col, case);
+            assert_case(label, &mut col, case, &fx.robot_geoms);
         }
 
         // The clear cases must really be clear: a model whose home pose
@@ -208,14 +235,25 @@ fn matches_python_reference_on_all_variants() {
             let program: Vec<Shape> = scene.program.iter().map(WireShape::to_shape).collect();
             col.set_layer(Layer::Installation, &install).unwrap();
             col.set_layer(Layer::Program, &program).unwrap();
+            // One base-to-shape pair per enforced shape is deliberately absent.
+            let enforced = install
+                .iter()
+                .chain(&program)
+                .filter(|s| s.collision)
+                .count();
             assert_eq!(
                 col.pair_count(),
-                scene.pair_count,
+                scene.pair_count - enforced,
                 "{label}/{}: collision pair count",
                 scene.name
             );
             for case in &scene.cases {
-                assert_case(&format!("{label}/{}", scene.name), &mut col, case);
+                assert_case(
+                    &format!("{label}/{}", scene.name),
+                    &mut col,
+                    case,
+                    &fx.robot_geoms,
+                );
             }
         }
 
@@ -223,7 +261,7 @@ fn matches_python_reference_on_all_variants() {
         col.set_layer(Layer::Installation, &[]).unwrap();
         col.set_layer(Layer::Program, &[]).unwrap();
         for case in &fx.robot_only {
-            assert_case(&format!("{label}/cleared"), &mut col, case);
+            assert_case(&format!("{label}/cleared"), &mut col, case, &fx.robot_geoms);
         }
     }
 }
@@ -265,7 +303,9 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
     assert_eq!(col.clearance(), 0.0);
     assert!(!col.check(&q_reach, false).unwrap().active());
 
-    // Installation keep-out: the arm's own floor, always in contact.
+    // Installation layer: the floor the base rests on, and a fence where the
+    // reach pose puts the arm. The base cannot move into or out of the
+    // floor, so that contact is not a collision; the fence is.
     let floor = Shape {
         name: "floor".to_owned(),
         kind: ShapeKind::Plane,
@@ -275,7 +315,12 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
         margin: None,
         physics: None,
     };
-    assert_eq!(col.set_layer(Layer::Installation, &[floor]).unwrap(), 1);
+    let mut fence = keepout.clone();
+    fence.name = "fence".to_owned();
+    assert_eq!(
+        col.set_layer(Layer::Installation, &[floor, fence]).unwrap(),
+        1
+    );
     assert_eq!(
         col.set_layer(Layer::Program, std::slice::from_ref(&keepout))
             .unwrap(),
@@ -291,8 +336,12 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
             .into_iter(),
     );
     assert!(
-        names.iter().any(|(a, b)| a == "floor" || b == "floor"),
+        names.iter().any(|(a, b)| a == "fence" || b == "fence"),
         "installation layer must be enforced: {names:?}"
+    );
+    assert!(
+        !names.iter().any(|(a, b)| a == "floor" || b == "floor"),
+        "the base resting on the floor is not a collision: {names:?}"
     );
     assert!(
         names.iter().any(|(a, b)| a == "keepout" || b == "keepout"),
@@ -310,7 +359,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
             .into_iter(),
     );
     assert!(
-        names.iter().any(|(a, b)| a == "floor" || b == "floor"),
+        names.iter().any(|(a, b)| a == "fence" || b == "fence"),
         "clearing the program layer must not drop installation keep-outs: {names:?}"
     );
     assert!(
