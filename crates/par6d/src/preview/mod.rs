@@ -16,12 +16,10 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
-use par6_bus::sim::rollout::Rollout;
-use par6_bus::sim::scene::{self, quat_from_matrix, quat_from_rpy, Scene};
-use par6_config::{GripperConfig, RobotConfig};
+use par6_bus::sim::scene::Scene;
+use par6_config::GripperConfig;
 use par6_motion::JogEngine;
 use par6_proto::Layer;
-use par6_proto::Shape;
 use par6_proto::{command::JogJ, Command, CompletionPolicy, WireError, NUM_JOINTS};
 use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
@@ -35,22 +33,6 @@ use crate::bridge::{CoreLink, CoreOp};
 use crate::daemon::{load_kin_stack, DaemonError};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
-
-/// Where one free world object went during a previewed command.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ObjectTrack {
-    /// The shape's name — the same identity it has in the collision world
-    /// and the readback.
-    pub name: String,
-    /// `[x, y, z, qw, qx, qy, qz]` per trajectory sample; a stationary
-    /// object carries one row.
-    pub poses: Vec<[f64; 7]>,
-    /// Riding the TCP rather than free.
-    pub carried: bool,
-    /// The track was stepped by the simulator; `false` when the rollout
-    /// hit its step budget and the poses are where things stood.
-    pub physics: bool,
-}
 
 /// One previewed command's outcome: the trajectory the runtime would
 /// drive, or the exact refusal it would answer with.
@@ -68,9 +50,6 @@ pub struct PreviewResult {
     pub duration_s: f64,
     /// The runtime's refusal, when the command would be refused.
     pub error: Option<WireError>,
-    /// The free world objects' motion over this command (empty when the
-    /// world has none).
-    pub object_tracks: Vec<ObjectTrack>,
 }
 
 impl PreviewResult {
@@ -78,12 +57,6 @@ impl PreviewResult {
     pub fn valid(&self) -> bool {
         self.error.is_none()
     }
-}
-
-/// A grasped object: its pose in the TCP frame at the grasp.
-struct Carried {
-    name: String,
-    grasp: [f64; 16],
 }
 
 /// The offline preview session: a virtual arm pose plus the real planner.
@@ -102,17 +75,10 @@ pub struct Preview {
     /// The applied world — the config's installation layer plus the
     /// program layer this session set — read back exactly as the runtime's.
     world: par6_server::WorldState,
-    /// The simulator scene the rollouts step, for this config's tool.
+    /// The simulator scene a run builds its plant from, for this
+    /// config's tool.
     scene: Scene,
-    robot: RobotConfig,
     gripper: Option<GripperConfig>,
-    /// The rollout, built on the first command that needs physics.
-    rollout: Option<Rollout>,
-    /// Objects the jaws hold, with the object pose in the TCP frame the
-    /// grasp closed at.
-    carried: Vec<Carried>,
-    /// The previewed jaw position (0 = open, 1 = closed).
-    jaw_closed: f64,
     /// The preview's runtime payload — none today; the field keeps the
     /// planner sync honest if a payload surface is added offline.
     payload: par6_server::PayloadSpec,
@@ -213,11 +179,7 @@ impl Preview {
             cfg,
             world: par6_server::WorldState::default(),
             scene,
-            robot: robot.clone(),
             gripper: gripper.cloned(),
-            rollout: None,
-            carried: Vec::new(),
-            jaw_closed: 0.5,
             payload: par6_server::PayloadSpec::default(),
             profile: String::new(),
             tcp_offset_mm: [0.0; 3],
@@ -244,249 +206,6 @@ impl Preview {
         Ok(preview)
     }
 
-    /// Preview a tool action: the jaws move to `closed` (0 = open,
-    /// 1 = closed) at the tool actions' default speed while the arm holds,
-    /// stepped in the simulator scene. Closing on an object jams the jaws
-    /// and the object becomes carried — it rides the TCP through the moves
-    /// that follow — and opening releases whatever is held to fall and
-    /// settle. With no free object in the world nothing is stepped and the
-    /// action takes no time, exactly as the runtime's tool actions
-    /// contribute none to a plan. The arm's pose never changes here.
-    pub fn preview_tool(&mut self, closed: f64) -> PreviewResult {
-        /// Step budget \[s\]; past it the track is reported as where
-        /// things stood, not physics.
-        const BUDGET_S: f64 = 2.0;
-        /// Objects slower than this are settled \[m/s, rad/s\] — above
-        /// the jitter of a body held between pressing pads.
-        const SETTLED: f64 = 2e-2;
-        /// Dwell after a jam before the grasp counts as settled \[s\].
-        const JAM_DWELL_S: f64 = 0.2;
-        /// A grasped object sits within this of the TCP \[m\].
-        const GRASP_REACH_M: f64 = 0.15;
-        let closed = closed.clamp(0.0, 1.0);
-        let q = self.snap.q;
-        // Which way the jaws are travelling, read before the new target
-        // replaces the old — then every path below leaves them where they
-        // were asked to go.
-        let closing = closed > self.jaw_closed;
-        self.jaw_closed = closed;
-        let names = scene::free_object_names(&self.world_refs());
-        if names.is_empty() {
-            return still(q, Vec::new());
-        }
-        let Ok(tcp) = self.planner.current_pose(&q) else {
-            return still(q, self.standing_tracks(&names));
-        };
-        let n = self.robot.joints.len();
-        let target = closed * 255.0;
-        if !closing {
-            // Opening releases whatever the jaws held.
-            self.carried.clear();
-        }
-        if self.ensure_rollout().is_none() {
-            return still(q, self.standing_tracks(&names));
-        }
-        let roll = self.rollout.as_mut().expect("just ensured");
-        roll.place_arm(&q[..n]);
-        let dt = roll.dt();
-        let budget = (BUDGET_S / dt).round() as usize;
-        let mut poses: Vec<Vec<[f64; 7]>> = vec![Vec::new(); names.len()];
-        let mut jam = None;
-        let mut jam_tick = 0;
-        let mut settled = false;
-        let mut ticks = 0;
-        while ticks < budget {
-            roll.step(Some(Rollout::jaw_drive(target)));
-            ticks += 1;
-            for (name, track) in names.iter().zip(poses.iter_mut()) {
-                if let Some(p) = roll.object_pose(name) {
-                    track.push(p);
-                }
-            }
-            if closing && jam.is_none() {
-                jam = roll.jaw_obstruction().0;
-                jam_tick = ticks;
-            }
-            let arrived = roll.jaw_byte().is_some_and(|b| (b - target).abs() < 1.5);
-            let moving = names
-                .iter()
-                .any(|name| roll.object_speed(name).is_some_and(|v| v > SETTLED));
-            let jam_dwelt = jam.is_some() && (ticks - jam_tick) as f64 * dt >= JAM_DWELL_S;
-            if (jam_dwelt || (arrived && !moving)) && ticks as f64 * dt >= 0.1 {
-                settled = true;
-                break;
-            }
-        }
-        if closing && jam.is_some() {
-            // The object between the pads: the free object nearest the TCP.
-            let tcp_p = [tcp[3], tcp[7], tcp[11]];
-            let nearest = names
-                .iter()
-                .filter_map(|name| roll.object_pose(name).map(|p| (name, p)))
-                .map(|(name, p)| {
-                    let d = (0..3)
-                        .map(|k| (p[k] - tcp_p[k]).powi(2))
-                        .sum::<f64>()
-                        .sqrt();
-                    (name, p, d)
-                })
-                .filter(|(_, _, d)| *d < GRASP_REACH_M)
-                .min_by(|a, b| a.2.total_cmp(&b.2));
-            if let Some((name, p, _)) = nearest {
-                let grasp = crate::kin::mat_mul(&mat_inv_rigid(&tcp), &pose7_to_mat(&p));
-                self.carried.retain(|c| c.name != *name);
-                self.carried.push(Carried {
-                    name: name.clone(),
-                    grasp,
-                });
-            }
-        }
-        self.jaw_closed = closed;
-        let carried = &self.carried;
-        let object_tracks = names
-            .iter()
-            .zip(poses)
-            .map(|(name, poses)| ObjectTrack {
-                name: name.clone(),
-                carried: carried.iter().any(|c| c.name == *name),
-                physics: settled,
-                poses,
-            })
-            .collect();
-        PreviewResult {
-            joint_trajectory_rad: vec![q; ticks],
-            tcp_poses: vec![tcp; ticks],
-            end_joints_rad: q,
-            duration_s: ticks as f64 * dt,
-            error: None,
-            object_tracks,
-        }
-    }
-
-    fn world_refs(&self) -> [&[Shape]; 2] {
-        [self.world.installation(), self.world.program()]
-    }
-
-    /// The rollout for the current world, built on first use; `None` when
-    /// the scene cannot be built (logged once, tracks then report standing
-    /// poses without physics).
-    fn ensure_rollout(&mut self) -> Option<&mut Rollout> {
-        if self.rollout.is_none() {
-            let n = self.robot.joints.len();
-            let q: Vec<f64> = self.snap.q[..n].to_vec();
-            let built = Rollout::new(
-                &self.scene,
-                &self.robot,
-                self.gripper.as_ref(),
-                &self.world_refs(),
-                &q,
-            );
-            match built {
-                Ok(mut roll) => {
-                    roll.place_jaw(self.jaw_closed * 255.0);
-                    self.rollout = Some(roll);
-                }
-                Err(e) => {
-                    log::warn!("preview physics unavailable: {e}");
-                    return None;
-                }
-            }
-        }
-        self.rollout.as_mut()
-    }
-
-    /// Rebuild the rollout's world after a layer change; objects that no
-    /// longer exist are no longer carried.
-    fn sync_rollout_world(&mut self) {
-        let names = scene::free_object_names(&self.world_refs());
-        self.carried.retain(|c| names.contains(&c.name));
-        let (world, rollout) = (&self.world, &mut self.rollout);
-        if let Some(roll) = rollout.as_mut() {
-            if let Err(e) = roll.set_world(&[world.installation(), world.program()]) {
-                log::warn!("preview scene rebuild refused, rebuilding from scratch: {e}");
-                self.rollout = None;
-            }
-        }
-    }
-
-    /// Where the free objects stand right now: the rollout's poses when it
-    /// exists, else where the world declares them.
-    fn standing_tracks(&self, names: &[String]) -> Vec<ObjectTrack> {
-        names
-            .iter()
-            .map(|name| ObjectTrack {
-                name: name.clone(),
-                poses: vec![self.standing_pose(name)],
-                carried: self.carried.iter().any(|c| c.name == *name),
-                physics: true,
-            })
-            .collect()
-    }
-
-    fn standing_pose(&self, name: &str) -> [f64; 7] {
-        if let Some(p) = self.rollout.as_ref().and_then(|r| r.object_pose(name)) {
-            return p;
-        }
-        self.world_refs()
-            .iter()
-            .flat_map(|layer| layer.iter())
-            .find(|s| s.name == name)
-            .map(|s| pose6_to_pose7(&s.pose))
-            .unwrap_or([0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0])
-    }
-
-    /// The objects' tracks over a planned trajectory ending at `end`:
-    /// carried objects ride the TCP by their grasp transform, free ones
-    /// stand where they are (one row). The rollout follows the arm and
-    /// the carried objects to the end pose.
-    fn tracks_along(
-        &mut self,
-        tcp_poses: &[[f64; 16]],
-        end: &[f64; MAX_JOINTS],
-    ) -> Vec<ObjectTrack> {
-        let names = scene::free_object_names(&self.world_refs());
-        if names.is_empty() {
-            return Vec::new();
-        }
-        let tracks: Vec<ObjectTrack> = names
-            .iter()
-            .map(|name| match self.carried.iter().find(|c| c.name == *name) {
-                Some(c) if !tcp_poses.is_empty() => ObjectTrack {
-                    name: name.clone(),
-                    poses: tcp_poses
-                        .iter()
-                        .map(|tcp| mat_to_pose7(&crate::kin::mat_mul(tcp, &c.grasp)))
-                        .collect(),
-                    carried: true,
-                    physics: true,
-                },
-                carried => ObjectTrack {
-                    name: name.clone(),
-                    poses: vec![self.standing_pose(name)],
-                    carried: carried.is_some(),
-                    physics: true,
-                },
-            })
-            .collect();
-        self.settle_rollout(end);
-        for t in &tracks {
-            if t.carried {
-                if let (Some(roll), Some(last)) = (self.rollout.as_mut(), t.poses.last()) {
-                    roll.place_object(&t.name, *last);
-                }
-            }
-        }
-        tracks
-    }
-
-    /// Follow the arm to `q` in the rollout, if one exists.
-    fn settle_rollout(&mut self, q: &[f64; MAX_JOINTS]) {
-        let n = self.robot.joints.len();
-        if let Some(roll) = self.rollout.as_mut() {
-            roll.place_arm(&q[..n]);
-        }
-    }
-
     fn publish(&mut self) {
         self.snap_w.publish(&self.snap);
     }
@@ -500,7 +219,6 @@ impl Preview {
     pub fn teleport_rad(&mut self, q: [f64; MAX_JOINTS]) {
         self.snap.q = q;
         self.publish();
-        self.settle_rollout(&q);
     }
 
     /// Whether the virtual arm holds its position references.
@@ -559,7 +277,6 @@ impl Preview {
     pub fn set_shapes(&mut self, shapes: &[par6_proto::Shape]) -> Result<u64, WireError> {
         self.world
             .apply(&mut self.planner, (), Layer::Program, shapes.to_vec())?;
-        self.sync_rollout_world();
         Ok(self.world.epoch())
     }
 
@@ -611,7 +328,6 @@ impl Preview {
             end_joints_rad: self.snap.q,
             duration_s: 0.0,
             error: Some(error),
-            object_tracks: Vec::new(),
         }
     }
 
@@ -658,7 +374,6 @@ impl Preview {
                 Err(_) => break,
             }
         }
-        let object_tracks = self.tracks_along(&tcp_poses, &q);
         self.snap.q = q;
         self.publish();
         PreviewResult {
@@ -667,7 +382,6 @@ impl Preview {
             tcp_poses,
             end_joints_rad: q,
             error: None,
-            object_tracks,
         }
     }
 
@@ -730,7 +444,6 @@ impl Preview {
                         end_joints_rad: self.snap.q,
                         duration_s: 0.0,
                         error: Some(error),
-                        object_tracks: Vec::new(),
                     },
                     1,
                 ),
@@ -759,7 +472,6 @@ impl Preview {
                             Err(_) => break,
                         }
                     }
-                    let object_tracks = self.tracks_along(&tcp_poses, &end);
                     self.snap.q = end;
                     (
                         PreviewResult {
@@ -768,7 +480,6 @@ impl Preview {
                             end_joints_rad: end,
                             duration_s,
                             error: None,
-                            object_tracks,
                         },
                         consumed,
                     )
@@ -787,7 +498,6 @@ impl Preview {
                     end_joints_rad: end,
                     duration_s: 0.0,
                     error: None,
-                    object_tracks: Vec::new(),
                 });
             }
             rest = &rest[consumed..];
@@ -812,67 +522,4 @@ impl Preview {
     pub fn default_config_path() -> Result<PathBuf, String> {
         resolve_config_path(None)
     }
-}
-
-/// Inverse of a rigid transform: `Rᵀ`, `−Rᵀ·t`.
-fn mat_inv_rigid(m: &[f64; 16]) -> [f64; 16] {
-    let mut out = [0.0; 16];
-    for r in 0..3 {
-        for c in 0..3 {
-            out[4 * r + c] = m[4 * c + r];
-        }
-        out[4 * r + 3] = -(0..3).map(|k| m[4 * k + r] * m[4 * k + 3]).sum::<f64>();
-    }
-    out[15] = 1.0;
-    out
-}
-
-/// The result of a tool action that moved nothing: the arm holds, and the
-/// objects are wherever `tracks` says they stand.
-fn still(q: [f64; MAX_JOINTS], tracks: Vec<ObjectTrack>) -> PreviewResult {
-    PreviewResult {
-        joint_trajectory_rad: Vec::new(),
-        tcp_poses: Vec::new(),
-        end_joints_rad: q,
-        duration_s: 0.0,
-        error: None,
-        object_tracks: tracks,
-    }
-}
-
-/// `[x, y, z, qw, qx, qy, qz]` of a rigid transform.
-fn mat_to_pose7(m: &[f64; 16]) -> [f64; 7] {
-    let q = quat_from_matrix([[m[0], m[1], m[2]], [m[4], m[5], m[6]], [m[8], m[9], m[10]]]);
-    [m[3], m[7], m[11], q[0], q[1], q[2], q[3]]
-}
-
-/// Rigid transform of `[x, y, z, qw, qx, qy, qz]`.
-fn pose7_to_mat(p: &[f64; 7]) -> [f64; 16] {
-    let (w, x, y, z) = (p[3], p[4], p[5], p[6]);
-    [
-        1.0 - 2.0 * (y * y + z * z),
-        2.0 * (x * y - w * z),
-        2.0 * (x * z + w * y),
-        p[0],
-        2.0 * (x * y + w * z),
-        1.0 - 2.0 * (x * x + z * z),
-        2.0 * (y * z - w * x),
-        p[1],
-        2.0 * (x * z - w * y),
-        2.0 * (y * z + w * x),
-        1.0 - 2.0 * (x * x + y * y),
-        p[2],
-        0.0,
-        0.0,
-        0.0,
-        1.0,
-    ]
-}
-
-/// `[x, y, z, qw, qx, qy, qz]` of a wire pose `[x, y, z, rx, ry, rz]`.
-/// The rotation is the scene builder's, so the grasp transform is taken
-/// against the orientation MuJoCo actually gave the geom.
-fn pose6_to_pose7(pose: &[f64]) -> [f64; 7] {
-    let q = quat_from_rpy(pose[3], pose[4], pose[5]);
-    [pose[0], pose[1], pose[2], q[0], q[1], q[2], q[3]]
 }

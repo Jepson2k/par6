@@ -37,7 +37,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pinokin import so3_rpy
 from waldoctl import ToolState, ToolStatus
-from waldoctl.results import DryRunResultData, ObjectTrack
+from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 
 from par6 import config as _cfg
@@ -233,9 +233,14 @@ class DryRunRobotClient:
         self._profile = "RUCKIG"
         self._policy = int(CompletionPolicy.SETTLED)
 
+        self._start_joints_rad = list(self._preview.angles_rad())
         if initial_joints_deg is not None:
             q = np.radians(np.asarray(initial_joints_deg, dtype=np.float64))
             self._preview.teleport_rad(q.tolist())
+            self._start_joints_rad = q.tolist()
+        # Every command this client plans, kept so the whole program can
+        # be handed to the engine afterwards and actually run.
+        self._program: list[dict] = []
         self._preview.set_homed(bool(initial_homed))
 
         self._tools = {spec.key: spec for spec in build_tools().available}
@@ -322,7 +327,6 @@ class DryRunRobotClient:
                 end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
                 duration=float(r["duration_s"]),
                 joint_trajectory_rad=self._q()[np.newaxis, :].copy(),
-                object_tracks=_tracks(r, None),
             )
         stride = max(1, len(traj) // self._max_points)
         idx = list(range(0, len(traj), stride))
@@ -337,7 +341,6 @@ class DryRunRobotClient:
             end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
             duration=float(r["duration_s"]),
             joint_trajectory_rad=sampled,
-            object_tracks=_tracks(r, idx),
         )
 
     def _error_result(self, err: RobotError) -> DryRunResultData:
@@ -355,6 +358,7 @@ class DryRunRobotClient:
         ``IK_PARTIAL_PATH`` — a preview wants to show how far a line gets,
         and the caller reads that off the result's ``error``.
         """
+        self._program.extend(cmds)
         results = self._preview.preview_program(cmds)
         out: list[DryRunResultData] = []
         for r in results:
@@ -386,6 +390,40 @@ class DryRunRobotClient:
         batch, self._held = self._held, []
         results = self._run_batch(batch)
         return _merge(results) if results else None
+
+    # ------------------------------------------------------------------
+    # The second pass: what the arm would actually do
+    # ------------------------------------------------------------------
+
+    def simulate(self, max_seconds: float | None = None) -> dict:
+        """Run everything planned so far through the engine and return the
+        tick record of what the arm did.
+
+        The planning pass answers "where is it told to go", fast enough to
+        run behind a keystroke.  This answers "where does it end up", by
+        queueing the same commands to the same planner driving the same
+        control loop against a simulated plant: servo lag, gravity sag,
+        contact, and a grasp that holds or does not hold.  The gap between
+        the two columns it returns is the thing worth looking at.
+
+        Costs roughly a sixtieth of the program's own duration, so it
+        belongs behind a longer idle than the planning pass, not on the
+        typing path.  ``max_seconds`` bounds SIMULATED time, so a program
+        that never terminates still comes back.
+
+        The world is the one applied NOW: a program that edits the
+        collision world part-way through is replayed against its final
+        state, not the state it had at each command.
+        """
+        self._close_chain()
+        here = list(self._preview.angles_rad())
+        self._preview.teleport_rad(self._start_joints_rad)
+        try:
+            return self._call(self._preview.run_program, self._program, max_seconds)
+        finally:
+            # The planning session goes on from where it was; a run is a
+            # question about the program, not a move.
+            self._preview.teleport_rad(here)
 
     def _discard_chain(self) -> None:
         """Drop a held chain unplanned.
@@ -891,6 +929,9 @@ class DryRunRobotClient:
         silently absorbed.
         """
         self._flush_quietly()
+        self._program.append(
+            {"type": "select_tool", "tool_name": tool_name, "variant_key": variant_key}
+        )
         key = _cfg.canonical_tool_key(tool_name)
         if variant_key and not getattr(self._tools.get(key), "variants", ()):
             logger.warning(
@@ -948,11 +989,14 @@ class DryRunRobotClient:
     ) -> DryRunResultData:
         """A gripper action: the arm holds still while the tool works.
 
-        Duration is only what the config supports.  A ``move`` finishes when
-        the driver reports it did — the config carries no jaw speed model to
-        predict that from, so it contributes no time; ``stop`` and ``idle``
-        settle the same way.  A ``calibrate`` runs the driver's homing
-        sequence, which the runtime holds for at least
+        A planned trajectory is all this pass can report, and a tool
+        action has none: a ``move`` finishes when the driver says it did,
+        which is a fact about jaws and contact rather than about the plan,
+        so it contributes no time here.  The simulated run
+        (``Preview.run_program``) is where a grasp gets its real duration,
+        and the difference between the two is the point of running it.
+        ``stop`` and ``idle`` settle the same way.  A ``calibrate`` runs
+        the driver's homing sequence, which the runtime holds for at least
         ``TOOL_CALIBRATE_MIN_WAIT_S`` (``crates/par6d/src/planner.rs``).
         """
         verb = action.strip().lower()
@@ -966,15 +1010,14 @@ class DryRunRobotClient:
                 ),
             )
         pending = self._close_chain()
-        if verb == "move":
-            # The jaws move in the simulator scene: closing on a free
-            # object carries it, opening releases it — the object tracks
-            # say where things went.
-            closed = {"open": 0.0, "close": 1.0}.get(action.strip().lower())
-            if closed is None:
-                closed = float(params[0]) if params else 1.0
-            result = self._convert(self._call(self._preview.preview_tool, closed))
-            return result if not pending else _merge([*pending, result])
+        self._program.append(
+            {
+                "type": "tool_action",
+                "tool_key": tool_key,
+                "action": verb,
+                "params": self._move_params(action, params) if verb == "move" else [],
+            }
+        )
         result = DryRunResultData(
             tcp_poses=self._si_pose_now()[np.newaxis, :],
             end_joints_rad=self._q().copy(),
@@ -987,6 +1030,24 @@ class DryRunRobotClient:
     # Commands with no effect on an offline plan
     # ------------------------------------------------------------------
 
+    def _move_params(self, action: str, params: list | None) -> list[float]:
+        """``[position, speed, current_ma]`` for a jaw move.
+
+        ``open`` / ``close`` name a position and carry no parameters, and
+        ``set_position`` carries only the position; the rest are the
+        defaults the live tool facade sends, so what a run executes is
+        what the machine would have been told.
+        """
+        position = {"open": 0.0, "close": 1.0}.get(action.strip().lower())
+        given = [float(v) for v in (params or [])]
+        if position is None:
+            position = given[0] if given else 1.0
+        return [
+            position,
+            given[1] if len(given) > 1 else 0.5,
+            given[2] if len(given) > 2 else _cfg.fitted_tool_ilim_ma(),
+        ]
+
     def _flush_quietly(self) -> None:
         """Close the hold for a command that only reconfigures state; the
         motion it releases is dropped (the caller asked no path back)."""
@@ -994,10 +1055,14 @@ class DryRunRobotClient:
 
     def checkpoint(self, label: str, **kwargs: Any) -> int:
         self._flush_quietly()
+        self._program.append({"type": "checkpoint", "label": label})
         return 0
 
     def delay(self, seconds: float = 0.0, **kwargs: Any) -> int:
         self._flush_quietly()
+        # No time passes in a plan; in a run it does, and a delay between
+        # a grasp and a lift is exactly where the two diverge.
+        self._program.append({"type": "delay", "seconds": float(seconds)})
         return 0
 
     def stop(self, clear_queue: bool = True, **kwargs: Any) -> int:
@@ -1191,70 +1256,6 @@ class _KinFacade:
         return out
 
 
-def _tracks(r: dict, idx: list[int] | None) -> tuple[ObjectTrack, ...] | None:
-    """The engine's object tracks, downsampled with the trajectory's own
-    sample index list so every row still aligns with a joint sample; a
-    one-row (stationary) track stays one row."""
-    raw = r.get("object_tracks") or []
-    if not raw:
-        return None
-    out = []
-    for t in raw:
-        poses = np.asarray(t["poses"], dtype=np.float64).reshape(-1, 7)
-        if idx is not None and poses.shape[0] > 1 and poses.shape[0] >= idx[-1] + 1:
-            poses = poses[idx]
-        out.append(
-            ObjectTrack(
-                name=str(t["name"]),
-                poses=poses,
-                carried=bool(t["carried"]),
-                physics=bool(t["physics"]),
-            )
-        )
-    return tuple(out)
-
-
-def _merge_tracks(results: list[DryRunResultData]) -> tuple[ObjectTrack, ...] | None:
-    """Object tracks of several motions as one, in the order they run: each
-    result's rows broadcast to its own trajectory length, then concatenated
-    per object, so the merged track stays aligned with the merged joint
-    trajectory."""
-    names: list[str] = []
-    for r in results:
-        for t in r.object_tracks or ():
-            if t.name not in names:
-                names.append(t.name)
-    if not names:
-        return None
-    merged = []
-    for name in names:
-        rows = []
-        carried = False
-        physics = True
-        for r in results:
-            n = (
-                r.joint_trajectory_rad.shape[0]
-                if r.joint_trajectory_rad is not None
-                else 1
-            )
-            t = next((t for t in r.object_tracks or () if t.name == name), None)
-            if t is None:
-                continue
-            p = t.poses if t.poses.shape[0] == n else np.repeat(t.poses[-1:], n, axis=0)
-            rows.append(p)
-            carried = t.carried
-            physics = physics and t.physics
-        merged.append(
-            ObjectTrack(
-                name=name,
-                poses=np.concatenate(rows, axis=0) if rows else np.empty((0, 7)),
-                carried=carried,
-                physics=physics,
-            )
-        )
-    return tuple(merged)
-
-
 def _merge(results: list[DryRunResultData]) -> DryRunResultData:
     """Several motions as one result, in the order they run.
 
@@ -1283,7 +1284,6 @@ def _merge(results: list[DryRunResultData]) -> DryRunResultData:
     trajectories = [r.joint_trajectory_rad for r in drawn]
     present = [t for t in trajectories if t is not None]
     return DryRunResultData(
-        object_tracks=_merge_tracks(results),
         tcp_poses=np.vstack([r.tcp_poses for r in drawn]),
         end_joints_rad=drawn[-1].end_joints_rad,
         duration=sum(r.duration for r in results),

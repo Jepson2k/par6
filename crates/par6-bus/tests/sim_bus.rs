@@ -1805,6 +1805,19 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
         "the block should rest on the floor at z {HALF_H}, got {}",
         rest[2]
     );
+    assert!(
+        rig.bus.object_speed("block").unwrap() < 1e-3,
+        "a block reported at rest must actually be at rest, not caught \
+         mid-bounce: {} m/s",
+        rig.bus.object_speed("block").unwrap()
+    );
+    // Only free bodies have poses to read: a keep-out is geometry the arm
+    // must avoid and a marker is a label, and neither is a thing that can
+    // move, so neither is in the index.
+    assert_eq!(rig.bus.object_names(), vec!["block".to_owned()]);
+    let mut poses = [[0.0; 7]; 4];
+    assert_eq!(rig.bus.object_poses_into(&mut poses), 1);
+    assert_eq!(poses[0], rest, "the bulk read agrees with the per-name one");
 
     // A fixture under the block: rebuilt with it in place, the block keeps
     // its pose (it survives the recompile) and the fixture is where a

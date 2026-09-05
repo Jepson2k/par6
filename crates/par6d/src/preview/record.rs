@@ -99,6 +99,12 @@ pub struct TickBatch {
     pub q_rad: Vec<f32>,
     /// Commanded joint positions \[rad\], post-limiter — what went on the
     /// motor bus. The difference from `q_rad` is the tracking error.
+    ///
+    /// NaN until the first tick that commands a position. An idle arm
+    /// holds itself with a gravity-compensating torque and no position
+    /// target at all, so there is nothing to report and nothing for the
+    /// achieved column to diverge from; a consumer drawing the gap
+    /// should draw none over those rows rather than invent one.
     pub q_commanded_rad: Vec<f32>,
     /// Achieved TCP `[x y z (m), roll pitch yaw (rad)]`, `rows × 6`,
     /// in the wire's intrinsic-XYZ convention.
@@ -134,6 +140,34 @@ impl TickBatch {
     /// Total simulated time the record covers \[s\].
     pub fn duration_s(&self) -> f64 {
         self.rows as f64 * self.row_dt_s
+    }
+}
+
+impl StopReason {
+    /// The name a consumer outside Rust identifies this by.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::BudgetExhausted => "budget_exhausted",
+        }
+    }
+}
+
+/// The RT mode's name, for a consumer outside Rust.
+pub fn mode_name(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Booting => "booting",
+        Mode::Idle => "idle",
+        Mode::ActiveError => "active_error",
+        Mode::Homing => "homing",
+        Mode::Jog => "jog",
+        Mode::Stream => "stream",
+        Mode::Exec => "exec",
+        Mode::HandGuiding => "hand_guiding",
+        Mode::Impedance => "impedance",
+        Mode::SafetyStop => "safety_stop",
+        Mode::Flashing => "flashing",
     }
 }
 

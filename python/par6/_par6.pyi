@@ -215,13 +215,35 @@ class Preview:
     def preview_jog(
         self, speeds: list[float], duration: float, accel: float | None = None
     ) -> dict[str, Any]: ...
-    def preview_tool(self, closed: float) -> dict:
-        """Preview a tool action: jaws to ``closed`` (0 open, 1 closed) while
-        the arm holds, stepped in the simulator scene; ``object_tracks``
-        carries the free world objects' motion."""
-        ...
-
     def preview_program(self, cmds: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
+    def run_program(
+        self, cmds: list[dict[str, Any]], max_seconds: float | None = None
+    ) -> dict[str, Any]:
+        """Run a program through the engine and return the tick record of
+        what the arm did.
+
+        Unlike ``preview_program``, which plans, this ticks the same
+        control loop and plant the simulator does. Sampled columns come
+        back as raw native-order buffers to be read with
+        ``np.frombuffer``, shaped by ``rows`` and ``joints``:
+
+        - ``q_rad``, ``q_commanded_rad``: float32, ``rows x joints``
+          (``q_commanded_rad`` is NaN until the first tick that commands
+          a position: an idle arm holds itself with a torque, not a
+          target, so there is no commanded path to diverge from)
+        - ``tcp``: float32, ``rows x 6`` (metres, radians)
+        - ``tool_closed``: float32, ``rows``; ``tool_gripping``: bool, ``rows``
+        - ``com``: float32, ``rows x 3``, empty without a plant
+        - ``contact_pos`` / ``contact_force``: float32, 3 per contact,
+          sliced per row by ``contact_starts`` (uint32, ``rows + 1``)
+        - ``objects``: ``[{"name", "rows", "poses"}]``, float32 ``rows x 7``
+        - ``modes``: ``[(start_row, name)]``; ``commands``:
+          ``[{"command", "start_row", "rows", "error"}]``
+        - ``stop``: ``"completed"``, ``"failed"`` or ``"budget_exhausted"``
+
+        ``max_seconds`` bounds SIMULATED time, so a program that never
+        terminates still returns."""
+        ...
 
 class TelemetryReader:
     def __init__(

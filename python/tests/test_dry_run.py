@@ -18,7 +18,6 @@ import time
 import numpy as np
 import pytest
 from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
-from waldoctl.results import ObjectTrack
 from waldoctl.shapes import Box, Physical
 
 from par6 import config as _cfg
@@ -972,23 +971,46 @@ async def _teleport_to(client, angles: list[float]) -> None:
     raise AssertionError("teleport never took effect")
 
 
-def _track(result: DryRunResultData | None, name: str) -> ObjectTrack:
-    """The named object's track on a result that must carry tracks."""
-    assert result is not None and result.object_tracks is not None
-    return {t.name: t for t in result.object_tracks}[name]
-
-
 def _samples(result: DryRunResultData | None) -> int:
     assert result is not None and result.joint_trajectory_rad is not None
     return result.joint_trajectory_rad.shape[0]
 
 
-class TestWorldObjects:
-    """The preview's physics through the client: a free block declared
-    through the world layer is grasped, carried and released, and its
-    track rides with every result."""
+def _cols(batch: dict) -> dict:
+    """The tick record's raw column buffers as arrays.
 
-    def test_grasp_carry_and_release_tracks(self):
+    ``run_program`` returns native-order bytes rather than lists so a
+    minute of program does not become a million Python floats;
+    ``frombuffer`` is a view over them, and this is the whole decode.
+    """
+    rows, joints = batch["rows"], batch["joints"]
+    f32 = lambda b: np.frombuffer(b, dtype=np.float32)  # noqa: E731
+    return {
+        "q": f32(batch["q_rad"]).reshape(rows, joints),
+        "q_commanded": f32(batch["q_commanded_rad"]).reshape(rows, joints),
+        "tcp": f32(batch["tcp"]).reshape(rows, 6),
+        "tool_closed": f32(batch["tool_closed"]),
+        "gripping": np.frombuffer(batch["tool_gripping"], dtype=np.bool_),
+        "contact_starts": np.frombuffer(batch["contact_starts"], dtype=np.uint32),
+    }
+
+
+def _object(batch: dict, name: str) -> np.ndarray:
+    t = {o["name"]: o for o in batch["objects"]}[name]
+    return np.frombuffer(t["poses"], dtype=np.float32).reshape(t["rows"], 7)
+
+
+class TestSimulatedRun:
+    """A grasp run through the whole engine, from Python.
+
+    Nothing here is arranged: the jaws stop on the block because the
+    contact solver says so, it rises because friction against the pads
+    carries it, and it falls when they open.  The columns come back as
+    buffers, so this also checks the shim's own contract — every one of
+    them decodes to the row count the record declares.
+    """
+
+    def test_grasp_carry_and_release(self):
         grasp_deg = [math.degrees(v) for v in (0.0, -0.25, 4.35, 0.0, -1.28, 0.0)]
         client = Robot().create_dry_run_client(initial_joints_deg=grasp_deg)
         stand = Box(
@@ -1009,23 +1031,54 @@ class TestWorldObjects:
         )
         client.set_shapes([stand, block])
 
-        closed = client.tool.close()
-        held = _track(closed, "block")
-        assert held.carried and held.physics
-        assert held.poses.shape == (_samples(closed), 7)
-        assert closed.duration > 0.1
-        held_z = held.poses[-1, 2]
-        assert abs(held_z - 0.04) < 0.01
-
+        # The planning pass, exactly as a preview runs it today.
         lifted = list(grasp_deg)
         lifted[1] -= math.degrees(0.3)
-        moved = client.move_j(lifted, speed=0.5)
-        riding = _track(moved, "block")
-        assert riding.carried and riding.physics
-        assert riding.poses.shape == (_samples(moved), 7)
-        assert riding.poses[-1, 2] > held_z + 0.05
+        client.tool.close()
+        client.move_j(lifted, speed=0.5)
+        client.tool.open()
 
-        opened = client.tool.open()
-        dropped = _track(opened, "block")
-        assert not dropped.carried and dropped.physics
-        assert dropped.poses[-1, 2] < riding.poses[-1, 2] - 0.05
+        # ...and then the same program, actually run.
+        batch = client.simulate()
+        assert batch["stop"] == "completed"
+        assert [c["error"] for c in batch["commands"]] == [None, None, None]
+
+        rows = batch["rows"]
+        cols = _cols(batch)
+        assert cols["q"].shape == (rows, batch["joints"])
+        assert cols["tcp"].shape == (rows, 6)
+        assert cols["tool_closed"].shape == (rows,)
+        assert cols["contact_starts"].shape == (rows + 1,)
+
+        # A static fixture is welded into the world, so it is not a body
+        # with a pose to track; only the free block is.
+        assert [o["name"] for o in batch["objects"]] == ["block"]
+        poses = _object(batch, "block")
+        assert poses.shape == (rows, 7)
+
+        close_end = batch["commands"][0]["start_row"] + batch["commands"][0]["rows"]
+        lift_end = batch["commands"][1]["start_row"] + batch["commands"][1]["rows"]
+        held, raised, dropped = (
+            poses[close_end - 1, 2],
+            poses[lift_end - 1, 2],
+            poses[-1, 2],
+        )
+        assert abs(held - 0.04) < 0.01, f"the block left its stand: z {held}"
+        assert raised > held + 0.05, f"the jaws did not carry it: {held} -> {raised}"
+        assert dropped < raised - 0.05, f"it did not fall: {raised} -> {dropped}"
+
+        lift = slice(batch["commands"][1]["start_row"], lift_end)
+        assert cols["gripping"][lift].any(), "the jaws never reported an object"
+        assert (np.diff(cols["contact_starts"])[lift] > 0).any(), (
+            "a block held between two pads has contacts"
+        )
+        # The tracking error the plan cannot show: real, and small.  It
+        # only exists where something was commanded — the opening tool
+        # action holds the arm with a torque and no position target, and
+        # those rows report NaN rather than a divergence of zero.
+        commanded = ~np.isnan(cols["q_commanded"]).any(axis=1)
+        assert not commanded[0] and commanded[-1], (
+            "an idle hold commands no position, a executed move does"
+        )
+        err = np.abs(cols["q"][commanded] - cols["q_commanded"][commanded]).max()
+        assert 1e-5 < err < 0.05, f"tracking error {err} rad"

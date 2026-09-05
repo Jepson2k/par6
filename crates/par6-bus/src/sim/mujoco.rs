@@ -409,18 +409,6 @@ impl MujocoPlant {
         )
     }
 
-    /// Place the free world object `name` at rest at `pose` (teleport).
-    pub fn place_object(&mut self, name: &str, pose: [f64; 7]) -> bool {
-        let Some((_, adr, dadr)) = self.object_joint(name) else {
-            return false;
-        };
-        self.qpos[adr..adr + 7].copy_from_slice(&pose);
-        self.qvel[dadr..dadr + 6].fill(0.0);
-        self.data.qpos_mut()[adr..adr + 7].copy_from_slice(&pose);
-        self.data.qvel_mut()[dadr..dadr + 6].fill(0.0);
-        true
-    }
-
     /// Names of the free world objects in the scene.
     pub fn object_names(&self) -> Vec<String> {
         self.objects.keys().cloned().collect()
@@ -449,28 +437,6 @@ impl MujocoPlant {
         self.data.qvel_mut().fill(0.0);
         self.data.forward();
         self.data.qfrc_bias()[..self.n].to_vec()
-    }
-
-    /// The jaws' measured position byte (0 = open, 255 = closed), `None`
-    /// on a tool without jaws.
-    pub fn jaw_byte(&self) -> Option<f64> {
-        self.jaw.map(|jaw| m_to_byte(self.qpos[jaw]))
-    }
-
-    /// Place the jaws at rest at `byte` and aim the servo there (the tool
-    /// half of a teleport).
-    pub fn place_jaw(&mut self, byte: f64) {
-        let Some(jaw) = self.jaw else {
-            return;
-        };
-        let x = byte_to_m(byte.clamp(0.0, 255.0));
-        self.jaw_cmd_byte = byte.clamp(0.0, 255.0);
-        for (q, v) in [(jaw, x), (jaw + 1, -x)] {
-            self.qpos[q] = v;
-            self.qvel[q] = 0.0;
-            self.data.qpos_mut()[q] = v;
-            self.data.qvel_mut()[q] = 0.0;
-        }
     }
 
     /// Measured motor state of arm joint `j` (position ticks, speed

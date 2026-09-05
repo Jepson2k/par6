@@ -33,7 +33,6 @@ mod gripper;
 mod jaw;
 mod map;
 mod mujoco;
-pub mod rollout;
 pub mod scene;
 
 pub use driver::FaultKind;

@@ -383,111 +383,6 @@ fn the_preview_enforces_the_configured_installation_layer() {
 /// block rides the TCP through the move that follows, and opening drops
 /// it — every track aligned with the trajectory it belongs to, and every
 /// one of them stepped, not guessed.
-#[test]
-fn the_preview_grasps_carries_and_releases_a_world_object() {
-    let config = test_config();
-    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
-    // Reach-down pose over the stand (config frame), as in the bus tests.
-    let grasp = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
-    preview.teleport_rad(grasp);
-    let shape = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| par6_proto::Shape {
-        kind: "box".into(),
-        params: params.to_vec(),
-        pose: vec![0.3713, 0.0, z, 0.0, 0.0, 0.0],
-        collision: true,
-        margin: None,
-        name: name.into(),
-        physics: Some(par6_proto::Physical {
-            mass,
-            friction: [1.0, 0.005, 0.0001],
-        }),
-    };
-    preview
-        .set_shapes(&[
-            shape("stand", [0.04, 0.04, 0.01], 0.005, None),
-            shape("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
-        ])
-        .expect("world applied");
-
-    // Close: the jaws jam on the block and it is carried.
-    let grasped = preview.preview_tool(1.0);
-    assert!(grasped.valid(), "{:?}", grasped.error);
-    assert!(
-        grasped.duration_s > 0.1,
-        "closing takes time: {}",
-        grasped.duration_s
-    );
-    let block = grasped
-        .object_tracks
-        .iter()
-        .find(|t| t.name == "block")
-        .expect("the block has a track");
-    assert!(block.physics, "the grasp was stepped");
-    assert!(block.carried, "closing on the block carries it");
-    assert_eq!(
-        block.poses.len(),
-        grasped.joint_trajectory_rad.len(),
-        "one pose per trajectory sample"
-    );
-    let held_z = block.poses.last().unwrap()[2];
-    assert!(
-        (held_z - 0.04).abs() < 0.01,
-        "the block stayed on the stand while grasped: z {held_z}"
-    );
-
-    // Lift: the carried block rides the TCP, one pose per sample.
-    // Lift: the shoulder swings back (its window is negative), raising the TCP.
-    let mut lifted = grasp;
-    lifted[1] -= 0.3;
-    let move_up = preview.preview(Command::MoveJ(MoveJ {
-        key: 9101,
-        angles: std::array::from_fn(|i| lifted[i].to_degrees()),
-        duration: None,
-        speed: Some(0.5),
-        accel: None,
-        blend_radius: None,
-        rel: false,
-    }));
-    assert!(move_up.valid(), "{:?}", move_up.error);
-    let block = move_up
-        .object_tracks
-        .iter()
-        .find(|t| t.name == "block")
-        .expect("the block has a track");
-    assert!(block.carried && block.physics);
-    assert_eq!(block.poses.len(), move_up.joint_trajectory_rad.len());
-    let lifted_z = block.poses.last().unwrap()[2];
-    assert!(
-        lifted_z > held_z + 0.05,
-        "the carried block rose with the TCP: {held_z} -> {lifted_z}"
-    );
-    // It rides the TCP: its offset from the TCP is what it was at the grasp.
-    let tcp0 = &grasped.tcp_poses[0];
-    let tcp1 = move_up.tcp_poses.last().unwrap();
-    let off0 = held_z - tcp0[11];
-    let off1 = lifted_z - tcp1[11];
-    assert!(
-        (off0 - off1).abs() < 0.02,
-        "grasp offset drifted: {off0} -> {off1}"
-    );
-
-    // Release: the block falls and settles below where it was held.
-    let released = preview.preview_tool(0.0);
-    assert!(released.valid());
-    let block = released
-        .object_tracks
-        .iter()
-        .find(|t| t.name == "block")
-        .expect("the block has a track");
-    assert!(!block.carried, "opening releases the block");
-    assert!(block.physics, "the fall was stepped");
-    let dropped_z = block.poses.last().unwrap()[2];
-    assert!(
-        dropped_z < lifted_z - 0.05,
-        "the released block fell: held at {lifted_z}, now {dropped_z}"
-    );
-}
-
 /// The simulated run against the planner it replaces.
 ///
 /// The planner says where the arm is *told* to go; the run says where it
@@ -558,7 +453,10 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
     // The tracking error the plan cannot show. It must be real — a
     // record where the two columns are identical is not measuring a
     // servo, it is copying the command — and it must stay small.
+    // Only over the rows that commanded a position: an idle arm holds
+    // itself with a torque and no target, and reports NaN.
     let worst = (0..batch.q_rad.len())
+        .filter(|i| batch.q_commanded_rad[*i].is_finite())
         .map(|i| (batch.q_rad[i] - batch.q_commanded_rad[i]).abs())
         .fold(0.0f32, f32::max);
     assert!(
@@ -568,5 +466,130 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
     assert!(
         worst < 0.05,
         "the arm is not following its commands: worst tracking error {worst} rad"
+    );
+}
+
+/// A grasp, through the whole machine.
+///
+/// Nothing here is arranged: the jaws close because a tool action was
+/// queued, they stop on the block because the contact solver says so, the
+/// block rises because friction against the pads carries it, and it falls
+/// when they open. There is no "carried" flag and no rigid transform
+/// welding it to the TCP — the earlier preview had both, and both were
+/// claims physics could contradict.
+#[test]
+fn a_run_grasps_lifts_and_drops_a_world_object() {
+    let config = test_config();
+    let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    // Reach-down pose over the stand (config frame), as in the bus tests.
+    let grasp_pose = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
+    session.teleport_rad(grasp_pose);
+    let shape = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| Shape {
+        kind: "box".into(),
+        params: params.to_vec(),
+        pose: vec![0.3713, 0.0, z, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: name.into(),
+        physics: Some(par6_proto::Physical {
+            mass,
+            friction: [1.0, 0.005, 0.0001],
+        }),
+    };
+    session
+        .set_shapes(&[
+            shape("stand", [0.04, 0.04, 0.01], 0.005, None),
+            shape("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
+        ])
+        .expect("world applied");
+
+    let tool = par6_config::RobotConfig::load(&config)
+        .expect("cfg")
+        .robot
+        .active_gripper;
+    let tool_move = |key: u64, closed: f64| {
+        Command::ToolAction(par6_proto::command::ToolAction {
+            key,
+            tool_key: tool.clone(),
+            action: "move".into(),
+            params: vec![
+                par6_proto::ToolParam::Float(closed),
+                par6_proto::ToolParam::Float(0.5),
+                par6_proto::ToolParam::Float(500.0),
+            ],
+        })
+    };
+    // Close on the block, swing the shoulder back to raise the TCP, open.
+    let mut lifted = grasp_pose;
+    lifted[1] -= 0.3;
+    let cmds = [
+        tool_move(9001, 1.0),
+        Command::MoveJ(MoveJ {
+            key: 9002,
+            angles: std::array::from_fn(|i| lifted[i].to_degrees()),
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        }),
+        tool_move(9003, 0.0),
+    ];
+    let batch = session
+        .run(&cmds, par6d::preview::RunLimits::default())
+        .expect("the run completes");
+    assert!(
+        batch.commands.iter().all(|c| c.error.is_none()),
+        "the grasp program was refused: {:?}",
+        batch.commands
+    );
+
+    let block = batch
+        .objects
+        .iter()
+        .find(|t| t.name == "block")
+        .expect("the block has a track");
+    assert!(
+        block.poses.len() > 1,
+        "a block that gets picked up and dropped is not a still object"
+    );
+    assert!(
+        !batch.objects.iter().any(|t| t.name == "stand"),
+        "a massless shape is a fixture welded into the world, not a body \
+         with a pose to track: {:?}",
+        batch.objects.iter().map(|t| &t.name).collect::<Vec<_>>()
+    );
+
+    let z = |row: usize| f64::from(block.poses[row][2]);
+    let close_end = batch.commands[0].start_row + batch.commands[0].rows;
+    let lift_end = batch.commands[1].start_row + batch.commands[1].rows;
+    let held = z(close_end - 1);
+    let raised = z(lift_end - 1);
+    let dropped = z(block.poses.len() - 1);
+    assert!(
+        (held - 0.04).abs() < 0.01,
+        "the block stayed on its stand while the jaws closed: z {held}"
+    );
+    assert!(
+        raised > held + 0.05,
+        "friction against the closed jaws must carry the block up: {held} -> {raised}"
+    );
+    assert!(
+        dropped < raised - 0.05,
+        "opening the jaws must drop it: held at {raised}, ended at {dropped}"
+    );
+
+    // The jaws report the hold themselves, and the contact solver has
+    // something to say for the whole time they do.
+    let gripping = batch.commands[1].start_row..lift_end;
+    assert!(
+        gripping.clone().any(|r| batch.tool_gripping[r]),
+        "the gripper never reported an object between its jaws"
+    );
+    assert!(
+        gripping
+            .clone()
+            .any(|r| batch.contact_starts[r + 1] > batch.contact_starts[r]),
+        "a block held between two pads has contacts"
     );
 }

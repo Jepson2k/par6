@@ -1,16 +1,27 @@
-//! The offline dry-run binding over `par6d::preview` — the daemon's own
-//! planner behind a virtual arm. The Python shim builds command dicts;
-//! planning, timing and collision gating all happen in the engine.
+//! The offline dry-run binding over `par6d::preview`.
+//!
+//! Two passes, and the difference between them is the point.
+//! [`Preview::preview_program`] plans: it asks the daemon's own planner
+//! what it would drive and hands back the trajectory, fast enough to run
+//! behind a keystroke. [`Preview::run_program`] *runs*: it ticks the same
+//! engine the simulator ticks, and what comes back is what the arm did,
+//! sag and servo lag and contact included.
+//!
+//! A tick record crosses as raw column buffers rather than lists of
+//! lists. A minute of program is a few hundred thousand numbers, and
+//! building a Python float per number costs more than the simulation
+//! that produced them; `np.frombuffer` on the other side is a view.
 
 use std::sync::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use par6_proto::command as cmd;
 use par6_proto::{Command, CompletionPolicy, Frame, NUM_JOINTS};
-use par6d::preview::{Preview as EnginePreview, PreviewResult};
+use par6d::preview::record::{mode_name, TickBatch};
+use par6d::preview::{Preview as EnginePreview, PreviewResult, RunLimits};
 
 use crate::convert::{robot_err, shape_dict, shape_from_py, tool_param_from_py, wire_error_tuple};
 
@@ -145,24 +156,89 @@ fn result_dict(py: Python<'_>, r: &PreviewResult) -> PyResult<PyObject> {
     d.set_item("tcp_poses", poses)?;
     d.set_item("end_joints_rad", r.end_joints_rad.to_vec())?;
     d.set_item("duration_s", r.duration_s)?;
-    let tracks = PyList::empty(py);
-    for t in &r.object_tracks {
-        let td = PyDict::new(py);
-        td.set_item("name", &t.name)?;
-        let poses = PyList::empty(py);
-        for p in &t.poses {
-            poses.append(p.to_vec())?;
-        }
-        td.set_item("poses", poses)?;
-        td.set_item("carried", t.carried)?;
-        td.set_item("physics", t.physics)?;
-        tracks.append(td)?;
-    }
-    d.set_item("object_tracks", tracks)?;
     match &r.error {
         Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
         None => d.set_item("error", py.None())?,
     }
+    Ok(d.into_any().unbind())
+}
+
+/// One numeric column as raw bytes, written straight into the Python
+/// buffer — no intermediate `Vec<u8>`, no Python object per number.
+fn col<'py, const N: usize, T: Copy>(
+    py: Python<'py>,
+    v: &[T],
+    ne: impl Fn(T) -> [u8; N],
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, v.len() * N, |buf| {
+        for (out, x) in buf.as_chunks_mut::<N>().0.iter_mut().zip(v) {
+            *out = ne(*x);
+        }
+        Ok(())
+    })
+}
+
+fn f32_col<'py>(py: Python<'py>, v: &[f32]) -> PyResult<Bound<'py, PyBytes>> {
+    col(py, v, f32::to_ne_bytes)
+}
+
+fn bool_col<'py>(py: Python<'py>, v: &[bool]) -> PyResult<Bound<'py, PyBytes>> {
+    col(py, v, |b| [u8::from(b)])
+}
+
+/// A [`TickBatch`] as the shim's `np.frombuffer` reads it. Shapes are
+/// implied by `rows` and `joints`; the byte order is the machine's,
+/// which is the only one either side runs on.
+fn batch_dict(py: Python<'_>, b: &TickBatch) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("row_dt_s", b.row_dt_s)?;
+    d.set_item("tick_dt_s", b.tick_dt_s)?;
+    d.set_item("stride", b.stride)?;
+    d.set_item("joints", b.joints)?;
+    d.set_item("rows", b.rows)?;
+    d.set_item("q_rad", f32_col(py, &b.q_rad)?)?;
+    d.set_item("q_commanded_rad", f32_col(py, &b.q_commanded_rad)?)?;
+    d.set_item("tcp", f32_col(py, &b.tcp)?)?;
+    d.set_item("tool_closed", f32_col(py, &b.tool_closed)?)?;
+    d.set_item("tool_gripping", bool_col(py, &b.tool_gripping)?)?;
+    d.set_item("com", f32_col(py, &b.com)?)?;
+    d.set_item("contact_pos", f32_col(py, &b.contact_pos)?)?;
+    d.set_item("contact_force", f32_col(py, &b.contact_force)?)?;
+    d.set_item(
+        "contact_starts",
+        col(py, &b.contact_starts, u32::to_ne_bytes)?,
+    )?;
+    d.set_item("stop", b.stop.as_str())?;
+
+    let modes = PyList::empty(py);
+    for span in &b.modes {
+        modes.append((span.start_row, mode_name(span.value)))?;
+    }
+    d.set_item("modes", modes)?;
+
+    let commands = PyList::empty(py);
+    for span in &b.commands {
+        let cd = PyDict::new(py);
+        cd.set_item("command", span.command)?;
+        cd.set_item("start_row", span.start_row)?;
+        cd.set_item("rows", span.rows)?;
+        match &span.error {
+            Some(e) => cd.set_item("error", wire_error_tuple(py, e))?,
+            None => cd.set_item("error", py.None())?,
+        }
+        commands.append(cd)?;
+    }
+    d.set_item("commands", commands)?;
+
+    let objects = PyList::empty(py);
+    for t in &b.objects {
+        let od = PyDict::new(py);
+        od.set_item("name", &t.name)?;
+        od.set_item("rows", t.poses.len())?;
+        od.set_item("poses", f32_col(py, t.poses.as_flattened())?)?;
+        objects.append(od)?;
+    }
+    d.set_item("objects", objects)?;
     Ok(d.into_any().unbind())
 }
 
@@ -356,14 +432,6 @@ impl Preview {
         result_dict(py, &r)
     }
 
-    /// Preview a tool action: the jaws to `closed` (0 = open, 1 = closed)
-    /// while the arm holds, stepped in the simulator scene; the free world
-    /// objects' tracks come back with the result.
-    fn preview_tool(&self, py: Python<'_>, closed: f64) -> PyResult<PyObject> {
-        let r = self.inner.lock().unwrap().preview_tool(closed);
-        result_dict(py, &r)
-    }
-
     /// Preview a queued program (list of command dicts, see
     /// `command_from_py`): one result dict per command, blend chains
     /// folded exactly as the live planner folds them.
@@ -378,5 +446,41 @@ impl Preview {
             .collect::<PyResult<Vec<_>>>()?;
         let results = self.inner.lock().unwrap().preview_batch(&commands);
         results.iter().map(|r| result_dict(py, r)).collect()
+    }
+
+    /// Run a program through the engine: the same planner driving a real
+    /// control loop against the simulated plant, ticked flat out. What
+    /// comes back is a tick record of what the arm DID — see
+    /// `batch_dict` for the columns — not a plan of what it was told to.
+    ///
+    /// `max_seconds` bounds the SIMULATED time, so a program that never
+    /// terminates still returns, with `stop = "budget_exhausted"`.
+    ///
+    /// The GIL is released for the run: at roughly sixty times real time
+    /// a ten minute program is some ten seconds of computing, and the
+    /// caller's event loop must not stop for it.
+    #[pyo3(signature = (cmds, max_seconds=None))]
+    fn run_program(
+        &self,
+        py: Python<'_>,
+        cmds: Vec<Bound<'_, PyDict>>,
+        max_seconds: Option<f64>,
+    ) -> PyResult<PyObject> {
+        let commands = cmds
+            .iter()
+            .map(command_from_py)
+            .collect::<PyResult<Vec<_>>>()?;
+        let limits = match max_seconds {
+            Some(max_seconds) => RunLimits { max_seconds },
+            None => RunLimits::default(),
+        };
+        let batch = py.allow_threads(|| {
+            self.inner
+                .lock()
+                .unwrap()
+                .run(&commands, limits)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        batch_dict(py, &batch)
     }
 }

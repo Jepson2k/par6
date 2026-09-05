@@ -350,6 +350,16 @@ def fitted_tool_key() -> str:
     return canonical_tool_key(load_robot_config()["robot"]["active_gripper"])
 
 
+def fitted_tool_ilim_ma() -> float:
+    """The fitted gripper driver's current limit \\[mA\\].
+
+    The full-scale value a tool move defaults to, and what the runtime
+    validates a requested current against.
+    """
+    cfg = load_gripper_configs()[fitted_tool_key()]
+    return float(cfg["driver"]["ilim_ma"])
+
+
 # ---------------------------------------------------------------------------
 # Tool kinematics
 # ---------------------------------------------------------------------------
