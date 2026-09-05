@@ -1478,6 +1478,9 @@ async def test_config_info_reports_the_effective_configuration(tmp_path):
 
         cfg = tomllib.loads(daemon.config.read_text())
         assert info["tick_dt_s"] == pytest.approx(cfg["robot"]["tick_dt_s"])
+        # The installation floor: config height, published so a client can
+        # draw the floor the collision world enforces.
+        assert info["floor_z_m"] == pytest.approx(cfg["installation"]["floor_z_m"])
         assert info["motion"]["jog_l_linear_max_m_s"] == pytest.approx(
             cfg["motion"]["jog_l_linear_max_m_s"]
         )

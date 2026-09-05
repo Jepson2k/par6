@@ -141,7 +141,7 @@ impl Preview {
         // keep-out the arm will refuse.
         preview
             .world
-            .install(&mut preview.planner, |_, _| Ok(None), &preview.cfg)
+            .install(&mut preview.planner, (), &preview.cfg)
             .map_err(|e| {
                 DaemonError::Config(par6_config::ConfigError::Invalid {
                     field: "installation_shapes".into(),
@@ -217,12 +217,8 @@ impl Preview {
     /// applied when the preview boots — it cannot be set from here, exactly
     /// as it cannot from the wire.
     pub fn set_shapes(&mut self, shapes: &[par6_proto::Shape]) -> Result<u64, WireError> {
-        self.world.apply(
-            &mut self.planner,
-            |_, _| Ok(None),
-            Layer::Program,
-            shapes.to_vec(),
-        )?;
+        self.world
+            .apply(&mut self.planner, (), Layer::Program, shapes.to_vec())?;
         Ok(self.world.epoch())
     }
 

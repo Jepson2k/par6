@@ -923,6 +923,69 @@ fn keepout_at(name: &str, tcp_mm: [f64; 3]) -> Shape {
     }
 }
 
+/// Applying a world layer reaches the simulator's scene and leaves the
+/// arm exactly as it was: still referenced, no error, and the next planned
+/// move runs. The world change rebuilds the simulator's model around the
+/// running arm, and a rebuild that dropped replies, tripped the link
+/// watchdog or moved the arm would show up as any of the three.
+#[test]
+fn applying_a_world_layer_keeps_the_arm_homed_and_still() {
+    let rig = boot_tagged("worldhome");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let before = wait_still(&rig);
+    c.ok(&set_shapes(vec![Shape {
+        kind: "box".into(),
+        params: vec![0.1, 0.1, 0.1],
+        pose: vec![0.3, 0.0, 0.3, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: "keepout".into(),
+        physics: None,
+    }]));
+    let watch = rig.collect_status(Duration::from_millis(600));
+    assert!(
+        watch.len() > 5,
+        "status kept flowing across the world change"
+    );
+    for s in &watch {
+        assert!(
+            s.homed,
+            "the world change dropped the home reference: {s:?}"
+        );
+        assert!(
+            s.error.is_none(),
+            "the world change raised an error: {:?}",
+            s.error
+        );
+        assert!(
+            angles_close(&s.angles, &before.angles, 0.5),
+            "the world change moved the arm: {:?} -> {:?}",
+            before.angles,
+            s.angles
+        );
+    }
+    let mut target = CART_START_DEG;
+    target[0] += 5.0;
+    let i = c.ok_index(&Command::MoveJ(MoveJ {
+        key: 7401,
+        angles: target,
+        duration: None,
+        speed: Some(0.5),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a planned move after the world change must run, got {detail:?}"
+    );
+    rig.shutdown();
+}
+
 fn set_shapes(shapes: Vec<Shape>) -> Command {
     Command::SetShapes(SetShapes { shapes })
 }

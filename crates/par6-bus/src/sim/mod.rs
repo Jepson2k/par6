@@ -38,8 +38,10 @@ pub mod scene;
 pub use driver::FaultKind;
 
 use std::collections::VecDeque;
+use std::sync::{Arc, Mutex};
 
 use par6_config::{Gains, GripperConfig, KtSource, RobotConfig, WatchdogAction};
+use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::FreshnessClock;
@@ -62,6 +64,42 @@ use map::JointMap;
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
+
+/// The base spec, owned and touched only by the bus that holds it.
+struct SendSpec(mujoco_rs::prelude::MjSpec);
+
+// SAFETY: the spec is only ever cloned from inside the bus's own methods;
+// nothing else holds a pointer into it, so moving it with the bus between
+// threads is sound.
+unsafe impl Send for SendSpec {}
+
+/// Where the runtime posts world layers for the simulator: one slot per
+/// layer, latest wins, taken by the bus on its own tick. Posting allocates
+/// on the poster's thread and never breaks the RT loop; the bus moves the
+/// posted vectors in, so the tick allocates nothing.
+#[derive(Clone, Default)]
+pub struct WorldMailbox(Arc<Mutex<[Option<Vec<Shape>>; 2]>>);
+
+impl WorldMailbox {
+    /// Post one layer's shapes; replaces whatever was posted for that
+    /// layer and not yet taken.
+    pub fn post(&self, layer: Layer, shapes: Vec<Shape>) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot[layer_index(layer)] = Some(shapes);
+    }
+
+    fn take(&self) -> Option<[Option<Vec<Shape>>; 2]> {
+        let mut slot = self.0.try_lock().ok()?;
+        (slot.iter().any(Option::is_some)).then(|| std::mem::take(&mut *slot))
+    }
+}
+
+fn layer_index(layer: Layer) -> usize {
+    match layer {
+        Layer::Installation => 0,
+        Layer::Program => 1,
+    }
+}
 /// Poll slots between device-info sweeps (~4 s at 250 Hz).
 const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 /// Default hall-sensor band half-width \[rad\].
@@ -114,6 +152,17 @@ pub struct SimBus {
     scene: scene::Scene,
     /// The active tool's config inertials (`None` = the variant URDF's).
     tool: Option<scene::ToolInertial>,
+    /// Installation floor height from the robot config.
+    floor_z_m: Option<f64>,
+    /// The compiled-once base spec (arm, tool, floor — no world objects);
+    /// every world change injects into a clone of it.
+    base_spec: Option<SendSpec>,
+    /// The world objects, installation then program layer.
+    world: [Vec<Shape>; 2],
+    /// A world layer changed since the model was last built.
+    world_dirty: bool,
+    /// World layers posted from other threads, taken every tick.
+    mailbox: WorldMailbox,
     /// Mirror of the gripper front end's latched firmware command, used
     /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
     mj_jaw_cmd: Option<FirmwareGripperCommand>,
@@ -162,6 +211,11 @@ impl SimBus {
             initial_q: None,
             scene,
             tool: None,
+            floor_z_m: None,
+            base_spec: None,
+            world: [Vec::new(), Vec::new()],
+            world_dirty: false,
+            mailbox: WorldMailbox::default(),
             mj_jaw_cmd: None,
             gripper_object_override: None,
             landed_unheld: false,
@@ -291,6 +345,28 @@ impl SimBus {
         }
     }
 
+    /// Replace one world layer. The scene is rebuilt on the next tick
+    /// (latest wins), with every shape entering the model as its
+    /// declaration says — see [`scene::inject_world`]; the arm and the
+    /// objects that stay keep their state. Before boot the layers are
+    /// built into the initial scene.
+    pub fn set_world(&mut self, layer: Layer, shapes: &[Shape]) {
+        self.world[layer_index(layer)] = shapes.to_vec();
+        self.world_dirty = true;
+    }
+
+    /// The mailbox other threads post world layers to; the bus takes what
+    /// is posted at the start of every tick.
+    pub fn mailbox(&self) -> WorldMailbox {
+        self.mailbox.clone()
+    }
+
+    /// Ground truth for a free world object: `[x, y, z, qw, qx, qy, qz]`
+    /// of the shape `name`, `None` when the scene has no such free body.
+    pub fn world_object_pose(&self, name: &str) -> Option<[f64; 7]> {
+        self.plant.as_ref()?.object_pose(name)
+    }
+
     /// Frames dropped because the RX queue was full.
     pub fn dropped_rx_frames(&self) -> u64 {
         self.dropped_rx
@@ -391,6 +467,17 @@ impl SimBus {
     /// boot wrap offset) — firmware's accumulated encoder count is the
     /// same value it reports, and host position commands echo it back.
     fn step_once(&mut self) {
+        if let Some(posted) = self.mailbox.take() {
+            for (layer, shapes) in self.world.iter_mut().zip(posted) {
+                if let Some(shapes) = shapes {
+                    *layer = shapes;
+                    self.world_dirty = true;
+                }
+            }
+        }
+        if self.world_dirty {
+            self.rebuild_world();
+        }
         let dt = self.dt;
         // Watchdog aging is per bus tick; the control laws run inside the
         // plant step at its substep rate.
@@ -1029,6 +1116,7 @@ impl DriverBus for SimBus {
             })
             .collect();
 
+        self.floor_z_m = robot.installation.floor_z_m;
         self.tool = gripper.map(|g| scene::ToolInertial {
             d_m: g.kinematics.d_m,
             a_m: g.kinematics.a_m,
@@ -1172,18 +1260,59 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
-    /// Compile the scene for this robot config and place the arm at `q0`.
-    fn make_plant(&self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
+    /// Compile the scene for this robot config with the current world and
+    /// place the arm at `q0`; keeps the base spec for later world changes.
+    fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
         let tuning: Vec<scene::JointTuning> = self
             .maps
             .iter()
             .zip(&robot.sim.motor_jm_kg_m2)
             .map(|(map, jm)| scene::JointTuning::from_config(map, *jm, &robot.sim))
             .collect();
-        let model = self
+        let build = scene::Build {
+            timestep: scene::timestep_for(self.dt),
+            joints: &tuning,
+            tool: self.tool.as_ref(),
+            floor_z_m: self.floor_z_m,
+        };
+        let mut spec = self
             .scene
-            .model(scene::timestep_for(self.dt), &tuning, self.tool.as_ref())
+            .spec(&build)
             .unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let base = spec
+            .try_clone()
+            .unwrap_or_else(|e| panic!("sim scene: cannot keep the base spec: {e}"));
+        scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
+            .unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+        self.base_spec = Some(SendSpec(base));
+        self.world_dirty = false;
         mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.holding_friction_nm)
+    }
+
+    /// Rebuild the scene around the current world layers, in place.
+    fn rebuild_world(&mut self) {
+        self.world_dirty = false;
+        let Some(base) = &self.base_spec else {
+            return;
+        };
+        let spec = base
+            .0
+            .try_clone()
+            .map_err(|e| e.to_string())
+            .and_then(|mut spec| {
+                scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
+                    .map(|()| spec)
+                    .map_err(|e| e.to_string())
+            });
+        let result = spec.and_then(|mut spec| {
+            self.plant
+                .as_mut()
+                .expect("the plant exists once boot_configure ran")
+                .recompile(&mut spec)
+        });
+        if let Err(e) = result {
+            log::error!("sim world update refused, keeping the previous world: {e}");
+        }
     }
 }

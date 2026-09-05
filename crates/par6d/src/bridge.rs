@@ -24,6 +24,7 @@ use std::time::{Duration, Instant};
 
 use par6_bus::sim::scene::Scene;
 use par6_bus::sim::SimBus;
+use par6_bus::sim::WorldMailbox;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::ConfigBundle;
 use par6_proto::command::MAX_JOG_DURATION_S;
@@ -447,6 +448,9 @@ pub(crate) struct RtBridge {
     sim: bool,
     /// The scene a simulator swap boots on.
     scene: Scene,
+    /// Where the running simulator takes world layers from; `None` on
+    /// hardware.
+    sim_world: Option<WorldMailbox>,
     cart: CartStream,
 }
 
@@ -462,6 +466,7 @@ impl RtBridge {
         bundle: Arc<ConfigBundle>,
         sim: bool,
         scene: Scene,
+        sim_world: Option<WorldMailbox>,
         cart: CartStream,
     ) -> Self {
         Self {
@@ -472,6 +477,7 @@ impl RtBridge {
             bundle,
             sim,
             scene,
+            sim_world,
             cart,
         }
     }
@@ -979,6 +985,14 @@ impl RtCommands for RtBridge {
             .map(Some)
     }
 
+    fn set_sim_world(&mut self, layer: Layer, shapes: &[par6_proto::Shape]) {
+        // Posted, not queued as an op: an op breaks the RT out of its
+        // pacing loop, and a world change is not worth a stalled tick.
+        if let Some(mailbox) = &self.sim_world {
+            mailbox.post(layer, shapes.to_vec());
+        }
+    }
+
     fn collision(&mut self) -> Option<CollisionState> {
         Some(self.cart.gate.lock().unwrap().latch.clone())
     }
@@ -1006,6 +1020,7 @@ impl RtBridge {
     /// LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
         let sim = SimBus::new(self.scene.clone());
+        self.sim_world = Some(sim.mailbox());
         let bundle = self.bundle.clone();
         self.sim = true;
         self.link.op(Box::new(move |core| {

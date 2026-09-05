@@ -51,4 +51,4 @@ pub use runtime::{
 };
 pub use server::{decode_error_to_wire, spawn, validate_supported, ServerHandle};
 pub use telemetry::{TelemetryField, TelemetryRecipe};
-pub use world::WorldState;
+pub use world::{WorldMirror, WorldState};

@@ -1003,20 +1003,37 @@ class AsyncRobotClient(_RobotClientABC):
         self,
         angles_deg: list[float],
         tool_positions: list[float] | None = None,
+        timeout: float = 2.0,
     ) -> int:
         """Instantly set joint angles (simulator only; the runtime rejects it
         outside sim mode with a real error).
+
+        The datagram is unacked and the runtime applies it on its own
+        tick, so this returns once STATUS reports the arm at the requested
+        angles (within half a degree) or *timeout* seconds have passed —
+        a planned move issued straight after a teleport is otherwise gated
+        against the pose the arm had before it.
 
         Category: Control
 
         Example:
             rbt.teleport([0, -90, 0, 0, 0, 0])
         """
+        target = _f6(angles_deg, "angles_deg")
         positions = (
             [float(p) for p in tool_positions] if tool_positions is not None else None
         )
         core = await self._ensure_core()
-        return await self._call(core.teleport(_f6(angles_deg, "angles_deg"), positions))
+        index = await self._call(core.teleport(target, positions))
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            s = await self.status()
+            if s is not None and all(
+                abs(a - b) < 0.5 for a, b in zip(s.angles, target)
+            ):
+                break
+            await asyncio.sleep(0.01)
+        return index
 
     async def reset_loop_stats(self) -> int:
         """Reset control-loop min/max metrics and overrun count (unacked).
@@ -1775,7 +1792,8 @@ class AsyncRobotClient(_RobotClientABC):
 
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
-        ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
+        ``tick_dt_s``, ``floor_z_m`` (the installation floor height in
+        metres, None when none is modelled), ``motion`` (the ``[motion]`` feel constants by
         name), ``joints`` (per-joint soft limits + EXEC
         velocity/acceleration), ``active_recipe`` (the running telemetry
         recipe, or None when telemetry is off) and ``recipes`` (the names

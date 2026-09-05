@@ -580,6 +580,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     .await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
+                    if p.on {
+                        // The swap booted a scene that knows only the
+                        // vendor file; the applied world goes with it.
+                        self.world.resend_sim(&mut self.runtime.rt);
+                    }
                 })
             }
             C::SelectProfile(p) => {
@@ -1450,11 +1455,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Apply the configured installation layer. Called once, before the
     /// server task starts; a refused set is a startup failure.
     fn install_shapes(&mut self) -> Result<(), WireError> {
-        self.world.install(
-            &mut self.runtime.planner,
-            |layer, shapes| self.runtime.rt.set_shapes(layer, shapes),
-            &self.cfg,
-        )
+        self.world
+            .install(&mut self.runtime.planner, &mut self.runtime.rt, &self.cfg)
     }
 
     /// Replace one layer of the world through both enforcement instances.
@@ -1465,7 +1467,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     ) -> Result<(), WireError> {
         self.world.apply(
             &mut self.runtime.planner,
-            |layer, shapes| self.runtime.rt.set_shapes(layer, shapes),
+            &mut self.runtime.rt,
             layer,
             shapes,
         )
@@ -1955,6 +1957,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     tick_dt_s: ci.tick_dt_s,
                     motion: ci.motion,
                     joints: ci.joints.clone(),
+                    floor_z_m: ci.floor_z_m,
                     active_recipe: self.recipe.clone(),
                     recipes: self.cfg.recipes.iter().map(|r| r.name.clone()).collect(),
                 }

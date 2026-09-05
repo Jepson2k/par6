@@ -556,6 +556,12 @@ profile = "scurve"
 jerk_factor = 3.0
 control_mode = "pid"
 
+[installation]
+# The floor the robot stands on [m, base frame]. Enforced by the collision
+# world as a keep-out under every moving link, modelled by the simulator as
+# the contact plane objects rest on, and drawn by clients at this height.
+floor_z_m = 0.0
+
 [sim]
 # Simulator drivetrain. Motor-referred rotor dynamics from the vendor
 # dynamics table, reflected through each joint's dynamics gear ratio as

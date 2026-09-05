@@ -380,6 +380,12 @@ pub trait RtCommands: Send {
         Ok(None)
     }
 
+    /// Hand one applied world layer to the simulator's scene, where every
+    /// shape becomes a body or geom as its declaration says. Called with
+    /// the set the planner accepted, after the gate mirror; a runtime on
+    /// hardware, or without a simulator, ignores it (the default).
+    fn set_sim_world(&mut self, _layer: Layer, _shapes: &[Shape]) {}
+
     /// The streaming gate's latched collision verdict — the pairs a
     /// refused or stopped jog/servo would have collided in. `None` =
     /// this runtime gates no streams. Merged into STATUS alongside the

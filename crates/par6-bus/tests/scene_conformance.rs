@@ -7,7 +7,11 @@
 use std::path::PathBuf;
 
 use mujoco_rs::prelude::*;
-use par6_bus::sim::scene::{urdf_inertials, JointTuning, Scene, Tool, ToolInertial, ARM_JOINTS};
+use par6_bus::sim::scene::{
+    inject_world, urdf_inertials, Build, JointTuning, Scene, Tool, ToolInertial, ARM_JOINTS,
+    WORLD_PREFIX,
+};
+use par6_proto::{Physical, Shape};
 use serde::Deserialize;
 
 fn assets() -> PathBuf {
@@ -38,9 +42,20 @@ fn scene(tool: Tool) -> Scene {
     }
 }
 
+/// A build with the shipped floor height and no config tool.
+fn build(joints: &[JointTuning]) -> Build<'_> {
+    Build {
+        timestep: 0.001,
+        joints,
+        tool: None,
+        floor_z_m: Some(0.0),
+    }
+}
+
 fn model(tool: Tool) -> MjModel {
+    let tuning = tuning();
     scene(tool)
-        .model(0.001, &tuning(), None)
+        .model(&build(&tuning), &[&[], &[]])
         .unwrap_or_else(|e| panic!("{tool:?}: {e}"))
 }
 
@@ -69,12 +84,14 @@ fn every_variant_compiles_with_the_expected_joints_and_decimated_meshes() {
             0,
             "{tool:?}: the plant drives qfrc_applied, not actuators"
         );
-        assert!(
-            m.name_to_id(MjtObj::mjOBJ_BODY, "grasp_object").is_some(),
-            "{tool:?}: grasp scene present"
+        assert_eq!(
+            m.ffi().nq as usize,
+            ARM_JOINTS.len() + if jaws { 2 } else { 0 },
+            "{tool:?}: the base scene carries no world objects"
         );
 
-        let spec = scene(tool).spec(0.001, &tuning(), None).expect("spec");
+        let tuning = tuning();
+        let spec = scene(tool).spec(&build(&tuning)).expect("spec");
         for mesh in spec.mesh_iter() {
             assert!(
                 mesh.file().ends_with("_simplified.stl"),
@@ -89,7 +106,8 @@ fn every_variant_compiles_with_the_expected_joints_and_decimated_meshes() {
 fn bodies_carry_the_urdf_mass_properties() {
     for tool in [Tool::Msg, Tool::Ssg48, Tool::Flange] {
         let sc = scene(tool);
-        let m = sc.model(0.001, &tuning(), None).expect("model");
+        let tuning = tuning();
+        let m = sc.model(&build(&tuning), &[&[], &[]]).expect("model");
         let inertials = urdf_inertials(&sc.urdf()).expect("urdf");
         let mut matched = 0;
         for want in &inertials {
@@ -247,8 +265,15 @@ fn the_tool_subtree_carries_the_config_inertials() {
         com_m: k.com_m,
         inertia_kg_m2: k.inertia_kg_m2,
     };
+    let tuning = tuning();
     let m = scene(Tool::Msg)
-        .model(0.001, &tuning(), Some(&tool))
+        .model(
+            &Build {
+                tool: Some(&tool),
+                ..build(&tuning)
+            },
+            &[&[], &[]],
+        )
         .expect("MSG scene with the config tool");
     let gripper = m
         .name_to_id(MjtObj::mjOBJ_BODY, "gripper")
@@ -282,4 +307,153 @@ fn the_tool_subtree_carries_the_config_inertials() {
             "tool subtree COM {got:?} vs config {want:?} (axis {i})"
         );
     }
+}
+
+/// Every world shape enters the scene as its declaration says: coal's
+/// constructor sizes become MuJoCo's, the pose rotation is the extrinsic
+/// XYZ one, contact is on only for `physics` shapes, and only a shape with
+/// mass gets a free body.
+#[test]
+fn world_shapes_enter_the_scene_as_declared() {
+    let physical = |mass: Option<f64>| {
+        Some(Physical {
+            mass,
+            friction: [0.8, 0.01, 0.001],
+        })
+    };
+    let shape =
+        |name: &str, kind: &str, params: &[f64], pose: [f64; 6], physics, collision| Shape {
+            kind: kind.to_owned(),
+            params: params.to_vec(),
+            pose: pose.to_vec(),
+            collision,
+            margin: None,
+            name: name.to_owned(),
+            physics,
+        };
+    let world = vec![
+        shape(
+            "crate",
+            "box",
+            &[0.2, 0.4, 0.6],
+            [1.0, 2.0, 3.0, 0.0, 0.0, 0.0],
+            physical(Some(2.0)),
+            true,
+        ),
+        shape(
+            "ball",
+            "sphere",
+            &[0.05],
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
+            physical(None),
+            true,
+        ),
+        shape(
+            "post",
+            "cylinder",
+            &[0.02, 0.5],
+            [0.5, 0.0, 0.25, 0.0, 0.0, 0.0],
+            None,
+            true,
+        ),
+        shape(
+            "bar",
+            "capsule",
+            &[0.01, 0.3],
+            [0.0, 0.5, 0.5, 0.0, 0.0, 0.0],
+            None,
+            false,
+        ),
+        shape(
+            "egg",
+            "ellipsoid",
+            &[0.1, 0.2, 0.3],
+            [0.0, -0.5, 0.5, 0.0, 0.0, 0.0],
+            physical(None),
+            true,
+        ),
+        // A wall: solid where x >= 0.8, i.e. normal -x, offset -0.8.
+        shape(
+            "wall",
+            "plane",
+            &[-1.0, 0.0, 0.0, -0.8],
+            [0.0; 6],
+            physical(None),
+            true,
+        ),
+        // Rotated 90° about z: the box's x side ends up along world y.
+        shape(
+            "turned",
+            "box",
+            &[0.2, 0.4, 0.6],
+            [0.0, 0.0, 0.0, 0.0, 0.0, std::f64::consts::FRAC_PI_2],
+            None,
+            true,
+        ),
+    ];
+    let tuning = tuning();
+    let mut spec = scene(Tool::Msg).spec(&build(&tuning)).expect("spec");
+    inject_world(&mut spec, &[&world, &[]]).expect("inject");
+    let m = spec.compile().expect("compile");
+    let geom = |name: &str| {
+        m.name_to_id(MjtObj::mjOBJ_GEOM, &format!("{WORLD_PREFIX}{name}"))
+            .expect(name)
+    };
+    let expect = [
+        ("crate", MjtGeom::mjGEOM_BOX, [0.1, 0.2, 0.3], 1),
+        ("ball", MjtGeom::mjGEOM_SPHERE, [0.05, 0.0, 0.0], 1),
+        ("post", MjtGeom::mjGEOM_CYLINDER, [0.02, 0.25, 0.0], 0),
+        ("bar", MjtGeom::mjGEOM_CAPSULE, [0.01, 0.15, 0.0], 0),
+        ("egg", MjtGeom::mjGEOM_ELLIPSOID, [0.1, 0.2, 0.3], 1),
+        ("wall", MjtGeom::mjGEOM_PLANE, [0.0, 0.0, 0.05], 1),
+    ];
+    for (name, kind, size, contype) in expect {
+        let g = geom(name);
+        assert_eq!(m.geom_type()[g], kind, "{name}: geom type");
+        for (k, (got, want)) in m.geom_size()[g].iter().zip(&size).enumerate() {
+            assert!((got - want).abs() < 1e-12, "{name}: size {k} = {got}");
+        }
+        assert_eq!(m.geom_contype()[g], contype, "{name}: contype");
+        assert_eq!(m.geom_conaffinity()[g], contype, "{name}: conaffinity");
+    }
+    // Only the massed shape is a free body, at its declared pose and mass.
+    let free: Vec<usize> = (0..m.ffi().njnt as usize)
+        .filter(|&j| m.jnt_type()[j] == MjtJoint::mjJNT_FREE)
+        .collect();
+    assert_eq!(free.len(), 1, "exactly one free body");
+    let body = m
+        .name_to_id(MjtObj::mjOBJ_BODY, &format!("{WORLD_PREFIX}crate"))
+        .expect("crate body");
+    assert!(
+        (m.body_mass()[body] - 2.0).abs() < 1e-12,
+        "crate mass {}",
+        m.body_mass()[body]
+    );
+    let mut data = m.make_data();
+    data.forward();
+    let p = data.xpos()[body];
+    assert!(
+        (p[0] - 1.0).abs() < 1e-12 && (p[1] - 2.0).abs() < 1e-12 && (p[2] - 3.0).abs() < 1e-12,
+        "crate at {p:?}"
+    );
+    // The wall's plane normal (local +z) points along -x, through x = 0.8.
+    let wall = geom("wall");
+    let n = data.geom_xmat()[wall];
+    assert!(
+        (n[2] + 1.0).abs() < 1e-9 && n[5].abs() < 1e-9 && n[8].abs() < 1e-9,
+        "wall normal {:?}",
+        [n[2], n[5], n[8]]
+    );
+    assert!(
+        (data.geom_xpos()[wall][0] - 0.8).abs() < 1e-9,
+        "wall at x {}",
+        data.geom_xpos()[wall][0]
+    );
+    // The turned box: local x (0.1 half side) along world y.
+    let turned = geom("turned");
+    let r = data.geom_xmat()[turned];
+    assert!(
+        r[3].abs() > 0.999 && r[0].abs() < 1e-9,
+        "turned box rotation {r:?}"
+    );
 }

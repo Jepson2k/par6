@@ -21,6 +21,7 @@ use par6_bus::{
     ObjectDetection, PollAction, PollKind,
 };
 use par6_config::{GripperConfig, HomingStrategy, RobotConfig};
+use par6_proto::{Layer, Physical, Shape};
 
 fn par6() -> RobotConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
@@ -31,6 +32,50 @@ fn msg_gripper() -> GripperConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
     GripperConfig::load(&path).expect("MSG gripper TOML")
+}
+
+/// A world shape at a world pose; `mass` `Some(None)` is a fixture,
+/// `Some(Some(kg))` a free body, `None` a keep-out.
+fn shape(
+    name: &str,
+    kind: &str,
+    params: &[f64],
+    pose: [f64; 6],
+    mass: Option<Option<f64>>,
+) -> Shape {
+    Shape {
+        kind: kind.to_owned(),
+        params: params.to_vec(),
+        pose: pose.to_vec(),
+        collision: true,
+        margin: None,
+        name: name.to_owned(),
+        physics: mass.map(|mass| Physical {
+            mass,
+            friction: [1.0, 0.005, 0.0001],
+        }),
+    }
+}
+
+/// The grasp scene the vendor MJCF used to hard-code: a stand and a
+/// 50 g block on it, in front of the robot under the reach-down pose.
+fn grasp_world() -> Vec<Shape> {
+    vec![
+        shape(
+            "stand",
+            "box",
+            &[0.04, 0.04, 0.01],
+            [0.3713, 0.0, 0.005, 0.0, 0.0, 0.0],
+            Some(None),
+        ),
+        shape(
+            "block",
+            "box",
+            &[0.036, 0.036, 0.06],
+            [0.3713, 0.0, 0.04, 0.0, 0.0, 0.0],
+            Some(Some(0.05)),
+        ),
+    ]
 }
 
 /// The MSG scene (the shipped default gripper).
@@ -1505,9 +1550,9 @@ fn hold_commands(rig: &mut Rig, robot: &RobotConfig) -> Vec<JointCommand> {
         .collect()
 }
 
-/// The grasp scenario end to end through the REAL status path:
-/// closing on the scene's free object jams the jaws mid-travel and
-/// the cmd-60 reply reports DetectedClosing at the commanded pressing
+/// The grasp scenario end to end through the REAL status path: a block
+/// placed through the world layer, closing on it jams the jaws mid-travel
+/// and the cmd-60 reply reports DetectedClosing at the commanded pressing
 /// current; opening away reports ReachedNoObject. No MuJoCo state is
 /// inspected — only decoded bus replies.
 #[test]
@@ -1515,6 +1560,7 @@ fn grasp_detected_through_status_bits() {
     let robot = par6();
     let gripper = msg_gripper();
     let mut rig = Rig::boot(&robot, Some(&gripper), Some(&GRASP_POSE));
+    rig.bus.set_world(Layer::Program, &grasp_world());
     let cmds = hold_commands(&mut rig, &robot);
 
     // Ring down the boot transient with the jaws held open: engaging
@@ -1660,4 +1706,152 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
         rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
         "drive did not resume after clear-error"
     );
+}
+
+/// The world reaches the scene as its declaration says, and changing it
+/// rebuilds the model around the running arm: a free block spawned in the
+/// air falls to the installation floor and rests on it, a fixture under it
+/// catches it, a keep-out or a marker gets no body, and the arm's own state
+/// carries across every rebuild.
+#[test]
+fn world_changes_rebuild_the_scene_around_the_running_arm() {
+    /// The block's half height \[m\]: where its centre rests on a surface.
+    const HALF_H: f64 = 0.03;
+    let robot = par6();
+    let q0 = [0.0, -1.85, 2.85, 0.0, 0.0, 0.0];
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    let hold = hold_all(&mut rig, &robot);
+    for _ in 0..u64::from(robot.ticks(0.5)) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    let before = rig.bus.true_joint_rad();
+    assert!(
+        rig.bus.world_object_pose("block").is_none(),
+        "no block before it is declared"
+    );
+
+    // A free block in the air over the floor, plus a keep-out and a marker
+    // that must not become bodies — all beyond the arm's reach, so nothing
+    // spawns inside a link.
+    let mut world = vec![
+        shape(
+            "block",
+            "box",
+            &[0.036, 0.036, 2.0 * HALF_H],
+            [0.2, 0.6, 0.3, 0.0, 0.0, 0.0],
+            Some(Some(0.05)),
+        ),
+        shape(
+            "fence",
+            "box",
+            &[0.1, 0.1, 0.1],
+            [0.2, -0.6, 0.3, 0.0, 0.0, 0.0],
+            None,
+        ),
+    ];
+    world.push(Shape {
+        collision: false,
+        ..shape(
+            "marker",
+            "sphere",
+            &[0.02],
+            [-0.6, 0.4, 0.3, 0.0, 0.0, 0.0],
+            Some(Some(1.0)),
+        )
+    });
+    rig.bus.set_world(Layer::Program, &world);
+    rig.step(&hold, &GripperCommand::NoGripper);
+    // The rebuild resets MuJoCo's constraint warm start, so the held arm
+    // sees one substep of transient — a fraction of a milliradian.
+    let after = rig.bus.true_joint_rad();
+    for (j, (a, b)) in after.iter().zip(&before).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "joint {j} moved {:+.5} rad across the rebuild",
+            a - b
+        );
+    }
+    assert!(
+        rig.bus.world_object_pose("fence").is_none(),
+        "a keep-out is not a body"
+    );
+    assert!(
+        rig.bus.world_object_pose("marker").is_none(),
+        "a marker is not a body"
+    );
+    // One tick of free fall after the spawn: a tenth of a millimetre.
+    let spawn = rig
+        .bus
+        .world_object_pose("block")
+        .expect("the block is a free body");
+    assert!(
+        (spawn[0] - 0.2).abs() < 1e-9
+            && (spawn[1] - 0.6).abs() < 1e-9
+            && (spawn[2] - 0.3).abs() < 1e-3,
+        "spawned where declared, got {spawn:?}"
+    );
+    for _ in 0..u64::from(robot.ticks(1.5)) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    let rest = rig.bus.world_object_pose("block").unwrap();
+    assert!(
+        (rest[2] - HALF_H).abs() < 0.005,
+        "the block should rest on the floor at z {HALF_H}, got {}",
+        rest[2]
+    );
+
+    // A fixture under the block: rebuilt with it in place, the block keeps
+    // its pose (it survives the recompile) and the fixture is where a
+    // second block lands.
+    world.push(shape(
+        "shelf",
+        "box",
+        &[0.3, 0.3, 0.1],
+        [-0.2, -0.6, 0.05, 0.0, 0.0, 0.0],
+        Some(None),
+    ));
+    world.push(shape(
+        "block2",
+        "box",
+        &[0.036, 0.036, 2.0 * HALF_H],
+        [-0.2, -0.6, 0.4, 0.0, 0.0, 0.0],
+        Some(Some(0.05)),
+    ));
+    rig.bus.set_world(Layer::Program, &world);
+    rig.step(&hold, &GripperCommand::NoGripper);
+    let kept = rig.bus.world_object_pose("block").unwrap();
+    assert!(
+        (kept[2] - rest[2]).abs() < 1e-6 && (kept[0] - rest[0]).abs() < 1e-6,
+        "the block that stayed must keep its pose across the rebuild ({rest:?} -> {kept:?})"
+    );
+    assert!(
+        rig.bus.world_object_pose("shelf").is_none(),
+        "a fixture is not a body"
+    );
+    for _ in 0..u64::from(robot.ticks(1.5)) {
+        rig.step(&hold, &GripperCommand::NoGripper);
+    }
+    let on_shelf = rig.bus.world_object_pose("block2").unwrap();
+    assert!(
+        (on_shelf[2] - (0.1 + HALF_H)).abs() < 0.005,
+        "block2 should rest on the shelf at z {}, got {}",
+        0.1 + HALF_H,
+        on_shelf[2]
+    );
+
+    // Clearing the layer removes the bodies; the arm still stands.
+    rig.bus.set_world(Layer::Program, &[]);
+    rig.step(&hold, &GripperCommand::NoGripper);
+    assert!(
+        rig.bus.world_object_pose("block").is_none()
+            && rig.bus.world_object_pose("block2").is_none()
+    );
+    let cleared = rig.bus.true_joint_rad();
+    for (j, (a, b)) in cleared.iter().zip(&before).enumerate() {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "joint {j} drifted {:+.5} rad through the world changes",
+            a - b
+        );
+    }
 }

@@ -45,10 +45,15 @@
 //! copies through `mj_getState`/`mj_setState`, and no allocation once the
 //! model is loaded.
 
-use mujoco_rs::prelude::{MjData, MjModel, MjtObj};
+use std::ffi::CStr;
+use std::ptr;
+
+use mujoco_rs::mujoco_c::{mj_id2name, mj_recompile, mjs_getError};
+use mujoco_rs::prelude::{MjData, MjModel, MjSpec, MjtJoint, MjtObj};
 
 use super::driver::{PlantCmd, VirtualDriver, FW_LOOP_DT};
 use super::map::JointMap;
+use super::scene::{self, WORLD_PREFIX};
 
 /// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
 /// shorted-phase brake of an idled driver. Free-motion viscous/Coulomb
@@ -93,9 +98,12 @@ pub(crate) enum JawDrive {
 pub(crate) struct MujocoPlant {
     /// The scene and its state; the data owns the model.
     data: MjData<Box<MjModel>>,
-    /// Arm joint count (scene joints `0..n` are the arm, `n`/`n+1` the
-    /// jaws, any free objects after).
+    /// Arm joint count (scene joints `0..n` are the arm, then the jaw
+    /// pair when the tool has one, then free world objects).
     n: usize,
+    /// qpos index of `jaw1_JOINT` (`jaw2_JOINT` follows), `None` on a
+    /// tool without jaws.
+    jaw: Option<usize>,
     /// Model timestep \[s\] (one bus tick = `round(dt/ts)` mj_steps).
     ts: f64,
     /// Cached generalized state, refreshed after every substep.
@@ -163,30 +171,13 @@ impl MujocoPlant {
             n,
             "holding friction needs one entry per arm joint"
         );
-        let nq = model.ffi().nq as usize;
         let nv = model.ffi().nv as usize;
         let ts = model.ffi().opt.timestep;
         assert!(
             ts > 0.0 && ts < 0.1,
             "implausible model timestep {ts} — broken model?"
         );
-        let joint_id =
-            |name: &str| -> Option<usize> { model.name_to_id(MjtObj::mjOBJ_JOINT, name) };
-        // The qpos/qvel address of scene joint i equals i only while every
-        // joint up to it is a 1-DOF hinge/slide — the plant indexes state
-        // by joint number, so the scene must keep arm + jaws first.
-        assert!(
-            joint_id("jaw1_JOINT") == Some(n) && joint_id("jaw2_JOINT") == Some(n + 1),
-            "scene joint order must be {n} arm joints, then jaw1_JOINT/jaw2_JOINT, \
-             then free objects (jaw ids: {:?}/{:?})",
-            joint_id("jaw1_JOINT"),
-            joint_id("jaw2_JOINT")
-        );
-        assert!(
-            nq >= n + 2 && nv >= n + 2 && nq - (n + 2) == (nv - (n + 2)) / 6 * 7,
-            "scene DOF layout unexpected: nq={nq} nv={nv} for {n} arm joints + 2 jaws \
-             + free-object joints"
-        );
+        let jaw = check_layout(&model, n);
         let coulomb = model.dof_frictionloss()[..n].to_vec();
 
         let mut data = MjData::new(Box::new(model));
@@ -194,8 +185,10 @@ impl MujocoPlant {
         // Boot pose: scene defaults, arm at q0, jaws at the boot byte.
         let mut qpos = data.qpos().to_vec();
         qpos[..n].copy_from_slice(q0);
-        qpos[n] = byte_to_m(JAW_INIT_BYTE);
-        qpos[n + 1] = -byte_to_m(JAW_INIT_BYTE);
+        if let Some(jaw) = jaw {
+            qpos[jaw] = byte_to_m(JAW_INIT_BYTE);
+            qpos[jaw + 1] = -byte_to_m(JAW_INIT_BYTE);
+        }
 
         // Apparent-inertia probe (idle damping): one-step velocity
         // response to a unit torque against the zero-torque baseline,
@@ -228,6 +221,7 @@ impl MujocoPlant {
         Self {
             data,
             n,
+            jaw,
             ts,
             qpos,
             qvel: vec![0.0; nv],
@@ -264,6 +258,116 @@ impl MujocoPlant {
         self.qfrc[..n].fill(0.0);
         self.data.qpos_mut()[..n].copy_from_slice(q0);
         self.data.qvel_mut()[..n].fill(0.0);
+    }
+
+    /// Rebuild the model from `spec` in place (MuJoCo's `mj_recompile`),
+    /// carrying the position and velocity of every joint that survives by
+    /// name: the arm and jaws carry on, objects that stay keep their pose,
+    /// new ones appear at their spawn pose. (MuJoCo preserves state only
+    /// for the spec a model was compiled from; this spec is a fresh clone
+    /// of the base, so the carry is done here.) The boot inertia probe is
+    /// kept — an object changes no arm-joint inertia. Fails, model
+    /// untouched, on a spec MuJoCo refuses.
+    pub fn recompile(&mut self, spec: &mut MjSpec) -> Result<(), String> {
+        let _guard = scene::load_lock();
+        // The state that must survive, keyed by joint name: what MuJoCo
+        // carries across a recompile is defined by the spec it compiled
+        // from, and this spec is a fresh clone.
+        let saved: Vec<(String, Vec<f64>, Vec<f64>)> = self
+            .joints()
+            .map(|(name, qadr, nq, dadr, nv)| {
+                (
+                    name,
+                    self.qpos[qadr..qadr + nq].to_vec(),
+                    self.qvel[dadr..dadr + nv].to_vec(),
+                )
+            })
+            .collect();
+        // SAFETY: the pointers come from the live wrappers this plant
+        // owns; mj_recompile reallocates the model and data in place and
+        // leaves both valid, or leaves them untouched on failure.
+        let rc = unsafe {
+            let m = self.data.model_mut().ffi_mut() as *mut _;
+            let d = self.data.ffi_mut() as *mut _;
+            mj_recompile(spec.ffi_mut() as *mut _, ptr::null(), m, d)
+        };
+        if rc != 0 {
+            // SAFETY: mjs_getError returns a NUL-terminated string owned by
+            // the spec, alive for the borrow.
+            let msg = unsafe { CStr::from_ptr(mjs_getError(spec.ffi_mut() as *mut _)) }
+                .to_string_lossy()
+                .into_owned();
+            return Err(format!("recompile failed: {msg}"));
+        }
+        let jaw = check_layout(self.data.model(), self.n);
+        assert_eq!(
+            jaw, self.jaw,
+            "a world update cannot add or remove the jaws"
+        );
+        let nq = self.data.model().ffi().nq as usize;
+        let nv = self.data.model().ffi().nv as usize;
+        self.qpos.resize(nq, 0.0);
+        self.qvel.resize(nv, 0.0);
+        self.qfrc.resize(nv, 0.0);
+        self.bias.resize(nv, 0.0);
+        let joints: Vec<(String, usize, usize, usize, usize)> = self.joints().collect();
+        for (name, qadr, nq, dadr, nv) in joints {
+            if let Some((_, q, v)) = saved.iter().find(|(n, _, _)| *n == name) {
+                if q.len() == nq && v.len() == nv {
+                    self.data.qpos_mut()[qadr..qadr + nq].copy_from_slice(q);
+                    self.data.qvel_mut()[dadr..dadr + nv].copy_from_slice(v);
+                }
+            }
+        }
+        self.qpos.copy_from_slice(self.data.qpos());
+        self.qvel.copy_from_slice(self.data.qvel());
+        self.qfrc.fill(0.0);
+        self.bias.copy_from_slice(self.data.qfrc_bias());
+        Ok(())
+    }
+
+    /// Every joint of the current model: `(name, qpos address, qpos
+    /// size, dof address, dof size)`.
+    fn joints(&self) -> impl Iterator<Item = (String, usize, usize, usize, usize)> + '_ {
+        let model = self.data.model();
+        (0..model.ffi().njnt as usize).map(move |j| {
+            // SAFETY: a valid model and an in-range joint id; the name is
+            // a NUL-terminated string owned by the model.
+            let name = unsafe {
+                let p = mj_id2name(model.ffi(), MjtObj::mjOBJ_JOINT as i32, j as i32);
+                if p.is_null() {
+                    String::new()
+                } else {
+                    CStr::from_ptr(p).to_string_lossy().into_owned()
+                }
+            };
+            let (nq, nv) = match model.jnt_type()[j] {
+                MjtJoint::mjJNT_FREE => (7, 6),
+                MjtJoint::mjJNT_BALL => (4, 3),
+                _ => (1, 1),
+            };
+            (
+                name,
+                model.jnt_qposadr()[j] as usize,
+                nq,
+                model.jnt_dofadr()[j] as usize,
+                nv,
+            )
+        })
+    }
+
+    /// Pose `[x, y, z, qw, qx, qy, qz]` of the free world object `name`
+    /// (its shape name), `None` when no such free body is in the scene.
+    pub fn object_pose(&self, name: &str) -> Option<[f64; 7]> {
+        let model = self.data.model();
+        let joint = model.name_to_id(MjtObj::mjOBJ_JOINT, &format!("{WORLD_PREFIX}{name}"))?;
+        if model.jnt_type()[joint] != MjtJoint::mjJNT_FREE {
+            return None;
+        }
+        let adr = model.jnt_qposadr()[joint] as usize;
+        let mut pose = [0.0; 7];
+        pose.copy_from_slice(&self.qpos[adr..adr + 7]);
+        Some(pose)
     }
 
     /// Measured motor state of arm joint `j` (position ticks, speed
@@ -353,10 +457,12 @@ impl MujocoPlant {
                 // byte_to_m is linear through 0, so it maps deltas too.
                 jaw_vt = byte_to_m(step) / h;
             }
-            let x_t = byte_to_m(self.jaw_cmd_byte);
-            let f = (JAW_KP * (x_t - self.qpos[self.n]) + JAW_KD * (jaw_vt - self.qvel[self.n]))
-                .clamp(-JAW_FMAX, JAW_FMAX);
-            self.qfrc[self.n] = f;
+            if let Some(jaw) = self.jaw {
+                let x_t = byte_to_m(self.jaw_cmd_byte);
+                let f = (JAW_KP * (x_t - self.qpos[jaw]) + JAW_KD * (jaw_vt - self.qvel[jaw]))
+                    .clamp(-JAW_FMAX, JAW_FMAX);
+                self.qfrc[jaw] = f;
+            }
             self.data.qfrc_applied_mut().copy_from_slice(&self.qfrc);
             self.data.step();
             self.qpos.copy_from_slice(self.data.qpos());
@@ -376,9 +482,9 @@ impl MujocoPlant {
                 self.data.qvel_mut().copy_from_slice(&self.qvel);
             }
         }
-        match jaw {
-            Some(JawDrive::Active { .. }) => {
-                let measured = m_to_byte(self.qpos[self.n]);
+        match (jaw, self.jaw) {
+            (Some(JawDrive::Active { .. }), Some(jaw_q)) => {
+                let measured = m_to_byte(self.qpos[jaw_q]);
                 let lag = self.jaw_cmd_byte - measured;
                 if lag > JAW_LAG_BYTES {
                     self.close_at = Some(measured.round() as u8);
@@ -397,4 +503,32 @@ impl MujocoPlant {
             }
         }
     }
+}
+
+/// The generalized-coordinate layout the plant indexes by: `n` arm hinges
+/// first (qpos address == joint number), then the jaw slide pair when the
+/// tool has one, then only free joints. Returns the jaws' qpos index.
+/// Panics with a descriptive message on anything else — a sim
+/// construction bug, not a runtime error.
+fn check_layout(model: &MjModel, n: usize) -> Option<usize> {
+    let joint_id = |name: &str| -> Option<usize> { model.name_to_id(MjtObj::mjOBJ_JOINT, name) };
+    let nq = model.ffi().nq as usize;
+    let nv = model.ffi().nv as usize;
+    let jaw = joint_id("jaw1_JOINT");
+    if let Some(jaw) = jaw {
+        assert!(
+            jaw == n && joint_id("jaw2_JOINT") == Some(n + 1),
+            "scene joint order must be {n} arm joints, then jaw1_JOINT/jaw2_JOINT, then \
+             free objects (jaw ids: {jaw}/{:?})",
+            joint_id("jaw2_JOINT")
+        );
+    }
+    let base = n + if jaw.is_some() { 2 } else { 0 };
+    assert!(
+        nq >= base && nv >= base && nq - base == (nv - base) / 6 * 7,
+        "scene DOF layout unexpected: nq={nq} nv={nv} for {n} arm joints, {} jaws and free \
+         objects",
+        if jaw.is_some() { 2 } else { 0 }
+    );
+    jaw
 }

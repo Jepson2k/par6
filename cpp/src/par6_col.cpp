@@ -224,6 +224,13 @@ struct par6_col {
                 const pinocchio::GeomIndex gi = geom.addGeometryObject(obj);
                 const double m = w.margin >= 0.0 ? w.margin : clearance;
                 for (std::size_t i = 0; i < robot_geoms; ++i) {
+                    /* A geometry fixed to the world (the base) cannot reach a
+                     * world shape by moving; pairing it would only make an
+                     * installation floor under the base a permanent
+                     * collision. */
+                    if (geom.geometryObjects[i].parentJoint == 0) {
+                        continue;
+                    }
                     geom.addCollisionPair(pinocchio::CollisionPair(i, gi));
                     margins.push_back(m);
                 }

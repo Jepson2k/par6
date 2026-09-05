@@ -8,6 +8,8 @@ repository.workspace = true
 
 [dependencies]
 par6-config = { workspace = true }
+# World shapes and layers the simulator scene is built from.
+par6-proto = { workspace = true }
 # The sim plant. mujoco-rs downloads libmujoco itself; build under
 # `pixi run` so MUJOCO_DOWNLOAD_DIR is set.
 mujoco-rs = { workspace = true }

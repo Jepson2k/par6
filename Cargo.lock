@@ -752,6 +752,7 @@ dependencies = [
  "log",
  "mujoco-rs",
  "par6-config",
+ "par6-proto",
  "roxmltree",
  "serde",
  "serde_json",

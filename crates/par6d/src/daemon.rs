@@ -184,8 +184,10 @@ impl Daemon {
         // Hardware prerequisites, in the order an operator fixes them:
         // the CAN interface, then the e-stop line. Both are startup
         // refusals — nothing has been spawned yet.
-        let bus = if opts.sim {
-            RuntimeBus::from(SimBus::new(sim_scene.clone()))
+        let sim_bus = opts.sim.then(|| SimBus::new(sim_scene.clone()));
+        let sim_world = sim_bus.as_ref().map(SimBus::mailbox);
+        let bus = if let Some(sim_bus) = sim_bus {
+            RuntimeBus::from(sim_bus)
         } else {
             RuntimeBus::from(open_hardware_bus(&robot.bus)?)
         };
@@ -256,6 +258,7 @@ impl Daemon {
             bundle.clone(),
             opts.sim,
             sim_scene,
+            sim_world,
             crate::bridge::CartStream {
                 kin: kin_bridge,
                 snapshots: bridge_snapshots,
@@ -591,6 +594,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
                 ]
             })
             .collect(),
+        floor_z_m: robot.installation.floor_z_m,
         robot_filename: files.robot_filename,
         robot_toml: files.robot_toml,
         grippers: files.grippers,
@@ -633,6 +637,7 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     // dimension, duplicate name) is a startup failure that names the
     // shape — never a keep-out that silently isn't there.
     cfg.installation_shapes = bundle.installation_shapes.clone();
+    cfg.floor_z_m = bundle.robot.installation.floor_z_m;
     if let Some(ip) = opts.bind {
         cfg.bind.set_ip(ip);
     }

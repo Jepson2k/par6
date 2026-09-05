@@ -258,12 +258,14 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             tick_dt_s,
             motion,
             joints,
+            floor_z_m,
             active_recipe,
             recipes,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
             d.set_item("tick_dt_s", *tick_dt_s)?;
+            d.set_item("floor_z_m", *floor_z_m)?;
             let m = PyDict::new(py);
             for (key, v) in [
                 "jog_l_linear_max_m_s",

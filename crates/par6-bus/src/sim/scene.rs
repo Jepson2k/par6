@@ -25,6 +25,7 @@ use std::sync::Mutex;
 use mujoco_rs::prelude::{MjModel, MjSpec, MjtGeom, MjtJoint, SpecItem, SpecObject};
 use mujoco_rs::wrappers::mj_editing::MjsGeom;
 use par6_config::SimConfig;
+use par6_proto::{Physical, Shape};
 
 use super::map::JointMap;
 
@@ -143,6 +144,229 @@ impl ToolInertial {
     }
 }
 
+/// What a scene is built with, besides the vendor file.
+#[derive(Debug, Clone, Copy)]
+pub struct Build<'a> {
+    /// Physics timestep \[s\].
+    pub timestep: f64,
+    /// Per-arm-joint drivetrain tuning, in [`ARM_JOINTS`] order.
+    pub joints: &'a [JointTuning],
+    /// The active tool's config inertials (`None` = the variant URDF's).
+    pub tool: Option<&'a ToolInertial>,
+    /// Installation floor height \[m\] (`None` = no floor).
+    pub floor_z_m: Option<f64>,
+}
+
+/// The world objects, installation layer then program layer.
+pub type World<'a> = [&'a [Shape]; 2];
+
+/// Name prefix of every injected world object (body, joint and geom).
+pub const WORLD_PREFIX: &str = "par6/obj/";
+
+/// Compile `spec` under the load lock (MuJoCo's compiler is not
+/// re-entrant across threads).
+pub(crate) fn compile(spec: &mut MjSpec) -> Result<MjModel, String> {
+    let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    spec.compile().map_err(|e| e.to_string())
+}
+
+/// The load lock, for callers that recompile in place.
+pub(crate) fn load_lock() -> std::sync::MutexGuard<'static, ()> {
+    LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Add every world shape to `spec` under [`WORLD_PREFIX`], as its
+/// declaration says (one rule, three consumers):
+///
+/// | declares | in the model | contact |
+/// |---|---|---|
+/// | `collision = false` | geom (renders) | off |
+/// | no `physics` | geom (renders) | off — keep-out is coal's |
+/// | `physics`, no mass | static geom | on |
+/// | `physics` with mass | free body + geom | on |
+///
+/// Pose is the shape's world pose (`R = Rz·Ry·Rx`); sizes follow coal's
+/// constructor conventions (full box sides, cylinder/capsule `radius,
+/// length`). MuJoCo has no cone: a cone gets its enclosing cylinder.
+pub fn inject_world(spec: &mut MjSpec, world: &World) -> Result<(), SceneError> {
+    let mut seen: Vec<&str> = Vec::new();
+    for shape in world.iter().flat_map(|layer| layer.iter()) {
+        if seen.contains(&shape.name.as_str()) {
+            return Err(SceneError::World(format!(
+                "world shape `{}` is declared twice",
+                shape.name
+            )));
+        }
+        seen.push(&shape.name);
+        let obj = WorldGeom::from_shape(shape)?;
+        let name = format!("{WORLD_PREFIX}{}", shape.name);
+        let (pos, quat) = obj.placement;
+        let world_body = spec.world_body_mut();
+        let dynamic = obj.mass.is_some();
+        let geom = if dynamic {
+            let body = world_body.add_body().with_name(&name);
+            body.with_pos(pos);
+            body.with_quat(quat);
+            body.add_joint()
+                .with_name(&name)
+                .with_type(MjtJoint::mjJNT_FREE);
+            let geom = body.add_geom();
+            geom.with_pos([0.0; 3]);
+            geom.with_quat([1.0, 0.0, 0.0, 0.0]);
+            geom
+        } else {
+            let geom = world_body.add_geom();
+            geom.with_pos(pos);
+            geom.with_quat(quat);
+            geom
+        };
+        geom.with_name(&name);
+        geom.with_type(obj.kind);
+        geom.with_size(obj.size);
+        geom.with_rgba(obj.rgba);
+        let contact = i32::from(obj.contact);
+        geom.set_contype(contact);
+        geom.set_conaffinity(contact);
+        if let Some(physics) = &shape.physics {
+            geom.with_friction(physics.friction);
+            pad_contact(geom);
+        }
+        if let Some(mass) = obj.mass {
+            geom.set_mass(mass);
+        }
+    }
+    Ok(())
+}
+
+/// A world shape resolved to a MuJoCo geom.
+struct WorldGeom {
+    kind: MjtGeom,
+    size: [f64; 3],
+    /// World position and orientation `[w, x, y, z]`.
+    placement: ([f64; 3], [f64; 4]),
+    contact: bool,
+    mass: Option<f64>,
+    rgba: [f32; 4],
+}
+
+impl WorldGeom {
+    fn from_shape(shape: &Shape) -> Result<Self, SceneError> {
+        let bad = |what: &str| SceneError::World(format!("world shape `{}`: {what}", shape.name));
+        if shape.pose.len() != 6 {
+            return Err(bad("pose must have 6 entries"));
+        }
+        let p = &shape.params;
+        let need = |n: usize| {
+            if p.len() < n {
+                Err(bad(&format!("{} needs {n} params", shape.kind)))
+            } else {
+                Ok(())
+            }
+        };
+        let mut pos = [shape.pose[0], shape.pose[1], shape.pose[2]];
+        let mut quat = quat_from_rpy(shape.pose[3], shape.pose[4], shape.pose[5]);
+        let (kind, size) = match shape.kind.as_str() {
+            "box" => {
+                need(3)?;
+                (MjtGeom::mjGEOM_BOX, [p[0] / 2.0, p[1] / 2.0, p[2] / 2.0])
+            }
+            "sphere" => {
+                need(1)?;
+                (MjtGeom::mjGEOM_SPHERE, [p[0], 0.0, 0.0])
+            }
+            "cylinder" | "cone" => {
+                need(2)?;
+                (MjtGeom::mjGEOM_CYLINDER, [p[0], p[1] / 2.0, 0.0])
+            }
+            "capsule" => {
+                need(2)?;
+                (MjtGeom::mjGEOM_CAPSULE, [p[0], p[1] / 2.0, 0.0])
+            }
+            "ellipsoid" => {
+                need(3)?;
+                (MjtGeom::mjGEOM_ELLIPSOID, [p[0], p[1], p[2]])
+            }
+            "plane" => {
+                need(4)?;
+                // Half-space `n·x <= offset` in the shape frame: MuJoCo's
+                // plane is solid below its local +z, so local z goes onto
+                // `n` and the plane passes through `offset · n`.
+                let n = normalize([p[0], p[1], p[2]]).ok_or_else(|| bad("plane normal is zero"))?;
+                let local = [n[0] * p[3], n[1] * p[3], n[2] * p[3]];
+                pos = add(pos, rotate(quat, local));
+                quat = quat_mul(quat, quat_from_z_to(n));
+                (MjtGeom::mjGEOM_PLANE, [0.0, 0.0, 0.05])
+            }
+            other => return Err(bad(&format!("unknown kind `{other}`"))),
+        };
+        let (contact, mass, rgba) = match (&shape.physics, shape.collision) {
+            (_, false) => (false, None, [0.3, 0.6, 0.9, 0.3]),
+            (None, true) => (false, None, [0.9, 0.3, 0.3, 0.3]),
+            (Some(Physical { mass: None, .. }), true) => (true, None, [0.5, 0.5, 0.55, 1.0]),
+            (Some(Physical { mass: Some(m), .. }), true) => {
+                (true, Some(*m), [0.85, 0.55, 0.2, 1.0])
+            }
+        };
+        Ok(Self {
+            kind,
+            size,
+            placement: (pos, quat),
+            contact,
+            mass,
+            rgba,
+        })
+    }
+}
+
+fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
+}
+
+fn normalize(v: [f64; 3]) -> Option<[f64; 3]> {
+    let n = (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt();
+    (n > 0.0).then(|| [v[0] / n, v[1] / n, v[2] / n])
+}
+
+/// Hamilton product `a ⊗ b` of `[w, x, y, z]` quaternions.
+fn quat_mul(a: [f64; 4], b: [f64; 4]) -> [f64; 4] {
+    [
+        a[0] * b[0] - a[1] * b[1] - a[2] * b[2] - a[3] * b[3],
+        a[0] * b[1] + a[1] * b[0] + a[2] * b[3] - a[3] * b[2],
+        a[0] * b[2] - a[1] * b[3] + a[2] * b[0] + a[3] * b[1],
+        a[0] * b[3] + a[1] * b[2] - a[2] * b[1] + a[3] * b[0],
+    ]
+}
+
+/// `[w, x, y, z]` of `R = Rz(rz)·Ry(ry)·Rx(rx)` — waldoctl's extrinsic
+/// XYZ pose rotation.
+fn quat_from_rpy(rx: f64, ry: f64, rz: f64) -> [f64; 4] {
+    let (sx, cx) = (rx / 2.0).sin_cos();
+    let (sy, cy) = (ry / 2.0).sin_cos();
+    let (sz, cz) = (rz / 2.0).sin_cos();
+    quat_mul(
+        quat_mul([cz, 0.0, 0.0, sz], [cy, 0.0, sy, 0.0]),
+        [cx, sx, 0.0, 0.0],
+    )
+}
+
+/// The rotation taking local +z onto the unit vector `n`.
+fn quat_from_z_to(n: [f64; 3]) -> [f64; 4] {
+    let d = n[2];
+    if d > 1.0 - 1e-12 {
+        return [1.0, 0.0, 0.0, 0.0];
+    }
+    if d < -1.0 + 1e-12 {
+        // Antipodal: a half turn about x.
+        return [0.0, 1.0, 0.0, 0.0];
+    }
+    // axis = z × n, angle = acos(d); q = [cos(θ/2), axis·sin(θ/2)/|axis|].
+    let axis = [-n[1], n[0], 0.0];
+    let s = (axis[0] * axis[0] + axis[1] * axis[1]).sqrt();
+    let half = d.acos() / 2.0;
+    let k = half.sin() / s;
+    [half.cos(), axis[0] * k, axis[1] * k, 0.0]
+}
+
 /// Why a scene could not be built.
 #[derive(Debug, thiserror::Error)]
 pub enum SceneError {
@@ -173,6 +397,9 @@ pub enum SceneError {
     /// The config tool cannot be placed on the scene.
     #[error("tool: {0}")]
     Tool(String),
+    /// A world object cannot be placed in the scene.
+    #[error("world: {0}")]
+    World(String),
 }
 
 /// The XML parser keeps global "last XML" state and is not thread-safe;
@@ -209,15 +436,15 @@ impl Scene {
         self.assets.join("assets")
     }
 
-    /// The edited spec: vendor base plus every par6 delta. With `tool`,
-    /// the tool bodies carry the config inertials instead of the variant
-    /// URDF's.
-    pub fn spec(
-        &self,
-        timestep: f64,
-        joints: &[JointTuning],
-        tool: Option<&ToolInertial>,
-    ) -> Result<MjSpec, SceneError> {
+    /// The base spec: vendor scene plus every par6 delta, without world
+    /// objects — what [`inject_world`] adds to a clone of it on every
+    /// world change. With `build.tool` the tool bodies carry the config
+    /// inertials instead of the variant URDF's; with `build.floor_z_m` the
+    /// installation floor is a contact plane.
+    pub fn spec(&self, build: &Build) -> Result<MjSpec, SceneError> {
+        let timestep = build.timestep;
+        let joints = build.joints;
+        let tool = build.tool;
         let path = self.vendor_mjcf();
         let mjcf = |detail: String| SceneError::Mjcf {
             path: path.clone(),
@@ -306,44 +533,20 @@ impl Scene {
             exclude.set_bodyname2("jaw2");
         }
 
-        // The grasp scene: floor, pedestal, and a free object above it under
-        // the reach-down test pose q = [0, -0.25, 4.35, 0, -1.28, 0].
-        let world = spec.world_body_mut();
-        world
-            .add_geom()
-            .with_name("floor")
-            .with_type(MjtGeom::mjGEOM_PLANE)
-            .with_size([0.0, 0.0, 0.05])
-            .with_rgba([0.3, 0.35, 0.4, 1.0])
-            .with_contype(1)
-            .with_conaffinity(1);
-        world
-            .add_geom()
-            .with_name("pedestal")
-            .with_type(MjtGeom::mjGEOM_BOX)
-            .with_pos([0.3713, 0.0, 0.005])
-            .with_size([0.02, 0.02, 0.005])
-            .with_rgba([0.4, 0.4, 0.45, 1.0])
-            .with_contype(1)
-            .with_conaffinity(1);
-        let object = world
-            .add_body()
-            .with_name("grasp_object")
-            .with_pos([0.3713, 0.0, 0.04]);
-        object
-            .add_joint()
-            .with_name("grasp_object_JOINT")
-            .with_type(MjtJoint::mjJNT_FREE);
-        let geom = object
-            .add_geom()
-            .with_name("grasp_object")
-            .with_type(MjtGeom::mjGEOM_BOX)
-            .with_size([0.018, 0.018, 0.03])
-            .with_rgba([0.85, 0.55, 0.2, 1.0])
-            .with_contype(1)
-            .with_conaffinity(1);
-        geom.set_mass(0.05);
-        pad_contact(geom);
+        // The installation floor: the plane objects rest on (contacts on),
+        // an unbounded half-space below `floor_z_m`. Everything else in the
+        // world arrives through `inject_world`.
+        if let Some(z) = build.floor_z_m {
+            spec.world_body_mut()
+                .add_geom()
+                .with_name("floor")
+                .with_type(MjtGeom::mjGEOM_PLANE)
+                .with_pos([0.0, 0.0, z])
+                .with_size([0.0, 0.0, 0.05])
+                .with_rgba([0.3, 0.35, 0.4, 1.0])
+                .with_contype(1)
+                .with_conaffinity(1);
+        }
 
         apply_urdf_inertials(&mut spec, &self.urdf())?;
         if let Some(tool) = tool {
@@ -361,21 +564,26 @@ impl Scene {
             }
         }
         prefer_simplified_meshes(&mut spec, &meshdir);
+        // World objects are injected under their own prefix, so nothing of
+        // the vendor's may live there.
+        for body in spec.body_iter() {
+            if body.name().starts_with(WORLD_PREFIX) {
+                return Err(SceneError::World(format!(
+                    "vendor body `{}` uses the world prefix {WORLD_PREFIX}",
+                    body.name()
+                )));
+            }
+        }
         Ok(spec)
     }
 
-    /// The compiled model.
-    pub fn model(
-        &self,
-        timestep: f64,
-        joints: &[JointTuning],
-        tool: Option<&ToolInertial>,
-    ) -> Result<MjModel, SceneError> {
-        let mut spec = self.spec(timestep, joints, tool)?;
-        let _guard = LOAD_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        spec.compile().map_err(|e| SceneError::Mjcf {
+    /// The compiled model of the base spec with `world` injected.
+    pub fn model(&self, build: &Build, world: &World) -> Result<MjModel, SceneError> {
+        let mut spec = self.spec(build)?;
+        inject_world(&mut spec, world)?;
+        compile(&mut spec).map_err(|detail| SceneError::Mjcf {
             path: self.vendor_mjcf(),
-            detail: e.to_string(),
+            detail,
         })
     }
 }

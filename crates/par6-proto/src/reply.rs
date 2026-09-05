@@ -280,6 +280,10 @@ pub enum QueryResult {
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
+        /// Installation floor height \[m, base frame\] — the floor the
+        /// collision world enforces under every moving link and the
+        /// simulator rests objects on; `None` = no floor is modelled.
+        floor_z_m: Option<f64>,
         /// Active telemetry recipe name (`None` = telemetry off).
         active_recipe: Option<String>,
         /// Recipe names SET_RECIPE accepts — the discovery surface a
@@ -578,10 +582,11 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             tick_dt_s,
             motion,
             joints,
+            floor_z_m,
             active_recipe,
             recipes,
         } => {
-            w_array(buf, 8);
+            w_array(buf, 9);
             w_uint(buf, u64::from(tag));
             w_str(buf, path);
             w_str(buf, fingerprint);
@@ -596,6 +601,10 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 for v in j {
                     w_f64(buf, *v);
                 }
+            }
+            match floor_z_m {
+                Some(z) => w_f64(buf, *z),
+                None => w_nil(buf),
             }
             match active_recipe {
                 Some(name) => w_str(buf, name),
@@ -963,7 +972,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             QueryResult::IsSimulator { active: r.bool()? }
         }
         T::ConfigInfo => {
-            expect_arity("config_info result", n, 8)?;
+            expect_arity("config_info result", n, 9)?;
             let path = r.str()?.to_owned();
             let fingerprint = r.str()?.to_owned();
             let tick_dt_s = r.f64()?;
@@ -982,6 +991,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             for _ in 0..jn {
                 joints.push(r_f64_fixed(r, "config_info.joints[]")?);
             }
+            let floor_z_m = r.opt_f64()?;
             let active_recipe = if r.peek_nil() {
                 r.nil()?;
                 None
@@ -995,6 +1005,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 tick_dt_s,
                 motion,
                 joints,
+                floor_z_m,
                 active_recipe,
                 recipes,
             }
