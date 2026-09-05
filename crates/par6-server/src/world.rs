@@ -72,12 +72,18 @@ pub struct WorldState {
     installation: Vec<Shape>,
     program: Vec<Shape>,
     epoch: u64,
+    floor_z_m: Option<f64>,
 }
 
 impl WorldState {
     /// Epoch of the applied world; 0 until the first accepted apply.
     pub fn epoch(&self) -> u64 {
         self.epoch
+    }
+
+    /// The installation floor height the gates enforce, if one is declared.
+    pub fn floor_z_m(&self) -> Option<f64> {
+        self.floor_z_m
     }
 
     /// The applied installation layer.
@@ -107,6 +113,7 @@ impl WorldState {
         M: WorldMirror,
     {
         let mut enforced = cfg.installation_shapes.clone();
+        self.floor_z_m = cfg.floor_z_m;
         if let Some(z) = cfg.floor_z_m {
             enforced.push(floor_box(z));
         }

@@ -295,6 +295,7 @@ impl Preview {
         d.set_item("installation", layer(world.installation())?)?;
         d.set_item("program", layer(world.program())?)?;
         d.set_item("epoch", world.epoch())?;
+        d.set_item("floor_z_m", world.floor_z_m())?;
         Ok(d.into_any().unbind())
     }
 

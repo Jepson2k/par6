@@ -1778,6 +1778,9 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._call(core.shapes())
         if result is None:
             return None
+        # The floor is config, not a layer: SHAPES carries the layers and
+        # CONFIG_INFO the height, and the world a display draws needs both.
+        info = await self._call(core.config_info())
 
         def _shape(w: dict) -> Shape:
             return shape_from_wire(**w)
@@ -1785,6 +1788,7 @@ class AsyncRobotClient(_RobotClientABC):
         return ShapeWorld(
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
+            floor_z_m=None if info is None else info.get("floor_z_m"),
         )
 
     async def config_info(self) -> dict | None:

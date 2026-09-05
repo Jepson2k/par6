@@ -1099,6 +1099,9 @@ async def test_the_installation_layer_is_one_world_for_runtime_and_preview(tmp_p
             assert runtime_world.installation == (cage,)
             assert preview.shapes().installation == runtime_world.installation
             assert preview.shapes().program == runtime_world.program == ()
+            # The floor rides the same readback: config, not a shape, so a
+            # display learns where the ground is from the world it draws.
+            assert runtime_world.floor_z_m == preview.shapes().floor_z_m == 0.0
 
             target = list(SWEEP_START_DEG)
             target[0] += 80.0
