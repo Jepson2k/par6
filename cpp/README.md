@@ -37,27 +37,30 @@ cpp/src/par6_col.cpp       par6_col_* implementation (pinocchio + coal)
 cpp/src/shim_err.hpp       shared err_buf helper
 cpp/CMakeLists.txt         builds libpar6_shim.so + libpar6_shim.a
 crates/pinokin-sys/        raw decls + safe Model/Trajectory wrappers + tests
-scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
+pixi.toml                  the C++ closure (conda-forge) + the toppra/shim build tasks
+scripts/ffi/build.sh       cmake glue for toppra and the shim (`pixi run setup`)
+scripts/ffi/setup.sh       cross-compile bootstrap only (aarch64 from x86_64)
 scripts/ffi/gen_fixtures.py  reference fixtures from pip `pin`
 ```
 
 ## Quick start
 
 ```bash
-scripts/ffi/setup.sh          # micromamba → conda env → cmake build+install
-source .ffi/env.sh            # exports PAR6_SHIM_LIB_DIR / PAR6_SHIM_INCLUDE_DIR
-cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+pixi run setup                # conda-forge closure → toppra → cmake build+install of the shim
+pixi run cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
 ```
 
-Everything lands in `<repo>/.ffi` (self-gitignored, override with
-`PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages + the
-from-source toppra install), `src/toppra` + `build-toppra` (toppra checkout
-and build tree), `shim/` (installed lib + header), `env.sh`. Re-running is
-idempotent; `FORCE=1` rebuilds the shim; delete
-`.ffi/env/lib/libtoppra.so` to rebuild toppra (e.g. after a pin bump).
+The conda-forge closure lives in `.pixi/envs/default`; `pixi run` activates
+it and exports `PAR6_SHIM_LIB_DIR` / `PAR6_SHIM_INCLUDE_DIR` /
+`LD_LIBRARY_PATH`. Our own builds land in `<repo>/.ffi` (gitignored):
+`src/toppra` (checkout), `build/` (cmake trees), `toppra/` and `shim/`
+(install prefixes, kept out of the conda prefix so `pixi install` cannot
+clobber them). Tasks are incremental on their inputs; `FORCE=1 pixi run
+build-shim` rebuilds the shim, `rm -rf .ffi/toppra` rebuilds toppra (e.g.
+after a pin bump).
 
-Pinned versions (see `scripts/ffi/setup.sh`, `PAR6_PINOCCHIO_VERSION` /
-`PAR6_TOPPRA_COMMIT` to override): **pinocchio 4.1.0**, **toppra
+Pinned versions (see `pixi.toml`: the `libpinocchio` requirement and
+`TOPPRA_COMMIT`): **pinocchio 4.1.0**, **toppra
 142456f3** (v0.6.9), with conda-forge companions as of 2026-08: eigen
 5.0.1, urdfdom 6.0.0, boost 1.90, cxx-compiler (hermetic gcc), cmake,
 ninja. The pip reference is pinned to the same release: `pin==4.1.0`.
@@ -94,7 +97,7 @@ dependency lib dir (`.ffi/env/lib`) — also what the CI cache covers.
   are all link pairs minus same-joint and parent/child-adjacent ones (the
   same set `pinokin.CollisionChecker` produces client-side); each world
   shape pairs against every robot link, never against another world shape.
-  Shape units are **metres and radians** (`R = Rx·Ry·Rz`) — waldoctl's units,
+  Shape units are **metres and radians** (`R = Rz·Ry·Rx`, extrinsic XYZ) — waldoctl's units,
   which the Python client puts on the wire unconverted. `par6_col_check`
   writes only into caller buffers and the handle's workspace, but coal's
   mesh narrow phase allocates internally: planner-side, not RT-side.

@@ -32,18 +32,20 @@ below works on a laptop and in CI.
 
 ## Installation
 
-`par6d` links a Pinocchio C-ABI shim, so that gets built once before the runtime.
-The library crates need no C++ toolchain; only the binary does.
+`par6d` links a Pinocchio C-ABI shim. [pixi](https://pixi.sh) provides the C++ closure
+it is built from (Pinocchio, coal, a compiler) and `pixi run setup` builds the shim once
+into `.ffi/`; Rust itself comes from rustup.
 
 ```bash
-scripts/ffi/setup.sh             # once — builds the shim into .ffi/
-source .ffi/env.sh               # each shell: par6d needs the shim to BUILD and to RUN
-cargo build -p par6d --release
-pip install -e "python[dev]"
+pixi run setup                                   # once — C++ closure + the shim into .ffi/
+pixi run cargo build -p par6d --release
+pixi run -e py312 pip install -e "python[dev]"
 ```
 
-`source .ffi/env.sh` is not only a build step. It sets `LD_LIBRARY_PATH`, and a `par6d`
-started without it exits with `libpar6_shim.so: cannot open shared object file`.
+`pixi run` is not only a build step: it activates the environment that sets
+`LD_LIBRARY_PATH`, and a `par6d` started outside it exits with
+`libpar6_shim.so: cannot open shared object file`. `pixi shell` opens a shell with the
+same activation for plain `cargo` use.
 
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 

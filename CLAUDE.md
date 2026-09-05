@@ -7,24 +7,26 @@ Read `README.md` for architecture, the command system, and the collision world.
 
 ## Commands
 
+Rust comes from rustup (`rust-toolchain.toml`). Everything C++ — Pinocchio,
+coal, the compiler, and the shim built from them — comes from pixi. Run
+commands through `pixi run` (or open a `pixi shell` once); there is no env
+file to source.
+
 ```bash
-scripts/ffi/setup.sh               # once: build the Pinocchio shim into .ffi/
-source .ffi/env.sh                 # each shell: par6d needs the shim to build AND run
-cargo build --workspace            # runtime
-cargo test --workspace             # rust tests
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # must be clean
-cargo run -p par6d -- --sim        # simulated runtime, no hardware
-pip install -e "python[dev]"       # python package (maturin: compiles the par6-py extension)
-cd python && pytest                # python tests (JUnit XML at python/test-results.xml)
+pixi run setup                                   # once: toppra + the Pinocchio shim into .ffi/
+pixi run cargo build --workspace                 # runtime
+pixi run cargo test --workspace                  # rust tests
+pixi run cargo clippy --workspace --all-targets -- -D warnings && cargo fmt --all   # must be clean
+pixi run cargo run -p par6d -- --sim             # simulated runtime, no hardware
+pixi run -e py312 pip install -e "python[dev]"   # python package (maturin builds the par6-py extension)
+cd python && pixi run -e py312 pytest            # python tests (JUnit XML at python/test-results.xml)
+pixi run -e tools python scripts/simplify_meshes.py   # asset generation (Open3D)
 ```
 
-`par6d` links the shim unconditionally — there is no kinematics-free build.
-The library crates still build without a C++ toolchain, which is what the
-`--exclude par6d --exclude par6-py --exclude par6-client` legs in CI cover
-(par6-py wraps par6d; par6-client's tests boot a daemon in-process).
-The python package builds the `par6._par6` extension, so `pip install`
-needs `source .ffi/env.sh` first, and so does running anything that
-imports `par6` (the extension dlopens the shim).
+`par6d` links the shim unconditionally — there is no kinematics-free build,
+and every crate builds and tests under the same environment. The python
+package builds the `par6._par6` extension against the shim and dlopens it on
+import, so it too runs under `pixi run`.
 
 ## Generated artifacts stay in sync
 

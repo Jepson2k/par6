@@ -11,7 +11,7 @@ and gravity compensation is gated on `homed`, so none is applied. This prints
 the worst |G(q)| over the reachable J1xJ2 box against that budget, which is
 what decides whether a weight-modelling simulator plant can home at all.
 
-Run under the pixi env (it needs pinocchio):  pixi run python scripts/gravity_margin.py
+Run under the pixi env (it needs pinocchio):  pixi run -e tools python scripts/gravity_margin.py
 """
 
 import pathlib

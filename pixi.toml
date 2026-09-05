@@ -7,29 +7,91 @@ version = "0.1.0"
 
 # The C++ dependency closure the shim (cpp/) links against, plus the tools that
 # build it. Rust comes from rustup (rust-toolchain.toml), not from here — pixi
-# owns the system/C++ side only.
+# owns the system/C++ side only. (A Python still lands in the default
+# environment through libpinocchio → casadi; the runtime never loads it.)
 #
-# libmujoco is NOT here: the `mujoco-rs` crate fetches it itself via its
-# `auto-download-mujoco` feature into $MUJOCO_DOWNLOAD_DIR.
+# libmujoco is NOT here for the runtime: the `mujoco-rs` crate fetches it itself
+# via its `auto-download-mujoco` feature into $MUJOCO_DOWNLOAD_DIR.
 [dependencies]
+# The C++ library packages, not the `pinocchio`/`coal` metapackages — those
+# drag in the Python bindings (and a Python) the runtime never loads.
 # Pinned: the Python side's `pinokin` must resolve the same major/minor, and
 # the shim's C ABI is written against this API.
-pinocchio = "4.1.*"
+libpinocchio = "4.1.*"
 # coal (hpp-fcl) backs par6_col_* and arrives as a pinocchio dependency
 # anyway; naming it keeps the shim's link line honest, so a pinocchio build
 # that drops collision support fails here rather than at cmake time.
-coal = "*"
+libcoal = "*"
 eigen = "*"
 urdfdom = "*"
 cmake = "*"
 ninja = "*"
 cxx-compiler = "*"
 
+# TEMPORARY until the hand-rolled MuJoCo FFI is replaced by mujoco-rs: the
+# `sim-mujoco` feature still links a system libmujoco, and its CI leg runs on
+# linux-64 only (the old provisioning never installed it for aarch64 either).
+[target.linux-64.dependencies]
+libmujoco = "3.10.*"
+
 [activation.env]
 PAR6_SHIM_LIB_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/lib"
 PAR6_SHIM_INCLUDE_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/include"
+# Runtime loading for binaries whose package did not embed an rpath — link
+# args do not propagate across cargo packages.
+LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.ffi/shim/lib:$PIXI_PROJECT_ROOT/.ffi/toppra/lib:$CONDA_PREFIX/lib"
 # mujoco-rs requires an absolute path; it fetches the libmujoco matching
 # CARGO_CFG_TARGET_ARCH into this directory.
 MUJOCO_DOWNLOAD_DIR = "$PIXI_PROJECT_ROOT/.ffi/mujoco"
+# Temporary — see [target.linux-64.dependencies].
+PAR6_MUJOCO_LIB_DIR = "$CONDA_PREFIX/lib"
+# toppra-cpp pin. Bump together with a rebuild (rm -rf .ffi/toppra).
+TOPPRA_COMMIT = "142456f3282c92c93ab97749a24856661924d989"
 
-[tasks]
+# toppra-cpp has no conda-forge C++ package (only pure-python `toppra-python`),
+# so the pinned commit is built from source. It installs into its own prefix
+# rather than $CONDA_PREFIX so `pixi install` cannot clobber it.
+[tasks.fetch-toppra]
+cmd = "bash scripts/ffi/fetch_toppra.sh"
+outputs = [".ffi/src/toppra/cpp/CMakeLists.txt"]
+
+[tasks.build-toppra]
+depends-on = ["fetch-toppra"]
+cmd = "bash scripts/ffi/build.sh toppra"
+outputs = [".ffi/toppra/lib/libtoppra.so"]
+
+[tasks.build-shim]
+depends-on = ["build-toppra"]
+cmd = "bash scripts/ffi/build.sh shim"
+inputs = ["cpp/**"]
+outputs = [".ffi/shim/lib/libpar6_shim.so"]
+
+[tasks.setup]
+depends-on = ["build-shim"]
+
+# Python interpreters for the package's supported versions. The package is a
+# maturin build linking the shim, so it needs this environment's activation at
+# build time and at import time: `pixi run -e py312 pip install -e "python[dev]"`.
+# conda-forge's `python` does not bundle pip; without it `pixi run -e py312 pip`
+# falls through to the OS pip and its PEP 668 refusal.
+[feature.py311.dependencies]
+python = "3.11.*"
+pip = "*"
+
+[feature.py312.dependencies]
+python = "3.12.*"
+pip = "*"
+
+# Asset generation and probes: Open3D for mesh decimation
+# (scripts/simplify_meshes.py) and pinocchio's Python bindings for
+# scripts/gravity_margin.py. Large, and never loaded by the runtime.
+[feature.tools.dependencies]
+python = "3.12.*"
+pinocchio-python = "4.1.*"
+open3d = "*"
+trimesh = "*"
+
+[environments]
+py311 = ["py311"]
+py312 = ["py312"]
+tools = ["tools"]

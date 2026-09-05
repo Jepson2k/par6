@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# NATIVE BUILDS NO LONGER USE THIS SCRIPT. `pixi run setup` does (pixi.toml,
+# scripts/ffi/build.sh, scripts/ffi/fetch_toppra.sh). This remains for the
+# cross-compile path only (`--target aarch64` from an x86_64 host) until the
+# deploy job moves off it.
 # Reproducible C++ FFI toolchain bootstrap for par6:
 #   1. installs micromamba into a local prefix (no system changes)
 #   2. creates a conda-forge env with Pinocchio + toolchain (pinned)
