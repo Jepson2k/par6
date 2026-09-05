@@ -28,14 +28,23 @@ par6-preflight = "par6.panel.preflight:main"
 # hardware wheels and carry `ty: ignore`, but a muted pyserial would be an
 # ignore that is used on CI and unused on any box that has it — a gate that
 # passes or fails on what happens to be installed.
-dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout", "pillow", "pyserial"]
+dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout", "pillow", "pyserial", "python-can>=4.0"]
 # The control box front panel (`par6-panel`, `par6-preflight`): PIL draws the
 # OLED frames, gpiozero owns the buttons and LEDs, the Adafruit driver talks
 # to the SSD1306 over I2C, pyserial to the mainboard PCB.
 panel = ["pillow", "gpiozero", "adafruit-circuitpython-ssd1306", "pyserial"]
+# The Drives tab par6 contributes to a waldoctl frontend. Only the host
+# process needs NiceGUI; the runtime and the CLI never import it.
+gui = ["nicegui"]
+# Firmware flashing talks SocketCAN directly, so it is only installable —
+# and only useful — on the machine holding the CAN interface.
+flash = ["python-can>=4.0"]
 
 [project.entry-points."waldoctl.robots"]
 par6 = "par6.robot:Robot"
+
+[project.entry-points."waldoctl.panels"]
+par6-drives = "par6.gui.drives:DrivesPanel"
 
 [tool.maturin]
 # The extension crate (the engine binding); the pure-Python shim package

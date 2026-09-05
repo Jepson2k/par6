@@ -482,6 +482,19 @@ configured drive update the config and restart the daemon. `par6 set-pid-gains`
 pushes one drive's tuning live, `par6 tool` runs a tool action, and
 `par6 flashing enter|exit` hands the bus to a firmware flasher and takes it back.
 
+`par6 flash --node N` is that flasher, built in: it fetches the vendor's latest
+release (`--product stepfoc|spectral-bldc`, `--tag` for a specific one, `--file`
+for a local `.bin`), verifies it against the release's `firmware.json` manifest
+and its vector table, takes the bus with `enter_flashing`, drives the drive's CAN
+bootloader through the image, and gives the bus back — the drive checks the
+whole-image CRC itself and reboots once the bus has been quiet for ~3 s. It has
+to run on the machine holding the CAN interface (the `flash` extra brings
+python-can). Retries are reported, not hidden: a run that needed forty is a bus
+worth looking at. An interrupted write leaves the drive waiting in its
+bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
+drive's parameters back, presets, calibration — is UART-only and stays with the
+vendor's tool over a bench connection.
+
 ### The bus-grant signal
 
 `can0` is a system-wide exclusive resource, and the vendor's CAN tools (the

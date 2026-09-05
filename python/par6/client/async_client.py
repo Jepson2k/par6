@@ -1390,12 +1390,6 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
 
-    async def set_recipe(self, name: str) -> int:
-        """Select the telemetry recipe.  Unknown names are refused by the
-        runtime (raises :class:`RobotError`)."""
-        core = await self._ensure_core()
-        return await self._call(core.set_recipe(name))
-
     async def write_io(self, index: int, value: int) -> int:
         """Set digital output by logical index (0 = first output pin).
 
@@ -1808,10 +1802,8 @@ class AsyncRobotClient(_RobotClientABC):
         A dict with ``path``, ``fingerprint`` (sha256 hex over the config
         bundle's files — compare against a local mirror to detect skew),
         ``tick_dt_s``, ``motion`` (the ``[motion]`` feel constants by
-        name), ``joints`` (per-joint soft limits + EXEC
-        velocity/acceleration), ``active_recipe`` (the running telemetry
-        recipe, or None when telemetry is off) and ``recipes`` (the names
-        :meth:`set_recipe` accepts).  Returns None if unreachable.
+        name) and ``joints`` (per-joint soft limits + EXEC
+        velocity/acceleration).  Returns None if unreachable.
 
         Category: Query
 
