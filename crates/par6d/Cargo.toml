@@ -11,8 +11,7 @@ repository.workspace = true
 # collision world is empty while `set_shapes` still answers success —
 # all invisible to a client. The runtime linked those in unconditionally
 # rather than serve that, so there is no feature to turn them off.
-# Build the shim first: scripts/ffi/setup.sh, then `source .ffi/env.sh`.
-# The library crates still build without any C++ toolchain.
+# Build the shim first (`pixi run setup`) and build under `pixi run`.
 
 [dependencies]
 par6-config = { workspace = true }
@@ -21,8 +20,8 @@ par6-motion = { workspace = true }
 par6-bus = { workspace = true }
 par6-rt = { workspace = true }
 par6-server = { workspace = true }
-par6-kin = { workspace = true, features = ["ffi"] }
-pinokin-sys = { path = "../pinokin-sys", features = ["ffi"] }
+par6-kin = { workspace = true }
+pinokin-sys = { workspace = true }
 tokio = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }

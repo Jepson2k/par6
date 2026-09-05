@@ -56,13 +56,12 @@ same activation for plain `cargo` use.
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
-source .ffi/env.sh   # the package compiles the par6-py extension against the shim
-pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
+pixi run -e py312 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
 The package is a maturin build: pip compiles the `par6-py` extension (the engine's
 client + preview), so a source install needs the Rust toolchain and the shim from
-`scripts/ffi/setup.sh`. Prebuilt wheels that need neither are the wheel CI's job.
+`pixi run setup`. Prebuilt wheels that need neither are the wheel CI's job.
 That gives you the client, the offline preview and the kinematics — but **not** the
 `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
@@ -382,11 +381,10 @@ The Python side reads three of its own:
 ## Development setup
 
 ```bash
-source .ffi/env.sh
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # CI gate
-cargo test --workspace
-cargo build -p par6d --release
-cd python && PAR6D_BIN=../target/release/par6d python3 -m pytest -q
+cargo fmt --all && pixi run cargo clippy --workspace --all-targets -- -D warnings   # CI gate
+pixi run cargo test --workspace --exclude par6-py
+pixi run cargo build -p par6d --release
+cd python && PAR6D_BIN=../target/release/par6d pixi run -e py312 python -m pytest -q
 ```
 
 Use `python3 -m pytest`, not a bare `pytest` — on some setups the `pytest` on PATH

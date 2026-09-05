@@ -2,18 +2,13 @@
 //! built from the pinokin C++ core — one numerics stack shared with the
 //! Python client (which uses pinokin directly).
 //!
-//! The safe wrapper ([`Kin`], feature `ffi`) preallocates model/data at
+//! The safe wrapper ([`Kin`]) preallocates model/data at
 //! init and exposes allocation-free `fk / tcp / jacobian / gravity / ik`
 //! calls suitable for the RT thread and planner. Fixtures generated from
 //! the same numerics stack regression-test this crate
 //! (`tests/golden/kinematics/`).
 //!
-//! Without the `ffi` feature the crate carries only the pure-data
-//! [`GripperVariant`] table, so `cargo build --workspace` needs no C++
-//! toolchain. Build the shim with `scripts/ffi/setup.sh`, then
-//! `source .ffi/env.sh` and add `--features ffi`.
-//!
-//! Collision ([`Collision`], same `ffi` feature) runs coal/hpp-fcl over the
+//! Collision ([`Collision`]) runs coal/hpp-fcl over the
 //! same URDF: self-collision plus the installation/program keep-out layers
 //! waldoctl defines, reporting `collision_active`, the colliding pairs and
 //! the `scene_epoch` of the applied world. It is planner-side (tens of µs to
@@ -93,23 +88,16 @@ mod wrap;
 
 pub use wrap::wrap_to_window;
 
-#[cfg(feature = "ffi")]
 mod kin;
 
-#[cfg(feature = "ffi")]
 mod collision;
 
-#[cfg(feature = "ffi")]
 mod shapes;
 
-#[cfg(feature = "ffi")]
 pub use kin::{IkOptions, IkOutcome, Kin, KinError, Pose};
 
-#[cfg(feature = "ffi")]
 pub use collision::{Collision, CollisionReport, MAX_REPORTED_PAIRS};
 
-#[cfg(feature = "ffi")]
 pub use par6_proto::Layer;
 
-#[cfg(feature = "ffi")]
 pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

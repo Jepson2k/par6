@@ -18,7 +18,7 @@
 # Usage:
 #   scripts/ffi/setup.sh                    # for this machine
 #   source .ffi/env.sh   # exports PAR6_SHIM_LIB_DIR / PAR6_SHIM_INCLUDE_DIR
-#   cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+#   pixi run cargo test -p pinokin-sys
 #
 #   scripts/ffi/setup.sh --target aarch64   # for the control box (RPi 5)
 #   source .ffi/env-aarch64.sh
@@ -333,7 +333,7 @@ echo
 if [[ $CROSS -eq 0 ]]; then
   echo ">>> done. To build/test the Rust FFI crate:"
   echo "    source $ENV_FILE"
-  echo "    cargo test --manifest-path $ROOT/crates/pinokin-sys/Cargo.toml --features ffi"
+  echo "    pixi run cargo test -p pinokin-sys"
 else
   echo ">>> done. To build the runtime for the control box:"
   echo "    source $ENV_FILE"

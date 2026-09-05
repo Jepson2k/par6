@@ -103,12 +103,6 @@ int32_t par6_kin_ik_solve(par6_kin *h, const double *q_seed,
                           const double *target_pose16, double *out_q,
                           int32_t max_iters, double tol, double damping);
 
-/* Forward dynamics: joint accelerations ddq = ABA(q, v, tau), including
- * the tool inertia when given at create. q/v/tau: nq doubles each;
- * out_a: nq doubles. Allocation-free after create. */
-par6_status par6_kin_aba(par6_kin *h, const double *q, const double *v,
-                         const double *tau, double *out_a);
-
 /* Seeded damped-least-squares IK.
  * Iterates q += J^T (J J^T + damping^2 I)^-1 e from q_seed toward
  * target_pose16 (row-major 4x4, same frame as par6_kin_fk output).
@@ -404,9 +398,12 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     fails to link it.
  * v10: par6_kin_set_tool added (reversible runtime payload attach at the
  *     end-effector frame). Purely additive; a stale v9 library fails to
- *     link it. */
+ *     link it.
+ * v11: par6_kin_aba removed — forward dynamics are the simulator's MuJoCo
+ *     plant's, and no consumer called it. A v10 library still satisfies a
+ *     v11 consumer. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 10
+#define PAR6_SHIM_ABI_VERSION 11
 
 #ifdef __cplusplus
 } /* extern "C" */

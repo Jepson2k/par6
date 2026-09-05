@@ -840,7 +840,6 @@ dependencies = [
  "log",
  "par6-bus",
  "par6-config",
- "pinokin-sys",
  "thiserror",
  "thread-priority",
 ]
@@ -901,6 +900,10 @@ checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
 [[package]]
 name = "pinokin-sys"
 version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
 
 [[package]]
 name = "pkg-config"

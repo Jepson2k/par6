@@ -6,7 +6,6 @@
 //!
 //! Semantic conformance (which configurations collide, and with what) is
 //! `par6-kin`'s golden-fixture suite; this file is about the boundary.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 
@@ -42,8 +41,8 @@ fn box_at(x: f64, y: f64, z: f64, side: f64) -> ShapeDesc {
 }
 
 #[test]
-fn abi_version_is_v10() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 10);
+fn abi_version_is_v11() {
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 11);
 }
 
 #[test]
@@ -112,7 +111,8 @@ fn geometry_layout_tracks_layer_replacement() {
     );
 
     // Documented layout: [robot..., installation..., program...], and each
-    // world shape pairs against every robot link.
+    // world shape pairs against every robot link but the base — fixed to
+    // the world, it can never move into or out of a shape.
     col.set_layer(Layer::Installation, &[box_at(1.0, 0.0, 0.0, 0.1)])
         .unwrap();
     col.set_layer(
@@ -121,7 +121,7 @@ fn geometry_layout_tracks_layer_replacement() {
     )
     .unwrap();
     assert_eq!(col.geom_count(), robot + 3);
-    assert_eq!(col.pair_count(), self_pairs + 3 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 3 * (robot - 1));
     assert_eq!(col.geom_name(robot).unwrap(), "installation/0");
     assert_eq!(col.geom_name(robot + 1).unwrap(), "program/0");
     assert_eq!(col.geom_name(robot + 2).unwrap(), "program/1");
@@ -133,7 +133,7 @@ fn geometry_layout_tracks_layer_replacement() {
     col.set_layer(Layer::Installation, &[]).unwrap();
     assert_eq!(col.geom_count(), robot + 2);
     assert_eq!(col.geom_name(robot).unwrap(), "program/0");
-    assert_eq!(col.pair_count(), self_pairs + 2 * robot);
+    assert_eq!(col.pair_count(), self_pairs + 2 * (robot - 1));
 
     // An out-of-range index and a buffer too small for the name are both
     // errors, not truncated strings.

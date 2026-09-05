@@ -18,7 +18,6 @@
 //! closest pair's separation, negative = deepest penetration depth, +inf
 //! with no active pairs; margins and clearance shift the check verdict,
 //! never the distance.
-#![cfg(feature = "ffi")]
 
 use std::f64::consts::{FRAC_PI_2, PI};
 use std::path::PathBuf;

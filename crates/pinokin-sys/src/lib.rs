@@ -6,19 +6,13 @@
 //! - [`ffi`]: raw `extern "C"` declarations mirroring `cpp/include/par6_shim.h`.
 //! - [`Model`] / [`Trajectory`] / [`CollisionModel`]: minimal safe wrappers
 //!   with dimension checking and RAII. [`Model`] covers create / fk /
-//!   jacobian / gravity / aba / ik_step; [`Trajectory`] covers TOPPRA
+//!   jacobian / gravity / ik_step; [`Trajectory`] covers TOPPRA
 //!   parameterize / duration / allocation-free sampling;
 //!   [`CollisionModel`] covers the coal geometry world — installation and
 //!   program shape layers, in-collision verdict and colliding pairs.
 //!
-//! Everything is gated behind the `ffi` feature (default off) so plain
-//! `cargo check` succeeds without the C++ toolchain. Build the shim with
-//! `scripts/ffi/setup.sh`, then:
-//!
-//! ```sh
-//! source .ffi/env.sh
-//! cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
-//! ```
+//! The shim is built by `pixi run setup`; build and test under `pixi run`,
+//! whose activation exports `PAR6_SHIM_LIB_DIR` for `build.rs`.
 //!
 //! Conventions (fixed by the C header):
 //! - poses: 4x4 homogeneous, row-major, 16 `f64`
@@ -26,23 +20,16 @@
 //!   LOCAL_WORLD_ALIGNED frame
 //! - gravity: RNEA at zero velocity/acceleration, `nq` torques
 
-#[cfg(feature = "ffi")]
 pub mod ffi;
 
-#[cfg(feature = "ffi")]
 mod model;
 
-#[cfg(feature = "ffi")]
 mod traj;
 
-#[cfg(feature = "ffi")]
 mod collision;
 
-#[cfg(feature = "ffi")]
 pub use model::{Error, IkOptions, Model, ToolParams};
 
-#[cfg(feature = "ffi")]
 pub use traj::Trajectory;
 
-#[cfg(feature = "ffi")]
 pub use collision::{CollisionModel, Layer, ShapeDesc};

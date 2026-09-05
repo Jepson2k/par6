@@ -46,20 +46,13 @@ jobs:
       # `python` job through the real import.
       - name: test
         run: pixi run cargo test --workspace --exclude par6-py
-      # pinokin-sys is its OWN workspace, so `--workspace` never reaches it.
-      - name: fmt + clippy + test (pinokin-sys)
-        run: |
-          cargo fmt --manifest-path crates/pinokin-sys/Cargo.toml --all --check
-          pixi run cargo clippy --manifest-path crates/pinokin-sys/Cargo.toml \
-            --all-targets --features ffi -- -D warnings
-          pixi run cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
       # The collision golden suite runs in `test` above; this reruns just its
       # timing case optimized and uncaptured, so the measured per-waypoint
       # cost the planner budgets against is visible in the log. The test only
       # fails on catastrophe, never on runner noise.
       - name: report collision check cost (par6-kin)
         run: |
-          pixi run cargo test -p par6-kin --release --features ffi \
+          pixi run cargo test -p par6-kin --release \
             --test golden_collision per_waypoint_check_cost_is_reported -- --nocapture
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
@@ -69,9 +62,10 @@ jobs:
       - name: shipped 250 Hz soak (par6d, release)
         run: pixi run cargo test -p par6d --release --test shipped_tick -- --nocapture
 
-  # The pure-Rust crates cross-compile for the control box without any C++.
-  # par6d's aarch64 build is the deploy build (deploy-aarch64 below), which
-  # supplies the cross-compiled shim.
+  # Every crate cross-checks for the control box under the same environment
+  # as the x86_64 legs. A check never links, so the host-built shim satisfies
+  # pinokin-sys's build script and no aarch64 sysroot is needed; par6d's real
+  # aarch64 build is the deploy build (deploy-aarch64 below).
   cross-check:
     name: cross check (aarch64)
     runs-on: ubuntu-latest
@@ -81,12 +75,24 @@ jobs:
         with:
           targets: aarch64-unknown-linux-gnu
       - uses: Swatinem/rust-cache@v2
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: ${{ env.PIXI_VERSION }}
+          cache: true
+          environments: default
+      - name: cache shim + toppra
+        uses: actions/cache@v4
+        with:
+          path: .ffi
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+      - name: build shim (pixi run setup)
+        run: pixi run setup
       - name: install cross linker
         run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
       - name: cross check
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: cargo check --workspace --exclude par6d --exclude par6-py --target aarch64-unknown-linux-gnu
+        run: pixi run cargo check --workspace --target aarch64-unknown-linux-gnu
 
   msrv:
     # The env context is not available to jobs.<id>.name, and a workflow

@@ -7,7 +7,6 @@
 //! same Pinocchio release, so agreement is limited only by summation
 //! order (~1e-15 scale); 1e-9 keeps wide margin while any convention slip
 //! (frame, row order, rpy) shows up at ~1e-3 or worse.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 

@@ -11,10 +11,8 @@ members = [
     "crates/par6-client",
     "crates/par6d",
     "crates/par6-py",
+    "crates/pinokin-sys",
 ]
-# pinokin-sys stays a standalone workspace (its ffi build needs the C++
-# toolchain); par6-bus reaches it via an optional path dependency.
-exclude = ["crates/pinokin-sys"]
 
 [workspace.package]
 version = "0.1.0"
@@ -30,6 +28,7 @@ rust-version = "1.95"
 par6-proto = { path = "crates/par6-proto" }
 par6-config = { path = "crates/par6-config" }
 par6-kin = { path = "crates/par6-kin" }
+pinokin-sys = { path = "crates/pinokin-sys" }
 par6-motion = { path = "crates/par6-motion" }
 par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }

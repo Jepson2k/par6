@@ -15,7 +15,6 @@
 //!
 //! Pre-fix failure: against the original SolidWorks inertials this test
 //! fails with per-joint errors up to 2.7 Nm (~50% of the shoulder load).
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 

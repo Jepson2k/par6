@@ -1,9 +1,9 @@
-//! Links the `par6_shim` C++ library when the `ffi` feature is enabled.
+//! Links the `par6_shim` C++ library.
 //!
 //! Consumes:
-//! - `PAR6_SHIM_LIB_DIR` (required with `ffi`): directory holding
-//!   `libpar6_shim.so` / `libpar6_shim.a` — `scripts/ffi/setup.sh` installs it
-//!   and writes a sourceable `.ffi/env.sh` exporting these.
+//! - `PAR6_SHIM_LIB_DIR` (required): directory holding `libpar6_shim.so` /
+//!   `libpar6_shim.a` — `pixi run setup` builds it and the pixi activation
+//!   exports this.
 //! - `PAR6_SHIM_INCLUDE_DIR` (optional): directory holding `par6_shim.h`;
 //!   only sanity-checked here (declarations are hand-written, no bindgen),
 //!   and the place a future bindgen step would point at.
@@ -20,16 +20,11 @@ fn main() {
     println!("cargo:rerun-if-env-changed=PAR6_SHIM_LINK");
     println!("cargo:rerun-if-env-changed=PAR6_SHIM_DEP_LIB_DIR");
 
-    if env::var_os("CARGO_FEATURE_FFI").is_none() {
-        return; // stub build: no C++ toolchain required
-    }
-
     let lib_dir = env::var("PAR6_SHIM_LIB_DIR").unwrap_or_else(|_| {
         panic!(
-            "pinokin-sys was built with the `ffi` feature but PAR6_SHIM_LIB_DIR \
-             is not set.\nRun scripts/ffi/setup.sh, then `source .ffi/env.sh` \
-             (or export PAR6_SHIM_LIB_DIR to the directory containing \
-             libpar6_shim.so)."
+            "PAR6_SHIM_LIB_DIR is not set. Build under `pixi run` (the activation \
+             exports it once `pixi run setup` has built the shim), or export it \
+             to the directory containing libpar6_shim.so."
         )
     });
 
@@ -43,7 +38,7 @@ fn main() {
     if !lib_path.exists() {
         panic!(
             "{} not found in PAR6_SHIM_LIB_DIR ({lib_dir}). \
-             Run scripts/ffi/setup.sh to build the shim.",
+             Run `pixi run setup` to build the shim.",
             lib_file
         );
     }

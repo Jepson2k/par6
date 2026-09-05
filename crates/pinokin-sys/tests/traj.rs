@@ -2,7 +2,6 @@
 //! TOPPRA time-optimal rest-to-rest parameterizations — limits respected
 //! everywhere AND actually saturated — with degenerate inputs rejected as
 //! errors across the FFI, never crashes.
-#![cfg(feature = "ffi")]
 
 use pinokin_sys::{ffi, Error, Trajectory};
 
@@ -23,7 +22,7 @@ fn curvy_waypoints(n: usize, nq: usize) -> Vec<f64> {
 
 #[test]
 fn respects_and_saturates_limits_on_multi_dof_path() {
-    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 10);
+    assert_eq!(unsafe { ffi::par6_shim_abi_version() }, 11);
 
     let nq = 6;
     let waypoints = curvy_waypoints(9, nq);
@@ -287,7 +286,7 @@ fn rejects_degenerate_inputs_across_the_ffi() {
     // NULL-pointer contract, unreachable through the wrapper: create
     // reports failure (no handle), accessors on NULL handles error.
     unsafe {
-        let mut err = [0i8; 128];
+        let mut err = [0 as std::ffi::c_char; 128];
         let h = ffi::par6_traj_create(
             std::ptr::null(),
             2,

@@ -295,31 +295,6 @@ impl Model {
         Ok(out)
     }
 
-    /// Forward dynamics: joint accelerations `ddq = ABA(q, v, tau)`
-    /// (including the tool inertia when given at construction) into `out`.
-    pub fn aba_into(
-        &mut self,
-        q: &[f64],
-        v: &[f64],
-        tau: &[f64],
-        out: &mut [f64],
-    ) -> Result<(), Error> {
-        self.check_len(q, self.nq)?;
-        self.check_len(v, self.nq)?;
-        self.check_len(tau, self.nq)?;
-        self.check_len(out, self.nq)?;
-        let status = unsafe {
-            ffi::par6_kin_aba(
-                self.raw.as_ptr(),
-                q.as_ptr(),
-                v.as_ptr(),
-                tau.as_ptr(),
-                out.as_mut_ptr(),
-            )
-        };
-        Self::check_status(status)
-    }
-
     /// DLS IK that refuses a step which would increase the residual.
     ///
     /// Same contract as [`Model::ik_step`] — `Ok(true)` converged,

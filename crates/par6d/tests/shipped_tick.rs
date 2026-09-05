@@ -17,8 +17,7 @@
 //! must additionally clear the tight on-box band:
 //!
 //! ```bash
-//! source .ffi/env.sh
-//! PAR6_P99_FACTOR=1.05 cargo test -p par6d --release --features ffi \
+//! PAR6_P99_FACTOR=1.05 pixi run cargo test -p par6d --release \
 //!     --test shipped_tick -- --nocapture
 //! ```
 //!
