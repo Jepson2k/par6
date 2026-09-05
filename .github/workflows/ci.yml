@@ -21,16 +21,7 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: cache pinocchio toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ffi/bin
-            .ffi/env
-            .ffi/shim
-          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build shim (scripts/ffi/setup.sh)
-        run: scripts/ffi/setup.sh
+      - uses: ./.github/actions/ffi-shim
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
@@ -78,16 +69,7 @@ jobs:
         with:
           toolchain: ${{ env.MSRV }}
       - uses: Swatinem/rust-cache@v2
-      - name: cache pinocchio toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ffi/bin
-            .ffi/env
-            .ffi/shim
-          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build shim (scripts/ffi/setup.sh)
-        run: scripts/ffi/setup.sh
+      - uses: ./.github/actions/ffi-shim
       - name: check
         run: |
           source .ffi/env.sh
@@ -112,18 +94,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: socketcan
-      # par6-bus builds its torque plant by default now, which links the
-      # shim like everything else.
-      - name: cache pinocchio toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ffi/bin
-            .ffi/env
-            .ffi/shim
-          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build shim (scripts/ffi/setup.sh)
-        run: scripts/ffi/setup.sh
       - name: create vcan0
         run: |
           sudo apt-get update
@@ -134,12 +104,14 @@ jobs:
       # Single-threaded: every test in the binary opens observer sockets on
       # the same vcan0 and asserts exact frame sequences, so concurrent
       # tests would see each other's traffic.
+      # Without the sim plants: they (and the C++ shim they link) have no
+      # part in a SocketCAN test, so this job carries no toolchain.
       - name: test par6-bus against vcan0
         env:
           PAR6_REQUIRE_VCAN: '1'
         run: |
-          source .ffi/env.sh
-          cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
+          cargo test -p par6-bus --no-default-features --test socketcan_vcan \
+            -- --test-threads=1 --nocapture
 
   python:
     name: python ${{ matrix.python }}
@@ -153,23 +125,14 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
-      # The package is a maturin build now: pip compiles the par6-py
-      # extension, which links the pinocchio shim like every other crate,
-      # so this job carries the same toolchain (and cache key) as `ffi`.
+      # The package is a maturin build: pip compiles the par6-py extension,
+      # which links the pinocchio shim like every other crate, so this job
+      # carries the same toolchain as the rust job.
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           key: python
-      - name: cache pinocchio toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ffi/bin
-            .ffi/env
-            .ffi/shim
-          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build shim (scripts/ffi/setup.sh)
-        run: scripts/ffi/setup.sh
+      - uses: ./.github/actions/ffi-shim
       # waldoctl branch-matching must happen BEFORE the package install:
       # a cross-repo change lands on a branch of the same name first
       # (CLAUDE.md's dev workflow), and while the release chain is in
@@ -246,17 +209,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: e2e-${{ matrix.layer }}
-      # par6d links the shim, so this job carries the same toolchain.
-      - name: cache pinocchio toolchain
-        uses: actions/cache@v4
-        with:
-          path: |
-            .ffi/bin
-            .ffi/env
-            .ffi/shim
-          key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build shim (scripts/ffi/setup.sh)
-        run: scripts/ffi/setup.sh
+      - uses: ./.github/actions/ffi-shim
       # Release, not debug: the sim runs in wall-clock time and an
       # unoptimized RT loop misses its deadlines and latches LOOP_CRITICAL.
       # par6d links the shim unconditionally, so this job needs it built.
@@ -288,13 +241,10 @@ jobs:
           # This job exists to run the e2e layer. Without the flag a
           # missing binary would skip all of it and still report green.
           PAR6_REQUIRE_E2E: "1"
-        # Sourced, not hand-listed: par6d embeds no rpath at all (cargo
-        # link-args do not propagate across packages), so it needs the
-        # shim's own directory as well as the conda prefix its Pinocchio
-        # and coal live in. env.sh is what setup.sh generates and what
-        # every other job here uses; a second hand-maintained copy of the
-        # list is what silently dropped .ffi/shim/lib and left every e2e
-        # test erroring on a missing libpar6_shim.so.
+        # env.sh, not a hand-listed variable set: it is the one list
+        # setup.sh maintains and what every other job here uses; a second
+        # hand-maintained copy is what once silently dropped .ffi/shim/lib
+        # and left every e2e test erroring on a missing libpar6_shim.so.
         run: |
           source .ffi/env.sh
           cd python

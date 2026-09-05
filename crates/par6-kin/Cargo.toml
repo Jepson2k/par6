@@ -7,7 +7,6 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 links = "par6_shim"
-build = "build.rs"
 
 [dependencies]
 thiserror = { workspace = true }
@@ -20,6 +19,10 @@ par6-proto = { workspace = true }
 rs-opw-kinematics = { version = "2.0.3", default-features = false }
 glam = "=0.30.10"
 urdf-rs = "0.9"
+
+[build-dependencies]
+# The shim staleness check digests cpp/ the way setup.sh does.
+sha2 = { workspace = true }
 
 [dev-dependencies]
 # The vendor gravity reference is JSON.

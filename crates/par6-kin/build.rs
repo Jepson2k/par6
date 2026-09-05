@@ -61,16 +61,20 @@ fn main() {
         }
     }
 
-    warn_if_shim_predates_its_sources(&lib_path);
+    check_shim_matches_sources(&lib_path);
 
     println!("cargo:rustc-link-search=native={lib_dir}");
     // The shim's install rpath covers its own Pinocchio deps; the rpath here
     // lets test/bin targets find the shim without LD_LIBRARY_PATH.
     println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
 
-    match link.as_str() {
+    // The directory dependents' own binaries and test executables need on
+    // their rpath to load the shim at run time; cargo hands it to their
+    // build scripts as `DEP_PAR6_SHIM_RPATH` through the `links` key.
+    let runtime_dir = match link.as_str() {
         "dylib" => {
             println!("cargo:rustc-link-lib=dylib=par6_shim");
+            lib_dir.clone()
         }
         "static" => {
             // Static shim archive: Pinocchio, coal and toppra (shared-only
@@ -90,62 +94,94 @@ fn main() {
             println!("cargo:rustc-link-lib=dylib=coal");
             println!("cargo:rustc-link-lib=dylib=toppra");
             println!("cargo:rustc-link-lib=dylib=stdc++");
+            dep_dir
         }
         _ => unreachable!(),
-    }
+    };
+    println!("cargo:rpath={runtime_dir}");
 }
 
-/// Fail the build when the installed shim is older than the `cpp/` sources it
-/// was built from.
+/// The digest `scripts/ffi/setup.sh` records beside the shim it installs:
+/// the identity of the `cpp/` tree it was built from.
+const CPP_DIGEST_FILE: &str = "cpp.sha256";
+
+/// Fail the build when the installed shim was not built from the `cpp/`
+/// beside it.
 ///
 /// Nothing else notices: cargo does not build the shim, so an edit under
 /// `cpp/` leaves a stale `.so` linked and the failures surface as wrong
 /// numbers deep in the kinematics tests — a TOPPRA timing law that has been
 /// replaced, an error message the shim does not carry yet — with nothing
-/// pointing at the build. Only meaningful in a checkout; an installed shim
-/// with no `cpp/` beside it is left alone.
-fn warn_if_shim_predates_its_sources(lib_path: &Path) {
+/// pointing at the build. The identity compared is the content digest
+/// `setup.sh` records at install, never a timestamp: a checkout, a rebase
+/// or a cache restore rewrites mtimes without changing a byte. Only
+/// meaningful in a checkout; an installed shim with no `cpp/` beside it is
+/// left alone.
+fn check_shim_matches_sources(lib_path: &Path) {
     let cpp = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../cpp");
     let Ok(cpp) = std::fs::canonicalize(&cpp) else {
         return;
     };
     println!("cargo:rerun-if-changed={}", cpp.display());
-    let Ok(built) = lib_path.metadata().and_then(|m| m.modified()) else {
+    let stamp = lib_path
+        .parent()
+        .and_then(Path::parent)
+        .map(|prefix| prefix.join(CPP_DIGEST_FILE))
+        .unwrap_or_default();
+    let recorded = std::fs::read_to_string(&stamp).ok();
+    let current = cpp_digest(&cpp);
+    if recorded.as_deref().map(str::trim) == Some(current.as_str()) {
+        println!("cargo:rerun-if-changed={}", stamp.display());
         return;
-    };
-    let mut newest: Option<(std::time::SystemTime, std::path::PathBuf)> = None;
-    let mut stack = vec![cpp];
+    }
+    panic!(
+        "the installed shim was not built from the cpp/ in this checkout:\n  \
+         {} records {}\n  cpp/ digests to {current}\n\n\
+         Linking it anyway runs the OLD C++ against the new Rust, which \
+         shows up as wrong numbers in the kinematics and trajectory tests \
+         rather than as a build error.\n\n  \
+         Rebuild it: scripts/ffi/setup.sh",
+        stamp.display(),
+        recorded.as_deref().map_or("no digest", str::trim),
+    );
+}
+
+/// The digest of every file under `cpp/`, as `setup.sh` computes it:
+/// `find cpp -type f | LC_ALL=C sort | xargs sha256sum | sha256sum` from the
+/// repo root, so the two sides agree byte for byte.
+fn cpp_digest(cpp: &Path) -> String {
+    use sha2::{Digest, Sha256};
+    let root = cpp.parent().expect("cpp/ has a parent");
+    let mut files = Vec::new();
+    let mut stack = vec![cpp.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
         for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
+            let Ok(kind) = entry.file_type() else {
                 continue;
-            }
-            println!("cargo:rerun-if-changed={}", path.display());
-            if let Ok(t) = entry.metadata().and_then(|m| m.modified()) {
-                if newest.as_ref().is_none_or(|(best, _)| t > *best) {
-                    newest = Some((t, path));
-                }
+            };
+            if kind.is_dir() {
+                stack.push(entry.path());
+            } else if kind.is_file() {
+                let path = entry.path();
+                let rel = path
+                    .strip_prefix(root)
+                    .expect("under the repo root")
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                files.push((rel, path));
             }
         }
     }
-    if let Some((t, path)) = newest {
-        if t > built {
-            panic!(
-                "the installed shim is older than the sources it is built from:\n                   {} was modified after {}\n\n\
-                 Linking it anyway runs the OLD C++ against the new Rust, which \
-                 shows up as wrong numbers in the kinematics and trajectory \
-                 tests rather than as a build error.\n\n  \
-                 Rebuild it: FORCE=1 scripts/ffi/setup.sh",
-                path.display(),
-                lib_path.display(),
-            );
-        }
+    files.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
+    let mut listing = Sha256::new();
+    for (rel, path) in files {
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+        listing.update(format!("{:x}  {rel}\n", Sha256::digest(&bytes)));
     }
+    format!("{:x}", listing.finalize())
 }
 
 /// `<repo>/.ffi/shim/<sub>` when `scripts/ffi/setup.sh` has populated it.

@@ -13,7 +13,7 @@ repos:
         pass_filenames: false
       - id: cargo-clippy
         name: cargo clippy (workspace)
-        entry: bash -c 'if [ ! -f .ffi/env.sh ]; then echo "no .ffi/env.sh — run scripts/ffi/setup.sh first"; exit 1; fi; . .ffi/env.sh && cargo clippy --workspace --all-targets -- -D warnings'
+        entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
         files: \.(rs|toml)$
         pass_filenames: false

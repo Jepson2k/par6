@@ -177,8 +177,8 @@ fi
 # shim links, the tests run, and a few numerical results move — which is how
 # a CI cache built from one solve keeps passing while a fresh machine
 # building from the same commit fails.
-for spec in "pinocchio=$PINOCCHIO_VERSION" "eigen=$EIGEN_VERSION" \
-            "urdfdom=$URDFDOM_VERSION" "coal=$COAL_VERSION"; do
+for spec in "${TARGET_SPECS[@]}"; do
+  [[ $spec == *=* ]] || continue
   pkg="${spec%%=*}"
   want="${spec#*=}"
   meta=("$ENV_DIR"/conda-meta/"$pkg"-[0-9]*.json)
@@ -301,14 +301,22 @@ else
 fi
 
 # --- 4. build + install the shim ---------------------------------------------
+# The identity of the sources a shim was built from: a digest of cpp/**,
+# recorded beside the install so a rebuild is decided on content rather
+# than on timestamps (a checkout or a cache restore rewrites those without
+# changing a byte). crates/par6-kin/build.rs computes the same digest and
+# refuses to link a shim whose record disagrees.
+cpp_digest() {
+  (cd "$ROOT" && find cpp -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1)
+}
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
 fi
 # Rebuild when cpp/ has moved on: cargo does not build the shim, so a stale
 # .so links silently and surfaces as wrong numbers in the kinematics tests.
 if [[ -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
-  if [[ -n "$(find "$ROOT/cpp" -type f -newer "$SHIM_PREFIX/lib/libpar6_shim.so" -print -quit)" ]]; then
-    echo ">>> cpp/ is newer than the installed shim; rebuilding"
+  if [[ "$(cat "$SHIM_PREFIX/cpp.sha256" 2>/dev/null)" != "$(cpp_digest)" ]]; then
+    echo ">>> the installed shim was not built from this cpp/; rebuilding"
     rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
   fi
 fi
@@ -322,8 +330,9 @@ if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
     -DCMAKE_INSTALL_RPATH="$DEP_RPATH"
   run_tool cmake --build "$BUILD_DIR"
   run_tool cmake --install "$BUILD_DIR"
+  cpp_digest > "$SHIM_PREFIX/cpp.sha256"
 else
-  echo ">>> shim exists and is newer than cpp/: $SHIM_PREFIX (FORCE=1 to rebuild)"
+  echo ">>> shim exists and matches cpp/: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
 
 # --- 4b. drop the build machine out of the artifacts we produce --------------

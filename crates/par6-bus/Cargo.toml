@@ -6,6 +6,9 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+# libmujoco is linked here and nowhere else; the key lets this build script
+# publish its directory to dependents (`DEP_MUJOCO_RPATH`).
+links = "mujoco"
 
 [features]
 # Both alternative sim plants ship on: the shim and libmujoco are hard

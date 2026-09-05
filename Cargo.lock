@@ -642,6 +642,7 @@ dependencies = [
  "rs-opw-kinematics",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.20",
  "urdf-rs",
 ]
@@ -669,6 +670,7 @@ name = "par6-py"
 version = "0.1.0"
 dependencies = [
  "log",
+ "par6-bus",
  "par6-client",
  "par6-config",
  "par6-kin",

@@ -206,8 +206,9 @@ def main() -> int:
     # linked from the env (libmujoco) ships with its closure like any
     # other dependency.
     dest = args.dest.resolve()
-    in_place = [r.resolve() for r in args.roots if r.resolve().parent == dest]
-    deps += [r.resolve() for r in args.roots if r.resolve().parent != dest]
+    roots = [r.resolve() for r in args.roots]
+    in_place = [r for r in roots if r.parent == dest]
+    deps += [r for r in roots if r.parent != dest]
 
     staged: dict[str, Path] = {}
     total = 0

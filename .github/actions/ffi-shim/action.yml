@@ -1,0 +1,18 @@
+name: ffi shim
+description: >-
+  Restore the cached Pinocchio toolchain and build the par6 C++ shim with
+  scripts/ffi/setup.sh. Every job that links the workspace runs this.
+runs:
+  using: composite
+  steps:
+    - name: cache pinocchio toolchain
+      uses: actions/cache@v4
+      with:
+        path: |
+          .ffi/bin
+          .ffi/env
+          .ffi/shim
+        key: ffi-toolchain-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+    - name: build shim (scripts/ffi/setup.sh)
+      shell: bash
+      run: scripts/ffi/setup.sh

@@ -1,26 +1,25 @@
 //! With feature `sim-dynamics`, embeds an rpath to the par6_shim install
 //! directory so this crate's own test binaries load `libpar6_shim.so`
 //! without `LD_LIBRARY_PATH`. Link-args do not propagate across packages,
-//! so par6-kin's identical rpath only covers ITS test binaries.
+//! so the directory comes from par6-kin's build script, which publishes
+//! the one it linked as `DEP_PAR6_SHIM_RPATH` through its `links` key.
 //!
 //! With feature `sim-mujoco`, links `libmujoco` from `PAR6_MUJOCO_LIB_DIR`
 //! (exported by `.ffi/env.sh` after `scripts/ffi/setup.sh`), falling back
 //! to the repo's own `.ffi/env/lib` so a checkout that has run `setup.sh`
-//! builds without sourcing the env file, and embeds the matching rpath.
+//! builds without sourcing the env file, embeds the matching rpath, and
+//! publishes the directory to dependents the same way (`DEP_MUJOCO_RPATH`).
 
 use std::env;
 use std::path::Path;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=PAR6_MUJOCO_LIB_DIR");
     if env::var_os("CARGO_FEATURE_SIM_DYNAMICS").is_some() {
-        // par6-kin's build script errors out with setup.sh guidance when this
-        // is missing; no need to duplicate the message here.
-        if let Ok(lib_dir) = env::var("PAR6_SHIM_LIB_DIR") {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
-        }
+        let shim = env::var("DEP_PAR6_SHIM_RPATH")
+            .expect("par6-kin's build script publishes the shim's rpath");
+        println!("cargo:rustc-link-arg=-Wl,-rpath,{shim}");
     }
+    println!("cargo:rerun-if-env-changed=PAR6_MUJOCO_LIB_DIR");
     if env::var_os("CARGO_FEATURE_SIM_MUJOCO").is_some() {
         let lib_dir = env::var("PAR6_MUJOCO_LIB_DIR")
             .ok()
@@ -43,6 +42,7 @@ fn main() {
         println!("cargo:rustc-link-search=native={lib_dir}");
         println!("cargo:rustc-link-lib=dylib=mujoco");
         println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+        println!("cargo:rpath={lib_dir}");
     }
 }
 

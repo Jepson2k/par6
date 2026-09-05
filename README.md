@@ -433,14 +433,15 @@ cpp/include/par6_shim.h    the frozen C ABI (PAR6_SHIM_ABI_VERSION)
 cpp/src/par6_shim.cpp      par6_kin_* (pinocchio)
 cpp/src/par6_traj.cpp      par6_traj_* (toppra-cpp)
 cpp/src/par6_col.cpp       par6_col_* (pinocchio + coal)
-crates/par6-kin/src/ffi.rs the raw decls; Kin/Trajectory/Collision wrap them in the same crate
+crates/par6-kin/src/sys/   the raw decls (ffi.rs) and the RAII handles over them; Kin/Collision/Trajectory build on those
 scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
 ```
 
 `scripts/ffi/setup.sh` puts everything under `<repo>/.ffi` (self-gitignored, override
 with `PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages including
 libmujoco, plus the from-source toppra install), `shim/` (installed lib + header),
-`env.sh`. Re-running is idempotent; `FORCE=1` rebuilds the shim. Pinned: **pinocchio
+`env.sh`. Re-running is idempotent: a shim whose recorded `cpp/` digest no longer
+matches the tree is rebuilt, and `FORCE=1` rebuilds it regardless. Pinned: **pinocchio
 4.1.0**, **toppra 142456f3**, **libmujoco 3.10.0** (`PAR6_PINOCCHIO_VERSION` /
 `PAR6_TOPPRA_COMMIT` / `PAR6_MUJOCO_VERSION` override). Builds discover the shim under
 `.ffi/shim/lib` and libmujoco under `.ffi/env/lib` on their own and carry both as
