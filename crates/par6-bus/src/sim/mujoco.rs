@@ -426,6 +426,19 @@ impl MujocoPlant {
         self.objects.keys().cloned().collect()
     }
 
+    /// Every free object's pose into `out`, in the same order
+    /// [`Self::object_names`] reports, returning how many were written
+    /// (never more than `out.len()`). One walk of the index: a caller
+    /// reading every object each tick pays no per-name lookup.
+    pub fn object_poses_into(&self, out: &mut [[f64; 7]]) -> usize {
+        let mut n = 0;
+        for (_, &(_, qadr, _)) in self.objects.iter().take(out.len()) {
+            out[n].copy_from_slice(&self.qpos[qadr..qadr + 7]);
+            n += 1;
+        }
+        n
+    }
+
     /// The scene's own gravity torque on the arm joints at `q` \[Nm\],
     /// at rest: `qfrc_bias` with every velocity zero, which leaves only
     /// gravity. The controller computes the same quantity from the URDF

@@ -10,7 +10,7 @@ use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
 use par6_bus::sim::rollout::Rollout;
-use par6_bus::sim::scene::{quat_from_matrix, quat_from_rpy, Scene};
+use par6_bus::sim::scene::{self, quat_from_matrix, quat_from_rpy, Scene};
 use par6_config::{GripperConfig, RobotConfig};
 use par6_motion::JogEngine;
 use par6_proto::Layer;
@@ -249,7 +249,7 @@ impl Preview {
         // were asked to go.
         let closing = closed > self.jaw_closed;
         self.jaw_closed = closed;
-        let names = Rollout::free_object_names(&self.world_refs());
+        let names = scene::free_object_names(&self.world_refs());
         if names.is_empty() {
             return still(q, Vec::new());
         }
@@ -377,7 +377,7 @@ impl Preview {
     /// Rebuild the rollout's world after a layer change; objects that no
     /// longer exist are no longer carried.
     fn sync_rollout_world(&mut self) {
-        let names = Rollout::free_object_names(&self.world_refs());
+        let names = scene::free_object_names(&self.world_refs());
         self.carried.retain(|c| names.contains(&c.name));
         let (world, rollout) = (&self.world, &mut self.rollout);
         if let Some(roll) = rollout.as_mut() {
@@ -423,7 +423,7 @@ impl Preview {
         tcp_poses: &[[f64; 16]],
         end: &[f64; MAX_JOINTS],
     ) -> Vec<ObjectTrack> {
-        let names = Rollout::free_object_names(&self.world_refs());
+        let names = scene::free_object_names(&self.world_refs());
         if names.is_empty() {
             return Vec::new();
         }

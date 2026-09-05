@@ -361,6 +361,30 @@ impl SimBus {
         self.plant.as_ref()?.object_pose(name)
     }
 
+    /// Every free world object's name, in scene order.
+    pub fn object_names(&self) -> Vec<String> {
+        self.plant
+            .as_ref()
+            .map(mujoco::MujocoPlant::object_names)
+            .unwrap_or_default()
+    }
+
+    /// A free world object's speed \[m/s, rad/s\], `None` when no such
+    /// object is in the scene.
+    pub fn object_speed(&self, name: &str) -> Option<f64> {
+        self.plant.as_ref()?.object_speed(name)
+    }
+
+    /// Every free object's pose into `out`, in scene order, returning how
+    /// many were written. No per-name lookup and no allocation: a caller
+    /// reading the world every tick asks for all of them at once.
+    pub fn object_poses_into(&self, out: &mut [[f64; 7]]) -> usize {
+        self.plant
+            .as_ref()
+            .map(|p| p.object_poses_into(out))
+            .unwrap_or(0)
+    }
+
     /// The scene's own gravity torque on the arm joints at `q` \[Nm\], at
     /// rest. The controller derives the same quantity from the URDF through
     /// Pinocchio, and the two must agree — see par6d's

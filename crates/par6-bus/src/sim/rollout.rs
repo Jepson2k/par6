@@ -13,7 +13,6 @@
 //! cmd-60 status path reports.
 
 use par6_config::{GripperConfig, RobotConfig};
-use par6_proto::Shape;
 
 use super::driver::VirtualDriver;
 use super::map::JointMap;
@@ -175,16 +174,5 @@ impl Rollout {
     /// Place the free object `name` at rest at `pose`.
     pub fn place_object(&mut self, name: &str, pose: [f64; 7]) -> bool {
         self.plant.place_object(name, pose)
-    }
-
-    /// The shapes' names that are free objects, in `world` order — what a
-    /// caller needs before the scene exists.
-    pub fn free_object_names(world: &World) -> Vec<String> {
-        world
-            .iter()
-            .flat_map(|layer| layer.iter())
-            .filter(|s| scene::is_free_body(s))
-            .map(|s: &Shape| s.name.clone())
-            .collect()
     }
 }

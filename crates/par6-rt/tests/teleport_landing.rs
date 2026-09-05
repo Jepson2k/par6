@@ -15,7 +15,6 @@ use std::sync::atomic::AtomicBool;
 use std::sync::{mpsc, Arc};
 
 use par6_bus::sim::SimBus;
-use par6_bus::spectral::JointConversion;
 use par6_config::ConfigBundle;
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
@@ -72,14 +71,7 @@ fn teleport(core: &mut RtCore<SimBus>, bundle: &ConfigBundle, q: &[f64; MAX_JOIN
     core.bus_mut()
         .teleport_joint_rad(&q[..bundle.robot.joints.len()])
         .expect("sim re-seed");
-    for (i, joint) in bundle.robot.joints.iter().enumerate() {
-        let conv = JointConversion::from_config(joint);
-        let true0 = conv.motor_ticks(q[i]);
-        let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
-        core.set_joint_reference(i, wrapped0, q[i]);
-    }
-    core.set_homed(true);
-    core.reseed_motion_targets();
+    core.adopt_landed_pose(&bundle.robot, q);
 }
 
 /// Boot, enable, then teleport through `poses`; every tick after each

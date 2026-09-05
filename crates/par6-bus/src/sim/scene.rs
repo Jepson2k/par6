@@ -384,6 +384,17 @@ pub fn quat_from_rpy(rx: f64, ry: f64, rz: f64) -> [f64; 4] {
     )
 }
 
+/// The names of every free body in `world`, in world order — what a
+/// caller needs before a scene exists to ask.
+pub fn free_object_names(world: &World) -> Vec<String> {
+    world
+        .iter()
+        .flat_map(|layer| layer.iter())
+        .filter(|s| is_free_body(s))
+        .map(|s: &Shape| s.name.clone())
+        .collect()
+}
+
 /// Whether a shape is a free body in the contact world — the arm can push
 /// it and it can fall. The classification [`WorldGeom::from_shape`] makes,
 /// as a predicate for callers that only need this one arm of it.

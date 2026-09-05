@@ -1452,10 +1452,12 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             ..
         } => {
             assert_eq!(program, Vec::<Shape>::new());
-            assert_eq!(installation.len(), 1, "{installation:?}");
-            assert_eq!(installation[0].name, "cage");
-            assert_eq!(installation[0].kind, "box");
-            assert_eq!(installation[0].params, vec![KEEPOUT_M; 3]);
+            // The shipped config declares the floor; this test adds the cage.
+            let names: Vec<&str> = installation.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["floor", "cage"], "{installation:?}");
+            let cage = &installation[1];
+            assert_eq!(cage.kind, "box");
+            assert_eq!(cage.params, vec![KEEPOUT_M; 3]);
         }
         other => panic!("unexpected SHAPES result {other:?}"),
     }
@@ -1495,8 +1497,8 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     c.ok(&Command::ResetState);
     match c.query(&Command::Shapes) {
         QueryResult::Shapes { installation, .. } => {
-            assert_eq!(installation.len(), 1, "{installation:?}");
-            assert_eq!(installation[0].name, "cage");
+            let names: Vec<&str> = installation.iter().map(|s| s.name.as_str()).collect();
+            assert_eq!(names, ["floor", "cage"], "{installation:?}");
         }
         other => panic!("unexpected SHAPES result {other:?}"),
     }

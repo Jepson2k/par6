@@ -920,17 +920,7 @@ impl RtCommands for RtBridge {
                     log::error!("teleport: sim tool re-seed failed: {e}");
                 }
             }
-            for (i, joint) in robot.joints.iter().enumerate() {
-                // The re-seeded sim reports the wrapped boot reading
-                // first; re-base the core's conversion so that reading
-                // maps exactly to the teleported angle.
-                let conv = par6_bus::spectral::JointConversion::from_config(joint);
-                let true0 = conv.motor_ticks(q[i]);
-                let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
-                core.set_joint_reference(i, wrapped0, q[i]);
-            }
-            core.set_homed(true);
-            core.reseed_motion_targets();
+            core.adopt_landed_pose(robot, &q);
             log::info!("teleport applied: {q:?} rad, homed=true");
         }));
     }

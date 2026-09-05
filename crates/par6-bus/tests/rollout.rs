@@ -95,7 +95,7 @@ fn a_rollout_grasps_releases_and_drops_what_the_simulator_would() {
     .expect("rollout scene");
     assert_eq!(roll.object_names(), vec!["block".to_owned()]);
     assert_eq!(
-        Rollout::free_object_names(&[&install, &world]),
+        par6_bus::sim::scene::free_object_names(&[&install, &world]),
         vec!["block".to_owned()]
     );
     let dt = roll.dt();
