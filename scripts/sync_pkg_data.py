@@ -67,7 +67,14 @@ def manifest() -> list[tuple[Path, Path]]:
         pairs.append((src, DATA / "config" / "grippers" / src.name))
     urdf_root = REPO / "assets" / "par6_description" / "URDF"
     for tree in URDF_TREES:
-        for sub, pattern in (("urdf", "*.urdf"), ("srdf", "*.srdf"), ("meshes", "*.STL")):
+        # Both cases: the SolidWorks exports are `.STL`, the decimated
+        # `_simplified` variants beside them are `.stl`.
+        for sub, pattern in (
+            ("urdf", "*.urdf"),
+            ("srdf", "*.srdf"),
+            ("meshes", "*.STL"),
+            ("meshes", "*.stl"),
+        ):
             for src in sorted((urdf_root / tree / sub).glob(pattern)):
                 pairs.append((src, DATA / "urdf" / tree / sub / src.name))
     return pairs
