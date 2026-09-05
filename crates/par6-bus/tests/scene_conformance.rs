@@ -177,3 +177,52 @@ fn flange_variant_gravity_matches_the_vendor_dynamics_table() {
         fx.cases.len()
     );
 }
+
+/// The configured gearbox holding friction covers gravity everywhere the
+/// arm reaches with the heaviest tool fitted, so an IDLE joint never
+/// back-drives under its own weight. Sampled over the shoulder/elbow box
+/// with the wrist at its extremes, where the tool's lever arm is longest.
+#[test]
+fn holding_friction_covers_gravity_across_the_reachable_envelope() {
+    /// Required margin over the worst measured gravity torque.
+    const MARGIN: f64 = 1.1;
+    let robot = par6_config::RobotConfig::load(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml"),
+    )
+    .expect("PAR6.toml");
+    let hold = &robot.sim.holding_friction_nm;
+    let m = model(Tool::Msg);
+    let mut data = m.make_data();
+    let grid = |j: usize, n: usize| -> Vec<f64> {
+        let (lo, hi) = (
+            robot.joints[j].limits.hard_min_rad,
+            robot.joints[j].limits.hard_max_rad,
+        );
+        (0..n)
+            .map(|i| lo + (hi - lo) * i as f64 / (n - 1) as f64)
+            .collect()
+    };
+    let mut worst = [0.0f64; 6];
+    for &q1 in &grid(1, 25) {
+        for &q2 in &grid(2, 25) {
+            for &q3 in &grid(3, 3) {
+                for &q4 in &grid(4, 3) {
+                    data.qpos_mut()[..6].copy_from_slice(&[0.0, q1, q2, q3, q4, 0.0]);
+                    data.forward();
+                    for (w, g) in worst.iter_mut().zip(&data.qfrc_bias()[..6]) {
+                        *w = w.max(g.abs());
+                    }
+                }
+            }
+        }
+    }
+    for (j, (w, h)) in worst.iter().zip(hold).enumerate() {
+        eprintln!("J{j}: worst |G| {w:.3} Nm, holding friction {h:.3} Nm");
+    }
+    for (j, (w, h)) in worst.iter().zip(hold).enumerate() {
+        assert!(
+            *h >= MARGIN * w,
+            "J{j}: holding friction {h} Nm does not cover {w:.3} Nm of gravity with a {MARGIN}x margin"
+        );
+    }
+}

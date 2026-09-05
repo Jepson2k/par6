@@ -1257,7 +1257,12 @@ impl SimBus {
             let model = scene
                 .model(scene::timestep_for(self.dt), &tuning)
                 .unwrap_or_else(|e| panic!("sim-mujoco: {e}"));
-            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(model, &self.maps, q0));
+            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(
+                model,
+                &self.maps,
+                q0,
+                &robot.sim.holding_friction_nm,
+            ));
         }
         #[cfg(feature = "sim-dynamics")]
         if let Some(urdf) = &self.urdf {

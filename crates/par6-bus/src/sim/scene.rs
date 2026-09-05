@@ -12,7 +12,7 @@
 //!   assets CHANGELOG);
 //! - timestep: the largest step ≤ 1 ms that divides the bus tick;
 //! - actuators: deleted — the plant drives every DOF through `qfrc_applied`;
-//! - arm joints: armature / damping / frictionloss / range from the robot
+//! - arm joints: armature / damping / frictionloss / limits from the robot
 //!   config, replacing the vendor's single eyeballed class-`Y` tuning;
 //! - contacts: off by default, on for the jaw pads, the floor, the pedestal
 //!   and the grasp object;
@@ -205,6 +205,18 @@ impl Scene {
             damping[0] = tuning.damping;
             joint.with_damping(damping);
             joint.with_range(tuning.range);
+            // The config hard limits are the plant's endstops: a stiff,
+            // critically damped limit constraint (reference time two
+            // substeps) that admits sub-milliradian penetration at the
+            // homing currents.
+            *joint.solref_limit_mut() = [2.0 * timestep, 1.0];
+            *joint.solimp_limit_mut() = [0.95, 0.99, 0.001, 0.5, 2.0];
+            // The drivetrain friction (set per substep by the plant) must
+            // hold, not creep: at MuJoCo's default impedance a held joint
+            // leaks ~5 % of its free-fall acceleration, which is degrees
+            // per second under the shoulder's load.
+            *joint.solref_friction_mut() = [2.0 * timestep, 1.0];
+            *joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
         }
 
         if self.tool == Tool::Flange {

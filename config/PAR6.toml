@@ -557,12 +557,17 @@ jerk_factor = 3.0
 control_mode = "pid"
 
 [sim]
-# Torque-level plant only (par6d --sim with the kinematics stack):
-# motor-referred rotor dynamics from the vendor dynamics table, reflected
-# through each joint's dynamics gear ratio as G^2*jm, G^2*b and G*tc.
+# Simulator drivetrain. Motor-referred rotor dynamics from the vendor
+# dynamics table, reflected through each joint's dynamics gear ratio as
+# G^2*jm, G^2*b and G*tc.
 motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
 motor_b_nm_s = 1.0e-4
 motor_tc_nm = 0.02
+# Gearbox holding friction [Nm, joint side]: the load an unpowered joint
+# carries without back-driving. Sized over the worst gravity torque in the
+# reachable envelope with the MSG gripper fitted (J1 6.9 Nm, J2 2.3 Nm),
+# which the scene conformance suite re-measures against these values.
+holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
 command_timeout_s = 0.04

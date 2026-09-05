@@ -1,12 +1,11 @@
-//! Contact-level arm plant (feature `sim-mujoco`): the whole scene —
-//! arm, gripper jaws, floor and graspable objects — lives in one MuJoCo
-//! model (built by [`super::scene`] from the vendor MJCF) and every DOF
-//! is driven through `qfrc_applied`:
+//! The arm plant: the whole scene — arm, gripper jaws, floor and graspable
+//! objects — lives in one MuJoCo model (built by [`super::scene`] from the
+//! vendor MJCF) and every DOF is driven through `qfrc_applied`:
 //!
 //! - arm joints get the motor torques from the driver current loops
-//!   (config torque↔current factor), idle-brake damping and config-limit
-//!   endstop spring-dampers — same drive model as the ABA plant, but
-//!   integrated by MuJoCo with contacts;
+//!   (config torque↔current factor) plus idle-brake damping. The config
+//!   hard limits are MuJoCo joint limits, and the drivetrain friction is
+//!   MuJoCo `frictionloss`, set every substep by the law below;
 //! - the jaw DOF runs a stiff PD servo. In firmware mode the plant
 //!   rate-limits its own approach to the RAW cmd-61 target (mirroring the
 //!   front end's byte kinematics) and reports physical obstructions from
@@ -16,9 +15,25 @@
 //!   (motor mode, calibration, idle) the servo just follows the front
 //!   end's reported jaw byte and detection is off.
 //!
-//! With this plant the `set_gripper_object_*` test hooks are owned by the
-//! scene — the plant overwrites them every tick with what the physics
-//! says is between the jaws.
+//! # Drivetrain
+//!
+//! The gearboxes are self-locking. The load on a joint (gravity and the
+//! velocity terms, MuJoCo's `qfrc_bias`) is absorbed by the gearbox up to
+//! the config `holding_friction_nm`: an unpowered joint holds, lowering a
+//! load costs the motor only its own reflected Coulomb loss `G · tc` (the
+//! scene's compiled `frictionloss`), and a motor working against the load
+//! feels exactly the part of it that its own torque has not matched — so
+//! an under-torqued lift holds instead of sagging, and the joint moves
+//! once the motor torque exceeds load plus loss. Beyond the holding
+//! friction the load back-drives the joint. The law is a per-substep
+//! `frictionloss` limit, so the dry friction stays on the solver side
+//! and a held joint rests without chatter. This is what lets the homing
+//! sequence idle the shoulder joints under gravity while the base homes,
+//! and what keeps an IDLE arm on its pose instead of collapsing.
+//!
+//! The `set_gripper_object_*` test hooks are owned by the scene — the
+//! plant overwrites them every tick with what the physics says is between
+//! the jaws.
 //!
 //! MuJoCo comes in through `mujoco-rs`, which owns the libmujoco download
 //! and the struct layouts. Generalized state is read and written through
@@ -31,10 +46,6 @@ use mujoco_rs::prelude::{MjData, MjModel, MjtObj};
 use super::driver::PlantCmd;
 use super::plant::JointMap;
 
-/// Endstop contact natural frequency \[rad/s\] (as the ABA plant).
-const STOP_OMEGA: f64 = 50.0;
-/// Endstop contact damping ratio.
-const STOP_ZETA: f64 = 1.2;
 /// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
 /// shorted-phase brake of an idled driver. Free-motion viscous/Coulomb
 /// friction lives in the MJCF joint defaults, not here.
@@ -81,10 +92,17 @@ pub(crate) struct MujocoPlant {
     qpos: Vec<f64>,
     qvel: Vec<f64>,
     qfrc: Vec<f64>,
-    /// Apparent joint inertias probed at boot \[kg·m²\].
+    /// Apparent joint inertias probed at boot \[kg·m²\] (idle damping).
     inertia: Vec<f64>,
-    k_stop: Vec<f64>,
-    c_stop: Vec<f64>,
+    /// Reflected motor Coulomb loss per arm joint \[N·m\] — the scene's
+    /// compiled `frictionloss`, the floor of the drivetrain friction.
+    coulomb: Vec<f64>,
+    /// Gearbox holding friction per arm joint \[N·m\].
+    hold: Vec<f64>,
+    /// This substep's drivetrain friction per arm joint \[N·m\].
+    friction: Vec<f64>,
+    /// Last substep's bias torques (gravity + velocity terms), all DOFs.
+    bias: Vec<f64>,
     /// The servo's commanded jaw byte (the front end's kinematic jaw).
     jaw_cmd_byte: f64,
     close_at: Option<u8>,
@@ -103,14 +121,36 @@ fn m_to_byte(x: f64) -> f64 {
     (-x / JAW_TRAVEL_M * 255.0).clamp(0.0, 255.0)
 }
 
+/// The drivetrain's dry-friction limit for a motor torque `motor_nm`
+/// against a load `load_nm` (the torque the rest of the world puts on the
+/// joint): the Coulomb loss plus the load the gearbox absorbs — all of it
+/// when the load pushes along the motor's drive or the motor is idle, the
+/// unmatched remainder when the motor works against it — capped at the
+/// holding friction.
+fn drivetrain_friction(coulomb: f64, hold: f64, motor_nm: f64, load_nm: f64) -> f64 {
+    let opposing = motor_nm != 0.0 && load_nm != 0.0 && (motor_nm > 0.0) != (load_nm > 0.0);
+    let absorbed = if opposing {
+        (load_nm.abs() - motor_nm.abs()).max(0.0)
+    } else {
+        load_nm.abs()
+    };
+    coulomb + absorbed.min(hold)
+}
+
 impl MujocoPlant {
     /// Take the compiled scene and place the arm at `q0` (config joint
     /// frame == scene qpos, jaws at the front end's boot byte, everything
-    /// else at the scene's default pose). Panics with a descriptive message
+    /// else at the scene's default pose), with `holding_nm` the gearbox
+    /// holding friction per arm joint. Panics with a descriptive message
     /// on a layout the plant cannot drive (a sim construction bug, not a
     /// runtime error).
-    pub fn new(model: MjModel, maps: &[JointMap], q0: &[f64]) -> Self {
+    pub fn new(model: MjModel, maps: &[JointMap], q0: &[f64], holding_nm: &[f64]) -> Self {
         let n = maps.len();
+        assert_eq!(
+            holding_nm.len(),
+            n,
+            "holding friction needs one entry per arm joint"
+        );
         let nq = model.ffi().nq as usize;
         let nv = model.ffi().nv as usize;
         let ts = model.ffi().opt.timestep;
@@ -135,6 +175,7 @@ impl MujocoPlant {
             "scene DOF layout unexpected: nq={nq} nv={nv} for {n} arm joints + 2 jaws \
              + free-object joints"
         );
+        let coulomb = model.dof_frictionloss()[..n].to_vec();
 
         let mut data = MjData::new(Box::new(model));
 
@@ -144,9 +185,9 @@ impl MujocoPlant {
         qpos[n] = byte_to_m(JAW_INIT_BYTE);
         qpos[n + 1] = -byte_to_m(JAW_INIT_BYTE);
 
-        // Apparent-inertia probe (endstop gains, idle damping): one-step
-        // velocity response to a unit torque against the zero-torque
-        // baseline, from the boot pose.
+        // Apparent-inertia probe (idle damping): one-step velocity
+        // response to a unit torque against the zero-torque baseline,
+        // from the boot pose.
         let mut probe = |tau: Option<usize>| -> Vec<f64> {
             data.reset();
             data.qpos_mut().copy_from_slice(&qpos);
@@ -169,14 +210,6 @@ impl MujocoPlant {
             );
             *m_j = 1.0 / inv_m;
         }
-        let k_stop = inertia
-            .iter()
-            .map(|i| i * STOP_OMEGA * STOP_OMEGA)
-            .collect();
-        let c_stop = inertia
-            .iter()
-            .map(|i| 2.0 * STOP_ZETA * i * STOP_OMEGA)
-            .collect();
 
         data.reset();
         data.qpos_mut().copy_from_slice(&qpos);
@@ -188,8 +221,10 @@ impl MujocoPlant {
             qvel: vec![0.0; nv],
             qfrc: vec![0.0; nv],
             inertia,
-            k_stop,
-            c_stop,
+            coulomb,
+            hold: holding_nm.to_vec(),
+            friction: vec![0.0; n],
+            bias: vec![0.0; nv],
             jaw_cmd_byte: JAW_INIT_BYTE,
             close_at: None,
             open_at: None,
@@ -225,9 +260,10 @@ impl MujocoPlant {
     }
 
     /// Advance one bus tick: loop currents (minus injected loads) become
-    /// joint torques + idle damping + config-limit endstop torques, the
-    /// jaw servo tracks its drive, MuJoCo integrates `round(dt/ts)`
-    /// steps with contacts, and the jaw obstruction state updates.
+    /// joint torques + idle damping, the drivetrain friction follows the
+    /// motor torque, the jaw servo tracks its drive, MuJoCo integrates
+    /// `round(dt/ts)` steps with contacts and limits, and the jaw
+    /// obstruction state updates.
     pub fn step(
         &mut self,
         dt: f64,
@@ -247,21 +283,27 @@ impl MujocoPlant {
         }
         let h = self.ts;
         for _ in 0..substeps as u32 {
+            self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {
                 let map = &maps[j];
-                let q = self.qpos[j];
                 let v = self.qvel[j];
-                let mut t = (cmds[j].current_ma - loads_ma[j]) / map.factor_ma_per_nm;
+                let motor = cmds[j].current_ma / map.factor_ma_per_nm;
+                let external = -loads_ma[j] / map.factor_ma_per_nm;
+                let mut t = motor + external;
                 if cmds[j].idle {
                     t -= IDLE_RATE * self.inertia[j] * v;
                 }
-                if q > map.hard_hi_rad {
-                    t += -self.k_stop[j] * (q - map.hard_hi_rad) - self.c_stop[j] * v;
-                } else if q < map.hard_lo_rad {
-                    t += -self.k_stop[j] * (q - map.hard_lo_rad) - self.c_stop[j] * v;
-                }
                 self.qfrc[j] = t;
+                // The load is what acts on the joint besides the motor:
+                // MuJoCo's bias (its sign is the force that cancels it)
+                // and the injected external load.
+                let load = external - self.bias[j];
+                self.friction[j] = drivetrain_friction(self.coulomb[j], self.hold[j], motor, load);
             }
+            // SAFETY: only per-DOF friction values change; the model's
+            // sizes and layout are untouched, so the data stays valid.
+            unsafe { self.data.model_mut() }.dof_frictionloss_mut()[..self.n]
+                .copy_from_slice(&self.friction);
             let mut jaw_vt = 0.0;
             if let Some(JawDrive::Active {
                 target_byte,

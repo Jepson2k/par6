@@ -429,12 +429,12 @@ fn default_open_retry_s() -> f64 {
     10.0
 }
 
-/// Torque-level sim plant parameters (feature `sim-dynamics`): the
-/// motor-referred rotor dynamics the vendor models
-/// (robots/PAR6.py dynamics table — values only, no code). Reflected
-/// through each joint's dynamics gear ratio G as G²·jm (inertia),
-/// G²·b (viscous) and G·tc (Coulomb). Ignored by the kinematic plant
-/// and by hardware.
+/// Simulator drivetrain parameters. The motor-referred rotor dynamics
+/// are the vendor's (robots/PAR6.py dynamics table — values only, no
+/// code), reflected through each joint's dynamics gear ratio G as G²·jm
+/// (inertia), G²·b (viscous) and G·tc (Coulomb). The holding friction is
+/// the gearbox's: what an unpowered joint carries without back-driving.
+/// Ignored by hardware.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SimConfig {
@@ -444,6 +444,10 @@ pub struct SimConfig {
     pub motor_b_nm_s: f64,
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
+    /// Gearbox holding friction per joint \[Nm, joint side\]: the load
+    /// the unpowered drivetrain holds without back-driving. Must cover
+    /// the joint's worst gravity torque or an IDLE arm collapses.
+    pub holding_friction_nm: Vec<f64>,
 }
 
 impl Default for SimConfig {
@@ -452,6 +456,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
+            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
 }
@@ -963,6 +968,20 @@ impl RobotConfig {
             if !(v.is_finite() && *v >= 0.0) {
                 return Err(invalid(
                     "sim.motor_jm_kg_m2",
+                    format!("entry {j} must be finite and >= 0"),
+                ));
+            }
+        }
+        if sim.holding_friction_nm.len() != self.joints.len() {
+            return Err(invalid(
+                "sim.holding_friction_nm",
+                "must carry one entry per joint",
+            ));
+        }
+        for (j, v) in sim.holding_friction_nm.iter().enumerate() {
+            if !(v.is_finite() && *v >= 0.0) {
+                return Err(invalid(
+                    "sim.holding_friction_nm",
                     format!("entry {j} must be finite and >= 0"),
                 ));
             }
