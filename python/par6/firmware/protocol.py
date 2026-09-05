@@ -2,7 +2,7 @@
 
 Reimplemented from the protocol's observable facts — frame ids, opcodes,
 page geometry, CRC parameters and the timings the hardware actually needs.
-The vendor's own host tooling is GPL and this package is MIT, so nothing
+The vendor's own host tooling is GPL and this package is Apache-2.0, so nothing
 here is ported from it; what carries over is behaviour and constants,
 which is the only thing that can.
 
