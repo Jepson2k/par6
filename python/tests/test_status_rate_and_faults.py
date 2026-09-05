@@ -15,7 +15,7 @@ import time
 import pytest
 from live_daemon import LiveDaemon, requires_par6d
 
-from par6.client import AsyncRobotClient
+from par6.client import AsyncRobotClient, RobotError
 
 pytestmark = requires_par6d
 
@@ -28,6 +28,12 @@ def daemon(tmp_path):
 
 
 async def _observed_hz(client: AsyncRobotClient, frames: int = 30) -> float:
+    """The arrival rate over *frames* whole intervals.
+
+    Timed from the first arrival, not from the call: the first frame lands
+    somewhere inside a period, so counting it as an interval would report
+    a rate that depends on when the measurement started.
+    """
     seen = 0
     start = 0.0
     async for _ in client.stream_status():
@@ -37,6 +43,20 @@ async def _observed_hz(client: AsyncRobotClient, frames: int = 30) -> float:
         if seen > frames:
             break
     return frames / max(time.perf_counter() - start, 1e-9)
+
+
+async def _rate_in_force(client: AsyncRobotClient, hz: float) -> None:
+    """Set *hz* and wait for the runtime to say it is broadcasting at it.
+
+    The readback is the barrier: it is a round trip through the same loop
+    that owns the broadcast interval, so once it answers with the new rate
+    the next frame is emitted at it. Sleeping instead would race the loop.
+    """
+    assert await client.set_status_rate(hz) > 0
+    back = await client.status_rate()
+    assert back is not None and back.hz == hz, (
+        f"asked for {hz} Hz and the runtime reports {back and back.hz}"
+    )
 
 
 @pytest.mark.asyncio
@@ -76,14 +96,10 @@ async def test_raising_the_rate_actually_delivers_more_frames(daemon: LiveDaemon
         assert high > low
 
         try:
-            assert await client.set_status_rate(low) > 0
-            await asyncio.sleep(0.4)
+            await _rate_in_force(client, low)
             slow = await _observed_hz(client)
 
-            assert await client.set_status_rate(high) > 0
-            back = await client.status_rate()
-            assert back is not None and back.hz == high
-            await asyncio.sleep(0.4)
+            await _rate_in_force(client, high)
             fast = await _observed_hz(client)
         finally:
             await client.set_status_rate(original.hz)
@@ -99,20 +115,29 @@ async def test_an_unachievable_rate_is_refused_and_says_what_would_work(
 ):
     """Refused rather than rounded: a capture taken at a rate nobody asked
     for is wrong in a way nothing reports. The refusal has to carry the
-    rates that would have worked, since that is the whole recovery."""
+    rates that would have worked, since that is the whole recovery.
+
+    Both shapes of "not servable" go through it. The second is the one
+    that hides: a rate the tick clock divides into a whole number of ticks
+    but that is not itself a rate the broadcast can hold, so accepting it
+    would serve — and report — a neighbouring one.
+    """
     async with daemon.client() as client:
         assert await client.wait_ready(timeout=10.0)
         before = await client.status_rate()
         assert before is not None
 
-        bogus = before.control_hz / 3 + 0.5
-        assert bogus not in before.achievable()
-
-        with pytest.raises(Exception) as caught:
-            await client.set_status_rate(bogus)
-        message = str(caught.value).lower()
-        assert "divide" in message, message
-        assert str(int(before.achievable()[0])) in message, message
+        whole_ticks = next(
+            before.control_hz / d
+            for d in range(2, 10)
+            if before.control_hz / d not in before.achievable()
+        )
+        for bogus in (before.control_hz / 3 + 0.5, whole_ticks):
+            with pytest.raises(RobotError) as caught:
+                await client.set_status_rate(bogus)
+            message = str(caught.value).lower()
+            assert "divide" in message, message
+            assert str(int(before.achievable()[0])) in message, message
 
         after = await client.status_rate()
         assert after is not None and after.hz == before.hz, (

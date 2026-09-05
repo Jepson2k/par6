@@ -25,9 +25,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from par6.firmware.protocol import MAX_APP_PAGES, validate_image
+from par6.firmware.protocol import ImageCheck, validate_image
 
 GITHUB_API = "https://api.github.com"
+GITHUB_API_HOST = "api.github.com"
 MANIFEST_NAME = "firmware.json"
 DEFAULT_TIMEOUT_S = 10.0
 
@@ -87,6 +88,10 @@ class FirmwareImage:
     #: False when the manifest declared no checksum: the bytes matched
     #: nothing because there was nothing to match them against.
     checksum_verified: bool
+    #: The verdict these bytes already passed, carried rather than
+    #: recomputed — it holds the whole-image CRC the flasher commits, and
+    #: computing that is a pure-Python pass over every byte.
+    check: ImageCheck
 
     @property
     def version(self) -> str:
@@ -110,8 +115,14 @@ def _fetch(
         url, headers={"Accept": accept, "User-Agent": "par6-firmware"}
     )
     token = os.environ.get("GITHUB_TOKEN")
-    if token:
-        request.add_header("Authorization", f"Bearer {token}")
+    if token and urllib.parse.urlsplit(url).hostname == GITHUB_API_HOST:
+        # An asset URL redirects to a pre-signed S3 URL that authenticates
+        # by query string, and S3 answers 400 to a request carrying both.
+        # An unredirected header is dropped when urllib follows the
+        # redirect, so the token reaches the API and nothing else — which
+        # is what makes a release fetch work on the machines that have a
+        # token at all, CI included.
+        request.add_unredirected_header("Authorization", f"Bearer {token}")
     try:
         with urllib.request.urlopen(request, timeout=timeout_s) as response:
             return response.read()
@@ -184,14 +195,17 @@ def _find_asset(release: dict[str, Any], name: str) -> dict[str, Any] | None:
     return None
 
 
-def _check_flashable(data: bytes, where: str) -> None:
+def _check_flashable(data: bytes, where: str) -> ImageCheck:
+    """The image's verdict, refusing anything that must not be flashed.
+
+    The verdict is returned rather than discarded because it holds the
+    whole-image CRC: computing that is a pure-Python pass over every byte,
+    and the flasher commits the same number a moment later.
+    """
     check = validate_image(data)
-    if check.pages > MAX_APP_PAGES:
-        raise FirmwareFetchError(
-            f"{where} is {check.pages} pages; the bootloader hosts {MAX_APP_PAGES}"
-        )
     if not check.ok:
         raise FirmwareFetchError(f"{where} is not flashable: {'; '.join(check.errors)}")
+    return check
 
 
 def _verify_against_manifest(
@@ -254,7 +268,7 @@ def fetch_release(
         if (directory / MANIFEST_NAME).is_file():
             manifest, path, data = load_manifest_dir(directory)
             digest, verified = _verify_against_manifest(data, manifest, str(path))
-            _check_flashable(data, str(path))
+            check = _check_flashable(data, str(path))
             log(f"Using the cached {product} {tag}.")
             return FirmwareImage(
                 product=product,
@@ -265,6 +279,7 @@ def fetch_release(
                 manifest=manifest,
                 cached=True,
                 checksum_verified=verified,
+                check=check,
             )
 
     url = (
@@ -313,7 +328,7 @@ def fetch_release(
     digest, verified = _verify_against_manifest(
         data, manifest, f"{resolved}/{filename}"
     )
-    _check_flashable(data, f"{resolved}/{filename}")
+    check = _check_flashable(data, f"{resolved}/{filename}")
     if not verified:
         log(f"{MANIFEST_NAME} in {resolved} declares no sha256: integrity unverified.")
 
@@ -333,6 +348,7 @@ def fetch_release(
         manifest=manifest,
         cached=False,
         checksum_verified=verified,
+        check=check,
     )
 
 
@@ -348,7 +364,7 @@ def load_file(path: str | Path) -> FirmwareImage:
         data = binary.read_bytes()
     except OSError as err:
         raise FirmwareFetchError(f"cannot read {binary}: {err}") from err
-    _check_flashable(data, str(binary))
+    check = _check_flashable(data, str(binary))
     return FirmwareImage(
         product="file",
         tag=binary.name,
@@ -358,4 +374,5 @@ def load_file(path: str | Path) -> FirmwareImage:
         manifest={},
         cached=True,
         checksum_verified=False,
+        check=check,
     )

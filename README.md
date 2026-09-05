@@ -486,8 +486,10 @@ pushes one drive's tuning live, `par6 tool` runs a tool action, and
 release (`--product stepfoc|spectral-bldc`, `--tag` for a specific one, `--file`
 for a local `.bin`), verifies it against the release's `firmware.json` manifest
 and its vector table, takes the bus with `enter_flashing`, drives the drive's CAN
-bootloader through the image, and gives the bus back — the drive checks the
-whole-image CRC itself and reboots once the bus has been quiet for ~3 s. It has
+bootloader through the image, holds the bus silent until the drive answers as an
+application again, and only then gives the bus back — the drive checks the
+whole-image CRC itself and boots it once the bus has been quiet for ~3 s, so
+handing the bus back at the commit would leave it in its bootloader. It has
 to run on the machine holding the CAN interface (the `flash` extra brings
 python-can). Retries are reported, not hidden: a run that needed forty is a bus
 worth looking at. An interrupted write leaves the drive waiting in its

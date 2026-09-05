@@ -2158,9 +2158,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Faults are gated on the node's live error bit, which every reply
     /// carries while a fault is active; the flag register itself is only
     /// refreshed on the round-robin poll, so trusting it alone would keep
-    /// reporting a fault the drive has already cleared. The aggregate
-    /// `error` bit is not emitted — it says only that one of the others is
-    /// set, which the labels already say more usefully.
+    /// reporting a fault the drive has already cleared. Which bits those
+    /// are and what each is called is [`par6_bus::ErrorFlags::faults`],
+    /// the same list the RT core latches from.
     fn wire_drive_health(snap: &par6_rt::StateSnapshot) -> par6_proto::DriveHealthWire {
         let read = |f: fn(&par6_rt::NodeState) -> Option<f64>| -> Vec<f64> {
             snap.nodes
@@ -2177,29 +2177,11 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         let faults = snap
             .nodes
             .iter()
-            .map(|n| {
-                let mut labels = Vec::new();
-                if !n.live_error_bit {
-                    return labels;
+            .map(|n| match n.error_flags {
+                Some(f) if n.live_error_bit => {
+                    f.faults().map(|fault| fault.name().to_owned()).collect()
                 }
-                let Some(f) = n.error_flags else {
-                    return labels;
-                };
-                for (set, name) in [
-                    (f.temperature, "overtemperature"),
-                    (f.encoder, "encoder"),
-                    (f.vbus, "bus_voltage"),
-                    (f.driver, "driver"),
-                    (f.velocity, "overspeed"),
-                    (f.current, "overcurrent"),
-                    (f.estop, "estop"),
-                    (f.watchdog, "watchdog"),
-                ] {
-                    if set {
-                        labels.push(name.to_owned());
-                    }
-                }
-                labels
+                _ => Vec::new(),
             })
             .collect();
         par6_proto::DriveHealthWire {
@@ -2632,43 +2614,45 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
     unsupported.and_then(refuse)
 }
 
-/// Whether a drive tune names a configured node and stays inside that
-/// node's configured ceilings.
-///
-/// The node id is config knowledge, so the codec cannot check it: an ack
-/// for a node this arm does not have would report a tune nothing
 /// Whether a requested STATUS rate can be served, and why not if it cannot.
 ///
-/// STATUS is emitted every Nth tick, so only divisors of the tick rate are
-/// achievable. A near miss is refused rather than rounded to the nearest
-/// one: a capture taken at a rate nobody asked for is wrong in a way
-/// nothing reports. The remedy names the rates that do work, since that is
-/// the whole of what the caller needs to recover.
+/// STATUS is emitted every Nth tick and the rate is held as a whole
+/// number of Hz, so the servable rates are the whole divisors of the tick
+/// rate and nothing else. A near miss is refused rather than rounded to
+/// the nearest one: a capture taken at a rate nobody asked for is wrong in
+/// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
+/// set is built once and both answered from and printed, so what is
+/// accepted and what the remedy offers cannot disagree.
 fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
-    let n = if hz > 0.0 { tick_hz / hz } else { 0.0 };
-    if hz > 0.0 && hz <= tick_hz && (n - n.round()).abs() < 1e-9 {
+    let ticks = tick_hz.round() as u32;
+    let allowed: Vec<u32> = (1..=ticks)
+        .filter(|d| ticks.is_multiple_of(*d))
+        .map(|d| ticks / d)
+        .collect();
+    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
         return None;
     }
-    let ticks = tick_hz.round() as u32;
-    let allowed: Vec<String> = (1..=ticks)
-        .filter(|d| ticks.is_multiple_of(*d))
-        .map(|d| (ticks / d).to_string())
-        .collect();
+    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
     Some(make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,
         &[(
             "detail",
             &format!(
-                "set_status_rate {hz} Hz does not divide the {tick_hz} Hz \
-                 tick rate; STATUS is emitted every Nth tick, so the \
-                 achievable rates are: {}",
-                allowed.join(", ")
+                "set_status_rate {hz} Hz is not one of the whole-Hz rates the \
+                 {tick_hz} Hz tick rate divides into; STATUS is emitted every \
+                 Nth tick, so the achievable rates are: {}",
+                listed.join(", ")
             ),
         )],
     ))
 }
 
+/// Whether a drive tune names a configured node and stays inside that
+/// node's configured ceilings.
+///
+/// The node id is config knowledge, so the codec cannot check it: an ack
+/// for a node this arm does not have would report a tune nothing
 /// received. The ceilings matter because the tune is stored and re-pushed
 /// on every reconnect — one datagram must not remove a current limit for
 /// the life of the process. Shared so the offline preview refuses a tune

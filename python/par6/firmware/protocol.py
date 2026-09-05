@@ -47,21 +47,18 @@ PAD_BYTE = 0xFF
 #: The application command that reboots a running drive into its
 #: bootloader. There is no matching "leave" command.
 APP_RESET_CMD = 14
+#: The application's ping (RTR out, data frame back). The one question a
+#: drive answers only once it is running its firmware, which is how a
+#: reboot out of the bootloader is confirmed rather than assumed.
+APP_PING_CMD = 10
 
 
 class BlCmd(IntEnum):
-    """Bootloader opcodes.
+    """The bootloader opcodes this host sends."""
 
-    ``WBUF`` (0x01), a word-at-a-time write, exists for hosts on lossy
-    serial adapters. On socketcan the chunk-verify path below is the loss
-    recovery, so it is named for completeness and never sent.
-    """
-
-    WBUF = 0x01
     WPAGE = 0x02
     WCRC = 0x03
     PING = 0x04
-    SET_ID = 0x05
     ERASE_APP = 0x06
     STREAM_BEGIN = 0x07
     STREAM_STATUS = 0x08

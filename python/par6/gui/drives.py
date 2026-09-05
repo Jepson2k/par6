@@ -20,13 +20,14 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import tomllib
 from pathlib import Path
 from typing import Any, cast
 
 from nicegui import ui
 from waldoctl import Commander, Panel, PanelSlot
 
+from par6 import config as _cfg
+from par6._par6 import Config
 from par6.client import AsyncRobotClient, RobotClient
 from par6.firmware import releases
 from par6.firmware.flasher import FlashReport
@@ -35,21 +36,21 @@ logger = logging.getLogger(__name__)
 
 REFRESH_S = 0.5
 
-#: The ten values one ``set_pid_gains`` frame replaces, with their config
-#: home and a label. The frame carries the whole tuple, so a partial write
-#: would zero what it left out — which is why this is one list and one
-#: Apply, not ten independent fields.
-GAIN_FIELDS: tuple[tuple[str, str, str, str], ...] = (
-    ("kpp", "gains", "Position P", ""),
-    ("kpv", "gains", "Velocity P", ""),
-    ("kiv", "gains", "Velocity I", ""),
-    ("kpiq", "gains", "Current P", ""),
-    ("kiiq", "gains", "Current I", ""),
-    ("kp", "gains", "Impedance stiffness", ""),
-    ("kd", "gains", "Impedance damping", ""),
-    ("ilim_ma", "joint", "Current limit", "mA"),
-    ("velocity_limit_ticks_s", "joint", "Velocity limit", "ticks/s"),
-    ("voltage_limit_mv", "joint", "Voltage limit (0 = VBUS)", "mV"),
+#: The ten values one ``set_pid_gains`` frame replaces, with a label and a
+#: unit. The frame carries the whole tuple, so a partial write would zero
+#: what it left out — which is why this is one list and one Apply, not ten
+#: independent fields.
+GAIN_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("kpp", "Position P", ""),
+    ("kpv", "Velocity P", ""),
+    ("kiv", "Velocity I", ""),
+    ("kpiq", "Current P", ""),
+    ("kiiq", "Current I", ""),
+    ("kp", "Impedance stiffness", ""),
+    ("kd", "Impedance damping", ""),
+    ("ilim_ma", "Current limit", "mA"),
+    ("velocity_limit_ticks_s", "Velocity limit", "ticks/s"),
+    ("voltage_limit_mv", "Voltage limit (0 = VBUS)", "mV"),
 )
 
 #: Modes in which a drive will accept commissioning. Anything else and the
@@ -70,6 +71,15 @@ def _describe(err: BaseException) -> str:
     return f"{getattr(err, 'title', str(err))}: {cause}" + (
         f" {remedy}" if remedy else ""
     )
+
+
+def _tunables(joint: dict[str, Any]) -> dict[str, Any]:
+    """One drive's writable values, flat.
+
+    The engine's joint records keep the seven gains in a sub-dict and the
+    three limits beside them; one ``set_pid_gains`` frame carries all ten.
+    """
+    return {**joint["gains"], **joint}
 
 
 def _fmt(value: float | None, unit: str, digits: int = 1) -> str:
@@ -101,7 +111,7 @@ class DrivesPanel(Panel):
         self._selected_node: int | None = None
         self._baseline: dict[str, float] = {}
         self._releases: list[releases.ReleaseSummary] = []
-        self._robot_config: dict[str, Any] = {}
+        self._interface = _cfg.DEFAULT_CAN_INTERFACE
         self._busy = False
         self._entry_rate_hz: float | None = None
         self._current_rate_hz: float | None = None
@@ -339,7 +349,7 @@ class DrivesPanel(Panel):
                 .mark("drives-node-select")
             )
             with ui.grid(columns=2).classes("w-full gap-1"):
-                for name, _home, label, unit in GAIN_FIELDS:
+                for name, label, unit in GAIN_FIELDS:
                     self._gain_inputs[name] = (
                         ui.number(label, suffix=unit or None, format="%g")
                         .props("dense outlined")
@@ -374,6 +384,9 @@ class DrivesPanel(Panel):
     def _on_node_change(self, event) -> None:
         self._selected_node = None if event.value is None else int(event.value)
         self._seed_gain_fields()
+        # The flash hint names this drive, so it is stale the moment the
+        # selection moves.
+        self._refresh_firmware_availability()
 
     def _seed_gain_fields(self) -> None:
         joint = self._joint_for(self._selected_node)
@@ -383,11 +396,9 @@ class DrivesPanel(Panel):
                 widget.value = None
             self._set_gain_note()
             return
-        gains = joint.get("gains") or {}
-        for name, home, _label, _unit in GAIN_FIELDS:
-            source = gains if home == "gains" else joint
-            value = source.get(name)
-            self._baseline[name] = float(value) if value is not None else 0.0
+        values = _tunables(joint)
+        for name, _label, _unit in GAIN_FIELDS:
+            self._baseline[name] = float(values[name])
             self._gain_inputs[name].value = self._baseline[name]
         self._set_gain_note()
 
@@ -399,7 +410,7 @@ class DrivesPanel(Panel):
             return
         changed = [
             label
-            for name, _home, label, _unit in GAIN_FIELDS
+            for name, label, _unit in GAIN_FIELDS
             if name in self._baseline
             and self._gain_inputs[name].value is not None
             and float(self._gain_inputs[name].value) != self._baseline[name]
@@ -422,7 +433,7 @@ class DrivesPanel(Panel):
         try:
             values = {
                 name: float(self._gain_inputs[name].value)
-                for name, _home, _label, _unit in GAIN_FIELDS
+                for name, _label, _unit in GAIN_FIELDS
             }
         except (TypeError, ValueError):
             ui.notify("Every field must hold a number", color="warning")
@@ -551,6 +562,9 @@ class DrivesPanel(Panel):
                         },
                         value="stepfoc",
                         label="Board",
+                        # The hint names this product, so it is stale the
+                        # moment the board changes.
+                        on_change=lambda _: self._refresh_firmware_availability(),
                     )
                     .props("dense outlined")
                     .classes("w-44")
@@ -583,15 +597,9 @@ class DrivesPanel(Panel):
         normal case, and telling the operator the one command to run there
         beats a button that cannot work.
         """
-        bus = self._robot_config.get("bus")
-        interface = (
-            bus["interface"]
-            if isinstance(bus, dict) and isinstance(bus.get("interface"), str)
-            else "can0"
-        )
-        if not Path(f"/sys/class/net/{interface}").exists():
+        if not Path(f"/sys/class/net/{self._interface}").exists():
             return False, (
-                f"No {interface} on this machine. Run this on the control box:"
+                f"No {self._interface} on this machine. Run this on the control box:"
             )
         try:
             import can  # noqa: F401
@@ -662,7 +670,13 @@ class DrivesPanel(Panel):
             if not confirmed:
                 return
             report = await asyncio.to_thread(self._run_flash, commander, node, image)
-            ui.notify(report.summary(), color="positive", multi_line=True)
+            # A drive that never answered after the reboot window is still
+            # holding the image in its bootloader, which is not a success.
+            ui.notify(
+                report.summary(),
+                color="positive" if report.booted else "warning",
+                multi_line=True,
+            )
         except (releases.FirmwareFetchError, ValueError, RuntimeError) as err:
             ui.notify(
                 f"Flash failed: {_describe(err)}", color="negative", multi_line=True
@@ -671,33 +685,41 @@ class DrivesPanel(Panel):
             self._busy = False
 
     async def _confirm(self, node: int, image: releases.FirmwareImage) -> bool:
-        result: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        """Yes or no, with a dismissal counting as no.
+
+        A dialog is dismissible by backdrop click and by Esc, and neither
+        goes through a button — so the answer has to come from the dialog
+        itself, which resolves to ``None`` when it is dismissed. Waiting
+        on anything else strands the flash mid-await with the panel busy
+        for the rest of the session.
+        """
         with ui.dialog() as dialog, ui.card():
             ui.label(f"Flash {image.version} to drive {node}?").classes(
                 "text-subtitle1"
             )
             ui.label(
-                f"{len(image.data)} bytes, sha256 {image.sha256[:12]}…"
+                f"{image.check.size} bytes, sha256 {image.sha256[:12]}…"
                 + ("" if image.checksum_verified else " — integrity unverified")
             ).classes("text-caption text-grey")
             ui.label(
-                "The bus goes silent for the whole write and the drive reboots "
-                "afterwards. An interrupted write leaves the drive waiting in "
-                "its bootloader — recoverable by flashing it again, but the arm "
-                "cannot move until it is."
+                "The bus goes silent for the whole write and for the seconds "
+                "of quiet the drive needs to boot what it took. An interrupted "
+                "write leaves the drive waiting in its bootloader — recoverable "
+                "by flashing it again, but the arm cannot move until it is."
             ).classes("text-caption")
             with ui.row().classes("w-full justify-end gap-2"):
+                ui.button("Cancel", on_click=lambda: dialog.submit(False)).props("flat")
                 ui.button(
-                    "Cancel",
-                    on_click=lambda: (dialog.close(), result.set_result(False)),
-                ).props("flat")
-                ui.button(
-                    "Flash",
-                    color="negative",
-                    on_click=lambda: (dialog.close(), result.set_result(True)),
+                    "Flash", color="negative", on_click=lambda: dialog.submit(True)
                 ).props("unelevated").mark("drives-flash-confirm")
-        dialog.open()
-        return await result
+        try:
+            return bool(await dialog)
+        finally:
+            # A dialog lives in the client layout, not in this card, so a
+            # closed one stays in the page until it is deleted. A dropped
+            # client deletes it first, and deleting it twice raises.
+            if not dialog.is_deleted:
+                dialog.delete()
 
     def _run_flash(
         self, commander: Commander, node: int, image: releases.FirmwareImage
@@ -708,8 +730,14 @@ class DrivesPanel(Panel):
         from par6.firmware.session import flash_lock, granted_bus
 
         sync = cast(RobotClient, commander.robot.create_sync_client())
-        with sync, flash_lock(), granted_bus(sync, "parked") as bus:
-            return flash_image(bus, node, image.data, on_log=logger.info)
+        with (
+            sync,
+            flash_lock(),
+            granted_bus(sync, "parked", channel=self._interface) as bus,
+        ):
+            return flash_image(
+                bus, node, image.data, check=image.check, on_log=logger.info
+            )
 
     # -- status rate ----------------------------------------------------
 
@@ -761,6 +789,12 @@ class DrivesPanel(Panel):
     # -- config ---------------------------------------------------------
 
     async def _load_config(self) -> None:
+        """Seed the fields from the runtime's own config.
+
+        Through the engine's loader, not a hand parse of the TOML: these
+        are the numbers a write is checked against, so they have to be the
+        validated records the runtime itself holds.
+        """
         client = self._client
         if client is None:
             return
@@ -770,18 +804,13 @@ class DrivesPanel(Panel):
             self._set_gain_note()
             return
         try:
-            parsed = tomllib.loads(bundle.get("robot_toml") or "")
-        except (tomllib.TOMLDecodeError, TypeError) as err:
-            self._config_error = f"the runtime's config did not parse: {err}"
+            path = await asyncio.to_thread(_cfg.materialize_bundle, bundle)
+            self._joints = await asyncio.to_thread(lambda: Config(str(path)).joints())
+        except (OSError, ValueError, KeyError, RuntimeError) as err:
+            self._config_error = f"the runtime's config did not load: {err}"
             self._set_gain_note()
             return
-        self._robot_config = parsed
-        joints = parsed.get("joints")
-        self._joints = (
-            [j for j in joints if isinstance(j, dict)]
-            if isinstance(joints, list)
-            else []
-        )
+        self._interface = _cfg.can_interface(bundle.get("robot_toml"))
         self._config_error = None
         names = self._drive_names()
         self._rebuild_reading_rows(names)
