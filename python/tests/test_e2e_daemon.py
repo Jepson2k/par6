@@ -61,14 +61,6 @@ RETRIABLE = frozenset(
 )
 
 
-@pytest.fixture
-def daemon(tmp_path):
-    """A fresh ``par6d --sim`` process on ephemeral ports."""
-    live = LiveDaemon.start(tmp_path)
-    yield live
-    live.stop()
-
-
 def park_deg() -> list[float]:
     """The config park pose in wire units — inside every soft window."""
     return [math.degrees(v) for v in _cfg.config().park_pose_rad()]

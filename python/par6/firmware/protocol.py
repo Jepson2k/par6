@@ -187,11 +187,8 @@ class ImageCheck:
     """What a candidate image looks like, and whether it may be flashed."""
 
     size: int
-    padded_size: int
     pages: int
     app_crc: int
-    stack_pointer: int | None
-    reset_vector: int | None
     errors: tuple[str, ...]
 
     @property
@@ -221,7 +218,6 @@ def validate_image(image: bytes) -> ImageCheck:
             f"({MAX_APP_PAGES} KiB)"
         )
 
-    sp = reset = None
     if len(image) >= 8:
         sp, reset = struct.unpack("<II", image[:8])
         if not RAM_START_ADDRESS <= sp <= RAM_END_ADDRESS:
@@ -241,10 +237,7 @@ def validate_image(image: bytes) -> ImageCheck:
 
     return ImageCheck(
         size=len(image),
-        padded_size=len(padded),
         pages=pages,
         app_crc=stm32_crc32(padded) if padded else 0,
-        stack_pointer=sp,
-        reset_vector=reset,
         errors=tuple(errors),
     )

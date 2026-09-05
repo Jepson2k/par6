@@ -19,6 +19,7 @@ from typing import Any
 
 from par6.client import RobotClient, RobotError
 from par6.firmware.releases import PRODUCTS as _FLASH_PRODUCTS
+from par6.tuning import GAIN_FIELDS
 
 #: Exit code when no runtime answers the target address.
 EXIT_UNREACHABLE = 2
@@ -193,22 +194,8 @@ def _cmd_save_config(client: RobotClient, args: argparse.Namespace) -> int:
 
 
 def _cmd_set_pid_gains(client: RobotClient, args: argparse.Namespace) -> int:
-    if (
-        client.set_pid_gains(
-            args.node,
-            kpp=args.kpp,
-            kpv=args.kpv,
-            kiv=args.kiv,
-            kpiq=args.kpiq,
-            kiiq=args.kiiq,
-            kp=args.kp,
-            kd=args.kd,
-            ilim_ma=args.ilim_ma,
-            velocity_limit_ticks_s=args.velocity_limit_ticks_s,
-            voltage_limit_mv=args.voltage_limit_mv,
-        )
-        != 1
-    ):
+    gains = {name: getattr(args, name) for name, _label, _unit in GAIN_FIELDS}
+    if client.set_pid_gains(args.node, **gains) != 1:
         return _unconfirmed("set-pid-gains", client)
     _emit(f"node {args.node} retuned", args.json)
     return 0
@@ -419,10 +406,17 @@ def build_parser() -> argparse.ArgumentParser:
         "set-pid-gains", help="push one drive's tuning live (every gain required)"
     )
     gains.add_argument("node", type=int, help="configured drive id")
-    for name in ("kpp", "kpv", "kiv", "kpiq", "kiiq", "kp", "kd", "ilim-ma"):
-        gains.add_argument(f"--{name}", type=float, required=True)
-    gains.add_argument("--velocity-limit-ticks-s", type=float, required=True)
-    gains.add_argument("--voltage-limit-mv", type=int, default=0, help="0 = VBUS")
+    for name, label, unit in GAIN_FIELDS:
+        flag = f"--{name.replace('_', '-')}"
+        if name == "voltage_limit_mv":
+            gains.add_argument(flag, type=int, default=0, help="0 = VBUS")
+        else:
+            gains.add_argument(
+                flag,
+                type=float,
+                required=True,
+                help=f"{label}{f' [{unit}]' if unit else ''}",
+            )
     gains.set_defaults(fn=_cmd_set_pid_gains)
 
     tool = sub.add_parser(

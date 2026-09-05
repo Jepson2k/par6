@@ -382,8 +382,6 @@ struct Core<R: RtCommands> {
     /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
     /// stays the boot value: SET_STATUS_RATE moves this one for a session.
     status_rate_hz: u32,
-    /// Set when the rate moved, so the run loop rebuilds its interval.
-    status_rate_dirty: bool,
 }
 
 enum Event {
@@ -459,14 +457,14 @@ impl<R: RtCommands> Core<R> {
             status_seq: 0,
             tcp_speed: 0.0,
             prev_tcp: None,
-            status_rate_dirty: false,
         }
     }
 
     async fn run(mut self, shutdown: Arc<Notify>) {
         let mut rxbuf = vec![0u8; 65535];
         let mut poll_iv = tokio::time::interval(self.cfg.poll_interval);
-        let mut status_iv = tokio::time::interval(rate_period(self.status_rate_hz));
+        let mut iv_hz = self.status_rate_hz;
+        let mut status_iv = tokio::time::interval(rate_period(iv_hz));
         for iv in [&mut poll_iv, &mut status_iv] {
             iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
@@ -474,9 +472,9 @@ impl<R: RtCommands> Core<R> {
         loop {
             // Rebuilt rather than reconfigured: a tokio interval's period is
             // fixed at construction, so a rate change has to make a new one.
-            if self.status_rate_dirty {
-                self.status_rate_dirty = false;
-                status_iv = tokio::time::interval(rate_period(self.status_rate_hz));
+            if iv_hz != self.status_rate_hz {
+                iv_hz = self.status_rate_hz;
+                status_iv = tokio::time::interval(rate_period(iv_hz));
                 status_iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
             }
             let ev = tokio::select! {
@@ -946,7 +944,6 @@ impl<R: RtCommands> Core<R> {
                     Some(error) => Err(error),
                     None => {
                         self.status_rate_hz = p.hz as u32;
-                        self.status_rate_dirty = true;
                         Ok(())
                     }
                 }

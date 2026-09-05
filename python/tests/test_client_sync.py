@@ -22,13 +22,6 @@ from par6.client import RobotClient
 pytestmark = [pytest.mark.e2e, requires_par6d]
 
 
-@pytest.fixture
-def daemon(tmp_path):
-    live = LiveDaemon.start(tmp_path)
-    yield live
-    live.stop()
-
-
 def park_deg() -> list[float]:
     return [math.degrees(v) for v in _cfg.config().park_pose_rad()]
 

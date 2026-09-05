@@ -63,15 +63,8 @@ def cache_dir() -> Path:
 @dataclass(frozen=True)
 class ReleaseSummary:
     tag: str
-    name: str
     prerelease: bool
-    published_at: str
     has_manifest: bool
-    assets: tuple[str, ...]
-
-    @property
-    def usable(self) -> bool:
-        return self.has_manifest
 
 
 @dataclass(frozen=True)
@@ -84,7 +77,6 @@ class FirmwareImage:
     data: bytes
     sha256: str
     manifest: dict[str, Any]
-    cached: bool
     #: False when the manifest declared no checksum: the bytes matched
     #: nothing because there was nothing to match them against.
     checksum_verified: bool
@@ -146,14 +138,11 @@ def _fetch_json(url: str, timeout_s: float) -> Any:
 
 
 def _summarize(release: dict[str, Any]) -> ReleaseSummary:
-    names = tuple(str(a.get("name", "")) for a in release.get("assets") or ())
+    names = (str(a.get("name", "")) for a in release.get("assets") or ())
     return ReleaseSummary(
         tag=str(release.get("tag_name") or ""),
-        name=str(release.get("name") or release.get("tag_name") or ""),
         prerelease=bool(release.get("prerelease")),
-        published_at=str(release.get("published_at") or ""),
         has_manifest=any(n.lower() == MANIFEST_NAME for n in names),
-        assets=names,
     )
 
 
@@ -277,7 +266,6 @@ def fetch_release(
                 data=data,
                 sha256=digest,
                 manifest=manifest,
-                cached=True,
                 checksum_verified=verified,
                 check=check,
             )
@@ -346,7 +334,6 @@ def fetch_release(
         data=data,
         sha256=digest,
         manifest=manifest,
-        cached=False,
         checksum_verified=verified,
         check=check,
     )
@@ -372,7 +359,6 @@ def load_file(path: str | Path) -> FirmwareImage:
         data=data,
         sha256=hashlib.sha256(data).hexdigest(),
         manifest={},
-        cached=True,
         checksum_verified=False,
         check=check,
     )

@@ -101,7 +101,6 @@ class BootloaderError(RuntimeError):
 class FlashStats:
     """Retries are the margin, so they are reported, not hidden."""
 
-    pages: int = 0
     page_retries: int = 0
     chunk_retries: int = 0
 
@@ -114,7 +113,6 @@ class FlashReport:
     image_bytes: int
     pages: int
     app_crc: int
-    erased: bool
     elapsed_s: float
     stats: FlashStats = field(default_factory=FlashStats)
     #: Whether the application answered after the reboot window. ``None``
@@ -349,7 +347,6 @@ class BootloaderSession:
                     timeout_s=WPAGE_TIMEOUT_S,
                     retries=1,
                 )
-                self.stats.pages += 1
                 return
             except BootloaderError as err:
                 last = err
@@ -536,7 +533,6 @@ def flash_image(
         image_bytes=check.size,
         pages=total_pages,
         app_crc=check.app_crc,
-        erased=erase,
         elapsed_s=time.monotonic() - started,
         stats=session.stats,
         booted=booted,

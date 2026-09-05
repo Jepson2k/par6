@@ -20,13 +20,6 @@ from par6.client import AsyncRobotClient, RobotError
 pytestmark = requires_par6d
 
 
-@pytest.fixture
-def daemon(tmp_path):
-    live = LiveDaemon.start(tmp_path)
-    yield live
-    live.stop()
-
-
 async def _observed_hz(client: AsyncRobotClient, frames: int = 30) -> float:
     """The arrival rate over *frames* whole intervals.
 

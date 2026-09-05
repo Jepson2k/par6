@@ -94,7 +94,6 @@ def granted_bus(
     assertion: str = "parked",
     *,
     channel: str | None = None,
-    bitrate: int | None = None,
 ) -> Iterator[Any]:
     """Take the bus from a live par6d, yield an open socket, give it back.
 
@@ -117,10 +116,9 @@ def granted_bus(
     try:
         client.enter_flashing(assertion)
         entered = True
-        kwargs: dict[str, Any] = {"interface": "socketcan", "channel": interface}
-        if bitrate is not None:
-            kwargs["bitrate"] = bitrate
-        bus = can.Bus(**kwargs)
+        # No bitrate: on SocketCAN the link is already configured by
+        # `ip link`, and python-can would only try to re-set it.
+        bus = can.Bus(interface="socketcan", channel=interface)
         yield bus
     finally:
         if bus is not None:

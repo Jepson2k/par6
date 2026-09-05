@@ -31,27 +31,11 @@ from par6._par6 import Config
 from par6.client import AsyncRobotClient, RobotClient
 from par6.firmware import releases
 from par6.firmware.flasher import FlashReport
+from par6.tuning import GAIN_FIELDS
 
 logger = logging.getLogger(__name__)
 
 REFRESH_S = 0.5
-
-#: The ten values one ``set_pid_gains`` frame replaces, with a label and a
-#: unit. The frame carries the whole tuple, so a partial write would zero
-#: what it left out — which is why this is one list and one Apply, not ten
-#: independent fields.
-GAIN_FIELDS: tuple[tuple[str, str, str], ...] = (
-    ("kpp", "Position P", ""),
-    ("kpv", "Velocity P", ""),
-    ("kiv", "Velocity I", ""),
-    ("kpiq", "Current P", ""),
-    ("kiiq", "Current I", ""),
-    ("kp", "Impedance stiffness", ""),
-    ("kd", "Impedance damping", ""),
-    ("ilim_ma", "Current limit", "mA"),
-    ("velocity_limit_ticks_s", "Velocity limit", "ticks/s"),
-    ("voltage_limit_mv", "Voltage limit (0 = VBUS)", "mV"),
-)
 
 #: Modes in which a drive will accept commissioning. Anything else and the
 #: arm is using the bus for something that matters more.
@@ -441,16 +425,8 @@ class DrivesPanel(Panel):
         try:
             await client.set_pid_gains(
                 node,
-                kpp=values["kpp"],
-                kpv=values["kpv"],
-                kiv=values["kiv"],
-                kpiq=values["kpiq"],
-                kiiq=values["kiiq"],
-                kp=values["kp"],
-                kd=values["kd"],
-                ilim_ma=values["ilim_ma"],
-                velocity_limit_ticks_s=values["velocity_limit_ticks_s"],
                 voltage_limit_mv=int(values["voltage_limit_mv"]),
+                **{k: v for k, v in values.items() if k != "voltage_limit_mv"},
             )
         except Exception as err:
             # The runtime refuses a write that would raise a limit past the
@@ -636,10 +612,10 @@ class DrivesPanel(Panel):
             {
                 r.tag: f"{r.tag}{' (prerelease)' if r.prerelease else ''}"
                 for r in found
-                if r.usable
+                if r.has_manifest
             }
         )
-        skipped = sum(1 for r in found if not r.usable)
+        skipped = sum(1 for r in found if not r.has_manifest)
         if self._firmware_note is not None and skipped:
             self._firmware_note.text = (
                 f"{skipped} release(s) carry no firmware.json and cannot be verified."
