@@ -72,16 +72,25 @@ use crate::bridge::{gripper_move_command, CoreLink};
 use crate::collision_world::{first_duplicate, is_world_name, ShapeNames};
 
 /// How long a started command may wait for its RT mode to engage before
-/// the planner declares the start failed.
-const MODE_GRACE: Duration = Duration::from_secs(2);
+/// the planner declares the start failed \[s\].
+///
+/// This and the tool timeouts below are counted in TICKS, not wall clock.
+/// They exist to catch a core that will not engage a mode or a gripper
+/// that will not answer, and both of those are measured in tick loop
+/// iterations: a core that has stopped ticking has not "taken too long"
+/// to enter EXEC, it has stopped, which is the RT watchdogs' business
+/// rather than the planner's. Counting ticks also makes the same planner
+/// behave identically when it drives an offline run flat out, where wall
+/// clock runs sixty times faster than the robot does.
+const MODE_GRACE_S: f64 = 2.0;
 /// Settling time before a gripper reply is trusted as the answer to the
 /// command just sent \[s\]: the RT loop consumes one command per tick and
 /// the reply arrives a frame later.
 const TOOL_COMMAND_GRACE_S: f64 = 0.05;
-/// How long a gripper move may run before the planner fails it.
-const TOOL_MOVE_TIMEOUT: Duration = Duration::from_secs(5);
-/// Gripper firmware calibrate timeout (vendor: 10 s).
-const TOOL_CALIBRATE_TIMEOUT: Duration = Duration::from_secs(12);
+/// How long a gripper move may run before the planner fails it \[s\].
+const TOOL_MOVE_TIMEOUT_S: f64 = 5.0;
+/// Gripper firmware calibrate timeout \[s\] (vendor: 10 s).
+const TOOL_CALIBRATE_TIMEOUT_S: f64 = 12.0;
 /// Minimum calibration wait \[s\] — the `calibrated` bit can still be set
 /// from the previous run (same rule as the homing FSM).
 const TOOL_CALIBRATE_MIN_WAIT_S: f64 = 2.0;
@@ -196,7 +205,9 @@ enum InFlightKind {
         /// RT tick the command was queued on; replies older than the
         /// grace still describe the PREVIOUS command.
         start_tick: u64,
-        timeout: Duration,
+        /// Ticks from `start_tick` after which the action has not
+        /// answered and is failed.
+        timeout_ticks: u64,
     },
     Exec {
         ring_index: u32,
@@ -215,7 +226,9 @@ enum InFlightKind {
 
 struct InFlight {
     server_index: u64,
-    started: Instant,
+    /// The tick the command was started on; every deadline below is
+    /// measured from here in ticks.
+    started_tick: u64,
     kind: InFlightKind,
 }
 
@@ -246,6 +259,14 @@ pub(crate) struct Par6Planner {
     tool: Option<ToolSpec>,
     tool_grace_ticks: u64,
     tool_cal_min_ticks: u64,
+    mode_grace_ticks: u64,
+    tool_move_timeout_ticks: u64,
+    tool_cal_timeout_ticks: u64,
+    /// Whether `poll` recomputes the enablement flags. Off for a host
+    /// with no STATUS broadcast and no REACHABLE query to answer — the
+    /// probe is two dozen seeded IK solves with collision checks, and
+    /// nothing offline reads what it produces.
+    probe_enabled: bool,
     inflight: Option<InFlight>,
     enablement: Enablement,
     /// Latched near-singularity warning for the cart path in flight
@@ -324,6 +345,10 @@ impl Par6Planner {
             tool,
             tool_grace_ticks: ticks(TOOL_COMMAND_GRACE_S).max(2),
             tool_cal_min_ticks: ticks(TOOL_CALIBRATE_MIN_WAIT_S),
+            mode_grace_ticks: ticks(MODE_GRACE_S),
+            tool_move_timeout_ticks: ticks(TOOL_MOVE_TIMEOUT_S),
+            tool_cal_timeout_ticks: ticks(TOOL_CALIBRATE_TIMEOUT_S),
+            probe_enabled: true,
             inflight: None,
             // Nothing measured yet, and the wire has no "unknown": claim
             // no freedom until the first probe runs (the next poll).
@@ -799,7 +824,7 @@ impl Par6Planner {
                 cmd.tool_key
             )));
         };
-        let (wait, timeout) = match cmd.action.as_str() {
+        let (wait, timeout_ticks) = match cmd.action.as_str() {
             "move" => {
                 let [position, speed, current] = scalars(&cmd.params)
                     .ok_or_else(|| invalid("move takes [position, speed, current_ma]".into()))?;
@@ -824,14 +849,14 @@ impl Par6Planner {
                 self.link.send(RtCommand::Gripper(gripper_move_command(
                     position, speed, current,
                 )));
-                (ToolWait::Move, TOOL_MOVE_TIMEOUT)
+                (ToolWait::Move, self.tool_move_timeout_ticks)
             }
             "calibrate" => {
                 if !cmd.params.is_empty() {
                     return Err(invalid("calibrate takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperCalibrate);
-                (ToolWait::Calibrate, TOOL_CALIBRATE_TIMEOUT)
+                (ToolWait::Calibrate, self.tool_cal_timeout_ticks)
             }
             // Halt in place: the RT re-targets the freshest reported jaw
             // byte with the standing command's speed/current (already in
@@ -846,7 +871,7 @@ impl Par6Planner {
                     return Err(invalid("stop takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperStop);
-                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
+                (ToolWait::Idle, self.tool_move_timeout_ticks)
             }
             // Release: action = 0 — limp on spectral-bldc, velocity-0
             // hold on stepfoc.
@@ -855,7 +880,7 @@ impl Par6Planner {
                     return Err(invalid("idle takes no parameters".into()));
                 }
                 self.link.send(RtCommand::GripperIdle);
-                (ToolWait::Idle, TOOL_MOVE_TIMEOUT)
+                (ToolWait::Idle, self.tool_move_timeout_ticks)
             }
             other => {
                 return Err(invalid(format!(
@@ -867,7 +892,7 @@ impl Par6Planner {
         Ok(InFlightKind::Tool {
             wait,
             start_tick: snap.tick,
-            timeout,
+            timeout_ticks,
         })
     }
 
@@ -1458,7 +1483,7 @@ impl Par6Planner {
             InFlightKind::Tool {
                 wait,
                 start_tick,
-                timeout,
+                timeout_ticks,
             } => {
                 let verdict = Self::tool_verdict(
                     wait,
@@ -1468,7 +1493,7 @@ impl Par6Planner {
                     snap,
                 );
                 match verdict {
-                    None if fl.started.elapsed() > *timeout => {
+                    None if snap.tick.saturating_sub(fl.started_tick) > *timeout_ticks => {
                         let state = match wait {
                             ToolWait::Move => "move",
                             ToolWait::Calibrate => "calibrate",
@@ -1491,7 +1516,7 @@ impl Par6Planner {
                 if !*seen_exec {
                     if snap.mode == Mode::Exec {
                         *seen_exec = true;
-                    } else if fl.started.elapsed() > MODE_GRACE {
+                    } else if snap.tick.saturating_sub(fl.started_tick) > self.mode_grace_ticks {
                         return Some(Err(make_error(
                             ErrorCode::MotnSetupFailed,
                             UNATTRIBUTED,
@@ -1508,7 +1533,7 @@ impl Par6Planner {
                 if !*seen_homing {
                     if snap.mode == Mode::Homing {
                         *seen_homing = true;
-                    } else if fl.started.elapsed() > MODE_GRACE {
+                    } else if snap.tick.saturating_sub(fl.started_tick) > self.mode_grace_ticks {
                         return Some(Err(make_error(
                             ErrorCode::MotnSetupFailed,
                             UNATTRIBUTED,
@@ -1542,6 +1567,16 @@ impl Par6Planner {
     /// belongs nowhere near the RT thread and not on every 500 Hz planner
     /// poll either — and a configuration that has not moved cannot have
     /// changed its answer.
+    /// Turn the enablement probe on or off.
+    ///
+    /// The flags it computes are read by exactly two things, the STATUS
+    /// broadcast and the REACHABLE query, so a host that serves neither
+    /// pays two dozen seeded IK solves and their collision checks per
+    /// idle tick for an answer nobody asks for.
+    pub(crate) fn set_enablement(&mut self, on: bool) {
+        self.probe_enabled = on;
+    }
+
     fn update_enablement(&mut self, snap: &StateSnapshot) {
         if !self.probe.due(&snap.q) {
             return;
@@ -2004,7 +2039,7 @@ impl Planner for Par6Planner {
         let (kind, consumed) = self.plan(head.cmd, &batch[1..])?;
         self.inflight = Some(InFlight {
             server_index: head.index,
-            started: Instant::now(),
+            started_tick: self.snapshots.latest().tick,
             kind,
         });
         self.pump_ring();
@@ -2029,7 +2064,7 @@ impl Planner for Par6Planner {
         ) {
             self.heartbeat.feed();
             self.pump_ring();
-        } else {
+        } else if self.probe_enabled {
             self.update_enablement(&snap);
         }
         if let Some(out) = self.invalidated.take() {

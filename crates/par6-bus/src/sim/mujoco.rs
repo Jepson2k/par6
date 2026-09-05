@@ -487,6 +487,38 @@ impl MujocoPlant {
         (self.close_at, self.open_at)
     }
 
+    /// The contacts the solver actually resolved this step, appended to
+    /// `pos` and `force` as world-frame triples.
+    ///
+    /// MuJoCo's contact list also holds near misses — pairs inside the
+    /// inclusion margin that generate no constraint row and carry no
+    /// force — so an unfiltered walk reports pushes where nothing is
+    /// touching. `efc_address` is what tells the two apart.
+    ///
+    /// `mj_contactForce` answers in the contact frame, whose rows are the
+    /// normal and the two tangents; rotating by its transpose puts the
+    /// force in the world the caller draws in.
+    pub fn contacts_into(&self, pos: &mut Vec<[f64; 3]>, force: &mut Vec<[f64; 3]>) {
+        for (i, c) in self.data.contact().iter().enumerate() {
+            if c.exclude != 0 || c.efc_address < 0 {
+                continue;
+            }
+            let f = self.data.contact_force(i);
+            let mut world = [0.0; 3];
+            for (axis, w) in world.iter_mut().enumerate() {
+                *w = f[0] * c.frame[axis] + f[1] * c.frame[3 + axis] + f[2] * c.frame[6 + axis];
+            }
+            pos.push(c.pos);
+            force.push(world);
+        }
+    }
+
+    /// The whole model's centre of mass \[m\], world frame. Body 0 is the
+    /// world body, whose subtree is everything.
+    pub fn center_of_mass(&self) -> [f64; 3] {
+        self.data.subtree_com()[0]
+    }
+
     /// Advance one bus tick: per substep the drivers close their loops on
     /// the measured state, loop currents (minus injected loads) become
     /// joint torques + idle damping, the drivetrain friction follows the

@@ -487,3 +487,86 @@ fn the_preview_grasps_carries_and_releases_a_world_object() {
         "the released block fell: held at {lifted_z}, now {dropped_z}"
     );
 }
+
+/// The simulated run against the planner it replaces.
+///
+/// The planner says where the arm is *told* to go; the run says where it
+/// *went*, because the same commands were queued to the same planner
+/// driving a real control loop against the plant. The two must agree
+/// inside the settle tolerance — that is what the `settled` completion
+/// policy promises — while the run additionally shows the tracking error
+/// the plan cannot: `q_commanded` is what went on the motor bus and `q`
+/// is what the joints did with it.
+#[test]
+fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
+    let config = test_config();
+    let park = to_rad(&park_deg());
+    let mut first = park_deg();
+    first[0] += 20.0;
+    let mut second = first;
+    second[1] -= 15.0;
+    let cmds = [move_j_cmd(first), move_j_cmd(second)];
+
+    let mut planned_session =
+        Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    planned_session.teleport_rad(park);
+    let planned = planned_session.preview_batch(&cmds);
+    assert!(planned.iter().all(|r| r.valid()), "{planned:?}");
+    let planned_end = planned.last().expect("two results").end_joints_rad;
+
+    let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    session.teleport_rad(park);
+    let batch = session
+        .run(&cmds, par6d::preview::RunLimits::default())
+        .expect("the run completes");
+
+    assert_eq!(batch.stop, par6d::preview::record::StopReason::Completed);
+    assert_eq!(batch.commands.len(), cmds.len(), "one span per command");
+    assert!(
+        batch.commands.iter().all(|c| c.error.is_none()),
+        "the run refused what the planner accepted: {:?}",
+        batch.commands
+    );
+    assert!(batch.rows > 10, "a two-move program takes ticks");
+    assert_eq!(batch.q_rad.len(), batch.rows * batch.joints);
+    assert_eq!(batch.tcp.len(), batch.rows * 6);
+
+    // Spans tile the record in order, so a consumer can map any row back
+    // to the line of the program that produced it.
+    let mut expected_start = 0;
+    for span in &batch.commands {
+        assert_eq!(
+            span.start_row, expected_start,
+            "command spans must tile the record: {:?}",
+            batch.commands
+        );
+        expected_start += span.rows;
+    }
+    assert_eq!(expected_start, batch.rows, "spans must cover every row");
+
+    // Where it ended up, against where the plan said.
+    let last = (batch.rows - 1) * batch.joints;
+    let achieved = &batch.q_rad[last..last + batch.joints];
+    for (j, (got, want)) in achieved.iter().zip(&planned_end).enumerate() {
+        assert!(
+            (f64::from(*got) - want).abs() < 0.01,
+            "joint {j} landed {:+.5} rad off the plan (settle tolerance is 0.01)",
+            f64::from(*got) - want
+        );
+    }
+
+    // The tracking error the plan cannot show. It must be real — a
+    // record where the two columns are identical is not measuring a
+    // servo, it is copying the command — and it must stay small.
+    let worst = (0..batch.q_rad.len())
+        .map(|i| (batch.q_rad[i] - batch.q_commanded_rad[i]).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        worst > 1e-5,
+        "q and q_commanded are the same column: the plant is not being simulated"
+    );
+    assert!(
+        worst < 0.05,
+        "the arm is not following its commands: worst tracking error {worst} rad"
+    );
+}

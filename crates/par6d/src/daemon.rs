@@ -823,7 +823,7 @@ fn io_source(
 /// scan, and the only answer that is never unrecoverable is "yes". Every
 /// FLASHING exit therefore costs a re-home; a marker-writing flasher is
 /// what would buy the scan-only case back.
-fn flash_marker() -> Box<dyn FlashMarker> {
+pub(crate) fn flash_marker() -> Box<dyn FlashMarker> {
     struct AssumeFlashed;
     impl FlashMarker for AssumeFlashed {
         fn flashed(&mut self) -> bool {

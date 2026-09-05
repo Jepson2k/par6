@@ -597,11 +597,26 @@ fn timed_move_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> Durat
         blend_radius: None,
         rel: false,
     });
-    let started = Instant::now();
     let index = c.ok_index(&cmd);
+    // Measured in STATUS frames, which the tick loop publishes — so this
+    // counts the RT's own progress through the trajectory. Host wall
+    // clock does not: a loaded machine deschedules the RT thread and
+    // stretches the same trajectory by tens of milliseconds, which makes
+    // a comparison of two profiles a comparison of the load instead.
+    // Dropped frames do not distort it either; `seq` is the sender's.
+    let start = rig.wait_status("the move is executing", |s| {
+        s.executing_index == index as i64
+    });
+    let end = rig.wait_status("the move completed", |s| s.completed_index >= index as i64);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "{profile} move must complete, got {detail:?}");
-    started.elapsed()
+    let hz = f64::from(
+        par6_config::RobotConfig::load(&test_config())
+            .expect("cfg")
+            .protocol
+            .status_rate_hz,
+    );
+    Duration::from_secs_f64((end.seq - start.seq) as f64 / hz)
 }
 
 fn tool_status(s: &Status) -> par6_proto::ToolStatusWire {

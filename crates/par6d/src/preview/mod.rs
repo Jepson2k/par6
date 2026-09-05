@@ -5,6 +5,13 @@
 //! timing, same collision gate — and then discarded instead of
 //! dispatched, so a preview can never drift from the runtime.
 
+mod driver;
+pub mod record;
+mod run;
+
+pub use record::TickBatch;
+pub use run::RunLimits;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -109,6 +116,15 @@ pub struct Preview {
     /// The preview's runtime payload — none today; the field keeps the
     /// planner sync honest if a payload surface is added offline.
     payload: par6_server::PayloadSpec,
+    /// The planning context this session is under. The query planner is
+    /// synced as it is set; a run builds its own planner and syncs it
+    /// from here.
+    profile: String,
+    tcp_offset_mm: [f64; 3],
+    policy: CompletionPolicy,
+    /// What a run rebuilds its kinematics and its engine from.
+    config_path: PathBuf,
+    opts: Options,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -203,6 +219,11 @@ impl Preview {
             carried: Vec::new(),
             jaw_closed: 0.5,
             payload: par6_server::PayloadSpec::default(),
+            profile: String::new(),
+            tcp_offset_mm: [0.0; 3],
+            policy: CompletionPolicy::Settled,
+            config_path,
+            opts,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
@@ -517,6 +538,9 @@ impl Preview {
         tcp_offset_mm: [f64; 3],
         policy: CompletionPolicy,
     ) {
+        self.profile = profile.to_string();
+        self.tcp_offset_mm = tcp_offset_mm;
+        self.policy = policy;
         self.planner.sync(PlanContext {
             profile,
             tool: "",

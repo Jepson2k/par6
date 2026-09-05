@@ -385,6 +385,21 @@ impl SimBus {
             .unwrap_or(0)
     }
 
+    /// The contacts the solver resolved this tick, appended to `pos` and
+    /// `force` as world-frame triples. Near misses inside the inclusion
+    /// margin are skipped — they carry no force.
+    pub fn contacts_into(&self, pos: &mut Vec<[f64; 3]>, force: &mut Vec<[f64; 3]>) {
+        if let Some(p) = self.plant.as_ref() {
+            p.contacts_into(pos, force);
+        }
+    }
+
+    /// The scene's centre of mass \[m\], world frame; `None` before the bus
+    /// is configured.
+    pub fn center_of_mass(&self) -> Option<[f64; 3]> {
+        Some(self.plant.as_ref()?.center_of_mass())
+    }
+
     /// The scene's own gravity torque on the arm joints at `q` \[Nm\], at
     /// rest. The controller derives the same quantity from the URDF through
     /// Pinocchio, and the two must agree — see par6d's
