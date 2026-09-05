@@ -43,6 +43,9 @@ pytestmark = [pytest.mark.e2e, requires_par6d]
 
 #: Wall-clock ceiling for one session step (boot, settle, a short move).
 STEP_BUDGET_S = 20.0
+
+#: Fraction of the cartesian ceiling the streamed servo_l tests drive at.
+SERVO_L_SPEED = 0.6
 #: The shipped PAR6 homing sequence takes ~60 s (its pre-moves, backoffs and
 #: release phases are config SECONDS, and the sim runs in wall-clock time).
 HOMING_BUDGET_S = 200.0
@@ -1149,7 +1152,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         goal = list(start)
         goal[2] -= 40.0
         arrived = await stream_toward(
-            client, goal, lambda p: client.servo_l(p, speed=0.6)
+            client, goal, lambda p: client.servo_l(p, speed=SERVO_L_SPEED)
         )
         assert arrived, (
             f"servo_l never reached the streamed target: "
@@ -1190,7 +1193,9 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             z_seen.append(float(s.pose[11]))
             return bool(s.collision_active)
 
-        streamer = Streamer(client, below, lambda p: client.servo_l(p, speed=0.6))
+        streamer = Streamer(
+            client, below, lambda p: client.servo_l(p, speed=SERVO_L_SPEED)
+        )
         blocked = False
         deadline = time.monotonic() + STEP_BUDGET_S
         while time.monotonic() < deadline and not blocked:
@@ -1213,18 +1218,34 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         )
         # How deep the arm gets is the gate's reaction plus the braking
         # distance, and housekeeping only reacts as often as it runs. A
-        # box too loaded to hold the loop period reacts later and coasts
-        # further, which is the loop failing rather than the gate — so
-        # the loop's own overrun count goes in the message to tell them
-        # apart.
+        # box that cannot hold its loop period reacts later and coasts
+        # further, which is the loop failing rather than the gate.
+        #
+        # Two different numbers say so, and only together: `overrun_count`
+        # counts ticks whose WORK ran past the next deadline, and the
+        # period is measured wake to wake, so it also carries the kernel's
+        # wake-up latency. A loaded runner shows up as a period over
+        # budget with no overruns at all — work that fits, woken late — so
+        # a message that printed only the overruns would call that box
+        # healthy. The intrusion is also given in ticks of travel, since
+        # one late tick is the smallest coast the gate can produce.
         stats = await client.loop_stats()
-        loop_note = (
-            f"the RT loop overran {stats.overrun_count} of {stats.loop_count} ticks "
-            f"(p99 {stats.p99_period_s * 1e3:.2f} ms against a "
-            f"{1e3 / stats.target_hz:.2f} ms budget)"
-            if stats is not None
-            else "loop stats unavailable"
-        )
+        if stats is not None:
+            budget_ms = 1e3 / stats.target_hz
+            p99_ms = stats.p99_period_s * 1e3
+            intrusion_mm = floor - min(z_seen)
+            ceiling_mm_s = 1e3 * float(_cfg.config().motion()["jog_l_linear_max_m_s"])
+            per_tick_mm = SERVO_L_SPEED * ceiling_mm_s / stats.target_hz
+            loop_note = (
+                f"the RT loop overran {stats.overrun_count} of {stats.loop_count} "
+                f"ticks and its p99 period was {p99_ms:.2f} ms against a "
+                f"{budget_ms:.2f} ms budget ({p99_ms / budget_ms:.3f}x); the arm "
+                f"went {intrusion_mm:.1f} mm past, which is "
+                f"{intrusion_mm / per_tick_mm:.1f} ticks of travel at "
+                f"{per_tick_mm:.1f} mm per tick"
+            )
+        else:
+            loop_note = "loop stats unavailable"
         assert min(z_seen) > floor, (
             f"the gated stream carried the TCP into the keep-out: "
             f"min z {min(z_seen):.1f} vs floor {floor:.1f}. {loop_note}"

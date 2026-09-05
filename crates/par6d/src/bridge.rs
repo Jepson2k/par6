@@ -78,6 +78,11 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// so the projection here uses the commanded target velocity — an upper
 /// bound on the ramping integrator's, which errs on the stopping side.
 pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
+
+/// Joint speed above which a stream counts as MOVING and is re-tested
+/// against its projection every period \[rad/s\]. Below it the arm is
+/// settling on a held target and the projection would be noise.
+const STREAM_MOVING_RAD_S: f64 = 0.01;
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -277,6 +282,26 @@ impl StreamGate {
         for (j, pct) in speeds.iter().enumerate() {
             la[j] = (la[j] + pct * self.jog_vel[j] * STREAM_LOOKAHEAD_S)
                 .clamp(self.soft_min[j], self.soft_max[j]);
+        }
+        la
+    }
+
+    /// Where the arm will be one lookahead horizon from `q` if it keeps
+    /// moving at `qd`, clamped into the soft window so a pose at the stop
+    /// cannot phantom-trip the gate.
+    ///
+    /// The jog projection asks the same question of a COMMANDED velocity
+    /// fraction; this one asks it of the measured motion, which is what a
+    /// position stream leaves to read: its datagrams carry a target, not
+    /// a rate.
+    pub(crate) fn motion_lookahead(
+        &self,
+        q: &[f64; MAX_JOINTS],
+        qd: &[f64; MAX_JOINTS],
+    ) -> [f64; MAX_JOINTS] {
+        let mut la = *q;
+        for (j, v) in qd.iter().enumerate() {
+            la[j] = (la[j] + v * STREAM_LOOKAHEAD_S).clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
     }
@@ -1219,14 +1244,45 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                 }
+                // A servo stream that is MOVING gets the jog treatment:
+                // its next datagram is admitted on the target it carries,
+                // which says nothing about the ground the arm covers
+                // getting there — and it cannot stop dead, so a target
+                // admitted just outside a keep-out is entered anyway on
+                // the braking distance. The measured motion is projected
+                // one lookahead horizon and re-tested every period, which
+                // is the same promise the jog path already makes.
+                Some(a)
+                    if a.kind == StreamKind::Servo
+                        && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
+                {
+                    let mut g = gate.lock().unwrap();
+                    let la = g.motion_lookahead(&snap.q, &snap.qd);
+                    match g.blocked(&snap.q, &la) {
+                        Ok(None) => {}
+                        Ok(Some(pairs)) => {
+                            drop(g);
+                            collision_stop(&link, &gate, "servo", pairs);
+                            sh.stream = None;
+                            continue;
+                        }
+                        Err(e) => {
+                            drop(g);
+                            log::error!("servo gate check failed: {}", e.cause);
+                            link.send(RtCommand::SetMode(Mode::Idle));
+                            sh.stream = None;
+                            continue;
+                        }
+                    }
+                }
                 Some(a) if a.kind == StreamKind::Servo => {
                     // A held servo target was admitted against the world
-                    // of its datagram, and a held target cannot move —
-                    // so it is re-tested exactly when the WORLD changes
-                    // (the analogue of the planner's in-flight
-                    // revalidation), never per period: the steady state
-                    // costs no collision queries, so the keep-alive below
-                    // is never starved past the RT stream watchdog.
+                    // of its datagram, and a target the arm has settled on
+                    // cannot move — so it is re-tested exactly when the
+                    // WORLD changes (the analogue of the planner's
+                    // in-flight revalidation), never per period: a resting
+                    // stream costs no collision queries, so the keep-alive
+                    // below is never starved past the RT stream watchdog.
                     if let Some(t) = a.servo_target {
                         let epoch = gate.lock().unwrap().epoch();
                         if epoch != a.world_epoch {

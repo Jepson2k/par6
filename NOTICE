@@ -1,0 +1,19 @@
+par6
+Copyright 2026 Jake Jepson
+
+This product includes software developed by Jake Jepson
+(https://github.com/Jepson2k/par6).
+
+Licensed under the Apache License, Version 2.0. See the LICENSE file
+for the full terms.
+
+Third-party material bundled with this product is NOT covered by that
+license and carries its own terms:
+
+  assets/par6_description/
+    Derived from the "PAR6 Description" directory of
+    https://github.com/Source-Robotics/PAR6-Collaborative-Robot-Arm,
+    Copyright Source Robotics. Upstream ships CERN-OHL-S v2 as its
+    LICENSE file while a directory readme names Apache-2.0; the
+    ambiguity is unresolved. See assets/NOTICE for what is verbatim,
+    what was modified, and what par6 authored.
