@@ -50,7 +50,7 @@ use std::path::PathBuf;
 use par6_config::{GripperConfig, KtSource, RobotConfig};
 
 use crate::bus::DriverBus;
-use crate::hw::sched::FreshnessClock;
+use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
 use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
@@ -71,8 +71,6 @@ use plant::{JointMap, KinJoint};
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
-/// Poll slots between device-info sweeps (~4 s at 250 Hz).
-const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 /// Default hall-sensor band half-width \[rad\].
 const HALL_HALF_WIDTH_RAD: f64 = 0.02;
 

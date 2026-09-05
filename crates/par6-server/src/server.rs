@@ -70,10 +70,12 @@ use crate::config::ServerConfig;
 use crate::faults::{gripper_fault_code, rt_standing_error};
 use crate::gating::{check_gate, gate, is_stream, GateContext};
 use crate::link::BroadcastLink;
+use crate::plane::{OwnedPlanContext, OwnedQueued, PlanEvent, PlanRequest, ReplyTag};
 use crate::runtime::{
-    blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
-    RtCommands, RuntimeHandle, ShapeLayer,
+    blend_radius_mm, CollisionState, CommandOutcome, Enablement, PayloadSpec, RtCommands,
+    RuntimeHandle, ShapeLayer,
 };
+use par6_proto::Shape;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
@@ -137,12 +139,8 @@ impl Drop for ServerHandle {
 
 /// Bind the command socket, run the broadcast-transport ladder, and
 /// spawn the server task.
-pub async fn spawn<P, R>(
-    cfg: ServerConfig,
-    runtime: RuntimeHandle<P, R>,
-) -> std::io::Result<ServerHandle>
+pub async fn spawn<R>(cfg: ServerConfig, runtime: RuntimeHandle<R>) -> std::io::Result<ServerHandle>
 where
-    P: Planner + 'static,
     R: RtCommands + 'static,
 {
     let socket = UdpSocket::bind(cfg.bind).await?;
@@ -293,9 +291,9 @@ impl Dedup {
     }
 }
 
-struct Core<P: Planner, R: RtCommands> {
+struct Core<R: RtCommands> {
     cfg: ServerConfig,
-    runtime: RuntimeHandle<P, R>,
+    runtime: RuntimeHandle<R>,
     socket: UdpSocket,
     link: BroadcastLink,
     txbuf: Vec<u8>,
@@ -312,6 +310,16 @@ struct Core<P: Planner, R: RtCommands> {
     /// Deadline the head of the queue is being held to, while it waits
     /// for the successor its blend radius asks to round a corner into.
     blend_hold: Option<Instant>,
+    /// The command index whose plan is outstanding, if any: the queue
+    /// holds still until the planner says how much of it that motion
+    /// covers, and the index is what makes a late answer identifiable.
+    planning: Option<u64>,
+    /// SET_SHAPES / reset_state clients parked on the planner's verdict,
+    /// with the set they are waiting to have applied.
+    pending_shapes: HashMap<ReplyTag, (u32, SocketAddr, Vec<Shape>)>,
+    /// Tool actions parked on `start_tool`'s verdict. Already acked, so
+    /// what waits on the answer is whether they execute or complete.
+    pending_tool: HashMap<ReplyTag, ToolExecuting>,
     accepted_index: i64,
     tool_executing: Option<ToolExecuting>,
     completed_index: i64,
@@ -364,7 +372,6 @@ struct Core<P: Planner, R: RtCommands> {
 
     /// Planner estimate of the pending queue, and the `(front, len)` of
     /// the queue it describes.
-    queue_estimate: f64,
     queue_estimate_for: (u64, usize),
 
     snap: StateSnapshot,
@@ -378,13 +385,17 @@ enum Event {
     Datagram(usize, SocketAddr),
     Poll,
     Status,
+    /// The planner answered. Its own `select!` arm rather than a poll,
+    /// so a COMPLETE reaches the client when the planner decides it
+    /// rather than at the next poll tick.
+    Plan(PlanEvent),
     Shutdown,
 }
 
-impl<P: Planner, R: RtCommands> Core<P, R> {
+impl<R: RtCommands> Core<R> {
     fn new(
         cfg: ServerConfig,
-        runtime: RuntimeHandle<P, R>,
+        runtime: RuntimeHandle<R>,
         socket: UdpSocket,
         link: BroadcastLink,
     ) -> Self {
@@ -411,6 +422,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             pending: VecDeque::new(),
             executing: None,
             blend_hold: None,
+            planning: None,
+            pending_shapes: HashMap::new(),
+            pending_tool: HashMap::new(),
             accepted_index: -1,
             tool_executing: None,
             completed_index: -1,
@@ -433,7 +447,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
-            queue_estimate: 0.0,
             queue_estimate_for: (0, 0),
             snap: StateSnapshot::default(),
             last_fresh: None,
@@ -461,6 +474,12 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     }
                 },
                 _ = poll_iv.tick() => Event::Poll,
+                ev = self.runtime.planner.next_event() => match ev {
+                    Some(ev) => Event::Plan(ev),
+                    // The planner thread is gone; nothing more will come
+                    // from it, and polling a closed channel would spin.
+                    None => Event::Shutdown,
+                },
                 _ = status_iv.tick() => Event::Status,
                 _ = shutdown.notified() => Event::Shutdown,
             };
@@ -476,6 +495,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     }
                 }
                 Event::Poll => self.on_poll().await,
+                Event::Plan(ev) => self.on_plan_event(ev).await,
                 Event::Status => self.on_status().await,
                 Event::Shutdown => break,
             }
@@ -578,8 +598,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.settle_enable().await;
         self.settle_flashing().await;
         self.expire_chunks().await;
-        self.collect_tool_outcome().await;
-        self.collect_outcomes().await;
         self.pump().await;
     }
 
@@ -782,6 +800,17 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.on_reset(req_id, addr).await;
             return;
         }
+        // Both of these end in a collision-world rebuild, which is the
+        // planner's and now a thread away, so their answer cannot be
+        // built from this match — they carry their own reply.
+        if matches!(cmd, C::ResetState) {
+            self.on_reset_state(req_id, addr).await;
+            return;
+        }
+        if let C::SetShapes(p) = cmd {
+            self.defer_program_shapes(req_id, addr, p.shapes.clone());
+            return;
+        }
         if let C::EnterFlashing(_) | C::ExitFlashing = cmd {
             self.on_flashing(req_id, matches!(cmd, C::EnterFlashing(_)), addr)
                 .await;
@@ -869,22 +898,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                     )),
                 }
             }
-            C::ResetState => {
-                self.cancel_all_motion("reset").await;
-                self.standing_error = None;
-                self.action_state = ActionState::Idle;
-                self.last_checkpoint.clear();
-                self.tool.clone_from(&self.cfg.fitted_tool);
-                self.tool_variant = None;
-                self.tcp_offset_mm = [0.0; 3];
-                self.completion_policy = CompletionPolicy::Settled;
-                self.profile = self.cfg.initial_profile.clone();
-                self.runtime.rt.reset_state();
-                self.sync_planner();
-                // The program layer only: installation keep-outs are the
-                // deployment's, not the program's, and survive.
-                self.apply_program_shapes(Vec::new())
-            }
             // Same reason `simulator` cancels first: the bus under a
             // running move is about to become a different arm, and a
             // move resumed against one whose position is not yet known
@@ -906,7 +919,6 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.sync_planner();
                 Ok(())
             }
-            C::SetShapes(p) => self.apply_program_shapes(p.shapes.clone()),
             // Values are codec-validated; the node id is config
             // knowledge, so it is checked here — an ack for a node this
             // arm does not have would report a tune nothing received.
@@ -1247,23 +1259,37 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             self.push_complete(prev.addr, prev.index, Some(error), None)
                 .await;
         }
-        match self.runtime.planner.start_tool(index, &cmd) {
-            Ok(()) => {
-                self.tool_executing = Some(ToolExecuting {
-                    index,
-                    addr,
-                    params,
-                });
-            }
+        let tag = self.runtime.planner.next_tag();
+        self.pending_tool.insert(
+            tag,
+            ToolExecuting {
+                index,
+                addr,
+                params,
+            },
+        );
+        self.runtime
+            .planner
+            .send(PlanRequest::StartTool { tag, index, cmd });
+    }
+
+    /// The planner answered `start_tool`.
+    async fn on_tool_started(&mut self, tag: ReplyTag, result: Result<(), WireError>) {
+        let Some(ex) = self.pending_tool.remove(&tag) else {
+            return;
+        };
+        match result {
+            Ok(()) => self.tool_executing = Some(ex),
             // A refused verb never touched the tool and never touched
             // motion, so unlike a failed motion it must not clear the
             // queue standing behind it.
             Err(mut error) => {
-                error.command_index = index as i64;
+                error.command_index = ex.index as i64;
                 self.standing_error = Some(error.clone());
                 self.action_state = ActionState::Error;
-                self.advance_completed(index);
-                self.push_complete(addr, index, Some(error), None).await;
+                self.advance_completed(ex.index);
+                self.push_complete(ex.addr, ex.index, Some(error), None)
+                    .await;
             }
         }
     }
@@ -1271,10 +1297,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Drain the tool side channel. Runs before the motion lane's
     /// outcomes and before `pump`, so a finished tool action is reported
     /// on the same tick it settles rather than behind a motion.
-    async fn collect_tool_outcome(&mut self) {
-        let Some(out) = self.runtime.planner.poll_tool() else {
-            return;
-        };
+    async fn on_tool_outcome(&mut self, out: CommandOutcome) {
         let Some(ex) = &self.tool_executing else {
             return; // outcome of a cancelled action
         };
@@ -1343,77 +1366,110 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
 
     // ---- queue engine ------------------------------------------------------
 
+    /// Offer the head of the queue to the planner.
+    ///
+    /// The answer comes back as a [`PlanEvent`], so nothing is popped
+    /// here: `plan_in_flight` holds the queue still until the planner
+    /// says how much of it the started motion covers. One plan is
+    /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
-        while self.executing.is_none() {
-            if self.active_stream.is_some() {
-                break;
-            }
-            let Some(head) = self.pending.front() else {
-                self.blend_hold = None;
-                break;
-            };
-            // The head waits for an enabled arm only if its gate says so:
-            // configuration queued for ordering (a TCP offset) lands on a
-            // disabled arm, exactly as it did when it was immediate.
-            if gate(head.cmd.tag()).needs_enabled
-                && (self.estop_latched || self.snap.state != ArmState::Enabled)
-            {
-                break;
-            }
-            if self.holding_for_blend() {
-                break;
-            }
-            self.blend_hold = None;
-            // Disjoint field borrows: the queue is read to build the
-            // lookahead while the planner is driven.
-            let batch: Vec<QueuedCommand<'_>> = self
-                .pending
-                .iter()
-                .take(self.cfg.blend_lookahead.max(1))
-                .map(|p| QueuedCommand {
-                    index: p.index,
-                    cmd: &p.cmd,
-                })
-                .collect();
-            let started = self.runtime.planner.start(&batch);
-            let taken = match started {
-                Ok(n) => n.clamp(1, batch.len()),
-                Err(_) => 1,
-            };
-            drop(batch);
-            let pc = self.pending.pop_front().expect("checked non-empty");
-            let blended: Vec<(u64, SocketAddr)> = (1..taken)
-                .map(|_| {
-                    let p = self.pending.pop_front().expect("planner took what it saw");
-                    (p.index, p.addr)
-                })
-                .collect();
-            match started {
-                Ok(_) => {
-                    let name = cmd_name(pc.cmd.tag());
-                    if !blended.is_empty() {
-                        log::debug!(
-                            "command {} blends {} following command(s) into one motion",
-                            pc.index,
-                            blended.len()
-                        );
-                    }
-                    self.action_state = ActionState::Executing;
-                    self.executing = Some(Executing {
-                        index: pc.index,
-                        addr: pc.addr,
-                        name,
-                        params: params_summary(&pc.cmd),
-                        effect: post_effect(&pc.cmd),
-                        blended,
-                    });
-                }
-                Err(e) => {
-                    self.fail_command(pc.index, pc.addr, Vec::new(), e).await;
-                    break;
-                }
-            }
+        if self.executing.is_some() || self.planning.is_some() || self.active_stream.is_some() {
+            return;
         }
+        let Some(head) = self.pending.front() else {
+            self.blend_hold = None;
+            return;
+        };
+        // The head waits for an enabled arm only if its gate says so:
+        // configuration queued for ordering (a TCP offset) lands on a
+        // disabled arm, exactly as it did when it was immediate.
+        if gate(head.cmd.tag()).needs_enabled
+            && (self.estop_latched || self.snap.state != ArmState::Enabled)
+        {
+            return;
+        }
+        if self.holding_for_blend() {
+            return;
+        }
+        self.blend_hold = None;
+        let batch: Vec<OwnedQueued> = self
+            .pending
+            .iter()
+            .take(self.cfg.blend_lookahead.max(1))
+            .map(|p| OwnedQueued {
+                index: p.index,
+                cmd: p.cmd.clone(),
+            })
+            .collect();
+        self.planning = Some(batch[0].index);
+        self.runtime.planner.send(PlanRequest::Start { batch });
+    }
+
+    /// Route what the planner had to say.
+    async fn on_plan_event(&mut self, ev: PlanEvent) {
+        match ev {
+            PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
+            PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
+            PlanEvent::Outcome(out) => self.on_outcome(out).await,
+            PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
+            PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
+            PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
+        }
+    }
+
+    /// A plan started: pop exactly what its motion covers.
+    ///
+    /// An answer for an index this server is no longer planning crossed
+    /// a cancellation — the command it names is gone, and neither the
+    /// queue nor the in-flight marker belongs to it any more. Clearing
+    /// the marker on a stale answer would free a slot a NEWER start
+    /// already holds, and the queue would be started twice.
+    async fn on_plan_started(&mut self, index: u64, taken: usize) {
+        if self.planning != Some(index) {
+            return;
+        }
+        self.planning = None;
+        let Some(pc) = self.pending.pop_front() else {
+            return;
+        };
+        let taken = taken.clamp(1, 1 + self.pending.len());
+        let blended: Vec<(u64, SocketAddr)> = (1..taken)
+            .map(|_| {
+                let p = self.pending.pop_front().expect("planner took what it saw");
+                (p.index, p.addr)
+            })
+            .collect();
+        if !blended.is_empty() {
+            log::debug!(
+                "command {} blends {} following command(s) into one motion",
+                pc.index,
+                blended.len()
+            );
+        }
+        self.action_state = ActionState::Executing;
+        self.executing = Some(Executing {
+            index: pc.index,
+            addr: pc.addr,
+            name: cmd_name(pc.cmd.tag()),
+            params: params_summary(&pc.cmd),
+            effect: post_effect(&pc.cmd),
+            blended,
+        });
+    }
+
+    /// A plan was refused. The refusal belongs to the head, and the
+    /// commands queued behind it must not run from a position the failed
+    /// move never reached.
+    async fn on_plan_rejected(&mut self, index: u64, error: WireError) {
+        if self.planning != Some(index) {
+            return;
+        }
+        self.planning = None;
+        let Some(pc) = self.pending.pop_front() else {
+            return;
+        };
+        self.fail_command(pc.index, pc.addr, Vec::new(), error)
+            .await;
     }
 
     /// Whether the head of the queue is a blended move still waiting for
@@ -1440,57 +1496,55 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         Instant::now() < deadline
     }
 
-    async fn collect_outcomes(&mut self) {
-        while let Some(out) = self.runtime.planner.poll() {
-            let Some(ex) = &self.executing else {
-                continue; // outcome of a cancelled command
-            };
-            if ex.index != out.index {
-                continue; // stale outcome (superseded by cancellation)
+    async fn on_outcome(&mut self, out: CommandOutcome) {
+        let Some(ex) = &self.executing else {
+            return; // outcome of a cancelled command
+        };
+        if ex.index != out.index {
+            return; // stale outcome (superseded by cancellation)
+        }
+        let ex = self.executing.take().expect("checked above");
+        match out.error {
+            None => {
+                self.advance_completed(ex.index);
+                self.action_state = ActionState::Idle;
+                match ex.effect {
+                    PostEffect::None => {}
+                    PostEffect::Checkpoint(label) => self.last_checkpoint = label,
+                    PostEffect::SelectVariant(variant) => {
+                        // A variant carries its own TCP frame, so an
+                        // offset measured against the old one describes
+                        // nothing once it changes — a real change clears
+                        // it, a re-selection of the same variant leaves
+                        // it alone (the client API documents the reset,
+                        // and it is what the parol6 runtime does).
+                        if variant != self.tool_variant {
+                            self.tcp_offset_mm = [0.0; 3];
+                        }
+                        self.tool_variant = variant;
+                        self.sync_planner();
+                    }
+                    PostEffect::TcpOffset(mm) => {
+                        self.tcp_offset_mm = mm;
+                        self.sync_planner();
+                    }
+                }
+                self.push_complete(ex.addr, ex.index, None, out.verdict)
+                    .await;
+                // Blended-away commands finished in the same motion:
+                // each is completed in queue order, and the
+                // high-water mark ends on the last of them.
+                for (index, addr) in ex.blended {
+                    self.advance_completed(index);
+                    self.push_complete(addr, index, None, None).await;
+                }
             }
-            let ex = self.executing.take().expect("checked above");
-            match out.error {
-                None => {
-                    self.advance_completed(ex.index);
-                    self.action_state = ActionState::Idle;
-                    match ex.effect {
-                        PostEffect::None => {}
-                        PostEffect::Checkpoint(label) => self.last_checkpoint = label,
-                        PostEffect::SelectVariant(variant) => {
-                            // A variant carries its own TCP frame, so an
-                            // offset measured against the old one describes
-                            // nothing once it changes — a real change clears
-                            // it, a re-selection of the same variant leaves
-                            // it alone (the client API documents the reset,
-                            // and it is what the parol6 runtime does).
-                            if variant != self.tool_variant {
-                                self.tcp_offset_mm = [0.0; 3];
-                            }
-                            self.tool_variant = variant;
-                            self.sync_planner();
-                        }
-                        PostEffect::TcpOffset(mm) => {
-                            self.tcp_offset_mm = mm;
-                            self.sync_planner();
-                        }
-                    }
-                    self.push_complete(ex.addr, ex.index, None, out.verdict)
-                        .await;
-                    // Blended-away commands finished in the same motion:
-                    // each is completed in queue order, and the
-                    // high-water mark ends on the last of them.
-                    for (index, addr) in ex.blended {
-                        self.advance_completed(index);
-                        self.push_complete(addr, index, None, None).await;
-                    }
-                }
-                Some(e) => {
-                    // The whole blended motion failed. The error is
-                    // attributed to the command that started it; the
-                    // ones folded into it report their cancellation like
-                    // the pending queue behind them.
-                    self.fail_command(ex.index, ex.addr, ex.blended, e).await;
-                }
+            Some(e) => {
+                // The whole blended motion failed. The error is
+                // attributed to the command that started it; the
+                // ones folded into it report their cancellation like
+                // the pending queue behind them.
+                self.fail_command(ex.index, ex.addr, ex.blended, e).await;
             }
         }
     }
@@ -1521,15 +1575,35 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// Take the active command and the moves blended into its motion —
     /// the commands a cancellation of the running motion drops.
     fn drop_active(&mut self) -> Vec<(u64, SocketAddr)> {
-        match self.executing.take() {
-            Some(ex) => {
-                self.action_state = ActionState::Idle;
-                let mut dropped = vec![(ex.index, ex.addr)];
-                dropped.extend(ex.blended);
-                dropped
+        // A head whose plan is still being computed is active motion too.
+        // It is not in `executing` yet — the planner has not answered —
+        // but it was acked, the planner is working on it, and leaving it
+        // in the queue would have `pump` start it again the moment the
+        // stop finished. parol6 gets the same property by draining its
+        // planner's queues outright on cancel; the queue here is the
+        // server's, so the head comes out of it directly.
+        let mut dropped = Vec::new();
+        if let Some(index) = self.planning.take() {
+            if self.pending.front().is_some_and(|p| p.index == index) {
+                let p = self.pending.pop_front().expect("checked above");
+                dropped.push((p.index, p.addr));
             }
-            None => Vec::new(),
         }
+        if let Some(ex) = self.executing.take() {
+            self.action_state = ActionState::Idle;
+            dropped.push((ex.index, ex.addr));
+            dropped.extend(ex.blended);
+        }
+        // Take the RT's copy of the motion with it, HERE and now: the
+        // caller may be a jog that streams itself in the same handler,
+        // and a discard arriving from the planner thread afterwards
+        // would drop the loop out of the mode the jog just entered.
+        // Only when something was actually dropped — an ExecFlush with
+        // nothing in the ring costs an RT command slot for nothing.
+        if !dropped.is_empty() {
+            self.runtime.rt.discard_exec();
+        }
+        dropped
     }
 
     /// Drain the pending queue — the commands a queue-clearing scope
@@ -1563,7 +1637,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// wrappers pair the drop with its COMPLETE, and the one caller that
     /// must hand the RT a setpoint in between speaks explicitly.
     fn drop_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.runtime.planner.cancel();
+        self.runtime.planner.send(PlanRequest::Cancel);
         let mut dropped = self.drop_active();
         // The tool goes with it. `stop` means halt motion, and jaws
         // still travelling are motion — `halt()` below never reached
@@ -1586,7 +1660,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// arriving cancels planned motion, but a gripper closing under it
     /// is exactly the overlap the side channel exists to allow.
     fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
-        self.runtime.planner.cancel_tool(halt);
+        self.runtime.planner.send(PlanRequest::CancelTool { halt });
         self.tool_executing.take().map(|t| (t.index, t.addr))
     }
 
@@ -1594,7 +1668,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// dropped — the queued program must not resume from wherever a
     /// manual jog left the arm.
     fn drop_planned(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.runtime.planner.cancel();
+        self.runtime.planner.send(PlanRequest::Cancel);
         let mut dropped = self.drop_active();
         dropped.extend(self.drop_pending());
         dropped
@@ -1660,7 +1734,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if self.standing_error.take().is_some() && self.action_state == ActionState::Error {
             self.action_state = ActionState::Idle;
         }
-        self.runtime.planner.clear_collision();
+        self.runtime.planner.send(PlanRequest::ClearCollision);
         self.runtime.rt.clear_collision();
         self.collision = CollisionState::default();
     }
@@ -1708,6 +1782,10 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     // ---- state assembly ----------------------------------------------------
 
     fn refresh_snapshot(&mut self) {
+        // The planner's publication rides along: both are the plane's
+        // view of state it does not own, and every reader of one wants
+        // the other to be as fresh.
+        self.runtime.planner.refresh();
         if let Some(s) = self.runtime.snapshots.take() {
             self.snap = s;
             self.last_fresh = Some(Instant::now());
@@ -1760,32 +1838,33 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     }
 
     fn sync_planner(&mut self) {
-        let ctx = PlanContext {
-            profile: &self.profile,
-            tool: &self.tool,
-            tool_variant: self.tool_variant.as_deref(),
-            tcp_offset_mm: self.tcp_offset_mm,
-            completion_policy: self.completion_policy,
-            payload: self.payload,
-        };
-        self.runtime.planner.sync(ctx);
+        self.runtime
+            .planner
+            .send(PlanRequest::Sync(OwnedPlanContext {
+                profile: self.profile.clone(),
+                tool: self.tool.clone(),
+                tool_variant: self.tool_variant.clone(),
+                tcp_offset_mm: self.tcp_offset_mm,
+                completion_policy: self.completion_policy,
+                payload: self.payload,
+            }));
     }
 
     /// Push the configured installation keep-outs into the planner's
     /// collision world. Called once, before the server task starts.
+    /// Adopt the installation world the planner was already given and
+    /// mirror it onto the streaming gate.
+    ///
+    /// The planner's half ran before it moved to its own thread — a
+    /// layer it refuses has to fail startup, and there is nobody
+    /// listening yet to be told. What is left is the gate, which
+    /// enforces the same world, and the epoch the SHAPES query reports.
     fn install_shapes(&mut self) -> Result<(), WireError> {
+        self.scene_epoch = self.runtime.installation_epoch;
         if self.cfg.installation_shapes.is_empty() {
             return Ok(());
         }
         let shapes = self.cfg.installation_shapes.clone();
-        if let Some(epoch) = self
-            .runtime
-            .planner
-            .set_shapes(ShapeLayer::Installation, &shapes)?
-        {
-            self.scene_epoch = epoch;
-        }
-        // The streaming gate enforces the same world the planner does.
         self.runtime
             .rt
             .set_shapes(ShapeLayer::Installation, &shapes)?;
@@ -1798,25 +1877,76 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// nothing — neither the enforced world, nor the readback, nor the
     /// epoch — so a client that sees the epoch move knows the shapes it
     /// sent are the shapes being enforced.
-    fn apply_program_shapes(&mut self, shapes: Vec<par6_proto::Shape>) -> Result<(), WireError> {
-        match self
-            .runtime
-            .planner
-            .set_shapes(ShapeLayer::Program, &shapes)?
-        {
-            Some(epoch) => self.scene_epoch = epoch,
-            // No collision world to adopt an epoch from: the server's own
-            // counter still has to move, or a readback cannot be tied to
-            // the world it describes.
-            None => self.scene_epoch += 1,
-        }
-        // Mirror into the streaming gate. The planner accepted this set,
-        // and the gate converts through the identical path, so a refusal
-        // here is a wiring defect — surfaced, because a jog gated against
-        // a STALE world is worse than a loud error.
-        self.runtime.rt.set_shapes(ShapeLayer::Program, &shapes)?;
-        self.shapes = shapes;
-        Ok(())
+    fn defer_program_shapes(&mut self, req_id: u32, addr: SocketAddr, shapes: Vec<Shape>) {
+        let tag = self.runtime.planner.next_tag();
+        self.pending_shapes
+            .insert(tag, (req_id, addr, shapes.clone()));
+        self.runtime.planner.send(PlanRequest::SetShapes {
+            tag,
+            layer: ShapeLayer::Program,
+            shapes,
+        });
+    }
+
+    /// `reset_state`: everything the wire can put back, ending in a
+    /// clear of the program keep-outs — which is the planner's, so the
+    /// client is answered when that lands.
+    async fn on_reset_state(&mut self, req_id: u32, addr: SocketAddr) {
+        self.cancel_all_motion("reset").await;
+        self.standing_error = None;
+        self.action_state = ActionState::Idle;
+        self.last_checkpoint.clear();
+        self.tool.clone_from(&self.cfg.fitted_tool);
+        self.tool_variant = None;
+        self.tcp_offset_mm = [0.0; 3];
+        self.completion_policy = CompletionPolicy::Settled;
+        self.profile = self.cfg.initial_profile.clone();
+        self.runtime.rt.reset_state();
+        self.sync_planner();
+        // The program layer only: installation keep-outs are the
+        // deployment's, not the program's, and survive.
+        self.defer_program_shapes(req_id, addr, Vec::new());
+    }
+
+    /// The planner applied (or refused) a program layer.
+    ///
+    /// A refusal changes nothing — not the enforced world, not the
+    /// readback, not the epoch — so a client that sees the epoch move
+    /// knows the shapes it sent are the shapes being enforced.
+    async fn on_shapes_applied(&mut self, tag: ReplyTag, result: Result<Option<u64>, WireError>) {
+        let Some((req_id, addr, shapes)) = self.pending_shapes.remove(&tag) else {
+            return;
+        };
+        let outcome = match result {
+            Ok(epoch) => {
+                match epoch {
+                    Some(e) => self.scene_epoch = e,
+                    // No collision world to adopt an epoch from: the
+                    // server's own counter still has to move, or a
+                    // readback cannot be tied to the world it describes.
+                    None => self.scene_epoch += 1,
+                }
+                // Mirror into the streaming gate. The planner accepted
+                // this set and the gate converts through the identical
+                // path, so a refusal here is a wiring defect — surfaced,
+                // because a jog gated against a STALE world is worse
+                // than a loud error.
+                let mirrored = self.runtime.rt.set_shapes(ShapeLayer::Program, &shapes);
+                if mirrored.is_ok() {
+                    self.shapes = shapes;
+                }
+                mirrored
+            }
+            Err(e) => Err(e),
+        };
+        let reply = match outcome {
+            Ok(()) => Reply::Ok {
+                req_id,
+                index: None,
+            },
+            Err(error) => Reply::Error { req_id, error },
+        };
+        self.reply(addr, &reply).await;
     }
 
     /// Refresh the STATUS collision fields from the latched verdicts.
@@ -1828,7 +1958,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// merge simply reports whichever is active.
     fn update_collision(&mut self) {
         let stream = self.runtime.rt.collision().filter(|s| s.active);
-        if let Some(state) = self.runtime.planner.collision() {
+        if let Some(state) = self.runtime.planner.report().collision.clone() {
             self.collision = if state.active {
                 state
             } else {
@@ -1984,7 +2114,8 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// The queue ETA a client reads: what the motion in flight has left
     /// to run plus the planner's estimate of everything still queued.
     fn queued_duration(&self) -> f64 {
-        self.runtime.planner.inflight_duration(&self.snap) + self.queue_estimate
+        let r = self.runtime.planner.report();
+        r.inflight_duration + r.queued_duration
     }
 
     /// Re-estimate the pending queue when its contents changed.
@@ -2001,15 +2132,22 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         if key == self.queue_estimate_for {
             return;
         }
-        let batch: Vec<QueuedCommand<'_>> = self
+        let pending: Vec<OwnedQueued> = self
             .pending
             .iter()
-            .map(|p| QueuedCommand {
+            .map(|p| OwnedQueued {
                 index: p.index,
-                cmd: &p.cmd,
+                cmd: p.cmd.clone(),
             })
             .collect();
-        self.queue_estimate = self.runtime.planner.queued_duration(&batch);
+        // Pricing a queue is real planning, so it is asked for rather
+        // than taken: the answer lands in the next report, which makes
+        // the estimate at most one planner pass old. It is a duration
+        // estimate on a queue that has just changed — nothing reads it
+        // for a decision.
+        self.runtime
+            .planner
+            .send(PlanRequest::QueueEstimate { pending });
         self.queue_estimate_for = key;
     }
 
@@ -2026,7 +2164,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
     /// planner's probe applies — so mid-jog, the flags grey the direction
     /// the tick the RT actually stops honoring it.
     fn enablement(&self) -> Enablement {
-        let mut en = self.runtime.planner.enablement();
+        let mut en = self.runtime.planner.report().enablement;
         if !self.cfg.cartesian {
             en.cart_en_wrf = [0; EN_SLOTS];
             en.cart_en_trf = [0; EN_SLOTS];
@@ -2097,7 +2235,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             paused: self.snap.exec.paused,
             warnings: {
                 let mut w = crate::faults::rt_warnings(&self.snap);
-                w.extend(self.runtime.planner.warnings());
+                w.extend(self.runtime.planner.report().warnings.iter().cloned());
                 w
             },
             link_health: Self::wire_link_health(&self.snap.link),

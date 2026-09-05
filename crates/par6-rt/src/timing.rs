@@ -11,8 +11,11 @@
 //! cannot latch a false critical.
 //!
 //! The sustain is a floor, not a resolution: `p99` only moves every
-//! [`RECOMPUTE_EVERY`] ticks, so a sustain shorter than that interval
-//! latches on the first bad percentile.
+//! `RECOMPUTE_EVERY` ticks, so a sustain shorter than that interval
+//! latches on the first bad percentile. That interval is a wall-clock
+//! one — `RECOMPUTE_EVERY · dt`, which [`sustain_resolution_s`] reports
+//! — so the tick rate decides whether a given sustain is resolvable at
+//! all, and `par6d` refuses a config that pairs the two badly.
 //!
 //! Everything is preallocated at construction; [`LoopTiming::record`] is
 //! allocation-free.
@@ -22,11 +25,26 @@ use par6_config::TimingConfig;
 use crate::state::LoopStats;
 
 /// Rolling-window size in samples (vendor constant).
+///
+/// A COUNT, not a duration, and deliberately so: `p99` is the 495th of
+/// these 500 order statistics, and a percentile needs its samples to
+/// mean anything. Held to a wall-clock span instead, a 50 ms tick would
+/// leave 40 samples and a "p99" that is really the window maximum.
 const WINDOW: usize = 500;
 /// Percentiles are recomputed every this many ticks (vendor constant).
+///
+/// Also a count — it buys the sort back over that many ticks. What it
+/// costs is resolution: `p99` cannot move faster than this, which is
+/// what [`sustain_resolution_s`] converts into the shortest critical
+/// sustain worth configuring.
 const RECOMPUTE_EVERY: u64 = 50;
 /// Ticks before the bands are evaluated at all (vendor constant; covers
 /// filling the window plus scheduler settling at boot).
+///
+/// Coupled to [`WINDOW`]: the bands cannot be judged before the window
+/// holds samples, so this must outrun it and is a count for the same
+/// reason. Longer at a slow tick is the conservative direction — it
+/// delays judgement, it does not weaken it.
 const WARMUP_TICKS: u64 = 850;
 /// EMA smoothing factor for the published mean period.
 const EMA_ALPHA: f64 = 0.05;
@@ -41,6 +59,20 @@ pub enum LoopHealth {
     /// p99 above the critical band for the sustain time — the caller
     /// hard-latches `LOOP_CRITICAL`.
     Critical,
+}
+
+/// The shortest critical-band sustain that means anything at tick `dt`
+/// \[s\].
+///
+/// `p99` only moves once every `RECOMPUTE_EVERY` ticks, so a sustain
+/// under that reduces `LOOP_CRITICAL` — a hard latch that disables the
+/// controller — to "the first bad percentile latches". The vendor
+/// default sustain of 1 s clears this only while the tick stays under
+/// 20 ms; past that the guard becomes a hair trigger with nothing to
+/// say so. `par6d` refuses a config that pairs the two badly; the
+/// number lives here because `RECOMPUTE_EVERY` does.
+pub fn sustain_resolution_s(dt: f64) -> f64 {
+    RECOMPUTE_EVERY as f64 * dt
 }
 
 /// Loop-period tracker. One instance per RT core, fed once per tick.

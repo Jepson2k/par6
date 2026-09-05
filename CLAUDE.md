@@ -80,6 +80,10 @@ anything. The python package builds the `par6._par6` extension, so
 - `Option<T>` channel semantics on the bus are load-bearing (None = omitted on the
   wire, NOT zero — the vendor firmware distinguishes them). Don't collapse them to defaults.
 - `-D warnings` clippy and rustfmt are CI gates.
+- Which thread a piece of work runs on is decided by its timing class, never by its
+  feature — see *One plane per deadline* in `README.md`. Bounded work never shares a
+  thread with unbounded work, and a new thread needs the one-sentence deadline
+  justification that section asks for.
 
 ## Code style
 

@@ -5,7 +5,7 @@
 #   3. builds + installs toppra-cpp (pinned commit; no conda-forge package)
 #      from source into the same env prefix
 #   4. builds + installs cpp/ (the par6_shim C-ABI library) against both
-#   5. prints/persists the env vars pinokin-sys's build.rs consumes
+#   5. prints/persists the env vars par6-kin's build.rs consumes
 #
 # Everything lands under $PAR6_FFI_DIR (default: <repo>/.ffi, self-gitignored).
 # Idempotent: re-running skips completed steps; FORCE=1 rebuilds the shim.
@@ -351,7 +351,7 @@ if [[ $CROSS -eq 1 ]]; then
     "$ENV_DIR/lib/libmujoco.so"
 fi
 
-# --- 5. env vars for pinokin-sys / par6-bus ----------------------------------
+# --- 5. env vars for par6-kin / par6-bus ----------------------------------
 {
   echo "export PAR6_SHIM_LIB_DIR=\"$SHIM_PREFIX/lib\""
   echo "export PAR6_SHIM_INCLUDE_DIR=\"$SHIM_PREFIX/include\""

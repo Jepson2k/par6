@@ -151,10 +151,12 @@ Waldo Commander (NiceGUI frontend, unchanged)
   par6d (single Rust binary; `par6d --sim` runs anywhere, including CI)
    ├─ command plane (tokio): validation/gating, queue, index allocator,
    │    push completion, status broadcaster
-   ├─ planner: TOPPRA (FFI) planned moves · rsruckig streaming/blending · trapezoid,
-   │    plus the plan-time collision gate
-   └─ RT thread (SCHED_FIFO 99, alloc-free): 250 Hz tick — CAN RX → state → gravity
-        comp G(q) → mode dispatch → CAN TX → state snapshot
+   ├─ planner thread: TOPPRA (FFI) planned moves · rsruckig streaming/blending ·
+   │    trapezoid, plus the plan-time collision gate and the enablement probe
+   ├─ housekeeping thread (soft-RT): cart-jog ramps, enable retries, flashing exits
+   └─ RT thread (SCHED_FIFO 99, alloc-free): fixed-rate tick (`tick_dt_s`, shipped
+        250 Hz) — CAN RX → state → gravity comp G(q) → mode dispatch → CAN TX →
+        state snapshot
    bus backends: SocketCAN (Spectral/STEPFOC) | closed-loop dynamics sim (Pinocchio ABA)
 ```
 
@@ -184,18 +186,93 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
-### Two planes, one process
+### One plane per deadline
 
-The **command plane** is tokio on ordinary threads: it parses datagrams, validates and
-gates them, allocates queue indices, and broadcasts STATUS. The **RT thread** runs
-`SCHED_FIFO` priority 99 pinned to one core and allocates nothing after init.
+`par6d` is one process with four planes, one per distinct deadline. Work is assigned to
+a plane by its **timing class**, never by feature:
 
-They are joined by an mpsc channel of `RtCommand`s and by latest-wins snapshot slots.
-The RT loop drains **at most one command per tick**, which is why every multi-step
-effect (mode dances, the e-stop clear sequence) is an ordered queue rather than a
-synchronous call, and why streamed setpoints use a latest-wins slot instead of the
-channel — a jog stream faster than the tick rate would otherwise grow a backlog and
-keep jogging after the operator let go.
+| Class | What it means | A miss costs |
+|---|---|---|
+| hard real-time | bounded, data-independent cost; runs every tick | a `LOOP_CRITICAL` latch — the controller disables |
+| soft real-time | bounded cost, but nothing physical depends on it landing this tick | a late effect nobody can see |
+| unbounded | cost depends on the data: path length, solver iterations, a collision walk | nothing — there is no deadline |
+
+**The rule:** a piece of work belongs in the fastest class whose *worst case* can meet
+that class's deadline, and no faster. It is decided per function, from the function's
+worst case, never from how fast it usually runs.
+
+Two corollaries do most of the work:
+
+1. **Bounded work never shares a thread with unbounded work.** It would inherit the
+   unbounded worst case, and the deadline it was placed for stops holding. That is what
+   a plane *is*; a thread that mixes classes is not a plane.
+2. **There are exactly as many planes as there are distinct deadlines.** A plane costs a
+   queue and an ownership rule, so each one has to earn its place with one sentence
+   naming its deadline and what a miss costs. If the sentence cannot be written, the
+   plane is wrong.
+
+The four sentences:
+
+| Thread | Class | Deadline | A miss costs |
+|---|---|---|---|
+| `par6d-rt` | hard | every tick | `LOOP_CRITICAL`; the arm stops |
+| `par6d-housekeeping` | soft | one tick | a cart-jog ramp or an enable retry lands a tick late |
+| command plane (tokio) | soft | the status period | a datagram is acked late; a STATUS frame is skipped |
+| `par6d-planner` | none | — | a queued move starts later |
+
+(`par6d-tee` is fan-out plumbing for the snapshot slot, not a plane: it has no work of
+its own.)
+
+The RT thread runs `SCHED_FIFO` priority 99 pinned to one core and allocates nothing
+after init. The command plane parses datagrams, validates and gates them, allocates
+queue indices and broadcasts STATUS — every step bounded and data-independent, which is
+what lets it keep a deadline at all. The planner thread owns the `Planner`: IK seeding,
+TOPPRA retiming, the plan-time collision walk and the enablement probe, all
+data-dependent, none with a deadline. It takes requests on one channel and answers on
+another, publishes a latest-wins report (enablement, collision state, warnings, the
+in-flight and queued durations) that STATUS and the queries read, and runs at most one
+expensive request per iteration between ring pumps, so a long plan can never starve the
+sample ring or the exec heartbeat.
+
+Cancelling is the consumer's act, never the planner's. Every event the planner emits
+names the queue index it belongs to, so the command plane attributes a late result to the
+command that asked for it and discards one for a command it has already dropped; on a
+stop the command plane flushes the ring and returns the RT to IDLE itself, without
+waiting on the planner, and only then tells the planner to forget its in-flight state.
+This is the shape parol6 already runs, copied deliberately because it is the working
+example: its planner is a subprocess (`parol6/server/motion_planner.py`) whose worker
+loop applies `CancelAll` cheaply and plans one `PlanCommand` at a time, every segment it
+emits carries its `command_index`, and the segment player in the control loop
+(`parol6/server/segment_player.py`) plays, attributes and discards stale segments on
+cancel — the planner's own `cancel()` only clears its blend buffer. Its enablement
+probe likewise lives in a separate IK worker process (`parol6/server/ik_worker.py`).
+par6's earlier single command task that owned the planner by value was the regression,
+not the improvement.
+
+Between planes:
+
+- command plane → RT: an mpsc channel of `RtCommand`s. The RT loop drains **at most one
+  command per tick**, which is why every multi-step effect (mode dances, the e-stop
+  clear sequence) is an ordered queue rather than a synchronous call.
+- streamed setpoints: a latest-wins slot instead of the channel — a jog stream faster
+  than the tick rate would otherwise grow a backlog and keep jogging after the operator
+  let go.
+- RT → everyone: latest-wins snapshot slots, fanned out by `par6d-tee`.
+
+**Where the tick rate comes from.** The tick period is a property of the bus, not of
+the software. Every tick sends one motion frame per joint and reads a reply for each;
+classic CAN carries a fixed number of bits per frame at a fixed bitrate, so the wire
+time per tick is fixed and the tick has to be longer than it. `bus_budget` in
+`crates/par6-bus/src/budget.rs` computes that time from the joint count, the gripper,
+the poll slot and the configured bitrate; the daemon refuses to boot when the configured
+`tick_dt_s` cannot carry it and logs the result at every hardware boot, so there is
+exactly one place the number comes from. Two things follow. A faster host tick needs a
+faster bus (CAN FD, EtherCAT), not different software: nothing in the runtime knows the
+shipped rate — every duration is configured in seconds and converted with
+`round(s / dt)` at construction, and the integration suites boot the simulator at a
+second rate to keep it that way. And the drives close their own control loop at their
+own rate, so a host tick faster than the bus allows would command motion the arm cannot
+track and duplicate a loop the drive already runs.
 
 ## Control loop internals
 
@@ -338,8 +415,8 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
 `cpp/` is one C-ABI shim over the C++ dependencies the Rust crates link:
 
 - **Pinocchio** (kinematics/dynamics) — `par6_kin_*`: create/destroy, fk, jacobian,
-  gravity, aba. Consumed by `crates/pinokin-sys`, and on top of that by `par6-kin`, whose
-  analytic IK (`par6_kin::Opw`) is derived from the URDF at load: the fit is checked
+  gravity, aba. Consumed by `par6-kin`, whose analytic IK (`par6_kin::Opw`) is derived
+  from the URDF at load: the fit is checked
   against this FK at pseudo-random configurations and a model the two disagree on is
   refused. That catches an FK the OPW form cannot express, not a wrong URDF — a
   mis-measured link length fits, so the geometry is nominal data the check does not
@@ -356,7 +433,7 @@ cpp/include/par6_shim.h    the frozen C ABI (PAR6_SHIM_ABI_VERSION)
 cpp/src/par6_shim.cpp      par6_kin_* (pinocchio)
 cpp/src/par6_traj.cpp      par6_traj_* (toppra-cpp)
 cpp/src/par6_col.cpp       par6_col_* (pinocchio + coal)
-crates/pinokin-sys/        raw decls + safe Model/Trajectory/CollisionModel wrappers
+crates/par6-kin/src/ffi.rs the raw decls; Kin/Trajectory/Collision wrap them in the same crate
 scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
 ```
 
@@ -379,7 +456,7 @@ is allocation-free (one handle per thread); `par6_traj_sample` is allocation-fre
 safe from the RT tick; `par6_col_check` allocates in coal's narrow phase and is
 planner-side only. Exceptions never cross the boundary.
 
-What the shim is held to: `crates/pinokin-sys/tests/{collision,traj}.rs` cover the C
+What the shim is held to: `crates/par6-kin/tests/c_boundary_{collision,traj}.rs` cover the C
 boundary itself (NULL/out-of-range arguments, geometry-index layout across layer
 replacement, buffer truncation, the time-optimality requirement of the retimer);
 `crates/par6-kin/tests/{kinematics,collision_world}.rs` cover the contract above the
