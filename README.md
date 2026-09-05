@@ -43,11 +43,12 @@ pip install -e "python[dev]"
 ```
 
 A checkout that has run `setup.sh` needs no environment for either step: the build
-scripts find the shim in `.ffi/shim` and bake its directory into `par6d` and the Python
-extension as an rpath, so both run from any shell. `source .ffi/env.sh` is still the way
-to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`), to cross-build, and to
-run the `sim-mujoco` feature (libmujoco lives in the env prefix, which only
-`LD_LIBRARY_PATH` reaches).
+scripts find the shim in `.ffi/shim` and libmujoco in `.ffi/env`, and `par6d` and the
+Python extension carry the directories they load from as rpaths, so both run from any
+shell. `source .ffi/env.sh` is still the way to point at libraries installed elsewhere
+(`PAR6_SHIM_LIB_DIR`, `PAR6_MUJOCO_LIB_DIR`), to cross-build, and to run
+`cargo test --workspace`, whose test binaries outside par6-bus and par6d reach
+libmujoco only through its `LD_LIBRARY_PATH`.
 
 `setup.sh` picks its compile parallelism from available RAM (one shim compile job
 peaks near 4 GB; a swapless small box overcommitting that livelocks rather than
@@ -57,7 +58,8 @@ same figure as `CARGO_BUILD_JOBS`.
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
-export PAR6_SHIM_LIB_DIR=/path/to/.ffi/shim/lib   # a git install has no checkout to find the shim in
+export PAR6_SHIM_LIB_DIR=/path/to/.ffi/shim/lib     # a git install has no checkout to find these in
+export PAR6_MUJOCO_LIB_DIR=/path/to/.ffi/env/lib
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
@@ -359,13 +361,15 @@ scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
 ```
 
 `scripts/ffi/setup.sh` puts everything under `<repo>/.ffi` (self-gitignored, override
-with `PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages + the from-source
-toppra install), `shim/` (installed lib + header), `env.sh`. Re-running is idempotent;
-`FORCE=1` rebuilds the shim. Pinned: **pinocchio 4.1.0**, **toppra 142456f3**
-(`PAR6_PINOCCHIO_VERSION` / `PAR6_TOPPRA_COMMIT` override). Builds discover the shim
-under `.ffi/shim/lib` on their own and carry it as an rpath, so `source .ffi/env.sh` is
-only needed to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`,
-`PAR6_SHIM_INCLUDE_DIR`, `PAR6_SHIM_LINK=dylib|static`, `PAR6_SHIM_DEP_LIB_DIR`).
+with `PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages including
+libmujoco, plus the from-source toppra install), `shim/` (installed lib + header),
+`env.sh`. Re-running is idempotent; `FORCE=1` rebuilds the shim. Pinned: **pinocchio
+4.1.0**, **toppra 142456f3**, **libmujoco 3.10.0** (`PAR6_PINOCCHIO_VERSION` /
+`PAR6_TOPPRA_COMMIT` / `PAR6_MUJOCO_VERSION` override). Builds discover the shim under
+`.ffi/shim/lib` and libmujoco under `.ffi/env/lib` on their own and carry both as
+rpaths, so `source .ffi/env.sh` is only needed to point at libraries installed
+elsewhere (`PAR6_SHIM_LIB_DIR`, `PAR6_SHIM_INCLUDE_DIR`, `PAR6_SHIM_LINK=dylib|static`,
+`PAR6_SHIM_DEP_LIB_DIR`, `PAR6_MUJOCO_LIB_DIR`).
 
 ABI conventions, frozen in `par6_shim.h`: poses are row-major 4×4; Jacobians 6×nq,
 rows `[linear; angular]`, world axes at the frame origin; gravity is RNEA at zero
@@ -552,7 +556,7 @@ The normal path is to build **on the box** ([Installation](#installation): the s
 ```bash
 cargo build -p par6d --release --target aarch64-unknown-linux-gnu
 python3 scripts/ffi/stage_runtime_libs.py --readelf readelf --lib-dir .ffi/env/lib \
-    --dest .ffi/stage/lib .ffi/shim/lib/libpar6_shim.so      # the shim's dependency closure
+    --dest .ffi/stage/lib .ffi/shim/lib/libpar6_shim.so .ffi/env/lib/libmujoco.so
 scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
 sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
 ```
@@ -607,8 +611,8 @@ the case where the box should not carry a compiler:
   pinned commit through a generated CMake toolchain file, exactly like the
   native path.
 - `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
-  `libpar6_shim.so` and copies the whole closure — 20 libraries, ~65 MB —
-  into the shim's own `lib/` directory. That directory is the deploy unit:
+  `libpar6_shim.so` and `libmujoco.so` and copies the whole closure into the
+  shim's own `lib/` directory. That directory is the deploy unit:
   the shim is linked with `$ORIGIN`, `par6d` with an rpath of
   `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
 

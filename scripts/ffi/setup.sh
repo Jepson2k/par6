@@ -24,9 +24,10 @@
 # linux-aarch64 and the matching aarch64 cross compiler for linux-64, so
 # nothing has to run on the target to produce its shim: the target env is
 # downloaded (never executed) and the compiler comes from the host env.
-# `stage_runtime_libs.py` then copies the shim's runtime closure next to
-# it and proves the result is loadable on the target's glibc, which is the
-# only check available without target hardware.
+# `stage_runtime_libs.py` then copies the runtime closure of the shim and
+# libmujoco next to the shim and proves the result is loadable on the
+# target's glibc, which is the only check available without target
+# hardware.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
@@ -289,16 +290,14 @@ fi
 
 # --- 3b. libmujoco into the same env prefix ----------------------------------
 # Additive to the pinocchio/toppra env; delete $ENV_DIR/lib/libmujoco.so (or
-# bump the pin) to force a re-install. `sim-mujoco` is a host-side simulator
-# plant, never deployed, so a cross target skips it.
-if [[ $CROSS -eq 0 ]]; then
-  if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
-    echo ">>> installing libmujoco=${MUJOCO_VERSION}"
-    "$MAMBA" install -y -p "$ENV_DIR" -c conda-forge --override-channels \
-      "libmujoco=${MUJOCO_VERSION}"
-  else
-    echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
-  fi
+# bump the pin) to force a re-install. par6-bus links it on every target:
+# the MuJoCo plant ships in par6d, so a cross build stages it with the shim.
+if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
+  echo ">>> installing libmujoco=${MUJOCO_VERSION}"
+  "$MAMBA" install -y -p "$ENV_DIR" --platform "$TARGET_SUBDIR" \
+    -c conda-forge --override-channels "libmujoco=${MUJOCO_VERSION}"
+else
+  echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
 fi
 
 # --- 4. build + install the shim ---------------------------------------------
@@ -338,17 +337,18 @@ if [[ $CROSS -eq 1 ]]; then
 fi
 
 # --- 4c. stage the runtime closure next to the cross shim --------------------
-# The control box gets no conda env, so everything the shim dlopens has to
-# ship with it. Staging into the shim's own lib dir makes the link-time
-# layout and the on-box layout the same directory, which is what makes a
-# plain `$ORIGIN` rpath correct in both places.
+# The control box gets no conda env, so everything the shim and libmujoco
+# dlopen has to ship with them. Staging into the shim's own lib dir makes
+# the link-time layout and the on-box layout the same directory, which is
+# what makes a plain `$ORIGIN` rpath correct in both places.
 if [[ $CROSS -eq 1 ]]; then
   echo ">>> staging runtime closure"
   python3 "$ROOT/scripts/ffi/stage_runtime_libs.py" \
     --readelf "$TOOLCHAIN_DIR/bin/$CROSS_PREFIX-readelf" \
     --lib-dir "$ENV_DIR/lib" \
     --dest "$SHIM_PREFIX/lib" \
-    "$SHIM_PREFIX/lib/libpar6_shim.so"
+    "$SHIM_PREFIX/lib/libpar6_shim.so" \
+    "$ENV_DIR/lib/libmujoco.so"
 fi
 
 # --- 5. env vars for pinokin-sys / par6-bus ----------------------------------
@@ -371,9 +371,9 @@ if [ -z "${CARGO_BUILD_JOBS:-}" ] || [ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; t
   unset _par6_jobs _par6_cores
 fi
 JOBS
+  echo "# libmujoco lives in the env prefix (par6-bus links it)."
+  echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
   if [[ $CROSS -eq 0 ]]; then
-    echo "# libmujoco lives in the env prefix (par6-bus feature sim-mujoco)."
-    echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
     echo "# Runtime loading for binaries whose package did not embed an rpath"
     echo "# (link-args don't propagate across cargo packages). Covers the shim AND"
     echo "# libmujoco + its conda deps."
