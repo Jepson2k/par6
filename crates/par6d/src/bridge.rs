@@ -810,6 +810,15 @@ impl RtCommands for RtBridge {
         self.stop_stream_commands();
     }
 
+    fn discard_exec(&mut self) {
+        // Marked before it is queued, for the reason `halt` gives: the
+        // mark is pinned to what is in the ring now, so a move accepted
+        // behind this keeps its own fill.
+        self.flush.mark();
+        self.link.send(RtCommand::ExecFlush);
+        self.link.send(RtCommand::SetMode(Mode::Idle));
+    }
+
     fn halt(&mut self) {
         self.shared.lock().unwrap().stream = None;
         self.link.send(RtCommand::JogRelease);

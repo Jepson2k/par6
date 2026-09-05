@@ -2190,14 +2190,12 @@ impl Planner for Par6Planner {
     }
 
     fn cancel(&mut self) {
-        // Only an in-flight command can own samples in the ring: one
-        // that completed drained it, one already discarded flushed it.
-        // The flush is generation-bounded, so a stray one can no longer
-        // erase the next command's samples, but sending it with nothing
-        // in flight would still cost an RT command slot for nothing.
-        if self.inflight.is_some() {
-            self.discard_planned();
-        }
+        // Only this planner's own state. The RT half of a cancellation —
+        // flushing the ring, putting the loop back to IDLE — is the
+        // server's `RtCommands::discard_exec`, because it has to be
+        // ordered against the stream that may be replacing this motion,
+        // and an answer arriving from another thread cannot be.
+        self.inflight = None;
         self.near_singularity = None;
     }
 

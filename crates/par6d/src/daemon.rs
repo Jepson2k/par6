@@ -11,7 +11,10 @@
 //!    single-reader by construction).
 //! 3. **Housekeeping** — jog/servo watchdogs and enable retries
 //!    (see [`crate::bridge`]).
-//! 4. **Tokio runtime** — the `par6-server` command-plane task.
+//! 4. **Planner** — the [`Par6Planner`] behind `par6-server`'s planner
+//!    plane: planning, the ring pump and the completion reports, off
+//!    the command plane so no plan can stall a datagram or a STATUS.
+//! 5. **Tokio runtime** — the `par6-server` command-plane task.
 //!
 //! Shutdown (SIGINT/SIGTERM → [`Daemon::shutdown`]): notify the server
 //! task and give it a grace period, then flag the worker threads and
@@ -325,9 +328,12 @@ impl Daemon {
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
         let (plan_w, plan_r) = snapshot_channel::<StateSnapshot>();
         let (hk_w, hk_r) = snapshot_channel::<StateSnapshot>();
+        // The planner LOOP needs its own view: it prices the motion in
+        // flight against the RT's published state, on its own thread.
+        let (loop_w, loop_r) = snapshot_channel::<StateSnapshot>();
         // The bridge only needs its own tap with feature `ffi` (seeding
         // cartesian streams from the measured pose).
-        let mut tee_writers = vec![srv_w, plan_w, hk_w];
+        let mut tee_writers = vec![srv_w, plan_w, hk_w, loop_w];
         let bridge_snapshots = {
             let (br_w, br_r) = snapshot_channel::<StateSnapshot>();
             tee_writers.push(br_w);
@@ -379,10 +385,31 @@ impl Daemon {
             .worker_threads(2)
             .enable_all()
             .build()?;
+        let mut threads: Vec<JoinHandle<()>> = Vec::new();
+        // The installation layer is applied here, while the planner is
+        // still in hand: it is immutable from the wire, and a keep-out
+        // the runtime cannot enforce has to stop the boot rather than
+        // reach an arm that would under-enforce it.
+        let mut planner = planner;
+        let installation_epoch = install_layer(&mut planner, &cfg.installation_shapes)?;
+        // The command plane's own poll interval, not the tick: this loop
+        // is where `Planner::poll` moved to, and that is what keeps the
+        // RT's sample ring fed and the EXEC heartbeat alive. Pacing it
+        // off the tick would pump the ring an order of magnitude less
+        // often than the plane used to and starve playback.
+        let plan_period = cfg.poll_interval;
+        let (plan_handle, plan_run) =
+            par6_server::planner_plane(planner, loop_r, plan_period, shutdown.clone());
+        threads.push(
+            std::thread::Builder::new()
+                .name("par6d-planner".into())
+                .spawn(plan_run)?,
+        );
         let server = runtime.block_on(par6_server::spawn(
             cfg,
             par6_server::RuntimeHandle {
-                planner,
+                planner: plan_handle,
+                installation_epoch,
                 rt: bridge,
                 snapshots: srv_r,
             },
@@ -409,7 +436,6 @@ impl Daemon {
                 tick_profile: opts.tick_profile,
             }
         };
-        let mut threads = Vec::new();
         {
             let (rt_break, shutdown) = (rt_break.clone(), shutdown.clone());
             threads.push(
@@ -584,6 +610,31 @@ fn tee_loop(
             }
             None => std::thread::sleep(Duration::from_millis(1)),
         }
+    }
+}
+
+/// Apply the configured installation keep-outs to `planner`, returning
+/// the epoch of the world it ended up enforcing.
+///
+/// Runs before the planner moves to its own thread. The layer is
+/// immutable from the wire, so this is the only chance to refuse it, and
+/// a keep-out the runtime cannot enforce must stop the boot: coming up
+/// anyway would under-enforce a world the operator configured, with
+/// nobody connected yet to be told.
+fn install_layer(
+    planner: &mut Par6Planner,
+    shapes: &[par6_proto::Shape],
+) -> Result<u64, DaemonError> {
+    use par6_server::Planner as _;
+    if shapes.is_empty() {
+        return Ok(0);
+    }
+    match planner.set_shapes(par6_server::ShapeLayer::Installation, shapes) {
+        Ok(epoch) => Ok(epoch.unwrap_or(0)),
+        Err(e) => Err(DaemonError::Kinematics(format!(
+            "installation shapes refused: {}",
+            e.cause
+        ))),
     }
 }
 

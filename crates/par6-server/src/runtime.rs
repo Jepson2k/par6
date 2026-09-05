@@ -418,6 +418,21 @@ pub trait RtCommands: Send {
     /// Reset loop timing statistics (truly unacked fire-and-forget).
     fn reset_loop_stats(&mut self);
 
+    /// Discard whatever planned motion the RT still holds: flush the
+    /// sample ring and put the loop back to IDLE.
+    ///
+    /// The SERVER owns this, not the planner, and the ordering is why.
+    /// A jog that preempts a queued move drops the planned motion and
+    /// then streams itself, both in one datagram handler; if the RT-side
+    /// discard travelled with the planner's cancel it would arrive after
+    /// the jog had already entered JOG mode and put the loop straight
+    /// back to IDLE. parol6 splits it the same way — its main loop
+    /// cancels the segment player itself and leaves the planner
+    /// subprocess to its own buffers.
+    ///
+    /// The default is a no-op for runtimes with no ring to flush.
+    fn discard_exec(&mut self) {}
+
     /// Mirror one collision-world layer into the RT side's own gate
     /// model (wire units, the same set just applied to the planner).
     ///
@@ -445,9 +460,17 @@ pub trait RtCommands: Send {
 }
 
 /// Everything the server needs from the rest of `par6d`, bundled.
-pub struct RuntimeHandle<P: Planner, R: RtCommands> {
-    /// Queued-command execution.
-    pub planner: P,
+pub struct RuntimeHandle<R: RtCommands> {
+    /// Queued-command execution, one thread over.
+    pub planner: crate::plane::PlannerHandle,
+    /// Scene epoch of the installation world, already applied to the
+    /// planner by whoever built it.
+    ///
+    /// The installation layer is immutable from the wire and a layer the
+    /// planner refuses is a startup failure, so it is applied before the
+    /// planner leaves its owner's hands — the server inherits the epoch
+    /// rather than the decision.
+    pub installation_epoch: u64,
     /// Immediate effects.
     pub rt: R,
     /// Reader half of the RT snapshot channel; feeds queries, STATUS and

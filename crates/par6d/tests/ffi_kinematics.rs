@@ -2784,3 +2784,108 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
 
     rig.shutdown();
 }
+
+/// The command plane stays answerable while the planner is working.
+///
+/// Regression: the planner ran inside the server's one `select!` loop —
+/// the same loop that receives datagrams and emits STATUS. Two things
+/// there are expensive and neither is bounded: planning a cartesian
+/// chain (seeded IK per waypoint, a TOPPRA retiming, a collision walk),
+/// and the enablement probe the planner runs whenever the arm has moved,
+/// which its own comment prices at up to 50 ms and which repeats every
+/// 100 ms. For the whole of either, the socket went unread and no STATUS
+/// went out: a jog waited in the kernel buffer, a software STOP waited
+/// behind it, and the operator's readout froze.
+///
+/// The observable is the broadcast, because it is the one thing that
+/// must keep arriving whatever the planner is doing — a plane that
+/// cannot broadcast could not have read a datagram either. A PING in the
+/// same window says it from the receive side.
+///
+/// The path is deliberately awkward to plan, and the test asserts that
+/// it WAS: a cheap plan proves nothing about a plane that blocks on
+/// expensive ones, so the premise is checked rather than assumed.
+#[test]
+fn planning_does_not_stall_the_command_plane() {
+    let rig = boot_tagged("plane-responsive", false);
+    let mut c = Client::new(rig.addr());
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+
+    // Twenty-four reversals: every corner is an IK solve and a blend,
+    // and the retimer has to search hard across them.
+    let waypoints: Vec<[f64; 6]> = (0..24)
+        .map(|i| {
+            let leg = f64::from(i);
+            let x = start[0] + if i % 2 == 0 { 60.0 } else { 0.0 };
+            wire_pose_at(&s.pose, [x, start[1], start[2] - leg * 4.0])
+        })
+        .collect();
+
+    // From the config the rig booted, so the bound cannot drift away
+    // from the cadence it is judging.
+    let status_hz = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("shipped config")
+        .protocol
+        .status_rate_hz;
+    let nominal = Duration::from_secs_f64(1.0 / f64::from(status_hz));
+    rig.set_status_timeout(Duration::from_secs(2));
+    rig.drain_status();
+    rig.wait_status("a frame before the plan", |_| true);
+
+    let queued = Instant::now();
+    let i = c.ok_index(&Command::MoveP(MoveP {
+        key: 9100,
+        waypoints,
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+        rel: false,
+    }));
+    // The ack precedes planning by construction, so a slow one would mean
+    // the plane was already blocked when the datagram arrived.
+    let ack = queued.elapsed();
+    assert!(
+        ack < nominal * 10,
+        "the queue ack took {ack:?}, which is not the enqueue it is supposed to be"
+    );
+
+    // Watch for exactly as long as the command takes, so the window is
+    // the planning window rather than a guess about it.
+    let mut worst = Duration::ZERO;
+    let mut ping_worst = Duration::ZERO;
+    let mut last = Instant::now();
+    let deadline = Instant::now() + BUDGET;
+    while !c.peek_complete(i) {
+        assert!(Instant::now() < deadline, "the command never completed");
+        if rig.recv_status().is_some() {
+            worst = worst.max(last.elapsed());
+            last = Instant::now();
+        }
+        // Also the receive-side probe: each one reads replies, which is
+        // what stashes the COMPLETE this loop is waiting for.
+        let t = Instant::now();
+        let _ = c.query(&Command::Ping);
+        ping_worst = ping_worst.max(t.elapsed());
+    }
+    let planned_for = queued.elapsed();
+    assert!(
+        planned_for > Duration::from_millis(300),
+        "this path resolved in {planned_for:?}; it is meant to be the expensive \
+         case, and a cheap one cannot show whether the plane blocks on expensive \
+         ones — give it a harder path rather than deleting this check"
+    );
+
+    let ceiling = nominal * 4;
+    assert!(
+        worst < ceiling,
+        "STATUS stalled for {worst:?} while the planner worked (period {nominal:?}); \
+         the command plane is blocked on the planner"
+    );
+    assert!(
+        ping_worst < ceiling,
+        "a PING took {ping_worst:?} while the planner worked; the plane was not \
+         reading its socket"
+    );
+}

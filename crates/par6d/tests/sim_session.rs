@@ -1207,7 +1207,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // One move in flight: the ETA is that move's planned duration.
     let index = c.ok_index(&sweep(7411, 20.0, 0.10));
     let started = Instant::now();
-    let fast = queued_duration(&mut c);
+    let fast = priced_duration(&mut c);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move must complete, got {detail:?}");
     let wall = started.elapsed().as_secs_f64();
@@ -1235,7 +1235,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // up to twice as long, less the ramps, which the acceleration limit
     // fixes independently of the speed fraction.
     let index = c.ok_index(&sweep(7412, -20.0, 0.05));
-    let slow = queued_duration(&mut c);
+    let slow = priced_duration(&mut c);
     let ratio = slow / fast;
     assert!(
         (1.4..=2.05).contains(&ratio),
@@ -1248,7 +1248,7 @@ fn queue_eta_counts_speed_parameterised_moves() {
     // not just the motion in flight.
     let a = c.ok_index(&sweep(7413, 20.0, 0.05));
     let b = c.ok_index(&sweep(7414, -20.0, 0.05));
-    let two = queued_duration(&mut c);
+    let two = priced_duration(&mut c);
     let ratio = two / slow;
     assert!(
         (1.8..2.2).contains(&ratio),
@@ -1260,6 +1260,32 @@ fn queue_eta_counts_speed_parameterised_moves() {
 }
 
 /// The QUEUE query's `queued_duration`.
+/// The queue ETA once the planner has priced everything now queued.
+///
+/// The ack says a command was accepted; the ETA is the planner's answer
+/// about it, and that arrives in a publication a pass later — so a read
+/// straight through the ack sees the queue as it was before. Settled
+/// means non-zero and unchanged across two reads, which is what "the
+/// planner has caught up" looks like from here: the estimate is
+/// recomputed only when the queue changes, so it stops moving once the
+/// change has been priced.
+fn priced_duration(c: &mut Client) -> f64 {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut last = f64::NAN;
+    loop {
+        let eta = queued_duration(c);
+        if eta > 0.0 && (eta - last).abs() < 1e-9 {
+            return eta;
+        }
+        last = eta;
+        assert!(
+            Instant::now() < deadline,
+            "the planner never settled on a price for the queue"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
 fn queued_duration(c: &mut Client) -> f64 {
     match c.query(&Command::Queue) {
         QueryResult::Queue {

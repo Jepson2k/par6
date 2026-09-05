@@ -543,6 +543,15 @@ impl Client {
     }
 
     /// The COMPLETE push for `index`, from the stash or off the wire.
+    /// The COMPLETE for `index` if one has already been stashed by an
+    /// earlier reply read, without waiting for one.
+    ///
+    /// Lets a test watch something else (the broadcast) for exactly as
+    /// long as a command takes, rather than for a guessed window.
+    pub fn peek_complete(&self, index: u64) -> bool {
+        self.completes.iter().any(|(i, ..)| *i == index)
+    }
+
     pub fn wait_complete(&mut self, index: u64) -> (bool, Option<WireError>) {
         let (ok, detail, _) = self.wait_complete_full(index);
         (ok, detail)
