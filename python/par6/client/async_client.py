@@ -514,9 +514,9 @@ class AsyncRobotClient(_RobotClientABC):
     async def set_status_rate(self, hz: float) -> int:
         """Set the rate the runtime broadcasts STATUS at, for this session.
 
-        STATUS is emitted every Nth tick, so only divisors of the tick rate
-        can be served; anything else is refused with the achievable rates
-        named rather than rounded to a neighbour.  Raising it is how a
+        STATUS is emitted every Nth tick, so only whole-number rates that
+        divide the tick rate can be served; anything else is refused with
+        the achievable rates named rather than rounded to a neighbour.  Raising it is how a
         capture or a tuning run gets resolution the default cannot, and it
         costs bandwidth and consumer CPU for as long as it is up.
 

@@ -32,7 +32,7 @@ use std::time::Instant;
 
 use par6_bus::spectral::{torque_to_ma_factor, JointConversion};
 use par6_bus::{
-    BusError, BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, Pack,
+    BusError, BusState, DriverBus, Fault, Freshness, GripperCommand, JointCommand, NodeId, Pack,
     PollAction,
 };
 use par6_config::{ConfigBundle, ControlMode, KtSource, LimitMode, MAX_IO_LINES};
@@ -252,6 +252,24 @@ pub enum GateRefusal {
     /// The mode's output law is not implemented yet (HAND_GUIDING,
     /// IMPEDANCE) — explicit refusal, never a silent no-op mode.
     NotImplemented,
+}
+
+/// The latch key one drive fault bit is held under.
+///
+/// Exhaustive on purpose: [`par6_bus::Fault`] is the single list of bits
+/// the drives report, so a new one cannot reach a client's label without
+/// also being latched here.
+fn latch_key(fault: Fault) -> ErrorCode {
+    match fault {
+        Fault::Temperature => ErrorCode::Temperature,
+        Fault::Encoder => ErrorCode::Encoder,
+        Fault::Vbus => ErrorCode::Vbus,
+        Fault::Driver => ErrorCode::Driver,
+        Fault::Velocity => ErrorCode::Velocity,
+        Fault::Current => ErrorCode::Current,
+        Fault::EstopMotor => ErrorCode::EstopMotor,
+        Fault::Watchdog => ErrorCode::Watchdog,
+    }
 }
 
 /// Bitmask of the joints a per-joint speed array actually drives.
@@ -2006,20 +2024,8 @@ impl<B: DriverBus> RtCore<B> {
         }
         let Some(flags) = n.error_flags else { return };
         let joint = Some(err_idx);
-        let map = [
-            (flags.temperature, ErrorCode::Temperature),
-            (flags.encoder, ErrorCode::Encoder),
-            (flags.vbus, ErrorCode::Vbus),
-            (flags.driver, ErrorCode::Driver),
-            (flags.velocity, ErrorCode::Velocity),
-            (flags.current, ErrorCode::Current),
-            (flags.estop, ErrorCode::EstopMotor),
-            (flags.watchdog, ErrorCode::Watchdog),
-        ];
-        for (set, code) in map {
-            if set {
-                self.errors.latch(code, joint);
-            }
+        for fault in flags.faults() {
+            self.errors.latch(latch_key(fault), joint);
         }
     }
 

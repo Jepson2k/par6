@@ -18,19 +18,18 @@ import errno
 import fcntl
 import logging
 import os
-import tomllib
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from par6.config import DEFAULT_CAN_INTERFACE, can_interface
 
 logger = logging.getLogger(__name__)
 
 #: Somewhere every process on the control box can reach, cleared by a
 #: reboot — a stale lock outliving a crashed flasher is worse than no lock.
 LOCK_PATH = Path(os.environ.get("PAR6_FLASH_LOCK", "/dev/shm/par6-flash.lock"))
-
-DEFAULT_CHANNEL = "can0"
 
 
 class FlashBusy(RuntimeError):
@@ -72,22 +71,21 @@ def bus_interface(client: Any = None, override: str | None = None) -> str:
 
     Asking the runtime beats guessing: it is the process actually bound
     to the interface, and a control box with two of them is exactly where
-    a guess flashes the wrong arm.
+    a guess flashes the wrong arm. A caller that already holds the
+    runtime's config passes it as *override* rather than paying for the
+    bundle a second time.
     """
     if override:
         return override
     if client is not None:
         try:
             bundle = client.config_bundle()
-            toml = bundle.get("robot_toml") if isinstance(bundle, dict) else None
-            parsed = tomllib.loads(toml) if isinstance(toml, str) else {}
-        except (OSError, RuntimeError, ValueError, tomllib.TOMLDecodeError):
+        except (OSError, RuntimeError, ValueError):
             logger.debug("the runtime did not name its bus; using the default")
         else:
-            bus = parsed.get("bus")
-            if isinstance(bus, dict) and isinstance(bus.get("interface"), str):
-                return bus["interface"]
-    return DEFAULT_CHANNEL
+            if isinstance(bundle, dict):
+                return can_interface(bundle.get("robot_toml"))
+    return DEFAULT_CAN_INTERFACE
 
 
 @contextmanager
@@ -104,6 +102,12 @@ def granted_bus(
     way out the bus wakes, stored drive config is re-pushed and homing is
     invalidated if firmware actually changed — which is why exiting
     matters even when the flash failed, and why it runs in ``finally``.
+
+    That wake-up is also why a flash must not return the moment it
+    commits: a freshly committed drive boots its image only after the bus
+    falls silent, and par6d's resumed traffic restarts that timer. The
+    silence is held inside the block, by
+    :func:`par6.firmware.flasher.wait_for_application`.
     """
     import can
 

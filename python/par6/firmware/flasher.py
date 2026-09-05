@@ -22,7 +22,9 @@ from dataclasses import dataclass, field
 from typing import Any, Protocol
 
 from par6.firmware.protocol import (
+    APP_PING_CMD,
     APP_RESET_CMD,
+    BOOTLOADER_APPEAR_S,
     CMD_ID,
     CMD_TIMEOUT_S,
     DEFAULT_CHUNK_FRAMES,
@@ -39,6 +41,7 @@ from par6.firmware.protocol import (
     WPAGE_TIMEOUT_S,
     BlCmd,
     BlError,
+    ImageCheck,
     app_frame_id,
     command_frame,
     pad_to_pages,
@@ -58,13 +61,28 @@ COMMAND_GAP_S = 0.005
 PING_RETRIES_NO_RESET = 4
 #: After an application reset the board takes seconds to appear, so this
 #: is a poll count against a short timeout, not a patience setting.
-PING_RETRIES_AFTER_RESET = 250
 PING_RETRY_TIMEOUT_S = 0.1
+PING_RETRIES_AFTER_RESET = round(BOOTLOADER_APPEAR_S / PING_RETRY_TIMEOUT_S)
 APP_RESET_GAP_S = 0.25
 #: Retries for the final commit. Losing this one after every page landed
 #: leaves the board holding a complete image it will not boot.
 WCRC_RETRIES = 3
 ERASE_RETRIES = 2
+
+#: Silence the committed image needs before the board boots it. There is
+#: no "jump to application" command: the bootloader validates what it
+#: holds and reboots only once the bus has been quiet this long, and any
+#: frame restarts that timer — including par6d's own traffic to the node,
+#: which lands in the same 11-bit id space the bootloader streams pages
+#: on. Handing the bus back the instant the CRC is committed is therefore
+#: how a drive ends up sitting in its bootloader on a perfect image.
+BOOT_QUIET_S = 3.5
+#: Rounds of silence-then-probe before giving up on hearing the
+#: application. The probe itself restarts the quiet timer, so rounds are a
+#: whole window apart rather than a tight poll.
+BOOT_CONFIRM_ROUNDS = 4
+#: How long the application has to answer one ping.
+APP_PING_TIMEOUT_S = 0.3
 
 
 class CanPort(Protocol):
@@ -77,10 +95,6 @@ class CanPort(Protocol):
 
 class BootloaderError(RuntimeError):
     """The board answered with an error, or did not answer at all."""
-
-
-class FlashCancelled(RuntimeError):
-    """The caller's cancel was set between steps."""
 
 
 @dataclass
@@ -103,6 +117,10 @@ class FlashReport:
     erased: bool
     elapsed_s: float
     stats: FlashStats = field(default_factory=FlashStats)
+    #: Whether the application answered after the reboot window. ``None``
+    #: when the window was skipped, so "not waited for" never reads as
+    #: "waited for and did not come back".
+    booted: bool | None = None
 
     @property
     def clean(self) -> bool:
@@ -115,20 +133,20 @@ class FlashReport:
             else f"{self.stats.page_retries} page and "
             f"{self.stats.chunk_retries} chunk retries"
         )
+        if self.booted is None:
+            boot = ""
+        elif self.booted:
+            boot = ", running the new image"
+        else:
+            boot = ", but the application never answered — power-cycle the drive"
         return (
             f"board {self.board_id}: {self.pages} page(s), "
             f"{self.image_bytes} bytes, CRC 0x{self.app_crc:08X}, "
-            f"{self.elapsed_s:.1f} s, {margin}"
+            f"{self.elapsed_s:.1f} s, {margin}{boot}"
         )
 
 
-#: ``(stage, fraction, page, total_pages, message)``.
-ProgressFn = Callable[[str, float, int | None, int, str], None]
 LogFn = Callable[[str], None]
-
-
-class CancelToken(Protocol):
-    def is_set(self) -> bool: ...
 
 
 def _message(arbitration_id: int, data: bytes):
@@ -149,37 +167,17 @@ class BootloaderSession:
     bus the caller already owns, use it, and let the caller close it.
     """
 
-    def __init__(
-        self,
-        bus: CanPort,
-        board_id: int,
-        *,
-        chunk_frames: int = DEFAULT_CHUNK_FRAMES,
-        frame_gap_s: float = 0.0,
-        cancel: CancelToken | None = None,
-        stats: FlashStats | None = None,
-    ) -> None:
+    def __init__(self, bus: CanPort, board_id: int) -> None:
         if not 0 <= board_id <= MAX_BOARD_ID:
             raise ValueError(
                 f"board id {board_id} is out of range 0..{MAX_BOARD_ID} "
                 "(14 and 15 are the host's)"
             )
-        if not 1 <= chunk_frames <= FRAMES_PER_PAGE:
-            raise ValueError(
-                f"chunk of {chunk_frames} frames is outside 1..{FRAMES_PER_PAGE}"
-            )
         self.bus = bus
         self.board_id = board_id
-        self.chunk_frames = chunk_frames
-        self.frame_gap_s = frame_gap_s
-        self.cancel = cancel
-        self.stats = stats if stats is not None else FlashStats()
+        self.stats = FlashStats()
 
     # -- plumbing ---------------------------------------------------
-
-    def _check_cancel(self) -> None:
-        if self.cancel is not None and self.cancel.is_set():
-            raise FlashCancelled("flash cancelled")
 
     def _send(self, arbitration_id: int, data: bytes) -> None:
         self.bus.send(_message(arbitration_id, data))
@@ -232,7 +230,6 @@ class BootloaderSession:
         the same refusal.
         """
         for _ in range(retries):
-            self._check_cancel()
             time.sleep(COMMAND_GAP_S)
             self._send(CMD_ID, command_frame(self.board_id, cmd, par1, par2))
             error = self._await_reply(cmd, par1, timeout_s)
@@ -259,7 +256,6 @@ class BootloaderSession:
         self, retries: int = PING_RETRIES_NO_RESET, timeout_s: float = PING_TIMEOUT_S
     ) -> bool:
         for _ in range(retries):
-            self._check_cancel()
             if self.ping(timeout_s):
                 return True
         return False
@@ -304,8 +300,6 @@ class BootloaderSession:
                     stream_frame_id(self.board_id, seq),
                     page_bytes[offset : offset + 8],
                 )
-                if self.frame_gap_s:
-                    time.sleep(self.frame_gap_s)
             try:
                 self.command(
                     BlCmd.STREAM_STATUS,
@@ -335,7 +329,6 @@ class BootloaderSession:
         page_crc = stm32_crc32(page_bytes)
         last: BootloaderError | None = None
         for attempt in range(PAGE_RETRIES):
-            self._check_cancel()
             if attempt:
                 self.stats.page_retries += 1
             try:
@@ -346,9 +339,8 @@ class BootloaderSession:
                     timeout_s=STREAM_BEGIN_TIMEOUT_S,
                     retries=1,
                 )
-                for start in range(0, FRAMES_PER_PAGE, self.chunk_frames):
-                    self._check_cancel()
-                    end = min(start + self.chunk_frames, FRAMES_PER_PAGE) - 1
+                for start in range(0, FRAMES_PER_PAGE, DEFAULT_CHUNK_FRAMES):
+                    end = min(start + DEFAULT_CHUNK_FRAMES, FRAMES_PER_PAGE) - 1
                     self._send_chunk(page_bytes, start, end)
                 self.command(
                     BlCmd.WPAGE,
@@ -369,7 +361,8 @@ class BootloaderSession:
 
         There is no "jump to application" command: the board checks the
         CRC itself and reboots after the bus has been quiet for about
-        three seconds, so the correct final act is silence.
+        three seconds, so the correct final act is silence — which is what
+        :func:`wait_for_application` then holds the bus to.
         """
         self.command(
             BlCmd.WCRC,
@@ -379,11 +372,6 @@ class BootloaderSession:
             retries=WCRC_RETRIES,
         )
 
-    def set_board_id(self, new_id: int) -> None:
-        if not 0 <= new_id <= MAX_BOARD_ID:
-            raise ValueError(f"board id {new_id} is out of range 0..{MAX_BOARD_ID}")
-        self.command(BlCmd.SET_ID, new_id)
-
 
 def _error_name(error: int) -> str:
     try:
@@ -392,35 +380,108 @@ def _error_name(error: int) -> str:
         return f"error {error}"
 
 
+def _stay_silent(bus: CanPort, seconds: float) -> None:
+    """Transmit nothing for *seconds*, draining whatever arrives.
+
+    Receiving costs the bus nothing; it is the transmitting that would
+    restart the bootloader's reboot timer.
+    """
+    deadline = time.monotonic() + seconds
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        bus.recv(min(remaining, 0.1))
+
+
+def _application_answers(bus: CanPort, node: int, timeout_s: float) -> bool:
+    """Whether the drive's *application* answers a ping.
+
+    A bootloader ignores this id, so an answer is positive proof the
+    board left it — which is the only thing that distinguishes a rebooted
+    drive from one still holding an unbooted image.
+    """
+    import can
+
+    reply_ids = (
+        app_frame_id(node, APP_PING_CMD),
+        app_frame_id(node, APP_PING_CMD, 1),
+    )
+    bus.send(
+        can.Message(
+            arbitration_id=reply_ids[0], is_remote_frame=True, is_extended_id=False
+        )
+    )
+    deadline = time.monotonic() + timeout_s
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        msg = bus.recv(min(remaining, 0.05))
+        if msg is None or getattr(msg, "is_remote_frame", False):
+            continue
+        if getattr(msg, "is_error_frame", False):
+            continue
+        if msg.arbitration_id in reply_ids:
+            return True
+
+
+def wait_for_application(
+    bus: CanPort,
+    node: int,
+    *,
+    quiet_s: float = BOOT_QUIET_S,
+    rounds: int = BOOT_CONFIRM_ROUNDS,
+) -> bool:
+    """Hold the bus silent until the drive answers as an application.
+
+    This is the last step of the protocol, not politeness: the board boots
+    a committed image only after the bus has been quiet (see
+    :data:`BOOT_QUIET_S`), so whoever holds the bus has to keep holding it
+    through that window. Waiting for the application to answer rather than
+    for a stopwatch is what turns "probably rebooted" into a fact the
+    report can carry, and the round count is the bound on how long that
+    can take before the caller is told it did not happen.
+    """
+    for _ in range(max(1, rounds)):
+        _stay_silent(bus, quiet_s)
+        if _application_answers(bus, node, APP_PING_TIMEOUT_S):
+            return True
+    return False
+
+
 def flash_image(
     bus: CanPort,
     board_id: int,
     image: bytes,
     *,
     erase: bool = True,
-    app_reset_node: int | None = None,
     reset_stalled_app: bool = True,
-    chunk_frames: int = DEFAULT_CHUNK_FRAMES,
-    frame_gap_s: float = 0.0,
-    on_progress: ProgressFn | None = None,
+    check: ImageCheck | None = None,
+    boot_quiet_s: float = BOOT_QUIET_S,
     on_log: LogFn | None = None,
-    cancel: CancelToken | None = None,
 ) -> FlashReport:
     """Flash *image* onto the drive at *board_id* and report what it took.
 
     The image is checked before anything is erased. That ordering is the
     whole point of the check: an image linked for the wrong base flashes
     perfectly and then does not boot, and by then the working firmware is
-    already gone.
+    already gone. A caller that already ran :func:`validate_image` — every
+    :class:`~par6.firmware.releases.FirmwareImage` has — passes its
+    *check* rather than paying for a second pass over the whole image.
 
-    Raises :class:`ValueError` for an image that must not be written,
-    :class:`BootloaderError` for a board that refuses or goes quiet, and
-    :class:`FlashCancelled` when *cancel* is set.
+    The bus is held silent for *boot_quiet_s* after the commit and then
+    the application is asked to prove it booted; passing 0 hands the bus
+    straight back, which only a bus with no drive on it can afford.
+
+    Raises :class:`ValueError` for an image that must not be written and
+    :class:`BootloaderError` for a board that refuses or goes quiet.
     """
     log = on_log or (lambda line: None)
     started = time.monotonic()
 
-    check = validate_image(image)
+    if check is None or check.size != len(image):
+        check = validate_image(image)
     if not check.ok:
         raise ValueError("; ".join(check.errors))
 
@@ -428,34 +489,16 @@ def flash_image(
     total_pages = check.pages
     log(f"{check.size} bytes -> {total_pages} page(s), app CRC 0x{check.app_crc:08X}")
 
-    session = BootloaderSession(
-        bus,
-        board_id,
-        chunk_frames=chunk_frames,
-        frame_gap_s=frame_gap_s,
-        cancel=cancel,
-    )
+    session = BootloaderSession(bus, board_id)
 
-    _progress(
-        on_progress, "pinging", 0.0, None, total_pages, "Looking for the bootloader"
-    )
     if not session.wait_for_bootloader():
         if not reset_stalled_app:
             raise BootloaderError(
                 f"no bootloader at board {board_id}. Power-cycle the board and "
                 "catch its startup window with a passive scan."
             )
-        target = board_id if app_reset_node is None else app_reset_node
-        _progress(
-            on_progress,
-            "resetting",
-            0.02,
-            None,
-            total_pages,
-            f"Resetting node {target} into its bootloader",
-        )
-        log(f"No bootloader answered; resetting node {target}.")
-        session.send_app_reset(target)
+        log(f"No bootloader answered; resetting node {board_id}.")
+        session.send_app_reset(board_id)
         time.sleep(APP_RESET_GAP_S)
         if not session.wait_for_bootloader(
             PING_RETRIES_AFTER_RESET, PING_RETRY_TIMEOUT_S
@@ -467,38 +510,26 @@ def flash_image(
     log(f"Bootloader on board {board_id} is listening.")
 
     if erase:
-        _progress(
-            on_progress,
-            "erasing",
-            0.04,
-            None,
-            total_pages,
-            "Erasing the application area",
-        )
         session.erase_app()
         log("Application area erased.")
 
-    stage_start = 0.08 if erase else 0.04
-    stage_end = 0.96
     for page_num in range(total_pages):
-        _progress(
-            on_progress,
-            "writing",
-            stage_start + (page_num / total_pages) * (stage_end - stage_start),
-            page_num,
-            total_pages,
-            f"Writing page {page_num + 1} of {total_pages}",
-        )
         session.write_page(
             page_num, padded[page_num * PAGE_SIZE : (page_num + 1) * PAGE_SIZE]
         )
 
-    _progress(
-        on_progress, "committing", 0.98, None, total_pages, "Committing the image"
-    )
     session.commit(total_pages, check.app_crc)
     log("Committed. The board validates and reboots on bus silence (~3 s).")
-    _progress(on_progress, "done", 1.0, None, total_pages, "Flash complete")
+
+    booted: bool | None = None
+    if boot_quiet_s > 0.0:
+        booted = wait_for_application(bus, board_id, quiet_s=boot_quiet_s)
+        log(
+            "The application answered: the drive is running the new image."
+            if booted
+            else "The application never answered. The drive may still be in "
+            "its bootloader; power-cycle it, or flash it again."
+        )
 
     report = FlashReport(
         board_id=board_id,
@@ -508,22 +539,7 @@ def flash_image(
         erased=erase,
         elapsed_s=time.monotonic() - started,
         stats=session.stats,
+        booted=booted,
     )
     log(report.summary())
     return report
-
-
-def _progress(
-    fn: ProgressFn | None,
-    stage: str,
-    fraction: float,
-    page: int | None,
-    total_pages: int,
-    message: str,
-) -> None:
-    if fn is None:
-        return
-    try:
-        fn(stage, fraction, page, total_pages, message)
-    except Exception:
-        logger.exception("flash progress callback failed")

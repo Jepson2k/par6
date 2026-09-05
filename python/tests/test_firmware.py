@@ -20,9 +20,10 @@ from pathlib import Path
 import pytest
 
 from par6.firmware import releases
-from par6.firmware.flasher import BootloaderSession, FlashStats, flash_image
+from par6.firmware.flasher import BootloaderSession, flash_image
 from par6.firmware.protocol import (
     APP_BASE_ADDRESS,
+    APP_PING_CMD,
     CMD_ID,
     FRAMES_PER_PAGE,
     MAX_APP_PAGES,
@@ -31,6 +32,7 @@ from par6.firmware.protocol import (
     REPLY_ID_BASE,
     BlCmd,
     BlError,
+    app_frame_id,
     command_frame,
     stm32_crc32,
     stream_frame_id,
@@ -223,12 +225,24 @@ class ScriptedBootloader:
     def _run(self) -> None:
         while not self._stop.is_set():
             msg = self.bus.recv(0.02)
-            if msg is None or msg.is_remote_frame:
+            if msg is None:
                 continue
-            if msg.arbitration_id == CMD_ID:
+            if msg.is_remote_frame:
+                self._on_remote(msg.arbitration_id)
+            elif msg.arbitration_id == CMD_ID:
                 self._on_command(bytes(msg.data))
             elif (msg.arbitration_id >> 7) == self.board_id:
                 self._on_stream(msg.arbitration_id & 0x7F, bytes(msg.data))
+
+    def _on_remote(self, can_id: int) -> None:
+        """Once the image is committed the board is running it, and the
+        application answers a ping its bootloader ignores."""
+        if self.committed_crc is None:
+            return
+        if can_id == app_frame_id(self.board_id, APP_PING_CMD):
+            self.bus.send(
+                can.Message(arbitration_id=can_id, data=b"", is_extended_id=False)
+            )
 
     def _on_stream(self, seq: int, data: bytes) -> None:
         self.seq_frames_seen += 1
@@ -307,13 +321,20 @@ def _loopback(drop_seqs=None) -> _Loopback:
     return _Loopback(drop_seqs)
 
 
-def test_a_full_flash_lands_byte_for_byte_and_commits_the_image_crc():
+def test_a_full_flash_lands_byte_for_byte_and_waits_for_the_drive_to_boot():
     """The whole session, end to end, on an image that does not divide
     into whole pages — so the erased-flash padding is part of what the
-    board's own CRC check has to accept."""
+    board's own CRC check has to accept.
+
+    The commit is not the end of it: the board boots what it took only
+    after the bus falls silent, so the flash has to hold the bus through
+    that window and come back with the application answering. Returning
+    at the commit hands the bus to a runtime whose traffic keeps the
+    board in its bootloader.
+    """
     image = _image(pages=2, tail=613)
     with _loopback() as (host_bus, board):
-        report = flash_image(host_bus, BOARD_ID, image)
+        report = flash_image(host_bus, BOARD_ID, image, boot_quiet_s=0.05)
 
     assert board.erased is True
     assert report.pages == 2
@@ -322,6 +343,10 @@ def test_a_full_flash_lands_byte_for_byte_and_commits_the_image_crc():
     assert bytes(board.flash[: len(image)]) == image
     assert set(board.flash[len(image) : 2 * PAGE_SIZE]) == {PAD_BYTE}
     assert report.clean, "a clean bus should need no retries"
+    assert report.booted is True, (
+        "the flash returned without the application ever answering"
+    )
+    assert "running the new image" in report.summary()
 
 
 def test_a_lost_stream_frame_resends_the_whole_chunk_and_is_counted():
@@ -329,7 +354,7 @@ def test_a_lost_stream_frame_resends_the_whole_chunk_and_is_counted():
     chunk is verified. The recovery must be visible in the report: a run
     that scraped through is not the same as one that did not."""
     with _loopback(drop_seqs={5}) as (host_bus, board):
-        report = flash_image(host_bus, BOARD_ID, _image(pages=1))
+        report = flash_image(host_bus, BOARD_ID, _image(pages=1), boot_quiet_s=0.0)
 
     assert report.stats.chunk_retries == 1
     assert report.stats.page_retries == 0
@@ -341,12 +366,12 @@ def test_a_lost_stream_frame_resends_the_whole_chunk_and_is_counted():
 def test_a_board_that_never_answers_is_reported_not_retried_forever():
     with _loopback() as (host_bus, board):
         board.stop()
-        session = BootloaderSession(host_bus, BOARD_ID, stats=FlashStats())
+        session = BootloaderSession(host_bus, BOARD_ID)
         assert session.ping(0.05) is False
 
 
 def test_the_erase_can_be_skipped_for_a_board_already_in_its_bootloader():
     with _loopback() as (host_bus, board):
-        flash_image(host_bus, BOARD_ID, _image(pages=1), erase=False)
+        flash_image(host_bus, BOARD_ID, _image(pages=1), erase=False, boot_quiet_s=0.0)
     assert board.erased is False
     assert BlCmd.ERASE_APP not in {cmd for cmd, _, _ in board.commands}

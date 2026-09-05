@@ -290,6 +290,7 @@ def _cmd_flash(client: RobotClient, args: argparse.Namespace) -> int:
                 image.data,
                 erase=not args.no_erase,
                 reset_stalled_app=not args.no_reset,
+                check=image.check,
                 on_log=log,
             )
     except FlashBusy as err:
@@ -315,6 +316,7 @@ def _cmd_flash(client: RobotClient, args: argparse.Namespace) -> int:
             "elapsed_s": round(report.elapsed_s, 1),
             "page_retries": report.stats.page_retries,
             "chunk_retries": report.stats.chunk_retries,
+            "booted": report.booted,
         }
         if args.json
         else report.summary(),
@@ -453,9 +455,11 @@ def build_parser() -> argparse.ArgumentParser:
         "flash",
         help="update one drive's firmware over CAN",
         description=(
-            "Takes the bus from the runtime, writes the image, and gives the "
-            "bus back. The drive validates what it received and reboots on "
-            "its own once the bus falls silent."
+            "Takes the bus from the runtime, writes the image, holds the bus "
+            "silent until the drive has rebooted into it, and gives the bus "
+            "back. The drive validates what it received and reboots on its "
+            "own once the bus falls silent, which is why the last seconds of "
+            "a flash look like nothing happening."
         ),
     )
     flash.add_argument("--node", type=int, required=True, help="drive CAN id")

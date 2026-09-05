@@ -234,9 +234,10 @@ pub struct SaveConfig {
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SetStatusRate {
-    /// Requested rate [Hz]. Status is emitted every Nth tick, so this must
-    /// divide the tick rate exactly; the server refuses anything else
-    /// rather than serving a neighbouring rate nobody asked for.
+    /// Requested rate [Hz]. Status is emitted every Nth tick and the rate
+    /// is held as a whole number of Hz, so this must be one of the tick
+    /// rate's whole divisors; the server refuses anything else rather than
+    /// serving a neighbouring rate nobody asked for.
     pub hz: f64,
 }
 
