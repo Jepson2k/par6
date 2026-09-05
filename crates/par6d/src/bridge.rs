@@ -26,15 +26,16 @@ use par6_bus::sim::SimBus;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::ConfigBundle;
 use par6_proto::command::MAX_JOG_DURATION_S;
+use par6_proto::Layer;
 use par6_proto::{make_error, Command, ErrorCode, WireError, NUM_JOINTS, UNATTRIBUTED};
 use par6_rt::{
     ArmState, FlushMarker, Mode, RtCommand, RtCore, SnapshotReader, StateSnapshot, StreamInput,
     StreamSetpoint, MAX_JOINTS,
 };
+use par6_server::CollisionState;
 use par6_server::RtCommands;
-use par6_server::{CollisionState, ShapeLayer};
 
-use crate::collision_world::{is_world_name, kin_layer, ShapeNames};
+use crate::collision_world::{is_world_name, ShapeNames};
 
 /// A closure applied to the core on the RT thread, between `run()`
 /// sessions.
@@ -167,14 +168,11 @@ impl StreamGate {
         }
     }
 
-    /// Mirror one layer of the planner-accepted world. The conversion is
-    /// the identical `Shape::from_proto` path the planner ran, so on a
-    /// set the server hands over it cannot disagree.
-    fn set_layer(
-        &mut self,
-        layer: ShapeLayer,
-        shapes: &[par6_proto::Shape],
-    ) -> Result<(), WireError> {
+    /// Mirror one layer of the planner-accepted world, returning this
+    /// gate's collision epoch. The conversion is the identical
+    /// `Shape::from_proto` path the planner ran, so on a set the server
+    /// hands over it cannot disagree — and the server checks the epoch.
+    fn set_layer(&mut self, layer: Layer, shapes: &[par6_proto::Shape]) -> Result<u64, WireError> {
         let converted = shapes
             .iter()
             .map(par6_kin::Shape::from_proto)
@@ -186,17 +184,15 @@ impl StreamGate {
                     &[("detail", &e.to_string())],
                 )
             })?;
-        self.collision
-            .set_layer(kin_layer(layer), &converted)
-            .map_err(|e| {
-                make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[("detail", &format!("stream gate collision world: {e}"))],
-                )
-            })?;
+        let epoch = self.collision.set_layer(layer, &converted).map_err(|e| {
+            make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[("detail", &format!("stream gate collision world: {e}"))],
+            )
+        })?;
         self.shape_names.set_layer(layer, &converted);
-        Ok(())
+        Ok(epoch)
     }
 
     /// Colliding pairs at `q`, in reporting names.
@@ -964,10 +960,15 @@ impl RtCommands for RtBridge {
 
     fn set_shapes(
         &mut self,
-        layer: ShapeLayer,
+        layer: Layer,
         shapes: &[par6_proto::Shape],
-    ) -> Result<(), WireError> {
-        self.cart.gate.lock().unwrap().set_layer(layer, shapes)
+    ) -> Result<Option<u64>, WireError> {
+        self.cart
+            .gate
+            .lock()
+            .unwrap()
+            .set_layer(layer, shapes)
+            .map(Some)
     }
 
     fn collision(&mut self) -> Option<CollisionState> {

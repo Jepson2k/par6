@@ -106,7 +106,10 @@ mod shapes;
 pub use kin::{IkOptions, IkOutcome, Kin, KinError, Pose};
 
 #[cfg(feature = "ffi")]
-pub use collision::{Collision, CollisionReport, Layer, MAX_REPORTED_PAIRS};
+pub use collision::{Collision, CollisionReport, MAX_REPORTED_PAIRS};
+
+#[cfg(feature = "ffi")]
+pub use par6_proto::Layer;
 
 #[cfg(feature = "ffi")]
 pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

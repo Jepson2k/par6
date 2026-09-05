@@ -25,8 +25,7 @@
 //! generated from this crate (`cargo run -p par6-proto --bin gen_python`);
 //! golden vectors under `tests/golden/protocol/` are the cross-language
 //! conformance suite (`cargo run -p par6-proto --bin gen_golden`). Tests in
-//! this crate fail if either is stale. Contract changes require a
-//! `contracts`-labeled issue (see README workflow).
+//! this crate fail if either is stale.
 
 #![warn(missing_docs)]
 
@@ -48,7 +47,7 @@ pub use chunk::{
     decode_chunk, encode_chunk, split_into_chunks, Assembled, Chunk, ChunkError, Expired,
     Reassembler,
 };
-pub use command::{decode_command, encode_command, Command, Shape, ToolParam};
+pub use command::{decode_command, encode_command, Command, Layer, Physical, Shape, ToolParam};
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
     FlashingAssertion, Frame, HomingJointState, HomingPhase, LinkState, MsgType, QueryType,

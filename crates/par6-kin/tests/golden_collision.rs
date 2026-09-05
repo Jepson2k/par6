@@ -72,6 +72,7 @@ impl WireShape {
             pose: self.pose.clone(),
             collision: self.collision,
             margin: self.margin,
+            physics: None,
             name: self.name.clone(),
         })
         .unwrap_or_else(|e| panic!("fixture shape {:?}: {e}", self.name))
@@ -235,6 +236,7 @@ fn box_shape(name: &str, half: f64, at: [f64; 3], margin: Option<f64>) -> Shape 
         pose: [at[0], at[1], at[2], 0.0, 0.0, 0.0],
         collision: true,
         margin,
+        physics: None,
     }
 }
 
@@ -271,6 +273,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
         pose: [0.0; 6],
         collision: true,
         margin: None,
+        physics: None,
     };
     assert_eq!(col.set_layer(Layer::Installation, &[floor]).unwrap(), 1);
     assert_eq!(
@@ -343,6 +346,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
         pose: [0.0; 6],
         collision: true,
         margin: None,
+        physics: None,
     };
     assert!(
         col.set_layer(Layer::Program, &[bad]).is_err(),
@@ -453,6 +457,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         pose: vec![0.0; 6],
         collision: true,
         margin: None,
+        physics: None,
         name: "t".to_owned(),
     })
     .is_err());
@@ -462,6 +467,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         pose: vec![0.0; 6],
         collision: true,
         margin: None,
+        physics: None,
         name: "b".to_owned(),
     })
     .is_err());
@@ -471,6 +477,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         pose: vec![0.0; 3],
         collision: true,
         margin: None,
+        physics: None,
         name: "b".to_owned(),
     })
     .is_err());
@@ -484,6 +491,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             pose: [0.0; 6],
             collision: true,
             margin: None,
+            physics: None,
         },
         Shape {
             name: "nan_box".to_owned(),
@@ -492,6 +500,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             pose: [0.0; 6],
             collision: true,
             margin: None,
+            physics: None,
         },
         Shape {
             name: "inf_pose".to_owned(),
@@ -500,6 +509,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             pose: [f64::INFINITY, 0.0, 0.0, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
+            physics: None,
         },
         Shape {
             name: "nan_margin".to_owned(),
@@ -508,6 +518,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             pose: [0.0; 6],
             collision: true,
             margin: Some(f64::NAN),
+            physics: None,
         },
         Shape {
             name: "zero_normal".to_owned(),
@@ -516,6 +527,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             pose: [0.0; 6],
             collision: true,
             margin: None,
+            physics: None,
         },
     ] {
         let name = bad.name.clone();

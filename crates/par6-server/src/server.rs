@@ -37,6 +37,7 @@
 //!   `reset_state` resets world/tool/errors but NOT the e-stop latch and
 //!   NOT the index allocator.
 
+use par6_proto::Layer;
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -59,9 +60,10 @@ use crate::gating::{gate, is_stream};
 use crate::link::BroadcastLink;
 use crate::runtime::{
     blend_radius_mm, CollisionState, Enablement, PayloadSpec, PlanContext, Planner, QueuedCommand,
-    RtCommands, RuntimeHandle, ShapeLayer,
+    RtCommands, RuntimeHandle,
 };
 use crate::telemetry;
+use crate::world::WorldState;
 
 /// Cap on the `action_params` summary string.
 const MAX_PARAMS_LEN: usize = 100;
@@ -246,8 +248,7 @@ struct Core<P: Planner, R: RtCommands> {
     tcp_offset_mm: [f64; 3],
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
-    shapes: Vec<par6_proto::Shape>,
-    scene_epoch: u64,
+    world: WorldState,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
     recipe: Option<String>,
@@ -316,8 +317,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
             payload: PayloadSpec::default(),
-            shapes: Vec::new(),
-            scene_epoch: 0,
+            world: WorldState::default(),
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
             queue_estimate: 0.0,
@@ -620,7 +620,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.sync_planner();
                 // The program layer only: installation keep-outs are the
                 // deployment's, not the program's, and survive.
-                self.apply_program_shapes(Vec::new())
+                self.apply_shapes(Layer::Program, Vec::new())
             }
             // Same reason `simulator` cancels first: the bus under a
             // running move is about to become a different arm, and a
@@ -650,7 +650,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 self.sync_planner();
                 Ok(())
             }
-            C::SetShapes(p) => self.apply_program_shapes(p.shapes.clone()),
+            C::SetShapes(p) => self.apply_shapes(Layer::Program, p.shapes.clone()),
             // Values are codec-validated; the node id is config
             // knowledge, so it is checked here — an ack for a node this
             // arm does not have would report a tune nothing received.
@@ -1447,52 +1447,28 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
         self.runtime.planner.sync(ctx);
     }
 
-    /// Push the configured installation keep-outs into the planner's
-    /// collision world. Called once, before the server task starts.
+    /// Apply the configured installation layer. Called once, before the
+    /// server task starts; a refused set is a startup failure.
     fn install_shapes(&mut self) -> Result<(), WireError> {
-        if self.cfg.installation_shapes.is_empty() {
-            return Ok(());
-        }
-        let shapes = self.cfg.installation_shapes.clone();
-        if let Some(epoch) = self
-            .runtime
-            .planner
-            .set_shapes(ShapeLayer::Installation, &shapes)?
-        {
-            self.scene_epoch = epoch;
-        }
-        // The streaming gate enforces the same world the planner does.
-        self.runtime
-            .rt
-            .set_shapes(ShapeLayer::Installation, &shapes)?;
-        Ok(())
+        self.world.install(
+            &mut self.runtime.planner,
+            |layer, shapes| self.runtime.rt.set_shapes(layer, shapes),
+            &self.cfg,
+        )
     }
 
-    /// Replace the program layer: the planner enforces it, the server
-    /// stores the copy the SHAPES query reads back, and the epoch of the
-    /// APPLIED world becomes the reported one. A refusal changes
-    /// nothing — neither the enforced world, nor the readback, nor the
-    /// epoch — so a client that sees the epoch move knows the shapes it
-    /// sent are the shapes being enforced.
-    fn apply_program_shapes(&mut self, shapes: Vec<par6_proto::Shape>) -> Result<(), WireError> {
-        match self
-            .runtime
-            .planner
-            .set_shapes(ShapeLayer::Program, &shapes)?
-        {
-            Some(epoch) => self.scene_epoch = epoch,
-            // No collision world to adopt an epoch from: the server's own
-            // counter still has to move, or a readback cannot be tied to
-            // the world it describes.
-            None => self.scene_epoch += 1,
-        }
-        // Mirror into the streaming gate. The planner accepted this set,
-        // and the gate converts through the identical path, so a refusal
-        // here is a wiring defect — surfaced, because a jog gated against
-        // a STALE world is worse than a loud error.
-        self.runtime.rt.set_shapes(ShapeLayer::Program, &shapes)?;
-        self.shapes = shapes;
-        Ok(())
+    /// Replace one layer of the world through both enforcement instances.
+    fn apply_shapes(
+        &mut self,
+        layer: Layer,
+        shapes: Vec<par6_proto::Shape>,
+    ) -> Result<(), WireError> {
+        self.world.apply(
+            &mut self.runtime.planner,
+            |layer, shapes| self.runtime.rt.set_shapes(layer, shapes),
+            layer,
+            shapes,
+        )
     }
 
     /// Refresh the STATUS collision fields from the latched verdicts.
@@ -1747,7 +1723,7 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
             simulator_active: self.simulator,
             collision_active: self.collision.active,
             collision_pairs: self.collision.pairs.clone(),
-            scene_epoch: self.scene_epoch,
+            scene_epoch: self.world.epoch(),
             accepted_index: self.accepted_index,
             homed: self.snap.homed,
             // Filtered, not raw: this is an operator readout, and the raw
@@ -1984,9 +1960,9 @@ impl<P: Planner, R: RtCommands> Core<P, R> {
                 }
             }
             C::Shapes => QueryResult::Shapes {
-                installation: self.cfg.installation_shapes.clone(),
-                program: self.shapes.clone(),
-                epoch: self.scene_epoch,
+                installation: self.world.installation().to_vec(),
+                program: self.world.program().to_vec(),
+                epoch: self.world.epoch(),
             },
             C::ConfigBundle => {
                 let ci = &self.cfg.config_info;

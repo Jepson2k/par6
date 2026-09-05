@@ -10,13 +10,14 @@ use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
 use par6_motion::JogEngine;
+use par6_proto::Layer;
 use par6_proto::{command::JogJ, Command, CompletionPolicy, WireError, NUM_JOINTS};
 use par6_proto::{make_error, ErrorCode, UNATTRIBUTED};
 use par6_rt::{
     sample_ring, snapshot_channel, ExecHeartbeat, JogEngine as RtJogEngine, Mode, SampleConsumer,
     SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
-use par6_server::{decode_error_to_wire, gate, PlanContext, Planner, QueuedCommand, ShapeLayer};
+use par6_server::{decode_error_to_wire, gate, PlanContext, Planner, QueuedCommand};
 
 use crate::adapters::MotionJog;
 use crate::bridge::{CoreLink, CoreOp};
@@ -62,6 +63,9 @@ pub struct Preview {
     /// what `validate_supported` refuses against, so a parameter the
     /// runtime cannot honour previews as the same refusal.
     cfg: par6_server::ServerConfig,
+    /// The applied world — the config's installation layer plus the
+    /// program layer this session set — read back exactly as the runtime's.
+    world: par6_server::WorldState,
     /// The preview's runtime payload — none today; the field keeps the
     /// planner sync honest if a payload surface is added offline.
     payload: par6_server::PayloadSpec,
@@ -125,12 +129,25 @@ impl Preview {
             dt,
             motion,
             cfg,
+            world: par6_server::WorldState::default(),
             payload: par6_server::PayloadSpec::default(),
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
             _ring: ring,
         };
         preview.publish();
+        // The installation layer is config, and the runtime applies it at
+        // startup — so does the preview, or a dry run plans through a
+        // keep-out the arm will refuse.
+        preview
+            .world
+            .install(&mut preview.planner, |_, _| Ok(None), &preview.cfg)
+            .map_err(|e| {
+                DaemonError::Config(par6_config::ConfigError::Invalid {
+                    field: "installation_shapes".into(),
+                    reason: e.cause,
+                })
+            })?;
         Ok(preview)
     }
 
@@ -194,14 +211,58 @@ impl Preview {
         });
     }
 
-    /// Replace one collision-world layer (wire units), exactly as the
-    /// runtime would; a refused set leaves the enforced world unchanged.
-    pub fn set_shapes(
+    /// Replace the program layer (wire units), exactly as the runtime
+    /// would; a refused set leaves the enforced world unchanged. Returns
+    /// the epoch of the applied world. The installation layer is config,
+    /// applied when the preview boots — it cannot be set from here, exactly
+    /// as it cannot from the wire.
+    pub fn set_shapes(&mut self, shapes: &[par6_proto::Shape]) -> Result<u64, WireError> {
+        self.world.apply(
+            &mut self.planner,
+            |_, _| Ok(None),
+            Layer::Program,
+            shapes.to_vec(),
+        )?;
+        Ok(self.world.epoch())
+    }
+
+    /// The applied world: the config's installation layer, the program
+    /// layer this session set, and the epoch — the runtime's SHAPES
+    /// readback, for the same config.
+    pub fn world(&self) -> &par6_server::WorldState {
+        &self.world
+    }
+
+    /// Colliding pairs at `q`, in the runtime's reporting vocabulary.
+    pub fn colliding_pairs(
         &mut self,
-        layer: ShapeLayer,
-        shapes: &[par6_proto::Shape],
-    ) -> Result<Option<u64>, WireError> {
-        self.planner.set_shapes(layer, shapes)
+        q: &[f64; MAX_JOINTS],
+    ) -> Result<Vec<(String, String)>, WireError> {
+        self.planner.colliding_pairs(q)
+    }
+
+    /// Whether `q` collides, in any pair.
+    pub fn in_collision(&mut self, q: &[f64; MAX_JOINTS]) -> Result<bool, WireError> {
+        self.planner.in_collision(q)
+    }
+
+    /// Minimum signed distance over every pair at `q` \[m\]; negative =
+    /// penetrating.
+    pub fn min_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
+        self.planner.min_distance(q)
+    }
+
+    /// Index of the first colliding sample along `path`.
+    pub fn first_collision(
+        &mut self,
+        path: &[[f64; MAX_JOINTS]],
+    ) -> Result<Option<usize>, WireError> {
+        self.planner.first_collision(path)
+    }
+
+    /// Default standoff \[m\] applied to pairs without a shape override.
+    pub fn clearance(&self) -> f64 {
+        self.planner.clearance()
     }
 
     /// Preview one command: plan it with the runtime's planner from the

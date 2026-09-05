@@ -6,8 +6,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use par6_proto::command::{MoveJ, MoveL, Teleport};
-use par6_proto::{Command, ErrorCode, Frame, Shape, NUM_JOINTS};
-use par6_server::ShapeLayer;
+use par6_proto::{Command, ErrorCode, Frame, QueryResult, Shape, NUM_JOINTS};
 use par6d::preview::Preview;
 
 mod common;
@@ -168,11 +167,12 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
         pose: vec![center_m[0], center_m[1], center_m[2], 0.0, 0.0, 0.0],
         collision: true,
         margin: None,
+        physics: None,
         name: "keepout".into(),
     }];
 
     preview
-        .set_shapes(ShapeLayer::Program, &keepout)
+        .set_shapes(&keepout)
         .expect("preview applies the keep-out");
     let refused = preview.preview(move_j_cmd(park));
     let err = refused
@@ -201,9 +201,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     assert!(err.cause.contains("keepout"), "{err:?}");
 
     // -- clearing the world un-refuses both sides ----------------------
-    preview
-        .set_shapes(ShapeLayer::Program, &[])
-        .expect("preview clears the world");
+    preview.set_shapes(&[]).expect("preview clears the world");
     assert!(preview.preview(move_j_cmd(park)).valid());
     c.ok(&Command::SetShapes(par6_proto::command::SetShapes {
         shapes: vec![],
@@ -298,4 +296,80 @@ fn the_preview_jogs_and_refuses_what_the_wire_refuses() {
         assert_eq!(err.code, ErrorCode::CommValidationError as u16, "{err:?}");
         assert_eq!(refused.end_joints_rad, end, "a refused jog moves nothing");
     }
+}
+
+/// The installation layer is config, applied by the runtime at startup.
+/// The preview plans with the same config, so it must enforce — and read
+/// back — the same layer; otherwise a dry run draws a confident path
+/// through a keep-out the arm refuses.
+#[test]
+fn the_preview_enforces_the_configured_installation_layer() {
+    let base = test_config();
+    let park = park_deg();
+    let mut target = park;
+    target[0] += 40.0;
+    let mut mid = park;
+    mid[0] += 20.0;
+
+    // Where the TCP passes half way along the sweep, read off the
+    // preview's own FK.
+    let center_m = {
+        let mut scout = Preview::new(Some(&base), Some(&assets())).expect("preview boots");
+        scout.teleport_rad(to_rad(&mid));
+        let pose = scout.pose().expect("preview FK");
+        [pose[3], pose[7], pose[11]]
+    };
+    let config = base.with_file_name("PAR6-caged.toml");
+    let mut text = std::fs::read_to_string(&base).expect("read test config");
+    text.push_str(&format!(
+        "\n[[installation_shapes]]\nname = \"cage\"\nkind = \"box\"\n\
+         params = [0.1, 0.1, 0.1]\npose = [{}, {}, {}, 0.0, 0.0, 0.0]\n",
+        center_m[0], center_m[1], center_m[2]
+    ));
+    std::fs::write(&config, text).expect("write caged config");
+
+    let mut preview = Preview::new(Some(&config), Some(&assets())).expect("preview boots");
+    let world = preview.world();
+    assert_eq!(
+        world.installation().len(),
+        1,
+        "the config's layer is applied at boot"
+    );
+    assert_eq!(world.installation()[0].name, "cage");
+    assert!(world.program().is_empty());
+    assert_eq!(world.epoch(), 1, "one accepted apply");
+    preview.teleport_rad(to_rad(&target));
+    let refused = preview.preview(move_j_cmd(park));
+    let err = refused
+        .error
+        .as_ref()
+        .expect("the preview must refuse the move through the installation keep-out");
+    assert_eq!(err.code, ErrorCode::SysSelfCollision as u16, "{err:?}");
+    assert!(err.cause.contains("install:cage"), "{err:?}");
+
+    // The same file boots the runtime into the same world.
+    let rig = Rig::boot(config.clone());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    let QueryResult::Shapes {
+        installation,
+        program,
+        epoch,
+    } = c.query(&Command::Shapes)
+    else {
+        panic!("the SHAPES query answers with the world");
+    };
+    assert_eq!(installation, preview.world().installation());
+    assert!(program.is_empty());
+    assert_eq!(epoch, preview.world().epoch(), "one world, one epoch");
+    teleport_home(&rig, &mut c, target);
+    let index = c.ok_index(&move_j_cmd(park));
+    let (ok, detail) = c.wait_complete(index);
+    assert!(
+        !ok,
+        "the runtime must refuse exactly what the preview refused"
+    );
+    let err = detail.expect("a refused move carries its error");
+    assert!(err.cause.contains("install:cage"), "{err:?}");
+    rig.shutdown();
 }

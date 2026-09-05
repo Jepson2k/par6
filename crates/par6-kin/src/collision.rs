@@ -23,29 +23,15 @@
 
 use std::path::Path;
 
+use par6_proto::Layer;
+
 use crate::shapes::Shape;
 use crate::{GripperVariant, KinError, NQ};
 
-/// Which replaceable world layer a shape set belongs to.
-///
-/// The layers are independent: replacing one leaves the other in place.
-/// [`Layer::Installation`] is the backend's persistent keep-out set from
-/// robot config — `SET_SHAPES` cannot change it; [`Layer::Program`] is the
-/// last-applied `SET_SHAPES` set (last-write-wins, survives program end).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum Layer {
-    /// Persistent keep-outs from robot config.
-    Installation,
-    /// Program shapes, replaced wholesale by `SET_SHAPES`.
-    Program,
-}
-
-impl Layer {
-    fn as_sys(self) -> pinokin_sys::Layer {
-        match self {
-            Layer::Installation => pinokin_sys::Layer::Installation,
-            Layer::Program => pinokin_sys::Layer::Program,
-        }
+fn layer_sys(layer: Layer) -> pinokin_sys::Layer {
+    match layer {
+        Layer::Installation => pinokin_sys::Layer::Installation,
+        Layer::Program => pinokin_sys::Layer::Program,
     }
 }
 
@@ -248,7 +234,7 @@ impl Collision {
             .collect();
 
         self.model
-            .set_layer(layer.as_sys(), &descs)
+            .set_layer(layer_sys(layer), &descs)
             .map_err(|e| match e {
                 pinokin_sys::Error::Create(msg) => KinError::Load(msg),
                 other => KinError::Ffi(other),

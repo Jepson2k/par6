@@ -4,6 +4,7 @@
 //! in-crate doubles; assertions go through replies, COMPLETE pushes,
 //! queries and STATUS broadcasts wherever the protocol can express them.
 
+use par6_proto::Layer;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -24,7 +25,7 @@ use par6_rt::{
 };
 use par6_server::{
     spawn, CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
-    RtCommands, RuntimeHandle, ServerConfig, ServerHandle, ShapeLayer, StatusTransport,
+    RtCommands, RuntimeHandle, ServerConfig, ServerHandle, StatusTransport,
 };
 use tokio::net::UdpSocket;
 use tokio::time::timeout;
@@ -200,7 +201,7 @@ struct PlannerState {
     cancels: usize,
     enablement: Enablement,
     /// Every accepted layer replacement, in order.
-    layers: Vec<(ShapeLayer, Vec<Shape>)>,
+    layers: Vec<(Layer, Vec<Shape>)>,
     /// Epoch of the applied world, moved only by an accepted replacement
     /// (`par6-kin`'s `Collision::set_layer` contract).
     epoch: u64,
@@ -235,11 +236,7 @@ impl Planner for TestPlanner {
         self.0.lock().unwrap().cancels += 1;
     }
     fn sync(&mut self, _ctx: PlanContext<'_>) {}
-    fn set_shapes(
-        &mut self,
-        layer: ShapeLayer,
-        shapes: &[Shape],
-    ) -> Result<Option<u64>, WireError> {
+    fn set_shapes(&mut self, layer: Layer, shapes: &[Shape]) -> Result<Option<u64>, WireError> {
         let mut s = self.0.lock().unwrap();
         if let Some(e) = s.fail_next_shapes.take() {
             return Err(e);
@@ -1876,6 +1873,7 @@ fn wire_shape(name: &str, kind: &str) -> Shape {
         collision: true,
         margin: None,
         name: name.to_owned(),
+        physics: None,
     }
 }
 
@@ -1903,7 +1901,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     // Startup: installation only, and STATUS reports the applied epoch.
     assert_eq!(
         h.planner.lock().unwrap().layers,
-        vec![(ShapeLayer::Installation, vec![install.clone()])],
+        vec![(Layer::Installation, vec![install.clone()])],
         "installation keep-outs are pushed once, at startup"
     );
     let epoch_after_install = 1;
@@ -1920,7 +1918,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     }
     assert_eq!(
         h.planner.lock().unwrap().layers.last(),
-        Some(&(ShapeLayer::Program, program.clone())),
+        Some(&(Layer::Program, program.clone())),
         "set_shapes replaces the program layer"
     );
     match c.query(&Command::Shapes).await {
@@ -1955,7 +1953,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     let applied = h.planner.lock().unwrap().layers.clone();
     assert_eq!(
         applied.last(),
-        Some(&(ShapeLayer::Program, program.clone())),
+        Some(&(Layer::Program, program.clone())),
         "a refused set must not reach the collision world"
     );
     match c.query(&Command::Shapes).await {
@@ -1980,13 +1978,13 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
     let applied = h.planner.lock().unwrap().layers.clone();
     assert_eq!(
         applied.last(),
-        Some(&(ShapeLayer::Program, Vec::new())),
+        Some(&(Layer::Program, Vec::new())),
         "reset_state clears the program layer"
     );
     assert_eq!(
         applied
             .iter()
-            .filter(|(l, _)| *l == ShapeLayer::Installation)
+            .filter(|(l, _)| *l == Layer::Installation)
             .count(),
         1,
         "installation shapes are never re-pushed or cleared: {applied:?}"

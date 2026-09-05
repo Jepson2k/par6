@@ -40,13 +40,15 @@ pub mod link;
 pub mod runtime;
 pub mod server;
 pub mod telemetry;
+pub mod world;
 
 pub use config::{ConfigInfoData, ServerConfig, StatusTransport};
 pub use faults::{gripper_fault_code, rt_standing_error};
 pub use gating::{gate, Gate};
 pub use runtime::{
     blend_radius_mm, CollisionState, CommandOutcome, Enablement, PayloadSpec, PlanContext, Planner,
-    QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
+    QueuedCommand, RtCommands, RuntimeHandle,
 };
 pub use server::{decode_error_to_wire, spawn, validate_supported, ServerHandle};
 pub use telemetry::{TelemetryField, TelemetryRecipe};
+pub use world::WorldState;

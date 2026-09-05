@@ -198,7 +198,15 @@
             ],
             true,
             5.0,
-            "table"
+            "table",
+            [
+              null,
+              [
+                1.0,
+                0.005,
+                0.0001
+              ]
+            ]
           ],
           [
             "sphere",
@@ -215,7 +223,8 @@
             ],
             false,
             null,
-            "camera"
+            "camera",
+            null
           ]
         ]
       ]
@@ -1857,7 +1866,15 @@
               ],
               true,
               5.0,
-              "table"
+              "table",
+              [
+                null,
+                [
+                  1.0,
+                  0.005,
+                  0.0001
+                ]
+              ]
             ]
           ],
           [
@@ -1876,7 +1893,8 @@
               ],
               false,
               null,
-              "camera"
+              "camera",
+              null
             ]
           ],
           3

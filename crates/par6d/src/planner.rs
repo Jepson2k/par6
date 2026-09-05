@@ -58,18 +58,18 @@ use par6_kin::NQ;
 use par6_motion::cart::Pose;
 use par6_motion::{MotionError, MotionLimits, MoveParams, ProfileKind, ProgramBuilder};
 use par6_proto::command::ToolParam;
-use par6_proto::{make_error, Command, ErrorCode, WireError, EN_SLOTS, UNATTRIBUTED};
+use par6_proto::{make_error, Command, ErrorCode, Layer, WireError, EN_SLOTS, UNATTRIBUTED};
 use par6_rt::{
     ExecHeartbeat, Mode, RtCommand, Sample as RingSample, SampleMeta, SampleProducer,
     SnapshotReader, SpecSettle, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand, ShapeLayer,
+    CollisionState, CommandOutcome, Enablement, PlanContext, Planner, QueuedCommand,
 };
 
 use crate::bridge::ESCAPE_TOL_M;
 use crate::bridge::{gripper_move_command, CoreLink};
-use crate::collision_world::{first_duplicate, is_world_name, kin_layer, ShapeNames};
+use crate::collision_world::{first_duplicate, is_world_name, ShapeNames};
 
 /// How long a started command may wait for its RT mode to engage before
 /// the planner declares the start failed.
@@ -1633,6 +1633,52 @@ impl Par6Planner {
         );
     }
 
+    /// Colliding pairs at `q` in reporting names — the preview's
+    /// collision surface, answered by the planner's own gate.
+    pub(crate) fn colliding_pairs(
+        &mut self,
+        q: &[f64; NQ],
+    ) -> Result<Vec<(String, String)>, WireError> {
+        self.baseline_pairs(q).map_err(collision_error)
+    }
+
+    /// Whether `q` collides, in any pair.
+    pub(crate) fn in_collision(&mut self, q: &[f64; NQ]) -> Result<bool, WireError> {
+        Ok(self
+            .collision
+            .check(q, true)
+            .map_err(collision_error)?
+            .active())
+    }
+
+    /// Minimum signed distance over every pair at `q` \[m\].
+    pub(crate) fn min_distance(&mut self, q: &[f64; NQ]) -> Result<f64, WireError> {
+        self.collision.min_distance(q).map_err(collision_error)
+    }
+
+    /// Index of the first colliding sample along `path`.
+    pub(crate) fn first_collision(
+        &mut self,
+        path: &[[f64; NQ]],
+    ) -> Result<Option<usize>, WireError> {
+        for (i, q) in path.iter().enumerate() {
+            if self
+                .collision
+                .check(q, true)
+                .map_err(collision_error)?
+                .active()
+            {
+                return Ok(Some(i));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Default standoff \[m\] applied to pairs without a shape override.
+    pub(crate) fn clearance(&self) -> f64 {
+        self.collision.clearance()
+    }
+
     /// The colliding pairs the arm is ALREADY in — the ones a probed
     /// direction may keep without being blocked for them. Same escape rule
     /// as the planner's collision gate: a direction may not CREATE a
@@ -2091,7 +2137,7 @@ impl Planner for Par6Planner {
 
     fn set_shapes(
         &mut self,
-        layer: ShapeLayer,
+        layer: Layer,
         shapes: &[par6_proto::Shape],
     ) -> Result<Option<u64>, WireError> {
         let refuse = |detail: String| {
@@ -2116,7 +2162,7 @@ impl Planner for Par6Planner {
         // `set_layer` moves it only for a world it actually applied.
         let epoch = self
             .collision
-            .set_layer(kin_layer(layer), &converted)
+            .set_layer(layer, &converted)
             .map_err(collision_error)?;
         self.shape_names.set_layer(layer, &converted);
         // The measured freedom was measured against the previous world.

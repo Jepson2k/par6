@@ -1,86 +1,82 @@
-//! Workspace collision shapes — the waldoctl shape world in Rust.
+//! Workspace shapes — the waldoctl shape world in Rust.
 //!
 //! These are the same primitives waldoctl's `waldoctl.shapes` dataclasses
 //! describe and `par6-proto`'s [`par6_proto::Shape`] carries on the wire:
 //! `kind` names a coal primitive, `params` are that primitive's constructor
 //! arguments in field order, `pose` places it in the world.
 //!
-//! **Units are metres and radians**, which is what the Python client puts on
-//! the wire: `par6/client/async_client.py::set_shapes` forwards
-//! `waldoctl.shapes.Shape.to_wire()` verbatim, and `Shape.pose` is
-//! documented there as "metres + radians (RPY)" with dimensions in metres.
-//! (`par6-proto`'s field docs say mm/degrees; nothing on either side of the
-//! wire converts, so the doc comment is what is wrong, not the data.)
+//! **Units are metres and radians**: the Python client forwards
+//! `waldoctl.shapes.Shape.to_wire()` verbatim and nothing on either side of
+//! the wire converts.
 
-/// A coal collision primitive, with the params it consumes.
-///
-/// Discriminants are the shim's `par6_shape_kind` values; the `kind` strings
-/// are waldoctl's lowercased class names, which is what arrives on the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShapeKind {
+use par6_proto::Physical;
+
+/// One table, every per-kind fact — the wire name and how many `params`
+/// the kind consumes. Adding a kind is one line here.
+macro_rules! shape_kinds {
+    ($( $(#[$meta:meta])* $variant:ident = $name:literal, $n_params:literal; )+) => {
+        /// A coal collision primitive, with the params it consumes.
+        ///
+        /// Discriminants are the shim's `par6_shape_kind` values; the `kind`
+        /// strings are waldoctl's lowercased class names, which is what
+        /// arrives on the wire.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+        pub enum ShapeKind {
+            $( $(#[$meta])* $variant, )+
+        }
+
+        impl ShapeKind {
+            /// The wire/`waldoctl` name of this kind.
+            pub fn as_str(self) -> &'static str {
+                match self { $( ShapeKind::$variant => $name, )+ }
+            }
+
+            /// Parse a wire `kind` string; `None` for a kind waldoctl does
+            /// not define (which the server must refuse rather than silently
+            /// drop).
+            pub fn parse(kind: &str) -> Option<Self> {
+                Some(match kind {
+                    $( $name => ShapeKind::$variant, )+
+                    _ => return None,
+                })
+            }
+
+            /// How many `params` this kind consumes.
+            pub fn n_params(self) -> usize {
+                match self { $( ShapeKind::$variant => $n_params, )+ }
+            }
+        }
+
+        /// Widest `params` array any kind uses.
+        pub const MAX_SHAPE_PARAMS: usize = {
+            let mut widest = 0;
+            $( if $n_params > widest { widest = $n_params; } )+
+            widest
+        };
+    };
+}
+
+shape_kinds! {
     /// Full side lengths `x, y, z` \[m\].
-    Box,
+    Box = "box", 3;
     /// `radius` \[m\].
-    Sphere,
+    Sphere = "sphere", 1;
     /// `radius, length` \[m\].
-    Cylinder,
+    Cylinder = "cylinder", 2;
     /// `radius, length` \[m\]; length excludes the end caps.
-    Capsule,
+    Capsule = "capsule", 2;
     /// `radius, length` \[m\].
-    Cone,
+    Cone = "cone", 2;
     /// `radius_x, radius_y, radius_z` \[m\].
-    Ellipsoid,
+    Ellipsoid = "ellipsoid", 3;
     /// Half-space `nx, ny, nz, offset`: solid where `n·x <= offset`.
     ///
     /// A half-space is unbounded, so coal cannot prune it against a link's
     /// mesh BVH and scans every triangle: ~35 ms per check versus ~25 µs
     /// for a large box covering the same region. Prefer a box for floors
     /// and walls.
-    Plane,
+    Plane = "plane", 4;
 }
-
-impl ShapeKind {
-    /// The wire/`waldoctl` name of this kind.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            ShapeKind::Box => "box",
-            ShapeKind::Sphere => "sphere",
-            ShapeKind::Cylinder => "cylinder",
-            ShapeKind::Capsule => "capsule",
-            ShapeKind::Cone => "cone",
-            ShapeKind::Ellipsoid => "ellipsoid",
-            ShapeKind::Plane => "plane",
-        }
-    }
-
-    /// Parse a wire `kind` string; `None` for a kind waldoctl does not
-    /// define (which the server must refuse rather than silently drop).
-    pub fn parse(kind: &str) -> Option<Self> {
-        Some(match kind {
-            "box" => ShapeKind::Box,
-            "sphere" => ShapeKind::Sphere,
-            "cylinder" => ShapeKind::Cylinder,
-            "capsule" => ShapeKind::Capsule,
-            "cone" => ShapeKind::Cone,
-            "ellipsoid" => ShapeKind::Ellipsoid,
-            "plane" => ShapeKind::Plane,
-            _ => return None,
-        })
-    }
-
-    /// How many `params` this kind consumes.
-    pub fn n_params(self) -> usize {
-        match self {
-            ShapeKind::Sphere => 1,
-            ShapeKind::Cylinder | ShapeKind::Capsule | ShapeKind::Cone => 2,
-            ShapeKind::Box | ShapeKind::Ellipsoid => 3,
-            ShapeKind::Plane => 4,
-        }
-    }
-}
-
-/// Widest `params` array any kind uses (`Plane`).
-pub const MAX_SHAPE_PARAMS: usize = 4;
 
 /// One workspace shape: a named coal primitive at a world pose.
 #[derive(Debug, Clone, PartialEq)]
@@ -100,6 +96,9 @@ pub struct Shape {
     pub collision: bool,
     /// Standoff override \[m\]; `None` = the model's default clearance.
     pub margin: Option<f64>,
+    /// Contact-world opt-in, carried unchanged from the wire; `None` =
+    /// keep-out only. The collision gate ignores it — the simulator reads it.
+    pub physics: Option<Physical>,
 }
 
 /// Why a wire shape could not be turned into a [`Shape`].
@@ -173,6 +172,7 @@ impl Shape {
             pose,
             collision: s.collision,
             margin: s.margin,
+            physics: s.physics.clone(),
         })
     }
 }

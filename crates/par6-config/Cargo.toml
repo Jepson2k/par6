@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+# Installation shapes are parsed straight into the wire type, so the config
+# schema cannot drift from the protocol.
+par6-proto = { workspace = true, features = ["serde"] }
 serde = { workspace = true }
 toml = { workspace = true }
 thiserror = { workspace = true }

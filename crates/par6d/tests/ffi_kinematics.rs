@@ -844,6 +844,7 @@ fn keepout_at(name: &str, tcp_mm: [f64; 3]) -> Shape {
         ],
         collision: true,
         margin: None,
+        physics: None,
         name: name.to_owned(),
     }
 }

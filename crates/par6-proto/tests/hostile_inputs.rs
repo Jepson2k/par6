@@ -225,6 +225,7 @@ fn the_counts_a_real_program_sends_still_decode() {
                     collision: true,
                     margin: None,
                     name: format!("s{i}"),
+                    physics: None,
                 })
                 .collect(),
         })

@@ -64,23 +64,88 @@ pub const MAX_SHAPES: usize = 256;
 /// `tool_action.params` are capped at 16 by [`Command::validate`].
 const MAX_VEC_ELEMS: usize = 16;
 
-/// One workspace collision shape (mirrors waldoctl `Shape.to_wire()`).
+/// One workspace shape (mirrors waldoctl `Shape.to_wire()`).
 ///
-/// Wire form: `[kind, params, pose, collision, margin|nil, name]`.
+/// Wire form: `[kind, params, pose, collision, margin|nil, name, physics|nil]`;
+/// decoders also accept the older 6-element form without `physics`.
+///
+/// **Units are metres and radians** — waldoctl's, put on the wire unconverted.
 #[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
 pub struct Shape {
-    /// Shape kind (`"box"`, `"sphere"`, …) — interpreted by the server layer.
+    /// Shape kind (`"box"`, `"sphere"`, …); the vocabulary is enforced by
+    /// the server layer.
     pub kind: String,
-    /// Kind-specific dimensions (mm).
+    /// Kind-specific constructor params \[m\], in waldoctl field order.
     pub params: Vec<f64>,
-    /// Shape pose (mm / degrees), kind-specific length.
+    /// World pose `[x, y, z, rx, ry, rz]` \[m, rad\]; rotation is extrinsic
+    /// XYZ, `R = Rz·Ry·Rx`.
     pub pose: Vec<f64>,
-    /// Whether the shape participates in collision checking.
+    /// Whether the shape participates in collision checking; `false` is a
+    /// visual-only marker.
+    #[cfg_attr(feature = "serde", serde(default = "collision_default"))]
     pub collision: bool,
-    /// Optional safety margin (mm); `None` = server default.
+    /// Standoff override \[m\]; `None` = the server's default clearance.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
     pub margin: Option<f64>,
-    /// Display name.
+    /// Display name — what colliding-pair reports name this shape by.
     pub name: String,
+    /// Contact-world opt-in; `None` = geometry and keep-out only.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub physics: Option<Physical>,
+}
+
+#[cfg(feature = "serde")]
+fn collision_default() -> bool {
+    true
+}
+
+/// What puts a shape into the simulator's contact world.
+///
+/// `mass == None` is a static, solid fixture — welded in place, but a surface
+/// things can rest on; `mass > 0` is a free body. Wire form:
+/// `[mass|nil, [slide, spin, roll]]`.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(deny_unknown_fields))]
+pub struct Physical {
+    /// Kilograms; `None` = static.
+    #[cfg_attr(
+        feature = "serde",
+        serde(default, skip_serializing_if = "Option::is_none")
+    )]
+    pub mass: Option<f64>,
+    /// Sliding, torsional and rolling friction coefficients.
+    #[cfg_attr(feature = "serde", serde(default = "friction_default"))]
+    pub friction: [f64; 3],
+}
+
+#[cfg(feature = "serde")]
+fn friction_default() -> [f64; 3] {
+    [1.0, 0.005, 0.0001]
+}
+
+/// Which replaceable layer of the world a shape set belongs to.
+///
+/// The layers are independent: `SET_SHAPES` and `reset_state` replace the
+/// [`Layer::Program`] layer only, so the installation shapes a deployment is
+/// configured with can never be cleared from the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum Layer {
+    /// Persistent shapes from the runtime's configuration — the robot's
+    /// boot-time environment, pushed once at startup.
+    Installation,
+    /// The last applied `SET_SHAPES` set (last-write-wins, survives
+    /// program end).
+    Program,
 }
 
 /// One scalar parameter of a [`Command::ToolAction`].
@@ -711,6 +776,27 @@ impl Command {
                         finite("shape.margin", m)?;
                         check(m >= 0.0, "shape.margin", "must be >= 0")?;
                     }
+                    if let Some(ph) = &s.physics {
+                        // Refused, not filtered: every other path strips a
+                        // collision=false shape, and stripping here would
+                        // yield a massed body with no contact — falling
+                        // through the world forever.
+                        check(
+                            s.collision,
+                            "shape.physics",
+                            "a collision=false marker cannot declare physics",
+                        )?;
+                        if let Some(m) = ph.mass {
+                            finite("shape.physics.mass", m)?;
+                            check(m > 0.0, "shape.physics.mass", "must be > 0")?;
+                        }
+                        finite_all("shape.physics.friction", &ph.friction)?;
+                        check(
+                            ph.friction.iter().all(|f| *f >= 0.0),
+                            "shape.physics.friction",
+                            "must be >= 0",
+                        )?;
+                    }
                 }
                 Ok(())
             }
@@ -1049,13 +1135,21 @@ fn w_opt_f64(buf: &mut Vec<u8>, v: Option<f64>) {
 }
 
 pub(crate) fn w_shape(buf: &mut Vec<u8>, s: &Shape) {
-    w_array(buf, 6);
+    w_array(buf, 7);
     w_str(buf, &s.kind);
     w_fixed(buf, &s.params);
     w_fixed(buf, &s.pose);
     w_bool(buf, s.collision);
     w_opt_f64(buf, s.margin);
     w_str(buf, &s.name);
+    match &s.physics {
+        Some(p) => {
+            w_array(buf, 2);
+            w_opt_f64(buf, p.mass);
+            w_fixed(buf, &p.friction);
+        }
+        None => w_nil(buf),
+    }
 }
 
 /// Encode `[cmd_tag, req_id, ...params]` into `buf` (cleared first).
@@ -1368,21 +1462,48 @@ fn r_waypoints(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<[f64; 6]>, 
 
 pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     let n = r.array_len()?;
-    if n != 6 {
+    if n != 6 && n != 7 {
         return Err(DecodeError::Arity {
             what: "shape",
-            expected: 6,
+            expected: 7,
             got: n,
         });
     }
+    let kind = r.str()?.to_owned();
+    let params = r_vec_f64(r, "shape.params")?;
+    let pose = r_vec_f64(r, "shape.pose")?;
+    let collision = r.bool()?;
+    let margin = r.opt_f64()?;
+    let name = r.str()?.to_owned();
+    let physics = if n == 7 { r_physics(r)? } else { None };
     Ok(Shape {
-        kind: r.str()?.to_owned(),
-        params: r_vec_f64(r, "shape.params")?,
-        pose: r_vec_f64(r, "shape.pose")?,
-        collision: r.bool()?,
-        margin: r.opt_f64()?,
-        name: r.str()?.to_owned(),
+        kind,
+        params,
+        pose,
+        collision,
+        margin,
+        name,
+        physics,
     })
+}
+
+fn r_physics(r: &mut Reader<'_>) -> Result<Option<Physical>, DecodeError> {
+    if r.peek_nil() {
+        r.nil()?;
+        return Ok(None);
+    }
+    let n = r.array_len()?;
+    if n != 2 {
+        return Err(DecodeError::Arity {
+            what: "shape.physics",
+            expected: 2,
+            got: n,
+        });
+    }
+    Ok(Some(Physical {
+        mass: r.opt_f64()?,
+        friction: r_fixed3(r, "shape.physics.friction")?,
+    }))
 }
 
 fn r_tool_param(r: &mut Reader<'_>) -> Result<ToolParam, DecodeError> {

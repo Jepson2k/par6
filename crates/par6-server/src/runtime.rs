@@ -12,7 +12,7 @@
 //! decoded by `par6-proto`; the implementations convert to SI internally,
 //! exactly like the protocol spec prescribes for the runtime.
 
-use par6_proto::{CompletionPolicy, Shape, WireError, EN_SLOTS, NUM_JOINTS};
+use par6_proto::{CompletionPolicy, Layer, Shape, WireError, EN_SLOTS, NUM_JOINTS};
 use par6_rt::{SnapshotReader, StateSnapshot};
 
 /// Outcome of a queued command previously handed to [`Planner::start`].
@@ -105,20 +105,6 @@ pub struct PlanContext<'a> {
     pub payload: PayloadSpec,
 }
 
-/// Which replaceable layer of the collision world a shape set belongs to.
-///
-/// The layers are independent: `SET_SHAPES` and `reset_state` replace the
-/// [`ShapeLayer::Program`] layer only, so the installation keep-outs a
-/// deployment is configured with can never be cleared from the wire.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ShapeLayer {
-    /// Persistent keep-outs from the runtime's configuration, pushed once
-    /// at startup.
-    Installation,
-    /// The last applied `SET_SHAPES` set (last-write-wins).
-    Program,
-}
-
 /// The collision verdict STATUS carries: `collision_active` and, when it
 /// is, the colliding geometry pairs by name.
 ///
@@ -204,13 +190,14 @@ pub trait Planner: Send {
     /// returning the `scene_epoch` of the world now applied.
     ///
     /// `Ok(None)` = this runtime enforces no collision world (a build
-    /// without kinematics); the server keeps its own epoch counter and
-    /// STATUS keeps reporting no collision. `Err` refuses the shape set
+    /// without kinematics); the applied world's epoch is the server's to
+    /// count either way, and STATUS keeps reporting no collision. When a
+    /// world IS enforced the returned epoch must equal the server's — both
+    /// count accepted replacements from zero. `Err` refuses the shape set
     /// WHOLE: the previously applied world stays enforced and its epoch
     /// does not move, so a malformed shape can never leave a half-built
     /// keep-out world in place.
-    fn set_shapes(&mut self, layer: ShapeLayer, shapes: &[Shape])
-        -> Result<Option<u64>, WireError>;
+    fn set_shapes(&mut self, layer: Layer, shapes: &[Shape]) -> Result<Option<u64>, WireError>;
 
     /// The latched collision verdict for the STATUS broadcast: the pairs
     /// the last blocked motion would have collided in. `None` = this
@@ -381,15 +368,16 @@ pub trait RtCommands: Send {
     fn reset_loop_stats(&mut self);
 
     /// Mirror one collision-world layer into the RT side's own gate
-    /// model (wire units, the same set just applied to the planner).
+    /// model (wire units, the same set just applied to the planner),
+    /// returning that gate's `scene_epoch` after the apply.
     ///
     /// The planner's [`Planner::set_shapes`] is the authoritative apply
-    /// — it validates, owns the epoch, and refuses first — so this is
-    /// called only with a set the planner accepted, and conversion is
-    /// the same deterministic path. The default is a no-op for runtimes
-    /// whose streaming gate has no collision world.
-    fn set_shapes(&mut self, _layer: ShapeLayer, _shapes: &[Shape]) -> Result<(), WireError> {
-        Ok(())
+    /// — it validates and refuses first — so this is called only with a
+    /// set the planner accepted, and conversion is the same deterministic
+    /// path. `Ok(None)` = this runtime's streaming gate has no collision
+    /// world, which is the default.
+    fn set_shapes(&mut self, _layer: Layer, _shapes: &[Shape]) -> Result<Option<u64>, WireError> {
+        Ok(None)
     }
 
     /// The streaming gate's latched collision verdict — the pairs a

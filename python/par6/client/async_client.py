@@ -1335,7 +1335,7 @@ class AsyncRobotClient(_RobotClientABC):
         """
         wire_shapes = []
         for shape in shapes:
-            kind, params, pose, collision, margin, name = shape.to_wire()
+            kind, params, pose, collision, margin, name, physics = shape.to_wire()
             wire_shapes.append(
                 {
                     "kind": kind,
@@ -1344,6 +1344,7 @@ class AsyncRobotClient(_RobotClientABC):
                     "collision": bool(collision),
                     "margin": float(margin) if margin is not None else None,
                     "name": name,
+                    "physics": physics,
                 }
             )
         core = await self._ensure_core()
@@ -1762,14 +1763,7 @@ class AsyncRobotClient(_RobotClientABC):
             return None
 
         def _shape(w: dict) -> Shape:
-            return shape_from_wire(
-                w["kind"],
-                w["params"],
-                w["pose"],
-                w["collision"],
-                w["margin"],
-                w["name"],
-            )
+            return shape_from_wire(**w)
 
         return ShapeWorld(
             installation=tuple(_shape(w) for w in result["installation"]),

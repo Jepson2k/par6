@@ -578,6 +578,7 @@ name = "par6-config"
 version = "0.1.0"
 dependencies = [
  "log",
+ "par6-proto",
  "serde",
  "thiserror",
  "toml",
@@ -608,6 +609,7 @@ dependencies = [
 name = "par6-proto"
 version = "0.1.0"
 dependencies = [
+ "serde",
  "serde_json",
  "thiserror",
 ]

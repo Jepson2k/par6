@@ -219,6 +219,7 @@ fn a_full_session_over_the_rust_client() {
                 collision: true,
                 margin: None,
                 name: format!("far-box-{i}"),
+                physics: None,
             })
             .collect();
         assert_eq!(

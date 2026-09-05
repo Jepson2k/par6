@@ -38,7 +38,7 @@ from numpy.typing import NDArray
 from pinokin import so3_rpy
 from waldoctl import ToolState, ToolStatus
 from waldoctl.results import DryRunResultData
-from waldoctl.shapes import Shape, ShapeWorld
+from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, make_wire_error
@@ -241,7 +241,6 @@ class DryRunRobotClient:
         self._tool_key = _cfg.fitted_tool_key()
         self._variant_key = ""
         self._tcp_offset_mm = (0.0, 0.0, 0.0)
-        self._shapes: tuple[Shape, ...] = ()
         self._tool = _DryRunTool(self)
         self._held: list[dict] = []
         self._io_inputs, self._io_outputs = _cfg.io_line_names()
@@ -277,8 +276,14 @@ class DryRunRobotClient:
         return list(self._tcp_offset_mm)
 
     def shapes(self) -> ShapeWorld:
-        """The preview's collision world (what this run has submitted)."""
-        return ShapeWorld(installation=(), program=self._shapes)
+        """The preview's applied world: the installation layer of the config
+        it booted with — the runtime's own, when both read the same file —
+        plus what this run has submitted."""
+        world = self._call(self._preview.shapes)
+        return ShapeWorld(
+            installation=tuple(shape_from_wire(**w) for w in world["installation"]),
+            program=tuple(shape_from_wire(**w) for w in world["program"]),
+        )
 
     def profile(self) -> str:
         return self._profile
@@ -926,7 +931,7 @@ class DryRunRobotClient:
         runtime enforces the set the live client sends."""
         wire = []
         for shape in shapes:
-            kind, params, pose, collision, margin, name = shape.to_wire()
+            kind, params, pose, collision, margin, name, physics = shape.to_wire()
             wire.append(
                 {
                     "kind": kind,
@@ -935,10 +940,10 @@ class DryRunRobotClient:
                     "collision": bool(collision),
                     "margin": float(margin) if margin is not None else None,
                     "name": name,
+                    "physics": physics,
                 }
             )
-        self._call(self._preview.set_shapes, "program", wire)
-        self._shapes = tuple(shapes)
+        self._call(self._preview.set_shapes, wire)
         return 1
 
     def _sync_context(self) -> None:

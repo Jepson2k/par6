@@ -136,7 +136,8 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     Ok(d.into_any().unbind())
 }
 
-fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
+/// Wire shape → Python shape dict (the `Shape.to_wire()` fields by name).
+pub fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
     let d = PyDict::new(py);
     d.set_item("kind", &s.kind)?;
     d.set_item("params", s.params.clone())?;
@@ -144,6 +145,10 @@ fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
     d.set_item("collision", s.collision)?;
     d.set_item("margin", s.margin)?;
     d.set_item("name", &s.name)?;
+    match &s.physics {
+        Some(p) => d.set_item("physics", (p.mass, p.friction))?,
+        None => d.set_item("physics", py.None())?,
+    }
     Ok(d.into_any().unbind())
 }
 
@@ -338,6 +343,21 @@ pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
             None => None,
         },
         name: get("name")?.extract()?,
+        physics: match d.get_item("physics")? {
+            Some(v) if !v.is_none() => {
+                let parts: Vec<Bound<'_, PyAny>> = v.extract()?;
+                let [mass, friction] = parts.as_slice() else {
+                    return Err(PyRuntimeError::new_err(
+                        "shape 'physics' must be [mass|None, [slide, spin, roll]]",
+                    ));
+                };
+                Some(par6_proto::Physical {
+                    mass: mass.extract()?,
+                    friction: friction.extract()?,
+                })
+            }
+            _ => None,
+        },
     })
 }
 

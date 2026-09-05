@@ -47,6 +47,7 @@ fn sphere(name: &str, radius: f64, at: [f64; 3]) -> Shape {
         pose: [at[0], at[1], at[2], 0.0, 0.0, 0.0],
         collision: true,
         margin: None,
+        physics: None,
     }
 }
 
@@ -58,6 +59,7 @@ fn boxed(name: &str, sides: [f64; 3], pose: [f64; 6]) -> Shape {
         pose,
         collision: true,
         margin: None,
+        physics: None,
     }
 }
 

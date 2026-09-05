@@ -676,23 +676,12 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     }
     cfg.profiles = crate::planner::profile_names();
     cfg.initial_profile = crate::planner::DEFAULT_PROFILE.to_owned();
-    // The configured installation keep-outs, as wire shapes. The server
+    // The configured installation shapes, already in wire form. The server
     // pushes them through the planner's `Shape::from_proto` path at
     // spawn, so a malformed entry (unknown kind, wrong arity, negative
     // dimension, duplicate name) is a startup failure that names the
     // shape — never a keep-out that silently isn't there.
-    cfg.installation_shapes = bundle
-        .installation_shapes
-        .iter()
-        .map(|s| par6_proto::Shape {
-            kind: s.kind.clone(),
-            params: s.params.clone(),
-            pose: s.pose.to_vec(),
-            collision: s.collision,
-            margin: s.margin,
-            name: s.name.clone(),
-        })
-        .collect();
+    cfg.installation_shapes = bundle.installation_shapes.clone();
     if let Some(ip) = opts.bind {
         cfg.bind.set_ip(ip);
     }

@@ -1044,6 +1044,68 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
 
 
 @pytest.mark.timeout(180)
+async def test_the_installation_layer_is_one_world_for_runtime_and_preview(tmp_path):
+    """A config's ``[[installation_shapes]]`` is the robot's boot-time
+    environment: the runtime applies it at startup and the wire cannot
+    clear it. The preview boots from the same file, so it must enforce the
+    same layer and read it back identically — the gap this closes is a dry
+    run that planned through a cage the arm then refused.
+    """
+    mid = list(SWEEP_START_DEG)
+    mid[0] += 40.0
+    pose = DryRunRobotClient(initial_joints_deg=mid).pose()
+    cage = Box(
+        name="cage",
+        x=0.1,
+        y=0.1,
+        z=0.1,
+        pose=(pose[0] / 1000.0, pose[1] / 1000.0, pose[2] / 1000.0, 0.0, 0.0, 0.0),
+    )
+    installation_toml = (
+        "[[installation_shapes]]\n"
+        'name = "cage"\nkind = "box"\nparams = [0.1, 0.1, 0.1]\n'
+        f"pose = [{cage.pose[0]}, {cage.pose[1]}, {cage.pose[2]}, 0.0, 0.0, 0.0]"
+    )
+    live = LiveDaemon.start(tmp_path, installation_toml=installation_toml)
+    try:
+        async with live.client() as client:
+            assert await client.wait_status(
+                lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S
+            )
+            preview = DryRunRobotClient(
+                initial_joints_deg=SWEEP_START_DEG, config_path=str(live.config)
+            )
+
+            runtime_world = await client.shapes()
+            assert runtime_world is not None
+            assert runtime_world.installation == (cage,)
+            assert preview.shapes().installation == runtime_world.installation
+            assert preview.shapes().program == runtime_world.program == ()
+
+            target = list(SWEEP_START_DEG)
+            target[0] += 80.0
+            await settle_at(client, SWEEP_START_DEG)
+            with pytest.raises(RobotError) as preview_refusal:
+                preview.move_j(angles=target)
+            with pytest.raises(RobotError) as live_refusal:
+                await client.move_j(target, wait=True, timeout=STEP_BUDGET_S)
+            for refusal in (preview_refusal.value, live_refusal.value):
+                assert refusal.code == ErrorCode.SYS_SELF_COLLISION
+                assert "install:cage" in refusal.cause, refusal.cause
+
+            # Replacing the program layer leaves the installation standing,
+            # on both sides.
+            assert await client.set_shapes([])
+            assert preview.set_shapes([])
+            runtime_world = await client.shapes()
+            assert runtime_world is not None
+            assert runtime_world.installation == (cage,)
+            assert preview.shapes().installation == (cage,)
+    finally:
+        live.stop()
+
+
+@pytest.mark.timeout(180)
 async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
     daemon: LiveDaemon,
 ):

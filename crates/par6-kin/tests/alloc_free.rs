@@ -97,6 +97,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
             pose: [0.0, 0.0, -0.06, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
+            physics: None,
         }],
     )
     .unwrap();
@@ -109,6 +110,7 @@ fn collision_checks_are_allocation_free_after_the_world_is_applied() {
             pose: [0.25, 0.0, 0.35, 0.0, 0.0, 0.0],
             collision: true,
             margin: None,
+            physics: None,
         }],
     )
     .unwrap();

@@ -326,6 +326,11 @@ fn shape_box() -> Shape {
         collision: true,
         margin: Some(5.0),
         name: "table".into(),
+        // A static fixture: solid in the contact world, not a free body.
+        physics: Some(crate::command::Physical {
+            mass: None,
+            friction: [1.0, 0.005, 0.0001],
+        }),
     }
 }
 
@@ -337,6 +342,7 @@ fn shape_sphere() -> Shape {
         collision: false,
         margin: None,
         name: "camera".into(),
+        physics: None,
     }
 }
 

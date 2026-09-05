@@ -7,20 +7,12 @@
 //! for a program keep-out, `install:<name>` for an installation one. A
 //! frontend tints by that prefix, so a bare name reads as a link.
 
-use par6_server::ShapeLayer;
+use par6_proto::Layer;
 
 /// waldoctl's reporting prefix for an installation-layer keep-out.
 const INSTALL_PREFIX: &str = "install:";
 /// waldoctl's reporting prefix for a program-layer keep-out.
 const SHAPE_PREFIX: &str = "shape:";
-
-/// The kinematics layer a wire layer applies to.
-pub(crate) fn kin_layer(layer: ShapeLayer) -> par6_kin::Layer {
-    match layer {
-        ShapeLayer::Installation => par6_kin::Layer::Installation,
-        ShapeLayer::Program => par6_kin::Layer::Program,
-    }
-}
 
 /// Whether a *reporting* name denotes a keep-out shape rather than robot
 /// geometry — the prefix is what the vocabulary exists to carry.
@@ -59,10 +51,10 @@ impl ShapeNames {
     /// Record the names of one applied layer, replacing what it held.
     /// Non-colliding shapes are visualization-only and never appear in a
     /// pair, so they are not recorded.
-    pub(crate) fn set_layer(&mut self, layer: ShapeLayer, shapes: &[par6_kin::Shape]) {
+    pub(crate) fn set_layer(&mut self, layer: Layer, shapes: &[par6_kin::Shape]) {
         let (slot, prefix) = match layer {
-            ShapeLayer::Installation => (0, INSTALL_PREFIX),
-            ShapeLayer::Program => (1, SHAPE_PREFIX),
+            Layer::Installation => (0, INSTALL_PREFIX),
+            Layer::Program => (1, SHAPE_PREFIX),
         };
         self.layers[slot] = shapes
             .iter()
@@ -118,17 +110,15 @@ mod tests {
             pose: [0.0; 6],
             collision,
             margin: None,
+            physics: None,
         }
     }
 
     #[test]
     fn reporting_names_carry_the_layer_and_strip_link_indices() {
         let mut names = ShapeNames::default();
-        names.set_layer(ShapeLayer::Installation, &[shape("fence", true)]);
-        names.set_layer(
-            ShapeLayer::Program,
-            &[shape("bin", true), shape("ghost", false)],
-        );
+        names.set_layer(Layer::Installation, &[shape("fence", true)]);
+        names.set_layer(Layer::Program, &[shape("bin", true), shape("ghost", false)]);
 
         assert_eq!(names.display("fence"), "install:fence");
         assert_eq!(names.display("bin"), "shape:bin");
@@ -145,10 +135,10 @@ mod tests {
     #[test]
     fn replacing_a_layer_retires_its_old_names_and_leaves_the_other() {
         let mut names = ShapeNames::default();
-        names.set_layer(ShapeLayer::Installation, &[shape("fence", true)]);
-        names.set_layer(ShapeLayer::Program, &[shape("bin", true)]);
+        names.set_layer(Layer::Installation, &[shape("fence", true)]);
+        names.set_layer(Layer::Program, &[shape("bin", true)]);
 
-        names.set_layer(ShapeLayer::Program, &[shape("crate", true)]);
+        names.set_layer(Layer::Program, &[shape("crate", true)]);
 
         assert_eq!(names.display("bin"), "bin");
         assert_eq!(names.display("crate"), "shape:crate");

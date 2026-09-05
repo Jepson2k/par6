@@ -10,10 +10,9 @@ use pyo3::types::{PyDict, PyList};
 
 use par6_proto::command as cmd;
 use par6_proto::{Command, CompletionPolicy, Frame, NUM_JOINTS};
-use par6_server::ShapeLayer;
 use par6d::preview::{Preview as EnginePreview, PreviewResult};
 
-use crate::convert::{robot_err, shape_from_py, tool_param_from_py, wire_error_tuple};
+use crate::convert::{robot_err, shape_dict, shape_from_py, tool_param_from_py, wire_error_tuple};
 
 fn frame_of(v: u8) -> PyResult<Frame> {
     Frame::from_wire(i64::from(v))
@@ -247,19 +246,11 @@ impl Preview {
         Ok(())
     }
 
-    /// Replace one collision-world layer ("installation" or "program",
-    /// wire units); raises `RobotWireError` exactly when the runtime
-    /// would refuse the set.
-    fn set_shapes(&self, layer: &str, shapes: Vec<Bound<'_, PyDict>>) -> PyResult<Option<u64>> {
-        let layer = match layer {
-            "installation" => ShapeLayer::Installation,
-            "program" => ShapeLayer::Program,
-            other => {
-                return Err(PyRuntimeError::new_err(format!(
-                    "unknown shape layer '{other}'"
-                )))
-            }
-        };
+    /// Replace the program layer (wire units); raises `RobotWireError`
+    /// exactly when the runtime would refuse the set. Returns the epoch of
+    /// the applied world. The installation layer is config: applied when
+    /// the engine boots, and no more settable from here than from the wire.
+    fn set_shapes(&self, shapes: Vec<Bound<'_, PyDict>>) -> PyResult<u64> {
         let shapes = shapes
             .iter()
             .map(shape_from_py)
@@ -267,8 +258,67 @@ impl Preview {
         self.inner
             .lock()
             .unwrap()
-            .set_shapes(layer, &shapes)
+            .set_shapes(&shapes)
             .map_err(|e| robot_err(&e))
+    }
+
+    /// The applied world — `installation` (from the engine's config),
+    /// `program` (what this session set) and `epoch`: the runtime's own
+    /// SHAPES readback, for the same file.
+    fn shapes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.inner.lock().unwrap();
+        let world = inner.world();
+        let layer = |shapes: &[par6_proto::Shape]| -> PyResult<Vec<PyObject>> {
+            shapes.iter().map(|s| shape_dict(py, s)).collect()
+        };
+        let d = PyDict::new(py);
+        d.set_item("installation", layer(world.installation())?)?;
+        d.set_item("program", layer(world.program())?)?;
+        d.set_item("epoch", world.epoch())?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Colliding pairs at `q` \[rad\], in the runtime's reporting
+    /// vocabulary (URDF link names; `install:`/`shape:`-prefixed shapes).
+    fn colliding_pairs(&self, q: [f64; NUM_JOINTS]) -> PyResult<Vec<(String, String)>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .colliding_pairs(&q)
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// Whether `q` \[rad\] collides — self or world.
+    fn in_collision(&self, q: [f64; NUM_JOINTS]) -> PyResult<bool> {
+        self.inner
+            .lock()
+            .unwrap()
+            .in_collision(&q)
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// Minimum signed distance over every pair at `q` \[m\]; negative =
+    /// penetrating.
+    fn min_distance(&self, q: [f64; NUM_JOINTS]) -> PyResult<f64> {
+        self.inner
+            .lock()
+            .unwrap()
+            .min_distance(&q)
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// Index of the first colliding sample along `path` \[rad\], or None.
+    fn first_collision(&self, path: Vec<[f64; NUM_JOINTS]>) -> PyResult<Option<usize>> {
+        self.inner
+            .lock()
+            .unwrap()
+            .first_collision(&path)
+            .map_err(|e| robot_err(&e))
+    }
+
+    /// Default standoff \[m\] applied to pairs without a shape override.
+    fn clearance(&self) -> f64 {
+        self.inner.lock().unwrap().clearance()
     }
 
     /// Preview a velocity jog (signed fractions per joint) held for
