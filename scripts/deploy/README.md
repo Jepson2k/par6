@@ -47,9 +47,13 @@ Nothing needs to run on the control box, and the box needs no compiler:
   native path.
 - `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
   `libpar6_shim.so` and copies the whole closure — 20 libraries, ~65 MB —
-  into the shim's own `lib/` directory. That directory is the deploy unit:
-  the shim is linked with `$ORIGIN`, `par6d` with an rpath of
-  `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
+  into the shim's own `lib/` directory. `build-aarch64.sh` adds what the
+  binary itself needs beyond the shim: `libmujoco`, which `mujoco-rs`
+  downloads for the cargo target into `.ffi/mujoco-aarch64/` during the
+  build (the simulator ships to the box like everything else). That
+  directory is the deploy unit: the shim is linked with `$ORIGIN`, `par6d`
+  with an rpath of `/usr/local/lib/par6`, and `install.sh` copies the one
+  into the other.
 
 The alternatives were building natively on the box (needs a Rust and C++
 toolchain on a Pi and takes the better part of an hour per change) and
@@ -83,7 +87,7 @@ From a dev machine (needs `ssh`/`scp` to the box and `sudo` on it):
 scripts/deploy/install.sh --host pi@par6-box
 ```
 
-It stages a bundle (binary + `lib/` — the shim and its runtime closure —
+It stages a bundle (binary + `lib/` — the shim, libmujoco and the runtime closure —
 + `config/PAR6.toml` + `config/grippers/*.toml` + `assets/par6_description`
 + the unit + a copy of itself), uploads it to `/tmp/par6-deploy-<timestamp>`,
 and re-runs itself there with `--local`. `PAR6_RUNTIME_LIB_SRC` (exported by
@@ -102,7 +106,7 @@ Layout after install:
 | Path | Contents |
 |---|---|
 | `/usr/local/bin/par6d` | the runtime binary |
-| `/usr/local/lib/par6/*.so` | the Pinocchio shim + its runtime closure (rpath target) |
+| `/usr/local/lib/par6/*.so` | the Pinocchio shim, libmujoco + the runtime closure (rpath target) |
 | `/etc/par6/PAR6.toml` | robot config (`PAR6_CONFIG` in the unit) |
 | `/etc/par6/grippers/*.toml` | gripper configs |
 | `/usr/share/par6/par6_description` | URDF/meshes — the kinematics and collision models |

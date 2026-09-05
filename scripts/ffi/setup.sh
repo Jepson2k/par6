@@ -66,12 +66,6 @@ PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
 TOPPRA_COMMIT="${PAR6_TOPPRA_COMMIT:-142456f3282c92c93ab97749a24856661924d989}"
-# libmujoco (par6-bus feature `sim-mujoco`). Pinned: the hand-rolled FFI
-# declarations in crates/par6-bus/src/sim/mujoco.rs are written against this
-# version's C API. `libmujoco` is the C library alone (the `mujoco`
-# conda-forge package is a metapackage that would drag in python bindings).
-# Host-side developer tooling only — a cross target never gets it.
-MUJOCO_VERSION="${PAR6_MUJOCO_VERSION:-3.10.0}"
 # Cross sysroot pin. conda-forge builds its own linux-aarch64 packages
 # against glibc 2.17, so the shim is built against the same floor: the
 # staged closure then has a single, lowest-common glibc requirement and
@@ -249,20 +243,6 @@ else
   echo ">>> toppra exists: $ENV_DIR/lib/libtoppra.so (delete it to rebuild)"
 fi
 
-# --- 3b. libmujoco into the same env prefix ----------------------------------
-# Additive to the pinocchio/toppra env; delete $ENV_DIR/lib/libmujoco.so (or
-# bump the pin) to force a re-install. `sim-mujoco` is a host-side simulator
-# plant, never deployed, so a cross target skips it.
-if [[ $CROSS -eq 0 ]]; then
-  if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
-    echo ">>> installing libmujoco=${MUJOCO_VERSION}"
-    "$MAMBA" install -y -p "$ENV_DIR" -c conda-forge --override-channels \
-      "libmujoco=${MUJOCO_VERSION}"
-  else
-    echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
-  fi
-fi
-
 # --- 4. build + install the shim ---------------------------------------------
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
@@ -310,17 +290,19 @@ fi
   echo "export PAR6_SHIM_LIB_DIR=\"$SHIM_PREFIX/lib\""
   echo "export PAR6_SHIM_INCLUDE_DIR=\"$SHIM_PREFIX/include\""
   if [[ $CROSS -eq 0 ]]; then
-    echo "# libmujoco lives in the env prefix (par6-bus feature sim-mujoco)."
-    echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
     echo "# Runtime loading for binaries whose package did not embed an rpath"
-    echo "# (link-args don't propagate across cargo packages). Covers the shim AND"
-    echo "# libmujoco + its conda deps."
+    echo "# (link-args don't propagate across cargo packages)."
     echo "export LD_LIBRARY_PATH=\"$SHIM_PREFIX/lib:$ENV_DIR/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
   else
     echo "# Cross target: nothing here runs on this host, so no LD_LIBRARY_PATH."
     echo "export PAR6_FFI_TARGET_ARCH=\"$TARGET_ARCH\""
     echo "# The whole set scripts/deploy/install.sh ships to /usr/local/lib/par6."
     echo "export PAR6_RUNTIME_LIB_SRC=\"$SHIM_PREFIX/lib\""
+    echo "# The target env's lib/, for closing par6d's own dependencies over."
+    echo "export PAR6_CROSS_ENV_LIB_DIR=\"$ENV_DIR/lib\""
+    echo "# mujoco-rs fetches the libmujoco matching the cargo target into this"
+    echo "# directory at build time; its own, so it never clobbers the host's."
+    echo "export MUJOCO_DOWNLOAD_DIR=\"$FFI_DIR/mujoco-$TARGET_ARCH\""
     echo "# Link par6d with the same cross toolchain the shim was built with, so"
     echo "# the binary and its C++ dependencies agree on glibc and the C++ ABI."
     echo "export CARGO_TARGET_$(echo "${TARGET_ARCH}_UNKNOWN_LINUX_GNU_LINKER" | tr '[:lower:]' '[:upper:]')=\"$TOOLCHAIN_DIR/bin/$CROSS_PREFIX-gcc\""

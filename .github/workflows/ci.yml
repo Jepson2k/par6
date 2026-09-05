@@ -287,8 +287,8 @@ jobs:
           pixi run -e py312 pytest -m examples --examples
 
   # The artifact that actually deploys: par6d cross-built for the control
-  # box WITH kinematics, plus the shim and the runtime closure that ship
-  # beside it. Nothing here can be executed (the runner is x86_64), so the
+  # box WITH kinematics and the simulator, plus the shim, libmujoco and the
+  # runtime closure that ship beside it. Nothing here can be executed (the runner is x86_64), so the
   # job proves what is checkable statically — that the cross toolchain
   # resolves, the shim links, and the staged closure's symbol versions are
   # internally satisfiable at a glibc floor the box clears.
@@ -313,7 +313,8 @@ jobs:
           path: |
             .ffi/bin
             .ffi/cross-aarch64
-          key: ffi-aarch64-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
+            .ffi/mujoco-aarch64
+          key: ffi-aarch64-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**', 'Cargo.lock') }}
       - name: build aarch64 shim + runtime closure
         run: scripts/ffi/setup.sh --target aarch64
       - name: cross-build par6d
@@ -329,6 +330,7 @@ jobs:
           scripts/deploy/install.sh --stage-only "$RUNNER_TEMP/bundle"
           test -x "$RUNNER_TEMP/bundle/par6d"
           test -f "$RUNNER_TEMP/bundle/lib/libpar6_shim.so"
+          ls "$RUNNER_TEMP"/bundle/lib/libmujoco.so.*
           test -f "$RUNNER_TEMP/bundle/config/PAR6.toml"
           test -d "$RUNNER_TEMP/bundle/par6_description"
       # Tarred so the executable bit and the closure's symlinks survive

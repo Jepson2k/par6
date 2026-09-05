@@ -13,7 +13,7 @@
 #
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
-#   /usr/local/lib/par6/*.so          the Pinocchio shim + its runtime closure
+#   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco + the runtime closure
 #   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
@@ -186,6 +186,9 @@ stage_bundle() {
    --runtime-libs DIR)"
   [ -e "$RUNTIME_LIBS/libpar6_shim.so" ] \
     || die "no libpar6_shim.so under $RUNTIME_LIBS"
+  ls "$RUNTIME_LIBS"/libmujoco.so.* >/dev/null 2>&1 \
+    || die "no libmujoco.so.* under $RUNTIME_LIBS — par6d links MuJoCo (the
+  simulator ships); scripts/deploy/build-aarch64.sh stages it after the build"
   [ -d "$ASSETS_DIR" ] || die "no assets tree at $ASSETS_DIR"
   mkdir -p "$dir/config/grippers"
   cp "$BINARY" "$dir/par6d"

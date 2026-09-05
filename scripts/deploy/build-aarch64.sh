@@ -37,6 +37,10 @@ command -v cargo >/dev/null || die "cargo not found"
 [ -e "$PAR6_SHIM_LIB_DIR/libpar6_shim.so" ] \
   || die "no libpar6_shim.so in PAR6_SHIM_LIB_DIR ($PAR6_SHIM_LIB_DIR)"
 
+[ -n "${MUJOCO_DOWNLOAD_DIR:-}" ] || die "MUJOCO_DOWNLOAD_DIR is not set — source
+  .ffi/env-aarch64.sh; mujoco-rs fetches the aarch64 libmujoco into it during the build"
+export MUJOCO_DOWNLOAD_DIR
+
 LINKER="${CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER:-}"
 [ -n "$LINKER" ] || die "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER is not set
   — source .ffi/env-aarch64.sh"
@@ -64,6 +68,26 @@ if [ -n "${PAR6_CROSS_PATCHELF:-}" ] && [ -x "$PAR6_CROSS_PATCHELF" ]; then
   "$PAR6_CROSS_PATCHELF" --set-rpath "$RUNTIME_LIB_DIR" "$BIN"
 fi
 
+# par6d's own dependencies beyond the shim — libmujoco, fetched by mujoco-rs
+# during the build — join the staged closure, so the one directory install.sh
+# ships resolves everything the binary asks for. Checked the same way the
+# shim's closure was: symbol versions satisfiable, glibc floor measured.
+READELF="${PAR6_CROSS_READELF:-}"
+MUJOCO_LIB_DIR="$(ls -d "$MUJOCO_DOWNLOAD_DIR"/mujoco-*/lib 2>/dev/null | sort -V | tail -1)"
+[ -n "$MUJOCO_LIB_DIR" ] || die "no libmujoco under $MUJOCO_DOWNLOAD_DIR after the build"
+if [ -n "$READELF" ] && command -v "$READELF" >/dev/null; then
+  python3 "$ROOT/scripts/ffi/stage_runtime_libs.py" \
+    --readelf "$READELF" \
+    --lib-dir "$PAR6_SHIM_LIB_DIR" \
+    --lib-dir "$MUJOCO_LIB_DIR" \
+    --lib-dir "${PAR6_CROSS_ENV_LIB_DIR:?source .ffi/env-aarch64.sh}" \
+    --dest "$PAR6_SHIM_LIB_DIR" \
+    --accept-rpath "$RUNTIME_LIB_DIR" \
+    "$BIN"
+else
+  die "PAR6_CROSS_READELF is not set — source .ffi/env-aarch64.sh"
+fi
+
 echo
 echo "built: $BIN"
 file "$BIN" 2>/dev/null || true
@@ -71,8 +95,7 @@ ls -lh "$BIN" | awk '{print "size:  " $5}'
 
 # The glibc floor is the one property of a cross build that silently breaks
 # on an older box, and it is measurable here.
-READELF="${PAR6_CROSS_READELF:-}"
-if [ -n "$READELF" ] && command -v "$READELF" >/dev/null; then
+if command -v "$READELF" >/dev/null; then
   floor="$("$READELF" -V "$BIN" 2>/dev/null \
     | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
   echo "glibc: needs at most ${floor:-none} (Raspberry Pi OS bookworm ships 2.36)"
