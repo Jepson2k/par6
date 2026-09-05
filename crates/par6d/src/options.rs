@@ -52,9 +52,10 @@ OPTIONS:
                                [env: PAR6_LOG_DIR]
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
-    --parent-pid <PID>         Exit when the process with this pid dies (the
-                               spawner's own pid; SIGTERM via PR_SET_PDEATHSIG),
-                               so a runtime a client spawned never outlives it.
+    --parent-pid <PID>         Exit when this process is no longer the parent
+                               (the spawner's own pid; a parent that dies has
+                               its children reparented), so a runtime a client
+                               spawned never outlives it.
     -h, --help                 Print this help
 ";
 
@@ -94,9 +95,8 @@ pub struct Options {
     pub log_dir: Option<PathBuf>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
-    /// Die with this process (`--parent-pid`): the spawner's pid, so the
-    /// death-signal request can be checked against the parent that is
-    /// actually there once it is armed.
+    /// Die with this process (`--parent-pid`): the spawner's pid, compared
+    /// against `getppid` before boot and from the main loop after it.
     pub parent_pid: Option<u32>,
     /// `--help` was requested.
     pub help: bool,
