@@ -675,13 +675,13 @@ pub(crate) struct KinStack {
     gate_collision: par6_kin::Collision,
     /// The one TCP-offset cell all of the above read.
     pub(crate) tool_offset: crate::kin::ToolOffset,
-    assets_dir: std::path::PathBuf,
+    pub(crate) assets_dir: std::path::PathBuf,
     /// The URDF variant the models were built for.
-    variant: par6_kin::GripperVariant,
+    pub(crate) variant: par6_kin::GripperVariant,
 }
 
 /// The sim scene tool matching a kinematics variant.
-fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
+pub(crate) fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
     match variant {
         par6_kin::GripperVariant::Flange => Tool::Flange,
         par6_kin::GripperVariant::Msg => Tool::Msg,

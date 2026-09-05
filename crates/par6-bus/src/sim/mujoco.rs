@@ -84,7 +84,7 @@ const JAW_INIT_BYTE: f64 = 127.5;
 
 /// How the scene's jaw DOF is driven this tick.
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum JawDrive {
+pub enum JawDrive {
     /// Follow the gripper front end's reported jaw byte (motor mode,
     /// calibration sweep, inactive/estopped/watchdogged command). No
     /// obstruction detection.
@@ -356,18 +356,83 @@ impl MujocoPlant {
         })
     }
 
-    /// Pose `[x, y, z, qw, qx, qy, qz]` of the free world object `name`
-    /// (its shape name), `None` when no such free body is in the scene.
-    pub fn object_pose(&self, name: &str) -> Option<[f64; 7]> {
+    /// The free joint of the world object `name` (its shape name):
+    /// `(joint id, qpos address, dof address)`.
+    fn object_joint(&self, name: &str) -> Option<(usize, usize, usize)> {
         let model = self.data.model();
         let joint = model.name_to_id(MjtObj::mjOBJ_JOINT, &format!("{WORLD_PREFIX}{name}"))?;
         if model.jnt_type()[joint] != MjtJoint::mjJNT_FREE {
             return None;
         }
-        let adr = model.jnt_qposadr()[joint] as usize;
+        Some((
+            joint,
+            model.jnt_qposadr()[joint] as usize,
+            model.jnt_dofadr()[joint] as usize,
+        ))
+    }
+
+    /// Pose `[x, y, z, qw, qx, qy, qz]` of the free world object `name`
+    /// (its shape name), `None` when no such free body is in the scene.
+    pub fn object_pose(&self, name: &str) -> Option<[f64; 7]> {
+        let (_, adr, _) = self.object_joint(name)?;
         let mut pose = [0.0; 7];
         pose.copy_from_slice(&self.qpos[adr..adr + 7]);
         Some(pose)
+    }
+
+    /// Speed of the free world object `name`: the norm of its six
+    /// generalized velocities \[m/s, rad/s\].
+    pub fn object_speed(&self, name: &str) -> Option<f64> {
+        let (_, _, dadr) = self.object_joint(name)?;
+        Some(
+            self.qvel[dadr..dadr + 6]
+                .iter()
+                .map(|v| v * v)
+                .sum::<f64>()
+                .sqrt(),
+        )
+    }
+
+    /// Place the free world object `name` at rest at `pose` (teleport).
+    pub fn place_object(&mut self, name: &str, pose: [f64; 7]) -> bool {
+        let Some((_, adr, dadr)) = self.object_joint(name) else {
+            return false;
+        };
+        self.qpos[adr..adr + 7].copy_from_slice(&pose);
+        self.qvel[dadr..dadr + 6].fill(0.0);
+        self.data.qpos_mut()[adr..adr + 7].copy_from_slice(&pose);
+        self.data.qvel_mut()[dadr..dadr + 6].fill(0.0);
+        true
+    }
+
+    /// Names of the free world objects in the scene.
+    pub fn object_names(&self) -> Vec<String> {
+        self.joints()
+            .filter(|(name, _, nq, _, _)| *nq == 7 && name.starts_with(WORLD_PREFIX))
+            .map(|(name, ..)| name[WORLD_PREFIX.len()..].to_owned())
+            .collect()
+    }
+
+    /// The jaws' measured position byte (0 = open, 255 = closed), `None`
+    /// on a tool without jaws.
+    pub fn jaw_byte(&self) -> Option<f64> {
+        self.jaw.map(|jaw| m_to_byte(self.qpos[jaw]))
+    }
+
+    /// Place the jaws at rest at `byte` and aim the servo there (the tool
+    /// half of a teleport).
+    pub fn place_jaw(&mut self, byte: f64) {
+        let Some(jaw) = self.jaw else {
+            return;
+        };
+        let x = byte_to_m(byte.clamp(0.0, 255.0));
+        self.jaw_cmd_byte = byte.clamp(0.0, 255.0);
+        for (q, v) in [(jaw, x), (jaw + 1, -x)] {
+            self.qpos[q] = v;
+            self.qvel[q] = 0.0;
+            self.data.qpos_mut()[q] = v;
+            self.data.qvel_mut()[q] = 0.0;
+        }
     }
 
     /// Measured motor state of arm joint `j` (position ticks, speed

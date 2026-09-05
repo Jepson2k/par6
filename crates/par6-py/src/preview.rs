@@ -145,6 +145,20 @@ fn result_dict(py: Python<'_>, r: &PreviewResult) -> PyResult<PyObject> {
     d.set_item("tcp_poses", poses)?;
     d.set_item("end_joints_rad", r.end_joints_rad.to_vec())?;
     d.set_item("duration_s", r.duration_s)?;
+    let tracks = PyList::empty(py);
+    for t in &r.object_tracks {
+        let td = PyDict::new(py);
+        td.set_item("name", &t.name)?;
+        let poses = PyList::empty(py);
+        for p in &t.poses {
+            poses.append(p.to_vec())?;
+        }
+        td.set_item("poses", poses)?;
+        td.set_item("carried", t.carried)?;
+        td.set_item("physics", t.physics)?;
+        tracks.append(td)?;
+    }
+    d.set_item("object_tracks", tracks)?;
     match &r.error {
         Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
         None => d.set_item("error", py.None())?,
@@ -344,6 +358,14 @@ impl Preview {
     /// Preview a queued program (list of command dicts, see
     /// `command_from_py`): one result dict per command, blend chains
     /// folded exactly as the live planner folds them.
+    /// Preview a tool action: the jaws to `closed` (0 = open, 1 = closed)
+    /// while the arm holds, stepped in the simulator scene; the free world
+    /// objects' tracks come back with the result.
+    fn preview_tool(&self, py: Python<'_>, closed: f64) -> PyResult<PyObject> {
+        let r = self.inner.lock().unwrap().preview_tool(closed);
+        result_dict(py, &r)
+    }
+
     fn preview_program(
         &self,
         py: Python<'_>,

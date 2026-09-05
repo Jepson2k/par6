@@ -18,6 +18,8 @@ import time
 import numpy as np
 import pytest
 from live_daemon import TICK_DT_S, LiveDaemon, requires_par6d
+from waldoctl.results import ObjectTrack
+from waldoctl.shapes import Box, Physical
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -968,3 +970,62 @@ async def _teleport_to(client, angles: list[float]) -> None:
         ):
             return
     raise AssertionError("teleport never took effect")
+
+
+def _track(result: DryRunResultData | None, name: str) -> ObjectTrack:
+    """The named object's track on a result that must carry tracks."""
+    assert result is not None and result.object_tracks is not None
+    return {t.name: t for t in result.object_tracks}[name]
+
+
+def _samples(result: DryRunResultData | None) -> int:
+    assert result is not None and result.joint_trajectory_rad is not None
+    return result.joint_trajectory_rad.shape[0]
+
+
+class TestWorldObjects:
+    """The preview's physics through the client: a free block declared
+    through the world layer is grasped, carried and released, and its
+    track rides with every result."""
+
+    def test_grasp_carry_and_release_tracks(self):
+        grasp_deg = [math.degrees(v) for v in (0.0, -0.25, 4.35, 0.0, -1.28, 0.0)]
+        client = Robot().create_dry_run_client(initial_joints_deg=grasp_deg)
+        stand = Box(
+            name="stand",
+            x=0.04,
+            y=0.04,
+            z=0.01,
+            pose=(0.3713, 0.0, 0.005, 0.0, 0.0, 0.0),
+            physics=Physical(),
+        )
+        block = Box(
+            name="block",
+            x=0.036,
+            y=0.036,
+            z=0.06,
+            pose=(0.3713, 0.0, 0.04, 0.0, 0.0, 0.0),
+            physics=Physical(mass=0.05),
+        )
+        client.set_shapes([stand, block])
+
+        closed = client.tool.close()
+        held = _track(closed, "block")
+        assert held.carried and held.physics
+        assert held.poses.shape == (_samples(closed), 7)
+        assert closed.duration > 0.1
+        held_z = held.poses[-1, 2]
+        assert abs(held_z - 0.04) < 0.01
+
+        lifted = list(grasp_deg)
+        lifted[1] -= math.degrees(0.3)
+        moved = client.move_j(lifted, speed=0.5)
+        riding = _track(moved, "block")
+        assert riding.carried and riding.physics
+        assert riding.poses.shape == (_samples(moved), 7)
+        assert riding.poses[-1, 2] > held_z + 0.05
+
+        opened = client.tool.open()
+        dropped = _track(opened, "block")
+        assert not dropped.carried and dropped.physics
+        assert dropped.poses[-1, 2] < riding.poses[-1, 2] - 0.05

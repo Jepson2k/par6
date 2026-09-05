@@ -33,6 +33,7 @@ mod gripper;
 mod jaw;
 mod map;
 mod mujoco;
+pub mod rollout;
 pub mod scene;
 
 pub use driver::FaultKind;
@@ -64,14 +65,6 @@ use map::JointMap;
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
-
-/// The base spec, owned and touched only by the bus that holds it.
-struct SendSpec(mujoco_rs::prelude::MjSpec);
-
-// SAFETY: the spec is only ever cloned from inside the bus's own methods;
-// nothing else holds a pointer into it, so moving it with the bus between
-// threads is sound.
-unsafe impl Send for SendSpec {}
 
 /// Where the runtime posts world layers for the simulator: one slot per
 /// layer, latest wins, taken by the bus on its own tick. Posting allocates
@@ -156,7 +149,7 @@ pub struct SimBus {
     floor_z_m: Option<f64>,
     /// The compiled-once base spec (arm, tool, floor — no world objects);
     /// every world change injects into a clone of it.
-    base_spec: Option<SendSpec>,
+    base_spec: Option<scene::BaseSpec>,
     /// The world objects, installation then program layer.
     world: [Vec<Shape>; 2],
     /// A world layer changed since the model was last built.
@@ -1279,13 +1272,11 @@ impl SimBus {
             .scene
             .spec(&build)
             .unwrap_or_else(|e| panic!("sim scene: {e}"));
-        let base = spec
-            .try_clone()
-            .unwrap_or_else(|e| panic!("sim scene: cannot keep the base spec: {e}"));
+        let base = scene::BaseSpec::new(&spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
         scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
             .unwrap_or_else(|e| panic!("sim scene: {e}"));
         let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
-        self.base_spec = Some(SendSpec(base));
+        self.base_spec = Some(base);
         self.world_dirty = false;
         mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.holding_friction_nm)
     }
@@ -1297,8 +1288,7 @@ impl SimBus {
             return;
         };
         let spec = base
-            .0
-            .try_clone()
+            .clone_spec()
             .map_err(|e| e.to_string())
             .and_then(|mut spec| {
                 scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])

@@ -163,6 +163,30 @@ pub type World<'a> = [&'a [Shape]; 2];
 /// Name prefix of every injected world object (body, joint and geom).
 pub const WORLD_PREFIX: &str = "par6/obj/";
 
+/// A base spec kept for cloning on world changes. Touched only by its
+/// owner's methods; nothing else holds a pointer into it.
+pub struct BaseSpec(MjSpec);
+
+// SAFETY: the spec is only cloned from inside the owner's own methods, so
+// moving it with the owner between threads is sound.
+unsafe impl Send for BaseSpec {}
+
+impl BaseSpec {
+    /// Keep a copy of `spec` before world objects are injected into it.
+    pub fn new(spec: &MjSpec) -> Result<Self, SceneError> {
+        spec.try_clone()
+            .map(Self)
+            .map_err(|e| SceneError::World(format!("cannot keep the base spec: {e}")))
+    }
+
+    /// A fresh clone to inject a world into.
+    pub fn clone_spec(&self) -> Result<MjSpec, SceneError> {
+        self.0
+            .try_clone()
+            .map_err(|e| SceneError::World(format!("cannot clone the base spec: {e}")))
+    }
+}
+
 /// Compile `spec` under the load lock (MuJoCo's compiler is not
 /// re-entrant across threads).
 pub(crate) fn compile(spec: &mut MjSpec) -> Result<MjModel, String> {

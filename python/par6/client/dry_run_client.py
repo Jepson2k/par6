@@ -37,7 +37,7 @@ import numpy as np
 from numpy.typing import NDArray
 from pinokin import so3_rpy
 from waldoctl import ToolState, ToolStatus
-from waldoctl.results import DryRunResultData
+from waldoctl.results import DryRunResultData, ObjectTrack
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 
 from par6 import config as _cfg
@@ -321,6 +321,7 @@ class DryRunRobotClient:
                 end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
                 duration=float(r["duration_s"]),
                 joint_trajectory_rad=self._q()[np.newaxis, :].copy(),
+                object_tracks=_tracks(r, None),
             )
         stride = max(1, len(traj) // self._max_points)
         idx = list(range(0, len(traj), stride))
@@ -335,6 +336,7 @@ class DryRunRobotClient:
             end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
             duration=float(r["duration_s"]),
             joint_trajectory_rad=sampled,
+            object_tracks=_tracks(r, idx),
         )
 
     def _error_result(self, err: RobotError) -> DryRunResultData:
@@ -977,6 +979,15 @@ class DryRunRobotClient:
                 ),
             )
         pending = self._close_chain()
+        if verb == "move":
+            # The jaws move in the simulator scene: closing on a free
+            # object carries it, opening releases it — the object tracks
+            # say where things went.
+            closed = {"open": 0.0, "close": 1.0}.get(action.strip().lower())
+            if closed is None:
+                closed = float(params[0]) if params else 1.0
+            result = self._convert(self._call(self._preview.preview_tool, closed))
+            return result if not pending else _merge([*pending, result])
         result = DryRunResultData(
             tcp_poses=self._si_pose_now()[np.newaxis, :],
             end_joints_rad=self._q().copy(),
@@ -1193,6 +1204,70 @@ class _KinFacade:
         return out
 
 
+def _tracks(r: dict, idx: list[int] | None) -> tuple[ObjectTrack, ...] | None:
+    """The engine's object tracks, downsampled with the trajectory's own
+    sample index list so every row still aligns with a joint sample; a
+    one-row (stationary) track stays one row."""
+    raw = r.get("object_tracks") or []
+    if not raw:
+        return None
+    out = []
+    for t in raw:
+        poses = np.asarray(t["poses"], dtype=np.float64).reshape(-1, 7)
+        if idx is not None and poses.shape[0] > 1 and poses.shape[0] >= idx[-1] + 1:
+            poses = poses[idx]
+        out.append(
+            ObjectTrack(
+                name=str(t["name"]),
+                poses=poses,
+                carried=bool(t["carried"]),
+                physics=bool(t["physics"]),
+            )
+        )
+    return tuple(out)
+
+
+def _merge_tracks(results: list[DryRunResultData]) -> tuple[ObjectTrack, ...] | None:
+    """Object tracks of several motions as one, in the order they run: each
+    result's rows broadcast to its own trajectory length, then concatenated
+    per object, so the merged track stays aligned with the merged joint
+    trajectory."""
+    names: list[str] = []
+    for r in results:
+        for t in r.object_tracks or ():
+            if t.name not in names:
+                names.append(t.name)
+    if not names:
+        return None
+    merged = []
+    for name in names:
+        rows = []
+        carried = False
+        physics = True
+        for r in results:
+            n = (
+                r.joint_trajectory_rad.shape[0]
+                if r.joint_trajectory_rad is not None
+                else 1
+            )
+            t = next((t for t in r.object_tracks or () if t.name == name), None)
+            if t is None:
+                continue
+            p = t.poses if t.poses.shape[0] == n else np.repeat(t.poses[-1:], n, axis=0)
+            rows.append(p)
+            carried = t.carried
+            physics = physics and t.physics
+        merged.append(
+            ObjectTrack(
+                name=name,
+                poses=np.concatenate(rows, axis=0) if rows else np.empty((0, 7)),
+                carried=carried,
+                physics=physics,
+            )
+        )
+    return tuple(merged)
+
+
 def _merge(results: list[DryRunResultData]) -> DryRunResultData:
     """Several motions as one result, in the order they run.
 
@@ -1221,6 +1296,7 @@ def _merge(results: list[DryRunResultData]) -> DryRunResultData:
     trajectories = [r.joint_trajectory_rad for r in drawn]
     present = [t for t in trajectories if t is not None]
     return DryRunResultData(
+        object_tracks=_merge_tracks(results),
         tcp_poses=np.vstack([r.tcp_poses for r in drawn]),
         end_joints_rad=drawn[-1].end_joints_rad,
         duration=sum(r.duration for r in results),

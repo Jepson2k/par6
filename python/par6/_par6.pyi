@@ -213,6 +213,12 @@ class Preview:
     def preview_jog(
         self, speeds: list[float], duration: float, accel: float | None = None
     ) -> dict[str, Any]: ...
+    def preview_tool(self, closed: float) -> dict:
+        """Preview a tool action: jaws to ``closed`` (0 open, 1 closed) while
+        the arm holds, stepped in the simulator scene; ``object_tracks``
+        carries the free world objects' motion."""
+        ...
+
     def preview_program(self, cmds: list[dict[str, Any]]) -> list[dict[str, Any]]: ...
 
 class TelemetryReader:
