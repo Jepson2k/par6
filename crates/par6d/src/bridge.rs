@@ -78,6 +78,20 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// so the projection here uses the commanded target velocity — an upper
 /// bound on the ramping integrator's, which errs on the stopping side.
 pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
+/// The horizon's floor in ticks. The gate's reaction is paid in ticks —
+/// the stop lands on the RT's next tick and the velocity loop brakes over
+/// the few after it — so a slow tick needs a longer horizon than the
+/// wall-clock floor alone gives. At the shipped 250 Hz the 0.15 s floor
+/// is 37 ticks and this never binds; at a 20 Hz test rate the floor is
+/// three ticks, less than the reaction itself.
+const STREAM_LOOKAHEAD_TICKS: f64 = 8.0;
+/// Joint-space spacing \[rad\] of the configurations checked along a
+/// projection or a servo hop, so a keep-out cannot fit between two
+/// samples: the endpoint alone lets a long projection step over one.
+const PROJECTION_STEP_RAD: f64 = 0.04;
+/// Cap on the samples one check spends, for a projection long enough to
+/// need more than this at the spacing above.
+const PROJECTION_MAX_SAMPLES: usize = 16;
 
 /// Joint speed above which a stream counts as MOVING and is re-tested
 /// against its projection every period \[rad/s\]. Below it the arm is
@@ -152,6 +166,9 @@ pub(crate) struct StreamGate {
     /// The pairs the last refused or stopped stream would have collided
     /// in — the streaming half of the STATUS `collision_active` fields.
     latch: CollisionState,
+    /// The projection horizon \[s\]: [`STREAM_LOOKAHEAD_S`] or
+    /// [`STREAM_LOOKAHEAD_TICKS`] of the tick, whichever is longer.
+    lookahead_s: f64,
 }
 
 impl StreamGate {
@@ -164,6 +181,7 @@ impl StreamGate {
     pub(crate) fn new(
         collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
+        tick_dt_s: f64,
     ) -> Self {
         Self {
             collision,
@@ -172,7 +190,14 @@ impl StreamGate {
             soft_min: jog_limits.soft_min,
             soft_max: jog_limits.soft_max,
             latch: CollisionState::default(),
+            lookahead_s: STREAM_LOOKAHEAD_S.max(STREAM_LOOKAHEAD_TICKS * tick_dt_s),
         }
+    }
+
+    /// How far ahead \[s\] a jog or a moving stream is projected before
+    /// it is admitted or re-checked.
+    pub(crate) fn lookahead_s(&self) -> f64 {
+        self.lookahead_s
     }
 
     /// Mirror one layer of the planner-accepted world. The conversion is
@@ -225,25 +250,44 @@ impl StreamGate {
     /// Whether streaming from `current` toward `target` must stop, and
     /// the pairs to report if so.
     ///
-    /// parol6's `collision_blocked` rule. Approaching: blocked when the
-    /// target configuration collides. Already colliding: blocked when
-    /// the target contacts a pair the arm is not already in, or when the
-    /// deepest world penetration grows (the hull-vs-world
-    /// `world_distance` drops by more than [`ESCAPE_TOL_M`]) — a
-    /// pair-set check alone cannot tell an escaping move from one
-    /// grinding deeper through the same pair, and the depth check alone
-    /// cannot tell an improving start-collision from a new shallower
-    /// one, so both run.
+    /// parol6's `collision_blocked` rule. Approaching: blocked when any
+    /// configuration on the straight joint-space segment to the target
+    /// collides, sampled every [`PROJECTION_STEP_RAD`]. Already
+    /// colliding: blocked when the target contacts a pair the arm is not
+    /// already in, or when the deepest world penetration grows (the
+    /// hull-vs-world `world_distance` drops by more than
+    /// [`ESCAPE_TOL_M`]) — a pair-set check alone cannot tell an
+    /// escaping move from one grinding deeper through the same pair, and
+    /// the depth check alone cannot tell an improving start-collision
+    /// from a new shallower one, so both run.
     pub(crate) fn blocked(
         &mut self,
         current: &[f64; MAX_JOINTS],
         target: &[f64; MAX_JOINTS],
     ) -> Result<Option<Vec<(String, String)>>, WireError> {
         let cur = self.offending(current)?;
-        let tgt = self.offending(target)?;
         if cur.is_empty() {
-            return Ok((!tgt.is_empty()).then_some(tgt));
+            let span = current
+                .iter()
+                .zip(target.iter())
+                .map(|(a, b)| (b - a).abs())
+                .fold(0.0_f64, f64::max);
+            let samples =
+                ((span / PROJECTION_STEP_RAD).ceil() as usize).clamp(1, PROJECTION_MAX_SAMPLES);
+            let mut q = [0.0; MAX_JOINTS];
+            for i in 1..=samples {
+                let t = i as f64 / samples as f64;
+                for (j, v) in q.iter_mut().enumerate() {
+                    *v = current[j] + (target[j] - current[j]) * t;
+                }
+                let hit = self.offending(&q)?;
+                if !hit.is_empty() {
+                    return Ok(Some(hit));
+                }
+            }
+            return Ok(None);
         }
+        let tgt = self.offending(target)?;
         let new: Vec<(String, String)> = tgt.iter().filter(|p| !cur.contains(p)).cloned().collect();
         if !new.is_empty() {
             return Ok(Some(new));
@@ -280,7 +324,7 @@ impl StreamGate {
     ) -> [f64; MAX_JOINTS] {
         let mut la = *q;
         for (j, pct) in speeds.iter().enumerate() {
-            la[j] = (la[j] + pct * self.jog_vel[j] * STREAM_LOOKAHEAD_S)
+            la[j] = (la[j] + pct * self.jog_vel[j] * self.lookahead_s)
                 .clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
@@ -301,7 +345,7 @@ impl StreamGate {
     ) -> [f64; MAX_JOINTS] {
         let mut la = *q;
         for (j, v) in qd.iter().enumerate() {
-            la[j] = (la[j] + v * STREAM_LOOKAHEAD_S).clamp(self.soft_min[j], self.soft_max[j]);
+            la[j] = (la[j] + v * self.lookahead_s).clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
     }
@@ -462,15 +506,42 @@ pub(crate) struct SharedState {
     flashing_outcome: Option<Result<(), WireError>>,
 }
 
-/// The bridge's kinematics kit (feature `ffi`): its own model instance,
-/// the snapshot reader that seeds IK from the measured pose, and the
-/// streaming collision gate it shares with housekeeping.
+/// The bridge's kinematics kit: its own model instance, the snapshot
+/// reader that seeds IK from the measured pose, and the streaming
+/// collision gate it shares with housekeeping.
 pub(crate) struct CartStream {
     pub(crate) kin: crate::kin::CartKin,
     pub(crate) snapshots: SnapshotReader<StateSnapshot>,
     pub(crate) soft_min: [f64; MAX_JOINTS],
     pub(crate) soft_max: [f64; MAX_JOINTS],
     pub(crate) gate: Arc<Mutex<StreamGate>>,
+}
+
+impl CartStream {
+    /// Admit one servo target against the world: the target configuration
+    /// itself, and, while the arm is moving, where the measured motion
+    /// carries it within one lookahead horizon — a target admitted just
+    /// outside a keep-out is entered anyway on the braking distance, and
+    /// an arm that has outrun its previous target is already past where
+    /// the target alone says it is. Housekeeping runs the same projection
+    /// between datagrams; running it here too makes the verdict a property
+    /// of every datagram rather than of when housekeeping last sampled a
+    /// moving tick. Returns the epoch of the world the target was admitted
+    /// against.
+    fn admit_servo_target(&mut self, target: &[f64; MAX_JOINTS]) -> Result<u64, WireError> {
+        let snap = self.snapshots.latest();
+        let mut gate = self.gate.lock().unwrap();
+        if let Some(pairs) = gate.blocked(&snap.q, target)? {
+            return Err(gate.refuse(pairs));
+        }
+        if snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) {
+            let la = gate.motion_lookahead(&snap.q, &snap.qd);
+            if let Some(pairs) = gate.blocked(&snap.q, &la)? {
+                return Err(gate.refuse(pairs));
+            }
+        }
+        Ok(gate.epoch())
+    }
 }
 
 /// The `RtCommands` implementation `par6d` hands to the server.
@@ -609,18 +680,11 @@ impl RtCommands for RtBridge {
                     *t = a.to_radians();
                 }
                 let mut sh = self.shared.lock().unwrap();
-                // Servo targets are explicit configurations, so the gate
-                // checks the target itself — each datagram is its own
-                // admission check, which is the streaming cadence parol6
-                // gates at.
-                let world_epoch = {
-                    let q = self.cart.snapshots.latest().q;
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    if let Some(pairs) = gate.blocked(&q, &target)? {
-                        return Err(gate.refuse(pairs));
-                    }
-                    gate.epoch()
-                };
+                // Servo targets are explicit configurations, so each
+                // datagram is its own admission check — the streaming
+                // cadence parol6 gates at — on the target and on the
+                // motion under way toward it.
+                let world_epoch = self.cart.admit_servo_target(&target)?;
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -681,14 +745,7 @@ impl RtCommands for RtBridge {
                 for (j, v) in target.iter_mut().enumerate() {
                     *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
                 }
-                let world_epoch = {
-                    let q = self.cart.snapshots.latest().q;
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    if let Some(pairs) = gate.blocked(&q, &target)? {
-                        return Err(gate.refuse(pairs));
-                    }
-                    gate.epoch()
-                };
+                let world_epoch = self.cart.admit_servo_target(&target)?;
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -749,9 +806,8 @@ impl RtCommands for RtBridge {
                     soft_min: self.cart.soft_min,
                     soft_max: self.cart.soft_max,
                 };
-                if let Ok((la, _)) =
-                    step_cart_jog(&mut self.cart.kin, &mut probe, STREAM_LOOKAHEAD_S)
-                {
+                let horizon = self.cart.gate.lock().unwrap().lookahead_s();
+                if let Ok((la, _)) = step_cart_jog(&mut self.cart.kin, &mut probe, horizon) {
                     let mut gate = self.cart.gate.lock().unwrap();
                     if let Some(pairs) = gate.blocked(&q, &la)? {
                         return Err(gate.refuse(pairs));
@@ -1245,13 +1301,11 @@ pub(crate) fn housekeeping_loop(
                     }
                 }
                 // A servo stream that is MOVING gets the jog treatment:
-                // its next datagram is admitted on the target it carries,
-                // which says nothing about the ground the arm covers
-                // getting there — and it cannot stop dead, so a target
-                // admitted just outside a keep-out is entered anyway on
-                // the braking distance. The measured motion is projected
-                // one lookahead horizon and re-tested every period, which
-                // is the same promise the jog path already makes.
+                // admission projects the motion under way, and between
+                // datagrams the arm keeps covering ground — it cannot
+                // stop dead — so the measured motion is projected one
+                // lookahead horizon and re-tested every period, the same
+                // promise the jog path already makes.
                 Some(a)
                     if a.kind == StreamKind::Servo
                         && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
@@ -1326,12 +1380,14 @@ pub(crate) fn housekeeping_loop(
                             Ok((target, qd)) => {
                                 // The velocity-scaled horizon, projected
                                 // past the step just integrated.
+                                let mut g = gate.lock().unwrap();
                                 let mut la = target;
                                 for (j, v) in la.iter_mut().enumerate() {
-                                    *v = (*v + qd[j] * STREAM_LOOKAHEAD_S)
+                                    *v = (*v + qd[j] * g.lookahead_s())
                                         .clamp(state.soft_min[j], state.soft_max[j]);
                                 }
-                                let verdict = gate.lock().unwrap().blocked(&before, &la);
+                                let verdict = g.blocked(&before, &la);
+                                drop(g);
                                 match verdict {
                                     Ok(None) => {
                                         stream_input.lock().unwrap().send(&StreamSetpoint {

@@ -27,6 +27,16 @@ pub const BUDGET: Duration = Duration::from_secs(30);
 /// deadline, long enough not to spin.
 pub const READ_TIMEOUT: Duration = Duration::from_millis(100);
 
+/// Daemon log lines land in the test's captured output: printed with a
+/// failure, silent otherwise. `RUST_LOG` still sets the level when given.
+fn init_test_logging() {
+    let mut builder = env_logger::builder();
+    if std::env::var_os("RUST_LOG").is_none() {
+        builder.filter_level(log::LevelFilter::Warn);
+    }
+    let _ = builder.is_test(true).try_init();
+}
+
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
@@ -174,7 +184,7 @@ pub fn boot_for_client(
     sim_dynamics: bool,
     status_port: u16,
 ) -> Result<Daemon, String> {
-    let _ = env_logger::builder().is_test(true).try_init();
+    init_test_logging();
     redirect_bus_grant();
     let opts = Options {
         sim_dynamics,
@@ -246,7 +256,7 @@ impl Rig {
         sim_dynamics: bool,
         status_rate_hz: Option<u32>,
     ) -> Result<Rig, String> {
-        let _ = env_logger::builder().is_test(true).try_init();
+        init_test_logging();
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx

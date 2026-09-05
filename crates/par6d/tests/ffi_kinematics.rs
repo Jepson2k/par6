@@ -1037,15 +1037,26 @@ fn jog_j(joint: usize, signed_pct: f64, duration_s: f64) -> Command {
 /// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
 /// loads — where a keep-out has to go to sit on the swept path.
 fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
-    let mut kin = par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
-        .expect("kin model");
-    let mut q = [0.0; NUM_JOINTS];
-    for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
-        *out = deg.to_radians();
+    // One model per thread: a status-rate sampler cannot afford a URDF
+    // load per frame.
+    thread_local! {
+        static KIN: std::cell::RefCell<Option<par6_kin::Kin>> =
+            const { std::cell::RefCell::new(None) };
     }
-    let mut pose = [0.0; 16];
-    kin.fk(&q, &mut pose).expect("fk");
-    [pose[3], pose[7], pose[11]]
+    KIN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let kin = slot.get_or_insert_with(|| {
+            par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
+                .expect("kin model")
+        });
+        let mut q = [0.0; NUM_JOINTS];
+        for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+            *out = deg.to_radians();
+        }
+        let mut pose = [0.0; 16];
+        kin.fk(&q, &mut pose).expect("fk");
+        [pose[3], pose[7], pose[11]]
+    })
 }
 
 /// The configured JOG-mode velocity limit of J0 \[rad/s\] — what a jog
@@ -2292,9 +2303,11 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
 /// AT it — so the stream here advances the way a UI's does.
 ///
 /// The bound is measured rather than named: a crawl at a fiftieth of the
-/// rate stops where the geometry says stop, since its own braking
-/// distance is negligible. A stream driven at full rate must not end up
-/// closer than the crawl did.
+/// rate, left to come to rest on the last target it was granted, stops
+/// where the geometry says stop, since its own braking distance is
+/// negligible. A stream driven at full rate must not end up closer than
+/// the crawl did. A failure prints the timeline of both approaches beside
+/// the daemon's own warnings.
 #[test]
 fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
     let rig = boot_tagged("servogate", false);
@@ -2311,9 +2324,6 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
 
     let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
 
-    /// Stream the target toward the box `step_mm` at a time until the
-    /// gate latches, then report how close the TCP ever got to the box
-    /// centre \[m\].
     struct Scene {
         start_deg: [f64; NUM_JOINTS],
         mid_deg: [f64; NUM_JOINTS],
@@ -2321,7 +2331,23 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
         deg_per_m: f64,
     }
 
-    fn approach(rig: &Rig, c: &mut Client, scene: &Scene, step_mm: f64, speed: Option<f64>) -> f64 {
+    /// The closest the TCP came to the box centre \[m\], and the
+    /// timeline of sends and frames that produced it.
+    struct Approach {
+        closest_m: f64,
+        trace: Vec<String>,
+    }
+
+    /// Stream the target toward the box `step_mm` at a time until the
+    /// gate latches, then let the arm come to rest on the last target it
+    /// was granted.
+    fn approach(
+        rig: &Rig,
+        c: &mut Client,
+        scene: &Scene,
+        step_mm: f64,
+        speed: Option<f64>,
+    ) -> Approach {
         let Scene {
             start_deg,
             mid_deg,
@@ -2332,16 +2358,40 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
         rig.drain_status();
         let step_deg = step_mm * 1e-3 * deg_per_m;
         let mut target = start_deg;
-        let deadline = Instant::now() + BUDGET;
-        let mut gated = false;
-        let mut closest = f64::INFINITY;
-        let sample = |s: &Status, closest: &mut f64| {
-            let tcp = tcp_at_m(s.angles);
-            let d = ((tcp[0] - mid_m[0]).powi(2) + (tcp[1] - mid_m[1]).powi(2)).sqrt();
-            *closest = closest.min(d);
+        let t0 = Instant::now();
+        let deadline = t0 + BUDGET;
+        let dist = |deg: [f64; NUM_JOINTS]| {
+            let tcp = tcp_at_m(deg);
+            ((tcp[0] - mid_m[0]).powi(2) + (tcp[1] - mid_m[1]).powi(2)).sqrt()
         };
+        let mut closest = f64::INFINITY;
+        let mut trace: Vec<String> = Vec::new();
+        let mut last_logged = f64::NAN;
+        let mut sample = |s: &Status, closest: &mut f64, trace: &mut Vec<String>| {
+            let d = dist(s.angles);
+            *closest = closest.min(d);
+            // A resting arm repeats its frame; motion and verdicts are
+            // what the timeline is for.
+            if last_logged.is_nan() || (d - last_logged).abs() > 0.5e-3 || s.collision_active {
+                last_logged = d;
+                trace.push(format!(
+                    "{:7.3}s frame {:6.1} mm mode={:?} collision_active={} j0={:+.4} rad/s",
+                    t0.elapsed().as_secs_f64(),
+                    d * 1e3,
+                    s.mode,
+                    s.collision_active,
+                    s.speeds[0]
+                ));
+            }
+        };
+        let mut gated = false;
         while Instant::now() < deadline && !gated {
             target[0] = (target[0] + step_deg).min(mid_deg[0]);
+            trace.push(format!(
+                "{:7.3}s send  {:6.1} mm",
+                t0.elapsed().as_secs_f64(),
+                dist(target) * 1e3
+            ));
             c.send(&Command::ServoJ(par6_proto::command::ServoJ {
                 angles: target,
                 speed,
@@ -2350,7 +2400,7 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
             let window = Instant::now() + Duration::from_millis(50);
             while Instant::now() < window {
                 if let Some(s) = rig.recv_status() {
-                    sample(&s, &mut closest);
+                    sample(&s, &mut closest, &mut trace);
                     if s.collision_active {
                         gated = true;
                         break;
@@ -2358,19 +2408,38 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
                 }
             }
         }
-        assert!(gated, "a stream driven into a keep-out was never gated");
-        // The coast after the refusal is the whole point, so keep
-        // sampling until the arm is at rest.
-        let settle = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < settle {
-            if let Some(s) = rig.recv_status() {
-                sample(&s, &mut closest);
-                if s.speeds.iter().all(|v| v.abs() < 0.05) {
-                    break;
-                }
-            }
+        assert!(
+            gated,
+            "a stream driven into a keep-out was never gated:\n{}",
+            trace.join("\n")
+        );
+        // The arm is still on its way to the last target it was granted,
+        // and a crawl moves below any speed threshold, so rest is the
+        // angles holding still across consecutive frames.
+        let mut last = [f64::NAN; NUM_JOINTS];
+        let mut still = 0;
+        while still < 10 {
+            assert!(
+                Instant::now() < deadline,
+                "the arm never came to rest after the gate latched:\n{}",
+                trace.join("\n")
+            );
+            let Some(s) = rig.recv_status() else {
+                continue;
+            };
+            sample(&s, &mut closest, &mut trace);
+            let moved = last[0].is_nan()
+                || s.angles
+                    .iter()
+                    .zip(last.iter())
+                    .any(|(a, b)| (a - b).abs() > 1e-3);
+            last = s.angles;
+            still = if moved { 0 } else { still + 1 };
         }
-        closest
+        Approach {
+            closest_m: closest,
+            trace,
+        }
     }
 
     let scene = Scene {
@@ -2379,23 +2448,26 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
         mid_m,
         deg_per_m,
     };
+    const STEP_MM: f64 = 5.0;
     let crawl = approach(&rig, &mut c, &scene, 1.0, Some(0.02));
-    let streamed = approach(&rig, &mut c, &scene, 5.0, None);
+    let streamed = approach(&rig, &mut c, &scene, STEP_MM, None);
     println!(
         "closest approach: crawl {:.1} mm, streamed {:.1} mm",
-        crawl * 1e3,
-        streamed * 1e3
+        crawl.closest_m * 1e3,
+        streamed.closest_m * 1e3
     );
     // A millimetre of slack for the sampling grid: STATUS is a snapshot
     // stream, so neither approach is observed continuously.
     assert!(
-        streamed > crawl - 1e-3,
+        streamed.closest_m > crawl.closest_m - 1e-3,
         "the streamed approach ran {:.1} mm past where a crawl stops \
          ({:.1} mm vs {:.1} mm from the box centre): the gate admitted \
-         targets the arm could not stop short of",
-        (crawl - streamed) * 1e3,
-        streamed * 1e3,
-        crawl * 1e3
+         targets the arm could not stop short of\n--- crawl ---\n{}\n--- streamed ---\n{}",
+        (crawl.closest_m - streamed.closest_m) * 1e3,
+        streamed.closest_m * 1e3,
+        crawl.closest_m * 1e3,
+        crawl.trace.join("\n"),
+        streamed.trace.join("\n")
     );
 
     rig.shutdown();

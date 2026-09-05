@@ -302,7 +302,7 @@ impl Preview {
                 stream_limits,
                 robot.stream.fault_latch_s,
             ),
-            gate: StreamGate::new(stack.gate_collision, &jog_limits),
+            gate: StreamGate::new(stack.gate_collision, &jog_limits, robot.robot.tick_dt_s),
             cfg,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,

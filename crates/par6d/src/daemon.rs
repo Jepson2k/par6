@@ -300,6 +300,7 @@ impl Daemon {
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
+            robot.robot.tick_dt_s,
         )));
         let bridge = RtBridge::new(
             link.clone(),
