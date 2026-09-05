@@ -34,7 +34,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ffi
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: fmt
@@ -126,7 +126,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ffi
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: check
@@ -196,7 +196,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ffi
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e ${{ matrix.env }} setup
       # waldoctl branch-matching must happen BEFORE the package install:
@@ -251,7 +251,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: .ffi
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e py312 setup
       # Release, not debug: the sim runs in wall-clock time and an

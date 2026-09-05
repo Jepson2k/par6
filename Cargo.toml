@@ -21,10 +21,10 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/Jepson2k/par6"
-# Verified by the `msrv` CI job, not asserted: 1.85 was declared and does
-# not build — rsruckig 3.0 calls `is_multiple_of` on an unsigned integer,
-# stabilized in 1.87.
-rust-version = "1.87"
+# Verified by the `msrv` CI job, not asserted. mujoco-rs 6 sets the floor
+# (edition 2024, rust-version 1.95); before it, rsruckig 3.0's use of
+# `is_multiple_of` needed 1.87.
+rust-version = "1.95"
 
 [workspace.dependencies]
 par6-proto = { path = "crates/par6-proto" }
@@ -34,6 +34,9 @@ par6-motion = { path = "crates/par6-motion" }
 par6-bus = { path = "crates/par6-bus" }
 par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }
+# The simulator's physics. `auto-download-mujoco` fetches the libmujoco matching
+# the target arch into $MUJOCO_DOWNLOAD_DIR (pixi sets it); no system libmujoco.
+mujoco-rs = { version = "6.0.0", default-features = false, features = ["auto-download-mujoco"] }
 par6-client = { path = "crates/par6-client" }
 
 serde = { version = "1", features = ["derive"] }

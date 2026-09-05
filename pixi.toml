@@ -28,12 +28,6 @@ cmake = "*"
 ninja = "*"
 cxx-compiler = "*"
 
-# TEMPORARY until the hand-rolled MuJoCo FFI is replaced by mujoco-rs: the
-# `sim-mujoco` feature still links a system libmujoco, and its CI leg runs on
-# linux-64 only (the old provisioning never installed it for aarch64 either).
-[target.linux-64.dependencies]
-libmujoco = "3.10.*"
-
 [activation.env]
 PAR6_SHIM_LIB_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/lib"
 PAR6_SHIM_INCLUDE_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/include"
@@ -43,8 +37,6 @@ LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.ffi/shim/lib:$PIXI_PROJECT_ROOT/.ffi/topp
 # mujoco-rs requires an absolute path; it fetches the libmujoco matching
 # CARGO_CFG_TARGET_ARCH into this directory.
 MUJOCO_DOWNLOAD_DIR = "$PIXI_PROJECT_ROOT/.ffi/mujoco"
-# Temporary — see [target.linux-64.dependencies].
-PAR6_MUJOCO_LIB_DIR = "$CONDA_PREFIX/lib"
 # toppra-cpp pin. Bump together with a rebuild (rm -rf .ffi/toppra).
 TOPPRA_COMMIT = "142456f3282c92c93ab97749a24856661924d989"
 
