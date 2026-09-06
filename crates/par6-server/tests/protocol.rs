@@ -3075,16 +3075,23 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     );
 
     // The STATUS broadcast carries the same number...
+    // Wait for the frame that carries BOTH, rather than asserting the ETA on
+    // the first frame that shows two segments: the segment count and the
+    // duration are refreshed from the same pass but a frame can be sampled
+    // between them, and failing on that says nothing about what STATUS
+    // carries.
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let s = recv_status(&h.status_rx).await;
-        if s.queued_segments == 2 {
-            assert!((s.queued_duration - 3.0).abs() < 1e-9);
+        if s.queued_segments == 2 && (s.queued_duration - 3.0).abs() < 1e-9 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no status frame with the queued moves"
+            "no status frame carrying the queued moves' 3 s ETA \
+             (last saw {} segments, {} s)",
+            s.queued_segments,
+            s.queued_duration
         );
     }
     // ... without asking the planner to re-plan for every frame.
