@@ -66,11 +66,16 @@ PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
 TOPPRA_COMMIT="${PAR6_TOPPRA_COMMIT:-142456f3282c92c93ab97749a24856661924d989}"
-# Cross sysroot pin. conda-forge builds its own linux-aarch64 packages
-# against glibc 2.17, so the shim is built against the same floor: the
-# staged closure then has a single, lowest-common glibc requirement and
-# runs on anything from bullseye upward. Raising this raises the floor.
-CROSS_SYSROOT_VERSION="${PAR6_CROSS_SYSROOT_VERSION:-2.17}"
+# Cross sysroot pin: the glibc floor of the whole staged closure, so that
+# it has a single lowest-common requirement rather than one per library.
+#
+# 2.28 rather than conda-forge's own 2.17 floor, because the closure now
+# carries a library we do not build: the vendor `libmujoco.so` for aarch64
+# references `powf@GLIBC_2.27`, a symbol version a 2.17 sysroot cannot
+# resolve, and the cross link fails outright. The floor is MuJoCo's, not
+# ours. 2.28 is the lowest conda-forge sysroot that clears it, and it keeps
+# the promise the old pin made — bullseye ships 2.31.
+CROSS_SYSROOT_VERSION="${PAR6_CROSS_SYSROOT_VERSION:-2.28}"
 
 # Packages the shim links against — the ones a cross target also needs.
 TARGET_SPECS=(

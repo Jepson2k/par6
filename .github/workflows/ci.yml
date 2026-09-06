@@ -59,7 +59,7 @@ jobs:
       - name: report collision check cost (par6-kin)
         run: |
           pixi run cargo test -p par6-kin --release \
-            --test golden_collision per_waypoint_check_cost_is_reported -- --nocapture
+            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
       # The shipped 250 Hz configuration, end to end: every other harness
       # patches tick_dt_s up for CI headroom, so this soak is the one place
       # the unpatched 0.004 runs before it meets the arm. Release because an
@@ -153,6 +153,22 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: socketcan
+      # par6-bus reaches par6-kin through its dev-dependencies, and par6-kin
+      # links the Pinocchio shim unconditionally — there is no toolchain-free
+      # leg to build any more, so this job needs the same closure the rest do.
+      # Same cache key as `rust`, so it lands on that job's shim.
+      - uses: prefix-dev/setup-pixi@v0.8.1
+        with:
+          pixi-version: ${{ env.PIXI_VERSION }}
+          cache: true
+          environments: default
+      - name: cache shim + toppra
+        uses: actions/cache@v4
+        with:
+          path: .ffi
+          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+      - name: build shim (pixi run setup)
+        run: pixi run setup
       - name: create vcan0
         run: |
           sudo apt-get update
@@ -166,7 +182,7 @@ jobs:
       - name: test par6-bus against vcan0
         env:
           PAR6_REQUIRE_VCAN: '1'
-        run: cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
+        run: pixi run cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
 
   python:
     name: python ${{ matrix.python }}
