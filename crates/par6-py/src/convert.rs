@@ -361,12 +361,12 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
 
 /// Python shape dict → wire shape.
 ///
-/// `physics` is decoded by hand rather than by the derive, because the
-/// two representations of [`par6_proto::Physical`] are not the same
-/// shape: the wire (and the shim, which mirrors it) carries
-/// `[mass|None, [slide, spin, roll]]`, while the robot TOML's
-/// `[installation_shapes.physics]` carries named fields. The derive
-/// serves the config; this serves the wire.
+/// `physics` is converted before the derive sees it. The shim speaks
+/// waldoctl's wire form, `[mass|None, [slide, spin, roll]]`, which every
+/// backend shares; [`par6_proto::Physical`]'s derive is the robot TOML's
+/// `[installation_shapes.physics]`, which is named fields. Handing the
+/// sequence straight to it fails with "'list' object cannot be converted
+/// to 'Mapping'".
 pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
     let physics = match d.get_item("physics")? {
         Some(v) if !v.is_none() => Some(physical_from_py(&v)?),
@@ -381,11 +381,21 @@ pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
 }
 
 /// `[mass|None, [slide, spin, roll]]` → [`par6_proto::Physical`].
+///
+/// Element by element rather than as a tuple: pyo3 extracts a tuple from a
+/// Python tuple only, and the shim sends a list.
 fn physical_from_py(v: &Bound<'_, PyAny>) -> PyResult<par6_proto::Physical> {
-    let (mass, friction): (Option<f64>, [f64; 3]) = v.extract().map_err(|_| {
+    let bad = || {
         PyRuntimeError::new_err("bad shape physics: expected [mass or None, [slide, spin, roll]]")
-    })?;
-    Ok(par6_proto::Physical { mass, friction })
+    };
+    let items: Vec<Bound<'_, PyAny>> = v.extract().map_err(|_| bad())?;
+    let [mass, friction] = items.as_slice() else {
+        return Err(bad());
+    };
+    Ok(par6_proto::Physical {
+        mass: mass.extract().map_err(|_| bad())?,
+        friction: friction.extract().map_err(|_| bad())?,
+    })
 }
 
 /// Python value → tool-action parameter.

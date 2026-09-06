@@ -60,8 +60,22 @@ cmd = "bash scripts/ffi/build.sh shim"
 inputs = ["cpp/**"]
 outputs = [".ffi/shim/lib/libpar6_shim.so"]
 
+# libmujoco is downloaded by `mujoco-rs`'s build script into
+# $MUJOCO_DOWNLOAD_DIR, so the only way to materialise it is to build the one
+# crate that depends on it. Without this, `pixi run setup` leaves `.ffi`
+# incomplete: everything that links `-lmujoco` without having built par6-bus
+# first — the maturin wheel build, most obviously — fails to link, and a
+# populated `.ffi` cache hides it until the cache key changes.
+#
+# Keyed on the library actually being there rather than on cargo's freshness:
+# `target/` and `.ffi` are cached separately, so cargo can hold par6-bus fresh
+# — skipping the build script that does the download — while `.ffi` is empty.
+# Cleaning mujoco-rs is what forces its script to run again.
+[tasks.fetch-mujoco]
+cmd = "bash scripts/ffi/fetch_mujoco.sh"
+
 [tasks.setup]
-depends-on = ["build-shim"]
+depends-on = ["build-shim", "fetch-mujoco"]
 
 # Python interpreters for the package's supported versions. The package is a
 # maturin build linking the shim, so it needs this environment's activation at

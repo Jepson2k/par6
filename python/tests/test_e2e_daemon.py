@@ -31,7 +31,7 @@ from live_daemon import (
     settle_at,
     sim_config,
 )
-from waldoctl.shapes import Box
+from waldoctl.shapes import Box, Physical
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -1093,6 +1093,65 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         assert await client.wait_status(
             lambda s: max_deg_error(s.angles, target) < 2.0, timeout=STEP_BUDGET_S
         ), "the move the keep-out was blocking never ran once it was cleared"
+
+
+@pytest.mark.timeout(180)
+async def test_shape_physics_survives_the_wire_in_both_directions(
+    daemon: LiveDaemon,
+):
+    """A shape's physics reaches the runtime and comes back.
+
+    ``physics`` is what decides whether a shape is a body the simulator can
+    rest things on, drop or grasp, or only geometry the planner keeps out
+    of — and it travels as the seventh element of the shape wire form.  It
+    was being dropped in three separate places at once, each of which
+    failed silently: the client packed six elements, the readback built its
+    dict without the field, and the engine decoded the rest through a
+    derive that expects the config file's named fields rather than the
+    wire's pair.  A shape declared with mass simply arrived without it.
+
+    The three cases are distinct and all three matter: a mass is a free
+    body, ``mass=None`` is a static fixture (a table, which must be a
+    keep-out AND a surface), and no physics at all is geometry only.
+    """
+    block = Box(
+        name="block",
+        x=0.04,
+        y=0.04,
+        z=0.06,
+        pose=(0.35, 0.0, 0.05, 0, 0, 0),
+        physics=Physical(mass=0.05, friction=(0.9, 0.004, 0.0002)),
+    )
+    table = Box(
+        name="table",
+        x=0.5,
+        y=0.5,
+        z=0.02,
+        pose=(0.35, 0.0, 0.01, 0, 0, 0),
+        physics=Physical(mass=None),
+    )
+    keepout = Box(name="wall", x=0.1, y=0.1, z=0.1, pose=(0.6, 0.0, 0.2, 0, 0, 0))
+
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        try:
+            assert await client.set_shapes([block, table, keepout]) == 1
+            world = await client.shapes()
+            assert world is not None
+            got = {s.name: s for s in world.program}
+            assert got["block"] == block, "the wire lost the body's physics"
+            assert got["table"] == table, "the wire lost the fixture's physics"
+            assert got["wall"].physics is None, (
+                "a shape declaring no physics must not acquire any"
+            )
+            # The runtime's own configured shapes read back the same way, so
+            # a client cannot tell an installation surface from a keep-out
+            # by whether the field survived the trip.
+            assert any(s.physics is not None for s in world.installation), (
+                "the configured installation layer reports no physics at all"
+            )
+        finally:
+            assert await client.set_shapes([]) == 1
 
 
 @pytest.mark.timeout(180)
