@@ -22,6 +22,20 @@ if compgen -G "$MUJOCO_DOWNLOAD_DIR"/mujoco-*/lib/libmujoco.so >/dev/null; then
   exit 0
 fi
 
-echo ">>> downloading libmujoco via mujoco-rs's build script"
-cargo clean -p mujoco-rs
-cargo build -p par6-bus
+# Retried: this is a network fetch of a ~50 MB archive from the internet, and
+# a one-shot download in CI eventually meets a reset connection — which fails
+# the whole job with "failed to download MuJoCo's hash file". Cleaning the
+# crate again is what makes the build script re-run rather than cache the
+# failure.
+for attempt in 1 2 3; do
+  echo ">>> downloading libmujoco via mujoco-rs's build script (attempt $attempt)"
+  cargo clean -p mujoco-rs
+  if cargo build -p par6-bus; then
+    exit 0
+  fi
+  echo ">>> attempt $attempt failed" >&2
+  sleep $((attempt * 5))
+done
+
+echo "libmujoco could not be downloaded after 3 attempts" >&2
+exit 1
