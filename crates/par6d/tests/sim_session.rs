@@ -760,7 +760,7 @@ fn flashing_window_over_protocol_v2() {
     assert!(ok, "motion after a re-home must complete, got {detail:?}");
 }
 
-fn timed_move_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> Duration {
+fn peak_speed_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> f64 {
     let park = park_deg();
     teleport_home(rig, c, park);
     c.ok(&select_profile(profile));
@@ -777,11 +777,26 @@ fn timed_move_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> Durat
         blend_radius: None,
         rel: false,
     });
-    let started = Instant::now();
+    rig.drain_status();
     let index = c.ok_index(&cmd);
+    let mut peak = 0.0f64;
+    let mut moved = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        let Some(s) = rig.recv_status() else { continue };
+        let v = s.speeds[0].abs();
+        peak = peak.max(v);
+        if v > 0.02 {
+            moved = true;
+        } else if moved {
+            break;
+        }
+    }
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "{profile} move must complete, got {detail:?}");
-    started.elapsed()
+    assert!(moved, "the {profile} probe never moved the joint");
+    println!("PEAK {profile} {peak:.4}");
+    peak
 }
 
 fn tool_status(s: &Status) -> par6_proto::ToolStatusWire {
@@ -888,34 +903,39 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // the same move under the same limits).
     let err = c.expect_error(&select_profile("BOGUS"));
     assert_eq!(err.code, ErrorCode::SysProfileInvalid as u16);
-    // Time the trajectory, not the servo: under `commanded` a move
-    // finishes when its last sample has been issued, so the measurement
-    // is the planned duration plus a datagram.
+    // The observable is the PEAK SPEED the probe reaches, not how long
+    // it took. Elapsed time cannot separate these: under `commanded` a
+    // probe this short fits in the sample ring whole, so every profile
+    // completes on the planner's poll interval, and under `settled` the
+    // settle swamps the difference — a jerk-limited trajectory arrives
+    // with less residual velocity and settles faster, giving back
+    // exactly the time its longer plan cost. The shape survives both.
+    // Over a move too short to reach cruise, a jerk limit is visible
+    // directly: ruckig spends the whole probe ramping and never gets
+    // near the speed an unlimited-jerk profile reaches.
     c.ok(&Command::SetCompletionPolicy(SetCompletionPolicy {
-        policy: CompletionPolicy::Commanded,
+        policy: CompletionPolicy::Settled,
     }));
-    let trapezoid = timed_move_under(&rig, &mut c, "TRAPEZOID", 5100);
-    let ruckig = timed_move_under(&rig, &mut c, "RUCKIG", 5101);
+    let trapezoid = peak_speed_under(&rig, &mut c, "TRAPEZOID", 5100);
+    let ruckig = peak_speed_under(&rig, &mut c, "RUCKIG", 5101);
     assert!(
-        ruckig > trapezoid.mul_f64(1.4),
-        "the selected profile did not change the trajectory: \
-         TRAPEZOID {trapezoid:?} vs RUCKIG {ruckig:?}"
+        ruckig * 1.4 < trapezoid,
+        "the selected profile did not change the trajectory: peak speed \
+         TRAPEZOID {trapezoid:.3} vs RUCKIG {ruckig:.3} rad/s"
     );
-    // Same proof for QUINTIC: unlimited jerk, so jerk-limited ruckig
-    // cannot beat it either. (It plans ~20% slower than the trapezoid
-    // over this move, but that gap is inside the ack-to-COMPLETE
-    // measurement noise, so the ruckig ratio is the observable.)
-    let quintic = timed_move_under(&rig, &mut c, "QUINTIC", 5103);
+    // Same proof for QUINTIC: unlimited jerk, so it too outruns the
+    // jerk-limited profile over the probe.
+    let quintic = peak_speed_under(&rig, &mut c, "QUINTIC", 5103);
     assert!(
-        ruckig > quintic.mul_f64(1.4),
-        "the QUINTIC selection did not reach the planner: \
-         QUINTIC {quintic:?} vs RUCKIG {ruckig:?}"
+        ruckig * 1.4 < quintic,
+        "the QUINTIC selection did not reach the planner: peak speed \
+         QUINTIC {quintic:.3} vs RUCKIG {ruckig:.3} rad/s"
     );
-    let toppra = timed_move_under(&rig, &mut c, "TOPPRA", 5102);
+    let toppra = peak_speed_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
-        toppra < ruckig,
-        "TOPPRA (time-optimal, no jerk limit) must not be slower than \
-         jerk-limited RUCKIG: {toppra:?} vs {ruckig:?}"
+        toppra > ruckig,
+        "TOPPRA (time-optimal, no jerk limit) must not be held under \
+         jerk-limited RUCKIG: peak speed {toppra:.3} vs {ruckig:.3} rad/s"
     );
 
     // ---- tools. The fitted tool reports from boot — a client does not

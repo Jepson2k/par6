@@ -46,7 +46,7 @@ use crate::planner::Par6Planner;
 
 /// Planner→RT sample ring capacity \[samples\] (~16 s at 4 ms; longer
 /// plans stream in under backpressure from the planner's poll loop).
-const RING_CAPACITY: usize = 4096;
+pub(crate) const RING_CAPACITY: usize = 4096;
 /// Grace period for the server task to exit after the shutdown notify.
 const SERVER_GRACE: Duration = Duration::from_millis(100);
 
@@ -796,8 +796,8 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
 /// [`par6_kin::Kin`] per consumer — pinocchio's `Data` is mutated by
 /// every call, so instances are never shared across threads.
 pub(crate) struct KinStack {
-    fk: crate::kin::KinFk,
-    gravity: crate::kin::KinGravity,
+    pub(crate) fk: crate::kin::KinFk,
+    pub(crate) gravity: crate::kin::KinGravity,
     pub(crate) planner: crate::kin::CartKin,
     bridge: crate::kin::CartKin,
     pub(crate) housekeeping: crate::kin::CartKin,
@@ -1026,7 +1026,7 @@ fn io_source(
 /// scan, and the only answer that is never unrecoverable is "yes". Every
 /// FLASHING exit therefore costs a re-home; a marker-writing flasher is
 /// what would buy the scan-only case back.
-fn flash_marker() -> Box<dyn FlashMarker> {
+pub(crate) fn flash_marker() -> Box<dyn FlashMarker> {
     struct AssumeFlashed;
     impl FlashMarker for AssumeFlashed {
         fn flashed(&mut self) -> bool {

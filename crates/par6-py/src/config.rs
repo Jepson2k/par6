@@ -283,14 +283,7 @@ impl Config {
     fn installation_shapes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         for s in &self.bundle.installation_shapes {
-            let d = PyDict::new(py);
-            d.set_item("kind", &s.kind)?;
-            d.set_item("params", s.params.clone())?;
-            d.set_item("pose", s.pose.to_vec())?;
-            d.set_item("collision", s.collision)?;
-            d.set_item("margin", s.margin)?;
-            d.set_item("name", &s.name)?;
-            out.append(d)?;
+            out.append(crate::convert::shape_dict(py, s)?)?;
         }
         Ok(out)
     }

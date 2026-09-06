@@ -1779,8 +1779,16 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
     only when the answer is declared and only to what was found. A
     payload declared BEFORE the call has to come back on every exit that
     does not declare: the estimate clears it to measure against an
-    unloaded model, and an arm still holding a 1.2 kg part must not be
-    left compensating for nothing because someone was curious.
+    unloaded model, and an arm still holding a part must not be left
+    compensating for nothing because someone was curious.
+
+    The part is a light one on purpose. A declared payload the arm is not
+    actually carrying is a torque bias — the controller lifts a mass that
+    is not there — and above a joint's gearbox holding friction that bias
+    drives the arm: at 0.3 kg the elbow runs 33 degrees and folds the
+    wrist into the forearm, so the swing this asks for has nowhere to go.
+    Below the friction the arm simply holds, which is the state a client
+    asking "what am I carrying" is in.
 
     Whether the number is RIGHT is not asserted here and cannot be: this
     fixture re-ticks the daemon for CI, and at that rate the torque plant
@@ -1796,9 +1804,9 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
 
         assert await enable(client, home) is None
 
-        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        assert await client.set_payload(0.1, com=(0.0, 0.01, 0.05)) == 1
         before = await client.payload()
-        assert before is not None and before.mass == pytest.approx(1.2)
+        assert before is not None and before.mass == pytest.approx(0.1)
 
         found = await client.estimate_payload(declare=False)
         assert found.poses >= 3, "the wrist must have been swung somewhere"

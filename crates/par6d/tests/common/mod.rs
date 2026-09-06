@@ -384,6 +384,23 @@ impl Rig {
     }
 }
 
+impl Drop for Rig {
+    /// Stop the daemon even when the test panicked before `shutdown`, or
+    /// never called it.
+    ///
+    /// A leaked daemon goes on broadcasting STATUS to the ephemeral port
+    /// its `Rig` bound. That port is released when the socket drops, the
+    /// kernel hands the number out again, and the next test's status
+    /// socket then receives two arms interleaved — which reads as a
+    /// wildly misbehaving robot in whichever test happened to draw the
+    /// reused port, not as the leak it is.
+    fn drop(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown();
+        }
+    }
+}
+
 /// A protocol-v2 client on a real socket.
 pub struct Client {
     sock: UdpSocket,

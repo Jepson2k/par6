@@ -560,11 +560,17 @@ control_mode = "pid"
 # The ground this robot stands on. An installation shape like any other:
 # the planner refuses to enter it, the simulator's scene rests things on
 # it, and `set_shapes` cannot remove it — it replaces the program layer.
+#
+# Its top face sits 20 mm BELOW the mounting plane, which is the height of
+# the plate the arm is bolted to. A floor level with z = 0 would touch
+# `base_link` — the arm stands on it — and, since that contact is inside
+# the 5 mm clearance, every motion would be refused against the ground the
+# robot is bolted to.
 [[installation_shapes]]
 name = "floor"
 kind = "box"
 params = [6.0, 6.0, 0.2]
-pose = [0.0, 0.0, -0.1, 0.0, 0.0, 0.0]
+pose = [0.0, 0.0, -0.12, 0.0, 0.0, 0.0]
 
 # No mass: welded where it is declared, and solid.
 [installation_shapes.physics]

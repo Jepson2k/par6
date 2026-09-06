@@ -40,11 +40,12 @@ pub use driver::FaultKind;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use par6_config::{Gains, GripperConfig, KtSource, RobotConfig, WatchdogAction};
+use par6_config::{GripperConfig, KtSource, RobotConfig};
 use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
-use crate::hw::sched::FreshnessClock;
+use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
+use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
     encode_pd_gains, encode_position_gains, encode_velocity_gains, encode_voltage_limit,
@@ -97,20 +98,8 @@ fn layer_index(layer: Layer) -> usize {
     }
 }
 /// Poll slots between device-info sweeps (~4 s at 250 Hz).
-const DEVICE_INFO_PERIOD_SLOTS: u64 = 1006;
 /// Default hall-sensor band half-width \[rad\].
 const HALL_HALF_WIDTH_RAD: f64 = 0.02;
-
-/// Config values re-sent to a node on the reconnect path.
-struct NodeConfig {
-    node: NodeId,
-    watchdog_ms: u32,
-    action: WatchdogAction,
-    velocity_limit_ticks_s: f64,
-    ilim_ma: f64,
-    voltage_limit_mv: u32,
-    gains: Gains,
-}
 
 /// The closed-loop sim bus. Construct, optionally set hooks
 /// ([`set_initial_joint_rad`](Self::set_initial_joint_rad)), then
@@ -855,7 +844,7 @@ impl SimBus {
         for _ in 0..repeats {
             let c = &self.node_configs[i];
             let frames = [
-                encode_watchdog(node, c.watchdog_ms, c.action),
+                encode_watchdog(node, c.watchdog_ms, c.watchdog_action),
                 encode_limits(node, c.velocity_limit_ticks_s as f32, c.ilim_ma as f32),
                 encode_voltage_limit(node, c.voltage_limit_mv),
                 encode_pd_gains(node, c.gains.kp as f32, c.gains.kd as f32),
@@ -1185,29 +1174,17 @@ impl DriverBus for SimBus {
         self.node_configs = robot
             .joints
             .iter()
-            .map(|j| NodeConfig {
-                node: j.node_id,
-                watchdog_ms: j.watchdog_timeout_ms,
-                action: robot.bus.watchdog_action,
-                velocity_limit_ticks_s: j.velocity_limit_ticks_s,
-                ilim_ma: j.ilim_ma,
-                voltage_limit_mv: j.voltage_limit_mv,
-                gains: j.gains,
-            })
+            .map(|j| NodeConfig::arm(j, robot.bus.watchdog_action))
             .collect();
         if has_can_gripper {
             let d = gripper
                 .and_then(|g| g.driver.as_ref())
                 .expect("has_can_gripper");
-            self.node_configs.push(NodeConfig {
-                node: self.gripper_node,
-                watchdog_ms: d.watchdog_timeout_ms,
-                action: robot.bus.watchdog_action,
-                velocity_limit_ticks_s: d.velocity_limit_ticks_s,
-                ilim_ma: d.ilim_ma,
-                voltage_limit_mv: d.voltage_limit_mv,
-                gains: d.gains,
-            });
+            self.node_configs.push(NodeConfig::gripper(
+                self.gripper_node,
+                d,
+                robot.bus.watchdog_action,
+            ));
         }
 
         self.configured = true;
@@ -1239,14 +1216,16 @@ impl DriverBus for SimBus {
                 reason: "retune_node for a node with no stored configuration",
             });
         };
-        c.gains = tune.gains;
-        c.ilim_ma = tune.ilim_ma;
-        c.velocity_limit_ticks_s = tune.velocity_limit_ticks_s;
-        c.voltage_limit_mv = tune.voltage_limit_mv;
+        c.apply_tune(tune);
         self.apply_node_config(node, repeats);
         Ok(())
     }
 
+    /// The virtual driver at `node` answers to `new_id` from here on:
+    /// the joint (or gripper) routing, the stored config's key and the
+    /// presence mask all move. An id nobody answers gets the frame and
+    /// nothing happens, exactly as on hardware; an id already on the bus
+    /// is refused, which hardware would not do for you.
     fn set_can_id(&mut self, node: NodeId, new_id: NodeId) -> Result<(), BusError> {
         self.ensure_ready()?;
         let taken = self.node_to_joint[usize::from(new_id)].is_some()

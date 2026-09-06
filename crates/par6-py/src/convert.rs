@@ -184,6 +184,13 @@ pub(crate) fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
     d.set_item("collision", s.collision)?;
     d.set_item("margin", s.margin)?;
     d.set_item("name", &s.name)?;
+    // `[mass|None, [slide, spin, roll]]`, the wire form the shim rebuilds
+    // a `Physical` from. Dropping it would report a block that falls and
+    // a keep-out that cannot be touched as the same shape.
+    match &s.physics {
+        Some(ph) => d.set_item("physics", (ph.mass, ph.friction.to_vec()))?,
+        None => d.set_item("physics", py.None())?,
+    }
     Ok(d.into_any().unbind())
 }
 
@@ -353,8 +360,32 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
 }
 
 /// Python shape dict → wire shape.
+///
+/// `physics` is decoded by hand rather than by the derive, because the
+/// two representations of [`par6_proto::Physical`] are not the same
+/// shape: the wire (and the shim, which mirrors it) carries
+/// `[mass|None, [slide, spin, roll]]`, while the robot TOML's
+/// `[installation_shapes.physics]` carries named fields. The derive
+/// serves the config; this serves the wire.
 pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
-    pythonize::depythonize(d).map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))
+    let physics = match d.get_item("physics")? {
+        Some(v) if !v.is_none() => Some(physical_from_py(&v)?),
+        _ => None,
+    };
+    let rest = d.copy()?;
+    rest.del_item("physics").ok();
+    let mut shape: Shape = pythonize::depythonize(&rest)
+        .map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))?;
+    shape.physics = physics;
+    Ok(shape)
+}
+
+/// `[mass|None, [slide, spin, roll]]` → [`par6_proto::Physical`].
+fn physical_from_py(v: &Bound<'_, PyAny>) -> PyResult<par6_proto::Physical> {
+    let (mass, friction): (Option<f64>, [f64; 3]) = v.extract().map_err(|_| {
+        PyRuntimeError::new_err("bad shape physics: expected [mass or None, [slide, spin, roll]]")
+    })?;
+    Ok(par6_proto::Physical { mass, friction })
 }
 
 /// Python value → tool-action parameter.

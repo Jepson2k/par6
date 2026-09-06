@@ -1760,6 +1760,7 @@ class AsyncRobotClient(_RobotClientABC):
                 w["collision"],
                 w["margin"],
                 w["name"],
+                w.get("physics"),
             )
 
         return ShapeWorld(

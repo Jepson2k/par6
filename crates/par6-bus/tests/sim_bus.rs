@@ -1070,13 +1070,20 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     run_calibration(&mut rig).expect("re-calibration failed");
     let mut prev = rig.state.gripper.reply.unwrap().position;
     let mut saw_moving = false;
-    for _ in 0..u64::from(robot.ticks(2.5)) {
+    for tick in 0..u64::from(robot.ticks(2.5)) {
         rig.step(&cmds, &move_to(252));
         let r = rig.state.gripper.reply.unwrap();
         assert!(r.position >= prev, "close travel reversed");
-        if r.action_status {
+        // `action_status` echoes the commanded action bit, which the
+        // replay holds set for the whole move — it never reports
+        // arrival, so a completion keyed on it would wait forever.
+        // Travel is reported by `object_detection` alone. (Tick 0's
+        // reply still describes the state before the command landed.)
+        if tick > 0 {
+            assert!(r.action_status, "action_status stopped echoing the command");
+        }
+        if r.object_detection == ObjectDetection::Moving {
             saw_moving = true;
-            assert_eq!(r.object_detection, ObjectDetection::Moving);
         }
         prev = r.position;
     }
@@ -1084,7 +1091,10 @@ fn gripper_firmware_calibrate_empty_polls_and_moves() {
     assert!(saw_moving, "no moving phase observed");
     assert_eq!(r.position, 252);
     assert_eq!(r.object_detection, ObjectDetection::ReachedNoObject);
-    assert!(!r.action_status);
+    assert!(
+        r.action_status,
+        "the standing command is still asserted after arrival"
+    );
     assert_eq!(r.current_ma, 0, "current at rest");
 
     // An object between the jaws jams the close early: detection code 1,
@@ -1583,9 +1593,13 @@ fn grasp_detected_through_status_bits() {
         ObjectDetection::DetectedClosing,
         "no object detected while closing (reply {r:?})"
     );
+    // `action_status` echoes the COMMANDED action bit, not motion, so
+    // the grip that is being held reads as still asserted — which is
+    // the invariant that keeps the jaws clamped. Arrival and contact
+    // are `object_detection`'s to report, asserted above.
     assert!(
-        !r.action_status,
-        "still reported moving while pressing the object"
+        r.action_status,
+        "the standing grip must still be asserted while it presses"
     );
     assert!(
         r.position > 100 && r.position < 240,
@@ -1735,6 +1749,16 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     // shape like any other, so the scene only has one once it is applied.
     rig.bus
         .set_world(Layer::Installation, &robot.installation_shapes);
+    // Where a dropped body comes to rest: the floor's own top face, read
+    // from the shape the config declares rather than assumed to be z = 0.
+    // It sits below the mounting plane by the height of the plate the arm
+    // is bolted to.
+    let floor_top = robot
+        .installation_shapes
+        .iter()
+        .find(|s| s.name == "floor")
+        .map(|s| s.pose[2] + s.params[2] / 2.0)
+        .expect("the shipped config declares a floor");
 
     // A free block in the air over the floor, plus a keep-out and a marker
     // that must not become bodies — all beyond the arm's reach, so nothing
@@ -1801,8 +1825,9 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     }
     let rest = rig.bus.world_object_pose("block").unwrap();
     assert!(
-        (rest[2] - HALF_H).abs() < 0.005,
-        "the block should rest on the floor at z {HALF_H}, got {}",
+        (rest[2] - (floor_top + HALF_H)).abs() < 0.005,
+        "the block should rest on the floor at z {}, got {}",
+        floor_top + HALF_H,
         rest[2]
     );
     assert!(
