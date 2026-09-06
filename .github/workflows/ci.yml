@@ -41,17 +41,14 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: pixi run cargo clippy --workspace --all-targets -- -D warnings
-      # par6-py is a Python extension: its test harness would need a libpython
-      # to link against. It is clippy-checked above and exercised by the
-      # `python` job through the real import.
-      # par6d's integration tests boot a real daemon on a real-time tick.
-      # Run alongside the rest of the workspace on a saturated machine
-      # they miss deadlines and fail on timing rather than behaviour, so
-      # they get the box to themselves.
+      # One command, every crate, nothing excluded. par6d's integration tests
+      # each boot a real daemon on a real-time tick, and two of those on one
+      # machine miss deadlines — but that is now held off in the harness
+      # (`Rig` takes a process-wide slot) rather than by giving the crate its
+      # own invocation, so a plain `cargo test` is the whole suite here and
+      # on a developer's machine alike.
       - name: test
-        run: pixi run cargo test --workspace --exclude par6-py --exclude par6d
-      - name: test (par6d, daemon integration)
-        run: pixi run cargo test -p par6d -- --test-threads=1
+        run: pixi run cargo test --workspace
       # The collision golden suite runs in `test` above; this reruns just its
       # timing case optimized and uncaptured, so the measured per-waypoint
       # cost the planner budgets against is visible in the log. The test only

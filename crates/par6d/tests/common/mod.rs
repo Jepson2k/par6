@@ -251,9 +251,24 @@ pub fn free_udp_port() -> u16 {
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
+/// Only one simulated daemon runs at a time, for the whole test binary.
+///
+/// A [`Rig`] boots a real RT loop that has to hold its configured period in
+/// wall-clock time, and the MuJoCo step inside it is not free. Two of them on
+/// one machine miss deadlines, and the tests that measure a reaction — how far
+/// the arm coasts past a keep-out, how a jog ramps down — then fail on the
+/// scheduler rather than on the behaviour they describe. Serializing here
+/// rather than with `--test-threads=1` is what lets a plain `cargo test`
+/// run the whole workspace and mean something.
+static RT_SLOT: Mutex<()> = Mutex::new(());
+
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
+    /// Held for the daemon's life; see [`RT_SLOT`]. Poisoning is ignored on
+    /// purpose: a panicking test has already failed, and taking the slot down
+    /// with it would fail every test after it for the wrong reason.
+    _slot: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Rig {
@@ -285,6 +300,7 @@ impl Rig {
 
     fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
         let _ = env_logger::builder().is_test(true).try_init();
+        let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
@@ -298,6 +314,7 @@ impl Rig {
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
+            _slot: slot,
         })
     }
 
