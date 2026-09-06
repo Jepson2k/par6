@@ -47,7 +47,7 @@ from par6._par6 import CoreClient, RobotWireError
 
 from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
-from ..protocol.constants import CompletionPolicy
+from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
 from ._wire import (
     blend as _blend,

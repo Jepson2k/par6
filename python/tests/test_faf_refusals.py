@@ -30,7 +30,7 @@ from live_daemon import LiveDaemon, angles_now, requires_par6d, settle_at
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
-from par6.protocol.constants import ErrorCode
+from par6.protocol import ErrorCode
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
 

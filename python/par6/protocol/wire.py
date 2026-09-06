@@ -10,9 +10,8 @@ What remains Python-side is the shared client-facing state:
 - :func:`update_status_from_dict` — the one filler, slice-assigning a
   frame dict from the extension into a buffer.
 
-Constants come from the generated :mod:`par6.protocol.constants`;
-``MAX_JOG_DURATION_S`` is re-exported from the extension (the Rust codec
-is the source of truth for the value).
+Constants come from the `par6._par6` extension — the Rust codec is the
+source of truth for every wire value, and nothing here restates one.
 """
 
 from __future__ import annotations
@@ -23,11 +22,10 @@ from typing import Mapping
 import numpy as np
 from waldoctl import ActionState, ToolState, ToolStatus
 
-from par6._par6 import MAX_JOG_DURATION_S
-
-from .constants import (
+from par6._par6 import (
     EN_SLOTS,
     IO_SLOTS,
+    MAX_JOG_DURATION_S,
     NUM_JOINTS,
     POSE_ELEMS,
     ControllerMode,

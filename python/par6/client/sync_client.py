@@ -29,7 +29,7 @@ from waldoctl.sync_tools import SyncTool, make_sync_tool
 from waldoctl.tools import ToolSpec, ToolStatus
 from waldoctl.types import Axis, Frame
 
-from ..protocol.constants import CompletionPolicy
+from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer
 from .async_client import (
     AsyncRobotClient,

@@ -337,8 +337,8 @@ The recipe, in the order the codec tests expect:
    Python shim (`python/par6/client/`). The preview needs nothing per-command: it drives
    the daemon's own planner.
 5. **Codec tests** — `crates/par6-proto`'s encode/decode round trip and hostile-input
-   tests cover every tag; regenerate the Python constants mirror
-   (`cargo run -p par6-proto --bin gen_python`).
+   tests cover every tag. Python needs no regeneration step: the extension
+   exposes the constants straight off the crate.
 6. **Test** — a sim e2e that drives the command through the real client against a real
    `par6d --sim`.
 

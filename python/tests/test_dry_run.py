@@ -23,7 +23,7 @@ from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
 from par6.client import RobotError
 from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
-from par6.protocol.constants import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
+from par6.protocol import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
 

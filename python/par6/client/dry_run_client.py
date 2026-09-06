@@ -38,7 +38,7 @@ from waldoctl.tools import ToolStatus
 from par6 import config as _cfg
 from par6._par6 import Preview, RobotWireError, matrix_to_xyzrpy
 from par6.client.async_client import QueueResult, ReachableResult
-from par6.protocol.constants import (
+from par6.protocol import (
     NUM_JOINTS,
     CompletionPolicy,
     ControllerMode,

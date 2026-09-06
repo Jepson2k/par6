@@ -31,8 +31,8 @@ imports `par6` (the extension dlopens the shim).
 - `crates/par6-proto`'s own tests are the codec suite (encode + decode +
   hostile inputs). A contract change without updated, passing tests is
   incomplete.
-- `python/par6/protocol/constants.py` is GENERATED from `par6-proto` — never edit by
-  hand; regenerate and let the freshness-guard test prove it.
+- Python never restates a wire value. Constants and enums come off the
+  `par6._par6` extension, built from `par6-proto`'s own `variants()`.
 
 ## Licensing rules
 

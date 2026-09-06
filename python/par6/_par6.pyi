@@ -8,11 +8,32 @@ for the exact keys).
 """
 
 from collections.abc import Awaitable
+from enum import IntEnum
 from typing import Any
 
+PROTO_VERSION: int
 NUM_JOINTS: int
+POSE_ELEMS: int
+IO_SLOTS: int
+MAX_IO_SLOTS: int
+EN_SLOTS: int
+STATUS_LEN: int
+STATUS_HEADER_LEN: int
 MAX_JOG_DURATION_S: float
 COLLISION_CLEARANCE_M: float
+
+# Built at module init from each wire enum's `variants()` in par6-proto, so
+# the members are the Rust definitions rather than a transcription of them.
+# `ActionState` and `ToolState` are deliberately absent: StatusBuffer hands
+# those to waldoctl consumers that compare by identity, so par6 re-exports
+# waldoctl's classes instead of defining equal-valued twins.
+class ErrorCode(IntEnum): ...
+class Frame(IntEnum): ...
+class ControllerMode(IntEnum): ...
+class CompletionPolicy(IntEnum): ...
+class LinkState(IntEnum): ...
+class HomingJointState(IntEnum): ...
+class HomingPhase(IntEnum): ...
 
 class RobotWireError(Exception):
     """A structured runtime refusal; ``args`` is the wire 6-tuple

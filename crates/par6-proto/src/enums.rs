@@ -1,9 +1,9 @@
 //! Wire enums: message/command/query tags and small value enums.
 //!
 //! Every enum here is FROZEN contract data. Values are explicit and grouped in
-//! ranges so the taxonomy is readable on the wire; the Python mirror
-//! (`python/par6/protocol/constants.py`) is generated from these definitions
-//! via [`crate::pygen`], so Rust and Python can never disagree.
+//! ranges so the taxonomy is readable on the wire. The `variants()` reflection
+//! the `wire_enum!` macro provides is what the Python binding builds its
+//! `IntEnum`s from, so Rust and Python cannot disagree.
 
 wire_enum! {
     /// Reply / push / broadcast message tags (slot 0 of every server→client
