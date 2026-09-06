@@ -5,8 +5,6 @@
 //! acceleration. A sign flip, a missed gravity subtraction, a slot
 //! offset, or mishandled jaw joints all land degrees-per-second² away.
 
-#![cfg(feature = "ffi")]
-
 use std::path::PathBuf;
 
 use par6_kin::{GripperVariant, Kin, NQ};

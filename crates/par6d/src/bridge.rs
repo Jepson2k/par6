@@ -22,7 +22,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use par6_bus::sim::scene::Scene;
 use par6_bus::sim::SimBus;
+use par6_bus::sim::WorldMailbox;
 use par6_bus::{RuntimeBus, SocketCanBus};
 use par6_config::ConfigBundle;
 use par6_proto::command::MAX_JOG_DURATION_S;
@@ -496,10 +498,16 @@ pub(crate) struct RtBridge {
     flush: FlushMarker,
     bundle: Arc<ConfigBundle>,
     sim: bool,
+    /// The scene a simulator swap boots on.
+    scene: Scene,
+    /// Where the running simulator takes world layers from; `None` on
+    /// hardware.
+    sim_world: Option<WorldMailbox>,
     cart: CartStream,
 }
 
 impl RtBridge {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         link: CoreLink,
         stream_input: Arc<Mutex<StreamInput>>,
@@ -507,6 +515,8 @@ impl RtBridge {
         flush: FlushMarker,
         bundle: Arc<ConfigBundle>,
         sim: bool,
+        scene: Scene,
+        sim_world: Option<WorldMailbox>,
         cart: CartStream,
     ) -> Self {
         Self {
@@ -516,6 +526,8 @@ impl RtBridge {
             flush,
             bundle,
             sim,
+            scene,
+            sim_world,
             cart,
         }
     }
@@ -1071,7 +1083,8 @@ impl RtBridge {
     /// (`bus.watchdog_action`), so on hardware this is a way to stop
     /// LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
-        let sim = SimBus::new();
+        let sim = SimBus::new(self.scene.clone());
+        self.sim_world = Some(sim.mailbox());
         let bundle = self.bundle.clone();
         self.sim = true;
         self.link.op(Box::new(move |core| {

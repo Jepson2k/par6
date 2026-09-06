@@ -915,6 +915,28 @@ impl<B: DriverBus> RtCore<B> {
     /// tracker state, JOG's integrated target — and the wire speed
     /// channel is only a feedforward, so a hold left aimed at the
     /// pre-teleport pose would actively drag the arm back to it.
+    /// Adopt `q` \[rad\] as the pose the plant was just re-seeded to.
+    ///
+    /// The core half of a teleport, after the bus has moved: a re-seeded
+    /// plant reports the WRAPPED boot reading first, so each joint's
+    /// conversion is re-based to make that reading map exactly to the
+    /// teleported angle. Then the arm counts as homed and every motion
+    /// target is reseeded off the new pose, or the next tick would drive
+    /// toward wherever the arm used to be.
+    ///
+    /// The bus half stays at the call site, which already holds the
+    /// concrete bus type.
+    pub fn adopt_landed_pose(&mut self, robot: &par6_config::RobotConfig, q: &[f64; MAX_JOINTS]) {
+        for (i, joint) in robot.joints.iter().enumerate() {
+            let conv = par6_bus::spectral::JointConversion::from_config(joint);
+            let true0 = conv.motor_ticks(q[i]);
+            let wrapped0 = true0.rem_euclid(1i32 << joint.encoder_bits);
+            self.set_joint_reference(i, wrapped0, q[i]);
+        }
+        self.set_homed(true);
+        self.reseed_motion_targets();
+    }
+
     pub fn reseed_motion_targets(&mut self) {
         let q = self.q;
         self.exec.reseed_hold(&q);

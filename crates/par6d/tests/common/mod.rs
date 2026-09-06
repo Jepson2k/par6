@@ -216,15 +216,10 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
 /// A daemon whose STATUS broadcast is aimed at `status_port` on
 /// loopback, for a test that listens with a real `par6_client::Client`
 /// instead of the rig's own socket.
-pub fn boot_for_client(
-    config: PathBuf,
-    sim_dynamics: bool,
-    status_port: u16,
-) -> Result<Daemon, String> {
+pub fn boot_for_client(config: PathBuf, status_port: u16) -> Result<Daemon, String> {
     let _ = env_logger::builder().is_test(true).try_init();
     redirect_bus_grant();
     let opts = Options {
-        sim_dynamics,
         ..sim_options(config, status_port)
     };
     Daemon::start(&opts).map_err(|e| e.to_string())
@@ -264,13 +259,13 @@ pub struct Rig {
 impl Rig {
     /// Boot the simulator on `config`, with the kinematic plant.
     pub fn boot(config: PathBuf) -> Rig {
-        Rig::boot_with(config, false)
+        Rig::boot_with(config)
     }
 
-    /// Boot the simulator on `config`; `sim_dynamics` selects the
+    /// Boot the simulator on `config`. The
     /// torque-level plant over the kinematic one.
-    pub fn boot_with(config: PathBuf, sim_dynamics: bool) -> Rig {
-        Rig::boot_opts(config, sim_dynamics, None)
+    pub fn boot_with(config: PathBuf) -> Rig {
+        Rig::boot_opts(config, None)
     }
 
     /// Boot the simulator with the STATUS broadcast rate overridden, as
@@ -281,18 +276,14 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, false, Some(hz))
+        Rig::try_boot_opts(config, Some(hz))
     }
 
-    fn boot_opts(config: PathBuf, sim_dynamics: bool, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, sim_dynamics, status_rate_hz).expect("daemon boots in sim mode")
+    fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
+        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(
-        config: PathBuf,
-        sim_dynamics: bool,
-        status_rate_hz: Option<u32>,
-    ) -> Result<Rig, String> {
+    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
         let _ = env_logger::builder().is_test(true).try_init();
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
@@ -300,7 +291,6 @@ impl Rig {
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
         let opts = Options {
-            sim_dynamics,
             status_rate_hz,
             ..sim_options(config, status_rx.local_addr().unwrap().port())
         };

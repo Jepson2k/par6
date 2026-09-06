@@ -25,24 +25,10 @@
 //! - jacobians: 6 x nq, row-major, rows `[linear; angular]`,
 //!   LOCAL_WORLD_ALIGNED frame
 //! - gravity: RNEA at zero velocity/acceleration, `nq` torques
-
-#[cfg(feature = "ffi")]
-pub mod ffi;
-
-#[cfg(feature = "ffi")]
-mod model;
-
-#[cfg(feature = "ffi")]
-mod traj;
-
-#[cfg(feature = "ffi")]
 mod collision;
-
-#[cfg(feature = "ffi")]
-pub use model::{Error, IkOptions, Model, ToolParams};
-
-#[cfg(feature = "ffi")]
-pub use traj::{PathDegree, Trajectory};
-
-#[cfg(feature = "ffi")]
+pub mod ffi;
+mod model;
+mod traj;
 pub use collision::{CollisionModel, Layer, ShapeDesc};
+pub use model::{Error, IkOptions, Model, ToolParams};
+pub use traj::{PathDegree, Trajectory};

@@ -2,7 +2,6 @@
 //! TOPPRA time-optimal rest-to-rest parameterizations — limits respected
 //! everywhere AND actually saturated — with degenerate inputs rejected as
 //! errors across the FFI, never crashes.
-#![cfg(feature = "ffi")]
 
 use pinokin_sys::{ffi, Error, Trajectory};
 

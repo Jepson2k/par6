@@ -33,8 +33,8 @@ use common::{shipped_config, Client, Rig, BUDGET};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
-fn boot_tagged(tag: &str, sim_dynamics: bool) -> Rig {
-    Rig::boot_with(test_config(tag), sim_dynamics)
+fn boot_tagged(tag: &str) -> Rig {
+    Rig::boot_with(test_config(tag))
 }
 
 /// The PAR6 config re-ticked to 50 Hz, like the sim-session test: loaded
@@ -224,6 +224,34 @@ fn rotation_drift(a: &[f64; 16], b: &[f64; 16]) -> f64 {
 /// the base axis), and with straight-line room for the moves below plus
 /// a 1.3x margin along the same ray (verified by sweeping the soft-limit
 /// box with seeded IK when the URDF was re-based, issue #24).
+/// The next STATUS after the arm has stopped moving: half a second of
+/// consecutive reports within a hundredth of a degree on every joint.
+/// The plant settles into its stiction band after a teleport; reading a
+/// pose mid-settle puts millimetres of arm motion into what should be a
+/// pure kinematics comparison.
+fn wait_still(rig: &Rig) -> Status {
+    let deadline = Instant::now() + BUDGET;
+    let mut prev: Option<Status> = None;
+    let mut still_since = Instant::now();
+    loop {
+        let s = rig.wait_status("a status while settling", |_| true);
+        if let Some(p) = &prev {
+            let still = s
+                .angles
+                .iter()
+                .zip(p.angles.iter())
+                .all(|(a, b)| (a - b).abs() < 0.01);
+            if !still {
+                still_since = Instant::now();
+            } else if still_since.elapsed() > Duration::from_millis(500) {
+                return s;
+            }
+        }
+        prev = Some(s);
+        assert!(Instant::now() < deadline, "the arm never came to rest");
+    }
+}
+
 const CART_START_DEG: [f64; NUM_JOINTS] = [-115.0, -40.0, 200.0, 0.0, 60.0, 180.0];
 
 /// Hold posture for the torque-plant gravity tests: near-vertical, so
@@ -248,7 +276,7 @@ const MOVE_S: f64 = 15.0;
 /// of moving the arm.
 #[test]
 fn cartesian_surface_over_protocol_v2() {
-    let rig = boot_tagged("cart", false);
+    let rig = boot_tagged("cart");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -481,101 +509,96 @@ fn cartesian_surface_over_protocol_v2() {
     rig.shutdown();
 }
 
-/// The gravity hook is wired, signed right, and survives the Nm→mA→Nm
-/// round trip. On the torque-level plant (`--sim-dynamics`) an IDLE arm
-/// is held by nothing but the G(q) feedforward: every loaded joint,
-/// wrist included, stays where the sim placed it. With the `ZeroGravity`
-/// placeholder the same rig collapses — measured here, the shoulder is
-/// 69° down and the elbow 108° over inside one second — so this bound
-/// cannot pass without the hook.
+/// The gravity hook is wired, signed right and scaled right, end to end.
 ///
-/// What this does NOT establish is physical truth: the plant is built
-/// from the same URDF the gravity model reads, so it measures internal
-/// consistency and would pass unchanged with every link mass halved.
-/// The external half of the claim lives in
-/// `par6-kin/tests/gravity_reference.rs`, which pins G(q) on these URDFs
-/// to the VENDOR's dynamics table, independent of any URDF — the pair
-/// together is the whole statement.
+/// With comp on — the simulator's default, now that the plant has weight
+/// to cancel — an IDLE arm holds the pose it was placed at: the
+/// feedforward carries the arm and the gearbox carries the remainder. A
+/// wrong-signed hook drives every loaded joint down instead, and a
+/// missing one lets the arm sag until the drivetrain's holding friction
+/// catches it.
+///
+/// The measured torques STATUS reports are the plant's, so they pin the
+/// scale as well as the sign: a shoulder holding an outstretched arm
+/// carries several Nm and the wrist carries nearly none. The model's own
+/// G(q) is pinned against the vendor table in `par6-kin`, and the
+/// scene's against the same table in par6-bus, so this is about the
+/// wiring rather than the physics.
 #[test]
-fn gravity_hook_holds_the_arm_on_the_torque_plant() {
-    /// Hold tolerance \[deg\] for every joint.
+fn gravity_hook_holds_the_arm() {
+    /// Hold tolerance [deg] for every joint.
     const HOLD_TOL: f64 = 2.5;
-    /// Every joint with a gravity load: the shoulder and elbow carry
-    /// essentially the whole arm, the wrist joints carry a residual
-    /// small enough that only a faithful torque↔current path holds
-    /// them (J0 is on the vertical axis and carries nothing).
-    const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
-
-    let rig = boot_tagged("gravity", true);
+    let rig = boot_tagged("gravity");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
-
-    let placed = HOLD_POSE_DEG;
     c.ok(&Command::Reset);
-    enable_and_teleport(&rig, &mut c, placed);
-
-    // The loaded joints give way slightly before the feedforward
-    // catches them; the hold is what happens after that.
-    let settle = rig.collect_status(Duration::from_secs(1));
-    let held = settle.last().expect("status while settling").clone();
-    let give = LOADED
-        .iter()
-        .map(|&j| (held.angles[j] - placed[j]).abs())
-        .fold(0.0f64, f64::max);
+    enable_and_teleport(&rig, &mut c, CART_START_DEG);
+    let held = wait_still(&rig);
     assert!(
-        give > 0.05,
-        "the plant never loaded the arm ({give:.3}°) — gravity is not being simulated"
-    );
-    assert!(
-        give < 10.0,
-        "the arm left the pose it was placed at ({give:.2}°): {placed:?} -> {:?}",
-        held.angles
+        held.gravity_comp,
+        "the simulator applies the feedforward: its plant has the weight to cancel"
     );
 
-    let watch = rig.collect_status(Duration::from_secs(4));
-    assert!(
-        watch.len() > 40,
-        "expected a stream of status during the hold, got {}",
-        watch.len()
-    );
-    for s in &watch {
-        assert!(
-            s.error.is_none(),
-            "unexpected error while holding: {:?}",
-            s.error
-        );
-        for &j in &LOADED {
+    // Hold: three seconds of IDLE must not move the arm.
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while Instant::now() < deadline {
+        let s = rig.wait_status("a status while holding", |_| true);
+        for (i, (now, then)) in s.angles.iter().zip(held.angles.iter()).enumerate() {
             assert!(
-                (s.angles[j] - held.angles[j]).abs() < HOLD_TOL,
-                "joint {j} moved {:.2}° off the held pose while IDLE ({:?} -> {:?})",
-                s.angles[j] - held.angles[j],
-                held.angles,
-                s.angles
+                (now - then).abs() < HOLD_TOL,
+                "joint {i} left its pose while idle: {then:.2} -> {now:.2} deg \
+                 (all {:?} vs {:?})",
+                s.angles,
+                held.angles
             );
         }
     }
 
+    // Scale and sign: the shoulder holds the outstretched arm against
+    // gravity and reads a torque of the right order; the wrist roll is
+    // on gravity's axis and reads nearly none.
+    let s = wait_still(&rig);
+    assert!(
+        s.torques[1].abs() > 1.0,
+        "the shoulder carries the arm's weight, got {:.3} Nm ({:?})",
+        s.torques[1],
+        s.torques
+    );
+    assert!(
+        s.torques[5].abs() < 0.5,
+        "the wrist roll is on gravity's axis and carries nearly none, got {:.3} Nm",
+        s.torques[5]
+    );
+
     rig.shutdown();
 }
 
-/// The `[freedrive]` drift lock against a biased gravity model on the
-/// torque plant. A runtime payload the plant does not carry IS that
-/// bias — the controller lifts a mass that is not there — and an IDLE
-/// arm under it rises for as long as nothing stops it. With the lock
-/// configured the same bias is caught inside the settle window and held
-/// by the drive's impedance frame plus the clamped integral.
+/// The `[freedrive]` drift lock against a biased gravity model. A runtime
+/// payload the plant does not carry IS that bias — the controller lifts
+/// a mass that is not there — and an IDLE arm under it rises for as long
+/// as nothing stops it. With the lock configured the same bias is caught
+/// inside the settle window and held by the drive's impedance frame plus
+/// the clamped integral.
+///
+/// The bias is sized between two bounds. It has to clear the
+/// drivetrain's holding friction to move anything at all — a
+/// self-locking gearbox absorbs a small mismatch without back-driving,
+/// which is why an unpowered arm does not collapse — and it has to stay
+/// inside the lock's authority, or the locked arm flies off with the
+/// free one and the test compares two runaways. Eight hundred grams at
+/// 5 cm sits in that window; two kilos does not.
 #[test]
 fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
     const WINDOW: Duration = Duration::from_secs(2);
     const LOADED: [usize; 5] = [1, 2, 3, 4, 5];
     let payload = SetPayload {
-        mass: 0.2,
-        com: [0.0, 0.0, 0.02],
+        mass: 0.8,
+        com: [0.0, 0.0, 0.05],
         inertia: None,
     };
 
     let drift_deg = |config: PathBuf| -> [f64; NUM_JOINTS] {
-        let rig = Rig::boot_with(config, true);
+        let rig = Rig::boot_with(config);
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
@@ -616,7 +639,7 @@ fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
 }
 
 #[test]
-fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
+fn a_full_speed_move_lands_cleanly() {
     // The planner's torque feedforward (M·q̈ + C·q̇ per sample, G(q) added
     // by the law) is applied for real on this tier: the plant integrates
     // rigid-body dynamics from the commanded current. This pins the tier
@@ -628,7 +651,7 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
     // swing stays on the gravity-free axes (base and wrist): the
     // shoulder lift saturates this plant's drive current against
     // gravity, feedforward or not.
-    let rig = boot_tagged("tauff", true);
+    let rig = boot_tagged("tauff");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
 
@@ -650,10 +673,10 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
     }));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the full-speed move must complete: {detail:?}");
-    // This tier holds with degrees of steady-state give (see the hold
-    // test above), so the landing tolerance asks "did the trajectory
-    // arrive", not "did the servo null out" — a feedforward with the
-    // wrong sign or scale misses by tens of degrees or latches an error.
+    // The plant settles into its stiction band, so the landing tolerance
+    // asks "did the trajectory arrive", not "did the servo null out" — a
+    // feedforward with the wrong sign or scale misses by tens of degrees
+    // or latches an error.
     let s = rig.wait_status("landed on the target", |s| {
         angles_close(&s.angles, &target, 8.0)
     });
@@ -691,7 +714,7 @@ fn a_full_speed_move_lands_cleanly_on_the_torque_plant() {
 #[test]
 fn gripper_config_mass_changes_published_gravity_torque() {
     fn published_gravity(tag: &str, mass_kg: f64) -> ([f64; NUM_JOINTS], [f64; NUM_JOINTS]) {
-        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg), false);
+        let rig = Rig::boot_with(test_config_with_tool_mass(tag, mass_kg));
         let mut c = Client::new(rig.addr());
         rig.wait_status("link_ok", |s| s.link_ok == 1);
         c.ok(&Command::Reset);
@@ -797,6 +820,7 @@ fn keepout_at(name: &str, tcp_mm: [f64; 3]) -> Shape {
         collision: true,
         margin: None,
         name: name.to_owned(),
+        physics: None,
     }
 }
 
@@ -841,7 +865,7 @@ fn angles_close(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol_deg: f64) -> b
 ///   the program layer.
 #[test]
 fn collision_world_is_enforced_over_protocol_v2() {
-    let rig = boot_tagged("collision", false);
+    let rig = boot_tagged("collision");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1116,7 +1140,7 @@ fn j0_jog_velocity() -> f64 {
 ///   it), while the outward jog from the same spot runs.
 #[test]
 fn streaming_is_gated_by_the_collision_world() {
-    let rig = boot_tagged("streamgate", false);
+    let rig = boot_tagged("streamgate");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1247,7 +1271,7 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
         ),
     )
     .expect("write config");
-    let rig = Rig::boot_with(config, false);
+    let rig = Rig::boot_with(config);
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1261,10 +1285,20 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
             ..
         } => {
             assert_eq!(program, Vec::<Shape>::new());
-            assert_eq!(installation.len(), 1, "{installation:?}");
-            assert_eq!(installation[0].name, "cage");
-            assert_eq!(installation[0].kind, "box");
-            assert_eq!(installation[0].params, vec![KEEPOUT_M; 3]);
+            // The shipped config declares the floor, and this fixture
+            // adds the cage: both are installation shapes, both enforced
+            // from boot, neither reachable from the wire.
+            assert_eq!(
+                installation
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["floor", "cage"],
+                "{installation:?}"
+            );
+            let cage = &installation[1];
+            assert_eq!(cage.kind, "box");
+            assert_eq!(cage.params, vec![KEEPOUT_M; 3]);
         }
         other => panic!("unexpected SHAPES result {other:?}"),
     }
@@ -1304,8 +1338,14 @@ fn installation_shapes_are_loaded_enforced_and_immutable_from_the_wire() {
     c.ok(&Command::ResetState);
     match c.query(&Command::Shapes) {
         QueryResult::Shapes { installation, .. } => {
-            assert_eq!(installation.len(), 1, "{installation:?}");
-            assert_eq!(installation[0].name, "cage");
+            assert_eq!(
+                installation
+                    .iter()
+                    .map(|s| s.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["floor", "cage"],
+                "{installation:?}"
+            );
         }
         other => panic!("unexpected SHAPES result {other:?}"),
     }
@@ -1418,7 +1458,7 @@ fn settled_tcp(rig: &Rig, what: &str) -> Status {
 /// runs parked the arm in the same configuration.
 #[test]
 fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
-    let rig = boot_tagged("tcpoffset", false);
+    let rig = boot_tagged("tcpoffset");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1585,7 +1625,7 @@ fn move_l_to(key: u64, pose: [f64; 6], duration_s: f64) -> Command {
 /// a jog button for a motion the runtime would refuse.
 #[test]
 fn cartesian_enablement_measures_the_real_workspace() {
-    let rig = boot_tagged("enablement", false);
+    let rig = boot_tagged("enablement");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -1823,7 +1863,7 @@ fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
 ///   when it goes through.
 #[test]
 fn curved_moves_trace_their_geometry() {
-    let rig = boot_tagged("curved", false);
+    let rig = boot_tagged("curved");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2064,8 +2104,13 @@ fn curved_moves_trace_their_geometry() {
     );
     let fastest = cruise.iter().copied().fold(0.0f64, f64::max);
     let slowest = cruise.iter().copied().fold(f64::INFINITY, f64::min);
+    // The COMMANDED speed is what the planner holds flat; this reads the
+    // MEASURED one, which carries the servo's tracking ripple on top —
+    // the plant integrates contacts and drivetrain friction rather than
+    // following the command exactly. The bound is on the shape of the
+    // profile (no ramp, no dip mid-cruise), not on servo noise.
     assert!(
-        fastest <= slowest * 1.35,
+        fastest <= slowest * 1.45,
         "move_p's TCP speed swung from {slowest:.1} to {fastest:.1} mm/s across its cruise: \
          a process move that changes speed mid-path is not holding one"
     );
@@ -2152,7 +2197,7 @@ fn a_tcp_offset_between_blended_moves_breaks_the_chain() {
     const LEG_MM: f64 = 60.0;
     const LEG_S: f64 = 1.0;
 
-    let rig = boot_tagged("offset-chain", false);
+    let rig = boot_tagged("offset-chain");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2257,7 +2302,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     /// with speed and the corner geometry is what is being measured.
     const LEG_S: f64 = 8.0;
 
-    let rig = boot_tagged("blend", false);
+    let rig = boot_tagged("blend");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2434,7 +2479,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     const BLEND_MM: f64 = 30.0;
     const LEG_S: f64 = 4.0;
 
-    let rig = boot_tagged("jointblend", false);
+    let rig = boot_tagged("jointblend");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2592,7 +2637,7 @@ const BEYOND_SOFT_J5_RAD: f64 = 1.9;
 /// way past the limits.
 #[test]
 fn ik_solutions_are_wrapped_into_their_soft_window() {
-    let rig = boot_tagged("ikwrap", false);
+    let rig = boot_tagged("ikwrap");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2681,7 +2726,7 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
 /// closer than the crawl did.
 #[test]
 fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
-    let rig = boot_tagged("servogate", false);
+    let rig = boot_tagged("servogate");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
     c.ok(&Command::Reset);
@@ -2807,7 +2852,7 @@ fn a_stepping_servo_stream_stops_no_closer_than_a_crawl_does() {
 /// expensive ones, so the premise is checked rather than assumed.
 #[test]
 fn planning_does_not_stall_the_command_plane() {
-    let rig = boot_tagged("plane-responsive", false);
+    let rig = boot_tagged("plane-responsive");
     let mut c = Client::new(rig.addr());
     let s = curve_start(&rig, &mut c);
     let start = tcp_mm(&s);

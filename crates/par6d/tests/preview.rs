@@ -143,6 +143,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
         collision: true,
         margin: None,
         name: "keepout".into(),
+        physics: None,
     }];
 
     preview

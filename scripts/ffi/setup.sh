@@ -1,4 +1,9 @@
 #!/usr/bin/env bash
+#
+# NATIVE BUILDS NO LONGER USE THIS SCRIPT. `pixi run setup` does (pixi.toml,
+# scripts/ffi/build.sh, scripts/ffi/fetch_toppra.sh). This remains for the
+# cross-compile path only (`--target aarch64` from an x86_64 host) until the
+# deploy job moves off it.
 # Reproducible C++ FFI toolchain bootstrap for par6:
 #   1. installs micromamba into a local prefix (no system changes)
 #   2. creates a conda-forge env with Pinocchio + toolchain (pinned)
@@ -13,7 +18,7 @@
 # Usage:
 #   scripts/ffi/setup.sh                    # for this machine
 #   source .ffi/env.sh   # exports PAR6_SHIM_LIB_DIR / PAR6_SHIM_INCLUDE_DIR
-#   cargo test --manifest-path crates/pinokin-sys/Cargo.toml --features ffi
+#   pixi run cargo test -p pinokin-sys
 #
 #   scripts/ffi/setup.sh --target aarch64   # for the control box (RPi 5)
 #   source .ffi/env-aarch64.sh
@@ -54,32 +59,13 @@ TARGET_SUBDIR="$(conda_subdir "$TARGET_ARCH")"
 CROSS=0
 [[ "$TARGET_ARCH" != "$HOST_ARCH" ]] && CROSS=1
 
-# RSS one compile job of the Pinocchio/coal translation units needs: 3.9 GB
-# measured on the control box (cgroup memory.peak, -j1, 2026-09). Overcommitting
-# this on a swapless host livelocks it, so the default parallelism is what
-# MemAvailable can hold; an explicit CMAKE_BUILD_PARALLEL_LEVEL still wins.
-JOB_MEM_GB="${PAR6_JOB_MEM_GB:-4}"
-if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
-  mem_jobs=$(awk -v g="$JOB_MEM_GB" '/MemAvailable/ { print int($2 / (g * 1024 * 1024)) }' /proc/meminfo 2>/dev/null || true)
-  cpu_jobs="$(nproc)"
-  jobs=$(( ${mem_jobs:-$cpu_jobs} < cpu_jobs ? ${mem_jobs:-$cpu_jobs} : cpu_jobs ))
-  (( jobs >= 1 )) || jobs=1
-  export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
-  echo ">>> build parallelism: $jobs jobs (RAM-capped; override with CMAKE_BUILD_PARALLEL_LEVEL)"
-fi
-
-# Pinned package set.
+# Pinned package set. pin (pip) and pinocchio (conda-forge) versions must
+# match so scripts/ffi/gen_fixtures.py validates against identical numerics.
 PINOCCHIO_VERSION="${PAR6_PINOCCHIO_VERSION:-4.1.0}"
 # toppra-cpp source pin (v0.6.9 release commit). MIT; built with the bundled
 # Seidel LP solver — no qpOASES/GLPK, so no extra conda deps.
 TOPPRA_REPO="${PAR6_TOPPRA_REPO:-https://github.com/hungpham2511/toppra}"
 TOPPRA_COMMIT="${PAR6_TOPPRA_COMMIT:-142456f3282c92c93ab97749a24856661924d989}"
-# libmujoco (par6-bus feature `sim-mujoco`). Pinned: the hand-rolled FFI
-# declarations in crates/par6-bus/src/sim/mujoco.rs are written against this
-# version's C API. `libmujoco` is the C library alone (the `mujoco`
-# conda-forge package is a metapackage that would drag in python bindings).
-# Host-side developer tooling only — a cross target never gets it.
-MUJOCO_VERSION="${PAR6_MUJOCO_VERSION:-3.10.0}"
 # Cross sysroot pin. conda-forge builds its own linux-aarch64 packages
 # against glibc 2.17, so the shim is built against the same floor: the
 # staged closure then has a single, lowest-common glibc requirement and
@@ -257,20 +243,6 @@ else
   echo ">>> toppra exists: $ENV_DIR/lib/libtoppra.so (delete it to rebuild)"
 fi
 
-# --- 3b. libmujoco into the same env prefix ----------------------------------
-# Additive to the pinocchio/toppra env; delete $ENV_DIR/lib/libmujoco.so (or
-# bump the pin) to force a re-install. `sim-mujoco` is a host-side simulator
-# plant, never deployed, so a cross target skips it.
-if [[ $CROSS -eq 0 ]]; then
-  if [[ ! -e "$ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}" ]]; then
-    echo ">>> installing libmujoco=${MUJOCO_VERSION}"
-    "$MAMBA" install -y -p "$ENV_DIR" -c conda-forge --override-channels \
-      "libmujoco=${MUJOCO_VERSION}"
-  else
-    echo ">>> libmujoco exists: $ENV_DIR/lib/libmujoco.so.${MUJOCO_VERSION}"
-  fi
-fi
-
 # --- 4. build + install the shim ---------------------------------------------
 if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
@@ -317,34 +289,20 @@ fi
 {
   echo "export PAR6_SHIM_LIB_DIR=\"$SHIM_PREFIX/lib\""
   echo "export PAR6_SHIM_INCLUDE_DIR=\"$SHIM_PREFIX/include\""
-  sed "s/JOB_MEM_GB_PLACEHOLDER/$JOB_MEM_GB/" <<'JOBS'
-# RAM-capped default build parallelism, computed each time this file is
-# sourced, at JOB_MEM_GB per job (the measured peak of one shim compile;
-# rustc stays well under it). A swapless small-RAM host that overcommits
-# this livelocks in reclaim instead of OOM-killing. Explicit values win.
-if [ -z "${CARGO_BUILD_JOBS:-}" ] || [ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]; then
-  _par6_cores="$(nproc 2>/dev/null || echo 1)"
-  _par6_jobs="$(awk -v g="${PAR6_JOB_MEM_GB:-JOB_MEM_GB_PLACEHOLDER}" '/MemAvailable/ { print int($2 / (g * 1024 * 1024)) }' /proc/meminfo 2>/dev/null || true)"
-  [ -n "${_par6_jobs:-}" ] || _par6_jobs="$_par6_cores"
-  [ "$_par6_jobs" -ge 1 ] || _par6_jobs=1
-  [ "$_par6_jobs" -le "$_par6_cores" ] || _par6_jobs="$_par6_cores"
-  export CARGO_BUILD_JOBS="${CARGO_BUILD_JOBS:-$_par6_jobs}"
-  export CMAKE_BUILD_PARALLEL_LEVEL="${CMAKE_BUILD_PARALLEL_LEVEL:-$_par6_jobs}"
-  unset _par6_jobs _par6_cores
-fi
-JOBS
   if [[ $CROSS -eq 0 ]]; then
-    echo "# libmujoco lives in the env prefix (par6-bus feature sim-mujoco)."
-    echo "export PAR6_MUJOCO_LIB_DIR=\"$ENV_DIR/lib\""
     echo "# Runtime loading for binaries whose package did not embed an rpath"
-    echo "# (link-args don't propagate across cargo packages). Covers the shim AND"
-    echo "# libmujoco + its conda deps."
+    echo "# (link-args don't propagate across cargo packages)."
     echo "export LD_LIBRARY_PATH=\"$SHIM_PREFIX/lib:$ENV_DIR/lib\${LD_LIBRARY_PATH:+:\$LD_LIBRARY_PATH}\""
   else
     echo "# Cross target: nothing here runs on this host, so no LD_LIBRARY_PATH."
     echo "export PAR6_FFI_TARGET_ARCH=\"$TARGET_ARCH\""
     echo "# The whole set scripts/deploy/install.sh ships to /usr/local/lib/par6."
     echo "export PAR6_RUNTIME_LIB_SRC=\"$SHIM_PREFIX/lib\""
+    echo "# The target env's lib/, for closing par6d's own dependencies over."
+    echo "export PAR6_CROSS_ENV_LIB_DIR=\"$ENV_DIR/lib\""
+    echo "# mujoco-rs fetches the libmujoco matching the cargo target into this"
+    echo "# directory at build time; its own, so it never clobbers the host's."
+    echo "export MUJOCO_DOWNLOAD_DIR=\"$FFI_DIR/mujoco-$TARGET_ARCH\""
     echo "# Link par6d with the same cross toolchain the shim was built with, so"
     echo "# the binary and its C++ dependencies agree on glibc and the C++ ABI."
     echo "export CARGO_TARGET_$(echo "${TARGET_ARCH}_UNKNOWN_LINUX_GNU_LINKER" | tr '[:lower:]' '[:upper:]')=\"$TOOLCHAIN_DIR/bin/$CROSS_PREFIX-gcc\""
@@ -357,7 +315,7 @@ echo
 if [[ $CROSS -eq 0 ]]; then
   echo ">>> done. To build/test the Rust FFI crate:"
   echo "    source $ENV_FILE"
-  echo "    cargo test --manifest-path $ROOT/crates/pinokin-sys/Cargo.toml --features ffi"
+  echo "    pixi run cargo test -p pinokin-sys"
 else
   echo ">>> done. To build the runtime for the control box:"
   echo "    source $ENV_FILE"

@@ -7,20 +7,15 @@ license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
 
-[features]
-# Torque-level sim plant (Pinocchio ABA forward dynamics) for the sim
-# backend. Requires the C++ shim: scripts/ffi/setup.sh, then
-# `source .ffi/env.sh` before building. Without it the sim backend uses
-# the pure-Rust kinematic plant and needs no C++ toolchain.
-sim-dynamics = ["dep:pinokin-sys"]
-# MuJoCo-backed sim plant (contacts, grasp scenarios) for the sim backend.
-# Requires libmujoco: scripts/ffi/setup.sh installs it into .ffi/env, then
-# `source .ffi/env.sh` before building (exports PAR6_MUJOCO_LIB_DIR).
-sim-mujoco = []
-
 [dependencies]
 par6-config = { workspace = true }
-pinokin-sys = { path = "../pinokin-sys", features = ["ffi"], optional = true }
+par6-proto = { workspace = true }
+# URDF inertials for the MuJoCo scene (sim/scene.rs).
+roxmltree = "0.21"
+pinokin-sys = { path = "../pinokin-sys" }
+# The sim plant. mujoco-rs downloads libmujoco itself; build under
+# `pixi run` so MUJOCO_DOWNLOAD_DIR is set.
+mujoco-rs = { workspace = true }
 socketcan = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

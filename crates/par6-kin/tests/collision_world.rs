@@ -6,7 +6,6 @@
 //! changes nothing, and a segment sweep finds what its endpoints hide.
 //! Every shape is placed from the model's own TCP so the scenarios hold on
 //! any tree without hand-entered coordinates.
-#![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 
@@ -426,6 +425,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "t".to_owned(),
+        physics: None,
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
@@ -435,6 +435,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "b".to_owned(),
+        physics: None,
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
@@ -444,6 +445,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "b".to_owned(),
+        physics: None,
     })
     .is_err());
 

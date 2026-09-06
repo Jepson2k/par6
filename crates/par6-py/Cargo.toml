@@ -18,7 +18,7 @@ par6-client = { workspace = true }
 par6-proto = { workspace = true }
 par6-config = { workspace = true }
 par6-server = { workspace = true }
-par6-kin = { workspace = true, features = ["ffi"] }
+par6-kin = { workspace = true }
 par6-motion = { workspace = true }
 par6d = { path = "../par6d" }
 par6-calibrate = { workspace = true }

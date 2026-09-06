@@ -2107,6 +2107,7 @@ fn wire_shape(name: &str, kind: &str) -> Shape {
         collision: true,
         margin: None,
         name: name.to_owned(),
+        physics: None,
     }
 }
 
