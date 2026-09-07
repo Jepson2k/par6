@@ -578,6 +578,9 @@ pub struct MotionConfig {
     pub settle_tolerance_rad: f64,
     /// Settle timeout \[s\].
     pub settle_timeout_s: f64,
+    /// Minimum time for a unit change of queued execution scale [s].
+    /// Joint acceleration constraints may extend a transition.
+    pub execution_override_transition_s: f64,
     /// Rotation weight `w` in the multi-segment path metric
     /// √(t² + (w·θ)²) \[m/rad\] (vendor: 0.15).
     pub path_rot_weight_m_per_rad: f64,
@@ -591,7 +594,7 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 13] = [
+    pub const KEYS: [&'static str; 14] = [
         "jog_l_linear_max_m_s",
         "jog_l_angular_max_rad_s",
         "cart_step_m",
@@ -602,6 +605,7 @@ impl MotionConfig {
         "dls_lambda",
         "settle_tolerance_rad",
         "settle_timeout_s",
+        "execution_override_transition_s",
         "path_rot_weight_m_per_rad",
         "singularity_cond_max",
         "singularity_sigma_min",
@@ -609,7 +613,7 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 13] {
+    pub fn as_array(&self) -> [f64; 14] {
         [
             self.jog_l_linear_max_m_s,
             self.jog_l_angular_max_rad_s,
@@ -621,6 +625,7 @@ impl MotionConfig {
             self.dls_lambda,
             self.settle_tolerance_rad,
             self.settle_timeout_s,
+            self.execution_override_transition_s,
             self.path_rot_weight_m_per_rad,
             self.singularity_cond_max,
             self.singularity_sigma_min,
@@ -641,6 +646,7 @@ impl Default for MotionConfig {
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
             settle_timeout_s: 2.0,
+            execution_override_transition_s: 1.0,
             path_rot_weight_m_per_rad: 0.15,
             singularity_cond_max: 1000.0,
             singularity_sigma_min: 1e-4,
@@ -1321,6 +1327,10 @@ impl RobotConfig {
             (m.dls_lambda, "motion.dls_lambda"),
             (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
             (m.settle_timeout_s, "motion.settle_timeout_s"),
+            (
+                m.execution_override_transition_s,
+                "motion.execution_override_transition_s",
+            ),
             (
                 m.path_rot_weight_m_per_rad,
                 "motion.path_rot_weight_m_per_rad",

@@ -42,6 +42,7 @@ enum RtEvent {
     SetGravityComp(bool),
     SetPayload(f64),
     ExecPaused(bool),
+    ExecSpeed(f64),
     SetEnabled(bool),
     Teleport([f64; 6]),
     EnterFlashing,
@@ -122,6 +123,9 @@ impl RtCommands for TestRt {
         self.push(RtEvent::SetPayload(payload.mass));
     }
 
+    fn set_exec_speed(&mut self, scale: f64) {
+        self.push(RtEvent::ExecSpeed(scale));
+    }
     fn set_exec_paused(&mut self, paused: bool) {
         self.push(RtEvent::ExecPaused(paused));
     }

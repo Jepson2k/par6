@@ -24,6 +24,7 @@ from live_daemon import (
     requires_par6d,
     teleport_to,
 )
+from waldoctl.skills import UnresolvedPreview
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -122,6 +123,36 @@ def _circle_through(
 @pytest.fixture(scope="module")
 def dry_run() -> DryRunRobotClient:
     return Robot().create_dry_run_client(initial_joints_deg=park_deg())
+
+
+def test_execution_override_retimes_preview_and_preserves_pause():
+    start = park_deg()
+    target = list(start)
+    target[0] += 8
+    normal = DryRunRobotClient(initial_joints_deg=start)
+    slow = DryRunRobotClient(initial_joints_deg=start)
+    nominal = _planned(normal.move_j(target, duration=2))
+    assert slow.pause() == 1
+    assert slow.set_execution_speed(0.5) == 1
+    assert slow.execution_speed().paused
+    with pytest.raises(UnresolvedPreview, match="paused"):
+        slow.delay(1)
+    np.testing.assert_allclose(slow.angles(), start)
+    assert slow.resume() == 1
+    # The accepted dwell remains pending until the explicit resume.
+    dwell = slow.flush()
+    assert len(dwell) == 1 and dwell[0].duration == pytest.approx(1)
+    retimed = _planned(slow.move_j(target, duration=2))
+    assert retimed.duration == pytest.approx(nominal.duration * 2)
+    assert retimed.joint_trajectory_rad is not None
+    assert nominal.joint_trajectory_rad is not None
+    np.testing.assert_allclose(
+        retimed.joint_trajectory_rad, nominal.joint_trajectory_rad
+    )
+    assert slow.execution_speed().applied_scale == 0.5
+    for value in (0, True, 2, math.nan):
+        with pytest.raises(ValueError):
+            slow.set_execution_speed(value)
 
 
 class TestPlannedMotion:

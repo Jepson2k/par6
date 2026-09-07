@@ -364,6 +364,7 @@ struct Core<R: RtCommands> {
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
+    execution_paused: bool,
     /// The RT latch last written to the activity log, so the latch is
     /// logged on its edges and never once per poll.
     rt_error_logged: Option<u16>,
@@ -453,6 +454,7 @@ impl<R: RtCommands> Core<R> {
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
+            execution_paused: false,
             queue_estimate_for: (0, 0),
             snap: StateSnapshot::default(),
             last_fresh: None,
@@ -842,7 +844,12 @@ impl<R: RtCommands> Core<R> {
                 self.cancel_all_motion("estop").await;
                 Ok(())
             }
+            C::SetExecutionSpeed(p) => {
+                self.runtime.rt.set_exec_speed(p.scale);
+                Ok(())
+            }
             C::Pause(p) => {
+                self.execution_paused = p.on;
                 self.runtime.rt.set_exec_paused(p.on);
                 Ok(())
             }
@@ -1397,6 +1404,9 @@ impl<R: RtCommands> Core<R> {
     /// says how much of it the started motion covers. One plan is
     /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
+        if self.execution_paused || self.snap.exec.target_scale == 0.0 {
+            return;
+        }
         if self.executing.is_some() || self.planning.is_some() || self.active_stream.is_some() {
             return;
         }
@@ -2508,6 +2518,11 @@ impl<R: RtCommands> Core<R> {
             C::TcpSpeed => QueryResult::TcpSpeed {
                 speed: self.tcp_speed,
             },
+            C::ExecutionSpeed => QueryResult::ExecutionSpeed {
+                target_scale: self.snap.exec.target_scale,
+                applied_scale: self.snap.exec.applied_scale,
+                resume_scale: self.snap.exec.resume_scale,
+            },
             C::TcpTransform => QueryResult::TcpTransform {
                 values: [
                     self.tcp_offset_mm[0],
@@ -2945,6 +2960,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Estop => "estop",
         T::SetGravityComp => "set_gravity_comp",
         T::Pause => "pause",
+        T::SetExecutionSpeed => "set_execution_speed",
+        T::ExecutionSpeed => "execution_speed",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

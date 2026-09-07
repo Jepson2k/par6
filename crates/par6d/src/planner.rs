@@ -188,6 +188,7 @@ enum InFlightKind {
     },
     Delay {
         target_tick: u64,
+        paused_ticks_at_start: u64,
     },
     Instant,
 }
@@ -356,10 +357,8 @@ impl Par6Planner {
     /// re-gate the REMAINDER of a running trajectory with the same rule.
     ///
     /// The path is walked at [`COLLISION_STEP_RAD`] joint-space pitch —
-    /// the endpoints of a move are usually clear while its interior is
-    /// not, and the samples ARE the trajectory the arm will run, so this
-    /// gates what actually happens rather than a straight line between
-    /// the two endpoints.
+    /// the caller samples the RT interpolant at this pitch and includes
+    /// its turning points. Every supplied position is checked.
     ///
     /// Normally any collision along the path refuses the move. The
     /// exception is a path that STARTS in collision — a keep-out
@@ -432,19 +431,7 @@ impl Par6Planner {
 
         let total = samples.len();
         let mut checked = 0usize;
-        let mut last: Option<[f64; NQ]> = None;
         for (k, q) in samples.enumerate().skip(from) {
-            let coarse = last.is_some_and(|prev| {
-                q.iter()
-                    .zip(prev.iter())
-                    .all(|(a, b)| (a - b).abs() <= COLLISION_STEP_RAD)
-            });
-            // The last sample is where the arm comes to rest, so it is
-            // checked however close it sits to its predecessor.
-            if coarse && k + 1 != total {
-                continue;
-            }
-            last = Some(q);
             checked += 1;
             let touching = named(&col.check(&q, false).map_err(collision_error)?);
             let offending: Vec<(String, String)> = touching
@@ -519,19 +506,25 @@ impl Par6Planner {
         };
         let index = *server_index;
         let q = self.snapshots.latest().q;
-        let nearest = samples
-            .iter()
-            .enumerate()
-            .min_by(|(_, a), (_, b)| joint_distance(&a.q, &q).total_cmp(&joint_distance(&b.q, &q)))
-            .map_or(0, |(i, _)| i);
-        let gated = Self::gate_collisions_from(
-            &mut self.collision,
-            &self.shape_names,
-            &mut self.collision_latch,
-            q,
-            samples.iter().map(|s| s.q),
-            nearest,
-        );
+        let gated = crate::execution_path::positions(samples, self.dt, &self.exec_limits)
+            .map_err(planning_error)
+            .and_then(|positions| {
+                let nearest = positions
+                    .iter()
+                    .enumerate()
+                    .min_by(|(_, a), (_, b)| {
+                        joint_distance(a, &q).total_cmp(&joint_distance(b, &q))
+                    })
+                    .map_or(0, |(i, _)| i);
+                Self::gate_collisions_from(
+                    &mut self.collision,
+                    &self.shape_names,
+                    &mut self.collision_latch,
+                    q,
+                    positions.into_iter(),
+                    nearest.saturating_sub(1),
+                )
+            });
         if let Err(error) = gated {
             log::warn!(
                 "command {index} invalidated by a world change: {}",
@@ -557,6 +550,7 @@ impl Par6Planner {
     /// stream the arm must not follow; see [`par6_motion::gate`].
     fn start_exec(
         &mut self,
+        start_q: [f64; MAX_JOINTS],
         samples: Vec<[f64; 3 * MAX_JOINTS]>,
         seen_exec: bool,
     ) -> Result<InFlightKind, WireError> {
@@ -571,20 +565,7 @@ impl Par6Planner {
             par6_motion::gate::ACCEL_TOLERANCE,
         )
         .map_err(planning_error)?;
-        self.gate_collisions(
-            samples.iter().map(|s| {
-                let mut q = [0.0; NQ];
-                q.copy_from_slice(&s[..NQ]);
-                q
-            }),
-            0,
-        )?;
-        // A fresh fill generation: a flush already queued for an earlier
-        // command can no longer reach these samples, however far behind
-        // the RT command queue is running.
-        self.producer.begin_generation();
         let ring_index = self.next_ring_index;
-        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         let n = samples.len();
         // The planned acceleration becomes the ring's torque feedforward
         // (`M(q)·q̈ + C(q,q̇)·q̇`; the law adds G(q) itself). A feedforward
@@ -600,6 +581,8 @@ impl Par6Planner {
                     q: [0.0; MAX_JOINTS],
                     qd: [0.0; MAX_JOINTS],
                     tau_ff: [0.0; MAX_JOINTS],
+                    inertia_velocity: [0.0; MAX_JOINTS],
+                    start: None,
                     meta: SampleMeta {
                         command_index: ring_index,
                         checkpoint_id: ring_index,
@@ -611,21 +594,49 @@ impl Par6Planner {
                 s.qd.copy_from_slice(&qqa[MAX_JOINTS..2 * MAX_JOINTS]);
                 let mut qdd = [0.0; MAX_JOINTS];
                 qdd.copy_from_slice(&qqa[2 * MAX_JOINTS..]);
-                match kin.dyn_feedforward(&s.q, &s.qd, &qdd) {
-                    Ok(tau) => {
+                if k == 0 {
+                    let acceleration = std::array::from_fn(|i| {
+                        (6.0 * (s.q[i] - start_q[i]) - 2.0 * s.qd[i] * self.dt)
+                            / (self.dt * self.dt)
+                    });
+                    let tau_ff =
+                        match kin.dyn_feedforward(&start_q, &[0.0; MAX_JOINTS], &acceleration) {
+                            Ok(tau) => tau.map(|t| t as f32),
+                            Err(e) => {
+                                id_failed = true;
+                                log::warn!("initial torque feedforward degraded to zero: {e}");
+                                [0.0; MAX_JOINTS]
+                            }
+                        };
+                    s.start = Some(par6_rt::SampleStart { q: start_q, tau_ff });
+                }
+                match (
+                    kin.dyn_feedforward(&s.q, &s.qd, &qdd),
+                    kin.dyn_feedforward(&s.q, &[0.0; MAX_JOINTS], &s.qd),
+                ) {
+                    (Ok(tau), Ok(inertia_velocity)) => {
                         for (out, t) in s.tau_ff.iter_mut().zip(tau.iter()) {
                             *out = *t as f32;
                         }
+                        for (out, t) in s.inertia_velocity.iter_mut().zip(inertia_velocity) {
+                            *out = t as f32;
+                        }
                     }
-                    Err(e) if !id_failed => {
+                    (Err(e), _) | (_, Err(e)) if !id_failed => {
                         id_failed = true;
                         log::warn!("torque feedforward degraded to zero: {e}");
                     }
-                    Err(_) => {}
+                    (Err(_), _) | (_, Err(_)) => {}
                 }
                 s
             })
             .collect();
+        let positions = crate::execution_path::positions(&samples, self.dt, &self.exec_limits)
+            .map_err(planning_error)?;
+        self.gate_collisions(positions.into_iter(), 0)?;
+        // A flush queued for an earlier command must not erase this fill.
+        self.producer.begin_generation();
+        self.next_ring_index = self.next_ring_index.checked_add(1).unwrap_or(1);
         self.link.send(RtCommand::SetMode(Mode::Exec));
         self.heartbeat.feed();
         Ok(InFlightKind::Exec {
@@ -650,7 +661,7 @@ impl Par6Planner {
         if samples.is_empty() {
             return Ok(InFlightKind::Instant);
         }
-        self.start_exec(samples, snap.mode == Mode::Exec)
+        self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
 
     /// The tick-rate samples a joint-space move from `start` to `target`
@@ -1142,7 +1153,7 @@ impl Par6Planner {
                 self.arclen_samples(&waypoints, poses, speed, accel, duration)?
             }
         };
-        let kind = self.start_exec(samples, snap.mode == Mode::Exec)?;
+        let kind = self.start_exec(snap.q, samples, snap.mode == Mode::Exec)?;
         self.near_singularity = singularity_verdict(&self.motion, worst_sigma, worst_cond);
         Ok(kind)
     }
@@ -1469,7 +1480,7 @@ impl Par6Planner {
             .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
             .filter(|_| chain.iter().all(|c| c.duration.is_some()));
         let samples = self.toppra_samples(&flat, speed, accel, duration)?;
-        self.start_exec(samples, snap.mode == Mode::Exec)
+        self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
 
     /// Plan `cmd`, looking at the queue standing behind it (`rest`, in
@@ -1546,6 +1557,7 @@ impl Par6Planner {
                 let ticks = (p.seconds * self.ticks_per_s).round().max(1.0) as u64;
                 InFlightKind::Delay {
                     target_tick: snap.tick + ticks,
+                    paused_ticks_at_start: snap.exec.paused_ticks,
                 }
             }
             Command::Checkpoint(_)
@@ -1697,7 +1709,18 @@ impl Par6Planner {
                     None
                 }
             }
-            InFlightKind::Delay { target_tick } => (snap.tick >= *target_tick).then_some(Ok(None)),
+            InFlightKind::Delay {
+                target_tick,
+                paused_ticks_at_start,
+            } => {
+                let elapsed_pause = snap
+                    .exec
+                    .paused_ticks
+                    .saturating_sub(*paused_ticks_at_start);
+                (snap.exec.target_scale > 0.0
+                    && snap.tick.saturating_sub(elapsed_pause) >= *target_tick)
+                    .then_some(Ok(None))
+            }
             InFlightKind::Instant => Some(Ok(None)),
         }
     }
@@ -2114,7 +2137,7 @@ pub(crate) enum PlannedMotion<'a> {
 
 impl Par6Planner {
     /// The in-flight command's planned motion, for the offline preview.
-    pub(crate) fn planned_motion(&self, now_tick: u64) -> PlannedMotion<'_> {
+    pub(crate) fn planned_motion(&self, snap: &StateSnapshot) -> PlannedMotion<'_> {
         match &self.inflight {
             Some(InFlight {
                 kind: InFlightKind::Exec { samples, .. },
@@ -2125,9 +2148,21 @@ impl Par6Planner {
                 ..
             }) => PlannedMotion::Home,
             Some(InFlight {
-                kind: InFlightKind::Delay { target_tick },
+                kind:
+                    InFlightKind::Delay {
+                        target_tick,
+                        paused_ticks_at_start,
+                    },
                 ..
-            }) => PlannedMotion::Hold(target_tick.saturating_sub(now_tick)),
+            }) => {
+                let elapsed_pause = snap
+                    .exec
+                    .paused_ticks
+                    .saturating_sub(*paused_ticks_at_start);
+                PlannedMotion::Hold(
+                    target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause)),
+                )
+            }
             _ => PlannedMotion::Still,
         }
     }
@@ -2468,9 +2503,19 @@ impl Planner for Par6Planner {
                 ticks as f64 * self.dt
             }
             Some(InFlight {
-                kind: InFlightKind::Delay { target_tick },
+                kind:
+                    InFlightKind::Delay {
+                        target_tick,
+                        paused_ticks_at_start,
+                    },
                 ..
-            }) => target_tick.saturating_sub(snap.tick) as f64 * self.dt,
+            }) => {
+                let elapsed_pause = snap
+                    .exec
+                    .paused_ticks
+                    .saturating_sub(*paused_ticks_at_start);
+                target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause)) as f64 * self.dt
+            }
             _ => 0.0,
         }
     }

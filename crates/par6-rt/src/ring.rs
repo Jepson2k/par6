@@ -2,8 +2,8 @@
 //!
 //! The in-process replacement for the vendor's chunked `RCBX` batches:
 //! the planner pushes interpolated [`Sample`]s (position/velocity/torque
-//! feedforward at tick resolution) and the RT EXEC mode pops exactly one
-//! per tick. Segment metadata travels ON the samples: `command_index`
+//! feedforward at tick resolution) and the RT EXEC mode consumes at most
+//! one per tick according to the selected execution speed. Segment metadata travels ON the samples: `command_index`
 //! attributes samples to queued commands, `checkpoint_id` changes mark
 //! checkpoint label boundaries, `blend_continues` tells the completion
 //! policy to skip settling at a segment end (blended corners stay
@@ -52,6 +52,14 @@ pub struct SampleMeta {
     pub is_last: bool,
 }
 
+/// Initial rest state of a separately planned path. Its first sample is
+/// one tick after this state, not the state itself.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SampleStart {
+    pub q: [f64; MAX_JOINTS],
+    pub tau_ff: [f32; MAX_JOINTS],
+}
+
 /// One tick of planned motion for all joints.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Sample {
@@ -62,6 +70,12 @@ pub struct Sample {
     /// Torque feedforward \[Nm\] (gravity is NOT included here — the RT
     /// adds G(q) itself).
     pub tau_ff: [f32; MAX_JOINTS],
+    /// `M(q)·q̇` for the nominal trajectory. Multiplying by the execution
+    /// scale's time derivative supplies the acceleration introduced by
+    /// changing that scale; gravity remains separate.
+    pub inertia_velocity: [f32; MAX_JOINTS],
+    /// Present on the first sample of a path starting from rest.
+    pub start: Option<SampleStart>,
     /// Segment metadata.
     pub meta: SampleMeta,
 }
@@ -72,6 +86,8 @@ impl Default for Sample {
             q: [0.0; MAX_JOINTS],
             qd: [0.0; MAX_JOINTS],
             tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
             meta: SampleMeta::default(),
         }
     }
@@ -237,13 +253,19 @@ impl SampleConsumer {
     /// Copy the next sample without consuming it (e.g. to inspect an
     /// upcoming boundary).
     pub fn peek(&self) -> Option<Sample> {
+        self.peek_offset(0)
+    }
+
+    /// Look ahead without releasing slots to the producer. Execution's
+    /// fractional clock needs both sides of a crossed sample interval.
+    pub(crate) fn peek_offset(&self, offset: usize) -> Option<Sample> {
         let ring = &*self.ring;
         let head = ring.head.load(Ordering::Relaxed);
         let tail = ring.tail.load(Ordering::Acquire);
-        if head == tail {
+        if offset as u64 >= tail - head {
             return None;
         }
-        let idx = (head as usize) % ring.buf.len();
+        let idx = ((head + offset as u64) as usize) % ring.buf.len();
         // SAFETY: as in `pop`; head does not advance so the slot stays ours.
         Some(unsafe { (*ring.buf[idx].get()).sample })
     }

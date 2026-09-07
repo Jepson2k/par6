@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from waldoctl import RobotClient as _RobotClientABC
+from waldoctl.execution import ExecutionSpeed, validate_execution_scale
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
     ActionState as WActionState,
@@ -164,6 +165,7 @@ class AsyncRobotClient(_RobotClientABC):
     def skill_capabilities(self) -> frozenset[str]:
         return super().skill_capabilities | {
             "backend.par6",
+            "execution.speed",
             "tool.gripper",
             "io.digital",
         }
@@ -1168,31 +1170,93 @@ class AsyncRobotClient(_RobotClientABC):
         raw = await self._call(core.payload())
         return None if raw is None else payload_from_dict(raw)
 
-    async def pause(self) -> int:
-        """Hold the executing trajectory where it is.
+    @staticmethod
+    def _validate_execution_timeout(timeout: float) -> None:
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Execution control timeout must be positive and finite")
 
-        Unlike :meth:`stop`, the queued samples are left intact, so
-        :meth:`resume` continues the move rather than requiring the caller
-        to re-issue it.
+    async def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        """Fresh requested, applied, and retained execution scales.
+
+        Category: Query
+
+        Example:
+            speed = rbt.execution_speed()
+        """
+        self._validate_execution_timeout(timeout)
+        async with asyncio.timeout(timeout):
+            core = await self._ensure_core()
+            raw = await self._call(core.execution_speed())
+            if raw is None:
+                raise ConnectionError("Controller execution speed is unavailable")
+            return ExecutionSpeed(**raw)
+
+    async def _request_execution_state(
+        self, *, timeout: float, scale: float | None = None, paused: bool = False
+    ) -> int:
+        self._validate_execution_timeout(timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                core = await self._ensure_core()
+                request = (
+                    core.set_execution_speed(scale)
+                    if scale is not None
+                    else core.pause(paused)
+                )
+                if not await self._call(request):
+                    return 0
+                while True:
+                    state = await self.execution_speed(timeout=timeout)
+                    confirmed = (
+                        state.resume_scale == scale
+                        if scale is not None
+                        else (state.target_scale == 0) == paused
+                    )
+                    if confirmed:
+                        return 1
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            return 0
+
+    async def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        """Select 10–100% of planned queued-motion speed without resuming.
+
+        Return 1 after controller readback confirms the selection, 0 on
+        timeout. Applied speed transitions under the backend motion limits.
+        Jog and externally streamed servo targets retain their own timing.
+
+        Category: Control
+
+        Example:
+            rbt.set_execution_speed(0.5)
+        """
+        return await self._request_execution_state(
+            scale=validate_execution_scale(scale), timeout=timeout
+        )
+
+    async def pause(self, *, timeout: float = 3.0) -> int:
+        """Request a controlled hold while retaining the queued trajectory.
+
+        Return 1 when the controller confirms the request. Read
+        ``execution_speed().paused`` to confirm that deceleration has ended.
+        Python execution and standalone completion timeouts are unchanged.
 
         Category: Control
 
         Example:
             rbt.pause()
         """
-        core = await self._ensure_core()
-        return await self._call(core.pause(True))
+        return await self._request_execution_state(paused=True, timeout=timeout)
 
-    async def resume(self) -> int:
-        """Continue a trajectory held by :meth:`pause`.
+    async def resume(self, *, timeout: float = 3.0) -> int:
+        """Resume the retained trajectory at the selected positive speed.
 
         Category: Control
 
         Example:
             rbt.resume()
         """
-        core = await self._ensure_core()
-        return await self._call(core.pause(False))
+        return await self._request_execution_state(paused=False, timeout=timeout)
 
     async def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive (hand-guiding).
