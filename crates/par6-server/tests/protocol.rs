@@ -252,6 +252,12 @@ struct PlannerState {
     fail_next_tool: Option<WireError>,
     /// `cancel_tool` calls and whether each asked for a halt.
     tool_cancels: Vec<bool>,
+    /// Holds `start_tool` inside the planner so a test can act while an
+    /// action is in flight — sent to the planner, not yet answered. That
+    /// window is a state of its own (`pending_tool`, not
+    /// `tool_executing`) and things that must supersede an action have to
+    /// supersede one there too.
+    stall_tool: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -293,6 +299,13 @@ impl Planner for TestPlanner {
         index: u64,
         _cmd: &par6_proto::command::ToolAction,
     ) -> Result<(), WireError> {
+        // Outside the lock: the test flips the flag from its own thread.
+        let stall = self.0.lock().unwrap().stall_tool.clone();
+        if let Some(stall) = stall {
+            while stall.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let mut s = self.0.lock().unwrap();
         if let Some(e) = s.fail_next_tool.take() {
             return Err(e);
@@ -3485,4 +3498,100 @@ async fn cancelling_a_running_motion_flushes_the_rt_ring() {
     .await;
 
     h.wait_rt(|ev| ev.contains(&RtEvent::DiscardExec)).await;
+}
+
+/// A tool action superseded while it is still in flight is completed.
+///
+/// The lane is depth one: a new action supersedes the old, and the old is
+/// COMPLETED rather than dropped, because it was acked and a client may be
+/// waiting on it. But an action that has been sent to the planner and not
+/// yet answered lives in `pending_tool`, not `tool_executing` — so a second
+/// action arriving inside that round trip found nothing to supersede, both
+/// landed under different tags, and `on_tool_started` kept whichever
+/// answered last. The first was never completed and its client waited out
+/// its timeout on an action the server had forgotten.
+#[tokio::test]
+async fn a_tool_action_superseded_in_flight_is_still_completed() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    let action = |key: u64| {
+        Command::ToolAction(ToolAction {
+            key,
+            tool_key: "gripper".to_owned(),
+            action: "move".to_owned(),
+            params: vec![ToolParam::Float(1.0)],
+        })
+    };
+
+    // Hold the planner inside `start_tool` so the first action stays in
+    // flight while the second arrives.
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    h.planner.lock().unwrap().stall_tool = Some(stall.clone());
+
+    let first = c.ok_index(&action(901)).await;
+    let second = c.ok_index(&action(902)).await;
+    stall.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The superseded one must be answered, not forgotten.
+    let (ok, detail) = c.wait_complete(first).await;
+    assert!(
+        !ok && detail.is_some(),
+        "a superseded action completes with a cancellation, not silently OK: \
+         ok={ok} detail={detail:?}"
+    );
+
+    // And the one that superseded it still runs.
+    h.wait_planner("the superseding action to start", |p| {
+        p.tools_started.contains(&second)
+    })
+    .await;
+}
+
+/// A protective STOP reaches the planner's tool lane whatever state the
+/// action is in, so the server has to let go of it in every state too.
+/// An action still inside the `StartTool` round trip is parked in
+/// `pending_tool`, and a STOP that took only `tool_executing` left it
+/// there: cancelled on the planner, still live as far as the server knew,
+/// and its client waiting out a timeout on a COMPLETE nobody would speak.
+#[tokio::test]
+async fn a_stop_completes_a_tool_action_still_inside_its_start_round_trip() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    // Hold the planner inside `start_tool` so the action is still parked
+    // when the stop lands.
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    h.planner.lock().unwrap().stall_tool = Some(stall.clone());
+
+    let index = c
+        .ok_index(&Command::ToolAction(ToolAction {
+            key: 911,
+            tool_key: "gripper".to_owned(),
+            action: "move".to_owned(),
+            params: vec![ToolParam::Float(1.0)],
+        }))
+        .await;
+
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    stall.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let (ok, detail) = c.wait_complete(index).await;
+    assert!(
+        !ok && detail.is_some(),
+        "a stop completes the parked action with a cancellation: \
+         ok={ok} detail={detail:?}"
+    );
 }

@@ -1260,7 +1260,22 @@ impl<R: RtCommands> Core<R> {
         // Depth one, as the reference runtime has it. The superseded
         // action was acked and something may be waiting on it, so it is
         // completed rather than dropped in silence.
-        if let Some(prev) = self.tool_executing.take() {
+        //
+        // BOTH states count. An action that has been sent to the planner
+        // but not yet confirmed sits in `pending_tool`, not
+        // `tool_executing` — so a second action arriving inside that round
+        // trip used to find nothing to supersede, and both would land under
+        // different tags. `on_tool_started` then overwrote `tool_executing`
+        // with whichever answered last, and the first was never completed:
+        // its client waited out its timeout on an action the server had
+        // silently forgotten.
+        let superseded: Vec<ToolExecuting> = self
+            .pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .collect();
+        for prev in superseded {
             let error = make_error(
                 ErrorCode::MotnCancelled,
                 prev.index as i64,
@@ -1666,12 +1681,24 @@ impl<R: RtCommands> Core<R> {
     /// Take the tool action off the side channel so the caller can speak
     /// its cancellation. `halt` asks the tool to stop where it is.
     ///
+    /// An action still inside the `StartTool` round trip is parked in
+    /// `pending_tool`, and the `CancelTool` above reaches the planner
+    /// either way — so taking only `tool_executing` cancelled the parked
+    /// action on the planner while the server went on believing it was
+    /// live, and its client waited out a timeout on a COMPLETE nobody
+    /// was left to speak.
+    ///
     /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
     /// arriving cancels planned motion, but a gripper closing under it
     /// is exactly the overlap the side channel exists to allow.
-    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+    fn drop_tool_action(&mut self, halt: bool) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.send(PlanRequest::CancelTool { halt });
-        self.tool_executing.take().map(|t| (t.index, t.addr))
+        self.pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .map(|t| (t.index, t.addr))
+            .collect()
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
