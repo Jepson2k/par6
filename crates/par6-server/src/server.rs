@@ -1320,9 +1320,13 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// Drain the tool side channel. Runs before the motion lane's
-    /// outcomes and before `pump`, so a finished tool action is reported
-    /// on the same tick it settles rather than behind a motion.
+    /// Report a finished tool action.
+    ///
+    /// The two lanes are polled in one planner pass and arrive as two
+    /// events, the motion outcome first. That order does not matter here
+    /// the way it did when both were drained inline: the side channel
+    /// shares no state with the motion lane, and a tool outcome is spoken
+    /// to its own client the moment its event is routed.
     async fn on_tool_outcome(&mut self, out: CommandOutcome) {
         let Some(ex) = &self.tool_executing else {
             return; // outcome of a cancelled action
@@ -1436,7 +1440,14 @@ impl<R: RtCommands> Core<R> {
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
-            PlanEvent::Outcome(out) => self.on_outcome(out).await,
+            PlanEvent::Outcome(out) => {
+                self.on_outcome(out).await;
+                // The slot the finished motion held is free now. Waiting
+                // for the next poll to notice leaves the arm standing
+                // still for a tick between two queued moves that did not
+                // blend.
+                self.pump().await;
+            }
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
@@ -1990,9 +2001,16 @@ impl<R: RtCommands> Core<R> {
     ///
     /// Two gates latch one: the planner's (a refused or invalidated
     /// planned move) and the streaming gate's (a refused or stopped
-    /// jog/servo). At most one motion pipeline is active at a time and
-    /// accepting a motion clears both, so they never disagree — the
-    /// merge simply reports whichever is active.
+    /// jog/servo). At most one motion pipeline is active at a time, so
+    /// at most one of them is meaningfully latched — but they are no
+    /// longer read from the same place. The streaming latch is the RT's,
+    /// live; the planner's arrives in a report published at the end of
+    /// the planner's pass, and the `ClearCollision` that drops it is a
+    /// request that pass has to service. So accepting a motion clears
+    /// the streaming latch at once and the planner's a pass later, and
+    /// for that pass the two can disagree. Preferring whichever reads
+    /// active is what makes the stale one harmless: it holds the warning
+    /// up a beat longer rather than dropping a live one.
     fn update_collision(&mut self) {
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.report().collision.clone() {
@@ -2178,10 +2196,12 @@ impl<R: RtCommands> Core<R> {
             })
             .collect();
         // Pricing a queue is real planning, so it is asked for rather
-        // than taken: the answer lands in the next report, which makes
-        // the estimate at most one planner pass old. It is a duration
-        // estimate on a queue that has just changed — nothing reads it
-        // for a decision.
+        // than taken. The answer lands in the report of whichever pass
+        // services it — the next one if the planner is free, later if an
+        // earlier expensive request is already holding the batch, since
+        // a pass takes only one. It is a duration estimate on a queue
+        // that has just changed and nothing reads it for a decision, so
+        // there is no bound worth paying for.
         self.runtime
             .planner
             .send(PlanRequest::QueueEstimate { pending });

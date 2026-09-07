@@ -149,10 +149,14 @@ pub enum PlanRequest {
 impl PlanRequest {
     /// Whether servicing this can take arbitrarily long.
     ///
-    /// The loop takes at most one expensive request per pass so a queue
-    /// of plans cannot starve the ring pump between them, and drains
-    /// every cheap one first so a cancel is applied before the next
-    /// pump feeds samples for a command the server has dropped.
+    /// The loop takes at most one expensive request into a pass, so a
+    /// queue of plans cannot starve the ring pump between them. What it
+    /// does NOT do is service the cheap ones first: everything taken is
+    /// serviced in the order it was sent, and anything arriving behind a
+    /// request the pass could not take waits with it. Running a cheap
+    /// `Cancel` ahead of the expensive `Start` it was sent to cancel
+    /// spends the cancel on the previous motion and rings the new one
+    /// anyway.
     fn is_expensive(&self) -> bool {
         matches!(
             self,
@@ -210,8 +214,11 @@ pub enum PlanEvent {
 ///
 /// Republished every pass of the loop. Reading it is a lock and a move,
 /// so the broadcast never waits on planning — at the cost of the values
-/// being at most one pass old, which for a queue-time estimate and a
-/// set of already-decided latches is what they were anyway.
+/// being at least one pass old. For the latches that is the whole story:
+/// they are read off the planner as the report is built, so they trail
+/// by exactly one pass. `queued_duration` trails by more, because it is
+/// held across passes and only a `QueueEstimate` re-prices it. Both are
+/// already-decided answers that nothing reads for a decision.
 #[derive(Debug, Clone)]
 pub struct PlanReport {
     /// Directional freedom for STATUS and the REACHABLE query.
