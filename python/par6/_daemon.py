@@ -57,6 +57,18 @@ def packaged_data_args() -> list[str]:
     ]
 
 
+def data_args_for(argv: list[str]) -> list[str]:
+    """The packaged-data arguments to add to `argv`, if any.
+
+    They are a DEFAULT for a caller who named nothing, never an override: a
+    caller who passes `--config` or `--assets` gets theirs, which is what
+    lets a systemd unit point this at `/etc/par6` on a control box.
+    """
+    if any(a.startswith(("--config", "--assets")) for a in argv):
+        return []
+    return packaged_data_args()
+
+
 def main() -> int:
     binary = packaged_binary()
     if binary is None:
@@ -68,10 +80,7 @@ def main() -> int:
         )
         return 2
     argv = sys.argv[1:]
-    # An explicit --config/--assets wins: the packaged data is a default for
-    # someone who passed nothing, not an override of what they asked for.
-    args = [] if any(a.startswith(("--config", "--assets")) for a in argv) else packaged_data_args()
-    os.execv(str(binary), [str(binary), *argv, *args])
+    os.execv(str(binary), [str(binary), *argv, *data_args_for(argv)])
 
 
 if __name__ == "__main__":
