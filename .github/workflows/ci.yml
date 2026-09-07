@@ -46,10 +46,23 @@ jobs:
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
+      # The vcan suite is part of `cargo test`, and it skips itself when no
+      # interface exists — so the interface is created here rather than in a
+      # job of its own. PAR6_REQUIRE_VCAN turns that developer-default skip
+      # into a hard failure: if creation ever breaks, this goes red instead of
+      # quietly dropping the SocketCAN backend's only real-transport coverage.
+      # The module is not in the runner's base image.
+      - name: create vcan0
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
+          sudo modprobe vcan
+          sudo ip link add dev vcan0 type vcan
+          sudo ip link set vcan0 up
       - name: fmt
         run: cargo fmt --all --check
       - name: clippy
-        run: pixi run cargo clippy --workspace --all-targets -- -D warnings
+        run: pixi run cargo clippy --all-targets -- -D warnings
       # One command, every crate, nothing excluded. par6d's integration tests
       # each boot a real daemon on a real-time tick, and two of those on one
       # machine miss deadlines — but that is now held off in the harness
@@ -57,7 +70,9 @@ jobs:
       # own invocation, so a plain `cargo test` is the whole suite here and
       # on a developer's machine alike.
       - name: test
-        run: pixi run cargo test --workspace
+        env:
+          PAR6_REQUIRE_VCAN: '1'
+        run: pixi run cargo test
       # The collision golden suite runs in `test` above; this reruns just its
       # timing case optimized and uncaptured, so the measured per-waypoint
       # cost the planner budgets against is visible in the log. The test only
@@ -113,7 +128,7 @@ jobs:
       - name: cross check
         env:
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: pixi run cargo check --workspace --target aarch64-unknown-linux-gnu
+        run: pixi run cargo check --target aarch64-unknown-linux-gnu
 
   msrv:
     # The env context is not available to jobs.<id>.name, and a workflow
@@ -156,66 +171,7 @@ jobs:
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: check
-        run: pixi run cargo check --workspace --all-targets
-
-  # The SocketCAN backend is the only bus that will ever touch the arm,
-  # and its vcan suite skips itself wherever no vcan interface exists —
-  # which used to be everywhere, CI included. GitHub's ubuntu runners
-  # allow sudo, and the vcan module lives in linux-modules-extra (not in
-  # the base image), so this job installs that package for the running
-  # kernel, creates the interface, and runs the suite for real.
-  # PAR6_REQUIRE_VCAN=1 turns the developer-default skip into a hard
-  # failure: if interface creation ever breaks, the job goes red instead
-  # of silently degrading to a no-op.
-  socketcan:
-    name: socketcan (vcan)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: socketcan
-      # par6-bus reaches par6-kin through its dev-dependencies, and par6-kin
-      # links the Pinocchio shim unconditionally — there is no toolchain-free
-      # leg to build any more, so this job needs the same closure the rest do.
-      # Same cache key as `rust`, so it lands on that job's shim.
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: default
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run setup
-      - name: create vcan0
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y "linux-modules-extra-$(uname -r)"
-          sudo modprobe vcan
-          sudo ip link add dev vcan0 type vcan
-          sudo ip link set vcan0 up
-      # Single-threaded: every test in the binary opens observer sockets on
-      # the same vcan0 and asserts exact frame sequences, so concurrent
-      # tests would see each other's traffic.
-      - name: test par6-bus against vcan0
-        env:
-          PAR6_REQUIRE_VCAN: '1'
-        run: pixi run cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1 --nocapture
+        run: pixi run cargo check --all-targets
 
   python:
     name: python ${{ matrix.python }}

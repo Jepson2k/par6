@@ -37,7 +37,6 @@ use par6_server::{
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
     housekeeping_period, step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate,
-    STREAM_LOOKAHEAD_S,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::CartKin;
@@ -319,7 +318,12 @@ impl Preview {
                 stream_limits,
                 robot.stream.fault_latch_s,
             ),
-            gate: StreamGate::new(stack.gate_collision, &jog_limits),
+            gate: StreamGate::new(
+                stack.gate_collision,
+                &jog_limits,
+                crate::daemon::position_loop_gains(robot),
+                robot.robot.tick_dt_s,
+            ),
             shapes: Vec::new(),
             scene_epoch: 0,
             config_path,
@@ -1092,8 +1096,15 @@ impl Preview {
         let q = self.snap.q;
         // A twist the jacobian cannot resolve is admitted: housekeeping
         // holds in place on a failed solve, so nothing unchecked streams.
-        let la = match step_cart_jog(&mut self.cart, probe, STREAM_LOOKAHEAD_S) {
-            Ok((la, _)) => la,
+        let la = match step_cart_jog(&mut self.cart, probe, self.gate.reaction_s()) {
+            Ok((la, qd)) => {
+                let mut la = la;
+                for (j, v) in la.iter_mut().enumerate() {
+                    *v = (*v + self.gate.braking_travel(j, qd[j]))
+                        .clamp(probe.soft_min[j], probe.soft_max[j]);
+                }
+                la
+            }
             Err(_) => return None,
         };
         match self.gate.blocked(&q, &la) {

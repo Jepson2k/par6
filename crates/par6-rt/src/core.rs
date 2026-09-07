@@ -72,6 +72,13 @@ struct BootConfig {
 /// wire time, not loop iterations — a count would shrink it below a CAN
 /// round trip at a fast tick and latch `CAN_LOST` on drives that simply
 /// had not replied yet.
+/// Executor velocity below which a releasing stream counts as stopped
+/// \[rad/s\]. Not an exact zero: the release runs Ruckig's velocity
+/// interface, whose ramp can approach zero asymptotically, and an
+/// equality test there leaves STREAM open forever on an arm that has
+/// visibly stopped.
+const STREAM_REST_RAD_S: f64 = 1e-9;
+
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
@@ -543,6 +550,9 @@ pub struct RtCore<B: DriverBus> {
     /// A `JogRelease` is ramping down. JOG outlives the command until
     /// the engine reaches rest, then the mode goes.
     jog_released: bool,
+    /// A `StreamRelease` is braking to rest. STREAM outlives it the same
+    /// way JOG outlives a release.
+    stream_released: bool,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -755,6 +765,7 @@ impl<B: DriverBus> RtCore<B> {
             homing_gcmd,
             jog_active: false,
             jog_released: false,
+            stream_released: false,
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -1369,6 +1380,12 @@ impl<B: DriverBus> RtCore<B> {
                 self.jog_released = true;
                 self.jog_joints = 0;
             }
+            RtCommand::StreamRelease => {
+                if self.mode == Mode::Stream {
+                    self.stream.release();
+                    self.stream_released = true;
+                }
+            }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
             RtCommand::ExecFlush => {
                 let n = self.exec.flush();
@@ -1584,6 +1601,7 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Stream => {
                 self.stream.activate(&self.q);
+                self.stream_released = false;
                 self.stream_last_rx_tick = self.tick;
                 self.stream_window_pos = 0;
                 self.stream_window_applied = 0;
@@ -1941,8 +1959,12 @@ impl<B: DriverBus> RtCore<B> {
             }
         }
 
-        // Stream watchdog.
+        // Stream watchdog. Not while the stream is RELEASING: a release
+        // discards incoming setpoints by design, so `stream_last_rx_tick`
+        // cannot advance, and a brake that outlasts the timeout would
+        // latch a link fault on a stream the daemon itself told to stop.
         if self.mode == Mode::Stream
+            && !self.stream_released
             && self.tick.saturating_sub(self.stream_last_rx_tick)
                 >= u64::from(self.stream_timeout_ticks)
         {
@@ -2227,7 +2249,13 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Stream => {
                 let mut applied = false;
-                if let Some(sp) = self.stream_rx.take() {
+                // A releasing stream is braking to rest and must not be
+                // retargeted: a setpoint still in flight when the gate
+                // refused would otherwise re-accelerate the arm toward
+                // the very configuration the refusal was about.
+                if self.stream_released {
+                    let _ = self.stream_rx.take();
+                } else if let Some(sp) = self.stream_rx.take() {
                     // Scale first: the limits have to be in force for
                     // the tick that consumes this target, not the one
                     // after. Only on a change — `set_limits` rewrites
@@ -2269,6 +2297,18 @@ impl<B: DriverBus> RtCore<B> {
                     &self.g,
                     &mut self.setpoints,
                 );
+                // A released stream brakes instead of stopping dead, and
+                // STREAM is the only mode that ticks this executor, so
+                // the mode outlives the release until the ramp is at
+                // rest — the same contract JOG has. Handing the arm to
+                // IDLE while it still carries velocity is what let a
+                // refused stream coast on past the keep-out that
+                // refused it.
+                if self.stream_released
+                    && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
+                {
+                    self.mode = Mode::Idle;
+                }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and
             // FLASHING returned above. Defensive zero-velocity.
