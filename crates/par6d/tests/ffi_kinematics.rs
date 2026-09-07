@@ -2868,7 +2868,14 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
         let mut gated = false;
         let mut closest = f64::INFINITY;
         let mut last_seen = f64::NAN;
-        while Instant::now() < deadline && !gated {
+        // Kept up until the target reaches the box CENTRE, not stopped at
+        // the first refusal. An operator dragging a jog does not let go
+        // the instant a warning appears — they keep pulling, and the
+        // question this test asks is where the arm ends up when they do.
+        // Stopping at the first refusal instead measures the last place
+        // the client happened to ask for, which on a fast host is well
+        // outside the keep-out and says nothing about the standoff.
+        while Instant::now() < deadline && target[0] < mid_deg[0] {
             target[0] = (target[0] + step_deg).min(mid_deg[0]);
             c.send(&Command::ServoJ(par6_proto::command::ServoJ {
                 angles: target,
@@ -2880,10 +2887,7 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
                 if let Some(s) = rig.recv_status() {
                     closest = closest.min(world_gap_m(col, s.angles));
                     last_seen = s.angles[0];
-                    if s.collision_active {
-                        gated = true;
-                        break;
-                    }
+                    gated |= s.collision_active;
                 }
             }
         }
