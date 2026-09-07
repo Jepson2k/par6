@@ -75,3 +75,35 @@ def test_the_console_script_is_declared() -> None:
         text=True,
     )
     assert "par6._daemon:main" in meta.stdout, meta.stdout or meta.stderr
+
+
+def test_a_console_script_with_nothing_behind_it_is_not_a_par6d(
+    tmp_path, monkeypatch
+) -> None:
+    """The entry point above is on `PATH` for a checkout too, because
+    `[project.scripts]` is static metadata -- so `which("par6d")` says yes on
+    an install that never built the runtime, and the caller finds out only
+    when the process it spawned exits 2. That is the difference between the
+    e2e suite skipping cleanly and 40 tests erroring in setup.
+    """
+    monkeypatch.delenv("PAR6D_BIN", raising=False)
+    monkeypatch.setenv("PATH", str(tmp_path))
+    script = tmp_path / "par6d"
+    script.write_text("#!/usr/bin/env python\nfrom par6._daemon import main\n")
+    script.chmod(0o755)
+
+    if _daemon.packaged_binary() is None:
+        assert _daemon.resolve() is None
+    else:
+        # A wheel ships one, so the same wrapper IS a par6d here.
+        assert _daemon.resolve() == str(script)
+
+    # A native binary on PATH is always one, wheel or not.
+    script.write_bytes(b"\x7fELF" + b"\x00" * 64)
+    assert _daemon.resolve() == str(script)
+
+    # And PAR6D_BIN still overrides both, including when it names nothing.
+    monkeypatch.setenv("PAR6D_BIN", str(script))
+    assert _daemon.resolve() == str(script)
+    monkeypatch.setenv("PAR6D_BIN", str(tmp_path / "absent"))
+    assert _daemon.resolve() is None
