@@ -99,6 +99,19 @@ echo "wheel targets $tag (the control box installs the bundle, not this)"
 python3 -m venv "$WORK/venv"
 "$WORK/venv/bin/pip" -q install "$wheel"
 "$WORK/venv/bin/python" -c "import par6; print('wheel imports self-contained:', par6.__version__)"
+# The wheel carries par6d (issue #33), so it can run a simulator with
+# nothing else installed. Only the venv is on PATH here: no system par6d,
+# no PAR6D_BIN, no build tree.
+env -i PATH="$WORK/venv/bin:/usr/bin:/bin" HOME="$WORK" \
+  "$WORK/venv/bin/python" - <<'RUNTIME'
+import shutil
+from par6 import Robot
+assert shutil.which("par6d"), "the wheel installed no par6d console script"
+with Robot() as robot:
+    client = robot.create_sync_client()
+    assert client.wait_ready(timeout=120.0), "the packaged par6d never became ready"
+    print("packaged runtime answered:", [round(a, 2) for a in client.angles()])
+RUNTIME
 
 say "6. kinematics, collision and the installed daemon"
 PAR6D_BIN=/usr/local/bin/par6d "$WORK/venv/bin/python" "$HERE/validate_engine.py"
