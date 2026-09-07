@@ -456,6 +456,33 @@ fn r_u8_fixed<const N: usize>(
     Ok(out)
 }
 
+/// The protocol version of a STATUS datagram, read from the prefix every
+/// version of the format has kept: the array header, the message tag, then
+/// the version.
+///
+/// Deliberately NOT [`decode_status`]'s prologue. That one rejects a short
+/// array before it reads the version — and a short array is exactly what a
+/// version skew produces, because the element count is what changes when
+/// fields are added. Reading the version through it would therefore be
+/// impossible in the one case the version is worth knowing: a client that
+/// cannot decode anything the daemon sends, and would otherwise report only
+/// silence.
+///
+/// Returns `None` for a datagram that is not a STATUS at all, or is too
+/// short to carry a version.
+pub fn peek_status_proto_version(data: &[u8]) -> Option<u8> {
+    let mut r = Reader::new(data);
+    // The tag and the version: no length check, because the length is the
+    // thing that disagrees.
+    if r.array_len().ok()? < 2 {
+        return None;
+    }
+    if r.int().ok()? != MsgType::Status as i64 {
+        return None;
+    }
+    u8::try_from(r.uint().ok()?).ok()
+}
+
 /// Decode a STATUS packet.
 ///
 /// Requires all [`STATUS_LEN`] v2 elements; any elements beyond them are
