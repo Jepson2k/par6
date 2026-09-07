@@ -1132,8 +1132,9 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
-                    self.active_stream = None;
-                    self.runtime.rt.cancel_stream();
+                    if !self.runtime.rt.stop_refused_stream() {
+                        self.active_stream = None;
+                    }
                 }
                 outcome
             }

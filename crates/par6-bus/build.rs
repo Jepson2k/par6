@@ -18,9 +18,9 @@ fn main() {
                 })
                 .join("mujoco-3.12.0/lib")
         });
-    let lib = lib
-        .canonicalize()
-        .expect("mujoco-rs must install its matching library");
+    // Cargo can run this script before mujoco-rs has downloaded the library.
+    // The linker checks its presence after dependencies have finished building.
+    let lib = std::path::absolute(lib).expect("MuJoCo library path must resolve");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
     println!("cargo:rpath={}", lib.display());
 }
