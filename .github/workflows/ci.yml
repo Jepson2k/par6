@@ -33,19 +33,16 @@ jobs:
       - name: cache shim + toppra
         uses: actions/cache@v4
         with:
-          # Not the cmake build trees: cmake bakes absolute paths into
-          # them, and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused
-          # under `py312` sends cmake looking for `envs/default/bin/ninja`,
-          # which that job never installed. `setup.sh` names them
-          # `build-shim` and `build-toppra`, so the exclusion has to be
-          # the glob — `!.ffi/build` matched a directory that never
-          # existed and cached both trees anyway. The expensive artifacts
-          # — toppra, the shim, libmujoco, the toppra checkout — are all
-          # installed prefixes and carry no such paths.
+          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
+          # and this cache is shared by jobs running DIFFERENT pixi
+          # environments. A tree configured under `default` then reused under
+          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
+          # that job never installed. The expensive artifacts — toppra, the
+          # shim, libmujoco, the toppra checkout — are all installed prefixes
+          # and carry no such paths.
           path: |
             .ffi
-            !.ffi/build-*
+            !.ffi/build
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
@@ -113,19 +110,16 @@ jobs:
       - name: cache shim + toppra
         uses: actions/cache@v4
         with:
-          # Not the cmake build trees: cmake bakes absolute paths into
-          # them, and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused
-          # under `py312` sends cmake looking for `envs/default/bin/ninja`,
-          # which that job never installed. `setup.sh` names them
-          # `build-shim` and `build-toppra`, so the exclusion has to be
-          # the glob — `!.ffi/build` matched a directory that never
-          # existed and cached both trees anyway. The expensive artifacts
-          # — toppra, the shim, libmujoco, the toppra checkout — are all
-          # installed prefixes and carry no such paths.
+          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
+          # and this cache is shared by jobs running DIFFERENT pixi
+          # environments. A tree configured under `default` then reused under
+          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
+          # that job never installed. The expensive artifacts — toppra, the
+          # shim, libmujoco, the toppra checkout — are all installed prefixes
+          # and carry no such paths.
           path: |
             .ffi
-            !.ffi/build-*
+            !.ffi/build
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
@@ -163,19 +157,16 @@ jobs:
       - name: cache shim + toppra
         uses: actions/cache@v4
         with:
-          # Not the cmake build trees: cmake bakes absolute paths into
-          # them, and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused
-          # under `py312` sends cmake looking for `envs/default/bin/ninja`,
-          # which that job never installed. `setup.sh` names them
-          # `build-shim` and `build-toppra`, so the exclusion has to be
-          # the glob — `!.ffi/build` matched a directory that never
-          # existed and cached both trees anyway. The expensive artifacts
-          # — toppra, the shim, libmujoco, the toppra checkout — are all
-          # installed prefixes and carry no such paths.
+          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
+          # and this cache is shared by jobs running DIFFERENT pixi
+          # environments. A tree configured under `default` then reused under
+          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
+          # that job never installed. The expensive artifacts — toppra, the
+          # shim, libmujoco, the toppra checkout — are all installed prefixes
+          # and carry no such paths.
           path: |
             .ffi
-            !.ffi/build-*
+            !.ffi/build
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
@@ -211,19 +202,16 @@ jobs:
       - name: cache shim + toppra
         uses: actions/cache@v4
         with:
-          # Not the cmake build trees: cmake bakes absolute paths into
-          # them, and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused
-          # under `py312` sends cmake looking for `envs/default/bin/ninja`,
-          # which that job never installed. `setup.sh` names them
-          # `build-shim` and `build-toppra`, so the exclusion has to be
-          # the glob — `!.ffi/build` matched a directory that never
-          # existed and cached both trees anyway. The expensive artifacts
-          # — toppra, the shim, libmujoco, the toppra checkout — are all
-          # installed prefixes and carry no such paths.
+          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
+          # and this cache is shared by jobs running DIFFERENT pixi
+          # environments. A tree configured under `default` then reused under
+          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
+          # that job never installed. The expensive artifacts — toppra, the
+          # shim, libmujoco, the toppra checkout — are all installed prefixes
+          # and carry no such paths.
           path: |
             .ffi
-            !.ffi/build-*
+            !.ffi/build
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e ${{ matrix.env }} setup
@@ -278,19 +266,16 @@ jobs:
       - name: cache shim + toppra
         uses: actions/cache@v4
         with:
-          # Not the cmake build trees: cmake bakes absolute paths into
-          # them, and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused
-          # under `py312` sends cmake looking for `envs/default/bin/ninja`,
-          # which that job never installed. `setup.sh` names them
-          # `build-shim` and `build-toppra`, so the exclusion has to be
-          # the glob — `!.ffi/build` matched a directory that never
-          # existed and cached both trees anyway. The expensive artifacts
-          # — toppra, the shim, libmujoco, the toppra checkout — are all
-          # installed prefixes and carry no such paths.
+          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
+          # and this cache is shared by jobs running DIFFERENT pixi
+          # environments. A tree configured under `default` then reused under
+          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
+          # that job never installed. The expensive artifacts — toppra, the
+          # shim, libmujoco, the toppra checkout — are all installed prefixes
+          # and carry no such paths.
           path: |
             .ffi
-            !.ffi/build-*
+            !.ffi/build
           key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e py312 setup

@@ -129,34 +129,6 @@ else
   TOOLCHAIN_FILE="$ARCH_DIR/toolchain.cmake"
   CROSS_PREFIX="$TARGET_ARCH-conda-linux-gnu"
 fi
-
-# A cmake build tree records the ABSOLUTE path of the generator it was
-# configured with. Reuse one across conda environments — a CI cache shared
-# by jobs on different pixi environments, or `pixi run -e py312 setup`
-# after a plain `pixi run setup` — and cmake goes looking for a ninja that
-# this environment never installed, failing at configure with "no such
-# file or directory". The tree is cheap; drop it rather than inherit a
-# path that is not there.
-#
-# Both halves of that: the tree is removed once its install has landed, so
-# nothing downstream can pick one up, and a tree that somehow survives is
-# checked before it is reused. PAR6_KEEP_BUILD_TREES=1 keeps them for
-# anyone iterating on the C++ with FORCE=1.
-drop_build_tree() {
-  [[ "${PAR6_KEEP_BUILD_TREES:-0}" == "1" ]] && return 0
-  rm -rf "$1"
-}
-
-drop_stale_build_tree() {
-  local dir="$1" cache="$1/CMakeCache.txt" prog
-  [[ -f "$cache" ]] || return 0
-  prog="$(sed -n 's/^CMAKE_MAKE_PROGRAM:[^=]*=//p' "$cache" | head -n1)"
-  if [[ -n "$prog" && ! -x "$prog" ]]; then
-    echo ">>> dropping build tree configured against a missing $prog: $dir"
-    rm -rf "$dir"
-  fi
-}
-
 TOPPRA_SRC="$FFI_DIR/src/toppra"
 
 mkdir -p "$FFI_DIR"
@@ -258,7 +230,6 @@ if [[ ! -e "$ENV_DIR/lib/libtoppra.so" ]]; then
     git -C "$TOPPRA_SRC" checkout -q --detach FETCH_HEAD
   fi
   echo ">>> building toppra-cpp for $TARGET_ARCH"
-  drop_stale_build_tree "$TOPPRA_BUILD"
   run_tool cmake -G Ninja -S "$TOPPRA_SRC/cpp" -B "$TOPPRA_BUILD" \
     "${cmake_cross_args[@]}" \
     -DCMAKE_BUILD_TYPE=Release \
@@ -273,7 +244,6 @@ if [[ ! -e "$ENV_DIR/lib/libtoppra.so" ]]; then
     -DTOPPRA_WARN_ON=OFF
   run_tool cmake --build "$TOPPRA_BUILD"
   run_tool cmake --install "$TOPPRA_BUILD"
-  drop_build_tree "$TOPPRA_BUILD"
 else
   echo ">>> toppra exists: $ENV_DIR/lib/libtoppra.so (delete it to rebuild)"
 fi
@@ -283,7 +253,6 @@ if [[ "${FORCE:-0}" == "1" ]]; then
   rm -rf "$BUILD_DIR" "$SHIM_PREFIX"
 fi
 if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
-  drop_stale_build_tree "$BUILD_DIR"
   echo ">>> building par6_shim for $TARGET_ARCH"
   run_tool cmake -G Ninja -S "$ROOT/cpp" -B "$BUILD_DIR" \
     "${cmake_cross_args[@]}" \
@@ -293,7 +262,6 @@ if [[ ! -e "$SHIM_PREFIX/lib/libpar6_shim.so" ]]; then
     -DCMAKE_INSTALL_RPATH="$DEP_RPATH"
   run_tool cmake --build "$BUILD_DIR"
   run_tool cmake --install "$BUILD_DIR"
-  drop_build_tree "$BUILD_DIR"
 else
   echo ">>> shim exists: $SHIM_PREFIX (FORCE=1 to rebuild)"
 fi
