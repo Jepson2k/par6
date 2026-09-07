@@ -90,6 +90,11 @@ cmd = "cargo test -p par6d --release --test shipped_tick -- --nocapture"
 [tasks.install-python]
 cmd = "pip install -e 'python[dev]'"
 
+# The stub's enum members come from the built extension, so this needs the
+# package installed (`install-python`) and reruns after a wire enum changes.
+[tasks.gen-stub]
+cmd = "python3 scripts/gen_stub.py"
+
 [tasks.lint-python]
 cmd = "pre-commit run --show-diff-on-failure --color=always --all-files"
 
