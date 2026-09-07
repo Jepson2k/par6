@@ -10,8 +10,15 @@ inputs:
     description: pixi environments to install (space separated)
     default: default
   cache-key:
-    description: extra discriminator for the cargo cache
-    default: ''
+    description: >-
+      Which cargo cache this job shares. rust-cache keys per JOB by default,
+      so seven jobs building the same shim would keep seven copies of it and
+      a cpp/ edit would rebuild all seven. Jobs that build the same thing
+      pass the same value here and share one entry. What "the same thing"
+      means is the toolchain and the pixi environment: the shim's install
+      rpath names the prefix it was built against, and each environment has
+      its own.
+    required: true
   rust-toolchain:
     description: rustup toolchain to force, or empty for rust-toolchain.toml
     default: ''
@@ -45,4 +52,5 @@ runs:
     # sources, and the build scripts that compile them.
     - uses: Swatinem/rust-cache@v2
       with:
-        key: ${{ inputs.cache-key }}-${{ hashFiles('pixi.lock', 'cpp/**', 'crates/*/build.rs') }}
+        shared-key: ${{ runner.arch }}-${{ inputs.cache-key }}
+        key: ${{ hashFiles('pixi.lock', 'cpp/**', 'crates/*/build.rs') }}

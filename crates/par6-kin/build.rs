@@ -32,6 +32,12 @@ const JOB_MEM_GB: u64 = 4;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=PAR6_TOPPRA_SRC");
+    // The shim's install rpath names the prefix it was built against, and
+    // pixi gives each environment its own. Without this a `py312` job could
+    // link a shim whose rpath points into `envs/default`, which is the same
+    // cross-environment mistake a shared build tree used to make — just
+    // relocated into OUT_DIR.
+    println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
 
     let lib_dir = build_shim();
 

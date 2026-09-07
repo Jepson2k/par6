@@ -32,7 +32,7 @@ jobs:
       - uses: ./.github/actions/pixi
         with:
           environments: py312
-          cache-key: release-arm64
+          cache-key: py312
       - run: pixi run -e py312 wheel
       - run: pixi run -e py312 bundle
       - uses: actions/upload-artifact@v4
@@ -55,7 +55,7 @@ jobs:
       - uses: ./.github/actions/pixi
         with:
           environments: py312
-          cache-key: release-x86
+          cache-key: py312
       - run: pixi run -e py312 wheel
       - name: checksums
         run: cd dist && sha256sum ./*.whl > SHA256SUMS-x86_64
@@ -75,7 +75,7 @@ jobs:
       - uses: ./.github/actions/pixi
         with:
           environments: py312
-          cache-key: sdist
+          cache-key: py312
       - run: pixi run -e py312 sdist
       - uses: actions/upload-artifact@v4
         with:
