@@ -460,7 +460,6 @@ cpp/src/par6_col.cpp       par6_col_* (pinocchio + coal)
 crates/par6-kin/src/sys/   the raw decls (ffi.rs) and the RAII handles over them; Kin/Collision/Trajectory build on those
 crates/par6-kin/build.rs   compiles toppra and cpp/ into cargo's OUT_DIR
 pixi.toml / pixi.lock      the C++ closure they link against
-scripts/ffi/setup.sh       cross only: a foreign-platform prefix and shim
 ```
 
 `crates/par6-kin/build.rs` builds toppra and the shim into cargo's `OUT_DIR`
@@ -472,10 +471,8 @@ against — **pinocchio 4.1**, **coal**, **eigen**, **urdfdom**, **libmujoco 3.1
 plus cmake, ninja and the compiler — comes from `pixi.lock`; **toppra 142456f3**
 is pinned in the build script.
 
-Two escape hatches, both for builds that cannot compile the shim in place:
-`PAR6_SHIM_LIB_DIR` (with `PAR6_SHIM_INCLUDE_DIR`) links one built elsewhere and
-skips the build, which is how the cross path works, and `PAR6_TOPPRA_SRC` supplies
-a checkout instead of fetching one.
+`PAR6_TOPPRA_SRC` supplies a toppra checkout instead of fetching one, for an
+offline build.
 
 ABI conventions, frozen in `par6_shim.h`: poses are row-major 4×4; Jacobians 6×nq,
 rows `[linear; angular]`, world axes at the frame origin; gravity is RNEA at zero
@@ -685,29 +682,15 @@ passed it, unchanged.
 
 The glibc floor comes from pixi's compiler, not the build machine's: the conda
 toolchain carries its own sysroot, so a native build on a glibc 2.39 host
-produces a `par6d` that needs 2.28 and a shim and closure that need 2.17 —
-under Raspberry Pi OS bookworm's 2.36 and bullseye's 2.31. Cross-building is
-therefore no longer required for compatibility; it is retained until the
-native bundle has a green run of `validate-bundle.sh` behind it.
+produces a bundle whose whole closure needs at most 2.28 — under Raspberry Pi
+OS bookworm's 2.36 and bullseye's 2.31, and measured into `manifest.json` on
+every build. There is no cross-compilation pipeline any more; native ARM64
+builds are the shipped path.
 
-Cross-building from another machine is optional — for CI, or a box that should not
-carry a toolchain:
-
-```
-scripts/ffi/setup.sh --target aarch64    build the aarch64 Pinocchio shim elsewhere
-scripts/deploy/build-aarch64.sh          cross-build par6d for aarch64
-scripts/deploy/install.sh --host ...     stage + upload + install over ssh
-scripts/deploy/par6d.service             the systemd unit
-scripts/deploy/par6-panel.service        the front panel service (optional)
-```
-
-### 1. Cross-build (optional)
+### 1. Build the bundle
 
 ```bash
-scripts/ffi/setup.sh --target aarch64    # once (or after a dependency pin bump)
-source .ffi/env-aarch64.sh
-scripts/deploy/build-aarch64.sh
-# -> target/aarch64-unknown-linux-gnu/release/par6d
+pixi run bundle          # -> dist/par6d-<arch>.tar.gz + SHA256SUMS + manifest.json
 ```
 
 **Every par6d carries kinematics.** The Pinocchio C-ABI shim — TCP FK,
@@ -716,54 +699,36 @@ TOPPRA, and the coal collision world — is linked unconditionally, because a
 runtime without it would broadcast a NaN TCP pose, report zero cartesian
 freedom, refuse every cartesian command, and answer `set_shapes` with success
 against a collision world that does not exist, none of which a client can
-see. `build-aarch64.sh` therefore fails early when the aarch64 shim has not
-been built. The library crates still compile without any C++ toolchain; it is
-only the binary that requires one.
+see. The shim is a build-time prerequisite of the whole workspace, so
+`par6-kin`'s build script builds it rather than looking for one.
 
-#### How the aarch64 shim is produced
+#### How the bundle is produced
 
-`scripts/ffi/setup.sh --target aarch64` cross-builds it on another machine, for
-the case where the box should not carry a compiler:
+`pixi run bundle` builds `par6d` in release, then `pack-bundle.sh`:
 
-- conda-forge publishes `pinocchio`, `coal`, `urdfdom` and `eigen` for
-  `linux-aarch64`, so micromamba **downloads** the target's libraries with
-  `--platform linux-aarch64` — an env that is never executed on the host.
-- the compiler is conda-forge's `gxx_linux-aarch64` cross toolchain from the
-  host's own `linux-64` channel, pinned to `sysroot_linux-aarch64=2.17` (the
-  same glibc conda-forge builds its own aarch64 packages against, which is
-  what keeps the whole set at one floor).
-- `toppra-cpp` has no conda-forge package at all, so it is built from the
-  pinned commit through a generated CMake toolchain file, exactly like the
-  native path.
-- `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
-  `libpar6_shim.so` and `libmujoco.so` and copies the whole closure into the
-  shim's own `lib/` directory. That directory is the deploy unit:
-  the shim is linked with `$ORIGIN`, `par6d` with an rpath of
-  `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
+- copies `par6d`, `libpar6_shim.so`, `libtoppra.so` and `libmujoco.so.*` into
+  one staging directory, and points the binary's rpath at the directory
+  `install.sh` fills on the box;
+- runs `stage_runtime_libs.py`, which walks `DT_NEEDED` from those roots,
+  copies every dependency out of the pixi prefix into the same flat
+  directory, and refuses a set that is not self-consistent;
+- rewrites every staged library to search `$ORIGIN`, so nothing that ships
+  names a path from the build machine;
+- packs the bundle and writes `SHA256SUMS` and `manifest.json`.
 
-The alternatives were building natively on the box (needs a Rust and C++
-toolchain on a Pi and takes the better part of an hour per change) and
-vendoring prebuilt binaries (unpinned, unreproducible, and a licence
-question). Cross-building keeps a single reproducible command and the same
-pins as the x86_64 path.
+**glibc floor.** The staged closure requires at most `GLIBC_2.17` and the
+`par6d` linked against it at most `GLIBC_2.28`, because pixi's conda compiler
+carries its own sysroot and is the Rust linker too. Raspberry Pi OS
+**bookworm ships 2.36** and bullseye 2.31, so both clear it.
+`pack-bundle.sh` measures the floor across the whole closure and writes it
+into `manifest.json`; `validate-bundle.sh` refuses a bundle that exceeds it.
 
-**glibc floor.** The staged closure and the shim require at most
-`GLIBC_2.17`; the `par6d` binary linked against them requires at most
-`GLIBC_2.17` as well, because `.ffi/env-aarch64.sh` makes the conda cross
-compiler the Rust linker too. Raspberry Pi OS **bookworm ships 2.36** and
-bullseye ships 2.31, so both clear it — a change from the previous
-Debian-cross build, whose floor was `GLIBC_2.34`. `build-aarch64.sh` prints
-the measured floor after each build, `stage_runtime_libs.py` prints the
-closure's, and `install.sh` runs `par6d --help` right after copying so a
-mismatch still fails loudly at install time.
-
-**Symbol-version check.** Because nothing here can be *executed* for
-aarch64, `stage_runtime_libs.py` performs the check that would otherwise
-only surface on the box: every versioned symbol (`GLIBCXX_*`, `CXXABI_*`,
-`GCC_*`, …) demanded of a library that ships must be provided by the copy
-that ships. This is what catches a cross compiler newer than the target
-env's C++ runtime, which otherwise appears as
-`version GLIBCXX_3.4.x not found` at the first `systemctl start`.
+**Symbol-version check.** `stage_runtime_libs.py` performs the check that
+would otherwise only surface on the box: every versioned symbol
+(`GLIBCXX_*`, `CXXABI_*`, `GCC_*`, …) demanded of a library that ships must
+be provided by the copy that ships. That catches a compiler newer than the
+env's C++ runtime, which otherwise appears as `version GLIBCXX_3.4.x not
+found` at the first `systemctl start`.
 
 ### 2. Install
 
@@ -777,10 +742,10 @@ scripts/deploy/install.sh --host pi@par6-box
 It stages a bundle (binary + `lib/` — the shim and its runtime closure —
 + `config/PAR6.toml` + `config/grippers/*.toml` + `assets/par6_description`
 + the unit + a copy of itself), uploads it to `/tmp/par6-deploy-<timestamp>`,
-and re-runs itself there with `--local`. `PAR6_RUNTIME_LIB_SRC` (exported by
-`.ffi/env-aarch64.sh`) says where the staged libraries come from; pass
-`--runtime-libs DIR` to override it. `--stage-only DIR` builds the bundle
-without uploading anything, which is what CI checks.
+and re-runs itself there with `--local`. `PAR6_RUNTIME_LIB_SRC` says where the
+staged libraries come from — `pack-bundle.sh` passes `--runtime-libs DIR`
+instead. `--stage-only DIR` builds the bundle without uploading anything,
+which is what `pixi run bundle` uses.
 
 On the box itself:
 

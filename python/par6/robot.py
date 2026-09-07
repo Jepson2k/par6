@@ -85,7 +85,7 @@ def _find_par6d() -> str:
     if found is None:
         raise RuntimeError(
             "par6d binary not found; set PAR6D_BIN or put it on PATH "
-            "(build with `scripts/ffi/setup.sh && cargo build -p par6d --release`)"
+            "(build it with `pixi run build-daemon`)"
         )
     return found
 

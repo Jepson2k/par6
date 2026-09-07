@@ -11,11 +11,6 @@
 //! where `CONDA_PREFIX` points.
 //!
 //! Consumed environment:
-//! - `PAR6_SHIM_LIB_DIR` — link a shim built elsewhere and skip the build
-//!   entirely. This is the cross path: `scripts/ffi/setup.sh --target
-//!   aarch64` produces a foreign-platform shim that cannot be built here,
-//!   and the deploy build points at it.
-//! - `PAR6_SHIM_INCLUDE_DIR` — its headers, when `PAR6_SHIM_LIB_DIR` is set.
 //! - `PAR6_TOPPRA_SRC` — a toppra checkout to build instead of fetching one
 //!   (offline builds; the commit is not checked, so it is the caller's job
 //!   to hand over the pinned one).
@@ -36,14 +31,9 @@ const TOPPRA_REPO: &str = "https://github.com/hungpham2511/toppra";
 const JOB_MEM_GB: u64 = 4;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_INCLUDE_DIR");
     println!("cargo:rerun-if-env-changed=PAR6_TOPPRA_SRC");
 
-    let lib_dir = match std::env::var("PAR6_SHIM_LIB_DIR") {
-        Ok(dir) => prebuilt(dir),
-        Err(_) => build_shim(),
-    };
+    let lib_dir = build_shim();
 
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
     println!("cargo:rustc-link-lib=dylib=par6_shim");
@@ -55,39 +45,14 @@ fn main() {
     println!("cargo:rpath={}", lib_dir.display());
 }
 
-/// Check over a shim someone else built (the cross path) and return its
-/// library directory.
-fn prebuilt(dir: String) -> PathBuf {
-    let dir = PathBuf::from(dir);
-    if !dir.join("libpar6_shim.so").exists() {
-        panic!(
-            "libpar6_shim.so not found in PAR6_SHIM_LIB_DIR ({}). For a cross \
-             build run `scripts/ffi/setup.sh --target <arch>`; unset the \
-             variable to build the shim here.",
-            dir.display()
-        );
-    }
-    if let Ok(include) = std::env::var("PAR6_SHIM_INCLUDE_DIR") {
-        let header = Path::new(&include).join("par6_shim.h");
-        if !header.exists() {
-            panic!(
-                "par6_shim.h not found in PAR6_SHIM_INCLUDE_DIR ({include}); \
-                 it does not look like a par6_shim install prefix."
-            );
-        }
-    }
-    dir
-}
-
 /// Build toppra and `cpp/` into `OUT_DIR`; return the shim's library dir.
 fn build_shim() -> PathBuf {
     let out = PathBuf::from(std::env::var("OUT_DIR").expect("cargo sets OUT_DIR"));
     let prefix = std::env::var("CONDA_PREFIX").unwrap_or_else(|_| {
         panic!(
             "CONDA_PREFIX is not set: the shim links Pinocchio, coal, eigen \
-             and urdfdom from the pixi environment.\nRun under pixi (`pixi \
-             run cargo ...`), or set PAR6_SHIM_LIB_DIR to a shim built \
-             elsewhere."
+             and urdfdom from the pixi environment.\nRun under pixi: \
+             `pixi run cargo ...`, or `pixi run setup`."
         )
     });
 
@@ -163,7 +128,16 @@ fn toppra_source(out: &Path) -> PathBuf {
     let dir = src.display().to_string();
     run(Command::new("git").args(["-C", &dir, "init", "-q"]));
     run(Command::new("git").args(["-C", &dir, "remote", "add", "origin", TOPPRA_REPO]));
-    run(Command::new("git").args(["-C", &dir, "fetch", "-q", "--depth", "1", "origin", TOPPRA_COMMIT]));
+    run(Command::new("git").args([
+        "-C",
+        &dir,
+        "fetch",
+        "-q",
+        "--depth",
+        "1",
+        "origin",
+        TOPPRA_COMMIT,
+    ]));
     run(Command::new("git").args(["-C", &dir, "checkout", "-q", "--detach", "FETCH_HEAD"]));
     src
 }

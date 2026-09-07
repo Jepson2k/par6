@@ -15,8 +15,8 @@ fn main() {
     let lib_dir = std::env::var("MUJOCO_DYNAMIC_LINK_DIR").unwrap_or_else(|_| {
         panic!(
             "MUJOCO_DYNAMIC_LINK_DIR is not set; par6-bus links libmujoco from \
-             the conda prefix pixi provides.\nRun under pixi (`pixi run \
-             cargo ...`), or source .ffi/env-<arch>.sh for a cross build."
+             the conda prefix pixi provides.\nRun under pixi: `pixi run \
+             cargo ...`."
         )
     });
     if !Path::new(&lib_dir).join("libmujoco.so").exists() {

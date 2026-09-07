@@ -44,26 +44,39 @@ shim_lib="$(ls -1dt "$ROOT"/target/release/build/par6-kin-*/out/shim/lib 2>/dev/
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$DIST"
 
+# The binary is rewritten BEFORE the closure is checked, not after: the check
+# asks whether each object can find its staged siblings once the directory
+# moves, and an answer taken from the build tree's rpath is not the one that
+# ships. par6d searches the directory install.sh fills; every library
+# searches its own.
+# The roots go in by hand. `stage_runtime_libs.py` closes over what its
+# roots NEED and copies that; a root is the thing being closed over, so it
+# is never its own dependency and never lands there on its own.
+cp "$BIN" "$STAGE/par6d"
+cp "$shim_lib/libpar6_shim.so" "$shim_lib/libtoppra.so" "$STAGE/"
+mujoco="$(readlink -f "$CONDA_PREFIX/lib/libmujoco.so")"
+cp "$mujoco" "$STAGE/$(basename "$mujoco")"
+patchelf --set-rpath "$RUNTIME_LIB_DIR" "$STAGE/par6d"
+
 echo ">>> staging the runtime closure"
 python3 "$ROOT/scripts/ffi/stage_runtime_libs.py" \
   --readelf "$(command -v readelf)" \
   --lib-dir "$CONDA_PREFIX/lib" \
   --lib-dir "$shim_lib" \
+  --lib-dir "$STAGE" \
   --dest "$STAGE" \
   --accept-rpath "$RUNTIME_LIB_DIR" \
-  "$BIN" \
-  "$shim_lib/libpar6_shim.so" \
-  "$CONDA_PREFIX/lib/libmujoco.so"
+  "$STAGE/par6d" \
+  "$STAGE/libpar6_shim.so" \
+  "$STAGE/$(basename "$mujoco")"
 
-# Every staged object resolves its siblings from its own directory, and the
-# binary from the directory install.sh fills. Build-machine paths — the
-# conda prefix, cargo's OUT_DIR — mean nothing on the box and must not
-# survive into what ships.
-echo ">>> rewriting rpaths"
+# The staged libraries pass the check on an `$ORIGIN` entry they already
+# carry, but ours also name the prefix they were built against. That path
+# does not exist on the box, and a build-machine path inside a shipped binary
+# is the thing `validate-bundle.sh` refuses, so it is trimmed away here.
+echo ">>> trimming build-machine paths"
 for so in "$STAGE"/*.so*; do patchelf --set-rpath '$ORIGIN' "$so"; done
 staged_bin="$STAGE/par6d"
-cp "$BIN" "$staged_bin"
-patchelf --set-rpath "$RUNTIME_LIB_DIR" "$staged_bin"
 
 BUNDLE="$ROOT/target/bundle"
 rm -rf "$BUNDLE"
@@ -85,7 +98,7 @@ tar -C "$(dirname "$BUNDLE")" -czf "$tarball" "$(basename "$BUNDLE")"
 # The manifest is what ties a published artifact to the commit and the
 # versions it was built from, so a box can be asked what it is running and
 # a release can be checked against what was validated.
-daemon_version="$("$BIN" --version 2>/dev/null | awk '{print $NF}')"
+daemon_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
 client_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/python/pyproject.toml" | head -1)"
 waldoctl_pin="$(sed -n 's#.*waldoctl.git@\([^"]*\).*#\1#p' "$ROOT/python/pyproject.toml" | head -1)"
 glibc_floor="$(readelf -V "$staged_bin" 2>/dev/null \
