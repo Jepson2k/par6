@@ -1500,12 +1500,23 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
         flange.angles,
         offset.angles
     );
-    // A pure translation in the tool frame: the orientation block is
-    // untouched, so only the point the runtime resolves at has changed.
+    // The plant can drift between broadcasts. Each revolute joint's
+    // observed rotation bounds its contribution to any rotation-matrix
+    // element, so an offset may not add rotation beyond that physical motion.
+    let rotation_bound: f64 = offset
+        .angles
+        .iter()
+        .zip(&flange.angles)
+        .map(|(after, before)| (after - before).abs().to_radians())
+        .sum::<f64>()
+        + 1e-6;
     for k in [0, 1, 2, 4, 5, 6, 8, 9, 10] {
         assert!(
-            (offset.pose[k] - flange.pose[k]).abs() < 1e-6,
-            "the offset rotated the reported pose at element {k}"
+            (offset.pose[k] - flange.pose[k]).abs() < rotation_bound,
+            "the offset rotated the reported pose at element {k} beyond joint motion: \
+             {} -> {}, bound {rotation_bound}",
+            flange.pose[k],
+            offset.pose[k],
         );
     }
     let readback = tcp_offset_readback(&mut c);

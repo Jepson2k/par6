@@ -191,7 +191,7 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
         assert events[1].parent_id == events[0].invocation_id
 
     async def cancel_motion() -> None:
-        from waldoctl.status import ActionState
+        from par6.protocol.constants import ErrorCode
 
         async with daemon.client() as client:
             moving = asyncio.Event()
@@ -222,9 +222,11 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
             assert cancelled_events[-1].phase == "cancelled"
             assert cancelled_events[-1].stop_confirmed is True
             assert await client.wait_status(
-                lambda s: s.action_state == ActionState.IDLE and s.queued_segments == 0,
+                lambda s: s.executing_index == -1 and s.queued_segments == 0,
                 timeout=3.0,
             )
+            standing = await client.error()
+            assert standing is not None and standing.code == ErrorCode.MOTN_CANCELLED
             # Cancellation belongs to the invocation, not the connection.
             await turn.async_call(client, -2.0)
 
