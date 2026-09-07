@@ -2,11 +2,12 @@
 # Install par6d + its config + the systemd unit onto the PAR6 control box.
 #
 #   # on the box, from a native build (the normal path — see README):
-#   scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
-#   sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
+#   pixi run bundle                       # -> dist/par6d-<arch>.tar.gz
+#   sudo tar -C /tmp -xzf dist/par6d-aarch64.tar.gz
+#   sudo /tmp/bundle/install.sh --local --bundle /tmp/bundle
 #
 #   # from another machine (optional; needs ssh/scp access; sudo on the box):
-#   scripts/deploy/build-aarch64.sh
+#   pixi run bundle
 #   scripts/deploy/install.sh --host pi@par6-box
 #
 #   # just build the bundle (what CI checks; no ssh, no box):
@@ -14,7 +15,7 @@
 #
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
-#   /usr/local/lib/par6/*.so          the Pinocchio shim + its runtime closure
+#   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco and their runtime closure
 #   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
@@ -37,7 +38,7 @@ FORCE_CONFIG=0
 BINARY="$ROOT/target/$TARGET_TRIPLE/release/par6d"
 CONFIG_DIR="$ROOT/config"
 ASSETS_DIR="$ROOT/assets/par6_description"
-# The staged shim + dependency closure scripts/ffi/setup.sh --target aarch64
+# The staged shim + dependency closure scripts/deploy/pack-bundle.sh
 # produced. par6d is linked with an rpath pointing at $LIBS_DEST, so these
 # have to arrive with the binary or it will not start.
 RUNTIME_LIBS="${PAR6_RUNTIME_LIB_SRC:-}"
@@ -87,8 +88,7 @@ install_local() {
   [ -f "$bundle/par6d.service" ] || die "no unit file in $bundle"
   [ -d "$bundle/lib" ] || die "no lib/ in $bundle — this bundle was staged without the
   Pinocchio shim, and par6d does not run without it. Rebuild with:
-    scripts/ffi/setup.sh --target aarch64 && source .ffi/env-aarch64.sh
-    scripts/deploy/build-aarch64.sh"
+    pixi run bundle"
 
   if command -v file >/dev/null && [ "$(uname -m)" = "aarch64" ]; then
     file -b "$bundle/par6d" | grep -q "ARM aarch64" \
@@ -179,11 +179,11 @@ install_config() {
 stage_bundle() {
   local dir="$1"
   [ -f "$BINARY" ] || die "binary not found: $BINARY
-  build it first: scripts/deploy/build-aarch64.sh"
+  build it first: pixi run bundle"
   [ -f "$CONFIG_DIR/PAR6.toml" ] || die "no PAR6.toml under $CONFIG_DIR"
   [ -d "$CONFIG_DIR/grippers" ] || die "no grippers/ under $CONFIG_DIR"
   [ -n "$RUNTIME_LIBS" ] || die "no runtime library directory
-  (set PAR6_RUNTIME_LIB_SRC by sourcing .ffi/env-aarch64.sh, or pass
+  (pass
    --runtime-libs DIR)"
   [ -e "$RUNTIME_LIBS/libpar6_shim.so" ] \
     || die "no libpar6_shim.so under $RUNTIME_LIBS"

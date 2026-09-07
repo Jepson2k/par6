@@ -109,7 +109,7 @@ pub struct CoreClient {
     /// The estimation model, built once per config it was asked for and
     /// kept: the mesh worlds cost hundreds of milliseconds, and a program
     /// that estimates after every pick asks for the same one every time.
-    estimation: Arc<tokio::sync::Mutex<Option<(String, par6_calibrate::EstimationModel)>>>,
+    estimation: Arc<tokio::sync::Mutex<Option<(String, par6d::calibrate::EstimationModel)>>>,
 }
 
 impl CoreClient {
@@ -511,7 +511,7 @@ impl CoreClient {
     /// the inertia tensor, which static poses cannot excite — and,
     /// optionally, tell the runtime. The whole protocol, including the
     /// clearing and restoring of whatever was declared, is
-    /// `par6_calibrate::estimate`'s; this only carries paths and results.
+    /// `par6d::calibrate::estimate`'s; this only carries paths and results.
     #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
     #[allow(clippy::too_many_arguments)]
     fn estimate_payload<'py>(
@@ -546,7 +546,7 @@ impl CoreClient {
                 *slot = Some((key, model));
             }
             let (_, model) = slot.as_mut().expect("just filled");
-            let report = par6_calibrate::estimate(&client, model, spread, ridge, declare)
+            let report = par6d::calibrate::estimate(&client, model, spread, ridge, declare)
                 .await
                 .map_err(PyRuntimeError::new_err)?;
             Python::with_gil(|py| {

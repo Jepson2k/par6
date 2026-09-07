@@ -66,6 +66,14 @@ fn main() {
         libc::signal(libc::SIGINT, handler);
         libc::signal(libc::SIGTERM, handler);
     }
+    // A parent that died in the gap between the spawn and this line is
+    // already gone; from here on the main loop watches it.
+    if let Some(pid) = opts.parent_pid {
+        if !parent_alive(pid) {
+            eprintln!("par6d: parent {pid} is gone; exiting");
+            std::process::exit(0);
+        }
+    }
     let daemon = match Daemon::start(&opts) {
         Ok(d) => d,
         Err(e) => {
@@ -80,9 +88,28 @@ fn main() {
         opts.sim
     );
     let _ = std::io::stdout().flush();
-    while !SHUTDOWN.load(Ordering::SeqCst) {
+    loop {
+        if SHUTDOWN.load(Ordering::SeqCst) {
+            log::info!("signal received; shutting down");
+            break;
+        }
+        if opts.parent_pid.is_some_and(|pid| !parent_alive(pid)) {
+            log::info!("parent process is gone; shutting down");
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
-    log::info!("signal received; shutting down");
     daemon.shutdown();
+}
+
+/// Whether `pid` is still this process's parent.
+///
+/// A parent that exits — however it exits, SIGKILL included — has its
+/// children reparented, so a changed `getppid` is the parent's death seen
+/// from here. Polled from the main loop rather than requested with
+/// `PR_SET_PDEATHSIG`, which is keyed to the THREAD that spawned the child
+/// and fires when that thread ends while the program lives on.
+fn parent_alive(pid: u32) -> bool {
+    // SAFETY: getppid has no arguments and cannot fail.
+    unsafe { libc::getppid() == pid as libc::pid_t }
 }

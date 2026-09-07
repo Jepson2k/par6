@@ -1,22 +1,111 @@
-//! The offline dry-run binding over `par6d::preview` — the daemon's own
-//! planner, server rules and streaming integrator behind a virtual arm.
-//! The Python shim builds command dicts; everything that decides what
-//! the arm would do happens in the engine.
+//! The offline dry-run binding over `par6d::preview`.
+//!
+//! Two passes, and the difference between them is the point.
+//! [`Preview::submit`] plans: it asks the daemon's own planner, server
+//! rules and streaming integrator what they would drive, fast enough to
+//! run behind a keystroke. [`Preview::run_program`] *runs*: it ticks the
+//! same engine the simulator ticks, and what comes back is what the arm
+//! did, sag and servo lag and contact included.
+//!
+//! A tick record crosses as raw column buffers rather than lists of
+//! lists. A minute of program is a few hundred thousand numbers, and
+//! building a Python float per number costs more than the simulation
+//! that produced them; `np.frombuffer` on the other side is a view.
 
 use std::sync::Mutex;
 
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyList};
+use pyo3::types::{PyBytes, PyDict, PyList};
 
 use par6_proto::NUM_JOINTS;
 use par6d::matrix_to_xyzrpy;
-use par6d::preview::{Preview as EnginePreview, PreviewResult};
+use par6d::preview::record::{mode_name, TickBatch};
+use par6d::preview::{Preview as EnginePreview, PreviewResult, RunLimits};
 
 use crate::config::motion_dict;
 use crate::convert::{
-    command_from_py, fill_payload, layer_of, robot_err, shape_from_py, wire_error_tuple,
+    command_from_py, fill_payload, layer_of, robot_err, shape_dict, shape_from_py, wire_error_tuple,
 };
+
+/// One numeric column as raw bytes, written straight into the Python
+/// buffer — no intermediate `Vec<u8>`, no Python object per number.
+fn col<'py, const N: usize, T: Copy>(
+    py: Python<'py>,
+    v: &[T],
+    ne: impl Fn(T) -> [u8; N],
+) -> PyResult<Bound<'py, PyBytes>> {
+    PyBytes::new_with(py, v.len() * N, |buf| {
+        for (out, x) in buf.as_chunks_mut::<N>().0.iter_mut().zip(v) {
+            *out = ne(*x);
+        }
+        Ok(())
+    })
+}
+
+fn f32_col<'py>(py: Python<'py>, v: &[f32]) -> PyResult<Bound<'py, PyBytes>> {
+    col(py, v, f32::to_ne_bytes)
+}
+
+fn bool_col<'py>(py: Python<'py>, v: &[bool]) -> PyResult<Bound<'py, PyBytes>> {
+    col(py, v, |b| [u8::from(b)])
+}
+
+/// A [`TickBatch`] as the shim's `np.frombuffer` reads it. Shapes are
+/// implied by `rows` and `joints`; the byte order is the machine's,
+/// which is the only one either side runs on.
+fn batch_dict(py: Python<'_>, b: &TickBatch) -> PyResult<PyObject> {
+    let d = PyDict::new(py);
+    d.set_item("row_dt_s", b.row_dt_s)?;
+    d.set_item("tick_dt_s", b.tick_dt_s)?;
+    d.set_item("stride", b.stride)?;
+    d.set_item("joints", b.joints)?;
+    d.set_item("rows", b.rows)?;
+    d.set_item("q_rad", f32_col(py, &b.q_rad)?)?;
+    d.set_item("q_commanded_rad", f32_col(py, &b.q_commanded_rad)?)?;
+    d.set_item("tcp", f32_col(py, &b.tcp)?)?;
+    d.set_item("tool_closed", f32_col(py, &b.tool_closed)?)?;
+    d.set_item("tool_gripping", bool_col(py, &b.tool_gripping)?)?;
+    d.set_item("com", f32_col(py, &b.com)?)?;
+    d.set_item("contact_pos", f32_col(py, &b.contact_pos)?)?;
+    d.set_item("contact_force", f32_col(py, &b.contact_force)?)?;
+    d.set_item(
+        "contact_starts",
+        col(py, &b.contact_starts, u32::to_ne_bytes)?,
+    )?;
+    d.set_item("stop", b.stop.as_str())?;
+
+    let modes = PyList::empty(py);
+    for span in &b.modes {
+        modes.append((span.start_row, mode_name(span.value)))?;
+    }
+    d.set_item("modes", modes)?;
+
+    let commands = PyList::empty(py);
+    for span in &b.commands {
+        let cd = PyDict::new(py);
+        cd.set_item("command", span.command)?;
+        cd.set_item("start_row", span.start_row)?;
+        cd.set_item("rows", span.rows)?;
+        match &span.error {
+            Some(e) => cd.set_item("error", wire_error_tuple(py, e))?,
+            None => cd.set_item("error", py.None())?,
+        }
+        commands.append(cd)?;
+    }
+    d.set_item("commands", commands)?;
+
+    let objects = PyList::empty(py);
+    for t in &b.objects {
+        let od = PyDict::new(py);
+        od.set_item("name", &t.name)?;
+        od.set_item("rows", t.poses.len())?;
+        od.set_item("poses", f32_col(py, t.poses.as_flattened())?)?;
+        objects.append(od)?;
+    }
+    d.set_item("objects", objects)?;
+    Ok(d.into_any().unbind())
+}
 
 /// Sample indices that keep a trajectory under `max_points` with both
 /// endpoints retained.
@@ -287,7 +376,7 @@ impl Preview {
     }
 
     /// The motion a payload estimation makes from here — the wrist swing
-    /// `par6_calibrate` plans, at its speed, ending where the arm stood —
+    /// `calibrate` plans, at its speed, ending where the arm stood —
     /// as one result dict like any other previewed command. Measures
     /// nothing.
     #[pyo3(signature = (spread=0.5))]
@@ -321,6 +410,58 @@ impl Preview {
             .unwrap()
             .set_shapes(layer, &shapes)
             .map_err(|e| robot_err(&e))
+    }
+
+    /// The applied world — `installation` (from the engine's config),
+    /// `program` (what this session set) and `epoch`: the runtime's own
+    /// SHAPES readback, for the same file.
+    fn shapes(&self, py: Python<'_>) -> PyResult<PyObject> {
+        let inner = self.inner.lock().unwrap();
+        let (installation, program, epoch) = inner.shapes();
+        let layer = |shapes: &[par6_proto::Shape]| -> PyResult<Vec<PyObject>> {
+            shapes.iter().map(|s| shape_dict(py, s)).collect()
+        };
+        let d = PyDict::new(py);
+        d.set_item("installation", layer(installation)?)?;
+        d.set_item("program", layer(program)?)?;
+        d.set_item("epoch", epoch)?;
+        Ok(d.into_any().unbind())
+    }
+
+    /// Run a program through the engine: the same planner driving a real
+    /// control loop against the simulated plant, ticked flat out. What
+    /// comes back is a tick record of what the arm DID — see
+    /// `batch_dict` for the columns — not a plan of what it was told to.
+    ///
+    /// `max_seconds` bounds the SIMULATED time, so a program that never
+    /// terminates still returns, with `stop = "budget_exhausted"`.
+    ///
+    /// The GIL is released for the run: at roughly sixty times real time
+    /// a ten minute program is some ten seconds of computing, and the
+    /// caller's event loop must not stop for it.
+    #[pyo3(signature = (cmds, max_seconds=None))]
+    fn run_program(
+        &self,
+        py: Python<'_>,
+        cmds: Vec<Bound<'_, PyDict>>,
+        max_seconds: Option<f64>,
+    ) -> PyResult<PyObject> {
+        let commands = cmds
+            .iter()
+            .map(command_from_py)
+            .collect::<PyResult<Vec<_>>>()?;
+        let limits = match max_seconds {
+            Some(max_seconds) => RunLimits { max_seconds },
+            None => RunLimits::default(),
+        };
+        let batch = py.allow_threads(|| {
+            self.inner
+                .lock()
+                .unwrap()
+                .run(&commands, limits)
+                .map_err(|e| PyRuntimeError::new_err(e.to_string()))
+        })?;
+        batch_dict(py, &batch)
     }
 }
 

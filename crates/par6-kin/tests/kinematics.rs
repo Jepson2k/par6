@@ -6,21 +6,15 @@
 //! a fabricated answer. (FK itself is cross-checked against the
 //! independent OPW closed form every time a model loads — `Opw::derive`
 //! refuses a tree whose FK it cannot reproduce.)
-#![cfg(feature = "ffi")]
 // Joint values are spelled the way config/PAR6.toml spells them.
 #![allow(clippy::approx_constant)]
 
-use std::path::PathBuf;
 use std::time::Instant;
 
 use par6_kin::{GripperVariant, IkOutcome, Kin, IK_POSE_TOL, NQ};
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/par6_description")
-        .canonicalize()
-        .unwrap()
-}
+mod common;
+use common::assets_dir;
 
 /// Configurations inside every joint's travel, spread over the workspace:
 /// the park pose (a wrist singularity), the runtime's cartesian test

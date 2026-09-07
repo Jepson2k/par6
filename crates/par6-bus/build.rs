@@ -1,42 +1,30 @@
-//! With feature `sim-dynamics`, embeds an rpath to the par6_shim install
-//! directory so this crate's own test binaries load `libpar6_shim.so`
-//! without `LD_LIBRARY_PATH`. Link-args do not propagate across packages,
-//! so pinokin-sys's identical rpath only covers ITS test binaries.
+//! Republishes libmujoco's directory as an rpath.
 //!
-//! With feature `sim-mujoco`, links `libmujoco` from `PAR6_MUJOCO_LIB_DIR`
-//! (exported by `.ffi/env.sh` after `scripts/ffi/setup.sh`) and embeds the
-//! matching rpath.
+//! `mujoco-rs`'s build script emits the link search path and `-lmujoco` for
+//! the prefix `MUJOCO_DYNAMIC_LINK_DIR` names — pixi's for a native build,
+//! the target env for a cross one — but no rpath — so nothing that links it runs without
+//! `LD_LIBRARY_PATH`. par6-bus is the only crate that links libmujoco, so
+//! its `links = "mujoco"` key is where the directory is derived once: as a
+//! link arg for this crate's own test binaries, and as `DEP_MUJOCO_RPATH`
+//! for dependents (link args do not propagate across cargo packages).
 
-use std::env;
 use std::path::Path;
 
 fn main() {
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_LIB_DIR");
-    println!("cargo:rerun-if-env-changed=PAR6_MUJOCO_LIB_DIR");
-    if env::var_os("CARGO_FEATURE_SIM_DYNAMICS").is_some() {
-        // pinokin-sys's build script errors out with run-setup.sh guidance when
-        // this is missing; no need to duplicate the message here.
-        if let Ok(lib_dir) = env::var("PAR6_SHIM_LIB_DIR") {
-            println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
-        }
+    println!("cargo:rerun-if-env-changed=MUJOCO_DYNAMIC_LINK_DIR");
+    let lib_dir = std::env::var("MUJOCO_DYNAMIC_LINK_DIR").unwrap_or_else(|_| {
+        panic!(
+            "MUJOCO_DYNAMIC_LINK_DIR is not set; par6-bus links libmujoco from \
+             the conda prefix pixi provides.\nRun under pixi: `pixi run \
+             cargo ...`."
+        )
+    });
+    if !Path::new(&lib_dir).join("libmujoco.so").exists() {
+        panic!(
+            "libmujoco.so not found in MUJOCO_DYNAMIC_LINK_DIR ({lib_dir}). \
+             It is a pixi dependency; run `pixi install`."
+        );
     }
-    if env::var_os("CARGO_FEATURE_SIM_MUJOCO").is_some() {
-        let lib_dir = env::var("PAR6_MUJOCO_LIB_DIR").unwrap_or_else(|_| {
-            panic!(
-                "par6-bus was built with the `sim-mujoco` feature but \
-                 PAR6_MUJOCO_LIB_DIR is not set.\nRun scripts/ffi/setup.sh, \
-                 then `source .ffi/env.sh` (or export PAR6_MUJOCO_LIB_DIR to \
-                 the directory containing libmujoco.so)."
-            )
-        });
-        if !Path::new(&lib_dir).join("libmujoco.so").exists() {
-            panic!(
-                "libmujoco.so not found in PAR6_MUJOCO_LIB_DIR ({lib_dir}). \
-                 Run scripts/ffi/setup.sh to install it."
-            );
-        }
-        println!("cargo:rustc-link-search=native={lib_dir}");
-        println!("cargo:rustc-link-lib=dylib=mujoco");
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
-    }
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+    println!("cargo:rpath={lib_dir}");
 }

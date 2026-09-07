@@ -8,11 +8,17 @@ after editing ``config/`` or ``assets/par6_description/URDF/``; the
 freshness-guard test in ``python/tests/test_robot.py`` fails when the copies
 are stale (same pattern as the generated ``protocol/constants.py``).
 
-The packaged tree keeps the assets layout (``URDF/<tree>/{urdf,srdf,meshes}``)
-so the engine's own loaders read it as an assets directory.  The ``.urdf``
-files are not copied verbatim — :func:`packaged_bytes` applies the two
-rewrites the packaged (client-facing) copies need.  ``assets/`` stays
-untouched, and the runtime keeps loading the originals from there.
+The packaged tree keeps the assets layout (the vendor MJCFs beside
+``assets/`` and ``URDF/<tree>/{urdf,srdf,meshes}``) so the engine's own
+loaders read it as an assets directory.  The ``.urdf`` files are not copied
+verbatim — :func:`packaged_bytes` applies the two rewrites the packaged
+(client-facing) copies need.
+
+The MJCF side is what lets a packaged dry run SIMULATE rather than only
+plan: the vendor scene is compiled from these files.  Only the decimated
+``*_simplified.stl`` meshes ride along, because that is what the scene
+builder picks whenever it finds one — the full-resolution STLs beside them
+would add 9 MB the plant never opens.
 """
 
 from __future__ import annotations
@@ -74,9 +80,19 @@ def manifest() -> list[tuple[Path, Path, str]]:
         triples.append((src, DATA / "config" / src.name, ""))
     for src in sorted((REPO / "config" / "grippers").glob("*.toml")):
         triples.append((src, DATA / "config" / "grippers" / src.name, ""))
-    urdf_root = REPO / "assets" / "par6_description" / "URDF"
+    assets_root = REPO / "assets" / "par6_description"
+    for src in sorted(assets_root.glob("PAR6_*_gripper.xml")):
+        triples.append((src, DATA / src.name, ""))
+    for src in sorted((assets_root / "assets").glob("*_simplified.stl")):
+        triples.append((src, DATA / "assets" / src.name, ""))
+    urdf_root = assets_root / "URDF"
     for tree in URDF_TREES:
-        for sub, pattern in (("urdf", "*.urdf"), ("srdf", "*.srdf"), ("meshes", "*.STL")):
+        for sub, pattern in (
+            ("urdf", "*.urdf"),
+            ("srdf", "*.srdf"),
+            ("meshes", "*.STL"),
+            ("meshes", "*_simplified.stl"),
+        ):
             for src in sorted((urdf_root / tree / sub).glob(pattern)):
                 triples.append((src, DATA / "URDF" / tree / sub / src.name, tree))
     return triples

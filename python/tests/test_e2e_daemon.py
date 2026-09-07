@@ -16,7 +16,12 @@ import asyncio
 import json
 import logging
 import math
+import os
+import signal
+import subprocess
+import sys
 import time
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -24,14 +29,15 @@ from live_daemon import (
     TICK_DT_S,
     LiveDaemon,
     angles_now,
+    daemon_env,
     free_udp_port,
     pose_now,
-    repo_assets_dir,
     requires_par6d,
     settle_at,
     sim_config,
+    teleport_to,
 )
-from waldoctl.shapes import Box
+from waldoctl.shapes import Box, Physical
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -105,22 +111,6 @@ async def enable(client: AsyncRobotClient, probe) -> RobotError | None:
             continue
         return None
     raise AssertionError("controller never left DISABLED after reset()")
-
-
-async def teleport_to(client: AsyncRobotClient, angles: list[float]) -> None:
-    """Drive the sim to *angles* with the fire-and-forget teleport.
-
-    Teleport is unacked and gated on ENABLED, so it is re-sent until the
-    broadcast shows it landed — the same thing a UI would do.
-    """
-    deadline = time.monotonic() + STEP_BUDGET_S
-    while time.monotonic() < deadline:
-        await client.teleport(angles)
-        if await client.wait_status(
-            lambda s: s.homed and max_deg_error(s.angles, angles) < 1.0, timeout=0.5
-        ):
-            return
-    raise AssertionError("teleport never took effect")
 
 
 @pytest.mark.timeout(240)
@@ -323,17 +313,6 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
             f"homing did not complete; daemon log:\n{daemon.log()}"
         )
 
-        # home(calibrate=True) on a referenced arm re-runs the seek instead of
-        # the planned return move: the RT core drops into HOMING mode again.
-        assert await client.wait_status(lambda s: s.homed, timeout=STEP_BUDGET_S)
-        recal_index = await client.home(calibrate=True)
-        assert recal_index >= 0
-        assert await client.wait_status(
-            lambda s: s.mode == ControllerMode.HOMING, timeout=STEP_BUDGET_S
-        ), f"calibrate=True never entered HOMING; daemon log:\n{daemon.log()}"
-        assert (
-            await client.wait_command(recal_index, timeout=HOMING_BUDGET_S) is True
-        ), f"re-referencing did not complete; daemon log:\n{daemon.log()}"
         assert await client.wait_status(lambda s: s.homed, timeout=STEP_BUDGET_S)
 
         homed = await client.angles()
@@ -345,6 +324,22 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
         assert max_deg_error(homed, boot) > 10.0, (
             "the sequence must physically re-reference the arm, not just set a flag"
         )
+
+        # home(calibrate=True) on an already-referenced arm re-runs the seek
+        # instead of the planned return. What is asserted here is that the
+        # client's keyword reaches the runtime — the RT dropping back into
+        # HOMING is the only thing a dropped flag could not produce, since
+        # the flag-clear path never leaves EXEC. The seek is then abandoned
+        # rather than waited out: it is the same ~60 s sequence already run
+        # above, and where it ENDS is pinned without the wall clock by
+        # `par6d/tests/sim_session.rs::
+        # home_calibrate_on_a_referenced_arm_reseeks_instead_of_returning_to_park`.
+        recal_index = await client.home(calibrate=True)
+        assert recal_index >= 0
+        assert await client.wait_status(
+            lambda s: s.mode == ControllerMode.HOMING, timeout=STEP_BUDGET_S
+        ), f"calibrate=True never entered HOMING; daemon log:\n{daemon.log()}"
+        assert await client.stop(clear_queue=True) == 1
 
 
 @pytest.mark.timeout(240)
@@ -387,16 +382,7 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     assert robot.is_available() is True, "a runtime it never started must survive"
 
     # -- spawn one of its own --------------------------------------------
-    port = free_udp_port()
-    assets = repo_assets_dir()
-    if assets is not None:
-        # The spawned runtime's config lives in a tmp dir; an ffi build looks
-        # for its kinematics assets next to the config unless told otherwise.
-        monkeypatch.setenv("PAR6_ASSETS", str(assets))
-    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / "spawned")))
-    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
-    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
-    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
+    port = _spawn_env(monkeypatch, tmp_path, "spawned")
 
     logs = Robot(host="127.0.0.1", port=port, normalize_logs=True)
     assert logs.is_available() is False
@@ -431,6 +417,104 @@ def test_robot_start_is_exclusive_spawns_its_own_and_forwards_its_log(
     while logs.is_available() and time.monotonic() < deadline:
         time.sleep(0.1)
     assert logs.is_available() is False, "Robot.stop() must reap what it spawned"
+
+
+def _spawn_env(monkeypatch, tmp_path: Path, tag: str) -> int:
+    """Give a ``Robot.start()`` spawn a config, ports and a grant directory of
+    its own, and return the command port it will serve on.
+
+    The spawned runtime runs beside the fixture's: without its own grant
+    directory it publishes ``loop_tick`` / ``robot_mode`` under the shipped
+    names in the default location, and stopping it removes the claim every
+    other daemon on the box is holding. An ffi build also looks for its
+    kinematics assets next to the config unless told otherwise.
+    """
+    for key, value in daemon_env(tmp_path / f"{tag}-shm").items():
+        if key.startswith("PAR6_"):
+            monkeypatch.setenv(key, value)
+    monkeypatch.setenv("PAR6_CONFIG", str(sim_config(tmp_path / tag)))
+    monkeypatch.setenv("PAR6_STATUS_TRANSPORT", "unicast")
+    monkeypatch.setenv("PAR6_STATUS_HOST", "127.0.0.1")
+    monkeypatch.setenv("PAR6_STATUS_PORT", str(free_udp_port()))
+    return free_udp_port()
+
+
+def _par6d_pids_serving(port: int) -> list[int]:
+    """Every live par6d whose command line binds *port*."""
+    found = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or not argv[0].endswith(b"par6d"):
+            continue
+        try:
+            served = argv[argv.index(b"--port") + 1]
+        except (ValueError, IndexError):
+            continue
+        if served == str(port).encode():
+            found.append(int(entry))
+    return found
+
+
+def test_a_spawned_runtime_dies_with_the_process_that_spawned_it(monkeypatch, tmp_path):
+    """A runtime ``Robot.start()`` spawned must not outlive the program.
+
+    parol6 pins this with ``set_pdeathsig`` (``tests/unit/test_pdeathsig.py``).
+    Without it a script that is SIGKILLed — a crashed GUI, a terminal
+    closed on it — leaves ``par6d`` running: it keeps the command port,
+    keeps the bus, and the next ``start()`` on that port refuses with
+    "already running" for a runtime nobody can reach to stop.
+    """
+    port = _spawn_env(monkeypatch, tmp_path, "orphan")
+
+    # The spawner is a real separate process, so killing it is the dirty
+    # exit under test and not something the test runner itself survives.
+    script = tmp_path / "spawner.py"
+    script.write_text(
+        "import sys, time\n"
+        "from par6 import Robot\n"
+        f"Robot(host='127.0.0.1', port={port}).start(timeout=60.0)\n"
+        "print('READY', flush=True)\n"
+        "time.sleep(3600)\n"
+    )
+    spawner = subprocess.Popen(
+        [sys.executable, str(script)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert spawner.stdout is not None
+        assert spawner.stdout.readline().strip() == "READY", (
+            spawner.stderr.read() if spawner.stderr else ""
+        )
+        probe = Robot(host="127.0.0.1", port=port)
+        assert probe.is_available() is True
+        assert _par6d_pids_serving(port), "the spawner's runtime must be visible"
+
+        os.kill(spawner.pid, signal.SIGKILL)
+        spawner.wait(timeout=STEP_BUDGET_S)
+
+        deadline = time.monotonic() + STEP_BUDGET_S
+        while time.monotonic() < deadline:
+            if not probe.is_available() and not _par6d_pids_serving(port):
+                break
+            time.sleep(0.1)
+        assert not _par6d_pids_serving(port), (
+            "par6d outlived the process that spawned it"
+        )
+        assert probe.is_available() is False
+    finally:
+        for pid in _par6d_pids_serving(port):
+            os.kill(pid, signal.SIGKILL)
+        if spawner.poll() is None:
+            spawner.kill()
+        spawner.wait(timeout=STEP_BUDGET_S)
 
 
 def _await_records(caplog, logger_name: str, budget_s: float) -> list:
@@ -568,7 +652,12 @@ async def test_servo_j_stream_drives_the_arm_and_leaves_the_controller_usable(
         # travel, so nothing but the commanded velocity keeps the arm
         # moving.
         step_deg = 0.25
-        cycles = 160
+        # Enough to reach and hold steady state: both regressions this
+        # guards (a watchdog rounding to one tick, and terminal velocity
+        # read as a cap) stop the arm inside the first second, and the
+        # landing assertion below is a fraction of what was commanded, so
+        # it holds at any cycle count.
+        cycles = 60
         target = list(park)
         for _ in range(cycles):
             target[0] += step_deg
@@ -1093,6 +1182,65 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         assert await client.wait_status(
             lambda s: max_deg_error(s.angles, target) < 2.0, timeout=STEP_BUDGET_S
         ), "the move the keep-out was blocking never ran once it was cleared"
+
+
+@pytest.mark.timeout(180)
+async def test_shape_physics_survives_the_wire_in_both_directions(
+    daemon: LiveDaemon,
+):
+    """A shape's physics reaches the runtime and comes back.
+
+    ``physics`` is what decides whether a shape is a body the simulator can
+    rest things on, drop or grasp, or only geometry the planner keeps out
+    of — and it travels as the seventh element of the shape wire form.  It
+    was being dropped in three separate places at once, each of which
+    failed silently: the client packed six elements, the readback built its
+    dict without the field, and the engine decoded the rest through a
+    derive that expects the config file's named fields rather than the
+    wire's pair.  A shape declared with mass simply arrived without it.
+
+    The three cases are distinct and all three matter: a mass is a free
+    body, ``mass=None`` is a static fixture (a table, which must be a
+    keep-out AND a surface), and no physics at all is geometry only.
+    """
+    block = Box(
+        name="block",
+        x=0.04,
+        y=0.04,
+        z=0.06,
+        pose=(0.35, 0.0, 0.05, 0, 0, 0),
+        physics=Physical(mass=0.05, friction=(0.9, 0.004, 0.0002)),
+    )
+    table = Box(
+        name="table",
+        x=0.5,
+        y=0.5,
+        z=0.02,
+        pose=(0.35, 0.0, 0.01, 0, 0, 0),
+        physics=Physical(mass=None),
+    )
+    keepout = Box(name="wall", x=0.1, y=0.1, z=0.1, pose=(0.6, 0.0, 0.2, 0, 0, 0))
+
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        try:
+            assert await client.set_shapes([block, table, keepout]) == 1
+            world = await client.shapes()
+            assert world is not None
+            got = {s.name: s for s in world.program}
+            assert got["block"] == block, "the wire lost the body's physics"
+            assert got["table"] == table, "the wire lost the fixture's physics"
+            assert got["wall"].physics is None, (
+                "a shape declaring no physics must not acquire any"
+            )
+            # The runtime's own configured shapes read back the same way, so
+            # a client cannot tell an installation surface from a keep-out
+            # by whether the field survived the trip.
+            assert any(s.physics is not None for s in world.installation), (
+                "the configured installation layer reports no physics at all"
+            )
+        finally:
+            assert await client.set_shapes([]) == 1
 
 
 @pytest.mark.timeout(180)
@@ -1779,8 +1927,16 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
     only when the answer is declared and only to what was found. A
     payload declared BEFORE the call has to come back on every exit that
     does not declare: the estimate clears it to measure against an
-    unloaded model, and an arm still holding a 1.2 kg part must not be
-    left compensating for nothing because someone was curious.
+    unloaded model, and an arm still holding a part must not be left
+    compensating for nothing because someone was curious.
+
+    The part is a light one on purpose. A declared payload the arm is not
+    actually carrying is a torque bias — the controller lifts a mass that
+    is not there — and above a joint's gearbox holding friction that bias
+    drives the arm: at 0.3 kg the elbow runs 33 degrees and folds the
+    wrist into the forearm, so the swing this asks for has nowhere to go.
+    Below the friction the arm simply holds, which is the state a client
+    asking "what am I carrying" is in.
 
     Whether the number is RIGHT is not asserted here and cannot be: this
     fixture re-ticks the daemon for CI, and at that rate the torque plant
@@ -1791,14 +1947,18 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
     async with daemon.client() as client:
         assert await client.wait_ready(timeout=STEP_BUDGET_S)
 
-        async def home():
-            assert await client.home(wait=True) >= 0
+        # A teleport references the arm (the sim is born at its endstops),
+        # which is all this test needs from HOME — and it costs a second
+        # against the shipped sequence's ~60 s of wall clock. The seek
+        # itself is covered live once, by
+        # `test_homing_sequence_drives_the_sim_to_the_configured_ready_pose`.
+        # The posture matters: `plan_poses` needs clear wrist poses to swing
+        # through, which park does not give it.
+        await settle_at(client, TILTED_POSTURE_DEG)
 
-        assert await enable(client, home) is None
-
-        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        assert await client.set_payload(0.1, com=(0.0, 0.01, 0.05)) == 1
         before = await client.payload()
-        assert before is not None and before.mass == pytest.approx(1.2)
+        assert before is not None and before.mass == pytest.approx(0.1)
 
         found = await client.estimate_payload(declare=False)
         assert found.poses >= 3, "the wrist must have been swung somewhere"

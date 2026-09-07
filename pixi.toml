@@ -1,0 +1,176 @@
+[workspace]
+authors = ["jepson2k <55201008+Jepson2k@users.noreply.github.com>"]
+channels = ["conda-forge"]
+name = "par6"
+platforms = ["linux-aarch64", "linux-64"]
+version = "0.1.0"
+
+# The C++ dependency closure the shim (cpp/) links against, plus the tools that
+# build it. Rust comes from rustup (rust-toolchain.toml), not from here — pixi
+# owns the system/C++ side only. (A Python still lands in the default
+# environment through libpinocchio → casadi; the runtime never loads it.)
+
+[dependencies]
+# The C++ library packages, not the `pinocchio`/`coal` metapackages — those
+# drag in the Python bindings (and a Python) the runtime never loads.
+# Pinned: the Python side's `pinokin` must resolve the same major/minor, and
+# the shim's C ABI is written against this API.
+libpinocchio = "4.1.*"
+# coal (hpp-fcl) backs par6_col_* and arrives as a pinocchio dependency
+# anyway; naming it keeps the shim's link line honest, so a pinocchio build
+# that drops collision support fails here rather than at cmake time.
+libcoal = "*"
+eigen = "*"
+urdfdom = "*"
+# The simulator's physics. `mujoco-rs` is bindings only here (no
+# `auto-download-mujoco`): it links what MUJOCO_DYNAMIC_LINK_DIR points at,
+# so libmujoco arrives from the same solve as everything else instead of a
+# second downloader with its own directory and cache. The version is the
+# one mujoco-rs 6.0.0 generates its bindings against (`+mj-3.12.0`).
+libmujoco = "3.12.*"
+cmake = "*"
+ninja = "*"
+cxx-compiler = "*"
+# Rewrites the rpaths of the shipped binary and its staged closure, and
+# reads them back in the packaging check.
+patchelf = "*"
+
+[activation.env]
+# Anything that links the workspace loads Pinocchio, coal and libmujoco from
+# here. The crates that link them emit an rpath for their own targets, but
+# link args do not propagate across cargo packages, so a test binary two
+# crates downstream has none — this covers those.
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+# Read by mujoco-rs's build script: link libmujoco from this prefix rather
+# than downloading a copy of its own.
+MUJOCO_DYNAMIC_LINK_DIR = "$CONDA_PREFIX/lib"
+
+# Every command CI runs, runnable the same way locally. CI calls these and
+# nothing else, so a green pipeline is reproducible with `pixi run <task>`.
+#
+# Nothing here builds the C++: `crates/par6-kin/build.rs` compiles the shim
+# and toppra into cargo's OUT_DIR, so any cargo invocation provisions them
+# and cargo owns their freshness. `setup` exists to do that once, up front,
+# so a job that only packages does not discover it mid-step.
+[tasks.setup]
+cmd = "cargo build --all-targets"
+
+[tasks.fmt]
+cmd = "cargo fmt --all --check"
+
+[tasks.clippy]
+cmd = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.lint]
+depends-on = ["fmt", "clippy"]
+
+# One command, every crate, nothing excluded — a workspace root already
+# means every member, so there is nothing to spell out and nothing to
+# exclude. par6d's integration tests each boot a real daemon on a real-time
+# tick; two on one machine miss deadlines, which the harness holds off with a
+# process-wide slot rather than a separate invocation.
+[tasks.test-rust]
+cmd = "cargo test"
+
+# The collision golden suite runs in `test-rust` too; this reruns its timing
+# case optimized and uncaptured so the per-waypoint cost the planner budgets
+# against is visible in the log.
+[tasks.test-collision-cost]
+cmd = "cargo test -p par6-kin --release --test collision_world per_waypoint_check_cost_is_reported -- --nocapture"
+
+# The shipped 250 Hz configuration end to end. Every other harness patches
+# tick_dt_s up for CI headroom; this soak is the one place the unpatched
+# 0.004 runs before it meets the arm. Release because an unoptimized RT loop
+# cannot hold a 4 ms period anywhere.
+[tasks.test-timing]
+cmd = "cargo test -p par6d --release --test shipped_tick -- --nocapture"
+
+# The python package, in one of the interpreter environments:
+#   pixi run -e py312 install-python && pixi run -e py312 test-python
+[tasks.install-python]
+cmd = "pip install -e 'python[dev]'"
+
+[tasks.lint-python]
+cmd = "pre-commit run --show-diff-on-failure --color=always --all-files"
+
+[tasks.test-python]
+cmd = "pytest"
+cwd = "python"
+
+# End to end: the real client against a real `par6d --sim` over real UDP.
+# PAR6D_BIN must point at the built daemon, which `build-daemon` produces.
+[tasks.build-daemon]
+cmd = "cargo build -p par6d --release"
+
+[tasks.test-e2e]
+cmd = "pytest -m e2e"
+cwd = "python"
+depends-on = ["build-daemon"]
+
+[tasks.test-examples]
+cmd = "pytest -m examples --examples"
+cwd = "python"
+depends-on = ["build-daemon"]
+
+# Release artifacts.
+#
+# The tag is auditwheel's, and it is NOT the control box's floor. The
+# closure's glibc requirement is 2.28, but conda-forge's Pinocchio needs
+# GLIBCXX_3.4.32 — libstdc++ from GCC 13 — and manylinux treats libstdc++ as
+# a system library, so auditwheel will not graft it in the way
+# `pack-bundle.sh` does for the daemon. A wheel therefore targets a host with
+# a modern toolchain; the control box installs the BUNDLE, which carries its
+# own libstdc++ and clears bookworm. Forcing a lower tag fails the build
+# rather than producing a wheel that would not import.
+[tasks.wheel]
+cmd = "maturin build --release -o ../dist"
+cwd = "python"
+
+[tasks.sdist]
+cmd = "maturin sdist -o ../dist"
+cwd = "python"
+
+# The daemon bundle a control box installs with `tar -x`: par6d, the shim
+# and its runtime closure, config and assets.
+[tasks.bundle]
+cmd = "bash scripts/deploy/pack-bundle.sh"
+depends-on = ["build-daemon"]
+
+# Python interpreters for the package's supported versions. The package is a
+# maturin build linking the shim, so it needs this environment's activation at
+# build time and at import time: `pixi run -e py312 pip install -e "python[dev]"`.
+# conda-forge's `python` does not bundle pip; without it `pixi run -e py312 pip`
+# falls through to the OS pip and its PEP 668 refusal.
+[feature.py311.dependencies]
+python = "3.11.*"
+pip = "*"
+# Builds the wheel (`pixi run -e py311 wheel`) and grafts the shim's
+# runtime closure into it, which is what makes the wheel installable with
+# no conda environment.
+maturin = ">=1.8,<2"
+
+[feature.py312.dependencies]
+python = "3.12.*"
+pip = "*"
+# Builds the wheel (`pixi run -e py312 wheel`) and grafts the shim's
+# runtime closure into it, which is what makes the wheel installable with
+# no conda environment.
+maturin = ">=1.8,<2"
+
+# Asset generation and probes: Open3D for mesh decimation
+# (scripts/simplify_meshes.py) and pinocchio's Python bindings for
+# scripts/gravity_margin.py. Large, and never loaded by the runtime.
+[feature.tools.dependencies]
+python = "3.12.*"
+pinocchio-python = "4.1.*"
+open3d = "*"
+trimesh = "*"
+
+# The default environment carries a Python, so `pixi run test-rust` and
+# `pixi run test-python` are one environment and one compiled shim — CI runs
+# the same commands in the same environment a developer does. `py311` swaps
+# the interpreter for the older-version leg; `tools` is asset generation.
+[environments]
+default = ["py312"]
+py311 = ["py311"]
+tools = ["tools"]
