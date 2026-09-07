@@ -713,7 +713,7 @@ pub fn estimation_model(
     config: Option<&Path>,
     assets: Option<&Path>,
     package_dir: Option<&Path>,
-) -> Result<par6_calibrate::EstimationModel, String> {
+) -> Result<crate::calibrate::EstimationModel, String> {
     let config_path = crate::options::resolve_config_path(config)?;
     let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
     let robot = &bundle.robot;
@@ -726,7 +726,7 @@ pub fn estimation_model(
     let kin = load_gravity_kin(&assets_dir, gripper)?;
     let collision =
         load_collision(&assets_dir, variant, package_dir, 0.0).map_err(|e| e.to_string())?;
-    Ok(par6_calibrate::EstimationModel {
+    Ok(crate::calibrate::EstimationModel {
         kin,
         collision,
         window: SoftWindow::from_config(robot).pairs(),

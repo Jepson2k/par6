@@ -5,30 +5,8 @@ use std::fmt;
 use std::path::Path;
 use std::ptr::NonNull;
 
-use crate::ffi;
-use crate::model::Error;
-
-/// Which replaceable world layer a shape set belongs to.
-///
-/// The two layers exist independently: replacing one leaves the other in
-/// place. `Installation` is the backend's persistent keep-out set (robot
-/// config); `Program` is the last-applied `SET_SHAPES` set.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub enum Layer {
-    /// Persistent keep-outs from robot config. `SET_SHAPES` cannot touch it.
-    Installation,
-    /// Last-applied program shape set (last-write-wins).
-    Program,
-}
-
-impl Layer {
-    fn as_raw(self) -> i32 {
-        match self {
-            Layer::Installation => 0,
-            Layer::Program => 1,
-        }
-    }
-}
+use super::ffi;
+use super::model::Error;
 
 /// A world collision shape: a coal primitive at a world pose.
 ///
@@ -67,6 +45,29 @@ impl ShapeDesc {
 /// replaceable world shape layers, answering "is `q` in collision, and
 /// which geometry pairs?".
 ///
+/// Which replaceable world layer a shape set belongs to.
+///
+/// The layers are independent: replacing one leaves the other in place.
+/// [`Layer::Installation`] is the backend's persistent keep-out set from
+/// robot config — `SET_SHAPES` cannot change it; [`Layer::Program`] is the
+/// last-applied `SET_SHAPES` set (last-write-wins, survives program end).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Layer {
+    /// Persistent keep-outs from robot config.
+    Installation,
+    /// Program shapes, replaced wholesale by `SET_SHAPES`.
+    Program,
+}
+
+impl Layer {
+    fn as_raw(self) -> i32 {
+        match self {
+            Layer::Installation => 0,
+            Layer::Program => 1,
+        }
+    }
+}
+
 /// `&mut self` because the underlying `pinocchio::GeometryData` is mutated
 /// by every check (not thread-safe).
 pub struct CollisionModel {

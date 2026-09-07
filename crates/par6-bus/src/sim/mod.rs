@@ -119,7 +119,7 @@ pub struct SimBus {
     urdf: Option<PathBuf>,
     /// Active tool inertials attached to the dynamics plant's wrist.
     #[cfg(feature = "sim-dynamics")]
-    dyn_tool: Option<pinokin_sys::ToolParams>,
+    dyn_tool: Option<par6_kin::ToolParams>,
     /// Frame the tool inertials attach at (`None` = the URDF's last frame).
     #[cfg(feature = "sim-dynamics")]
     dyn_ee_frame: Option<String>,
@@ -188,7 +188,7 @@ impl SimBus {
     pub fn with_dynamics(
         urdf: impl Into<PathBuf>,
         ee_frame: Option<String>,
-        tool: Option<pinokin_sys::ToolParams>,
+        tool: Option<par6_kin::ToolParams>,
     ) -> Self {
         let mut bus = Self::new();
         bus.urdf = Some(urdf.into());

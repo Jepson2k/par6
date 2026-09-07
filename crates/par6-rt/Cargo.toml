@@ -9,10 +9,6 @@ rust-version.workspace = true
 
 [features]
 default = ["gpio"]
-# Gravity via the Pinocchio FFI shim (pinokin-sys). Off by default so plain
-# builds need no C++ toolchain; the zero-torque and test gravity models are
-# always available.
-ffi = ["dep:pinokin-sys"]
 # The control box's physical ESTOP_1 line, through the Linux GPIO character
 # device. ON by default: a hardware runtime that cannot read the button
 # refuses to start, so shipping this off would ship an arm that never
@@ -24,7 +20,6 @@ gpio = ["dep:gpiocdev"]
 [dependencies]
 par6-config = { workspace = true }
 par6-bus = { workspace = true }
-pinokin-sys = { path = "../pinokin-sys", features = ["ffi"], optional = true }
 thread-priority = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

@@ -287,7 +287,7 @@ impl Preview {
     }
 
     /// The motion a payload estimation makes from here — the wrist swing
-    /// `par6_calibrate` plans, at its speed, ending where the arm stood —
+    /// `calibrate` plans, at its speed, ending where the arm stood —
     /// as one result dict like any other previewed command. Measures
     /// nothing.
     #[pyo3(signature = (spread=0.5))]

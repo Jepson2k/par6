@@ -146,7 +146,18 @@ class _Par6dManager:
         binary = _find_par6d()
         try:
             self._proc = subprocess.Popen(
-                [binary, "--sim", "--bind", host, "--port", str(port)],
+                [
+                    binary,
+                    "--sim",
+                    "--bind",
+                    host,
+                    "--port",
+                    str(port),
+                    # Dies with this process: a runtime that outlived the
+                    # program that spawned it keeps the port and the bus.
+                    "--parent-pid",
+                    str(os.getpid()),
+                ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,

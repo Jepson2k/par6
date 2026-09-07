@@ -11,7 +11,6 @@
 //! can call it per waypoint without churning the allocator. It is NOT an RT
 //! call: coal's mesh narrow phase allocates on the C++ side, which this
 //! allocator cannot see and the shim does not claim to avoid.
-#![cfg(feature = "ffi")]
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::cell::Cell;

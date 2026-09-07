@@ -14,7 +14,7 @@
 #
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
-#   /usr/local/lib/par6/*.so          the Pinocchio shim + its runtime closure
+#   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco and their runtime closure
 #   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)

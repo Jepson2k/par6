@@ -6,18 +6,14 @@
 //!
 //! Which configurations collide, and with what, is `par6-kin`'s
 //! `collision_world` suite; this file is about the boundary.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 
-use pinokin_sys::{ffi, CollisionModel, Error, Layer, ShapeDesc};
+use par6_kin::sys::{ffi, CollisionModel, Error, ShapeDesc};
+use par6_kin::Layer;
 
-fn repo_root() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-}
+mod common;
+use common::repo_root;
 
 fn urdf() -> PathBuf {
     repo_root().join("assets/par6_description/URDF/par6_flange/urdf/par6_flange.urdf")

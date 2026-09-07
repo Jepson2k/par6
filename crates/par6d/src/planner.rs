@@ -25,7 +25,7 @@
 //! ([`Par6Planner::start_cart_path`]): `par6-motion`'s [`cart`] geometry
 //! produces the pose list, seeded IK turns each pose into a joint
 //! waypoint (guarded against soft-window exits and IK branch flips),
-//! TOPPRA ([`pinokin_sys::Trajectory`]) times the waypoint chain, and
+//! TOPPRA ([`par6_kin::Trajectory`]) times the waypoint chain, and
 //! the timed trajectory streams into the ring at tick dt. The geometry
 //! is all that differs between them:
 //!
@@ -116,13 +116,13 @@ const WAYPOINT_SNAP_M: f64 = 5e-3;
 /// corner could take.
 const MOVE_P_AUTO_BLEND_FRAC: f64 = 0.25;
 
-/// Joint-space pitch of the collision gate \[rad\]: consecutive checked
-/// configurations along a planned path never differ by more than this on
-/// any joint. At PAR6's ~0.45 m reach a 0.02 rad shoulder step sweeps the
+/// Joint-space pitch of the collision gate \[rad\], shared with the
+/// streaming gate's segment sweep: consecutive checked configurations
+/// along a planned path never differ by more than this on any joint. At PAR6's ~0.45 m reach a 0.02 rad shoulder step sweeps the
 /// wrist under 10 mm, so a keep-out thicker than that cannot be tunneled
 /// through; the cost is bounded by the path's joint-space length rather
 /// than by the sample count (a 90° single-joint move costs ~79 checks).
-const COLLISION_STEP_RAD: f64 = 0.02;
+pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 
 /// The planned-move profiles this planner really implements, in the
 /// upper-case spelling clients use on the wire. The server refuses any
@@ -759,7 +759,7 @@ impl Par6Planner {
             accel,
             min_duration,
             None,
-            pinokin_sys::PathDegree::Cubic,
+            par6_kin::PathDegree::Cubic,
             None,
         )
     }
@@ -780,7 +780,7 @@ impl Par6Planner {
         accel: Option<f64>,
         min_duration: Option<f64>,
         knots: Option<&[f64]>,
-        degree: pinokin_sys::PathDegree,
+        degree: par6_kin::PathDegree,
         max_path_speed: Option<f64>,
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let speed_frac = speed.unwrap_or(1.0);
@@ -797,7 +797,7 @@ impl Par6Planner {
             .iter()
             .map(|a| a * accel_frac)
             .collect();
-        let traj = pinokin_sys::Trajectory::parameterize_with(
+        let traj = par6_kin::Trajectory::parameterize_with(
             waypoints,
             MAX_JOINTS,
             &vel,
@@ -1310,7 +1310,7 @@ impl Par6Planner {
             accel,
             duration,
             Some(knots.knots()),
-            pinokin_sys::PathDegree::Cubic,
+            par6_kin::PathDegree::Cubic,
             Some(cap),
         )
     }

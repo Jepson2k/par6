@@ -1,21 +1,18 @@
 //! A development build runs straight out of `target/`, where nothing has
-//! installed the shim beside it, so the binary (and the crate's test
-//! executables) carry the shim directory
-//! as an rpath: `PAR6_SHIM_LIB_DIR` when set, else the repo's own
-//! `.ffi/shim/lib` from `scripts/ffi/setup.sh`. Deploy builds replace it
-//! (`build-aarch64.sh` sets the install prefix's rpath with patchelf).
+//! installed the shim or libmujoco beside it, so the binary (and the
+//! crate's test executables) carry both directories as rpaths. Each
+//! directory comes from the crate that links the library: par6-kin
+//! publishes the shim's as `DEP_PAR6_SHIM_RPATH` and par6-bus libmujoco's
+//! as `DEP_MUJOCO_RPATH`, through their `links` keys, so a path is derived
+//! in one place. Deploy builds replace both (`build-aarch64.sh` sets the
+//! install prefix's rpath with patchelf).
 fn main() {
-    println!("cargo:rerun-if-env-changed=PAR6_SHIM_LIB_DIR");
-    let repo_shim = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../.ffi/shim/lib");
-    let dir = std::env::var("PAR6_SHIM_LIB_DIR").ok().or_else(|| {
-        std::fs::canonicalize(&repo_shim)
-            .ok()
-            .map(|p| p.to_string_lossy().into_owned())
-    });
-    if let Some(dir) = dir {
-        // Every linked target, not just bins and the tests/ directory:
-        // the library's own unit-test harness is neither, and without the
-        // rpath it dies at startup with a missing libpar6_shim.
-        println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+    for var in ["DEP_PAR6_SHIM_RPATH", "DEP_MUJOCO_RPATH"] {
+        if let Ok(dir) = std::env::var(var) {
+            // Every linked target, not just bins and the tests/ directory:
+            // the library's own unit-test harness is neither, and without
+            // the rpath it dies at startup with a missing library.
+            println!("cargo:rustc-link-arg=-Wl,-rpath,{dir}");
+        }
     }
 }

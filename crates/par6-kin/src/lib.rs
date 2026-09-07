@@ -1,8 +1,8 @@
 //! Kinematics and dynamics via Pinocchio, linked through the repo's C-ABI
-//! shim (`cpp/`, wrapped by `pinokin-sys`) — the one numerics stack the
+//! shim (`cpp/`, wrapped by [`sys`]) — the one numerics stack the
 //! runtime plans with and the Python binding exposes.
 //!
-//! The safe wrapper ([`Kin`], feature `ffi`) preallocates model/data at
+//! The safe wrapper ([`Kin`]) preallocates model/data at
 //! init and exposes allocation-free `fk / tcp / jacobian / gravity / ik`
 //! calls suitable for the RT thread and planner. `tests/kinematics.rs`
 //! holds it to the contract (Jacobian = dFK/dq, IK lands on every FK
@@ -12,12 +12,7 @@
 //! A wrong link length is expressible, so the fit would follow it; the
 //! URDF's geometry is nominal data, not something this proves.
 //!
-//! Without the `ffi` feature the crate carries only the pure-data
-//! [`GripperVariant`] table, so `cargo build --workspace` needs no C++
-//! toolchain. Build the shim with `scripts/ffi/setup.sh`, then
-//! `source .ffi/env.sh` and add `--features ffi`.
-//!
-//! Collision ([`Collision`], same `ffi` feature) runs coal/hpp-fcl over the
+//! Collision ([`Collision`]) runs coal/hpp-fcl over the
 //! same URDF: self-collision plus the installation/program keep-out layers
 //! waldoctl defines, reporting `collision_active`, the colliding pairs and
 //! the `scene_epoch` of the applied world. It is planner-side (tens of µs to
@@ -113,33 +108,31 @@ impl GripperVariant {
     }
 }
 
+pub mod sys;
 mod wrap;
 
 pub use wrap::wrap_to_window;
 
-#[cfg(feature = "ffi")]
+// The generic Pinocchio layer: par6-bus drives the torque plant with it
+// and par6d/par6-motion parameterize trajectories with it.
+pub use sys::{Layer, Model, PathDegree, ToolParams, Trajectory};
+
 mod kin;
 
-#[cfg(feature = "ffi")]
 mod opw;
 
-#[cfg(feature = "ffi")]
 mod collision;
 
-#[cfg(feature = "ffi")]
 mod shapes;
 
-#[cfg(feature = "ffi")]
 pub mod gravity;
 
-#[cfg(feature = "ffi")]
 pub use kin::{IkOutcome, Kin, KinError, Pose, IK_POSE_TOL};
 
-#[cfg(feature = "ffi")]
 pub use opw::{relative_pose, Opw, OpwError, FIT_TOL};
 
-#[cfg(feature = "ffi")]
-pub use collision::{Collision, CollisionReport, Layer, MAX_REPORTED_PAIRS};
+pub use collision::{
+    link_of, Collision, CollisionReport, COLLISION_CLEARANCE_M, MAX_REPORTED_PAIRS,
+};
 
-#[cfg(feature = "ffi")]
 pub use shapes::{Shape, ShapeError, ShapeKind, MAX_SHAPE_PARAMS};

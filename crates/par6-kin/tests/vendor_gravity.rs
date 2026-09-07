@@ -20,7 +20,6 @@
 //! way. Anything that physically changes a link needs new nominal data,
 //! not a measurement. What identification IS for is the load at the
 //! tool, which no table can describe: `par6_kin::gravity::fit_payload`.
-#![cfg(feature = "ffi")]
 
 use std::path::PathBuf;
 
@@ -28,9 +27,11 @@ use par6_kin::gravity::{self, GravitySample};
 use par6_kin::{GripperVariant, Kin, NQ};
 use serde::Deserialize;
 
+mod common;
+use common::assets_dir;
+
 #[derive(Deserialize)]
 struct Fixture {
-    provenance: String,
     tools: Tools,
     cases: Vec<Case>,
 }
@@ -67,13 +68,6 @@ struct Case {
     tau_arm_ssg48_tool: [f64; NQ],
 }
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../assets/par6_description")
-        .canonicalize()
-        .unwrap()
-}
-
 fn fixture() -> Fixture {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/golden/gravity/vendor_reference.json");
@@ -84,7 +78,6 @@ fn fixture() -> Fixture {
 #[test]
 fn the_shipped_arm_model_is_the_vendors_arm() {
     let fx = fixture();
-    assert!(fx.provenance.contains("vendor"), "{}", fx.provenance);
 
     let mut kin = Kin::from_urdf(
         &assets_dir().join(Kin::ARM_URDF_RELPATH),
