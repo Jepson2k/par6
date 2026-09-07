@@ -185,6 +185,13 @@ pub(crate) fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
     d.set_item("collision", s.collision)?;
     d.set_item("margin", s.margin)?;
     d.set_item("name", &s.name)?;
+    // `[mass|None, [slide, spin, roll]]`, the wire form the shim rebuilds
+    // a `Physical` from. Dropping it would report a block that falls and
+    // a keep-out that cannot be touched as the same shape.
+    match &s.physics {
+        Some(ph) => d.set_item("physics", (ph.mass, ph.friction.to_vec()))?,
+        None => d.set_item("physics", py.None())?,
+    }
     Ok(d.into_any().unbind())
 }
 
@@ -358,8 +365,42 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
 }
 
 /// Python shape dict → wire shape.
+///
+/// `physics` is converted before the derive sees it. The shim speaks
+/// waldoctl's wire form, `[mass|None, [slide, spin, roll]]`, which every
+/// backend shares; [`par6_proto::Physical`]'s derive is the robot TOML's
+/// `[installation_shapes.physics]`, which is named fields. Handing the
+/// sequence straight to it fails with "'list' object cannot be converted
+/// to 'Mapping'".
 pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
-    pythonize::depythonize(d).map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))
+    let physics = match d.get_item("physics")? {
+        Some(v) if !v.is_none() => Some(physical_from_py(&v)?),
+        _ => None,
+    };
+    let rest = d.copy()?;
+    rest.del_item("physics").ok();
+    let mut shape: Shape = pythonize::depythonize(&rest)
+        .map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))?;
+    shape.physics = physics;
+    Ok(shape)
+}
+
+/// `[mass|None, [slide, spin, roll]]` → [`par6_proto::Physical`].
+///
+/// Element by element rather than as a tuple: pyo3 extracts a tuple from a
+/// Python tuple only, and the shim sends a list.
+fn physical_from_py(v: &Bound<'_, PyAny>) -> PyResult<par6_proto::Physical> {
+    let bad = || {
+        PyRuntimeError::new_err("bad shape physics: expected [mass or None, [slide, spin, roll]]")
+    };
+    let items: Vec<Bound<'_, PyAny>> = v.extract().map_err(|_| bad())?;
+    let [mass, friction] = items.as_slice() else {
+        return Err(bad());
+    };
+    Ok(par6_proto::Physical {
+        mass: mass.extract().map_err(|_| bad())?,
+        friction: friction.extract().map_err(|_| bad())?,
+    })
 }
 
 /// Python value → tool-action parameter.

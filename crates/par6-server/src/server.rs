@@ -650,6 +650,10 @@ impl<R: RtCommands> Core<R> {
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, Command::BusScan) {
             // Answered from `answer_scans` once the RT's rescan has
             // settled (or the deadline passes): a scan is a round trip
@@ -800,6 +804,10 @@ impl<R: RtCommands> Core<R> {
             cmd_name(cmd.tag()),
             params_summary(cmd)
         );
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
             return;
@@ -1597,8 +1605,7 @@ impl<R: RtCommands> Core<R> {
         // server's, so the head comes out of it directly.
         let mut dropped = Vec::new();
         if let Some(index) = self.planning.take() {
-            if self.pending.front().is_some_and(|p| p.index == index) {
-                let p = self.pending.pop_front().expect("checked above");
+            if let Some(p) = self.pending.pop_front_if(|p| p.index == index) {
                 dropped.push((p.index, p.addr));
             }
         }

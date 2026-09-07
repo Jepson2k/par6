@@ -28,9 +28,6 @@ OPTIONS:
     --assets <DIR>             assets/par6_description tree with the PAR6 URDFs
                                (default: $PAR6_ASSETS, then the tree next to the
                                config directory). Used by the kinematics stack.
-    --sim-dynamics             With --sim: torque-level physics plant (Pinocchio
-                               forward dynamics) instead of the kinematic plant.
-                               [env: PAR6_SIM_DYNAMICS=1]
     --port <PORT>              Command UDP port; 0 = ephemeral. The bound port is
                                printed on stdout as `PAR6D_READY command_port=...`.
                                [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
@@ -52,6 +49,10 @@ OPTIONS:
                                [env: PAR6_LOG_DIR]
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
+    --parent-pid <PID>         Exit when this process is no longer the parent
+                               (the spawner's own pid; a parent that dies has
+                               its children reparented), so a runtime a client
+                               spawned never outlives it.
     -h, --help                 Print this help
 ";
 
@@ -68,9 +69,6 @@ pub struct Options {
     /// an installed package whose URDFs reference their meshes by package
     /// URI rather than a repo checkout's `<assets>/URDF` layout.
     pub package_dir: Option<PathBuf>,
-    /// Run the sim on the torque-level dynamics plant (`--sim-dynamics` /
-    /// `PAR6_SIM_DYNAMICS`); requires feature `ffi`.
-    pub sim_dynamics: bool,
     /// Run the RT tick's per-phase profiler (`--tick-profile` /
     /// `PAR6_TICK_PROFILE`); the profile is logged once a second.
     pub tick_profile: bool,
@@ -91,6 +89,9 @@ pub struct Options {
     pub log_dir: Option<PathBuf>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
+    /// Die with this process (`--parent-pid`): the spawner's pid, compared
+    /// against `getppid` before boot and from the main loop after it.
+    pub parent_pid: Option<u32>,
     /// `--help` was requested.
     pub help: bool,
 }
@@ -106,7 +107,6 @@ impl Options {
                 "--sim" => o.sim = true,
                 "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
                 "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
-                "--sim-dynamics" => o.sim_dynamics = true,
                 "--tick-profile" => o.tick_profile = true,
                 "--port" | "--command-port" => {
                     o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
@@ -126,6 +126,15 @@ impl Options {
                 }
                 "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
                 "--check-config" => o.check_config = true,
+                "--parent-pid" => {
+                    let raw = value(&mut args, &arg)?;
+                    let pid: u32 = raw
+                        .parse()
+                        .ok()
+                        .filter(|p| *p > 0)
+                        .ok_or_else(|| format!("--parent-pid: `{raw}` is not a process id"))?;
+                    o.parent_pid = Some(pid);
+                }
                 "-h" | "--help" => o.help = true,
                 other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
             }
@@ -148,11 +157,6 @@ impl Options {
         if !self.tick_profile {
             if let Some(v) = env_var("PAR6_TICK_PROFILE") {
                 self.tick_profile = v == "1" || v.eq_ignore_ascii_case("true");
-            }
-        }
-        if !self.sim_dynamics {
-            if let Some(v) = env_var("PAR6_SIM_DYNAMICS") {
-                self.sim_dynamics = v == "1" || v.eq_ignore_ascii_case("true");
             }
         }
         if self.command_port.is_none() {

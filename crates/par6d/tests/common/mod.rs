@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use par6_proto::{
     decode_reply, decode_status, encode_command, Command, QueryResult, Reply, Status, WireError,
+    NUM_JOINTS,
 };
 use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
@@ -26,6 +27,16 @@ pub const BUDGET: Duration = Duration::from_secs(30);
 /// Socket read timeout — short enough that a wait loop notices its
 /// deadline, long enough not to spin.
 pub const READ_TIMEOUT: Duration = Duration::from_millis(100);
+
+/// Daemon log lines land in the test's captured output: printed with a
+/// failure, silent otherwise. `RUST_LOG` still sets the level when given.
+fn init_test_logging() {
+    let mut builder = env_logger::builder();
+    if std::env::var_os("RUST_LOG").is_none() {
+        builder.filter_level(log::LevelFilter::Warn);
+    }
+    let _ = builder.is_test(true).try_init();
+}
 
 pub fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -216,15 +227,10 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
 /// A daemon whose STATUS broadcast is aimed at `status_port` on
 /// loopback, for a test that listens with a real `par6_client::Client`
 /// instead of the rig's own socket.
-pub fn boot_for_client(
-    config: PathBuf,
-    sim_dynamics: bool,
-    status_port: u16,
-) -> Result<Daemon, String> {
-    let _ = env_logger::builder().is_test(true).try_init();
+pub fn boot_for_client(config: PathBuf, status_port: u16) -> Result<Daemon, String> {
+    init_test_logging();
     redirect_bus_grant();
     let opts = Options {
-        sim_dynamics,
         ..sim_options(config, status_port)
     };
     Daemon::start(&opts).map_err(|e| e.to_string())
@@ -256,21 +262,36 @@ pub fn free_udp_port() -> u16 {
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
+/// Only one simulated daemon runs at a time, for the whole test binary.
+///
+/// A [`Rig`] boots a real RT loop that has to hold its configured period in
+/// wall-clock time, and the MuJoCo step inside it is not free. Two of them on
+/// one machine miss deadlines, and the tests that measure a reaction — how far
+/// the arm coasts past a keep-out, how a jog ramps down — then fail on the
+/// scheduler rather than on the behaviour they describe. Serializing here
+/// rather than with `--test-threads=1` is what lets a plain `cargo test`
+/// run the whole workspace and mean something.
+static RT_SLOT: Mutex<()> = Mutex::new(());
+
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
+    /// Held for the daemon's life; see [`RT_SLOT`]. Poisoning is ignored on
+    /// purpose: a panicking test has already failed, and taking the slot down
+    /// with it would fail every test after it for the wrong reason.
+    _slot: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Rig {
     /// Boot the simulator on `config`, with the kinematic plant.
     pub fn boot(config: PathBuf) -> Rig {
-        Rig::boot_with(config, false)
+        Rig::boot_with(config)
     }
 
-    /// Boot the simulator on `config`; `sim_dynamics` selects the
+    /// Boot the simulator on `config`. The
     /// torque-level plant over the kinematic one.
-    pub fn boot_with(config: PathBuf, sim_dynamics: bool) -> Rig {
-        Rig::boot_opts(config, sim_dynamics, None)
+    pub fn boot_with(config: PathBuf) -> Rig {
+        Rig::boot_opts(config, None)
     }
 
     /// Boot the simulator with the STATUS broadcast rate overridden, as
@@ -281,26 +302,22 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, false, Some(hz))
+        Rig::try_boot_opts(config, Some(hz))
     }
 
-    fn boot_opts(config: PathBuf, sim_dynamics: bool, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, sim_dynamics, status_rate_hz).expect("daemon boots in sim mode")
+    fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
+        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(
-        config: PathBuf,
-        sim_dynamics: bool,
-        status_rate_hz: Option<u32>,
-    ) -> Result<Rig, String> {
-        let _ = env_logger::builder().is_test(true).try_init();
+    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
+        init_test_logging();
+        let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
         let opts = Options {
-            sim_dynamics,
             status_rate_hz,
             ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
@@ -308,6 +325,7 @@ impl Rig {
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
+            _slot: slot,
         })
     }
 
@@ -389,8 +407,47 @@ impl Rig {
         out
     }
 
+    /// Broadcast frames up to and including the one that reports `index`
+    /// complete, or the whole `window` if it never does.
+    ///
+    /// A window has to be sized for the slowest the motion can run, and
+    /// [`Self::collect_status`] then pays that size on every run however
+    /// fast the motion actually was. Stopping at the COMPLETE keeps the
+    /// same samples and gives the slack back.
+    pub fn collect_through(&self, index: u64, window: Duration) -> Vec<Status> {
+        let until = Instant::now() + window;
+        let mut out = Vec::new();
+        while Instant::now() < until {
+            if let Some(s) = self.recv_status() {
+                let done = s.completed_index >= index as i64;
+                out.push(s);
+                if done {
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     pub fn shutdown(mut self) {
         self.daemon.take().expect("running").shutdown();
+    }
+}
+
+impl Drop for Rig {
+    /// Stop the daemon even when the test panicked before `shutdown`, or
+    /// never called it.
+    ///
+    /// A leaked daemon goes on broadcasting STATUS to the ephemeral port
+    /// its `Rig` bound. That port is released when the socket drops, the
+    /// kernel hands the number out again, and the next test's status
+    /// socket then receives two arms interleaved — which reads as a
+    /// wildly misbehaving robot in whichever test happened to draw the
+    /// reused port, not as the leak it is.
+    fn drop(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown();
+        }
     }
 }
 
@@ -647,4 +704,103 @@ pub fn teleport_home(rig: &Rig, c: &mut Client, angles: [f64; par6_proto::NUM_JO
             "teleport did not take effect within budget"
         );
     }
+}
+
+// ---- cartesian path geometry ------------------------------------------------
+// Shared by the live suite, which measures a sampled STATUS path, and the
+// preview suite, which measures the planned one.
+
+/// Distance \[mm\] from `p` to the segment `a`→`b`.
+pub fn distance_to_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let t = ((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2).clamp(0.0, 1.0);
+    let e = [w[0] - t * d[0], w[1] - t * d[1], w[2] - t * d[2]];
+    (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+}
+
+/// Euclidean distance \[mm\] between two TCP positions.
+pub fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+/// Fraction of the segment `a`→`b` covered by `p`'s projection.
+pub fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    (w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2
+}
+
+/// Closest a TCP path came to `p` \[mm\], measured against the path's
+/// segments rather than only its sampled points.
+pub fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
+    path.windows(2)
+        .map(|w| distance_to_segment(p, w[0], w[1]))
+        .fold(f64::INFINITY, f64::min)
+}
+
+/// Wire pose `[x y z mm, rx ry rz deg]` from a pose matrix (row-major
+/// 4x4) with the translation replaced. Only the rotation block is read,
+/// so the matrix's own translation units do not matter.
+///
+/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
+/// convention, written out here rather than borrowed from the runtime so
+/// the two halves of the round trip cannot agree on the wrong thing.
+pub fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
+    let (r00, r01, r02) = (pose[0], pose[1], pose[2]);
+    let (r12, r22) = (pose[6], pose[10]);
+    let cp = r12.hypot(r22);
+    [
+        xyz_mm[0],
+        xyz_mm[1],
+        xyz_mm[2],
+        (-r12).atan2(r22).to_degrees(),
+        r02.atan2(cp).to_degrees(),
+        (-r01).atan2(r00).to_degrees(),
+    ]
+}
+
+/// Angle \[deg\] between the rotation blocks of two pose matrices.
+pub fn rotation_angle_deg(a: &[f64; 16], b: &[f64; 16]) -> f64 {
+    // trace(Rᵃᵀ Rᵇ) = 1 + 2 cos θ
+    let mut trace = 0.0;
+    for col in 0..3 {
+        for row in 0..3 {
+            trace += a[row * 4 + col] * b[row * 4 + col];
+        }
+    }
+    ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
+}
+
+/// The start posture of the curved-move scenes, plan-side and live: clear
+/// of the wrist-aligned park singularity and comfortably inside every
+/// soft window, so a refusal means the geometry, not the pose. Chosen by
+/// the soft-limit-box sweep for room around it — 120 mm of straight-line
+/// travel is IK-feasible in every axis direction and along the diagonals
+/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
+/// soft window.
+pub const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
+
+/// Radius of the half circle the `move_c` scene traces \[mm\].
+pub const ARC_RADIUS_MM: f64 = 60.0;
+
+/// The `move_s` scene: three waypoints \[mm\] climbing away from `start`
+/// with a dip between them, so a polyline through them would be visibly
+/// different from the spline.
+pub fn spline_waypoints(start: [f64; 3]) -> Vec<[f64; 3]> {
+    [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
+        .iter()
+        .map(|d| [start[0] + d[0], start[1] + d[1], start[2] + d[2]])
+        .collect()
+}
+
+/// The `move_p` scene: one right-angle corner \[mm\] 100 mm out from
+/// `start`, then 100 mm down — returned as `(corner, finish)`.
+pub fn process_corner(start: [f64; 3]) -> ([f64; 3], [f64; 3]) {
+    let corner = [start[0] + 100.0, start[1], start[2]];
+    let finish = [corner[0], corner[1], corner[2] - 100.0];
+    (corner, finish)
 }

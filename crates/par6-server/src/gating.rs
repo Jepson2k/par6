@@ -1,8 +1,10 @@
 //! The declarative gating table: what state a command requires before it
-//! is accepted. Derived from [`command_class`] (SYSTEM and QUERY commands
-//! always apply) plus the protocol's per-command requirements: motion
-//! needs a homed robot, `teleport` is simulator-only, and every
-//! motion-class command needs an ENABLED controller.
+//! is accepted. Every dispatch path consults it, so an entry here is the
+//! whole gate for that command. Derived from [`command_class`] (SYSTEM and
+//! QUERY commands carry no requirement by default) plus the protocol's
+//! per-command requirements: motion needs a homed robot, `teleport` is
+//! simulator-only, and every motion-class command needs an ENABLED
+//! controller.
 //!
 //! Rejections always answer with a structured ERROR carrying the echoed
 //! `req_id` — including FIRE_AND_FORGET commands, whose SUCCESS stays

@@ -2107,6 +2107,7 @@ fn wire_shape(name: &str, kind: &str) -> Shape {
         collision: true,
         margin: None,
         name: name.to_owned(),
+        physics: None,
     }
 }
 
@@ -3074,16 +3075,23 @@ async fn queue_eta_adds_the_inflight_motion_to_the_pending_estimate() {
     );
 
     // The STATUS broadcast carries the same number...
+    // Wait for the frame that carries BOTH, rather than asserting the ETA on
+    // the first frame that shows two segments: the segment count and the
+    // duration are refreshed from the same pass but a frame can be sampled
+    // between them, and failing on that says nothing about what STATUS
+    // carries.
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
         let s = recv_status(&h.status_rx).await;
-        if s.queued_segments == 2 {
-            assert!((s.queued_duration - 3.0).abs() < 1e-9);
+        if s.queued_segments == 2 && (s.queued_duration - 3.0).abs() < 1e-9 {
             break;
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no status frame with the queued moves"
+            "no status frame carrying the queued moves' 3 s ETA \
+             (last saw {} segments, {} s)",
+            s.queued_segments,
+            s.queued_duration
         );
     }
     // ... without asking the planner to re-plan for every frame.
@@ -3154,14 +3162,45 @@ async fn pause_reaches_the_rt_and_is_not_gated_on_enablement() {
         );
         h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(on))).await;
     }
+
+    // The gating half: a state the arm cannot plan motion from. The move
+    // establishes that this state really does refuse — without it the
+    // pause below would be asserting nothing.
+    h.publish(|s| {
+        s.state = ArmState::Disabled;
+        s.homed = false;
+    });
+    match c.request(&move_j(801)).await {
+        Reply::Error { error, .. } => assert_eq!(
+            error.code,
+            ErrorCode::SysControllerDisabled as u16,
+            "{}",
+            error.cause
+        ),
+        other => panic!("a disabled, unreferenced arm must refuse a move, got {other:?}"),
+    }
+    assert!(
+        matches!(
+            c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+                .await,
+            Reply::Ok { .. }
+        ),
+        "holding a moving arm must not depend on the controller being enabled"
+    );
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
 }
 
 /// SET_PAYLOAD: a valid payload reaches the RT and the planner sync, and
-/// the PAYLOAD query reads back what was set; invalid inertia and
-/// negative mass are refused at the wire and leave the readback
-/// untouched.
+/// the PAYLOAD query reads back what was set.
+///
+/// The refusals live one layer down, where they are reachable: a negative
+/// mass or an indefinite inertia never survives `decode_command`, so the
+/// server has no such case to answer. `par6-proto`'s
+/// `a_payload_that_is_not_a_rigid_body_is_refused_at_the_wire` holds that
+/// boundary.
 #[tokio::test]
-async fn set_payload_applies_reads_back_and_refuses_garbage() {
+async fn set_payload_applies_and_reads_back() {
     let h = start(|_| {}).await;
     let mut c = Client::new(&h).await;
 
@@ -3202,10 +3241,6 @@ async fn set_payload_applies_reads_back_and_refuses_garbage() {
         }
         other => panic!("expected PAYLOAD response, got {other:?}"),
     }
-
-    // Refusals (negative mass, indefinite inertia) are decode-side —
-    // par6-proto's hostile-input tests pin them, and encode_command
-    // refuses the same inputs client-side before a byte leaves.
 
     // Clearing is mass 0.
     match c

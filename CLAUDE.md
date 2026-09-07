@@ -8,23 +8,24 @@ Read `README.md` for architecture, the command system, and the collision world.
 ## Commands
 
 ```bash
-scripts/ffi/setup.sh               # once: build the Pinocchio shim into .ffi/
-source .ffi/env.sh                 # each shell: par6d needs the shim to build AND run
-cargo build --workspace            # runtime
-cargo test --workspace             # rust tests
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # must be clean
-cargo run -p par6d -- --sim        # simulated runtime, no hardware
-pip install -e "python[dev]"       # python package (maturin: compiles the par6-py extension)
-cd python && pytest                # python tests (JUnit XML at python/test-results.xml)
+pixi run setup                     # once: solves the C++ deps and builds the shim
+pixi run lint                      # fmt + clippy, must be clean
+pixi run test-rust                 # rust tests
+pixi run cargo run -p par6d -- --sim        # simulated runtime, no hardware
+pixi run install-python            # python package (maturin: compiles par6-py)
+pixi run test-python               # python tests (JUnit XML at python/test-results.xml)
+pixi run test-e2e                  # the client against a real par6d --sim
 ```
 
-`par6d` links the shim unconditionally — there is no kinematics-free build.
-The library crates still build without a C++ toolchain, which is what the
-`--exclude par6d --exclude par6-py --exclude par6-client` legs in CI cover
-(par6-py wraps par6d; par6-client's tests boot a daemon in-process).
-The python package builds the `par6._par6` extension, so `pip install`
-needs `source .ffi/env.sh` first, and so does running anything that
-imports `par6` (the extension dlopens the shim).
+pixi provides the C++ closure (Pinocchio, coal, eigen, urdfdom, libmujoco,
+cmake, ninja, the compiler) from `pixi.lock`; Rust comes from rustup via
+`rust-toolchain.toml`. `crates/par6-kin/build.rs` compiles the shim and
+toppra into cargo's `OUT_DIR`, so any cargo invocation under `pixi run`
+provisions them and cargo owns their freshness — there is no separate
+bootstrap step and no `.ffi` for a native build.
+
+CI runs these same tasks and nothing else: a red job is reproduced locally
+with the command in its `run:` line.
 
 ## Contract discipline (multi-agent repo)
 

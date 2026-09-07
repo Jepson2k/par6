@@ -43,7 +43,7 @@ sector_master_position_ticks = 3969
 sector_home_offset_rad = 1.570796327
 
 [joints.gains]
-kpp = 5.0
+kpp = 1.5
 kpv = 0.015
 kiv = 0.0015
 kpiq = 7.0
@@ -557,6 +557,24 @@ profile = "scurve"
 jerk_factor = 3.0
 control_mode = "pid"
 
+# The ground this robot stands on. An installation shape like any other:
+# the planner refuses to enter it, the simulator's scene rests things on
+# it, and `set_shapes` cannot remove it — it replaces the program layer.
+#
+# Its top face sits 20 mm BELOW the mounting plane, which is the height of
+# the plate the arm is bolted to. A floor level with z = 0 would touch
+# `base_link` — the arm stands on it — and, since that contact is inside
+# the 5 mm clearance, every motion would be refused against the ground the
+# robot is bolted to.
+[[installation_shapes]]
+name = "floor"
+kind = "box"
+params = [6.0, 6.0, 0.2]
+pose = [0.0, 0.0, -0.12, 0.0, 0.0, 0.0]
+
+# No mass: welded where it is declared, and solid.
+[installation_shapes.physics]
+
 [sim]
 # Torque-level plant only (par6d --sim with the kinematics stack):
 # motor-referred rotor dynamics from the vendor dynamics table, reflected
@@ -564,6 +582,10 @@ control_mode = "pid"
 motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
 motor_b_nm_s = 1.0e-4
 motor_tc_nm = 0.02
+# Gearbox holding friction [Nm, joint side]: the load an unpowered joint
+# carries without back-driving. Sized over the worst gravity torque in the
+# joint's range, or an IDLE arm collapses under its own weight.
+holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
 command_timeout_s = 0.04

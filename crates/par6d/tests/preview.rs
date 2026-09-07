@@ -7,12 +7,15 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use par6_proto::command::{Home, JogL, MoveJ, MoveL, SelectProfile, Stop, WriteIo};
-use par6_proto::{Command, ErrorCode, Frame, Shape, NUM_JOINTS};
+use par6_proto::{Command, ControllerMode, ErrorCode, Frame, Shape, NUM_JOINTS};
 use par6_server::ShapeLayer;
 use par6d::preview::Preview;
 
 mod common;
-use common::{max_deg_error, park_deg, teleport_cmd, teleport_home, to_deg, to_rad, Client, Rig};
+use common::{
+    max_deg_error, park_deg, rotation_angle_deg, teleport_cmd, teleport_home, to_deg, to_rad,
+    Client, Rig,
+};
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
 /// AND the preview so the parity below is over identical inputs.
@@ -143,6 +146,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
         collision: true,
         margin: None,
         name: "keepout".into(),
+        physics: None,
     }];
 
     preview
@@ -657,6 +661,13 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
 /// used to answer a datagram with no open session by bouncing the RT
 /// through IDLE, which stops the arm from ramp speed and restarts it from
 /// rest: the very stop the ramp-down exists to remove.
+///
+/// The bounce is read off the MODE, not off the speed. A real plant
+/// decelerating under a servo overshoots and springs back, so the
+/// measured joint velocity crosses zero on its own during any ramp down
+/// — a floor under it would fail on physics rather than on the bug.
+/// Staying in JOG is what "the session stayed open and the re-press
+/// joined the ramp" means.
 #[test]
 fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
     let config = test_config();
@@ -681,24 +692,50 @@ fn a_jog_re_pressed_during_its_ramp_down_never_comes_to_rest() {
         c.send(&jog_j_cmd(speeds, frame_s));
         std::thread::sleep(Duration::from_secs_f64(frame_s * 0.5));
     }
-    let released = rig.wait_status("cruising", |s| s.speeds[0].abs() > 0.05);
-    // Inside the ramp down, before it can have reached rest.
-    std::thread::sleep(Duration::from_secs_f64(frame_s + 0.25 * accel_s));
+    // The press loop never read a status, so a second of them is queued
+    // on the socket. Draining first is what makes "cruising" the arm's
+    // speed NOW rather than its speed when the press began — the stale
+    // reading is a fraction of cruise, and every window measured from it
+    // lands after the ramp down has already finished.
     rig.drain_status();
-    let mut slowest = f64::INFINITY;
+    let released = rig.wait_status("cruising", |s| s.speeds[0].abs() > 0.05);
+    let cruise = released.speeds[0].abs();
+    // Let the duration watchdog expire, then re-press the moment a status
+    // reports the ramp down under way. Sleeping a fraction of the ramp
+    // instead lands wherever the scheduler puts it, and on a loaded
+    // machine that is past rest — which reads as exactly the bug below.
+    std::thread::sleep(Duration::from_secs_f64(frame_s));
+    rig.drain_status();
+    let ramping = rig.wait_status("the jog ramp down to start", |s| {
+        s.speeds[0].abs() < 0.9 * cruise
+    });
+    assert!(
+        ramping.speeds[0].abs() > 0.05,
+        "the ramp down was already at rest ({:.3} rad/s) on the first status \
+         that reported it: this machine could not sample the ramp, so the \
+         re-press below would prove nothing",
+        ramping.speeds[0].abs()
+    );
+    let mut left_jog = None;
+    let mut seen = 0usize;
     let re_pressed = std::time::Instant::now();
     while re_pressed.elapsed().as_secs_f64() < accel_s {
         c.send(&jog_j_cmd(speeds, frame_s));
         if let Some(s) = rig.recv_status() {
-            if s.seq > released.seq {
-                slowest = slowest.min(s.speeds[0].abs());
+            if s.seq > ramping.seq {
+                seen += 1;
+                if s.mode != ControllerMode::Jog && left_jog.is_none() {
+                    left_jog = Some(s.mode);
+                }
             }
         }
     }
+    assert!(seen > 0, "no status arrived during the re-press");
     assert!(
-        slowest > 0.02,
-        "the arm came to rest ({slowest:.3} rad/s) between release and re-press: \
-         the re-press bounced the RT through IDLE instead of joining the ramp"
+        left_jog.is_none(),
+        "the RT left JOG for {:?} between release and re-press: the re-press \
+         bounced it through IDLE instead of joining the ramp already running",
+        left_jog.expect("checked above")
     );
     c.send(&jog_j_cmd([0.0; NUM_JOINTS], frame_s));
     rig.shutdown();
@@ -835,16 +872,7 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
     let translation = |p: &[f64; 16]| {
         ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
     };
-    // Rotation angle between the start orientation and `p`.
-    let rotation = |p: &[f64; 16]| {
-        let mut trace = 0.0;
-        for r in 0..3 {
-            for k in 0..3 {
-                trace += start[r * 4 + k] * p[r * 4 + k];
-            }
-        }
-        ((trace - 1.0) / 2.0).clamp(-1.0, 1.0).acos().to_degrees()
-    };
+    let rotation = |p: &[f64; 16]| rotation_angle_deg(&start, p);
     let moving = r
         .tcp_poses
         .iter()

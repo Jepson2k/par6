@@ -5,19 +5,10 @@
 //! acceleration. A sign flip, a missed gravity subtraction, a slot
 //! offset, or mishandled jaw joints all land degrees-per-second² away.
 
-#![cfg(feature = "ffi")]
-
-use std::path::PathBuf;
-
 use par6_kin::{GripperVariant, Kin, NQ};
 
-fn assets_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../..")
-        .canonicalize()
-        .unwrap()
-        .join("assets/par6_description")
-}
+mod common;
+use common::assets_dir;
 
 #[test]
 fn feedforward_plus_gravity_reproduces_the_acceleration_through_aba() {
@@ -39,8 +30,7 @@ fn feedforward_plus_gravity_reproduces_the_acceleration_through_aba() {
         );
 
         let urdf = assets.join(variant.urdf_relpath());
-        let mut raw =
-            pinokin_sys::Model::from_urdf(&urdf, Some(variant.tcp_frame()), None).unwrap();
+        let mut raw = par6_kin::Model::from_urdf(&urdf, Some(variant.tcp_frame()), None).unwrap();
         let nq = raw.nq();
         let mut qf = vec![0.0; nq];
         qf[..NQ].copy_from_slice(&q);

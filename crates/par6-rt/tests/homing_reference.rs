@@ -73,7 +73,7 @@ fn boot_core(
         fk: Box::new(NoFk),
         samples: consumer,
     };
-    let mut bus = SimBus::new();
+    let mut bus = SimBus::new(common::scene(&bundle));
     bus.set_initial_joint_rad(q0);
     let (mut core, handles) = RtCore::new(&bundle, bus, hooks).expect("sim core");
     core.bus_mut()
