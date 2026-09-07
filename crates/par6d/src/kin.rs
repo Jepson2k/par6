@@ -135,22 +135,22 @@ pub fn load_gravity_kin(
 
 // ----------------------------------------------------------- tool offset
 
-/// The commanded TCP offset, shared by every FK/IK consumer.
+/// The commanded TCP correction, shared by every FK/IK consumer.
 ///
 /// `T_flange→TCP = T_tool(variant) · T_offset`: the URDF variant already
 /// carries `T_tool` (FK/IK resolve at its `tcp` frame), so the commanded
-/// offset is a pure translation in the TOOL-LOCAL frame composed AFTER
-/// it — it never replaces the variant's own TCP. Same composition as the
+/// correction is a rigid transform in the tool-local frame composed after
+/// it. The same composition is used by the
 /// Python client's `set_active_tool`, so client-side preview FK/IK and
 /// the runtime resolve at the same point.
 ///
 /// One cell with many readers rather than a copy per consumer: the
 /// planner, the bridge, housekeeping and the RT FK hook all clone this
-/// handle, so a single `set` reaches all of them and they cannot
+/// handle, so a single `set_transform` reaches all of them and they cannot
 /// disagree about where the TCP is. Writes come from the command plane
 /// only (one writer), reads happen on the RT thread — hence the seqlock:
 /// the reader never blocks a writer and never observes a half-written
-/// offset, and with writes only on `set_tcp_offset` / tool selection the
+/// transform, and with writes only on TCP configuration / tool selection the
 /// retry loop effectively never spins.
 #[derive(Clone)]
 pub(crate) struct ToolOffset {
@@ -160,7 +160,7 @@ pub(crate) struct ToolOffset {
 struct OffsetCell {
     /// Even = settled, odd = a write is in progress.
     version: AtomicU64,
-    xyz_m: [AtomicU64; 3],
+    matrix: [AtomicU64; 16],
 }
 
 impl ToolOffset {
@@ -168,18 +168,20 @@ impl ToolOffset {
         Self {
             cell: Arc::new(OffsetCell {
                 version: AtomicU64::new(0),
-                xyz_m: [AtomicU64::new(0), AtomicU64::new(0), AtomicU64::new(0)],
+                matrix: std::array::from_fn(|i| {
+                    AtomicU64::new(if i % 5 == 0 { 1.0_f64.to_bits() } else { 0 })
+                }),
             }),
         }
     }
 
-    /// Publish the tool-local offset \[m\]. Command plane only.
-    pub(crate) fn set(&self, xyz_m: [f64; 3]) {
+    /// Publish a tool-local rigid transform (translation in metres). Command plane only.
+    pub(crate) fn set_transform(&self, matrix: Pose) {
         let v = self.cell.version.load(Ordering::Relaxed);
         self.cell
             .version
             .store(v.wrapping_add(1), Ordering::Release);
-        for (slot, value) in self.cell.xyz_m.iter().zip(xyz_m) {
+        for (slot, value) in self.cell.matrix.iter().zip(matrix) {
             slot.store(value.to_bits(), Ordering::Release);
         }
         self.cell
@@ -187,12 +189,12 @@ impl ToolOffset {
             .store(v.wrapping_add(2), Ordering::Release);
     }
 
-    /// The published offset \[m\].
-    pub(crate) fn get(&self) -> [f64; 3] {
+    /// The published rigid transform (translation in metres).
+    pub(crate) fn get(&self) -> Pose {
         loop {
             let before = self.cell.version.load(Ordering::Acquire);
-            let mut out = [0.0; 3];
-            for (o, slot) in out.iter_mut().zip(self.cell.xyz_m.iter()) {
+            let mut out = [0.0; 16];
+            for (o, slot) in out.iter_mut().zip(self.cell.matrix.iter()) {
                 *o = f64::from_bits(slot.load(Ordering::Acquire));
             }
             if before.is_multiple_of(2) && self.cell.version.load(Ordering::Acquire) == before {
@@ -286,6 +288,19 @@ pub(crate) fn mat_mul(a: &Pose, b: &Pose) -> Pose {
     out
 }
 
+/// Rigid inverse of a row-major homogeneous transform.
+pub(crate) fn inverse_pose(m: &Pose) -> Pose {
+    let mut out = [0.0; 16];
+    for r in 0..3 {
+        for c in 0..3 {
+            out[r * 4 + c] = m[c * 4 + r];
+        }
+        out[r * 4 + 3] = -(0..3).map(|c| m[c * 4 + r] * m[c * 4 + 3]).sum::<f64>();
+    }
+    out[15] = 1.0;
+    out
+}
+
 // -------------------------------------------------------------- RT hooks
 
 /// TCP FK behind the RT [`ForwardKin`] seam: full FK matrix, rpy
@@ -312,7 +327,7 @@ impl ForwardKin for KinFk {
     fn tcp(&mut self, q: &[f64; MAX_JOINTS], out: &mut [f64; 6]) {
         match self.kin.fk(q, &mut self.scratch) {
             Ok(()) => {
-                translate_local(&mut self.scratch, self.offset.get());
+                self.scratch = mat_mul(&self.scratch, &self.offset.get());
                 *out = matrix_to_xyzrpy(&self.scratch);
             }
             Err(_) => out.fill(f64::NAN),
@@ -432,7 +447,7 @@ impl CartKin {
     /// commands and STATUS reports — or a one-line error.
     pub(crate) fn fk(&mut self, q: &[f64; NQ]) -> Result<Pose, String> {
         let mut pose = self.fk_model(q)?;
-        translate_local(&mut pose, self.offset.get());
+        pose = mat_mul(&pose, &self.offset.get());
         Ok(pose)
     }
 
@@ -474,7 +489,7 @@ impl CartKin {
 
     /// Closed-form IK toward `target`, which is where the OFFSET TCP must
     /// land: the solver works at the URDF's TCP frame, so the target is
-    /// walked back along its own axes by the offset first.
+    /// composed with the inverse user transform first.
     ///
     /// Every solved joint is normalized onto the 2π branch its soft
     /// window admits, nearest the seed ([`par6_kin::wrap_to_window`]).
@@ -483,9 +498,7 @@ impl CartKin {
     /// the seed, so a solution that is still far from it really is
     /// another posture.
     pub(crate) fn ik(&mut self, seed: &[f64; NQ], target: &Pose) -> IkResult {
-        let d = self.offset.get();
-        let mut target = *target;
-        translate_local(&mut target, [-d[0], -d[1], -d[2]]);
+        let target = mat_mul(target, &inverse_pose(&self.offset.get()));
         let mut out = [0.0; NQ];
         match self.kin.ik(seed, &target, &mut out) {
             Ok(IkOutcome::Converged) => {
@@ -547,7 +560,8 @@ impl CartKin {
     /// `r = R·d`) — otherwise a pure rotation jog would pivot the arm
     /// about the flange while FK reported the offset point moving.
     pub(crate) fn twist_to_qd(&mut self, q: &[f64; NQ], v: &[f64; 6]) -> Result<[f64; NQ], String> {
-        let d = self.offset.get();
+        let correction = self.offset.get();
+        let d = [correction[3], correction[7], correction[11]];
         let r = if d == [0.0; 3] {
             [0.0; 3]
         } else {

@@ -286,6 +286,7 @@ pub struct ConnectHardware {
 #[serde(deny_unknown_fields)]
 pub struct SetTcpOffset {
     /// Idempotency key.
+    #[serde(default)]
     pub key: u64,
     /// X offset (mm).
     pub x: f64,
@@ -293,6 +294,28 @@ pub struct SetTcpOffset {
     pub y: f64,
     /// Z offset (mm).
     pub z: f64,
+}
+
+/// SET_TCP_TRANSFORM: queued tool-local TCP correction, composed after the
+/// registered tool frame. Translation is mm; orientation is intrinsic XYZ degrees.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTcpTransform {
+    /// Idempotency key.
+    #[serde(default)]
+    pub key: u64,
+    /// X translation (mm).
+    pub x: f64,
+    /// Y translation (mm).
+    pub y: f64,
+    /// Z translation (mm).
+    pub z: f64,
+    /// Intrinsic X rotation (degrees).
+    pub roll: f64,
+    /// Intrinsic Y rotation (degrees).
+    pub pitch: f64,
+    /// Intrinsic Z rotation (degrees).
+    pub yaw: f64,
 }
 
 /// SET_PAYLOAD: replace the runtime payload carried at the TCP frame.
@@ -742,6 +765,7 @@ pub enum Command {
     ResetState,
     ConnectHardware(ConnectHardware),
     SetTcpOffset(SetTcpOffset),
+    SetTcpTransform(SetTcpTransform),
     SetPayload(SetPayload),
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
@@ -767,6 +791,7 @@ pub enum Command {
     Error,
     TcpSpeed,
     TcpOffset,
+    TcpTransform,
     ToolStatus,
     IsSimulator,
     Shapes,
@@ -813,6 +838,7 @@ impl Command {
             C::ResetState => CmdType::ResetState,
             C::ConnectHardware(_) => CmdType::ConnectHardware,
             C::SetTcpOffset(_) => CmdType::SetTcpOffset,
+            C::SetTcpTransform(_) => CmdType::SetTcpTransform,
             C::SetPayload(_) => CmdType::SetPayload,
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
@@ -837,6 +863,7 @@ impl Command {
             C::Error => CmdType::Error,
             C::TcpSpeed => CmdType::TcpSpeed,
             C::TcpOffset => CmdType::TcpOffset,
+            C::TcpTransform => CmdType::TcpTransform,
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
@@ -882,6 +909,7 @@ impl Command {
             C::Checkpoint(p) => Some(p.key),
             C::ToolAction(p) => Some(p.key),
             C::SetTcpOffset(p) => Some(p.key),
+            C::SetTcpTransform(p) => Some(p.key),
             _ => None,
         }
     }
@@ -914,6 +942,7 @@ impl Command {
             | C::Error
             | C::TcpSpeed
             | C::TcpOffset
+            | C::TcpTransform
             | C::ToolStatus
             | C::IsSimulator
             | C::Shapes
@@ -956,6 +985,12 @@ impl Command {
             }
             C::SelectProfile(p) => str_len("select_profile.profile", &p.profile, 1, 32),
             C::ConnectHardware(p) => str_len("connect_hardware.port", &p.port, 1, 256),
+            C::SetTcpTransform(p) => {
+                for v in [p.x, p.y, p.z, p.roll, p.pitch, p.yaw] {
+                    finite("set_tcp_transform", v)?;
+                }
+                Ok(())
+            }
             C::SetTcpOffset(p) => {
                 finite("set_tcp_offset.x", p.x)?;
                 finite("set_tcp_offset.y", p.y)?;
@@ -1294,6 +1329,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Error
         | T::TcpSpeed
         | T::TcpOffset
+        | T::TcpTransform
         | T::ToolStatus
         | T::IsSimulator
         | T::Shapes
@@ -1314,6 +1350,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Pose => 3,
         T::WriteIo => 4,
         T::SetTcpOffset => 6,
+        T::SetTcpTransform => 9,
         T::SetPayload => 5,
         T::SetPidGains => 13,
         T::SetCanId => 5,
@@ -1399,6 +1436,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
@@ -1427,6 +1465,12 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         C::Pause(p) => w_bool(buf, p.on),
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
+        C::SetTcpTransform(p) => {
+            w_uint(buf, p.key);
+            for v in [p.x, p.y, p.z, p.roll, p.pitch, p.yaw] {
+                w_f64(buf, v);
+            }
+        }
         C::SetTcpOffset(p) => {
             w_uint(buf, p.key);
             w_f64(buf, p.x);
@@ -1820,6 +1864,15 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::ConnectHardware => Command::ConnectHardware(ConnectHardware {
             port: r.str()?.to_owned(),
         }),
+        T::SetTcpTransform => Command::SetTcpTransform(SetTcpTransform {
+            key: r.uint()?,
+            x: r.f64()?,
+            y: r.f64()?,
+            z: r.f64()?,
+            roll: r.f64()?,
+            pitch: r.f64()?,
+            yaw: r.f64()?,
+        }),
         T::SetTcpOffset => Command::SetTcpOffset(SetTcpOffset {
             key: r.uint()?,
             x: r.f64()?,
@@ -1904,6 +1957,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::Error => Command::Error,
         T::TcpSpeed => Command::TcpSpeed,
         T::TcpOffset => Command::TcpOffset,
+        T::TcpTransform => Command::TcpTransform,
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,

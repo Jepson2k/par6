@@ -566,6 +566,18 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
+    def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        """Queue the TCP transform; wait for its returned command index."""
+        return _run(self._inner.set_tcp_transform(x, y, z, roll, pitch, yaw))
+
     def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm on top of the current tool transform."""
         return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
@@ -675,6 +687,10 @@ class RobotClient:
     def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
         """Whether every joint is below *threshold_speed* (rad/s)."""
         return _run(self._inner.is_robot_stopped(threshold_speed))
+
+    def tcp_transform(self) -> list[float]:
+        """Read the applied TCP correction (mm, intrinsic XYZ degrees)."""
+        return _run(self._inner.tcp_transform())
 
     def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z]."""

@@ -81,6 +81,8 @@ pub struct OwnedPlanContext {
     pub tool_variant: Option<String>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
+    /// Tool-local intrinsic XYZ orientation correction (degrees).
+    pub tcp_rotation_deg: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
     /// The runtime payload the torque feedforward must carry.
@@ -94,6 +96,7 @@ impl OwnedPlanContext {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
             completion_policy: self.completion_policy,
             payload: self.payload,
         }

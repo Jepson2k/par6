@@ -395,13 +395,25 @@ other. A tool's TCP is not modelled separately: it is the `tcp` link of that too
 tree, so selecting a tool selects the tree the runtime is fitted with and FK resolves
 exactly where `par6d` does.
 
-`set_tcp_offset` composes after the tool transform, in the tool-local frame. A variant
-change clears it, because an offset measured against the old TCP describes nothing once
-the frame moves. It is a queued command: the offset lands at its turn, so moves queued
-before it keep the old frame, moves after it are planned against the new one, and a
-blend chain never folds across it. `SELECT_TOOL` and `SET_TCP_OFFSET` therefore apply in
-program order, and the `TCP_OFFSET` query reports the new value only once the command
-has completed — the same lag `TOOLS` has after `select_tool`.
+`set_tcp_transform(x, y, z, roll, pitch, yaw)` composes a full user correction
+after the registered tool frame, using millimetres and intrinsic XYZ degrees
+(`Rx · Ry · Rz`). FK, inverse kinematics, streaming frame conversion and native
+preview use this same correction. Physical tool meshes, collision geometry and
+inertia stay attached to the registered tool links. Calibration changes the
+commanded tip and axes; it does not rotate the fitted gripper mesh.
+
+Both TCP setters are queued: earlier moves keep their original frame and later
+moves use the new one, with blend chains split at the configuration change.
+Wait for the returned index before querying `tcp_transform()`. A cancelled
+pending correction leaves the applied value unchanged. Selecting a different
+variant or resetting the controller clears the correction; reselecting the
+same variant preserves it.
+
+The existing `set_tcp_offset(x, y, z)` remains the translation-only API and clears
+user rotation. `tcp_offset()` returns three translations; `tcp_transform()`
+returns all six values. Both raise on an unanswered query. This readback change
+requires callers that previously treated missing replies as zeros to handle
+connection failures explicitly.
 
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See

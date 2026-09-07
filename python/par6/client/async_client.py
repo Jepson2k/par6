@@ -1359,9 +1359,35 @@ class AsyncRobotClient(_RobotClientABC):
             )
         )
 
+    async def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        """Queue a tool-local TCP correction (mm, intrinsic XYZ degrees).
+
+        Wait for the returned command index before reading the applied transform.
+        Changing tool or variant clears the correction.
+
+        Category: Configuration
+
+        Example:
+            index = rbt.set_tcp_transform(0, 0, 20, 0, 90, 0)
+            rbt.wait_command(index)
+        """
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_tcp_transform([float(v) for v in (x, y, z, roll, pitch, yaw)])
+        )
+
     async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm, composed on top of the current tool
-        transform.  (0, 0, 0) resets; changing tools resets it too.
+        transform, clearing any user orientation correction. Wait for the
+        returned command index before readback. Changing tool/variant resets it.
 
         Category: Configuration
 
@@ -1729,6 +1755,20 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.is_robot_stopped(float(threshold_speed)))
 
+    async def tcp_transform(self) -> list[float]:
+        """Read the applied TCP correction (mm, intrinsic XYZ degrees).
+
+        Category: Configuration
+
+        Example:
+            transform = rbt.tcp_transform()
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.tcp_transform())
+        if result is None:
+            raise TimeoutError("TCP transform readback was not confirmed")
+        return list(result)
+
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
 
@@ -1740,7 +1780,7 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         result = await self._call(core.tcp_offset())
         if result is None:
-            return [0.0, 0.0, 0.0]
+            raise TimeoutError("TCP offset readback was not confirmed")
         return list(result)
 
     async def is_simulator(self) -> bool:

@@ -99,6 +99,8 @@ pub struct PlanContext<'a> {
     pub tool_variant: Option<&'a str>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
+    /// Tool-local intrinsic XYZ orientation correction (degrees).
+    pub tcp_rotation_deg: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
     /// The runtime payload the torque feedforward must carry.

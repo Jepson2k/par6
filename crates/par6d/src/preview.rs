@@ -166,6 +166,7 @@ pub struct Preview {
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    tcp_rotation_deg: [f64; 3],
     policy: CompletionPolicy,
     payload: PayloadSpec,
     io_levels: Vec<u8>,
@@ -300,6 +301,7 @@ impl Preview {
             tool: cfg.fitted_tool.clone(),
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            tcp_rotation_deg: [0.0; 3],
             policy: CompletionPolicy::Settled,
             payload: PayloadSpec::default(),
             io_levels: vec![0; cfg.digital_outputs.len()],
@@ -360,6 +362,7 @@ impl Preview {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
             completion_policy: self.policy,
             payload: self.payload,
         });
@@ -423,6 +426,18 @@ impl Preview {
     /// The active motion profile, in the registry's spelling.
     pub fn profile(&self) -> &str {
         &self.profile
+    }
+
+    /// Applied user TCP correction (mm, intrinsic XYZ degrees).
+    pub fn tcp_transform(&self) -> [f64; 6] {
+        [
+            self.tcp_offset_mm[0],
+            self.tcp_offset_mm[1],
+            self.tcp_offset_mm[2],
+            self.tcp_rotation_deg[0],
+            self.tcp_rotation_deg[1],
+            self.tcp_rotation_deg[2],
+        ]
     }
 
     /// The TCP offset \[mm\] on top of the tool transform.
@@ -832,6 +847,7 @@ impl Preview {
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
+                self.tcp_rotation_deg = [0.0; 3];
                 self.policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
                 self.sync_planner();
@@ -880,10 +896,6 @@ impl Preview {
                         ))
                     }
                 }
-            }
-            Command::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.sync_planner();
             }
             Command::SetPayload(p) => {
                 self.payload = PayloadSpec {
@@ -1288,11 +1300,22 @@ impl Preview {
     /// the server's post-effects and the tool state a program reads back.
     fn note_effects(&mut self, head: &Command) {
         match head {
+            Command::SetTcpTransform(p) => {
+                self.tcp_offset_mm = [p.x, p.y, p.z];
+                self.tcp_rotation_deg = [p.roll, p.pitch, p.yaw];
+                self.sync_planner();
+            }
+            Command::SetTcpOffset(p) => {
+                self.tcp_offset_mm = [p.x, p.y, p.z];
+                self.tcp_rotation_deg = [0.0; 3];
+                self.sync_planner();
+            }
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.
                 if p.variant_key != self.tool_variant {
                     self.tcp_offset_mm = [0.0; 3];
+                    self.tcp_rotation_deg = [0.0; 3];
                 }
                 self.tool_variant = p.variant_key.clone();
                 self.sync_planner();
