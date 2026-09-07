@@ -1817,7 +1817,17 @@ pub(crate) fn housekeeping_loop(
                           gate: &Arc<Mutex<StreamGate>>,
                           what: &str,
                           pairs: Vec<(String, String)>| {
-        log::warn!("{what}: collision predicted; stopping the stream");
+        // Name the pairs: "collision predicted" without them leaves an
+        // operator (or a failing test) no way to tell a keep-out from a
+        // self-collision, and the gate has them right here.
+        log::warn!(
+            "{what}: collision predicted; stopping the stream: {}",
+            pairs
+                .iter()
+                .map(|(a, b)| format!("[{a}, {b}]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         gate.lock().unwrap().refuse(pairs);
         // Both releases, because either mode may be the one running and
         // each ignores the release that is not its own. They ramp the

@@ -7,14 +7,34 @@
 
 use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
+use std::collections::VecDeque;
 
-/// Assumed firmware velocity-loop period \[s\]. The config `kiv` is a
-/// per-loop-iteration gain; the firmware loop runs much faster than the
-/// bus tick, so the sim integrates `kiv · err` once per firmware
-/// iteration (`dt / FW_LOOP_DT` times per tick). Without this the
-/// integral unwinds so slowly that a homing backoff cannot break the
-/// endstop seat within the vendor-configured backoff window.
-pub(crate) const FW_LOOP_DT: f64 = 0.001;
+/// Firmware control-loop period \[s\]: STEPFOC's `LOOP_TIME`
+/// (`constants.h:56`). Position loop, velocity PI and current loop all
+/// run once per iteration of that loop, so the config `kiv` is a
+/// per-iteration gain and the sim integrates `kiv · err` once per
+/// firmware iteration rather than once per plant substep.
+///
+/// This was 0.001 — a guess at "much faster than the bus tick" — which
+/// is 6.25x too slow. Against a 1 ms plant substep it rounded the count
+/// to ONE, so the velocity integral wound up at a sixth of the rate the
+/// drives actually use, and every conclusion drawn about a `kiv`- or
+/// `kpp`-dependent behaviour was drawn against a drive the vendor does
+/// not ship.
+pub(crate) const FW_LOOP_DT: f64 = 0.00016;
+
+/// Samples in the firmware's velocity moving average (`movingAverage`,
+/// `utils.cpp:177`), which is what the velocity PI reads — NOT the raw
+/// finite difference.
+const FW_VEL_AVG_SAMPLES: f64 = 20.0;
+
+/// Time the firmware's velocity estimate is averaged over \[s\].
+///
+/// The lag matters, the sample rate does not: the sim cannot afford a
+/// 160 us plant substep, so it averages over the same WINDOW at whatever
+/// rate the plant runs. Feeding the PI an exact instantaneous velocity
+/// instead gave the loop derivative information no drive has.
+pub(crate) const FW_VEL_AVG_S: f64 = FW_VEL_AVG_SAMPLES * FW_LOOP_DT;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -94,6 +114,10 @@ pub(crate) struct VirtualDriver {
     // -- control state --
     mode: Mode,
     integral_ma: f64,
+    /// Rolling window behind the firmware's `Velocity_Filter`.
+    vel_window: VecDeque<f64>,
+    vel_window_len: usize,
+    vel_sum: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
@@ -125,6 +149,9 @@ impl VirtualDriver {
             kt_nm_a: kt_nm_a as f32,
             mode: Mode::Idle,
             integral_ma: 0.0,
+            vel_window: VecDeque::new(),
+            vel_window_len: 1,
+            vel_sum: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
@@ -312,6 +339,13 @@ impl VirtualDriver {
     /// current held over a whole coarse bus tick destabilizes a
     /// strongly-driven joint).
     pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
+        // The firmware's loops read `Velocity_Filter`, never the raw
+        // difference, so the filter is inside the loop and its lag is part
+        // of the plant the gains were tuned against. One plant substep
+        // stands for `fw_steps` firmware iterations, so the firmware's
+        // 20-sample window is that many substeps wide.
+        self.vel_window_len = (FW_VEL_AVG_SAMPLES / fw_steps).round().max(1.0) as usize;
+        let vel_ticks_s = self.filter_velocity(vel_ticks_s);
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
@@ -390,6 +424,7 @@ impl VirtualDriver {
     /// friction back-drive a degree before the feedforward arrives.
     pub fn reseed_hold(&mut self, pos_ticks: f64) {
         self.integral_ma = 0.0;
+        self.reset_velocity_filter();
         self.cur_out_ma = 0.0;
         self.mode = Mode::Position {
             pos: pos_ticks,
@@ -425,6 +460,28 @@ impl VirtualDriver {
     /// firmware gripper to halt jaw motion on command silence).
     pub fn watchdog_fired(&self) -> bool {
         self.armed && self.ticks_since_data >= self.watchdog_ticks
+    }
+
+    /// The firmware's `Velocity_Filter`: a moving average over
+    /// [`FW_VEL_AVG_S`] of measurement, resampled to the plant's substep.
+    ///
+    /// The window is sized from the substep the plant actually calls with,
+    /// so a scene timestep change keeps the firmware's averaging TIME
+    /// rather than its sample count.
+    fn filter_velocity(&mut self, vel_ticks_s: f64) -> f64 {
+        self.vel_sum += vel_ticks_s;
+        self.vel_window.push_back(vel_ticks_s);
+        while self.vel_window.len() > self.vel_window_len {
+            self.vel_sum -= self.vel_window.pop_front().expect("len checked");
+        }
+        self.vel_sum / self.vel_window.len() as f64
+    }
+
+    /// Drop the velocity history: a re-seeded pose makes every sample in
+    /// it a difference across a teleport, which is not a speed.
+    fn reset_velocity_filter(&mut self) {
+        self.vel_window.clear();
+        self.vel_sum = 0.0;
     }
 
     fn velocity_pi(&mut self, vel_target: f64, vel_meas: f64, cur_ff: f64, fw_steps: f64) -> f64 {
