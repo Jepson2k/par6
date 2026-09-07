@@ -58,7 +58,7 @@ outputs = [".ffi/toppra/lib/libtoppra.so"]
 depends-on = ["build-toppra"]
 cmd = "bash scripts/ffi/build.sh shim"
 inputs = ["cpp/**"]
-outputs = [".ffi/shim/lib/libpar6_shim.so"]
+outputs = [".ffi/shim/lib/libpar6_shim.so", ".ffi/shim/cpp.sha256"]
 
 # libmujoco is downloaded by `mujoco-rs`'s build script into
 # $MUJOCO_DOWNLOAD_DIR, so the only way to materialise it is to build the one

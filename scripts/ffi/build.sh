@@ -49,6 +49,7 @@ build_shim() {
     -DCMAKE_INSTALL_RPATH="$PREFIX/lib;$TOPPRA_PREFIX/lib"
   cmake --build "$FFI/build/shim"
   cmake --install "$FFI/build/shim"
+  (cd "$ROOT" && find cpp -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum | sha256sum | cut -d' ' -f1) > "$SHIM_PREFIX/cpp.sha256"
 }
 
 case "${1:-all}" in

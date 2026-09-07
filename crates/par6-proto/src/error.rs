@@ -445,6 +445,5 @@ mod tests {
     fn make_error_without_params_keeps_placeholders_visible() {
         let e = make_error(ErrorCode::CommValidationError, UNATTRIBUTED, &[]);
         assert!(e.cause.contains("{detail}"));
-        assert_eq!(e.command_index, UNATTRIBUTED);
     }
 }

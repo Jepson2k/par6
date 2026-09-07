@@ -955,6 +955,28 @@ mod tests {
 
     #[test]
     fn can_id_roundtrips_over_full_field_ranges() {
+        // Round-tripping pack against unpack passes for any pair of
+        // matching shifts, so the field positions are pinned to literal
+        // ids read off the vendor layout `(node << 7) | (cmd << 1) | err`
+        // first. Get a shift wrong and every drive on the bus answers to
+        // the wrong arbitration id.
+        for (node, cmd, err, id) in [
+            (0u8, CommandId::Estop, false, 0x000u16),
+            (0, CommandId::DataPack1, false, 0x004),
+            (1, CommandId::DataPack1, false, 0x084),
+            (2, CommandId::RespondDataPack1, true, 0x107),
+            (3, CommandId::Ping, false, 0x194),
+            (5, CommandId::Limits, false, 0x2A8),
+            (15, CommandId::Reset, true, 0x79D),
+        ] {
+            assert_eq!(
+                pack_can_id(node, cmd, err),
+                id,
+                "node {node} {cmd:?} err={err}"
+            );
+            assert_eq!(unpack_can_id(id), (node, cmd.raw(), err), "id {id:#05X}");
+        }
+
         for node in 0u8..16 {
             for raw in 0u8..64 {
                 let Some(cmd) = CommandId::from_raw(raw) else {

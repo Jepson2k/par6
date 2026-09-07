@@ -18,13 +18,11 @@ pip install -e "python[dev]"       # python package (maturin: compiles the par6-
 cd python && pytest                # python tests (JUnit XML at python/test-results.xml)
 ```
 
-`par6d` links the shim unconditionally — there is no kinematics-free build.
-The library crates still build without a C++ toolchain, which is what the
-`--exclude par6d --exclude par6-py --exclude par6-client` legs in CI cover
-(par6-py wraps par6d; par6-client's tests boot a daemon in-process).
-The python package builds the `par6._par6` extension, so `pip install`
-needs `source .ffi/env.sh` first, and so does running anything that
-imports `par6` (the extension dlopens the shim).
+The shim is a prerequisite for the whole workspace: `scripts/ffi/setup.sh`
+once, then `source .ffi/env.sh` in each shell to build, test or run
+anything. The python package builds the `par6._par6` extension, so
+`pip install` needs it too, and so does running anything that imports
+`par6` (the extension dlopens the shim).
 
 ## Contract discipline (multi-agent repo)
 
