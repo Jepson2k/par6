@@ -30,13 +30,16 @@ BIN="$ROOT/target/release/par6d"
 : "${CONDA_PREFIX:?run under pixi}"
 command -v patchelf >/dev/null || die "patchelf not found (it is a pixi dependency)"
 
-# The shim and toppra live in cargo's OUT_DIR. par6-kin is the only crate
-# that builds them, so there is exactly one of each per profile.
-shim_lib="$(echo "$ROOT"/target/release/build/par6-kin-*/out/shim/lib)"
-toppra_lib="$(echo "$ROOT"/target/release/build/par6-kin-*/out/toppra/lib)"
-[ -e "$shim_lib/libpar6_shim.so" ] \
+# The shim lives in cargo's OUT_DIR. Cargo keeps a build directory per build
+# script *invocation*, not per crate, so a tree that has been built more than
+# one way holds several — the newest is the one the binary beside it links.
+shim_lib="$(ls -1dt "$ROOT"/target/release/build/par6-kin-*/out/shim/lib 2>/dev/null | head -1)"
+[ -n "$shim_lib" ] && [ -e "$shim_lib/libpar6_shim.so" ] \
   || die "no libpar6_shim.so under target/release/build/par6-kin-*/out — a
   release build of par6d must have produced one"
+[ -e "$shim_lib/libtoppra.so" ] \
+  || die "libtoppra.so is not beside the shim in $shim_lib; par6-kin's build
+  script installs it there so one rpath covers the pair"
 
 rm -rf "$STAGE"
 mkdir -p "$STAGE" "$DIST"
@@ -46,7 +49,6 @@ python3 "$ROOT/scripts/ffi/stage_runtime_libs.py" \
   --readelf "$(command -v readelf)" \
   --lib-dir "$CONDA_PREFIX/lib" \
   --lib-dir "$shim_lib" \
-  --lib-dir "$toppra_lib" \
   --dest "$STAGE" \
   --accept-rpath "$RUNTIME_LIB_DIR" \
   "$BIN" \

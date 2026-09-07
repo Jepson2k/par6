@@ -70,8 +70,15 @@ running the command in its `run:` line:
 | `pixi run -e py312 bundle` | the daemon bundle, checksums and manifest |
 
 Compile parallelism is picked from available RAM: one shim compile job peaks
-near 4 GB, and a swapless small box that overcommits that livelocks rather
+near 4 GB, and a small box that overcommits that livelocks in reclaim rather
 than failing. `CMAKE_BUILD_PARALLEL_LEVEL` overrides it.
+
+That rule covers the C++ only — cargo's own job count is cargo's. A RELEASE
+build is the memory-hungry one (`lto = "thin"`, `codegen-units = 1`, and
+debug info on `par6d`), and on an 8 GB box four parallel rustc jobs will take
+it out: `CARGO_BUILD_JOBS=1 pixi run bundle` is the way to build a deploy
+bundle on the control box itself. Hosted CI runners have the headroom and set
+neither.
 
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
