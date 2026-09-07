@@ -28,6 +28,11 @@ OPTIONS:
     --assets <DIR>             assets/par6_description tree with the PAR6 URDFs
                                (default: $PAR6_ASSETS, then the tree next to the
                                config directory). Used by the kinematics stack.
+    --package-dir <DIR>        Where `package://` mesh URIs resolve [env:
+                               PAR6_PACKAGE_DIR]. Needed when the assets tree is
+                               an installed package whose URDFs name their meshes
+                               by package URI — a pip-installed `par6` points this
+                               at its site-packages directory.
     --port <PORT>              Command UDP port; 0 = ephemeral. The bound port is
                                printed on stdout as `PAR6D_READY command_port=...`.
                                [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
@@ -65,7 +70,8 @@ pub struct Options {
     pub config: Option<PathBuf>,
     /// Explicit `assets/par6_description` tree (`--assets` / `PAR6_ASSETS`).
     pub assets: Option<PathBuf>,
-    /// Where `package://` mesh URIs resolve. Set when the assets tree is
+    /// Where `package://` mesh URIs resolve (`--package-dir` /
+    /// `PAR6_PACKAGE_DIR`). Set when the assets tree is
     /// an installed package whose URDFs reference their meshes by package
     /// URI rather than a repo checkout's `<assets>/URDF` layout.
     pub package_dir: Option<PathBuf>,
@@ -107,6 +113,9 @@ impl Options {
                 "--sim" => o.sim = true,
                 "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
                 "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
+                "--package-dir" => {
+                    o.package_dir = Some(PathBuf::from(value(&mut args, "--package-dir")?))
+                }
                 "--tick-profile" => o.tick_profile = true,
                 "--port" | "--command-port" => {
                     o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
@@ -152,6 +161,11 @@ impl Options {
         if self.assets.is_none() {
             if let Some(v) = env_var("PAR6_ASSETS") {
                 self.assets = Some(PathBuf::from(v));
+            }
+        }
+        if self.package_dir.is_none() {
+            if let Some(v) = env_var("PAR6_PACKAGE_DIR") {
+                self.package_dir = Some(PathBuf::from(v));
             }
         }
         if !self.tick_profile {
