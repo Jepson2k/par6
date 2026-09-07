@@ -129,6 +129,17 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// Whether the server task has ended.
+    ///
+    /// It is expected to be running until it is asked to stop, so a `true`
+    /// here that nobody asked for means the command plane is gone — the
+    /// planner thread died and took its channels with it, or the task
+    /// panicked. The supervisor treats that as fatal rather than leaving an
+    /// arm powered, ticking, and unable to be commanded or stopped.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 impl Drop for ServerHandle {
