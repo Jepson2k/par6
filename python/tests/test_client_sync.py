@@ -145,6 +145,93 @@ def test_sync_facade_refuses_use_inside_a_running_loop():
 
 
 @pytest.mark.timeout(120)
+def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
+    from waldoctl.skills import observe_skills, skill
+
+    from par6.client import AsyncRobotClient
+
+    @skill(
+        id="test.turn",
+        version="1.0.0",
+        requires=frozenset({"motion.joint", "backend.par6"}),
+    )
+    async def turn(rbt: AsyncRobotClient, degrees: float) -> list[float]:
+        angles = await rbt.angles()
+        assert angles is not None
+        angles[0] += degrees
+        index = await rbt.move_j(angles, speed=0.5)
+        assert index >= 0 and await rbt.wait_command(index, timeout=30.0)
+        observed = await rbt.angles()
+        assert observed is not None
+        return observed
+
+    @skill(id="test.round_trip", version="1.0.0")
+    async def round_trip(rbt: AsyncRobotClient) -> tuple[list[float], list[float]]:
+        outward = await turn.async_call(rbt, 5.0)
+        homeward = await turn.async_call(rbt, -5.0)
+        return outward, homeward
+
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0)
+        park = park_deg()
+        settle_at(client, park)
+        events = []
+        with observe_skills(events.append):
+            outward, homeward = round_trip(client)
+        assert outward[0] == pytest.approx(park[0] + 5, abs=0.5)
+        assert homeward[0] == pytest.approx(park[0], abs=0.5)
+        assert [e.phase for e in events] == [
+            "started",
+            "started",
+            "completed",
+            "started",
+            "completed",
+            "completed",
+        ]
+        assert events[1].parent_id == events[0].invocation_id
+
+    async def cancel_motion() -> None:
+        from waldoctl.status import ActionState
+
+        async with daemon.client() as client:
+            moving = asyncio.Event()
+
+            @skill(id="test.cancel", version="1.0.0")
+            async def sequence(rbt: AsyncRobotClient) -> None:
+                target = list(park)
+                target[0] += 20.0
+                index = await rbt.move_j(target, duration=5.0)
+                assert index >= 0
+                moving.set()
+                try:
+                    await rbt.wait_command(index, timeout=15.0)
+                except asyncio.CancelledError:
+                    await rbt.move_j(park, speed=0.5)
+                    pytest.fail("a cancelled skill issued another motion")
+
+            cancelled_events = []
+            with observe_skills(cancelled_events.append):
+                task = asyncio.create_task(sequence.async_call(client))
+                await asyncio.wait_for(moving.wait(), timeout=10.0)
+                assert await client.wait_status(
+                    lambda s: s.angles[0] > park[0] + 1.0, timeout=10.0
+                )
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            assert cancelled_events[-1].phase == "cancelled"
+            assert cancelled_events[-1].stop_confirmed is True
+            assert await client.wait_status(
+                lambda s: s.action_state == ActionState.IDLE and s.queued_segments == 0,
+                timeout=3.0,
+            )
+            # Cancellation belongs to the invocation, not the connection.
+            await turn.async_call(client, -2.0)
+
+    asyncio.run(cancel_motion())
+
+
+@pytest.mark.timeout(120)
 def test_cli_reads_a_live_runtime_and_reports_an_unreachable_one(daemon, capsys):
     """The console script is the shell view of the sync client.
 

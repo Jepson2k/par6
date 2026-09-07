@@ -250,6 +250,10 @@ class DryRunRobotClient:
     def profile(self) -> str:
         return self._preview.profile()
 
+    @property
+    def skill_capabilities(self) -> frozenset[str]:
+        return frozenset({"motion.joint", "motion.linear", "backend.par6"})
+
     def is_simulator(self) -> bool:
         return True
 
