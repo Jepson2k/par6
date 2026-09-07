@@ -10,9 +10,9 @@ Read `README.md` for architecture, the command system, and the collision world.
 ```bash
 scripts/ffi/setup.sh               # once: build the Pinocchio shim into .ffi/
 source .ffi/env.sh                 # each shell: par6d needs the shim to build AND run
-cargo build --workspace            # runtime
-cargo test --workspace             # rust tests
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # must be clean
+cargo build                       # runtime
+cargo test             # rust tests
+cargo fmt --all && cargo clippy --all-targets -- -D warnings          # must be clean
 cargo run -p par6d -- --sim        # simulated runtime, no hardware
 pip install -e "python[dev]"       # python package (maturin: compiles the par6-py extension)
 cd python && pytest                # python tests (JUnit XML at python/test-results.xml)

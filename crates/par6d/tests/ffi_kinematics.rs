@@ -42,8 +42,14 @@ fn boot_tagged(tag: &str) -> Rig {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    common::retimed_config(&format!("ffi-{tag}"), 0.02)
+    common::retimed_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
 }
+
+/// The tick period every rig in this file boots at. Anything that has to
+/// agree with the runtime's own tick-derived arithmetic — the streaming
+/// gate's stopping projection, for one — has to read THIS, not the
+/// shipped config's period.
+const TEST_TICK_DT_S: f64 = 0.02;
 
 /// [`test_config`] with the active (MSG) gripper's `[kinematics] mass_kg`
 /// replaced — the knob the gravity-wiring test turns.
@@ -1100,6 +1106,53 @@ fn jog_j(joint: usize, signed_pct: f64, duration_s: f64) -> Command {
     })
 }
 
+/// Signed distance from the arm's collision geometry to the keep-out at
+/// `angles_deg` \[m\], through the same model the daemon gates on.
+///
+/// This is the only honest clearance number in this test. A flange-to-box
+/// distance is not one: the bodies that get refused are `gripper` and
+/// `jaw2`, which reach the box while the flange is still ~100 mm away,
+/// so a flange measurement reports the tool's length as if it were the
+/// gate's margin.
+fn keepout_world(keepout_centre_m: [f64; 3]) -> par6_kin::Collision {
+    let mut col = par6_kin::Collision::load(
+        &common::assets_dir(),
+        par6_kin::GripperVariant::Msg,
+        par6d::COLLISION_CLEARANCE_M,
+    )
+    .expect("reference collision model");
+    col.set_layer(
+        par6_kin::Layer::Program,
+        &[par6_kin::Shape {
+            name: "keepout".to_owned(),
+            kind: par6_kin::ShapeKind::Box,
+            params: [KEEPOUT_M, KEEPOUT_M, KEEPOUT_M],
+            pose: [
+                keepout_centre_m[0],
+                keepout_centre_m[1],
+                keepout_centre_m[2],
+                0.0,
+                0.0,
+                0.0,
+            ],
+            collision: true,
+            margin: None,
+        }],
+    )
+    .expect("keep-out into the reference world");
+    col
+}
+
+/// Signed distance from the arm's collision geometry to the keep-out at
+/// `angles_deg` \[m\], through a world built by [`keepout_world`].
+fn world_gap_m(col: &mut par6_kin::Collision, angles_deg: [f64; NUM_JOINTS]) -> f64 {
+    let mut q = [0.0; par6_kin::NQ];
+    for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+        *out = deg.to_radians();
+    }
+    col.world_distance(&q).expect("world distance")
+}
+
 /// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
 /// loads — where a keep-out has to go to sit on the swept path.
 fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
@@ -1114,14 +1167,29 @@ fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
     [pose[3], pose[7], pose[11]]
 }
 
-/// The configured JOG-mode velocity limit of J0 \[rad/s\] — what a jog
-/// `speeds` fraction commands, and what the gate's lookahead projects.
-fn j0_jog_velocity() -> f64 {
+/// The J0 jog `speeds` fraction whose stopping projection covers
+/// `travel_rad` — the inverse of [`par6d::stream_stopping_travel`],
+/// found by bisection rather than by restating the gate's arithmetic
+/// here (a test that recomputes the projection cannot catch it being
+/// wrong).
+fn j0_speed_reaching(travel_rad: f64) -> f64 {
     let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    cfg.joints[0]
-        .limits
-        .for_mode(par6_config::LimitMode::Jog)
-        .velocity_rad_s
+    let lim = cfg.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
+    // The rig's period, not the shipped one: the projection is counted
+    // in ticks, so a helper that inverts it against a different tick
+    // rate asks for a speed whose lookahead lands somewhere else
+    // entirely.
+    let (v_max, accel, dt) = (lim.velocity_rad_s, lim.acceleration_rad_s2, TEST_TICK_DT_S);
+    let (mut lo, mut hi) = (0.0, v_max);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if par6d::stream_stopping_travel(mid, accel, dt) < travel_rad {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (0.5 * (lo + hi) / v_max).clamp(0.01, 1.0)
 }
 
 /// Streaming motion is gated by the same collision world as planned
@@ -1150,7 +1218,6 @@ fn streaming_is_gated_by_the_collision_world() {
     // The J0 arc the TCP travels on: converts arc metres to J0 radians.
     let radius_m = (mid_m[0].powi(2) + mid_m[1].powi(2)).sqrt();
     let deg_per_m = 1.0_f64.to_degrees() / radius_m;
-    let v0 = j0_jog_velocity();
 
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout.clone()]));
@@ -1221,7 +1288,7 @@ fn streaming_is_gated_by_the_collision_world() {
     // tolerance — the centre is where the measured drop is unambiguous.
     // The refusal still cannot be excused as "the far side is shallower
     // again": the centre is the depth extremum, not past it.
-    let pct = (0.8 * (KEEPOUT_M / 2.0) / radius_m / (v0 * 0.15)).clamp(0.01, 1.0);
+    let pct = j0_speed_reaching(0.8 * (KEEPOUT_M / 2.0) / radius_m);
     let err = c.expect_error(&jog_j(0, pct, 5.0));
     assert_eq!(
         err.code,
@@ -2727,20 +2794,32 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
     rig.shutdown();
 }
 
+/// A stream driven into a keep-out stays OUT of it and LANDS ON THE
+/// STANDOFF — the same distance whatever speed it arrived at.
+///
 /// A position stream carries a target, not a rate, and the arm cannot
 /// stop dead. Every datagram of a stepping stream is admissible on its
-/// own target, so the arm builds speed toward the keep-out; when a target
-/// finally lands inside it, the braking distance carries the TCP on. A
-/// single held target never shows this — the limiter decelerates to stop
-/// AT it — so the stream here advances the way a UI's does.
+/// own target, so the arm builds speed toward the keep-out; when a
+/// target finally lands inside it, the braking distance carries the TCP
+/// on. A single held target never shows this — the limiter decelerates
+/// to stop AT it — so the stream here advances the way a UI's does.
 ///
-/// The bound is the keep-out itself, sampled through the coast after the
-/// refusal: whatever speed the stream built, the TCP must never end up
-/// inside the box. A reference run cannot serve as the bound — a slow
-/// approach stops where its own lag left it rather than where the
-/// geometry is, so comparing the two compares two lags.
+/// Refusing says only that the arm must not finish where it was asked
+/// to. Left at that, where it ACTUALLY finishes is whatever the
+/// executor's tracking lag and the datagram timing happened to leave:
+/// measured on this rig at anywhere from 2.7 mm to 24 mm from a keep-out
+/// whose standoff is 5 mm, varying run to run at one speed. So the
+/// refusal is answered instead — the arm is brought to rest and then
+/// placed on the standoff — and this asserts the result of that.
+///
+/// Both bounds bite. Below the clearance the arm has entered ground it
+/// was configured to keep out of. Above it the gate is imposing a
+/// standoff nobody asked for, and that surplus is workspace an arm
+/// cannot use next to its own fixtures. Two speeds an order apart,
+/// because a landing that depends on approach speed is a lag, not a
+/// standoff.
 #[test]
-fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
+fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
     let rig = boot_tagged("servogate");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -2753,25 +2832,38 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout]));
 
-    let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
-
     /// Stream the target toward the box `step_mm` at a time until the
     /// gate latches, then report how close the TCP ever got to the box
     /// centre \[m\].
+    /// Each run picks its own run-up: at 1 mm a datagram the fast run's
+    /// full approach is thousands of datagrams of nothing happening, and
+    /// the gate's answer does not depend on how much clear space came
+    /// before it.
     struct Scene {
-        start_deg: [f64; NUM_JOINTS],
         mid_deg: [f64; NUM_JOINTS],
-        mid_m: [f64; 3],
         deg_per_m: f64,
     }
 
-    fn approach(rig: &Rig, c: &mut Client, scene: &Scene, step_mm: f64, speed: Option<f64>) -> f64 {
-        let Scene {
-            start_deg,
-            mid_deg,
-            mid_m,
-            deg_per_m,
-        } = *scene;
+    fn approach(
+        rig: &Rig,
+        c: &mut Client,
+        scene: &Scene,
+        col: &mut par6_kin::Collision,
+        step_mm: f64,
+        speed: Option<f64>,
+        run_up_m: f64,
+    ) -> (f64, f64) {
+        let Scene { mid_deg, deg_per_m } = *scene;
+        let start_deg = with_j0(mid_deg, -run_up_m * deg_per_m);
+        // The gripper reaches ~96 mm past the TCP, so a run-up measured
+        // from the box CENTRE can start the jaw already inside it — and
+        // an approach that begins in the keep-out measures nothing about
+        // approaching one.
+        assert!(
+            world_gap_m(col, start_deg) > par6d::COLLISION_CLEARANCE_M,
+            "the run-up starts {:.1} mm from the keep-out, inside the standoff",
+            world_gap_m(col, start_deg) * 1e3
+        );
         enable_and_teleport(rig, c, start_deg);
         rig.drain_status();
         // `collision_active` is LATCHED: it describes the configuration
@@ -2786,11 +2878,7 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
         let deadline = Instant::now() + BUDGET;
         let mut gated = false;
         let mut closest = f64::INFINITY;
-        let sample = |s: &Status, closest: &mut f64| {
-            let tcp = tcp_at_m(s.angles);
-            let d = ((tcp[0] - mid_m[0]).powi(2) + (tcp[1] - mid_m[1]).powi(2)).sqrt();
-            *closest = closest.min(d);
-        };
+        let mut last_seen = f64::NAN;
         while Instant::now() < deadline && !gated {
             target[0] = (target[0] + step_deg).min(mid_deg[0]);
             c.send(&Command::ServoJ(par6_proto::command::ServoJ {
@@ -2801,7 +2889,8 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
             let window = Instant::now() + Duration::from_millis(50);
             while Instant::now() < window {
                 if let Some(s) = rig.recv_status() {
-                    sample(&s, &mut closest);
+                    closest = closest.min(world_gap_m(col, s.angles));
+                    last_seen = s.angles[0];
                     if s.collision_active {
                         gated = true;
                         break;
@@ -2809,57 +2898,213 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
                 }
             }
         }
-        assert!(gated, "a stream driven into a keep-out was never gated");
-        // The coast after the refusal is the whole point, so keep
-        // sampling until the arm is at rest.
-        let settle = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < settle {
-            if let Some(s) = rig.recv_status() {
-                sample(&s, &mut closest);
-                if s.speeds.iter().all(|v| v.abs() < 0.05) {
-                    break;
-                }
+        assert!(
+            gated,
+            "a stream driven into a keep-out was never gated: target reached \
+             j0={:.3} deg of {:.3}, arm {:.3} deg, closest {:.2} mm",
+            target[0],
+            mid_deg[0],
+            last_seen,
+            closest * 1e3
+        );
+        // The travel after the refusal is the whole point, so keep
+        // sampling until the arm has actually finished moving. A single
+        // slow frame is not rest: the executor re-plans onto the
+        // standoff and its velocity passes through zero on the way, so
+        // rest is only believable once the arm has held still across
+        // several consecutive frames.
+        // A refusal is answered in two steps — the arm is brought to
+        // rest, then placed on the standoff — so a pause is not the end
+        // of the motion. Rest is only believable once the arm has held
+        // still across a window WIDER than that pause.
+        let settle = Instant::now() + Duration::from_secs(20);
+        // Wider than the whole refusal sequence's travel budget, so a
+        // pause between braking and placement cannot be read as the end
+        // of the motion.
+        let quiet = Duration::from_secs(4);
+        let mut rest = f64::NAN;
+        let mut last = f64::NAN;
+        let mut moved_at = Instant::now();
+        while Instant::now() < settle && moved_at.elapsed() < quiet {
+            let Some(s) = rig.recv_status() else { continue };
+            let gap = world_gap_m(col, s.angles);
+            closest = closest.min(gap);
+            rest = gap;
+            if s.speeds.iter().any(|v| v.abs() >= 0.005) || (s.angles[0] - last).abs() >= 1e-4 {
+                moved_at = Instant::now();
             }
+            last = s.angles[0];
         }
-        closest
+        assert!(
+            moved_at.elapsed() >= quiet,
+            "the arm never came to rest after the refusal"
+        );
+        (closest, rest)
     }
 
-    let scene = Scene {
-        start_deg,
-        mid_deg,
-        mid_m,
-        deg_per_m,
-    };
-    let started_at = 2.0 * KEEPOUT_M;
-    let streamed = approach(&rig, &mut c, &scene, 5.0, None);
+    let scene = Scene { mid_deg, deg_per_m };
+    let mut col = keepout_world(mid_m);
+    let (fast_closest, streamed) =
+        approach(&rig, &mut c, &scene, &mut col, 5.0, None, 2.0 * KEEPOUT_M);
     println!(
-        "closest approach: {:.1} mm from the box centre (started {:.1} mm out)",
+        "fast stream: rest {:.1} mm, closest {:.1} mm",
         streamed * 1e3,
-        started_at * 1e3
+        fast_closest * 1e3
     );
-    // Half the box's side: inside this the TCP is in the keep-out, which
-    // is the one thing the gate exists to prevent.
-    let inside = KEEPOUT_M / 2.0;
-    assert!(
-        streamed > inside,
-        "the stream coasted {:.1} mm INTO the keep-out ({:.1} mm from the \
-         centre of a {:.0} mm box): the gate admitted targets the arm \
-         could not stop short of",
-        (inside - streamed) * 1e3,
-        streamed * 1e3,
-        KEEPOUT_M * 1e3
+    // The same rig, crawling: slow enough that its stopping distance is
+    // nearly nothing, so where it is refused is where the geometry alone
+    // forbids the next step.
+    //
+    // On a rig of its own, because an approach ends with the arm held
+    // inside the gate's refusal and a teleport back out of that never
+    // takes — a second run in the same daemon cannot be positioned to
+    // start. The first rig has to go DOWN before the second comes up:
+    // `RT_SLOT` admits one daemon at a time, so two live rigs deadlock.
+    rig.shutdown();
+    let floor_rig = boot_tagged("servofloor");
+    let mut floor_c = Client::new(floor_rig.addr());
+    floor_rig.wait_status("link_ok", |s| s.link_ok == 1);
+    floor_c.ok(&Command::Reset);
+    floor_c.ok(&set_shapes(vec![keepout_at(
+        "keepout",
+        [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3],
+    )]));
+    let (crawl_closest, crawled) = approach(
+        &floor_rig,
+        &mut floor_c,
+        &scene,
+        &mut col,
+        1.0,
+        None,
+        2.0 * KEEPOUT_M,
     );
-    // And it must have actually approached: an arm refused before it
-    // moved would clear the bound above without testing anything.
-    assert!(
-        streamed < started_at - 0.02,
-        "the stream never approached the keep-out (closest {:.1} mm, \
-         started {:.1} mm out), so nothing about the coast was measured",
-        streamed * 1e3,
-        started_at * 1e3
+    floor_rig.shutdown();
+    println!(
+        "crawl: rest {:.1} mm, closest {:.1} mm",
+        crawled * 1e3,
+        crawl_closest * 1e3
     );
 
+    // THE REQUIREMENT: a motion driven into a keep-out lands on the
+    // clearance. Not "outside it somewhere" — on it. The clearance is
+    // the standoff the machine is configured to hold, so where the arm
+    // finishes is a property of the geometry, and approach speed must
+    // not change it.
+    //
+    // Both bounds bite. Below the clearance the arm has entered ground
+    // it was configured to keep out of. Above it the gate is imposing a
+    // standoff nobody asked for, and that surplus is workspace an arm
+    // cannot use next to its own fixtures.
+    let clearance = par6d::COLLISION_CLEARANCE_M;
+    let tol = 0.001;
+    // The keep-out itself, not just the resting place: whatever speed the
+    // stream built, the arm must never be inside the box on the way. The
+    // clearance is the budget for the coast, and it has to be a budget
+    // rather than an overdraft.
+    println!(
+        "closest approach: fast {:.1} mm, crawl {:.1} mm",
+        fast_closest * 1e3,
+        crawl_closest * 1e3
+    );
+    for (what, closest) in [("fast stream", fast_closest), ("crawl", crawl_closest)] {
+        assert!(
+            closest > 0.0,
+            "the {what} put the arm {:.1} mm INSIDE the keep-out on its way to rest",
+            -closest * 1e3
+        );
+    }
+    for (what, rest) in [("fast stream", streamed), ("crawl", crawled)] {
+        assert!(
+            (rest - clearance).abs() <= tol,
+            "the {what} came to rest {:.1} mm from the keep-out; it must \
+             land on the {:.1} mm clearance (within {:.1} mm). {}",
+            rest * 1e3,
+            clearance * 1e3,
+            tol * 1e3,
+            if rest < clearance {
+                "The gate stopped it too late and it entered the standoff."
+            } else {
+                "The gate stopped it early, costing usable workspace."
+            }
+        );
+    }
+}
+
+/// A servo target the client holds is a position the arm SETTLES on.
+///
+/// Every promise the streaming collision gate makes is a promise about
+/// where the arm ends up, and none of them can hold if a held setpoint
+/// is not a place the arm can rest. This is the floor under all of them,
+/// and it is asserted here rather than inside a gate test so a failure
+/// names the control loop instead of the keep-out.
+///
+/// The bound is the machine's own `[motion] settle_tolerance_rad` — what
+/// the config declares "arrived" means — read from the config the rig
+/// booted rather than restated here.
+///
+/// Measured against the shipped drive gains this does NOT hold: the
+/// joint limit-cycles at ~10 Hz with a 9 deg peak-to-peak swing that
+/// neither grows nor decays, at every tick rate, with the commanded
+/// position pinned exactly on the target. Bisecting the shipped gains on
+/// the sim rig puts the stability edge between `kpp` 2.5 (8.1 deg
+/// spread) and 2.0 (0.18 deg); at `kpp` 1.5 the same hold settles to
+/// 0.012 deg. Zeroing `kiv` also removes it, which names the mechanism:
+/// the drive's velocity-PI integral saturates against `ilim_ma` on the
+/// position error the plant carries while it lags a streamed ramp, and
+/// then bangs between current limits. EXEC playback is unaffected
+/// because its samples carry a torque feedforward, so the plant never
+/// falls far enough behind to wind the integrator up.
+#[test]
+fn a_held_servo_target_settles() {
+    let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("shipped config")
+        .motion
+        .settle_tolerance_rad;
+    let rig = boot_tagged("servosettle");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    rig.drain_status();
+
+    let target = with_j0(SWEEP_START_DEG, 20.0);
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut sent = Instant::now() - Duration::from_secs(1);
+    let mut trace: Vec<f64> = Vec::new();
+    while Instant::now() < end {
+        if sent.elapsed() >= Duration::from_millis(50) {
+            c.send(&Command::ServoJ(par6_proto::command::ServoJ {
+                angles: target,
+                speed: None,
+                accel: None,
+            }));
+            sent = Instant::now();
+        }
+        if let Some(s) = rig.recv_status() {
+            trace.push(s.angles[0]);
+        }
+    }
     rig.shutdown();
+
+    // The last second of a five-second hold: by then the arm has had
+    // four seconds to cover twenty degrees.
+    assert!(trace.len() > 40, "no status stream to judge");
+    let tail = &trace[trace.len() - 30..];
+    let lo = tail.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = tail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let tol_deg = tol_rad.to_degrees();
+    assert!(
+        hi - lo <= tol_deg,
+        "a held servo target left the joint swinging {:.3} deg peak to peak \
+         (settle tolerance {tol_deg:.3} deg): the arm is not resting on it",
+        hi - lo
+    );
+    assert!(
+        (tail[tail.len() - 1] - target[0]).abs() <= tol_deg,
+        "a held servo target left the joint {:.3} deg away from it \
+         (settle tolerance {tol_deg:.3} deg)",
+        tail[tail.len() - 1] - target[0]
+    );
 }
 
 /// The command plane stays answerable while the planner is working.

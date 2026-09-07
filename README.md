@@ -595,9 +595,8 @@ The Python side reads three of its own:
 
 ```bash
 scripts/ffi/setup.sh                                                       # once: the shim
-cargo fmt --all && cargo clippy --workspace --all-targets -- -D warnings   # CI gate
-cargo test --workspace
-cargo test -p par6-bus --test socketcan_vcan -- --test-threads=1           # needs vcan0
+cargo fmt --all && cargo clippy --all-targets -- -D warnings          # CI gate
+cargo test
 cargo build -p par6d --release
 pip install -e "python[dev]"                                               # builds par6._par6
 cd python && PAR6D_BIN=../target/release/par6d python3 -m pytest -q
