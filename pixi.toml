@@ -113,6 +113,15 @@ cwd = "python"
 depends-on = ["build-daemon"]
 
 # Release artifacts.
+#
+# The tag is auditwheel's, and it is NOT the control box's floor. The
+# closure's glibc requirement is 2.28, but conda-forge's Pinocchio needs
+# GLIBCXX_3.4.32 — libstdc++ from GCC 13 — and manylinux treats libstdc++ as
+# a system library, so auditwheel will not graft it in the way
+# `pack-bundle.sh` does for the daemon. A wheel therefore targets a host with
+# a modern toolchain; the control box installs the BUNDLE, which carries its
+# own libstdc++ and clears bookworm. Forcing a lower tag fails the build
+# rather than producing a wheel that would not import.
 [tasks.wheel]
 cmd = "maturin build --release -o ../dist"
 cwd = "python"

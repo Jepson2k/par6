@@ -88,6 +88,14 @@ par6d --check-config
 say "5. the wheel, in a bare venv"
 wheel="$(echo "$DIST"/par6-*.whl)"
 [ -f "$wheel" ] || die "no par6 wheel in $DIST"
+# The wheel carries a manylinux tag and pip resolves on it alone, so what it
+# says has to be recorded rather than assumed. It is deliberately NOT held to
+# the control box's floor: conda-forge's Pinocchio needs GLIBCXX_3.4.32 and
+# manylinux will not let auditwheel bundle libstdc++, so a wheel targets a
+# modern host and the box installs the bundle above, which ships its own.
+tag="$(basename "$wheel" | sed -n 's/.*-\(manylinux[^-]*\)\.whl/\1/p')"
+[ -n "$tag" ] || die "$(basename "$wheel") carries no manylinux tag"
+echo "wheel targets $tag (the control box installs the bundle, not this)"
 python3 -m venv "$WORK/venv"
 "$WORK/venv/bin/pip" -q install "$wheel"
 "$WORK/venv/bin/python" -c "import par6; print('wheel imports self-contained:', par6.__version__)"

@@ -83,15 +83,42 @@ neither.
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
+pip install https://github.com/Jepson2k/par6/releases/download/<tag>/par6-<version>-cp310-abi3-manylinux_2_39_aarch64.whl
+```
+
+The release wheel is self-contained: `par6/_par6.abi3.so` plus the whole
+C++ closure — the shim, toppra, Pinocchio, coal, urdfdom and libmujoco —
+grafted into `par6.libs/` by maturin's repair step, with rpaths rewritten to
+`$ORIGIN`. No Rust toolchain, no conda environment, no `LD_LIBRARY_PATH`;
+`validate-bundle.sh` proves it imports under `env -i` in a bare venv. Its
+one non-wheel dependency is `waldoctl`, pinned to a git tag, so the install
+needs `git` and network but never a compiler.
+
+Three things it is not.
+
+It is **not on PyPI** — the release workflow attaches artifacts to a GitHub
+release and publishes nothing, so the URL above is the install, not
+`pip install par6`.
+
+It is **not installable on the control box**. The manylinux tag is not the
+glibc floor `manifest.json` records: the closure needs glibc 2.28, but
+conda-forge's Pinocchio needs `GLIBCXX_3.4.32` — libstdc++ from GCC 13 —
+and manylinux treats libstdc++ as a system library, so auditwheel will not
+graft it into the wheel the way `pack-bundle.sh` does for the daemon.
+Raspberry Pi OS bookworm ships GCC 12 (`GLIBCXX_3.4.30`). A wheel therefore
+targets a host with a modern toolchain; **the box installs the bundle**,
+which carries its own `libstdc++.so.6`.
+
+And it does **not** contain `par6d`:
+
+```bash
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
-The package is a maturin build: pip compiles the `par6-py` extension (the engine's
-client + preview), so a source install needs the Rust toolchain and the shim from
-the C++ closure pixi provides — so it is built from a checkout under `pixi run`,
-or installed from one of the release wheels, which need neither.
-That gives you the client, the offline preview and the kinematics — but **not** the
-`par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
+A git URL never consumes a wheel, so that form compiles the extension from
+source and needs the toolchain and the C++ closure — build it from a checkout
+under `pixi run`. Either way you get the client, the offline preview and the
+kinematics — but **not** the `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
 a runtime is already listening — which is the normal case on the control box, where
 Waldo Commander, this client and `par6d` all run on the same machine and the runtime
