@@ -30,6 +30,7 @@
 //! preview (which drives its own planner synchronously, and should)
 //! exactly as they were.
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::Duration;
@@ -316,12 +317,15 @@ pub fn planner_plane<P: Planner + 'static>(
 
 /// The planner thread.
 ///
-/// Order is load-bearing. Cheap requests drain FIRST so a `Cancel` is
-/// applied before the next [`Planner::poll`] feeds the sample ring for
-/// a command the server has already dropped. `poll` runs every pass
-/// because it is what pumps that ring and feeds the EXEC heartbeat.
-/// Only then does one expensive request run, so a queue of plans cannot
-/// starve either.
+/// Order is load-bearing, and it is the ARRIVAL order. Requests are
+/// serviced as they were sent, then [`Planner::poll`] runs — so a
+/// `Cancel` still lands before the ring is next fed for a command the
+/// server has dropped, and a `Cancel` that followed a `Start` now
+/// cancels THAT start instead of the previous motion. `poll` runs every
+/// pass because it is what pumps that ring and feeds the EXEC
+/// heartbeat. At most one expensive request per pass, so a queue of
+/// plans cannot starve the cheap ones; anything that does not fit waits
+/// its turn, in order, in `deferred`.
 fn planner_loop<P: Planner>(
     mut p: P,
     requests: mpsc::Receiver<PlanRequest>,
@@ -340,38 +344,42 @@ fn planner_loop<P: Planner>(
     // re-pricing it every pass would be the re-planning the trait's own
     // contract forbids.
     let mut queued_duration = 0.0f64;
-    let mut deferred: Option<PlanRequest> = None;
+    // Requests drained but not yet serviced, in the order they arrived.
+    let mut deferred: VecDeque<PlanRequest> = VecDeque::new();
 
     while !shutdown.load(Ordering::SeqCst) {
-        // 1. every cheap request, plus the first expensive one held back.
-        let mut expensive = deferred.take();
+        // 1. Drain into one ORDERED batch: at most one expensive request,
+        //    and nothing that arrived behind whatever we could not take.
+        //
+        //    Order is the whole point. Servicing cheap requests as they
+        //    are drained while an expensive one waits reorders the
+        //    operator's own commands — and the pair that matters is
+        //    `[Start, Cancel]`. `Start` is expensive and was held; `Cancel`
+        //    is cheap and ran immediately, so it cancelled whatever the
+        //    PREVIOUS pass had running, and then the held `Start` was
+        //    planned and rung. The cancel was consumed and the motion it
+        //    was meant to stop went anyway.
+        let mut batch: VecDeque<PlanRequest> = std::mem::take(&mut deferred);
+        let mut have_expensive = batch.iter().any(PlanRequest::is_expensive);
         loop {
             match requests.try_recv() {
-                Ok(req) if req.is_expensive() => {
-                    if expensive.is_none() {
-                        expensive = Some(req);
-                    } else {
-                        // One per pass; the rest wait their turn in the
-                        // channel, which preserves their order.
-                        deferred = Some(req);
-                        break;
-                    }
+                // Once anything is deferred, everything after it defers
+                // too: taking a later request first is the reordering
+                // this loop exists to avoid.
+                Ok(req) if !deferred.is_empty() => deferred.push_back(req),
+                Ok(req) if req.is_expensive() && have_expensive => {
+                    deferred.push_back(req);
                 }
-                Ok(req) => apply_cheap(&mut p, req, &emit),
+                Ok(req) => {
+                    have_expensive |= req.is_expensive();
+                    batch.push_back(req);
+                }
                 Err(_) => break,
             }
         }
 
-        // 2. the ring pump and the heartbeat, every pass.
-        if let Some(out) = p.poll() {
-            emit(PlanEvent::Outcome(out));
-        }
-        if let Some(out) = p.poll_tool() {
-            emit(PlanEvent::ToolOutcome(out));
-        }
-
-        // 3. at most one piece of unbounded work.
-        if let Some(req) = expensive {
+        // 2. Service the batch in arrival order.
+        for req in batch {
             match req {
                 // The server never offers an empty batch; if one ever
                 // arrives there is nothing to attribute an answer to, so
@@ -400,6 +408,17 @@ fn planner_loop<P: Planner>(
                 }
                 other => apply_cheap(&mut p, other, &emit),
             }
+        }
+
+        // 3. The ring pump and the heartbeat, after the batch rather than
+        //    before it: an outcome the batch just produced is then
+        //    reported in this pass instead of the next, which closes a
+        //    bounded one-period hole between non-blended queued moves.
+        if let Some(out) = p.poll() {
+            emit(PlanEvent::Outcome(out));
+        }
+        if let Some(out) = p.poll_tool() {
+            emit(PlanEvent::ToolOutcome(out));
         }
 
         // 4. publish what the command plane reads.
