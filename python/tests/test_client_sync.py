@@ -183,7 +183,7 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
         assert events[1].parent_id == events[0].invocation_id
 
     async def cancel_motion() -> None:
-        from par6.protocol.constants import ErrorCode
+        from par6.protocol import ErrorCode
 
         async with daemon.client() as client:
             moving = asyncio.Event()
