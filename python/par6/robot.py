@@ -19,7 +19,6 @@ import subprocess
 import threading
 import time
 from dataclasses import dataclass
-from importlib import resources
 from typing import Any, Literal
 
 import numpy as np
@@ -75,54 +74,20 @@ def _ping_runtime(host: str, port: int, timeout: float = 0.5) -> bool:
     return ping_blocking(host, port, timeout)
 
 
-def packaged_par6d() -> str | None:
-    """The ``par6d`` a release wheel ships, if this install has one.
-
-    Wheels built by `pixi run wheel` carry the runtime beside the extension
-    (`scripts/deploy/pack-wheel.py`), so `pip install par6` is enough to run
-    a simulator. A source install has no such file, and a checkout is
-    expected to use its own build.
-    """
-    try:
-        binary = resources.files("par6") / "_bin" / "par6d"
-        with resources.as_file(binary) as path:
-            return str(path) if path.is_file() else None
-    except (ModuleNotFoundError, FileNotFoundError):
-        return None
-
-
-def _packaged_data_args(binary: str) -> list[str]:
-    """Point a WHEEL-shipped ``par6d`` at the config and assets that came
-    with it, and nowhere else.
-
-    A daemon on `PATH` or named by `PAR6D_BIN` is the machine's own — on the
-    control box that is the systemd service reading `/etc/par6`, which a
-    client must not redirect. Only the copy inside this package is told to
-    use this package's data.
-
-    The package dir is needed because the packaged URDFs name their meshes
-    by `package://par6/_data/...` rather than relative to the tree, so the
-    runtime has to be told what `package://par6` means.
-    """
-    if binary != packaged_par6d():
-        return []
-    data = _cfg.data_root()
-    return [
-        "--config", str(data / "config" / "PAR6.toml"),
-        "--assets", str(data),
-        "--package-dir", str(_cfg.package_search_dir()),
-    ]
-
-
 def _find_par6d() -> str:
-    """Resolve the par6d binary: ``PAR6D_BIN``, then PATH, then the one this
-    wheel shipped."""
+    """Resolve the par6d binary: ``PAR6D_BIN``, then PATH.
+
+    A wheel install puts its own runtime on PATH as the `par6d` console
+    script (:mod:`par6._daemon`), so nothing here needs to know about
+    packaged binaries: a system runtime and a shipped one are found the same
+    way, and `PAR6D_BIN` still overrides both.
+    """
     env_bin = os.environ.get("PAR6D_BIN")
     if env_bin:
         if not os.path.isfile(env_bin):
             raise RuntimeError(f"PAR6D_BIN={env_bin!r} does not exist")
         return env_bin
-    found = shutil.which("par6d") or packaged_par6d()
+    found = shutil.which("par6d")
     if found is None:
         raise RuntimeError(
             "par6d binary not found; set PAR6D_BIN or put it on PATH "
@@ -198,7 +163,6 @@ class _Par6dManager:
                     # program that spawned it keeps the port and the bus.
                     "--parent-pid",
                     str(os.getpid()),
-                    *_packaged_data_args(binary),
                 ],
                 stdin=subprocess.DEVNULL,
                 stdout=subprocess.PIPE,

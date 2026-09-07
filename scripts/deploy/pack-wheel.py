@@ -31,8 +31,8 @@ import sys
 import zipfile
 from pathlib import Path
 
-#: Where the binary lands inside the wheel, and what `par6.runtime_binary()`
-#: looks for.
+#: Where the binary lands inside the wheel, and what
+#: `par6._daemon.packaged_binary()` looks for.
 BIN_IN_WHEEL = "par6/_bin/par6d"
 LIBS_DIR = "par6.libs"
 
