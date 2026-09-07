@@ -42,7 +42,7 @@ from rustup via `rust-toolchain.toml`.
 ```bash
 pixi run setup                    # solves the closure and builds the shim
 pixi run cargo build -p par6d --release
-pixi run -e py312 install-python
+pixi run install-python
 ```
 
 There is no bootstrap step to remember and nothing to source. The shim and
@@ -59,15 +59,15 @@ running the command in its `run:` line:
 |---|---|
 | `pixi run setup` | build the workspace and its C++ dependencies |
 | `pixi run lint` | `cargo fmt --check` and `clippy -D warnings` |
-| `pixi run test-rust` | `cargo test --workspace` |
+| `pixi run test-rust` | `cargo test` |
 | `pixi run test-timing` | the shipped 250 Hz soak, release |
 | `pixi run test-collision-cost` | the per-waypoint collision cost, uncaptured |
-| `pixi run -e py312 install-python` | `pip install -e python[dev]` |
-| `pixi run -e py312 lint-python` | pre-commit (ruff, ruff-format, ty, hygiene) |
-| `pixi run -e py312 test-python` | `pytest` |
-| `pixi run -e py312 test-e2e` | the client against a real `par6d --sim` |
-| `pixi run -e py312 wheel` | the `par6` wheel into `dist/` |
-| `pixi run -e py312 bundle` | the daemon bundle, checksums and manifest |
+| `pixi run install-python` | `pip install -e python[dev]` |
+| `pixi run lint-python` | pre-commit (ruff, ruff-format, ty, hygiene) |
+| `pixi run test-python` | `pytest` |
+| `pixi run test-e2e` | the client against a real `par6d --sim` |
+| `pixi run wheel` | the `par6` wheel into `dist/` |
+| `pixi run bundle` | the daemon bundle, checksums and manifest |
 
 Compile parallelism is picked from available RAM: one shim compile job peaks
 near 4 GB, and a small box that overcommits that livelocks in reclaim rather
@@ -626,9 +626,9 @@ The Python side reads three of its own:
 pixi run lint                      # the CI gate: fmt + clippy -D warnings
 pixi run test-rust
 pixi run build-daemon
-pixi run -e py312 install-python   # builds par6._par6
-pixi run -e py312 test-python
-pixi run -e py312 test-e2e         # the client against a real par6d --sim
+pixi run install-python   # builds par6._par6
+pixi run test-python
+pixi run test-e2e         # the client against a real par6d --sim
 ```
 
 CI is these tasks and nothing else, on aarch64 first: the arm runs on a
@@ -661,7 +661,7 @@ The normal path is to build **on the box** ([Installation](#installation): the s
 `par6d` and the Python package build there in minutes) and install locally:
 
 ```bash
-pixi run -e py312 bundle           # -> dist/par6d-aarch64.tar.gz + SHA256SUMS + manifest.json
+pixi run bundle           # -> dist/par6d-aarch64.tar.gz + SHA256SUMS + manifest.json
 sudo tar -C /tmp -xzf dist/par6d-aarch64.tar.gz
 sudo /tmp/bundle/install.sh --local --bundle /tmp/bundle
 ```

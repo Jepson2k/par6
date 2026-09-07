@@ -12,9 +12,9 @@ pixi run setup                     # once: solves the C++ deps and builds the sh
 pixi run lint                      # fmt + clippy, must be clean
 pixi run test-rust                 # rust tests
 pixi run cargo run -p par6d -- --sim        # simulated runtime, no hardware
-pixi run -e py312 install-python   # python package (maturin: compiles par6-py)
-pixi run -e py312 test-python      # python tests (JUnit XML at python/test-results.xml)
-pixi run -e py312 test-e2e         # the client against a real par6d --sim
+pixi run install-python            # python package (maturin: compiles par6-py)
+pixi run test-python               # python tests (JUnit XML at python/test-results.xml)
+pixi run test-e2e                  # the client against a real par6d --sim
 ```
 
 pixi provides the C++ closure (Pinocchio, coal, eigen, urdfdom, libmujoco,

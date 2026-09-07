@@ -53,7 +53,7 @@ MUJOCO_DYNAMIC_LINK_DIR = "$CONDA_PREFIX/lib"
 # and cargo owns their freshness. `setup` exists to do that once, up front,
 # so a job that only packages does not discover it mid-step.
 [tasks.setup]
-cmd = "cargo build --workspace --all-targets"
+cmd = "cargo build --all-targets"
 
 [tasks.fmt]
 cmd = "cargo fmt --all --check"
@@ -64,12 +64,13 @@ cmd = "cargo clippy --all-targets -- -D warnings"
 [tasks.lint]
 depends-on = ["fmt", "clippy"]
 
-# One command, every crate, nothing excluded. par6d's integration tests each
-# boot a real daemon on a real-time tick; two on one machine miss deadlines,
-# which the harness holds off with a process-wide slot rather than a separate
-# invocation.
+# One command, every crate, nothing excluded — a workspace root already
+# means every member, so there is nothing to spell out and nothing to
+# exclude. par6d's integration tests each boot a real daemon on a real-time
+# tick; two on one machine miss deadlines, which the harness holds off with a
+# process-wide slot rather than a separate invocation.
 [tasks.test-rust]
-cmd = "cargo test --workspace"
+cmd = "cargo test"
 
 # The collision golden suite runs in `test-rust` too; this reruns its timing
 # case optimized and uncaptured so the per-waypoint cost the planner budgets
@@ -156,7 +157,11 @@ pinocchio-python = "4.1.*"
 open3d = "*"
 trimesh = "*"
 
+# The default environment carries a Python, so `pixi run test-rust` and
+# `pixi run test-python` are one environment and one compiled shim — CI runs
+# the same commands in the same environment a developer does. `py311` swaps
+# the interpreter for the older-version leg; `tools` is asset generation.
 [environments]
+default = ["py312"]
 py311 = ["py311"]
-py312 = ["py312"]
 tools = ["tools"]

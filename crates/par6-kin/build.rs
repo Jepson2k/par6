@@ -38,6 +38,12 @@ fn main() {
     // cross-environment mistake a shared build tree used to make — just
     // relocated into OUT_DIR.
     println!("cargo:rerun-if-env-changed=CONDA_PREFIX");
+    // The prefix's PATH is not the whole of what the shim links: its
+    // CONTENTS are pinned by the lock, so a re-solve that moves Pinocchio
+    // has to rebuild the shim even though CONDA_PREFIX never changed.
+    if let Some(lock) = repo_file("pixi.lock") {
+        println!("cargo:rerun-if-changed={}", lock.display());
+    }
 
     let lib_dir = build_shim();
 
@@ -111,6 +117,15 @@ fn build_shim() -> PathBuf {
         }
     }
     lib
+}
+
+/// A path in the repository root, when this is a checkout rather than a
+/// package unpacked somewhere on its own.
+fn repo_file(name: &str) -> Option<PathBuf> {
+    let p = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(name);
+    std::fs::canonicalize(p).ok()
 }
 
 /// The pinned toppra checkout, fetched into `OUT_DIR` unless one was handed

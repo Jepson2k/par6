@@ -1538,10 +1538,28 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
     );
     // A pure translation in the tool frame: the orientation block is
     // untouched, so only the point the runtime resolves at has changed.
+    //
+    // The bound is the arm's OWN motion between the two broadcasts, not a
+    // constant. These are two STATUS frames from a live plant holding a
+    // target, and a rotation-matrix element drifts with the joints under
+    // it — the check right above admits 0.1 deg of exactly that, so a
+    // fixed 1e-6 here asserted something its sibling already allowed to be
+    // false, and did until the plant became a contact simulation. A tool
+    // rotation is orders of magnitude past this; drift cannot be.
+    let arm_moved_rad: f64 = offset
+        .angles
+        .iter()
+        .zip(flange.angles.iter())
+        .map(|(a, b)| (a - b).abs().to_radians())
+        .sum();
+    let tol = arm_moved_rad + 1e-6;
     for k in [0, 1, 2, 4, 5, 6, 8, 9, 10] {
+        let drift = (offset.pose[k] - flange.pose[k]).abs();
         assert!(
-            (offset.pose[k] - flange.pose[k]).abs() < 1e-6,
-            "the offset rotated the reported pose at element {k}"
+            drift < tol,
+            "the offset rotated the reported pose at element {k}: {drift:.3e}, \
+             past the {tol:.3e} the arm's own {:.4} deg of motion allows",
+            arm_moved_rad.to_degrees()
         );
     }
     let readback = tcp_offset_readback(&mut c);

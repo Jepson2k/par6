@@ -31,10 +31,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pixi
         with:
-          environments: py312
-          cache-key: py312
-      - run: pixi run -e py312 wheel
-      - run: pixi run -e py312 bundle
+          cache-key: default
+      - run: pixi run wheel
+      - run: pixi run bundle
       - uses: actions/upload-artifact@v4
         with:
           name: par6-aarch64
@@ -54,9 +53,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pixi
         with:
-          environments: py312
-          cache-key: py312
-      - run: pixi run -e py312 wheel
+          cache-key: default
+      - run: pixi run wheel
       - name: checksums
         run: cd dist && sha256sum ./*.whl > SHA256SUMS-x86_64
       - uses: actions/upload-artifact@v4
@@ -74,9 +72,8 @@ jobs:
       - uses: actions/checkout@v4
       - uses: ./.github/actions/pixi
         with:
-          environments: py312
-          cache-key: py312
-      - run: pixi run -e py312 sdist
+          cache-key: default
+      - run: pixi run sdist
       - uses: actions/upload-artifact@v4
         with:
           name: sdist
