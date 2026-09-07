@@ -158,6 +158,10 @@ class AsyncRobotClient(_RobotClientABC):
     group 239.255.0.71).
     """
 
+    @property
+    def skill_capabilities(self) -> frozenset[str]:
+        return super().skill_capabilities | {"backend.par6"}
+
     def __init__(
         self,
         host: str | None = None,

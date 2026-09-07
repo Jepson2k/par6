@@ -136,6 +136,16 @@ class RobotClient:
             rbt.home(wait=True)
     """
 
+    def run_skill(
+        self, invoke: Callable[[AsyncRobotClient], Coroutine[Any, Any, T]]
+    ) -> T:
+        """Run a skill on this facade's loop with the connected async client."""
+        return _run(invoke(self._inner))
+
+    @property
+    def skill_capabilities(self) -> frozenset[str]:
+        return self._inner.skill_capabilities
+
     def __init__(
         self,
         host: str | None = None,

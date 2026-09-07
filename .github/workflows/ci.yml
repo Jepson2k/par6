@@ -41,9 +41,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: fmt
@@ -103,9 +105,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: install cross linker
@@ -150,9 +154,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: check
@@ -197,9 +203,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run setup
       - name: create vcan0
@@ -254,9 +262,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e ${{ matrix.env }} setup
       # waldoctl branch-matching must happen BEFORE the package install:
@@ -318,9 +328,11 @@ jobs:
           # shim, libmujoco, the toppra checkout — are all installed prefixes
           # and carry no such paths.
           path: |
-            .ffi
-            !.ffi/build
-          key: ffi-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
+            .ffi/shim
+            .ffi/toppra
+            .ffi/src
+            .ffi/mujoco
+          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
       - name: build shim (pixi run setup)
         run: pixi run -e py312 setup
       # Release, not debug: the sim runs in wall-clock time and an
