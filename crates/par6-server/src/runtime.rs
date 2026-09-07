@@ -316,6 +316,14 @@ pub trait RtCommands: Send {
     /// Stop the active streaming session (hold in place). Idempotent.
     fn cancel_stream(&mut self);
 
+    /// Stop continuation of a stream whose update was refused. Return true
+    /// while the runtime owns a bounded stopping sequence, so a later stop
+    /// or preemption can still cancel that sequence.
+    fn stop_refused_stream(&mut self) -> bool {
+        self.cancel_stream();
+        false
+    }
+
     /// Halt all motion now (stop/estop scope). Idempotent.
     fn halt(&mut self);
 

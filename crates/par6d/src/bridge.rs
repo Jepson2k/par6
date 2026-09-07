@@ -1420,6 +1420,19 @@ impl RtCommands for RtBridge {
         self.stop_stream_commands();
     }
 
+    fn stop_refused_stream(&mut self) -> bool {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.stream.as_ref().is_some_and(|a| a.standoff.is_some()) {
+            // The collision gate owns braking and placement. Cancelling it
+            // on a late datagram would abandon the configured standoff.
+            return true;
+        }
+        shared.stream = None;
+        drop(shared);
+        self.stop_stream_commands();
+        false
+    }
+
     fn discard_exec(&mut self) {
         // Marked before it is queued, for the reason `halt` gives: the
         // mark is pinned to what is in the ring now, so a move accepted
