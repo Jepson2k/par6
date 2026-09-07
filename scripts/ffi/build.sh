@@ -16,6 +16,16 @@ FFI="$ROOT/.ffi"
 TOPPRA_PREFIX="$FFI/toppra"
 SHIM_PREFIX="$FFI/shim"
 
+# A Pinocchio/coal compilation peaks near 4 GB; cap Ninja before a small
+# host runs out of RAM. An explicit caller limit takes precedence.
+if [[ -z "${CMAKE_BUILD_PARALLEL_LEVEL:-}" ]]; then
+  mem_jobs=$(awk -v g="${PAR6_JOB_MEM_GB:-4}" '/MemAvailable/ { print int($2 / (g * 1024 * 1024)) }' /proc/meminfo 2>/dev/null || true)
+  cpu_jobs="$(nproc)"
+  jobs=$(( ${mem_jobs:-$cpu_jobs} < cpu_jobs ? ${mem_jobs:-$cpu_jobs} : cpu_jobs ))
+  (( jobs >= 1 )) || jobs=1
+  export CMAKE_BUILD_PARALLEL_LEVEL="$jobs"
+fi
+
 build_toppra() {
   if [[ -e "$TOPPRA_PREFIX/lib/libtoppra.so" ]]; then
     echo ">>> toppra built: $TOPPRA_PREFIX (rm -rf it to rebuild)"

@@ -37,35 +37,32 @@ below works on a laptop and in CI.
 par6 links a Pinocchio C-ABI shim, so that gets built once before anything else.
 
 ```bash
-scripts/ffi/setup.sh             # once — builds the shim into .ffi/
-cargo build -p par6d --release
-pip install -e "python[dev]"
+pixi run setup                  # builds the shim and fetches matching MuJoCo
+pixi run cargo build -p par6d --release
+pixi run -e py312 pip install -e "python[dev]"
 ```
 
-A checkout that has run `setup.sh` needs no environment for either step: the build
-scripts find the shim in `.ffi/shim` and libmujoco in `.ffi/env`, and `par6d` and the
-Python extension carry the directories they load from as rpaths, so both run from any
-shell. `source .ffi/env.sh` is still the way to point at libraries installed elsewhere
-(`PAR6_SHIM_LIB_DIR`, `PAR6_MUJOCO_LIB_DIR`), to cross-build, and to run
-`cargo test --workspace`, whose test binaries outside par6-bus and par6d reach
-libmujoco only through its `LD_LIBRARY_PATH`.
+A checkout uses the shim in `.ffi/shim` and the matching library downloaded by
+`mujoco-rs` into `.ffi/mujoco`. The daemon and Python extension embed these
+directories as rpaths. Run tests through pixi: other crates' test binaries also
+need the library paths from its activation. External installs can supply
+`PAR6_SHIM_LIB_DIR` and `MUJOCO_DYNAMIC_LINK_DIR`. The cross-build bootstrap
+remains `scripts/ffi/setup.sh --target aarch64` and `.ffi/env-aarch64.sh`.
 
-`setup.sh` picks its compile parallelism from available RAM (one shim compile job
-peaks near 4 GB; a swapless small box overcommitting that livelocks rather than
-failing). Set `CMAKE_BUILD_PARALLEL_LEVEL` to override it; `.ffi/env.sh` exports the
-same figure as `CARGO_BUILD_JOBS`.
+Shim builds cap compile parallelism by available RAM (about 4 GB per job).
+Set `CMAKE_BUILD_PARALLEL_LEVEL` to override the cap.
 
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
 export PAR6_SHIM_LIB_DIR=/path/to/.ffi/shim/lib     # a git install has no checkout to find these in
-export PAR6_MUJOCO_LIB_DIR=/path/to/.ffi/env/lib
+export MUJOCO_DYNAMIC_LINK_DIR=/path/to/.ffi/mujoco/mujoco-3.12.0/lib
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
 The package is a maturin build: pip compiles the `par6-py` extension (the engine's
 client + preview), so a source install needs the Rust toolchain and the shim from
-`scripts/ffi/setup.sh`. Prebuilt wheels that need neither are the wheel CI's job.
+`pixi run setup`. Prebuilt wheels that need neither are the wheel CI's job.
 That gives you the client, the offline preview and the kinematics — but **not** the
 `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
@@ -613,12 +610,13 @@ The Python side reads three of its own:
 ## Development setup
 
 ```bash
-scripts/ffi/setup.sh                                                       # once: the shim
-cargo fmt --all && cargo clippy --all-targets -- -D warnings          # CI gate
-cargo test
-cargo build -p par6d --release
-pip install -e "python[dev]"                                               # builds par6._par6
-cd python && PAR6D_BIN=../target/release/par6d python3 -m pytest -q
+pixi run setup
+cargo fmt --all
+pixi run cargo clippy --workspace --all-targets -- -D warnings
+pixi run cargo test --workspace
+pixi run cargo build -p par6d --release
+pixi run -e py312 pip install -e "python[dev]"
+cd python && PAR6D_BIN=../target/release/par6d pixi run -e py312 python -m pytest -q
 ```
 
 The Rust tests are the whole test surface for the numerics: the kinematics contract
