@@ -10,20 +10,15 @@ rust-version.workspace = true
 # publish its directory to dependents (`DEP_MUJOCO_RPATH`).
 links = "mujoco"
 
-[features]
-# Both alternative sim plants ship on: the shim and libmujoco are hard
-# prerequisites (`scripts/ffi/setup.sh`), so a plain `cargo test` covers
-# the torque-level and contact plants rather than silently skipping them.
-default = ["sim-dynamics", "sim-mujoco"]
-# Torque-level sim plant (Pinocchio ABA forward dynamics).
-sim-dynamics = ["dep:par6-kin"]
-# MuJoCo-backed sim plant (contacts, grasp scenarios); links libmujoco from
-# the same `.ffi` prefix as the shim (PAR6_MUJOCO_LIB_DIR).
-sim-mujoco = []
-
 [dependencies]
 par6-config = { workspace = true }
-par6-kin = { workspace = true, optional = true }
+par6-proto = { workspace = true }
+# URDF inertials for the MuJoCo scene (sim/scene.rs).
+roxmltree = "0.21"
+# The sim plant. Bindings only: mujoco-rs links the libmujoco that
+# $MUJOCO_DYNAMIC_LINK_DIR names — pixi's prefix — and emits its own link
+# flags; this crate's build script only republishes the directory as an rpath.
+mujoco-rs = { workspace = true }
 socketcan = { workspace = true }
 thiserror = { workspace = true }
 log = { workspace = true }

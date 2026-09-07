@@ -1584,8 +1584,7 @@ impl<R: RtCommands> Core<R> {
         // server's, so the head comes out of it directly.
         let mut dropped = Vec::new();
         if let Some(index) = self.planning.take() {
-            if self.pending.front().is_some_and(|p| p.index == index) {
-                let p = self.pending.pop_front().expect("checked above");
+            if let Some(p) = self.pending.pop_front_if(|p| p.index == index) {
                 dropped.push((p.index, p.addr));
             }
         }

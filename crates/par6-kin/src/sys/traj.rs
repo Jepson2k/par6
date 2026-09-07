@@ -85,6 +85,7 @@ impl Trajectory {
     /// `max_path_speed` caps `ds/dt`. Against arc-length knots that is a
     /// ceiling on the speed the tool crosses the path at, which is what
     /// holds a process move to one speed instead of letting it run away
+    #[allow(clippy::too_many_arguments)]
     /// wherever the joints happen to have room.
     // Arity is the C entry point's, not a choice: bundling these into a
     // params struct would put a shape between the caller and the ABI that

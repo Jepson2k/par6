@@ -15,13 +15,14 @@ show how far a line gets, and the caller reads that off the result's
 from __future__ import annotations
 
 import copy
+import hashlib
 import logging
 from collections.abc import Callable, Coroutine, Iterator
 from typing import Any
 
 import numpy as np
 from waldoctl.results import DryRunResultData
-from waldoctl.shapes import Shape, ShapeWorld
+from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
     ActionState,
     ActivityResult,
@@ -32,6 +33,7 @@ from waldoctl.status import (
     ToolResult,
 )
 from waldoctl.sync_tools import make_sync_tool
+from waldoctl.ticks import ObjectTicks, TickBlock, TickIndex
 from waldoctl.tools import ToolState as WToolState
 from waldoctl.tools import ToolStatus
 
@@ -122,6 +124,12 @@ class DryRunRobotClient:
             bool(initial_gripper_calibrated),
         )
         self._engine: Preview | None = None
+        # Every command this session submitted, in order, and the pose it
+        # started from: what `simulate` replays through the engine. The
+        # planning pass answers each command as it arrives and keeps no
+        # program; a run needs the whole thing at once.
+        self._program: list[dict[str, Any]] = []
+        self._start_joints_rad: list[float] = []
         # Motion a state-only command closed out of the blend hold: nobody
         # asked for it at the time, so it rides at the head of the next
         # result rather than being dropped.
@@ -159,6 +167,7 @@ class DryRunRobotClient:
                 )
             engine.set_homed(homed)
             engine.set_gripper_calibrated(calibrated)
+            self._start_joints_rad = list(engine.angles_rad())
             self._engine = engine
         return self._engine
 
@@ -214,8 +223,29 @@ class DryRunRobotClient:
         return self._preview.tcp_offset_mm()
 
     def shapes(self) -> ShapeWorld:
-        """The preview's collision world (what this run has submitted)."""
-        return ShapeWorld(installation=(), program=self._shapes)
+        """The preview's collision world, read back from the engine.
+
+        The installation layer is config and is applied when the engine
+        boots — the preview refuses against it, so a readback that
+        reported an empty one would disagree with the refusals.
+        """
+
+        def _shape(w: dict) -> Shape:
+            return shape_from_wire(
+                w["kind"],
+                w["params"],
+                w["pose"],
+                w["collision"],
+                w["margin"],
+                w["name"],
+                w.get("physics"),
+            )
+
+        world = self._preview.shapes()
+        return ShapeWorld(
+            installation=tuple(_shape(w) for w in world["installation"]),
+            program=tuple(_shape(w) for w in world["program"]),
+        )
 
     def profile(self) -> str:
         return self._preview.profile()
@@ -238,7 +268,9 @@ class DryRunRobotClient:
     def _submit(self, cmd: dict[str, Any]) -> DryRunResultData | None:
         """Submit one wire command; ``None`` while it waits in the blend
         hold, else its result.  Raises the runtime's refusal."""
-        return self._result(self._preview.submit(cmd))
+        preview = self._preview  # builds the engine, so the start pose is set
+        self._program.append(cmd)
+        return self._result(preview.submit(cmd))
 
     def _result(self, r: dict[str, Any] | None) -> DryRunResultData | None:
         if r is None:
@@ -293,6 +325,51 @@ class DryRunRobotClient:
         if released is not None:
             owed.append(released)
         return [_merge(owed)] if owed else []
+
+    # ------------------------------------------------------------------
+    # The second pass: what the arm would actually do
+    # ------------------------------------------------------------------
+
+    @property
+    def program_length(self) -> int:
+        """How many commands have been recorded so far.
+
+        A host mapping a simulated row back to a source line reads this
+        after each call it makes and attributes whatever appeared to the
+        line it was on; this client cannot know the line itself.
+        """
+        return len(self._program)
+
+    def simulate(self, max_seconds: float | None = None) -> TickIndex:
+        """Run everything submitted so far through the engine and return
+        the tick record of what the arm did.
+
+        The planning pass answers "where is it told to go", fast enough to
+        run behind a keystroke.  This answers "where does it end up", by
+        queueing the same commands to the same planner driving the same
+        control loop against a simulated plant: servo lag, gravity sag,
+        contact, and a grasp that holds or does not hold.  The gap between
+        the two joint columns it returns is the thing worth looking at.
+
+        Costs roughly a sixtieth of the program's own duration, so it
+        belongs behind a longer idle than the planning pass, not on the
+        typing path.  ``max_seconds`` bounds SIMULATED time, so a program
+        that never terminates still comes back.
+
+        The world is the one applied NOW: a program that edits the
+        collision world part-way through is replayed against its final
+        state, not the state it had at each command.
+        """
+        preview = self._preview
+        here = list(preview.angles_rad())
+        preview.teleport_rad(self._start_joints_rad)
+        try:
+            raw = self._call(preview.run_program, self._program, max_seconds)
+            return _tick_index(raw)
+        finally:
+            # The planning session goes on from where it was; a run is a
+            # question about the program, not a move.
+            preview.teleport_rad(here)
 
     # ------------------------------------------------------------------
     # Motion
@@ -992,6 +1069,80 @@ class DryRunRobotClient:
 
     def close(self) -> None:
         return None
+
+
+def _tick_index(raw: dict) -> TickIndex:
+    """The engine's column buffers as the shared record type.
+
+    ``frombuffer`` is a view, not a copy: the engine wrote native-order
+    bytes precisely so a minute of program does not become a million
+    Python floats on the way here.
+    """
+    rows, joints = raw["rows"], raw["joints"]
+
+    def f32(key: str) -> np.ndarray:
+        return np.frombuffer(raw[key], dtype=np.float32)
+
+    return TickIndex(
+        row_dt_s=float(raw["row_dt_s"]),
+        joints_rad=f32("q_rad").reshape(rows, joints),
+        commanded_rad=f32("q_commanded_rad").reshape(rows, joints),
+        tcp=f32("tcp").reshape(rows, 6),
+        tool_closed=f32("tool_closed"),
+        tool_gripping=np.frombuffer(raw["tool_gripping"], dtype=np.bool_),
+        blocks=tuple(
+            TickBlock(
+                command=b["command"],
+                start_row=b["start_row"],
+                rows=b["rows"],
+                error=RobotError.from_wire(b["error"]) if b["error"] else None,
+            )
+            for b in raw["commands"]
+        ),
+        objects=tuple(
+            ObjectTicks(
+                name=o["name"],
+                poses=np.frombuffer(o["poses"], dtype=np.float32).reshape(o["rows"], 7),
+            )
+            for o in raw["objects"]
+        ),
+        stop=str(raw["stop"]),
+        digest=_digest(raw),
+        channels={
+            # Per-row, sharing the record's row axis.
+            "com": f32("com").reshape(-1, 3),
+            # The RT mode as spans: `mode_starts[i]` is the first row
+            # `mode_names[i]` holds from. Two arrays rather than pairs
+            # because every channel is a buffer.
+            "mode_starts": np.asarray([r for r, _ in raw["modes"]], dtype=np.uint32),
+            "mode_names": np.asarray([m for _, m in raw["modes"]], dtype=np.str_),
+            # Ragged: row r owns contacts [starts[r]:starts[r + 1]].
+            "contact_pos": f32("contact_pos").reshape(-1, 3),
+            "contact_force": f32("contact_force").reshape(-1, 3),
+            "contact_starts": np.frombuffer(raw["contact_starts"], dtype=np.uint32),
+        },
+    )
+
+
+def _digest(raw: dict) -> bytes:
+    """Identity of a run, over the columns that reach the screen.
+
+    Quantised below what a display can resolve — a tenth of a milliradian
+    at the joints, ten microns at the TCP and at objects — so two runs
+    that would paint the same picture hash the same and the host can skip
+    the redraw.  The engine is deterministic, so this only ever differs
+    when something visible did.
+    """
+    h = hashlib.blake2b(digest_size=16)
+    h.update(str(raw["rows"]).encode())
+    for key, scale in (("q_rad", 1e4), ("tcp", 1e5)):
+        q = np.rint(np.nan_to_num(np.frombuffer(raw[key], dtype=np.float32)) * scale)
+        h.update(q.astype(np.int32).tobytes())
+    for o in raw["objects"]:
+        h.update(o["name"].encode())
+        poses = np.rint(np.frombuffer(o["poses"], dtype=np.float32) * 1e5)
+        h.update(poses.astype(np.int32).tobytes())
+    return h.digest()
 
 
 def _merge(results: list[DryRunResultData]) -> DryRunResultData:

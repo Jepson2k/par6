@@ -7,6 +7,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
 
+use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::SimBus;
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
@@ -77,7 +78,14 @@ fn steady_state_ticks_allocate_nothing() {
         fk: Box::new(NoFk),
         samples: consumer,
     };
-    let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(), hooks).expect("core");
+    // The scene the sim bus boots: this test allocates nothing per tick,
+    // and the plant is part of what must not.
+    let scene = Scene {
+        tool: Tool::Flange,
+        assets: std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/par6_description"),
+    };
+    let (mut core, mut handles) = RtCore::new(&bundle, SimBus::new(scene), hooks).expect("core");
 
     // Warmup past boot one-shots, the scheduled config re-send shots and
     // transient buffer growth anywhere in the stack.

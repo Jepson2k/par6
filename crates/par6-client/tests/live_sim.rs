@@ -177,6 +177,7 @@ fn a_full_session_over_the_rust_client() {
                 collision: true,
                 margin: None,
                 name: format!("far-box-{i}"),
+                physics: None,
             })
             .collect();
         assert_eq!(
@@ -379,6 +380,7 @@ fn program_box(name: &str) -> Shape {
         pose: vec![0.9, 0.9, -0.01, 0.0, 0.0, 0.0],
         collision: true,
         margin: None,
+        physics: None,
         name: name.to_owned(),
     }
 }

@@ -9,22 +9,17 @@
 //! telemetry replies on the RTR round-robin, per-type fault injection and
 //! the per-frame live err bit.
 //!
-//! Behind the drivers sits a plant stepped at the fixed tick dt (time is
-//! the caller's tick counter — wall clock never enters):
-//!
-//! - default: a rate-limited kinematic plant per joint
-//!   ([`plant::KinJoint`]) with hard endstops, stall behavior (current
-//!   winds to the loop's saturated output, displacement plateaus),
-//!   gearbox-windup preload that relaxes during release-phase current
-//!   commands, and hall-sensor emulation at configured trigger positions;
-//! - feature `sim-dynamics`: torque-level dynamics through Pinocchio ABA
-//!   ([`dynamics::DynamicsPlant`]) — motor torques + gravity + friction +
-//!   endstop spring-dampers, semi-implicit Euler integration;
-//! - feature `sim-mujoco`: contact-level dynamics through MuJoCo
-//!   ([`mujoco::MujocoPlant`]) — the same torque drive integrated in a
-//!   full scene (floor, graspable objects), with physical jaw
-//!   obstructions fed back into the gripper front end so contact grasps
-//!   surface through the real cmd-60 detection bits.
+//! Behind the drivers sits the plant, stepped at the fixed tick dt (time is
+//! the caller's tick counter — wall clock never enters): the MuJoCo scene
+//! ([`mujoco::MujocoPlant`], built by [`scene`] from the vendor MJCF) —
+//! the arm under gravity with the drivetrain reflected from the robot
+//! config (rotor inertia, viscous and Coulomb losses, the self-locking
+//! gearbox's holding friction), the config hard limits as joint limits,
+//! the gripper jaws, a floor and graspable objects. Physical jaw
+//! obstructions feed back into the gripper front end so contact grasps
+//! surface through the real cmd-60 detection bits; hall sensors are
+//! emulated at configured trigger positions. The gripper's motor-mode jaw
+//! runs a private 1-DOF model ([`jaw::JawJoint`]) in motor-tick space.
 //!
 //! Encoder output goes through the real spectral conversions: positions
 //! report from the 14-bit-wrapped boot reading (sector semantics) and
@@ -34,20 +29,19 @@
 //! command streams produce bit-identical state streams.
 
 mod driver;
-#[cfg(feature = "sim-dynamics")]
-mod dynamics;
 mod gripper;
-#[cfg(feature = "sim-mujoco")]
+mod jaw;
+mod map;
 mod mujoco;
-mod plant;
+pub mod scene;
 
 pub use driver::FaultKind;
 
 use std::collections::VecDeque;
-#[cfg(any(feature = "sim-dynamics", feature = "sim-mujoco"))]
-use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use par6_config::{GripperConfig, KtSource, RobotConfig};
+use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
@@ -64,23 +58,48 @@ use crate::types::{
     GripperCommand, HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
 };
 
-use driver::{PlantCmd, ReplyKind, VirtualDriver};
+use driver::{ReplyKind, VirtualDriver};
 use gripper::GripperSim;
-use plant::{JointMap, KinJoint};
+use map::JointMap;
 
 /// RX queue capacity \[frames\]. Replies past it are dropped, mirroring
 /// the silent kernel-queue drop of a saturated real interface.
 const RX_QUEUE_CAP: usize = 512;
+
+/// Where the runtime posts world layers for the simulator: one slot per
+/// layer, latest wins, taken by the bus on its own tick. Posting allocates
+/// on the poster's thread and never breaks the RT loop; the bus moves the
+/// posted vectors in, so the tick allocates nothing.
+#[derive(Clone, Default)]
+pub struct WorldMailbox(Arc<Mutex<[Option<Vec<Shape>>; 2]>>);
+
+impl WorldMailbox {
+    /// Post one layer's shapes; replaces whatever was posted for that
+    /// layer and not yet taken.
+    pub fn post(&self, layer: Layer, shapes: Vec<Shape>) {
+        let mut slot = self.0.lock().unwrap_or_else(|e| e.into_inner());
+        slot[layer_index(layer)] = Some(shapes);
+    }
+
+    /// Take whatever is posted, leaving the slots empty. All-`None` when
+    /// nothing was posted or the lock is contended — the next tick retries.
+    fn take(&self) -> [Option<Vec<Shape>>; 2] {
+        match self.0.try_lock() {
+            Ok(mut slot) => std::mem::take(&mut *slot),
+            Err(_) => [None, None],
+        }
+    }
+}
+
+fn layer_index(layer: Layer) -> usize {
+    match layer {
+        Layer::Installation => 0,
+        Layer::Program => 1,
+    }
+}
+/// Poll slots between device-info sweeps (~4 s at 250 Hz).
 /// Default hall-sensor band half-width \[rad\].
 const HALL_HALF_WIDTH_RAD: f64 = 0.02;
-
-enum ArmPlant {
-    Kinematic(Vec<KinJoint>),
-    #[cfg(feature = "sim-dynamics")]
-    Dynamics(Box<dynamics::DynamicsPlant>),
-    #[cfg(feature = "sim-mujoco")]
-    Mujoco(mujoco::MujocoPlant),
-}
 
 /// The closed-loop sim bus. Construct, optionally set hooks
 /// ([`set_initial_joint_rad`](Self::set_initial_joint_rad)), then
@@ -100,10 +119,10 @@ pub struct SimBus {
     connected: u16,
     drivers: Vec<VirtualDriver>,
     gripper: Option<GripperSim>,
-    plant: ArmPlant,
+    /// The scene, compiled at `boot_configure`.
+    plant: Option<mujoco::MujocoPlant>,
     maps: Vec<JointMap>,
     loads_ma: Vec<f64>,
-    cmd_buf: Vec<PlantCmd>,
     hall_bands: Vec<Option<(f64, f64)>>,
     rx: VecDeque<(u64, CanFrame)>,
     dropped_rx: u64,
@@ -115,25 +134,36 @@ pub struct SimBus {
     joints_sent_this_tick: bool,
     health: LinkHealth,
     initial_q: Option<Vec<f64>>,
-    #[cfg(feature = "sim-dynamics")]
-    urdf: Option<PathBuf>,
-    /// Active tool inertials attached to the dynamics plant's wrist.
-    #[cfg(feature = "sim-dynamics")]
-    dyn_tool: Option<par6_kin::ToolParams>,
-    /// Frame the tool inertials attach at (`None` = the URDF's last frame).
-    #[cfg(feature = "sim-dynamics")]
-    dyn_ee_frame: Option<String>,
-    #[cfg(feature = "sim-mujoco")]
-    mjcf_scene: Option<PathBuf>,
+    scene: scene::Scene,
+    /// The active tool's config inertials (`None` = the variant URDF's).
+    tool: Option<scene::ToolInertial>,
+    /// The compiled-once base spec (arm, tool, floor — no world objects);
+    /// every world change injects into a clone of it.
+    base_spec: Option<scene::BaseSpec>,
+    /// The world objects, installation then program layer.
+    world: [Vec<Shape>; 2],
+    /// A world layer changed since the model was last built.
+    world_dirty: bool,
+    /// World layers posted from other threads, taken every tick.
+    mailbox: WorldMailbox,
     /// Mirror of the gripper front end's latched firmware command, used
     /// to drive the scene's jaw DOF (see [`mujoco::JawDrive`]).
-    #[cfg(feature = "sim-mujoco")]
     mj_jaw_cmd: Option<FirmwareGripperCommand>,
+    /// Test-declared jaw obstructions `(closing at, opening at)`; `None`
+    /// leaves them to the scene physics.
+    gripper_object_override: Option<(Option<u8>, Option<u8>)>,
+    /// A teleport landed and no joint frames have re-commanded the arm
+    /// since: the plant clamps the landed pose meanwhile.
+    landed_unheld: bool,
 }
 
 impl SimBus {
-    /// A sim bus with the default rate-limited kinematic plant.
-    pub fn new() -> Self {
+    /// A sim bus on the MuJoCo scene built from `scene` (arm + gripper
+    /// jaws + graspable objects, see [`scene`]) at
+    /// [`DriverBus::boot_configure`] time, with the drivetrain reflected
+    /// from the robot config. Panics at boot if the scene cannot be built
+    /// or its joint layout does not match the robot config.
+    pub fn new(scene: scene::Scene) -> Self {
         Self {
             tick: 0,
             dt: 0.004,
@@ -148,10 +178,9 @@ impl SimBus {
             connected: 0,
             drivers: Vec::new(),
             gripper: None,
-            plant: ArmPlant::Kinematic(Vec::new()),
+            plant: None,
             maps: Vec::new(),
             loads_ma: Vec::new(),
-            cmd_buf: Vec::new(),
             hall_bands: Vec::new(),
             rx: VecDeque::new(),
             dropped_rx: 0,
@@ -163,54 +192,16 @@ impl SimBus {
             joints_sent_this_tick: false,
             health: LinkHealth::default(),
             initial_q: None,
-            #[cfg(feature = "sim-dynamics")]
-            urdf: None,
-            #[cfg(feature = "sim-dynamics")]
-            dyn_tool: None,
-            #[cfg(feature = "sim-dynamics")]
-            dyn_ee_frame: None,
-            #[cfg(feature = "sim-mujoco")]
-            mjcf_scene: None,
-            #[cfg(feature = "sim-mujoco")]
+            scene,
+            tool: None,
+            base_spec: None,
+            world: [Vec::new(), Vec::new()],
+            world_dirty: false,
+            mailbox: WorldMailbox::default(),
             mj_jaw_cmd: None,
+            gripper_object_override: None,
+            landed_unheld: false,
         }
-    }
-
-    /// A sim bus whose arm plant is the torque-level Pinocchio dynamics
-    /// model built from `urdf` at [`DriverBus::boot_configure`] time,
-    /// with `tool`'s inertials attached to the wrist — the plant swings
-    /// the same body the runtime's gravity model describes, so an IDLE
-    /// arm under G(q) feedforward floats instead of sagging (no tool) or
-    /// rising (tool compensated but not carried). Panics at boot if the
-    /// URDF cannot be loaded or its joint count does not match the robot
-    /// config.
-    #[cfg(feature = "sim-dynamics")]
-    pub fn with_dynamics(
-        urdf: impl Into<PathBuf>,
-        ee_frame: Option<String>,
-        tool: Option<par6_kin::ToolParams>,
-    ) -> Self {
-        let mut bus = Self::new();
-        bus.urdf = Some(urdf.into());
-        bus.dyn_ee_frame = ee_frame;
-        bus.dyn_tool = tool;
-        bus
-    }
-
-    /// A sim bus whose arm plant is the MuJoCo scene at `scene` (arm +
-    /// gripper jaws + graspable objects, see
-    /// `sim-assets/PAR6_MSG_scene.xml`), built at
-    /// [`DriverBus::boot_configure`] time. With this plant the gripper's
-    /// object positions are owned by the scene physics —
-    /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)
-    /// values are overwritten every tick. Panics at boot if the scene
-    /// cannot be loaded or its joint layout does not match the robot
-    /// config.
-    #[cfg(feature = "sim-mujoco")]
-    pub fn with_mujoco(scene: impl Into<PathBuf>) -> Self {
-        let mut bus = Self::new();
-        bus.mjcf_scene = Some(scene.into());
-        bus
     }
 
     /// Override the true boot pose \[rad\], one entry per joint (default:
@@ -224,14 +215,16 @@ impl SimBus {
     /// Teleport the simulated arm to `q` \[rad\] (one entry per joint,
     /// clamped inside the hard limits) after boot: the plant state moves
     /// and the reported-position wrap re-bases onto the new pose, while
-    /// the drivers, the gripper and the link state carry on.
+    /// the drivers, the gripper and the link state carry on. The arm
+    /// appears at rest and stays held: the drivetrain clamps the landed
+    /// pose until the runtime's next joint frames re-command it.
     ///
     /// This is a re-seed, not a reboot. Re-running
     /// [`DriverBus::boot_configure`] would place the arm too, but it
     /// rebuilds the whole bus around it — fresh virtual drivers (their
     /// latched mode, limits and loop state gone), a fresh gripper front
-    /// end (calibration gone) and, for the plants that own a scene, a
-    /// fresh model with every object back at its spawn.
+    /// end (calibration gone) and a fresh scene with every object back at
+    /// its spawn.
     pub fn teleport_joint_rad(&mut self, q: &[f64]) -> Result<(), BusError> {
         self.ensure_ready()?;
         if q.len() != self.maps.len() {
@@ -243,20 +236,19 @@ impl SimBus {
         for (j, map) in self.maps.iter_mut().enumerate() {
             clamped[j] = q[j].clamp(map.hard_lo_rad, map.hard_hi_rad);
             map.reseed(clamped[j]);
-            self.drivers[j].reset_motion_transients();
+            // Held at the landed reading until re-commanded.
+            let wire = f64::from(map.conv.motor_ticks(clamped[j])) + map.report_offset;
+            self.drivers[j].reseed_hold(wire);
         }
         let q = &clamped[..self.maps.len()];
-        match &mut self.plant {
-            ArmPlant::Kinematic(joints) => {
-                for (j, joint) in joints.iter_mut().enumerate() {
-                    joint.reseed(f64::from(self.maps[j].conv.motor_ticks(q[j])));
-                }
-            }
-            #[cfg(feature = "sim-dynamics")]
-            ArmPlant::Dynamics(d) => d.reseed(q),
-            #[cfg(feature = "sim-mujoco")]
-            ArmPlant::Mujoco(p) => p.reseed(q),
-        }
+        self.plant_mut().reseed(q);
+        // Replies queued this tick describe the pose the arm just left;
+        // drained under the re-based reference they would read as a jump
+        // — and one tick of gravity feedforward for that phantom pose
+        // kicks a light wrist joint degrees off the landing. A teleport
+        // voids them; the nodes simply age one tick.
+        self.rx.clear();
+        self.landed_unheld = true;
         Ok(())
     }
 
@@ -278,9 +270,9 @@ impl SimBus {
     }
 
     /// Constant external load on `node`'s motor, in motor-current
-    /// equivalent \[mA\] (positive opposes positive motion). The
-    /// dynamics plant converts it to a joint torque through the config
-    /// torque↔current factor.
+    /// equivalent \[mA\] (positive opposes positive motion). The plant
+    /// converts it to a joint torque through the config torque↔current
+    /// factor; it counts as load, not motor torque, for the gearbox.
     pub fn set_joint_load_ma(&mut self, node: NodeId, load_ma: f64) {
         if let Some(j) = self.node_to_joint[usize::from(node)] {
             self.loads_ma[j] = load_ma;
@@ -311,19 +303,98 @@ impl SimBus {
         Ok(())
     }
 
-    /// Put (or remove) an object between the jaws: closing jams at this
-    /// position byte (`None` = free travel).
+    /// Declare an object between the jaws: closing jams at this position
+    /// byte. This overrides what the scene physics reports; with neither
+    /// direction declared jammed (`None` here and for opening) the
+    /// physics decides again.
     pub fn set_gripper_object_closing(&mut self, at: Option<u8>) {
+        let (_, open) = self.gripper_object_override.unwrap_or((None, None));
+        self.set_gripper_object_override(at, open);
+    }
+
+    /// Declare an object jamming the opening direction at this position
+    /// byte (same override semantics as
+    /// [`set_gripper_object_closing`](Self::set_gripper_object_closing)).
+    pub fn set_gripper_object_opening(&mut self, at: Option<u8>) {
+        let (close, _) = self.gripper_object_override.unwrap_or((None, None));
+        self.set_gripper_object_override(close, at);
+    }
+
+    fn set_gripper_object_override(&mut self, close: Option<u8>, open: Option<u8>) {
+        self.gripper_object_override = (close.is_some() || open.is_some()).then_some((close, open));
         if let Some(g) = &mut self.gripper {
-            g.object_close_at = at;
+            (g.object_close_at, g.object_open_at) = (close, open);
         }
     }
 
-    /// Jam (or free) the opening direction at this position byte.
-    pub fn set_gripper_object_opening(&mut self, at: Option<u8>) {
-        if let Some(g) = &mut self.gripper {
-            g.object_open_at = at;
+    /// Replace one world layer. The scene is rebuilt on the next tick
+    /// (latest wins), with every shape entering the model as its
+    /// declaration says — see [`scene::inject_world`]; the arm and the
+    /// objects that stay keep their state. Before boot the layers are
+    /// built into the initial scene.
+    pub fn set_world(&mut self, layer: Layer, shapes: &[Shape]) {
+        self.world[layer_index(layer)] = shapes.to_vec();
+        self.world_dirty = true;
+    }
+
+    /// The mailbox other threads post world layers to; the bus takes what
+    /// is posted at the start of every tick.
+    pub fn mailbox(&self) -> WorldMailbox {
+        self.mailbox.clone()
+    }
+
+    /// Ground truth for a free world object: `[x, y, z, qw, qx, qy, qz]`
+    /// of the shape `name`, `None` when the scene has no such free body.
+    pub fn world_object_pose(&self, name: &str) -> Option<[f64; 7]> {
+        self.plant.as_ref()?.object_pose(name)
+    }
+
+    /// Every free world object's name, in scene order.
+    pub fn object_names(&self) -> Vec<String> {
+        self.plant
+            .as_ref()
+            .map(mujoco::MujocoPlant::object_names)
+            .unwrap_or_default()
+    }
+
+    /// A free world object's speed \[m/s, rad/s\], `None` when no such
+    /// object is in the scene.
+    pub fn object_speed(&self, name: &str) -> Option<f64> {
+        self.plant.as_ref()?.object_speed(name)
+    }
+
+    /// Every free object's pose into `out`, in scene order, returning how
+    /// many were written. No per-name lookup and no allocation: a caller
+    /// reading the world every tick asks for all of them at once.
+    pub fn object_poses_into(&self, out: &mut [[f64; 7]]) -> usize {
+        self.plant
+            .as_ref()
+            .map(|p| p.object_poses_into(out))
+            .unwrap_or(0)
+    }
+
+    /// The contacts the solver resolved this tick, appended to `pos` and
+    /// `force` as world-frame triples. Near misses inside the inclusion
+    /// margin are skipped — they carry no force.
+    pub fn contacts_into(&self, pos: &mut Vec<[f64; 3]>, force: &mut Vec<[f64; 3]>) {
+        if let Some(p) = self.plant.as_ref() {
+            p.contacts_into(pos, force);
         }
+    }
+
+    /// The scene's centre of mass \[m\], world frame; `None` before the bus
+    /// is configured.
+    pub fn center_of_mass(&self) -> Option<[f64; 3]> {
+        Some(self.plant.as_ref()?.center_of_mass())
+    }
+
+    /// The scene's own gravity torque on the arm joints at `q` \[Nm\], at
+    /// rest. The controller derives the same quantity from the URDF through
+    /// Pinocchio, and the two must agree — see par6d's
+    /// `dynamics_conformance` suite. `None` before the bus is configured.
+    /// Leaves the plant at `q`, at rest.
+    pub fn gravity_at(&mut self, q: &[f64]) -> Option<Vec<f64>> {
+        Some(self.plant.as_mut()?.gravity_at(q))
     }
 
     /// Frames dropped because the RX queue was full.
@@ -385,20 +456,25 @@ impl SimBus {
         self.rx.push_back((self.tick, frame));
     }
 
-    fn motor_state(&self, j: usize) -> (f64, f64) {
-        match &self.plant {
-            ArmPlant::Kinematic(joints) => (joints[j].pos, joints[j].reported_vel),
-            #[cfg(feature = "sim-dynamics")]
-            ArmPlant::Dynamics(d) => d.motor_state(j, &self.maps[j]),
-            #[cfg(feature = "sim-mujoco")]
-            ArmPlant::Mujoco(p) => p.motor_state(j, &self.maps[j]),
-        }
+    fn plant(&self) -> &mujoco::MujocoPlant {
+        self.plant
+            .as_ref()
+            .expect("the plant exists once boot_configure ran")
     }
 
-    /// How the MuJoCo scene's jaw DOF should be driven this tick: run the
-    /// plant's own approach for an actionable latched firmware command,
-    /// otherwise follow the front end's reported jaw byte.
-    #[cfg(feature = "sim-mujoco")]
+    fn plant_mut(&mut self) -> &mut mujoco::MujocoPlant {
+        self.plant
+            .as_mut()
+            .expect("the plant exists once boot_configure ran")
+    }
+
+    fn motor_state(&self, j: usize) -> (f64, f64) {
+        self.plant().motor_state(j, &self.maps[j])
+    }
+
+    /// How the scene's jaw DOF should be driven this tick: run the plant's
+    /// own approach for an actionable latched firmware command, otherwise
+    /// follow the front end's reported jaw byte.
     fn mj_jaw_drive(&self) -> Option<mujoco::JawDrive> {
         let g = self.gripper.as_ref()?;
         Some(match self.mj_jaw_cmd {
@@ -421,46 +497,41 @@ impl SimBus {
     /// boot wrap offset) — firmware's accumulated encoder count is the
     /// same value it reports, and host position commands echo it back.
     fn step_once(&mut self) {
-        let dt = self.dt;
-        // The dynamics plant closes the driver loops itself, at its
-        // physics substep rate; everything else latches one loop output
-        // per tick here.
-        #[cfg(feature = "sim-dynamics")]
-        let latched = !matches!(self.plant, ArmPlant::Dynamics(_));
-        #[cfg(not(feature = "sim-dynamics"))]
-        let latched = true;
-        if latched {
-            for j in 0..self.drivers.len() {
-                let (p, v) = self.motor_state(j);
-                self.cmd_buf[j] = self.drivers[j].control_step(p + self.maps[j].report_offset, v);
+        for (layer, posted) in self.world.iter_mut().zip(self.mailbox.take()) {
+            if let Some(shapes) = posted {
+                *layer = shapes;
+                self.world_dirty = true;
             }
         }
-        #[cfg(feature = "sim-mujoco")]
+        if self.world_dirty {
+            self.rebuild_world();
+        }
+        let dt = self.dt;
+        // Watchdog aging is per bus tick; the control laws run inside the
+        // plant step at its substep rate.
+        for drv in self.drivers.iter_mut() {
+            drv.age_watchdog();
+        }
         let jaw_drive = self.mj_jaw_drive();
-        match &mut self.plant {
-            ArmPlant::Kinematic(joints) => {
-                for (j, joint) in joints.iter_mut().enumerate() {
-                    joint.step(dt, &self.cmd_buf[j], self.loads_ma[j]);
-                }
-            }
-            #[cfg(feature = "sim-dynamics")]
-            ArmPlant::Dynamics(d) => {
-                // Watchdog aging is per bus tick, not per substep; the
-                // control law itself runs inside the plant step.
-                for drv in self.drivers.iter_mut() {
-                    drv.age_watchdog();
-                }
-                d.step(dt, &mut self.drivers, &self.loads_ma, &self.maps);
-            }
-            #[cfg(feature = "sim-mujoco")]
-            ArmPlant::Mujoco(p) => {
-                p.step(dt, &self.cmd_buf, &self.loads_ma, &self.maps, jaw_drive);
-                // The scene owns the object positions: whatever physically
-                // jammed the jaws becomes the front end's obstruction.
-                if let Some(g) = &mut self.gripper {
-                    (g.object_close_at, g.object_open_at) = p.jaw_obstruction();
-                }
-            }
+        let plant = self
+            .plant
+            .as_mut()
+            .expect("the plant exists once boot_configure ran");
+        plant.step(
+            dt,
+            &mut self.drivers,
+            &self.loads_ma,
+            &self.maps,
+            jaw_drive,
+            self.landed_unheld,
+        );
+        // The scene owns the object positions unless a test declared them:
+        // whatever physically jammed the jaws becomes the front end's
+        // obstruction.
+        if let Some(g) = &mut self.gripper {
+            (g.object_close_at, g.object_open_at) = self
+                .gripper_object_override
+                .unwrap_or_else(|| plant.jaw_obstruction());
         }
         if let Some(g) = &mut self.gripper {
             g.step(dt);
@@ -694,10 +765,7 @@ impl SimBus {
                         estop: bits[2],
                         release_dir: bits[3],
                     };
-                    #[cfg(feature = "sim-mujoco")]
-                    {
-                        self.mj_jaw_cmd = Some(fcmd);
-                    }
+                    self.mj_jaw_cmd = Some(fcmd);
                     g.on_firmware_command(fcmd);
                     None
                 }
@@ -714,10 +782,7 @@ impl SimBus {
                 (CommandId::GripperDataPack, _) => None,
                 (CommandId::GripperCalibrate, 0) => {
                     // The calibration sweep replaces the latched command.
-                    #[cfg(feature = "sim-mujoco")]
-                    {
-                        self.mj_jaw_cmd = None;
-                    }
+                    self.mj_jaw_cmd = None;
                     g.on_calibrate();
                     None
                 }
@@ -725,7 +790,6 @@ impl SimBus {
             }
         };
         // A handled motor-mode frame hands the jaw to the motor loop.
-        #[cfg(feature = "sim-mujoco")]
         if matches!(motor_reply, Some(r) if r != ReplyKind::None) {
             self.mj_jaw_cmd = None;
         }
@@ -848,12 +912,6 @@ impl SimBus {
     }
 }
 
-impl Default for SimBus {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl DriverBus for SimBus {
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
@@ -905,10 +963,10 @@ impl DriverBus for SimBus {
             };
             let n = usize::from(node);
             state.nodes[n].live_error_bit = err_bit;
-            if self
-                .fresh
-                .mark(node, self.tick, self.connected & (1 << node) != 0)
-            {
+            // A node already on `connected` has booted, so its first frame
+            // after a gap is a reconnect rather than a discovery.
+            let booted = self.connected & (1 << n) != 0;
+            if self.fresh.mark(node, self.tick, booted) {
                 state.reconnected_mask |= 1 << n;
             }
             let (_, raw_cmd, _) = unpack_can_id(frame.id);
@@ -935,6 +993,7 @@ impl DriverBus for SimBus {
                 reason: "command slice length != configured joint count",
             });
         }
+        self.landed_unheld = false;
         if self.joints_sent_this_tick {
             return Err(BusError::InvalidCommand {
                 reason: "second joint send in one tick (single-send invariant)",
@@ -1078,15 +1137,6 @@ impl DriverBus for SimBus {
             })
             .collect();
         self.loads_ma = vec![0.0; n];
-        self.cmd_buf = vec![
-            PlantCmd {
-                current_ma: 0.0,
-                ff_ma: 0.0,
-                vel_limit_ticks_s: 0.0,
-                idle: true,
-            };
-            n
-        ];
         self.hall_bands = robot
             .homing
             .joints
@@ -1097,11 +1147,17 @@ impl DriverBus for SimBus {
             })
             .collect();
 
-        self.plant = self.make_arm_plant(robot, &q0);
-        #[cfg(feature = "sim-mujoco")]
-        {
-            self.mj_jaw_cmd = None;
-        }
+        self.tool = gripper.map(|g| scene::ToolInertial {
+            d_m: g.kinematics.d_m,
+            a_m: g.kinematics.a_m,
+            alpha_rad: g.kinematics.alpha_rad,
+            mass_kg: g.kinematics.mass_kg,
+            com_m: g.kinematics.com_m,
+            inertia_kg_m2: g.kinematics.inertia_kg_m2,
+        });
+        self.plant = Some(self.make_plant(robot, &q0));
+        self.mj_jaw_cmd = None;
+        self.gripper_object_override = None;
 
         let has_can_gripper = gripper.is_some_and(|g| g.driver.is_some());
         self.gripper = if has_can_gripper {
@@ -1260,41 +1316,55 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
-    fn make_arm_plant(&self, robot: &RobotConfig, q0: &[f64]) -> ArmPlant {
-        #[cfg(feature = "sim-mujoco")]
-        if let Some(scene) = &self.mjcf_scene {
-            return ArmPlant::Mujoco(mujoco::MujocoPlant::new(scene, &self.maps, q0));
-        }
-        #[cfg(feature = "sim-dynamics")]
-        if let Some(urdf) = &self.urdf {
-            return ArmPlant::Dynamics(Box::new(dynamics::DynamicsPlant::new(
-                urdf,
-                self.dyn_ee_frame.as_deref(),
-                self.dyn_tool.as_ref(),
-                &self.maps,
-                q0,
-                &robot.sim,
-            )));
-        }
-        ArmPlant::Kinematic(Self::kinematic_joints(robot, &self.maps, q0, self.dt))
+    /// Compile the scene for this robot config with the current world and
+    /// place the arm at `q0`; keeps the base spec for later world changes.
+    fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
+        let tuning: Vec<scene::JointTuning> = self
+            .maps
+            .iter()
+            .zip(&robot.sim.motor_jm_kg_m2)
+            .map(|(map, jm)| scene::JointTuning::from_config(map, *jm, &robot.sim))
+            .collect();
+        let build = scene::Build {
+            timestep: scene::timestep_for(self.dt),
+            joints: &tuning,
+            tool: self.tool.as_ref(),
+        };
+        let mut spec = self
+            .scene
+            .spec(&build)
+            .unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let base = scene::BaseSpec::new(&spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+        scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
+            .unwrap_or_else(|e| panic!("sim scene: {e}"));
+        let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
+        self.base_spec = Some(base);
+        self.world_dirty = false;
+        mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.holding_friction_nm)
     }
 
-    fn kinematic_joints(
-        robot: &RobotConfig,
-        maps: &[JointMap],
-        q0: &[f64],
-        dt: f64,
-    ) -> Vec<KinJoint> {
-        robot
-            .joints
-            .iter()
-            .zip(maps)
-            .zip(q0)
-            .map(|((j, map), q)| {
-                let pos0 = f64::from(map.conv.motor_ticks(*q));
-                let accel_max = j.limits.acceleration_rad_s2 * map.tpr;
-                KinJoint::new(dt, pos0, map.bound_lo, map.bound_hi, accel_max, j.ilim_ma)
-            })
-            .collect()
+    /// Rebuild the scene around the current world layers, in place.
+    fn rebuild_world(&mut self) {
+        self.world_dirty = false;
+        let Some(base) = &self.base_spec else {
+            return;
+        };
+        let spec = base
+            .clone_spec()
+            .map_err(|e| e.to_string())
+            .and_then(|mut spec| {
+                scene::inject_world(&mut spec, &[&self.world[0], &self.world[1]])
+                    .map(|()| spec)
+                    .map_err(|e| e.to_string())
+            });
+        let result = spec.and_then(|mut spec| {
+            self.plant
+                .as_mut()
+                .expect("the plant exists once boot_configure ran")
+                .recompile(&mut spec)
+        });
+        if let Err(e) = result {
+            log::error!("sim world update refused, keeping the previous world: {e}");
+        }
     }
 }

@@ -111,8 +111,19 @@ def _joint_transform(tool_key: str, joint_name: str) -> np.ndarray:
 #: an agreement that only holds where the tool axis lines up with the flange
 #: axis cannot pass.  All inside every hard window, so the sim's teleport
 #: clamp does not move them.
+#: Poses the client and the runtime must describe identically.
+#:
+#: The first is the home pose with the wrist off its singularity by half a
+#: degree. At J5 = 0 the TCP's pitch is exactly -90 and the intrinsic-XYZ
+#: decomposition both sides report is degenerate — roll and yaw are 0/0 in
+#: `atan2`, so each side returns an arbitrary pair whose DIFFERENCE is
+#: rounding noise. Reconstructing matrices from those pairs turns 10 urad
+#: of noise into a quarter of a degree of apparent frame rotation, which
+#: says nothing about whether the two agree. Half a degree off the
+#: singularity the decomposition is well conditioned and the comparison
+#: means what it says.
 AGREEMENT_POSES_DEG = [
-    [0.0, -90.0, 180.0, 0.0, 0.0, 180.0],
+    [0.0, -90.0, 180.0, 0.0, 0.5, 180.0],
     [30.0, -60.0, 200.0, -25.0, 40.0, 120.0],
     [-45.0, -120.0, 250.0, 60.0, -50.0, 300.0],
 ]

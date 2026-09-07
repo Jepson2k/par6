@@ -2,13 +2,13 @@
 """Stage a cross-built shim's runtime library closure and prove it loadable.
 
 The PAR6 control box gets no conda environment: `par6d` links
-`libpar6_shim.so` (Pinocchio, coal, toppra) and `libmujoco.so`, and everything
-those pull in has to be installed alongside them. This walks `DT_NEEDED` from
-the given roots, copies every dependency found in the conda env's `lib/` into
-one flat directory — along with any root that does not already live there —
-and then answers the only question that can be answered without target
-hardware: *would the dynamic loader be able to resolve this set on the
-target?*
+`libpar6_shim.so` — which pulls in Pinocchio, coal, toppra and their
+transitive dependencies — and `libmujoco`, the simulator's physics, and all
+of those have to be installed alongside it. This walks `DT_NEEDED` from the
+given roots, copies every dependency found in the given library directories
+into one flat directory, and then answers the only question that can be
+answered without target hardware: *would the dynamic loader be able to
+resolve this set on the target?*
 
 Two checks make up that answer:
 
@@ -23,8 +23,9 @@ Two checks make up that answer:
 * **rpath reachability** — the staged directory is flat and moves to
   ``/usr/local/lib/par6``, and ``DT_RUNPATH`` is *not* inherited by transitive
   dependencies, so every staged library that depends on another staged library
-  must carry an ``$ORIGIN`` entry of its own. Without it the dependency
-  resolves here (from an absolute build path) and not on the box.
+  must carry an ``$ORIGIN`` entry of its own (a binary may instead name that
+  install directory, ``--accept-rpath``). Without it the dependency resolves
+  here (from an absolute build path) and not on the box.
 
 Idempotent: a destination file that already matches the source by size and
 mtime is left alone.
@@ -147,8 +148,12 @@ def glibc_floor(readelf: str, path: Path) -> tuple[int, int, int]:
     return highest
 
 
-def walk(readelf: str, roots: list[Path], lib_dir: Path) -> tuple[list[Path], set[str]]:
-    """Transitive DT_NEEDED closure of *roots* resolved inside *lib_dir*."""
+def walk(
+    readelf: str, roots: list[Path], lib_dirs: list[Path]
+) -> tuple[list[Path], set[str]]:
+    """Transitive DT_NEEDED closure of *roots* resolved inside *lib_dirs*
+    (searched in order — the staging directory itself may be one of them,
+    so a closure staged earlier is found rather than copied again)."""
     seen: set[Path] = set()
     deps: list[Path] = []
     unresolved: set[str] = set()
@@ -164,8 +169,8 @@ def walk(readelf: str, roots: list[Path], lib_dir: Path) -> tuple[list[Path], se
         for soname in needed(readelf, obj):
             if soname in SYSTEM_SONAMES:
                 continue
-            candidate = lib_dir / soname
-            if not candidate.exists():
+            candidate = next((d / soname for d in lib_dirs if (d / soname).exists()), None)
+            if candidate is None:
                 unresolved.add(soname)
                 continue
             queue.append(candidate.resolve())
@@ -173,8 +178,11 @@ def walk(readelf: str, roots: list[Path], lib_dir: Path) -> tuple[list[Path], se
 
 
 def copy_with_soname(src: Path, dest_dir: Path, soname: str) -> None:
-    """Copy *src* as *soname*, skipping an already-identical destination."""
+    """Copy *src* as *soname*, skipping an already-identical destination
+    (or a source that already lives in the staging directory)."""
     dest = dest_dir / soname
+    if src.resolve().parent == dest_dir.resolve():
+        return
     if dest.exists():
         s, d = src.stat(), dest.stat()
         if s.st_size == d.st_size and int(s.st_mtime) == int(d.st_mtime):
@@ -185,8 +193,24 @@ def copy_with_soname(src: Path, dest_dir: Path, soname: str) -> None:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--readelf", required=True, help="target-arch readelf binary")
-    ap.add_argument("--lib-dir", required=True, type=Path, help="conda env lib/")
+    ap.add_argument(
+        "--lib-dir",
+        required=True,
+        type=Path,
+        action="append",
+        dest="lib_dirs",
+        help="directory to resolve dependencies in (repeatable, searched in order)",
+    )
     ap.add_argument("--dest", required=True, type=Path, help="staging directory")
+    ap.add_argument(
+        "--accept-rpath",
+        type=str,
+        action="append",
+        default=[],
+        dest="accepted_rpaths",
+        help="an rpath entry that also reaches the staged set on the target — "
+        "the directory install.sh fills, which the binary is linked against",
+    )
     ap.add_argument("roots", nargs="+", type=Path, help="objects to close over")
     args = ap.parse_args()
 
@@ -195,20 +219,12 @@ def main() -> int:
             raise SystemExit(f"root object missing: {root}")
     args.dest.mkdir(parents=True, exist_ok=True)
 
-    deps, unresolved = walk(args.readelf, args.roots, args.lib_dir)
+    deps, unresolved = walk(args.readelf, args.roots, args.lib_dirs)
     if unresolved:
         raise SystemExit(
             "unresolved shared libraries (not in "
-            f"{args.lib_dir}): {', '.join(sorted(unresolved))}"
+            f"{', '.join(str(d) for d in args.lib_dirs)}): {', '.join(sorted(unresolved))}"
         )
-
-    # The shim is installed straight into the staging directory; a root
-    # linked from the env (libmujoco) ships with its closure like any
-    # other dependency.
-    dest = args.dest.resolve()
-    roots = [r.resolve() for r in args.roots]
-    in_place = [r for r in roots if r.parent == dest]
-    deps += [r for r in roots if r.parent != dest]
 
     staged: dict[str, Path] = {}
     total = 0
@@ -228,7 +244,7 @@ def main() -> int:
         staged[soname] = args.dest / soname
         total += dep.stat().st_size
 
-    objects = in_place + list(staged.values())
+    objects = [p.resolve() for p in args.roots] + list(staged.values())
 
     # 1. glibc floor across everything that ships.
     floor = max(glibc_floor(args.readelf, obj) for obj in objects)
@@ -248,13 +264,17 @@ def main() -> int:
                     f"{soname}, which the staged copy does not provide"
                 )
     # 3. anything with a dependency inside the staged set has to be able to
-    #    find it after the directory moves — i.e. from $ORIGIN, since
-    #    DT_RUNPATH does not reach transitive dependencies.
-    for path in objects:
+    #    find it after the directory moves — i.e. from $ORIGIN (or from the
+    #    install directory a binary is linked against), since DT_RUNPATH
+    #    does not reach transitive dependencies.
+    accepted = {os.path.normpath(p) for p in args.accepted_rpaths}
+    for path in [p.resolve() for p in args.roots] + list(staged.values()):
         if not any(n in staged for n in needed(args.readelf, path)):
             continue
         entries = runpath(args.readelf, path)
-        if not any(is_origin_entry(e) for e in entries):
+        if not any(
+            is_origin_entry(e) or os.path.normpath(e) in accepted for e in entries
+        ):
             failures.append(
                 f"{path.name} depends on staged libraries but searches "
                 f"{', '.join(entries) or '(no rpath)'} — none of which is "

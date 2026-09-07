@@ -81,8 +81,7 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
     }
 
     let status_port = free_udp_port();
-    let daemon =
-        boot_for_client(config, true, status_port).expect("daemon boots on the torque plant");
+    let daemon = boot_for_client(config, status_port).expect("daemon boots on the torque plant");
     let cmd = daemon.command_addr();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
     let samples = rt.block_on(async {
@@ -265,7 +264,7 @@ fn a_failed_estimate_leaves_the_declared_payload_standing() {
     let config = common::retimed_config("estimate-restore", 0.02);
     let model_config = config.clone();
     let status_port = free_udp_port();
-    let daemon = boot_for_client(config, false, status_port).expect("daemon boots");
+    let daemon = boot_for_client(config, status_port).expect("daemon boots");
     let cmd = daemon.command_addr();
     let rt = tokio::runtime::Runtime::new().expect("runtime");
 

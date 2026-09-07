@@ -1,3 +1,7 @@
+# ARM64 is the primary platform: the arm ships on a Raspberry Pi 5, so the
+# full suite runs on aarch64 runners and x86_64 is the compatibility check a
+# developer's laptop needs. Every step is a pixi task, so a red job is
+# reproduced locally with the command in its `run:` line.
 name: ci
 
 on:
@@ -5,95 +9,49 @@ on:
     branches: [main]
   pull_request:
 
+# A new push supersedes the run it interrupts. main is exempt: its runs are
+# what the release job requires by commit SHA.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # One Rust job. The Pinocchio shim is a prerequisite, so there is no
-  # `--exclude` or `--features` anywhere below: `cargo test --workspace` is
-  # the whole Rust suite, which is what a contributor runs locally too.
+  # Cheap and toolchain-only: no pixi solve, no C++, no cargo build. Every
+  # expensive job waits on it, so a formatting slip costs one runner-minute
+  # rather than the whole matrix.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # The primary leg: everything the arm runs, built once and tested on the
+  # architecture it runs on. vcan is created here rather than in a job of
+  # its own — the suite that needs it is part of `cargo test`
+  # and skips itself without the interface, so a separate job bought a
+  # second machine and a second build of the whole workspace to run five
+  # lines of modprobe.
   rust:
-    name: rust (x86_64, shim)
-    runs-on: ubuntu-latest
+    name: rust (aarch64)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/pixi
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/ffi-shim
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: |
-          source .ffi/env.sh
-          cargo clippy --workspace --all-targets -- -D warnings
-      - name: test
-        run: |
-          source .ffi/env.sh
-          cargo test --workspace
-      # Reruns just the timing case optimized and uncaptured, so the measured
-      # per-waypoint cost the planner budgets against is visible in the log.
-      # The test only fails on catastrophe, never on runner noise.
-      - name: report collision check cost (par6-kin)
-        run: |
-          source .ffi/env.sh
-          cargo test -p par6-kin --release \
-            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
-      # The shipped 250 Hz configuration, end to end: every other harness
-      # patches tick_dt_s up for CI headroom, so this soak is the one place
-      # the unpatched 0.004 runs before it meets the arm. Release because
-      # an unoptimized RT loop cannot hold a 4 ms period anywhere (the test
-      # skips itself in debug builds for the same reason).
-      - name: shipped 250 Hz soak (par6d, release)
-        run: |
-          source .ffi/env.sh
-          cargo test -p par6d --release --test shipped_tick -- --nocapture
-
-  msrv:
-    # The env context is not available to jobs.<id>.name, and a workflow
-    # using it there is invalid as a whole — every run of this file dies
-    # at parse with zero jobs. The toolchain version shows in the job log.
-    name: msrv
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # The declared rust-version had never been built, so nothing stopped
-      # a newer-toolchain feature from landing and breaking the floor the
-      # workspace advertises.
-      - name: read MSRV from Cargo.toml
-        run: |
-          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          echo "MSRV=$msrv" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: ./.github/actions/ffi-shim
-      - name: check
-        run: |
-          source .ffi/env.sh
-          cargo check --workspace --all-targets
-
-  # The SocketCAN backend is the only bus that will ever touch the arm,
-  # and its vcan suite skips itself wherever no vcan interface exists —
-  # which used to be everywhere, CI included. GitHub's ubuntu runners
-  # allow sudo, and the vcan module lives in linux-modules-extra (not in
-  # the base image), so this job installs that package for the running
-  # kernel, creates the interface, and runs the suite for real.
-  # PAR6_REQUIRE_VCAN=1 turns the developer-default skip into a hard
-  # failure: if interface creation ever breaks, the job goes red instead
-  # of silently degrading to a no-op.
-  socketcan:
-    name: socketcan (vcan)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: socketcan
+          cache-key: default
+      # PAR6_REQUIRE_VCAN turns the developer-default skip into a hard
+      # failure: if creation ever breaks this goes red instead of quietly
+      # dropping the SocketCAN backend's only real-transport coverage. The
+      # module is not in the runner image.
       - name: create vcan0
         run: |
           sudo apt-get update
@@ -101,210 +59,155 @@ jobs:
           sudo modprobe vcan
           sudo ip link add dev vcan0 type vcan
           sudo ip link set vcan0 up
-      # Single-threaded: every test in the binary opens observer sockets on
-      # the same vcan0 and asserts exact frame sequences, so concurrent
-      # tests would see each other's traffic.
-      # Without the sim plants: they (and the C++ shim they link) have no
-      # part in a SocketCAN test, so this job carries no toolchain.
-      - name: test par6-bus against vcan0
-        env:
+      - run: pixi run clippy
+      - env:
           PAR6_REQUIRE_VCAN: '1'
-        run: |
-          cargo test -p par6-bus --no-default-features --test socketcan_vcan \
-            -- --test-threads=1 --nocapture
-
-  python:
-    name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        python: ['3.11', '3.12']
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python }}
-      # The package is a maturin build: pip compiles the par6-py extension,
-      # which links the pinocchio shim like every other crate, so this job
-      # carries the same toolchain as the rust job.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: python
-      - uses: ./.github/actions/ffi-shim
-      # waldoctl branch-matching must happen BEFORE the package install:
-      # a cross-repo change lands on a branch of the same name first
-      # (CLAUDE.md's dev workflow), and while the release chain is in
-      # flight the pinned tag may not exist yet — a dead pin fails the
-      # whole resolve. The pin is rewritten for this resolve only.
-      - name: install (waldoctl branch-matched)
-        run: |
-          source .ffi/env.sh
-          branch="${{ github.head_ref || github.ref_name }}"
-          repo=https://github.com/Jepson2k/waldoctl.git
-          matched=""
-          if [ "$branch" != "main" ] && \
-             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
-            echo "installing waldoctl from branch $branch"
-            matched=1
-            pip install "waldoctl @ git+$repo@$branch"
-            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
-          else
-            echo "no waldoctl branch $branch; keeping the pinned tag"
-          fi
-          pip install -e "python[dev]"
-          if [ -n "$matched" ]; then
-            mv python/pyproject.toml.bak python/pyproject.toml
-          fi
-      - name: pre-commit (ruff, ruff-format, ty, file hygiene)
-        run: pre-commit run --show-diff-on-failure --color=always --all-files
-      # env.sh at run time too: the extension dlopens the shim on import.
-      - name: pytest
-        run: |
-          source .ffi/env.sh
-          cd python
-          pytest
-      - name: upload test results
-        if: always()
+        run: pixi run test-rust
+      - run: pixi run test-collision-cost
+      - run: pixi run test-timing
+      - name: upload failure logs
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: test-results-python-${{ matrix.python }}
-          path: python/test-results.xml
+          name: rust-aarch64-logs
+          path: |
+            test-results.xml
+            target/**/*.log
+          if-no-files-found: ignore
 
-  # End-to-end: the real python client against a real `par6d --sim` process
-  # over real UDP. Needs the binary, so it builds par6d here and points
-  # PAR6D_BIN at it; without that the same tests skip themselves (which is
-  # what happens in the `python` job above).
-  # Two legs, because they are the two halves of the old single step and
-  # neither needs the other: `examples` spawns its own daemons on its own
-  # ephemeral ports. Splitting them takes the examples layer off the e2e
-  # leg's critical path, and — because the old step ran both under
-  # `bash -e` — stops an e2e failure from cancelling the examples run
-  # before it starts.
-  e2e:
-    name: e2e (${{ matrix.layer }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # The rig allocates every port and grant directory per daemon, so
-          # the layer parallelises; `ubuntu-latest` is 4 vCPU on a public
-          # repo. Each worker still runs one daemon at a time, which is what
-          # keeps the 50 ms tick inside its budget.
-          - layer: e2e
-            args: -m e2e -n 4
-          # Serial on purpose: each example drives a full homing seek, and
-          # four concurrent seeks on a 4-vCPU runner miss their budgets.
-          - layer: examples
-            args: -m examples --examples
+  # The compatibility check. A developer's machine is x86_64, so the
+  # workspace has to build and its logic-level tests pass there — the
+  # timing soak and the packaging legs belong to the platform that ships.
+  rust-x86:
+    name: rust (x86_64, compat)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: ./.github/actions/pixi
         with:
-          python-version: '3.12'
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: e2e-${{ matrix.layer }}
-      - uses: ./.github/actions/ffi-shim
-      # Release, not debug: the sim runs in wall-clock time and an
-      # unoptimized RT loop misses its deadlines and latches LOOP_CRITICAL.
-      # par6d links the shim unconditionally, so this job needs it built.
-      - name: build par6d
-        run: |
-          source .ffi/env.sh
-          cargo build -p par6d --release
-      # Same branch-matching as the python job: the pinned waldoctl tag
-      # may not exist while the release chain is in flight.
-      - name: install python client (waldoctl branch-matched)
-        run: |
-          source .ffi/env.sh
-          branch="${{ github.head_ref || github.ref_name }}"
-          repo=https://github.com/Jepson2k/waldoctl.git
-          matched=""
-          if [ "$branch" != "main" ] && \
-             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
-            matched=1
-            pip install "waldoctl @ git+$repo@$branch"
-            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
-          fi
-          pip install -e "python[dev]"
-          if [ -n "$matched" ]; then
-            mv python/pyproject.toml.bak python/pyproject.toml
-          fi
-      - name: pytest ${{ matrix.args }}
-        env:
-          PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
-          # This job exists to run the e2e layer. Without the flag a
-          # missing binary would skip all of it and still report green.
-          PAR6_REQUIRE_E2E: "1"
-        # env.sh, not a hand-listed variable set: it is the one list
-        # setup.sh maintains and what every other job here uses; a second
-        # hand-maintained copy is what once silently dropped .ffi/shim/lib
-        # and left every e2e test erroring on a missing libpar6_shim.so.
-        run: |
-          source .ffi/env.sh
-          cd python
-          pytest ${{ matrix.args }}
-      # `if: always()`, because the run that failed is the one worth reading.
-      - name: upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results-${{ matrix.layer }}
-          path: python/test-results.xml
+          cache-key: default
+      - run: pixi run clippy
+      - run: pixi run test-rust
 
-  # The artifact that actually deploys: par6d cross-built for the control
-  # box WITH kinematics, plus the shim and the runtime closure that ship
-  # beside it. Nothing here can be executed (the runner is x86_64), so the
-  # job proves what is checkable statically — that the cross toolchain
-  # resolves, the shim links, and the staged closure's symbol versions are
-  # internally satisfiable at a glibc floor the box clears.
-  deploy-aarch64:
-    name: deploy artifact (aarch64, ffi)
-    runs-on: ubuntu-latest
+  msrv:
+    name: msrv
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The declared rust-version had never been built, so nothing stopped a
+      # newer-toolchain feature from landing and breaking the floor the
+      # workspace advertises. Read here because the env context is not
+      # available to jobs.<id>.name.
+      - name: read MSRV from Cargo.toml
+        run: echo "MSRV=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/pixi
         with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+          rust-toolchain: ${{ env.MSRV }}
+          cache-key: msrv
+      - run: pixi run cargo check --all-targets
+
+  # Both interpreters in one job. `par6-py` is an abi3-py310 extension, so
+  # the compiled half is identical for 3.11 and 3.12 — a matrix here spent a
+  # second machine and a second build of the workspace to run the same
+  # tests against a different pure-python interpreter.
+  python:
+    name: python (3.11, 3.12)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
         with:
-          key: deploy-aarch64
-      - name: cache aarch64 pinocchio toolchain
-        uses: actions/cache@v4
+          environments: default py311
+          cache-key: default
+      - uses: ./.github/actions/waldoctl-branch
         with:
-          path: |
-            .ffi/bin
-            .ffi/cross-aarch64
-          key: ffi-aarch64-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**') }}
-      - name: build aarch64 shim + runtime closure
-        run: scripts/ffi/setup.sh --target aarch64
-      - name: cross-build par6d
+          environment: default
+      - run: pixi run lint-python
+      - run: pixi run test-python
+      - uses: ./.github/actions/waldoctl-branch
+        with:
+          environment: py311
+      - run: pixi run -e py311 test-python
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-python
+          path: python/test-results.xml
+          if-no-files-found: ignore
+
+  # The e2e layers and the release artifacts share a job because they share
+  # the expensive thing: one release build of par6d. Splitting them made
+  # three machines build it.
+  bundle-arm64:
+    name: e2e + bundle (aarch64)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - uses: ./.github/actions/waldoctl-branch
+        with:
+          environment: default
+      - name: e2e
+        env:
+          PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
+          # Without the flag a missing binary would skip the whole layer
+          # and still report green.
+          PAR6_REQUIRE_E2E: '1'
         run: |
-          source .ffi/env-aarch64.sh
-          scripts/deploy/build-aarch64.sh
-      # The deploy bundle is staged (not uploaded) so the packaging half of
-      # install.sh is exercised too: a missing shim, config or assets tree
-      # fails here rather than on the box.
-      - name: stage the deploy bundle
-        run: |
-          source .ffi/env-aarch64.sh
-          scripts/deploy/install.sh --stage-only "$RUNNER_TEMP/bundle"
-          test -x "$RUNNER_TEMP/bundle/par6d"
-          test -f "$RUNNER_TEMP/bundle/lib/libpar6_shim.so"
-          test -f "$RUNNER_TEMP/bundle/config/PAR6.toml"
-          test -d "$RUNNER_TEMP/bundle/par6_description"
-      # Tarred so the executable bit and the closure's symlinks survive
-      # the artifact round-trip; `scp` + `tar -x` on the box is the whole
-      # install.
-      - name: pack the bundle
-        run: tar -C "$RUNNER_TEMP" -czf par6d-aarch64.tar.gz bundle
+          pixi run test-e2e
+          pixi run test-examples
+      # The wheel first: pack-bundle writes the checksums over everything in
+      # dist/, and a wheel built after it would not be covered.
+      - run: pixi run wheel
+      - run: pixi run bundle
       - uses: actions/upload-artifact@v4
         with:
-          name: par6d-aarch64-bundle
-          path: par6d-aarch64.tar.gz
+          name: par6-aarch64
+          path: |
+            dist/*.whl
+            dist/par6d-aarch64.tar.gz
+            dist/manifest.json
+            dist/SHA256SUMS
+      - name: upload test results
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-e2e
+          path: python/test-results.xml
+          if-no-files-found: ignore
+
+  validate-arm64:
+    name: validate (aarch64)
+    needs: bundle-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: par6-aarch64
+          path: dist
+      # Deliberately no pixi, no rustup, no .ffi and no LD_LIBRARY_PATH: the
+      # artifacts have to carry their own closure or this fails.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: scripts/deploy/validate-bundle.sh dist
+      - name: upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-aarch64-logs
+          path: /tmp/par6-validate/**
+          if-no-files-found: ignore

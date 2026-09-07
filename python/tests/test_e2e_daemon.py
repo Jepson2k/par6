@@ -37,7 +37,7 @@ from live_daemon import (
     sim_config,
     teleport_to,
 )
-from waldoctl.shapes import Box
+from waldoctl.shapes import Box, Physical
 
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
@@ -1185,6 +1185,65 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
 
 
 @pytest.mark.timeout(180)
+async def test_shape_physics_survives_the_wire_in_both_directions(
+    daemon: LiveDaemon,
+):
+    """A shape's physics reaches the runtime and comes back.
+
+    ``physics`` is what decides whether a shape is a body the simulator can
+    rest things on, drop or grasp, or only geometry the planner keeps out
+    of — and it travels as the seventh element of the shape wire form.  It
+    was being dropped in three separate places at once, each of which
+    failed silently: the client packed six elements, the readback built its
+    dict without the field, and the engine decoded the rest through a
+    derive that expects the config file's named fields rather than the
+    wire's pair.  A shape declared with mass simply arrived without it.
+
+    The three cases are distinct and all three matter: a mass is a free
+    body, ``mass=None`` is a static fixture (a table, which must be a
+    keep-out AND a surface), and no physics at all is geometry only.
+    """
+    block = Box(
+        name="block",
+        x=0.04,
+        y=0.04,
+        z=0.06,
+        pose=(0.35, 0.0, 0.05, 0, 0, 0),
+        physics=Physical(mass=0.05, friction=(0.9, 0.004, 0.0002)),
+    )
+    table = Box(
+        name="table",
+        x=0.5,
+        y=0.5,
+        z=0.02,
+        pose=(0.35, 0.0, 0.01, 0, 0, 0),
+        physics=Physical(mass=None),
+    )
+    keepout = Box(name="wall", x=0.1, y=0.1, z=0.1, pose=(0.6, 0.0, 0.2, 0, 0, 0))
+
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        try:
+            assert await client.set_shapes([block, table, keepout]) == 1
+            world = await client.shapes()
+            assert world is not None
+            got = {s.name: s for s in world.program}
+            assert got["block"] == block, "the wire lost the body's physics"
+            assert got["table"] == table, "the wire lost the fixture's physics"
+            assert got["wall"].physics is None, (
+                "a shape declaring no physics must not acquire any"
+            )
+            # The runtime's own configured shapes read back the same way, so
+            # a client cannot tell an installation surface from a keep-out
+            # by whether the field survived the trip.
+            assert any(s.physics is not None for s in world.installation), (
+                "the configured installation layer reports no physics at all"
+            )
+        finally:
+            assert await client.set_shapes([]) == 1
+
+
+@pytest.mark.timeout(180)
 async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
     daemon: LiveDaemon,
 ):
@@ -1868,8 +1927,16 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
     only when the answer is declared and only to what was found. A
     payload declared BEFORE the call has to come back on every exit that
     does not declare: the estimate clears it to measure against an
-    unloaded model, and an arm still holding a 1.2 kg part must not be
-    left compensating for nothing because someone was curious.
+    unloaded model, and an arm still holding a part must not be left
+    compensating for nothing because someone was curious.
+
+    The part is a light one on purpose. A declared payload the arm is not
+    actually carrying is a torque bias — the controller lifts a mass that
+    is not there — and above a joint's gearbox holding friction that bias
+    drives the arm: at 0.3 kg the elbow runs 33 degrees and folds the
+    wrist into the forearm, so the swing this asks for has nowhere to go.
+    Below the friction the arm simply holds, which is the state a client
+    asking "what am I carrying" is in.
 
     Whether the number is RIGHT is not asserted here and cannot be: this
     fixture re-ticks the daemon for CI, and at that rate the torque plant
@@ -1889,9 +1956,9 @@ async def test_estimate_payload_runs_from_a_program_and_only_declares_what_it_fo
         # through, which park does not give it.
         await settle_at(client, TILTED_POSTURE_DEG)
 
-        assert await client.set_payload(1.2, com=(0.0, 0.01, 0.05)) == 1
+        assert await client.set_payload(0.1, com=(0.0, 0.01, 0.05)) == 1
         before = await client.payload()
-        assert before is not None and before.mass == pytest.approx(1.2)
+        assert before is not None and before.mass == pytest.approx(0.1)
 
         found = await client.estimate_payload(declare=False)
         assert found.poses >= 3, "the wrist must have been swung somewhere"

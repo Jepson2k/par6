@@ -458,6 +458,10 @@ pub struct SimConfig {
     pub motor_b_nm_s: f64,
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
+    /// Gearbox holding friction per joint \[Nm, joint side\]: the load
+    /// the unpowered drivetrain holds without back-driving. Must cover
+    /// the joint's worst gravity torque or an IDLE arm collapses.
+    pub holding_friction_nm: Vec<f64>,
 }
 
 impl Default for SimConfig {
@@ -466,6 +470,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
+            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
 }
@@ -810,6 +815,13 @@ pub struct RobotConfig {
     /// Torque-level sim plant parameters. Omitted = the vendor table.
     #[serde(default)]
     pub sim: SimConfig,
+    /// This installation's standing collision restrictions — the floor,
+    /// cage walls, the table, fixtures. Enforced from boot in the
+    /// planner's gate, the streaming gate and the simulator's scene;
+    /// `set_shapes` replaces the program layer only, so nothing on the
+    /// wire can remove them. Omitted = none.
+    #[serde(default)]
+    pub installation_shapes: Vec<par6_proto::Shape>,
 }
 
 impl RobotConfig {

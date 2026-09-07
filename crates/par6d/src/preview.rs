@@ -6,6 +6,13 @@
 //! never drift from the runtime. Nothing here re-implements a rule;
 //! every refusal is the server's own text.
 
+mod driver;
+pub mod record;
+mod run;
+
+pub use record::TickBatch;
+pub use run::RunLimits;
+
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -30,7 +37,6 @@ use par6_server::{
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
     housekeeping_period, step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate,
-    STREAM_LOOKAHEAD_S,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::CartKin;
@@ -194,6 +200,16 @@ pub struct Preview {
     /// The streaming collision gate, the same one the housekeeping loop
     /// runs: a jog is admitted only if its projected lookahead clears.
     gate: StreamGate,
+    /// The program layer this session applied, and the epoch of the
+    /// world holding it — the runtime's SHAPES readback, for the same
+    /// config. The installation layer is config and lives on `cfg`.
+    shapes: Vec<par6_proto::Shape>,
+    scene_epoch: u64,
+    /// What a run rebuilds its kinematics, its scene and its engine
+    /// from. A dry run boots a second engine from the same bundle, so
+    /// it needs the file rather than the models this session holds.
+    config_path: PathBuf,
+    opts: Options,
     // Keep the stub channel/ring ends alive so the planner's control
     // sends stay silent no-ops instead of logged errors.
     _cmds_rx: mpsc::Receiver<par6_rt::RtCommand>,
@@ -302,7 +318,16 @@ impl Preview {
                 stream_limits,
                 robot.stream.fault_latch_s,
             ),
-            gate: StreamGate::new(stack.gate_collision, &jog_limits, robot.robot.tick_dt_s),
+            gate: StreamGate::new(
+                stack.gate_collision,
+                &jog_limits,
+                crate::daemon::position_loop_gains(robot),
+                robot.robot.tick_dt_s,
+            ),
+            shapes: Vec::new(),
+            scene_epoch: 0,
+            config_path,
+            opts,
             cfg,
             _cmds_rx: cmds_rx,
             _ops_rx: ops_rx,
@@ -810,10 +835,7 @@ impl Preview {
                 self.policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
                 self.sync_planner();
-                if let Err(e) = self.planner.set_shapes(ShapeLayer::Program, &[]) {
-                    return self.refuse(e);
-                }
-                if let Err(e) = self.gate.set_layer(ShapeLayer::Program, &[]) {
+                if let Err(e) = self.set_shapes(ShapeLayer::Program, &[]) {
                     return self.refuse(e);
                 }
             }
@@ -872,10 +894,7 @@ impl Preview {
                 self.sync_planner();
             }
             Command::SetShapes(p) => {
-                if let Err(e) = self.planner.set_shapes(ShapeLayer::Program, &p.shapes) {
-                    return self.refuse(e);
-                }
-                if let Err(e) = self.gate.set_layer(ShapeLayer::Program, &p.shapes) {
+                if let Err(e) = self.set_shapes(ShapeLayer::Program, &p.shapes) {
                     return self.refuse(e);
                 }
             }
@@ -1077,8 +1096,15 @@ impl Preview {
         let q = self.snap.q;
         // A twist the jacobian cannot resolve is admitted: housekeeping
         // holds in place on a failed solve, so nothing unchecked streams.
-        let la = match step_cart_jog(&mut self.cart, probe, STREAM_LOOKAHEAD_S) {
-            Ok((la, _)) => la,
+        let la = match step_cart_jog(&mut self.cart, probe, self.gate.reaction_s()) {
+            Ok((la, qd)) => {
+                let mut la = la;
+                for (j, v) in la.iter_mut().enumerate() {
+                    *v = (*v + self.gate.braking_travel(j, qd[j]))
+                        .clamp(probe.soft_min[j], probe.soft_max[j]);
+                }
+                la
+            }
             Err(_) => return None,
         };
         match self.gate.blocked(&q, &la) {
@@ -1308,10 +1334,28 @@ impl Preview {
         let epoch = self.planner.set_shapes(layer, shapes)?;
         // The streaming gate keeps its own world, and only a set the
         // planner accepted reaches it — the same order the server uses.
-        if epoch.is_some() {
+        if let Some(epoch) = epoch {
             self.gate.set_layer(layer, shapes)?;
+            self.scene_epoch = epoch;
+            // The plant a dry run boots needs the program layer as
+            // bodies, not only as keep-outs, so the accepted set is
+            // kept rather than handed on and forgotten.
+            if layer == ShapeLayer::Program {
+                self.shapes = shapes.to_vec();
+            }
         }
         Ok(epoch)
+    }
+
+    /// The applied world: the config's installation layer, the program
+    /// layer this session set, and the epoch — the runtime's own SHAPES
+    /// readback, for the same config.
+    pub fn shapes(&self) -> (&[par6_proto::Shape], &[par6_proto::Shape], u64) {
+        (
+            &self.cfg.installation_shapes,
+            &self.shapes,
+            self.scene_epoch,
+        )
     }
 }
 

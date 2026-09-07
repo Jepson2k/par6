@@ -279,6 +279,13 @@ pub(crate) struct Par6Planner {
 }
 
 impl Par6Planner {
+    /// Turn the cartesian enablement probe off. Nothing offline serves
+    /// STATUS or answers REACHABLE, and the probe costs 24 seeded IK
+    /// solves and a collision check every time it fires.
+    pub(crate) fn set_enablement_probe(&mut self, on: bool) {
+        self.probe.enabled = on;
+    }
+
     pub(crate) fn new(
         link: CoreLink,
         producer: SampleProducer,
@@ -2049,6 +2056,10 @@ struct EnablementProbe {
     period: Duration,
     due_at: Option<Instant>,
     last_q: Option<[f64; MAX_JOINTS]>,
+    /// Whether the probe runs at all. An offline dry run serves no
+    /// STATUS and answers no REACHABLE, and this is the single most
+    /// expensive thing on the poll loop.
+    enabled: bool,
 }
 
 impl EnablementProbe {
@@ -2057,10 +2068,14 @@ impl EnablementProbe {
             period,
             due_at: None,
             last_q: None,
+            enabled: true,
         }
     }
 
     fn due(&mut self, q: &[f64; MAX_JOINTS]) -> bool {
+        if !self.enabled {
+            return false;
+        }
         let now = Instant::now();
         if self.due_at.is_some_and(|t| now < t) || self.last_q == Some(*q) {
             return false;

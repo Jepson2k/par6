@@ -107,6 +107,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "bytemuck"
+version = "1.25.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "95832e849adfb21180ccb6826a99da14e5d266ae5c2e668e1602cf234f153797"
+
+[[package]]
 name = "byteorder"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -500,9 +506,9 @@ checksum = "3eaf3ede3fee6db1a4c2ee091bf8a8b4dccdc6d17f656fb07896ee72867612f2"
 
 [[package]]
 name = "log"
-version = "0.4.33"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "memchr"
@@ -528,6 +534,18 @@ dependencies = [
  "libc",
  "wasi",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "mujoco-rs"
+version = "6.0.0+mj-3.12.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d666a32cb2b6563fc486e7ce3127be87e4fb13c26b898dbf10cb7f9723054d4e"
+dependencies = [
+ "bytemuck",
+ "log",
+ "paste",
+ "pkg-config",
 ]
 
 [[package]]
@@ -601,8 +619,10 @@ version = "0.1.0"
 dependencies = [
  "libc",
  "log",
+ "mujoco-rs",
  "par6-config",
- "par6-kin",
+ "par6-proto",
+ "roxmltree",
  "socketcan",
  "thiserror 2.0.20",
 ]
@@ -627,6 +647,7 @@ name = "par6-config"
 version = "0.1.0"
 dependencies = [
  "log",
+ "par6-proto",
  "serde",
  "thiserror 2.0.20",
  "toml",
@@ -642,7 +663,6 @@ dependencies = [
  "rs-opw-kinematics",
  "serde",
  "serde_json",
- "sha2",
  "thiserror 2.0.20",
  "urdf-rs",
 ]
@@ -732,10 +752,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "paste"
+version = "1.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
+
+[[package]]
 name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
+
+[[package]]
+name = "pkg-config"
+version = "0.3.34"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f6b464fbc74e149a392436b17d523f769e057cb6877f6a5c4618bc6f11800548"
 
 [[package]]
 name = "portable-atomic"
@@ -917,6 +949,15 @@ name = "regex-syntax"
 version = "0.8.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "rs-opw-kinematics"

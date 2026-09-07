@@ -227,15 +227,10 @@ pub fn sim_options(config: PathBuf, status_port: u16) -> Options {
 /// A daemon whose STATUS broadcast is aimed at `status_port` on
 /// loopback, for a test that listens with a real `par6_client::Client`
 /// instead of the rig's own socket.
-pub fn boot_for_client(
-    config: PathBuf,
-    sim_dynamics: bool,
-    status_port: u16,
-) -> Result<Daemon, String> {
+pub fn boot_for_client(config: PathBuf, status_port: u16) -> Result<Daemon, String> {
     init_test_logging();
     redirect_bus_grant();
     let opts = Options {
-        sim_dynamics,
         ..sim_options(config, status_port)
     };
     Daemon::start(&opts).map_err(|e| e.to_string())
@@ -267,21 +262,36 @@ pub fn free_udp_port() -> u16 {
 }
 
 /// A running daemon plus the sockets its broadcasts land on.
+/// Only one simulated daemon runs at a time, for the whole test binary.
+///
+/// A [`Rig`] boots a real RT loop that has to hold its configured period in
+/// wall-clock time, and the MuJoCo step inside it is not free. Two of them on
+/// one machine miss deadlines, and the tests that measure a reaction — how far
+/// the arm coasts past a keep-out, how a jog ramps down — then fail on the
+/// scheduler rather than on the behaviour they describe. Serializing here
+/// rather than with `--test-threads=1` is what lets a plain `cargo test`
+/// run the whole workspace and mean something.
+static RT_SLOT: Mutex<()> = Mutex::new(());
+
 pub struct Rig {
     daemon: Option<Daemon>,
     status_rx: UdpSocket,
+    /// Held for the daemon's life; see [`RT_SLOT`]. Poisoning is ignored on
+    /// purpose: a panicking test has already failed, and taking the slot down
+    /// with it would fail every test after it for the wrong reason.
+    _slot: std::sync::MutexGuard<'static, ()>,
 }
 
 impl Rig {
     /// Boot the simulator on `config`, with the kinematic plant.
     pub fn boot(config: PathBuf) -> Rig {
-        Rig::boot_with(config, false)
+        Rig::boot_with(config)
     }
 
-    /// Boot the simulator on `config`; `sim_dynamics` selects the
+    /// Boot the simulator on `config`. The
     /// torque-level plant over the kinematic one.
-    pub fn boot_with(config: PathBuf, sim_dynamics: bool) -> Rig {
-        Rig::boot_opts(config, sim_dynamics, None)
+    pub fn boot_with(config: PathBuf) -> Rig {
+        Rig::boot_opts(config, None)
     }
 
     /// Boot the simulator with the STATUS broadcast rate overridden, as
@@ -292,26 +302,22 @@ impl Rig {
 
     /// The same, surfacing the startup error instead of panicking.
     pub fn try_boot_at_status_rate(config: PathBuf, hz: u32) -> Result<Rig, String> {
-        Rig::try_boot_opts(config, false, Some(hz))
+        Rig::try_boot_opts(config, Some(hz))
     }
 
-    fn boot_opts(config: PathBuf, sim_dynamics: bool, status_rate_hz: Option<u32>) -> Rig {
-        Rig::try_boot_opts(config, sim_dynamics, status_rate_hz).expect("daemon boots in sim mode")
+    fn boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Rig {
+        Rig::try_boot_opts(config, status_rate_hz).expect("daemon boots in sim mode")
     }
 
-    fn try_boot_opts(
-        config: PathBuf,
-        sim_dynamics: bool,
-        status_rate_hz: Option<u32>,
-    ) -> Result<Rig, String> {
+    fn try_boot_opts(config: PathBuf, status_rate_hz: Option<u32>) -> Result<Rig, String> {
         init_test_logging();
+        let slot = RT_SLOT.lock().unwrap_or_else(|e| e.into_inner());
         redirect_bus_grant();
         let status_rx = UdpSocket::bind("127.0.0.1:0").expect("status socket");
         status_rx
             .set_read_timeout(Some(READ_TIMEOUT))
             .expect("timeout");
         let opts = Options {
-            sim_dynamics,
             status_rate_hz,
             ..sim_options(config, status_rx.local_addr().unwrap().port())
         };
@@ -319,6 +325,7 @@ impl Rig {
         Ok(Rig {
             daemon: Some(daemon),
             status_rx,
+            _slot: slot,
         })
     }
 
@@ -424,6 +431,23 @@ impl Rig {
 
     pub fn shutdown(mut self) {
         self.daemon.take().expect("running").shutdown();
+    }
+}
+
+impl Drop for Rig {
+    /// Stop the daemon even when the test panicked before `shutdown`, or
+    /// never called it.
+    ///
+    /// A leaked daemon goes on broadcasting STATUS to the ephemeral port
+    /// its `Rig` bound. That port is released when the socket drops, the
+    /// kernel hands the number out again, and the next test's status
+    /// socket then receives two arms interleaved — which reads as a
+    /// wildly misbehaving robot in whichever test happened to draw the
+    /// reused port, not as the leak it is.
+    fn drop(&mut self) {
+        if let Some(daemon) = self.daemon.take() {
+            daemon.shutdown();
+        }
     }
 }
 

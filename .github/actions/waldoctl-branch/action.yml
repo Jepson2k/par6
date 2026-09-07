@@ -1,0 +1,34 @@
+name: install the python package
+description: >-
+  Install `python[dev]` into a pixi environment, resolving waldoctl from a
+  branch of the same name when one exists. A cross-repo change lands on a
+  matching branch first (CLAUDE.md's dev workflow), and while the release
+  chain is in flight the pinned tag may not exist yet — a dead pin fails the
+  whole resolve. The rewrite is for this resolve only; pyproject.toml is
+  restored afterwards so nothing downstream sees a branch pin.
+inputs:
+  environment:
+    description: pixi environment to install into
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        branch="${{ github.head_ref || github.ref_name }}"
+        repo=https://github.com/Jepson2k/waldoctl.git
+        matched=""
+        if [ "$branch" != "main" ] && \
+           git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
+          echo "installing waldoctl from branch $branch"
+          matched=1
+          pixi run -e "${{ inputs.environment }}" pip install "waldoctl @ git+$repo@$branch"
+          sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
+        else
+          echo "no waldoctl branch $branch; keeping the pinned tag"
+        fi
+        pixi run -e "${{ inputs.environment }}" install-python
+        if [ -n "$matched" ]; then
+          mv python/pyproject.toml.bak python/pyproject.toml
+        fi

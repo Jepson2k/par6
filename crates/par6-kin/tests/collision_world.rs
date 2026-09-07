@@ -423,6 +423,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "t".to_owned(),
+        physics: None,
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
@@ -432,6 +433,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "b".to_owned(),
+        physics: None,
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
@@ -441,6 +443,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
         collision: true,
         margin: None,
         name: "b".to_owned(),
+        physics: None,
     })
     .is_err());
 
