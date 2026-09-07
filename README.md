@@ -34,37 +34,55 @@ below works on a laptop and in CI.
 
 ## Installation
 
-`par6d` links a Pinocchio C-ABI shim, so that gets built once before the runtime.
-The library crates need no C++ toolchain; only the binary does.
+par6 links a Pinocchio C-ABI shim built from `cpp/`. [pixi](https://pixi.sh)
+provides the C++ closure it needs — Pinocchio, coal, eigen, urdfdom, libmujoco,
+cmake, ninja and the compiler — from the committed `pixi.lock`, and Rust comes
+from rustup via `rust-toolchain.toml`.
 
 ```bash
-scripts/ffi/setup.sh             # once — builds the shim into .ffi/
-cargo build -p par6d --release
-pip install -e "python[dev]"
+pixi run setup                    # solves the closure and builds the shim
+pixi run cargo build -p par6d --release
+pixi run -e py312 install-python
 ```
 
-A checkout that has run `setup.sh` needs no environment for either step: the build
-scripts find the shim in `.ffi/shim` and bake its directory into `par6d` and the Python
-extension as an rpath, so both run from any shell. `source .ffi/env.sh` is still the way
-to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`), to cross-build, and to
-run the `sim-mujoco` feature (libmujoco lives in the env prefix, which only
-`LD_LIBRARY_PATH` reaches).
+There is no bootstrap step to remember and nothing to source. The shim and
+toppra are compiled by `crates/par6-kin/build.rs` into cargo's `OUT_DIR`, so
+any cargo invocation under `pixi run` builds them if they are missing and
+rebuilds them when `cpp/` changes — cargo owns their freshness the same way
+it owns every other artifact's. `par6d` and the Python extension carry the
+directories they load from as rpaths, so both run from any shell.
 
-`setup.sh` picks its compile parallelism from available RAM (one shim compile job
-peaks near 4 GB; a swapless small box overcommitting that livelocks rather than
-failing). Set `CMAKE_BUILD_PARALLEL_LEVEL` to override it; `.ffi/env.sh` exports the
-same figure as `CARGO_BUILD_JOBS`.
+Every command CI runs is a pixi task, so a red job is reproduced locally by
+running the command in its `run:` line:
+
+| task | what it does |
+|---|---|
+| `pixi run setup` | build the workspace and its C++ dependencies |
+| `pixi run lint` | `cargo fmt --check` and `clippy -D warnings` |
+| `pixi run test-rust` | `cargo test --workspace` |
+| `pixi run test-timing` | the shipped 250 Hz soak, release |
+| `pixi run test-collision-cost` | the per-waypoint collision cost, uncaptured |
+| `pixi run -e py312 install-python` | `pip install -e python[dev]` |
+| `pixi run -e py312 lint-python` | pre-commit (ruff, ruff-format, ty, hygiene) |
+| `pixi run -e py312 test-python` | `pytest` |
+| `pixi run -e py312 test-e2e` | the client against a real `par6d --sim` |
+| `pixi run -e py312 wheel` | the `par6` wheel into `dist/` |
+| `pixi run -e py312 bundle` | the daemon bundle, checksums and manifest |
+
+Compile parallelism is picked from available RAM: one shim compile job peaks
+near 4 GB, and a swapless small box that overcommits that livelocks rather
+than failing. `CMAKE_BUILD_PARALLEL_LEVEL` overrides it.
 
 Installing just the client, which is what Waldo Commander's `[par6]` extra does:
 
 ```bash
-export PAR6_SHIM_LIB_DIR=/path/to/.ffi/shim/lib   # a git install has no checkout to find the shim in
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
 The package is a maturin build: pip compiles the `par6-py` extension (the engine's
 client + preview), so a source install needs the Rust toolchain and the shim from
-`scripts/ffi/setup.sh`. Prebuilt wheels that need neither are the wheel CI's job.
+the C++ closure pixi provides — so it is built from a checkout under `pixi run`,
+or installed from one of the release wheels, which need neither.
 That gives you the client, the offline preview and the kinematics — but **not** the
 `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
 client-only install has nothing to spawn until either the workspace above is built or
@@ -414,8 +432,8 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
 `cpp/` is one C-ABI shim over the C++ dependencies the Rust crates link:
 
 - **Pinocchio** (kinematics/dynamics) — `par6_kin_*`: create/destroy, fk, jacobian,
-  gravity, aba. Consumed by `crates/pinokin-sys`, and on top of that by `par6-kin`, whose
-  analytic IK (`par6_kin::Opw`) is derived from the URDF at load: the fit is checked
+  gravity, aba. Consumed by `par6-kin`, whose analytic IK (`par6_kin::Opw`) is derived
+  from the URDF at load: the fit is checked
   against this FK at pseudo-random configurations and a model the two disagree on is
   refused. That catches an FK the OPW form cannot express, not a wrong URDF — a
   mis-measured link length fits, so the geometry is nominal data the check does not
@@ -424,7 +442,7 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
   and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
   parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).
 - **toppra-cpp** (time-optimal path parameterization) — `par6_traj_*`. Built from source
-  by `scripts/ffi/setup.sh` (conda-forge ships no C++ toppra), pinned to commit
+  by `crates/par6-kin/build.rs` (conda-forge ships no C++ toppra), pinned to commit
   `142456f3` (v0.6.9), with its bundled Seidel LP solver — no qpOASES, no GPL GLPK.
 
 ```
@@ -432,18 +450,25 @@ cpp/include/par6_shim.h    the frozen C ABI (PAR6_SHIM_ABI_VERSION)
 cpp/src/par6_shim.cpp      par6_kin_* (pinocchio)
 cpp/src/par6_traj.cpp      par6_traj_* (toppra-cpp)
 cpp/src/par6_col.cpp       par6_col_* (pinocchio + coal)
-crates/pinokin-sys/        raw decls + safe Model/Trajectory/CollisionModel wrappers
-scripts/ffi/setup.sh       reproducible toolchain bootstrap (micromamba)
+crates/par6-kin/src/sys/   the raw decls (ffi.rs) and the RAII handles over them; Kin/Collision/Trajectory build on those
+crates/par6-kin/build.rs   compiles toppra and cpp/ into cargo's OUT_DIR
+pixi.toml / pixi.lock      the C++ closure they link against
+scripts/ffi/setup.sh       cross only: a foreign-platform prefix and shim
 ```
 
-`scripts/ffi/setup.sh` puts everything under `<repo>/.ffi` (self-gitignored, override
-with `PAR6_FFI_DIR`): `bin/micromamba`, `env/` (conda-forge packages + the from-source
-toppra install), `shim/` (installed lib + header), `env.sh`. Re-running is idempotent;
-`FORCE=1` rebuilds the shim. Pinned: **pinocchio 4.1.0**, **toppra 142456f3**
-(`PAR6_PINOCCHIO_VERSION` / `PAR6_TOPPRA_COMMIT` override). Builds discover the shim
-under `.ffi/shim/lib` on their own and carry it as an rpath, so `source .ffi/env.sh` is
-only needed to point at a shim installed elsewhere (`PAR6_SHIM_LIB_DIR`,
-`PAR6_SHIM_INCLUDE_DIR`, `PAR6_SHIM_LINK=dylib|static`, `PAR6_SHIM_DEP_LIB_DIR`).
+`crates/par6-kin/build.rs` builds toppra and the shim into cargo's `OUT_DIR`
+(`target/<profile>/build/par6-kin-*/out/shim/lib`), with libtoppra installed beside
+the shim so one directory and one rpath cover the pair. Cargo owns their freshness:
+an edit under `cpp/` reruns the script and rebuilds what it touched, and a
+`cargo clean` removes them along with everything else. The C++ closure they link
+against — **pinocchio 4.1**, **coal**, **eigen**, **urdfdom**, **libmujoco 3.12**,
+plus cmake, ninja and the compiler — comes from `pixi.lock`; **toppra 142456f3**
+is pinned in the build script.
+
+Two escape hatches, both for builds that cannot compile the shim in place:
+`PAR6_SHIM_LIB_DIR` (with `PAR6_SHIM_INCLUDE_DIR`) links one built elsewhere and
+skips the build, which is how the cross path works, and `PAR6_TOPPRA_SRC` supplies
+a checkout instead of fetching one.
 
 ABI conventions, frozen in `par6_shim.h`: poses are row-major 4×4; Jacobians 6×nq,
 rows `[linear; angular]`, world axes at the frame origin; gravity is RNEA at zero
@@ -453,7 +478,7 @@ is allocation-free (one handle per thread); `par6_traj_sample` is allocation-fre
 safe from the RT tick; `par6_col_check` allocates in coal's narrow phase and is
 planner-side only. Exceptions never cross the boundary.
 
-What the shim is held to: `crates/pinokin-sys/tests/{collision,traj}.rs` cover the C
+What the shim is held to: `crates/par6-kin/tests/c_boundary_{collision,traj}.rs` cover the C
 boundary itself (NULL/out-of-range arguments, geometry-index layout across layer
 replacement, buffer truncation, the time-optimality requirement of the retimer);
 `crates/par6-kin/tests/{kinematics,collision_world}.rs` cover the contract above the
@@ -594,13 +619,18 @@ The Python side reads three of its own:
 ## Development setup
 
 ```bash
-scripts/ffi/setup.sh                                                       # once: the shim
-cargo fmt --all && cargo clippy --all-targets -- -D warnings          # CI gate
-cargo test
-cargo build -p par6d --release
-pip install -e "python[dev]"                                               # builds par6._par6
-cd python && PAR6D_BIN=../target/release/par6d python3 -m pytest -q
+pixi run lint                      # the CI gate: fmt + clippy -D warnings
+pixi run test-rust
+pixi run build-daemon
+pixi run -e py312 install-python   # builds par6._par6
+pixi run -e py312 test-python
+pixi run -e py312 test-e2e         # the client against a real par6d --sim
 ```
+
+CI is these tasks and nothing else, on aarch64 first: the arm runs on a
+Raspberry Pi, so the full Rust, Python, e2e and packaging suites run on ARM64
+runners and x86_64 carries a build plus the core tests as the compatibility
+check a developer's laptop needs.
 
 The Rust tests are the whole test surface for the numerics: the kinematics contract
 (`par6-kin/tests/kinematics.rs`), the collision verdicts (`collision_world.rs`), and the
@@ -627,16 +657,31 @@ The normal path is to build **on the box** ([Installation](#installation): the s
 `par6d` and the Python package build there in minutes) and install locally:
 
 ```bash
-cargo build -p par6d --release --target aarch64-unknown-linux-gnu
-python3 scripts/ffi/stage_runtime_libs.py --readelf readelf --lib-dir .ffi/env/lib \
-    --dest .ffi/stage/lib .ffi/shim/lib/libpar6_shim.so      # the shim's dependency closure
-scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
-sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
+pixi run -e py312 bundle           # -> dist/par6d-aarch64.tar.gz + SHA256SUMS + manifest.json
+sudo tar -C /tmp -xzf dist/par6d-aarch64.tar.gz
+sudo /tmp/bundle/install.sh --local --bundle /tmp/bundle
 ```
 
-`install.sh` reads the binary from `target/aarch64-unknown-linux-gnu/`, so the
-explicit `--target` matters even natively. Folding the staging step into
-`install.sh` itself is still to do.
+`pixi run bundle` builds `par6d`, stages its whole runtime closure — the shim,
+toppra, libmujoco, Pinocchio, coal and everything they pull in — into one flat
+directory, rewrites every rpath to `$ORIGIN` (the binary's to the install
+directory), and proves the set loadable before packing it: one glibc floor
+across the closure, no soname the staged copies do not provide, and no
+build-machine path left in anything that ships. The manifest records the commit,
+the daemon and client versions, the waldoctl pin and the measured glibc floor.
+
+`scripts/deploy/validate-bundle.sh dist/` is what CI runs against that output:
+it unpacks and installs the bundle and the wheel with no pixi, no cargo, no
+`.ffi` and no `LD_LIBRARY_PATH`, then drives forward kinematics, a keep-out
+refusal and a live daemon through them. A release publishes the artifacts that
+passed it, unchanged.
+
+The glibc floor comes from pixi's compiler, not the build machine's: the conda
+toolchain carries its own sysroot, so a native build on a glibc 2.39 host
+produces a `par6d` that needs 2.28 and a shim and closure that need 2.17 —
+under Raspberry Pi OS bookworm's 2.36 and bullseye's 2.31. Cross-building is
+therefore no longer required for compatibility; it is retained until the
+native bundle has a green run of `validate-bundle.sh` behind it.
 
 Cross-building from another machine is optional — for CI, or a box that should not
 carry a toolchain:
@@ -684,8 +729,8 @@ the case where the box should not carry a compiler:
   pinned commit through a generated CMake toolchain file, exactly like the
   native path.
 - `scripts/ffi/stage_runtime_libs.py` then walks `DT_NEEDED` from
-  `libpar6_shim.so` and copies the whole closure — 20 libraries, ~65 MB —
-  into the shim's own `lib/` directory. That directory is the deploy unit:
+  `libpar6_shim.so` and `libmujoco.so` and copies the whole closure into the
+  shim's own `lib/` directory. That directory is the deploy unit:
   the shim is linked with `$ORIGIN`, `par6d` with an rpath of
   `/usr/local/lib/par6`, and `install.sh` copies the one into the other.
 

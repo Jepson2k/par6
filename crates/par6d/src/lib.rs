@@ -28,6 +28,7 @@
 
 mod adapters;
 mod bridge;
+pub mod calibrate;
 pub mod collision_world;
 pub mod daemon;
 mod grant;
@@ -39,6 +40,7 @@ pub mod preview;
 pub mod vitals;
 
 pub use bridge::stream_stopping_travel;
-pub use daemon::{Daemon, DaemonError, COLLISION_CLEARANCE_M};
+pub use daemon::{Daemon, DaemonError};
 pub use kin::{matrix_to_xyzrpy, translate_local};
 pub use options::Options;
+pub use par6_kin::COLLISION_CLEARANCE_M;

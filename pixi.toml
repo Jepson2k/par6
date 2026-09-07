@@ -9,9 +9,7 @@ version = "0.1.0"
 # build it. Rust comes from rustup (rust-toolchain.toml), not from here — pixi
 # owns the system/C++ side only. (A Python still lands in the default
 # environment through libpinocchio → casadi; the runtime never loads it.)
-#
-# libmujoco is NOT here for the runtime: the `mujoco-rs` crate fetches it itself
-# via its `auto-download-mujoco` feature into $MUJOCO_DOWNLOAD_DIR.
+
 [dependencies]
 # The C++ library packages, not the `pinocchio`/`coal` metapackages — those
 # drag in the Python bindings (and a Python) the runtime never loads.
@@ -24,58 +22,109 @@ libpinocchio = "4.1.*"
 libcoal = "*"
 eigen = "*"
 urdfdom = "*"
+# The simulator's physics. `mujoco-rs` is bindings only here (no
+# `auto-download-mujoco`): it links what MUJOCO_DYNAMIC_LINK_DIR points at,
+# so libmujoco arrives from the same solve as everything else instead of a
+# second downloader with its own directory and cache. The version is the
+# one mujoco-rs 6.0.0 generates its bindings against (`+mj-3.12.0`).
+libmujoco = "3.12.*"
 cmake = "*"
 ninja = "*"
 cxx-compiler = "*"
+# Rewrites the rpaths of the shipped binary and its staged closure, and
+# reads them back in the packaging check.
+patchelf = "*"
 
 [activation.env]
-PAR6_SHIM_LIB_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/lib"
-PAR6_SHIM_INCLUDE_DIR = "$PIXI_PROJECT_ROOT/.ffi/shim/include"
-# Runtime loading for binaries whose package did not embed an rpath — link
-# args do not propagate across cargo packages (par6-bus's libmujoco rpath
-# covers its own test binaries only; par6-rt, par6d and par6-py load it
-# from here). The mujoco directory follows the workspace mujoco-rs pin.
-LD_LIBRARY_PATH = "$PIXI_PROJECT_ROOT/.ffi/shim/lib:$PIXI_PROJECT_ROOT/.ffi/toppra/lib:$PIXI_PROJECT_ROOT/.ffi/mujoco/mujoco-3.12.0/lib:$CONDA_PREFIX/lib"
-# mujoco-rs requires an absolute path; it fetches the libmujoco matching
-# CARGO_CFG_TARGET_ARCH into this directory.
-MUJOCO_DOWNLOAD_DIR = "$PIXI_PROJECT_ROOT/.ffi/mujoco"
-# toppra-cpp pin. Bump together with a rebuild (rm -rf .ffi/toppra).
-TOPPRA_COMMIT = "142456f3282c92c93ab97749a24856661924d989"
+# Anything that links the workspace loads Pinocchio, coal and libmujoco from
+# here. The crates that link them emit an rpath for their own targets, but
+# link args do not propagate across cargo packages, so a test binary two
+# crates downstream has none — this covers those.
+LD_LIBRARY_PATH = "$CONDA_PREFIX/lib"
+# Read by mujoco-rs's build script: link libmujoco from this prefix rather
+# than downloading a copy of its own.
+MUJOCO_DYNAMIC_LINK_DIR = "$CONDA_PREFIX/lib"
 
-# toppra-cpp has no conda-forge C++ package (only pure-python `toppra-python`),
-# so the pinned commit is built from source. It installs into its own prefix
-# rather than $CONDA_PREFIX so `pixi install` cannot clobber it.
-[tasks.fetch-toppra]
-cmd = "bash scripts/ffi/fetch_toppra.sh"
-outputs = [".ffi/src/toppra/cpp/CMakeLists.txt"]
-
-[tasks.build-toppra]
-depends-on = ["fetch-toppra"]
-cmd = "bash scripts/ffi/build.sh toppra"
-outputs = [".ffi/toppra/lib/libtoppra.so"]
-
-[tasks.build-shim]
-depends-on = ["build-toppra"]
-cmd = "bash scripts/ffi/build.sh shim"
-inputs = ["cpp/**"]
-outputs = [".ffi/shim/lib/libpar6_shim.so"]
-
-# libmujoco is downloaded by `mujoco-rs`'s build script into
-# $MUJOCO_DOWNLOAD_DIR, so the only way to materialise it is to build the one
-# crate that depends on it. Without this, `pixi run setup` leaves `.ffi`
-# incomplete: everything that links `-lmujoco` without having built par6-bus
-# first — the maturin wheel build, most obviously — fails to link, and a
-# populated `.ffi` cache hides it until the cache key changes.
+# Every command CI runs, runnable the same way locally. CI calls these and
+# nothing else, so a green pipeline is reproducible with `pixi run <task>`.
 #
-# Keyed on the library actually being there rather than on cargo's freshness:
-# `target/` and `.ffi` are cached separately, so cargo can hold par6-bus fresh
-# — skipping the build script that does the download — while `.ffi` is empty.
-# Cleaning mujoco-rs is what forces its script to run again.
-[tasks.fetch-mujoco]
-cmd = "bash scripts/ffi/fetch_mujoco.sh"
-
+# Nothing here builds the C++: `crates/par6-kin/build.rs` compiles the shim
+# and toppra into cargo's OUT_DIR, so any cargo invocation provisions them
+# and cargo owns their freshness. `setup` exists to do that once, up front,
+# so a job that only packages does not discover it mid-step.
 [tasks.setup]
-depends-on = ["build-shim", "fetch-mujoco"]
+cmd = "cargo build --workspace --all-targets"
+
+[tasks.fmt]
+cmd = "cargo fmt --all --check"
+
+[tasks.clippy]
+cmd = "cargo clippy --all-targets -- -D warnings"
+
+[tasks.lint]
+depends-on = ["fmt", "clippy"]
+
+# One command, every crate, nothing excluded. par6d's integration tests each
+# boot a real daemon on a real-time tick; two on one machine miss deadlines,
+# which the harness holds off with a process-wide slot rather than a separate
+# invocation.
+[tasks.test-rust]
+cmd = "cargo test --workspace"
+
+# The collision golden suite runs in `test-rust` too; this reruns its timing
+# case optimized and uncaptured so the per-waypoint cost the planner budgets
+# against is visible in the log.
+[tasks.test-collision-cost]
+cmd = "cargo test -p par6-kin --release --test collision_world per_waypoint_check_cost_is_reported -- --nocapture"
+
+# The shipped 250 Hz configuration end to end. Every other harness patches
+# tick_dt_s up for CI headroom; this soak is the one place the unpatched
+# 0.004 runs before it meets the arm. Release because an unoptimized RT loop
+# cannot hold a 4 ms period anywhere.
+[tasks.test-timing]
+cmd = "cargo test -p par6d --release --test shipped_tick -- --nocapture"
+
+# The python package, in one of the interpreter environments:
+#   pixi run -e py312 install-python && pixi run -e py312 test-python
+[tasks.install-python]
+cmd = "pip install -e 'python[dev]'"
+
+[tasks.lint-python]
+cmd = "pre-commit run --show-diff-on-failure --color=always --all-files"
+
+[tasks.test-python]
+cmd = "pytest"
+cwd = "python"
+
+# End to end: the real client against a real `par6d --sim` over real UDP.
+# PAR6D_BIN must point at the built daemon, which `build-daemon` produces.
+[tasks.build-daemon]
+cmd = "cargo build -p par6d --release"
+
+[tasks.test-e2e]
+cmd = "pytest -m e2e"
+cwd = "python"
+depends-on = ["build-daemon"]
+
+[tasks.test-examples]
+cmd = "pytest -m examples --examples"
+cwd = "python"
+depends-on = ["build-daemon"]
+
+# Release artifacts.
+[tasks.wheel]
+cmd = "maturin build --release -o ../dist"
+cwd = "python"
+
+[tasks.sdist]
+cmd = "maturin sdist -o ../dist"
+cwd = "python"
+
+# The daemon bundle a control box installs with `tar -x`: par6d, the shim
+# and its runtime closure, config and assets.
+[tasks.bundle]
+cmd = "bash scripts/deploy/pack-bundle.sh"
+depends-on = ["build-daemon"]
 
 # Python interpreters for the package's supported versions. The package is a
 # maturin build linking the shim, so it needs this environment's activation at
@@ -85,10 +134,18 @@ depends-on = ["build-shim", "fetch-mujoco"]
 [feature.py311.dependencies]
 python = "3.11.*"
 pip = "*"
+# Builds the wheel (`pixi run -e py311 wheel`) and grafts the shim's
+# runtime closure into it, which is what makes the wheel installable with
+# no conda environment.
+maturin = ">=1.8,<2"
 
 [feature.py312.dependencies]
 python = "3.12.*"
 pip = "*"
+# Builds the wheel (`pixi run -e py312 wheel`) and grafts the shim's
+# runtime closure into it, which is what makes the wheel installable with
+# no conda environment.
+maturin = ">=1.8,<2"
 
 # Asset generation and probes: Open3D for mesh decimation
 # (scripts/simplify_meshes.py) and pinocchio's Python bindings for

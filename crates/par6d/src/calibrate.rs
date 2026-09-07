@@ -327,8 +327,12 @@ pub const MEASURED: f64 = 0.5;
 /// resolution (`par6d::kin::estimation_model`), so an estimate runs
 /// against exactly the arm the daemon models.
 pub struct EstimationModel {
+    /// Gravity model the fit predicts torques with. Loaded with NO tool
+    /// when the load at the flange is what is being measured.
     pub kin: Kin,
+    /// The world the wrist poses are planned clear of.
     pub collision: Collision,
+    /// Per-joint soft limits every pose and its approach must stay inside.
     pub window: [(f64, f64); NQ],
 }
 

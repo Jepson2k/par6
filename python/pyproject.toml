@@ -29,7 +29,7 @@ par6-preflight = "par6.panel.preflight:main"
 # hardware wheels and carry `ty: ignore`, but a muted pyserial would be an
 # ignore that is used on CI and unused on any box that has it — a gate that
 # passes or fails on what happens to be installed.
-dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout", "pillow", "pyserial"]
+dev = ["ruff==0.15.8", "ty", "pre-commit", "pytest", "pytest-asyncio", "pytest-timeout", "pytest-xdist", "pillow", "pyserial"]
 # The control box front panel (`par6-panel`, `par6-preflight`): PIL draws the
 # OLED frames, gpiozero owns the buttons and LEDs, the Adafruit driver talks
 # to the SSD1306 over I2C, pyserial to the mainboard PCB.

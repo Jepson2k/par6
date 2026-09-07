@@ -14,8 +14,7 @@
 #
 # Installs to:
 #   /usr/local/bin/par6d              the runtime binary
-#   /usr/local/lib/par6/*.so          the Pinocchio shim + its runtime closure,
-#                                     and libmujoco (the simulator's physics)
+#   /usr/local/lib/par6/*.so          the Pinocchio shim, libmujoco and their runtime closure
 #   /etc/par6/PAR6.toml               robot config (kept on re-install unless --force-config)
 #   /etc/par6/grippers/*.toml         gripper configs (same rule)
 #   /usr/share/par6/par6_description  URDF/meshes (the kinematics/collision models)
@@ -42,16 +41,6 @@ ASSETS_DIR="$ROOT/assets/par6_description"
 # produced. par6d is linked with an rpath pointing at $LIBS_DEST, so these
 # have to arrive with the binary or it will not start.
 RUNTIME_LIBS="${PAR6_RUNTIME_LIB_SRC:-}"
-# libmujoco ships too: par6d links it for the simulator, and mujoco-rs
-# downloads it into its own directory rather than into the shim's closure,
-# so it is not covered by the staging above. The glob follows the mujoco-rs
-# pin, which decides the version directory's name.
-MUJOCO_LIBS="${PAR6_MUJOCO_LIB_SRC:-}"
-if [ -z "$MUJOCO_LIBS" ] && [ -n "${MUJOCO_DOWNLOAD_DIR:-}" ]; then
-  for d in "$MUJOCO_DOWNLOAD_DIR"/mujoco-*/lib; do
-    [ -d "$d" ] && MUJOCO_LIBS="$d"
-  done
-fi
 UNIT="$ROOT/scripts/deploy/par6d.service"
 
 STAGE_DIR=""
@@ -78,7 +67,6 @@ while [ $# -gt 0 ]; do
     --config) CONFIG_DIR="${2:?--config needs a directory}"; shift 2;;
     --assets) ASSETS_DIR="${2:?--assets needs a directory}"; shift 2;;
     --runtime-libs) RUNTIME_LIBS="${2:?--runtime-libs needs a directory}"; shift 2;;
-    --mujoco-libs) MUJOCO_LIBS="${2:?--mujoco-libs needs a directory}"; shift 2;;
     --bundle) BUNDLE="${2:?--bundle needs a directory}"; shift 2;;
     --stage-only) STAGE_ONLY="${2:?--stage-only needs a directory}"; shift 2;;
     --local) LOCAL=1; shift;;
@@ -199,10 +187,6 @@ stage_bundle() {
    --runtime-libs DIR)"
   [ -e "$RUNTIME_LIBS/libpar6_shim.so" ] \
     || die "no libpar6_shim.so under $RUNTIME_LIBS"
-  [ -n "$MUJOCO_LIBS" ] || die "no libmujoco directory
-  (source .ffi/env-aarch64.sh so MUJOCO_DOWNLOAD_DIR is set and build par6d
-   first, or pass --mujoco-libs DIR)"
-  [ -e "$MUJOCO_LIBS/libmujoco.so" ] || die "no libmujoco.so under $MUJOCO_LIBS"
   [ -d "$ASSETS_DIR" ] || die "no assets tree at $ASSETS_DIR"
   mkdir -p "$dir/config/grippers"
   cp "$BINARY" "$dir/par6d"
@@ -212,9 +196,6 @@ stage_bundle() {
   cp "$CONFIG_DIR"/grippers/*.toml "$dir/config/grippers/"
   mkdir -p "$dir/lib"
   cp "$RUNTIME_LIBS"/*.so* "$dir/lib/"
-  # -a: the vendor ships libmujoco.so as a symlink to the versioned file, and
-  # the loader follows the SONAME, so both have to arrive intact.
-  cp -a "$MUJOCO_LIBS"/libmujoco.so* "$dir/lib/"
   cp -a "$ASSETS_DIR" "$dir/par6_description"
 }
 

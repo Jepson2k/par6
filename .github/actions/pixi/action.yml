@@ -1,0 +1,48 @@
+name: pixi environment
+description: >-
+  Rust from rustup and the C++ closure from pixi, plus the cargo cache that
+  holds the compiled shim. Every job that builds the workspace runs this.
+inputs:
+  pixi-version:
+    description: pinned pixi release
+    default: v0.79.0
+  environments:
+    description: pixi environments to install (space separated)
+    default: default
+  cache-key:
+    description: extra discriminator for the cargo cache
+    default: ''
+  rust-toolchain:
+    description: rustup toolchain to force, or empty for rust-toolchain.toml
+    default: ''
+  rust-targets:
+    description: extra rustup targets
+    default: ''
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@master
+      if: inputs.rust-toolchain != ''
+      with:
+        toolchain: ${{ inputs.rust-toolchain }}
+        targets: ${{ inputs.rust-targets }}
+    - uses: dtolnay/rust-toolchain@stable
+      if: inputs.rust-toolchain == ''
+      with:
+        components: rustfmt, clippy
+        targets: ${{ inputs.rust-targets }}
+    - uses: prefix-dev/setup-pixi@v0.8.1
+      with:
+        pixi-version: ${{ inputs.pixi-version }}
+        environments: ${{ inputs.environments }}
+        locked: true
+        cache: true
+    # The compiled shim and toppra live in cargo's OUT_DIR, so this single
+    # cache holds them and cargo's fingerprints together and the two cannot
+    # skew — which is what the separate `.ffi` cache used to allow. The key
+    # carries what OUT_DIR depends on beyond the Cargo.lock, rustc version
+    # and target triple rust-cache already hashes: the conda solve, the C++
+    # sources, and the build scripts that compile them.
+    - uses: Swatinem/rust-cache@v2
+      with:
+        key: ${{ inputs.cache-key }}-${{ hashFiles('pixi.lock', 'cpp/**', 'crates/*/build.rs') }}

@@ -35,10 +35,13 @@ def main() -> None:
     preview.set_shapes([keepout])
     try:
         preview.move_j(target, speed=0.4)
-        print("preview: allowed (the keep-out missed the path)")
-        return
     except RobotError as e:
+        previewed = e
         print(f"preview refused: [{e.code}] {e.cause}")
+    else:
+        raise SystemExit(
+            "the preview allowed the move: the keep-out is not across the path"
+        )
 
     # The client is closed on the way out: it owns a background event loop
     # and the runtime's status stream, and leaving those to interpreter
@@ -59,9 +62,20 @@ def main() -> None:
         rbt.set_shapes([keepout])
         try:
             rbt.move_j(target, speed=0.4, wait=True)
-            print("runtime: allowed — preview and runtime DISAGREE")
         except RobotError as e:
             print(f"runtime refused: [{e.code}] {e.cause}")
+            if e.code != previewed.code:
+                raise SystemExit(
+                    f"preview refused with {previewed.code} but the runtime "
+                    f"refused with {e.code}"
+                ) from e
+            for refusal in (previewed, e):
+                if "shape:keepout" not in refusal.cause:
+                    raise SystemExit(
+                        f"a refusal did not name the keep-out: {refusal.cause!r}"
+                    )
+        else:
+            raise SystemExit("the runtime ran the move the preview refused")
 
         # Clear the world and the same move runs.
         rbt.set_shapes([])
