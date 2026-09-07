@@ -20,6 +20,9 @@
 #   6. the wheel imports and computes in a bare venv
 set -euo pipefail
 
+# Resolved before the working directory moves: everything below runs from a
+# scratch directory, so a path relative to this script would not survive it.
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 DIST="$(cd "${1:?usage: validate-bundle.sh <dist dir>}" && pwd)"
 WORK="${PAR6_VALIDATE_DIR:-/tmp/par6-validate}"
 # Raspberry Pi OS bookworm ships glibc 2.36; bullseye 2.31. The floor the
@@ -90,7 +93,6 @@ python3 -m venv "$WORK/venv"
 "$WORK/venv/bin/python" -c "import par6; print('wheel imports self-contained:', par6.__version__)"
 
 say "6. kinematics, collision and the installed daemon"
-PAR6D_BIN=/usr/local/bin/par6d "$WORK/venv/bin/python" \
-  "$(dirname "${BASH_SOURCE[0]}")/validate_engine.py"
+PAR6D_BIN=/usr/local/bin/par6d "$WORK/venv/bin/python" "$HERE/validate_engine.py"
 
 say "the shipped artifacts install and run outside the build environment"
