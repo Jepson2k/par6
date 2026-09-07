@@ -60,16 +60,14 @@ def main() -> int:
         raise SystemExit("a keep-out across the path did not refuse the move")
 
     # The daemon the bundle installed, spawned from PATH and answering.
-    robot.start()
-    try:
-        with robot.create_client() as rbt:
-            rbt.wait_ready(timeout=60.0)
-            angles = rbt.angles()
-            if len(angles) != 6:
-                raise SystemExit(f"daemon reported {angles!r}")
-            print("daemon answered with", [round(a, 2) for a in angles])
-    finally:
-        robot.stop()
+    with robot:
+        rbt = robot.create_sync_client()
+        if not rbt.wait_ready(timeout=60.0):
+            raise SystemExit("the installed par6d never became ready")
+        angles = rbt.angles()
+        if len(angles) != 6:
+            raise SystemExit(f"daemon reported {angles!r}")
+        print("daemon answered with", [round(a, 2) for a in angles])
 
     print("engine and daemon both live outside the build environment")
     return 0

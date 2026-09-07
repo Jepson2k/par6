@@ -200,8 +200,10 @@ jobs:
         with:
           environments: py312
           cache-key: bundle
-      - run: pixi run -e py312 bundle
+      # The wheel first: pack-bundle writes the checksums over everything in
+      # dist/, and a wheel built after it would not be covered.
       - run: pixi run -e py312 wheel
+      - run: pixi run -e py312 bundle
       - uses: actions/upload-artifact@v4
         with:
           name: par6-aarch64
