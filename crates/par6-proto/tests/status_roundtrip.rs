@@ -14,6 +14,7 @@ use par6_proto::{decode_status, DriveHealthWire, Status, StatusEncoder};
 fn populated() -> Status {
     Status {
         seq: 4242,
+        session_id: u64::MAX - 1,
         angles: [1.0, -2.0, 3.5, -4.25, 5.125, -6.0625],
         torques: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         torques_ext: [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
@@ -42,6 +43,7 @@ fn every_status_slot_survives_encode_and_decode() {
     let got = decode_status(bytes).expect("the encoder's own output must decode");
 
     assert_eq!(got.seq, sent.seq);
+    assert_eq!(got.session_id, sent.session_id);
     assert_eq!(got.angles, sent.angles);
     assert_eq!(got.torques_ext, sent.torques_ext);
     assert_eq!(got.io, sent.io);
@@ -75,4 +77,17 @@ fn a_bus_with_no_drives_still_round_trips() {
     let got = decode_status(bytes).expect("an empty drive_health must decode");
     assert!(got.drive_health.faults.is_empty());
     assert!(got.drive_health.temperatures_c.is_empty());
+}
+
+#[test]
+fn session_metadata_requires_an_unsigned_integer_and_complete_field() {
+    let mut encoder = StatusEncoder::new();
+    let mut prefix = encoder.encode(&Status::default()).to_vec();
+    prefix.pop();
+    assert!(decode_status(&prefix).is_err());
+    for invalid in [vec![0xc0], vec![0xc3], vec![0xff], vec![0xa1, b'1']] {
+        let mut packet = prefix.clone();
+        packet.extend_from_slice(&invalid);
+        assert!(decode_status(&packet).is_err());
+    }
 }

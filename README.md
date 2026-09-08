@@ -518,6 +518,22 @@ and one check costs ~35 ms against 25 µs for a box.
 conda-forge ships `linux-aarch64` Pinocchio, so the control box builds the shim natively
 with the same script; cross-compiling it from x86_64 is not supported.
 
+## Timed observations
+
+STATUS carries `session_id`, `seq` and `mono_time_ns`. `controller_id` identifies
+the configured controller; `session_id` identifies this running publisher and
+changes on restart. The client accepts a new session even when its sequence
+starts below the previous one, and ignores duplicate/out-of-order sequence
+numbers within one session. The timestamp belongs to the controller's monotonic
+snapshot clock, not a synchronized host clock or guaranteed common sensor
+acquisition time. The Python client advertises `observation.timed`.
+
+Waldo Commander can retain these joint/tool observations, their source cadence
+and gaps. Its conservative replay uses the existing native joint planner and
+delays, with ordinary limits, collision checks and completion behavior. It stops
+at observed waypoints and can take substantially longer than the demonstration.
+The Python client and daemon must both include this STATUS extension.
+
 ## Ports and environment variables
 
 Only the **6001** command port is fixed by the wire contract; the rest are defaults in

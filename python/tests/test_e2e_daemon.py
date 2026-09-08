@@ -129,6 +129,8 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
                 if len(frames) == 5:
                     break
         assert [f.proto_version for f in frames] == [PROTO_VERSION] * 5
+        assert frames[0].session_id > 0
+        assert all(f.session_id == frames[0].session_id for f in frames)
         assert all(b.seq > a.seq for a, b in zip(frames, frames[1:]))
         assert all(b.mono_time_ns > a.mono_time_ns for a, b in zip(frames, frames[1:]))
         assert all(f.link_ok == 1 and f.simulator_active for f in frames)
