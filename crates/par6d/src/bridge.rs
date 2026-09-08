@@ -94,7 +94,30 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// tick, and an RT that drains one command per tick. Counted in ticks
 /// because that is what those stages are made of — a flat wall-clock
 /// horizon was a different number of pipeline stages at every tick rate.
-const STOP_PIPELINE_TICKS: f64 = 24.0;
+///
+/// Three, because that is how many stages the paragraph above names.
+/// This was 24, which is not a stage count: it is eight times the
+/// pipeline, and because the term is multiplied by the tick period it
+/// bought a different horizon at every rate -- 0.096 s on the shipped
+/// 250 Hz robot, but 1.2 SECONDS on a 20 Hz test rig, which projected
+/// the elbow 58 degrees ahead and refused an ordinary descent against a
+/// floor the arm was never going to reach.
+///
+/// Measured by logging each gate refusal's projection beside the travel
+/// the arm actually made before coming to rest (rad):
+///
+/// | joint | v      | predicted | actual | ratio |
+/// |-------|--------|-----------|--------|-------|
+/// | J2    |  0.093 |  0.190    |  0.037 | 0.19  |
+/// | J3    | -0.473 | -0.801    | -0.076 | 0.10  |
+/// | J5    |  0.399 |  0.702    |  0.128 | 0.18  |
+///
+/// The arm stops in well under the settling term below, so the pipeline
+/// has nothing left to stand in for. At the shipped tick rate this
+/// barely moves the projection -- the settling term dominates there
+/// either way -- and at a slow rig it removes an order of magnitude of
+/// phantom lookahead.
+const STOP_PIPELINE_TICKS: f64 = 3.0;
 
 /// First-order lags the settling term counts.
 ///
