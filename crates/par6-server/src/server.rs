@@ -362,6 +362,8 @@ struct Core<R: RtCommands> {
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
+    attachment_epoch: u64,
+    attachment_stop_pending: bool,
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
@@ -453,6 +455,10 @@ impl<R: RtCommands> Core<R> {
             tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
             shapes: Vec::new(),
+            attachment_epoch: RandomState::new()
+                .hash_one((std::process::id(), std::time::SystemTime::now()))
+                .max(1),
+            attachment_stop_pending: false,
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
@@ -527,6 +533,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_datagram(&mut self, data: &[u8], addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match peek_tag(data) {
             Ok(t) if t == MsgType::Chunk as u8 as i64 => self.on_chunk(data, addr).await,
             _ => self.on_command_bytes(data, addr).await,
@@ -613,6 +620,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
@@ -647,6 +655,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_status(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.update_tcp_speed();
         self.update_collision();
         self.refresh_queue_estimate();
@@ -829,6 +838,10 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         if let C::SetShapes(p) = cmd {
+            if let Some(error) = self.attachment_shapes_error(&p.shapes) {
+                self.reply(addr, &Reply::Error { req_id, error }).await;
+                return;
+            }
             self.defer_program_shapes(req_id, addr, p.shapes.clone());
             return;
         }
@@ -897,6 +910,7 @@ impl<R: RtCommands> Core<R> {
                 }
             },
             C::Simulator(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the simulator switch").await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
@@ -929,6 +943,7 @@ impl<R: RtCommands> Core<R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the hardware connect").await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
@@ -998,6 +1013,7 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
+        self.invalidate_attachments();
         self.estop_latched = false;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1041,6 +1057,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         // An exit from any mode but FLASHING is refused HERE: it would
         // dispatch `SetMode(Idle)`, which from a working mode cancels
         // motion the client never asked to stop.
@@ -1383,6 +1400,17 @@ impl<R: RtCommands> Core<R> {
     }
 
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
+        if is_arm_motion(tag)
+            && (!self.attachments_valid()
+                || self
+                    .pending_shapes
+                    .values()
+                    .any(|(_, _, shapes)| shapes.iter().any(|s| s.attachment.is_some())))
+        {
+            return Some(attachment_error(
+                "attachment context changed or apply is pending; reconcile and reapply",
+            ));
+        }
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
@@ -1409,6 +1437,7 @@ impl<R: RtCommands> Core<R> {
     /// says how much of it the started motion covers. One plan is
     /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
+        self.stop_invalid_attachments().await;
         if self.execution_paused || self.snap.exec.target_scale == 0.0 {
             return;
         }
@@ -1446,6 +1475,8 @@ impl<R: RtCommands> Core<R> {
 
     /// Route what the planner had to say.
     async fn on_plan_event(&mut self, ev: PlanEvent) {
+        self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
@@ -1558,6 +1589,7 @@ impl<R: RtCommands> Core<R> {
                         // it alone (the client API documents the reset,
                         // and it is what the parol6 runtime does).
                         if variant != self.tool_variant {
+                            self.invalidate_attachments();
                             self.tcp_offset_mm = [0.0; 3];
                             self.tcp_rotation_deg = [0.0; 3];
                         }
@@ -1835,6 +1867,67 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
+    fn attachments_valid(&self) -> bool {
+        self.shapes.iter().all(|s| {
+            s.attachment
+                .as_ref()
+                .is_none_or(|a| a.epoch == self.attachment_epoch)
+        })
+    }
+
+    fn invalidate_attachments(&mut self) {
+        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+        if self.shapes.iter().any(|s| s.attachment.is_some()) {
+            self.attachment_stop_pending = true;
+            self.scene_epoch += 1;
+        }
+    }
+
+    async fn stop_invalid_attachments(&mut self) {
+        if self.attachments_valid()
+            && self.shapes.iter().any(|s| s.attachment.is_some())
+            && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            self.invalidate_attachments();
+        }
+        if self.attachment_stop_pending {
+            self.attachment_stop_pending = false;
+            self.cancel_all_motion("attachment context changed").await;
+            self.standing_error = Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+    }
+
+    fn attachment_shapes_error(&self, shapes: &[Shape]) -> Option<WireError> {
+        let attached = shapes.iter().any(|s| s.attachment.is_some());
+        if (attached || self.shapes.iter().any(|s| s.attachment.is_some()))
+            && (self.executing.is_some()
+                || self.planning.is_some()
+                || self.active_stream.is_some()
+                || !self.pending.is_empty()
+                || !self.pending_shapes.is_empty())
+        {
+            return Some(attachment_error("stop motion before changing attachments"));
+        }
+        if attached && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            return Some(attachment_error(
+                "attachments require fresh enabled, referenced state",
+            ));
+        }
+        if shapes.iter().any(|s| {
+            s.attachment
+                .as_ref()
+                .is_some_and(|a| a.epoch != self.attachment_epoch)
+        }) {
+            return Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+        None
+    }
+
     /// Age of the freshest MOTOR-BUS data \[ms, saturating\]: the youngest
     /// node age the RT snapshot carries (ticks → ms) plus the wall age of
     /// the snapshot itself. `u16::MAX` = no node has ever answered — the
@@ -1933,6 +2026,7 @@ impl<R: RtCommands> Core<R> {
     /// clear of the program keep-outs — which is the planner's, so the
     /// client is answered when that lands.
     async fn on_reset_state(&mut self, req_id: u32, addr: SocketAddr) {
+        self.invalidate_attachments();
         self.cancel_all_motion("reset").await;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1962,7 +2056,7 @@ impl<R: RtCommands> Core<R> {
         let outcome = match result {
             Ok(epoch) => {
                 match epoch {
-                    Some(e) => self.scene_epoch = e,
+                    Some(e) => self.scene_epoch = e.max(self.scene_epoch + 1),
                     // No collision world to adopt an epoch from: the
                     // server's own counter still has to move, or a
                     // readback cannot be tied to the world it describes.
@@ -2574,6 +2668,7 @@ impl<R: RtCommands> Core<R> {
                 installation: self.cfg.installation_shapes.clone(),
                 program: self.shapes.clone(),
                 epoch: self.scene_epoch,
+                attachment_epoch: self.attachment_epoch,
             },
             C::ConfigBundle => {
                 let ci = &self.cfg.config_info;
@@ -3041,4 +3136,31 @@ pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
         _ => ErrorCode::CommDecodeError,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
+}
+
+fn attachment_error(detail: &str) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", detail)],
+    )
+}
+
+/// Commands that change arm pose and require reconciled held geometry.
+pub fn is_arm_motion(tag: CmdType) -> bool {
+    matches!(
+        tag,
+        CmdType::MoveJ
+            | CmdType::MoveJPose
+            | CmdType::MoveL
+            | CmdType::MoveC
+            | CmdType::MoveS
+            | CmdType::MoveP
+            | CmdType::JogJ
+            | CmdType::JogL
+            | CmdType::ServoJ
+            | CmdType::ServoJPose
+            | CmdType::ServoL
+            | CmdType::Teleport
+    )
 }

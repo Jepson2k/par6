@@ -605,6 +605,7 @@ mod tests {
             bundle.installation_shapes[1..],
             [
                 par6_proto::Shape {
+                    attachment: None,
                     name: "table".into(),
                     kind: "box".into(),
                     params: vec![0.8, 0.8, 0.02],
@@ -614,6 +615,7 @@ mod tests {
                     physics: None,
                 },
                 par6_proto::Shape {
+                    attachment: None,
                     name: "marker".into(),
                     kind: "sphere".into(),
                     params: vec![0.05],

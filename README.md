@@ -406,6 +406,26 @@ Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names fo
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
 
+Program shapes may declare `attachment=Attachment(epoch=world.attachment_epoch,
+allowed_contacts=(...))`, using a fresh `world = rbt.shapes()` readback. Their
+pose is then relative to the `gripper` flange frame, in metres and extrinsic-XYZ
+radians (`Rz @ Ry @ Rx`), independently of TCP offsets. `shape.attach(...)` and
+`shape.detach(world_pose=...)` construct declarations; `set_shapes(...)` applies
+the complete program layer and confirms it. Changing attachments requires idle,
+referenced motion. Attached shapes require collision checking and cannot also
+declare physical simulation properties.
+
+Allowed contacts name exact collision-report partners, up to 32 unique names.
+Only pairs involving that attached shape are exempted; unknown names and
+wildcards are rejected, leaving the existing world unchanged. Declarations do
+not actuate a gripper or confirm a grasp. Context loss, controller reset,
+reference loss and source/tool changes invalidate held assumptions. Readback
+retains the old declarations with `attachments_valid=False`; arm motion is
+refused until they are cleared or explicitly reconciled against the new epoch.
+Saved world files do not restore a fresh context. The offline preview uses the
+same reference/context gates. Generic confirmed attach/detach skills and UI
+controls are available in Waldo Commander.
+
 The client side runs the same world. `Robot.in_collision` / `colliding_pairs` /
 `check_trajectory` / `min_distance` / `apply_shapes` drive the engine's `CollisionWorld`
 (`par6_kin::Collision` through `par6._par6`) on the active tool's own URDF tree with its
@@ -457,7 +477,7 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
   second-guess.
 - **coal / hpp-fcl** (collision) — `par6_col_*`: a two-layer world (installation keep-outs
   and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
-  parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).
+  parent/child-adjacent ones, shapes in metres and radians (`R = Rz·Ry·Rx`).
 - **toppra-cpp** (time-optimal path parameterization) — `par6_traj_*`. Built from source
   by `scripts/ffi/setup.sh` (conda-forge ships no C++ toppra), pinned to commit
   `142456f3` (v0.6.9), with its bundled Seidel LP solver — no qpOASES, no GPL GLPK.

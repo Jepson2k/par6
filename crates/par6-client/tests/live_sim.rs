@@ -171,6 +171,7 @@ fn a_full_session_over_the_rust_client() {
         // Chunked transfer: a shape world too large for one datagram.
         let shapes: Vec<Shape> = (0..64)
             .map(|i| Shape {
+                attachment: None,
                 kind: "box".into(),
                 params: vec![0.02, 0.02, 0.02],
                 pose: vec![2.0 + (i as f64) * 0.05, 2.0, 2.0, 0.0, 0.0, 0.0],
@@ -389,6 +390,7 @@ fn a_too_small_mtu_is_refused_at_connect() {
 /// A program keep-out on the wire, metres/radians.
 fn program_box(name: &str) -> Shape {
     Shape {
+        attachment: None,
         physics: None,
         kind: "box".to_owned(),
         params: vec![0.6, 0.4, 0.02],

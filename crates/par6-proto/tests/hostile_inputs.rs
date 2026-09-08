@@ -221,6 +221,7 @@ fn the_counts_a_real_program_sends_still_decode() {
         Command::SetShapes(par6_proto::command::SetShapes {
             shapes: (0..n)
                 .map(|i| par6_proto::Shape {
+                    attachment: None,
                     kind: "sphere".into(),
                     params: vec![0.05],
                     pose: vec![0.0; 6],

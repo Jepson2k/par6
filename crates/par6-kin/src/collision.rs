@@ -244,10 +244,28 @@ impl Collision {
             })
             .collect();
 
-        self.model.set_layer(layer, &descs).map_err(|e| match e {
-            sys::Error::Create(msg) => KinError::Load(msg),
-            other => KinError::Ffi(other),
-        })?;
+        let prefix = match layer {
+            Layer::Installation => "install:",
+            Layer::Program => "shape:",
+        };
+        let placements = shapes
+            .iter()
+            .filter(|s| s.collision)
+            .map(|s| sys::ShapePlacement {
+                name: format!("{prefix}{}", s.name),
+                parent_frame: s.attachment.as_ref().map(|_| "gripper".to_owned()),
+                allowed_contacts: s
+                    .attachment
+                    .as_ref()
+                    .map_or_else(Vec::new, |a| a.allowed_contacts.clone()),
+            })
+            .collect::<Vec<_>>();
+        self.model
+            .set_layer_placed(layer, &descs, &placements)
+            .map_err(|e| match e {
+                sys::Error::Create(msg) => KinError::Load(msg),
+                other => KinError::Ffi(other),
+            })?;
 
         let slot = match layer {
             Layer::Installation => 0,

@@ -425,7 +425,7 @@ impl Preview {
     /// SHAPES readback, for the same file.
     fn shapes(&self, py: Python<'_>) -> PyResult<PyObject> {
         let inner = self.inner.lock().unwrap();
-        let (installation, program, epoch) = inner.shapes();
+        let (installation, program, epoch, attachment_epoch) = inner.shapes();
         let layer = |shapes: &[par6_proto::Shape]| -> PyResult<Vec<PyObject>> {
             shapes.iter().map(|s| shape_dict(py, s)).collect()
         };
@@ -433,6 +433,7 @@ impl Preview {
         d.set_item("installation", layer(installation)?)?;
         d.set_item("program", layer(program)?)?;
         d.set_item("epoch", epoch)?;
+        d.set_item("attachment_epoch", attachment_epoch)?;
         Ok(d.into_any().unbind())
     }
 

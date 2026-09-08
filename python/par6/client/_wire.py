@@ -117,7 +117,7 @@ def jog_l_velocities(
 
 
 def shape_to_wire(shape: Shape) -> dict[str, Any]:
-    kind, params, pose, collision, margin, name, physics = shape.to_wire()
+    kind, params, pose, collision, margin, name, physics, attachment = shape.to_wire()
     return {
         "kind": kind,
         "params": [float(p) for p in params],
@@ -128,6 +128,7 @@ def shape_to_wire(shape: Shape) -> dict[str, Any]:
         # `[mass|None, [slide, spin, roll]]`, or None for geometry the
         # simulator only keeps out of rather than resting things on.
         "physics": physics,
+        "attachment": attachment,
     }
 
 

@@ -813,6 +813,7 @@ fn move_j(key: u64, angles_deg: [f64; NUM_JOINTS], duration_s: f64) -> Command {
 /// STATUS translations are mm.
 fn keepout_at(name: &str, tcp_mm: [f64; 3]) -> Shape {
     Shape {
+        attachment: None,
         kind: "box".to_owned(),
         params: vec![KEEPOUT_M, KEEPOUT_M, KEEPOUT_M],
         pose: vec![
@@ -1153,6 +1154,7 @@ fn keepout_world(keepout_centre_m: [f64; 3]) -> par6_kin::Collision {
     col.set_layer(
         par6_kin::Layer::Program,
         &[par6_kin::Shape {
+            attachment: None,
             name: "keepout".to_owned(),
             kind: par6_kin::ShapeKind::Box,
             params: [KEEPOUT_M, KEEPOUT_M, KEEPOUT_M],

@@ -42,7 +42,8 @@ pub use chunk::{
     Reassembler,
 };
 pub use command::{
-    decode_command, encode_command, validate_shape, Command, Layer, Physical, Shape, ToolParam,
+    decode_command, encode_command, validate_shape, Attachment, Command, Layer, Physical, Shape,
+    ToolParam,
 };
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
