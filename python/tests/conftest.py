@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from live_daemon import par6d_binary
+from live_daemon import LiveDaemon, par6d_binary
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -42,3 +42,11 @@ def pytest_sessionstart(session: pytest.Session) -> None:
             "(`cargo build -p par6d --release`), or unset PAR6_REQUIRE_E2E "
             "to allow the e2e tests to skip."
         )
+
+
+@pytest.fixture
+def daemon(tmp_path):
+    """A fresh ``par6d --sim`` process on ephemeral ports."""
+    live = LiveDaemon.start(tmp_path)
+    yield live
+    live.stop()

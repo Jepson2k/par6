@@ -379,6 +379,19 @@ impl Client {
         self.query(Command::BusScan).await
     }
 
+    /// Set the STATUS broadcast rate for this session (`SET_STATUS_RATE`).
+    /// Only whole-number rates that divide the tick rate can be served;
+    /// anything else is refused with the achievable rates named.
+    pub async fn set_status_rate(&self, hz: f64) -> Result<Ack, ClientError> {
+        self.system(Command::SetStatusRate(cmd::SetStatusRate { hz }))
+            .await
+    }
+
+    /// Current STATUS rate and the tick rate it divides (`STATUS_RATE`).
+    pub async fn status_rate(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::StatusRate).await
+    }
+
     /// Replace the program-layer collision shapes.
     pub async fn set_shapes(&self, shapes: Vec<Shape>) -> Result<Ack, ClientError> {
         self.system(Command::SetShapes(cmd::SetShapes { shapes }))

@@ -389,8 +389,8 @@ The recipe, in the order the codec tests expect:
    Python shim (`python/par6/client/`). The preview needs nothing per-command: it drives
    the daemon's own planner.
 5. **Codec tests** — `crates/par6-proto`'s encode/decode round trip and hostile-input
-   tests cover every tag; regenerate the Python constants mirror
-   (`cargo run -p par6-proto --bin gen_python`).
+   tests cover every tag. Python needs no regeneration step: the extension
+   exposes the constants straight off the crate.
 6. **Test** — a sim e2e that drives the command through the real client against a real
    `par6d --sim`.
 
@@ -614,6 +614,21 @@ way. The runtime keeps addressing the ids the config names, so after renaming a
 configured drive update the config and restart the daemon. `par6 set-pid-gains`
 pushes one drive's tuning live, `par6 tool` runs a tool action, and
 `par6 flashing enter|exit` hands the bus to a firmware flasher and takes it back.
+
+`par6 flash --node N` is that flasher, built in: it fetches the vendor's latest
+release (`--product stepfoc|spectral-bldc`, `--tag` for a specific one, `--file`
+for a local `.bin`), verifies it against the release's `firmware.json` manifest
+and its vector table, takes the bus with `enter_flashing`, drives the drive's CAN
+bootloader through the image, holds the bus silent until the drive answers as an
+application again, and only then gives the bus back — the drive checks the
+whole-image CRC itself and boots it once the bus has been quiet for ~3 s, so
+handing the bus back at the commit would leave it in its bootloader. It has
+to run on the machine holding the CAN interface (the `flash` extra brings
+python-can). Retries are reported, not hidden: a run that needed forty is a bus
+worth looking at. An interrupted write leaves the drive waiting in its
+bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
+drive's parameters back, presets, calibration — is UART-only and stays with the
+vendor's tool over a bench connection.
 
 ### The bus-grant signal
 

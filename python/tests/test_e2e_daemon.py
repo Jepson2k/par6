@@ -42,7 +42,7 @@ from waldoctl.shapes import Box, Physical
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient, RobotError
 from par6.client.dry_run_client import DryRunRobotClient
-from par6.protocol.constants import ActionState, ControllerMode, ErrorCode
+from par6.protocol import PROTO_VERSION, ActionState, ControllerMode, ErrorCode
 from par6.robot import Robot
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
@@ -65,14 +65,6 @@ RETRIABLE = frozenset(
         ErrorCode.MOTN_SETUP_FAILED,
     }
 )
-
-
-@pytest.fixture
-def daemon(tmp_path):
-    """A fresh ``par6d --sim`` process on ephemeral ports."""
-    live = LiveDaemon.start(tmp_path)
-    yield live
-    live.stop()
 
 
 def park_deg() -> list[float]:
@@ -136,7 +128,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
                 frames.append(status)
                 if len(frames) == 5:
                     break
-        assert [f.proto_version for f in frames] == [3] * 5
+        assert [f.proto_version for f in frames] == [PROTO_VERSION] * 5
         assert all(b.seq > a.seq for a, b in zip(frames, frames[1:]))
         assert all(b.mono_time_ns > a.mono_time_ns for a, b in zip(frames, frames[1:]))
         assert all(f.link_ok == 1 and f.simulator_active for f in frames)

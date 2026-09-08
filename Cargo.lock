@@ -615,7 +615,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "par6-bus"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "log",
@@ -629,7 +629,7 @@ dependencies = [
 
 [[package]]
 name = "par6-client"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "log",
@@ -644,7 +644,7 @@ dependencies = [
 
 [[package]]
 name = "par6-config"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "par6-proto",
@@ -655,7 +655,7 @@ dependencies = [
 
 [[package]]
 name = "par6-kin"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "glam",
  "par6-config",
@@ -669,7 +669,7 @@ dependencies = [
 
 [[package]]
 name = "par6-motion"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "par6-config",
  "par6-rt",
@@ -679,7 +679,7 @@ dependencies = [
 
 [[package]]
 name = "par6-proto"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "thiserror 2.0.20",
@@ -687,7 +687,7 @@ dependencies = [
 
 [[package]]
 name = "par6-py"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "par6-bus",
@@ -707,7 +707,7 @@ dependencies = [
 
 [[package]]
 name = "par6-rt"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "gpiocdev",
  "libc",
@@ -720,7 +720,7 @@ dependencies = [
 
 [[package]]
 name = "par6-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "par6-config",
@@ -733,7 +733,7 @@ dependencies = [
 
 [[package]]
 name = "par6d"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "libc",

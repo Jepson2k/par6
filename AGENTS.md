@@ -15,6 +15,7 @@ pixi run cargo run -p par6d -- --sim        # simulated runtime, no hardware
 pixi run install-python            # python package (maturin: compiles par6-py)
 pixi run test-python               # python tests (JUnit XML at python/test-results.xml)
 pixi run test-e2e                  # the client against a real par6d --sim
+pixi run gen-stub                  # after changing a wire enum (see below)
 ```
 
 pixi provides the C++ closure (Pinocchio, coal, eigen, urdfdom, libmujoco,
@@ -26,6 +27,14 @@ bootstrap step and no `.ffi` for a native build.
 
 CI runs these same tasks and nothing else: a red job is reproduced locally
 with the command in its `run:` line.
+
+`par6._par6` builds its `IntEnum`s at import from par6-proto's `variants()`,
+so the runtime cannot drift from the Rust — but a type stub is read
+statically, by a checker that imports nothing, and cannot share that. The
+members in `python/par6/_par6.pyi` are therefore written from the same
+reflection by `pixi run gen-stub`, and `python/tests/test_stub.py` fails when
+they disagree. Change a wire enum and you must regenerate, or `ty` stops
+resolving that enum everywhere it is used.
 
 ## Contract discipline (multi-agent repo)
 

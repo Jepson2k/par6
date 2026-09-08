@@ -10,9 +10,8 @@ What remains Python-side is the shared client-facing state:
 - :func:`update_status_from_dict` — the one filler, slice-assigning a
   frame dict from the extension into a buffer.
 
-Constants come from the generated :mod:`par6.protocol.constants`;
-``MAX_JOG_DURATION_S`` is re-exported from the extension (the Rust codec
-is the source of truth for the value).
+Constants come from the `par6._par6` extension — the Rust codec is the
+source of truth for every wire value, and nothing here restates one.
 """
 
 from __future__ import annotations
@@ -23,11 +22,10 @@ from typing import Mapping
 import numpy as np
 from waldoctl import ActionState, ToolState, ToolStatus
 
-from par6._par6 import MAX_JOG_DURATION_S
-
-from .constants import (
+from par6._par6 import (
     EN_SLOTS,
     IO_SLOTS,
+    MAX_JOG_DURATION_S,
     NUM_JOINTS,
     POSE_ELEMS,
     ControllerMode,
@@ -146,10 +144,11 @@ class StatusBuffer:
     """External joint torque estimate [Nm]: filtered measured torque
     minus the model's gravity torque."""
     drive_health: dict = field(default_factory=dict)
-    """Per-drive analog readings: ``temperatures_c`` and ``currents_ma``
+    """Per-drive readings and faults: ``temperatures_c`` and ``currents_ma``
     (per node, arm joints first, ``NaN`` where a node has not answered
-    that register) and ``bus_voltage_v`` (the lowest any node reports,
-    None when none has)."""
+    that register), ``bus_voltage_v`` (the lowest any node reports, None
+    when none has), and ``faults`` — per node, the labels for the fault
+    bits it currently asserts, empty for a healthy drive."""
     loop_health: dict = field(default_factory=dict)
     """Control-loop health: ``p99_period_s`` and ``overruns``."""
     # Aliases into the two enable arrays the filler mutates in place.

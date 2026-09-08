@@ -24,13 +24,9 @@ from .client import (
 )
 from .protocol import (
     ActionState,
-    CmdType,
-    CommandClass,
     CompletionPolicy,
     ErrorCode,
     Frame,
-    MsgType,
-    QueryType,
     StatusBuffer,
     ToolState,
     ToolStatusWire,
@@ -65,13 +61,9 @@ __all__ = [
     "copy_status",
     # protocol
     "ActionState",
-    "CmdType",
-    "CommandClass",
     "CompletionPolicy",
     "ErrorCode",
     "Frame",
-    "MsgType",
-    "QueryType",
     "StatusBuffer",
     "ToolState",
     "ToolStatusWire",
