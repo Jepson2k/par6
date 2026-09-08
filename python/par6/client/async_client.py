@@ -328,13 +328,16 @@ class AsyncRobotClient(_RobotClientABC):
             return
         self._closed = True
         self._status_event.set()
-        if self._status_task is not None:
-            self._status_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_task
-            self._status_task = None
         if self._core is not None:
             self._core.close()
+        try:
+            if self._status_task is not None:
+                # Cancellation finishes the Python Future before its Rust
+                # callback; normal completion drains that bridge before exit.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._status_task
+        finally:
+            self._status_task = None
             self._core = None
 
     async def __aenter__(self) -> "AsyncRobotClient":
