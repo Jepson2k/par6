@@ -478,6 +478,19 @@ impl Daemon {
         })
     }
 
+    /// Whether the command plane has stopped without being asked to.
+    ///
+    /// The planner runs on its own thread; if it dies, its channels close,
+    /// the server task reads that as a shutdown and returns. Nothing else
+    /// notices: the RT thread keeps ticking, the tee keeps publishing, and
+    /// the arm stays powered with no way to command or stop it over the
+    /// wire. Polled by the supervisor so that becomes a clean exit.
+    pub fn command_plane_gone(&self) -> bool {
+        self.server
+            .as_ref()
+            .is_some_and(par6_server::ServerHandle::is_finished)
+    }
+
     /// Stop everything: server task first, then the worker threads (all
     /// joined), then the tokio runtime.
     pub fn shutdown(mut self) {
