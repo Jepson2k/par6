@@ -1297,8 +1297,7 @@ impl RtCommands for RtBridge {
             | Command::ServoL(par6_proto::command::ServoL {
                 pose, speed, accel, ..
             }) => {
-                let mut sh = self.shared.lock().unwrap();
-                let seed = match &sh.stream {
+                let seed = match &self.shared.lock().unwrap().stream {
                     Some(ActiveStream {
                         kind: StreamKind::Servo,
                         servo_target: Some(t),
@@ -1322,43 +1321,11 @@ impl RtCommands for RtBridge {
                 for (j, v) in target.iter_mut().enumerate() {
                     *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
                 }
-                let world_epoch = {
-                    let q = self.cart.snapshots.latest().q;
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    if let Some(pairs) = gate.blocked(&q, &target)? {
-                        return Err(gate.refuse(pairs));
-                    }
-                    gate.epoch()
-                };
-                if !matches!(
-                    sh.stream,
-                    Some(ActiveStream {
-                        kind: StreamKind::Servo,
-                        ..
-                    })
-                ) {
-                    self.enter_stream_mode(Mode::Stream);
-                }
-                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
-                self.stream_input.lock().unwrap().send(&StreamSetpoint {
-                    q: target,
-                    speed: scale.0,
-                    accel: scale.1,
-                });
-                sh.stream = Some(ActiveStream {
-                    releasing: false,
-                    kind: StreamKind::Servo,
-                    deadline: Instant::now() + self.servo_grace(),
-                    servo_target: Some(target),
-                    standoff: None,
-                    jog: [0.0; MAX_JOINTS],
-                    world_epoch,
-                    cart: None,
-                    parked: false,
-                    still: 0,
-                    still_tick: 0,
-                    scale,
-                });
+                return self.stream(&Command::ServoJ(par6_proto::command::ServoJ {
+                    angles: std::array::from_fn(|j| target[j].to_degrees()),
+                    speed: *speed,
+                    accel: *accel,
+                }));
             }
             // Cartesian velocity jog: housekeeping steps the twist
             // through the jacobian each period until the watchdog
