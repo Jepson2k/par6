@@ -882,6 +882,11 @@ struct ActiveStream {
     /// re-check keys on, so the steady state costs no collision queries.
     world_epoch: u64,
     cart: Option<CartJogState>,
+    /// The arm is parked ON a gate-solved standoff, holding it as an
+    /// ordinary servo target. A further refusal changes nothing: the arm
+    /// is already at rest where the gate put it, and releasing it again
+    /// to re-solve the same boundary only lets it drift.
+    parked: bool,
     /// Consecutive FRESH snapshots the arm has measured stopped in.
     still: u8,
     /// The tick `still` last counted, so housekeeping running faster than
@@ -1114,6 +1119,7 @@ impl RtCommands for RtBridge {
                     jog: speeds,
                     world_epoch: 0,
                     cart: None,
+                    parked: false,
                     still: 0,
                     still_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
@@ -1134,14 +1140,35 @@ impl RtCommands for RtBridge {
                 // clears the standing collision verdict on any command it
                 // accepts, would also wipe the latch that says the stream
                 // was stopped.
-                if matches!(
-                    sh.stream,
-                    Some(ActiveStream {
-                        standoff: Some(_),
-                        ..
-                    })
-                ) {
-                    return Err(self.cart.gate.lock().unwrap().standing_refusal());
+                //
+                // The datagram is not ignored, though: an operator who
+                // keeps dragging is asking for a standoff nearer the
+                // keep-out than the one the first refusal solved, and the
+                // arm should end up on the nearest one asked for rather
+                // than wherever the drag first crossed the line. The goal
+                // is re-aimed and the solve re-run; only the reply is
+                // refused.
+                if let Some(a) = sh.stream.as_mut() {
+                    if a.parked {
+                        return Err(self.cart.gate.lock().unwrap().standing_refusal());
+                    }
+                    if let Some(phase) = a.standoff {
+                        let mut gate = self.cart.gate.lock().unwrap();
+                        // Only while still braking. Once the standoff is
+                        // solved the arm is travelling to a boundary that
+                        // is fixed geometry — a deeper request lands on
+                        // the same place — and re-aiming there would just
+                        // restart the sequence under a client that has
+                        // not stopped sending.
+                        if matches!(phase, Standoff::Braking { .. }) {
+                            let q = self.cart.snapshots.latest().q;
+                            if gate.blocked(&q, &target)?.is_some() {
+                                a.standoff = Some(Standoff::Braking { goal: target });
+                                a.deadline = Instant::now() + STANDOFF_TRAVEL_BUDGET;
+                            }
+                        }
+                        return Err(gate.standing_refusal());
+                    }
                 }
                 // Servo targets are explicit configurations, so the gate
                 // checks the target itself — each datagram is its own
@@ -1219,6 +1246,7 @@ impl RtCommands for RtBridge {
                         jog: [0.0; MAX_JOINTS],
                         world_epoch,
                         cart: None,
+                        parked: false,
                         still: 0,
                         still_tick: 0,
                         scale,
@@ -1253,6 +1281,7 @@ impl RtCommands for RtBridge {
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
+                    parked: false,
                     still: 0,
                     still_tick: 0,
                     scale,
@@ -1325,6 +1354,7 @@ impl RtCommands for RtBridge {
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
+                    parked: false,
                     still: 0,
                     still_tick: 0,
                     scale,
@@ -1339,6 +1369,7 @@ impl RtCommands for RtBridge {
                     Some(ActiveStream {
                         kind: StreamKind::CartJog,
                         cart: Some(state),
+                        parked: false,
                         still: 0,
                         still_tick: 0,
                         ..
@@ -1395,6 +1426,7 @@ impl RtCommands for RtBridge {
                     standoff: None,
                     jog: [0.0; MAX_JOINTS],
                     world_epoch: 0,
+                    parked: false,
                     still: 0,
                     still_tick: 0,
                     cart: Some(CartJogState {
@@ -1956,6 +1988,7 @@ pub(crate) fn housekeeping_loop(
                                 // standoff would have left it, and the
                                 // normal servo lifecycle ends it.
                                 a.standoff = None;
+                                a.parked = true;
                                 a.servo_target = Some(stop);
                                 a.deadline = now + servo_grace;
                                 continue;

@@ -391,12 +391,12 @@ fn a_too_small_mtu_is_refused_at_connect() {
 fn program_box(name: &str) -> Shape {
     Shape {
         attachment: None,
-        physics: None,
         kind: "box".to_owned(),
         params: vec![0.6, 0.4, 0.02],
         pose: vec![0.9, 0.9, -0.01, 0.0, 0.0, 0.0],
         collision: true,
         margin: None,
+        physics: None,
         name: name.to_owned(),
     }
 }

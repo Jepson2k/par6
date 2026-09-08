@@ -720,6 +720,25 @@ fn log_unclaimed(inner: &Inner, error: &WireError) {
 static VERSION_SKEW_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Report a daemon whose protocol version is not this client's, once.
+///
+/// `None` is a datagram we could not even identify as a STATUS, which says
+/// nothing about versions and is left to the caller's debug line.
+fn warn_once_on_skew(daemon: Option<u8>) {
+    let Some(daemon) = daemon.filter(|v| *v != par6_proto::PROTO_VERSION) else {
+        return;
+    };
+    if VERSION_SKEW_WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    log::warn!(
+        "daemon speaks protocol v{daemon} but this client was built for v{}: \
+         messages whose layout differs will fail to decode, and STATUS may \
+         stop arriving entirely",
+        par6_proto::PROTO_VERSION
+    );
+}
+
 async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
     let mut buf = vec![0u8; 65536];
     loop {
@@ -736,20 +755,18 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
         let status = match decode_status(&buf[..n]) {
             Ok(status) => status,
             Err(e) => {
+                // Skew is checked HERE too, not only on the success path.
+                // A version that adds fields makes the array longer, so an
+                // older daemon's STATUS fails on arity before `decode_status`
+                // ever reads the version — which is to say the check below
+                // could never fire in the one case it exists for, and the
+                // client went silent with a debug line as its only account.
+                warn_once_on_skew(par6_proto::peek_status_proto_version(&buf[..n]));
                 log::debug!("ignoring undecodable status datagram: {e}");
                 continue;
             }
         };
-        if status.proto_version != par6_proto::PROTO_VERSION
-            && !VERSION_SKEW_WARNED.swap(true, Ordering::Relaxed)
-        {
-            log::warn!(
-                "daemon speaks protocol v{} but this client was built for v{}: \
-                 messages whose layout differs will fail to decode",
-                status.proto_version,
-                par6_proto::PROTO_VERSION
-            );
-        }
+        warn_once_on_skew(Some(status.proto_version));
         {
             let mut last = inner.last_seq.lock().unwrap();
             if let Some((session, prev)) = *last {

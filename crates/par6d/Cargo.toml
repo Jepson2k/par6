@@ -12,7 +12,7 @@ rust-version.workspace = true
 # collision world is empty while `set_shapes` still answers success —
 # all invisible to a client. The runtime linked those in unconditionally
 # rather than serve that, so there is no feature to turn them off.
-# Build the shim first: scripts/ffi/setup.sh, then `source .ffi/env.sh`.
+# The shim is built by par6-kin's build script; build under `pixi run`.
 
 [dependencies]
 par6-config = { workspace = true }

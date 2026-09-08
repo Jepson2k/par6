@@ -8,12 +8,27 @@
 use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
 
-/// Assumed firmware velocity-loop period \[s\]. The config `kiv` is a
-/// per-loop-iteration gain; the firmware loop runs much faster than the
-/// bus tick, so the sim integrates `kiv · err` once per firmware
+/// Firmware velocity-loop period the sim assumes \[s\]. The config `kiv`
+/// is a per-loop-iteration gain; the firmware loop runs much faster than
+/// the bus tick, so the sim integrates `kiv · err` once per firmware
 /// iteration (`dt / FW_LOOP_DT` times per tick). Without this the
 /// integral unwinds so slowly that a homing backoff cannot break the
 /// endstop seat within the vendor-configured backoff window.
+///
+/// KNOWN WRONG, and do not "fix" it by editing this number alone. The
+/// firmware (`Source-Robotics/STEPFOC-stepper-controller`,
+/// `src/constants.h`) sets `LOOP_TIME 0.00016`: the real cascade closes
+/// at 6.25 kHz, not 1 kHz. But the sim evaluates the loop ONCE per
+/// physics substep and only scales the integral by `fw_steps`, so
+/// lowering this models the destabilising half of a faster loop — 6.25x
+/// the integral accumulation — without the stabilising half, which is the
+/// phase lag a faster loop does not have. The result oscillates harder
+/// and reads as a drive-tuning problem that is not there;
+/// `a_held_servo_target_settles` is ignored for exactly this reason.
+///
+/// Fixing it properly means iterating the driver loop at `LOOP_TIME`
+/// between physics steps, and feeding back a moving average of the
+/// measured velocity as `Position_mode()` does.
 pub(crate) const FW_LOOP_DT: f64 = 0.001;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).

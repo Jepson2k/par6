@@ -443,8 +443,13 @@ pub trait RtCommands: Send {
     /// cancels the segment player itself and leaves the planner
     /// subprocess to its own buffers.
     ///
-    /// The default is a no-op for runtimes with no ring to flush.
-    fn discard_exec(&mut self) {}
+    /// REQUIRED, deliberately. It defaulted to a no-op "for runtimes with
+    /// no ring to flush", and the cost was that a double could satisfy the
+    /// trait while silently ignoring the flush — which is exactly what the
+    /// protocol suite's `TestRt` did, leaving the suite structurally unable
+    /// to assert that a cancel takes the RT's copy of the motion with it.
+    /// A runtime with nothing to flush writes an empty body and says so.
+    fn discard_exec(&mut self);
 
     /// Mirror one collision-world layer into the RT side's own gate
     /// model (wire units, the same set just applied to the planner).

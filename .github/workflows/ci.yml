@@ -1,3 +1,7 @@
+# ARM64 is the primary platform: the arm ships on a Raspberry Pi 5, so the
+# full suite runs on aarch64 runners and x86_64 is the compatibility check a
+# developer's laptop needs. Every step is a pixi task, so a red job is
+# reproduced locally with the command in its `run:` line.
 name: ci
 
 on:
@@ -5,55 +9,49 @@ on:
     branches: [main]
   pull_request:
 
+# A new push supersedes the run it interrupts. main is exempt: its runs are
+# what the release job requires by commit SHA.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
 env:
   CARGO_TERM_COLOR: always
-  PIXI_VERSION: v0.79.0
 
 jobs:
-  # Every crate builds and tests under one environment: pixi provides the C++
-  # closure, `pixi run setup` builds toppra and the Pinocchio shim, and par6d
-  # links that shim unconditionally — so there is no toolchain-free leg to
-  # carve out and nothing to `--exclude`.
-  rust:
-    name: rust (x86_64)
-    runs-on: ubuntu-latest
+  # Cheap and toolchain-only: no pixi solve, no C++, no cargo build. Every
+  # expensive job waits on it, so a formatting slip costs one runner-minute
+  # rather than the whole matrix.
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
-      - uses: Swatinem/rust-cache@v2
-      - uses: prefix-dev/setup-pixi@v0.8.1
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  # The primary leg: everything the arm runs, built once and tested on the
+  # architecture it runs on. vcan is created here rather than in a job of
+  # its own — the suite that needs it is part of `cargo test`
+  # and skips itself without the interface, so a separate job bought a
+  # second machine and a second build of the whole workspace to run five
+  # lines of modprobe.
+  rust:
+    name: rust (aarch64)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
         with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: default
-      # Built once, cached on the lock: a comment edit in a script no longer
-      # busts the whole toolchain.
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi/shim
-            .ffi/toppra
-            .ffi/src
-            .ffi/mujoco
-          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run setup
-      # The vcan suite is part of `cargo test`, and it skips itself when no
-      # interface exists — so the interface is created here rather than in a
-      # job of its own. PAR6_REQUIRE_VCAN turns that developer-default skip
-      # into a hard failure: if creation ever breaks, this goes red instead of
-      # quietly dropping the SocketCAN backend's only real-transport coverage.
-      # The module is not in the runner's base image.
+          cache-key: default
+      # PAR6_REQUIRE_VCAN turns the developer-default skip into a hard
+      # failure: if creation ever breaks this goes red instead of quietly
+      # dropping the SocketCAN backend's only real-transport coverage. The
+      # module is not in the runner image.
       - name: create vcan0
         run: |
           sudo apt-get update
@@ -61,330 +59,156 @@ jobs:
           sudo modprobe vcan
           sudo ip link add dev vcan0 type vcan
           sudo ip link set vcan0 up
-      - name: fmt
-        run: cargo fmt --all --check
-      - name: clippy
-        run: pixi run cargo clippy --all-targets -- -D warnings
-      # One command, every crate, nothing excluded. par6d's integration tests
-      # each boot a real daemon on a real-time tick, and two of those on one
-      # machine miss deadlines — but that is now held off in the harness
-      # (`Rig` takes a process-wide slot) rather than by giving the crate its
-      # own invocation, so a plain `cargo test` is the whole suite here and
-      # on a developer's machine alike.
-      - name: test
-        env:
+      - run: pixi run clippy
+      - env:
           PAR6_REQUIRE_VCAN: '1'
-        run: pixi run cargo test
-      # The collision golden suite runs in `test` above; this reruns just its
-      # timing case optimized and uncaptured, so the measured per-waypoint
-      # cost the planner budgets against is visible in the log. The test only
-      # fails on catastrophe, never on runner noise.
-      - name: report collision check cost (par6-kin)
-        run: |
-          pixi run cargo test -p par6-kin --release \
-            --test collision_world per_waypoint_check_cost_is_reported -- --nocapture
-      # The shipped 250 Hz configuration, end to end: every other harness
-      # patches tick_dt_s up for CI headroom, so this soak is the one place
-      # the unpatched 0.004 runs before it meets the arm. Release because an
-      # unoptimized RT loop cannot hold a 4 ms period anywhere (the test skips
-      # itself in debug builds for the same reason).
-      - name: shipped 250 Hz soak (par6d, release)
-        run: pixi run cargo test -p par6d --release --test shipped_tick -- --nocapture
-
-  # Every crate cross-checks for the control box under the same environment
-  # as the x86_64 legs. A check never links, so the host-built shim satisfies
-  # pinokin-sys's build script and no aarch64 sysroot is needed; par6d's real
-  # aarch64 build is the deploy build (deploy-aarch64 below).
-  cross-check:
-    name: cross check (aarch64)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: default
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi/shim
-            .ffi/toppra
-            .ffi/src
-            .ffi/mujoco
-          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run setup
-      - name: install cross linker
-        run: sudo apt-get update && sudo apt-get install -y gcc-aarch64-linux-gnu
-      - name: cross check
-        env:
-          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
-        run: pixi run cargo check --target aarch64-unknown-linux-gnu
-
-  msrv:
-    # The env context is not available to jobs.<id>.name, and a workflow
-    # using it there is invalid as a whole — every run of this file dies
-    # at parse with zero jobs. The toolchain version shows in the job log.
-    name: msrv
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # The declared rust-version had never been built, so nothing stopped
-      # a newer-toolchain feature from landing and breaking the floor the
-      # workspace advertises.
-      - name: read MSRV from Cargo.toml
-        run: |
-          msrv=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)
-          echo "MSRV=$msrv" >> "$GITHUB_ENV"
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: ${{ env.MSRV }}
-      - uses: Swatinem/rust-cache@v2
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: default
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi/shim
-            .ffi/toppra
-            .ffi/src
-            .ffi/mujoco
-          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run setup
-      - name: check
-        run: pixi run cargo check --all-targets
-
-  python:
-    name: python ${{ matrix.python }}
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - python: '3.11'
-            env: py311
-          - python: '3.12'
-            env: py312
-    steps:
-      - uses: actions/checkout@v4
-      # The package is a maturin build: pip compiles the par6-py extension,
-      # which links the pinocchio shim like every other crate, so this job
-      # carries the same toolchain as `rust`. The interpreter comes from the
-      # pixi environment for the matrix version.
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: python
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: ${{ matrix.env }}
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi/shim
-            .ffi/toppra
-            .ffi/src
-            .ffi/mujoco
-          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run -e ${{ matrix.env }} setup
-      # waldoctl branch-matching must happen BEFORE the package install:
-      # a cross-repo change lands on a branch of the same name first
-      # (CLAUDE.md's dev workflow), and while the release chain is in
-      # flight the pinned tag may not exist yet — a dead pin fails the
-      # whole resolve. The pin is rewritten for this resolve only.
-      - name: install (waldoctl branch-matched)
-        run: |
-          branch="${{ github.head_ref || github.ref_name }}"
-          repo=https://github.com/Jepson2k/waldoctl.git
-          matched=""
-          if [ "$branch" != "main" ] && \
-             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
-            echo "installing waldoctl from branch $branch"
-            matched=1
-            pixi run -e ${{ matrix.env }} pip install "waldoctl @ git+$repo@$branch"
-            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
-          else
-            echo "no waldoctl branch $branch; keeping the pinned tag"
-          fi
-          pixi run -e ${{ matrix.env }} pip install -e "python[dev]"
-          if [ -n "$matched" ]; then
-            mv python/pyproject.toml.bak python/pyproject.toml
-          fi
-      - name: pre-commit (ruff, ruff-format, ty, file hygiene)
-        run: pixi run -e ${{ matrix.env }} pre-commit run --show-diff-on-failure --color=always --all-files
-      # Under pixi at run time too: the extension dlopens the shim on import.
-      - name: pytest
-        run: cd python && pixi run -e ${{ matrix.env }} pytest
-
-  # End-to-end: the real python client against a real `par6d --sim` process
-  # over real UDP. Needs the binary, so it builds par6d here and points
-  # PAR6D_BIN at it; without that the same tests skip themselves (which is
-  # what happens in the `python` job above).
-  e2e:
-    name: e2e (python client <-> par6d --sim)
-    runs-on: ubuntu-latest
-    timeout-minutes: 40
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: e2e
-      - uses: prefix-dev/setup-pixi@v0.8.1
-        with:
-          pixi-version: ${{ env.PIXI_VERSION }}
-          cache: true
-          environments: py312
-      - name: cache shim + toppra
-        uses: actions/cache@v4
-        with:
-          # Not `.ffi/build`: cmake bakes absolute paths into its build tree,
-          # and this cache is shared by jobs running DIFFERENT pixi
-          # environments. A tree configured under `default` then reused under
-          # `py312` sends cmake looking for `envs/default/bin/ninja`, which
-          # that job never installed. The expensive artifacts — toppra, the
-          # shim, libmujoco, the toppra checkout — are all installed prefixes
-          # and carry no such paths.
-          path: |
-            .ffi/shim
-            .ffi/toppra
-            .ffi/src
-            .ffi/mujoco
-          key: ffi-prefixes-v2-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pixi.lock', 'Cargo.lock', 'cpp/**', 'scripts/ffi/*.sh') }}
-      - name: build shim (pixi run setup)
-        run: pixi run -e py312 setup
-      # Release, not debug: the sim runs in wall-clock time and an
-      # unoptimized RT loop misses its deadlines and latches LOOP_CRITICAL.
-      - name: build par6d
-        run: pixi run -e py312 cargo build -p par6d --release
-      # Same branch-matching as the python job: the pinned waldoctl tag
-      # may not exist while the release chain is in flight.
-      - name: install python client (waldoctl branch-matched)
-        run: |
-          branch="${{ github.head_ref || github.ref_name }}"
-          repo=https://github.com/Jepson2k/waldoctl.git
-          matched=""
-          if [ "$branch" != "main" ] && \
-             git ls-remote --exit-code --heads "$repo" "$branch" >/dev/null 2>&1; then
-            matched=1
-            pixi run -e py312 pip install "waldoctl @ git+$repo@$branch"
-            sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${branch}#" python/pyproject.toml
-          fi
-          pixi run -e py312 pip install -e "python[dev]"
-          if [ -n "$matched" ]; then
-            mv python/pyproject.toml.bak python/pyproject.toml
-          fi
-      # par6d embeds no rpath at all (cargo link-args do not propagate across
-      # packages), so it needs the shim's directory as well as the prefix its
-      # Pinocchio and coal live in — which is exactly what the pixi activation
-      # provides, the same way for every job here.
-      - name: pytest -m e2e
-        env:
-          PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
-          # This job exists to run the e2e layer. Without the flag a
-          # missing binary would skip all of it and still report green.
-          PAR6_REQUIRE_E2E: "1"
-        run: |
-          cd python
-          pixi run -e py312 pytest -m e2e --junitxml=test-results-e2e.xml
-          pixi run -e py312 pytest -m examples --examples --junitxml=test-results-examples.xml
-      - name: Preserve end-to-end test reports
-        if: always()
+        run: pixi run test-rust
+      - run: pixi run test-collision-cost
+      - run: pixi run test-timing
+      - name: upload failure logs
+        if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: par6-e2e-results
-          path: python/test-results-*.xml
+          name: rust-aarch64-logs
+          path: |
+            test-results.xml
+            target/**/*.log
           if-no-files-found: ignore
 
-  # The artifact that actually deploys: par6d cross-built for the control
-  # box WITH kinematics and the simulator, plus the shim, libmujoco and the
-  # runtime closure that ship beside it. Nothing here can be executed (the runner is x86_64), so the
-  # job proves what is checkable statically — that the cross toolchain
-  # resolves, the shim links, and the staged closure's symbol versions are
-  # internally satisfiable at a glibc floor the box clears.
-  #
-  # Still on scripts/ffi/setup.sh: this is the one path pixi cannot replace
-  # from an x86_64 host (it cannot materialise a foreign-platform prefix).
-  deploy-aarch64:
-    name: deploy artifact (aarch64, ffi)
-    runs-on: ubuntu-latest
+  # The compatibility check. A developer's machine is x86_64, so the
+  # workspace has to build and its logic-level tests pass there — the
+  # timing soak and the packaging legs belong to the platform that ships.
+  rust-x86:
+    name: rust (x86_64, compat)
+    needs: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - run: pixi run clippy
+      - run: pixi run test-rust
+
+  msrv:
+    name: msrv
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      # The declared rust-version had never been built, so nothing stopped a
+      # newer-toolchain feature from landing and breaking the floor the
+      # workspace advertises. Read here because the env context is not
+      # available to jobs.<id>.name.
+      - name: read MSRV from Cargo.toml
+        run: echo "MSRV=$(grep -m1 '^rust-version' Cargo.toml | cut -d'"' -f2)" >> "$GITHUB_ENV"
+      - uses: ./.github/actions/pixi
         with:
-          targets: aarch64-unknown-linux-gnu
-      - uses: Swatinem/rust-cache@v2
+          rust-toolchain: ${{ env.MSRV }}
+          cache-key: msrv
+      - run: pixi run cargo check --all-targets
+
+  # Both interpreters in one job. `par6-py` is an abi3-py310 extension, so
+  # the compiled half is identical for 3.11 and 3.12 — a matrix here spent a
+  # second machine and a second build of the workspace to run the same
+  # tests against a different pure-python interpreter.
+  python:
+    name: python (3.11, 3.12)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
         with:
-          key: deploy-aarch64
-      - name: cache aarch64 pinocchio toolchain
-        uses: actions/cache@v4
+          environments: default py311
+          cache-key: default
+      - uses: ./.github/actions/waldoctl-branch
         with:
-          path: |
-            .ffi/bin
-            .ffi/cross-aarch64
-            .ffi/mujoco-aarch64
-          key: ffi-aarch64-${{ runner.os }}-${{ hashFiles('scripts/ffi/setup.sh', 'cpp/**', 'Cargo.lock') }}
-      - name: build aarch64 shim + runtime closure
-        run: scripts/ffi/setup.sh --target aarch64
-      - name: cross-build par6d
+          environment: default
+      - run: pixi run lint-python
+      - run: pixi run test-python
+      - uses: ./.github/actions/waldoctl-branch
+        with:
+          environment: py311
+      - run: pixi run -e py311 test-python
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-python
+          path: python/test-results.xml
+          if-no-files-found: ignore
+
+  # The e2e layers and the release artifacts share a job because they share
+  # the expensive thing: one release build of par6d. Splitting them made
+  # three machines build it.
+  bundle-arm64:
+    name: e2e + bundle (aarch64)
+    needs: fmt
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - uses: ./.github/actions/waldoctl-branch
+        with:
+          environment: default
+      - name: e2e
+        env:
+          PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
+          # Without the flag a missing binary would skip the whole layer
+          # and still report green.
+          PAR6_REQUIRE_E2E: '1'
         run: |
-          source .ffi/env-aarch64.sh
-          scripts/deploy/build-aarch64.sh
-      # The deploy bundle is staged (not uploaded) so the packaging half of
-      # install.sh is exercised too: a missing shim, config or assets tree
-      # fails here rather than on the box.
-      - name: stage the deploy bundle
-        run: |
-          source .ffi/env-aarch64.sh
-          scripts/deploy/install.sh --stage-only "$RUNNER_TEMP/bundle"
-          test -x "$RUNNER_TEMP/bundle/par6d"
-          test -f "$RUNNER_TEMP/bundle/lib/libpar6_shim.so"
-          ls "$RUNNER_TEMP"/bundle/lib/libmujoco.so.*
-          test -f "$RUNNER_TEMP/bundle/config/PAR6.toml"
-          test -d "$RUNNER_TEMP/bundle/par6_description"
-      # Tarred so the executable bit and the closure's symlinks survive
-      # the artifact round-trip; `scp` + `tar -x` on the box is the whole
-      # install.
-      - name: pack the bundle
-        run: tar -C "$RUNNER_TEMP" -czf par6d-aarch64.tar.gz bundle
+          pixi run test-e2e
+          pixi run test-examples
+      # The wheel first: pack-bundle writes the checksums over everything in
+      # dist/, and a wheel built after it would not be covered.
+      # `wheel-with-runtime`, not `wheel`: a released wheel carries par6d.
+      - run: pixi run wheel-with-runtime
+      - run: pixi run bundle
       - uses: actions/upload-artifact@v4
         with:
-          name: par6d-aarch64-bundle
-          path: par6d-aarch64.tar.gz
+          name: par6-aarch64
+          path: |
+            dist/*.whl
+            dist/par6d-aarch64.tar.gz
+            dist/manifest.json
+            dist/SHA256SUMS
+      - name: upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-e2e
+          path: python/test-results-*.xml
+          if-no-files-found: ignore
+
+  validate-arm64:
+    name: validate (aarch64)
+    needs: bundle-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: par6-aarch64
+          path: dist
+      # Deliberately no pixi, no rustup, no .ffi and no LD_LIBRARY_PATH: the
+      # artifacts have to carry their own closure or this fails.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: scripts/deploy/validate-bundle.sh dist
+      - name: upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-aarch64-logs
+          path: /tmp/par6-validate/**
+          if-no-files-found: ignore

@@ -1306,10 +1306,8 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
 
     class Streamer:
         """UI-style streaming: each datagram advances the COMMANDED target
-        1 mm, paced by the 50 ms status wait. The retimed test runtime has
-        a longer stopping projection; its unobstructed approach must also
-        leave room to brake above the installation floor. Stepping
-        from the measurement instead feeds the plant's tracking lag back
+        5 mm, paced by the 50 ms status wait. Stepping from the
+        measurement instead feeds the plant's tracking lag back
         into the target and limit-cycles the arm."""
 
         def __init__(self, client, goal, send):
@@ -1322,7 +1320,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             if self.target is None:
                 self.target = list(await pose_now(self.client))
             for i in range(3):
-                self.target[i] += max(-1.0, min(1.0, self.goal[i] - self.target[i]))
+                self.target[i] += max(-5.0, min(5.0, self.goal[i] - self.target[i]))
             await self.send(self.target)
 
     async def stream_toward(client, goal, send, budget=STEP_BUDGET_S):

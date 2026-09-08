@@ -1,26 +1,33 @@
-//! Publish native library paths to the daemon and Python extension. MuJoCo's
-//! matching library is installed by mujoco-rs into the pixi download prefix.
-use std::{env, path::PathBuf};
+//! Republishes libmujoco's directory as an rpath.
+//!
+//! `mujoco-rs`'s build script emits the link search path and `-lmujoco` for
+//! the prefix `MUJOCO_DYNAMIC_LINK_DIR` names — pixi's for a native build,
+//! the target env for a cross one — but no rpath — so nothing that links it runs without
+//! `LD_LIBRARY_PATH`. par6-bus is the only crate that links libmujoco, so
+//! its `links = "mujoco"` key is where the directory is derived once: as a
+//! link arg for this crate's own test binaries, and as `DEP_MUJOCO_RPATH`
+//! for dependents (link args do not propagate across cargo packages).
+
+use std::path::Path;
 
 fn main() {
-    let shim = env::var("DEP_PAR6_SHIM_RPATH").expect("par6-kin publishes the linked shim path");
+    let shim =
+        std::env::var("DEP_PAR6_SHIM_RPATH").expect("par6-kin publishes the linked shim path");
     println!("cargo:rustc-link-arg=-Wl,-rpath,{shim}");
     println!("cargo:rerun-if-env-changed=MUJOCO_DYNAMIC_LINK_DIR");
-    println!("cargo:rerun-if-env-changed=MUJOCO_DOWNLOAD_DIR");
-    // This directory follows the mujoco-rs pin, as in pixi's activation.
-    let lib = env::var_os("MUJOCO_DYNAMIC_LINK_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            env::var_os("MUJOCO_DOWNLOAD_DIR")
-                .map(PathBuf::from)
-                .unwrap_or_else(|| {
-                    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.ffi/mujoco")
-                })
-                .join("mujoco-3.12.0/lib")
-        });
-    // Cargo can run this script before mujoco-rs has downloaded the library.
-    // The linker checks its presence after dependencies have finished building.
-    let lib = std::path::absolute(lib).expect("MuJoCo library path must resolve");
-    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib.display());
-    println!("cargo:rpath={}", lib.display());
+    let lib_dir = std::env::var("MUJOCO_DYNAMIC_LINK_DIR").unwrap_or_else(|_| {
+        panic!(
+            "MUJOCO_DYNAMIC_LINK_DIR is not set; par6-bus links libmujoco from \
+             the conda prefix pixi provides.\nRun under pixi: `pixi run \
+             cargo ...`."
+        )
+    });
+    if !Path::new(&lib_dir).join("libmujoco.so").exists() {
+        panic!(
+            "libmujoco.so not found in MUJOCO_DYNAMIC_LINK_DIR ({lib_dir}). \
+             It is a pixi dependency; run `pixi install`."
+        );
+    }
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{lib_dir}");
+    println!("cargo:rpath={lib_dir}");
 }

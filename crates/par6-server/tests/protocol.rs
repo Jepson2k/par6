@@ -37,6 +37,8 @@ const BUDGET: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq)]
 enum RtEvent {
     Stream(CmdType),
+    /// The RT was told to drop the planned motion it still holds.
+    DiscardExec,
     CancelStream,
     Halt,
     SetGravityComp(bool),
@@ -47,13 +49,20 @@ enum RtEvent {
     Teleport([f64; 6]),
     EnterFlashing,
     ExitFlashing,
-    SetPidGains { node: u8, kpp: f64, ilim_ma: f64 },
+    SetPidGains {
+        node: u8,
+        kpp: f64,
+        ilim_ma: f64,
+    },
     WriteIo(u8, u8),
     Simulator(bool),
     ConnectHardware(String),
     ResetState,
     ResetLoopStats,
-    SetCanId { node: u8, new_id: u8 },
+    SetCanId {
+        node: u8,
+        new_id: u8,
+    },
     SaveConfig(u8),
     RescanBus,
 }
@@ -109,6 +118,9 @@ impl RtCommands for TestRt {
         }
         self.push(RtEvent::Stream(cmd.tag()));
         Ok(())
+    }
+    fn discard_exec(&mut self) {
+        self.0.lock().unwrap().events.push(RtEvent::DiscardExec);
     }
     fn cancel_stream(&mut self) {
         self.push(RtEvent::CancelStream);
@@ -244,6 +256,12 @@ struct PlannerState {
     fail_next_tool: Option<WireError>,
     /// `cancel_tool` calls and whether each asked for a halt.
     tool_cancels: Vec<bool>,
+    /// Holds `start_tool` inside the planner so a test can act while an
+    /// action is in flight — sent to the planner, not yet answered. That
+    /// window is a state of its own (`pending_tool`, not
+    /// `tool_executing`) and things that must supersede an action have to
+    /// supersede one there too.
+    stall_tool: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[derive(Clone)]
@@ -285,6 +303,13 @@ impl Planner for TestPlanner {
         index: u64,
         _cmd: &par6_proto::command::ToolAction,
     ) -> Result<(), WireError> {
+        // Outside the lock: the test flips the flag from its own thread.
+        let stall = self.0.lock().unwrap().stall_tool.clone();
+        if let Some(stall) = stall {
+            while stall.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
         let mut s = self.0.lock().unwrap();
         if let Some(e) = s.fail_next_tool.take() {
             return Err(e);
@@ -3423,4 +3448,173 @@ async fn status_reports_a_paused_playback() {
             "STATUS never reported the pause"
         );
     }
+}
+
+/// A planner that dies takes the command plane down with it, visibly.
+///
+/// The planner runs on its own thread. If it panics, its channels close
+/// and the server task reads that as a shutdown and returns — correctly,
+/// since there is nothing left to plan with. What was missing is anyone
+/// NOTICING: `par6d` kept running with the RT thread ticking, status
+/// broadcasting and every command met with silence, an arm powered and
+/// unreachable. `ServerHandle::is_finished` is what the supervisor polls
+/// to turn that into a clean exit.
+#[tokio::test]
+async fn a_dead_planner_ends_the_command_plane_visibly() {
+    let mut h = start(|_| {}).await;
+    assert!(
+        !h.server.is_finished(),
+        "the command plane must be running before the planner dies, or this \
+         test proves nothing"
+    );
+
+    // Stop the planner thread and let it go: its channels close exactly as
+    // they would if it had panicked.
+    h.plan_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    if let Some(t) = h.plan_thread.take() {
+        t.join().expect("planner thread");
+    }
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while !h.server.is_finished() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the command plane is still running with no planner behind it: \
+             every command would be accepted and never answered"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// Cancelling a running motion takes the RT's copy of it with it.
+///
+/// The server drops the command and answers the client, but the RT still
+/// holds the planned samples in its ring — so without the flush the arm
+/// keeps playing a motion the client has already been told was cancelled.
+/// `RtCommands::discard_exec` is what carries that, and it is the SERVER's
+/// to send, not the planner's, so that a jog which preempts in the same
+/// handler is not dropped back to IDLE afterwards.
+///
+/// This could not be asserted before: `discard_exec` had a defaulted
+/// no-op body, `TestRt` inherited it, and the flush went nowhere the suite
+/// could see.
+#[tokio::test]
+async fn cancelling_a_running_motion_flushes_the_rt_ring() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let index = c.ok_index(&move_j(950)).await;
+    h.wait_planner("the move to start", |p| {
+        p.started.iter().any(|(i, _)| *i == index)
+    })
+    .await;
+    assert!(
+        !h.rt_events().contains(&RtEvent::DiscardExec),
+        "nothing has been cancelled yet, so the ring must not have been \
+         flushed"
+    );
+
+    c.ok(&Command::Stop(par6_proto::command::Stop {
+        clear_queue: true,
+    }))
+    .await;
+
+    h.wait_rt(|ev| ev.contains(&RtEvent::DiscardExec)).await;
+}
+
+/// A tool action superseded while it is still in flight is completed.
+///
+/// The lane is depth one: a new action supersedes the old, and the old is
+/// COMPLETED rather than dropped, because it was acked and a client may be
+/// waiting on it. But an action that has been sent to the planner and not
+/// yet answered lives in `pending_tool`, not `tool_executing` — so a second
+/// action arriving inside that round trip found nothing to supersede, both
+/// landed under different tags, and `on_tool_started` kept whichever
+/// answered last. The first was never completed and its client waited out
+/// its timeout on an action the server had forgotten.
+#[tokio::test]
+async fn a_tool_action_superseded_in_flight_is_still_completed() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    let action = |key: u64| {
+        Command::ToolAction(ToolAction {
+            key,
+            tool_key: "gripper".to_owned(),
+            action: "move".to_owned(),
+            params: vec![ToolParam::Float(1.0)],
+        })
+    };
+
+    // Hold the planner inside `start_tool` so the first action stays in
+    // flight while the second arrives.
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    h.planner.lock().unwrap().stall_tool = Some(stall.clone());
+
+    let first = c.ok_index(&action(901)).await;
+    let second = c.ok_index(&action(902)).await;
+    stall.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    // The superseded one must be answered, not forgotten.
+    let (ok, detail) = c.wait_complete(first).await;
+    assert!(
+        !ok && detail.is_some(),
+        "a superseded action completes with a cancellation, not silently OK: \
+         ok={ok} detail={detail:?}"
+    );
+
+    // And the one that superseded it still runs.
+    h.wait_planner("the superseding action to start", |p| {
+        p.tools_started.contains(&second)
+    })
+    .await;
+}
+
+/// A protective STOP reaches the planner's tool lane whatever state the
+/// action is in, so the server has to let go of it in every state too.
+/// An action still inside the `StartTool` round trip is parked in
+/// `pending_tool`, and a STOP that took only `tool_executing` left it
+/// there: cancelled on the planner, still live as far as the server knew,
+/// and its client waiting out a timeout on a COMPLETE nobody would speak.
+#[tokio::test]
+async fn a_stop_completes_a_tool_action_still_inside_its_start_round_trip() {
+    let mut h = start(|cfg| {
+        cfg.tools = vec!["gripper".to_owned()];
+        cfg.fitted_tool = "gripper".to_owned();
+        cfg.tool_dof = 1;
+    })
+    .await;
+    h.publish(|s| s.homed = true);
+    let mut c = Client::new(&h).await;
+
+    // Hold the planner inside `start_tool` so the action is still parked
+    // when the stop lands.
+    let stall = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    h.planner.lock().unwrap().stall_tool = Some(stall.clone());
+
+    let index = c
+        .ok_index(&Command::ToolAction(ToolAction {
+            key: 911,
+            tool_key: "gripper".to_owned(),
+            action: "move".to_owned(),
+            params: vec![ToolParam::Float(1.0)],
+        }))
+        .await;
+
+    c.request(&Command::Stop(Stop { clear_queue: false })).await;
+    stall.store(false, std::sync::atomic::Ordering::SeqCst);
+
+    let (ok, detail) = c.wait_complete(index).await;
+    assert!(
+        !ok && detail.is_some(),
+        "a stop completes the parked action with a cancellation: \
+         ok={ok} detail={detail:?}"
+    );
 }

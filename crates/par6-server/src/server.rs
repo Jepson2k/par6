@@ -130,6 +130,17 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// Whether the server task has ended.
+    ///
+    /// It is expected to be running until it is asked to stop, so a `true`
+    /// here that nobody asked for means the command plane is gone — the
+    /// planner thread died and took its channels with it, or the task
+    /// panicked. The supervisor treats that as fatal rather than leaving an
+    /// arm powered, ticking, and unable to be commanded or stopped.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 impl Drop for ServerHandle {
@@ -1302,7 +1313,22 @@ impl<R: RtCommands> Core<R> {
         // Depth one, as the reference runtime has it. The superseded
         // action was acked and something may be waiting on it, so it is
         // completed rather than dropped in silence.
-        if let Some(prev) = self.tool_executing.take() {
+        //
+        // BOTH states count. An action that has been sent to the planner
+        // but not yet confirmed sits in `pending_tool`, not
+        // `tool_executing` — so a second action arriving inside that round
+        // trip used to find nothing to supersede, and both would land under
+        // different tags. `on_tool_started` then overwrote `tool_executing`
+        // with whichever answered last, and the first was never completed:
+        // its client waited out its timeout on an action the server had
+        // silently forgotten.
+        let superseded: Vec<ToolExecuting> = self
+            .pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .collect();
+        for prev in superseded {
             let error = make_error(
                 ErrorCode::MotnCancelled,
                 prev.index as i64,
@@ -1347,9 +1373,13 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// Drain the tool side channel. Runs before the motion lane's
-    /// outcomes and before `pump`, so a finished tool action is reported
-    /// on the same tick it settles rather than behind a motion.
+    /// Report a finished tool action.
+    ///
+    /// The two lanes are polled in one planner pass and arrive as two
+    /// events, the motion outcome first. That order does not matter here
+    /// the way it did when both were drained inline: the side channel
+    /// shares no state with the motion lane, and a tool outcome is spoken
+    /// to its own client the moment its event is routed.
     async fn on_tool_outcome(&mut self, out: CommandOutcome) {
         let Some(ex) = &self.tool_executing else {
             return; // outcome of a cancelled action
@@ -1480,7 +1510,14 @@ impl<R: RtCommands> Core<R> {
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
-            PlanEvent::Outcome(out) => self.on_outcome(out).await,
+            PlanEvent::Outcome(out) => {
+                self.on_outcome(out).await;
+                // The slot the finished motion held is free now. Waiting
+                // for the next poll to notice leaves the arm standing
+                // still for a tick between two queued moves that did not
+                // blend.
+                self.pump().await;
+            }
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
@@ -1728,12 +1765,24 @@ impl<R: RtCommands> Core<R> {
     /// Take the tool action off the side channel so the caller can speak
     /// its cancellation. `halt` asks the tool to stop where it is.
     ///
+    /// An action still inside the `StartTool` round trip is parked in
+    /// `pending_tool`, and the `CancelTool` above reaches the planner
+    /// either way — so taking only `tool_executing` cancelled the parked
+    /// action on the planner while the server went on believing it was
+    /// live, and its client waited out a timeout on a COMPLETE nobody
+    /// was left to speak.
+    ///
     /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
     /// arriving cancels planned motion, but a gripper closing under it
     /// is exactly the overlap the side channel exists to allow.
-    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+    fn drop_tool_action(&mut self, halt: bool) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.send(PlanRequest::CancelTool { halt });
-        self.tool_executing.take().map(|t| (t.index, t.addr))
+        self.pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .map(|t| (t.index, t.addr))
+            .collect()
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
@@ -2089,9 +2138,16 @@ impl<R: RtCommands> Core<R> {
     ///
     /// Two gates latch one: the planner's (a refused or invalidated
     /// planned move) and the streaming gate's (a refused or stopped
-    /// jog/servo). At most one motion pipeline is active at a time and
-    /// accepting a motion clears both, so they never disagree — the
-    /// merge simply reports whichever is active.
+    /// jog/servo). At most one motion pipeline is active at a time, so
+    /// at most one of them is meaningfully latched — but they are no
+    /// longer read from the same place. The streaming latch is the RT's,
+    /// live; the planner's arrives in a report published at the end of
+    /// the planner's pass, and the `ClearCollision` that drops it is a
+    /// request that pass has to service. So accepting a motion clears
+    /// the streaming latch at once and the planner's a pass later, and
+    /// for that pass the two can disagree. Preferring whichever reads
+    /// active is what makes the stale one harmless: it holds the warning
+    /// up a beat longer rather than dropping a live one.
     fn update_collision(&mut self) {
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.report().collision.clone() {
@@ -2277,10 +2333,12 @@ impl<R: RtCommands> Core<R> {
             })
             .collect();
         // Pricing a queue is real planning, so it is asked for rather
-        // than taken: the answer lands in the next report, which makes
-        // the estimate at most one planner pass old. It is a duration
-        // estimate on a queue that has just changed — nothing reads it
-        // for a decision.
+        // than taken. The answer lands in the report of whichever pass
+        // services it — the next one if the planner is free, later if an
+        // earlier expensive request is already holding the batch, since
+        // a pass takes only one. It is a duration estimate on a queue
+        // that has just changed and nothing reads it for a decision, so
+        // there is no bound worth paying for.
         self.runtime
             .planner
             .send(PlanRequest::QueueEstimate { pending });
