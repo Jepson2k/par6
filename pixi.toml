@@ -122,9 +122,23 @@ depends-on = ["build-daemon"]
 # a modern toolchain; the control box installs the BUNDLE, which carries its
 # own libstdc++ and clears bookworm. Forcing a lower tag fails the build
 # rather than producing a wheel that would not import.
+# The extension is relinked, not reused, and this is not optional. maturin
+# HARDLINKS cargo's cdylib into `target/maturin` and auditwheel patches it
+# there — through the link, so cargo's own artifact comes back with its
+# DT_NEEDED rewritten to the hashed names of that run. cargo still calls it
+# fresh, so the next build repairs an already-repaired file and dies looking
+# for the previous run's hashes. `cargo clean -p par6-py` does not help
+# (cargo has nothing recorded to remove); deleting the artifact does.
 [tasks.wheel]
-cmd = "maturin build --release -o ../dist"
+cmd = "bash -c 'rm -f ../target/release/deps/lib_par6.so && rm -rf ../target/maturin ../dist/par6-*.whl && maturin build --release -o ../dist'"
 cwd = "python"
+
+# `pip install par6` should be enough to run a simulator, so the runtime is
+# grafted into the repaired wheel — it needs only the shim and libmujoco,
+# which the wheel already carries for the extension (issue #33).
+[tasks.wheel-with-runtime]
+cmd = "bash -c 'python3 scripts/deploy/pack-wheel.py \"$(ls -1t dist/par6-*.whl | head -1)\" --binary target/release/par6d'"
+depends-on = ["wheel", "build-daemon"]
 
 [tasks.sdist]
 cmd = "maturin sdist -o ../dist"

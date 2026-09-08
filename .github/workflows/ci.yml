@@ -169,7 +169,8 @@ jobs:
           pixi run test-examples
       # The wheel first: pack-bundle writes the checksums over everything in
       # dist/, and a wheel built after it would not be covered.
-      - run: pixi run wheel
+      # `wheel-with-runtime`, not `wheel`: a released wheel carries par6d.
+      - run: pixi run wheel-with-runtime
       - run: pixi run bundle
       - uses: actions/upload-artifact@v4
         with:

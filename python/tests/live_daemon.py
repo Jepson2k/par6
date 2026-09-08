@@ -26,6 +26,7 @@ from typing import Callable
 
 import pytest
 
+from par6 import _daemon
 from par6 import config as _cfg
 from par6.client import AsyncRobotClient
 
@@ -46,11 +47,13 @@ STATUS_RATE_HZ = 20
 
 
 def par6d_binary() -> str | None:
-    """The ``par6d`` binary from ``PAR6D_BIN``, then ``PATH``; None if absent."""
-    env_bin = os.environ.get("PAR6D_BIN")
-    if env_bin:
-        return env_bin if os.path.isfile(env_bin) else None
-    return shutil.which("par6d")
+    """The ``par6d`` binary from ``PAR6D_BIN``, then ``PATH``; None if absent.
+
+    The same resolution the package itself uses, so a checkout that has not
+    built the runtime skips these tests rather than spawning the console
+    script that has nothing to exec.
+    """
+    return _daemon.resolve()
 
 
 requires_par6d = pytest.mark.skipif(

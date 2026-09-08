@@ -32,7 +32,7 @@ jobs:
       - uses: ./.github/actions/pixi
         with:
           cache-key: default
-      - run: pixi run wheel
+      - run: pixi run wheel-with-runtime
       - run: pixi run bundle
       - uses: actions/upload-artifact@v4
         with:
@@ -54,7 +54,7 @@ jobs:
       - uses: ./.github/actions/pixi
         with:
           cache-key: default
-      - run: pixi run wheel
+      - run: pixi run wheel-with-runtime
       - name: checksums
         run: cd dist && sha256sum ./*.whl > SHA256SUMS-x86_64
       - uses: actions/upload-artifact@v4

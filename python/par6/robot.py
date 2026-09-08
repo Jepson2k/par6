@@ -14,7 +14,6 @@ from __future__ import annotations
 import logging
 import os
 import re
-import shutil
 import subprocess
 import threading
 import time
@@ -35,6 +34,7 @@ from waldoctl import (
 )
 from waldoctl.results import IKResult
 
+from par6 import _daemon
 from par6 import config as _cfg
 from par6._par6 import (
     COLLISION_CLEARANCE_M,
@@ -75,13 +75,19 @@ def _ping_runtime(host: str, port: int, timeout: float = 0.5) -> bool:
 
 
 def _find_par6d() -> str:
-    """Resolve the par6d binary: ``PAR6D_BIN`` env, then PATH."""
+    """Resolve the par6d binary: ``PAR6D_BIN``, then PATH.
+
+    A wheel install puts its own runtime on PATH as the `par6d` console
+    script (:mod:`par6._daemon`), so a system runtime and a shipped one are
+    found the same way and `PAR6D_BIN` still overrides both. What the
+    resolution has to reject is the third case: the same console script on a
+    checkout that never built the runtime, which is on PATH regardless and
+    would be spawned only to exit 2.
+    """
     env_bin = os.environ.get("PAR6D_BIN")
-    if env_bin:
-        if not os.path.isfile(env_bin):
-            raise RuntimeError(f"PAR6D_BIN={env_bin!r} does not exist")
-        return env_bin
-    found = shutil.which("par6d")
+    if env_bin and not os.path.isfile(env_bin):
+        raise RuntimeError(f"PAR6D_BIN={env_bin!r} does not exist")
+    found = _daemon.resolve()
     if found is None:
         raise RuntimeError(
             "par6d binary not found; set PAR6D_BIN or put it on PATH "
