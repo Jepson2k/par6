@@ -129,17 +129,17 @@ jobs:
         with:
           environment: default
       - run: pixi run lint-python
-      - run: pixi run test-python
+      - run: pixi run test-python --junitxml=test-results-py312.xml
       - uses: ./.github/actions/waldoctl-branch
         with:
           environment: py311
-      - run: pixi run -e py311 test-python
+      - run: pixi run -e py311 test-python --junitxml=test-results-py311.xml
       - name: upload test results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: test-results-python
-          path: python/test-results.xml
+          path: python/test-results-py*.xml
           if-no-files-found: ignore
 
   # The e2e layers and the release artifacts share a job because they share
@@ -158,6 +158,9 @@ jobs:
       - uses: ./.github/actions/waldoctl-branch
         with:
           environment: default
+          # PR wheels must install before the coordinated dependency release.
+          # main and release builds continue to use the source's tagged pin.
+          retain-branch-pin: 'true'
       - name: e2e
         env:
           PAR6D_BIN: ${{ github.workspace }}/target/release/par6d
