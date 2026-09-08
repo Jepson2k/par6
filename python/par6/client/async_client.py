@@ -1728,6 +1728,18 @@ class AsyncRobotClient(_RobotClientABC):
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
 
+        Raises ``ConnectionError`` when the controller does not answer,
+        because ``[0, 0, 0]`` is a legitimate offset -- a tool deliberately
+        cleared -- and returning it as a not-answered sentinel leaves the
+        caller unable to tell "the offset is zero" from "there is no
+        controller". A host that adopts the readback then quietly erases
+        the offset the user just set. The waldoctl contract spells this
+        out; this used to return the sentinel.
+
+        The sibling queries return ``None`` for the same condition, which
+        is unambiguous where they do it: no real answer is ``None``. This
+        one cannot, because its type is a plain list of three.
+
         Category: Configuration
 
         Example:
@@ -1736,7 +1748,7 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         result = await self._call(core.tcp_offset())
         if result is None:
-            return [0.0, 0.0, 0.0]
+            raise ConnectionError("the controller did not answer tcp_offset()")
         return list(result)
 
     async def is_simulator(self) -> bool:

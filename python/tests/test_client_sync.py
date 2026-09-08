@@ -226,3 +226,36 @@ def test_cli_scan_lists_every_node_id_with_the_configured_drives_present(
     assert present == [r["node"] for r in rows if r["configured"]]
     assert len(present) >= 6
     assert all(r["freshness"] == 1 for r in rows if r["configured"])
+
+
+@pytest.mark.timeout(120)
+def test_tcp_offset_refuses_to_answer_for_a_controller_that_did_not(daemon):
+    """An unreachable controller must raise, not answer ``[0, 0, 0]``.
+
+    Zero is a legitimate offset -- a tool deliberately cleared -- so a
+    caller handed it as a not-answered sentinel cannot tell "the offset is
+    zero" from "there is no controller". waldoctl's contract says so in as
+    many words, and a host that adopts the readback quietly erases the
+    offset the user just set.
+
+    The sibling queries answer ``None`` for the same condition and are
+    right to: no real rate or pose is ``None``. This one has no spare
+    value, so it raises.
+    """
+    with sync_client(daemon) as client:
+        assert client.wait_ready(timeout=10.0) is True
+        assert client.set_tcp_offset(0.0, 0.0, 0.0) is not None
+        # A real, deliberate zero reads back as a value, not as an error.
+        assert [float(v) for v in client.tcp_offset()] == [0.0, 0.0, 0.0]
+
+    # Nothing is listening on a port we know is free.
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        dead = int(probe.getsockname()[1])
+
+    mute = RobotClient(host="127.0.0.1", port=dead, timeout=0.2, retries=1)
+    try:
+        with pytest.raises(ConnectionError):
+            mute.tcp_offset()
+    finally:
+        mute.close()
