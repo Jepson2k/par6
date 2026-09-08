@@ -6,7 +6,7 @@
 //!   closed at the physics substep rate on the substep's own measured
 //!   state (the firmware's loops run at ~1 kHz; a current held over a
 //!   whole bus tick spins a light wrist joint into a tick-rate limit
-//!   cycle), through the config torque↔current factor, plus idle-brake
+//!   cycle), through the config torque↔current factor, plus assumed powered-idle
 //!   damping. The config hard limits are MuJoCo joint limits, and the
 //!   drivetrain friction is MuJoCo `frictionloss`, set every substep by
 //!   the law below;
@@ -21,19 +21,14 @@
 //!
 //! # Drivetrain
 //!
-//! The gearboxes are self-locking. The load on a joint (gravity and the
-//! velocity terms, MuJoCo's `qfrc_bias`) is absorbed by the gearbox up to
-//! the config `holding_friction_nm`: an unpowered joint holds, lowering a
-//! load costs the motor only its own reflected Coulomb loss `G · tc` (the
-//! scene's compiled `frictionloss`), and a motor working against the load
-//! feels exactly the part of it that its own torque has not matched — so
-//! an under-torqued lift holds instead of sagging, and the joint moves
-//! once the motor torque exceeds load plus loss. Beyond the holding
-//! friction the load back-drives the joint. The law is a per-substep
-//! `frictionloss` limit, so the dry friction stays on the solver side
-//! and a held joint rests without chatter. This is what lets the homing
-//! sequence idle the shoulder joints under gravity while the base homes,
-//! and what keeps an IDLE arm on its pose instead of collapsing.
+//! Powered load support is an empirical simulation fit, not a passive
+//! gearbox lock. The configured support and extra idle damping scale with
+//! the scenario's supply envelope. At zero supply there is no motor torque,
+//! load support, jaw servo force, or driver-enforced velocity clamp. Gravity,
+//! reflected rotor inertia, viscous/Coulomb friction and joint limits remain.
+//! Neither robot has motor brakes. The optional linear supply-decay envelope
+//! is an assumed approximation; it does not model or characterize the PAR6
+//! capacitor bank or predict its real collapse time.
 //!
 //! The `set_gripper_object_*` test hooks are owned by the scene — the
 //! plant overwrites them every tick with what the physics says is between
@@ -56,8 +51,8 @@ use super::driver::{PlantCmd, VirtualDriver, FW_LOOP_DT};
 use super::map::JointMap;
 use super::scene::{self, WORLD_PREFIX};
 
-/// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — the
-/// shorted-phase brake of an idled driver. Free-motion viscous/Coulomb
+/// Idle (watchdog fired / cmd 12) extra damping rate \[1/s\] — an
+/// assumed powered-idle loss. Free-motion viscous/Coulomb
 /// friction lives in the MJCF joint defaults, not here.
 const IDLE_RATE: f64 = 40.0;
 /// Drivetrain friction limit \[N·m\] that clamps a joint outright: applied
@@ -96,6 +91,11 @@ pub enum JawDrive {
     Active { target_byte: f64, rate_bytes_s: f64 },
 }
 
+pub(crate) struct PowerState {
+    pub landing_clamp: bool,
+    pub supply_scale: f64,
+}
+
 pub(crate) struct MujocoPlant {
     /// The scene and its state; the data owns the model.
     data: MjData<Box<MjModel>>,
@@ -116,7 +116,7 @@ pub(crate) struct MujocoPlant {
     /// Reflected motor Coulomb loss per arm joint \[N·m\] — the scene's
     /// compiled `frictionloss`, the floor of the drivetrain friction.
     coulomb: Vec<f64>,
-    /// Gearbox holding friction per arm joint \[N·m\].
+    /// Assumed powered load support per arm joint \[N·m\].
     hold: Vec<f64>,
     /// This substep's drivetrain friction per arm joint \[N·m\].
     friction: Vec<f64>,
@@ -164,8 +164,8 @@ fn drivetrain_friction(coulomb: f64, hold: f64, motor_nm: f64, load_nm: f64) -> 
 impl MujocoPlant {
     /// Take the compiled scene and place the arm at `q0` (config joint
     /// frame == scene qpos, jaws at the front end's boot byte, everything
-    /// else at the scene's default pose), with `holding_nm` the gearbox
-    /// holding friction per arm joint. Panics with a descriptive message
+    /// else at the scene's default pose), with `holding_nm` the assumed powered
+    /// load support per arm joint. Panics with a descriptive message
     /// on a layout the plant cannot drive (a sim construction bug, not a
     /// runtime error).
     pub fn new(model: MjModel, maps: &[JointMap], q0: &[f64], holding_nm: &[f64]) -> Self {
@@ -503,8 +503,12 @@ impl MujocoPlant {
         loads_ma: &[f64],
         maps: &[JointMap],
         jaw: Option<JawDrive>,
-        clamp_arm: bool,
+        power: PowerState,
     ) {
+        let PowerState {
+            landing_clamp: clamp_arm,
+            supply_scale,
+        } = power;
         let substeps = (dt / self.ts).round();
         assert!(
             substeps >= 1.0 && (dt / self.ts - substeps).abs() < 1e-6,
@@ -524,11 +528,11 @@ impl MujocoPlant {
                 self.cmds[j] = drivers[j].loop_step(pos + map.report_offset, vel, fw_steps);
                 let cmds = &self.cmds;
                 let v = self.qvel[j];
-                let motor = cmds[j].current_ma / map.factor_ma_per_nm;
+                let motor = supply_scale * cmds[j].current_ma / map.factor_ma_per_nm;
                 let external = -loads_ma[j] / map.factor_ma_per_nm;
                 let mut t = motor + external;
                 if cmds[j].idle {
-                    t -= IDLE_RATE * self.inertia[j] * v;
+                    t -= supply_scale * IDLE_RATE * self.inertia[j] * v;
                 }
                 self.qfrc[j] = t;
                 // The load is what acts on the joint besides the motor:
@@ -537,10 +541,13 @@ impl MujocoPlant {
                 let load = external - self.bias[j];
                 let hold = if clamp_arm {
                     LANDING_CLAMP_NM
+                } else if cmds[j].idle {
+                    0.0
                 } else {
                     self.hold[j]
                 };
-                self.friction[j] = drivetrain_friction(self.coulomb[j], hold, motor, load);
+                self.friction[j] =
+                    drivetrain_friction(self.coulomb[j], supply_scale * hold, motor, load);
             }
             // SAFETY: only per-DOF friction values change; the model's
             // sizes and layout are untouched, so the data stays valid.
@@ -562,7 +569,7 @@ impl MujocoPlant {
                 let x_t = byte_to_m(self.jaw_cmd_byte);
                 let f = (JAW_KP * (x_t - self.qpos[jaw]) + JAW_KD * (jaw_vt - self.qvel[jaw]))
                     .clamp(-JAW_FMAX, JAW_FMAX);
-                self.qfrc[jaw] = f;
+                self.qfrc[jaw] = supply_scale * f;
             }
             self.data.qfrc_applied_mut().copy_from_slice(&self.qfrc);
             self.data.step();
@@ -574,7 +581,7 @@ impl MujocoPlant {
                 let vlim = self.cmds[j].vel_limit_ticks_s.abs()
                     * (std::f64::consts::TAU / f64::from(maps[j].encoder_max_counts))
                     / maps[j].gear_ratio;
-                if self.qvel[j].abs() > vlim {
+                if supply_scale > 0.0 && self.qvel[j].abs() > vlim {
                     self.qvel[j] = self.qvel[j].clamp(-vlim, vlim);
                     clamped = true;
                 }

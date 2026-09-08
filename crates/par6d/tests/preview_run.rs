@@ -39,6 +39,224 @@ fn move_j_cmd(angles_deg: [f64; NUM_JOINTS], key: u64, speed: f64) -> Command {
 }
 
 #[test]
+fn physics_time_budget_includes_control_commands() {
+    use par6_proto::command::Pause;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let commands = vec![Command::Pause(Pause { on: false }); 100];
+    let run = preview
+        .run(&commands, RunLimits { max_seconds: 0.04 })
+        .unwrap();
+    assert_eq!(run.stop, StopReason::BudgetExhausted);
+    assert!(run.duration_s() <= 0.04);
+}
+
+#[test]
+fn physics_applies_program_configuration_and_reports_unsupported_operations() {
+    use par6_proto::command::{Delay, SelectProfile, SetCompletionPolicy, SetPayload};
+    use par6_proto::CompletionPolicy;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let initial_payload = preview.payload();
+    let commands = [
+        Command::SelectProfile(SelectProfile {
+            profile: preview.profile().to_owned(),
+        }),
+        Command::SetPayload(SetPayload {
+            mass: 0.05,
+            com: [0.0, 0.0, 0.04],
+            inertia: None,
+        }),
+        Command::SetCompletionPolicy(SetCompletionPolicy {
+            policy: CompletionPolicy::Commanded,
+        }),
+        move_j_cmd(park_deg(), 9950, 0.1),
+        Command::Delay(Delay {
+            key: 9951,
+            seconds: 0.2,
+        }),
+    ];
+    let run = preview
+        .run(&commands, RunLimits { max_seconds: 3.0 })
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+    assert!(run.commands.last().unwrap().rows > 0);
+    assert_eq!(preview.payload(), initial_payload);
+
+    let unsupported = preview
+        .run(
+            &[Command::Reset, commands[4].clone()],
+            RunLimits { max_seconds: 1.0 },
+        )
+        .unwrap();
+    assert_eq!(unsupported.stop, StopReason::Failed);
+    assert!(unsupported.commands[0]
+        .error
+        .as_ref()
+        .unwrap()
+        .cause
+        .contains("offline physics replay"));
+    assert_eq!(unsupported.commands[1].rows, 0);
+}
+
+#[test]
+fn physics_refuses_stale_attachments_before_running_later_commands() {
+    use par6_proto::command::{Delay, SetShapes};
+    use par6_proto::Attachment;
+    let config = test_config();
+    for context in ["incoming", "initial", "unreferenced"] {
+        let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+        let mut part = Shape {
+            name: "part".into(),
+            kind: "sphere".into(),
+            params: vec![0.01],
+            pose: vec![0.0, 0.0, 0.3, 0.0, 0.0, 0.0],
+            collision: true,
+            margin: None,
+            physics: None,
+            attachment: Some(Attachment {
+                epoch: preview.shapes().3,
+                allowed_contacts: vec![],
+            }),
+        };
+        let first = match context {
+            "initial" => {
+                preview.set_shapes(ShapeLayer::Program, &[part]).unwrap();
+                assert!(preview.submit(Command::Reset).valid());
+                move_j_cmd(park_deg(), 9940, 0.1)
+            }
+            "incoming" => {
+                part.attachment.as_mut().unwrap().epoch += 1;
+                Command::SetShapes(SetShapes { shapes: vec![part] })
+            }
+            _ => {
+                preview.set_homed(false);
+                Command::SetShapes(SetShapes { shapes: vec![part] })
+            }
+        };
+        let run = preview
+            .run(
+                &[
+                    first,
+                    Command::Delay(Delay {
+                        key: 9941,
+                        seconds: 0.2,
+                    }),
+                ],
+                RunLimits { max_seconds: 2.0 },
+            )
+            .unwrap();
+        assert_eq!(
+            run.stop,
+            StopReason::Failed,
+            "{context}: {:?}",
+            run.commands
+        );
+        let error = run.commands[0].error.as_ref().expect("attachment refusal");
+        assert!(error.cause.contains("attachment"), "{context}: {error:?}");
+        assert_eq!(run.commands[1].rows, 0, "continued after {context} refusal");
+    }
+}
+
+#[test]
+fn queued_tcp_changes_affect_only_subsequent_physics_rows() {
+    use par6_proto::command::{Delay, SetTcpOffset};
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let commands = [
+        Command::Delay(Delay {
+            key: 9920,
+            seconds: 0.2,
+        }),
+        Command::SetTcpOffset(SetTcpOffset {
+            key: 9921,
+            x: 100.0,
+            y: 0.0,
+            z: 0.0,
+        }),
+        Command::Delay(Delay {
+            key: 9922,
+            seconds: 0.2,
+        }),
+    ];
+    let run = preview
+        .run(&commands, RunLimits { max_seconds: 2.0 })
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+    let mut nominal = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    for (row, offset_m) in [(0, 0.0), (run.rows - 1, 0.1)] {
+        let q = std::array::from_fn(|j| f64::from(run.q_rad[row * NUM_JOINTS + j]));
+        nominal.teleport_rad(q);
+        let pose = nominal.pose().unwrap();
+        let distance = (0..3)
+            .map(|j| (f64::from(run.tcp[row * 6 + j]) - pose[j * 4 + 3]).powi(2))
+            .sum::<f64>()
+            .sqrt();
+        assert!(
+            (distance - offset_m).abs() < 1e-5,
+            "row {row}: TCP correction {distance} m, expected {offset_m} m"
+        );
+    }
+    assert_eq!(
+        preview.tcp_offset_mm(),
+        [0.0; 3],
+        "a run must not mutate the planning session"
+    );
+}
+
+#[test]
+fn world_edits_take_effect_at_their_program_boundary() {
+    use par6_proto::command::{Delay, SetShapes};
+    use par6_proto::Physical;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let block = Shape {
+        kind: "box".into(),
+        params: vec![0.04; 3],
+        pose: vec![1.0, 1.0, 0.3, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: "falling".into(),
+        attachment: None,
+        physics: Some(Physical {
+            mass: Some(0.05),
+            friction: [1.0, 0.005, 0.0001],
+        }),
+    };
+    let cmds = [
+        Command::Delay(Delay {
+            key: 9900,
+            seconds: 0.2,
+        }),
+        Command::SetShapes(SetShapes {
+            shapes: vec![block],
+        }),
+        Command::Delay(Delay {
+            key: 9901,
+            seconds: 0.8,
+        }),
+        Command::SetShapes(SetShapes { shapes: vec![] }),
+        Command::Delay(Delay {
+            key: 9902,
+            seconds: 0.2,
+        }),
+    ];
+    let run = preview.run(&cmds, RunLimits { max_seconds: 4.0 }).unwrap();
+    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+    let object = run.objects.iter().find(|o| o.name == "falling").unwrap();
+    assert_eq!(object.poses.len(), run.rows);
+    assert!(object.poses.first().unwrap()[2].is_nan());
+    assert!(object.poses.last().unwrap()[2].is_nan());
+    let existing: Vec<_> = object.poses.iter().filter(|p| p[2].is_finite()).collect();
+    assert!(existing.first().unwrap()[2] > 0.2);
+    assert!(existing.last().unwrap()[2] < 0.03);
+    assert!(
+        preview.shapes().1.is_empty(),
+        "simulation changed the planning world"
+    );
+}
+
+#[test]
 fn execution_controls_reach_the_simulated_runtime() {
     use par6_proto::command::{Pause, SetExecutionSpeed};
     let config = test_config();
@@ -179,6 +397,7 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
 fn a_run_grasps_lifts_and_drops_a_world_object() {
     let config = test_config();
     let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    session.set_gripper_calibrated(true);
     // Reach-down pose over the stand (config frame), as in the bus tests.
     let grasp_pose = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
     session.teleport_rad(grasp_pose);

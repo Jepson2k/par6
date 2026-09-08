@@ -821,9 +821,10 @@ fn wrong_dlc_frames_discarded_whole() {
     );
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
-    assert!(
-        rig.state.nodes[node].speed_ticks_s.unwrap().abs() <= 60,
-        "wrong-DLC frames fed the watchdog (drive still running)"
+    assert_eq!(
+        rig.state.nodes[node].current_ma,
+        Some(0),
+        "a watchdog-released driver must stop supplying current; gravity may still move it"
     );
     rig.bus.queue_poll_override(
         PollAction::Poll {
@@ -1350,55 +1351,193 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
 /// Reach-down pose over the scene's grasp object (config frame).
 const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
-/// The drivetrain holds: with every driver IDLE the arm keeps its pose
-/// under gravity (the gearboxes do not back-drive), and a load past
-/// the configured holding friction back-drives the joint — the hold is
-/// finite, not a weld.
+/// A released motor cannot supply static holding torque, even while its
+/// electronics are powered and the host keeps polling it.
 #[test]
-fn unpowered_arm_holds_until_the_holding_friction_is_exceeded() {
-    /// Reported drift an unpowered joint may show \[ticks\].
-    const HOLD_TOL_TICKS: i32 = 20;
-    let robot = par6();
-    let j = 1usize;
-    let node = usize::from(robot.joints[j].node_id);
-    // Arm stretched out, nothing in contact: ~5 Nm of gravity on J1.
+fn released_drivers_have_no_static_powered_support() {
+    let mut robot = par6();
     let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
-    let mut rig = Rig::boot(&robot, None, Some(&q0));
-    // cmd-12 Idle frames: the drivers go limp (a velocity-0 frame
-    // would be a hold).
-    let idle: Vec<JointCommand> = vec![JointCommand::drop_to_idle(); rig.joints];
-    let sample = |rig: &mut Rig, ticks: u64| -> (i32, i32) {
-        let mut first = None;
-        for _ in 0..ticks {
-            rig.step(&idle, &GripperCommand::NoGripper);
-            rig.bus.queue_poll_override(
-                PollAction::Poll {
-                    node: node as u8,
-                    kind: PollKind::Encoder,
-                },
-                1,
-            );
-            if first.is_none() {
-                first = rig.state.nodes[node].position_ticks;
-            }
-        }
-        (
-            first.expect("shoulder position"),
-            rig.state.nodes[node].position_ticks.unwrap(),
-        )
+    robot.sim.powered_support_nm.fill(0.0);
+    let mut passive = Rig::boot(&robot, None, Some(&q0));
+    robot.sim.powered_support_nm.fill(1e6);
+    let mut released = Rig::boot(&robot, None, Some(&q0));
+    let idle = vec![JointCommand::drop_to_idle(); passive.joints];
+    for _ in 0..robot.ticks(1.0) {
+        passive.step(&idle, &GripperCommand::NoGripper);
+        released.step(&idle, &GripperCommand::NoGripper);
+        assert_eq!(
+            passive.bus.true_joint_rad(),
+            released.bus.true_joint_rad(),
+            "a released driver retained configured powered support"
+        );
+    }
+    assert!(
+        (released.bus.true_joint_rad()[1] - q0[1]).abs() > 0.005,
+        "the released shoulder did not yield to gravity"
+    );
+}
+
+#[test]
+fn scenarios_perturb_observations_and_power_without_changing_the_local_servo_feedback() {
+    use par6_bus::sim::scenario::{DriverFault, SimulationScenario, SupplyLoss, Window};
+    let robot = par6();
+    let node = usize::from(robot.joints[0].node_id);
+    let mut clean = Rig::boot(&robot, None, None);
+    let mut noisy = Rig::boot(&robot, None, None);
+    let mut repeated = Rig::boot(&robot, None, None);
+    let profile = SimulationScenario {
+        seed: 73,
+        observation_delay_s: robot.robot.tick_dt_s * 3.0,
+        encoder_noise_ticks: 20,
+        ..Default::default()
     };
-    let (first, last) = sample(&mut rig, u64::from(robot.ticks(1.0)));
+    noisy.bus.set_scenario(&profile).unwrap();
+    repeated.bus.set_scenario(&profile).unwrap();
+    let commands = vec![JointCommand::velocity(0, 0); clean.joints];
+    let mut changed = false;
+    for _ in 0..robot.ticks(0.3) {
+        for rig in [&mut clean, &mut noisy, &mut repeated] {
+            rig.step(&commands, &GripperCommand::NoGripper);
+        }
+        changed |= clean.state.nodes[node].position_ticks != noisy.state.nodes[node].position_ticks;
+        assert_eq!(
+            noisy.state.nodes[node].position_ticks,
+            repeated.state.nodes[node].position_ticks
+        );
+        assert_eq!(clean.bus.true_joint_rad(), noisy.bus.true_joint_rad());
+        assert_eq!(noisy.bus.true_joint_rad(), repeated.bus.true_joint_rad());
+    }
+    assert!(changed, "the requested observation noise was not applied");
+    assert!(noisy.state.frame_age_max_ticks >= 3);
+
+    let lost_s = robot.bus.lost_s;
+    noisy
+        .bus
+        .set_scenario(&SimulationScenario {
+            dropout: Some(Window {
+                start_s: 0.0,
+                duration_s: lost_s + 0.1,
+            }),
+            driver_fault: Some(DriverFault {
+                at_s: lost_s + 0.12,
+                node: node as u8,
+                kind: FaultKind::Encoder,
+            }),
+            ..Default::default()
+        })
+        .unwrap();
+    for _ in 0..robot.ticks(lost_s + 0.05) {
+        noisy.step(&commands, &GripperCommand::NoGripper);
+    }
+    assert_eq!(noisy.bus.freshness(node as u8), Freshness::Lost);
+    for _ in 0..robot.ticks(0.4) {
+        noisy.step(&commands, &GripperCommand::NoGripper);
+    }
+    assert!(noisy.state.nodes[node].live_error_bit);
+    assert!(noisy.state.nodes[node].error_flags.unwrap().encoder);
+    assert!(noisy.bus.dropped_rx_frames() > 0);
+
+    let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
+    let mut off = Rig::boot(&robot, None, Some(&q0));
+    let mut decaying = Rig::boot(&robot, None, Some(&q0));
+    for (rig, decay_s) in [(&mut off, 0.0), (&mut decaying, 0.5)] {
+        rig.bus
+            .set_scenario(&SimulationScenario {
+                supply_loss: Some(SupplyLoss { at_s: 0.0, decay_s }),
+                ..Default::default()
+            })
+            .unwrap();
+    }
+    for _ in 0..robot.ticks(0.2) {
+        off.step(&commands, &GripperCommand::NoGripper);
+        decaying.step(&commands, &GripperCommand::NoGripper);
+    }
+    let immediate = (off.bus.true_joint_rad()[1] - q0[1]).abs();
+    let gradual = (decaying.bus.true_joint_rad()[1] - q0[1]).abs();
     assert!(
-        (last - first).abs() <= HOLD_TOL_TICKS,
-        "unpowered shoulder drifted under gravity ({first} → {last})"
+        immediate > 0.005 && gradual < immediate,
+        "supply envelopes did not change collapse: {immediate} / {gradual}"
     );
-    // A load far past the holding friction (plus gravity) back-drives it.
-    rig.bus.set_joint_load_ma(robot.joints[j].node_id, 3000.0);
-    let (first, last) = sample(&mut rig, u64::from(robot.ticks(0.5)));
+    for _ in 0..robot.ticks(1.0) {
+        decaying.step(&commands, &GripperCommand::NoGripper);
+    }
     assert!(
-        (last - first).abs() > 200,
-        "an overload did not back-drive the shoulder ({first} → {last})"
+        (decaying.bus.true_joint_rad()[1] - q0[1]).abs() > 0.02,
+        "zero supply incorrectly held the arm"
     );
+    assert_eq!(decaying.bus.freshness(node as u8), Freshness::Lost);
+
+    for invalid in [f64::NAN, f64::INFINITY, -0.1, 1.01] {
+        assert!(clean
+            .bus
+            .set_scenario(&SimulationScenario {
+                observation_delay_s: invalid,
+                ..Default::default()
+            })
+            .is_err());
+    }
+}
+
+#[test]
+fn declared_attachment_uses_the_flange_in_the_mujoco_model() {
+    use mujoco_rs::prelude::{MjData, MjtObj};
+    use par6_bus::sim::scene::{Build, JointTuning};
+    let robot = par6();
+    let tuning: Vec<_> = robot
+        .joints
+        .iter()
+        .map(|j| JointTuning {
+            armature: 0.001,
+            damping: 0.1,
+            frictionloss: 0.01,
+            range: [j.limits.hard_min_rad, j.limits.hard_max_rad],
+        })
+        .collect();
+    let mut held = shape(
+        "held",
+        "box",
+        &[0.04, 0.04, 0.04],
+        [0.03, 0.02, 0.25, 0.0, 0.0, 0.0],
+        None,
+    );
+    held.attachment = Some(par6_proto::Attachment {
+        epoch: 1,
+        allowed_contacts: vec![],
+    });
+    for tool in [Tool::Flange, Tool::Msg, Tool::Ssg48] {
+        let mut source = scene();
+        source.tool = tool;
+        let model = source
+            .model(
+                &Build {
+                    timestep: 0.001,
+                    joints: &tuning,
+                    tool: None,
+                },
+                &[&[], &[held.clone()]],
+            )
+            .unwrap();
+        let flange = model.name_to_id(MjtObj::mjOBJ_BODY, "gripper").unwrap();
+        let geom = model
+            .name_to_id(MjtObj::mjOBJ_GEOM, "par6/obj/held")
+            .unwrap();
+        assert_eq!(
+            model.geom_bodyid()[geom] as usize,
+            flange,
+            "attachment remained in world coordinates"
+        );
+        let mut data = MjData::new(Box::new(model));
+        data.forward();
+        let first = data.geom_xpos()[geom];
+        data.qpos_mut()[0] = 0.4;
+        data.forward();
+        assert_ne!(data.geom_xpos()[geom], first);
+        assert_eq!(
+            data.model().geom_contype()[geom],
+            0,
+            "a geometry declaration invented physical contact"
+        );
+    }
 }
 
 /// Position-hold commands for every arm joint at its current wire
@@ -1863,8 +2002,15 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
         [-0.2, -0.6, 0.4, 0.0, 0.0, 0.0],
         Some(Some(0.05)),
     ));
+    let before_shelf = rig.bus.true_joint_rad();
     rig.bus.set_world(Layer::Program, &world);
     rig.step(&hold, &GripperCommand::NoGripper);
+    for (a, b) in rig.bus.true_joint_rad().iter().zip(&before_shelf) {
+        assert!(
+            (a - b).abs() < 1e-3,
+            "world update disturbed the arm: {b} -> {a}"
+        );
+    }
     let kept = rig.bus.world_object_pose("block").unwrap();
     assert!(
         (kept[2] - rest[2]).abs() < 1e-6 && (kept[0] - rest[0]).abs() < 1e-6,
@@ -1886,6 +2032,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     );
 
     // Clearing the layer removes the bodies; the arm still stands.
+    let before_clear = rig.bus.true_joint_rad();
     rig.bus.set_world(Layer::Program, &[]);
     rig.step(&hold, &GripperCommand::NoGripper);
     assert!(
@@ -1893,10 +2040,10 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
             && rig.bus.world_object_pose("block2").is_none()
     );
     let cleared = rig.bus.true_joint_rad();
-    for (j, (a, b)) in cleared.iter().zip(&before).enumerate() {
+    for (j, (a, b)) in cleared.iter().zip(&before_clear).enumerate() {
         assert!(
             (a - b).abs() < 1e-3,
-            "joint {j} drifted {:+.5} rad through the world changes",
+            "joint {j} moved {:+.5} rad across the world removal",
             a - b
         );
     }

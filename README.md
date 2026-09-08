@@ -1038,3 +1038,6 @@ sync facade accepts the same options. Omitted deadlines keep client defaults.
 Named read/wait/write skills are available in `waldo_commander.skills` using
 `waldoctl.signals.DigitalSignal` mappings. Native preview clients advertise
 `execution.preview` so those skills require explicit observation fixtures.
+
+Offline reproducible observation and supply-loss cases are documented in
+[Simulation scenarios](docs/simulation-scenarios.md).

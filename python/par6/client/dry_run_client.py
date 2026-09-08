@@ -170,6 +170,7 @@ class DryRunRobotClient:
             engine.set_homed(homed)
             engine.set_gripper_calibrated(calibrated)
             self._start_joints_rad = list(engine.angles_rad())
+            engine.begin_program()
             self._engine = engine
         return self._engine
 
@@ -269,6 +270,7 @@ class DryRunRobotClient:
                 "io.digital",
                 "execution.preview",
                 "world.attachments",
+                "simulation.scenarios",
                 "execution.speed",
             }
         )
@@ -373,7 +375,12 @@ class DryRunRobotClient:
         """
         return len(self._program)
 
-    def simulate(self, max_seconds: float | None = None) -> TickIndex:
+    def simulate(
+        self,
+        max_seconds: float | None = None,
+        *,
+        scenario: dict[str, Any] | None = None,
+    ) -> TickIndex:
         """Run everything submitted so far through the engine and return
         the tick record of what the arm did.
 
@@ -389,27 +396,15 @@ class DryRunRobotClient:
         typing path.  ``max_seconds`` bounds SIMULATED time, so a program
         that never terminates still comes back.
 
-        The world is the one applied NOW: a program that edits the
-        collision world part-way through is replayed against its final
-        state, not the state it had at each command.
+        World changes are replayed at their command boundaries. A free-body
+        object track contains NaN rows while that object has no free body.
+        ``scenario`` supplies deterministic observation perturbations or an
+        assumed supply-loss envelope, validated by the native simulator.
         """
-        preview = self._preview
-        here = list(preview.angles_rad())
-        execution = self.execution_speed()
-        preview.teleport_rad(self._start_joints_rad)
-        preview.submit({"type": "pause", "on": False})
-        preview.submit({"type": "set_execution_speed", "scale": 1.0})
-        try:
-            raw = self._call(preview.run_program, self._program, max_seconds)
-            return _tick_index(raw)
-        finally:
-            # The planning session goes on from where it was; a run is a
-            # question about the program, not a move.
-            preview.teleport_rad(here)
-            preview.submit(
-                {"type": "set_execution_speed", "scale": execution.resume_scale}
-            )
-            preview.submit({"type": "pause", "on": execution.paused})
+        raw = self._call(
+            self._preview.run_program, self._program, max_seconds, scenario
+        )
+        return _tick_index(raw)
 
     # ------------------------------------------------------------------
     # Motion

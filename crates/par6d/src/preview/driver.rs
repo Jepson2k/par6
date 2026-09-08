@@ -92,6 +92,8 @@ pub(crate) struct SimSetup<'a> {
     pub(crate) gravity: KinGravity,
     /// Where the arm starts.
     pub(crate) q0: [f64; MAX_JOINTS],
+    pub(crate) homed: bool,
+    pub(crate) calibrated: bool,
 }
 
 /// A booted engine nothing paces.
@@ -112,8 +114,8 @@ pub(crate) struct SimDriver {
 }
 
 impl SimDriver {
-    /// Boot an engine over a simulated bus and leave it enabled, homed at
-    /// `q0`, with the gripper calibrated — the state a dry run starts from.
+    /// Boot a private engine at `q0`, applying the requested reference and
+    /// gripper-calibration state before the recorded scenario begins.
     ///
     /// The command source consumes at most one command per tick, so each
     /// phase polls the snapshot rather than counting ticks.
@@ -126,6 +128,8 @@ impl SimDriver {
             fk,
             gravity,
             q0,
+            homed,
+            calibrated,
         } = setup;
         let robot = &bundle.robot;
         let dt = robot.robot.tick_dt_s;
@@ -193,10 +197,14 @@ impl SimDriver {
         d.land(bundle, &q0);
         // A tool action is refused against an uncalibrated gripper, and a
         // teleported jaw does not set the bit — only the firmware sweep does.
-        d.send(RtCommand::GripperCalibrate);
-        d.tick_until(CALIBRATE_BUDGET_S, "calibrated its gripper", |s| {
-            s.gripper.reply.is_some_and(|r| r.calibrated)
-        })?;
+        if calibrated {
+            d.send(RtCommand::GripperCalibrate);
+            d.tick_until(CALIBRATE_BUDGET_S, "calibrated its gripper", |s| {
+                s.gripper.reply.is_some_and(|r| r.calibrated)
+            })?;
+        }
+        d.core.set_homed(homed);
+        d.tick();
         Ok((d, ports))
     }
 
@@ -303,6 +311,8 @@ mod tests {
         }
 
         let (mut d, _ports) = SimDriver::boot(SimSetup {
+            homed: true,
+            calibrated: true,
             bundle: &bundle,
             scene,
             installation: &bundle.robot.installation_shapes,

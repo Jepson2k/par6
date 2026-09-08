@@ -140,6 +140,7 @@ pub struct ServoPreview {
 /// server-side validation and state (profile, TCP offset, completion
 /// policy, IO levels, tool state) — everything a program can observe.
 pub struct Preview {
+    run_origin: Option<run::RunStart>,
     planner: Par6Planner,
     jog: MotionJog,
     /// The housekeeping loop's own cartesian solver, so a `jog_l` preview
@@ -287,6 +288,7 @@ impl Preview {
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let mut preview = Self {
+            run_origin: None,
             planner,
             jog,
             cart: stack.cart,
@@ -375,6 +377,12 @@ impl Preview {
     }
 
     // ------------------------------------------------------------ state
+
+    /// Preserve the current initial conditions for repeated whole-program
+    /// physics runs while subsequent submissions advance the planning session.
+    pub fn begin_program(&mut self) {
+        self.run_origin = Some(run::RunStart::capture(self));
+    }
 
     /// How many queued commands the planner may see ahead of the one it
     /// is about to start — what bounds a blend chain's hold.
