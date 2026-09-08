@@ -1802,7 +1802,7 @@ pub(crate) fn housekeeping_loop(
                           gate: &Arc<Mutex<StreamGate>>,
                           what: &str,
                           pairs: Vec<(String, String)>| {
-        log::warn!("{what}: collision predicted; stopping the stream");
+        log::warn!("{what}: collision predicted for {pairs:?}; stopping the stream");
         gate.lock().unwrap().refuse(pairs);
         // Both releases, because either mode may be the one running and
         // each ignores the release that is not its own. They ramp the

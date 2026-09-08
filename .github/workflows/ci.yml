@@ -322,8 +322,15 @@ jobs:
           PAR6_REQUIRE_E2E: "1"
         run: |
           cd python
-          pixi run -e py312 pytest -m e2e
-          pixi run -e py312 pytest -m examples --examples
+          pixi run -e py312 pytest -m e2e --junitxml=test-results-e2e.xml
+          pixi run -e py312 pytest -m examples --examples --junitxml=test-results-examples.xml
+      - name: Preserve end-to-end test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: par6-e2e-results
+          path: python/test-results-*.xml
+          if-no-files-found: ignore
 
   # The artifact that actually deploys: par6d cross-built for the control
   # box WITH kinematics and the simulator, plus the shim, libmujoco and the

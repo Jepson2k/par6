@@ -88,8 +88,8 @@ impl CollisionReport<'_> {
 ///
 /// Self-collision pairs cover every link pair except structurally-touching
 /// neighbours (same parent joint, or parent/child in the kinematic tree).
-/// Every world shape is checked against every robot link; world shapes are
-/// never checked against each other.
+/// World shapes are checked against robot links, and attached shapes also
+/// against other world shapes, subject to their scoped contact declarations.
 pub struct Collision {
     model: sys::CollisionModel,
     nq_full: usize,
