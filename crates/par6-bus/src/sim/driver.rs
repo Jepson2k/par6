@@ -8,28 +8,13 @@
 use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
 
-/// Firmware velocity-loop period the sim assumes \[s\]. The config `kiv`
-/// is a per-loop-iteration gain; the firmware loop runs much faster than
-/// the bus tick, so the sim integrates `kiv · err` once per firmware
-/// iteration (`dt / FW_LOOP_DT` times per tick). Without this the
-/// integral unwinds so slowly that a homing backoff cannot break the
-/// endstop seat within the vendor-configured backoff window.
-///
-/// KNOWN WRONG, and do not "fix" it by editing this number alone. The
-/// firmware (`Source-Robotics/STEPFOC-stepper-controller`,
-/// `src/constants.h`) sets `LOOP_TIME 0.00016`: the real cascade closes
-/// at 6.25 kHz, not 1 kHz. But the sim evaluates the loop ONCE per
-/// physics substep and only scales the integral by `fw_steps`, so
-/// lowering this models the destabilising half of a faster loop — 6.25x
-/// the integral accumulation — without the stabilising half, which is the
-/// phase lag a faster loop does not have. The result oscillates harder
-/// and reads as a drive-tuning problem that is not there;
-/// `a_held_servo_target_settles` is ignored for exactly this reason.
-///
-/// Fixing it properly means iterating the driver loop at `LOOP_TIME`
-/// between physics steps, and feeding back a moving average of the
-/// measured velocity as `Position_mode()` does.
-pub(crate) const FW_LOOP_DT: f64 = 0.001;
+/// Firmware cascade frequency [Hz], from STEPFOC constants.h at 32fb5b5.
+/// The physics integrates between loop evaluations; scaling the integral
+/// without updating plant feedback adds a phase lag the drive does not have.
+const FW_LOOP_HZ: f64 = 6250.0;
+pub(crate) const FW_LOOP_DT: f64 = 1.0 / FW_LOOP_HZ;
+/// STEPFOC's measured-velocity moving average, sampled each drive iteration.
+const VELOCITY_WINDOW: usize = 20;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -94,8 +79,6 @@ pub(crate) enum ReplyKind {
 
 pub(crate) struct VirtualDriver {
     dt: f64,
-    /// Firmware velocity-loop iterations per bus tick (≥ 1).
-    fw_steps: f64,
     // -- pushed configuration (updated live by config frames) --
     kpp: f64,
     kpv: f64,
@@ -109,6 +92,12 @@ pub(crate) struct VirtualDriver {
     // -- control state --
     mode: Mode,
     integral_ma: f64,
+    loop_phase: f64,
+    last_drive: PlantCmd,
+    velocity_history: [f64; VELOCITY_WINDOW],
+    velocity_samples: usize,
+    previous_encoder: Option<f64>,
+    pub measured_velocity: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
@@ -128,7 +117,6 @@ impl VirtualDriver {
     pub fn new(dt: f64, node: NodeId, vel_limit: f64, ilim_ma: f64, kt_nm_a: f64) -> Self {
         Self {
             dt,
-            fw_steps: (dt / FW_LOOP_DT).round().max(1.0),
             kpp: 0.0,
             kpv: 0.0,
             kiv: 0.0,
@@ -140,6 +128,17 @@ impl VirtualDriver {
             kt_nm_a: kt_nm_a as f32,
             mode: Mode::Idle,
             integral_ma: 0.0,
+            loop_phase: 0.0,
+            last_drive: PlantCmd {
+                current_ma: 0.0,
+                ff_ma: 0.0,
+                vel_limit_ticks_s: vel_limit,
+                idle: true,
+            },
+            velocity_history: [0.0; VELOCITY_WINDOW],
+            velocity_samples: 0,
+            previous_encoder: None,
+            measured_velocity: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
@@ -199,7 +198,6 @@ impl VirtualDriver {
                 self.mode = Mode::Current {
                     cur: f64::from(unpack_i16([d[0], d[1]])),
                 };
-                self.integral_ma = 0.0;
                 self.armed = true;
                 ReplyKind::Motion
             }
@@ -209,7 +207,6 @@ impl VirtualDriver {
                     vel: f64::from(unpack_i24([d[3], d[4], d[5]])),
                     cur_ff: f64::from(unpack_i16([d[6], d[7]])),
                 };
-                self.integral_ma = 0.0;
                 self.armed = true;
                 ReplyKind::Motion
             }
@@ -260,7 +257,6 @@ impl VirtualDriver {
             }
             (Idle, 0) => {
                 self.mode = Mode::Idle;
-                self.integral_ma = 0.0;
                 ReplyKind::None
             }
             (Estop, 0) => {
@@ -306,32 +302,39 @@ impl VirtualDriver {
         self.ticks_since_data = 0;
     }
 
-    /// One control-loop step at the measured plant state. Ages the
-    /// watchdog first (a fire drops to Idle and latches the watchdog
-    /// flag), then computes the mode's Ilim-saturated current output.
-    ///
-    /// A latched fault removes drive authority entirely, as it does on the
-    /// arm: firmware runs its mode switch only while `Error == 0`, and the
-    /// else branch forces `Controller_mode = 0` and drops SLEEP/RESET
-    /// until `Clear_Error`.
-    pub fn control_step(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
-        self.age_watchdog();
-        let fw_steps = self.fw_steps;
-        self.loop_step(pos_ticks, vel_ticks_s, fw_steps)
+    /// A physics step can be shorter than one drive iteration. Carry
+    /// its fraction forward so host retiming cannot change the drive's
+    /// sampling window or integral gain.
+    pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
+        self.loop_phase += fw_steps;
+        if self.loop_phase >= 1.0 - 1e-10 {
+            self.loop_phase = (self.loop_phase - 1.0).max(0.0);
+            self.last_drive = self.control_iteration(pos_ticks, vel_ticks_s);
+        }
+        self.last_drive
     }
 
-    /// The control law alone, integrating the velocity loop over
-    /// `fw_steps` firmware iterations — separated from the per-tick
-    /// watchdog aging so the dynamics plant can close the loops at its
-    /// physics substep rate (the firmware's own loops run at ~1 kHz; a
-    /// current held over a whole coarse bus tick destabilizes a
-    /// strongly-driven joint).
-    pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
+    fn control_iteration(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
+        let fw_steps = 1.0;
+        let pos_ticks = pos_ticks.round();
+        let vel_ticks_s = self
+            .previous_encoder
+            .map_or(vel_ticks_s, |previous| (pos_ticks - previous) * FW_LOOP_HZ)
+            .trunc();
+        self.previous_encoder = Some(pos_ticks);
+        self.velocity_history.rotate_left(1);
+        self.velocity_history[VELOCITY_WINDOW - 1] = vel_ticks_s;
+        self.velocity_samples = (self.velocity_samples + 1).min(VELOCITY_WINDOW);
+        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW - self.velocity_samples..]
+            .iter()
+            .sum::<f64>()
+            / self.velocity_samples as f64)
+            .trunc();
+        self.measured_velocity = vel_ticks_s;
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
             self.mode = Mode::Idle;
-            self.integral_ma = 0.0;
             self.cur_out_ma = 0.0;
             return PlantCmd {
                 current_ma: 0.0,
@@ -404,6 +407,17 @@ impl VirtualDriver {
     /// held — a limp tick lets a wrist loaded past its gearbox's holding
     /// friction back-drive a degree before the feedforward arrives.
     pub fn reseed_hold(&mut self, pos_ticks: f64) {
+        self.loop_phase = 0.0;
+        self.last_drive = PlantCmd {
+            current_ma: 0.0,
+            ff_ma: 0.0,
+            vel_limit_ticks_s: self.vel_limit,
+            idle: false,
+        };
+        self.velocity_history.fill(0.0);
+        self.velocity_samples = 0;
+        self.previous_encoder = None;
+        self.measured_velocity = 0.0;
         self.integral_ma = 0.0;
         self.cur_out_ma = 0.0;
         self.mode = Mode::Position {
@@ -430,7 +444,6 @@ impl VirtualDriver {
         self.ticks_since_data = self.ticks_since_data.saturating_add(1);
         if self.ticks_since_data == self.watchdog_ticks {
             self.mode = Mode::Idle;
-            self.integral_ma = 0.0;
             self.flags.watchdog = true;
             self.flags.error = true;
         }
@@ -463,6 +476,7 @@ impl VirtualDriver {
     }
 
     pub fn clear_faults(&mut self) {
+        self.mode = Mode::Idle;
         let (calibrated, activated) = (self.flags.calibrated, self.flags.activated);
         self.flags = ErrorFlags {
             calibrated,

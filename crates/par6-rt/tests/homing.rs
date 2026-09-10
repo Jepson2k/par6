@@ -19,7 +19,7 @@ use par6_bus::{
     BusState, DriverBus, GripperCommand, GripperReply, HallState, JointCommand, LoopbackBus, Pack,
     Reply, TxRecord,
 };
-use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, SequenceStep};
+use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep};
 use par6_rt::homing::{HomingSystem, SeqStatus};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
@@ -38,7 +38,17 @@ fn sim_core() -> (
     mpsc::Sender<RtCommand>,
     Arc<AtomicBool>,
 ) {
-    let bundle = common::bundle();
+    sim_core_with_bundle(&common::bundle())
+}
+
+fn sim_core_with_bundle(
+    bundle: &ConfigBundle,
+) -> (
+    RtCore<SimBus>,
+    RtHandles,
+    mpsc::Sender<RtCommand>,
+    Arc<AtomicBool>,
+) {
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;
     let (tx, rx) = mpsc::channel();
@@ -59,7 +69,7 @@ fn sim_core() -> (
         samples: consumer,
     };
     let (mut core, handles) =
-        RtCore::new(&bundle, SimBus::new(common::scene(&bundle)), hooks).expect("sim core");
+        RtCore::new(bundle, SimBus::new(common::scene(bundle)), hooks).expect("sim core");
     core.bus_mut().set_hall_trigger(5, -0.3, 0.02);
     (core, handles, tx, line)
 }
@@ -134,6 +144,56 @@ fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
         assert!(
             (got - want).abs() < 0.05,
             "J{i}: measured {got} want {want} after homing"
+        );
+    }
+}
+
+#[test]
+fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
+    let mut bundle = common::bundle();
+    bundle.robot.homing.sequence = (0..2)
+        .map(|_| SequenceStep {
+            pre_moves: vec![par6_config::PreMove::Nudge {
+                joint: 0,
+                speed_ticks_s: 500.0,
+                duration_s: 35.0,
+            }],
+            home: None,
+            move_to: vec![],
+            post_moves: vec![],
+        })
+        .collect();
+    bundle.robot.homing.post_moves.clear();
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+    let dt = core.tick_dt_s();
+    for _ in 0..2 {
+        start_homing(&mut core, &mut handles, &tx);
+        for _ in 0..(45.0 / dt).round() as usize {
+            core.tick(dt, false);
+        }
+        let s = handles.snapshots.latest();
+        assert!(s.homing.active, "each run gets its own time budget");
+        assert_eq!(s.homing.sequence_step, 1, "first step has completed");
+        for _ in 0..(15.0 / dt).round() as usize {
+            core.tick(dt, false);
+        }
+        let s = handles.snapshots.latest();
+        assert!(
+            !s.homing.active,
+            "the whole sequence must stop within 60 seconds"
+        );
+        assert_eq!(s.mode, Mode::Idle);
+        assert!(
+            !s.homed,
+            "a timed-out sequence must not establish references"
+        );
+        for _ in 0..(0.5 / dt).round() as usize {
+            core.tick(dt, false);
+        }
+        let s = handles.snapshots.latest();
+        assert!(
+            s.qd[0].abs() < 0.01,
+            "the simulated joint must actually stop"
         );
     }
 }
@@ -259,24 +319,27 @@ fn two_pass_mismatch_fails_the_joint_and_restores_config() {
     let jh = &bundle.robot.homing.joints[0];
     let mut h = HomingHarness::new(&bundle);
 
-    // Entry swap: Limits(normal vel, homing current) ×4 to every arm
-    // node and the gripper motor.
+    // Waiting actuators retain their normal holding authority.
     for i in 0..MAX_JOINTS {
         let node = bundle.robot.joints[i].node_id;
-        let ma = bundle.robot.homing.joints[i].current_ma as f32;
-        assert_eq!(h.limits_count(node, ma), 4, "entry limit swap for J{i}");
+        let ma = bundle.robot.joints[i].ilim_ma as f32;
+        assert_eq!(
+            h.limits_count(node, ma),
+            4,
+            "initial holding limit for J{i}"
+        );
     }
     let gripper_ma = bundle
         .active_gripper()
         .unwrap()
-        .homing
+        .driver
         .as_ref()
         .unwrap()
-        .current_ma as f32;
+        .ilim_ma as f32;
     assert_eq!(
         h.limits_count(bundle.robot.bus.gripper_node, gripper_ma),
         4,
-        "entry limit swap covers the gripper motor"
+        "gripper begins with its normal holding limit"
     );
 
     // Scripted plant for J0: velocity integrates; a plateau at `stop`
@@ -1209,4 +1272,198 @@ fn a_retune_before_homing_is_the_limit_homing_restores() {
         s.homing.effective_current_limit_ma[0], tune.ilim_ma as f32,
         "J1 must come back to the tuned Ilim, not the config-time one"
     );
+}
+
+#[test]
+fn a_failed_clearance_move_stops_before_the_next_homing_group() {
+    let mut bundle = common::bundle();
+    bundle.robot.homing.sequence = vec![
+        SequenceStep {
+            pre_moves: vec![],
+            home: None,
+            move_to: vec![MoveTo {
+                joint: 0,
+                // A real plant hard stop prevents this clearance target.
+                position_rad: bundle.robot.joints[0].limits.hard_max_rad + 1.0,
+                duration_s: 0.5,
+            }],
+            post_moves: vec![],
+        },
+        SequenceStep {
+            pre_moves: vec![],
+            home: Some(HomeGroup {
+                joints: vec![3, 5],
+                gripper: None,
+            }),
+            move_to: vec![],
+            post_moves: vec![],
+        },
+    ];
+    bundle.robot.homing.post_moves.clear();
+    let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+    let dt = core.tick_dt_s();
+    start_homing(&mut core, &mut handles, &tx);
+    let mut stopped = false;
+    for _ in 0..((4.0 / dt) as usize) {
+        core.tick(dt, false);
+        let s = handles.snapshots.latest();
+        assert_eq!(
+            s.homing.sequence_step, 0,
+            "must not home the wrist without clearance"
+        );
+        if !s.homing.active {
+            assert!(!s.homed);
+            assert_eq!(s.homing.per_joint[0], HomingJointStatus::Failed);
+            assert_eq!(s.homing.per_joint[3], HomingJointStatus::Idle);
+            assert_eq!(s.homing.per_joint[5], HomingJointStatus::Idle);
+            stopped = true;
+            break;
+        }
+    }
+    assert!(
+        stopped,
+        "clearance failure must finish with an explicit failure"
+    );
+}
+
+/// Every position phase must fail if a physical stop blocks its target,
+/// even when that axis has already acquired a valid home reference.
+#[test]
+fn unreachable_positions_fail_in_every_homing_phase() {
+    let mut failures = Vec::new();
+    for phase in ["pre", "post", "global_post", "joint_post"] {
+        let mut bundle = single_joint_bundle(0);
+        let target = bundle.robot.joints[0].limits.hard_max_rad + 1.0;
+        let position = par6_config::PreMove::Position {
+            joint: 0,
+            position_rad: target,
+            duration_s: 0.5,
+        };
+        let mut last_step = 0;
+        match phase {
+            "pre" => {
+                bundle.robot.homing.sequence.push(SequenceStep {
+                    pre_moves: vec![position],
+                    home: Some(HomeGroup {
+                        joints: vec![3, 5],
+                        gripper: None,
+                    }),
+                    move_to: vec![],
+                    post_moves: vec![],
+                });
+                last_step = 1;
+            }
+            "post" => bundle.robot.homing.sequence[0].post_moves.push(position),
+            "global_post" => {
+                bundle.robot.homing.post_moves.push(position);
+                last_step = 1;
+            }
+            "joint_post" => {
+                bundle.robot.homing.joints[0].post_home = Some(par6_config::PostHomeConfig {
+                    position_rad: target,
+                    speed_ticks_s: 30_000.0,
+                })
+            }
+            _ => unreachable!(),
+        }
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        let mut referenced = false;
+        let mut stopped = false;
+        for _ in 0..(25.0 / dt).round() as usize {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            referenced |= s.homing.per_joint[0] == HomingJointStatus::Done;
+            if s.homing.per_joint[3] != HomingJointStatus::Idle
+                || s.homing.per_joint[5] != HomingJointStatus::Idle
+            {
+                failures.push(format!("{phase}: wrist homing started without clearance"));
+                break;
+            }
+            if !s.homing.active {
+                stopped = true;
+                if s.homed || s.homing.per_joint[0] != HomingJointStatus::Failed {
+                    failures.push(format!(
+                        "{phase}: unreachable target was accepted: {:?}",
+                        s.homing
+                    ));
+                }
+                if s.homing.sequence_step > last_step {
+                    failures.push(format!(
+                        "{phase}: advanced beyond the failed positioning step"
+                    ));
+                }
+                break;
+            }
+        }
+        assert!(
+            referenced,
+            "{phase}: must exercise positioning AFTER referencing J1"
+        );
+        if !stopped {
+            failures.push(format!(
+                "{phase}: did not stop after the positioning failure"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// A valid slow positioning profile must reach its destination; the
+/// settling budget starts after the planned travel, not at its start.
+#[test]
+fn homing_positioning_waits_for_profiles_longer_than_four_seconds() {
+    let mut failures = Vec::new();
+    for phase in ["pre", "post", "global_post", "joint_post"] {
+        let mut bundle = single_joint_bundle(0);
+        let target = bundle.robot.homing.joints[0].home_offset_rad - 0.3;
+        let position = par6_config::PreMove::Position {
+            joint: 0,
+            position_rad: target,
+            duration_s: 6.0,
+        };
+        match phase {
+            "pre" => bundle.robot.homing.sequence.push(SequenceStep {
+                pre_moves: vec![position],
+                home: None,
+                move_to: vec![],
+                post_moves: vec![],
+            }),
+            "post" => bundle.robot.homing.sequence[0].post_moves.push(position),
+            "global_post" => bundle.robot.homing.post_moves.push(position),
+            "joint_post" => {
+                bundle.robot.homing.joints[0].post_home = Some(par6_config::PostHomeConfig {
+                    position_rad: target,
+                    // Six-second Hermite profile across 0.3 rad.
+                    speed_ticks_s: JointConversion::from_config(&bundle.robot.joints[0])
+                        .motor_speed_ticks_s(1.5 * 0.3 / 6.0)
+                        .abs(),
+                })
+            }
+            _ => unreachable!(),
+        }
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(&bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        let mut stopped = false;
+        for _ in 0..(25.0 / dt).round() as usize {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            if !s.homing.active {
+                stopped = true;
+                if s.homing.per_joint[0] != HomingJointStatus::Done
+                    || (s.q[0] - target).abs() > 0.01
+                {
+                    failures.push(format!(
+                        "{phase}: ended at {} instead of {target}, {:?}",
+                        s.q[0], s.homing
+                    ));
+                }
+                break;
+            }
+        }
+        assert!(stopped, "{phase}: positioning never finished");
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
 }

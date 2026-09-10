@@ -525,8 +525,8 @@ impl CoreClient {
 
     /// Estimate what the arm is carrying — mass and centre of mass, never
     /// the inertia tensor, which static poses cannot excite — and,
-    /// optionally, tell the runtime. The whole protocol, including the
-    /// clearing and restoring of whatever was declared, is
+    /// optionally, tell the runtime. The position-hold measurement and
+    /// acknowledged declaration replacement are
     /// `par6d::calibrate::estimate`'s; this only carries paths and results.
     #[pyo3(signature = (config=None, assets=None, package_dir=None, spread=0.5, ridge=0.01, declare=false))]
     #[allow(clippy::too_many_arguments)]

@@ -4,7 +4,7 @@
 //!
 //! - arm joints get the motor torques from the driver current loops,
 //!   closed at the physics substep rate on the substep's own measured
-//!   state (the firmware's loops run at ~1 kHz; a current held over a
+//!   state (the firmware's loops run at 6.25 kHz; a current held over a
 //!   whole bus tick spins a light wrist joint into a tick-rate limit
 //!   cycle), through the config torque↔current factor, plus idle-brake
 //!   damping. The config hard limits are MuJoCo joint limits, and the
@@ -515,7 +515,7 @@ impl MujocoPlant {
             self.jaw_cmd_byte = byte;
         }
         let h = self.ts;
-        let fw_steps = (h / FW_LOOP_DT).round().max(1.0);
+        let fw_steps = h / FW_LOOP_DT;
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {

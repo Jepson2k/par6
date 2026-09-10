@@ -160,7 +160,7 @@ pub struct MoveTo {
     pub joint: u8,
     /// Target position \[rad\].
     pub position_rad: f64,
-    /// Move duration \[s\] (timeout = duration + 2 s, warn-and-continue).
+    /// Move duration \[s\] (failure timeout = duration + 2 s).
     pub duration_s: f64,
 }
 
@@ -177,8 +177,8 @@ pub struct HomeGroup {
 }
 
 /// One step of the homing sequence. Runs `pre_moves`, then the `home`
-/// group in parallel, then `move_to` moves. Pre/post/move_to timeouts
-/// warn and continue; home-phase timeouts FAIL the sequence.
+/// group in parallel, then `move_to` moves. A timeout in any position or
+/// home phase fails the sequence; later phases cannot run without clearance.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SequenceStep {

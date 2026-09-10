@@ -258,7 +258,7 @@ impl LoopbackBus {
                 current_ma,
                 ..
             } => {
-                state.nodes[node].position_ticks = Some(position_ticks);
+                state.nodes[node].record_position(position_ticks);
                 state.nodes[node].speed_ticks_s = Some(speed_ticks_s);
                 state.nodes[node].current_ma = Some(current_ma);
             }
@@ -270,7 +270,7 @@ impl LoopbackBus {
                 hall,
                 ..
             } => {
-                state.nodes[node].position_ticks = Some(position_ticks);
+                state.nodes[node].record_position(position_ticks);
                 state.nodes[node].hall = Some(hall);
             }
             Reply::Kt { kt_nm_a, .. } => state.nodes[node].kt_nm_a = Some(kt_nm_a),

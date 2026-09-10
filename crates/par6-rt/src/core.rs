@@ -78,6 +78,8 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+/// Encoder stability window before releasing velocity authority [s].
+const STREAM_BRAKE_SETTLE_S: f64 = 0.1;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
@@ -571,6 +573,12 @@ pub struct RtCore<B: DriverBus> {
     /// A `StreamRelease` is braking to rest. STREAM outlives it the same
     /// way JOG outlives a release.
     stream_released: bool,
+    stream_brake_min: [f64; MAX_JOINTS],
+    stream_brake_max: [f64; MAX_JOINTS],
+    stream_brake_since: Option<u64>,
+    stream_brake_generation: [u64; MAX_JOINTS],
+    stream_brake_ticks: u64,
+    stream_brake_resolution: [f64; MAX_JOINTS],
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -784,6 +792,15 @@ impl<B: DriverBus> RtCore<B> {
             jog_active: false,
             jog_released: false,
             stream_released: false,
+            stream_brake_min: [0.0; MAX_JOINTS],
+            stream_brake_max: [0.0; MAX_JOINTS],
+            stream_brake_since: None,
+            stream_brake_generation: [0; MAX_JOINTS],
+            stream_brake_ticks: u64::from(robot.ticks(STREAM_BRAKE_SETTLE_S).max(1)),
+            stream_brake_resolution: std::array::from_fn(|i| {
+                let j = &robot.joints[i];
+                2.0 * std::f64::consts::TAU / f64::from(1i32 << j.encoder_bits) / j.gear_ratio
+            }),
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -1620,6 +1637,10 @@ impl<B: DriverBus> RtCore<B> {
             Mode::Stream => {
                 self.stream.activate(&self.q);
                 self.stream_released = false;
+                self.stream_brake_since = None;
+                self.stream_brake_generation = std::array::from_fn(|i| {
+                    self.bus_state.nodes[usize::from(self.node_of[i])].position_generation
+                });
                 self.stream_last_rx_tick = self.tick;
                 self.stream_window_pos = 0;
                 self.stream_window_applied = 0;
@@ -2303,17 +2324,46 @@ impl<B: DriverBus> RtCore<B> {
                     &self.g,
                     &mut self.setpoints,
                 );
-                // A released stream brakes instead of stopping dead, and
-                // STREAM is the only mode that ticks this executor, so
-                // the mode outlives the release until the ramp is at
-                // rest — the same contract JOG has. Handing the arm to
-                // IDLE while it still carries velocity is what let a
-                // refused stream coast on past the keep-out that
-                // refused it.
+                // The planned ramp can finish before the plant stops.
+                // Keep velocity authority until encoder positions settle;
+                // one zero quantized velocity sample cannot establish rest.
                 if self.stream_released
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
                 {
-                    self.mode = Mode::Idle;
+                    let gravity = self.gravity_applied();
+                    for i in 0..MAX_JOINTS {
+                        self.setpoints[i] = dispatch::JointSetpoint::zero_velocity();
+                        self.setpoints[i].torque_nm = Some(if gravity { self.g[i] } else { 0.0 });
+                    }
+                    let mut positions_fresh = true;
+                    for i in 0..MAX_JOINTS {
+                        let node = &self.bus_state.nodes[usize::from(self.node_of[i])];
+                        positions_fresh &= node.position_ticks.is_some()
+                            && node.position_generation != self.stream_brake_generation[i];
+                        self.stream_brake_generation[i] = node.position_generation;
+                        self.stream_brake_min[i] = self.stream_brake_min[i].min(self.q[i]);
+                        self.stream_brake_max[i] = self.stream_brake_max[i].max(self.q[i]);
+                    }
+                    let moved = (0..MAX_JOINTS).any(|i| {
+                        self.stream_brake_max[i] - self.stream_brake_min[i]
+                            > self.stream_brake_resolution[i]
+                    });
+                    match self.stream_brake_since {
+                        Some(since) if positions_fresh && !moved => {
+                            if self.tick - since >= self.stream_brake_ticks {
+                                self.mode = Mode::Idle;
+                            }
+                        }
+                        _ => {
+                            self.stream_brake_min = self.q;
+                            self.stream_brake_max = self.q;
+                            // Cached encoder values cannot establish rest even
+                            // while voltage or fault replies keep the node live.
+                            self.stream_brake_since = positions_fresh.then_some(self.tick);
+                        }
+                    }
+                } else {
+                    self.stream_brake_since = None;
                 }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and

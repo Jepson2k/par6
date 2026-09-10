@@ -2264,10 +2264,47 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
         "expected the corner region to be sampled, got {} frames",
         mid.len()
     );
-    let slowest = mid
-        .iter()
-        .map(|s| s.speeds.iter().fold(0.0f64, |m, v| m.max(v.abs())))
-        .fold(f64::INFINITY, f64::min);
+    // The drive reports velocity over only 20 firmware samples (3.2 ms).
+    // One encoder count in that window is already 0.0187 rad/s on J1;
+    // judge continued path progress over 100 ms instead of mistaking a
+    // quantized sample for a stop. The same speed threshold must
+    // distinguish the unblended control from the rounded path.
+    let slowest_progress = |frames: &[Status]| {
+        let mut slowest = f64::INFINITY;
+        let mut windows = 0;
+        for (i, a) in frames.iter().enumerate() {
+            if from_corner(a, corner_deg) >= 4.0 {
+                continue;
+            }
+            let Some(b) = frames[i + 1..]
+                .iter()
+                .find(|b| b.mono_time_ns.saturating_sub(a.mono_time_ns) >= 100_000_000)
+            else {
+                continue;
+            };
+            if from_corner(b, corner_deg) >= 4.0 {
+                continue;
+            }
+            let dt = (b.mono_time_ns - a.mono_time_ns) as f64 * 1e-9;
+            let travel = a
+                .angles
+                .iter()
+                .zip(b.angles)
+                .map(|(a, b)| (b - a).to_radians().powi(2))
+                .sum::<f64>()
+                .sqrt();
+            slowest = slowest.min(travel / dt);
+            windows += 1;
+        }
+        assert!(windows >= 5, "not enough corner progress windows");
+        slowest
+    };
+    let sharp_slowest = slowest_progress(&sharp);
+    let slowest = slowest_progress(&blended);
+    assert!(
+        sharp_slowest < 0.02,
+        "the unblended control must actually stop at the corner, got {sharp_slowest:.4} rad/s"
+    );
     assert!(
         slowest > 0.02,
         "the blended joint corner slowed to {slowest:.4} rad/s: a blend that stops is not a blend"
@@ -2665,41 +2702,10 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
 /// the config declares "arrived" means — read from the config the rig
 /// booted rather than restated here.
 ///
-/// IGNORED: the simulator cannot answer this yet, and the requirement is
-/// real, so it is neither deleted nor weakened. Run it with
-/// `cargo test -- --ignored` when the drive model is fixed.
-///
-/// Against the vendor drive gains the sim does NOT hold: the joint
-/// limit-cycles at ~10 Hz with a 9.3 deg peak-to-peak swing that neither
-/// grows nor decays, at every tick rate, with the commanded position
-/// pinned on the target. Bisecting on the sim rig puts the stability edge
-/// between `kpp` 2.5 (8.1 deg spread) and 2.0 (0.18 deg); at 1.5 the hold
-/// settles to 0.012 deg.
-///
-/// That is NOT evidence the vendor mistuned J1, because the sim's drive
-/// model differs from the firmware
-/// (`Source-Robotics/STEPFOC-stepper-controller`) in two ways that act
-/// directly on stability margin:
-///
-/// - `constants.h` sets `LOOP_TIME 0.00016` — the cascade closes at
-///   6.25 kHz. `sim::driver::FW_LOOP_DT` assumes 1 ms, and the loop is
-///   evaluated once per physics substep, so the sim runs it ~6x slower
-///   and carries ~6x the phase lag.
-/// - `Position_mode()` feeds back `controller.Velocity_Filter`, a moving
-///   average of the measured velocity; the sim feeds back the raw value.
-///
-/// The one mechanism that WOULD have been ours is ruled out: the firmware
-/// clamps `V_errSum` to the current limit and has no anti-windup, exactly
-/// as the sim does, so the integrator behaviour is faithful.
-///
-/// Raising `FW_LOOP_DT` alone would make this worse and would wrongly
-/// convict the vendor: it models the destabilising half of a faster loop
-/// (6.25x the integral accumulation) without the stabilising half (less
-/// phase lag). The fix is to iterate the driver loop at 160 us between
-/// physics steps and filter the velocity feedback.
+/// This extended pose exercises the base joint's high-inertia load. The
+/// configured drive gains must settle it without changing the machine's
+/// arrival tolerance; otherwise a keep-out landing has no stable endpoint.
 #[test]
-#[ignore = "the sim's drive model runs the firmware cascade ~6x too slowly; \
-            see the doc comment and the sim-fidelity issue"]
 fn a_held_servo_target_settles() {
     let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
         .expect("shipped config")
@@ -2750,6 +2756,94 @@ fn a_held_servo_target_settles() {
          (settle tolerance {tol_deg:.3} deg)",
         tail[tail.len() - 1] - target[0]
     );
+}
+
+/// Manual system-identification experiment through the public retuning and
+/// servo interfaces. This reports measurements; it does not relax or replace
+/// the held-target regression or change the shipped profile.
+#[test]
+#[ignore = "manual simulator gain experiment"]
+fn diagnose_extended_pose_servo_gains() {
+    use std::io::Write;
+
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../../2026-09-10/sim-servo-gain-sweep.csv");
+    let mut out = std::fs::File::create(&path).expect("diagnostic csv");
+    writeln!(out, "case,t_s,q_deg,qd_rad_s,current_ma,target_deg").unwrap();
+    let bundle = par6_config::ConfigBundle::load(&shipped_config()).unwrap();
+    let j = &bundle.robot.joints[0];
+    for (name, kpp, kpv, kiv) in [
+        ("vendor", 5.0, 0.015, 0.0015),
+        ("lower_position_p", 2.0, 0.015, 0.0015),
+        ("higher_velocity_p", 5.0, 0.030, 0.0015),
+        ("lower_velocity_i", 5.0, 0.015, 0.0005),
+        ("combined", 3.0, 0.030, 0.0005),
+        ("high_velocity_p", 5.0, 0.060, 0.0015),
+    ] {
+        let rig = boot_tagged(&format!("gain-{name}"));
+        let mut c = Client::new(rig.addr());
+        rig.wait_status("link_ok", |s| s.link_ok == 1);
+        c.ok(&Command::Reset);
+        c.ok(&Command::SetPidGains(par6_proto::command::SetPidGains {
+            node: j.node_id,
+            kpp,
+            kpv,
+            kiv,
+            kpiq: j.gains.kpiq,
+            kiiq: j.gains.kiiq,
+            kp: j.gains.kp,
+            kd: j.gains.kd,
+            ilim_ma: j.ilim_ma,
+            velocity_limit_ticks_s: j.velocity_limit_ticks_s,
+            voltage_limit_mv: j.voltage_limit_mv,
+        }));
+        enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+        rig.drain_status();
+        let target = with_j0(SWEEP_START_DEG, 20.0);
+        let started = Instant::now();
+        let mut sent = started - Duration::from_secs(1);
+        let mut tail = Vec::new();
+        while started.elapsed() < Duration::from_secs(6) {
+            if sent.elapsed() >= Duration::from_millis(50) {
+                c.send(&Command::ServoJ(par6_proto::command::ServoJ {
+                    angles: target,
+                    speed: None,
+                    accel: None,
+                }));
+                sent = Instant::now();
+            }
+            if let Some(s) = rig.recv_status() {
+                let t = started.elapsed().as_secs_f64();
+                let current = s
+                    .drive_health
+                    .currents_ma
+                    .first()
+                    .copied()
+                    .unwrap_or(f64::NAN);
+                writeln!(
+                    out,
+                    "{name},{t},{},{},{current},{}",
+                    s.angles[0], s.speeds[0], target[0]
+                )
+                .unwrap();
+                if t >= 5.0 {
+                    tail.push(s.angles[0]);
+                }
+            }
+        }
+        rig.shutdown();
+        assert!(tail.len() >= 20, "fresh final-second measurements");
+        let lo = tail.iter().copied().fold(f64::INFINITY, f64::min);
+        let hi = tail.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let rms =
+            (tail.iter().map(|q| (q - target[0]).powi(2)).sum::<f64>() / tail.len() as f64).sqrt();
+        println!(
+            "{name}: kpp={kpp} kpv={kpv} kiv={kiv} peak_to_peak_deg={:.6} rms_error_deg={rms:.6}",
+            hi - lo
+        );
+        out.flush().unwrap();
+    }
+    println!("Diagnostic trace: {}", path.display());
 }
 
 // ---- curved moves: the arm ON the plan ------------------------------------

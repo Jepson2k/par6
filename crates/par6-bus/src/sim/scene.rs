@@ -10,7 +10,7 @@
 //! - inertials: overwritten from the URDF, the mass-property source of
 //!   truth (the vendor MJCF carries stale shell-only inertias — see the
 //!   assets CHANGELOG);
-//! - timestep: the largest step ≤ 1 ms that divides the bus tick;
+//! - timestep: the largest step ≤ the drive-loop period that divides the bus tick;
 //! - actuators: deleted — the plant drives every DOF through `qfrc_applied`;
 //! - arm joints: armature / damping / frictionloss / limits from the robot
 //!   config, replacing the vendor's single eyeballed class-`Y` tuning;
@@ -41,7 +41,7 @@ pub const ARM_JOINTS: [&str; 6] = [
 
 /// Upper bound on the integration step \[s\]; the actual step is the
 /// largest value at or under this that divides the bus tick exactly.
-pub const MAX_TIMESTEP_S: f64 = 0.001;
+pub const MAX_TIMESTEP_S: f64 = super::driver::FW_LOOP_DT;
 
 /// The tool the scene is fitted with — the config's `urdf_variant`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

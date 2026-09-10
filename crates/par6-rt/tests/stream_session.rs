@@ -217,3 +217,47 @@ fn the_command_lowpass_converges_between_setpoints() {
          per-receipt stepping ~{per_receipt:.3e}"
     );
 }
+
+/// Liveness telemetry is not position feedback. Losing just one joint's
+/// encoder updates must not turn a cached pose into a completed release.
+#[test]
+fn telemetry_without_encoder_updates_cannot_complete_a_stream_release() {
+    for dt in [0.004, 0.02] {
+        let mut rig = Rig::at_tick_dt(dt);
+        rig.ready();
+        rig.cmd(RtCommand::SetMode(Mode::Stream));
+        let node = rig.node_of[0];
+        rig.skip_nodes = 1 << node;
+        rig.send(RtCommand::StreamRelease);
+        for _ in 0..(0.24_f64 / dt).round() as u32 {
+            rig.core
+                .bus_mut()
+                .inject(false, par6_bus::Reply::Voltage { node, mv: 24000 });
+            rig.tick();
+            let s = rig.snap();
+            assert_eq!(
+                s.node_freshness[0],
+                par6_bus::Freshness::Fresh,
+                "the drive still answers telemetry"
+            );
+            assert_eq!(s.mode, Mode::Stream,
+                "dt {dt}: cached encoder positions completed a release without new position feedback");
+            assert!(
+                !s.error_active,
+                "live telemetry must keep this distinct from CAN loss"
+            );
+        }
+        rig.skip_nodes = 0;
+        for _ in 0..(0.2_f64 / dt).round() as u32 {
+            rig.tick();
+            if rig.snap().mode == Mode::Idle {
+                break;
+            }
+        }
+        assert_eq!(
+            rig.snap().mode,
+            Mode::Idle,
+            "fresh, stationary encoder replies must allow the release to complete"
+        );
+    }
+}

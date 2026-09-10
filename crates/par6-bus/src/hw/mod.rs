@@ -305,7 +305,9 @@ impl SocketCanBus {
         for n in 0..MAX_NODES {
             let b = &self.boot_state.nodes[n];
             let s = &mut state.nodes[n];
-            s.position_ticks = b.position_ticks.or(s.position_ticks);
+            if let Some(position) = b.position_ticks {
+                s.record_position(position);
+            }
             s.speed_ticks_s = b.speed_ticks_s.or(s.speed_ticks_s);
             s.current_ma = b.current_ma.or(s.current_ma);
             s.temperature_c = b.temperature_c.or(s.temperature_c);
@@ -447,7 +449,7 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             speed_ticks_s,
             current_ma,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
             state.nodes[n].current_ma = Some(current_ma);
         }
@@ -455,14 +457,14 @@ fn apply_payload(decoded: &DecodedFrame, state: &mut BusState) {
             position_ticks,
             speed_ticks_s,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
         }
         Payload::Hall {
             position_ticks,
             state: hall,
         } => {
-            state.nodes[n].position_ticks = Some(position_ticks);
+            state.nodes[n].record_position(position_ticks);
             state.nodes[n].hall = Some(hall);
         }
         Payload::Temperature { deg_c } => state.nodes[n].temperature_c = Some(deg_c),

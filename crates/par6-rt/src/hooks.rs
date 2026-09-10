@@ -65,7 +65,7 @@ pub enum RtCommand {
     /// Release the jog button (ramp to zero).
     JogRelease,
     /// End a STREAM session by braking to rest, rather than abandoning
-    /// the arm at speed. STREAM outlives this until the ramp is at rest,
+    /// the arm at speed. STREAM outlives this until the ramp and measured arm are at rest,
     /// then the mode goes IDLE on its own — IDLE holds against gravity
     /// and has no velocity authority, so a moving arm dropped into it
     /// coasts on its own momentum.
@@ -397,8 +397,8 @@ pub trait StreamTracker: Send {
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
     /// Stop: shed whatever velocity the tracker is carrying, under its
     /// own limits, and keep reporting it through [`Self::step`] until
-    /// the velocity it writes is zero. The core holds STREAM mode open
-    /// until then.
+    /// the velocity it writes is zero. The core then retains a velocity brake
+    /// until measured encoder positions settle before leaving STREAM.
     ///
     /// Deliberately has no default. A tracker that silently declined to
     /// brake would leave the arm coasting exactly when something decided

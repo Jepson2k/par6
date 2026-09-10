@@ -718,8 +718,8 @@ class DryRunRobotClient:
 
         A dry run has no torque to read, so the estimate is empty — mass
         0, nothing determined — and ``declare`` declares nothing. The
-        MOTION is the engine's: the same wrist poses the arm would swing
-        through from here, at the estimation protocol's speed, planned
+        MOTION is the engine's: the wrist poses and the small shoulder,
+        elbow and wrist approaches, at the estimation protocol's speed, planned
         against the same keep-outs and refused where the arm would be.
         """
         del ridge, declare

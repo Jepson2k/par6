@@ -552,6 +552,7 @@ fn watchdog_silence_drops_driver_to_idle() {
     // carries a joint through the RT's homing pattern of idle frames plus
     // encoder polls.
     cmds[0] = JointCommand::default();
+    let polled_start = rig.state.nodes[0].position_ticks.unwrap();
     for _ in 0..(wd_ticks + 90) {
         rig.bus.queue_poll_override(
             PollAction::Poll {
@@ -567,9 +568,10 @@ fn watchdog_silence_drops_driver_to_idle() {
         Freshness::Fresh,
         "polls keep freshness"
     );
-    let polled = rig.state.nodes[0].speed_ticks_s.unwrap();
+    let polled = f64::from(rig.state.nodes[0].position_ticks.unwrap() - polled_start)
+        / ((wd_ticks + 90) as f64 * robot.robot.tick_dt_s);
     assert!(
-        polled <= -6000,
+        polled <= -6000.0,
         "a polled driver holds its command ({polled}): firmware feeds the \
          watchdog on every answered RTR request"
     );
@@ -635,12 +637,15 @@ fn watchdog_silence_drops_driver_to_idle() {
     // Clear-error resets the flags; new commands re-arm the driver.
     rig.bus.send_clear_error(0, 3).unwrap();
     cmds[0] = JointCommand::velocity(-8000, 0);
+    let resumed_start = rig.state.nodes[0].position_ticks.unwrap();
     for _ in 0..120 {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
+    let resumed = f64::from(rig.state.nodes[0].position_ticks.unwrap() - resumed_start)
+        / (120.0 * robot.robot.tick_dt_s);
     assert!(
-        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
-        "drive did not resume after clear-error"
+        resumed <= -6000.0,
+        "drive did not resume after clear-error: mean {resumed} ticks/s"
     );
     assert!(!rig.state.nodes[0].live_error_bit, "err bit survived clear");
     rig.bus.queue_poll_override(
@@ -983,6 +988,99 @@ fn zero_speed_position_frames_still_close_position_error() {
          feedforward, not a velocity cap",
         (last - target).abs(),
     );
+}
+
+/// With Rstint=0, bypassing the velocity loop or clearing a fault
+/// preserves its accumulated current; a command packet is not a reset.
+#[test]
+fn velocity_integral_survives_mode_changes_and_fault_clear() {
+    let robot = par6();
+    let mut q0 = calibration_pose(&robot);
+    q0[0] = robot.joints[0].limits.hard_max_rad;
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    let mut cmds = rig.idle_cmds();
+    let node = usize::from(robot.joints[0].node_id);
+    for mode in ["current", "pd", "idle", "fault"] {
+        cmds[0] = JointCommand::velocity(8000, 0);
+        for _ in 0..robot.ticks(0.4) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let loaded = rig.state.nodes[node].current_ma.unwrap();
+        assert!(
+            loaded > 1000,
+            "the blocked drive must accumulate effort: {loaded} mA"
+        );
+        cmds[0] = match mode {
+            "pd" => {
+                let mut cmd =
+                    JointCommand::position(rig.state.nodes[node].position_ticks.unwrap(), 0, 0);
+                cmd.pack = par6_bus::Pack::Pd;
+                cmd
+            }
+            "idle" => JointCommand::drop_to_idle(),
+            "fault" => {
+                rig.bus.inject_fault(node as u8, FaultKind::Estop);
+                JointCommand::velocity(0, 0)
+            }
+            _ => JointCommand::current(0),
+        };
+        for _ in 0..robot.ticks(0.02) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        if mode == "fault" {
+            assert_eq!(
+                rig.state.nodes[node].current_ma.unwrap(),
+                0,
+                "fault removes drive authority"
+            );
+            rig.bus.send_clear_error(node as u8, 3).unwrap();
+        }
+        cmds[0] = JointCommand::velocity(0, 0);
+        for _ in 0..robot.ticks(0.04) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let resumed = rig.state.nodes[node].current_ma.unwrap();
+        assert!(
+            resumed > loaded / 2,
+            "mode {mode} erased the velocity integral: {loaded} -> {resumed} mA"
+        );
+    }
+}
+
+/// Encoder differences are averaged over 3.2 ms by the drive; slowing
+/// the host bus must not turn that telemetry into continuous plant velocity.
+#[test]
+fn slow_motion_reports_the_drive_encoder_velocity_quantum() {
+    for dt in [0.004, 0.02, 0.003] {
+        let mut robot = par6();
+        robot.robot.tick_dt_s = dt;
+        let mut rig = Rig::boot(&robot, None, None);
+        let mut cmds = vec![JointCommand::velocity(0, 0); rig.joints];
+        for _ in 0..robot.ticks(1.0) {
+            rig.step(&cmds, &GripperCommand::NoGripper);
+        }
+        let node = usize::from(robot.joints[0].node_id);
+        let start = rig.state.nodes[node].position_ticks.unwrap();
+        let mut moving_samples = 0;
+        for tick in 0..robot.ticks(2.0) {
+            let target = start + (145.0 * f64::from(tick) * dt).round() as i32;
+            cmds[0] = JointCommand::position(target, 145, 0);
+            rig.step(&cmds, &GripperCommand::NoGripper);
+            let v = rig.state.nodes[node].speed_ticks_s.unwrap();
+            moving_samples += usize::from(v != 0);
+            // Integer truncation of k / 0.0032 yields 0, 312, 625, 937, ...
+            // and the corresponding negative values.
+            assert!(
+                matches!(v.abs() % 625, 0 | 312),
+                "host dt {dt}: speed {v} ticks/s is outside the drive's encoder quantum"
+            );
+        }
+        let travelled = rig.state.nodes[node].position_ticks.unwrap() - start;
+        assert!(
+            (travelled - 290).abs() < 40 && moving_samples > 10,
+            "the slow profile must actually move: {travelled} ticks, {moving_samples} moving samples"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1715,12 +1813,15 @@ fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
 
     // Clearing restores authority — the fault gate is not a one-way trip.
     rig.bus.send_clear_error(0, 3).unwrap();
+    let resumed_start = rig.state.nodes[0].position_ticks.unwrap();
     for _ in 0..200 {
         rig.step(&cmds, &GripperCommand::NoGripper);
     }
+    let resumed = f64::from(rig.state.nodes[0].position_ticks.unwrap() - resumed_start)
+        / (200.0 * robot.robot.tick_dt_s);
     assert!(
-        rig.state.nodes[0].speed_ticks_s.unwrap() <= -6000,
-        "drive did not resume after clear-error"
+        resumed <= -6000.0,
+        "drive did not resume after clear-error: mean {resumed} ticks/s"
     );
 }
 

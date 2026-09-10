@@ -120,7 +120,9 @@ fn bind_send_socket(cfg: &ServerConfig, unicast: bool) -> std::io::Result<UdpSoc
 }
 
 async fn probe(sock: &UdpSocket, cfg: &ServerConfig) -> bool {
-    let recv = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, cfg.status_port)).await {
+    // Probe on an ephemeral port so existing status subscribers cannot
+    // turn a reachable multicast interface into a unicast fallback.
+    let recv = match UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).await {
         Ok(s) => s,
         Err(e) => {
             log::debug!("multicast probe: receiver bind failed: {e}");
@@ -131,9 +133,13 @@ async fn probe(sock: &UdpSocket, cfg: &ServerConfig) -> bool {
         log::debug!("multicast probe: group join failed: {e}");
         return false;
     }
+    let port = match recv.local_addr() {
+        Ok(addr) => addr.port(),
+        Err(_) => return false,
+    };
     let token = probe_token(cfg.controller_id);
     if sock
-        .send_to(&token, (cfg.multicast_group, cfg.status_port))
+        .send_to(&token, (cfg.multicast_group, port))
         .await
         .is_err()
     {
@@ -204,19 +210,10 @@ mod tests {
     /// perfectly is exactly what hid it.
     #[tokio::test]
     async fn auto_keeps_multicast_when_the_configured_interface_reaches_the_group() {
-        // The probe binds its receiver on `status_port`, so it needs a
-        // real one — and a free one, since these tests run in parallel.
-        let free_port = {
-            let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))
-                .await
-                .expect("probe port");
-            s.local_addr().expect("addr").port()
-        };
         let cfg = ServerConfig {
             status_transport: StatusTransport::Auto,
             multicast_iface: Ipv4Addr::LOCALHOST,
             status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
-            status_port: free_port,
             ..ServerConfig::default()
         };
         let link = BroadcastLink::open(&cfg).await.expect("bind");
@@ -242,6 +239,54 @@ mod tests {
             .expect("multicast delivery within budget")
             .expect("recv");
         assert_eq!(&buf[..n], b"broadcast");
+    }
+
+    #[tokio::test]
+    async fn auto_broadcasts_to_clients_already_listening_at_startup() {
+        let cfg = ServerConfig {
+            status_transport: StatusTransport::Auto,
+            multicast_iface: Ipv4Addr::LOCALHOST,
+            status_dest_host: IpAddr::V4(Ipv4Addr::LOCALHOST),
+            ..ServerConfig::default()
+        };
+        let subscribe = |port| {
+            let sock = socket2::Socket::new(
+                socket2::Domain::IPV4,
+                socket2::Type::DGRAM,
+                Some(socket2::Protocol::UDP),
+            )
+            .expect("socket");
+            sock.set_reuse_address(true).expect("reuse");
+            sock.set_nonblocking(true).expect("nonblocking");
+            sock.bind(&SocketAddr::from((Ipv4Addr::UNSPECIFIED, port)).into())
+                .expect("bind subscriber");
+            sock.join_multicast_v4(&cfg.multicast_group, &cfg.multicast_iface)
+                .expect("join");
+            UdpSocket::from_std(std::net::UdpSocket::from(sock)).expect("subscriber")
+        };
+        let first = subscribe(0);
+        let port = first.local_addr().expect("address").port();
+        let second = subscribe(port);
+        let cfg = ServerConfig {
+            status_port: port,
+            ..cfg
+        };
+        let mut link = BroadcastLink::open(&cfg).await.expect("startup");
+        assert!(!link.unicast, "existing clients must not force unicast");
+        link.send(port, b"status for both").await;
+        for rx in [&first, &second] {
+            let mut buf = [0u8; 64];
+            tokio::time::timeout(Duration::from_secs(2), async {
+                loop {
+                    let (n, _) = rx.recv_from(&mut buf).await.expect("receive");
+                    if &buf[..n] == b"status for both" {
+                        break;
+                    }
+                }
+            })
+            .await
+            .expect("each existing subscriber receives the broadcast");
+        }
     }
 
     /// Three consecutive real send errors fail over to unicast, and the

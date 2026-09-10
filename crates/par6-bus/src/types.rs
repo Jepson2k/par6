@@ -371,6 +371,9 @@ pub struct HallState {
 pub struct NodeState {
     /// Motor position \[encoder ticks\] (cmd 3 / 28 / 32 replies).
     pub position_ticks: Option<i32>,
+    /// Changes on every received position sample, including unchanged positions.
+    /// Other telemetry does not advance this wrapping counter.
+    pub position_generation: u64,
     /// Motor speed \[encoder ticks/s\].
     pub speed_ticks_s: Option<i32>,
     /// Motor current \[mA\].
@@ -399,6 +402,7 @@ impl Default for NodeState {
     fn default() -> Self {
         Self {
             position_ticks: None,
+            position_generation: 0,
             speed_ticks_s: None,
             current_ma: None,
             temperature_c: None,
@@ -410,6 +414,13 @@ impl Default for NodeState {
             live_error_bit: false,
             data_age_ticks: u64::MAX,
         }
+    }
+}
+
+impl NodeState {
+    pub(crate) fn record_position(&mut self, position_ticks: i32) {
+        self.position_ticks = Some(position_ticks);
+        self.position_generation = self.position_generation.wrapping_add(1);
     }
 }
 

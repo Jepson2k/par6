@@ -629,13 +629,20 @@ impl Preview {
         let to_deg = |q: &[f64; NQ]| -> [f64; par6_proto::NUM_JOINTS] {
             std::array::from_fn(|j| q[j].to_degrees())
         };
-        let moves: Vec<Command> = poses
-            .iter()
-            .chain(std::iter::once(&start))
+        let visits = poses.iter().flat_map(|q| {
+            [1.0, -1.0].into_iter().flat_map(|dir| {
+                [
+                    crate::calibrate::approach_pose(q, dir * protocol.approach_rad),
+                    *q,
+                ]
+            })
+        });
+        let moves: Vec<Command> = visits
+            .chain(std::iter::once(start))
             .map(|q| {
                 Command::MoveJ(cmd::MoveJ {
                     key: 0,
-                    angles: to_deg(q),
+                    angles: to_deg(&q),
                     duration: None,
                     speed: Some(protocol.speed),
                     accel: None,

@@ -179,10 +179,17 @@ impl GripperSim {
     pub fn step(&mut self, dt: f64) {
         match self.ctrl {
             Ctrl::Motor => {
-                let cmd = self
-                    .driver
-                    .control_step(self.joint.pos, self.joint.reported_vel);
-                self.joint.step(dt, &cmd, self.load_ma);
+                self.driver.age_watchdog();
+                let steps = (dt / super::driver::FW_LOOP_DT).ceil() as u32;
+                let h = dt / f64::from(steps);
+                for _ in 0..steps {
+                    let cmd = self.driver.loop_step(
+                        self.joint.pos,
+                        self.joint.reported_vel,
+                        h / super::driver::FW_LOOP_DT,
+                    );
+                    self.joint.step(h, &cmd, self.load_ma);
+                }
                 self.pos_byte =
                     255.0 * (1.0 - (self.joint.pos / self.stroke_ticks).clamp(0.0, 1.0));
             }

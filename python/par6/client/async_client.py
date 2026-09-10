@@ -1093,18 +1093,16 @@ class AsyncRobotClient(_RobotClientABC):
         runtime carries the result as a point mass, which is what most
         payloads are well enough described by.
 
-        Call it after closing on a part whose mass you do not know.  The
-        WRIST swings where the arm already stands — the payload's lever
-        arm about the wrist is what makes its first moment observable —
-        so nothing below moves, the pick is not disturbed, and the whole
-        thing takes seconds.
+        Measurement poses vary the wrist. Each is approached from both
+        directions with small shoulder, elbow and wrist moves (0.05 rad)
+        to reduce drivetrain friction bias. Position feedback remains
+        active throughout the final approach and sampling.
 
-        The runtime's payload is cleared first: the load is estimated
-        from the torque the *unloaded* model cannot account for, so a
-        payload already declared would be compensated away and come back
-        as nothing.  With *declare* (the default) the result is sent
-        straight back as the new payload, so the gravity model carries
-        the part from the next tick.
+        The current payload declaration stays in place while measuring.
+        With *declare*, a valid result replaces it after the routine
+        returns to the starting pose. A failed application restores the
+        previous declaration. Load-dependent gearbox friction can bias
+        the fit; a low residual alone does not validate its mass.
 
         *spread* is how far each wrist joint swings either way (rad);
         widen it when the wrist has room and the result reads noisy.

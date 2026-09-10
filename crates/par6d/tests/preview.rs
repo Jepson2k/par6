@@ -885,3 +885,46 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
         rotation(moving)
     );
 }
+
+/// Calibration visits include both sides of each measurement pose, not
+/// just its resting targets. Hiding these moves understates the space
+/// the real procedure needs around the shoulder and elbow.
+#[test]
+fn calibration_preview_includes_the_shoulder_and_elbow_approaches() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let start = to_rad(&park_deg());
+    preview.teleport_rad(start);
+    let (_, planned) = preview
+        .preview_estimation(0.5)
+        .expect("calibration preview");
+    assert!(planned.valid(), "the calibration path must plan");
+    for j in [1, 2] {
+        let lo = planned
+            .joint_trajectory_rad
+            .iter()
+            .map(|q| q[j])
+            .fold(f64::INFINITY, f64::min);
+        let hi = planned
+            .joint_trajectory_rad
+            .iter()
+            .map(|q| q[j])
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            lo <= start[j] - 0.049 && hi >= start[j] + 0.049,
+            "J{} approach excursions are missing: {}..{} around {}",
+            j + 1,
+            lo,
+            hi,
+            start[j]
+        );
+    }
+    assert!(
+        planned
+            .end_joints_rad
+            .iter()
+            .zip(start)
+            .all(|(a, b)| (a - b).abs() < 1e-6),
+        "calibration must preview its return to the starting pose"
+    );
+}

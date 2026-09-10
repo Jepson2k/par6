@@ -556,7 +556,8 @@ impl SimBus {
     }
 
     fn joint_reply_values(&self, j: usize) -> (i32, i32, i16) {
-        let (pos, vel) = self.motor_state(j);
+        let (pos, _) = self.motor_state(j);
+        let vel = self.drivers[j].measured_velocity;
         let cur = self.drivers[j].cur_out_ma;
         (
             self.maps[j].report_pos(pos),
@@ -878,7 +879,7 @@ impl SimBus {
                 speed_ticks_s,
                 current_ma,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
                 state.nodes[n].current_ma = Some(current_ma);
             }
@@ -886,14 +887,14 @@ impl SimBus {
                 position_ticks,
                 speed_ticks_s,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].speed_ticks_s = Some(speed_ticks_s);
             }
             Payload::Hall {
                 position_ticks,
                 state: hall,
             } => {
-                state.nodes[n].position_ticks = Some(position_ticks);
+                state.nodes[n].record_position(position_ticks);
                 state.nodes[n].hall = Some(hall);
             }
             Payload::Temperature { deg_c } => state.nodes[n].temperature_c = Some(deg_c),

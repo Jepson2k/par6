@@ -167,3 +167,54 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
         "steady-state polling answers every tick"
     );
 }
+
+#[test]
+fn a_joint_waiting_for_its_homing_turn_keeps_its_holding_authority() {
+    let mut bundle = common::bundle();
+    bundle.robot.homing.sequence = vec![SequenceStep {
+        pre_moves: vec![PreMove::Idle {
+            joint: 1,
+            duration_s: 1.5,
+        }],
+        home: None,
+        move_to: vec![],
+        post_moves: vec![],
+    }];
+    bundle.robot.homing.post_moves.clear();
+    let mut bus = SimBus::new(common::scene(&bundle));
+    bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+        .unwrap();
+    let node = bundle.robot.joints[0].node_id;
+    // Inside the normal current budget, above the seeking budget plus
+    // gearbox friction. No change to the plant's friction is needed.
+    bus.set_joint_load_ma(node, 1500.0);
+    let mut state = BusState::new();
+    let mut t = 0;
+    let mut cmds = [JointCommand::idle(); MAX_JOINTS];
+    for _ in 0..500 {
+        step(&mut bus, &mut state, &mut t, &cmds);
+    }
+    let initial = i64::from(state.nodes[usize::from(node)].position_ticks.unwrap());
+    let mut sys = HomingSystem::new(&bundle);
+    let mut conv = std::array::from_fn(|i| JointConversion::from_config(&bundle.robot.joints[i]));
+    let mut gcmd = GripperCommand::NoGripper;
+    sys.start(&mut bus);
+    let mut max_drift = 0;
+    for _ in 0..350 {
+        t += 1;
+        bus.begin_tick(t);
+        bus.drain_rx(&mut state).unwrap();
+        assert_eq!(
+            sys.tick(&mut bus, &mut state, &mut conv, &mut cmds, &mut gcmd),
+            SeqStatus::Running
+        );
+        bus.send_joint_commands(&cmds).unwrap();
+        bus.send_gripper(&gcmd).unwrap();
+        let p = i64::from(state.nodes[usize::from(node)].position_ticks.unwrap());
+        max_drift = max_drift.max((p - initial).abs());
+    }
+    assert!(
+        max_drift < 200,
+        "waiting joint lost its hold: {max_drift} encoder ticks"
+    );
+}

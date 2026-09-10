@@ -3,38 +3,37 @@
 //! for the load at the end of the chain
 //! ([`par6_kin::gravity::fit_payload`]).
 //!
-//! Only the WRIST moves. The payload hangs off the end of the chain, so
-//! its lever arm changes with the wrist and nothing else has to travel
-//! for the four parameters to separate — which is what keeps this a
-//! seconds-long operation a program can run after a pick, rather than a
-//! workspace-wide procedure. The arm's own links are never fitted; their
-//! inertials are the vendor's and stay that way.
+//! Measurement poses vary the wrist. Small opposite-direction approaches
+//! also move the shoulder and elbow: friction on every gravity-loaded
+//! joint must change sign before the pair can estimate gravity torque.
+//! These static measurements identify payload; arm gravity calibration
+//! also needs poses that vary the arm's own lever arms.
 
 use std::time::Duration;
 
-use par6_client::Client;
+use par6_client::{Ack, Client};
 use par6_kin::gravity::{self, GravitySample, PayloadFit};
 use par6_kin::{Collision, Kin, NQ};
-use par6_proto::CompletionPolicy;
+use par6_proto::{CompletionPolicy, ControllerMode};
 
-/// Joints the identification moves. The payload's lever arm about the
-/// wrist is what makes its first moment observable; the arm below stays
-/// where the caller left it, so the pick is not disturbed and the moves
-/// stay small.
+/// Joints varied between measurement poses. The opposite-direction
+/// approaches also move the shoulder and elbow by `Protocol::approach_rad`.
 pub const WRIST_JOINTS: [usize; 3] = [3, 4, 5];
+
+/// Every gravity-loaded joint participates in opposite-direction
+/// approaches so its drivetrain friction does not enter as payload mass.
+pub const APPROACH_JOINTS: [usize; 5] = [1, 2, 3, 4, 5];
 
 /// How a run rests and reads the arm.
 #[derive(Debug, Clone, Copy)]
 pub struct Protocol {
     /// Joint-move speed fraction between poses.
     pub speed: f64,
-    /// Approach offset per moved joint \[rad\]. Every pose is measured
-    /// twice, reached once from each side, and the readings averaged: a
-    /// joint's friction opposes its travel, so it enters the two with
-    /// opposite signs and cancels. A single-direction reading folds the
-    /// whole friction band into the identified mass.
+    /// Approach offset on every gravity-loaded joint \[rad\]. Every pose
+    /// is measured from both sides. The average cancels symmetric
+    /// friction; load-dependent gearbox friction needs identification too.
     pub approach_rad: f64,
-    /// Rest after the runtime reports the move complete, before reading.
+    /// Required stable position hold before collecting the sample window.
     pub settle: Duration,
     /// Consecutive STATUS frames averaged per reading.
     pub frames: usize,
@@ -96,7 +95,7 @@ pub fn plan_poses(
         // approach mid-run has already had the payload cleared.
         let mut usable = true;
         for dir in [0.0, 1.0, -1.0] {
-            let probe = offset(&q, dir * approach_rad);
+            let probe = approach_pose(&q, dir * approach_rad);
             let inside = (0..NQ).all(|j| {
                 let (lo, hi) = window[j];
                 probe[j] >= lo && probe[j] <= hi
@@ -125,10 +124,10 @@ pub fn plan_poses(
     Ok(out)
 }
 
-/// Offset only the joints the identification moves.
-fn offset(q: &[f64; NQ], by: f64) -> [f64; NQ] {
+/// An opposite-direction approach, shared by execution and preview.
+pub fn approach_pose(q: &[f64; NQ], by: f64) -> [f64; NQ] {
     let mut out = *q;
-    for j in WRIST_JOINTS {
+    for j in APPROACH_JOINTS {
         out[j] += by;
     }
     out
@@ -151,88 +150,155 @@ async fn move_to(client: &Client, q: &[f64; NQ], protocol: &Protocol) -> Result<
         .await
         .map_err(|e| format!("move_j: {e}"))?
         .ok_or("move_j went unconfirmed")?;
-    match client.wait_command(index, protocol.pose_timeout).await {
+    let result = match client.wait_command(index, protocol.pose_timeout).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("move_j {index} did not complete in time")),
         Err(e) => Err(format!("move_j {index}: {e}")),
+    };
+    if result.is_err() {
+        stopped(client, result).await
+    } else {
+        result
     }
 }
 
-/// How far a joint may drift across one pose's sampling window before
-/// the frames stop describing a single pose \[deg\].
-///
-/// Sized between the two things it has to tell apart: the position
-/// loop's limit cycle, measured at about half a degree peak-to-peak
-/// across a window, and the smallest motion this commands, which is the
-/// approach offset at 0.05 rad (2.9 deg). parol6 draws the same line at
-/// half a degree, but frame-to-frame rather than across a window, and
-/// pairs it with a speed threshold and a settle window.
-const REST_DRIFT_DEG: f64 = 2.0;
+/// A static measurement must stay inside a quarter-degree envelope and
+/// below 0.03 rad/s; a persistent limit cycle is not a gravity sample.
+const REST_DRIFT_DEG: f64 = 0.25;
+const REST_SPEED_RAD_S: f64 = 0.03;
+const TARGET_ERROR_DEG: f64 = 0.5;
+const STATUS_TIMEOUT: Duration = Duration::from_millis(500);
+const HOLD_PERIOD: Duration = Duration::from_millis(20);
 
-/// The mean configuration and torque over `protocol.frames` STATUS
-/// frames, taken where the arm currently rests.
-async fn read_held(client: &Client, protocol: &Protocol) -> Result<GravitySample, String> {
-    tokio::time::sleep(protocol.settle).await;
+async fn stopped<T>(client: &Client, result: Result<T, String>) -> Result<T, String> {
+    let stop_error = match client.stop(true).await {
+        Ok(Ack::Confirmed) => return result,
+        Ok(Ack::Unconfirmed) => "controller stop was not acknowledged".to_owned(),
+        Err(e) => format!("controller stop failed: {e}"),
+    };
+    Err(match result {
+        Ok(_) => stop_error,
+        Err(e) => format!("{e}; {stop_error}"),
+    })
+}
+
+/// Hold the requested pose with position feedback while reading actual
+/// drive torque. IDLE's model-only feedforward cannot measure model error.
+async fn read_held(
+    client: &Client,
+    q: &[f64; NQ],
+    protocol: &Protocol,
+) -> Result<GravitySample, String> {
+    let target = to_deg(q);
     let mut rx = client.subscribe_status();
+    let mut heartbeat = tokio::time::interval(HOLD_PERIOD);
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let deadline = tokio::time::Instant::now() + protocol.pose_timeout;
+    let mut last_frame = tokio::time::Instant::now();
+    let mut last_seq = None;
+    let mut stable_since = None;
     let mut sample = GravitySample {
         q: [0.0; NQ],
         tau: [0.0; NQ],
     };
     let mut taken = 0usize;
-    let mut first: Option<[f64; NQ]> = None;
-    let deadline = tokio::time::Instant::now() + protocol.pose_timeout;
-    while taken < protocol.frames {
-        match tokio::time::timeout_at(deadline, rx.changed()).await {
-            Ok(Ok(())) => {}
-            _ => return Err("the status stream stopped while sampling".into()),
+    let mut lo = [f64::INFINITY; NQ];
+    let mut hi = [f64::NEG_INFINITY; NQ];
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep_until(deadline) => {
+                return Err(format!("the arm did not hold a stable pose within the sampling budget: target_deg={target:?}, latest={:?}", client.latest_status().map(|s| (s.mode, s.angles, s.speeds, s.data_age_ms))));
+            }
+            _ = heartbeat.tick() => {
+                if last_frame.elapsed() > STATUS_TIMEOUT {
+                    return Err("the status stream stopped while sampling".into());
+                }
+                client.servo_j(target, Some(protocol.speed), None).await
+                    .map_err(|e| format!("position hold: {e}"))?;
+                continue;
+            }
+            changed = rx.changed() => {
+                changed.map_err(|_| "the status stream closed while sampling")?;
+            }
         }
         let Some(s) = rx.borrow_and_update().clone() else {
             continue;
         };
-        // A torque reading is only gravity if the arm is actually
-        // holding the pose. A fault, a dropped bus or a disabled arm all
-        // produce numbers that look like measurements and would be
-        // fitted as if they were. Rest is NOT tested on speed: the
-        // position loop holds a pose in a limit cycle, so reported
-        // speeds stay nonzero while the angles sit still.
+        if last_seq.is_some_and(|seq| s.seq <= seq) {
+            continue;
+        }
+        last_seq = Some(s.seq);
+        if s.data_age_ms <= 100 {
+            last_frame = tokio::time::Instant::now();
+        }
         if let Some(e) = &s.error {
             return Err(format!(
                 "the arm faulted while sampling: {} ({})",
                 e.cause, e.code
             ));
         }
-        if !s.enabled {
-            return Err("the arm was disabled while sampling".into());
+        if !s.enabled || !s.homed {
+            return Err("the arm became disabled or unreferenced while sampling".into());
         }
         if s.link_ok != 1 {
-            return Err("the motor bus link went stale while sampling".into());
+            return Err(format!("the motor bus link went stale while sampling: link_ok={}, data_age_ms={}, mode={:?}, loop={:?}", s.link_ok, s.data_age_ms, s.mode, s.loop_health));
         }
-        match &first {
-            None => first = Some(std::array::from_fn(|j| s.angles[j])),
-            Some(a0) => {
-                let drift = (0..NQ)
-                    .map(|j| (s.angles[j] - a0[j]).abs())
-                    .fold(0.0, f64::max);
-                if drift > REST_DRIFT_DEG {
-                    return Err(format!(
-                        "the arm moved {drift:.3} deg while sampling this pose, so the \
-                         frames are not one pose's torque"
-                    ));
-                }
-            }
+        if !(0..NQ)
+            .all(|j| s.angles[j].is_finite() && s.speeds[j].is_finite() && s.torques[j].is_finite())
+        {
+            return Err("non-finite position, speed or torque while sampling".into());
+        }
+        // Delayed frames invalidate this sampling window. A sustained
+        // loss still stops through the link and heartbeat deadlines.
+        let stable = s.data_age_ms <= 100
+            && s.mode == ControllerMode::Stream
+            && (0..NQ).all(|j| {
+                s.speeds[j].abs() <= REST_SPEED_RAD_S
+                    && (s.angles[j] - target[j]).abs() <= TARGET_ERROR_DEG
+            });
+        if !stable {
+            stable_since = None;
+            taken = 0;
+            sample = GravitySample {
+                q: [0.0; NQ],
+                tau: [0.0; NQ],
+            };
+            lo.fill(f64::INFINITY);
+            hi.fill(f64::NEG_INFINITY);
+            continue;
+        }
+        let since = *stable_since.get_or_insert(s.mono_time_ns);
+        if Duration::from_nanos(s.mono_time_ns.saturating_sub(since)) < protocol.settle {
+            continue;
+        }
+        for j in 0..NQ {
+            lo[j] = lo[j].min(s.angles[j]);
+            hi[j] = hi[j].max(s.angles[j]);
+        }
+        if (0..NQ).any(|j| hi[j] - lo[j] > REST_DRIFT_DEG) {
+            stable_since = None;
+            taken = 0;
+            sample = GravitySample {
+                q: [0.0; NQ],
+                tau: [0.0; NQ],
+            };
+            lo.fill(f64::INFINITY);
+            hi.fill(f64::NEG_INFINITY);
+            continue;
         }
         for j in 0..NQ {
             sample.q[j] += s.angles[j].to_radians();
             sample.tau[j] += s.torques[j];
         }
         taken += 1;
+        if taken == protocol.frames {
+            for j in 0..NQ {
+                sample.q[j] /= taken as f64;
+                sample.tau[j] /= taken as f64;
+            }
+            return Ok(sample);
+        }
     }
-    let n = taken as f64;
-    for j in 0..NQ {
-        sample.q[j] /= n;
-        sample.tau[j] /= n;
-    }
-    Ok(sample)
 }
 
 /// Rest the arm in `q` and read the torques it holds there with, arrived
@@ -247,9 +313,17 @@ pub async fn measure_pose(
         tau: [0.0; NQ],
     };
     for dir in [1.0, -1.0] {
-        move_to(client, &offset(q, dir * protocol.approach_rad), protocol).await?;
-        move_to(client, q, protocol).await?;
-        let s = read_held(client, protocol).await?;
+        move_to(
+            client,
+            &approach_pose(q, dir * protocol.approach_rad),
+            protocol,
+        )
+        .await?;
+        // Keep position feedback active from the final approach through
+        // sampling. Completing a queued move first enters torque-only
+        // IDLE, which loses the approach's friction history and lets a
+        // biased feedforward move the arm before the hold starts.
+        let s = stopped(client, read_held(client, q, protocol).await).await?;
         for j in 0..NQ {
             mean.q[j] += 0.5 * s.q[j];
             mean.tau[j] += 0.5 * s.tau[j];
@@ -264,11 +338,21 @@ pub async fn measure(
     poses: &[[f64; NQ]],
     protocol: &Protocol,
 ) -> Result<Vec<GravitySample>, String> {
-    // The readings are the torques the arm holds a FINISHED move with, so
-    // the runtime has to be the one that decides a move is finished and
-    // settled — the policy is stated here rather than assumed. It is the
-    // caller's session, though, so whatever they had is put back after:
-    // what they set, or the server's boot default if they never did.
+    if !protocol.speed.is_finite()
+        || !(0.0..=1.0).contains(&protocol.speed)
+        || protocol.speed == 0.0
+        || !protocol.approach_rad.is_finite()
+        || protocol.approach_rad <= 0.0
+        || protocol.frames < 2
+        || protocol.pose_timeout.is_zero()
+        || protocol.settle >= protocol.pose_timeout
+        || poses.is_empty()
+        || poses.iter().flatten().any(|q| !q.is_finite())
+    {
+        return Err("invalid calibration poses or sampling protocol".into());
+    }
+    // Arrive under the caller-independent settle policy, then keep a
+    // live position hold during the measurement. Restore the policy on exit.
     let previous = client
         .completion_policy()
         .unwrap_or(CompletionPolicy::Settled);
@@ -284,7 +368,7 @@ pub async fn measure(
         }
         Ok::<_, String>(samples)
     };
-    let result = run.await;
+    let result = stopped(client, run.await).await;
     client
         .set_completion_policy(previous)
         .await
@@ -298,8 +382,9 @@ pub async fn measure(
 /// from `poses` if its approach did not clear.
 ///
 /// `kin` must carry no payload — the residual the fit explains is the
-/// torque the UNLOADED model cannot account for — so the caller clears
-/// the runtime's payload first and declares the result afterwards.
+/// torque the unloaded identification model cannot account for. The
+/// controller keeps its existing compensation while position feedback
+/// supplies the difference during measurement.
 pub async fn identify(
     client: &Client,
     kin: &mut Kin,
@@ -362,19 +447,19 @@ async fn declare(client: &Client, (mass, com, inertia): Declared) -> Result<(), 
     client
         .set_payload(mass, com, inertia)
         .await
-        .map(|_| ())
         .map_err(|e| format!("set_payload: {e}"))
+        .and_then(|ack| match ack {
+            Ack::Confirmed => Ok(()),
+            Ack::Unconfirmed => Err("set_payload was not acknowledged".into()),
+        })
 }
 
 /// The whole operation, as a program calls it: find what the arm is
 /// carrying and, if asked, tell the runtime.
 ///
-/// The load is found in the torque the UNLOADED model cannot explain, so
-/// whatever is declared comes off first — and goes back on every exit
-/// that does not declare, failure included, or a curious call leaves the
-/// arm compensating for nothing while it still holds the part. With
-/// `declare`, a result the poses did not actually measure is refused
-/// rather than pushed into the gravity model as noise.
+/// Position feedback stays active while measuring. The existing payload
+/// declaration remains in place until a valid replacement is ready.
+/// A failure to apply that replacement restores the previous declaration.
 pub async fn estimate(
     client: &Client,
     model: &mut EstimationModel,
@@ -383,8 +468,6 @@ pub async fn estimate(
     declare_result: bool,
 ) -> Result<Report, String> {
     let previous = declared(client).await?;
-    declare(client, (0.0, [0.0; 3], None)).await?;
-
     let run = async {
         let angles = client.angles().await.map_err(|e| format!("angles: {e}"))?;
         let mut start = [0.0; NQ];
@@ -420,16 +503,15 @@ pub async fn estimate(
     };
     match run.await {
         Ok((report, true)) => {
-            declare(client, (report.fit.mass, report.fit.com, None)).await?;
+            if let Err(error) = declare(client, (report.fit.mass, report.fit.com, None)).await {
+                return match declare(client, previous).await {
+                    Ok(()) => Err(error),
+                    Err(restore) => Err(format!("{error}; restoring payload: {restore}")),
+                };
+            }
             Ok(report)
         }
-        Ok((report, false)) => {
-            declare(client, previous).await?;
-            Ok(report)
-        }
-        Err(e) => {
-            declare(client, previous).await?;
-            Err(e)
-        }
+        Ok((report, false)) => Ok(report),
+        Err(e) => Err(e),
     }
 }
