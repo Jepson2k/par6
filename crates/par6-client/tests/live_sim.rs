@@ -476,3 +476,129 @@ fn set_shapes_is_confirmed_refused_or_unconfirmed_never_a_fake_success() {
         silent.close();
     });
 }
+
+/// A keep-out sphere centred on the TCP the arm would reach at `there`,
+/// so a servo toward `there` is refused by the collision gate.
+async fn keep_out_at(
+    client: &Client,
+    park: [f64; NUM_JOINTS],
+    there: [f64; NUM_JOINTS],
+) -> (Shape, [f64; 3]) {
+    settle_at(client, there).await;
+    let pose = client.pose(Frame::Wrf).await.expect("pose at the target");
+    settle_at(client, park).await;
+    // Status poses are in mm; shapes are declared in metres.
+    let centre = [pose[3] / 1000.0, pose[7] / 1000.0, pose[11] / 1000.0];
+    let shape = Shape {
+        name: "wall".into(),
+        kind: "sphere".into(),
+        params: vec![0.06],
+        pose: vec![centre[0], centre[1], centre[2], 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        physics: None,
+    };
+    (shape, centre)
+}
+
+/// A servo target refused while the arm is at rest is refused and nothing
+/// more: the standoff exists to shed momentum, and an arm with none must
+/// not be driven toward the keep-out it was just refused.
+#[test]
+fn a_servo_target_refused_at_rest_leaves_the_arm_where_it_is() {
+    run_session("servo-rest", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        let mut there = park;
+        there[0] += 12.0;
+        let (wall, _) = keep_out_at(&client, park, there).await;
+        client
+            .set_shapes(vec![wall])
+            .await
+            .expect("keep-out applies");
+        let rest = client.angles().await.expect("angles at rest");
+        client
+            .servo_j(there, Some(0.2), None)
+            .await
+            .expect("fire-and-forget sends");
+        // Longer than the standoff's whole travel budget.
+        let moved = client
+            .wait_status(
+                move |s| !close_deg(&s.angles, &rest, 0.3),
+                Duration::from_millis(3500),
+            )
+            .await;
+        assert!(!moved, "a refused target at rest moved the arm");
+        client.set_shapes(vec![]).await.expect("keep-out clears");
+    })
+}
+
+/// The wire's [x, y, z, roll, pitch, yaw] (mm / degrees) for a status pose
+/// matrix — the inverse of `par6_proto::pose_matrix`.
+fn wire_pose(m: &[f64; 16]) -> [f64; 6] {
+    let pitch = m[2].clamp(-1.0, 1.0).asin();
+    let roll = (-m[6]).atan2(m[10]);
+    let yaw = (-m[1]).atan2(m[0]);
+    [
+        m[3],
+        m[7],
+        m[11],
+        roll.to_degrees(),
+        pitch.to_degrees(),
+        yaw.to_degrees(),
+    ]
+}
+
+/// A Cartesian servo stream that is already moving when its next setpoint
+/// is refused is braked and placed short of the keep-out, like the joint
+/// servo stream, rather than dropped into IDLE with its momentum — which
+/// coasts it through the keep-out the refusal was about.
+#[test]
+fn a_moving_cartesian_servo_stream_stops_outside_the_keep_out() {
+    run_session("servo-l-brake", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        let mut there = park;
+        there[0] += 25.0;
+        settle_at(&client, there).await;
+        let end = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at the target"));
+        let (wall, centre) = keep_out_at(&client, park, there).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at park"));
+        client
+            .set_shapes(vec![wall])
+            .await
+            .expect("keep-out applies");
+        for step in 1..=40u32 {
+            let t = f64::from(step) / 40.0;
+            let mut pose = [0.0; 6];
+            for (i, p) in pose.iter_mut().enumerate() {
+                *p = start[i] + (end[i] - start[i]) * t;
+            }
+            client
+                .servo_l(pose, Some(1.0), Some(1.0))
+                .await
+                .expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let stopped = client
+            .wait_status(
+                |s| s.speeds.iter().all(|v| v.abs() < 0.01),
+                Duration::from_secs(5),
+            )
+            .await;
+        assert!(stopped, "the refused stream never came to rest");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let pose = client.pose(Frame::Wrf).await.expect("pose");
+        let tcp = [pose[3] / 1000.0, pose[7] / 1000.0, pose[11] / 1000.0];
+        let distance = ((tcp[0] - centre[0]).powi(2)
+            + (tcp[1] - centre[1]).powi(2)
+            + (tcp[2] - centre[2]).powi(2))
+        .sqrt();
+        assert!(
+            distance > 0.06,
+            "the arm coasted into the keep-out ({:.1} mm from its centre)",
+            distance * 1000.0
+        );
+        client.set_shapes(vec![]).await.expect("keep-out clears");
+    })
+}
