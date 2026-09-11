@@ -497,6 +497,7 @@ async fn keep_out_at(
         collision: true,
         margin: None,
         physics: None,
+        attachment: None,
     };
     (shape, centre)
 }
