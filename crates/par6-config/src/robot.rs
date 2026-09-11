@@ -765,7 +765,7 @@ impl Default for FreedriveConfig {
             release_rad_s: 0.08,
             settle_s: 0.3,
             ki_nm_rad_s: 1.0,
-            integral_limit_nm: 0.3,
+            integral_limit_nm: 1.0,
         }
     }
 }

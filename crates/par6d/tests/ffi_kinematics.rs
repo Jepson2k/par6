@@ -90,6 +90,7 @@ fn drift_lock_config(tag: &str) -> PathBuf {
         ("drift_lock = false", "drift_lock = true"),
         ("release_rad_s = 0.08", "release_rad_s = 1.0"),
         ("settle_s = 0.3", "settle_s = 0.2"),
+        ("integral_limit_nm = 1.0", "integral_limit_nm = 6.0"),
     ] {
         assert!(patched.contains(from), "patch point {from:?} must exist");
         patched = patched.replace(from, to);
@@ -544,13 +545,11 @@ fn gravity_hook_holds_the_arm() {
 /// inside the settle window and held by the drive's impedance frame plus
 /// the clamped integral.
 ///
-/// The bias is sized between two bounds. It has to clear the
-/// drivetrain's holding friction to move anything at all — a
-/// self-locking gearbox absorbs a small mismatch without back-driving,
-/// which is why an unpowered arm does not collapse — and it has to stay
-/// inside the lock's authority, or the locked arm flies off with the
-/// free one and the test compares two runaways. Eight hundred grams at
-/// 5 cm sits in that window; two kilos does not.
+/// A powered drive carries its load on its own loops, so the bias moves
+/// every gravity-loaded joint (only an idled drive's detent absorbs a
+/// mismatch); the lock is therefore given the integral authority the
+/// shoulder's share of the bias needs, or the locked arm flies off with
+/// the free one and the test compares two runaways.
 #[test]
 fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
     const WINDOW: Duration = Duration::from_secs(2);
@@ -595,8 +594,10 @@ fn the_drift_lock_bounds_the_drift_of_a_biased_gravity_model() {
         "the biased model must visibly move an unlocked arm in {WINDOW:?}; \
          drifted {free:.2}° ({free_per_joint:.2?})"
     );
+    // The lock arms after its settle window; what the wrist drifts inside
+    // that window on Coulomb friction alone is the bound, not zero.
     assert!(
-        locked < 2.0 && locked < free / 3.0,
+        locked < 3.0 && locked < free / 10.0,
         "the lock must bound the drift: locked {locked:.2}° vs free {free:.2}° \
          (per joint: locked {locked_per_joint:.2?}, free {free_per_joint:.2?})"
     );
