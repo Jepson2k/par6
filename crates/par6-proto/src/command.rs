@@ -286,6 +286,7 @@ pub struct ConnectHardware {
 #[serde(deny_unknown_fields)]
 pub struct SetTcpOffset {
     /// Idempotency key.
+    #[serde(default)]
     pub key: u64,
     /// X offset (mm).
     pub x: f64,

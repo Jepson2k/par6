@@ -43,6 +43,7 @@ par6-server = { path = "crates/par6-server" }
 par6-client = { path = "crates/par6-client" }
 
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rmp-serde = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 socketcan = "3.6"
