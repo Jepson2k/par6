@@ -1498,9 +1498,13 @@ fn explicitly_configured_holding_friction_is_finite() {
     );
 }
 
+/// With no passive holding declared, the same released shoulder is
+/// fully back-drivable: the shipped default is what keeps it up, not
+/// the plant.
 #[test]
-fn default_planetary_plant_backdrives_under_gravity() {
-    let robot = par6();
+fn a_zero_holding_config_backdrives_under_gravity() {
+    let mut robot = par6();
+    robot.sim.holding_friction_nm = vec![0.0; 6];
     let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
     let mut rig = Rig::boot(&robot, None, Some(&q0));
     let node = robot.joints[1].node_id;
@@ -1522,7 +1526,7 @@ fn default_planetary_plant_backdrives_under_gravity() {
     let last = rig.state.nodes[usize::from(node)].position_ticks.unwrap();
     assert!(
         (last - first.unwrap()).abs() > 200,
-        "unpowered shoulder was artificially held against gravity"
+        "a shoulder with no declared holding must back-drive under gravity"
     );
 }
 

@@ -21,21 +21,19 @@
 //!
 //! # Drivetrain
 //!
-//! Optional load-dependent holding friction models a measured self-locking
-//! drivetrain; it is disabled for the stock planetary configuration.
-//! When enabled, the load on a joint (gravity and the
-//! velocity terms, MuJoCo's `qfrc_bias`) is absorbed by the gearbox up to
-//! the config `holding_friction_nm`: an unpowered joint holds, lowering a
-//! load costs the motor only its own reflected Coulomb loss `G · tc` (the
-//! scene's compiled `frictionloss`), and a motor working against the load
-//! feels exactly the part of it that its own torque has not matched — so
-//! an under-torqued lift holds instead of sagging, and the joint moves
-//! once the motor torque exceeds load plus loss. Beyond the holding
-//! friction the load back-drives the joint. The law is a per-substep
-//! `frictionloss` limit, so the dry friction stays on the solver side
-//! and a held joint rests without chatter. This is what lets the homing
-//! sequence idle the shoulder joints under gravity while the base homes,
-//! and what keeps an IDLE arm on its pose instead of collapsing.
+//! Passive holding models the detent of an idled drive through the
+//! reduction, sized per joint by the config `holding_friction_nm`; zero
+//! makes a joint fully back-drivable. While a drive is idle (cmd 12,
+//! watchdog fired) the load on its joint (gravity and the velocity terms,
+//! MuJoCo's `qfrc_bias`) is absorbed by the gearbox up to that value, so a
+//! released shoulder stays up — what lets the homing sequence idle a joint
+//! under gravity — and beyond it the load back-drives the joint. A
+//! powered drive gets only its reflected Coulomb loss `G · tc` (the
+//! scene's compiled `frictionloss`) and carries its load on its own
+//! loops, so the motor current is the load: nothing in the drivetrain
+//! hides torque from a measurement made through the motor. The law is a
+//! per-substep `frictionloss` limit, so the dry friction stays on the
+//! solver side and a held joint rests without chatter.
 //!
 //! The `set_gripper_object_*` test hooks are owned by the scene — the
 //! plant overwrites them every tick with what the physics says is between
@@ -147,20 +145,17 @@ fn m_to_byte(x: f64) -> f64 {
     (-x / JAW_TRAVEL_M * 255.0).clamp(0.0, 255.0)
 }
 
-/// The drivetrain's dry-friction limit for a motor torque `motor_nm`
-/// against a load `load_nm` (the torque the rest of the world puts on the
-/// joint): the Coulomb loss plus the load the gearbox absorbs — all of it
-/// when the load pushes along the motor's drive or the motor is idle, the
-/// unmatched remainder when the motor works against it — capped at the
-/// holding friction.
-fn drivetrain_friction(coulomb: f64, hold: f64, motor_nm: f64, load_nm: f64) -> f64 {
-    let opposing = motor_nm != 0.0 && load_nm != 0.0 && (motor_nm > 0.0) != (load_nm > 0.0);
-    let absorbed = if opposing {
-        (load_nm.abs() - motor_nm.abs()).max(0.0)
-    } else {
-        load_nm.abs()
-    };
-    coulomb + absorbed.min(hold)
+/// The drivetrain's dry-friction limit under a load `load_nm` (the
+/// torque the rest of the world puts on the joint): the Coulomb loss,
+/// plus — only while the drive is idle — the load the passive holding
+/// (stepper detent through the reduction) absorbs, capped at `hold`. A
+/// powered drive carries its load on its own loops, so the current it
+/// draws is the load itself; letting the gearbox absorb part of it while
+/// driving would hide that load from every torque measurement made
+/// through the motor.
+fn drivetrain_friction(coulomb: f64, hold: f64, idle: bool, load_nm: f64) -> f64 {
+    let absorbed = if idle { load_nm.abs().min(hold) } else { 0.0 };
+    coulomb + absorbed
 }
 
 impl MujocoPlant {
@@ -537,12 +532,11 @@ impl MujocoPlant {
                 // MuJoCo's bias (its sign is the force that cancels it)
                 // and the injected external load.
                 let load = external - self.bias[j];
-                let hold = if clamp_arm {
+                self.friction[j] = if clamp_arm {
                     LANDING_CLAMP_NM
                 } else {
-                    self.hold[j]
+                    drivetrain_friction(self.coulomb[j], self.hold[j], cmds[j].idle, load)
                 };
-                self.friction[j] = drivetrain_friction(self.coulomb[j], hold, motor, load);
             }
             // SAFETY: only per-DOF friction values change; the model's
             // sizes and layout are untouched, so the data stays valid.

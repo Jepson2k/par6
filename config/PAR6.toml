@@ -569,9 +569,12 @@ motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
 motor_b_nm_s = 1.0e-4
 motor_tc_nm = 0.02
 # Gearbox holding friction [Nm, joint side]: the load an unpowered joint
-# carries without back-driving. No load-dependent self-locking is assumed
-# for the planetary gearboxes; Coulomb and viscous losses remain modeled.
-holding_friction_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+# carries without back-driving (stepper detent through the reduction).
+# An estimate, not a measurement: verify on the arm by idling one driver
+# for two seconds at the ready pose and watching the encoder. Calibration
+# never relies on a static hold, so this only shapes what the sim does
+# with a released or idled drive.
+holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
 command_timeout_s = 0.04

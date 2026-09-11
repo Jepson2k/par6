@@ -95,14 +95,15 @@ fn step(bus: &mut SimBus, state: &mut BusState, t: &mut u64, cmds: &[JointComman
 }
 
 /// Through the real codec and the closed-loop sim: a loaded joint held
-/// by the armed velocity loop stays put; the same joint dropped with
-/// cmd 12 has no holding torque of its own and yields to the load (limp
-/// — the point of the idle pre-move), while the encoder polls keep its
-/// position reported and its freshness green the whole time. The 1.5 Nm
-/// load exceeds ordinary drivetrain friction and stays inside the loop's
-/// current authority. Gravity plays no part on the base's vertical axis.
+/// by the armed velocity loop stays put; dropped with cmd 12 it keeps
+/// only its passive holding (`sim.holding_friction_nm`, the detent through
+/// the reduction) — a load inside that stays, a load past it back-drives
+/// (limp — the point of the idle pre-move) — while the encoder polls keep
+/// its position reported and its freshness green the whole time. Loads
+/// stay inside the loop's current authority; gravity plays no part on the
+/// base's vertical axis.
 #[test]
-fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
+fn a_dropped_driver_holds_its_detent_and_yields_past_it_while_polls_keep_it_fresh() {
     let bundle = common::bundle();
     let robot = &bundle.robot;
     let mut bus = SimBus::new(common::scene(&bundle));
@@ -113,7 +114,9 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
     let n1 = usize::from(node1);
     let ma_per_nm =
         torque_to_ma_factor(jc.gear_ratio, jc.gear_efficiency, jc.kt_nm_a, jc.dir).abs();
-    bus.set_joint_load_ma(node1, 1.5 * ma_per_nm);
+    let holding = robot.sim.holding_friction_nm[0];
+    assert!(holding > 0.0, "the shipped config models passive holding");
+    bus.set_joint_load_ma(node1, 0.5 * holding * ma_per_nm);
     let mut state = BusState::new();
     let mut t = 0u64;
 
@@ -134,7 +137,8 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
         held_end - held_start
     );
 
-    // Drop to idle (twice, the pre-move cadence), then poll.
+    // Drop to idle (twice, the pre-move cadence), then poll. Half the
+    // detent load: the released joint stays where it was dropped.
     let mut cmds = hold;
     cmds[0] = JointCommand::drop_to_idle();
     for _ in 0..2 {
@@ -148,12 +152,9 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
         max_age = max_age.max(state.nodes[n1].data_age_ticks);
     }
     let idle_end = i64::from(state.nodes[n1].position_ticks.unwrap());
-    // The discriminator is the order of magnitude — an armed loop drifts
-    // tens of ticks (and the pre-fix vel-0 keep-alive would keep holding
-    // here), a limp joint hangs hundreds before its hard stop catches it.
     assert!(
-        (idle_end - idle_start).abs() >= 400,
-        "an idled driver must yield to the load (moved {})",
+        (idle_end - idle_start).abs() < 40,
+        "an idled driver inside its passive holding stays put (moved {})",
         idle_end - idle_start
     );
     assert!(
@@ -163,6 +164,21 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
     assert_eq!(
         state.nodes[n1].data_age_ticks, 0,
         "steady-state polling answers every tick"
+    );
+
+    // 1.5 Nm past the detent: the same released joint hangs limp. The
+    // discriminator is the order of magnitude — an armed loop drifts tens
+    // of ticks, a limp joint hundreds before its hard stop catches it.
+    bus.set_joint_load_ma(node1, (holding + 1.5) * ma_per_nm);
+    let limp_start = i64::from(state.nodes[n1].position_ticks.unwrap());
+    for _ in 0..200 {
+        step(&mut bus, &mut state, &mut t, &cmds);
+    }
+    let limp_end = i64::from(state.nodes[n1].position_ticks.unwrap());
+    assert!(
+        (limp_end - limp_start).abs() >= 400,
+        "an idled driver must yield to a load past its holding (moved {})",
+        limp_end - limp_start
     );
 }
 

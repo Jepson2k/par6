@@ -459,8 +459,9 @@ pub struct SimConfig {
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
     /// Gearbox holding friction per joint \[Nm, joint side\]: the load
-    /// the unpowered drivetrain holds without back-driving. Zero by default:
-    /// load-dependent self-locking must be established by measurement.
+    /// the unpowered drivetrain holds without back-driving (stepper detent
+    /// through the reduction). An estimate until measured on the arm; it
+    /// shapes only what the sim does with an idled or released drive.
     pub holding_friction_nm: Vec<f64>,
 }
 
@@ -470,7 +471,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
-            holding_friction_nm: vec![0.0; 6],
+            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
 }
