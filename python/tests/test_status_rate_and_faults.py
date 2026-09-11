@@ -10,10 +10,11 @@ say which drive actually tripped and what its driver calls it.
 from __future__ import annotations
 
 import asyncio
+import threading
 import time
 
 import pytest
-from live_daemon import LiveDaemon, requires_par6d
+from live_daemon import LiveDaemon, requires_par6d, settle_at
 
 from par6.client import AsyncRobotClient, RobotError
 
@@ -170,3 +171,62 @@ async def test_drive_health_reports_one_fault_slot_per_node(daemon: LiveDaemon):
         assert all(not f for f in faults), (
             f"the sim bus reports no faults, so every slot should be clear: {faults}"
         )
+
+
+@pytest.mark.asyncio
+async def test_delayed_native_status_is_stale_to_calibration(
+    calibration_daemon: LiveDaemon, tmp_path
+):
+    """A cached real packet cannot become fresh when Python finally sees it."""
+    from par6.calibration.session import CalibrationSession, feedback_age
+
+    async with calibration_daemon.client() as client:
+        assert await client.wait_ready(timeout=10.0)
+        await settle_at(client, [0, -90, 180, 0, -20, 180])
+        core = await client._ensure_core()
+        # Only the readiness reader is under test; entering a full calibration
+        # would add unrelated geometry, drive identity, and capture requirements.
+        session = CalibrationSession(
+            client, tmp_path / "unused", tmp_path / "unused.bin"
+        )
+        session.core = core
+        fresh = await session.fresh()
+        assert feedback_age(fresh) < 0.1
+
+        # Native UDP reception continues while Python's event loop is paused.
+        # A completed older Future must not hide a newer received packet.
+        pending_ready = asyncio.create_task(session.fresh())
+        await asyncio.sleep(0)
+        threading.Event().wait(0.15)
+        recovered = await pending_ready
+        assert feedback_age(recovered) < 0.1
+        assert recovered["seq"] != fresh["seq"]
+
+        # Joined listener shutdown is the barrier: no later UDP packet can
+        # replace this real, otherwise-ready STATUS while delivery is delayed.
+        await client.close()
+        cached = core.latest_status()
+        assert cached is not None
+        assert cached["homed"] and cached["enabled"] and cached["link_ok"] == 1
+        assert not cached["error"] and not any(cached["drive_health"]["faults"])
+        pending = core.status_after(-1, 0.5)
+        delay_start = time.monotonic()
+        # Deliberately block the event loop while releasing the GIL. This is
+        # the impairment being tested, not a wait for simulator state to settle.
+        threading.Event().wait(0.15)
+        delayed = await pending
+        assert delayed is not None
+        assert delayed["seq"] == cached["seq"]
+        assert delayed["data_age_ms"] == cached["data_age_ms"]
+        assert delayed["data_age_ms"] < 100
+        assert delayed["client_received_monotonic_s"] <= delay_start
+        assert delayed["client_received_monotonic_s"] == pytest.approx(
+            cached["client_received_monotonic_s"], abs=0.01, rel=0
+        )
+        assert feedback_age(delayed) >= 0.15
+
+        # Exercise the actual admission gate, including another native-to-Python
+        # conversion of the same old packet. Re-reading must not reset its age.
+        session.sequence = -1
+        with pytest.raises(RuntimeError, match="feedback_age_ms"):
+            await session.fresh()

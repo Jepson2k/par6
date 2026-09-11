@@ -999,6 +999,10 @@ class DryRunRobotClient:
             buf.tool_status_present = True
         return buf
 
+    def capture_info(self) -> dict:
+        """Offline preview has no native diagnostic recorder."""
+        return {"identity": None}
+
     def config_info(self) -> dict:
         """The effective configuration in the live query's shape, from the
         file the engine loaded."""

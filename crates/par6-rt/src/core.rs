@@ -459,6 +459,7 @@ pub struct RtCore<B: DriverBus> {
 
     // Seams.
     gravity: Box<dyn GravityModel>,
+    gravity_scale: [f64; MAX_JOINTS],
     jog: Box<dyn JogEngine>,
     stream: Box<dyn StreamTracker>,
     exec: ExecPlayback,
@@ -630,6 +631,7 @@ pub struct RtCore<B: DriverBus> {
 
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
+    capture: Option<crate::diagnostics::CaptureWriter>,
     snap: StateSnapshot,
 }
 
@@ -714,6 +716,7 @@ impl<B: DriverBus> RtCore<B> {
                 ControlMode::Pd => Pack::Pd,
             },
             gravity: hooks.gravity,
+            gravity_scale: robot.gravity_scale,
             jog: hooks.jog,
             stream: hooks.stream,
             exec: ExecPlayback::new(hooks.samples, hooks.settle),
@@ -841,6 +844,7 @@ impl<B: DriverBus> RtCore<B> {
             profile: TickProfile::default(),
             writer,
             snap: StateSnapshot::default(),
+            capture: None,
         };
         Ok((
             core,
@@ -853,6 +857,11 @@ impl<B: DriverBus> RtCore<B> {
                 },
             },
         ))
+    }
+
+    /// Attach a bounded recorder before running the control loop.
+    pub fn set_capture(&mut self, writer: crate::diagnostics::CaptureWriter) {
+        self.capture = Some(writer);
     }
 
     /// Current operating mode.
@@ -1185,6 +1194,9 @@ impl<B: DriverBus> RtCore<B> {
 
         // Gravity: computed every tick, published always.
         self.gravity.gravity(&self.q, &mut self.g);
+        for (g, scale) in self.g.iter_mut().zip(self.gravity_scale) {
+            *g *= scale;
+        }
 
         // External torque: what the measured (filtered) torque carries
         // beyond the model's gravity — a contact, a payload the model
@@ -2551,5 +2563,8 @@ impl<B: DriverBus> RtCore<B> {
             discard_pct: self.stream_discard,
         };
         self.writer.publish(&self.snap);
+        if let Some(w) = self.capture.as_mut() {
+            let _ = w.push(&self.snap);
+        }
     }
 }

@@ -208,27 +208,16 @@ impl StreamTracker for MotionStream {
 
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
         match self.executor.step() {
-            Ok(StreamStep { q, qd, finished }) => {
+            Ok(StreamStep { q, finished, .. }) => {
                 self.finished = finished;
                 *q_out = q;
                 self.clamp(q_out);
-                // The velocity channel of a cmd-2 position frame is an
-                // additive feedforward on the driver's position loop
-                // (vendor firmware). The OTG reports the velocity it ends the
-                // tick AT, which is zero on every tick that lands on the
-                // current target — a stepped stream advancing a reachable
-                // target every cycle would get no feedforward at all and
-                // track only on position error. Send the larger of the
-                // OTG's profile velocity and the rate the position
-                // channel actually advanced this tick, so the driver is
-                // fed the true rate of the commanded motion.
+                // Cmd-2 velocity is additive position-loop feedforward.
+                // Use the interval-average rate consistently: choosing between
+                // it and endpoint velocity creates a jerk jump at reversals.
+                // An interval that lands at rest still needs its advance fed.
                 for j in 0..MAX_JOINTS {
-                    let advance = (q_out[j] - self.hold_q[j]) / self.dt;
-                    qd_out[j] = if advance.abs() > qd[j].abs() {
-                        advance
-                    } else {
-                        qd[j]
-                    };
+                    qd_out[j] = (q_out[j] - self.hold_q[j]) / self.dt;
                 }
                 self.hold_q = *q_out;
                 if self.fail_streak > 0 {
@@ -344,6 +333,57 @@ mod tests {
         stream.step(&mut q, &mut qd);
         assert!(!stream.faulted(), "a recovered limiter is healthy");
         assert!(q[0] > start[0], "and it is tracking the target again");
+    }
+
+    #[test]
+    fn stream_reversals_preserve_feedforward_jerk() {
+        let mut limits = stream_limits();
+        limits.velocity.fill(0.2);
+        limits.acceleration.fill(0.4);
+        limits.jerk.fill(1.2);
+        let dt = 0.004;
+        let mut stream = MotionStream::new(
+            StreamingExecutor::new(dt, &limits).expect("executor"),
+            dt,
+            limits,
+            0.5,
+        );
+        let start = std::array::from_fn(|j| (limits.soft_min[j] + limits.soft_max[j]) / 2.0);
+        stream.activate(&start);
+        stream.set_scale(0.5, 0.5);
+        let mut q = start;
+        let mut qd = [0.0; MAX_JOINTS];
+        let mut previous_velocity = 0.0;
+        let mut previous_accel = 0.0;
+        let mut peak_jerk = 0.0_f64;
+        let mut reversals = 0;
+        for tick in 0..1000 {
+            // Encoder-sized corrections cross zero velocity at nonzero
+            // acceleration, as settling and renewed servo targets can do.
+            let mut target = start;
+            target[4] += if (tick / 7) % 2 == 0 {
+                0.00002
+            } else {
+                -0.00002
+            };
+            stream.set_target(&target);
+            stream.step(&mut q, &mut qd);
+            let acceleration = (qd[4] - previous_velocity) / dt;
+            let jerk = (acceleration - previous_accel) / dt;
+            assert!(qd[4].abs() <= 0.1 + 1e-9);
+            assert!(acceleration.abs() <= 0.2 + 1e-9);
+            peak_jerk = peak_jerk.max(jerk.abs());
+            if qd[4] * previous_velocity < 0.0 {
+                reversals += 1;
+            }
+            previous_velocity = qd[4];
+            previous_accel = acceleration;
+        }
+        assert!(reversals > 10, "the trial must exercise velocity reversals");
+        assert!(
+            peak_jerk <= 0.6 + 1e-7,
+            "wire jerk {peak_jerk} exceeds the scaled bound"
+        );
     }
 
     /// A servo source nudging its target a little further every cycle —

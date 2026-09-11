@@ -71,6 +71,7 @@ pub struct Kin {
     g_full: Vec<f64>,
     /// Gravity regressor workspace: `nq_full` rows by `4 * bodies`.
     regressor_full: Vec<f64>,
+    gravity_correction: Vec<f64>,
 }
 
 impl std::fmt::Debug for Kin {
@@ -222,6 +223,7 @@ impl Kin {
             a_full: vec![0.0; nq_full],
             g_full: vec![0.0; nq_full],
             regressor_full: vec![0.0; nq_full * 4 * bodies],
+            gravity_correction: Vec::new(),
         };
         kin.opw = Opw::derive(urdf, &mut kin);
         Ok(kin)
@@ -310,6 +312,31 @@ impl Kin {
         self.set_q(q);
         self.model.gravity_into(&self.q_full, &mut self.tau_full)?;
         tau.copy_from_slice(&self.tau_full[..NQ]);
+        if !self.gravity_correction.is_empty() {
+            self.model
+                .gravity_regressor_into(&self.q_full, &mut self.regressor_full)?;
+            let cols = 4 * self.body_count();
+            for (j, value) in tau.iter_mut().enumerate() {
+                *value += self.regressor_full[j * cols..(j + 1) * cols]
+                    .iter()
+                    .zip(&self.gravity_correction)
+                    .map(|(a, b)| a * b)
+                    .sum::<f64>();
+            }
+        }
+        Ok(())
+    }
+
+    /// Install an identified gravity-only correction outside the RT tick.
+    pub fn set_gravity_correction(&mut self, delta: &[f64]) -> Result<(), KinError> {
+        if (!delta.is_empty() && delta.len() != 4 * self.body_count())
+            || delta.iter().any(|v| !v.is_finite() || v.abs() > 10.0)
+        {
+            return Err(KinError::Load(
+                "invalid gravity correction size or coefficient".into(),
+            ));
+        }
+        self.gravity_correction = delta.to_vec();
         Ok(())
     }
 

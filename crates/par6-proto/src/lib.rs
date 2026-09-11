@@ -51,7 +51,8 @@ pub use enums::{
 };
 pub use error::{make_error, template, ErrorCode, ErrorTemplate, WireError, UNATTRIBUTED};
 pub use reply::{
-    decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
+    decode_reply, encode_reply, BusNode, CaptureIdentity, LoopStatsResult, QueryResult, Reply,
+    ToolStatusWire,
 };
 pub use status::{
     decode_status, encode_status_into, peek_status_proto_version, DriveHealthWire, HomingWire,

@@ -459,8 +459,8 @@ pub struct SimConfig {
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
     /// Gearbox holding friction per joint \[Nm, joint side\]: the load
-    /// the unpowered drivetrain holds without back-driving. Must cover
-    /// the joint's worst gravity torque or an IDLE arm collapses.
+    /// the unpowered drivetrain holds without back-driving. Zero by default:
+    /// load-dependent self-locking must be established by measurement.
     pub holding_friction_nm: Vec<f64>,
 }
 
@@ -470,7 +470,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
-            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            holding_friction_nm: vec![0.0; 6],
         }
     }
 }
@@ -773,6 +773,13 @@ impl Default for FreedriveConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RobotConfig {
+    /// Observable gravity correction [mass, mx, my, mz] per moving body.
+    /// Does not change nominal inertias or the declared payload.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gravity_correction: Vec<f64>,
+    /// Per-joint gravity feedforward trim. Does not change motor torque constants.
+    #[serde(default = "default_gravity_scale")]
+    pub gravity_scale: [f64; 6],
     /// Identity and global timing.
     pub robot: RobotSection,
     /// Arm joints, in kinematic order.
@@ -822,6 +829,10 @@ pub struct RobotConfig {
     /// wire can remove them. Omitted = none.
     #[serde(default)]
     pub installation_shapes: Vec<par6_proto::Shape>,
+}
+
+fn default_gravity_scale() -> [f64; 6] {
+    [1.0; 6]
 }
 
 impl RobotConfig {
@@ -874,6 +885,27 @@ impl RobotConfig {
 
     /// Validate the whole tree; every error names its field.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if (!self.gravity_correction.is_empty() && self.gravity_correction.len() != 24)
+            || self
+                .gravity_correction
+                .iter()
+                .any(|v| !v.is_finite() || v.abs() > 10.0)
+        {
+            return Err(invalid(
+                "gravity_correction",
+                "requires 24 finite composite-link coefficients (or empty), magnitude at most 10",
+            ));
+        }
+        if self
+            .gravity_scale
+            .iter()
+            .any(|v| !v.is_finite() || *v <= 0.0 || *v > 2.0)
+        {
+            return Err(invalid(
+                "gravity_scale",
+                "requires six finite gains in (0, 2]",
+            ));
+        }
         let r = &self.robot;
         if !(r.tick_dt_s > 0.0 && r.tick_dt_s < 1.0) {
             return Err(invalid("robot.tick_dt_s", "must be in (0, 1) seconds"));

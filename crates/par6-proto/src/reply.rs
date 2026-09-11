@@ -16,6 +16,19 @@ use crate::error::WireError;
 use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS};
 
+/// The native recorder identity also stored in its CAP2 file header.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaptureIdentity {
+    /// Daemon process ID on its host.
+    pub pid: u64,
+    /// Recorder creation time, Unix seconds (exactly the header's f64).
+    pub started: f64,
+    /// Native sample period in seconds.
+    pub dt: f64,
+    /// Loaded robot/gripper configuration fingerprint.
+    pub fingerprint: String,
+}
+
 /// Full tool status as it travels on the wire (STATUS body, STATUS query and
 /// TOOL_STATUS query). 8 slots:
 /// `[key, state, engaged, part_detected, fault_code, positions, channels,
@@ -287,6 +300,11 @@ pub enum QueryResult {
         /// Whether the simulator backend is active.
         active: bool,
     },
+    /// CAPTURE_INFO result. None means this runtime has no native recorder.
+    CaptureInfo {
+        /// Identity shared with the local recording header.
+        identity: Option<CaptureIdentity>,
+    },
     /// CONFIG_INFO result: the runtime's effective configuration — the
     /// config-skew hook a UI compares against its packaged mirror.
     ConfigInfo {
@@ -378,6 +396,7 @@ impl QueryResult {
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
+            Q::CaptureInfo { .. } => QueryType::CaptureInfo,
             Q::ConfigBundle { .. } => QueryType::ConfigBundle,
             Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
@@ -609,6 +628,19 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 2);
             w_uint(buf, u64::from(tag));
             w_bool(buf, *active);
+        }
+        Q::CaptureInfo { identity } => {
+            w_array(buf, 2);
+            w_uint(buf, u64::from(tag));
+            if let Some(info) = identity {
+                w_array(buf, 4);
+                w_uint(buf, info.pid);
+                w_f64(buf, info.started);
+                w_f64(buf, info.dt);
+                w_str(buf, &info.fingerprint);
+            } else {
+                w_nil(buf);
+            }
         }
         Q::ConfigInfo {
             path,
@@ -1040,6 +1072,23 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::IsSimulator => {
             expect_arity("is_simulator result", n, 2)?;
             QueryResult::IsSimulator { active: r.bool()? }
+        }
+        T::CaptureInfo => {
+            expect_arity("capture_info result", n, 2)?;
+            let identity = if r.peek_nil() {
+                r.nil()?;
+                None
+            } else {
+                let count = r.array_len()?;
+                expect_arity("capture_info.identity", count, 4)?;
+                Some(CaptureIdentity {
+                    pid: r.uint()?,
+                    started: r.f64()?,
+                    dt: r.f64()?,
+                    fingerprint: r.str()?.to_owned(),
+                })
+            };
+            QueryResult::CaptureInfo { identity }
         }
         T::ConfigInfo => {
             expect_arity("config_info result", n, 6)?;

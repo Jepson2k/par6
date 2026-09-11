@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 
 import pytest
-from live_daemon import LiveDaemon, par6d_binary
+from live_daemon import LiveDaemon, _set_scalar, par6d_binary
 
 
 def pytest_addoption(parser: pytest.Parser) -> None:
@@ -50,3 +50,18 @@ def daemon(tmp_path):
     live = LiveDaemon.start(tmp_path)
     yield live
     live.stop()
+
+
+@pytest.fixture
+def calibration_daemon(tmp_path):
+    """Use calibration's native feedback cadence, including its 100 ms age gate."""
+    live = LiveDaemon.start(
+        tmp_path,
+        config_patch=lambda s: _set_scalar(
+            _set_scalar(s, "tick_dt_s", 0.004), "status_rate_hz", 50
+        ),
+    )
+    try:
+        yield live
+    finally:
+        live.stop()

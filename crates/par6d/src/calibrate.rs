@@ -1,13 +1,6 @@
-//! Payload identification against a running `par6d`: rest the arm in a
-//! few wrist poses, read the torques it holds each one with, and solve
-//! for the load at the end of the chain
-//! ([`par6_kin::gravity::fit_payload`]).
-//!
-//! Measurement poses vary the wrist. Small opposite-direction approaches
-//! also move the shoulder and elbow: friction on every gravity-loaded
-//! joint must change sign before the pair can estimate gravity torque.
-//! These static measurements identify payload; arm gravity calibration
-//! also needs poses that vary the arm's own lever arms.
+//! Payload identification from paired slow, opposite-direction sweeps.
+//! Moving measurements separate gravity from symmetric gearbox friction;
+//! a stopped position hold can conceal gravity error inside static friction.
 
 use std::time::Duration;
 
@@ -24,7 +17,7 @@ pub const WRIST_JOINTS: [usize; 3] = [3, 4, 5];
 /// approaches so its drivetrain friction does not enter as payload mass.
 pub const APPROACH_JOINTS: [usize; 5] = [1, 2, 3, 4, 5];
 
-/// How a run rests and reads the arm.
+/// How a run approaches and samples the arm.
 #[derive(Debug, Clone, Copy)]
 pub struct Protocol {
     /// Joint-move speed fraction between poses.
@@ -33,7 +26,7 @@ pub struct Protocol {
     /// is measured from both sides. The average cancels symmetric
     /// friction; load-dependent gearbox friction needs identification too.
     pub approach_rad: f64,
-    /// Required stable position hold before collecting the sample window.
+    /// Ramp and transient exclusion before collecting moving samples.
     pub settle: Duration,
     /// Consecutive STATUS frames averaged per reading.
     pub frames: usize,
@@ -162,10 +155,7 @@ async fn move_to(client: &Client, q: &[f64; NQ], protocol: &Protocol) -> Result<
     }
 }
 
-/// A static measurement must stay inside a quarter-degree envelope and
-/// below 0.03 rad/s; a persistent limit cycle is not a gravity sample.
-const REST_DRIFT_DEG: f64 = 0.25;
-const REST_SPEED_RAD_S: f64 = 0.03;
+const SWEEP_RAD_S: f64 = 0.035;
 const TARGET_ERROR_DEG: f64 = 0.5;
 const STATUS_TIMEOUT: Duration = Duration::from_millis(500);
 const HOLD_PERIOD: Duration = Duration::from_millis(20);
@@ -182,43 +172,52 @@ async fn stopped<T>(client: &Client, result: Result<T, String>) -> Result<T, Str
     })
 }
 
-/// Hold the requested pose with position feedback while reading actual
-/// drive torque. IDLE's model-only feedforward cannot measure model error.
-async fn read_held(
+/// Sample while crossing the pose. All gravity-loaded axes must actually move
+/// in the requested direction; commanded feedforward is never a measurement.
+async fn read_moving(
     client: &Client,
     q: &[f64; NQ],
+    direction: f64,
     protocol: &Protocol,
 ) -> Result<GravitySample, String> {
-    let target = to_deg(q);
     let mut rx = client.subscribe_status();
     let mut heartbeat = tokio::time::interval(HOLD_PERIOD);
     heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-    let deadline = tokio::time::Instant::now() + protocol.pose_timeout;
-    let mut last_frame = tokio::time::Instant::now();
+    let begin = tokio::time::Instant::now();
+    let deadline = begin + protocol.pose_timeout;
+    let mut last_frame = begin;
     let mut last_seq = None;
-    let mut stable_since = None;
+    let speed = SWEEP_RAD_S * protocol.speed;
+    let ramp = protocol.settle.as_secs_f64().max(0.2);
+    let mut target = approach_pose(q, -direction * protocol.approach_rad);
     let mut sample = GravitySample {
         q: [0.0; NQ],
         tau: [0.0; NQ],
     };
     let mut taken = 0usize;
-    let mut lo = [f64::INFINITY; NQ];
-    let mut hi = [f64::NEG_INFINITY; NQ];
+    let mut history = std::collections::VecDeque::new();
     loop {
         tokio::select! {
             _ = tokio::time::sleep_until(deadline) => {
-                return Err(format!("the arm did not hold a stable pose within the sampling budget: target_deg={target:?}, latest={:?}", client.latest_status().map(|s| (s.mode, s.angles, s.speeds, s.data_age_ms))));
+                return Err("moving gravity sample exceeded its time budget".into());
             }
             _ = heartbeat.tick() => {
                 if last_frame.elapsed() > STATUS_TIMEOUT {
-                    return Err("the status stream stopped while sampling".into());
+                    return Err("status stopped during gravity sweep".into());
                 }
-                client.servo_j(target, Some(protocol.speed), None).await
-                    .map_err(|e| format!("position hold: {e}"))?;
+                let t = begin.elapsed().as_secs_f64();
+                let travel = if t < ramp { speed * t * t / (2.0 * ramp) }
+                    else { speed * (t - ramp * 0.5) };
+                if travel >= 2.0 * protocol.approach_rad {
+                    return Err(format!("insufficient moving samples through pose: {taken}/{}", protocol.frames));
+                }
+                target = approach_pose(q, direction * (travel - protocol.approach_rad));
+                client.servo_j(to_deg(&target), Some(protocol.speed), None).await
+                    .map_err(|e| format!("gravity sweep: {e}"))?;
                 continue;
             }
             changed = rx.changed() => {
-                changed.map_err(|_| "the status stream closed while sampling")?;
+                changed.map_err(|_| "status closed during gravity sweep")?;
             }
         }
         let Some(s) = rx.borrow_and_update().clone() else {
@@ -231,59 +230,39 @@ async fn read_held(
         if s.data_age_ms <= 100 {
             last_frame = tokio::time::Instant::now();
         }
-        if let Some(e) = &s.error {
-            return Err(format!(
-                "the arm faulted while sampling: {} ({})",
-                e.cause, e.code
-            ));
-        }
-        if !s.enabled || !s.homed {
-            return Err("the arm became disabled or unreferenced while sampling".into());
-        }
-        if s.link_ok != 1 {
-            return Err(format!("the motor bus link went stale while sampling: link_ok={}, data_age_ms={}, mode={:?}, loop={:?}", s.link_ok, s.data_age_ms, s.mode, s.loop_health));
+        if s.error.is_some() || !s.enabled || !s.homed || s.link_ok != 1 {
+            return Err(format!("gravity sweep lost readiness: {:?}", s.error));
         }
         if !(0..NQ)
             .all(|j| s.angles[j].is_finite() && s.speeds[j].is_finite() && s.torques[j].is_finite())
         {
-            return Err("non-finite position, speed or torque while sampling".into());
+            return Err("non-finite gravity sweep feedback".into());
         }
-        // Delayed frames invalidate this sampling window. A sustained
-        // loss still stops through the link and heartbeat deadlines.
-        let stable = s.data_age_ms <= 100
-            && s.mode == ControllerMode::Stream
-            && (0..NQ).all(|j| {
-                s.speeds[j].abs() <= REST_SPEED_RAD_S
-                    && (s.angles[j] - target[j]).abs() <= TARGET_ERROR_DEG
-            });
-        if !stable {
-            stable_since = None;
-            taken = 0;
-            sample = GravitySample {
-                q: [0.0; NQ],
-                tau: [0.0; NQ],
-            };
-            lo.fill(f64::INFINITY);
-            hi.fill(f64::NEG_INFINITY);
+        if s.data_age_ms > 100
+            || s.mode != ControllerMode::Stream
+            || begin.elapsed().as_secs_f64() < 2.0 * ramp
+        {
             continue;
         }
-        let since = *stable_since.get_or_insert(s.mono_time_ns);
-        if Duration::from_nanos(s.mono_time_ns.saturating_sub(since)) < protocol.settle {
+        history.push_back((s.mono_time_ns, s.angles));
+        while history.len() > 2 && s.mono_time_ns.saturating_sub(history[1].0) >= 100_000_000 {
+            history.pop_front();
+        }
+        let (then, angles) = history.front().unwrap();
+        let span = s.mono_time_ns.saturating_sub(*then) as f64 * 1e-9;
+        if span < 0.08 {
             continue;
         }
-        for j in 0..NQ {
-            lo[j] = lo[j].min(s.angles[j]);
-            hi[j] = hi[j].max(s.angles[j]);
-        }
-        if (0..NQ).any(|j| hi[j] - lo[j] > REST_DRIFT_DEG) {
-            stable_since = None;
-            taken = 0;
-            sample = GravitySample {
-                q: [0.0; NQ],
-                tau: [0.0; NQ],
-            };
-            lo.fill(f64::INFINITY);
-            hi.fill(f64::NEG_INFINITY);
+        // Centered window keeps opposite-direction configurations paired. The
+        // approach's acceleration and its final deceleration are excluded.
+        let usable = APPROACH_JOINTS.iter().all(|&j| {
+            let velocity = direction * (s.angles[j] - angles[j]).to_radians() / span;
+            velocity >= speed * 0.5
+                && velocity <= speed * 1.8
+                && (s.angles[j].to_radians() - q[j]).abs() <= protocol.approach_rad * 0.5
+                && (s.angles[j] - target[j].to_degrees()).abs() <= TARGET_ERROR_DEG
+        });
+        if !usable {
             continue;
         }
         for j in 0..NQ {
@@ -301,8 +280,7 @@ async fn read_held(
     }
 }
 
-/// Rest the arm in `q` and read the torques it holds there with, arrived
-/// at from both directions and averaged (see [`Protocol::approach_rad`]).
+/// Cross `q` in both directions and average the moving torques.
 pub async fn measure_pose(
     client: &Client,
     q: &[f64; NQ],
@@ -319,11 +297,7 @@ pub async fn measure_pose(
             protocol,
         )
         .await?;
-        // Keep position feedback active from the final approach through
-        // sampling. Completing a queued move first enters torque-only
-        // IDLE, which loses the approach's friction history and lets a
-        // biased feedforward move the arm before the hold starts.
-        let s = stopped(client, read_held(client, q, protocol).await).await?;
+        let s = stopped(client, read_moving(client, q, -dir, protocol).await).await?;
         for j in 0..NQ {
             mean.q[j] += 0.5 * s.q[j];
             mean.tau[j] += 0.5 * s.tau[j];

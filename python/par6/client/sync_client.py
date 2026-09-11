@@ -682,6 +682,10 @@ class RobotClient:
         """The collision world the runtime is enforcing, by layer."""
         return _run(self._inner.shapes())
 
+    def capture_info(self) -> dict | None:
+        """The connected runtime's optional native recorder identity."""
+        return _run(self._inner.capture_info())
+
     def config_info(self) -> dict | None:
         """The runtime's effective configuration (path, fingerprint,
         limits, motion constants)."""

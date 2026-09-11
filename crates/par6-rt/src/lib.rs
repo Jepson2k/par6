@@ -42,6 +42,7 @@
 //!   latch list, homing/exec/jog/stream status, loop stats).
 
 pub mod core;
+pub mod diagnostics;
 pub mod dispatch;
 pub mod drift_lock;
 pub mod errors;

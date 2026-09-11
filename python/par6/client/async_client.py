@@ -1015,7 +1015,9 @@ class AsyncRobotClient(_RobotClientABC):
 
     async def stop(self, clear_queue: bool = True) -> int:
         """Stop all motion; with *clear_queue* (the default) also clear the
-        queue.  The controller stays enabled and holding position.
+        queue. The controller stays enabled. Idle support follows the gravity
+        compensation and freedrive settings; with gravity enabled it can use
+        torque-only support rather than a position hold.
 
         Category: Control
 
@@ -1794,6 +1796,14 @@ class AsyncRobotClient(_RobotClientABC):
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
         )
+
+    async def capture_info(self) -> dict | None:
+        """Native recorder identity, or identity=None when recording is disabled.
+
+        Category: Query
+        """
+        core = await self._ensure_core()
+        return await self._call(core.capture_info())
 
     async def config_info(self) -> dict | None:
         """The runtime's effective configuration.

@@ -31,6 +31,7 @@ mod bridge;
 pub mod calibrate;
 pub mod collision_world;
 pub mod daemon;
+mod diagnostics;
 mod grant;
 pub mod kin;
 pub mod logging;

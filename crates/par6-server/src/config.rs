@@ -125,6 +125,8 @@ pub struct ServerConfig {
     /// Effective-configuration readback served for the CONFIG_INFO
     /// query. The daemon fills it from the loaded bundle at startup.
     pub config_info: ConfigInfoData,
+    /// Optional recorder identity, shared with the native capture header.
+    pub capture_identity: Option<par6_proto::CaptureIdentity>,
 }
 
 /// The CONFIG_INFO payload: where the runtime's config came from, what
@@ -208,6 +210,7 @@ impl Default for ServerConfig {
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
             installation_shapes: Vec::new(),
             config_info: ConfigInfoData::default(),
+            capture_identity: None,
         }
     }
 }

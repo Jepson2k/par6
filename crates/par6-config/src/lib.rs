@@ -536,7 +536,7 @@ mod tests {
             .map(|h| h.joints.clone())
             .filter(|j| !j.is_empty())
             .collect();
-        assert_eq!(arm_steps, vec![vec![0], vec![1, 2], vec![3, 5], vec![4]]);
+        assert_eq!(arm_steps, vec![vec![1, 2], vec![0], vec![3, 5], vec![4]]);
         // ...and the flange's own J4 offset is what the runtime homes to.
         assert_eq!(bundle.effective_home_offset(4), Some(-2.258));
     }
@@ -712,6 +712,15 @@ mod tests {
 
     #[test]
     fn validation_errors_name_the_field() {
+        for value in [0.0, -1.0, f64::NAN, f64::INFINITY, 2.01] {
+            let mut cfg = RobotConfig::load(&config_dir().join("PAR6.toml")).unwrap();
+            cfg.gravity_scale[2] = value;
+            assert!(cfg
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("gravity_scale"));
+        }
         let path = config_dir().join("PAR6.toml");
         let good = RobotConfig::load(&path).unwrap();
 

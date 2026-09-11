@@ -161,20 +161,23 @@ impl Preview {
     #[new]
     #[pyo3(signature = (config=None, assets=None, package_dir=None, max_points=200))]
     fn new(
+        py: Python<'_>,
         config: Option<String>,
         assets: Option<String>,
         package_dir: Option<String>,
         max_points: usize,
     ) -> PyResult<Self> {
-        let inner = EnginePreview::new(
-            config.map(std::path::PathBuf::from).as_deref(),
-            assets.map(std::path::PathBuf::from).as_deref(),
-            package_dir.map(std::path::PathBuf::from).as_deref(),
-        )
-        .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
-        Ok(Self {
-            inner: Mutex::new(inner),
-            max_points: max_points.max(2),
+        py.allow_threads(|| {
+            let inner = EnginePreview::new(
+                config.map(std::path::PathBuf::from).as_deref(),
+                assets.map(std::path::PathBuf::from).as_deref(),
+                package_dir.map(std::path::PathBuf::from).as_deref(),
+            )
+            .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
+            Ok(Self {
+                inner: Mutex::new(inner),
+                max_points: max_points.max(2),
+            })
         })
     }
 
@@ -236,7 +239,8 @@ impl Preview {
     }
     /// Preview a servo stream through the runtime's own limiter: each
     /// target [rad] held for `hold_ticks` ticks; returns per-tick
-    /// commanded `q`/`qd` and the tick the last target was reached.
+    /// commanded `q`/`qd`, nominal stopping projections `q_stop`/`target_stop`,
+    /// and the tick the last target was reached.
     #[pyo3(signature = (targets, hold_ticks, speed=None, accel=None))]
     fn preview_servo(
         &self,
@@ -262,6 +266,8 @@ impl Preview {
         }
         d.set_item("q", q)?;
         d.set_item("qd", qd)?;
+        d.set_item("q_stop", r.q_stop)?;
+        d.set_item("target_stop", r.target_stop)?;
         d.set_item("finished_tick", r.finished_tick)?;
         Ok(d.into_any().unbind())
     }

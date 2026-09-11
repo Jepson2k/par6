@@ -89,6 +89,39 @@ fn start_homing(core: &mut RtCore<SimBus>, handles: &mut RtHandles, tx: &mpsc::S
 }
 
 #[test]
+fn shoulder_reference_finishes_before_the_base_seek() {
+    fn shoulder_done_when_base_starts(bundle: &ConfigBundle) -> bool {
+        let (mut core, mut handles, tx, _line) = sim_core_with_bundle(bundle);
+        let dt = core.tick_dt_s();
+        start_homing(&mut core, &mut handles, &tx);
+        for _ in 0..30_000 {
+            core.tick(dt, false);
+            let s = handles.snapshots.latest();
+            assert!(!s.error_active, "homing failed before the base seek");
+            if s.homing.per_joint[0] == HomingJointStatus::Running {
+                return s.homing.per_joint[1] == HomingJointStatus::Done;
+            }
+        }
+        panic!("homing never reached the base seek");
+    }
+    let bundle = common::bundle();
+    assert!(shoulder_done_when_base_starts(&bundle));
+
+    // Negative control: the previous base-first sequence reaches J1 while
+    // the shoulder is still unreferenced, even when its home later succeeds.
+    let mut base_first = bundle.clone();
+    base_first.robot.homing.sequence[0].home = Some(HomeGroup {
+        joints: vec![0],
+        gripper: None,
+    });
+    base_first.robot.homing.sequence[1].home = Some(HomeGroup {
+        joints: vec![1, 2],
+        gripper: None,
+    });
+    assert!(!shoulder_done_when_base_starts(&base_first));
+}
+
+#[test]
 fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
     let (mut core, mut handles, tx, _line) = sim_core();
     let bundle = common::bundle();
@@ -106,6 +139,21 @@ fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
                 == bundle.robot.homing.joints[0].current_ma as f32
         {
             saw_j0_running_at_homing_current = true;
+        }
+        if s.homing.per_joint[6] == HomingJointStatus::Running {
+            assert!(
+                s.homing.per_joint[..6]
+                    .iter()
+                    .all(|status| *status == HomingJointStatus::Done),
+                "the gripper must not start until all arm references are complete"
+            );
+            let ready = [1.57, -1.85, 2.85, 0.0, -0.5, std::f64::consts::PI];
+            for (actual, target) in s.q.iter().zip(ready) {
+                assert!(
+                    (actual - target).abs() < 0.01,
+                    "the arm must reach its ready pose before gripper calibration"
+                );
+            }
         }
         if !s.homing.active && s.mode == Mode::Idle {
             finished = true;

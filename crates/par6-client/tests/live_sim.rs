@@ -5,6 +5,7 @@
 //! COMPLETE contract and the STATUS fallback.
 
 use std::net::{IpAddr, Ipv4Addr, UdpSocket};
+use std::sync::Arc;
 use std::time::Duration;
 
 use par6_client::{
@@ -100,6 +101,39 @@ async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
             "teleport did not take effect within budget"
         );
     }
+}
+
+#[test]
+fn status_receipt_stays_paired_with_its_original_packet() {
+    run_session("status-receipt", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        assert!(client.wait_status(|_| true, BUDGET).await);
+        let before = client.latest_received_status().expect("received STATUS");
+        assert!(
+            client
+                .wait_status(|s| s.seq != before.status.seq, BUDGET)
+                .await,
+            "another actual UDP frame must arrive"
+        );
+        client.close_joined().await;
+        let after = client.latest_received_status().expect("cached STATUS");
+        assert_ne!(after.status.seq, before.status.seq);
+        assert!(after.received_at > before.received_at);
+
+        // After joined shutdown all three APIs must expose the same final
+        // frame. Keeping a snapshot or re-reading it cannot refresh receipt.
+        let wire = client.latest_status().expect("legacy latest STATUS");
+        let subscription = client.subscribe_status();
+        let watched = subscription
+            .borrow()
+            .clone()
+            .expect("legacy watched STATUS");
+        assert!(Arc::ptr_eq(&wire, &after.status));
+        assert!(Arc::ptr_eq(&watched, &after.status));
+        let reread = client.latest_received_status().expect("reread STATUS");
+        assert!(Arc::ptr_eq(&reread.status, &after.status));
+        assert_eq!(reread.received_at, after.received_at);
+    });
 }
 
 #[test]

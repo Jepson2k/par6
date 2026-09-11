@@ -21,7 +21,9 @@
 //!
 //! # Drivetrain
 //!
-//! The gearboxes are self-locking. The load on a joint (gravity and the
+//! Optional load-dependent holding friction models a measured self-locking
+//! drivetrain; it is disabled for the stock planetary configuration.
+//! When enabled, the load on a joint (gravity and the
 //! velocity terms, MuJoCo's `qfrc_bias`) is absorbed by the gearbox up to
 //! the config `holding_friction_nm`: an unpowered joint holds, lowering a
 //! load costs the motor only its own reflected Coulomb loss `G · tc` (the

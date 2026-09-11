@@ -117,7 +117,12 @@ def jog_l_velocities(
 
 
 def shape_to_wire(shape: Shape) -> dict[str, Any]:
-    kind, params, pose, collision, margin, name, physics = shape.to_wire()
+    row = shape.to_wire()
+    if len(row) == 8:
+        if row[7] is not None:
+            raise ValueError("This par6 runtime does not support shape attachments")
+        row = row[:7]
+    kind, params, pose, collision, margin, name, physics = row
     return {
         "kind": kind,
         "params": [float(p) for p in params],

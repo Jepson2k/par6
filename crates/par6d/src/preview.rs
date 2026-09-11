@@ -129,6 +129,10 @@ pub struct ServoPreview {
     pub q: Vec<[f64; MAX_JOINTS]>,
     /// Commanded joint velocities per tick \[rad/s\].
     pub qd: Vec<[f64; MAX_JOINTS]>,
+    /// Nominal stopping projections of commanded positions, assuming ideal tracking.
+    pub q_stop: Vec<[f64; MAX_JOINTS]>,
+    /// Nominal stopping projections of the submitted targets, as checked by ServoJ.
+    pub target_stop: Vec<[f64; MAX_JOINTS]>,
     /// The tick the limiter first reported the LAST target reached, if
     /// it did inside the window.
     pub finished_tick: Option<usize>,
@@ -571,6 +575,8 @@ impl Preview {
         let mut out = ServoPreview {
             q: Vec::with_capacity(targets.len() * hold),
             qd: Vec::with_capacity(targets.len() * hold),
+            q_stop: Vec::with_capacity(targets.len() * hold),
+            target_stop: Vec::with_capacity(targets.len() * hold),
             finished_tick: None,
         };
         let last = targets.len().saturating_sub(1);
@@ -583,6 +589,9 @@ impl Preview {
                 if i == last && out.finished_tick.is_none() && self.stream.at_target() {
                     out.finished_tick = Some(out.q.len());
                 }
+                out.q_stop.push(self.gate.motion_lookahead(&q, &qd));
+                out.target_stop
+                    .push(self.gate.motion_lookahead(target, &qd));
                 out.q.push(q);
                 out.qd.push(qd);
             }

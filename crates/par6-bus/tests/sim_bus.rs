@@ -384,9 +384,8 @@ fn stall_endstop_signatures_and_release_preload() {
         }
     }
     let sampled = sampled.expect("release sample point inside the phase");
-    // The release current pulls AWAY from the stop, against the joint's
-    // load: the self-locking gearbox keeps the joint seated — it relaxes
-    // by at most the limit penetration and never leaves the stop...
+    // At this pose the release current unloads contact without lifting
+    // the arm from the stop: displacement is bounded by contact penetration.
     let relaxed = f64::from(sampled - rest) * -sign;
     assert!(
         (0.0..=50.0).contains(&relaxed),
@@ -825,9 +824,11 @@ fn wrong_dlc_frames_discarded_whole() {
     );
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
     rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    // With a back-drivable plant, gravity can move a joint after the
+    // watchdog cuts drive torque. Check actuation, not passive motion.
     assert!(
-        rig.state.nodes[node].speed_ticks_s.unwrap().abs() <= 60,
-        "wrong-DLC frames fed the watchdog (drive still running)"
+        rig.state.nodes[node].current_ma.unwrap().abs() <= 2,
+        "wrong-DLC frames kept the drive producing current after watchdog expiry"
     );
     rig.bus.queue_poll_override(
         PollAction::Poll {
@@ -1447,15 +1448,14 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
 /// Reach-down pose over the scene's grasp object (config frame).
 const GRASP_POSE: [f64; 6] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
 
-/// The drivetrain holds: with every driver IDLE the arm keeps its pose
-/// under gravity (the gearboxes do not back-drive), and a load past
-/// the configured holding friction back-drives the joint — the hold is
-/// finite, not a weld.
+/// An explicitly configured holding-friction model resists a small load
+/// but remains back-drivable above that declared breakaway threshold.
 #[test]
-fn unpowered_arm_holds_until_the_holding_friction_is_exceeded() {
+fn explicitly_configured_holding_friction_is_finite() {
     /// Reported drift an unpowered joint may show \[ticks\].
     const HOLD_TOL_TICKS: i32 = 20;
-    let robot = par6();
+    let mut robot = par6();
+    robot.sim.holding_friction_nm = vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3];
     let j = 1usize;
     let node = usize::from(robot.joints[j].node_id);
     // Arm stretched out, nothing in contact: ~5 Nm of gravity on J1.
@@ -1495,6 +1495,34 @@ fn unpowered_arm_holds_until_the_holding_friction_is_exceeded() {
     assert!(
         (last - first).abs() > 200,
         "an overload did not back-drive the shoulder ({first} → {last})"
+    );
+}
+
+#[test]
+fn default_planetary_plant_backdrives_under_gravity() {
+    let robot = par6();
+    let q0 = [0.0, -0.8, 3.5, 0.0, -1.0, 0.0];
+    let mut rig = Rig::boot(&robot, None, Some(&q0));
+    let node = robot.joints[1].node_id;
+    let idle = vec![JointCommand::drop_to_idle(); rig.joints];
+    let mut first = None;
+    for _ in 0..robot.ticks(0.5) {
+        rig.step(&idle, &GripperCommand::NoGripper);
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node,
+                kind: PollKind::Encoder,
+            },
+            1,
+        );
+        if first.is_none() {
+            first = rig.state.nodes[usize::from(node)].position_ticks;
+        }
+    }
+    let last = rig.state.nodes[usize::from(node)].position_ticks.unwrap();
+    assert!(
+        (last - first.unwrap()).abs() > 200,
+        "unpowered shoulder was artificially held against gravity"
     );
 }
 
@@ -1838,8 +1866,11 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     let q0 = [0.0, -1.85, 2.85, 0.0, 0.0, 0.0];
     let mut rig = Rig::boot(&robot, None, Some(&q0));
     let hold = hold_all(&mut rig, &robot);
+    let mut control = Rig::boot(&robot, None, Some(&q0));
+    let control_hold = hold_all(&mut control, &robot);
     for _ in 0..u64::from(robot.ticks(0.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let before = rig.bus.true_joint_rad();
     assert!(
@@ -1892,6 +1923,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     });
     rig.bus.set_world(Layer::Program, &world);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     // The rebuild resets MuJoCo's constraint warm start, so the held arm
     // sees one substep of transient — a fraction of a milliradian.
     let after = rig.bus.true_joint_rad();
@@ -1923,6 +1955,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     );
     for _ in 0..u64::from(robot.ticks(1.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let rest = rig.bus.world_object_pose("block").unwrap();
     assert!(
@@ -1964,6 +1997,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     ));
     rig.bus.set_world(Layer::Program, &world);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     let kept = rig.bus.world_object_pose("block").unwrap();
     assert!(
         (kept[2] - rest[2]).abs() < 1e-6 && (kept[0] - rest[0]).abs() < 1e-6,
@@ -1975,6 +2009,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     );
     for _ in 0..u64::from(robot.ticks(1.5)) {
         rig.step(&hold, &GripperCommand::NoGripper);
+        control.step(&control_hold, &GripperCommand::NoGripper);
     }
     let on_shelf = rig.bus.world_object_pose("block2").unwrap();
     assert!(
@@ -1987,12 +2022,16 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
     // Clearing the layer removes the bodies; the arm still stands.
     rig.bus.set_world(Layer::Program, &[]);
     rig.step(&hold, &GripperCommand::NoGripper);
+    control.step(&control_hold, &GripperCommand::NoGripper);
     assert!(
         rig.bus.world_object_pose("block").is_none()
             && rig.bus.world_object_pose("block2").is_none()
     );
     let cleared = rig.bus.true_joint_rad();
-    for (j, (a, b)) in cleared.iter().zip(&before).enumerate() {
+    // Compare the same elapsed physical hold without the object rebuilds.
+    // A finite-gain hold can sag slightly even with an unchanged scene.
+    let unchanged = control.bus.true_joint_rad();
+    for (j, (a, b)) in cleared.iter().zip(&unchanged).enumerate() {
         assert!(
             (a - b).abs() < 1e-3,
             "joint {j} drifted {:+.5} rad through the world changes",

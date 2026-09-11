@@ -293,3 +293,36 @@ fn a_declared_payload_changes_the_gravity_the_arm_holds() {
         );
     }
 }
+
+#[test]
+fn arm_correction_changes_gravity_without_corrupting_payload_or_dynamics() {
+    let tool = heavy_tool();
+    let mut nominal = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
+    let mut fitted = Kin::load_arm(&assets_dir(), Some(&tool)).unwrap();
+    let mut delta = vec![0.0; fitted.body_count() * 4];
+    delta[9] = 0.02;
+    fitted.set_gravity_correction(&delta).unwrap();
+    for q in CASES {
+        let mut a = [0.; NQ];
+        let mut b = [0.; NQ];
+        nominal.gravity(&q, &mut a).unwrap();
+        fitted.gravity(&q, &mut b).unwrap();
+        let change = gravity::predict(&mut nominal, &delta, &q).unwrap();
+        assert!(max_abs_diff(&b, &std::array::from_fn::<_, NQ, _>(|j| a[j] + change[j])) < 1e-10);
+        nominal
+            .dyn_feedforward(&q, &[0.1; NQ], &[0.2; NQ], &mut a)
+            .unwrap();
+        fitted
+            .dyn_feedforward(&q, &[0.1; NQ], &[0.2; NQ], &mut b)
+            .unwrap();
+        assert!(max_abs_diff(&a, &b) < 1e-10);
+    }
+    fitted.set_gravity_correction(&[]).unwrap();
+    let mut a = [0.; NQ];
+    let mut b = [0.; NQ];
+    nominal.gravity(&CASES[0], &mut a).unwrap();
+    fitted.gravity(&CASES[0], &mut b).unwrap();
+    assert!(max_abs_diff(&a, &b) < 1e-10);
+    assert!(fitted.set_gravity_correction(&[f64::NAN; 28]).is_err());
+    assert!(fitted.set_gravity_correction(&[0.; 4]).is_err());
+}

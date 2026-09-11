@@ -13,14 +13,14 @@ use std::collections::HashMap;
 use std::net::Ipv4Addr;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, split_into_chunks, Command, Reply,
     Status, WireError,
 };
 use tokio::net::UdpSocket;
-use tokio::sync::{oneshot, watch};
+use tokio::sync::{oneshot, watch, RwLock};
 use tokio::task::JoinHandle;
 
 use crate::error::ClientError;
@@ -135,6 +135,19 @@ pub enum Ack {
 /// object).
 pub type Completion = (bool, Option<WireError>, Option<u8>);
 
+/// A wire STATUS frame paired with its receipt time on this client.
+///
+/// The controller's `data_age_ms` describes its own feedback age. This
+/// local timestamp additionally exposes time spent in client processing
+/// and delivery, without changing the wire frame or its clock domain.
+#[derive(Debug, Clone)]
+pub struct ReceivedStatus {
+    /// The decoded controller frame, unchanged from the wire.
+    pub status: Arc<Status>,
+    /// Local monotonic time immediately after the UDP receive completed.
+    pub received_at: Instant,
+}
+
 struct Completions {
     /// Finished commands by index, insertion-ordered for eviction.
     log: HashMap<u64, Completion>,
@@ -146,11 +159,13 @@ pub(crate) struct Inner {
     pub(crate) cfg: ClientConfig,
     sock: UdpSocket,
     pending: Mutex<HashMap<u32, oneshot::Sender<Reply>>>,
+    requests: RwLock<()>,
     completions: Mutex<Completions>,
     req_id: AtomicU32,
     transfer_id: AtomicU32,
     key_state: AtomicU64,
     pub(crate) status_tx: watch::Sender<Option<Arc<Status>>>,
+    received_status: Mutex<Option<ReceivedStatus>>,
     last_seq: Mutex<Option<u64>>,
     seq_gaps: AtomicU64,
     unclaimed: Mutex<HashMap<u16, std::time::Instant>>,
@@ -160,6 +175,18 @@ pub(crate) struct Inner {
     /// for its own run has to know what to put back.
     pub(crate) completion_policy: Mutex<Option<par6_proto::CompletionPolicy>>,
     closed: AtomicBool,
+}
+
+// An async request can be dropped at any await, before its normal return.
+struct PendingRequest<'a> {
+    inner: &'a Inner,
+    req_id: u32,
+}
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.inner.pending.lock().unwrap().remove(&self.req_id);
+    }
 }
 
 /// The async par6 client. Cheap to clone; all clones share one transport.
@@ -211,6 +238,7 @@ impl Client {
             cfg,
             sock,
             pending: Mutex::new(HashMap::new()),
+            requests: RwLock::new(()),
             completions: Mutex::new(Completions {
                 log: HashMap::new(),
                 order: std::collections::VecDeque::new(),
@@ -220,6 +248,7 @@ impl Client {
             transfer_id: AtomicU32::new(seed as u32),
             key_state: AtomicU64::new(seed | 1),
             status_tx,
+            received_status: Mutex::new(None),
             last_seq: Mutex::new(None),
             seq_gaps: AtomicU64::new(0),
             unclaimed: Mutex::new(HashMap::new()),
@@ -250,14 +279,14 @@ impl Client {
         self.inner.status_tx.send_modify(|_| {});
     }
 
-    /// Wait for the aborted listener tasks to wind down.
+    /// Stop listeners and wait until outstanding roundtrips can no longer send.
     ///
-    /// `close` only requests the abort; the tasks' teardown still runs on
-    /// a runtime worker afterwards. A caller that is about to let the
-    /// process exit must wait it out — a worker mid-teardown while the C
-    /// runtime tears the process down dies with a non-unwinding panic.
+    /// The write guard joins entered requests and serializes concurrent closes.
+    /// A future first polled after shutdown observes `closed` before sending.
+    /// Datagrams already handed to the socket cannot be recalled.
     pub async fn close_joined(&self) {
         self.close();
+        let _requests = self.inner.requests.write().await;
         let tasks: Vec<_> = self.tasks.lock().unwrap().drain(..).collect();
         for task in tasks {
             let _ = task.await;
@@ -339,36 +368,42 @@ impl Client {
         req_id: u32,
         attempts: u32,
     ) -> Result<Option<Reply>, ClientError> {
+        let _request = self.inner.requests.read().await;
         if self.is_closed() {
             return Err(ClientError::Closed);
         }
         let (tx, mut rx) = oneshot::channel();
         self.inner.pending.lock().unwrap().insert(req_id, tx);
-        let result = async {
-            for attempt in 0..attempts {
-                for datagram in datagrams {
-                    self.inner.sock.send(datagram).await?;
+        let _pending = PendingRequest {
+            inner: &self.inner,
+            req_id,
+        };
+        for attempt in 0..attempts {
+            for datagram in datagrams {
+                if self.is_closed() {
+                    return Err(ClientError::Closed);
                 }
-                match tokio::time::timeout(self.inner.cfg.timeout, &mut rx).await {
-                    Ok(Ok(reply)) => return Ok(Some(reply)),
-                    Ok(Err(_)) => return Err(ClientError::Closed),
-                    Err(_) if attempt + 1 < attempts => {
-                        // Deterministic backoff with a key-derived jitter.
-                        let base = (0.05 * 2f64.powi(attempt as i32)).min(0.5);
-                        let jitter = (self.fresh_key() % 50) as f64 / 1000.0;
-                        tokio::time::sleep(Duration::from_secs_f64(base + jitter)).await;
-                        if let Ok(reply) = rx.try_recv() {
-                            return Ok(Some(reply));
-                        }
-                    }
-                    Err(_) => {}
-                }
+                self.inner.sock.send(datagram).await?;
             }
-            Ok(None)
+            match tokio::time::timeout(self.inner.cfg.timeout, &mut rx).await {
+                Ok(Ok(reply)) => return Ok(Some(reply)),
+                Ok(Err(_)) => return Err(ClientError::Closed),
+                Err(_) if attempt + 1 < attempts => {
+                    // Closing clears the sender, waking this wait as well as
+                    // the reply timeout; no retry survives the backoff.
+                    let base = (0.05 * 2f64.powi(attempt as i32)).min(0.5);
+                    let jitter = (self.fresh_key() % 50) as f64 / 1000.0;
+                    let backoff = Duration::from_secs_f64(base + jitter);
+                    match tokio::time::timeout(backoff, &mut rx).await {
+                        Ok(Ok(reply)) => return Ok(Some(reply)),
+                        Ok(Err(_)) => return Err(ClientError::Closed),
+                        Err(_) => {}
+                    }
+                }
+                Err(_) => {}
+            }
         }
-        .await;
-        self.inner.pending.lock().unwrap().remove(&req_id);
-        result
+        Ok(None)
     }
 
     fn encode(&self, cmd: &Command, req_id: u32) -> Result<Vec<u8>, ClientError> {
@@ -469,6 +504,14 @@ impl Client {
     /// The latest STATUS frame, if any has arrived.
     pub fn latest_status(&self) -> Option<Arc<Status>> {
         self.inner.status_tx.borrow().clone()
+    }
+
+    /// The latest frame together with its original local receipt time.
+    ///
+    /// Re-reading a cached frame never refreshes its timestamp. The frame
+    /// and receipt are copied together, even if another packet arrives.
+    pub fn latest_received_status(&self) -> Option<ReceivedStatus> {
+        self.inner.received_status.lock().unwrap().clone()
     }
 
     /// Block until `pred` holds for a STATUS frame, or `timeout` expires.
@@ -752,6 +795,7 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
                 continue;
             }
         };
+        let received_at = Instant::now();
         let status = match decode_status(&buf[..n]) {
             Ok(status) => status,
             Err(e) => {
@@ -778,6 +822,15 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
             }
             *last = Some(status.seq);
         }
-        inner.status_tx.send_replace(Some(Arc::new(status)));
+        let status = Arc::new(status);
+        // Publish the paired receipt before waking the existing subscribers.
+        *inner.received_status.lock().unwrap() = Some(ReceivedStatus {
+            status: status.clone(),
+            received_at,
+        });
+        inner.status_tx.send_replace(Some(status));
     }
 }
+
+#[cfg(test)]
+mod tests;

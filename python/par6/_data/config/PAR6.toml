@@ -44,7 +44,9 @@ sector_home_offset_rad = 1.570796327
 
 [joints.gains]
 kpp = 5.0
-kpv = 0.015
+# Velocity damping for the extended-arm load; validated by the held-servo
+# and keep-out approach regressions. Physical tuning remains to be verified.
+kpv = 0.060
 kiv = 0.0015
 kpiq = 7.0
 kiiq = 0.9
@@ -414,75 +416,44 @@ home_offset_rad = 1.86159
 home_offset_gripper_dependent = false
 
 # ============================================================ homing sequence
-# From config/PAR6_homing.xml, step for step.
+# Reference the shoulder/elbow before the base. Home and close the gripper last.
 
-# Home J0 while J1/J2 hold idle and J4 nudges clear.
+# Clear the wrist, then reference J2/J3 (zero-based joints 1/2) before J1.
 [[homing.sequence]]
-pre_moves = [
-    { kind = "idle", joint = 1, duration_s = 4.0 },
-    { kind = "idle", joint = 2, duration_s = 4.0 },
-    { kind = "nudge", joint = 4, speed_ticks_s = -7000.0, duration_s = 2.8 },
-]
+pre_moves = [{ kind = "idle", joint = 1, duration_s = 4.0 }, { kind = "idle", joint = 2, duration_s = 4.0 }, { kind = "nudge", joint = 4, speed_ticks_s = -7000.0, duration_s = 2.8 }]
+home = { joints = [1, 2] }
 
-[homing.sequence.home]
-joints = [0]
-
-# Home J1 + J2 in parallel.
 [[homing.sequence]]
-[homing.sequence.home]
-joints = [1, 2]
+home = { joints = [0] }
 
-# Nudge J4 back.
 [[homing.sequence]]
 pre_moves = [{ kind = "nudge", joint = 4, speed_ticks_s = 5000.0, duration_s = 1.9 }]
 
-# Gripper firmware calibration (built-in activation sequence).
-[[homing.sequence]]
-[homing.sequence.home]
-gripper = "firmware"
-
-# Gripper motor homing (stall-detect against the endstop).
-[[homing.sequence]]
-[homing.sequence.home]
-gripper = "motor"
-
-# Park the gripper jaws near closed.
-[[homing.sequence]]
-pre_moves = [
-    { kind = "gripper_move", position = 252, speed = 150, current_ma = 500, activate = true, action = true, estop = false, release_dir = false, duration_s = 2.5 },
-]
-
-# Nudge J5 off its stop, then move J1/J2 to the mid pose.
 [[homing.sequence]]
 pre_moves = [{ kind = "nudge", joint = 5, speed_ticks_s = -9000.0, duration_s = 1.8 }]
-move_to = [
-    { joint = 1, position_rad = -1.85, duration_s = 2.5 },
-    { joint = 2, position_rad = 2.85, duration_s = 2.5 },
-]
+move_to = [{ joint = 1, position_rad = -1.85, duration_s = 2.5 }, { joint = 2, position_rad = 2.85, duration_s = 2.5 }]
 
-# Home J3 + J5 in parallel.
 [[homing.sequence]]
-[homing.sequence.home]
-joints = [3, 5]
+home = { joints = [3, 5] }
 
-# Move J5 to pi.
 [[homing.sequence]]
 move_to = [{ joint = 5, position_rad = 3.141592654, duration_s = 2.0 }]
 
-# Home J4.
 [[homing.sequence]]
-[homing.sequence.home]
-joints = [4]
+home = { joints = [4] }
 
-# Final ready pose.
 [[homing.sequence]]
-move_to = [
-    { joint = 0, position_rad = 1.57, duration_s = 3.0 },
-    { joint = 3, position_rad = 0.0, duration_s = 3.0 },
-    { joint = 4, position_rad = -0.5, duration_s = 3.0 },
-]
+move_to = [{ joint = 0, position_rad = 1.57, duration_s = 3.0 }, { joint = 3, position_rad = 0.0, duration_s = 3.0 }, { joint = 4, position_rad = -0.5, duration_s = 3.0 }]
 
-# ================================================== bus (vendor CAN protocol)
+[[homing.sequence]]
+home = { gripper = "firmware" }
+
+[[homing.sequence]]
+home = { gripper = "motor" }
+
+[[homing.sequence]]
+pre_moves = [{ kind = "gripper_move", position = 252, speed = 150, current_ma = 500, activate = true, action = true, estop = false, release_dir = false, duration_s = 2.5 }]
+
 [bus]
 interface = "can0"
 bitrate = 1000000
@@ -583,9 +554,9 @@ motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
 motor_b_nm_s = 1.0e-4
 motor_tc_nm = 0.02
 # Gearbox holding friction [Nm, joint side]: the load an unpowered joint
-# carries without back-driving. Sized over the worst gravity torque in the
-# joint's range, or an IDLE arm collapses under its own weight.
-holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
+# carries without back-driving. No load-dependent self-locking is assumed
+# for the planetary gearboxes; Coulomb and viscous losses remain modeled.
+holding_friction_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
 
 [stream]
 command_timeout_s = 0.04

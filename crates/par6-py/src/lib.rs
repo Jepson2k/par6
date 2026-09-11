@@ -3,6 +3,7 @@
 //! faces over the Rust crates. The Python package (`par6`) keeps its
 //! public API as a shim over this module and holds no numerics of its own.
 
+mod calibration;
 mod client;
 mod collision;
 mod config;
@@ -88,6 +89,8 @@ fn make_wire_error(
 
 #[pymodule]
 fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
+    m.add_class::<calibration::GravityModel>()?;
+    m.add_function(wrap_pyfunction!(calibration::calibration_config, m)?)?;
     m.add_class::<client::CoreClient>()?;
     m.add_class::<preview::Preview>()?;
     m.add_class::<kinematics::Kinematics>()?;

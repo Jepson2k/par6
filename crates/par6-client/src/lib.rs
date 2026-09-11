@@ -13,7 +13,9 @@ mod sockets;
 mod sync;
 
 pub use crate::api::{freedrive, MotionWait};
-pub use crate::core::{Ack, Client, ClientConfig, Completion, StatusTransport, MIN_MTU};
+pub use crate::core::{
+    Ack, Client, ClientConfig, Completion, ReceivedStatus, StatusTransport, MIN_MTU,
+};
 pub use crate::error::ClientError;
 pub use crate::sync::SyncClient;
 

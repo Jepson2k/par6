@@ -5,6 +5,7 @@
 //! exposed; everything else lives in the config file.
 
 use std::net::IpAddr;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 
 pub use par6_server::StatusTransport;
@@ -52,6 +53,10 @@ OPTIONS:
                                thread, 2 MiB x5) and commands.log (command plane,
                                daemon, host vitals, 20 MiB x5). stderr is unchanged.
                                [env: PAR6_LOG_DIR]
+    --diagnostics-max-samples <N>
+                               Positive recording budget [default: 900000].
+                               [env: PAR6_DIAGNOSTICS_MAX_SAMPLES]
+                               PAR6_DIAGNOSTICS names the new capture file.
     --check-config             Validate the config bundle (robot TOML + grippers)
                                and exit: 0 = valid, 1 = invalid.
     --parent-pid <PID>         Exit when this process is no longer the parent
@@ -93,6 +98,9 @@ pub struct Options {
     /// Directory for the rotating activity logs (`--log-dir` /
     /// `PAR6_LOG_DIR`); `None` = stderr only.
     pub log_dir: Option<PathBuf>,
+    /// Maximum native samples in an opt-in diagnostic capture.
+    /// `None` uses the bounded default of 900,000 samples.
+    pub diagnostics_max_samples: Option<NonZeroU64>,
     /// `--check-config` was requested: validate the bundle and exit.
     pub check_config: bool,
     /// Die with this process (`--parent-pid`): the spawner's pid, compared
@@ -134,6 +142,10 @@ impl Options {
                     o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
                 }
                 "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
+                "--diagnostics-max-samples" => {
+                    o.diagnostics_max_samples =
+                        Some(parse_sample_budget(&value(&mut args, &arg)?, &arg)?);
+                }
                 "--check-config" => o.check_config = true,
                 "--parent-pid" => {
                     let raw = value(&mut args, &arg)?;
@@ -201,6 +213,12 @@ impl Options {
         if self.status_rate_hz.is_none() {
             if let Some(v) = env_var("PAR6_STATUS_RATE_HZ") {
                 self.status_rate_hz = Some(parse_rate(&v, "PAR6_STATUS_RATE_HZ")?);
+            }
+        }
+        if self.diagnostics_max_samples.is_none() {
+            if let Some(v) = env_var("PAR6_DIAGNOSTICS_MAX_SAMPLES") {
+                self.diagnostics_max_samples =
+                    Some(parse_sample_budget(&v, "PAR6_DIAGNOSTICS_MAX_SAMPLES")?);
             }
         }
         if self.log_dir.is_none() {
@@ -274,6 +292,11 @@ fn parse_num(v: &str, what: &str) -> Result<u16, String> {
 fn parse_rate(v: &str, what: &str) -> Result<u32, String> {
     v.parse::<u32>()
         .map_err(|_| format!("{what}: invalid rate `{v}`"))
+}
+
+fn parse_sample_budget(v: &str, what: &str) -> Result<NonZeroU64, String> {
+    v.parse()
+        .map_err(|_| format!("{what}: `{v}` is not a positive sample count"))
 }
 
 fn parse_ip(v: &str, what: &str) -> Result<IpAddr, String> {

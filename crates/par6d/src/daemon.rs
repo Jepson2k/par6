@@ -281,7 +281,7 @@ impl Daemon {
             fk: fk_hook,
             samples: consumer,
         };
-        let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        let (mut core, handles) = RtCore::new(&bundle, bus, hooks)?;
 
         // The RT snapshot channel is single-reader; the tee fans it out.
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
@@ -349,6 +349,22 @@ impl Daemon {
             .enable_all()
             .build()?;
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
+        if let Some(path) = std::env::var_os("PAR6_DIAGNOSTICS") {
+            let (writer, reader) = par6_rt::diagnostics::capture_channel(2048);
+            core.set_capture(writer);
+            let (thread, identity) = crate::diagnostics::spawn(
+                std::path::Path::new(&path),
+                reader,
+                &cfg.config_info.fingerprint,
+                dt,
+                shutdown.clone(),
+                opts.diagnostics_max_samples
+                    .unwrap_or(crate::diagnostics::DEFAULT_MAX_SAMPLES),
+            )?;
+            cfg.capture_identity = Some(identity);
+            threads.push(thread);
+        }
+
         // The installation layer is applied here, while the planner is
         // still in hand: it is immutable from the wire, and a keep-out
         // the runtime cannot enforce has to stop the boot rather than
@@ -939,8 +955,11 @@ pub(crate) fn load_kin_stack(
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{KinFk, KinGravity, ToolOffset};
     let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
-    let gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_gripper)
+    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_gripper)
         .map_err(DaemonError::Kinematics)?;
+    gravity_kin
+        .set_gravity_correction(&robot.gravity_correction)
+        .map_err(|e| DaemonError::Kinematics(e.to_string()))?;
     let tool_offset = ToolOffset::new();
     Ok(KinStack {
         fk: KinFk::new(src.kin()?, tool_offset.clone()),

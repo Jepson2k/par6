@@ -191,6 +191,8 @@ wire_enum! {
         BusScan = 61,
         /// Current STATUS rate, and the tick rate it divides.
         StatusRate = 62,
+        /// Identity of the optional native diagnostic recorder.
+        CaptureInfo = 63,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -288,6 +290,8 @@ wire_enum! {
         BusScan = 22,
         /// See [`CmdType::StatusRate`].
         StatusRate = 23,
+        /// See [`CmdType::CaptureInfo`].
+        CaptureInfo = 24,
     }
 }
 
@@ -472,7 +476,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Payload
         | C::ConfigBundle
         | C::BusScan
-        | C::StatusRate => CommandClass::Query,
+        | C::StatusRate
+        | C::CaptureInfo => CommandClass::Query,
 
         C::ServoJ
         | C::ServoJPose

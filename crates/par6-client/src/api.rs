@@ -123,8 +123,13 @@ impl Client {
         self.query(Command::Shapes).await
     }
 
+    /// Identity of the runtime's optional native diagnostic recorder.
+    pub async fn capture_info(&self) -> Result<QueryResult, ClientError> {
+        self.query(Command::CaptureInfo).await
+    }
+
     /// The runtime's effective configuration (path, content fingerprint,
-    /// per-joint limits, motion constants) — the config-skew hook.
+    /// per-joint limits, motion constants).
     pub async fn config_info(&self) -> Result<QueryResult, ClientError> {
         self.query(Command::ConfigInfo).await
     }

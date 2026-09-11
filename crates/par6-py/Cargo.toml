@@ -27,6 +27,7 @@ par6d = { path = "../par6d" }
 # Command dicts deserialize straight into `par6_proto::Command`.
 pythonize = "0.23"
 serde = { workspace = true }
+toml = { workspace = true }
 pyo3 = { version = "0.23", features = ["abi3-py310", "extension-module"] }
 pyo3-async-runtimes = { version = "0.23", features = ["tokio-runtime"] }
 tokio = { workspace = true }

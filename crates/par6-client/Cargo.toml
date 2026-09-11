@@ -15,6 +15,7 @@ thiserror = { workspace = true }
 log = { workspace = true }
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
 par6d = { path = "../par6d" }
 par6-config = { workspace = true }
 env_logger = { workspace = true }

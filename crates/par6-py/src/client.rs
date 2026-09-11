@@ -18,8 +18,8 @@ use par6_proto::command as cmd;
 use par6_proto::{Command, CompletionPolicy, NUM_JOINTS};
 
 use crate::convert::{
-    client_err, flashing_assertion, frame_of, query_result_dict, shape_from_py, status_dict,
-    tool_param_from_py, wire_error_tuple,
+    client_err, flashing_assertion, frame_of, query_result_dict, received_status_dict,
+    shape_from_py, tool_param_from_py, wire_error_tuple,
 };
 
 /// The model a payload identification measures against: the arm with no
@@ -239,16 +239,18 @@ impl CoreClient {
         self.client.status_seq_gaps()
     }
 
-    /// The latest STATUS frame as a dict, or `None` before the first one.
+    /// The latest STATUS frame and its client-local monotonic receipt time,
+    /// or `None` before the first one.
     fn latest_status(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        match self.client.latest_status() {
-            Some(s) => Ok(Some(status_dict(py, &s)?)),
+        match self.client.latest_received_status() {
+            Some(s) => Ok(Some(received_status_dict(py, &s)?)),
             None => Ok(None),
         }
     }
 
     /// Await a STATUS frame whose seq differs from `last_seq` (pass -1
     /// for "any frame"), up to `timeout` seconds; `None` on timeout.
+    /// `client_received_monotonic_s` includes time spent awaiting Python.
     fn status_after<'py>(
         &self,
         py: Python<'py>,
@@ -266,8 +268,8 @@ impl CoreClient {
             if !hit {
                 return Ok(None);
             }
-            match client.latest_status() {
-                Some(s) => Python::with_gil(|py| status_dict(py, &s).map(Some)),
+            match client.latest_received_status() {
+                Some(s) => Python::with_gil(|py| received_status_dict(py, &s).map(Some)),
                 None => Ok(None),
             }
         })
@@ -509,6 +511,10 @@ impl CoreClient {
 
     fn shapes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         query_future(py, self.rt(), Command::Shapes)
+    }
+
+    fn capture_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        query_future(py, self.rt(), Command::CaptureInfo)
     }
 
     fn config_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {

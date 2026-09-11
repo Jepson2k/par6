@@ -2580,6 +2580,9 @@ impl<R: RtCommands> Core<R> {
                 hz: f64::from(self.status_rate_hz),
                 tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
             },
+            C::CaptureInfo => QueryResult::CaptureInfo {
+                identity: self.cfg.capture_identity.clone(),
+            },
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -3020,6 +3023,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
         T::ConfigInfo => "config_info",
+        T::CaptureInfo => "capture_info",
         T::ConfigBundle => "config_bundle",
         T::Payload => "payload",
         T::ServoJ => "servo_j",
