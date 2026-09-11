@@ -842,6 +842,7 @@ impl<R: RtCommands> Core<R> {
                 self.standing_error =
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 self.cancel_all_motion("estop").await;
+                self.clear_pause();
                 Ok(())
             }
             C::SetExecutionSpeed(p) => {
@@ -863,6 +864,7 @@ impl<R: RtCommands> Core<R> {
                 } else {
                     self.cancel_active_motion("stop").await
                 };
+                self.clear_pause();
                 if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
@@ -1718,6 +1720,16 @@ impl<R: RtCommands> Core<R> {
 
     /// estop / reset_state / simulator-toggle scope: everything, each
     /// dropped command's COMPLETE spoken.
+    /// A pause holds the queue it interrupted. Stop, Estop and reset
+    /// discard that queue, so a standing pause would otherwise withhold
+    /// every command queued afterwards with nothing to say why.
+    fn clear_pause(&mut self) {
+        if self.execution_paused {
+            self.execution_paused = false;
+            self.runtime.rt.set_exec_paused(false);
+        }
+    }
+
     async fn cancel_all_motion(&mut self, scope: &'static str) -> usize {
         let mut dropped = self.drop_active_motion();
         dropped.extend(self.drop_pending());
@@ -1938,6 +1950,7 @@ impl<R: RtCommands> Core<R> {
         self.tcp_rotation_deg = [0.0; 3];
         self.completion_policy = CompletionPolicy::Settled;
         self.profile = self.cfg.initial_profile.clone();
+        self.clear_pause();
         self.runtime.rt.reset_state();
         self.sync_planner();
         // The program layer only: installation keep-outs are the
