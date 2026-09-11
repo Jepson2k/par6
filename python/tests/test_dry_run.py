@@ -18,6 +18,7 @@ import time
 import numpy as np
 import pytest
 from live_daemon import STATUS_RATE_HZ, TICK_DT_S, LiveDaemon, requires_par6d
+from waldoctl import CommandKind, command_table
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -1165,3 +1166,114 @@ def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
     assert dry_run.angles() == pytest.approx(start, abs=1e-6), (
         "the swing must end where the pick left the arm"
     )
+
+
+_TABLE_ARGS: dict[str, tuple] = {
+    "move_j": ([10.0, -80.0, 160.0, 5.0, -10.0, 170.0],),
+    "move_l": (None,),
+    "move_c": (None, None),
+    "move_s": (None,),
+    "move_p": (None,),
+    "servo_j": ([10.0, -80.0, 160.0, 5.0, -10.0, 170.0],),
+    "servo_l": (None,),
+    "jog_j": (0, 0.5, 0.1),
+    "jog_l": ("WRF", "X", 0.5, 0.1),
+    "estimate_payload": (),
+    "home": (),
+    "checkpoint": ("mark",),
+    "delay": (0.1,),
+    "write_io": (0, 1),
+    "tool_action": ("<fitted>", "calibrate"),
+    "reset": (),
+    "reset_state": (),
+    "simulator": (True,),
+    "teleport": (None,),
+    "freedrive": (False,),
+    "set_shapes": ([],),
+    "select_profile": ("RUCKIG",),
+    "select_tool": ("<fitted>",),
+    "set_tcp_offset": (0.0, 0.0, 0.0),
+    "set_payload": (0.1,),
+    "stop": (),
+    "estop": (),
+}
+_TABLE_KWARGS: dict[str, dict] = {
+    n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")
+}
+
+
+def test_every_table_command_answers_with_the_kind_it_declares() -> None:
+    """The command table on ``RobotClient`` classifies every command; this
+    preview answers each kind the way a program can rely on.
+
+    Queued work answers with the plan the runtime will run (or ``None``
+    while the blend hold keeps it) — the frontend's preview turns that into
+    the queue index the ABC promises. A system or control command has no
+    plan, so it answers with the live client's own ``1``/``0``/negative
+    code: ``if rbt.stop() < 0`` reads the same offline and on the arm.
+    """
+    client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+    park = park_deg()
+    base = np.asarray(client.pose())
+    pose = _offset(base, (20.0, 0.0, 0.0)).tolist()
+    problems: list[str] = []
+    exercised = 0
+    for name, spec in command_table().items():
+        if spec.kind not in (
+            CommandKind.MOTION,
+            CommandKind.QUEUED,
+            CommandKind.SYSTEM,
+            CommandKind.CONTROL,
+        ):
+            continue
+        method = getattr(client, name, None)
+        if method is None or name == "connect_hardware":
+            # An optional command par6 does not implement, or the one that
+            # puts the preview on hardware, where teleport is refused.
+            continue
+        assert name in _TABLE_ARGS, f"add sample arguments for {name}"
+        args = tuple(
+            park
+            if name == "teleport"
+            else pose
+            if a is None
+            else client.active_tool_key
+            if a == "<fitted>"
+            else a
+            for a in _TABLE_ARGS[name]
+        )
+        if name in ("move_s", "move_p"):
+            args = ([pose, _offset(base, (20.0, 0.0, 20.0)).tolist()],)
+        if name == "move_c":
+            args = (_offset(base, (10.0, 10.0, 0.0)).tolist(), pose)
+        # An e-stop latches and a move leaves the arm where it finished;
+        # clear both so the next command answers for itself.
+        client.reset()
+        client.teleport(park)
+        result = getattr(client, name)(*args, **_TABLE_KWARGS.get(name, {}))
+        exercised += 1
+        if name == "estimate_payload":
+            if result is None or not hasattr(result, "mass"):
+                problems.append(
+                    f"estimate_payload answers the estimate, got {result!r}"
+                )
+        elif spec.kind in (CommandKind.MOTION, CommandKind.QUEUED):
+            # Queued work: the plan, an index, or None while the hold keeps it.
+            if isinstance(result, DryRunResultData):
+                if result.error is not None:
+                    problems.append(f"{name}: refused: {result.error}")
+            elif isinstance(result, bool) or not isinstance(result, (int, type(None))):
+                problems.append(
+                    f"{name}: queued work previews as a plan or an index, "
+                    f"got {result!r}"
+                )
+            elif isinstance(result, int) and result < 0:
+                problems.append(f"{name}: refused with {result}")
+            if name == "home" and result is None:
+                problems.append("home: the return move is a plan, not nothing")
+        elif isinstance(result, bool) or not isinstance(result, int):
+            problems.append(f"{name}: {spec.kind.value} returns an int, got {result!r}")
+        elif result < 0:
+            problems.append(f"{name}: refused with {result}")
+    assert not problems, "\n".join(problems)
+    assert exercised >= 20
