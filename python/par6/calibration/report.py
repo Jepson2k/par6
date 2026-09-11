@@ -1,4 +1,5 @@
-"""Owner-only calibration evidence and native-validated startup profiles."""
+"""Run evidence on disk (owner-only), the TOML patch a routine measured, and
+the staged candidate/rollback configs Commander activates with PAR6_CONFIG."""
 
 from __future__ import annotations
 
@@ -6,6 +7,7 @@ import hashlib
 import json
 import os
 import tempfile
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 from par6._par6 import calibration_config
@@ -38,34 +40,97 @@ def fingerprint(bundle: dict) -> str:
     ).hexdigest()
 
 
-def export_profile(
-    directory: Path,
-    bundle: dict,
-    report: dict,
-    *,
-    gravity=None,
-    exec_limits=None,
-    stream_limits=None,
-    jog_limits=None,
-    feedback_gains=None,
-) -> Path:
-    """Stage a validated config and rollback bundle. Does not restart a controller.
+@dataclass
+class Patch:
+    """Only what a routine measured; everything else in the config is untouched.
 
-    Activation uses the normal Commander-managed runtime launch with PAR6_CONFIG;
-    verify_applied checks its readback before any comparison moves are allowed.
+    `gravity` is the 24-coefficient arm correction (with `gravity_scale` reset
+    to ones, since the correction supersedes a manual trim), `exec_limits` /
+    `stream_limits` are per-joint `[v, a, j]`, `feedback_gains` maps a joint
+    index to its `[kpp, kpv, kiv]`.
+    """
+
+    gravity: list[float] | None = None
+    exec_limits: list[list[float]] | None = None
+    stream_limits: list[list[float]] | None = None
+    feedback_gains: dict[int, list[float]] = field(default_factory=dict)
+
+    def is_empty(self) -> bool:
+        return (
+            self.gravity is None
+            and self.exec_limits is None
+            and self.stream_limits is None
+            and not self.feedback_gains
+        )
+
+    def to_dict(self) -> dict:
+        d = asdict(self)
+        d["feedback_gains"] = {str(k): v for k, v in self.feedback_gains.items()}
+        return d
+
+    def toml(self) -> str:
+        """A human-readable summary of the patch in TOML form."""
+        lines = ["# par6 calibration patch: measured values only"]
+        if self.gravity is not None:
+            lines.append(f"gravity_correction = {json.dumps(self.gravity)}")
+            lines.append("gravity_scale = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]")
+        for name, limits in (
+            ("exec", self.exec_limits),
+            ("stream", self.stream_limits),
+        ):
+            if limits is None:
+                continue
+            for j, (v, a, jerk) in enumerate(limits):
+                lines.append(f"# joint{j + 1}")
+                lines.append(f"[joints.limits.{name}]  # J{j + 1}")
+                lines.append(f"velocity_rad_s = {v:.4g}")
+                lines.append(f"acceleration_rad_s2 = {a:.4g}")
+                lines.append(f"jerk_rad_s3 = {jerk:.4g}")
+        for j, (kpp, kpv, kiv) in sorted(self.feedback_gains.items()):
+            lines.append(f"[joints.gains]  # J{j + 1}")
+            lines.append(f"kpp = {kpp:.6g}")
+            lines.append(f"kpv = {kpv:.6g}")
+            lines.append(f"kiv = {kiv:.6g}")
+        return "\n".join(lines) + "\n"
+
+    def apply(self, robot: dict, robot_toml: str) -> str:
+        """The full robot TOML with this patch merged, through the native
+        writer (`calibration_config`) so the result is validated as the
+        runtime will read it."""
+        gains = None
+        if self.feedback_gains:
+            gains = [
+                [j["gains"][k] for k in ("kpp", "kpv", "kiv")] for j in robot["joints"]
+            ]
+            for joint, values in self.feedback_gains.items():
+                gains[joint] = list(values)
+        return calibration_config(
+            robot_toml,
+            self.gravity,
+            self.exec_limits,
+            self.stream_limits,
+            None,
+            gains,
+        )
+
+
+def write_profile(
+    directory: Path, bundle: dict, robot: dict, report: dict, patch: Patch
+) -> Path:
+    """Stage `candidate/` (the patched config) and `rollback/` (the loaded one)
+    beside a manifest. Nothing is restarted here: activation is a normal
+    Commander-managed launch with PAR6_CONFIG pointing at the candidate, and
+    verify_applied checks the readback before any comparison move.
     """
     if report.get("valid") is not True:
         raise ValueError("Only a validated report may produce an operating profile")
     if report.get("baseline_fingerprint") != fingerprint(bundle):
         raise ValueError("Calibration report belongs to a different configuration")
-    text = calibration_config(
-        bundle["robot_toml"],
-        gravity,
-        exec_limits,
-        stream_limits,
-        jog_limits,
-        feedback_gains,
-    )
+    if patch.is_empty():
+        raise ValueError("Nothing was measured; there is no profile to stage")
+    text = patch.apply(robot, bundle["robot_toml"])
+    atomic_text(directory / "calibration-patch.toml", patch.toml())
+    atomic_json(directory / "patch.json", patch.to_dict())
     for dest, robot_text in [
         (directory / "candidate", text),
         (directory / "rollback", bundle["robot_toml"]),

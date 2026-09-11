@@ -1,4 +1,12 @@
-"""Reader for bounded native PAR6CAP2 recordings; partial records are ignored."""
+"""Reader for the native PAR6CAP2 recording (250 Hz RT snapshots on disk).
+
+Every measurement in this package comes from this file, never from the
+50 Hz STATUS stream: Python scheduling jitter can delay a status packet,
+it cannot change what the RT thread wrote. Partial trailing records are
+ignored.
+"""
+
+from __future__ import annotations
 
 import struct
 import time
@@ -27,13 +35,32 @@ DTYPE = np.dtype(
         ("values", "<f8", (len(FIELDS), 6)),
     ]
 )
-
-
 HEADER_SIZE = 96
+#: The disk writer trails the RT thread by its flush cadence; on a loaded host
+#: a couple of seconds still means "recording", ten minutes into a run.
+WRITER_LAG_S = 2.0
+
+#: `flags` bits written by par6d's recorder (see crates/par6d/src/diagnostics.rs).
+FLAG_FAULT = 1
+FLAG_HOMED = 2
+FLAG_ENABLED = 4
+FLAG_STALE = 8
+FLAG_GRAVITY = 16
+MODE_SHIFT = 8
+MODE_IDLE = 1
+MODE_HOMING = 3
+MODE_JOG = 4
+MODE_STREAM = 5
+MODE_EXEC = 6
+MOTION_MODES = (MODE_JOG, MODE_STREAM, MODE_EXEC)
 
 
-def metadata(path: Path):
-    with path.open("rb") as f:
+def mode(row) -> int:
+    return row["flags"] >> MODE_SHIFT
+
+
+def metadata(path: Path) -> dict:
+    with Path(path).open("rb") as f:
         header = f.read(HEADER_SIZE)
     if len(header) != HEADER_SIZE or header[:8] != b"PAR6CAP2":
         raise ValueError("Not a PAR6CAP2 recording")
@@ -45,25 +72,55 @@ def metadata(path: Path):
     }
 
 
-def active_rows(rows):
-    """Remove idle edges, preserving and validating every tick during motion."""
-    if any(r["flags"] & 1 for r in rows):
+def length(path: Path) -> int:
+    return max(0, (Path(path).stat().st_size - HEADER_SIZE) // DTYPE.itemsize)
+
+
+def read_capture(path: Path, start: int = 0, end: int | None = None):
+    """Rows `start..end` as dicts; returns `(dt, rows)`."""
+    path = Path(path)
+    info = metadata(path)
+    with path.open("rb") as f:
+        f.seek(HEADER_SIZE + start * DTYPE.itemsize)
+        data = f.read() if end is None else f.read(max(0, end - start) * DTYPE.itemsize)
+    array = np.frombuffer(
+        data[: len(data) // DTYPE.itemsize * DTYPE.itemsize], dtype=DTYPE
+    )
+    columns = {name: array["values"][:, i, :].tolist() for i, name in enumerate(FIELDS)}
+    rows = [
+        {
+            "tick": tick,
+            "elapsed_ns": elapsed,
+            "flags": flags,
+            **{name: columns[name][i] for name in FIELDS},
+        }
+        for i, (tick, elapsed, flags) in enumerate(
+            zip(
+                array["tick"].tolist(),
+                array["elapsed_ns"].tolist(),
+                array["flags"].tolist(),
+            )
+        )
+    ]
+    return info["dt"], rows
+
+
+def active_rows(rows, modes=MOTION_MODES):
+    """The rows between the first and last motion-mode tick, validated."""
+    if any(r["flags"] & FLAG_FAULT for r in rows):
         raise ValueError("Controller fault during the recorded trial or stop")
-    active = [i for i, r in enumerate(rows) if r["flags"] >> 8 in (4, 5, 6)]
+    active = [i for i, r in enumerate(rows) if mode(r) in modes]
     if not active:
         raise ValueError("Capture contains no controlled motion")
     result = rows[active[0] : active[-1] + 1]
-    if any(r["flags"] >> 8 not in (4, 5, 6) for r in result):
+    if any(mode(r) not in modes for r in result):
         raise ValueError("Controller left motion mode during the trial")
     return result
 
 
 def measurement_rows(rows, dt, *, simulator):
-    """Use the plant clock for derivatives while retaining host timing evidence.
-
-    MuJoCo advances exactly one configured dt per native tick, including host
-    catch-up ticks. Physical encoder measurements retain monotonic host time.
-    """
+    """Derivative clock per row: the plant tick in simulation (one dt per
+    native tick, catch-up ticks included), monotonic host time on hardware."""
     if not np.isfinite(dt) or not 0 < dt < 1:
         raise ValueError("Invalid measurement period")
     return [
@@ -78,6 +135,7 @@ def measurement_rows(rows, dt, *, simulator):
 
 
 def assert_live(path: Path, expected_fingerprint: str, *, expected_identity=None):
+    """The file is the connected runtime's recorder and is still advancing."""
     info = metadata(path)
     if expected_identity is not None and any(
         info[key] != expected_identity.get(key)
@@ -93,52 +151,22 @@ def assert_live(path: Path, expected_fingerprint: str, *, expected_identity=None
         not rows
         or not -0.5
         <= time.time() - info["started"] - rows[-1]["elapsed_ns"] * 1e-9
-        <= 0.5
+        <= WRITER_LAG_S
     ):
         raise RuntimeError("Native recording stopped or is stale")
     return info
 
 
-def read_capture(path: Path, start=0, end=None):
-    with path.open("rb") as f:
-        info = metadata(path)
-        f.seek(HEADER_SIZE + start * DTYPE.itemsize)
-        data = f.read() if end is None else f.read(max(0, end - start) * DTYPE.itemsize)
-    array = np.frombuffer(
-        data[: len(data) // DTYPE.itemsize * DTYPE.itemsize], dtype=DTYPE
-    )
-    # Decode columns in bulk. Repeated NumPy scalar/field indexing in the
-    # 50 Hz command task can otherwise consume an entire command interval.
-    columns = {name: array["values"][:, i, :].tolist() for i, name in enumerate(FIELDS)}
-    return info["dt"], [
-        {
-            "tick": tick,
-            "elapsed_ns": elapsed,
-            "flags": flags,
-            **{name: columns[name][i] for name in FIELDS},
-        }
-        for i, (tick, elapsed, flags) in enumerate(
-            zip(
-                array["tick"].tolist(),
-                array["elapsed_ns"].tolist(),
-                array["flags"].tolist(),
-            )
-        )
-    ]
-
-
-def length(path: Path):
-    return max(0, (path.stat().st_size - HEADER_SIZE) // DTYPE.itemsize)
-
-
-def reference_identity(path: Path):
-    """Bind observations to one process and its latest homing/unhomed interval."""
+def reference_identity(path: Path) -> dict:
+    """The recorder process and the tick its latest homing reference dates from."""
     info = metadata(path)
     count = length(path)
     if not count:
         raise ValueError("Capture has no reference evidence")
     samples = np.memmap(path, dtype=DTYPE, mode="r", offset=HEADER_SIZE, shape=(count,))
     flags = samples["flags"]
-    changed = np.flatnonzero(((flags & 2) == 0) | ((flags >> 8) == 3))
+    changed = np.flatnonzero(
+        ((flags & FLAG_HOMED) == 0) | ((flags >> MODE_SHIFT) == MODE_HOMING)
+    )
     tick = int(samples["tick"][changed[-1]]) if len(changed) else None
     return {"pid": info["pid"], "started": info["started"], "reference_tick": tick}

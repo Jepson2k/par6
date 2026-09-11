@@ -563,6 +563,7 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_TICK_PROFILE` | per-phase RT tick profiler, logged once a second (`--tick-profile`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
+| `PAR6_DIAGNOSTICS` | write a 250 Hz native recording (PAR6CAP2) of every RT snapshot to this new file; `PAR6_DIAGNOSTICS_MAX_SAMPLES` / `--diagnostics-max-samples` bound it (default one hour). Calibration reads it. |
 
 ### Activity logs
 
@@ -629,6 +630,16 @@ worth looking at. An interrupted write leaves the drive waiting in its
 bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
 drive's parameters back, presets, calibration — is UART-only and stays with the
 vendor's tool over a bench connection.
+
+### Calibrating the arm
+
+`par6-calibrate {check,tune-feedback,gravity,limits}` (or the Calibration
+section of Commander's Diagnostics tab) measures one arm — motion baseline,
+velocity-loop gains against vibration, the gravity model, the joint
+velocity/acceleration/jerk limits — against the running `par6d` with
+`PAR6_DIAGNOSTICS` set, and stages a candidate config plus rollback that a
+restart with `PAR6_CONFIG` activates. See [`docs/calibration.md`](docs/calibration.md)
+for the routines, their acceptance rules and what the evidence does not show.
 
 ### The bus-grant signal
 

@@ -1,18 +1,23 @@
-"""Measured arm calibration. Profiles are promoted only after held-out validation."""
+"""Measured arm calibration: check, tune-feedback, gravity, limits.
 
-from .feedback import feedback
-from .profiles import export_profile, verify_applied
-from .routines import check_motion, gravity, motion_envelope, smoothness, verify_gravity
-from .session import CalibrationSession
+Every routine runs against the connected par6d with its native recorder on,
+judges the recording after an acknowledged Stop, and stages a candidate
+config (plus rollback) that Commander activates with PAR6_CONFIG. Nothing is
+applied automatically.
+"""
+
+from .report import Patch, verify_applied, write_profile
+from .routines import check, gravity, limits, tune_feedback
+from .session import Session, TrialRejected
 
 __all__ = [
-    "CalibrationSession",
+    "Patch",
+    "Session",
+    "TrialRejected",
+    "check",
     "gravity",
-    "feedback",
-    "check_motion",
-    "motion_envelope",
-    "smoothness",
-    "export_profile",
+    "limits",
+    "tune_feedback",
     "verify_applied",
-    "verify_gravity",
+    "write_profile",
 ]

@@ -22,6 +22,7 @@ par6 = "par6.cli:main"
 par6d = "par6._daemon:main"
 par6-panel = "par6.panel.service:main"
 par6-preflight = "par6.panel.preflight:main"
+par6-calibrate = "par6.calibration.cli:main"
 
 [project.optional-dependencies]
 # ruff is pinned: it was unpinned and unconfigured, so CI installed whatever

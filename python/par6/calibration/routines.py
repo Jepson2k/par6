@@ -1,346 +1,345 @@
-"""Repeatable calibration protocols, separate from Commander presentation."""
+"""The four calibration routines. Each is plain sequential code over a
+Session: plan, preflight, stimulate, judge the recording, report a Patch."""
 
 from __future__ import annotations
 
-import json
-from pathlib import Path
-
 import numpy as np
 
-from .analysis import fit_gravity
-from .gravity_validation import coverage, paired_torque, sweep_evidence
-from .preflight import check_stream, stream_scale
-from .profiles import atomic_json, export_profile
-from .session import TrialRejected
-from .trajectory import candidate_values, coupled_move, envelope_move, move, sweeps
-from .validation import measured_excitation
+from .gravity import (
+    centers,
+    coverage,
+    fit_gravity,
+    gravity_centers,
+    paired_torque,
+    sweep_evidence,
+)
+from .metrics import (
+    motion_acceptance,
+    motion_metrics,
+    motion_window_peaks,
+    steady_samples,
+)
+from .preflight import check_stream
+from .report import Patch, atomic_json, write_profile
+from .session import Session, TrialRejected
+from .trajectory import move, sweeps
+
+#: Slow limits for identification sweeps [rad/s, rad/s², rad/s³].
+SLOW = np.array([0.07, 0.12, 0.5])
+#: Speed at which a moving sample counts as moving (encoder noise floor).
+MOVING_RAD_S = 0.015
 
 
-def centers(start):
-    # Different shoulder/elbow lever arms; the full paths are checked before motion.
-    values = []
-    for shoulder, elbow, wrist in [
-        (0, 0, 0),
-        (0.3, 0.3, 0.3),
-        (-0.15, 0.2, -0.2),
-        (0.2, -0.2, 0.2),
-        (-0.1, 0.4, 0.1),
-        (0.15, 0.1, -0.1),
-    ]:
-        q = np.array(start, dtype=float)
-        q[1] += shoulder
-        q[2] += elbow
-        q[4] += wrist
-        values.append(q)
-    return values
+def _report(
+    session: Session, kind: str, valid: bool, reasons: list[str], **fields
+) -> dict:
+    report = {
+        "kind": kind,
+        "valid": bool(valid),
+        "reasons": reasons,
+        "baseline_fingerprint": session.fingerprint,
+        "identity": session.identity,
+        "acceptance": session.policy,
+        "table_vibration_measured": False,
+        **fields,
+    }
+    atomic_json(session.directory / f"{kind}.json", report)
+    return report
 
 
-def gravity_centers(start):
-    """Excite different gravity lever arms and wrist orientations."""
-    result = []
-    for offsets in [
-        (0, 0, 0, 0, 0),
-        (0.8, -0.55, 0.45, 0.4, -0.4),
-        (-0.25, 0.65, -0.45, -0.4, 0.4),
-        (0.5, 0.5, 0.35, -0.3, -0.3),
-        (0.25, -0.45, -0.35, 0.45, 0.3),
-        (0.65, 0.15, -0.5, 0.1, 0.5),
-    ]:
-        q = np.array(start, dtype=float)
-        q[1:] += offsets
-        result.append(q)
-    return result
+def _stage(session: Session, report: dict, patch: Patch):
+    if report["valid"] and not patch.is_empty():
+        path = write_profile(
+            session.directory / "profile", session.bundle, session.robot, report, patch
+        )
+        report["candidate_config"] = str(path)
+        report["patch"] = patch.to_dict()
+        atomic_json(session.directory / f"{report['kind']}.json", report)
+        session.log(f"Candidate config staged: {path}")
+        session.log(f"Patch:\n{patch.toml()}")
+    return report
 
 
-def verification_centers(start):
-    """Wrist orientations distinct from the identification protocol."""
-    offsets = [
-        (0.15, -0.15, 0.30, 0.12, -0.25),
-        (0.35, 0.20, -0.30, -0.12, 0.25),
-        (-0.10, 0.35, 0.50, -0.25, 0.40),
-        (0.50, -0.30, -0.50, 0.25, -0.40),
-        (0.25, 0.10, 0.15, 0.30, 0.50),
-        (0.40, 0.30, -0.15, -0.30, -0.50),
-    ]
-    return [np.asarray(start) + np.r_[0, row] for row in offsets]
+# ------------------------------------------------------------------ check
 
 
-def _steady(rows, dt):
-    if len(rows) < 30:
-        return []
-    positions = np.array([r["q"] for r in rows])
-    seconds = np.array([r.get("sample_time_ns", r["elapsed_ns"]) for r in rows]) * 1e-9
-    width = max(3, int(round(0.12 / dt)))
-    # Position differences average over encoder quantization and the drive's
-    # reported velocity estimator. Never label a commanded speed as measured.
-    velocity = np.gradient(positions, seconds, axis=0)
-    smooth = np.stack(
-        [
-            np.convolve(velocity[:, j], np.ones(width) / width, mode="same")
-            for j in range(6)
-        ],
-        axis=1,
-    )
-    acceleration = np.gradient(smooth, seconds, axis=0)
-    selected = []
-    for i, r in enumerate(rows):
-        current = np.abs(r["current_ma"])
-        limit = np.asarray(r["ilim_ma"])
-        if (
-            i < width
-            or i >= len(rows) - width
-            or r["flags"] & 1
-            or np.any(current > 0.85 * limit)
-        ):
-            continue
-        if np.max(np.abs(acceleration[i])) > 0.12 or np.max(np.abs(smooth[i])) > 0.15:
-            continue
-        if np.any(np.abs(smooth[i]) >= 0.015):
-            selected.append(
-                {
-                    "tick": r["tick"],
-                    "q": r["q"],
-                    "qd": smooth[i].tolist(),
-                    "tau": r["tau"],
-                }
-            )
-    return selected
-
-
-async def check_motion(session, *, joints=(1, 2), amplitude=0.04):
-    """Short recorded bidirectional check before a full identification run."""
-    results = []
-    plans = list(
-        sweeps(
+async def check(session: Session, *, joints=(1, 2), amplitude=0.04) -> dict:
+    """Short bidirectional sweeps on `joints`; a before/after baseline of
+    tracking, velocity residual, windowed vibration and current saturation."""
+    plans = [
+        p
+        for p in sweeps(
             centers(session.start)[:3],
-            np.minimum(session.limits, [0.07, 0.12, 0.5]),
+            np.minimum(session.limits, SLOW),
             amplitude=amplitude,
         )
-    )
-    plans = [p for p in plans if p["group"] == 0 and p["joint"] in joints]
+        if p["group"] == 0 and p["joint"] in joints
+    ]
     if not plans:
         raise ValueError("No joints selected")
     for p in plans:
         session.check_path([session.start, p["start"]])
         session.check_path(p["positions"])
-    await session.active_support()
+    await session.set_gravity(False)
+    results = []
     for p in plans:
-        print(
-            f"Recorded check J{p['joint'] + 1} direction {p['direction']}", flush=True
-        )
+        session.log(f"check: J{p['joint'] + 1} direction {p['direction']:+d}")
         await session.position(p["start"])
-        _, metrics = await session.stimulus(
-            "check",
-            p["times"],
-            p["positions"],
-            joint=p["joint"],
-            direction=p["direction"],
-        )
-        results.append(metrics)
-    await session.position(session.start)
-    report = {
-        "kind": "motion-check",
-        "gravity_comp": False,
-        "tested_mode": "STREAM",
-        "valid": all(passes(r) for r in results),
-        "identity": session.identity,
-        "measurements": results,
-    }
-    atomic_json(session.directory / "motion-check.json", report)
-    return report
-
-
-async def gravity(session, *, prior=None):
-    """Collect independent trajectory groups and fit only observable corrections."""
-    limits = np.minimum(session.limits, [0.07, 0.12, 0.5])
-    train, validation = [], []
-    group_offset = 0
-    if prior is not None:
-        prior = Path(prior)
-        identity = json.loads((prior / "identity.json").read_text())
-        if json.loads((prior / "acceptance.json").read_text()) != session.policy:
-            raise ValueError("Prior gravity data used different acceptance checks")
-        if identity.get("reference") != session.identity["reference"]:
-            raise ValueError(
-                "Prior gravity data predates a restart or reference change"
+        try:
+            _, metrics = await session.stimulus(
+                "check",
+                p["times"],
+                p["positions"],
+                joint=p["joint"],
+                direction=p["direction"],
             )
-        if identity["config_fingerprint"] != session.fingerprint:
-            raise ValueError("Prior gravity data belongs to a different configuration")
-        fields = ("node", "hw_ver", "sw_ver", "serial")
-
-        def devices(value):
-            return [
-                tuple(d[k] for k in fields) for d in value["drives"] if d["present"]
-            ]
-
-        if identity["simulator"] != session.identity["simulator"] or devices(
-            identity
-        ) != devices(session.identity):
-            raise ValueError(
-                "Prior gravity data belongs to a different runtime or drive identity"
-            )
-        data = json.loads((prior / "gravity-samples.json").read_text())
-        train, validation = data["train"], data["validation"]
-        group_offset = 1 + max((r["group"] for r in train + validation), default=-1)
-        atomic_json(
-            session.directory / "prior.json",
-            {"directory": str(prior.resolve()), "identity": identity},
-        )
-    poses = gravity_centers(session.start)
-    # Recollection retains each physical center's original split. Renumbering
-    # a subset would put a formerly trained center into held-out validation.
-    if prior is not None:
-        protocol = json.loads((prior / "gravity-protocol.json").read_text())
-        if protocol.get("protocol_version") != 3:
-            raise ValueError("Prior gravity data used an older collection protocol")
-        if not np.allclose(protocol["start_rad"], session.start, atol=0.001, rtol=0):
-            raise ValueError("Prior gravity collection used a different reference pose")
-    plans, _, excluded = _gravity_plans(session, poses, limits)
-    planned = {}
-    for name, held_out in (("train", False), ("validation", True)):
-        part = [p for p in plans if p["held_out"] == held_out]
-        planned[name] = _fitting_coverage(
-            session,
-            [
-                {"q": q.tolist(), "joint": p["joint"], "group": p["group"]}
-                for p in part
-                for q in p["positions"][::5]
-            ],
-        )
-    for plan in plans:
-        plan["group"] += group_offset
-    atomic_json(
-        session.directory / "gravity-protocol.json",
-        {
-            "protocol_version": 3,
-            "start_rad": session.start.tolist(),
-            "centers_rad": [p.tolist() for p in poses],
-            "amplitude_rad": 0.18,
-            "group_offset": group_offset,
-            "retained_train_samples": len(train),
-            "retained_validation_samples": len(validation),
-            "selected_groups": sorted({p["group"] for p in plans}),
-            "excluded_poses": excluded,
-            "planned_coverage": planned,
-        },
-    )
-    if not all(c["valid"] for c in planned.values()):
-        raise ValueError(
-            "Collision-free gravity groups do not cover independent fitting and validation"
-        )
-    await session.active_support()
-    for i, p in enumerate(plans):
-        print(
-            f"Gravity sweep {i + 1}/{len(plans)} J{p['joint'] + 1} direction {p['direction']}",
-            flush=True,
-        )
-        await session.position(p["start"])
-        rows, _ = await session.stimulus(
-            "gravity",
-            p["times"],
-            p["positions"],
-            group=p["group"],
-            held_out=p["held_out"],
-            joint=p["joint"],
-            direction=p["direction"],
-        )
-        samples = [
-            r
-            for r in _steady(rows, session.robot["robot"]["tick_dt_s"])
-            if p["direction"] * r["qd"][p["joint"]] >= 0.015
-        ]
-        (validation if p["held_out"] else train).extend(
-            {
-                **r,
-                "group": p["group"],
-                "center_group": p["group"] - group_offset,
-                "joint": p["joint"],
-                "direction": p["direction"],
+            metrics["valid"] = True
+        except TrialRejected as exc:
+            metrics = {
+                **session.trials[-1].get("metrics", {}),
+                "valid": False,
+                "rejection": str(exc),
             }
-            for r in samples
-        )
-        # Durable progress is usable even if a later trajectory is refused.
-        atomic_json(
-            session.directory / "gravity-samples.json",
-            {"train": train, "validation": validation},
-        )
-    measured = {
-        name: _fitting_coverage(session, rows)
-        for name, rows in (("train", train), ("validation", validation))
-    }
-    requested = {(p["group"], p["joint"], p["direction"]) for p in plans}
-    evidence = sweep_evidence(train + validation, requested)
-    reasons = []
-    if not all(c["valid"] for c in measured.values()):
-        reasons.append(
-            "Measured fitting or validation gravity coverage is insufficient"
-        )
-    reasons.extend(evidence["reasons"])
-    fit = None
-    if not reasons:
-        fit = fit_gravity(
-            train,
-            validation,
-            session.model,
-            baseline_correction=session.robot.get("gravity_correction"),
-            baseline_scale=session.robot.get("gravity_scale"),
-            max_validation_rms_nm=session.policy["gravity_residual_nm"],
-        )
-    report = {
-        **(fit.to_dict() if fit is not None else {"valid": False, "reasons": reasons}),
-        "baseline_fingerprint": session.fingerprint,
-        "identity": session.identity,
-        "kind": "gravity",
-        "support_mode": "active_feedback",
-        "applied_validation_complete": False,
-        "status": "candidate" if fit is not None and fit.valid else "rejected",
-        "planned_coverage": planned,
-        "measured_coverage": measured,
-        "sweep_evidence": evidence,
-        "excluded_poses": excluded,
-        "friction_assumption": "odd Coulomb and viscous friction during steady motion",
-        "limitation": "Load-dependent directional friction can be indistinguishable from gravity error",
-    }
-    atomic_json(session.directory / "gravity-fit.json", report)
+        results.append({"joint": p["joint"], "direction": p["direction"], **metrics})
     await session.position(session.start)
-    if fit is not None and fit.valid:
-        path = export_profile(
-            session.directory / "gravity-profile",
-            session.bundle,
-            report,
-            gravity=fit.correction,
+    reasons = [
+        f"J{r['joint'] + 1} direction {r['direction']:+d}: {r.get('rejection', 'rejected')}"
+        for r in results
+        if not r["valid"]
+    ]
+    summary = {
+        f"J{r['joint'] + 1}{'+' if r['direction'] > 0 else '-'}": {
+            k: r[k][r["joint"]]
+            for k in (
+                "tracking_peak_deg",
+                "velocity_residual_rms",
+                "measured_vibration_rms",
+                "command_ripple_rms",
+                "saturation_s",
+            )
+            if k in r
+        }
+        for r in results
+    }
+    for name, values in summary.items():
+        session.log(
+            f"check {name}: " + ", ".join(f"{k}={v:.4g}" for k, v in values.items())
         )
-        print(
-            f"Fitted gravity candidate: {path}. Requires activation and verify-gravity.",
-            flush=True,
-        )
-    else:
-        print(f"Gravity profile rejected: {report['reasons']}", flush=True)
-    return report
-
-
-def passes(metrics):
-    check = metrics.get("acceptance", {})
-    return check.get("valid") is True and check.get("oscillation_checked") is True
-
-
-def _fitting_coverage(session, samples):
-    # Repeated observations at one center cannot replace independent poses.
-    if len({r.get("center_group", r["group"]) for r in samples}) < 2:
-        return {"valid": False, "reason": "Fewer than two independent pose groups"}
-    return coverage(
-        session.model,
-        [r["q"] for r in samples],
-        [r["joint"] for r in samples],
-        session.window,
+    return _report(
+        session, "check", not reasons, reasons, summary=summary, measurements=results
     )
 
 
-def _gravity_plans(session, poses, limits):
-    """Retain complete reachable groups without changing the held-out split."""
-    plans = [p for p in sweeps(poses, limits, amplitude=0.18) if p["joint"] != 0]
+# ------------------------------------------------------------ tune-feedback
+
+QUALITY_PHASES = ("motion", "hold", "window_peaks")
+#: Preference order: lower the integral first (keeps damping), then both.
+CANDIDATES = ((1.0, 0.8), (1.0, 0.6), (0.8, 0.8), (0.6, 0.6))
+
+
+def trial_quality(rows, dt, joint) -> dict:
+    """Travel, the last second of hold, and overlapping windows over the whole
+    trial, so neither a quiet hold nor a quiet travel can hide the other."""
+    moving = np.flatnonzero(
+        np.abs(np.asarray([r["qd_commanded"][joint] for r in rows])) > 0.005
+    )
+    if not len(moving) or (moving[-1] - moving[0]) * dt < 0.5:
+        raise ValueError("Feedback trial lacks sustained measured motion")
+    edge = round(0.1 / dt)
+    travel = rows[max(0, moving[0] - edge) : moving[-1] + edge + 1]
+    end = rows[-1]["sample_time_ns"]
+    hold = [r for r in rows if r["sample_time_ns"] >= end - 1_000_000_000]
+    h = motion_metrics(hold, dt)
+    h["position_peak_to_peak_deg"] = np.rad2deg(
+        np.ptp([r["q"] for r in hold], axis=0)
+    ).tolist()
+    return {
+        "window_peaks": motion_window_peaks(rows, dt),
+        "motion": motion_metrics(travel, dt),
+        "hold": h,
+    }
+
+
+def oscillation(trials, joint) -> float:
+    return float(
+        np.mean(
+            [
+                max(t[phase]["oscillation_energy"][joint] for phase in QUALITY_PHASES)
+                for t in trials
+            ]
+        )
+    )
+
+
+def better(candidate, baseline, *, joint, policy, noise) -> bool:
+    """The candidate trials all pass ordinary acceptance, hold still, respond
+    no slower, and carry at most 70 % of the baseline's oscillation energy on
+    the tuned joint without raising any other joint's."""
+    before = np.max(
+        [t[p]["oscillation_energy"] for t in baseline for p in QUALITY_PHASES], axis=0
+    )
+    after = np.max(
+        [t[p]["oscillation_energy"] for t in candidate for p in QUALITY_PHASES], axis=0
+    )
+    before_delay = np.max([t["motion"]["response_delay_s"] for t in baseline], axis=0)
+    after_delay = np.max([t["motion"]["response_delay_s"] for t in candidate], axis=0)
+    return bool(
+        np.all(after_delay <= np.maximum(0.1, before_delay + 0.04))
+        and oscillation(candidate, joint)
+        <= 0.7 * max(noise[joint], oscillation(baseline, joint))
+        and np.all(after <= np.maximum(noise, before * 1.2))
+        and all(
+            t["completed"]
+            and all(motion_acceptance(t[p], policy)["valid"] for p in QUALITY_PHASES)
+            and max(t["hold"]["position_peak_to_peak_deg"]) <= 0.05
+            and t["hold"]["velocity_residual_rms"][joint]
+            <= policy["velocity_residual_rad_s"]
+            for t in candidate
+        )
+    )
+
+
+async def tune_feedback(
+    session: Session, *, joint=2, center=None, amplitude=0.18
+) -> dict:
+    """Lower one joint's velocity-loop gains until sustained moves and holds
+    stop oscillating; the winner must also pass three independent trials."""
+    if joint not in range(6):
+        raise ValueError("Joint must be an index from zero to five")
+    if not np.isfinite(amplitude) or not 0.02 <= amplitude <= 0.18:
+        raise ValueError("Feedback excursion must be between 0.02 and 0.18 rad")
+    center = np.array(session.start if center is None else center, dtype=float)
+    session.check_path([session.start, center])
+    targets = []
+    for offset in (1, -1, 1, -1, 0.75, -0.75, 0.65, -0.65, 0.85):
+        t = center.copy()
+        t[joint] += offset * amplitude
+        targets.append(t)
+    for a in [center, *targets]:
+        for b in targets:
+            session.check_path([a, b])
+    quantum = np.array(
+        [
+            2 * np.pi / (2 ** j["encoder_bits"] * j["gear_ratio"])
+            for j in session.robot["joints"]
+        ]
+    )
+    noise = np.maximum(1e-4, (quantum / session.robot["robot"]["tick_dt_s"]) ** 2)
+    dt = session.robot["robot"]["tick_dt_s"]
+    measured: dict[str, list] = {}
+    await session.set_gravity(False)
+
+    async def trials(label, indices):
+        result = []
+        for i in indices:
+            initial = center if i == 0 else targets[i - 1]
+            await session.position(initial, diagnostic=True)
+            here = np.deg2rad((await session.fresh())["angles"])
+            t, q = move(here, targets[i], np.minimum(session.limits, [0.05, 0.08, 0.3]))
+            t = np.r_[t, t[-1] + np.arange(0.02, 2.52, 0.02)]
+            q = np.vstack([q, np.repeat(targets[i][None, :], 125, axis=0)])
+            rejection = None
+            try:
+                rows, _ = await session.stimulus(
+                    "feedback",
+                    t,
+                    q,
+                    settle=False,
+                    allow_oscillation=True,
+                    joint=joint,
+                    candidate=label,
+                    repeat=i,
+                )
+            except TrialRejected as exc:
+                rejection = str(exc)
+                from . import capture
+
+                trial = session.trials[-1]
+                _, rows = capture.read_capture(
+                    session.capture_path, trial["capture_start"], trial["capture_end"]
+                )
+                rows = capture.measurement_rows(
+                    capture.active_rows(rows, (capture.MODE_STREAM,)),
+                    dt,
+                    simulator=session.identity["simulator"],
+                )
+            quality = trial_quality(rows, dt, joint)
+            entry = {**quality, "completed": rejection is None, "rejection": rejection}
+            result.append(entry)
+            measured.setdefault(label, []).append(entry)
+            atomic_json(session.directory / "feedback-progress.json", measured)
+            session.log(
+                f"{label} J{joint + 1}: moving RMS "
+                f"{quality['motion']['velocity_residual_rms'][joint]:.4f} rad/s, hold excursion "
+                f"{quality['hold']['position_peak_to_peak_deg'][joint]:.4f} deg"
+            )
+        return result
+
+    baseline = await trials("baseline", range(6))
+    candidate = None
+    reference = None
+    if oscillation(baseline, joint) > noise[joint]:
+        for kpv_scale, kiv_scale in CANDIDATES:
+            label = f"kpv-{kpv_scale}-kiv-{kiv_scale}"
+            async with session.gains(
+                joint, kpv_scale=kpv_scale, kiv_scale=kiv_scale
+            ) as gains:
+                rows = await trials(label, range(6))
+            if not better(
+                rows, baseline, joint=joint, policy=session.policy, noise=noise
+            ):
+                continue
+            if reference is None:
+                reference = await trials("validation-baseline", range(6, 9))
+            async with session.gains(joint, kpv_scale=kpv_scale, kiv_scale=kiv_scale):
+                validation = await trials(f"validation-{label}", range(6, 9))
+            if better(
+                validation, reference, joint=joint, policy=session.policy, noise=noise
+            ):
+                candidate = gains
+                break
+    await session.position(session.start)
+    reasons = (
+        []
+        if candidate is not None
+        else [
+            "No repeatable baseline oscillation above encoder noise"
+            if oscillation(baseline, joint) <= noise[joint]
+            else "No candidate passed motion, hold, latency and independent validation"
+        ]
+    )
+    patch = Patch()
+    if candidate is not None:
+        patch.feedback_gains[joint] = [
+            candidate["kpp"],
+            candidate["kpv"],
+            candidate["kiv"],
+        ]
+    report = _report(
+        session,
+        "tune-feedback",
+        candidate is not None,
+        reasons,
+        joint=joint,
+        center_rad=center.tolist(),
+        amplitude_rad=amplitude,
+        candidate=candidate,
+        encoder_noise_energy_floor=noise.tolist(),
+        measurements=measured,
+        baseline_restored=True,
+        drive_parameter_readback=False,
+    )
+    return _stage(session, report, patch)
+
+
+# ---------------------------------------------------------------- gravity
+
+
+def _plans(session: Session, poses, limits, amplitude=0.18):
+    """Whole reachable groups (approach, every sweep, return), in order."""
+    plans = [p for p in sweeps(poses, limits, amplitude=amplitude, joints=range(1, 6))]
     previous = session.start
-    selected, selected_poses, excluded = [], [], []
+    selected, excluded = [], []
     for group, pose in enumerate(poses):
         group_plans = [p for p in plans if p["group"] == group]
         trial_previous = previous
@@ -362,740 +361,422 @@ def _gravity_plans(session, poses, limits):
             )
             continue
         selected.extend(group_plans)
-        selected_poses.append(pose)
         previous = trial_previous
-    return selected, selected_poses, excluded
+    return selected, excluded
 
 
-async def verify_gravity(session):
-    """Measure loaded-model error with feedback active and no parameter refit."""
-    plans, poses, excluded = _gravity_plans(
-        session,
-        verification_centers(session.start),
-        np.minimum(session.limits, [0.05, 0.08, 0.3]),
+def _coverage(session: Session, samples):
+    if len({r["group"] for r in samples}) < 2:
+        return {"valid": False, "reason": "Fewer than two independent pose groups"}
+    return coverage(
+        session.model,
+        [r["q"] for r in samples],
+        [r["joint"] for r in samples],
+        session.window,
     )
-    planned = (
-        coverage(
-            session.model,
-            [p for p in poses for _ in range(1, 6)],
-            list(range(1, 6)) * len(poses),
-            session.window,
-        )
-        if len(poses) >= 3
-        else {
-            "valid": False,
-            "reason": "Fewer than three complete collision-free pose groups",
-        }
-    )
+
+
+async def _collect(session: Session, plans):
+    """Run every planned sweep; steady moving samples labelled by group/joint/direction."""
     samples = []
-    report = {
-        "kind": "gravity-torque-verification",
-        "valid": False,
-        "complete": False,
-        "identity": session.identity,
-        "acceptance": session.policy,
-        "planned_coverage": planned,
-        "excluded_poses": excluded,
-        "reasons": [],
-        "support_mode": "active_feedback",
-        "applied_validation_complete": False,
-        "scope": "tested poses, configured gripper, empty hand",
-        "centers_rad": [p.tolist() for p in poses],
-        "excursion_rad": 0.18,
-        "unmeasured_joint_combinations_validated": False,
-        "validation_target": "paired measured torque under an odd-friction assumption",
-    }
-    try:
-        if not planned["valid"]:
-            report["reasons"].append(
-                "Verification poses do not span the observable gravity model"
-            )
-            return report
-        await session.active_support()
-        for i, p in enumerate(plans):
-            print(
-                f"Gravity verification {i + 1}/{len(plans)} "
-                f"J{p['joint'] + 1} direction {p['direction']}",
-                flush=True,
-            )
-            await session.position(p["start"])
-            rows, _ = await session.stimulus(
-                "gravity-verification",
-                p["times"],
-                p["positions"],
-                group=p["group"],
-                joint=p["joint"],
-                direction=p["direction"],
-            )
-            samples.extend(
-                {
-                    **r,
-                    "group": p["group"],
-                    "joint": p["joint"],
-                    "direction": p["direction"],
-                }
-                for r in _steady(rows, session.robot["robot"]["tick_dt_s"])
-            )
-            atomic_json(
-                session.directory / "gravity-verification-samples.json",
-                {"samples": samples},
-            )
-        torque = paired_torque(
-            samples,
-            session.model,
-            correction=session.robot.get("gravity_correction"),
-            scale=session.robot.get("gravity_scale"),
-            limit_nm=session.policy["gravity_residual_nm"],
+    dt = session.robot["robot"]["tick_dt_s"]
+    for i, p in enumerate(plans):
+        session.log(
+            f"gravity sweep {i + 1}/{len(plans)}: J{p['joint'] + 1} direction {p['direction']:+d}"
         )
-        observed = {(r["group"], r["joint"]) for r in samples}
-        required = {(p["group"], p["joint"]) for p in plans}
-        if observed != required:
-            report["reasons"].append(
-                "Missing moving evidence for a requested joint or pose"
-            )
-        report["torque"] = torque
-        report["reasons"].extend(torque["reasons"])
-        if torque["pairs"]:
-            measured = coverage(
-                session.model,
-                [p["q"] for p in torque["pairs"]],
-                [p["joint"] for p in torque["pairs"]],
-                session.window,
-            )
-            report["measured_coverage"] = measured
-            if not measured["valid"]:
-                report["reasons"].append(
-                    "Measured moving evidence lacks gravity model coverage"
-                )
-        else:
-            report["reasons"].append("No usable torque pairs")
-        await session.position(session.start)
-        report["complete"] = True
-        report["valid"] = not report["reasons"]
-        report["status"] = "torque-consistent" if report["valid"] else "rejected"
-        return report
-    except BaseException as exc:
-        report["reasons"].append(f"{type(exc).__name__}: {exc}")
-        raise
-    finally:
-        atomic_json(session.directory / "gravity-verification.json", report)
-
-
-def _assess_smoothness(reports, baseline, candidate):
-    """Require matched evidence and independent improvement at held-out poses."""
-    baseline, candidate = (
-        np.asarray(value, dtype=float) for value in (baseline, candidate)
-    )
-    if any(
-        value.shape != (6, 3) or not np.isfinite(value).all() or np.any(value <= 0)
-        for value in (baseline, candidate)
-    ):
-        raise ValueError("Smoothness requires finite positive six-joint limits")
-    report = {
-        "kind": "smoothness",
-        "protocol_version": 3,
-        "valid": False,
-        "complete": False,
-        "reasons": [],
-        "measurements": reports,
-        "baseline_limits": baseline.tolist(),
-        "limits": candidate.tolist(),
-        "table_vibration_measured": False,
-        "tested_mode": "STREAM",
-        "scope": "tested single-axis excursions and joint encoder vibration",
-        "applied_validation_complete": False,
-    }
-    reasons = report["reasons"]
-    if np.any(candidate > baseline * (1 + 1e-12)):
-        reasons.append("Candidate increases a comparison limit")
-    if np.allclose(candidate, baseline, rtol=1e-12, atol=0):
-        reasons.append("Baseline and candidate settings are identical")
-    required = {
-        (g, j, r, d)
-        for g in range(3)
-        for j in range(6)
-        for r in range(3)
-        for d in (-1, 1)
-    }
-    for label in ("baseline", "candidate"):
-        readings = reports.get(label, [])
-        keys = [
-            tuple(row.get(k) for k in ("group", "joint", "repeat", "direction"))
-            for row in readings
-        ]
-        if (
-            len(keys) != len(required)
-            or set(keys) != required
-            or any(
-                row.get("held_out") is not (row.get("group") == 2) for row in readings
-            )
-        ):
-            reasons.append(f"{label}: incomplete or mismatched pose evidence")
-            return report
-        for field in ("oscillation_energy", "response_delay_s"):
-            values = np.asarray([row[field] for row in readings], dtype=float)
-            if (
-                values.shape != (len(required), 6)
-                or not np.isfinite(values).all()
-                or np.any(values < 0)
-            ):
-                raise ValueError(f"Invalid smoothness {field} measurements")
-    report["complete"] = True
-    if not all(
-        row.get("acceptance", {}).get("valid") is True for row in reports["baseline"]
-    ):
-        reasons.append("Baseline tracking or current check failed")
-    if not all(passes(row) for row in reports["candidate"]):
-        reasons.append("Candidate motion acceptance failed")
-
-    def compare(predicate):
-        selected = {
-            label: [r for r in reports[label] if predicate(r)]
-            for label in ("baseline", "candidate")
-        }
-        energy = [
-            np.mean([r["oscillation_energy"] for r in selected[label]], axis=0)
-            for label in ("baseline", "candidate")
-        ]
-        delay = [
-            np.max([r["response_delay_s"] for r in selected[label]], axis=0)
-            for label in ("baseline", "candidate")
-        ]
-        return (
-            {
-                "joint_oscillation_before": energy[0].tolist(),
-                "joint_oscillation_after": energy[1].tolist(),
-                "response_delay_before_s": delay[0].tolist(),
-                "response_delay_after_s": delay[1].tolist(),
-            },
-            energy,
-            delay,
+        await session.position(p["start"])
+        rows, _ = await session.stimulus(
+            "gravity",
+            p["times"],
+            p["positions"],
+            group=p["group"],
+            held_out=p["held_out"],
+            joint=p["joint"],
+            direction=p["direction"],
         )
-
-    summary, _, _ = compare(lambda _: True)
-    report.update(summary)
-    report["pose_comparisons"] = []
-    noise = 1e-5
-    for group in range(3):
-        summary, (before, after), (before_delay, after_delay) = compare(
-            lambda row: row["group"] == group
-        )
-        report["pose_comparisons"].append({"group": group, **summary})
-        for joint in np.flatnonzero(after > np.maximum(noise, before * 1.1)):
-            reasons.append(f"Pose group {group}: J{joint + 1} oscillation increased")
-        if np.any(after_delay > np.maximum(0.1, before_delay + 0.04)):
-            reasons.append(
-                f"Pose group {group}: candidate adds excessive response delay"
-            )
-    report["excursion_comparisons"] = []
-    for group in range(3):
-        for requested_joint in range(6):
-            for direction in (-1, 1):
-                summary, (before, after), (before_delay, after_delay) = compare(
-                    lambda row: (
-                        row["group"] == group
-                        and row["joint"] == requested_joint
-                        and row["direction"] == direction
-                    )
-                )
-                report["excursion_comparisons"].append(
+        for r in steady_samples(rows, dt):
+            if p["direction"] * r["qd"][p["joint"]] >= MOVING_RAD_S:
+                samples.append(
                     {
-                        "group": group,
-                        "joint": requested_joint,
-                        "direction": direction,
-                        **summary,
+                        **r,
+                        "group": p["group"],
+                        "joint": p["joint"],
+                        "direction": p["direction"],
+                        "held_out": p["held_out"],
                     }
                 )
-                label = (
-                    f"Pose group {group}, J{requested_joint + 1}, direction {direction}"
-                )
-                for joint in np.flatnonzero(after > np.maximum(noise, before * 1.1)):
-                    reasons.append(f"{label}: J{joint + 1} oscillation increased")
-                if np.any(after_delay > np.maximum(0.1, before_delay + 0.04)):
-                    reasons.append(f"{label}: candidate adds excessive response delay")
-    for label, held_out in (("training", False), ("held_out", True)):
-        summary, (before, after), _ = compare(lambda row: row["held_out"] == held_out)
-        measurable = bool(np.sum(before) > noise)
-        report[label] = {**summary, "improvement_above_noise_evaluable": measurable}
-        if measurable:
-            if np.sum(after) > 0.7 * np.sum(before):
-                reasons.append(f"{label}: less than 30% oscillation improvement")
-        elif not held_out:
-            reasons.append(
-                "Training baseline is below the noise floor; improvement is unproven"
-            )
-        elif np.sum(after) > noise:
-            reasons.append("Held-out candidate exceeds a quiet baseline's noise floor")
-    report["valid"] = not reasons
-    report["status"] = "improved" if report["valid"] else "rejected"
-    return report
+        atomic_json(session.directory / "gravity-samples.json", {"samples": samples})
+    return samples
 
 
-def _smoothness_settings(robot, exec_limits):
-    """Choose distinct caps realizable by the runtime's global stream fractions."""
-    loaded = np.array(
-        [
-            [
-                joint["limits"].get("stream", {}).get(key, joint["limits"][key])
-                for key in ("velocity_rad_s", "acceleration_rad_s2", "jerk_rad_s3")
-            ]
-            for joint in robot["joints"]
-        ]
-    )
-    requested = np.minimum(loaded, exec_limits)
-    requested[:, 0] = np.minimum(requested[:, 0], 0.3)
-    fractions = stream_scale(robot, requested)
-    comparison = loaded * [fractions["speed"], fractions["accel"], fractions["accel"]]
-    candidate = comparison * [1.0, 0.5, 0.5]
-    # A velocity-limited quintic can ignore both changed derivative bounds.
-    # Evaluate move()'s duration bounds without allocating a very long path.
-    duration = []
-    for limits in (comparison, candidate):
-        values = np.maximum.reduce(
-            [
-                1.875 * 0.08 / limits[:, 0],
-                np.sqrt((10 / np.sqrt(3)) * 0.08 / limits[:, 1]),
-                np.cbrt(60 * 0.08 / limits[:, 2]),
-            ]
-        )
-        duration.append(np.ceil(values / 0.02) * 0.02)
-    if not np.isfinite(duration).all() or np.any(duration[1] < 1.05 * duration[0]):
+async def gravity(session: Session, *, verify_only=False) -> dict:
+    """Identify the arm's gravity model from slow bidirectional sweeps at six
+    shoulder/elbow/wrist centres (feedforward off, position feedback on),
+    fit with friction projected out, and demand every held-out joint stay
+    under the residual ceiling. `verify_only` skips the fit and instead
+    checks the currently loaded model against the held-out groups by paired
+    opposite-direction torque — the acceptance run after a candidate is
+    applied."""
+    limits = np.minimum(session.limits, SLOW)
+    poses = gravity_centers(session.start)
+    plans, excluded = _plans(session, poses, limits)
+    if verify_only:
+        plans = [p for p in plans if p["held_out"]]
+    groups = sorted({p["group"] for p in plans})
+    if len(groups) < (2 if verify_only else 3):
         raise ValueError(
-            "Smoothness probe cannot excite the proposed acceleration/jerk change"
+            f"Too few collision-free pose groups ({groups}); excluded: {excluded}"
         )
-    return comparison, candidate
-
-
-async def smoothness(session):
-    """Compare distinct STREAM settings; table motion and JOG remain unmeasured."""
-    reports = {"baseline": [], "candidate": []}
-    report = {
-        "kind": "smoothness",
-        "protocol_version": 3,
-        "valid": False,
-        "complete": False,
-        "status": "incomplete",
-        "reasons": [],
-        "measurements": reports,
-        "gravity_comp": False,
-        "identity": session.identity,
-        "acceptance": session.policy,
-        "baseline_fingerprint": session.fingerprint,
-        "table_vibration_measured": False,
-        "tested_mode": "STREAM",
-        "applied_validation_complete": False,
-    }
-    try:
-        comparison, candidate = _smoothness_settings(session.robot, session.limits)
-        settings = [("baseline", comparison), ("candidate", candidate)]
-        scales = {
-            label: stream_scale(session.robot, limits) for label, limits in settings
-        }
-        await session.active_support()
-        for group, center in enumerate(centers(session.start)[:3]):
-            for joint in range(6):
-                for repeat in range(3):
-                    for label, limits in settings:
-                        await session.position(center)
-                        for direction in (1, -1):
-                            print(
-                                f"Smoothness {label}: pose {group + 1}, J{joint + 1}, "
-                                f"repeat {repeat + 1}, direction {direction}",
-                                flush=True,
-                            )
-                            end = center.copy()
-                            end[joint] += direction * 0.08
-                            times, positions = move(center, end, limits)
-                            metadata = {
-                                "group": group,
-                                "joint": joint,
-                                "repeat": repeat,
-                                "direction": direction,
-                                "held_out": group == 2,
-                            }
-                            _, metrics = await session.stimulus(
-                                label,
-                                times,
-                                positions,
-                                command_limits=limits,
-                                **scales[label],
-                                **metadata,
-                                allow_oscillation=label == "baseline",
-                            )
-                            reports[label].append({**metrics, **metadata})
-                            await session.position(center)
-        report = {
-            **report,
-            **_assess_smoothness(reports, comparison, candidate),
-        }
-        await session.position(session.start)
-        if report["valid"]:
-            export_profile(
-                session.directory / "smooth-profile",
-                session.bundle,
-                report,
-                stream_limits=candidate.tolist(),
-            )
-        return report
-    except BaseException as exc:
-        report["valid"] = report["complete"] = False
-        report["status"] = "failed"
-        report["reasons"].append(f"{type(exc).__name__}: {exc}")
-        raise
-    finally:
-        atomic_json(session.directory / "smoothness.json", report)
-
-
-async def motion_envelope(session, *, max_trials=180, resume=None):
-    """Measured operating envelope with 10% steps and durable continuation.
-
-    A geometric or runtime bound censors the search. Only fully repeated,
-    measured candidates contribute to the exported 80% operating envelope.
-    """
-    report = {
-        "kind": "motion-envelope",
-        "gravity_comp": False,
-        "valid": False,
-        "complete": False,
-        "status": "running",
-        "reasons": [],
-        "identity": session.identity,
-        "baseline_fingerprint": session.fingerprint,
-        "tested_mode": "STREAM",
-        "applied_validation_complete": False,
-    }
-    path = session.directory / "motion-envelope.json"
-    try:
-        # Same-session continuation may reuse this path after an older result.
-        atomic_json(path, report)
-        if (session.directory / "motion-profile").exists():
-            raise RuntimeError(
-                "Output already contains a motion profile; use a new session directory"
-            )
-        return await _search_motion_envelope(
-            session, report, max_trials=max_trials, resume=resume
-        )
-    except BaseException as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        report.update(valid=False, complete=False, status="failed", error=error)
-        if error not in report["reasons"]:
-            report["reasons"].append(error)
-        raise
-    finally:
-        atomic_json(path, report)
-
-
-async def _search_motion_envelope(session, report, *, max_trials, resume):
-    if not isinstance(max_trials, int) or max_trials < 1:
-        raise ValueError("max_trials must be a positive integer")
-    ceiling = np.array(
-        [
+    planned = {
+        name: _coverage(
+            session,
             [
-                j["limits"].get("stream", {}).get(k, j["limits"][k])
-                for k in ["velocity_rad_s", "acceleration_rad_s2", "jerk_rad_s3"]
-            ]
-            for j in session.robot["joints"]
-        ]
-    )
-    initial = np.minimum(np.minimum(session.limits, [0.1, 0.3, 1.0]), ceiling)
-    state = {
-        "protocol_version": 5,
-        "gravity_comp": False,
-        "baseline_fingerprint": session.fingerprint,
-        "poses": [c.tolist() for c in centers(session.start)[:3]],
-        "identity": session.identity,
-        "measurements": {},
-        "acceptance": session.policy,
-    }
-    if resume is not None:
-        state = json.loads(Path(resume).read_text())
-        if state.get("protocol_version") != 5 or state.get("gravity_comp") is not False:
-            raise ValueError("Resume data lacks the required gravity-disabled protocol")
-        if state["baseline_fingerprint"] != session.fingerprint:
-            raise ValueError(
-                "Resume data belongs to a different controller configuration"
-            )
-        if state.get("acceptance") != session.policy:
-            raise ValueError("Resume data used different acceptance checks")
-        previous = state.get("identity")
-
-        def devices(identity):
-            return [
-                (d["node"], d["hw_ver"], d["sw_ver"], d["serial"])
-                for d in identity["drives"]
-                if d["present"]
-            ]
-
-        if (
-            previous is None
-            or previous.get("reference") != session.identity["reference"]
-            or previous["simulator"] != session.identity["simulator"]
-            or devices(previous) != devices(session.identity)
-        ):
-            raise ValueError(
-                "Resume data belongs to a different runtime or drive identity"
-            )
-    poses = [np.asarray(q) for q in state["poses"]]
-    for q in poses:
-        session.check_path([q, q])
-    await session.active_support()
-    checkpoint = session.directory / "envelope-progress.json"
-    best = initial.copy()
-    measured = np.zeros((6, 3), dtype=bool)
-    boundaries = []
-    count = 0
-    complete = True
-    for j in range(6):
-        for axis in range(3):
-            for value in candidate_values(initial[j, axis], ceiling[j, axis]):
-                # This is a stream experiment. A separate EXEC ceiling may be
-                # much faster than the actual limiter and cannot size its pulse.
-                candidate = ceiling.copy()
-                candidate[j, axis] = value
-                scale = stream_scale(session.robot, candidate)
-                effective = ceiling * [scale["speed"], scale["accel"], scale["accel"]]
-                key = f"{j}:{axis}:{value:.12g}"
-                readings = state["measurements"].setdefault(key, [])
-                accepted = True
-                for group, center in enumerate(poses[:2]):
-                    try:
-                        t, positions = envelope_move(
-                            center, j, axis, value, effective, session.window
-                        )
-                        _, peaks = check_stream(
-                            session.preview,
-                            t,
-                            positions,
-                            candidate,
-                            **scale,
-                            check_path=session.check_path,
-                        )
-                        if peaks[j][axis] < 0.9 * value:
-                            raise ValueError(
-                                "Native command cannot excite this derivative"
-                            )
-                    except ValueError as exc:
-                        boundaries.append(
-                            {
-                                "joint": j,
-                                "dimension": axis,
-                                "candidate": value,
-                                "reason": str(exc),
-                                "measured": False,
-                            }
-                        )
-                        accepted = False
-                        break
-                    for direction in [-1, 1]:
-                        path = positions if direction == 1 else positions[::-1]
-                        for repeat in range(3):
-                            index = group * 6 + (direction == 1) * 3 + repeat
-                            if index < len(readings):
-                                reading = readings[index]
-                            else:
-                                if count >= max_trials:
-                                    complete = False
-                                    break
-                                try:
-                                    await session.position(path[0])
-                                    rows, metrics = await session.stimulus(
-                                        "envelope",
-                                        t,
-                                        path,
-                                        joint=j,
-                                        dimension=axis,
-                                        candidate=float(value),
-                                        command_limits=candidate,
-                                        repeat=repeat,
-                                        group=group,
-                                        direction=direction,
-                                        **scale,
-                                    )
-                                    achieved = measured_excitation(
-                                        metrics, rows, session.policy
-                                    )[j, axis]
-                                    accepted = (
-                                        passes(metrics) and achieved >= 0.9 * value
-                                    )
-                                    reading = {
-                                        "accepted": bool(accepted),
-                                        "achieved": float(achieved),
-                                        "metrics": metrics,
-                                    }
-                                except TrialRejected as exc:
-                                    # stimulus() has already confirmed the stop.
-                                    # A failed current/settling bound is durable:
-                                    # continuation must not retry it indefinitely.
-                                    await session.fresh()
-                                    reading = {"accepted": False, "reason": str(exc)}
-                                readings.append(reading)
-                                count += 1
-                                atomic_json(checkpoint, state)
-                            if not reading["accepted"]:
-                                accepted = False
-                                boundaries.append(
-                                    {
-                                        "joint": j,
-                                        "dimension": axis,
-                                        "candidate": value,
-                                        "reason": "tracking, current, or actual excitation failed",
-                                        "measured": True,
-                                    }
-                                )
-                                break
-                        if not accepted or not complete:
-                            break
-                    if not accepted or not complete:
-                        break
-                if not accepted or not complete:
-                    break
-                best[j, axis] = value
-                measured[j, axis] = True
-            if not complete:
-                break
-        if not complete:
-            break
-    operating = np.minimum(ceiling, best * 0.8)
-    valid = complete and bool(measured.all())
-    combined = None
-    if valid:
-        combined = await _combined_envelope(
-            session, poses[2], operating, state, checkpoint, max_trials - count
+                {"q": q.tolist(), "joint": p["joint"], "group": p["group"]}
+                for p in plans
+                if p["held_out"] == held
+                for q in p["positions"][::5]
+            ],
         )
-        valid = combined["valid"]
-        complete = complete and combined["complete"]
-    report.update(
-        {
-            "kind": "motion-envelope",
-            "valid": valid,
-            "complete": complete,
-            "status": "candidate"
-            if valid
-            else "incomplete"
-            if not complete
-            else "rejected",
-            "identity": session.identity,
-            "baseline_fingerprint": session.fingerprint,
-            "limits": operating.tolist(),
-            "measured": measured.tolist(),
-            "boundaries": boundaries,
-            "combined": combined,
-            "checkpoint": str(checkpoint),
-            "payload_scope": "attached gripper, no held object",
-            "scope": "tested poses and excursions; lower bound on achievable maximum",
-            "tested_mode": "STREAM",
-            "applied_validation_complete": False,
-        }
-    )
-    atomic_json(checkpoint, state)
-    return await _finish_motion_envelope(session, report, operating)
-
-
-async def _finish_motion_envelope(session, report, operating):
-    """Return to the starting pose before staging EXEC limits from STREAM evidence."""
-    report.update(tested_mode="STREAM", applied_validation_complete=False)
-    try:
-        await session.position(session.start)
-        if report["valid"]:
-            export_profile(
-                session.directory / "motion-profile",
-                session.bundle,
-                report,
-                exec_limits=operating.tolist(),
+        for name, held in (("train", False), ("validation", True))
+        if not (verify_only and name == "train")
+    }
+    if not all(c["valid"] for c in planned.values()):
+        raise ValueError(
+            f"Planned sweeps do not cover the observable gravity directions: {planned}"
+        )
+    await session.set_gravity(False)
+    samples = await _collect(session, plans)
+    await session.position(session.start)
+    requested = {(p["group"], p["joint"], p["direction"]) for p in plans}
+    evidence = sweep_evidence(samples, requested)
+    reasons = list(evidence["reasons"])
+    loaded_correction = session.robot.get("gravity_correction") or None
+    loaded_scale = session.robot.get("gravity_scale") or None
+    patch = Patch()
+    fields = {
+        "excluded_poses": excluded,
+        "sweep_evidence": evidence,
+        "planned_coverage": planned,
+    }
+    if verify_only:
+        check = paired_torque(
+            samples,
+            session.model,
+            correction=loaded_correction,
+            scale=loaded_scale,
+            limit_nm=session.policy["gravity_residual_nm"],
+        )
+        reasons += check["reasons"]
+        fields["paired_torque"] = check
+        for m in check["measurements"]:
+            session.log(
+                f"verify group {m['group']} J{m['joint'] + 1}: rms {m['rms_nm']:.4f} Nm, peak {m['peak_nm']:.4f} Nm"
             )
-        return report
-    except BaseException as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        report.update(valid=False, complete=False, status="failed", error=error)
-        reasons = report.setdefault("reasons", [])
-        if error not in reasons:
-            reasons.append(error)
-        raise
-    finally:
-        atomic_json(session.directory / "motion-envelope.json", report)
-
-
-async def _combined_envelope(session, center, limits, state, checkpoint, budget):
-    """Require recorded all-axis excitation at the held-out pose before export."""
-    scale = stream_scale(session.robot, limits)
-    saved = state.setdefault(
-        "combined_validation",
-        {"limits": limits.tolist(), "stream_scale": scale, "measurements": {}},
+        return _report(session, "verify-gravity", not reasons, reasons, **fields)
+    train = [r for r in samples if not r["held_out"]]
+    validation = [r for r in samples if r["held_out"]]
+    measured = {
+        "train": _coverage(session, train),
+        "validation": _coverage(session, validation),
+    }
+    fields["measured_coverage"] = measured
+    if not all(c["valid"] for c in measured.values()):
+        reasons.append(
+            "Measured fitting or validation gravity coverage is insufficient"
+        )
+    fit = None
+    if not reasons:
+        fit = fit_gravity(
+            train,
+            validation,
+            session.model,
+            baseline_correction=loaded_correction,
+            baseline_scale=loaded_scale,
+            max_validation_rms_nm=session.policy["gravity_residual_nm"],
+        )
+        reasons += fit.reasons
+        fields["fit"] = fit.to_dict()
+        session.log(
+            "gravity held-out residual before "
+            + ", ".join(f"{v:.3f}" for v in fit.validation_before_nm)
+            + " Nm; after "
+            + ", ".join(f"{v:.3f}" for v in fit.validation_after_nm)
+            + " Nm"
+        )
+        if fit.valid:
+            patch.gravity = fit.correction
+    report = _report(
+        session, "gravity", fit is not None and fit.valid, reasons, **fields
     )
-    if saved.get("stream_scale") != scale:
-        raise ValueError("Combined evidence used different native stream fractions")
-    if saved["limits"] != limits.tolist():
-        raise ValueError("Combined evidence belongs to different operating limits")
-    plans = []
-    # Each out-and-back excites every derivative; both initial directions
-    # and opposing joint signs test coupling without duplicate axis sweeps.
-    for pattern, signs in enumerate(([1] * 6, [1, -1, 1, -1, 1, -1])):
-        for direction in [-1, 1]:
+    return _stage(session, report, patch)
+
+
+# ----------------------------------------------------------------- limits
+
+FRACTIONS = (0.25, 0.5, 0.75, 1.0)
+#: Room each side of the centre a joint needs for its limit moves [rad].
+MIN_TRAVEL_RAD = 0.35
+MAX_TRAVEL_RAD = 1.0
+#: A probe only exercises a limit when the planner actually commanded at
+#: least this share of the fraction it was asked for; a short travel that
+#: never gets up to speed proves nothing about the speed.
+EXERCISED = 0.9
+
+
+#: Following error while moving is a lag, not a fault; what a limit must
+#: keep bounded is the arrival: the error over the last 0.3 s of the move.
+SETTLE_WINDOW_S = 0.3
+MOVING_TRACKING_DEG = 3.0
+#: Velocity residual allowed as a share of the commanded peak speed.
+RESIDUAL_SHARE = 0.04
+
+
+def _settle_error_deg(rows, dt):
+    n = max(2, round(SETTLE_WINDOW_S / dt))
+    tail = rows[-n:]
+    q = np.asarray([r["q"] for r in tail])
+    qc = np.asarray([r["q_commanded"] for r in tail])
+    return np.rad2deg(np.max(np.abs(q - qc), axis=0))
+
+
+def _limits_pass(rows, metrics, joint, policy) -> list[str]:
+    """What a limit must keep bounded: the arrival, the current, and any
+    residual or vibration beyond the encoder's noise floor and a share of the
+    speed itself (a velocity estimate at 1 rad/s is noisier than at rest)."""
+    reasons = []
+    dt = policy["tick_dt_s"]
+    if metrics["tracking_peak_deg"][joint] > MOVING_TRACKING_DEG:
+        reasons.append("tracking error")
+    if _settle_error_deg(rows, dt)[joint] > policy["tracking_deg"]:
+        reasons.append("arrival error")
+    if metrics["saturation_s"][joint] > 0.0:
+        reasons.append("current saturation")
+    noise = policy["velocity_noise_floor_rad_s"][joint]
+    speed = metrics["commanded_peaks"][joint][0]
+    windows = metrics["window_peaks"]
+    residual_limit = max(
+        noise, policy["velocity_residual_rad_s"], RESIDUAL_SHARE * speed
+    )
+    if windows["velocity_residual_rms"][joint] > residual_limit:
+        reasons.append("velocity residual")
+    if windows["measured_vibration_rms"][joint] > max(noise, policy["vibration_rad_s"]):
+        reasons.append("vibration")
+    return reasons
+
+
+async def limits(session: Session, *, joints=range(6), margin=0.8) -> dict:
+    """Per joint, rising speed fractions then rising acceleration fractions
+    of the configured exec limits through the real EXEC planner, both
+    directions. A dimension is certified only where the planner actually
+    commanded the fraction asked for; the largest clean certified peak times
+    `margin` becomes the proposed exec (and stream) limit, a dimension the
+    travel could not exercise keeps its configured value. Two all-joint
+    moves at the proposal must pass before anything is staged."""
+    keys = ("velocity_rad_s", "acceleration_rad_s2", "jerk_rad_s3")
+    hard = np.array([[j["limits"][k] for k in keys] for j in session.robot["joints"]])
+    exec_limits = session.limits.copy()
+    centre = np.clip(
+        session.start,
+        session.window[:, 0] + MIN_TRAVEL_RAD,
+        session.window[:, 1] - MIN_TRAVEL_RAD,
+    )
+    travel = np.minimum(
+        MAX_TRAVEL_RAD,
+        np.minimum(centre - session.window[:, 0], session.window[:, 1] - centre) - 0.05,
+    )
+    session.check_path([session.start, centre])
+    results = {}
+    proposed = exec_limits.copy()
+
+    # Position feedback with no gravity feedforward, like every other routine:
+    # a probe judges the drives' tracking of the planner, and toggling the
+    # support mode between approach and probe moved the wrist before the
+    # move even started.
+    await session.set_gravity(False)
+    await session.position(centre)
+    # The session judges a probe on faults, saturation and arrival; following
+    # error while moving and speed-scaled residual are this routine's call.
+    probe_policy = {**session.policy, "tracking_deg": MOVING_TRACKING_DEG}
+
+    async def probe(joint, speed, accel):
+        """Out, back, and home again at the fractions; the worst measured and
+        commanded peaks over the three moves, or the first rejection."""
+        a, b = centre.copy(), centre.copy()
+        a[joint] -= travel[joint]
+        b[joint] += travel[joint]
+        measured, commanded = [], []
+        for target in (a, b, centre):
             try:
-                times, path = coupled_move(
-                    center,
-                    limits,
-                    session.window,
-                    signs=np.asarray(signs) * direction,
+                rows, metrics = await session.queued_move(
+                    target,
+                    speed=speed,
+                    accel=accel,
+                    allow_oscillation=True,
+                    policy=probe_policy,
+                    joint=joint,
+                    probe=(speed, accel),
                 )
-                _, peaks = check_stream(
-                    session.preview,
-                    times,
-                    path,
-                    limits,
-                    **scale,
-                    check_path=session.check_path,
-                )
-                if np.any(np.asarray(peaks) < 0.9 * limits):
-                    raise ValueError(
-                        "Native command does not reach the operating derivatives"
-                    )
-                session.check_path([session.start, path[0]])
-                session.check_path([path[-1], session.start])
-            except ValueError as exc:
-                return {
-                    "valid": False,
-                    "complete": True,
-                    "reason": f"Coupled operating limits cannot be exercised: {exc}",
-                    "measurements": saved["measurements"],
-                }
-            for repeat in range(3):
-                plans.append((f"{pattern}:{direction}:{repeat}", times, path))
-    for key, times, positions in plans:
-        if key not in saved["measurements"]:
-            if budget <= 0:
-                return {
-                    "valid": False,
-                    "complete": False,
-                    "measurements": saved["measurements"],
-                }
-            try:
-                await session.position(positions[0])
-                rows, metrics = await session.stimulus(
-                    "combined-validation",
-                    times,
-                    positions,
-                    command_limits=limits,
-                    trial=key,
-                    **scale,
-                )
-                achieved = measured_excitation(metrics, rows, session.policy)
-                reading = {
-                    "accepted": passes(metrics)
-                    and bool(np.all(achieved >= 0.9 * limits)),
-                    "achieved": achieved.tolist(),
-                    "metrics": metrics,
-                }
             except TrialRejected as exc:
-                await session.fresh()
-                reading = {"accepted": False, "reason": str(exc)}
-            saved["measurements"][key] = reading
-            budget -= 1
-            atomic_json(checkpoint, state)
-        if not saved["measurements"][key]["accepted"]:
-            return {
-                "valid": False,
-                "complete": True,
-                "measurements": saved["measurements"],
+                return None, None, str(exc)
+            bad = _limits_pass(rows, metrics, joint, session.policy)
+            if bad:
+                return None, None, ", ".join(bad)
+            measured.append(
+                (
+                    metrics["peak_velocity_rad_s"][joint],
+                    metrics["estimated_peak_acceleration_rad_s2"][joint],
+                )
+            )
+            commanded.append(metrics["commanded_peaks"][joint][:2])
+        return np.max(measured, axis=0), np.max(commanded, axis=0), None
+
+    def certify(joint, dimension, probes):
+        """The largest passing probe whose command reached its fraction."""
+        exercised = [
+            p
+            for p in probes
+            if p["peak"] is not None
+            and p["commanded"][dimension]
+            >= EXERCISED * p["fraction"] * exec_limits[joint, dimension]
+        ]
+        if not exercised:
+            return None
+        best = max(exercised, key=lambda p: p["fraction"])
+        return best["peak"][dimension]
+
+    for joint in joints:
+        speed_probes, accel_probes = [], []
+        for f in FRACTIONS:
+            peak, commanded, why = await probe(joint, f, 0.5)
+            speed_probes.append(
+                {
+                    "fraction": f,
+                    "peak": None if peak is None else peak.tolist(),
+                    "commanded": None if commanded is None else commanded.tolist(),
+                    "rejected": why,
+                }
+            )
+            session.log(
+                f"limits J{joint + 1} speed {f:.2f}: "
+                + (
+                    f"ok measured {np.round(peak, 3)} commanded {np.round(commanded, 3)}"
+                    if peak is not None
+                    else why
+                )
+            )
+            if peak is None:
+                break
+        passing = [p for p in speed_probes if p["peak"] is not None]
+        if not passing:
+            results[joint] = {
+                "speed_probes": speed_probes,
+                "reason": "no speed fraction passed",
             }
-    return {"valid": True, "complete": True, "measurements": saved["measurements"]}
+            continue
+        best_speed = passing[-1]["fraction"]
+        for f in FRACTIONS:
+            peak, commanded, why = await probe(joint, best_speed, f)
+            accel_probes.append(
+                {
+                    "fraction": f,
+                    "peak": None if peak is None else peak.tolist(),
+                    "commanded": None if commanded is None else commanded.tolist(),
+                    "rejected": why,
+                }
+            )
+            session.log(
+                f"limits J{joint + 1} accel {f:.2f}: "
+                + (
+                    f"ok measured {np.round(peak, 3)} commanded {np.round(commanded, 3)}"
+                    if peak is not None
+                    else why
+                )
+            )
+            if peak is None:
+                break
+        best_accel = next(
+            (p["fraction"] for p in reversed(accel_probes) if p["peak"] is not None),
+            None,
+        )
+        v = certify(joint, 0, speed_probes)
+        a = certify(joint, 1, accel_probes)
+        entry = {
+            "speed_probes": speed_probes,
+            "accel_probes": accel_probes,
+            "best_speed_fraction": best_speed,
+            "best_accel_fraction": best_accel,
+            "velocity_exercised": v is not None,
+            "acceleration_exercised": a is not None,
+        }
+        if v is not None:
+            proposed[joint, 0] = margin * min(v, hard[joint, 0])
+        if a is not None:
+            proposed[joint, 1] = margin * min(a, hard[joint, 1])
+            proposed[joint, 2] = 3 * proposed[joint, 1]
+        if v is None and a is None:
+            entry["note"] = (
+                f"travel of {travel[joint]:.2f} rad never reached the configured "
+                "limits; they are kept as configured"
+            )
+        entry["proposed"] = proposed[joint].tolist()
+        results[joint] = entry
+    reasons = [f"J{j + 1}: {r['reason']}" for j, r in results.items() if "reason" in r]
+    coupled = []
+    if not reasons:
+        # The proposal is only as good as an all-joint move at it: the client
+        # fractions are global, so use the weakest joint's fraction.
+        speed = min(r["best_speed_fraction"] for r in results.values())
+        accel = min(r["best_accel_fraction"] or 0.25 for r in results.values())
+        # Only the probed joints move: a joint this run did not certify has
+        # no business travelling at the weakest certified fraction.
+        offset = np.zeros(6)
+        for j in results:
+            offset[j] = min(travel[j], MIN_TRAVEL_RAD) / 2
+        for target in (centre - offset, centre + offset, centre):
+            try:
+                rows, metrics = await session.queued_move(
+                    target,
+                    speed=speed,
+                    accel=accel,
+                    allow_oscillation=True,
+                    policy=probe_policy,
+                    coupled=True,
+                )
+                verdicts = [
+                    _limits_pass(rows, metrics, j, session.policy) for j in range(6)
+                ]
+                bad = [f"J{j + 1} " + ", ".join(v) for j, v in enumerate(verdicts) if v]
+                coupled.append({"target": target.tolist(), "rejected": bad or None})
+                session.log(
+                    "limits coupled move: " + ("ok" if not bad else "; ".join(bad))
+                )
+                if bad:
+                    reasons.append("coupled move: " + "; ".join(bad))
+                    break
+            except TrialRejected as exc:
+                coupled.append({"target": target.tolist(), "rejected": str(exc)})
+                session.log(f"limits coupled move: {exc}")
+                reasons.append(f"coupled move: {exc}")
+                break
+    await session.position(session.start)
+    changed = not reasons and not np.allclose(proposed, exec_limits)
+    patch = (
+        Patch(exec_limits=proposed.tolist(), stream_limits=proposed.tolist())
+        if changed
+        else Patch()
+    )
+    report = _report(
+        session,
+        "limits",
+        not reasons,
+        reasons,
+        per_joint={str(j): r for j, r in results.items()},
+        coupled=coupled,
+        margin=margin,
+        travel_rad=travel.tolist(),
+        configured_limits=hard.tolist(),
+        configured_exec_limits=exec_limits.tolist(),
+        proposed_exec_limits=proposed.tolist(),
+        scope="RUCKIG EXEC path with the empty configured gripper; JOG is not measured",
+    )
+    return _stage(session, report, patch)
