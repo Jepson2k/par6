@@ -234,6 +234,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
+| `python/par6/_data/` | generated copy of `config/` + the URDF/MJCF assets, written by `scripts/sync_pkg_data.py` and enforced fresh by a test: edit `config/PAR6.toml`, never this. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config does, including when a stale copy is brought back into line |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 

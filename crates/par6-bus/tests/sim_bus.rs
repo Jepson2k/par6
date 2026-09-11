@@ -2047,6 +2047,19 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
             a - b
         );
     }
+    // And across the whole sequence, not only across each rebuild: the arm
+    // held one position throughout, so drift that accumulates between the
+    // rebuilds is exactly what the per-step comparisons cannot see. The bound
+    // is the position loop's measured steady-state creep under hold on this
+    // plant over these ~3.5 s (worst joint 1.5 mrad, the loaded elbow), not a
+    // claim that holding is exact.
+    for (j, (a, b)) in cleared.iter().zip(&before).enumerate() {
+        assert!(
+            (a - b).abs() < 2e-3,
+            "joint {j} drifted {:+.5} rad while holding through the rebuilds",
+            a - b
+        );
+    }
 }
 
 /// The kinematic plant drives on the loop's own feedback share: a torque
