@@ -506,3 +506,33 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
         "a block held between two pads has contacts"
     );
 }
+
+/// Programs write outputs and stop themselves in ordinary use (WC's
+/// signal and motion skills do both), and the planning pass accepts them;
+/// the physics replay must apply the write, end the program at Stop, and
+/// report neither as a failure of the run.
+#[test]
+fn physics_replays_io_writes_and_ends_the_program_at_stop() {
+    use par6_proto::command::{Stop, WriteIo};
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let mut target = park_deg();
+    target[0] += 5.0;
+    let commands = [
+        Command::WriteIo(WriteIo { port: 0, value: 1 }),
+        move_j_cmd(target, 9960, 0.2),
+        Command::Stop(Stop { clear_queue: true }),
+        move_j_cmd(park_deg(), 9961, 0.2),
+    ];
+    let run = preview
+        .run(&commands, RunLimits { max_seconds: 5.0 })
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+    assert!(run.commands[0].error.is_none(), "{:?}", run.commands[0]);
+    assert!(
+        run.commands[1].rows > 0,
+        "the move after the write never ran"
+    );
+    assert!(run.commands[2].error.is_none(), "{:?}", run.commands[2]);
+    assert_eq!(run.commands[3].rows, 0, "Stop ends the program");
+}

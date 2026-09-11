@@ -304,10 +304,32 @@ impl Preview {
             // ---- pump: start the next command when nothing is running.
             while executing.is_none() && next < cmds.len() {
                 let start_row = rec.rows();
-                // Admission failures end the run just as they clear the live queue.
+                // Admission failures end the run just as they clear the live
+                // queue — for the commands that queue. A fire-and-forget
+                // command's refusal answers only its own datagram live, so
+                // here it is reported on its own line and the run goes on.
                 if let Err(error) = self.admit(&cmds[next], &driver, &context) {
                     spans[next] = (start_row, 0, Some(error));
+                    if command_class(cmds[next].tag()) == CommandClass::FireAndForget {
+                        next += 1;
+                        continue;
+                    }
                     stop = StopReason::Failed;
+                    next = cmds.len();
+                    break;
+                }
+                if let Command::WriteIo(p) = &cmds[next] {
+                    driver.send(RtCommand::WriteIo {
+                        port: p.port,
+                        value: p.value,
+                    });
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    break;
+                }
+                if let Command::Stop(_) = &cmds[next] {
+                    // Live, Stop clears the queue: the program ends here.
+                    spans[next] = (start_row, 0, None);
                     next = cmds.len();
                     break;
                 }
@@ -575,6 +597,8 @@ impl Preview {
                     | Command::SelectProfile(_)
                     | Command::SetPayload(_)
                     | Command::SetCompletionPolicy(_)
+                    | Command::WriteIo(_)
+                    | Command::Stop(_)
             )
         {
             return Err(make_error(
