@@ -2519,10 +2519,17 @@ impl<R: RtCommands> Core<R> {
                 com: self.payload.com,
                 inertia: self.payload.inertia.unwrap_or_default(),
             },
-            C::StatusRate => QueryResult::StatusRate {
-                hz: f64::from(self.status_rate_hz),
-                tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
-            },
+            C::StatusRate => {
+                let tick_hz = 1.0 / self.cfg.config_info.tick_dt_s;
+                QueryResult::StatusRate {
+                    hz: f64::from(self.status_rate_hz),
+                    tick_hz,
+                    // The runtime's own set, from the same helper
+                    // SET_STATUS_RATE is checked against, so what a caller is
+                    // offered and what is accepted cannot disagree.
+                    servable: servable_status_rates(tick_hz),
+                }
+            }
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -2766,16 +2773,20 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
 /// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
 /// set is built once and both answered from and printed, so what is
 /// accepted and what the remedy offers cannot disagree.
-fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+pub(crate) fn servable_status_rates(tick_hz: f64) -> Vec<f64> {
     let ticks = tick_hz.round() as u32;
-    let allowed: Vec<u32> = (1..=ticks)
+    (1..=ticks)
         .filter(|d| ticks.is_multiple_of(*d))
-        .map(|d| ticks / d)
-        .collect();
-    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
+        .map(|d| f64::from(ticks / d))
+        .collect()
+}
+
+fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+    let allowed = servable_status_rates(tick_hz);
+    if allowed.contains(&hz) {
         return None;
     }
-    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
+    let listed: Vec<String> = allowed.iter().map(|rate| format!("{rate}")).collect();
     Some(make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,
