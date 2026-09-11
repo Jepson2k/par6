@@ -166,4 +166,13 @@ pub trait DriverBus {
     /// Last known kernel link health (bus-off/error-passive/restarts,
     /// sampled off the RT thread at ~1 Hz on hardware backends).
     fn link_health(&self) -> LinkHealth;
+
+    /// Cycle the physical link once because the boot scan found NO node
+    /// at all — the whole-bus silence of a controller that came up
+    /// error-passive, not a missing drive. Returns whether a cycle was
+    /// performed; the caller re-runs its boot scan after a `true`.
+    /// Backends without a link to cycle answer `false`.
+    fn recover_link(&mut self) -> bool {
+        false
+    }
 }

@@ -72,6 +72,8 @@ pub struct SocketCanBus {
     sock: CanSocket,
     monitor: link::LinkMonitor,
     interface: String,
+    /// Link parameters for a boot-time cycle (`recover_link`).
+    link_cfg: par6_config::BusConfig,
 
     // Node map, installed by boot_configure.
     joint_nodes: Vec<NodeId>,
@@ -139,6 +141,7 @@ impl SocketCanBus {
             sock,
             monitor: link::LinkMonitor::spawn(&cfg.interface),
             interface: cfg.interface.clone(),
+            link_cfg: cfg.clone(),
             joint_nodes: Vec::new(),
             gripper_node: 0,
             timing_dummy_node: 0,
@@ -779,6 +782,24 @@ impl DriverBus for SocketCanBus {
             tx_errors: self.tx_errors,
             rx_frames: self.rx_frames,
             ..self.monitor.health()
+        }
+    }
+
+    /// The raw socket stays bound across the down/up; frames queued
+    /// while the link is down are dropped by the kernel, which is what
+    /// a boot scan that found nobody has to lose anyway.
+    fn recover_link(&mut self) -> bool {
+        let state = self.monitor.health().state;
+        log::warn!(
+            "CAN '{}': no node answered the boot scan (link {state:?}); cycling the interface once",
+            self.interface
+        );
+        match link::cycle(&self.link_cfg) {
+            Ok(()) => true,
+            Err(e) => {
+                log::warn!("CAN '{}': interface cycle failed: {e}", self.interface);
+                false
+            }
         }
     }
 }

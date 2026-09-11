@@ -55,7 +55,8 @@ use crate::spectral::codec::{
 use crate::spectral::convert::JointConversion;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, FirmwareGripperCommand, Freshness,
-    GripperCommand, HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
+    GripperCommand, HallState, JointCommand, LinkHealth, LinkState, NodeId, PollAction, PollKind,
+    MAX_NODES,
 };
 
 use driver::{ReplyKind, VirtualDriver};
@@ -109,6 +110,9 @@ pub struct SimBus {
     tick: u64,
     dt: f64,
     silent: bool,
+    /// Test hook: the bus swallows every reply, as a controller that
+    /// came up error-passive does, until `recover_link` cycles it.
+    deaf: bool,
     configured: bool,
     joint_nodes: Vec<NodeId>,
     node_to_joint: [Option<usize>; MAX_NODES],
@@ -168,6 +172,7 @@ impl SimBus {
             tick: 0,
             dt: 0.004,
             silent: false,
+            deaf: false,
             configured: false,
             joint_nodes: Vec::new(),
             node_to_joint: [None; MAX_NODES],
@@ -946,8 +951,8 @@ impl DriverBus for SimBus {
             };
             count += 1;
             self.health.rx_frames += 1;
-            if self.silent {
-                // FLASHING: drain-and-discard, never decode.
+            if self.silent || self.deaf {
+                // FLASHING (or a deaf link): drain-and-discard, never decode.
                 continue;
             }
             let age = self.tick.saturating_sub(enqueued);
@@ -1199,8 +1204,13 @@ impl DriverBus for SimBus {
                 self.deliver_rtr(*node, PollKind::Kt);
             }
         }
-        // Bus scan: every simulated driver answers its ping.
-        self.connected = nodes.iter().fold(0u16, |m, n| m | (1 << u16::from(*n)));
+        // Bus scan: every simulated driver answers its ping — unless the
+        // link is deaf, in which case nobody is heard, as on hardware.
+        self.connected = if self.deaf {
+            0
+        } else {
+            nodes.iter().fold(0u16, |m, n| m | (1 << u16::from(*n)))
+        };
         Ok(())
     }
 
@@ -1314,9 +1324,34 @@ impl DriverBus for SimBus {
     fn link_health(&self) -> LinkHealth {
         self.health
     }
+
+    fn recover_link(&mut self) -> bool {
+        self.deaf = false;
+        self.health.restarts += 1;
+        self.health.state = LinkState::Up;
+        // The drives answer again the moment the link is back.
+        self.connected = self
+            .node_configs
+            .iter()
+            .fold(0u16, |m, c| m | (1 << u16::from(c.node)));
+        true
+    }
 }
 
 impl SimBus {
+    /// Test hook: make the link deaf (every reply is dropped undecoded,
+    /// the way an error-passive controller hears nobody) until the
+    /// runtime cycles it through `recover_link`. The link reports
+    /// error-passive while deaf.
+    pub fn set_deaf(&mut self, deaf: bool) {
+        self.deaf = deaf;
+        self.health.state = if deaf {
+            LinkState::ErrorPassive
+        } else {
+            LinkState::Up
+        };
+    }
+
     /// Compile the scene for this robot config with the current world and
     /// place the arm at `q0`; keeps the base spec for later world changes.
     fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {

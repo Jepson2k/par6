@@ -207,6 +207,15 @@ pub struct HomingConfig {
     /// Global trailing moves after the last step.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub post_moves: Vec<PreMove>,
+    /// Per-joint bound \[Nm\] on the mean holding-torque residual
+    /// `|tau_measured − G(q)|` over the final hold at the ready pose. A
+    /// joint above its bound fails the sequence: the reference it
+    /// latched puts the arm somewhere the gravity model says it cannot
+    /// be holding this load — the signature of a seek that stopped
+    /// short of the endstop. Empty disables the check; sized well above
+    /// the model's own error so only a gross reference error trips it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub reference_check_nm: Vec<f64>,
 }
 
 impl JointHoming {
@@ -371,6 +380,27 @@ impl HomingConfig {
             ));
         }
         validate_moves(&self.post_moves, num_joints, "homing.post_moves")?;
+        if !self.reference_check_nm.is_empty() {
+            if self.reference_check_nm.len() != num_joints {
+                return Err(invalid(
+                    "homing.reference_check_nm",
+                    format!(
+                        "must be empty or one bound per joint ({num_joints} joints, {} entries)",
+                        self.reference_check_nm.len()
+                    ),
+                ));
+            }
+            if self
+                .reference_check_nm
+                .iter()
+                .any(|v| !v.is_finite() || *v <= 0.0)
+            {
+                return Err(invalid(
+                    "homing.reference_check_nm",
+                    "every bound must be a finite torque > 0 Nm",
+                ));
+            }
+        }
         Ok(())
     }
 }

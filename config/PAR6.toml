@@ -322,6 +322,15 @@ torque_rate_nm_s = 198.0
 # as homing_release_duration_s = NaN; here the [release] table is simply
 # omitted (its current_ma/sample_pct then have no meaning and are dropped).
 
+# Post-homing reference check: mean |tau_measured - G(q)| per joint over
+# the final 0.5 s hold at the ready pose. A stall seek that latched short
+# of the endstop puts the arm where the model cannot explain the holding
+# current; ~3x the model's own error on this arm (0.35/0.65/0.55 Nm on
+# J0-J2 at the ready pose) so only a wrong reference trips it. On the sim
+# plant a shoulder reference half a radian off reads ~3 Nm on J1.
+[homing]
+reference_check_nm = [1.5, 2.0, 1.5, 1.0, 1.0, 0.5]
+
 [[homing.joints]] # J0
 strategy = "stall"
 speed_ticks_s = 4500.0
@@ -334,13 +343,17 @@ two_pass_max_diff_ticks = 3500
 home_offset_rad = 2.96279
 home_offset_gripper_dependent = false
 
+# J1/J2 seek values are measurements on the arm this config ships for:
+# 250 mA at 6000 ticks/s stopped at inconsistent positions (rejected by
+# the two-pass check) and 900 mA at 6000 ticks/s ran past the seek
+# timeout; these completed repeatably. Another assembly may need its own.
 [[homing.joints]] # J1
 strategy = "stall"
-speed_ticks_s = 6000.0
+speed_ticks_s = 15000.0
 direction = 1
-current_ma = 250.0
-timeout_s = 10.0
-backoff_s = 1.5
+current_ma = 900.0
+timeout_s = 20.0
+backoff_s = 0.6
 two_pass = true
 two_pass_max_diff_ticks = 2000
 home_offset_rad = -2.5259796
@@ -353,10 +366,10 @@ sample_pct = 0.8
 
 [[homing.joints]] # J2
 strategy = "stall"
-speed_ticks_s = 6000.0
+speed_ticks_s = 12000.0
 direction = 0
-current_ma = 250.0
-timeout_s = 10.0
+current_ma = 1000.0
+timeout_s = 20.0
 backoff_s = 1.5
 two_pass = true
 two_pass_max_diff_ticks = 1500
@@ -419,8 +432,10 @@ home_offset_gripper_dependent = false
 # Reference the shoulder/elbow before the base. Home and close the gripper last.
 
 # Clear the wrist, then reference J2/J3 (zero-based joints 1/2) before J1.
+# The vendor idles J1/J2 here so their drivetrains unload while the BASE
+# homes; with the shoulder homing first there is nothing to wait for.
 [[homing.sequence]]
-pre_moves = [{ kind = "idle", joint = 1, duration_s = 4.0 }, { kind = "idle", joint = 2, duration_s = 4.0 }, { kind = "nudge", joint = 4, speed_ticks_s = -7000.0, duration_s = 2.8 }]
+pre_moves = [{ kind = "nudge", joint = 4, speed_ticks_s = -7000.0, duration_s = 2.8 }]
 home = { joints = [1, 2] }
 
 [[homing.sequence]]

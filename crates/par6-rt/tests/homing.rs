@@ -23,9 +23,9 @@ use par6_config::{ConfigBundle, GripperHomeMode, HomeGroup, MoveTo, SequenceStep
 use par6_rt::homing::{HomingSystem, SeqStatus};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
-    sample_ring, ArmState, CompletionPolicy, ErrorCode, HomingJointStatus, HomingPhase, Mode, NoFk,
-    RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo, SharedFlashMarker, SharedLineGpio,
-    SpecSettle, ZeroGravity, MAX_JOINTS,
+    sample_ring, ArmState, CompletionPolicy, ErrorCode, GravityModel, HomingJointStatus,
+    HomingPhase, Mode, NoFk, RtCommand, RtCore, RtHandles, RtHooks, SharedDigitalIo,
+    SharedFlashMarker, SharedLineGpio, SpecSettle, ZeroGravity, MAX_JOINTS,
 };
 
 /// An RtCore over the closed-loop sim bus. J5's hall band is moved onto
@@ -49,6 +49,18 @@ fn sim_core_with_bundle(
     mpsc::Sender<RtCommand>,
     Arc<AtomicBool>,
 ) {
+    sim_core_with_gravity(bundle, Box::new(ZeroGravity))
+}
+
+fn sim_core_with_gravity(
+    bundle: &ConfigBundle,
+    gravity: Box<dyn GravityModel>,
+) -> (
+    RtCore<SimBus>,
+    RtHandles,
+    mpsc::Sender<RtCommand>,
+    Arc<AtomicBool>,
+) {
     let robot = &bundle.robot;
     let dt = robot.robot.tick_dt_s;
     let (tx, rx) = mpsc::channel();
@@ -57,7 +69,7 @@ fn sim_core_with_bundle(
     let (io, _io_lines) = SharedDigitalIo::new(robot.io.inputs.len(), robot.io.outputs.len());
     let (_producer, consumer) = sample_ring(64);
     let hooks = RtHooks {
-        gravity: Box::new(ZeroGravity),
+        gravity,
         jog: Box::new(RampJog::new(robot)),
         stream: Box::new(ClampStream::new(robot)),
         settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
@@ -196,6 +208,82 @@ fn full_par6_sequence_homes_closed_loop_to_the_ready_pose() {
     }
 }
 
+/// Run the shipped sequence to its end under `gravity` and return the
+/// final snapshot plus the measured holding torque during the last
+/// homing tick — the ready-pose load the reference check compares
+/// against the model.
+fn home_under(gravity: Box<dyn GravityModel>) -> (par6_rt::StateSnapshot, [f64; MAX_JOINTS]) {
+    let (mut core, mut handles, tx, _line) = sim_core_with_gravity(&common::bundle(), gravity);
+    let dt = core.tick_dt_s();
+    start_homing(&mut core, &mut handles, &tx);
+    let mut hold = [0.0; MAX_JOINTS];
+    for _ in 0..30_000 {
+        core.tick(dt, false);
+        let s = handles.snapshots.latest();
+        if s.homing.active {
+            hold = s.tau_filtered;
+        } else if s.mode == Mode::Idle {
+            // The HOMING_FAILED warning is a per-tick condition on the
+            // statuses, published from the tick after the sequence ends.
+            core.tick(dt, false);
+            return (handles.snapshots.latest(), hold);
+        }
+    }
+    panic!("sequence must finish within the tick budget");
+}
+
+#[test]
+fn a_reference_the_gravity_model_cannot_explain_fails_the_sequence() {
+    let bundle = common::bundle();
+    let bounds = &bundle.robot.homing.reference_check_nm;
+    assert_eq!(
+        bounds.len(),
+        MAX_JOINTS,
+        "the shipped config enables the check"
+    );
+
+    // A placeholder model describes nothing, so the check stands aside
+    // and the sequence is judged on its seeks alone.
+    let (s, hold) = home_under(Box::new(ZeroGravity));
+    assert!(s.homed && !s.error_active, "nominal home under no model");
+    assert!(
+        hold.iter().any(|t| t.abs() > 0.5),
+        "the sim arm holds a real gravity load at the ready pose: {hold:?}"
+    );
+
+    // A model that explains the ready-pose load passes the check.
+    let (s, _) = home_under(Box::new(common::ConstGravity(hold)));
+    assert!(
+        s.homed && !s.error_active,
+        "a consistent reference is accepted"
+    );
+
+    // The same seeks under a model the measured load contradicts by more
+    // than J1's bound: the reference is refused, attributed to J1 in its
+    // Finished phase, and nothing else about the sequence changes.
+    let mut wrong = hold;
+    wrong[1] += bounds[1] + 1.0;
+    let (s, _) = home_under(Box::new(common::ConstGravity(wrong)));
+    assert!(!s.homed, "an implausible reference must not count as homed");
+    assert_eq!(s.homing.per_joint[1], HomingJointStatus::Failed);
+    assert_eq!(s.homing.phase[1], HomingPhase::Finished);
+    for j in (0..MAX_JOINTS).filter(|j| *j != 1) {
+        assert_eq!(
+            s.homing.per_joint[j],
+            HomingJointStatus::Done,
+            "J{j} unaffected"
+        );
+    }
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::HomingFailed && e.joint == Some(1)),
+        "HOMING_FAILED names the refused joint: {:?}",
+        s.errors
+    );
+}
+
 #[test]
 fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
     let mut bundle = common::bundle();
@@ -287,6 +375,9 @@ fn hard_error_mid_homing_aborts_unhomes_and_zeroes_statuses() {
 /// A bundle whose sequence is a single step homing exactly `joint`.
 fn single_joint_bundle(joint: u8) -> ConfigBundle {
     let mut bundle = common::bundle();
+    // These cases drive the HomingSystem seam alone; the reference check
+    // is the core's (it needs the torque model), so its hold is left out.
+    bundle.robot.homing.reference_check_nm.clear();
     bundle.robot.homing.sequence = vec![SequenceStep {
         pre_moves: vec![],
         home: Some(HomeGroup {
@@ -1094,6 +1185,7 @@ fn hall_homing_latches_at_the_sensor_not_on_a_cached_trigger() {
 /// A bundle whose whole sequence is the firmware gripper calibration.
 fn gripper_cal_bundle() -> ConfigBundle {
     let mut bundle = common::bundle();
+    bundle.robot.homing.reference_check_nm.clear();
     bundle.robot.homing.sequence = vec![SequenceStep {
         pre_moves: vec![],
         home: Some(HomeGroup {

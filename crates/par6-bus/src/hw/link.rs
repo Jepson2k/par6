@@ -81,6 +81,59 @@ pub enum OpenError {
     },
 }
 
+/// Take the interface down and back up at the configured timing: the
+/// recovery for a controller that came up error-passive and answers no
+/// node until its error counters are reset by a link restart.
+pub(super) fn cycle(cfg: &BusConfig) -> Result<(), OpenError> {
+    let iface = CanInterface::open(&cfg.interface).map_err(|e| OpenError::NoInterface {
+        iface: cfg.interface.clone(),
+        detail: e.to_string(),
+    })?;
+    let fail = |detail: String| OpenError::BringUp {
+        iface: cfg.interface.clone(),
+        bitrate: cfg.bitrate,
+        detail,
+    };
+    iface
+        .bring_down()
+        .map_err(|e| fail(format!("link down: {e}")))?;
+    bring_up_timed(&iface, cfg, &fail)?;
+    log::info!(
+        "CAN interface '{}' cycled: {} bps, restart-ms {}",
+        cfg.interface,
+        cfg.bitrate,
+        cfg.restart_ms
+    );
+    Ok(())
+}
+
+/// Bitrate/restart-ms (on interfaces that have bit timing), up, then the
+/// TX queue length — the shared tail of a first bring-up and a cycle.
+fn bring_up_timed(
+    iface: &CanInterface,
+    cfg: &BusConfig,
+    fail: &impl Fn(String) -> OpenError,
+) -> Result<(), OpenError> {
+    let details = iface
+        .details()
+        .map_err(|e| fail(format!("querying interface details: {e}")))?;
+    // Virtual interfaces have no bit timing; a bitrate/restart-ms set on
+    // one fails, and there is nothing to time.
+    if details.can.bit_timing_const.is_some() {
+        iface
+            .set_bitrate(cfg.bitrate, None::<u32>)
+            .map_err(|e| fail(format!("set bitrate {}: {e}", cfg.bitrate)))?;
+        iface
+            .set_restart_ms(cfg.restart_ms)
+            .map_err(|e| fail(format!("set restart-ms {}: {e}", cfg.restart_ms)))?;
+    }
+    iface
+        .bring_up()
+        .map_err(|e| fail(format!("link up: {e}")))?;
+    set_txqueuelen(&cfg.interface, cfg.txqueuelen);
+    Ok(())
+}
+
 /// Bring the configured interface into its operating state (up at the
 /// configured bitrate), if it is not already there.
 ///
@@ -130,20 +183,7 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
     iface
         .bring_down()
         .map_err(|e| fail(format!("link down: {e}")))?;
-    // Virtual interfaces have no bit timing; a bitrate/restart-ms set on
-    // one fails, and there is nothing to time.
-    if details.can.bit_timing_const.is_some() {
-        iface
-            .set_bitrate(cfg.bitrate, None::<u32>)
-            .map_err(|e| fail(format!("set bitrate {}: {e}", cfg.bitrate)))?;
-        iface
-            .set_restart_ms(cfg.restart_ms)
-            .map_err(|e| fail(format!("set restart-ms {}: {e}", cfg.restart_ms)))?;
-    }
-    iface
-        .bring_up()
-        .map_err(|e| fail(format!("link up: {e}")))?;
-    set_txqueuelen(&cfg.interface, cfg.txqueuelen);
+    bring_up_timed(&iface, cfg, &fail)?;
     log::info!(
         "CAN interface '{}' brought up: {} bps, restart-ms {}",
         cfg.interface,

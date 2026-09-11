@@ -82,6 +82,10 @@ const STREAM_REST_RAD_S: f64 = 1e-9;
 const STREAM_BRAKE_SETTLE_S: f64 = 0.1;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
+/// Settling time between a boot-time link cycle and the re-scan that
+/// judges it \[s\]: the interface comes back up, the first stored-config
+/// shot (0.2 s) reaches the drives, and their replies fill the roll.
+const LINK_RECOVERY_SETTLE_S: f64 = 0.5;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
 const CLEAR_ERROR_REPEATS: u8 = 3;
 /// EXEC link watchdog: heartbeat silence while samples pending that
@@ -483,6 +487,14 @@ pub struct RtCore<B: DriverBus> {
 
     // Subsystems.
     homing: HomingSystem,
+    /// `homing.reference_check_nm`: per-joint bound on the mean holding
+    /// residual over the sequence's final hold; empty disables.
+    ref_check_nm: Vec<f64>,
+    ref_check_sum: [f64; MAX_JOINTS],
+    ref_check_n: u32,
+    /// One link cycle per bus life: a boot scan that finds nobody cycles
+    /// the interface once and re-scans; a second silence is a fault.
+    link_recovered: bool,
     errors: ErrorManager,
     timing: LoopTiming,
     bus_faults: BusFaultLogs,
@@ -624,6 +636,8 @@ pub struct RtCore<B: DriverBus> {
     /// Tick after a bus comes up at which the selfcheck runs, from
     /// [`BOOT_SELFCHECK_S`] at this tick rate.
     boot_selfcheck_tick: u64,
+    /// Tick of the one re-scan that follows a boot-time link cycle.
+    rescan_at: Option<u64>,
 
     // Opt-in per-phase tick profiler (see `TickProfile`).
     profile_on: bool,
@@ -731,6 +745,10 @@ impl<B: DriverBus> RtCore<B> {
             commands: hooks.commands,
             fk: hooks.fk,
             homing: HomingSystem::new(bundle),
+            ref_check_nm: robot.homing.reference_check_nm.clone(),
+            ref_check_sum: [0.0; MAX_JOINTS],
+            ref_check_n: 0,
+            link_recovered: false,
             errors: ErrorManager::new(dt),
             timing: LoopTiming::new(dt, robot.loop_timing()),
             bus_faults: BusFaultLogs::new(u64::from(robot.ticks(BUS_FAULT_LOG_PERIOD_S).max(1))),
@@ -840,6 +858,7 @@ impl<B: DriverBus> RtCore<B> {
             scan_settle_ticks: u8::try_from(robot.ticks(SCAN_SETTLE_S).max(1)).unwrap_or(u8::MAX),
             scan_epoch: 0,
             boot_selfcheck_tick: u64::from(robot.ticks(BOOT_SELFCHECK_S).max(1)),
+            rescan_at: None,
             profile_on: false,
             profile: TickProfile::default(),
             writer,
@@ -924,6 +943,8 @@ impl<B: DriverBus> RtCore<B> {
         self.filters_seeded = false;
         self.bus_booted_at = self.tick;
         self.config_repush_armed_at = self.tick;
+        self.link_recovered = false;
+        self.rescan_at = None;
         self.homed = false;
         self.not_homed_refused = false;
         self.mode = Mode::Booting;
@@ -1253,13 +1274,58 @@ impl<B: DriverBus> RtCore<B> {
 
     // ------------------------------------------------------------ boot
 
+    /// The post-homing reference plausibility check: with every joint
+    /// held on its drive's own loops at the ready pose, the current it
+    /// draws is the load the latched reference implies. A mean residual
+    /// against G(q) beyond the configured bound means the reference is
+    /// wrong by far more than the model is — a seek that stopped early.
+    fn check_reference(&mut self) -> bool {
+        if self.ref_check_nm.is_empty() || self.ref_check_n == 0 || !self.gravity.describes_arm() {
+            return false;
+        }
+        let n = f64::from(self.ref_check_n);
+        let residuals: [f64; MAX_JOINTS] = std::array::from_fn(|j| self.ref_check_sum[j] / n);
+        log::info!(
+            "homing reference check: mean holding residual {residuals:.2?} Nm over {n} ticks, \
+             bounds {:.2?} Nm",
+            self.ref_check_nm
+        );
+        let mut refused = false;
+        for (j, (residual, bound)) in residuals.iter().zip(&self.ref_check_nm).enumerate() {
+            if residual.abs() > *bound {
+                log::warn!(
+                    "homing reference check: J{j} holding residual {residual:+.2} Nm exceeds \
+                     {bound:.2} Nm at the ready pose; the reference is refused"
+                );
+                self.homing.fail_reference(j);
+                refused = true;
+            }
+        }
+        refused
+    }
+
     fn boot_oneshots(&mut self) {
         // Ticks since this BUS came up, not since the process did: a
         // backend swapped in at tick 90 000 needs the same selfcheck and
         // the same config re-sends a backend opened at boot got.
         let since_boot = self.tick - self.bus_booted_at;
-        if since_boot == self.boot_selfcheck_tick {
+        if since_boot == self.boot_selfcheck_tick || self.rescan_at == Some(self.tick) {
+            self.rescan_at = None;
             let connected = self.bus.connected_nodes();
+            let arm_mask: u16 = self
+                .node_of
+                .iter()
+                .fold(0, |m, node| m | (1 << u16::from(*node)));
+            if connected & arm_mask == 0 && !self.link_recovered && self.bus.recover_link() {
+                // Whole-bus silence, cycled once: the stored-config shots
+                // re-arm from this tick and the scan is judged again once
+                // the link and the drives have had time to answer.
+                self.link_recovered = true;
+                self.config_repush_armed_at = self.tick;
+                let settle = u64::from(self.boot.robot.ticks(LINK_RECOVERY_SETTLE_S).max(1));
+                self.rescan_at = Some(self.tick + settle);
+                return;
+            }
             for i in 0..MAX_JOINTS {
                 if connected & (1 << u16::from(self.node_of[i])) == 0 {
                     self.errors.latch(ErrorCode::CanLost, Some(i as u8));
@@ -1633,6 +1699,8 @@ impl<B: DriverBus> RtCore<B> {
         match target {
             Mode::Homing => {
                 self.homed = false;
+                self.ref_check_sum = [0.0; MAX_JOINTS];
+                self.ref_check_n = 0;
                 self.homing.start(&mut self.bus);
             }
             Mode::Jog => {
@@ -2166,7 +2234,14 @@ impl<B: DriverBus> RtCore<B> {
             self.step_scan();
             let _ = self.bus.poll_step();
             match status {
+                SeqStatus::Checking => {
+                    for (sum, ext) in self.ref_check_sum.iter_mut().zip(self.tau_ext) {
+                        *sum += ext;
+                    }
+                    self.ref_check_n += 1;
+                }
                 SeqStatus::Complete => {
+                    let refused = self.check_reference();
                     // Complete only says the sequence ran to its end, not
                     // that it referenced anything: a config whose home
                     // groups omit a joint still completes. Claiming
@@ -2180,6 +2255,9 @@ impl<B: DriverBus> RtCore<B> {
                         log::info!("homing sequence complete");
                         self.homed = true;
                         self.not_homed_refused = false;
+                    } else if refused {
+                        log::warn!("homing sequence FAILED the reference check");
+                        self.homed = false;
                     } else {
                         log::warn!(
                             "homing sequence completed without referencing {unreferenced:?}; \

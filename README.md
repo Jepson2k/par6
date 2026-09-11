@@ -945,7 +945,12 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
   `reset()` does not return until the RT has actually answered, because "the enable was
   queued" is not "the arm will move".
 - **Homing references the arm.** Planned motion is refused before it; jogging is not, so
-  an arm can be driven clear of an obstruction before it is referenced.
+  an arm can be driven clear of an obstruction before it is referenced. A completed
+  sequence is still refused when the ready-pose holding torque contradicts the gravity
+  model by more than `homing.reference_check_nm` (a stall seek that latched short of its
+  endstop); the joint reports `HOMING_FAILED` in its `Finished` phase. A boot scan that
+  hears no drive at all cycles the CAN interface once and re-scans before latching
+  `CAN_LOST` — the signature of a controller that came up error-passive.
 - **aarch64 kinematics are built but not validated** — the shim's numerics have never
   been executed on that ISA ([#31](https://github.com/Jepson2k/par6/issues/31)).
 - The vendor runtime (RCB-Runtime) and the Spectral firmware are GPL: they are

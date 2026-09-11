@@ -46,6 +46,9 @@ use crate::{MAX_JOINTS, NUM_NODES};
 
 /// Whole-sequence deadline, including all seeks and trailing moves \[s\].
 const SEQUENCE_TIMEOUT_S: f64 = 60.0;
+/// Final hold at the ready pose over which the reference-check residual
+/// is averaged \[s\].
+const REFERENCE_CHECK_S: f64 = 0.5;
 /// Settling allowance after a pre/post positioning profile \[s\].
 const PRE_POST_TIMEOUT_S: f64 = 4.0;
 /// move_to failure timeout = duration + this \[s\].
@@ -99,6 +102,9 @@ pub enum SeqStatus {
     Inactive,
     /// Sequence in progress.
     Running,
+    /// Every step has run; the arm holds the ready pose while the
+    /// runtime accumulates the reference-check residual.
+    Checking,
     /// Sequence finished successfully — the runtime sets `homed`.
     Complete,
     /// Sequence failed — the runtime clears `homed` and returns to IDLE.
@@ -739,6 +745,10 @@ pub struct HomingSystem {
     cal_failed: bool,
     endstop_ticks: Option<i32>,
     ticks_per_meter: Option<f64>,
+    /// Length of the final hold reported as [`SeqStatus::Checking`];
+    /// zero when the config carries no reference bounds.
+    check_ticks: u32,
+    check_left: u32,
 }
 
 impl HomingSystem {
@@ -856,12 +866,25 @@ impl HomingSystem {
             cal_failed: false,
             endstop_ticks: None,
             ticks_per_meter: None,
+            check_ticks: if robot.homing.reference_check_nm.is_empty() {
+                0
+            } else {
+                ticks(REFERENCE_CHECK_S).max(1)
+            },
+            check_left: 0,
         }
     }
 
     /// Whether a sequence is currently running.
     pub fn active(&self) -> bool {
         self.active
+    }
+
+    /// The reference check rejected `joint`'s latched reference: the
+    /// joint is marked failed in its `Finished` phase so the ordinary
+    /// `HOMING_FAILED` warning attributes it.
+    pub fn fail_reference(&mut self, joint: usize) {
+        self.statuses[joint] = HomingJointStatus::Failed;
     }
 
     /// A live retune of `node` replaces the "normal" limits the sequence
@@ -906,6 +929,7 @@ impl HomingSystem {
         self.cal_failed = false;
         self.last_fw_cmd = None;
         self.gripper_homer_started = false;
+        self.check_left = self.check_ticks;
         for h in &mut self.homers {
             h.phase = HPhase::Finished;
         }
@@ -1403,6 +1427,13 @@ impl HomingSystem {
             return self.fail(bus, cmds, gcmd);
         }
         if all_done {
+            // The idle keep-alive frames already filled in by `tick`
+            // hold every joint on the drive's own loops, so the current
+            // they draw is the load the reference puts them under.
+            if self.check_left > 0 {
+                self.check_left -= 1;
+                return SeqStatus::Checking;
+            }
             self.active = false;
             return SeqStatus::Complete;
         }
