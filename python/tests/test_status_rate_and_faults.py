@@ -54,24 +54,39 @@ async def _rate_in_force(client: AsyncRobotClient, hz: float) -> None:
 
 @pytest.mark.asyncio
 async def test_the_runtime_serves_every_rate_it_says_it_can(daemon: LiveDaemon):
-    """``control_hz`` is the whole contract: a caller derives the legal set
-    from it instead of probing, so every rate it implies must be accepted
-    and the current one must itself be legal."""
+    """The runtime reports the set itself, from the same divisors
+    SET_STATUS_RATE is checked against, so every rate it lists is accepted
+    and the current one is on the list.
+
+    Deriving the set from the tick rate instead means re-implementing the
+    rule in the client, and answering nothing at all for a tick rate that is
+    not a whole number of Hz.
+    """
     async with daemon.client() as client:
         assert await client.wait_ready(timeout=10.0)
 
         rate = await client.status_rate()
         assert rate is not None
         assert rate.control_hz > 0.0 and rate.hz > 0.0
-        assert rate.hz in rate.achievable(), (
-            f"broadcasting at {rate.hz} Hz, which its own {rate.control_hz} Hz "
-            f"tick rate cannot divide into"
+        assert rate.servable, "the runtime has to answer with its own rate set"
+        assert rate.achievable() == rate.servable, (
+            "the reported set is what a caller is offered; nothing should be "
+            "falling back to the client-side guess"
+        )
+        assert max(rate.servable) == pytest.approx(rate.control_hz), (
+            "the fastest servable rate is one frame per tick"
+        )
+        assert rate.hz in rate.servable, (
+            f"broadcasting at {rate.hz} Hz, which it does not list as servable"
         )
 
-        for candidate in rate.achievable():
+        for candidate in rate.servable:
             assert await client.set_status_rate(candidate) > 0, (
-                f"{candidate} Hz divides {rate.control_hz} Hz but was refused"
+                f"{candidate} Hz is listed as servable but was refused"
             )
+        refused = max(rate.servable) + 1
+        with pytest.raises(RobotError):
+            await client.set_status_rate(refused)
         assert await client.set_status_rate(rate.hz) > 0
 
 
