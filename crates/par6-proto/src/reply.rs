@@ -326,14 +326,19 @@ pub enum QueryResult {
         /// Every node id's row.
         nodes: Vec<BusNode>,
     },
-    /// STATUS_RATE result: the broadcast rate and the loop it divides.
+    /// STATUS_RATE result: the broadcast rate, the loop it divides, and the
+    /// rates this runtime will accept.
     StatusRate {
         /// Rate STATUS is broadcast at now \[Hz\].
         hz: f64,
-        /// Tick rate the broadcast divides \[Hz\]. Achievable rates are
-        /// `tick_hz / N`, so a caller derives the legal set from this
-        /// instead of probing for it.
+        /// Tick rate the broadcast divides \[Hz\].
         tick_hz: f64,
+        /// Rates this runtime accepts, highest first \[Hz\]. The runtime's own
+        /// answer, from the same set SET_STATUS_RATE is checked against: a
+        /// caller deriving it from `tick_hz` has to re-implement the rule,
+        /// and gets nothing at all for a tick rate that is not a whole
+        /// number of Hz.
+        servable: Vec<f64>,
     },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
@@ -680,11 +685,19 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 w_f64(buf, *v);
             }
         }
-        Q::StatusRate { hz, tick_hz } => {
-            w_array(buf, 3);
+        Q::StatusRate {
+            hz,
+            tick_hz,
+            servable,
+        } => {
+            w_array(buf, 4);
             w_uint(buf, u64::from(tag));
             w_f64(buf, *hz);
             w_f64(buf, *tick_hz);
+            w_array(buf, servable.len());
+            for rate in servable {
+                w_f64(buf, *rate);
+            }
         }
         Q::BusScan { nodes } => {
             w_array(buf, 2);
@@ -767,6 +780,19 @@ pub fn encode_reply(reply: &Reply, buf: &mut Vec<u8>) {
             }
         }
     }
+}
+
+/// The servable-rate list: a whole-Hz divisor set, so one entry per Hz of the
+/// tick rate bounds it before anything is reserved on the length's word.
+const MAX_SERVABLE_RATES: usize = 4096;
+
+fn r_f64_vec(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<f64>, DecodeError> {
+    let n = crate::command::r_len(r, what, MAX_SERVABLE_RATES)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(r.f64()?);
+    }
+    Ok(out)
 }
 
 fn r_f64_fixed<const N: usize>(
@@ -1134,10 +1160,11 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::StatusRate => {
-            expect_arity("status rate result", n, 3)?;
+            expect_arity("status rate result", n, 4)?;
             QueryResult::StatusRate {
                 hz: r.f64()?,
                 tick_hz: r.f64()?,
+                servable: r_f64_vec(r, "status rate servable")?,
             }
         }
         T::BusScan => {
