@@ -4,14 +4,14 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.3.0"
+version = "0.4.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
 requires-python = ">=3.11"
 dependencies = [
   "numpy>=2.0,<2.5",
-  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.14.0",
+  "waldoctl @ git+https://github.com/Jepson2k/waldoctl.git@v0.15.0",
 ]
 
 [project.scripts]
@@ -63,6 +63,9 @@ target-version = "py311"
 # Explicit, not inherited: ruff's defaults change between releases, and an
 # inherited set silently re-lints the whole package on every upgrade.
 select = ["E4", "E7", "E9", "F", "I"]
+
+[tool.ty.environment]
+extra-paths = ["tests"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

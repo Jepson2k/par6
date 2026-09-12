@@ -277,6 +277,11 @@ pub enum QueryResult {
         /// Z offset (mm).
         z: f64,
     },
+    /// Applied tool-local TCP transform (mm, intrinsic XYZ degrees).
+    TcpTransform {
+        /// Translation followed by orientation.
+        values: [f64; 6],
+    },
     /// TOOL_STATUS result.
     ToolStatus {
         /// Tool status, if a tool is selected.
@@ -380,6 +385,7 @@ impl QueryResult {
             Q::Error { .. } => QueryType::Error,
             Q::TcpSpeed { .. } => QueryType::TcpSpeed,
             Q::TcpOffset { .. } => QueryType::TcpOffset,
+            Q::TcpTransform { .. } => QueryType::TcpTransform,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
@@ -597,6 +603,13 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 2);
             w_uint(buf, u64::from(tag));
             w_f64(buf, *speed);
+        }
+        Q::TcpTransform { values } => {
+            w_array(buf, 7);
+            w_uint(buf, u64::from(tag));
+            for v in values {
+                w_f64(buf, *v);
+            }
         }
         Q::TcpOffset { x, y, z } => {
             w_array(buf, 4);
@@ -1048,6 +1061,20 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::TcpSpeed => {
             expect_arity("tcp_speed result", n, 2)?;
             QueryResult::TcpSpeed { speed: r.f64()? }
+        }
+        T::TcpTransform => {
+            expect_arity("tcp_transform result", n, 7)?;
+            let mut values = [0.0; 6];
+            for v in &mut values {
+                *v = r.f64()?;
+                if !v.is_finite() {
+                    return Err(DecodeError::Validation {
+                        what: "tcp_transform result",
+                        why: "must be finite".to_owned(),
+                    });
+                }
+            }
+            QueryResult::TcpTransform { values }
         }
         T::TcpOffset => {
             expect_arity("tcp_offset result", n, 4)?;

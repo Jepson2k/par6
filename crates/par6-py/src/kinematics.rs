@@ -13,7 +13,7 @@ use crate::convert::joints;
 use pyo3::types::{PyDict, PyList};
 
 use par6_kin::{relative_pose, wrap_to_window, IkOutcome, Kin, Pose, NQ};
-use par6d::{matrix_to_xyzrpy, translate_local};
+use par6d::matrix_to_xyzrpy;
 
 /// FK/IK on one URDF tree, resolved at `ee_frame` (the tree's last frame
 /// when `None`), optionally past a fixed `tool_transform`. Poses are
@@ -284,13 +284,36 @@ pub fn pose_matrix_py(xyz: [f64; 3], rpy: [f64; 3]) -> Vec<f64> {
 }
 
 /// A tool frame: `origin`/`rpy` (the tool's TCP off the flange) with
-/// `offset` walked along the tool's own axes afterwards — the
-/// composition the runtime applies to `set_tcp_offset`.
+/// the user translation and intrinsic XYZ rotation composed afterwards.
 #[pyfunction]
-pub fn compose_tool_frame(origin: [f64; 3], rpy: [f64; 3], offset: [f64; 3]) -> Vec<f64> {
-    let mut m = par6_proto::pose_matrix(origin, rpy);
-    translate_local(&mut m, offset);
-    m.to_vec()
+#[pyo3(signature = (origin, rpy, offset, rotation=None))]
+pub fn compose_tool_frame(
+    origin: [f64; 3],
+    rpy: [f64; 3],
+    offset: [f64; 3],
+    rotation: Option<[f64; 3]>,
+) -> PyResult<Vec<f64>> {
+    let rotation = rotation.unwrap_or([0.0; 3]);
+    if origin
+        .iter()
+        .chain(&rpy)
+        .chain(&offset)
+        .chain(&rotation)
+        .any(|v| !v.is_finite())
+    {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "TCP transform must be finite",
+        ));
+    }
+    let a = par6_proto::pose_matrix(origin, rpy);
+    let b = par6_proto::pose_matrix(offset, rotation);
+    let mut out = [0.0; 16];
+    for row in 0..4 {
+        for col in 0..4 {
+            out[row * 4 + col] = (0..4).map(|k| a[row * 4 + k] * b[k * 4 + col]).sum();
+        }
+    }
+    Ok(out.to_vec())
 }
 
 /// The fixed transform from `from_frame` to `to_frame` in `urdf`, as

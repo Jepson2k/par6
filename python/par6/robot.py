@@ -361,6 +361,10 @@ class Robot(_RobotABC):
         return len(_cfg.io_line_names()[0])
 
     @property
+    def has_tcp_transform(self) -> bool:
+        return True
+
+    @property
     def has_force_torque(self) -> bool:
         """Joint torques are measured every tick (motor currents through
         the torque constants), and the external-torque estimate rides the
@@ -444,6 +448,8 @@ class Robot(_RobotABC):
         tool_key: str,
         tcp_offset_m: tuple[float, float, float] | None = None,
         variant_key: str | None = None,
+        *,
+        tcp_rotation_rad: tuple[float, float, float] | None = None,
     ) -> None:
         """Point the local FK/IK model at a tool's TCP.
 
@@ -467,6 +473,9 @@ class Robot(_RobotABC):
             [float(v) for v in origin],
             [float(v) for v in rpy],
             [float(v) for v in offset],
+            [float(v) for v in tcp_rotation_rad]
+            if tcp_rotation_rad is not None
+            else None,
         )
         if all(abs(a - b) < 1e-15 for a, b in zip(frame, _IDENTITY)):
             frame = None

@@ -218,6 +218,10 @@ class DryRunRobotClient:
         world_in_tool[:3, 3] *= 1000.0
         return matrix_to_xyzrpy(world_in_tool.flatten().tolist())
 
+    def tcp_transform(self) -> list[float]:
+        """Read the preview's applied TCP correction."""
+        return self._preview.tcp_transform()
+
     def tcp_offset(self) -> list[float]:
         """The TCP offset applied on top of the tool transform, in mm."""
         return self._preview.tcp_offset_mm()
@@ -691,6 +695,27 @@ class DryRunRobotClient:
             }
         )
         return 0
+
+    def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        return self._system(
+            {
+                "type": "set_tcp_transform",
+                "x": float(x),
+                "y": float(y),
+                "z": float(z),
+                "roll": float(roll),
+                "pitch": float(pitch),
+                "yaw": float(yaw),
+            }
+        )
 
     def set_tcp_offset(
         self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any
