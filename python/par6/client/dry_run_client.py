@@ -257,7 +257,14 @@ class DryRunRobotClient:
     @property
     def skill_capabilities(self) -> frozenset[str]:
         return frozenset(
-            {"motion.joint", "motion.linear", "tool.gripper", "backend.par6"}
+            {
+                "motion.joint",
+                "motion.linear",
+                "tool.gripper",
+                "backend.par6",
+                "io.digital",
+                "execution.preview",
+            }
         )
 
     def is_simulator(self) -> bool:
@@ -965,7 +972,7 @@ class DryRunRobotClient:
     # Queries
     # ------------------------------------------------------------------
 
-    def io(self) -> list[int]:
+    def io(self, *, timeout: float | None = None) -> list[int]:
         """``inputs ++ outputs ++ [estop]``, the runtime's own layout."""
         return list(self._preview.io())
 

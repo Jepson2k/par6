@@ -935,3 +935,12 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 Apache-2.0 (`LICENSE`). `assets/par6_description/` derives from Source Robotics' PAR6
 repository under a licence upstream states two ways — see `assets/NOTICE`, which records
 what is verbatim, what par6 modified, and what par6 authored.
+
+The Python client advertises `io.digital` and accepts per-call deadlines:
+`await rbt.io(timeout=1.0)` returns `None` without a reply;
+`await rbt.write_io(0, 1, timeout=1.0)` raises `TimeoutError` when acceptance
+remains unconfirmed. Deadlines include connection setup and retries, and the
+sync facade accepts the same options. Omitted deadlines keep client defaults.
+Named read/wait/write skills are available in `waldo_commander.skills` using
+`waldoctl.signals.DigitalSignal` mappings. Native preview clients advertise
+`execution.preview` so those skills require explicit observation fixtures.

@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import copy
 import logging
+import math
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
@@ -161,7 +162,11 @@ class AsyncRobotClient(_RobotClientABC):
 
     @property
     def skill_capabilities(self) -> frozenset[str]:
-        return super().skill_capabilities | {"backend.par6", "tool.gripper"}
+        return super().skill_capabilities | {
+            "backend.par6",
+            "tool.gripper",
+            "io.digital",
+        }
 
     def __init__(
         self,
@@ -1424,7 +1429,9 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
 
-    async def write_io(self, index: int, value: int) -> int:
+    async def write_io(
+        self, index: int, value: int, *, timeout: float | None = None
+    ) -> int:
         """Set digital output by logical index (0 = first output pin).
 
         *index* addresses the ``[io].outputs`` list, which is also where the
@@ -1436,6 +1443,9 @@ class AsyncRobotClient(_RobotClientABC):
         its own and refuses a port it does not have, so a box wired
         differently is caught either way.
 
+        ``timeout`` bounds command acceptance. TimeoutError leaves application
+        unconfirmed; None uses the client defaults.
+
         Category: I/O
 
         Example:
@@ -1446,8 +1456,13 @@ class AsyncRobotClient(_RobotClientABC):
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        core = await self._ensure_core()
-        return await self._call(core.write_io(index, value))
+        if timeout is not None and (
+            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("I/O timeout must be positive and finite")
+        async with asyncio.timeout(timeout):
+            core = await self._ensure_core()
+            return await self._call(core.write_io(index, value))
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1573,16 +1588,27 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.pose_xyzrpy(_wire_frame(frame)))
 
-    async def io(self) -> list[int] | None:
-        """Digital I/O state [in1, in2, out1, out2, estop].
+    async def io(self, *, timeout: float | None = None) -> list[int] | None:
+        """Digital I/O in configured input/output order, followed by E-stop.
+
+        ``timeout`` bounds setup, retries, and the reply; None uses client defaults.
 
         Category: Query
 
         Example:
             io = rbt.io()
         """
-        core = await self._ensure_core()
-        return await self._call(core.io())
+        if timeout is not None and (
+            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
+        ):
+            raise ValueError("I/O timeout must be positive and finite")
+        try:
+            async with asyncio.timeout(timeout):
+                core = await self._ensure_core()
+                levels = await self._call(core.io())
+                return list(levels) if levels is not None else None
+        except TimeoutError:
+            return None
 
     async def joint_speeds(self) -> list[float] | None:
         """Current joint velocities in rad/s.
