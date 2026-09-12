@@ -628,6 +628,15 @@ bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
 drive's parameters back, presets, calibration — is UART-only and stays with the
 vendor's tool over a bench connection.
 
+The page state machine itself — the ack ladder, the page window, the reboot
+handshake — is only tested on a drive: `par6 flash` against a board on the
+bench, which reports the retries it needed. A scripted bootloader would test
+the host against our reading of the drive rather than against the drive, which
+is the misreading a test is there to catch, so `python/tests/test_firmware.py`
+covers the CRC, the frame layout and what a release must refuse, and stops
+there. A bench flash is part of bringing up a new drive; treat an image that
+has never been flashed on hardware as untested.
+
 ### The bus-grant signal
 
 `can0` is a system-wide exclusive resource, and the vendor's CAN tools (the

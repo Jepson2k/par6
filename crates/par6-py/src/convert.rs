@@ -247,9 +247,14 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("next", next)?;
             d.set_item("params", params)?;
         }
-        QueryResult::StatusRate { hz, tick_hz } => {
+        QueryResult::StatusRate {
+            hz,
+            tick_hz,
+            servable,
+        } => {
             d.set_item("hz", hz)?;
             d.set_item("tick_hz", tick_hz)?;
+            d.set_item("servable", servable.clone())?;
         }
         QueryResult::LoopStats(s) => {
             d.set_item("target_hz", s.target_hz)?;
