@@ -252,7 +252,9 @@ class DryRunRobotClient:
 
     @property
     def skill_capabilities(self) -> frozenset[str]:
-        return frozenset({"motion.joint", "motion.linear", "backend.par6"})
+        return frozenset(
+            {"motion.joint", "motion.linear", "tool.gripper", "backend.par6"}
+        )
 
     def is_simulator(self) -> bool:
         return True
