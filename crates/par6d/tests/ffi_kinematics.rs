@@ -1213,11 +1213,17 @@ fn j0_speed_reaching(travel_rad: f64) -> f64 {
     // in ticks, so a helper that inverts it against a different tick
     // rate asks for a speed whose lookahead lands somewhere else
     // entirely.
-    let (v_max, accel, dt) = (lim.velocity_rad_s, lim.acceleration_rad_s2, TEST_TICK_DT_S);
+    // The settling term the gate projects is `v / kpp`, the position loop's
+    // own gain -- not an acceleration. Inverting it against the jog
+    // acceleration limit (an order larger) asks for a speed whose real
+    // projection is many times the travel, so the helper's contract ("the
+    // speed whose stop covers `travel_rad`") would not hold.
+    let kpp = cfg.joints[0].gains.kpp;
+    let (v_max, dt) = (lim.velocity_rad_s, TEST_TICK_DT_S);
     let (mut lo, mut hi) = (0.0, v_max);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
-        if par6d::stream_stopping_travel(mid, accel, dt) < travel_rad {
+        if par6d::stream_stopping_travel(mid, kpp, dt) < travel_rad {
             lo = mid;
         } else {
             hi = mid;
