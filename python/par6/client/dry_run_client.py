@@ -412,10 +412,18 @@ class DryRunRobotClient:
 
     def teleport(
         self, angles_deg: list[float], tool_positions: list[float] | None = None
-    ) -> DryRunResultData | None:
+    ) -> int:
         """Sim-only jump to *angles_deg*, establishing the position reference.
-        Refused outside a joint's travel, exactly as the runtime refuses."""
-        return self._submit(
+
+        Refused outside a joint's travel, exactly as the runtime refuses;
+        applied, it answers `1` as the live client does, so a program that
+        checks the code reads the same offline.
+        """
+        # The arm runs a held blend chain before it snaps, so close the hold
+        # here: that motion belongs to the next result, not to this command,
+        # which answers with a code and has no path of its own.
+        self._pending.extend(self.flush())
+        self._submit(
             {
                 "type": "teleport",
                 "angles": f6(angles_deg, "angles_deg"),
@@ -426,6 +434,7 @@ class DryRunRobotClient:
                 ),
             }
         )
+        return 1
 
     def move_j(
         self,
