@@ -18,12 +18,11 @@
 //! | [`error`] | [`ErrorCode`] + KUKA-style catalog ([`make_error`]) |
 //! | [`status`] | broadcast STATUS packet, reusable-buffer encoder |
 //! | [`chunk`] | chunked bulk envelope + [`Reassembler`] |
-//! | [`pygen`] | generator for the Python constants mirror |
 //!
-//! The Python constants mirror (`python/par6/protocol/constants.py`) is
-//! generated from this crate (`cargo run -p par6-proto --bin gen_python`);
-//! a test in this crate fails if it is stale. Contract changes require a
-//! `contracts`-labeled issue (see README workflow).
+//! Python reads these constants off the `par6._par6` extension, which builds
+//! its enums from each wire enum's `variants()` — there is no transcription
+//! to keep in step. Contract changes require a `contracts`-labeled issue
+//! (see README workflow).
 
 #![warn(missing_docs)]
 
@@ -34,7 +33,6 @@ pub mod chunk;
 pub mod command;
 pub mod enums;
 pub mod error;
-pub mod pygen;
 pub mod reply;
 pub mod status;
 mod wire;
@@ -61,7 +59,7 @@ pub use status::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 3;
+pub const PROTO_VERSION: u8 = 4;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

@@ -321,6 +321,8 @@ impl Daemon {
         let stream_gate = Arc::new(Mutex::new(crate::bridge::StreamGate::new(
             gate_collision,
             &jog_limits,
+            position_loop_gains(robot),
+            robot.robot.tick_dt_s,
         )));
         let bridge = RtBridge::new(
             link.clone(),
@@ -434,12 +436,14 @@ impl Daemon {
             let (link, shutdown) = (link, shutdown.clone());
             let jog_accel_time_s = robot.jog.accel_time_s;
             let hk_dt = robot.robot.tick_dt_s;
+            let hk_servo_grace = Duration::from_secs_f64(robot.stream.servo_grace_s);
             threads.push(
                 std::thread::Builder::new()
                     .name("par6d-housekeeping".into())
                     .spawn(move || {
                         housekeeping_loop(
                             hk_dt,
+                            hk_servo_grace,
                             jog_accel_time_s,
                             link,
                             stream_input,
@@ -572,6 +576,22 @@ fn tee_loop(
             None => std::thread::sleep(Duration::from_millis(1)),
         }
     }
+}
+
+/// The drive position-loop gains the runtime itself pushes at boot.
+///
+/// The streaming gate's stopping projection is a statement about how
+/// fast the ARM can settle out of its tracking error, and that is this
+/// loop's time constant — so the projection reads the same numbers the
+/// drivers are configured with rather than a constant of its own.
+pub(crate) fn position_loop_gains(
+    robot: &par6_config::RobotConfig,
+) -> [f64; par6_proto::NUM_JOINTS] {
+    let mut out = [0.0; par6_proto::NUM_JOINTS];
+    for (slot, joint) in out.iter_mut().zip(robot.joints.iter()) {
+        *slot = joint.gains.kpp;
+    }
+    out
 }
 
 /// Apply the configured installation keep-outs to `planner`, returning
@@ -823,13 +843,6 @@ pub(crate) fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
     }
 }
 
-/// Standoff \[m\] every collision pair is checked with: geometry within
-/// this distance counts as colliding, so the arm keeps a near-miss buffer
-/// from itself and from keep-outs that absorbs model and calibration
-/// error. The value parol6 runs the same arm with; a shape that wants a
-/// wider berth carries its own `margin`.
-pub const COLLISION_CLEARANCE_M: f64 = 0.005;
-
 /// Resolve the assets tree and load every model instance. Any failure
 /// (missing tree, bad URDF) is a clean startup error.
 /// What every kinematics object is built from: the resolved assets
@@ -893,7 +906,7 @@ impl KinSource {
             &self.assets_dir,
             self.variant,
             self.package_dir.as_deref(),
-            COLLISION_CLEARANCE_M,
+            par6_kin::COLLISION_CLEARANCE_M,
         )
         .map_err(|e| {
             DaemonError::Kinematics(format!(

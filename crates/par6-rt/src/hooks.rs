@@ -64,6 +64,12 @@ pub enum RtCommand {
     },
     /// Release the jog button (ramp to zero).
     JogRelease,
+    /// End a STREAM session by braking to rest, rather than abandoning
+    /// the arm at speed. STREAM outlives this until the ramp is at rest,
+    /// then the mode goes IDLE on its own — IDLE holds against gravity
+    /// and has no velocity authority, so a moving arm dropped into it
+    /// coasts on its own momentum.
+    StreamRelease,
     /// Pause/resume EXEC playback (pause holds in place, ring untouched).
     ExecSetPaused(bool),
     /// Discard the EXEC ring samples the planner marked for discard
@@ -389,6 +395,16 @@ pub trait StreamTracker: Send {
     fn set_scale(&mut self, speed: f64, accel: f64);
     /// One tick: write the post-limiter position/velocity setpoint.
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
+    /// Stop: shed whatever velocity the tracker is carrying, under its
+    /// own limits, and keep reporting it through [`Self::step`] until
+    /// the velocity it writes is zero. The core holds STREAM mode open
+    /// until then.
+    ///
+    /// Deliberately has no default. A tracker that silently declined to
+    /// brake would leave the arm coasting exactly when something decided
+    /// it must stop, and the caller cannot tell that from a tracker that
+    /// stopped instantly.
+    fn release(&mut self);
     /// Whether the tracker's own machinery has been failing for a
     /// sustained interval (a limiter that holds in place instead of
     /// tracking). The core hard-latches `StreamFault` while this reads
@@ -428,6 +444,13 @@ impl ClampStream {
 }
 
 impl StreamTracker for ClampStream {
+    fn release(&mut self) {
+        // Nothing to shed: this tracker does no rate limiting, so its
+        // step already writes zero velocity and holds the last clamped
+        // position. Stopping is what it does every tick.
+        self.target = self.current;
+    }
+
     fn activate(&mut self, q_meas: &[f64; MAX_JOINTS]) {
         self.current = *q_meas;
         self.target = *q_meas;

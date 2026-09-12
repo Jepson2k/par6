@@ -6,10 +6,10 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+links = "par6_shim"
 
 [dependencies]
 thiserror = { workspace = true }
-pinokin-sys = { path = "../pinokin-sys" }
 # Collision only: turning decoded wire shapes into checkable ones, so the
 # server's SET_SHAPES seam is one call rather than a hand-rolled match.
 par6-proto = { workspace = true }
@@ -20,7 +20,14 @@ rs-opw-kinematics = { version = "2.0.3", default-features = false }
 glam = "=0.30.10"
 urdf-rs = "0.9"
 
+[build-dependencies]
+# The shim staleness check digests cpp/ the way setup.sh does.
+sha2 = { workspace = true }
+
 [dev-dependencies]
 # The vendor gravity reference is JSON.
 serde = { workspace = true }
 serde_json = "1"
+# The joint window the self-collision audit sweeps is the config's, not
+# the URDF's: the vendor URDF declares every limit as 0.
+par6-config = { workspace = true }

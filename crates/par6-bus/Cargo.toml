@@ -6,13 +6,14 @@ edition.workspace = true
 license.workspace = true
 repository.workspace = true
 rust-version.workspace = true
+links = "mujoco"
 
 [dependencies]
 par6-config = { workspace = true }
 par6-proto = { workspace = true }
 # URDF inertials for the MuJoCo scene (sim/scene.rs).
 roxmltree = "0.21"
-pinokin-sys = { path = "../pinokin-sys" }
+par6-kin = { workspace = true }
 # The sim plant. mujoco-rs downloads libmujoco itself; build under
 # `pixi run` so MUJOCO_DOWNLOAD_DIR is set.
 mujoco-rs = { workspace = true }

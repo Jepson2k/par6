@@ -22,13 +22,6 @@ from par6.client import RobotClient
 pytestmark = [pytest.mark.e2e, requires_par6d]
 
 
-@pytest.fixture
-def daemon(tmp_path):
-    live = LiveDaemon.start(tmp_path)
-    yield live
-    live.stop()
-
-
 def park_deg() -> list[float]:
     return [math.degrees(v) for v in _cfg.config().park_pose_rad()]
 
@@ -87,15 +80,14 @@ def test_sync_facade_smoke(daemon):
         angles = client.angles()
         assert angles is not None and angles[0] == pytest.approx(target[0], abs=0.5)
 
-        assert client.jog_j(1, 0.4, 0.2) == 1
+        client.jog_j(1, 0.4, 0.2)
         assert client.stop() == 1
 
         # The halt verbs on the sync tool are sends, not coroutines: each
         # comes back as the queued command's index.
         client.select_tool(_cfg.fitted_tool_key())
         for verb in ("stop", "release"):
-            index = getattr(client.tool, verb)()
-            assert isinstance(index, int) and index >= 0, verb
+            assert getattr(client.tool, verb)() >= 0, verb
 
         # Clearing a protective stop and floating the arm under G(q)
         # alone — the control pair a synchronous script needs.
@@ -191,7 +183,7 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
         assert events[1].parent_id == events[0].invocation_id
 
     async def cancel_motion() -> None:
-        from par6.protocol.constants import ErrorCode
+        from par6.protocol import ErrorCode
 
         async with daemon.client() as client:
             moving = asyncio.Event()

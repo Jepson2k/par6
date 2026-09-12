@@ -787,33 +787,22 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "par6-bus"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "libc",
  "log",
  "mujoco-rs",
  "par6-config",
+ "par6-kin",
  "par6-proto",
- "pinokin-sys",
  "roxmltree",
  "socketcan",
  "thiserror 2.0.20",
 ]
 
 [[package]]
-name = "par6-calibrate"
-version = "0.1.0"
-dependencies = [
- "log",
- "par6-client",
- "par6-kin",
- "par6-proto",
- "tokio",
-]
-
-[[package]]
 name = "par6-client"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "log",
@@ -828,7 +817,7 @@ dependencies = [
 
 [[package]]
 name = "par6-config"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "par6-proto",
@@ -839,21 +828,22 @@ dependencies = [
 
 [[package]]
 name = "par6-kin"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "glam",
+ "par6-config",
  "par6-proto",
- "pinokin-sys",
  "rs-opw-kinematics",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.20",
  "urdf-rs",
 ]
 
 [[package]]
 name = "par6-motion"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "par6-config",
  "par6-rt",
@@ -863,7 +853,7 @@ dependencies = [
 
 [[package]]
 name = "par6-proto"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -872,10 +862,10 @@ dependencies = [
 
 [[package]]
 name = "par6-py"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
- "par6-calibrate",
+ "par6-bus",
  "par6-client",
  "par6-config",
  "par6-kin",
@@ -892,21 +882,21 @@ dependencies = [
 
 [[package]]
 name = "par6-rt"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "gpiocdev",
  "libc",
  "log",
  "par6-bus",
  "par6-config",
- "pinokin-sys",
+ "par6-kin",
  "thiserror 2.0.20",
  "thread-priority",
 ]
 
 [[package]]
 name = "par6-server"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "log",
  "par6-config",
@@ -919,13 +909,12 @@ dependencies = [
 
 [[package]]
 name = "par6d"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "env_logger",
  "libc",
  "log",
  "par6-bus",
- "par6-calibrate",
  "par6-client",
  "par6-config",
  "par6-kin",
@@ -933,7 +922,6 @@ dependencies = [
  "par6-proto",
  "par6-rt",
  "par6-server",
- "pinokin-sys",
  "sha2 0.10.9",
  "thiserror 2.0.20",
  "tokio",
@@ -956,14 +944,6 @@ name = "pin-project-lite"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a89322df9ebe1c1578d689c92318e070967d1042b512afbe49518723f4e6d5cd"
-
-[[package]]
-name = "pinokin-sys"
-version = "0.1.0"
-dependencies = [
- "serde",
- "serde_json",
-]
 
 [[package]]
 name = "pkg-config"

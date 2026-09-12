@@ -86,19 +86,112 @@ fn jog_deadline(duration_s: f64) -> Instant {
     Instant::now() + Duration::from_secs_f64(bounded)
 }
 
-/// Velocity-scaled streaming lookahead horizon \[s\]: a jog is refused or
-/// stopped when the configuration this far ahead AT THE COMMANDED
-/// VELOCITY would collide, so faster jogs stop further from contact.
-/// parol6 runs the same horizon (`COLLISION_JOG_LOOKAHEAD_S`) on its
-/// server-side jog integrator; par6's integrator ramps on the RT thread,
-/// so the projection here uses the commanded target velocity — an upper
-/// bound on the ramping integrator's, which errs on the stopping side.
-pub(crate) const STREAM_LOOKAHEAD_S: f64 = 0.15;
+/// Ticks of PIPELINE the streaming stopping projection allows for,
+/// before the arm's own settling is added.
+///
+/// This is the part of the reaction that is bookkeeping rather than
+/// physics: a snapshot at most one tick old, a housekeeping pass every
+/// tick, and an RT that drains one command per tick. Counted in ticks
+/// because that is what those stages are made of — a flat wall-clock
+/// horizon was a different number of pipeline stages at every tick rate.
+const STOP_PIPELINE_TICKS: f64 = 24.0;
+
+/// First-order lags the settling term counts.
+///
+/// Two, not one: the DRIVE closing its position error is one lag, and
+/// the streaming executor re-planning every setpoint to be reached at
+/// rest is a second one of comparable size in front of it. Measured on
+/// the sim rig, a single lag under-projects a 1 mm/50 ms approach by
+/// about half its coast.
+const STOP_SETTLE_LAGS: f64 = 2.0;
+
+/// Signed joint travel between "moving at `v_rad_s`" and "stopped"
+/// \[rad\]: [`STOP_PIPELINE_TICKS`] of `tick_dt_s` before anything
+/// happens, then the arm settling out of its own tracking error.
+///
+/// The settling term is `v / position_loop_hz`, not `v^2 / 2a`. In this
+/// regime the arm is not deceleration-limited: the streaming executor's
+/// command drops inside a handful of ticks and what takes the time is
+/// the DRIVE closing the position error it was already carrying, which
+/// is a first-order lag with time constant `1 / kpp`. Pricing the coast
+/// at the configured acceleration ceiling instead was optimistic by
+/// more than an order of magnitude — measured on the sim rig at ~0.7
+/// rad/s^2 achieved against a 32 rad/s^2 stream limit — and the arm
+/// coasted through the whole standoff every time.
+///
+/// This is what the streaming collision gate projects, so a caller
+/// choosing a jog speed that must be refused (or admitted) at a known
+/// distance from an obstacle inverts this function rather than guessing.
+///
+/// A non-finite or non-positive gain contributes no settling term,
+/// rather than an infinite one that would refuse every motion.
+pub fn stream_stopping_travel(v_rad_s: f64, position_loop_hz: f64, tick_dt_s: f64) -> f64 {
+    let pipeline = v_rad_s * STOP_PIPELINE_TICKS * tick_dt_s;
+    if !position_loop_hz.is_finite() || position_loop_hz <= 0.0 {
+        return pipeline;
+    }
+    pipeline + STOP_SETTLE_LAGS * v_rad_s / position_loop_hz
+}
 
 /// Joint speed above which a stream counts as MOVING and is re-tested
 /// against its projection every period \[rad/s\]. Below it the arm is
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
+
+/// How near a joint has to be to a gate-imposed standoff to count as
+/// arrived \[rad\]. Half a millimetre at the arm's reach, an order below
+/// the standoff itself, so "arrived" is a statement about the geometry
+/// rather than about the executor's last increment.
+const STANDOFF_ARRIVED_RAD: f64 = 2.0e-3;
+
+/// How far short of the solved boundary the placement is commanded
+/// \[rad\], on the fastest joint.
+///
+/// `stop_point` returns the configuration exactly ON the clearance, and
+/// an arm commanded exactly there settles either side of it — half the
+/// settle distribution lands inside the standoff, which is the one place
+/// it must not. Commanding the boundary less this margin puts the whole
+/// distribution outside. Half a millimetre at the arm's reach: enough to
+/// cover the settle, an order below the standoff it is protecting.
+const STANDOFF_SETTLE_MARGIN_RAD: f64 = 1.0e-3;
+
+/// How far ahead of the MEASURED pose a placement setpoint may sit
+/// \[rad\].
+///
+/// The placement ends ON a keep-out's clearance, so it is the one move
+/// that must not overshoot — and a position command the plant is
+/// chasing is exactly a move that does: measured on the sim rig, a 5.3
+/// degree placement commanded outright ran 5.7 mm past the standoff
+/// before settling back onto it, straight through the keep-out. Walking
+/// the setpoint on from the measurement means the command never leads
+/// the arm by more than this, so there is no stored tracking error to
+/// carry it past.
+const STANDOFF_CREEP_RAD: f64 = 4.0e-3;
+
+/// Speed and acceleration fractions the placement move onto a standoff
+/// runs at.
+///
+/// The placement is a short, precise move onto a surface the arm was
+/// just refused at, made from rest — there is nothing to gain by taking
+/// it at streaming speed.
+const STANDOFF_PLACEMENT_SCALE: (f64, f64) = (0.05, 0.05);
+
+/// Consecutive FRESH snapshots below [`STREAM_MOVING_RAD_S`] that count
+/// as the arm having stopped.
+///
+/// One frame is not rest — a snapshot's velocity passes through zero
+/// whenever the executor re-plans — and housekeeping runs faster than
+/// the RT publishes, so the count only advances on a new tick.
+const STANDOFF_STILL_TICKS: u8 = 8;
+
+/// How long the arm is given to reach a standoff before the stream is
+/// ended anyway.
+///
+/// The refeed exists because the client has stopped sending — its
+/// motion was refused — so nothing else would keep the stream alive
+/// across the travel. That makes it the one place a stuck executor
+/// could hold a stream open forever, and this is the backstop.
+const STANDOFF_TRAVEL_BUDGET: Duration = Duration::from_secs(3);
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -107,7 +200,7 @@ const STREAM_MOVING_RAD_S: f64 = 0.01;
 pub(crate) const ESCAPE_TOL_M: f64 = 1e-4;
 /// The streaming gate's escape-depth tolerance \[m\]. parol6 applies
 /// [`ESCAPE_TOL_M`] per integrator step (~10 ms of travel); par6's gate
-/// compares across the whole [`STREAM_LOOKAHEAD_S`] projection in one
+/// compares across the whole stopping projection in one
 /// step, so the same per-step slack scales with the horizon — otherwise
 /// an escaping arc whose link transiently dips ~1 mm deeper inside the
 /// window is refused, and the arm is trapped in the keep-out the rule
@@ -115,6 +208,42 @@ pub(crate) const ESCAPE_TOL_M: f64 = 1e-4;
 /// housekeeping re-check advances `current` every period, so a deepening
 /// beyond this slack cannot accumulate unrefused.
 const STREAM_ESCAPE_TOL_M: f64 = 1.5e-3;
+
+/// Joint-space pitch of the coarse pass in [`StreamGate::stop_point`],
+/// matching the planner's own sweep pitch: at PAR6's reach a 0.02 rad
+/// step moves the wrist under 10 mm, so no keep-out thick enough to
+/// matter can be stepped over.
+const GATE_STEP_RAD: f64 = 0.02;
+
+/// Joint-space pitch of the gate's SEGMENT check, coarser than
+/// [`GATE_STEP_RAD`] because it runs on every admitted datagram rather
+/// than once per refusal: 0.05 rad moves the wrist about 25 mm at PAR6's
+/// reach, still well under any keep-out worth declaring, and it keeps a
+/// stopping projection at streaming speed to single-digit collision
+/// queries instead of tens.
+const GATE_SEGMENT_STEP_RAD: f64 = 0.05;
+
+/// Samples one segment check will take before coarsening further. The
+/// bound is what keeps the command plane's admission cost flat when a
+/// client streams targets across the whole soft window.
+const GATE_SEGMENT_MAX_STEPS: usize = 32;
+
+/// Interior samples every gate sweep takes even when the pitch would
+/// ask for fewer. A pitch bounds the joint travel one sample can hide,
+/// not the obstacle it can step over, and the shortest sweeps are the
+/// ones that graze a keep-out rather than drive through it.
+const GATE_MIN_SAMPLES: usize = 8;
+
+/// Coarse samples [`StreamGate::stop_point`] will take before giving up.
+/// The bound matters because the span comes off the wire: a target at
+/// the far end of the soft window must not turn into an unbounded sweep.
+const GATE_MAX_STEPS: usize = 512;
+
+/// Bisection rounds refining the coarse pass. The pitch above resolves
+/// the stopping point to ~10 mm, which is twice the standoff it is
+/// supposed to land on; 16 halvings take that under 1 um, and each
+/// round is one collision check.
+const GATE_BISECT_ROUNDS: u32 = 16;
 
 /// A firmware "go to position" gripper frame from wire units: `closed`
 /// and `speed` are fractions in \[0, 1\] (0 = fully open / slowest byte,
@@ -163,6 +292,14 @@ pub(crate) struct StreamGate {
     /// fraction of ±1 commands, and therefore what the lookahead
     /// projects with.
     jog_vel: [f64; MAX_JOINTS],
+    /// Per-joint drive position-loop gains \[1/s\] (the config `kpp`
+    /// pushed to each driver) — the reciprocal of the time constant the
+    /// arm takes to settle out of its tracking error, and so most of how
+    /// far it travels stopping.
+    position_loop_hz: [f64; MAX_JOINTS],
+    /// RT period \[s\]; the reaction half of the stopping distance is
+    /// counted in ticks of it.
+    tick_dt_s: f64,
     soft_min: [f64; MAX_JOINTS],
     soft_max: [f64; MAX_JOINTS],
     /// The pairs the last refused or stopped stream would have collided
@@ -180,11 +317,15 @@ impl StreamGate {
     pub(crate) fn new(
         collision: par6_kin::Collision,
         jog_limits: &par6_motion::MotionLimits,
+        position_loop_hz: [f64; MAX_JOINTS],
+        tick_dt_s: f64,
     ) -> Self {
         Self {
             collision,
             shape_names: ShapeNames::default(),
             jog_vel: jog_limits.velocity,
+            position_loop_hz,
+            tick_dt_s,
             soft_min: jog_limits.soft_min,
             soft_max: jog_limits.soft_max,
             latch: CollisionState::default(),
@@ -223,6 +364,66 @@ impl StreamGate {
         Ok(())
     }
 
+    /// Interior samples for a segment check between `from` and `to`:
+    /// [`GATE_SEGMENT_STEP_RAD`] apart on the fastest joint, bounded so a
+    /// target off the far end of the soft window cannot turn into an
+    /// unbounded sweep.
+    fn segment_steps(&self, from: &[f64; MAX_JOINTS], to: &[f64; MAX_JOINTS]) -> usize {
+        let span = from[..par6_kin::NQ]
+            .iter()
+            .zip(to[..par6_kin::NQ].iter())
+            .map(|(a, b)| (b - a).abs())
+            .fold(0.0, f64::max);
+        if !span.is_finite() {
+            return GATE_SEGMENT_MAX_STEPS;
+        }
+        ((span / GATE_SEGMENT_STEP_RAD).ceil() as usize)
+            .clamp(GATE_MIN_SAMPLES, GATE_SEGMENT_MAX_STEPS)
+    }
+
+    /// The colliding pairs at the first sample along `from -> to` that
+    /// collides, or `None` when the whole segment clears.
+    fn hit_along(
+        &mut self,
+        from: &[f64; MAX_JOINTS],
+        to: &[f64; MAX_JOINTS],
+        steps: usize,
+    ) -> Result<Option<Vec<(String, String)>>, WireError> {
+        let mut a = [0.0; par6_kin::NQ];
+        let mut b = [0.0; par6_kin::NQ];
+        a.copy_from_slice(&from[..par6_kin::NQ]);
+        b.copy_from_slice(&to[..par6_kin::NQ]);
+        let Some(i) = self
+            .collision
+            .check_segment(&a, &b, steps)
+            .map_err(gate_error)?
+        else {
+            return Ok(None);
+        };
+        let mut hit = *from;
+        let t = i as f64 / (steps + 1) as f64;
+        for j in 0..par6_kin::NQ {
+            hit[j] = from[j] + t * (to[j] - from[j]);
+        }
+        Ok(Some(self.offending(&hit)?))
+    }
+
+    /// Whether `q` itself collides, clearance included — the point half
+    /// of [`blocked`]'s verdict, without the pair names or the segment
+    /// walk. What a sweep that has already established its start is
+    /// clear needs per sample.
+    ///
+    /// [`blocked`]: StreamGate::blocked
+    fn collides(&mut self, q: &[f64; MAX_JOINTS]) -> Result<bool, WireError> {
+        let mut nq = [0.0; par6_kin::NQ];
+        nq.copy_from_slice(&q[..par6_kin::NQ]);
+        Ok(self
+            .collision
+            .check(&nq, true)
+            .map_err(gate_error)?
+            .active())
+    }
+
     /// Colliding pairs at `q`, in reporting names.
     fn offending(&mut self, q: &[f64; MAX_JOINTS]) -> Result<Vec<(String, String)>, WireError> {
         let mut nq = [0.0; par6_kin::NQ];
@@ -230,6 +431,159 @@ impl StreamGate {
         let names = &self.shape_names;
         let report = self.collision.check(&nq, false).map_err(gate_error)?;
         Ok(names.render(&report))
+    }
+
+    /// The offending pairs at `q` that involve a world shape.
+    ///
+    /// Self pairs are excluded because a standing self contact is not a
+    /// thing the arm can back out of along a commanded path — the SRDF
+    /// leaves the park pose resting in some — while a world contact is
+    /// exactly what the standoff exists to hold.
+    fn world_offenders(
+        &mut self,
+        q: &[f64; MAX_JOINTS],
+    ) -> Result<Vec<(String, String)>, WireError> {
+        Ok(self
+            .offending(q)?
+            .into_iter()
+            .filter(|p| is_world_name(&p.0) || is_world_name(&p.1))
+            .collect())
+    }
+
+    /// Where a refused motion should come to rest: the configuration on
+    /// the `current -> target` line that sits ON the standoff.
+    ///
+    /// Refusing a motion says only that the arm must not finish where it
+    /// was asked to; it does not say where it should finish. Left at
+    /// that, the resting place is whatever the executor's tracking lag
+    /// and the datagram timing happened to leave — measured on the sim
+    /// rig at anywhere from 2.7 mm to 24 mm from a keep-out whose
+    /// standoff is 5 mm, varying run to run at one speed. Commanding
+    /// this point makes the stop a property of the geometry instead: the
+    /// arm lands ON the clearance, whatever speed it approached at.
+    ///
+    /// The model's clearance is already inside the collision verdict, so
+    /// the boundary between world-clear and world-touching IS the
+    /// standoff — nothing here adds a margin of its own.
+    ///
+    /// Two directions, because a refusal can arrive either side of the
+    /// boundary:
+    ///
+    /// - Clear of the world: walk FORWARD and stop at the last admitted
+    ///   sample. [`blocked`] is the predicate, not a bare collision
+    ///   test, so a tolerated standing self contact does not read as
+    ///   "nowhere to go".
+    /// - Already touching the world: walk BACKWARD down the same line
+    ///   until the arm is off the shape, and stop there. This is the
+    ///   case the escape-depth half of [`blocked`] cannot help with —
+    ///   once a mesh-vs-box pair is in contact its reported depth is
+    ///   nearly flat, so `blocked` admits deeper motion and the
+    ///   forward walk would hand back a configuration inside the
+    ///   standoff.
+    ///
+    /// Each direction takes a coarse pass at [`GATE_STEP_RAD`] and then
+    /// bisects, so a non-convex clear region cannot be skipped over.
+    ///
+    /// [`blocked`]: StreamGate::blocked
+    pub(crate) fn stop_point(
+        &mut self,
+        current: &[f64; MAX_JOINTS],
+        target: &[f64; MAX_JOINTS],
+    ) -> Result<[f64; MAX_JOINTS], WireError> {
+        let mut dir = [0.0; MAX_JOINTS];
+        for j in 0..par6_kin::NQ {
+            dir[j] = target[j] - current[j];
+        }
+        let span = dir[..par6_kin::NQ]
+            .iter()
+            .map(|v| v.abs())
+            .fold(0.0, f64::max);
+        if !span.is_finite() || span == 0.0 {
+            return Ok(*current);
+        }
+        let at = |t: f64| {
+            let mut q = *current;
+            for j in 0..par6_kin::NQ {
+                q[j] = current[j] + t * dir[j];
+            }
+            q
+        };
+        // One coarse step is GATE_STEP_RAD on the fastest joint.
+        let dt = GATE_STEP_RAD / span;
+
+        if !self.world_offenders(current)?.is_empty() {
+            // BOTH directions along the line, nearest escape first. The
+            // refused target is not reliably the way back out: a refusal
+            // is answered by braking, and the arm can coast past the
+            // target it was refused at, which leaves `goal` BEHIND it and
+            // "away from goal" pointing straight through the keep-out.
+            // Which side the arm entered from is not recoverable at rest,
+            // so the shortest way out is the honest answer.
+            let mut escaped = None;
+            'coarse: for i in 1..=GATE_MAX_STEPS {
+                let step = i as f64 * dt;
+                for t in [-step, step] {
+                    if self.world_offenders(&at(t))?.is_empty() {
+                        escaped = Some(t);
+                        break 'coarse;
+                    }
+                }
+            }
+            // Nothing on this line clears the world. Hold rather than
+            // drive the arm somewhere nobody asked for.
+            let Some(mut clear) = escaped else {
+                return Ok(*current);
+            };
+            // Bisect against `current` itself: it is the one sample known
+            // to be inside on the same side as the escape.
+            let mut inside = 0.0;
+            for _ in 0..GATE_BISECT_ROUNDS {
+                let mid = 0.5 * (clear + inside);
+                if self.world_offenders(&at(mid))?.is_empty() {
+                    clear = mid;
+                } else {
+                    inside = mid;
+                }
+            }
+            return Ok(at(clear));
+        }
+
+        // Per-sample point test, not `blocked`: the start is known clear
+        // here, so any collision at a sample is a new one, and walking
+        // the segment once is what keeps this linear — re-asking
+        // `blocked`, which walks the whole segment itself, at every
+        // sample squares the cost and stalls the command plane.
+        // At least GATE_MIN_SAMPLES whatever the span. The pitch alone is
+        // a bound on how much JOINT travel a sample can hide, not on how
+        // much of an obstacle it can step over: a short projection that
+        // only grazes a keep-out gets two or three samples at that pitch
+        // and can miss it entirely — while the segment check that refused
+        // the motion, walking the same line, did not.
+        let steps =
+            ((span / GATE_STEP_RAD).ceil() as usize).clamp(GATE_MIN_SAMPLES, GATE_MAX_STEPS);
+        let mut clear = 0.0;
+        let mut hit = None;
+        for i in 1..=steps {
+            let t = i as f64 / steps as f64;
+            if self.collides(&at(t))? {
+                hit = Some(t);
+                break;
+            }
+            clear = t;
+        }
+        let Some(mut refused) = hit else {
+            return Ok(*target);
+        };
+        for _ in 0..GATE_BISECT_ROUNDS {
+            let mid = 0.5 * (clear + refused);
+            if self.collides(&at(mid))? {
+                refused = mid;
+            } else {
+                clear = mid;
+            }
+        }
+        let stop = at(clear);
+        Ok(stop)
     }
 
     fn world_distance(&mut self, q: &[f64; MAX_JOINTS]) -> Result<f64, WireError> {
@@ -258,7 +612,20 @@ impl StreamGate {
         let cur = self.offending(current)?;
         let tgt = self.offending(target)?;
         if cur.is_empty() {
-            return Ok((!tgt.is_empty()).then_some(tgt));
+            if !tgt.is_empty() {
+                return Ok(Some(tgt));
+            }
+            // The SEGMENT, not just its end. A stopping projection is a
+            // long reach at speed, and a keep-out is a solid: an
+            // endpoint test lets the projection tunnel clean through one
+            // and report clear, which is why raising the horizon stopped
+            // making the arm stop any earlier. The pairs reported are
+            // the ones at the first colliding sample.
+            let steps = self.segment_steps(current, target);
+            if let Some(hit) = self.hit_along(current, target, steps)? {
+                return Ok(Some(hit));
+            }
+            return Ok(None);
         }
         let new: Vec<(String, String)> = tgt.iter().filter(|p| !cur.contains(p)).cloned().collect();
         if !new.is_empty() {
@@ -272,10 +639,31 @@ impl StreamGate {
         let world_pair = cur
             .iter()
             .any(|p| is_world_name(&p.0) || is_world_name(&p.1));
-        if world_pair
-            && self.world_distance(target)? < self.world_distance(current)? - STREAM_ESCAPE_TOL_M
-        {
-            return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
+        if world_pair {
+            // Still touching a keep-out at the target, so the move has to
+            // EARN its way out: measurably farther, not merely "no
+            // deeper". The weaker rule cannot be enforced with the signal
+            // available — coal's penetration depth for a mesh-vs-box pair
+            // is a local contact-patch estimate, nearly flat in the true
+            // depth (~5 mm of reported deepening across 40 mm of
+            // face-to-centre travel on the sim rig), so "deeper" is
+            // indistinguishable from "lateral" and a stream that once
+            // reached contact was admitted straight through the box.
+            //
+            // Nothing is trapped by this: a refusal is answered by
+            // placing the arm ON the standoff (see `stop_point`), which
+            // leaves it clear of the world and free to move again.
+            // `world_distance >= clearance` IS "no world shape offends":
+            // that is the threshold `check` flags a world pair at. Read
+            // off the distance already needed rather than running a
+            // second full check for the pair list — this whole branch
+            // runs on the command plane, per datagram.
+            let reach = self.collision.clearance();
+            let (d_target, d_current) =
+                (self.world_distance(target)?, self.world_distance(current)?);
+            if d_target < reach && d_target <= d_current + STREAM_ESCAPE_TOL_M {
+                return Ok(Some(if tgt.is_empty() { cur } else { tgt }));
+            }
         }
         Ok(None)
     }
@@ -296,8 +684,8 @@ impl StreamGate {
     ) -> [f64; MAX_JOINTS] {
         let mut la = *q;
         for (j, pct) in speeds.iter().enumerate() {
-            la[j] = (la[j] + pct * self.jog_vel[j] * STREAM_LOOKAHEAD_S)
-                .clamp(self.soft_min[j], self.soft_max[j]);
+            let v = pct * self.jog_vel[j];
+            la[j] = (la[j] + self.stopping_travel(j, v)).clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
     }
@@ -305,6 +693,15 @@ impl StreamGate {
     /// Where the arm will be one lookahead horizon from `q` if it keeps
     /// moving at `qd`, clamped into the soft window so a pose at the stop
     /// cannot phantom-trip the gate.
+    ///
+    /// Callers pass the COMMANDED pose, not the measured one. The plant
+    /// trails what it has been told by roughly a position-loop time
+    /// constant, and that trailing distance is ground the arm will cover
+    /// whatever happens next — projecting from the measurement leaves it
+    /// out and the arm coasts that much further than the gate priced
+    /// for. Measured on the sim rig: projecting from the measurement,
+    /// both a 5 mm/50 ms and a 1 mm/50 ms approach ended up inside the
+    /// keep-out; from the commanded pose, both stop 1.9 mm clear of it.
     ///
     /// The jog projection asks the same question of a COMMANDED velocity
     /// fraction; this one asks it of the measured motion, which is what a
@@ -317,9 +714,51 @@ impl StreamGate {
     ) -> [f64; MAX_JOINTS] {
         let mut la = *q;
         for (j, v) in qd.iter().enumerate() {
-            la[j] = (la[j] + v * STREAM_LOOKAHEAD_S).clamp(self.soft_min[j], self.soft_max[j]);
+            la[j] = (la[j] + self.stopping_travel(j, *v)).clamp(self.soft_min[j], self.soft_max[j]);
         }
         la
+    }
+
+    /// Where joint `joint` comes to rest from `v` \[rad\]; see
+    /// [`stream_stopping_travel`].
+    pub(crate) fn stopping_travel(&self, joint: usize, v: f64) -> f64 {
+        stream_stopping_travel(v, self.position_loop_hz[joint], self.tick_dt_s)
+    }
+
+    /// How long the arm holds its speed before a refusal takes effect \[s\].
+    pub(crate) fn reaction_s(&self) -> f64 {
+        STOP_PIPELINE_TICKS * self.tick_dt_s
+    }
+
+    /// The braking half of [`stream_stopping_travel`] \[rad\] — the
+    /// cartesian paths integrate the reaction half through the jacobian
+    /// instead, so they add only this.
+    pub(crate) fn braking_travel(&self, joint: usize, v: f64) -> f64 {
+        stream_stopping_travel(v, self.position_loop_hz[joint], self.tick_dt_s)
+            - v * self.reaction_s()
+    }
+
+    /// Re-report the standing verdict without re-testing anything.
+    ///
+    /// A stream being walked onto a standoff is under the gate's control,
+    /// not the client's, and the client has already been told. Its next
+    /// datagram must still be answered with the refusal rather than
+    /// accepted, because the server clears the `collision_active` latch
+    /// on any command it accepts.
+    pub(crate) fn standing_refusal(&self) -> WireError {
+        let rendered = self
+            .latch
+            .pairs
+            .iter()
+            .take(4)
+            .map(|(a, b)| format!("[{a}, {b}]"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        make_error(
+            ErrorCode::SysSelfCollision,
+            UNATTRIBUTED,
+            &[("sample", "0"), ("total", "1"), ("pairs", &rendered)],
+        )
     }
 
     /// Latch `pairs` as the streaming collision verdict and build the
@@ -424,6 +863,15 @@ struct ActiveStream {
     /// the RT reports it left JOG, or `deadline` (the ramp cap) passes.
     releasing: bool,
     servo_target: Option<[f64; MAX_JOINTS]>,
+    /// The gate refusal this stream is working through, if any.
+    ///
+    /// A refused stream is no longer following the client — it is being
+    /// brought to rest and then placed on the standoff — so it outlives
+    /// the client's grace: the client has been told the motion was
+    /// refused and has stopped sending, and expiring the stream
+    /// mid-travel would abandon the arm wherever it had got to rather
+    /// than on the standoff.
+    standoff: Option<Standoff>,
     /// The live `jog_j` command: per-joint signed speed fraction, all
     /// zero once the button released. What housekeeping's periodic
     /// collision re-check projects the lookahead from.
@@ -434,10 +882,52 @@ struct ActiveStream {
     /// re-check keys on, so the steady state costs no collision queries.
     world_epoch: u64,
     cart: Option<CartJogState>,
+    /// Consecutive FRESH snapshots the arm has measured stopped in.
+    still: u8,
+    /// The tick `still` last counted, so housekeeping running faster than
+    /// the RT publishes cannot count one frame eight times.
+    still_tick: u64,
     /// The stream's `(speed, accel)` fractions, carried so housekeeping's
     /// keep-alive refeeds the setpoint the client asked for rather than
     /// silently restoring full-speed limits between datagrams.
     scale: (f64, f64),
+}
+
+/// The pose a stopping projection starts from.
+///
+/// The COMMANDED pose when the RT has one: the plant trails what it has
+/// been told by roughly a position-loop time constant, and that trailing
+/// distance is ground the arm will cover whatever happens next.
+///
+/// Modes that command no position (IDLE, BOOTING) publish NaN there, and
+/// a projection seeded from NaN reaches nowhere and everywhere at once —
+/// so the measured pose stands in, which is what it was before the arm
+/// was under a position law anyway.
+fn projection_seed(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
+    if snap.q_commanded.iter().all(|v| v.is_finite()) {
+        snap.q_commanded
+    } else {
+        snap.q
+    }
+}
+
+/// A gate refusal being worked through, in two steps.
+///
+/// The arm cannot simply be commanded onto the standoff: a refusal
+/// arrives while it is moving, and at streaming speed the standoff is
+/// usually already inside its own stopping distance — commanding it
+/// asks the plant for a deceleration it cannot make, and it overshoots
+/// and rings around the setpoint instead of landing on it. So the arm is
+/// stopped first, under its own limits, and only then placed.
+#[derive(Clone, Copy)]
+enum Standoff {
+    /// Shedding velocity under the executor's release. `goal` is the
+    /// refused target, kept because the standoff has to be solved from
+    /// wherever the arm actually stops: short of it after a gentle
+    /// refusal, past it and inside the keep-out after a fast one.
+    Braking { goal: [f64; MAX_JOINTS] },
+    /// Travelling the last stretch onto the solved standoff.
+    Placing { stop: [f64; MAX_JOINTS] },
 }
 
 /// An enable request in flight, retried by housekeeping until the RT
@@ -546,6 +1036,106 @@ impl RtBridge {
         self.link.send(RtCommand::SetMode(target));
     }
 
+    /// Admit a servo target, the way every servo stream is gated: the
+    /// target and the arm's own stopping travel must both be clear. A
+    /// refusal on a moving arm installs the standoff housekeeping works
+    /// through; an arm already at rest is simply refused. Returns the
+    /// gate epoch the datagram was admitted under.
+    fn admit_servo_target(
+        cart: &mut CartStream,
+        link: &CoreLink,
+        sh: &mut SharedState,
+        target: &[f64; MAX_JOINTS],
+        scale: (f64, f64),
+    ) -> Result<u64, WireError> {
+        let target = *target;
+        let (refusal, world_epoch) = {
+            let snap = cart.snapshots.latest();
+            let mut gate = cart.gate.lock().unwrap();
+            let epoch = gate.epoch();
+            // Two questions, both of which must pass. The target
+            // is where the client asked the arm to finish; the
+            // lookahead is where the arm's own momentum would
+            // carry it if this datagram were the last. Checking
+            // only the target admits motion right up to the
+            // keep-out and then discovers, one braking distance
+            // later, that the arm cannot stop outside it — the
+            // same re-check housekeeping already runs on a
+            // moving stream, moved to where the datagram is
+            // still refusable.
+            let la = gate.motion_lookahead(&projection_seed(&snap), &snap.qd);
+            // Which question failed decides where the arm is then
+            // put. The TARGET failing means the arm must stop
+            // before the configuration it was sent to, so the
+            // standoff is solved toward that target. The
+            // PROJECTION failing means the target is fine and the
+            // arm's own momentum is the problem, so it is solved
+            // toward the projection instead — solving toward a
+            // target that is already clear just parks the arm
+            // back on it.
+            // The target carries the arm's stopping travel with
+            // it: arriving AT a configuration and stopping there
+            // are different places, and a target admitted right
+            // on the clearance is entered anyway on the way to
+            // rest. Measured on the sim rig, that is the whole
+            // of what a 1 mm/50 ms approach still had left over
+            // once the projection covered everything else.
+            let target_stop = gate.motion_lookahead(&target, &snap.qd);
+            let verdict = match gate.blocked(&snap.q, &target_stop)? {
+                Some(pairs) => Some((pairs, target_stop)),
+                None => gate.blocked(&snap.q, &la)?.map(|pairs| (pairs, la)),
+            };
+            let moving = snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S);
+            match verdict {
+                None => (None, epoch),
+                Some((pairs, goal)) => (Some((gate.refuse(pairs), goal, moving)), epoch),
+            }
+        };
+        if let Some((refusal, goal, moving)) = refusal {
+            // A standoff sheds momentum. An arm already at rest has
+            // none: the refusal is the whole answer, and driving it
+            // toward the keep-out it was refused would be motion
+            // the client was just told it did not get.
+            if !moving {
+                return Err(refusal);
+            }
+            log::warn!("servo: collision predicted; stopping on the standoff");
+            // A release, not a position hold. The drive closes a
+            // position error against the arm's own momentum, and
+            // handing it a hold while the arm still carries
+            // velocity is what makes it ring: measured on the sim
+            // rig at 10.4 Hz, growing ~8% a cycle, from a 0.14
+            // rad/s residual. The release sheds the velocity
+            // first; the standoff is commanded from rest.
+            link.send(RtCommand::JogRelease);
+            link.send(RtCommand::StreamRelease);
+            sh.stream = Some(ActiveStream {
+                releasing: false,
+                kind: StreamKind::Servo,
+                // A refused stream outlives the client's
+                // silence: the refusal is why it stopped
+                // sending, and the arm still has to be stopped
+                // and placed.
+                deadline: Instant::now() + STANDOFF_TRAVEL_BUDGET,
+                servo_target: None,
+                standoff: Some(Standoff::Braking { goal }),
+                jog: [0.0; MAX_JOINTS],
+                world_epoch,
+                cart: None,
+                still: 0,
+                still_tick: 0,
+                scale,
+            });
+            // Reported, not swallowed. A command the server
+            // treats as accepted clears the standing collision
+            // verdict — so a refusal that returned Ok would
+            // wipe, on its own datagram, the STATUS latch that
+            // tells the operator the stream was stopped at all.
+            return Err(refusal);
+        }
+        Ok(world_epoch)
+    }
+
     fn stop_stream_commands(&self) {
         self.link.send(RtCommand::JogRelease);
         self.link.send(RtCommand::SetMode(Mode::Idle));
@@ -620,9 +1210,12 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Jog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
+                    standoff: None,
                     jog: speeds,
                     world_epoch: 0,
                     cart: None,
+                    still: 0,
+                    still_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
                     // executor; its accel rides `RtCommand::Jog`. Kept
                     // here so a change of accel alone still resends.
@@ -635,18 +1228,34 @@ impl RtCommands for RtBridge {
                     *t = a.to_radians();
                 }
                 let mut sh = self.shared.lock().unwrap();
+                // A refusal already in progress owns the arm until it is
+                // on the standoff. Accepting a datagram here would throw
+                // that away mid-placement — and, because the server
+                // clears the standing collision verdict on any command it
+                // accepts, would also wipe the latch that says the stream
+                // was stopped.
+                if matches!(
+                    sh.stream,
+                    Some(ActiveStream {
+                        standoff: Some(_),
+                        ..
+                    })
+                ) {
+                    return Err(self.cart.gate.lock().unwrap().standing_refusal());
+                }
                 // Servo targets are explicit configurations, so the gate
                 // checks the target itself — each datagram is its own
                 // admission check, which is the streaming cadence parol6
                 // gates at.
-                let world_epoch = {
-                    let q = self.cart.snapshots.latest().q;
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    if let Some(pairs) = gate.blocked(&q, &target)? {
-                        return Err(gate.refuse(pairs));
-                    }
-                    gate.epoch()
-                };
+                // A refused target is not simply dropped. Dropping it
+                // leaves the arm wherever its tracking lag put it, which
+                // is not a distance anyone chose — measured on the sim
+                // rig at anywhere from 2.7 mm to 24 mm from a keep-out
+                // whose standoff is 5 mm. Instead the arm is stopped and
+                // then placed ON the standoff; housekeeping runs that.
+                let scale = (p.speed.unwrap_or(1.0), p.accel.unwrap_or(1.0));
+                let world_epoch =
+                    Self::admit_servo_target(&mut self.cart, &self.link, &mut sh, &target, scale)?;
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -656,7 +1265,6 @@ impl RtCommands for RtBridge {
                 ) {
                     self.enter_stream_mode(Mode::Stream);
                 }
-                let scale = (p.speed.unwrap_or(1.0), p.accel.unwrap_or(1.0));
                 self.stream_input.lock().unwrap().send(&StreamSetpoint {
                     q: target,
                     speed: scale.0,
@@ -667,9 +1275,12 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
+                    standoff: None,
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
+                    still: 0,
+                    still_tick: 0,
                     scale,
                 });
             }
@@ -688,6 +1299,7 @@ impl RtCommands for RtBridge {
                     Some(ActiveStream {
                         kind: StreamKind::Servo,
                         servo_target: Some(t),
+                        standoff: None,
                         ..
                     }) => *t,
                     _ => self.cart.snapshots.latest().q,
@@ -707,14 +1319,9 @@ impl RtCommands for RtBridge {
                 for (j, v) in target.iter_mut().enumerate() {
                     *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
                 }
-                let world_epoch = {
-                    let q = self.cart.snapshots.latest().q;
-                    let mut gate = self.cart.gate.lock().unwrap();
-                    if let Some(pairs) = gate.blocked(&q, &target)? {
-                        return Err(gate.refuse(pairs));
-                    }
-                    gate.epoch()
-                };
+                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
+                let world_epoch =
+                    Self::admit_servo_target(&mut self.cart, &self.link, &mut sh, &target, scale)?;
                 if !matches!(
                     sh.stream,
                     Some(ActiveStream {
@@ -724,7 +1331,6 @@ impl RtCommands for RtBridge {
                 ) {
                     self.enter_stream_mode(Mode::Stream);
                 }
-                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
                 self.stream_input.lock().unwrap().send(&StreamSetpoint {
                     q: target,
                     speed: scale.0,
@@ -735,9 +1341,12 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::Servo,
                     deadline: Instant::now() + self.servo_grace(),
                     servo_target: Some(target),
+                    standoff: None,
                     jog: [0.0; MAX_JOINTS],
                     world_epoch,
                     cart: None,
+                    still: 0,
+                    still_tick: 0,
                     scale,
                 });
             }
@@ -750,6 +1359,8 @@ impl RtCommands for RtBridge {
                     Some(ActiveStream {
                         kind: StreamKind::CartJog,
                         cart: Some(state),
+                        still: 0,
+                        still_tick: 0,
                         ..
                     }) => state.q,
                     _ => self.cart.snapshots.latest().q,
@@ -775,10 +1386,14 @@ impl RtCommands for RtBridge {
                     soft_min: self.cart.soft_min,
                     soft_max: self.cart.soft_max,
                 };
-                if let Ok((la, _)) =
-                    step_cart_jog(&mut self.cart.kin, &mut probe, STREAM_LOOKAHEAD_S)
+                let reaction_s = self.cart.gate.lock().unwrap().reaction_s();
+                if let Ok((mut la, qd)) = step_cart_jog(&mut self.cart.kin, &mut probe, reaction_s)
                 {
                     let mut gate = self.cart.gate.lock().unwrap();
+                    for (j, v) in la.iter_mut().enumerate() {
+                        *v = (*v + gate.braking_travel(j, qd[j]))
+                            .clamp(probe.soft_min[j], probe.soft_max[j]);
+                    }
                     if let Some(pairs) = gate.blocked(&q, &la)? {
                         return Err(gate.refuse(pairs));
                     }
@@ -797,8 +1412,11 @@ impl RtCommands for RtBridge {
                     kind: StreamKind::CartJog,
                     deadline: jog_deadline(p.duration),
                     servo_target: None,
+                    standoff: None,
                     jog: [0.0; MAX_JOINTS],
                     world_epoch: 0,
+                    still: 0,
+                    still_tick: 0,
                     cart: Some(CartJogState {
                         twist,
                         frame: p.frame,
@@ -820,6 +1438,19 @@ impl RtCommands for RtBridge {
     fn cancel_stream(&mut self) {
         self.shared.lock().unwrap().stream = None;
         self.stop_stream_commands();
+    }
+
+    fn stop_refused_stream(&mut self) -> bool {
+        let mut shared = self.shared.lock().unwrap();
+        if shared.stream.as_ref().is_some_and(|a| a.standoff.is_some()) {
+            // The collision gate owns braking and placement. Cancelling it
+            // on a late datagram would abandon the configured standoff.
+            return true;
+        }
+        shared.stream = None;
+        drop(shared);
+        self.stop_stream_commands();
+        false
     }
 
     fn discard_exec(&mut self) {
@@ -1169,6 +1800,7 @@ impl RtBridge {
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn housekeeping_loop(
     dt: f64,
+    servo_grace: Duration,
     jog_accel_time_s: f64,
     link: CoreLink,
     stream_input: Arc<Mutex<StreamInput>>,
@@ -1188,15 +1820,25 @@ pub(crate) fn housekeeping_loop(
                           pairs: Vec<(String, String)>| {
         log::warn!("{what}: collision predicted; stopping the stream");
         gate.lock().unwrap().refuse(pairs);
+        // Both releases, because either mode may be the one running and
+        // each ignores the release that is not its own. They ramp the
+        // arm to rest under its limits and hand the mode to IDLE
+        // themselves once it is there.
+        //
+        // Not `SetMode(Idle)`: IDLE holds against gravity and has no
+        // velocity authority, so a moving arm dropped into it keeps its
+        // momentum. A refused servo stream coasted ~164 mm that way —
+        // straight through the keep-out the refusal was about, however
+        // early the gate saw it coming.
         link.send(RtCommand::JogRelease);
-        link.send(RtCommand::SetMode(Mode::Idle));
+        link.send(RtCommand::StreamRelease);
     };
     // Longer than any ramp the config can ask for (the s-curve profile
     // adds jerk phases to the linear time); only reached if the RT never
     // reports rest.
     let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
     let mut profile_logged = Instant::now();
-    while !shutdown.load(Ordering::SeqCst) {
+    'housekeeping: while !shutdown.load(Ordering::SeqCst) {
         let now = Instant::now();
         let snap = snapshots.latest();
         if now.duration_since(profile_logged) >= Duration::from_secs(1) {
@@ -1214,200 +1856,363 @@ pub(crate) fn housekeeping_loop(
         }
         {
             let mut sh = shared.lock().unwrap();
-            match &mut sh.stream {
-                // The ramp reached rest and the RT left JOG on its own:
-                // the session is over.
-                Some(a) if a.releasing && snap.mode != Mode::Jog => {
-                    sh.stream = None;
-                }
-                Some(a) if now >= a.deadline => {
-                    match a.kind {
-                        // Released rather than idled: `JogRelease` zeroes
-                        // the engine's target but not its velocity, and
-                        // the RT only ticks the engine in JOG, so cutting
-                        // to IDLE here would stop the arm dead from full
-                        // jog speed. The session stays open while the
-                        // ramp runs, so a re-press joins it instead of
-                        // bouncing the RT through IDLE.
-                        StreamKind::Jog if !a.releasing => {
-                            log::debug!("jog duration elapsed; releasing");
-                            link.send(RtCommand::JogRelease);
-                            a.releasing = true;
-                            a.jog = [0.0; MAX_JOINTS];
-                            a.deadline = now + jog_ramp_cap;
-                            continue;
-                        }
-                        StreamKind::Jog => {
-                            log::warn!("jog ramp never reported rest; idling");
-                            link.send(RtCommand::SetMode(Mode::Idle));
-                        }
-                        StreamKind::Servo => {
-                            log::debug!("servo stream went silent; stopping");
-                            link.send(RtCommand::SetMode(Mode::Idle));
-                        }
-                        StreamKind::CartJog => {
-                            log::debug!("jog_l duration elapsed; stopping");
-                            link.send(RtCommand::SetMode(Mode::Idle));
-                        }
+            // The standoff arm leaves through the block label, not
+            // `continue`: the enable/flashing bookkeeping below and the
+            // period sleep must run on every iteration, however long a
+            // brake-and-place takes.
+            'stream: {
+                match &mut sh.stream {
+                    // The ramp reached rest and the RT left JOG on its own:
+                    // the session is over.
+                    Some(a) if a.releasing && snap.mode != Mode::Jog => {
+                        sh.stream = None;
                     }
-                    sh.stream = None;
-                }
-                // The moving-jog re-check: the admission gate saw the
-                // configuration the jog STARTED at, and the arm has
-                // moved since. Every period the lookahead is projected
-                // from the measured pose and re-tested — against the
-                // world as it is NOW, so a keep-out dropped onto a
-                // running jog stops it too.
-                Some(a) if a.kind == StreamKind::Jog && a.jog.iter().any(|v| *v != 0.0) => {
-                    let speeds = a.jog;
-                    let mut g = gate.lock().unwrap();
-                    let la = g.jog_lookahead(&snap.q, &speeds);
-                    match g.blocked(&snap.q, &la) {
-                        Ok(None) => {}
-                        Ok(Some(pairs)) => {
-                            drop(g);
-                            collision_stop(&link, &gate, "jog_j", pairs);
-                            sh.stream = None;
-                        }
-                        Err(e) => {
-                            // A world the gate cannot query gates
-                            // nothing it can prove; stop rather than
-                            // stream unchecked.
-                            drop(g);
-                            log::error!("jog_j gate check failed: {}", e.cause);
-                            link.send(RtCommand::JogRelease);
-                            link.send(RtCommand::SetMode(Mode::Idle));
-                            sh.stream = None;
-                        }
-                    }
-                }
-                // A servo stream that is MOVING gets the jog treatment:
-                // its next datagram is admitted on the target it carries,
-                // which says nothing about the ground the arm covers
-                // getting there — and it cannot stop dead, so a target
-                // admitted just outside a keep-out is entered anyway on
-                // the braking distance. The measured motion is projected
-                // one lookahead horizon and re-tested every period, which
-                // is the same promise the jog path already makes.
-                Some(a)
-                    if a.kind == StreamKind::Servo
-                        && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
-                {
-                    let mut g = gate.lock().unwrap();
-                    let la = g.motion_lookahead(&snap.q, &snap.qd);
-                    match g.blocked(&snap.q, &la) {
-                        Ok(None) => {}
-                        Ok(Some(pairs)) => {
-                            drop(g);
-                            collision_stop(&link, &gate, "servo", pairs);
-                            sh.stream = None;
-                            continue;
-                        }
-                        Err(e) => {
-                            drop(g);
-                            log::error!("servo gate check failed: {}", e.cause);
-                            link.send(RtCommand::SetMode(Mode::Idle));
-                            sh.stream = None;
-                            continue;
-                        }
-                    }
-                }
-                Some(a) if a.kind == StreamKind::Servo => {
-                    // A held servo target was admitted against the world
-                    // of its datagram, and a target the arm has settled on
-                    // cannot move — so it is re-tested exactly when the
-                    // WORLD changes (the analogue of the planner's
-                    // in-flight revalidation), never per period: a resting
-                    // stream costs no collision queries, so the keep-alive
-                    // below is never starved past the RT stream watchdog.
-                    if let Some(t) = a.servo_target {
-                        let epoch = gate.lock().unwrap().epoch();
-                        if epoch != a.world_epoch {
-                            a.world_epoch = epoch;
-                            let verdict = gate.lock().unwrap().blocked(&snap.q, &t);
-                            match verdict {
-                                Ok(None) => {}
-                                Ok(Some(pairs)) => {
-                                    collision_stop(&link, &gate, "servo", pairs);
-                                    sh.stream = None;
-                                    continue;
+                    // Working through a gate refusal: brake to rest, then
+                    // place the arm on the standoff. The client is not
+                    // sending any more — it was told the motion was refused
+                    // — so the grace below would otherwise end the stream in
+                    // transit and leave the arm wherever the brake happened
+                    // to stop it.
+                    Some(a) if a.standoff.is_some() => {
+                        let phase = a.standoff.expect("checked by the guard");
+                        let expired = now >= a.deadline;
+                        match phase {
+                            Standoff::Braking { goal } => {
+                                if snap.tick != a.still_tick {
+                                    a.still_tick = snap.tick;
+                                    a.still =
+                                        if snap.qd.iter().all(|v| v.abs() <= STREAM_MOVING_RAD_S) {
+                                            a.still.saturating_add(1)
+                                        } else {
+                                            0
+                                        };
                                 }
-                                Err(e) => {
-                                    // A world the gate cannot query gates
-                                    // nothing it can prove; stop (without
-                                    // a collision verdict — this is a
-                                    // model failure) rather than stream
-                                    // unchecked.
-                                    log::error!("servo gate check failed: {}", e.cause);
+                                if a.still < STANDOFF_STILL_TICKS && !expired {
+                                    break 'stream;
+                                }
+                                if a.still < STANDOFF_STILL_TICKS {
+                                    log::warn!(
+                                        "the arm did not come to rest after a refusal; idling"
+                                    );
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                     sh.stream = None;
-                                    continue;
+                                    break 'stream;
                                 }
+                                // Solved from where the arm ACTUALLY stopped:
+                                // short of the standoff after a gentle
+                                // refusal, past it and inside the keep-out
+                                // after a fast one. `stop_point` answers
+                                // both, forwards and backwards.
+                                let stop = gate.lock().unwrap().stop_point(&snap.q, &goal);
+                                let Ok(stop) = stop else {
+                                    log::error!("the gate could not solve a standoff; idling");
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    break 'stream;
+                                };
+                                // Backed off the boundary by the settle
+                                // margin, along the line the standoff was
+                                // solved on and away from what refused it.
+                                let stop = {
+                                    let mut back = stop;
+                                    let span = (0..par6_kin::NQ)
+                                        .map(|j| (goal[j] - stop[j]).abs())
+                                        .fold(0.0, f64::max);
+                                    if span > 0.0 {
+                                        let k = STANDOFF_SETTLE_MARGIN_RAD / span;
+                                        for j in 0..par6_kin::NQ {
+                                            back[j] = stop[j] - k * (goal[j] - stop[j]);
+                                        }
+                                    }
+                                    back
+                                };
+                                if snap
+                                    .q
+                                    .iter()
+                                    .zip(stop.iter())
+                                    .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
+                                {
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    break 'stream;
+                                }
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                                link.send(RtCommand::SetMode(Mode::Stream));
+                                stream_input.lock().unwrap().send(&StreamSetpoint {
+                                    q: stop,
+                                    speed: STANDOFF_PLACEMENT_SCALE.0,
+                                    accel: STANDOFF_PLACEMENT_SCALE.1,
+                                });
+                                a.standoff = Some(Standoff::Placing { stop });
+                                a.deadline = now + STANDOFF_TRAVEL_BUDGET;
+                                a.still = 0;
+                                a.still_tick = 0;
+                                break 'stream;
+                            }
+                            Standoff::Placing { stop } => {
+                                // Arrival is measured in POSITION, not in
+                                // speed: a snapshot's velocity passes through
+                                // zero whenever the executor re-plans, and
+                                // ending the stream on that reading abandons
+                                // the arm mid-travel.
+                                // At the standoff AND stopped on it. IDLE has
+                                // no velocity authority — it holds against
+                                // gravity and nothing else — so an arm handed
+                                // over while it still carries speed coasts off
+                                // the standoff it was just placed on: measured
+                                // on the sim rig at 10.5 degrees of drift-back
+                                // after an otherwise exact placement.
+                                let arrived = snap
+                                    .q
+                                    .iter()
+                                    .zip(stop.iter())
+                                    .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
+                                    && snap.qd.iter().all(|v| v.abs() <= STREAM_MOVING_RAD_S);
+                                if arrived {
+                                    // Held, not idled. IDLE has no position
+                                    // authority — it holds against gravity and
+                                    // nothing else — so an arm handed to it
+                                    // settles back off the standoff under
+                                    // drivetrain friction. Handing the stream
+                                    // its own target instead leaves the arm
+                                    // exactly where a client commanding the
+                                    // standoff would have left it, and the
+                                    // normal servo lifecycle ends it.
+                                    a.standoff = None;
+                                    a.servo_target = Some(stop);
+                                    a.deadline = now + servo_grace;
+                                    break 'stream;
+                                }
+                                if expired {
+                                    log::warn!(
+                                    "the standoff was not reached within the travel budget; idling"
+                                );
+                                    // The RT is still in STREAM, and a stream
+                                    // left unfed trips the streaming watchdog
+                                    // and latches a fault on an arm that did
+                                    // exactly what the gate told it to.
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    break 'stream;
+                                }
+                                let mut next = snap.q;
+                                for j in 0..par6_kin::NQ {
+                                    next[j] = snap.q[j]
+                                        + (stop[j] - snap.q[j])
+                                            .clamp(-STANDOFF_CREEP_RAD, STANDOFF_CREEP_RAD);
+                                }
+                                stream_input.lock().unwrap().send(&StreamSetpoint {
+                                    q: next,
+                                    speed: STANDOFF_PLACEMENT_SCALE.0,
+                                    accel: STANDOFF_PLACEMENT_SCALE.1,
+                                });
+                                break 'stream;
                             }
                         }
                     }
-                    // Keep the RT stream watchdog fed between client
-                    // datagrams (its timeout is shorter than the grace).
-                    if let Some(t) = a.servo_target {
-                        stream_input.lock().unwrap().send(&StreamSetpoint {
-                            q: t,
-                            speed: a.scale.0,
-                            accel: a.scale.1,
-                        });
+                    Some(a) if now >= a.deadline => {
+                        match a.kind {
+                            // Released rather than idled: `JogRelease` zeroes
+                            // the engine's target but not its velocity, and
+                            // the RT only ticks the engine in JOG, so cutting
+                            // to IDLE here would stop the arm dead from full
+                            // jog speed. The session stays open while the
+                            // ramp runs, so a re-press joins it instead of
+                            // bouncing the RT through IDLE.
+                            StreamKind::Jog if !a.releasing => {
+                                log::debug!("jog duration elapsed; releasing");
+                                link.send(RtCommand::JogRelease);
+                                a.releasing = true;
+                                a.jog = [0.0; MAX_JOINTS];
+                                a.deadline = now + jog_ramp_cap;
+                                continue 'housekeeping;
+                            }
+                            StreamKind::Jog => {
+                                log::warn!("jog ramp never reported rest; idling");
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                            }
+                            StreamKind::Servo => {
+                                log::debug!("servo stream went silent; stopping");
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                            }
+                            StreamKind::CartJog => {
+                                log::debug!("jog_l duration elapsed; stopping");
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                            }
+                        }
+                        sh.stream = None;
                     }
-                }
-                Some(a) if a.kind == StreamKind::CartJog => {
-                    if let Some(state) = &mut a.cart {
-                        let before = state.q;
-                        match step_cart_jog(&mut kin, state, dt) {
-                            Ok((target, qd)) => {
-                                // The velocity-scaled horizon, projected
-                                // past the step just integrated.
-                                let mut la = target;
-                                for (j, v) in la.iter_mut().enumerate() {
-                                    *v = (*v + qd[j] * STREAM_LOOKAHEAD_S)
-                                        .clamp(state.soft_min[j], state.soft_max[j]);
-                                }
-                                let verdict = gate.lock().unwrap().blocked(&before, &la);
-                                match verdict {
-                                    Ok(None) => {
-                                        stream_input.lock().unwrap().send(&StreamSetpoint {
-                                            q: target,
-                                            speed: a.scale.0,
-                                            accel: a.scale.1,
-                                        })
-                                    }
-                                    Ok(Some(pairs)) => {
-                                        collision_stop(&link, &gate, "jog_l", pairs);
-                                        sh.stream = None;
-                                        continue;
-                                    }
-                                    Err(e) => {
-                                        // Stop without a collision verdict:
-                                        // this is a model failure, not a
-                                        // predicted contact.
-                                        log::error!("jog_l gate check failed: {}", e.cause);
-                                        link.send(RtCommand::SetMode(Mode::Idle));
-                                        sh.stream = None;
-                                        continue;
-                                    }
-                                }
+                    // The moving-jog re-check: the admission gate saw the
+                    // configuration the jog STARTED at, and the arm has
+                    // moved since. Every period the lookahead is projected
+                    // from the measured pose and re-tested — against the
+                    // world as it is NOW, so a keep-out dropped onto a
+                    // running jog stops it too.
+                    Some(a) if a.kind == StreamKind::Jog && a.jog.iter().any(|v| *v != 0.0) => {
+                        let speeds = a.jog;
+                        let mut g = gate.lock().unwrap();
+                        let la = g.jog_lookahead(&snap.q, &speeds);
+                        match g.blocked(&snap.q, &la) {
+                            Ok(None) => {}
+                            Ok(Some(pairs)) => {
+                                drop(g);
+                                collision_stop(&link, &gate, "jog_j", pairs);
+                                sh.stream = None;
                             }
                             Err(e) => {
-                                // Hold in place rather than integrate on a
-                                // failed solve; the stream watchdog still
-                                // needs feeding.
-                                log::warn!("jog_l step failed ({e}); holding");
-                                stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: state.q,
-                                    speed: a.scale.0,
-                                    accel: a.scale.1,
-                                });
+                                // A world the gate cannot query gates
+                                // nothing it can prove; stop rather than
+                                // stream unchecked.
+                                drop(g);
+                                log::error!("jog_j gate check failed: {}", e.cause);
+                                link.send(RtCommand::JogRelease);
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                                sh.stream = None;
                             }
                         }
                     }
+                    // A servo stream that is MOVING gets the jog treatment:
+                    // its next datagram is admitted on the target it carries,
+                    // which says nothing about the ground the arm covers
+                    // getting there — and it cannot stop dead, so a target
+                    // admitted just outside a keep-out is entered anyway on
+                    // the braking distance. The measured motion is projected
+                    // to where it would come to rest and re-tested every
+                    // period, which is the same promise the jog path makes.
+                    Some(a)
+                        if a.kind == StreamKind::Servo
+                            && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
+                    {
+                        let mut g = gate.lock().unwrap();
+                        let la = g.motion_lookahead(&projection_seed(&snap), &snap.qd);
+                        match g.blocked(&snap.q, &la) {
+                            Ok(None) => {}
+                            Ok(Some(pairs)) => {
+                                // Brake, then place — see `Standoff`. The
+                                // goal is `la`, not the servo target: the
+                                // target is what the arm is still permitted
+                                // to reach, so solving a standoff toward it
+                                // is a no-op. `la` is the configuration that
+                                // just failed the check, so the last
+                                // admitted point on the way to it is the
+                                // standoff itself.
+                                drop(g);
+                                collision_stop(&link, &gate, "servo", pairs);
+                                a.standoff = Some(Standoff::Braking { goal: la });
+                                a.servo_target = None;
+                                a.deadline = now + STANDOFF_TRAVEL_BUDGET;
+                                continue 'housekeeping;
+                            }
+                            Err(e) => {
+                                drop(g);
+                                log::error!("servo gate check failed: {}", e.cause);
+                                link.send(RtCommand::SetMode(Mode::Idle));
+                                sh.stream = None;
+                                continue 'housekeeping;
+                            }
+                        }
+                    }
+                    Some(a) if a.kind == StreamKind::Servo => {
+                        // A held servo target was admitted against the world
+                        // of its datagram, and a target the arm has settled on
+                        // cannot move — so it is re-tested exactly when the
+                        // WORLD changes (the analogue of the planner's
+                        // in-flight revalidation), never per period: a resting
+                        // stream costs no collision queries, so the keep-alive
+                        // below is never starved past the RT stream watchdog.
+                        if let Some(t) = a.servo_target {
+                            let epoch = gate.lock().unwrap().epoch();
+                            if epoch != a.world_epoch {
+                                a.world_epoch = epoch;
+                                let verdict = gate.lock().unwrap().blocked(&snap.q, &t);
+                                match verdict {
+                                    Ok(None) => {}
+                                    Ok(Some(pairs)) => {
+                                        collision_stop(&link, &gate, "servo", pairs);
+                                        sh.stream = None;
+                                        continue 'housekeeping;
+                                    }
+                                    Err(e) => {
+                                        // A world the gate cannot query gates
+                                        // nothing it can prove; stop (without
+                                        // a collision verdict — this is a
+                                        // model failure) rather than stream
+                                        // unchecked.
+                                        log::error!("servo gate check failed: {}", e.cause);
+                                        link.send(RtCommand::SetMode(Mode::Idle));
+                                        sh.stream = None;
+                                        continue 'housekeeping;
+                                    }
+                                }
+                            }
+                        }
+                        // Keep the RT stream watchdog fed between client
+                        // datagrams (its timeout is shorter than the grace).
+                        if let Some(t) = a.servo_target {
+                            stream_input.lock().unwrap().send(&StreamSetpoint {
+                                q: t,
+                                speed: a.scale.0,
+                                accel: a.scale.1,
+                            });
+                        }
+                    }
+                    Some(a) if a.kind == StreamKind::CartJog => {
+                        if let Some(state) = &mut a.cart {
+                            let before = state.q;
+                            match step_cart_jog(&mut kin, state, dt) {
+                                Ok((target, qd)) => {
+                                    // Where the arm comes to rest if this
+                                    // step turns out to be the last one
+                                    // admitted.
+                                    let mut la = target;
+                                    let verdict = {
+                                        let mut g = gate.lock().unwrap();
+                                        for (j, v) in la.iter_mut().enumerate() {
+                                            *v = (*v + g.stopping_travel(j, qd[j]))
+                                                .clamp(state.soft_min[j], state.soft_max[j]);
+                                        }
+                                        g.blocked(&before, &la)
+                                    };
+                                    match verdict {
+                                        Ok(None) => {
+                                            stream_input.lock().unwrap().send(&StreamSetpoint {
+                                                q: target,
+                                                speed: a.scale.0,
+                                                accel: a.scale.1,
+                                            })
+                                        }
+                                        Ok(Some(pairs)) => {
+                                            collision_stop(&link, &gate, "jog_l", pairs);
+                                            sh.stream = None;
+                                            continue 'housekeeping;
+                                        }
+                                        Err(e) => {
+                                            // Stop without a collision verdict:
+                                            // this is a model failure, not a
+                                            // predicted contact.
+                                            log::error!("jog_l gate check failed: {}", e.cause);
+                                            link.send(RtCommand::SetMode(Mode::Idle));
+                                            sh.stream = None;
+                                            continue 'housekeeping;
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    // Hold in place rather than integrate on a
+                                    // failed solve; the stream watchdog still
+                                    // needs feeding.
+                                    log::warn!("jog_l step failed ({e}); holding");
+                                    stream_input.lock().unwrap().send(&StreamSetpoint {
+                                        q: state.q,
+                                        speed: a.scale.0,
+                                        accel: a.scale.1,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
                 }
-                _ => {}
             }
             if let Some(req) = &mut sh.enable {
                 // `enable_seq` counts every Enable the core PROCESSED,
