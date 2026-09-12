@@ -151,7 +151,7 @@ pub(crate) struct Inner {
     transfer_id: AtomicU32,
     key_state: AtomicU64,
     pub(crate) status_tx: watch::Sender<Option<Arc<Status>>>,
-    last_seq: Mutex<Option<u64>>,
+    last_seq: Mutex<Option<(u64, u64)>>,
     seq_gaps: AtomicU64,
     unclaimed: Mutex<HashMap<u16, std::time::Instant>>,
     pub(crate) last_command_index: AtomicI64,
@@ -752,14 +752,17 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
         }
         {
             let mut last = inner.last_seq.lock().unwrap();
-            if let Some(prev) = *last {
-                if status.seq > prev + 1 {
+            if let Some((session, prev)) = *last {
+                if session == status.session_id && status.seq <= prev {
+                    continue;
+                }
+                if session == status.session_id && status.seq > prev.saturating_add(1) {
                     inner
                         .seq_gaps
                         .fetch_add(status.seq - prev - 1, Ordering::Relaxed);
                 }
             }
-            *last = Some(status.seq);
+            *last = Some((status.session_id, status.seq));
         }
         inner.status_tx.send_replace(Some(Arc::new(status)));
     }

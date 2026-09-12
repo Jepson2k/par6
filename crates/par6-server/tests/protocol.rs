@@ -743,6 +743,23 @@ async fn recv_status(sock: &UdpSocket) -> par6_proto::Status {
     decode_status(&buf[..n]).expect("decodable status")
 }
 
+#[tokio::test]
+async fn status_identifies_new_publisher_sessions_and_actual_snapshot_times() {
+    let first = start(|_| {}).await;
+    let before = recv_status(&first.status_rx).await;
+    let after = recv_status(&first.status_rx).await;
+    assert_ne!(before.session_id, 0);
+    assert_eq!(before.session_id, after.session_id);
+    assert!(after.seq > before.seq);
+    assert!(after.mono_time_ns > before.mono_time_ns);
+    drop(first);
+
+    let restarted = start(|_| {}).await;
+    let next = recv_status(&restarted.status_rx).await;
+    assert_eq!(next.controller_id, before.controller_id);
+    assert_ne!(next.session_id, before.session_id);
+}
+
 /// A TCP rotation with three substantial components \[rad\] — the only
 /// kind that tells the wire's rotation convention apart from the
 /// fixed-axis reading of the same three numbers.

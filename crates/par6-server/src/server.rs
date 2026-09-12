@@ -50,7 +50,8 @@
 //!   `reset_state` resets world/tool/errors but NOT the e-stop latch and
 //!   NOT the index allocator.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{hash_map::RandomState, BTreeSet, HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -379,6 +380,7 @@ struct Core<R: RtCommands> {
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
+    session_id: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
     /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
@@ -459,6 +461,9 @@ impl<R: RtCommands> Core<R> {
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
+            session_id: RandomState::new()
+                .hash_one((std::process::id(), std::time::SystemTime::now()))
+                .max(1),
             tcp_speed: 0.0,
             prev_tcp: None,
         }
@@ -2244,6 +2249,7 @@ impl<R: RtCommands> Core<R> {
         Status {
             proto_version: PROTO_VERSION,
             controller_id: self.cfg.controller_id,
+            session_id: self.session_id,
             seq: self.status_seq,
             mono_time_ns: self.mono_ns(),
             link_ok: u8::from(self.link_ok()),

@@ -63,6 +63,7 @@ class StatusBuffer:
     # v2 header
     proto_version: int = 0
     controller_id: int = 0
+    session_id: int = 0
     seq: int = 0
     mono_time_ns: int = 0
     link_ok: int = 0
@@ -182,6 +183,7 @@ def update_status_from_dict(buf: StatusBuffer, d: Mapping) -> None:
     """
     buf.proto_version = d["proto_version"]
     buf.controller_id = d["controller_id"]
+    buf.session_id = d["session_id"]
     buf.seq = d["seq"]
     buf.mono_time_ns = d["mono_time_ns"]
     buf.link_ok = int(d["link_ok"])
