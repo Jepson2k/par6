@@ -234,6 +234,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
+| `python/par6/_data/` | generated copy of `config/` + the URDF/MJCF assets, written by `scripts/sync_pkg_data.py` and enforced fresh by a test: edit `config/PAR6.toml`, never this. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config does, including when a stale copy is brought back into line |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
@@ -702,6 +703,15 @@ worth looking at. An interrupted write leaves the drive waiting in its
 bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
 drive's parameters back, presets, calibration — is UART-only and stays with the
 vendor's tool over a bench connection.
+
+The page state machine itself — the ack ladder, the page window, the reboot
+handshake — is only tested on a drive: `par6 flash` against a board on the
+bench, which reports the retries it needed. A scripted bootloader would test
+the host against our reading of the drive rather than against the drive, which
+is the misreading a test is there to catch, so `python/tests/test_firmware.py`
+covers the CRC, the frame layout and what a release must refuse, and stops
+there. A bench flash is part of bringing up a new drive; treat an image that
+has never been flashed on hardware as untested.
 
 ### The bus-grant signal
 
