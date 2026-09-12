@@ -554,7 +554,11 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._call(core.status_rate())
         if result is None:
             return None
-        return StatusRate(hz=result["hz"], control_hz=result["tick_hz"])
+        return StatusRate(
+            hz=result["hz"],
+            control_hz=result["tick_hz"],
+            servable=tuple(float(rate) for rate in result["servable"]),
+        )
 
     async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
         """Commissioning: tell drive *node* to answer as *new_id* from now on.
