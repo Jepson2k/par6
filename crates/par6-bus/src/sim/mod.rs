@@ -13,8 +13,8 @@
 //! the caller's tick counter — wall clock never enters): the MuJoCo scene
 //! ([`mujoco::MujocoPlant`], built by [`scene`] from the vendor MJCF) —
 //! the arm under gravity with the drivetrain reflected from the robot
-//! config (rotor inertia, viscous and Coulomb losses, the self-locking
-//! gearbox's holding friction), the config hard limits as joint limits,
+//! config (rotor inertia, viscous and Coulomb losses, assumed powered
+//! load support), the config hard limits as joint limits,
 //! the gripper jaws, a floor and graspable objects. Physical jaw
 //! obstructions feed back into the gripper front end so contact grasps
 //! surface through the real cmd-60 detection bits; hall sensors are
@@ -33,9 +33,11 @@ mod gripper;
 mod jaw;
 mod map;
 mod mujoco;
+pub mod scenario;
 pub mod scene;
 
 pub use driver::FaultKind;
+pub use scenario::SimulationScenario;
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -50,7 +52,8 @@ use crate::spectral::codec::{
     decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
     encode_pd_gains, encode_position_gains, encode_velocity_gains, encode_voltage_limit,
     encode_watchdog, fold_bits_msb_first, pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32,
-    unfold_bits_msb_first, unpack_can_id, unpack_i16, CanFrame, CommandId, Payload,
+    unfold_bits_msb_first, unpack_can_id, unpack_i16, unpack_i24, unpack_i32, CanFrame, CommandId,
+    Payload,
 };
 use crate::spectral::convert::JointConversion;
 use crate::types::{
@@ -106,6 +109,7 @@ const HALL_HALF_WIDTH_RAD: f64 = 0.02;
 /// [`DriverBus::boot_configure`] with the real configs before any
 /// per-tick call.
 pub struct SimBus {
+    scenario: scenario::ActiveScenario,
     tick: u64,
     dt: f64,
     silent: bool,
@@ -165,6 +169,7 @@ impl SimBus {
     /// or its joint layout does not match the robot config.
     pub fn new(scene: scene::Scene) -> Self {
         Self {
+            scenario: scenario::ActiveScenario::default(),
             tick: 0,
             dt: 0.004,
             silent: false,
@@ -210,6 +215,25 @@ impl SimBus {
     /// clamped inside the hard limits.
     pub fn set_initial_joint_rad(&mut self, q0: &[f64]) {
         self.initial_q = Some(q0.to_vec());
+    }
+
+    /// Activate an offline perturbation profile relative to the current tick.
+    /// Boot the bus first; a profile never changes hardware or robot config.
+    pub fn set_scenario(&mut self, scenario: &SimulationScenario) -> Result<(), String> {
+        scenario.validate()?;
+        if !self.configured {
+            return Err("boot the simulated bus before activating a scenario".into());
+        }
+        if let Some(fault) = scenario.driver_fault {
+            if self.driver_mut(fault.node).is_none() {
+                return Err(format!(
+                    "scenario fault node {} is not configured",
+                    fault.node
+                ));
+            }
+        }
+        self.scenario = scenario::ActiveScenario::new(scenario, self.tick, self.dt);
+        Ok(())
     }
 
     /// Teleport the simulated arm to `q` \[rad\] (one entry per joint,
@@ -448,10 +472,28 @@ impl SimBus {
         Ok(())
     }
 
-    fn enqueue(&mut self, frame: CanFrame) {
+    fn enqueue(&mut self, mut frame: CanFrame) {
+        if self.scenario.drop_reply(self.tick) {
+            self.dropped_rx += 1;
+            return;
+        }
         if self.rx.len() >= RX_QUEUE_CAP {
             self.dropped_rx += 1;
             return;
+        }
+        let (_, command, _) = unpack_can_id(frame.id);
+        match CommandId::from_raw(command) {
+            Some(CommandId::RespondDataPack1 | CommandId::RespondDataHall) if frame.dlc >= 3 => {
+                let pos = unpack_i24([frame.data[0], frame.data[1], frame.data[2]]);
+                frame.data[..3]
+                    .copy_from_slice(&pack_i24(pos.saturating_add(self.scenario.encoder_noise())));
+            }
+            Some(CommandId::EncoderData) if frame.dlc >= 4 => {
+                let pos = unpack_i32([frame.data[0], frame.data[1], frame.data[2], frame.data[3]]);
+                frame.data[..4]
+                    .copy_from_slice(&pack_i32(pos.saturating_add(self.scenario.encoder_noise())));
+            }
+            _ => {}
         }
         self.rx.push_back((self.tick, frame));
     }
@@ -497,6 +539,9 @@ impl SimBus {
     /// boot wrap offset) — firmware's accumulated encoder count is the
     /// same value it reports, and host position commands echo it back.
     fn step_once(&mut self) {
+        if let Some((node, kind)) = self.scenario.take_fault(self.tick) {
+            self.inject_fault(node, kind);
+        }
         for (layer, posted) in self.world.iter_mut().zip(self.mailbox.take()) {
             if let Some(shapes) = posted {
                 *layer = shapes;
@@ -523,7 +568,10 @@ impl SimBus {
             &self.loads_ma,
             &self.maps,
             jaw_drive,
-            self.landed_unheld,
+            mujoco::PowerState {
+                landing_clamp: self.landed_unheld,
+                supply_scale: self.scenario.supply_scale(self.tick),
+            },
         );
         // The scene owns the object positions unless a test declared them:
         // whatever physically jammed the jaws becomes the front end's
@@ -617,6 +665,9 @@ impl SimBus {
     /// Deliver an RTR telemetry poll to `node` and enqueue its reply.
     /// Nodes without a driver (the timing dummy) stay silent.
     fn deliver_rtr(&mut self, node: NodeId, kind: PollKind) {
+        if self.scenario.supply_scale(self.tick) == 0.0 {
+            return;
+        }
         let joint = self.node_to_joint[usize::from(node)];
         let motion = joint.map(|j| self.joint_reply_values(j)).or_else(|| {
             if node == self.gripper_node {
@@ -708,6 +759,9 @@ impl SimBus {
     /// Deliver one host→driver DATA frame to its node and enqueue
     /// whatever the driver replies.
     fn deliver_data(&mut self, frame: &CanFrame) {
+        if self.scenario.supply_scale(self.tick) == 0.0 {
+            return;
+        }
         let (node, raw_cmd, _) = unpack_can_id(frame.id);
         let Some(cmd) = CommandId::from_raw(raw_cmd) else {
             return;
@@ -916,7 +970,8 @@ impl DriverBus for SimBus {
     fn begin_tick(&mut self, tick: u64) {
         debug_assert!(tick >= self.tick, "tick must be non-decreasing");
         if self.configured {
-            for _ in self.tick..tick {
+            while self.tick < tick {
+                self.tick += 1;
                 self.step_once();
             }
         }
@@ -940,6 +995,13 @@ impl DriverBus for SimBus {
         let mut age_min = u64::MAX;
         let mut age_max = 0u64;
         while count < cap {
+            if self
+                .rx
+                .front()
+                .is_some_and(|(at, _)| self.tick.saturating_sub(*at) < self.scenario.delay_ticks)
+            {
+                break;
+            }
             let Some((enqueued, frame)) = self.rx.pop_front() else {
                 break;
             };
@@ -1340,7 +1402,7 @@ impl SimBus {
         let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
         self.base_spec = Some(base);
         self.world_dirty = false;
-        mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.holding_friction_nm)
+        mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.powered_support_nm)
     }
 
     /// Rebuild the scene around the current world layers, in place.

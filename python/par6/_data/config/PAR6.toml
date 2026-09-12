@@ -43,7 +43,7 @@ sector_master_position_ticks = 3969
 sector_home_offset_rad = 1.570796327
 
 [joints.gains]
-kpp = 1.5
+kpp = 5.0
 kpv = 0.015
 kiv = 0.0015
 kpiq = 7.0
@@ -582,10 +582,10 @@ pose = [0.0, 0.0, -0.12, 0.0, 0.0, 0.0]
 motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
 motor_b_nm_s = 1.0e-4
 motor_tc_nm = 0.02
-# Gearbox holding friction [Nm, joint side]: the load an unpowered joint
-# carries without back-driving. Sized over the worst gravity torque in the
-# joint's range, or an IDLE arm collapses under its own weight.
-holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
+# Assumed powered load support [Nm, joint side], fitted to the existing
+# enabled/idle simulation. These are not measured passive friction or brakes.
+# A supply-loss scenario removes this support as its supply envelope decays.
+powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
 command_timeout_s = 0.04

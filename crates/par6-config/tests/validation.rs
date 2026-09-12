@@ -39,6 +39,32 @@ fn refused_field(result: Result<RobotConfig, ConfigError>, what: &str) -> String
 }
 
 #[test]
+fn powered_support_requires_one_finite_nonnegative_value_per_joint() {
+    for values in [
+        "[]",
+        "[1.0]",
+        "[1.0, 8.0, 3.0, 0.5, 0.5, 0.3, 0.1]",
+        "[nan, 8.0, 3.0, 0.5, 0.5, 0.3]",
+        "[inf, 8.0, 3.0, 0.5, 0.5, 0.3]",
+        "[-1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
+    ] {
+        let field = refused_field(
+            load_with(
+                "powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
+                &format!("powered_support_nm = {values}"),
+            ),
+            values,
+        );
+        assert_eq!(field, "sim.powered_support_nm");
+    }
+    load_with(
+        "powered_support_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]",
+        "powered_support_nm = [0.0, 0.0, 0.0, 0.0, 0.0, 0.0]",
+    )
+    .expect("zero support is a valid model assumption");
+}
+
+#[test]
 fn nan_and_unbounded_values_are_refused_by_name() {
     let field = refused_field(
         load_with("torque_rate_nm_s = 364.0", "torque_rate_nm_s = nan"),

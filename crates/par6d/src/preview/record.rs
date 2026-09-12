@@ -185,8 +185,6 @@ pub(crate) struct Recorder {
     /// Per object, the rows recorded so far. Collapsed to a single row
     /// at the end when nothing moved.
     tracks: Vec<Vec<[f32; 7]>>,
-    /// Scratch the object read fills, sized once.
-    poses: Vec<[f64; 7]>,
     contact_pos: Vec<[f64; 3]>,
     contact_force: Vec<[f64; 3]>,
     out: TickBatch,
@@ -208,7 +206,6 @@ impl Recorder {
             joints,
             object_names,
             tracks: vec![Vec::new(); n],
-            poses: vec![[0.0; 7]; n],
             contact_pos: Vec::new(),
             contact_force: Vec::new(),
             out: TickBatch {
@@ -267,11 +264,11 @@ impl Recorder {
                 .is_some_and(|r| r.object_detection == ObjectDetection::DetectedClosing),
         );
         if let Some(sim) = bus.sim_mut() {
-            let n = sim.object_poses_into(&mut self.poses);
-            for (track, pose) in self.tracks.iter_mut().zip(&self.poses[..n]) {
+            for (name, track) in self.object_names.iter().zip(&mut self.tracks) {
+                let pose = sim.world_object_pose(name).unwrap_or([f64::NAN; 7]);
                 let mut row = [0.0f32; 7];
                 for (o, v) in row.iter_mut().zip(pose) {
-                    *o = *v as f32;
+                    *o = v as f32;
                 }
                 track.push(row);
             }

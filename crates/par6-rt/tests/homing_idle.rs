@@ -99,8 +99,7 @@ fn step(bus: &mut SimBus, state: &mut BusState, t: &mut u64, cmds: &[JointComman
 /// cmd 12 has no holding torque of its own and yields to the load (limp
 /// — the point of the idle pre-move), while the encoder polls keep its
 /// position reported and its freshness green the whole time. The load
-/// exceeds the gearbox's holding friction (below it a self-locking
-/// drivetrain holds an unpowered joint whatever the driver does) and
+/// exceeds the model's assumed powered support and
 /// stays inside the loop's current authority; the base joint is where
 /// that window is wide, and gravity plays no part on its vertical axis.
 #[test]
@@ -115,7 +114,7 @@ fn a_dropped_driver_hangs_limp_under_load_while_polls_keep_it_fresh() {
     let n1 = usize::from(node1);
     let ma_per_nm =
         torque_to_ma_factor(jc.gear_ratio, jc.gear_efficiency, jc.kt_nm_a, jc.dir).abs();
-    bus.set_joint_load_ma(node1, 1.5 * robot.sim.holding_friction_nm[0] * ma_per_nm);
+    bus.set_joint_load_ma(node1, 1.5 * robot.sim.powered_support_nm[0] * ma_per_nm);
     let mut state = BusState::new();
     let mut t = 0u64;
 
