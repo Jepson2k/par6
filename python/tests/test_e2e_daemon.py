@@ -50,6 +50,57 @@ pytestmark = [pytest.mark.e2e, requires_par6d]
 #: Wall-clock ceiling for one session step (boot, settle, a short move).
 STEP_BUDGET_S = 20.0
 
+
+@pytest.mark.timeout(90)
+async def test_attachments_require_reconciliation_after_context_loss(
+    daemon: LiveDaemon,
+):
+    from waldoctl.shapes import Sphere
+
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        await settle_at(client, TILTED_POSTURE_DEG)
+        world = await client.shapes()
+        assert world is not None
+        local = (0.0, 0.0, 0.3, 0.0, 0.0, 0.0)
+        part = Sphere(name="part", radius=0.01).attach(
+            flange_pose=local,
+            epoch=world.attachment_epoch,
+        )
+        assert await client.set_shapes([part]) == 1
+        applied = await client.shapes()
+        assert applied is not None and applied.program == (part,)
+        target = list(TILTED_POSTURE_DEG)
+        target[0] += 3
+        await client.move_j(target, duration=1.5, wait=True, timeout=STEP_BUDGET_S)
+
+        assert await client.estop() == 1
+        async with asyncio.timeout(STEP_BUDGET_S):
+            while True:
+                current = await client.shapes()
+                assert current is not None
+                if not current.attachments_valid:
+                    break
+                await asyncio.sleep(0)
+        assert current.attachment_epoch != world.attachment_epoch
+        assert await client.reset() == 1
+        with pytest.raises(RobotError, match="attachment context"):
+            await client.move_j(TILTED_POSTURE_DEG, duration=1.5)
+        with pytest.raises(RobotError, match="attachment context"):
+            await client.set_shapes([part])
+        fresh = await client.shapes()
+        assert fresh is not None
+        reconciled = part.attach(flange_pose=local, epoch=fresh.attachment_epoch)
+        assert await client.set_shapes([reconciled]) == 1
+        applied = await client.shapes()
+        assert applied is not None and applied.attachments_valid
+        released = reconciled.detach(world_pose=(1.0, 1.0, 1.0, 0.0, 0.0, 0.0))
+        assert await client.set_shapes([released]) == 1
+        await client.move_j(
+            TILTED_POSTURE_DEG, duration=1.5, wait=True, timeout=STEP_BUDGET_S
+        )
+
+
 #: Fraction of the cartesian ceiling the streamed servo_l tests drive at.
 SERVO_L_SPEED = 0.6
 #: The shipped PAR6 homing sequence takes ~60 s (its pre-moves, backoffs and
@@ -1255,8 +1306,8 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
 
     class Streamer:
         """UI-style streaming: each datagram advances the COMMANDED target
-        a few mm, the way a 50 Hz frontend integrates a gesture. Stepping
-        from the measurement instead feeds the plant's tracking lag back
+        5 mm, paced by the 50 ms status wait. Stepping from the
+        measurement instead feeds the plant's tracking lag back
         into the target and limit-cycles the arm."""
 
         def __init__(self, client, goal, send):
@@ -1301,7 +1352,8 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         )
         assert arrived, (
             f"servo_l never reached the streamed target: "
-            f"{(await pose_now(client))[:3]} vs {goal[:3]}"
+            f"{(await pose_now(client))[:3]} vs {goal[:3]}; "
+            f"controller error: {await client.error()}; daemon log:\n{daemon.log()}"
         )
 
         # --- servo_j(pose=...): the same target through the joint-space

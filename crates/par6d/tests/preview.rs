@@ -58,6 +58,47 @@ fn jog_l_cmd(velocities: [f64; 6], duration: f64) -> Command {
 }
 
 #[test]
+fn held_geometry_requires_reference_and_reset_reconciliation() {
+    use par6_proto::Attachment;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let mut part = Shape {
+        name: "part".into(),
+        kind: "sphere".into(),
+        params: vec![0.01],
+        pose: vec![0.0, 0.0, 0.3, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        physics: None,
+        attachment: Some(Attachment {
+            epoch: preview.shapes().3,
+            allowed_contacts: vec![],
+        }),
+    };
+    preview.set_homed(false);
+    assert!(preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .is_err());
+    preview.set_homed(true);
+    part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
+    preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .unwrap();
+    assert!(preview.submit(Command::Reset).valid());
+    assert!(preview
+        .set_shapes(ShapeLayer::Program, std::slice::from_ref(&part))
+        .is_err());
+    let refused = preview.submit(move_j_cmd(to_deg(&preview.angles_rad()), None));
+    assert!(!refused.valid());
+    part.attachment.as_mut().unwrap().epoch = preview.shapes().3;
+    preview.set_shapes(ShapeLayer::Program, &[part]).unwrap();
+    preview.set_shapes(ShapeLayer::Program, &[]).unwrap();
+    assert!(preview
+        .submit(move_j_cmd(to_deg(&preview.angles_rad()), None))
+        .valid());
+}
+
+#[test]
 fn execution_override_retimes_the_plan_and_preserves_paused_commands() {
     use par6_proto::command::{Pause, SetExecutionSpeed};
     let config = test_config();
@@ -168,6 +209,7 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let center_m = [pose[3], pose[7], pose[11]];
     preview.place_rad(to_rad(&target));
     let keepout = vec![Shape {
+        attachment: None,
         kind: "box".into(),
         params: vec![0.1, 0.1, 0.1],
         pose: vec![center_m[0], center_m[1], center_m[2], 0.0, 0.0, 0.0],

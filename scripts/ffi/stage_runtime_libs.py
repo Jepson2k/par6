@@ -2,13 +2,13 @@
 """Stage a cross-built shim's runtime library closure and prove it loadable.
 
 The PAR6 control box gets no conda environment: `par6d` links
-`libpar6_shim.so` (Pinocchio, coal, toppra) and `libmujoco.so`, and everything
-those pull in has to be installed alongside them. This walks `DT_NEEDED` from
-the given roots, copies every dependency found in the conda env's `lib/` into
-one flat directory — along with any root that does not already live there —
-and then answers the only question that can be answered without target
-hardware: *would the dynamic loader be able to resolve this set on the
-target?*
+`libpar6_shim.so` — which pulls in Pinocchio, coal, toppra and their
+transitive dependencies — and `libmujoco`, the simulator's physics, and all
+of those have to be installed alongside it. This walks `DT_NEEDED` from the
+given roots, copies every dependency found in the given library directories
+into one flat directory, and then answers the only question that can be
+answered without target hardware: *would the dynamic loader be able to
+resolve this set on the target?*
 
 Two checks make up that answer:
 
@@ -226,14 +226,6 @@ def main() -> int:
             f"{', '.join(str(d) for d in args.lib_dirs)}): {', '.join(sorted(unresolved))}"
         )
 
-    # The shim is installed straight into the staging directory; a root
-    # linked from the env (libmujoco) ships with its closure like any
-    # other dependency.
-    dest = args.dest.resolve()
-    roots = [r.resolve() for r in args.roots]
-    in_place = [r for r in roots if r.parent == dest]
-    deps += [r for r in roots if r.parent != dest]
-
     staged: dict[str, Path] = {}
     total = 0
     for dep in sorted(deps):
@@ -252,7 +244,7 @@ def main() -> int:
         staged[soname] = args.dest / soname
         total += dep.stat().st_size
 
-    objects = in_place + list(staged.values())
+    objects = [p.resolve() for p in args.roots] + list(staged.values())
 
     # 1. glibc floor across everything that ships.
     floor = max(glibc_floor(args.readelf, obj) for obj in objects)

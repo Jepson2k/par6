@@ -14,7 +14,9 @@
 
 #include <Eigen/Dense>
 
+#include <algorithm>
 #include <cmath>
+#include <stdexcept>
 #include <cstring>
 #include <exception>
 #include <limits>
@@ -156,7 +158,24 @@ struct WorldShape {
     pinocchio::SE3 placement = pinocchio::SE3::Identity();
     double margin = -1.0;
     std::string name;
+    pinocchio::FrameIndex parent_frame = 0;
+    std::vector<std::string> allowed_contacts;
 };
+
+std::string reporting_name(const std::string &name) {
+    if (name.find(':') != std::string::npos) return name;
+    const auto split = name.rfind('_');
+    if (split != std::string::npos && split + 1 < name.size() &&
+        name.find_first_not_of("0123456789", split + 1) == std::string::npos)
+        return name.substr(0, split);
+    return name;
+}
+
+bool allows(const WorldShape *owner, const std::string &partner) {
+    return owner != nullptr && owner->parent_frame != 0 &&
+        std::find(owner->allowed_contacts.begin(), owner->allowed_contacts.end(), partner)
+            != owner->allowed_contacts.end();
+}
 
 } // namespace
 
@@ -175,8 +194,8 @@ struct par6_col {
 
     /* Working world: base_geom + installation + program, with GeometryData
      * and per-pair security margins rebuilt by rebuild_world(). */
-    pinocchio::GeometryModel geom;
-    pinocchio::GeometryData geom_data;
+    std::unique_ptr<pinocchio::GeometryModel> geom;
+    std::unique_ptr<pinocchio::GeometryData> geom_data;
 
     /* Index of the first WORLD pair in geom.collisionPairs: self pairs
      * come first (copied from base_geom), world pairs are appended by
@@ -185,7 +204,7 @@ struct par6_col {
 
     Eigen::VectorXd q;
 
-    par6_col() : data(pinocchio::Model()), geom_data(pinocchio::GeometryModel()) {}
+    par6_col() : data(pinocchio::Model()) {}
 
     /* Drop pairs that are structurally always in contact: same parent joint
      * (pinocchio already skips those) and parent/child links in the tree. */
@@ -209,31 +228,53 @@ struct par6_col {
     }
 
     void rebuild_world() {
-        geom = base_geom;
-        world_pairs_from = geom.collisionPairs.size();
-        /* Per-pair standoff, parallel to geom.collisionPairs: robot self
-         * pairs use the default clearance, world pairs the shape's override. */
-        std::vector<double> margins(geom.collisionPairs.size(), clearance);
+        auto next_geom = std::make_unique<pinocchio::GeometryModel>(base_geom);
+        auto &candidate = *next_geom;
+        const auto first_world_pair = candidate.collisionPairs.size();
+        std::vector<double> margins(first_world_pair, clearance);
+        std::vector<const WorldShape *> owners(robot_geoms, nullptr);
+        std::vector<std::string> names;
+        for (const auto &obj : candidate.geometryObjects)
+            names.push_back(reporting_name(obj.name));
 
-        for (int32_t layer = 0; layer < LAYER_COUNT; ++layer) {
-            for (const WorldShape &w : layers[layer]) {
-                pinocchio::GeometryObject obj(
-                    w.name, static_cast<pinocchio::JointIndex>(0),
-                    static_cast<pinocchio::FrameIndex>(0), w.placement,
-                    w.geometry);
-                const pinocchio::GeomIndex gi = geom.addGeometryObject(obj);
-                const double m = w.margin >= 0.0 ? w.margin : clearance;
-                for (std::size_t i = 0; i < robot_geoms; ++i) {
-                    geom.addCollisionPair(pinocchio::CollisionPair(i, gi));
-                    margins.push_back(m);
-                }
+        for (const auto &layer : layers) {
+            for (const auto &w : layer) {
+                const auto &frame = model.frames[w.parent_frame];
+                const auto placement = w.parent_frame == 0 ? w.placement :
+                    frame.placement * w.placement;
+                candidate.addGeometryObject(pinocchio::GeometryObject(
+                    w.name, frame.parentJoint, w.parent_frame, placement, w.geometry));
+                owners.push_back(&w);
+                names.push_back(w.name);
             }
         }
-
-        geom_data = pinocchio::GeometryData(geom);
-        for (std::size_t k = 0; k < geom_data.collisionRequests.size(); ++k) {
-            geom_data.collisionRequests[k].security_margin = margins[k];
+        for (std::size_t gi = robot_geoms; gi < owners.size(); ++gi) {
+            const auto &w = *owners[gi];
+            for (const auto &partner : w.allowed_contacts) {
+                if (partner == names[gi] ||
+                    std::find(names.begin(), names.end(), partner) == names.end())
+                    throw std::invalid_argument("unknown or self allowed contact: " + partner);
+            }
+            for (std::size_t i = 0; i < gi; ++i) {
+                const auto *other = owners[i];
+                if (other != nullptr && w.parent_frame == 0 && other->parent_frame == 0)
+                    continue;
+                if (allows(&w, names[i]) || allows(other, names[gi])) continue;
+                candidate.addCollisionPair(pinocchio::CollisionPair(i, gi));
+                const double m = w.margin >= 0.0 ? w.margin : clearance;
+                const double other_margin = other != nullptr && other->margin >= 0.0 ?
+                    other->margin : clearance;
+                margins.push_back(other == nullptr ? m : std::max(m, other_margin));
+            }
         }
+        // Pinocchio functors retain GeometryObject addresses; copying the model
+        // after constructing GeometryData would leave dangling references.
+        auto next_data = std::make_unique<pinocchio::GeometryData>(candidate);
+        for (std::size_t k = 0; k < next_data->collisionRequests.size(); ++k)
+            next_data->collisionRequests[k].security_margin = margins[k];
+        geom.swap(next_geom);
+        geom_data.swap(next_data);
+        world_pairs_from = first_world_pair;
     }
 };
 
@@ -330,20 +371,20 @@ int32_t par6_col_robot_geom_count(const par6_col *h) {
 }
 
 int32_t par6_col_geom_count(const par6_col *h) {
-    return h == nullptr ? 0 : static_cast<int32_t>(h->geom.ngeoms);
+    return h == nullptr ? 0 : static_cast<int32_t>(h->geom->ngeoms);
 }
 
 int32_t par6_col_pair_count(const par6_col *h) {
-    return h == nullptr ? 0 : static_cast<int32_t>(h->geom.collisionPairs.size());
+    return h == nullptr ? 0 : static_cast<int32_t>(h->geom->collisionPairs.size());
 }
 
 par6_status par6_col_geom_name(const par6_col *h, int32_t idx,
                                char *buf, int32_t buf_len) {
     if (h == nullptr || buf == nullptr || buf_len <= 0 || idx < 0 ||
-        static_cast<std::size_t>(idx) >= h->geom.ngeoms) {
+        static_cast<std::size_t>(idx) >= h->geom->ngeoms) {
         return PAR6_ERR_INVALID_ARG;
     }
-    const std::string &name = h->geom.geometryObjects[idx].name;
+    const std::string &name = h->geom->geometryObjects[idx].name;
     if (name.size() + 1 > static_cast<std::size_t>(buf_len)) {
         return PAR6_ERR_INVALID_ARG;
     }
@@ -353,6 +394,7 @@ par6_status par6_col_geom_name(const par6_col *h, int32_t idx,
 
 par6_status par6_col_set_layer(par6_col *h, int32_t layer,
                                const par6_shape *shapes, int32_t n_shapes,
+                               const par6_shape_placement *placements,
                                char *err_buf, int32_t err_len) {
     if (h == nullptr) {
         write_err(err_buf, err_len, "handle is NULL");
@@ -393,11 +435,44 @@ par6_status par6_col_set_layer(par6_col *h, int32_t layer,
                                 shapes[i].pose[2]));
             w.margin = shapes[i].margin;
             w.name = prefix + std::to_string(i);
+            if (placements != nullptr) {
+                const auto &meta = placements[i];
+                if (meta.name == nullptr || std::strlen(meta.name) > 256 ||
+                    meta.n_allowed_contacts < 0 || meta.n_allowed_contacts > 32 ||
+                    (meta.n_allowed_contacts > 0 && meta.allowed_contacts == nullptr))
+                    throw std::invalid_argument("invalid shape placement metadata");
+                w.name = meta.name;
+                if (meta.parent_frame != nullptr) {
+                    if (layer != 1 || !h->model.existFrame(meta.parent_frame))
+                        throw std::invalid_argument("attachment requires a program shape and known frame");
+                    w.parent_frame = h->model.getFrameId(meta.parent_frame);
+                    if (w.parent_frame == 0)
+                        throw std::invalid_argument("attachment frame cannot be universe");
+                } else if (meta.n_allowed_contacts != 0) {
+                    throw std::invalid_argument("only attached shapes can allow contacts");
+                }
+                for (int32_t j = 0; j < meta.n_allowed_contacts; ++j) {
+                    if (meta.allowed_contacts[j] == nullptr)
+                        throw std::invalid_argument("null contact name");
+                    const std::string partner(meta.allowed_contacts[j]);
+                    if (partner.empty() || partner.size() > 128 ||
+                        partner.find_first_of("*?[]") != std::string::npos ||
+                        std::find(w.allowed_contacts.begin(), w.allowed_contacts.end(), partner)
+                            != w.allowed_contacts.end())
+                        throw std::invalid_argument("contacts must be distinct exact reporting names");
+                    w.allowed_contacts.push_back(partner);
+                }
+            }
             built.push_back(std::move(w));
         }
 
-        h->layers[layer] = std::move(built);
-        h->rebuild_world();
+        h->layers[layer].swap(built);
+        try {
+            h->rebuild_world();
+        } catch (...) {
+            h->layers[layer].swap(built);
+            throw;
+        }
         return PAR6_OK;
     } catch (const std::bad_alloc &) {
         write_err(err_buf, err_len, "out of memory");
@@ -427,7 +502,7 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
     try {
         h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
         const bool hit = pinocchio::computeCollisions(
-            h->model, h->data, h->geom, h->geom_data, h->q,
+            h->model, h->data, *h->geom, *h->geom_data, h->q,
             stop_at_first != 0);
         if (!hit) {
             return 0;
@@ -437,14 +512,14 @@ int32_t par6_col_check(par6_col *h, const double *q, int32_t stop_at_first,
          * the triggering pair is stale from an earlier call — collect the
          * one pair that stopped it and nothing else. */
         int32_t written = 0;
-        for (std::size_t k = 0; k < h->geom.collisionPairs.size(); ++k) {
+        for (std::size_t k = 0; k < h->geom->collisionPairs.size(); ++k) {
             if (written >= max_pairs) {
                 break;
             }
-            if (!h->geom_data.collisionResults[k].isCollision()) {
+            if (!h->geom_data->collisionResults[k].isCollision()) {
                 continue;
             }
-            const pinocchio::CollisionPair &p = h->geom.collisionPairs[k];
+            const pinocchio::CollisionPair &p = h->geom->collisionPairs[k];
             out_pairs[2 * written] = static_cast<int32_t>(p.first);
             out_pairs[2 * written + 1] = static_cast<int32_t>(p.second);
             ++written;
@@ -474,7 +549,7 @@ par6_status par6_col_distance(par6_col *h, const double *q,
 
     try {
         h->q = Eigen::Map<const Eigen::VectorXd>(q, h->model.nq);
-        pinocchio::computeDistances(h->model, h->data, h->geom, h->geom_data,
+        pinocchio::computeDistances(h->model, h->data, *h->geom, *h->geom_data,
                                     h->q);
         /* coal's per-pair result is signed: separation when apart,
          * -(penetration depth) when overlapping. The minimum over every
@@ -482,7 +557,7 @@ par6_status par6_col_distance(par6_col *h, const double *q,
          * there are no pairs at all. Margins never enter — this is raw
          * geometry, unlike par6_col_check's margin-shifted verdict. */
         double best = std::numeric_limits<double>::infinity();
-        for (const coal::DistanceResult &r : h->geom_data.distanceResults) {
+        for (const coal::DistanceResult &r : h->geom_data->distanceResults) {
             if (r.min_distance < best) {
                 best = r.min_distance;
             }
@@ -517,12 +592,12 @@ par6_status par6_col_world_distance(par6_col *h, const double *q,
          * hull, EPA) signal was measured and rejected — true depth reads
          * a transverse multi-link escape as "deepening" and refuses the
          * one motion that gets the arm out of a keep-out dropped on it. */
-        pinocchio::updateGeometryPlacements(h->model, h->data, h->geom,
-                                            h->geom_data, h->q);
+        pinocchio::updateGeometryPlacements(h->model, h->data, *h->geom,
+                                            *h->geom_data, h->q);
         double best = std::numeric_limits<double>::infinity();
         for (std::size_t k = h->world_pairs_from;
-             k < h->geom.collisionPairs.size(); ++k) {
-            const double d = pinocchio::computeDistance(h->geom, h->geom_data,
+             k < h->geom->collisionPairs.size(); ++k) {
+            const double d = pinocchio::computeDistance(*h->geom, *h->geom_data,
                                                         k)
                                  .min_distance;
             if (d < best) {

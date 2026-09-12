@@ -13,6 +13,8 @@ mod run;
 pub use record::TickBatch;
 pub use run::RunLimits;
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -206,6 +208,7 @@ pub struct Preview {
     /// config. The installation layer is config and lives on `cfg`.
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
+    attachment_epoch: u64,
     /// What a run rebuilds its kinematics, its scene and its engine
     /// from. A dry run boots a second engine from the same bundle, so
     /// it needs the file rather than the models this session holds.
@@ -328,6 +331,9 @@ impl Preview {
             ),
             shapes: Vec::new(),
             scene_epoch: 0,
+            attachment_epoch: RandomState::new()
+                .hash_one(std::time::SystemTime::now())
+                .max(1),
             config_path,
             opts,
             cfg,
@@ -391,6 +397,9 @@ impl Preview {
     /// and HOME previews as the referencing seek instead of a planned
     /// park return.
     pub fn set_homed(&mut self, homed: bool) {
+        if self.snap.homed != homed {
+            self.invalidate_attachments();
+        }
         self.snap.homed = homed;
         self.publish();
     }
@@ -564,6 +573,22 @@ impl Preview {
     /// FLASHING window is what the RT reports it as — disabled — rather
     /// than a refusal of the preview's own wording.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
+        if par6_server::is_arm_motion(command.tag())
+            && self.shapes.iter().any(|s| {
+                s.attachment
+                    .as_ref()
+                    .is_some_and(|a| a.epoch != self.attachment_epoch)
+            })
+        {
+            return Some(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "attachment context changed; reconcile and reapply",
+                )],
+            ));
+        }
         check_gate(
             command.tag(),
             &GateContext {
@@ -848,10 +873,14 @@ impl Preview {
                 self.latches.stop(cleared);
             }
             Command::Estop => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.latches.estop();
             }
-            Command::Reset => self.latches.reset(),
+            Command::Reset => {
+                self.invalidate_attachments();
+                self.latches.reset();
+            }
             Command::Pause(p) => {
                 self.snap.exec.paused = p.on;
                 let scale = if p.on {
@@ -873,6 +902,7 @@ impl Preview {
             }
             Command::SetGravityComp(_) => {}
             Command::ResetState => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
@@ -896,12 +926,14 @@ impl Preview {
             // (`swap_to_sim` sets homed), while real hardware knows
             // nothing until it seeks (`swap_to_hardware` un-homes).
             Command::Simulator(p) => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.simulator = p.on;
                 self.snap.homed = p.on;
                 self.publish();
             }
             Command::ConnectHardware(_) => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.simulator = false;
                 self.snap.homed = false;
@@ -1345,6 +1377,7 @@ impl Preview {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.
                 if p.variant_key != self.tool_variant {
+                    self.invalidate_attachments();
                     self.tcp_offset_mm = [0.0; 3];
                     self.tcp_rotation_deg = [0.0; 3];
                 }
@@ -1385,6 +1418,32 @@ impl Preview {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<Option<u64>, WireError> {
+        if shapes.iter().any(|s| s.attachment.is_some())
+            && (!self.snap.homed || self.flashing || self.latches.estop_latched)
+        {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "attachments require fresh enabled, referenced state",
+                )],
+            ));
+        }
+        if shapes.iter().any(|s| {
+            s.attachment
+                .as_ref()
+                .is_some_and(|a| layer != ShapeLayer::Program || a.epoch != self.attachment_epoch)
+        }) {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "attachment context changed; reconcile and reapply",
+                )],
+            ));
+        }
         let epoch = self.planner.set_shapes(layer, shapes)?;
         // The streaming gate keeps its own world, and only a set the
         // planner accepted reaches it — the same order the server uses.
@@ -1401,14 +1460,19 @@ impl Preview {
         Ok(epoch)
     }
 
+    fn invalidate_attachments(&mut self) {
+        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+    }
+
     /// The applied world: the config's installation layer, the program
     /// layer this session set, and the epoch — the runtime's own SHAPES
     /// readback, for the same config.
-    pub fn shapes(&self) -> (&[par6_proto::Shape], &[par6_proto::Shape], u64) {
+    pub fn shapes(&self) -> (&[par6_proto::Shape], &[par6_proto::Shape], u64, u64) {
         (
             &self.cfg.installation_shapes,
             &self.shapes,
             self.scene_epoch,
+            self.attachment_epoch,
         )
     }
 }

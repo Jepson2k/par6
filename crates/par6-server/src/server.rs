@@ -130,6 +130,17 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// Whether the server task has ended.
+    ///
+    /// It is expected to be running until it is asked to stop, so a `true`
+    /// here that nobody asked for means the command plane is gone — the
+    /// planner thread died and took its channels with it, or the task
+    /// panicked. The supervisor treats that as fatal rather than leaving an
+    /// arm powered, ticking, and unable to be commanded or stopped.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 impl Drop for ServerHandle {
@@ -362,6 +373,8 @@ struct Core<R: RtCommands> {
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
+    attachment_epoch: u64,
+    attachment_stop_pending: bool,
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
@@ -453,6 +466,10 @@ impl<R: RtCommands> Core<R> {
             tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
             shapes: Vec::new(),
+            attachment_epoch: RandomState::new()
+                .hash_one((std::process::id(), std::time::SystemTime::now()))
+                .max(1),
+            attachment_stop_pending: false,
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
@@ -527,6 +544,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_datagram(&mut self, data: &[u8], addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match peek_tag(data) {
             Ok(t) if t == MsgType::Chunk as u8 as i64 => self.on_chunk(data, addr).await,
             _ => self.on_command_bytes(data, addr).await,
@@ -613,6 +631,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
@@ -647,6 +666,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_status(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.update_tcp_speed();
         self.update_collision();
         self.refresh_queue_estimate();
@@ -829,6 +849,10 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         if let C::SetShapes(p) = cmd {
+            if let Some(error) = self.attachment_shapes_error(&p.shapes) {
+                self.reply(addr, &Reply::Error { req_id, error }).await;
+                return;
+            }
             self.defer_program_shapes(req_id, addr, p.shapes.clone());
             return;
         }
@@ -899,6 +923,7 @@ impl<R: RtCommands> Core<R> {
                 }
             },
             C::Simulator(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the simulator switch").await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
@@ -931,6 +956,7 @@ impl<R: RtCommands> Core<R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the hardware connect").await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
@@ -1000,6 +1026,7 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
+        self.invalidate_attachments();
         self.estop_latched = false;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1043,6 +1070,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         // An exit from any mode but FLASHING is refused HERE: it would
         // dispatch `SetMode(Idle)`, which from a working mode cancels
         // motion the client never asked to stop.
@@ -1287,7 +1315,22 @@ impl<R: RtCommands> Core<R> {
         // Depth one, as the reference runtime has it. The superseded
         // action was acked and something may be waiting on it, so it is
         // completed rather than dropped in silence.
-        if let Some(prev) = self.tool_executing.take() {
+        //
+        // BOTH states count. An action that has been sent to the planner
+        // but not yet confirmed sits in `pending_tool`, not
+        // `tool_executing` — so a second action arriving inside that round
+        // trip used to find nothing to supersede, and both would land under
+        // different tags. `on_tool_started` then overwrote `tool_executing`
+        // with whichever answered last, and the first was never completed:
+        // its client waited out its timeout on an action the server had
+        // silently forgotten.
+        let superseded: Vec<ToolExecuting> = self
+            .pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .collect();
+        for prev in superseded {
             let error = make_error(
                 ErrorCode::MotnCancelled,
                 prev.index as i64,
@@ -1332,9 +1375,13 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// Drain the tool side channel. Runs before the motion lane's
-    /// outcomes and before `pump`, so a finished tool action is reported
-    /// on the same tick it settles rather than behind a motion.
+    /// Report a finished tool action.
+    ///
+    /// The two lanes are polled in one planner pass and arrive as two
+    /// events, the motion outcome first. That order does not matter here
+    /// the way it did when both were drained inline: the side channel
+    /// shares no state with the motion lane, and a tool outcome is spoken
+    /// to its own client the moment its event is routed.
     async fn on_tool_outcome(&mut self, out: CommandOutcome) {
         let Some(ex) = &self.tool_executing else {
             return; // outcome of a cancelled action
@@ -1385,6 +1432,17 @@ impl<R: RtCommands> Core<R> {
     }
 
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
+        if is_arm_motion(tag)
+            && (!self.attachments_valid()
+                || self
+                    .pending_shapes
+                    .values()
+                    .any(|(_, _, shapes)| shapes.iter().any(|s| s.attachment.is_some())))
+        {
+            return Some(attachment_error(
+                "attachment context changed or apply is pending; reconcile and reapply",
+            ));
+        }
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
@@ -1411,6 +1469,7 @@ impl<R: RtCommands> Core<R> {
     /// says how much of it the started motion covers. One plan is
     /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
+        self.stop_invalid_attachments().await;
         if self.execution_paused || self.snap.exec.target_scale == 0.0 {
             return;
         }
@@ -1448,10 +1507,19 @@ impl<R: RtCommands> Core<R> {
 
     /// Route what the planner had to say.
     async fn on_plan_event(&mut self, ev: PlanEvent) {
+        self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
-            PlanEvent::Outcome(out) => self.on_outcome(out).await,
+            PlanEvent::Outcome(out) => {
+                self.on_outcome(out).await;
+                // The slot the finished motion held is free now. Waiting
+                // for the next poll to notice leaves the arm standing
+                // still for a tick between two queued moves that did not
+                // blend.
+                self.pump().await;
+            }
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
@@ -1560,6 +1628,7 @@ impl<R: RtCommands> Core<R> {
                         // it alone (the client API documents the reset,
                         // and it is what the parol6 runtime does).
                         if variant != self.tool_variant {
+                            self.invalidate_attachments();
                             self.tcp_offset_mm = [0.0; 3];
                             self.tcp_rotation_deg = [0.0; 3];
                         }
@@ -1698,12 +1767,24 @@ impl<R: RtCommands> Core<R> {
     /// Take the tool action off the side channel so the caller can speak
     /// its cancellation. `halt` asks the tool to stop where it is.
     ///
+    /// An action still inside the `StartTool` round trip is parked in
+    /// `pending_tool`, and the `CancelTool` above reaches the planner
+    /// either way — so taking only `tool_executing` cancelled the parked
+    /// action on the planner while the server went on believing it was
+    /// live, and its client waited out a timeout on a COMPLETE nobody
+    /// was left to speak.
+    ///
     /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
     /// arriving cancels planned motion, but a gripper closing under it
     /// is exactly the overlap the side channel exists to allow.
-    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+    fn drop_tool_action(&mut self, halt: bool) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.send(PlanRequest::CancelTool { halt });
-        self.tool_executing.take().map(|t| (t.index, t.addr))
+        self.pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .map(|t| (t.index, t.addr))
+            .collect()
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
@@ -1847,6 +1928,67 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
+    fn attachments_valid(&self) -> bool {
+        self.shapes.iter().all(|s| {
+            s.attachment
+                .as_ref()
+                .is_none_or(|a| a.epoch == self.attachment_epoch)
+        })
+    }
+
+    fn invalidate_attachments(&mut self) {
+        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+        if self.shapes.iter().any(|s| s.attachment.is_some()) {
+            self.attachment_stop_pending = true;
+            self.scene_epoch += 1;
+        }
+    }
+
+    async fn stop_invalid_attachments(&mut self) {
+        if self.attachments_valid()
+            && self.shapes.iter().any(|s| s.attachment.is_some())
+            && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            self.invalidate_attachments();
+        }
+        if self.attachment_stop_pending {
+            self.attachment_stop_pending = false;
+            self.cancel_all_motion("attachment context changed").await;
+            self.standing_error = Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+    }
+
+    fn attachment_shapes_error(&self, shapes: &[Shape]) -> Option<WireError> {
+        let attached = shapes.iter().any(|s| s.attachment.is_some());
+        if (attached || self.shapes.iter().any(|s| s.attachment.is_some()))
+            && (self.executing.is_some()
+                || self.planning.is_some()
+                || self.active_stream.is_some()
+                || !self.pending.is_empty()
+                || !self.pending_shapes.is_empty())
+        {
+            return Some(attachment_error("stop motion before changing attachments"));
+        }
+        if attached && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            return Some(attachment_error(
+                "attachments require fresh enabled, referenced state",
+            ));
+        }
+        if shapes.iter().any(|s| {
+            s.attachment
+                .as_ref()
+                .is_some_and(|a| a.epoch != self.attachment_epoch)
+        }) {
+            return Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+        None
+    }
+
     /// Age of the freshest MOTOR-BUS data \[ms, saturating\]: the youngest
     /// node age the RT snapshot carries (ticks → ms) plus the wall age of
     /// the snapshot itself. `u16::MAX` = no node has ever answered — the
@@ -1945,6 +2087,7 @@ impl<R: RtCommands> Core<R> {
     /// clear of the program keep-outs — which is the planner's, so the
     /// client is answered when that lands.
     async fn on_reset_state(&mut self, req_id: u32, addr: SocketAddr) {
+        self.invalidate_attachments();
         self.cancel_all_motion("reset").await;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1975,7 +2118,7 @@ impl<R: RtCommands> Core<R> {
         let outcome = match result {
             Ok(epoch) => {
                 match epoch {
-                    Some(e) => self.scene_epoch = e,
+                    Some(e) => self.scene_epoch = e.max(self.scene_epoch + 1),
                     // No collision world to adopt an epoch from: the
                     // server's own counter still has to move, or a
                     // readback cannot be tied to the world it describes.
@@ -2008,9 +2151,16 @@ impl<R: RtCommands> Core<R> {
     ///
     /// Two gates latch one: the planner's (a refused or invalidated
     /// planned move) and the streaming gate's (a refused or stopped
-    /// jog/servo). At most one motion pipeline is active at a time and
-    /// accepting a motion clears both, so they never disagree — the
-    /// merge simply reports whichever is active.
+    /// jog/servo). At most one motion pipeline is active at a time, so
+    /// at most one of them is meaningfully latched — but they are no
+    /// longer read from the same place. The streaming latch is the RT's,
+    /// live; the planner's arrives in a report published at the end of
+    /// the planner's pass, and the `ClearCollision` that drops it is a
+    /// request that pass has to service. So accepting a motion clears
+    /// the streaming latch at once and the planner's a pass later, and
+    /// for that pass the two can disagree. Preferring whichever reads
+    /// active is what makes the stale one harmless: it holds the warning
+    /// up a beat longer rather than dropping a live one.
     fn update_collision(&mut self) {
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.report().collision.clone() {
@@ -2196,10 +2346,12 @@ impl<R: RtCommands> Core<R> {
             })
             .collect();
         // Pricing a queue is real planning, so it is asked for rather
-        // than taken: the answer lands in the next report, which makes
-        // the estimate at most one planner pass old. It is a duration
-        // estimate on a queue that has just changed — nothing reads it
-        // for a decision.
+        // than taken. The answer lands in the report of whichever pass
+        // services it — the next one if the planner is free, later if an
+        // earlier expensive request is already holding the batch, since
+        // a pass takes only one. It is a duration estimate on a queue
+        // that has just changed and nothing reads it for a decision, so
+        // there is no bound worth paying for.
         self.runtime
             .planner
             .send(PlanRequest::QueueEstimate { pending });
@@ -2594,6 +2746,7 @@ impl<R: RtCommands> Core<R> {
                 installation: self.cfg.installation_shapes.clone(),
                 program: self.shapes.clone(),
                 epoch: self.scene_epoch,
+                attachment_epoch: self.attachment_epoch,
             },
             C::ConfigBundle => {
                 let ci = &self.cfg.config_info;
@@ -3065,4 +3218,31 @@ pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
         _ => ErrorCode::CommDecodeError,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
+}
+
+fn attachment_error(detail: &str) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", detail)],
+    )
+}
+
+/// Commands that change arm pose and require reconciled held geometry.
+pub fn is_arm_motion(tag: CmdType) -> bool {
+    matches!(
+        tag,
+        CmdType::MoveJ
+            | CmdType::MoveJPose
+            | CmdType::MoveL
+            | CmdType::MoveC
+            | CmdType::MoveS
+            | CmdType::MoveP
+            | CmdType::JogJ
+            | CmdType::JogL
+            | CmdType::ServoJ
+            | CmdType::ServoJPose
+            | CmdType::ServoL
+            | CmdType::Teleport
+    )
 }

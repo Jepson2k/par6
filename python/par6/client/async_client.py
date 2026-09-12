@@ -167,6 +167,7 @@ class AsyncRobotClient(_RobotClientABC):
             "backend.par6",
             "execution.speed",
             "observation.timed",
+            "world.attachments",
             "tool.gripper",
             "io.digital",
         }
@@ -1929,9 +1930,11 @@ class AsyncRobotClient(_RobotClientABC):
                 w["margin"],
                 w["name"],
                 w.get("physics"),
+                w.get("attachment"),
             )
 
         return ShapeWorld(
+            attachment_epoch=result["attachment_epoch"],
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
         )

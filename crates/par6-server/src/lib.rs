@@ -52,6 +52,6 @@ pub use runtime::{
     QueuedCommand, RtCommands, RuntimeHandle, ShapeLayer,
 };
 pub use server::{
-    cmd_name, decode_error_to_wire, pid_gains_fault, spawn, teleport_angle_fault,
+    cmd_name, decode_error_to_wire, is_arm_motion, pid_gains_fault, spawn, teleport_angle_fault,
     validate_registries, validate_supported, write_io_fault, ServerHandle,
 };

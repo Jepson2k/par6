@@ -42,7 +42,8 @@ pub use chunk::{
     Reassembler,
 };
 pub use command::{
-    decode_command, encode_command, validate_shape, Command, Layer, Physical, Shape, ToolParam,
+    decode_command, encode_command, validate_shape, Attachment, Command, Layer, Physical, Shape,
+    ToolParam,
 };
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
@@ -54,12 +55,12 @@ pub use reply::{
     decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
 };
 pub use status::{
-    decode_status, encode_status_into, DriveHealthWire, HomingWire, LinkHealthWire, LoopHealthWire,
-    Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
+    decode_status, encode_status_into, peek_status_proto_version, DriveHealthWire, HomingWire,
+    LinkHealthWire, LoopHealthWire, Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 4;
+pub const PROTO_VERSION: u8 = 5;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

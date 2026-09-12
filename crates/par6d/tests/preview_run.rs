@@ -183,6 +183,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     let grasp_pose = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
     session.teleport_rad(grasp_pose);
     let shape = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| Shape {
+        attachment: None,
         kind: "box".into(),
         params: params.to_vec(),
         pose: vec![0.3713, 0.0, z, 0.0, 0.0, 0.0],

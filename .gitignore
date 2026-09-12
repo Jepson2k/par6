@@ -9,6 +9,3 @@ python/par6/*.so
 # pixi environments
 .pixi/*
 !.pixi/config.toml
-
-# FFI build tree: C++ shim, toppra, mujoco download
-.ffi/

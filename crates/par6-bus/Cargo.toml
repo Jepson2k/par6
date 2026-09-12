@@ -14,8 +14,9 @@ par6-proto = { workspace = true }
 # URDF inertials for the MuJoCo scene (sim/scene.rs).
 roxmltree = "0.21"
 par6-kin = { workspace = true }
-# The sim plant. mujoco-rs downloads libmujoco itself; build under
-# `pixi run` so MUJOCO_DOWNLOAD_DIR is set.
+# The sim plant. Bindings only: mujoco-rs links the libmujoco that
+# $MUJOCO_DYNAMIC_LINK_DIR names — pixi's prefix — and emits its own link
+# flags; this crate's build script only republishes the directory as an rpath.
 mujoco-rs = { workspace = true }
 socketcan = { workspace = true }
 thiserror = { workspace = true }

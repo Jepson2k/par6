@@ -245,10 +245,12 @@ class DryRunRobotClient:
                 w["margin"],
                 w["name"],
                 w.get("physics"),
+                w.get("attachment"),
             )
 
         world = self._preview.shapes()
         return ShapeWorld(
+            attachment_epoch=world["attachment_epoch"],
             installation=tuple(_shape(w) for w in world["installation"]),
             program=tuple(_shape(w) for w in world["program"]),
         )
@@ -266,6 +268,7 @@ class DryRunRobotClient:
                 "backend.par6",
                 "io.digital",
                 "execution.preview",
+                "world.attachments",
                 "execution.speed",
             }
         )

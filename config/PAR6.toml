@@ -43,7 +43,7 @@ sector_master_position_ticks = 3969
 sector_home_offset_rad = 1.570796327
 
 [joints.gains]
-kpp = 1.5
+kpp = 5.0
 kpv = 0.015
 kiv = 0.0015
 kpiq = 7.0

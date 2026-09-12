@@ -1,0 +1,46 @@
+name: install the python package
+description: >-
+  Install `python[dev]` into a pixi environment, resolving waldoctl from a
+  branch of the same name when one exists. A cross-repo change lands on a
+  matching branch first (CLAUDE.md's dev workflow), and while the release
+  chain is in flight the pinned tag may not exist yet — a dead pin fails the
+  whole resolve. By default pyproject.toml is restored after installation.
+  PR bundle jobs can retain the exact matched commit in their wheel metadata
+  so installation outside the build environment resolves the same dependency.
+inputs:
+  environment:
+    description: pixi environment to install into
+    required: true
+  retain-branch-pin:
+    description: Keep the matched commit in metadata for a development wheel
+    default: 'false'
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        WALDOCTL_BRANCH: ${{ github.head_ref || github.ref_name }}
+        PIXI_ENVIRONMENT: ${{ inputs.environment }}
+        RETAIN_BRANCH_PIN: ${{ inputs.retain-branch-pin }}
+      run: |
+        set -euo pipefail
+        branch="$WALDOCTL_BRANCH"
+        repo=https://github.com/Jepson2k/waldoctl.git
+        matched=""
+        if [ "$branch" != "main" ] && \
+           reference=$(git ls-remote --exit-code --heads "$repo" "refs/heads/$branch"); then
+          revision="${reference%%[[:space:]]*}"
+          [[ "$revision" =~ ^[0-9a-f]{40}$ ]] || exit 1
+          echo "installing waldoctl from branch $branch at $revision"
+          matched=1
+          pixi run -e "$PIXI_ENVIRONMENT" pip install "waldoctl @ git+$repo@$revision"
+          sed -i.bak "s#waldoctl.git@v[0-9.]*#waldoctl.git@${revision}#" python/pyproject.toml
+          trap 'mv python/pyproject.toml.bak python/pyproject.toml' EXIT
+        else
+          echo "no waldoctl branch $branch; keeping the pinned tag"
+        fi
+        pixi run -e "$PIXI_ENVIRONMENT" install-python
+        if [ -n "$matched" ] && [ "$RETAIN_BRANCH_PIN" = true ]; then
+          trap - EXIT
+          rm python/pyproject.toml.bak
+        fi
