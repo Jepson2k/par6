@@ -1486,6 +1486,10 @@ impl RtCommands for RtBridge {
         });
     }
 
+    fn set_exec_speed(&mut self, scale: f64) {
+        self.link.send(RtCommand::ExecSetSpeedScale(scale));
+    }
+
     fn set_exec_paused(&mut self, paused: bool) {
         self.link.send(RtCommand::ExecSetPaused(paused));
     }

@@ -339,7 +339,7 @@ pub struct LoopStats {
 }
 
 /// EXEC-mode live state.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ExecStatus {
     /// Samples left in the ring — the planner's deadline signal.
     pub samples_remaining: u64,
@@ -351,6 +351,30 @@ pub struct ExecStatus {
     pub settling: bool,
     /// Whether EXEC is paused (holding in place, ring untouched).
     pub paused: bool,
+    /// Requested scale of queued trajectory time; zero requests pause.
+    pub target_scale: f64,
+    /// Scale currently applied to queued trajectory time.
+    pub applied_scale: f64,
+    /// Last positive request, retained while paused for explicit resume.
+    pub resume_scale: f64,
+    /// RT ticks spent under an explicit pause request, across all modes.
+    pub paused_ticks: u64,
+}
+
+impl Default for ExecStatus {
+    fn default() -> Self {
+        Self {
+            samples_remaining: 0,
+            active_command_index: 0,
+            completed_index: 0,
+            settling: false,
+            paused: false,
+            target_scale: 1.0,
+            applied_scale: 1.0,
+            resume_scale: 1.0,
+            paused_ticks: 0,
+        }
+    }
 }
 
 /// Jog-mode live state.

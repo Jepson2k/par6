@@ -364,6 +364,10 @@ impl Preview {
         self.inner.lock().unwrap().tick_dt_s()
     }
 
+    fn execution_speed(&self) -> [f64; 3] {
+        self.inner.lock().unwrap().execution_speed()
+    }
+
     /// The effective `[motion]` feel constants, keyed by config name.
     fn motion<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let m = self.inner.lock().unwrap().motion();

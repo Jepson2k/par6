@@ -1010,31 +1010,60 @@ fn collision_world_is_enforced_over_protocol_v2() {
     // A world change does not spare motion already committed: drop the
     // keep-out onto the path of a move that is already running and it
     // stops, instead of being enforced only from the next command on.
-    c.ok(&set_shapes(Vec::new()));
-    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
-    let i = c.ok_index(&move_j(7004, end_deg, SWEEP_S));
-    rig.drain_status();
-    rig.wait_status("the sweep is under way but short of the keep-out", |s| {
-        s.executing_index == i as i64
-            && s.angles[0] > SWEEP_START_DEG[0] + 3.0
-            && s.angles[0] < -10.0
-    });
-    c.ok(&set_shapes(vec![keepout.clone()]));
-    let (ok, detail) = c.wait_complete(i);
-    assert!(!ok, "a keep-out dropped on a running move must stop it");
-    let e = detail.expect("a failed COMPLETE carries the error");
-    assert_eq!(
-        e.code,
-        ErrorCode::SysSelfCollision as u16,
-        "the invalidated move must report SYS_SELF_COLLISION, got {e:?}"
-    );
-    rig.drain_status();
-    let s = rig.wait_status("the arm stops", |s| s.speeds.iter().all(|v| v.abs() < 0.05));
-    assert!(
-        s.angles[0] < mid_deg[0],
-        "the arm drove into the keep-out it was stopped for: {:?}",
-        s.angles
-    );
+    for pause in [false, true] {
+        c.ok(&set_shapes(Vec::new()));
+        enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+        let i = c.ok_index(&move_j(7004 + u64::from(pause) * 100, end_deg, SWEEP_S));
+        rig.drain_status();
+        rig.wait_status("the sweep is under way but short of the keep-out", |s| {
+            s.executing_index == i as i64
+                && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+                && s.angles[0] < -10.0
+        });
+        if pause {
+            c.ok(&Command::Pause(par6_proto::command::Pause { on: true }));
+            c.ok(&Command::SetExecutionSpeed(
+                par6_proto::command::SetExecutionSpeed { scale: 0.5 },
+            ));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                match c.query(&Command::ExecutionSpeed) {
+                    QueryResult::ExecutionSpeed {
+                        target_scale: 0.0,
+                        applied_scale: 0.0,
+                        resume_scale: 0.5,
+                    } => break,
+                    state => assert!(
+                        std::time::Instant::now() < deadline,
+                        "motion did not pause: {state:?}"
+                    ),
+                }
+                rig.recv_status();
+            }
+            assert!(!c.peek_complete(i), "pause completed the unfinished move");
+        }
+        c.ok(&set_shapes(vec![keepout.clone()]));
+        let (ok, detail) = c.wait_complete(i);
+        assert!(!ok, "a keep-out dropped on a running move must stop it");
+        let e = detail.expect("a failed COMPLETE carries the error");
+        assert_eq!(
+            e.code,
+            ErrorCode::SysSelfCollision as u16,
+            "the invalidated move must report SYS_SELF_COLLISION, got {e:?}"
+        );
+        rig.drain_status();
+        let s = rig.wait_status("the arm stops", |s| s.speeds.iter().all(|v| v.abs() < 0.05));
+        assert!(
+            s.angles[0] < mid_deg[0],
+            "the arm drove into the keep-out it was stopped for: {:?}",
+            s.angles
+        );
+
+        c.ok(&Command::Pause(par6_proto::command::Pause { on: false }));
+        c.ok(&Command::SetExecutionSpeed(
+            par6_proto::command::SetExecutionSpeed { scale: 1.0 },
+        ));
+    }
 
     // Removing the keep-out advances the epoch and lets the very same
     // move through — and accepting it clears the latched verdict.

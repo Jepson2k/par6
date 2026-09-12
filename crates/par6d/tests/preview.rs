@@ -58,6 +58,34 @@ fn jog_l_cmd(velocities: [f64; 6], duration: f64) -> Command {
 }
 
 #[test]
+fn execution_override_retimes_the_plan_and_preserves_paused_commands() {
+    use par6_proto::command::{Pause, SetExecutionSpeed};
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let start = preview.angles_rad();
+    let mut target = to_deg(&start);
+    target[0] += 8.0;
+    let normal = preview.submit(move_j_cmd(target, None));
+    assert!(normal.valid());
+    preview.teleport_rad(start);
+    let result = preview.submit(Command::SetExecutionSpeed(SetExecutionSpeed { scale: 0.5 }));
+    assert!(result.valid(), "{result:?}");
+    let slow = preview.submit(move_j_cmd(target, None));
+    assert!(slow.valid());
+    assert!((slow.duration_s - 2.0 * normal.duration_s).abs() < 1e-9);
+    assert_eq!(normal.joint_trajectory_rad, slow.joint_trajectory_rad);
+    assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
+    let held = preview.submit(move_j_cmd(to_deg(&start), None));
+    assert!(held.pending, "pause cannot claim motion completed");
+    assert_eq!(preview.angles_rad(), slow.end_joints_rad);
+    assert!(preview.flush().unwrap().pending);
+    assert!(preview.submit(Command::Pause(Pause { on: false })).valid());
+    let resumed = preview.flush().unwrap();
+    assert!(resumed.valid() && !resumed.pending);
+    assert!(max_deg_error(&to_deg(&resumed.end_joints_rad), &to_deg(&start)) < 0.01);
+}
+
+#[test]
 fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     let config = test_config();
     let rig = Rig::boot(config.clone());

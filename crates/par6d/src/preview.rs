@@ -485,6 +485,15 @@ impl Preview {
         self.dt
     }
 
+    /// Planning state has no in-flight transition; a run ticks the real core.
+    pub fn execution_speed(&self) -> [f64; 3] {
+        [
+            self.snap.exec.target_scale,
+            self.snap.exec.applied_scale,
+            self.snap.exec.resume_scale,
+        ]
+    }
+
     /// Where the configured homing seek leaves the arm \[rad\].
     pub fn homing_ready_pose_rad(&self) -> [f64; MAX_JOINTS] {
         self.ready_pose
@@ -728,7 +737,7 @@ impl Preview {
         }
         self.latches.motion_accepted();
         self.held.push_back(command);
-        if self.holding_for_blend() {
+        if self.snap.exec.paused || self.holding_for_blend() {
             return PreviewResult::pending(self.snap.q);
         }
         self.run_held()
@@ -746,6 +755,9 @@ impl Preview {
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
+        }
+        if self.snap.exec.paused {
+            return Some(PreviewResult::pending(self.snap.q));
         }
         let batch: Vec<Command> = self.held.drain(..).collect();
         let results = self.plan_batch(&batch);
@@ -840,7 +852,26 @@ impl Preview {
                 self.latches.estop();
             }
             Command::Reset => self.latches.reset(),
-            Command::Pause(_) | Command::SetGravityComp(_) => {}
+            Command::Pause(p) => {
+                self.snap.exec.paused = p.on;
+                let scale = if p.on {
+                    0.0
+                } else {
+                    self.snap.exec.resume_scale
+                };
+                self.snap.exec.target_scale = scale;
+                self.snap.exec.applied_scale = scale;
+                self.publish();
+            }
+            Command::SetExecutionSpeed(p) => {
+                self.snap.exec.resume_scale = p.scale;
+                if !self.snap.exec.paused {
+                    self.snap.exec.target_scale = p.scale;
+                    self.snap.exec.applied_scale = p.scale;
+                }
+                self.publish();
+            }
+            Command::SetGravityComp(_) => {}
             Command::ResetState => {
                 self.held.clear();
                 self.latches.reset();
@@ -1244,10 +1275,10 @@ impl Preview {
     /// to where it ends, and cancel it (nothing executes here).
     fn collect_plan(&mut self, head: &Command) -> PreviewResult {
         let (trajectory, duration_s): (Vec<[f64; MAX_JOINTS]>, f64) =
-            match self.planner.planned_motion(self.snap.tick) {
+            match self.planner.planned_motion(&self.snap) {
                 PlannedMotion::Exec(samples) => {
                     let q: Vec<_> = samples.iter().map(|s| s.q).collect();
-                    let duration = q.len() as f64 * self.dt;
+                    let duration = q.len() as f64 * self.dt / self.snap.exec.resume_scale;
                     (q, duration)
                 }
                 // The seek establishes the references and ends where the

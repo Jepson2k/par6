@@ -21,6 +21,8 @@ fn to_ring(s: &par6_motion::Sample) -> par6_rt::Sample {
         q: s.q,
         qd: s.qd,
         tau_ff: [0.0; par6_rt::MAX_JOINTS],
+        inertia_velocity: [0.0; par6_rt::MAX_JOINTS],
+        start: None,
         meta: par6_rt::SampleMeta {
             command_index: s.meta.command_index,
             checkpoint_id: s.meta.checkpoint_id,

@@ -282,6 +282,15 @@ pub enum QueryResult {
         /// Translation followed by orientation.
         values: [f64; 6],
     },
+    /// Fresh queued-execution timing from the real-time loop.
+    ExecutionSpeed {
+        /// Zero when pause is requested; otherwise the selected speed.
+        target_scale: f64,
+        /// Applied trajectory-clock rate, including transitions to rest.
+        applied_scale: f64,
+        /// Selected positive speed, retained while paused.
+        resume_scale: f64,
+    },
     /// TOOL_STATUS result.
     ToolStatus {
         /// Tool status, if a tool is selected.
@@ -304,9 +313,9 @@ pub enum QueryResult {
         /// RT tick period \[s\].
         tick_dt_s: f64,
         /// Every `[motion]` key in declaration order; the labels are
-        /// `MotionConfig::KEYS` in par6-config (13 entries), and an
+        /// `MotionConfig::KEYS` in par6-config (14 entries), and an
         /// omitted optional key (`joint_step_rad`) rides as NaN.
-        motion: [f64; 13],
+        motion: [f64; 14],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
@@ -386,6 +395,7 @@ impl QueryResult {
             Q::TcpSpeed { .. } => QueryType::TcpSpeed,
             Q::TcpOffset { .. } => QueryType::TcpOffset,
             Q::TcpTransform { .. } => QueryType::TcpTransform,
+            Q::ExecutionSpeed { .. } => QueryType::ExecutionSpeed,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
@@ -603,6 +613,17 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_array(buf, 2);
             w_uint(buf, u64::from(tag));
             w_f64(buf, *speed);
+        }
+        Q::ExecutionSpeed {
+            target_scale,
+            applied_scale,
+            resume_scale,
+        } => {
+            w_array(buf, 4);
+            w_uint(buf, u64::from(tag));
+            w_f64(buf, *target_scale);
+            w_f64(buf, *applied_scale);
+            w_f64(buf, *resume_scale);
         }
         Q::TcpTransform { values } => {
             w_array(buf, 7);
@@ -1061,6 +1082,26 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
         T::TcpSpeed => {
             expect_arity("tcp_speed result", n, 2)?;
             QueryResult::TcpSpeed { speed: r.f64()? }
+        }
+        T::ExecutionSpeed => {
+            expect_arity("execution_speed result", n, 4)?;
+            let target_scale = r.f64()?;
+            let applied_scale = r.f64()?;
+            let resume_scale = r.f64()?;
+            if !(0.0..=1.0).contains(&applied_scale)
+                || !(0.1..=1.0).contains(&resume_scale)
+                || !(target_scale == 0.0 || target_scale == resume_scale)
+            {
+                return Err(DecodeError::Validation {
+                    what: "execution_speed result",
+                    why: "invalid or inconsistent execution scales".to_owned(),
+                });
+            }
+            QueryResult::ExecutionSpeed {
+                target_scale,
+                applied_scale,
+                resume_scale,
+            }
         }
         T::TcpTransform => {
             expect_arity("tcp_transform result", n, 7)?;

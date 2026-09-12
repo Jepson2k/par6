@@ -364,6 +364,7 @@ struct Core<R: RtCommands> {
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
+    execution_paused: bool,
     /// The RT latch last written to the activity log, so the latch is
     /// logged on its edges and never once per poll.
     rt_error_logged: Option<u16>,
@@ -453,6 +454,7 @@ impl<R: RtCommands> Core<R> {
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
+            execution_paused: false,
             queue_estimate_for: (0, 0),
             snap: StateSnapshot::default(),
             last_fresh: None,
@@ -840,9 +842,15 @@ impl<R: RtCommands> Core<R> {
                 self.standing_error =
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 self.cancel_all_motion("estop").await;
+                self.clear_pause();
+                Ok(())
+            }
+            C::SetExecutionSpeed(p) => {
+                self.runtime.rt.set_exec_speed(p.scale);
                 Ok(())
             }
             C::Pause(p) => {
+                self.execution_paused = p.on;
                 self.runtime.rt.set_exec_paused(p.on);
                 Ok(())
             }
@@ -856,6 +864,7 @@ impl<R: RtCommands> Core<R> {
                 } else {
                     self.cancel_active_motion("stop").await
                 };
+                self.clear_pause();
                 if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
@@ -1397,6 +1406,9 @@ impl<R: RtCommands> Core<R> {
     /// says how much of it the started motion covers. One plan is
     /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
+        if self.execution_paused || self.snap.exec.target_scale == 0.0 {
+            return;
+        }
         if self.executing.is_some() || self.planning.is_some() || self.active_stream.is_some() {
             return;
         }
@@ -1708,6 +1720,16 @@ impl<R: RtCommands> Core<R> {
 
     /// estop / reset_state / simulator-toggle scope: everything, each
     /// dropped command's COMPLETE spoken.
+    /// A pause holds the queue it interrupted. Stop, Estop and reset
+    /// discard that queue, so a standing pause would otherwise withhold
+    /// every command queued afterwards with nothing to say why.
+    fn clear_pause(&mut self) {
+        if self.execution_paused {
+            self.execution_paused = false;
+            self.runtime.rt.set_exec_paused(false);
+        }
+    }
+
     async fn cancel_all_motion(&mut self, scope: &'static str) -> usize {
         let mut dropped = self.drop_active_motion();
         dropped.extend(self.drop_pending());
@@ -1928,6 +1950,7 @@ impl<R: RtCommands> Core<R> {
         self.tcp_rotation_deg = [0.0; 3];
         self.completion_policy = CompletionPolicy::Settled;
         self.profile = self.cfg.initial_profile.clone();
+        self.clear_pause();
         self.runtime.rt.reset_state();
         self.sync_planner();
         // The program layer only: installation keep-outs are the
@@ -2508,6 +2531,11 @@ impl<R: RtCommands> Core<R> {
             C::TcpSpeed => QueryResult::TcpSpeed {
                 speed: self.tcp_speed,
             },
+            C::ExecutionSpeed => QueryResult::ExecutionSpeed {
+                target_scale: self.snap.exec.target_scale,
+                applied_scale: self.snap.exec.applied_scale,
+                resume_scale: self.snap.exec.resume_scale,
+            },
             C::TcpTransform => QueryResult::TcpTransform {
                 values: [
                     self.tcp_offset_mm[0],
@@ -2956,6 +2984,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Estop => "estop",
         T::SetGravityComp => "set_gravity_comp",
         T::Pause => "pause",
+        T::SetExecutionSpeed => "set_execution_speed",
+        T::ExecutionSpeed => "execution_speed",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",

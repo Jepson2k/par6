@@ -16,6 +16,7 @@ import weakref
 from collections.abc import Callable, Coroutine, Iterable
 from typing import Any, TypeVar
 
+from waldoctl.execution import ExecutionSpeed
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import (
     ActivityResult,
@@ -432,13 +433,21 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
-    def pause(self) -> int:
-        """Hold the executing trajectory; the queue survives."""
-        return _run(self._inner.pause())
+    def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        """Read the controller's selected and applied execution speed."""
+        return _run(self._inner.execution_speed(timeout=timeout))
 
-    def resume(self) -> int:
+    def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        """Select queued-motion speed without releasing pause."""
+        return _run(self._inner.set_execution_speed(scale, timeout=timeout))
+
+    def pause(self, *, timeout: float = 3.0) -> int:
+        """Hold the executing trajectory; the queue survives."""
+        return _run(self._inner.pause(timeout=timeout))
+
+    def resume(self, *, timeout: float = 3.0) -> int:
         """Continue a trajectory held by :meth:`pause`."""
-        return _run(self._inner.resume())
+        return _run(self._inner.resume(timeout=timeout))
 
     def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive: IDLE under G(q) with no position hold."""

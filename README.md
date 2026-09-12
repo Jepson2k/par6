@@ -361,6 +361,27 @@ spline for `move_s`, an auto-rounded polyline for `move_p`.
 `duration` acts as a **minimum** the plan is stretched to meet. The two are mutually
 exclusive.
 
+`set_execution_speed(scale)` separately scales queued trajectory execution from
+0.1 through 1.0 without replanning its path. `pause()` retains the queue and
+decelerates queued motion to a hold; `resume()` restores the selected positive
+scale. Selecting a different scale while paused preserves the pause. Zero is
+rejected by the speed setter. Jog and servo streams keep their own timing.
+
+Override transitions use a separate rate ramp and acceleration checks. The
+nominal motion profile's jerk ceiling is not guaranteed during a transition.
+
+These controls return 1 when the request is confirmed and 0 if confirmation
+times out. `execution_speed()` returns fresh `target_scale`, `applied_scale` and
+`resume_scale`; its `paused` property confirms that the applied scale reached
+zero. A pause acknowledgement can precede that hold. Queued dwell time stops
+during a pause but is unaffected by positive speed overrides.
+
+Standalone completion waits keep wall-clock deadlines while motion is paused:
+`wait_command()` returns false on timeout, and blocking motion methods raise
+`TimeoutError`. A wait timing out does not cancel queued motion; use `stop()` to
+discard it. Planning preview scales trajectory durations and reports paused
+queued operations as `UnresolvedPreview` until an explicit resume.
+
 A move with a positive blend radius `r` is **held** until the command after it decides
 what the corner looks like; consecutive same-family moves fold into one motion that
 completes every command it consumed at the same instant.
@@ -373,7 +394,11 @@ in two layers: `installation` (from the robot TOML, immutable from the wire) and
 
 The rule, for planned and streamed motion alike: a configuration may **keep** a pair the
 start is already in — an arm inside a keep-out has to be able to move its way out — but
-may not **add** one. Planned paths are walked at 0.02 rad joint pitch; streams are
+may not **add** one. Planned paths are walked at 0.02 rad joint pitch along the
+same interpolant used for fractional-speed playback, including every joint
+turning point. Soft limits are checked at those extrema as well as the stored
+samples. World changes recheck the remaining interpolated path, including while
+paused. Streams are
 projected one velocity-scaled lookahead ahead, so a faster jog stops further from
 contact.
 

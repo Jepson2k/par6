@@ -243,11 +243,15 @@ pub struct Simulator {
     pub on: bool,
 }
 
-/// PAUSE: hold or resume the executing trajectory.
-///
-/// Distinct from STOP: the sample ring is left intact, so resuming
-/// continues the move from where it paused instead of requiring the
-/// caller to re-issue it.
+/// Select queued-execution speed while preserving the explicit pause state.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetExecutionSpeed {
+    /// Positive fraction of the original plan, in [0.1, 1].
+    pub scale: f64,
+}
+
+/// Explicit pause or resume, retaining the selected execution speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pause {
@@ -758,6 +762,8 @@ pub enum Command {
     SetGravityComp(SetGravityComp),
     /// Hold or resume the executing trajectory.
     Pause(Pause),
+    /// Select queued-execution speed without changing pause.
+    SetExecutionSpeed(SetExecutionSpeed),
     Stop(Stop),
     WriteIo(WriteIo),
     Simulator(Simulator),
@@ -792,6 +798,8 @@ pub enum Command {
     TcpSpeed,
     TcpOffset,
     TcpTransform,
+    /// Read controller-owned execution timing.
+    ExecutionSpeed,
     ToolStatus,
     IsSimulator,
     Shapes,
@@ -831,6 +839,7 @@ impl Command {
             C::Estop => CmdType::Estop,
             C::SetGravityComp(_) => CmdType::SetGravityComp,
             C::Pause(_) => CmdType::Pause,
+            C::SetExecutionSpeed(_) => CmdType::SetExecutionSpeed,
             C::Stop(_) => CmdType::Stop,
             C::WriteIo(_) => CmdType::WriteIo,
             C::Simulator(_) => CmdType::Simulator,
@@ -864,6 +873,7 @@ impl Command {
             C::TcpSpeed => CmdType::TcpSpeed,
             C::TcpOffset => CmdType::TcpOffset,
             C::TcpTransform => CmdType::TcpTransform,
+            C::ExecutionSpeed => CmdType::ExecutionSpeed,
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
@@ -942,6 +952,7 @@ impl Command {
             | C::Error
             | C::TcpSpeed
             | C::TcpOffset
+            | C::ExecutionSpeed
             | C::TcpTransform
             | C::ToolStatus
             | C::IsSimulator
@@ -973,6 +984,11 @@ impl Command {
                 p.node <= 15,
                 "save_config.node",
                 "must be a CAN node id (0..=15)",
+            ),
+            C::SetExecutionSpeed(p) => check(
+                p.scale.is_finite() && (0.1..=1.0).contains(&p.scale),
+                "set_execution_speed.scale",
+                "must be finite and in [0.1, 1]; use Pause to pause",
             ),
             C::SetStatusRate(p) => check(
                 p.hz.is_finite() && p.hz > 0.0,
@@ -1329,6 +1345,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Error
         | T::TcpSpeed
         | T::TcpOffset
+        | T::ExecutionSpeed
         | T::TcpTransform
         | T::ToolStatus
         | T::IsSimulator
@@ -1355,7 +1372,7 @@ fn arity(tag: CmdType) -> usize {
         T::SetPidGains => 13,
         T::SetCanId => 5,
         T::SaveConfig => 4,
-        T::SetStatusRate => 3,
+        T::SetStatusRate | T::SetExecutionSpeed => 3,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -1436,6 +1453,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::ExecutionSpeed
         | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
@@ -1463,6 +1481,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         C::Simulator(p) => w_bool(buf, p.on),
         C::SetGravityComp(p) => w_bool(buf, p.on),
         C::Pause(p) => w_bool(buf, p.on),
+        C::SetExecutionSpeed(p) => w_f64(buf, p.scale),
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
         C::SetTcpTransform(p) => {
@@ -1857,6 +1876,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::Simulator => Command::Simulator(Simulator { on: r.bool()? }),
         T::SetGravityComp => Command::SetGravityComp(SetGravityComp { on: r.bool()? }),
         T::Pause => Command::Pause(Pause { on: r.bool()? }),
+        T::SetExecutionSpeed => Command::SetExecutionSpeed(SetExecutionSpeed { scale: r.f64()? }),
         T::SelectProfile => Command::SelectProfile(SelectProfile {
             profile: r.str()?.to_owned(),
         }),
@@ -1958,6 +1978,7 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::TcpSpeed => Command::TcpSpeed,
         T::TcpOffset => Command::TcpOffset,
         T::TcpTransform => Command::TcpTransform,
+        T::ExecutionSpeed => Command::ExecutionSpeed,
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,
