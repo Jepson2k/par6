@@ -239,6 +239,10 @@ const SEEK_CURRENT_STEP: f64 = 1.25;
 /// distance covered.
 const IMPLAUSIBLE_STEP_FACTOR: f64 = 3.0;
 
+/// A reference spread beyond this is a counter that re-zeroed between runs,
+/// not a joint that found a different stop \[deg\].
+const COUNTER_EPOCH_DEG: f64 = 10.0;
+
 /// How many ticks a limit is repeated over. The vendor repeats a config frame
 /// three times; spreading them one per tick keeps the cadence clean.
 const LIMIT_REPEATS: usize = 3;
@@ -676,6 +680,11 @@ struct Arm {
     scale_floor: Vec<f64>,
     /// Joints that have latched a reference.
     referenced: Vec<bool>,
+    /// The encoder tick each joint's reference was latched AT, which is the
+    /// thing whose repeatability matters. The joint angle afterwards is
+    /// re-anchored to it every run, so comparing those would compare a
+    /// number to itself.
+    home_ticks: Vec<Option<i32>>,
     cadence: Cadence,
     last_tick_at: Option<Instant>,
     /// Where the watched joint was when it last actually moved, and when.
@@ -800,6 +809,7 @@ impl Arm {
             tick: 0,
             scales: vec![1.0; n],
             referenced: vec![false; n],
+            home_ticks: vec![None; n],
             cadence: Cadence::default(),
             last_tick_at: None,
             motion_mark: None,
@@ -1839,6 +1849,7 @@ impl Arm {
                     let offset = self.home_offset[joint];
                     self.conv[joint].set_home(latched, offset);
                     self.referenced[joint] = true;
+                    self.home_ticks[joint] = Some(latched);
                     self.results.home_rad[joint] = Some(offset);
                     println!(
                         "  J{}: referenced at {latched} ticks ({:.4} rad)",
@@ -2287,13 +2298,15 @@ const USAGE: &str = "\
 par6-selfcal [CONFIG] [--sim] [--apply] [--home-only]
 
 Homes one PAR6 arm, measures what this arm needs, and proves the result. Talks
-to the CAN bus directly: par6d must NOT be running.
+to the CAN bus directly, and refuses to start while par6d is running.
 
   CONFIG       robot config to read (default config/PAR6.toml)
   --sim        run against the simulated bus, with no arm attached
   --apply      write the measurements into CONFIG, keeping a .before-selfcal
                backup. Only ever written when the run verified.
   --home-only  stop after step 1 (homing), for repeatability runs
+  --repeat N   home N more times afterwards and report how far each joint's
+               reference moves between runs
 
 Step 1 homes on the configured gains, raising a joint's seek current or its
 velocity gains when it will not reach its endstop. Step 2 measures each loaded
@@ -2308,11 +2321,44 @@ Needs CAP_SYS_NICE (or root) for SCHED_FIFO; without it the command cadence
 slips and the drives feel that as a disturbance. Takes about two minutes.
 ";
 
+/// The PID of a running `par6d`, if there is one.
+///
+/// Two processes commanding the same drives is not a race this tool can win or
+/// should try to: the runtime holds position while this one is seeking
+/// endstops, and the drives obey whichever frame arrived last. Checked by name
+/// in /proc rather than by port, because the daemon's command socket may be on
+/// an ephemeral one.
+fn running_daemon() -> Option<u32> {
+    let mine = std::process::id();
+    let entries = std::fs::read_dir("/proc").ok()?;
+    for entry in entries.flatten() {
+        let pid: u32 = match entry.file_name().to_str().and_then(|n| n.parse().ok()) {
+            Some(pid) if pid != mine => pid,
+            _ => continue,
+        };
+        let comm = std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+        if comm.trim() == "par6d" {
+            return Some(pid);
+        }
+    }
+    None
+}
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
     if std::env::args().any(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
         return;
+    }
+    if !std::env::args().any(|a| a == "--sim") {
+        if let Some(pid) = running_daemon() {
+            eprintln!(
+                "par6d is running as pid {pid}. This tool drives the bus itself, and \
+                 two processes commanding the same drives means the arm obeys whichever \
+                 frame arrived last. Stop par6d and run this again."
+            );
+            std::process::exit(2);
+        }
     }
     let path = std::env::args()
         .nth(1)
@@ -2331,6 +2377,10 @@ fn main() {
         .and_then(|p| p.parent())
         .map(|p| p.join("assets/par6_description"))
         .unwrap_or_else(|| std::path::PathBuf::from("assets/par6_description"));
+    let repeats = std::env::args()
+        .skip_while(|a| a != "--repeat")
+        .nth(1)
+        .and_then(|n| n.parse::<usize>().ok());
     let simulated = std::env::args().any(|a| a == "--sim");
     if simulated {
         println!("--sim: the simulated bus, to prove the script with no arm attached");
@@ -2378,6 +2428,10 @@ fn main() {
             return Ok(());
         }
         step2(&mut arm)
+    });
+    let outcome = outcome.and_then(|()| match repeats {
+        Some(n) => repeatability(&mut arm, n),
+        None => Ok(()),
     });
     let scales = arm.scales.clone();
     match &outcome {
@@ -3002,6 +3056,69 @@ fn verify_once(arm: &mut Arm, scales: &[f64; par6_kin::NQ]) -> Result<(), Verify
         detail: format!("verification failed: {}", failures.join("; ")),
         joints: missed,
     })
+}
+
+/// Home again `extra` times and report how far the references move.
+///
+/// A reference is only as good as its repeatability, and the number that
+/// matters is not whether one seek found a stop but whether the next one finds
+/// the same stop. Reported per joint in degrees, because a tick is a different
+/// angle on every joint — fifty of them is 0.044 deg at the shoulder and
+/// 0.172 deg at the base.
+fn repeatability(arm: &mut Arm, extra: usize) -> Result<(), String> {
+    let n = arm.n();
+    let mut seen: Vec<Vec<i32>> = (0..n)
+        .map(|j| arm.home_ticks[j].map(|p| vec![p]).unwrap_or_default())
+        .collect();
+    let mut took = Vec::new();
+    for round in 0..extra {
+        println!("\nrepeat {} of {extra}: homing again", round + 1);
+        let began = Instant::now();
+        // Forget every reference: a run that kept them would be measuring the
+        // conversion it already had, not a fresh seek.
+        arm.referenced.iter_mut().for_each(|r| *r = false);
+        arm.vibration_fatal = false;
+        step1(arm)?;
+        arm.vibration_fatal = true;
+        took.push(began.elapsed().as_secs_f64());
+        for (j, ticks) in seen.iter_mut().enumerate() {
+            if let Some(p) = arm.home_ticks[j] {
+                ticks.push(p);
+            }
+        }
+    }
+    println!("\nhoming repeatability over {} runs:", extra + 1);
+    for (j, ticks) in seen.iter().enumerate() {
+        if ticks.len() < 2 {
+            continue;
+        }
+        let lo = ticks.iter().copied().min().unwrap_or(0);
+        let hi = ticks.iter().copied().max().unwrap_or(0);
+        let spread = arm.deg_for_ticks(j, i64::from(hi) - i64::from(lo));
+        let kind = match arm.homing[j].strategy {
+            HomingStrategy::Hall => "hall edge",
+            HomingStrategy::Stall => "endstop",
+        };
+        // A reference is relative to the stop it latches, so a drive whose
+        // counter re-zeroes between runs is harmless — but it is not a spread,
+        // and reporting it as one would hide a real one.
+        if spread > COUNTER_EPOCH_DEG {
+            println!(
+                "  J{}  its counter moved between runs ({spread:.1} deg apart), so \
+                 these references cannot be compared — the references themselves \
+                 are still sound, each being relative to the stop it found",
+                j + 1
+            );
+            continue;
+        }
+        println!("  J{}  {spread:.4} deg across {} runs  ({kind})", j + 1, ticks.len());
+    }
+    let slowest = took.iter().copied().fold(0.0_f64, f64::max);
+    println!(
+        "  slowest repeat {slowest:.1} s; every run must home inside the time the \
+         operator is willing to wait"
+    );
+    Ok(())
 }
 
 /// Step 1: home the arm, making every joint arrive.

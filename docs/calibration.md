@@ -16,9 +16,13 @@ acceleration sweep, which runs against a live `par6d`.
 par6-selfcal --help
 par6-selfcal                       # read config/PAR6.toml, measure, verify
 par6-selfcal --apply               # and write what it measured into the config
-par6-selfcal --home-only           # homing alone, for repeatability runs
+par6-selfcal --home-only           # homing alone
+par6-selfcal --home-only --repeat 4  # home five times, report the spread
 par6-selfcal --sim                 # no arm attached
 ```
+
+It refuses to start while `par6d` is running: two processes commanding the same
+drives means the arm obeys whichever frame arrived last.
 
 Needs `CAP_SYS_NICE` or root: it paces the drives at the config's tick rate
 under SCHED_FIFO, and a slipped command is a disturbance the drives feel.
@@ -67,13 +71,26 @@ joint has actually reached a pose on it.
 
 ### Measured on this arm
 
-Six consecutive passing runs at 110–119 s; worst command tick 4099 µs against a
-4000 µs target. Five consecutive `--home-only` runs at 54–55 s whose stall
-references repeat within 0.03° (the J6 hall edge spreads 0.25°). This arm needed
-J3 `kpv`/`kiv` ×1.25 and a 1125 mA shoulder seek current; all four gravity
-scales measured 1.000, so the vendor's model is correct for it — provided the
-fitted gripper is in the chain. Leaving the tool out of G(q) had the model
-asking for +25 mA at the wrist pitch where the drive was pulling −655 mA.
+Eleven consecutive passing runs at 110–138 s; worst command tick 4095–4134 µs
+against a 4000 µs target, p99 4010 µs.
+
+`--repeat 4`, five homing runs, slowest 51.7 s, reference spread per joint:
+
+| J1 | J2 | J3 | J4 | J5 | J6 (hall) |
+|---|---|---|---|---|---|
+| 0.003° | 0.039° | 0.046° | 0.044° | 0.011° | 0.055° |
+
+This arm needed J3 `kpv`/`kiv` ×1.25 and a 1125 mA shoulder seek current. Its
+gravity scales measure 1.000 except the elbow at 1.080, so the vendor's model is
+essentially right for it — **provided the fitted gripper is in the chain**.
+Leaving the tool out of G(q) had the model asking for +25 mA at the wrist pitch
+where the drive was pulling −655 mA.
+
+One characteristic worth knowing: the elbow's drift readings scatter about
+0.01–0.05 deg/s at its loaded pose, where the wrist and wrist pitch repeat to
+0.005. That is stiction in a joint carrying 2 A, and it is why the hold
+tolerance sits above that scatter and why verification re-measures rather than
+trusting one reading.
 
 ### Limits of the evidence
 
