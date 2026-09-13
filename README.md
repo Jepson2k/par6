@@ -633,13 +633,20 @@ vendor's tool over a bench connection.
 
 ### Calibrating the arm
 
-`par6-calibrate {check,tune-feedback,gravity,limits}` (or the Calibration
-section of Commander's Diagnostics tab) measures one arm — motion baseline,
-velocity-loop gains against vibration, the gravity model, the joint
-velocity/acceleration/jerk limits — against the running `par6d` with
-`PAR6_DIAGNOSTICS` set, and stages a candidate config plus rollback that a
-restart with `PAR6_CONFIG` activates. See [`docs/calibration.md`](docs/calibration.md)
-for the routines, their acceptance rules and what the evidence does not show.
+`par6-selfcal` is what to run on a new arm. One binary, about two minutes,
+`par6d` stopped: it homes the arm, raises a joint's seek current or velocity
+gains where it will not reach its endstop, measures each loaded joint's gravity
+feedforward on a torque-only hold, and then returns every joint to its worst
+pose and proves it holds there. `--apply` writes what it measured into the
+config, keeping a backup, and only ever after that proof passes.
+
+`par6-calibrate limits` (or the Calibration section of Commander's Diagnostics
+tab) is the separate one-off velocity/acceleration sweep, against a running
+`par6d` with `PAR6_DIAGNOSTICS` set; it stages a candidate config plus rollback
+that a restart with `PAR6_CONFIG` activates.
+
+See [`docs/calibration.md`](docs/calibration.md) for both, their acceptance
+rules, and what the evidence does not show.
 
 ### The bus-grant signal
 

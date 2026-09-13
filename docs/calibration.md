@@ -1,16 +1,94 @@
 # Measured calibration
 
-`par6.calibration` tunes one PAR6 arm from its own measurements: a motion
-baseline, velocity-loop gains against vibration, the gravity model, and the
-joint velocity/acceleration/jerk limits. Every routine runs against the
-connected `par6d`, judges the 250 Hz native recording after an acknowledged
-Stop, and stages a candidate config you activate by restarting the runtime
-with `PAR6_CONFIG`. Nothing is applied automatically; a rollback copy is
-staged beside every candidate.
+Two tools, for two different jobs.
 
-## Prerequisites
+`par6-selfcal` is the one to run on a new arm: a single binary that homes it,
+finds the seek currents and velocity gains it needs, measures its gravity
+feedforward, and proves the result. It drives the CAN bus itself, so `par6d`
+must not be running. Two minutes.
 
-- The arm is homed and idle with an empty queue, the configured gripper fitted
+`par6.calibration` (`par6-calibrate limits`) is the one-off velocity and
+acceleration sweep, which runs against a live `par6d`.
+
+## par6-selfcal
+
+```sh
+par6-selfcal --help
+par6-selfcal                       # read config/PAR6.toml, measure, verify
+par6-selfcal --apply               # and write what it measured into the config
+par6-selfcal --home-only           # homing alone, for repeatability runs
+par6-selfcal --sim                 # no arm attached
+```
+
+Needs `CAP_SYS_NICE` or root: it paces the drives at the config's tick rate
+under SCHED_FIFO, and a slipped command is a disturbance the drives feel.
+
+**Step 1 — home.** Runs the config's own homing sequence. A joint that will not
+reach its endstop is diagnosed rather than retried blindly: a drive sitting on
+its approach current limit is short of current, so the seek current goes up
+toward that joint's `ilim_ma`; a joint that simply will not move gets more
+velocity gain. A stall only counts as an endstop if the joint reached half its
+commanded speed first — a loaded joint that creeps the whole way looks
+identical to one arriving at a stop, and the shoulder was once referenced
+0.66° into a 38° seek that way. Stall references are confirmed by a second
+approach agreeing within the config's tolerance.
+
+**Step 2 — gravity, distal first.** Each loaded joint is taken to the pose
+where it carries the most, and held **torque only** on the model's G(q) times a
+scale — the runtime's own `law_idle`. Torque-only is the point: on a position
+hold, these drives' integrating loops supply whatever the feedforward does not,
+so the joint holds at any scale and nothing about gravity is measured. The
+scale is moved by a secant on the measured drift rate, and a joint whose drift
+does not improve as its feedforward grows is reported as a feedback problem
+rather than walked out of range.
+
+**Step 3 — verification.** Every loaded joint goes back to its worst pose and
+must hold on the scale that was chosen. A joint that misses is measured again
+from that number and re-verified, up to three rounds. Nothing is written by
+`--apply` unless this passes.
+
+### What it writes
+
+`selfcal-measurements.toml` on every exit, including a failure — a run that
+measured four joints and failed on the fifth has still measured four joints.
+`--apply` edits the config in place (comments preserved) and keeps a
+`PAR6.toml.before-selfcal` backup. A gain only becomes a measurement once a
+joint has actually reached a pose on it.
+
+### Two rules it enforces on every tick
+
+- **No joint moving for 1 s fails the run.** Checked on the one path every
+  command goes through, not at each place that might judge its own wait
+  reasonable. The only stillness left anywhere is the sub-second gravity
+  measurement, the wait for the drives' first frames, and the handover.
+- **Once a joint's feedforward is measured, any oscillation fails the run.**
+  Every joint, every tick — a joint that rings only while a *different* joint
+  is driven is invisible to a check that watches the joint under test.
+
+### Measured on this arm
+
+Six consecutive passing runs at 110–119 s; worst command tick 4099 µs against a
+4000 µs target. Five consecutive `--home-only` runs at 54–55 s whose stall
+references repeat within 0.03° (the J6 hall edge spreads 0.25°). This arm needed
+J3 `kpv`/`kiv` ×1.25 and a 1125 mA shoulder seek current; all four gravity
+scales measured 1.000, so the vendor's model is correct for it — provided the
+fitted gripper is in the chain. Leaving the tool out of G(q) had the model
+asking for +25 mA at the wrist pitch where the drive was pulling −655 mA.
+
+### Limits of the evidence
+
+Encoders measure joint motion, not table vibration. Torque is inferred from
+motor current through `kt_nm_a` and the gear ratio. A gravity scale is measured
+at one pose per joint, so a single scalar cannot describe a model that is wrong
+in shape rather than in size; the drift the elbow shows between runs (its
+readings scatter ~0.01–0.05 deg/s) is stiction, and the tolerance is set above
+that scatter rather than below it.
+
+## par6.calibration: the limits sweep
+
+### Prerequisites
+
+- The arm is homed (run `par6-selfcal` first) and idle with an empty queue, the configured gripper fitted
   and no declared payload.
 - `par6d` was started with `PAR6_DIAGNOSTICS=<file>.bin` (the native recorder;
   default budget one hour at 250 Hz, `PAR6_DIAGNOSTICS_MAX_SAMPLES` for more).
@@ -19,10 +97,6 @@ staged beside every candidate.
 
 ```sh
 PAR6_DIAGNOSTICS=$PWD/calibration-runs/capture.bin par6d            # or via Commander
-par6-calibrate check                       # 2 min: shoulder/elbow baseline
-par6-calibrate tune-feedback --joint 3     # ~6 min per joint
-par6-calibrate gravity                     # ~12 min: identify, stage candidate
-par6-calibrate gravity --verify            # after restarting on the candidate
 par6-calibrate limits                      # ~20 min, one-off
 ```
 
@@ -32,32 +106,7 @@ offsets and metrics), `identity.json`, `world.json`, and on success
 `profile/candidate/PAR6.toml`, `profile/rollback/PAR6.toml`,
 `calibration-patch.toml` (only the keys that were measured).
 
-## Routines
-
-**check** — ±0.04 rad opposite-direction sweeps on J2/J3 at 0.05 rad/s.
-Reports tracking peak, velocity-residual RMS, windowed vibration, command
-ripple and current saturation per joint. Run it before and after any change.
-
-**tune-feedback --joint N** — six ±0.18 rad sustained moves with a 2.5 s hold
-at the baseline gains, then candidates in preference order (Kiv×0.8, Kiv×0.6,
-Kpv and Kiv ×0.8, ×0.6). A candidate must pass ordinary acceptance in travel,
-hold and every 1.2 s window, hold within 0.05°, respond no slower, and carry
-at most 70 % of the baseline's oscillation energy; the first such candidate
-must then pass three further independent trials against three further
-baseline trials. Gains are pushed volatile (`set_pid_gains`) and restored on
-every exit; Kpp, current-loop gains and limits are never changed.
-
-**gravity** — six shoulder/elbow/wrist centres, ±0.18 rad sweeps on J2–J6 in
-both directions at ≤0.07 rad/s with gravity feedforward off and position
-feedback on. Only slow, unsaturated, low-acceleration samples are used;
-Coulomb and viscous friction are projected out; groups whose approach or
-sweep would collide are dropped whole (at least three must remain, and the
-fit and held-out halves must each cover the observable gravity directions).
-Every held-out joint must stay under 0.05 Nm RMS residual — relative
-improvement alone stages nothing. The candidate writes `gravity_correction`
-(24 coefficients) and resets `gravity_scale`. `--verify` runs only the
-held-out groups against the loaded model by paired opposite-direction torque,
-without refitting: the acceptance run after the candidate is applied.
+### The routine
 
 **limits** — per joint, `move_j` through the ordinary EXEC planner (position
 feedback, gravity feedforward off, as in every other routine) at speed
@@ -76,7 +125,7 @@ acceleration; `limits.stream` = exec, which is what stopped the 50 Hz J2
 stream pulses). Two all-joint moves at the proposal must pass before
 staging. JOG is not measured.
 
-## Safety rules (enforced by `Session`)
+### Safety rules (enforced by `Session`)
 
 Every stimulus is preflighted through the native stream limiter and the
 collision world, including the gate's stopping projections. The live STATUS
@@ -89,10 +138,15 @@ alike. Whole-trial and windowed acceptance both apply and are judged after
 Stop. An unconfirmed SYSTEM acknowledgement is a failure. The arm is handed
 back in the support mode it arrived in.
 
-## Limits of the evidence
+### Limits of the evidence
 
-Encoders measure joint motion, not table vibration. Torque comes from motor
-current through `kt_nm_a` and the gear ratio; the gravity fit assumes
-friction is odd in velocity, so load-dependent directional friction can be
-indistinguishable from a small gravity error. `limits` certifies the RUCKIG
-EXEC path with the empty configured gripper, not a mechanical maximum.
+`limits` certifies the RUCKIG EXEC path with the configured gripper fitted and
+no payload, not a mechanical maximum. Torque is inferred from motor current
+through `kt_nm_a` and the gear ratio.
+
+## Superseded
+
+`par6.calibration` also carries `check`, `tune-feedback` and `gravity`
+routines, written before `par6-selfcal` and never completed on this arm. Use
+`par6-selfcal` for homing, gains and gravity; do not run both against the same
+arm in one session.

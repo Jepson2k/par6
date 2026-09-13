@@ -2261,10 +2261,40 @@ fn hermite(start: f64, target: f64, elapsed: u32, span: u32, dt: f64) -> (f64, f
     (start + h * d, dh * d / (f64::from(span.max(1)) * dt))
 }
 
+const USAGE: &str = "\
+par6-selfcal [CONFIG] [--sim] [--apply] [--home-only]
+
+Homes one PAR6 arm, measures what this arm needs, and proves the result. Talks
+to the CAN bus directly: par6d must NOT be running.
+
+  CONFIG       robot config to read (default config/PAR6.toml)
+  --sim        run against the simulated bus, with no arm attached
+  --apply      write the measurements into CONFIG, keeping a .before-selfcal
+               backup. Only ever written when the run verified.
+  --home-only  stop after step 1 (homing), for repeatability runs
+
+Step 1 homes on the configured gains, raising a joint's seek current or its
+velocity gains when it will not reach its endstop. Step 2 measures each loaded
+joint's gravity feedforward scale on a torque-only hold, distal first. Step 3
+returns every joint to its most loaded pose and checks it holds on what was
+measured; a joint that misses is measured again and re-verified.
+
+Every exit writes selfcal-measurements.toml, including a failed run: a run that
+measured four joints and failed on the fifth has still measured four joints.
+
+Needs CAP_SYS_NICE (or root) for SCHED_FIFO; without it the command cadence
+slips and the drives feel that as a disturbance. Takes about two minutes.
+";
+
 fn main() {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+    if std::env::args().any(|a| a == "--help" || a == "-h") {
+        print!("{USAGE}");
+        return;
+    }
     let path = std::env::args()
         .nth(1)
+        .filter(|a| !a.starts_with('-'))
         .unwrap_or_else(|| "config/PAR6.toml".to_string());
     let bundle = match ConfigBundle::load(std::path::Path::new(&path)) {
         Ok(b) => b,
