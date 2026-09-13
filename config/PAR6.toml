@@ -1,3 +1,4 @@
+gravity_scale = [1.0000, 1.0000, 1.0815, 1.0000, 1.0000, 1.0000]  # selfcal: measured per joint
 # PAR6 robot configuration.
 #
 # Values transcribed from the vendor RCB-Runtime configs (facts only, no code):

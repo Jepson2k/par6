@@ -90,6 +90,10 @@ const RING_REVERSALS: usize = 8;
 /// a ring rather than that joint working.
 const RING_OVER_FLOOR: f64 = 1.5;
 
+/// How long a ring has to persist before the run is over \[ticks\]: one whole
+/// further window of it, continuously.
+const RING_PERSIST_TICKS: usize = RING_WINDOW_TICKS;
+
 /// How long a joint is left alone after a move before anything judges it
 /// \[s\].
 ///
@@ -106,12 +110,14 @@ const SETTLE_BEFORE_JUDGING_S: f64 = 0.25;
 /// so a fixed count is 0.10 deg of slop on the base and 0.026 deg on the
 /// shoulder. The same shake would be flagged on one joint and invisible on
 /// the next, which is exactly what happened to the base.
-const RING_AMPLITUDE_DEG: f64 = 0.10;
-// 0.02 deg was below the arrival window itself (0.044 deg), so it called the
-// drive's own dither a ring: the elbow was failed at every gain for moving
-// less than the tolerance it was being held to, and the ladder had nothing it
-// could do about it. The ring that is actually audible on this arm measured
-// 0.204 deg, so this sits at half of that and twice the arrival window.
+const RING_AMPLITUDE_DEG: f64 = 0.20;
+// The only externally calibrated figure available: the ring that is audible
+// from this arm, standing next to it, measured 0.204 deg. Below that the
+// numbers are the drives working — the elbow swings 0.05-0.13 deg holding 2 A
+// at full extension, varying between windows, and every tighter bar I tried
+// failed healthy runs on it. 0.02 deg was below the arrival window itself
+// (0.044 deg), which failed the elbow for moving less than the tolerance it
+// was being held to.
 
 /// The most two seek passes may disagree before the first stop is called an
 /// obstruction rather than the endstop \[deg\].
@@ -710,6 +716,13 @@ struct Arm {
     /// config's guess. Carried into step 3, which judges them with the
     /// measured feedforward in force.
     rang_while_homing: Vec<bool>,
+    /// The joint currently held on torque alone, if any.
+    ///
+    /// It has been deliberately released from position control so its gravity
+    /// feedforward can be measured, so whatever it does in that window is the
+    /// measurement — not a verdict on its gains. The oscillation rule judges
+    /// joints the tool is holding.
+    torque_only: Option<usize>,
     /// Set for step 3 only: the arrival window tightens to the runtime's.
     verifying: bool,
     /// Set while the arm is being handed back. The park drives two joints onto
@@ -754,6 +767,21 @@ struct Arm {
     /// oscillation means step 1 shipped a gain set that does not hold the
     /// arm, and the run is over.
     vibration_fatal: bool,
+    /// The swing each joint showed while POSITION-held at its loaded pose
+    /// \[ticks\], captured just before it is released for measurement.
+    ///
+    /// That is the state the oscillation rule judges, so it is the state the
+    /// bar has to come from. Sampling it after the torque-only window instead
+    /// measured the release, and clearing that window's history left nothing to
+    /// measure at all.
+    hold_swing: Vec<f64>,
+    /// How long each joint has been continuously ringing \[ticks\].
+    ///
+    /// A verdict on one window is a verdict on a burst: the elbow's swings vary
+    /// between windows, and a run of two minutes should not end because one of
+    /// them was large. The rule fires on oscillation that is still there a
+    /// window later.
+    ringing_for: Vec<u32>,
     /// Each joint's own dither while it is holding a pose it has been
     /// calibrated for \[ticks\], measured rather than assumed.
     ///
@@ -879,6 +907,8 @@ impl Arm {
             referenced: vec![false; n],
             home_ticks: vec![None; n],
             ring_floor: vec![0.0; n],
+            ringing_for: vec![0; n],
+            hold_swing: vec![0.0; n],
             cadence: Cadence::default(),
             last_tick_at: None,
             motion_mark: None,
@@ -887,6 +917,7 @@ impl Arm {
             seek_saturated: false,
             rang_while_homing: vec![false; n],
             awaiting_gravity: vec![false; n],
+            torque_only: None,
             verifying: false,
             handing_over: false,
             scale_floor: vec![0.0; n],
@@ -1115,8 +1146,9 @@ impl Arm {
         self.motion_mark = None;
         self.still_mark = None;
         // Seeks and moves all start here, so an error that skipped a
-        // measurement window's cleanup cannot leave the rule switched off.
+        // measurement window's cleanup cannot leave either rule switched off.
         self.measuring = false;
+        self.torque_only = None;
     }
 
     /// Whether `joint` has moved within the last `window_s`.
@@ -1159,23 +1191,33 @@ impl Arm {
     /// looks at the joint under test, and that is the ring that was reported
     /// from the room while the tool reported success.
     fn enforce_quiet(&mut self) -> Result<(), String> {
-        if !self.vibration_fatal {
+        if !self.vibration_fatal || self.handing_over {
+            // Handing back is parking two joints onto their stops and letting
+            // go; a verdict there stops the park and leaves the arm worse.
             return Ok(());
         }
         // Asked as a question first, because this runs on every tick: the list
         // is only built once something is actually wrong.
-        let any = (0..self.history.len()).any(|j| {
-            !self.awaiting_gravity[j]
+        let mut sustained = false;
+        for j in 0..self.history.len() {
+            let ringing = Some(j) != self.torque_only
+                && !self.awaiting_gravity[j]
                 && self.history[j].len() >= WATCH_WINDOW_TICKS
-                && ringing_now(&self.history[j], self.ring_threshold(j))
-        });
-        if !any {
+                && ringing_now(&self.history[j], self.ring_threshold(j));
+            self.ringing_for[j] = if ringing { self.ringing_for[j] + 1 } else { 0 };
+            sustained |= self.ringing_for[j] as usize >= RING_PERSIST_TICKS;
+        }
+        if !sustained {
             return Ok(());
         }
         let ringing: Vec<(usize, f64)> = self
             .oscillating()
             .into_iter()
-            .filter(|(j, _)| !self.awaiting_gravity[*j])
+            .filter(|(j, _)| {
+                self.ringing_for[*j] as usize >= RING_PERSIST_TICKS
+                    && Some(*j) != self.torque_only
+                    && !self.awaiting_gravity[*j]
+            })
             .collect();
         if ringing.is_empty() {
             return Ok(());
@@ -2805,7 +2847,14 @@ impl Arm {
             }
         }
         let start = self.position(joint).ok_or("no position")?;
+        // Settled, still on position: this is the joint working, which is what
+        // the oscillation rule has to be measured against.
+        let (reversals, swing) = ring_swings(&self.history[joint]);
+        if reversals >= RING_REVERSALS {
+            self.hold_swing[joint] = swing;
+        }
         self.reset_motion_watch();
+        self.torque_only = Some(joint);
         let mut g = [0.0_f64; par6_kin::NQ];
         let mut drift = 0.0_f64;
         // (elapsed, joint angle) through the watch. The verdict is the SLOPE
@@ -2881,6 +2930,11 @@ impl Arm {
             }
         }
         self.measuring = false;
+        self.torque_only = None;
+        // What this joint did while it was let go is a measurement, not
+        // evidence about its gains — and the window outlives the release, so
+        // leaving it in place would have the rule judge the next move on it.
+        self.history[joint].clear();
         Ok(sag_rate(&samples, g[joint]).unwrap_or(drift / GRAVITY_WATCH_S))
     }
 
@@ -3070,8 +3124,8 @@ fn search_gravity(
     // This joint is holding the pose it was just calibrated for, so whatever it
     // is doing now is what it does when it is working. That is the figure the
     // oscillation rule has to beat.
-    let (reversals, swing) = ring_swings(&arm.history[joint]);
-    if reversals >= RING_REVERSALS {
+    let swing = arm.hold_swing[joint];
+    if swing > 0.0 {
         arm.ring_floor[joint] = arm.ring_floor[joint].max(swing);
         println!(
             "  J{}: it dithers {:.4} deg holding this pose; a ring has to beat \
