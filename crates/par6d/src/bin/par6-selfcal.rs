@@ -2479,23 +2479,46 @@ fn main() {
     let scales = arm.scales.clone();
     match &outcome {
         Ok(()) => {
-            println!("\nhomed. velocity-gain scales this arm needed:");
-            let mut changed = false;
-            for (j, scale) in scales.iter().enumerate().take(arm.n()) {
-                if *scale != 1.0 {
-                    changed = true;
-                    let g = &arm.robot.joints[j].gains;
-                    println!(
-                        "  J{}  x{:.2}   kpv = {:.6}  kiv = {:.6}",
-                        j + 1,
-                        scales[j],
-                        g.kpv * scales[j],
-                        g.kiv * scales[j]
-                    );
-                }
+            // One table, because the answer to "what did it find" should not
+            // have to be assembled out of a hundred lines of progress.
+            println!("\nwhat this arm needed, per joint:");
+            println!(
+                "  {:<4}{:>10}{:>10}{:>10}{:>10}{:>10}",
+                "", "home", "gain", "seek mA", "gravity", "dither"
+            );
+            for j in 0..arm.n() {
+                let gain = scales.get(j).copied().unwrap_or(1.0);
+                let seek = arm.results.seek_ma[j];
+                let grav = arm.results.gravity_scale.get(j).copied().unwrap_or(1.0);
+                let dither = arm.deg_for_ticks(j, arm.ring_floor[j] as i64);
+                println!(
+                    "  J{:<3}{:>10}{:>10}{:>10}{:>10}{:>10}",
+                    j + 1,
+                    arm.home_ticks[j]
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".into()),
+                    if gain == 1.0 {
+                        "vendor".to_string()
+                    } else {
+                        format!("x{gain:.2}")
+                    },
+                    seek
+                        .map(|ma| format!("{ma:.0}"))
+                        .unwrap_or_else(|| "vendor".into()),
+                    if grav == 1.0 {
+                        "vendor".to_string()
+                    } else {
+                        format!("x{grav:.3}")
+                    },
+                    if dither > 0.0 {
+                        format!("{dither:.3} deg")
+                    } else {
+                        "-".into()
+                    },
+                );
             }
-            if !changed {
-                println!("  none: the configured gains homed the arm as they are");
+            if scales.iter().all(|s| *s == 1.0) {
+                println!("  the configured gains homed the arm as they are");
             }
         }
         Err(e) => eprintln!("\n{e}"),
