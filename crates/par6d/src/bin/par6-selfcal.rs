@@ -311,9 +311,16 @@ const GRAVITY_HOLD_RAD_S: f64 = 1.0e-3;
 /// steps.
 const GRAVITY_GAIN: f64 = 0.08;
 
-/// How far inside the hold tolerance a scale has to land to be accepted. A
-/// value at the edge passes once and fails on the next look.
-const ACCEPT_MARGIN: f64 = 0.5;
+/// How far inside the hold tolerance a scale has to land to be accepted.
+///
+/// A quarter, from what the joints actually do: the wrist and wrist pitch
+/// settle at 0.005-0.013 deg/s on their right scale, while the elbow was
+/// accepted at 0.025 — inside the tolerance, on the edge of this margin — and
+/// then drifted 0.63 deg/s when verification looked again. Verification
+/// recovers from that, but it costs a refinement round the search should not
+/// have needed: a reading five times worse than a joint's own best is a signal
+/// to keep looking, not an answer.
+const ACCEPT_MARGIN: f64 = 0.25;
 
 /// Attempts per joint before the answer is "this is not a gravity-scale
 /// problem".
@@ -1213,19 +1220,17 @@ impl Arm {
             self.last_ff.iter_mut().for_each(|f| *f = 0);
             return;
         }
-        let ff: Vec<i16> = g
-            .iter()
-            .enumerate()
-            .take(self.n())
-            .map(|(j, tau)| {
-                if self.referenced[j] {
-                    self.torque_to_ma(j, self.grav_scale[j] * tau)
-                } else {
-                    0
-                }
-            })
-            .collect();
-        self.last_ff[..ff.len()].copy_from_slice(&ff);
+        // A fixed array, not a Vec: this runs on every tick of a loop that is
+        // pacing drives, and the heap is not something to touch 250 times a
+        // second for six numbers.
+        let mut ff = [0_i16; par6_kin::NQ];
+        for (j, out) in ff.iter_mut().enumerate().take(self.n()) {
+            if self.referenced[j] {
+                *out = self.torque_to_ma(j, self.grav_scale[j] * g[j]);
+            }
+        }
+        let n = self.n().min(par6_kin::NQ);
+        self.last_ff[..n].copy_from_slice(&ff[..n]);
     }
 
     /// Every joint idle except `active`, which holds whatever the caller
@@ -2164,6 +2169,23 @@ fn gravity_model(
     par6_kin::Kin::load_arm(assets_dir, tool.as_ref()).map_err(|e| format!("gravity model: {e}"))
 }
 
+/// The rate `joint` is FALLING at \[rad/s\], from its own angle history and
+/// the model's torque for it. Positive is a sag, whichever way gravity pulls.
+///
+/// The sign convention of the whole gravity search, in one place so that one
+/// test can pin it. G(q) is the torque the motor must apply to HOLD, so
+/// gravity accelerates the joint the other way: falling is motion in the
+/// direction `-sign(G)`. Getting this backwards is not a compile error — it
+/// labelled a lifting wrist "sagging", stepped the scale the wrong way, and
+/// made the slope test conclude the feedforward was not helping.
+fn sag_rate(samples: &[(f64, f64)], torque_nm: f64) -> Option<f64> {
+    let along_gravity: Vec<(f64, f64)> = samples
+        .iter()
+        .map(|(t, angle)| (*t, angle * -torque_nm.signum()))
+        .collect();
+    slope_per_s(&along_gravity)
+}
+
 /// Least-squares slope of `(t, y)` \[y per second\], or None with too few
 /// samples to fit one.
 fn slope_per_s(samples: &[(f64, f64)]) -> Option<f64> {
@@ -2654,7 +2676,7 @@ impl Arm {
                 drift = moved * -g[joint].signum();
                 let at = watch_began.elapsed().as_secs_f64();
                 if at >= GRAVITY_SETTLE_IN_S {
-                    samples.push((at, here * -g[joint].signum()));
+                    samples.push((at, here));
                 }
             }
             // Verdict reached: it has clearly moved off, or it has settled and
@@ -2671,7 +2693,7 @@ impl Arm {
             }
         }
         self.measuring = false;
-        Ok(slope_per_s(&samples).unwrap_or(drift / GRAVITY_WATCH_S))
+        Ok(sag_rate(&samples, g[joint]).unwrap_or(drift / GRAVITY_WATCH_S))
     }
 
     /// Joint torque to the drive's current feedforward \[mA\].
@@ -3026,4 +3048,168 @@ fn step1(arm: &mut Arm) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A joint that is FALLING reads as a positive drift rate.
+    ///
+    /// This is the convention the whole gravity search rests on, and getting
+    /// it backwards is not a compile error: the label said "sagging" while the
+    /// joint lifted, the first step moved the scale the wrong way, and the
+    /// slope test concluded the feedforward was not helping. Those three read
+    /// the same number, so one test pins all three.
+    #[test]
+    fn falling_is_a_positive_drift_rate() {
+        // G(q) > 0 means the motor must pull positive to hold, so gravity
+        // accelerates the joint NEGATIVE: falling is a decreasing angle.
+        // Raw encoder angles, exactly as the watch records them.
+        let ramp = |per_s: f64| -> Vec<(f64, f64)> {
+            (0..100)
+                .map(|k| {
+                    let t = f64::from(k) * 0.004;
+                    (t, 0.5 + per_s * t)
+                })
+                .collect()
+        };
+        // G(q) > 0: the motor pulls positive to hold, so falling decreases the
+        // angle.
+        let rate = sag_rate(&ramp(-0.02), 1.7).expect("enough samples to fit");
+        assert!(rate > 0.0, "a falling joint must read as a sag, got {rate}");
+        assert!((rate - 0.02).abs() < 1e-6, "and at its real rate: {rate}");
+        let rate = sag_rate(&ramp(0.02), 1.7).expect("enough samples to fit");
+        assert!(rate < 0.0, "a lifting joint must read negative, got {rate}");
+
+        // G(q) < 0: falling is now an INCREASING angle, and still a sag.
+        let rate = sag_rate(&ramp(0.02), -1.7).expect("enough samples to fit");
+        assert!(rate > 0.0, "sign of G(q) must not change the verdict: {rate}");
+        let rate = sag_rate(&ramp(-0.02), -1.7).expect("enough samples to fit");
+        assert!(rate < 0.0, "nor the other verdict: {rate}");
+    }
+
+    #[test]
+    fn a_fit_needs_more_than_a_couple_of_samples() {
+        assert!(sag_rate(&[(0.0, 0.0), (0.004, 0.1)], 1.0).is_none());
+        // All at one instant: no slope exists, and dividing by zero spread
+        // would invent one.
+        let stacked: Vec<(f64, f64)> = (0..20).map(|_| (0.5, 1.0)).collect();
+        assert!(slope_per_s(&stacked).is_none());
+    }
+
+    /// Ring and droop are opposite failures with the same symptom, and the
+    /// tool does opposite things about them: lower the gains, or raise them.
+    #[test]
+    fn ringing_and_drifting_are_told_apart() {
+        let amplitude = 20_i64;
+        // A ring: reversals that keep coming, no net travel.
+        let ring: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| (60.0 * ((k as f64) * 0.35).sin()) as i32)
+            .collect();
+        assert!(ringing_now(&ring, amplitude), "a shaking joint is ringing");
+        assert!(!drifting_now(&ring, amplitude), "and it is not drifting");
+
+        // A droop: one way, no reversals.
+        let droop: Vec<i32> = (0..RING_WINDOW_TICKS).map(|k| -(k as i32) / 4).collect();
+        assert!(drifting_now(&droop, amplitude), "a sliding joint is drifting");
+        assert!(!ringing_now(&droop, amplitude), "and it is not ringing");
+
+        // A joint sitting still is neither, however long it is watched.
+        let still = vec![1234_i32; RING_WINDOW_TICKS];
+        assert!(!ringing_now(&still, amplitude));
+        assert!(!drifting_now(&still, amplitude));
+
+        // Dither below the amplitude that counts is neither: the elbow was
+        // failed at every gain for moving less than its own arrival window.
+        let dither: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| if k % 2 == 0 { 0 } else { amplitude as i32 / 4 })
+            .collect();
+        assert!(!ringing_now(&dither, amplitude));
+    }
+
+    #[test]
+    fn a_profile_starts_and_ends_at_rest() {
+        let (pos, vel) = hermite(100.0, 900.0, 0, 250, 0.004);
+        assert!((pos - 100.0).abs() < 1e-9, "starts where the joint is");
+        assert!(vel.abs() < 1e-9, "and at rest");
+        let (pos, vel) = hermite(100.0, 900.0, 250, 250, 0.004);
+        assert!((pos - 900.0).abs() < 1e-9, "ends on target");
+        assert!(vel.abs() < 1e-9, "and at rest");
+        // Halfway through a symmetric profile is halfway there, moving.
+        let (pos, vel) = hermite(100.0, 900.0, 125, 250, 0.004);
+        assert!((pos - 500.0).abs() < 1e-6, "symmetric at the midpoint");
+        assert!(vel > 0.0, "and moving toward the target");
+    }
+
+    /// `--apply` edits the config as text, so this is the test that it edits
+    /// the RIGHT text — on the config this arm actually ships, because that is
+    /// the file whose shape matters: comments explaining why its numbers are
+    /// what they are, and a gains section that repeats once per joint.
+    #[test]
+    fn apply_patches_the_named_joint_and_keeps_the_comments() {
+        let shipped = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../config/PAR6.toml")
+            .canonicalize()
+            .expect("the shipped config");
+        let original = std::fs::read_to_string(&shipped).expect("read shipped config");
+        let dir = std::env::temp_dir().join(format!("selfcal-apply-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("PAR6.toml");
+        std::fs::write(&path, &original).expect("copy config");
+        // The bundle reads the gripper library beside the config, and the
+        // patched file is re-validated below, so the copy needs one too.
+        let grippers = dir.join("grippers");
+        std::fs::create_dir_all(&grippers).expect("gripper dir");
+        for entry in std::fs::read_dir(shipped.parent().unwrap().join("grippers")).expect("grippers")
+        {
+            let entry = entry.expect("gripper entry");
+            std::fs::copy(entry.path(), grippers.join(entry.file_name())).expect("copy gripper");
+        }
+        let bundle = ConfigBundle::load(&path).expect("load the copy");
+        let robot = bundle.robot.clone();
+
+        let mut results = Results::new(robot.joints.len());
+        // The ELBOW's gains, the SHOULDER's seek current, one scale: three
+        // different sections, each of which repeats per joint.
+        results.gain_scale[2] = 1.25;
+        results.seek_ma[1] = Some(1125.0);
+        results.gravity_scale[2] = 1.08;
+        results.apply(&path, &robot).expect("apply");
+        let patched = std::fs::read_to_string(&path).expect("read back");
+
+        let kpv_expected = format!("kpv = {:.6}", robot.joints[2].gains.kpv * 1.25);
+        assert!(
+            patched.contains(&kpv_expected),
+            "the elbow gets x1.25 of its own vendor value ({kpv_expected})"
+        );
+        assert!(
+            patched.contains("current_ma = 1125.0"),
+            "the shoulder's seek current is written"
+        );
+        assert!(
+            patched.contains("gravity_scale = [1.0000, 1.0000, 1.0800"),
+            "the scale lands at the top level as a bare key"
+        );
+        // Untouched joints keep their own values, not the patched joint's.
+        let j0 = format!("kpv = {}", robot.joints[0].gains.kpv);
+        assert!(
+            patched.contains(&j0) || patched.contains(&format!("kpv = {:.3}", robot.joints[0].gains.kpv)),
+            "joint 1 is left alone"
+        );
+        // Comments are the reason this is a text edit rather than a round trip
+        // through a serialiser.
+        let comments_before = original.lines().filter(|l| l.trim_start().starts_with('#')).count();
+        let comments_after = patched.lines().filter(|l| l.trim_start().starts_with('#')).count();
+        assert!(
+            comments_after >= comments_before,
+            "every comment survives: {comments_before} before, {comments_after} after"
+        );
+        // And the patched file is still a config the runtime can load.
+        ConfigBundle::load(&path).expect("the patched config still validates");
+
+        let backup = std::fs::read_to_string(dir.join("PAR6.toml.before-selfcal")).expect("backup");
+        assert_eq!(backup, original, "the backup is the file as it was");
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
