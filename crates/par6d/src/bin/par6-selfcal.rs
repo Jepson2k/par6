@@ -423,13 +423,37 @@ fn monotonic_now() -> Duration {
 }
 
 /// What the command cadence actually did, in microseconds per tick.
-#[derive(Default)]
 struct Cadence {
-    periods_us: Vec<u32>,
+    /// Tick periods as a fixed histogram rather than a sample per tick: the
+    /// tick path must not allocate, and a Vec that grows once every couple of
+    /// hundred ticks still allocates. A run can be minutes long, so the sample
+    /// list was unbounded too.
+    hist: [u32; CADENCE_BUCKETS],
+    count: usize,
+    sum_us: u64,
     worst_us: u32,
     worst_at: usize,
     worst_phase: String,
     phase: String,
+}
+
+/// Histogram resolution and extent for the cadence record: 50 us buckets up to
+/// 10 ms, with everything beyond in the last one.
+const CADENCE_BUCKET_US: u32 = 50;
+const CADENCE_BUCKETS: usize = 200;
+
+impl Default for Cadence {
+    fn default() -> Self {
+        Self {
+            hist: [0; CADENCE_BUCKETS],
+            count: 0,
+            sum_us: 0,
+            worst_us: 0,
+            worst_at: 0,
+            worst_phase: String::new(),
+            phase: String::new(),
+        }
+    }
 }
 
 impl Cadence {
@@ -437,10 +461,16 @@ impl Cadence {
         let us = d.as_micros() as u32;
         if us > self.worst_us {
             self.worst_us = us;
-            self.worst_at = self.periods_us.len();
-            self.worst_phase = self.phase.clone();
+            self.worst_at = self.count;
+            // The one allocation in here, and only when a new worst appears:
+            // a handful of times per run, never per tick.
+            self.worst_phase.clear();
+            self.worst_phase.push_str(&self.phase);
         }
-        self.periods_us.push(us);
+        let bucket = (us / CADENCE_BUCKET_US) as usize;
+        self.hist[bucket.min(CADENCE_BUCKETS - 1)] += 1;
+        self.count += 1;
+        self.sum_us += u64::from(us);
     }
 
     /// Name what the tool is doing, so a late tick can be attributed instead
@@ -451,14 +481,22 @@ impl Cadence {
 
     /// Mean, p99, worst \[us\] and the sample count.
     fn summary(&self) -> Option<(f64, u32, u32, usize)> {
-        if self.periods_us.is_empty() {
+        if self.count == 0 {
             return None;
         }
-        let mut v = self.periods_us.clone();
-        v.sort_unstable();
-        let n = v.len();
-        let mean = v.iter().map(|x| f64::from(*x)).sum::<f64>() / n as f64;
-        Some((mean, v[n * 99 / 100], v[n - 1], n))
+        let mean = self.sum_us as f64 / self.count as f64;
+        // The bucket the 99th percentile falls in, reported as its upper edge.
+        let target = (self.count as f64 * 0.99).ceil() as usize;
+        let mut seen = 0usize;
+        let mut p99 = self.worst_us;
+        for (b, n) in self.hist.iter().enumerate() {
+            seen += *n as usize;
+            if seen >= target {
+                p99 = ((b + 1) as u32 * CADENCE_BUCKET_US).min(self.worst_us);
+                break;
+            }
+        }
+        Some((mean, p99, self.worst_us, self.count))
     }
 }
 
@@ -703,8 +741,9 @@ struct Arm {
     /// Where the watched joint was when it last actually moved, and when.
     motion_mark: Option<(i32, Instant)>,
     /// Where EVERY joint was the last time any of them moved, and when.
-    /// The arm-wide rule is enforced from this.
-    still_mark: Option<(Vec<Option<i32>>, Instant)>,
+    /// The arm-wide rule is enforced from this. A fixed array, because it is
+    /// rebuilt on every tick and the tick path does not allocate.
+    still_mark: Option<([Option<i32>; par6_kin::NQ], Instant)>,
     /// Set only while stillness is the measurement: a hold proof and a
     /// gravity watch are asking whether the arm stays put, so the rule that
     /// staying put is a failure cannot apply to them. Both are bounded by
@@ -744,6 +783,13 @@ struct Arm {
     kin: par6_kin::Kin,
     /// Gravity feedforward per joint from the last tick \[mA\].
     last_ff: Vec<i16>,
+    /// The frame being built, allocated once.
+    ///
+    /// This tool's tick path is an RT tick path — it paces the drives itself —
+    /// and the house rule for those is that they allocate nothing after init. A
+    /// six-element Vec per tick is cheap until the page it wants is not
+    /// resident, and one run showed a 24 ms tick.
+    cmds: Vec<JointCommand>,
     /// Gravity scale in force per joint; the config's until step 2 measures.
     grav_scale: Vec<f64>,
     /// Everything measured so far.
@@ -851,6 +897,7 @@ impl Arm {
             ready_pose: [0.0; par6_kin::NQ],
             kin: gravity_model(assets_dir, gripper)?,
             last_ff: vec![0; n],
+            cmds: vec![JointCommand::idle(); n],
             grav_scale: grav_scale.to_vec(),
             results: Results::new(n),
         })
@@ -962,10 +1009,9 @@ impl Arm {
         // fall once this process is gone. Said out loud rather than hidden.
         println!("  releasing on the brake pack");
         self.measuring = true;
-        let cmds = vec![JointCommand::current(0); self.n()];
         let ticks = (RELEASE_S / self.dt).round().max(1.0) as u64;
         for _ in 0..ticks {
-            if let Err(e) = self.exchange(&cmds) {
+            if let Err(e) = self.tick_each(|_, _| JointCommand::current(0)) {
                 eprintln!("  release: {e}");
                 break;
             }
@@ -981,13 +1027,10 @@ impl Arm {
         let mut next_tick = Instant::now();
         let targets: Vec<Option<i32>> = (0..self.n()).map(|j| self.position(j)).collect();
         for _ in 0..ticks {
-            let mut cmds = vec![JointCommand::idle(); self.n()];
-            for (j, target) in targets.iter().enumerate() {
-                if let Some(p) = target {
-                    cmds[j] = JointCommand::position(*p, 0, 0);
-                }
-            }
-            self.exchange(&cmds)?;
+            self.tick_each(|_, j| match targets[j] {
+                Some(p) => JointCommand::position(p, 0, 0),
+                None => JointCommand::idle(),
+            })?;
             self.sleep_to(&mut next_tick);
         }
         self.measuring = false;
@@ -1119,6 +1162,16 @@ impl Arm {
         if !self.vibration_fatal {
             return Ok(());
         }
+        // Asked as a question first, because this runs on every tick: the list
+        // is only built once something is actually wrong.
+        let any = (0..self.history.len()).any(|j| {
+            !self.awaiting_gravity[j]
+                && self.history[j].len() >= WATCH_WINDOW_TICKS
+                && ringing_now(&self.history[j], self.ring_threshold(j))
+        });
+        if !any {
+            return Ok(());
+        }
         let ringing: Vec<(usize, f64)> = self
             .oscillating()
             .into_iter()
@@ -1144,12 +1197,15 @@ impl Arm {
             self.still_mark = None;
             return Ok(());
         }
-        let now: Vec<Option<i32>> = (0..self.n()).map(|j| self.position(j)).collect();
+        let mut now = [None; par6_kin::NQ];
+        for (j, slot) in now.iter_mut().enumerate().take(self.n()) {
+            *slot = self.position(j);
+        }
         let Some((marked, since)) = self.still_mark.take() else {
             self.still_mark = Some((now, Instant::now()));
             return Ok(());
         };
-        let moved = (0..self.n()).any(|j| {
+        let moved = (0..self.n().min(par6_kin::NQ)).any(|j| {
             match (now.get(j).copied().flatten(), marked.get(j).copied().flatten()) {
                 (Some(a), Some(b)) => {
                     (i64::from(a) - i64::from(b)).abs() > self.ticks_for_deg(j, STILL_DEG).max(1)
@@ -1166,6 +1222,7 @@ impl Arm {
         }
         let held = since.elapsed().as_secs_f64();
         if held >= NO_MOTION_ABORT_S {
+            // Only on the way out, where one allocation costs nothing.
             let where_at: Vec<String> = (0..self.n())
                 .filter_map(|j| {
                     self.position(j)
@@ -1275,19 +1332,45 @@ impl Arm {
     /// Every joint idle except `active`, which holds whatever the caller
     /// built. A joint with a reference holds position so it does not sag
     /// while another joint works.
-    fn frame(&self, active: Option<(usize, JointCommand)>) -> Vec<JointCommand> {
-        let mut cmds = vec![JointCommand::idle(); self.n()];
+    fn fill_frame(&self, cmds: &mut [JointCommand], active: Option<(usize, JointCommand)>) {
         for (j, cmd) in cmds.iter_mut().enumerate() {
-            if self.referenced[j] {
-                if let Some(p) = self.position(j) {
-                    *cmd = JointCommand::position(p, 0, self.last_ff[j]);
+            *cmd = if self.referenced[j] {
+                match self.position(j) {
+                    Some(p) => JointCommand::position(p, 0, self.last_ff[j]),
+                    None => JointCommand::idle(),
                 }
-            }
+            } else {
+                JointCommand::idle()
+            };
         }
         if let Some((j, cmd)) = active {
             cmds[j] = cmd;
         }
-        cmds
+    }
+
+    /// One tick: build the standard frame into the owned buffer and send it.
+    fn tick_frame(&mut self, active: Option<(usize, JointCommand)>) -> Result<(), String> {
+        let mut buf = std::mem::take(&mut self.cmds);
+        buf.resize(self.n(), JointCommand::idle());
+        self.fill_frame(&mut buf, active);
+        let sent = self.exchange(&buf);
+        self.cmds = buf;
+        sent
+    }
+
+    /// One tick, with every joint's command decided by `build`.
+    fn tick_each(
+        &mut self,
+        mut build: impl FnMut(&Self, usize) -> JointCommand,
+    ) -> Result<(), String> {
+        let mut buf = std::mem::take(&mut self.cmds);
+        buf.resize(self.n(), JointCommand::idle());
+        for (j, cmd) in buf.iter_mut().enumerate() {
+            *cmd = build(self, j);
+        }
+        let sent = self.exchange(&buf);
+        self.cmds = buf;
+        sent
     }
 
     /// Wait for the next tick boundary. Absolute deadlines, so an early wake
@@ -1327,8 +1410,7 @@ impl Arm {
         let cap = (BOOT_READING_CAP_S / self.dt).round().max(1.0) as u64;
         for k in 0..cap {
             self.cadence.phase("waiting for first readings");
-            let cmds = self.frame(None);
-            self.exchange(&cmds)?;
+            self.tick_frame(None)?;
             let mut unused = Instant::now();
             self.sleep_to(&mut unused);
             if (0..self.n()).all(|j| self.position(j).is_some()) {
@@ -1374,8 +1456,7 @@ impl Arm {
         let ticks = (seconds / self.dt).round().max(1.0) as u64;
         let mut next = Instant::now();
         for _ in 0..ticks {
-            let cmds = self.frame(None);
-            self.exchange(&cmds)?;
+            self.tick_frame(None)?;
             self.sleep_to(&mut next);
         }
         Ok(())
@@ -1492,8 +1573,7 @@ impl Arm {
         self.reset_motion_watch();
         for _ in 0..ticks {
             let cmd = JointCommand::velocity(speed_ticks_s as i32, cur);
-            let cmds = self.frame(Some((joint, cmd)));
-            self.exchange(&cmds)?;
+            self.tick_frame(Some((joint, cmd)))?;
             self.sleep_to(&mut next);
             // A nudge unloads a joint; it is not a measurement and it has no
             // target. Once the joint has stopped moving it has done everything
@@ -1541,8 +1621,7 @@ impl Arm {
         let mut next_tick = Instant::now();
         for t in 0..ticks {
             let cmd = JointCommand::hall(speed, HALL_TRIGGER_VALUE);
-            let cmds = self.frame(Some((joint, cmd)));
-            self.exchange(&cmds)?;
+            self.tick_frame(Some((joint, cmd)))?;
             self.sleep_to(&mut next_tick);
             let hall = self.state.nodes[usize::from(node)].hall;
             let Some(hall) = hall else { continue };
@@ -1562,8 +1641,7 @@ impl Arm {
                 let backoff = (h.backoff_s / self.dt).round().max(1.0) as u64;
                 for _ in 0..backoff {
                     let cmd = JointCommand::hall(back, HALL_TRIGGER_VALUE);
-                    let cmds = self.frame(Some((joint, cmd)));
-                    self.exchange(&cmds)?;
+                    self.tick_frame(Some((joint, cmd)))?;
                     self.sleep_to(&mut next_tick);
                 }
                 started_clear = true;
@@ -1687,8 +1765,7 @@ impl Arm {
                 break;
             }
             let cmd = JointCommand::velocity(speed, 0);
-            let cmds = self.frame(Some((joint, cmd)));
-            self.exchange(&cmds)?;
+            self.tick_frame(Some((joint, cmd)))?;
             self.sleep_to(&mut next);
             let Some(pos) = self.position(joint) else {
                 continue;
@@ -1755,8 +1832,7 @@ impl Arm {
                 let backoff = (h.backoff_s / self.dt).round().max(1.0) as u64;
                 for _ in 0..backoff {
                     let cmd = JointCommand::velocity(back, 0);
-                    let cmds = self.frame(Some((joint, cmd)));
-                    self.exchange(&cmds)?;
+                    self.tick_frame(Some((joint, cmd)))?;
                     self.sleep_to(&mut next);
                 }
                 println!(
@@ -1779,8 +1855,7 @@ impl Arm {
             self.reset_motion_watch();
             for _ in 0..backoff {
                 let cmd = JointCommand::velocity(back, 0);
-                let cmds = self.frame(Some((joint, cmd)));
-                self.exchange(&cmds)?;
+                self.tick_frame(Some((joint, cmd)))?;
                 self.sleep_to(&mut next);
                 // If it cannot reverse either, there is nothing to unload and
                 // nothing to wait for.
@@ -1976,8 +2051,7 @@ impl Arm {
                     self.dt,
                 );
                 let cmd = JointCommand::position(pos as i32, vel as i32, self.last_ff[joint]);
-                let cmds = self.frame(Some((joint, cmd)));
-                self.exchange(&cmds)?;
+                self.tick_frame(Some((joint, cmd)))?;
                 self.sleep_to(&mut next_tick);
                 if let Some(c) = self.current_ma(joint) {
                     peak_current = peak_current.max(f64::from(c.abs()));
@@ -2525,7 +2599,7 @@ fn main() {
     }
     if let Some((mean, p99, worst, n)) = arm.cadence.summary() {
         println!(
-            "\ncommand cadence over {n} ticks: target {:.0} us, mean {mean:.0}, p99 {p99}, \
+            "\ncommand cadence over {n} ticks: target {:.0} us, mean {mean:.0}, p99 under {p99}, \
              worst {worst} at tick {} during {}",
             arm.dt * 1e6,
             arm.cadence.worst_at,
@@ -2724,11 +2798,7 @@ impl Arm {
         self.measuring = true;
         let settle_cap = (SETTLE_BEFORE_JUDGING_S / self.dt).round().max(1.0) as u64;
         for _ in 0..settle_cap {
-            let mut cmds = vec![JointCommand::idle(); self.n()];
-            for j in 0..self.n() {
-                cmds[j] = JointCommand::position(targets[j], 0, 0);
-            }
-            self.exchange(&cmds)?;
+            self.tick_each(|_, j| JointCommand::position(targets[j], 0, 0))?;
             self.sleep_to(&mut next_tick);
             if !self.still_moving(joint, SETTLED_TICKS) {
                 break;
@@ -2757,18 +2827,17 @@ impl Arm {
             self.kin
                 .gravity(&q, &mut g)
                 .map_err(|e| format!("gravity: {e}"))?;
-            let mut cmds = vec![JointCommand::idle(); self.n()];
-            for j in 0..self.n() {
+            self.tick_each(|arm, j| {
                 // The joint under test gets the scale being tried; the ones
                 // already settled keep theirs; the rest are held on position
                 // so they cannot contribute motion of their own.
                 let s = if j == joint { scale } else { settled[j] };
                 let ff = if j < par6_kin::NQ {
-                    self.torque_to_ma(j, s * g[j])
+                    arm.torque_to_ma(j, s * g[j])
                 } else {
                     0
                 };
-                cmds[j] = if j == joint {
+                if j == joint {
                     // TORQUE ONLY for the joint being measured — the runtime's
                     // own gravity hold (`law_idle`), and the only frame in
                     // which this question has an answer. Held on the position
@@ -2784,9 +2853,8 @@ impl Arm {
                     // Everything else stays clamped on position so it cannot
                     // contribute motion of its own.
                     JointCommand::position(targets[j], 0, ff)
-                };
-            }
-            self.exchange(&cmds)?;
+                }
+            })?;
             self.sleep_to(&mut next_tick);
             if let Some(p) = self.position(joint) {
                 let here = self.conv[joint].joint_rad(p);
@@ -3247,9 +3315,49 @@ fn step1(arm: &mut Arm) -> Result<(), String> {
     Ok(())
 }
 
+/// Counting allocator, test builds only, so the tick path's own rule can be
+/// asserted rather than read.
+#[cfg(test)]
+mod counting {
+    use std::alloc::{GlobalAlloc, Layout, System};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+
+    pub struct CountingAlloc;
+
+    // SAFETY: every operation is delegated to the system allocator unchanged;
+    // the counter is a relaxed atomic side effect.
+    unsafe impl GlobalAlloc for CountingAlloc {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc(layout) }
+        }
+
+        unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.alloc_zeroed(layout) }
+        }
+
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Ordering::Relaxed);
+            unsafe { System.realloc(ptr, layout, new_size) }
+        }
+
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            unsafe { System.dealloc(ptr, layout) }
+        }
+    }
+}
+
+#[cfg(test)]
+#[global_allocator]
+static COUNTING: counting::CountingAlloc = counting::CountingAlloc;
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     /// A joint that is FALLING reads as a positive drift rate.
     ///
@@ -3358,6 +3466,42 @@ mod tests {
             .map(|k| (60.0 * ((k as f64) * 0.35).sin()) as i32)
             .collect();
         assert!(ringing_now(&ring, 20));
+    }
+
+    /// The tick path allocates nothing once it is running.
+    ///
+    /// The house rule for an RT tick path, and this tool is one: it paces the
+    /// drives itself. A six-element Vec per tick is cheap right up until the
+    /// page it wants is not resident, and one run on the arm showed a 24 ms
+    /// tick — against a 4 ms period — while the feedforward was being built
+    /// into a fresh Vec every time.
+    #[test]
+    fn the_tick_path_allocates_nothing_once_it_is_running() {
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description");
+        let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let bundle = ConfigBundle::load(&config).expect("config");
+        let mut arm = Arm::open(&bundle, &assets, true).expect("simulated arm");
+
+        // Warm everything the first tick would touch: the bus's own buffers,
+        // the gravity model's lazy setup, the history vectors.
+        for _ in 0..WATCH_WINDOW_TICKS + 10 {
+            arm.tick_frame(None).expect("warm-up tick");
+        }
+
+        let before = counting::ALLOCS.load(Ordering::Relaxed);
+        for _ in 0..200 {
+            arm.tick_frame(None).expect("tick");
+        }
+        let plain = counting::ALLOCS.load(Ordering::Relaxed) - before;
+
+        let before = counting::ALLOCS.load(Ordering::Relaxed);
+        for _ in 0..200 {
+            arm.tick_each(|_, _| JointCommand::current(0)).expect("tick");
+        }
+        let each = counting::ALLOCS.load(Ordering::Relaxed) - before;
+
+        assert_eq!(plain, 0, "tick_frame allocated {plain} times in 200 ticks");
+        assert_eq!(each, 0, "tick_each allocated {each} times in 200 ticks");
     }
 
     #[test]

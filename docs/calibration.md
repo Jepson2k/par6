@@ -106,6 +106,12 @@ trusting one reading.
 
 ### Limits of the evidence
 
+The tick path allocates nothing once running (asserted by test), but residual
+outliers of a few milliseconds against the 4000 µs period still appear once or
+twice in a run, from outside this tool — the p99 stays under 4050 µs. A drive's
+watchdog is seconds, so a single late frame is a small command discontinuity
+rather than a hazard, but it is not nothing.
+
 Encoders measure joint motion, not table vibration. Torque is inferred from
 motor current through `kt_nm_a` and the gear ratio. A gravity scale is measured
 at one pose per joint, so a single scalar cannot describe a model that is wrong
