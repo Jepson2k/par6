@@ -9,3 +9,8 @@ python/par6/*.so
 # pixi environments
 .pixi/*
 !.pixi/config.toml
+
+# par6-selfcal run artefacts: the measurement patch it writes on every exit,
+# and the config backup --apply leaves behind.
+selfcal-measurements.toml
+*.before-selfcal

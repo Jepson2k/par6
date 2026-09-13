@@ -44,9 +44,7 @@ sector_home_offset_rad = 1.570796327
 
 [joints.gains]
 kpp = 5.0
-# Velocity damping for the extended-arm load; validated by the held-servo
-# and keep-out approach regressions. Physical tuning remains to be verified.
-kpv = 0.060
+kpv = 0.015
 kiv = 0.0015
 kpiq = 7.0
 kiiq = 0.9
@@ -151,8 +149,8 @@ sector_home_offset_rad = 1.913322625
 
 [joints.gains]
 kpp = 5.0
-kpv = 0.015
-kiv = 0.0015
+kpv = 0.018750  # selfcal: x1.250 of the vendor value
+kiv = 0.001875  # selfcal: x1.250 of the vendor value
 kpiq = 7.0
 kiiq = 0.9
 kp = 0.12
@@ -338,7 +336,7 @@ reference_check_nm = [1.5, 2.0, 1.5, 1.0, 1.0, 0.5]
 strategy = "stall"
 speed_ticks_s = 4500.0
 direction = 0
-current_ma = 700.0
+current_ma = 1200.0
 timeout_s = 13.0
 backoff_s = 0.3
 two_pass = true
@@ -346,15 +344,24 @@ two_pass_max_diff_ticks = 3500
 home_offset_rad = 2.96279
 home_offset_gripper_dependent = false
 
-# J1/J2 seek values are measurements on the arm this config ships for:
-# 250 mA at 6000 ticks/s stopped at inconsistent positions (rejected by
-# the two-pass check) and 900 mA at 6000 ticks/s ran past the seek
-# timeout; these completed repeatably. Another assembly may need its own.
+# The shoulder and elbow seek FASTER than the vendor asks, and that is the
+# load-bearing part. These drives run a cascade whose velocity loop commands
+# current as kpv x (commanded - measured) speed, so the commanded speed sets
+# how much current the loop is willing to ask for. At the vendor's 6000
+# ticks/s the shoulder asks for too little to move a loaded arm: it creeps at
+# 850 ticks/s on a wound-up integrator, never reaches its stop, and a speed
+# collapse that never got going looks exactly like arriving at one. At 15000
+# it moves. Measured on this arm; another assembly may differ.
+#
+# The current is this arm's too — 250 mA stops the shoulder and elbow at
+# inconsistent positions. It is both the approach LIMIT and the stall
+# threshold (the vendor's own field does both jobs), so it is raised only
+# where it had to be.
 [[homing.joints]] # J1
 strategy = "stall"
 speed_ticks_s = 15000.0
 direction = 1
-current_ma = 900.0
+current_ma = 1125.0  # selfcal: the drive saturated below this
 timeout_s = 20.0
 backoff_s = 0.6
 two_pass = true
@@ -423,7 +430,7 @@ sample_pct = 0.8
 strategy = "hall"
 speed_ticks_s = 12000.0
 direction = 0
-current_ma = 800.0
+current_ma = 1200.0
 timeout_s = 15.0
 backoff_s = 0.3
 two_pass = false

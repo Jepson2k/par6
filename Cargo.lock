@@ -749,6 +749,7 @@ dependencies = [
  "par6-server",
  "sha2",
  "thiserror 2.0.20",
+ "thread-priority",
  "tokio",
 ]
 

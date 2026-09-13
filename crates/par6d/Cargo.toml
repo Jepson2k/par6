@@ -30,6 +30,9 @@ env_logger = { workspace = true }
 log = { workspace = true }
 sha2 = { workspace = true }
 libc = "0.2"
+# par6-selfcal paces the drives itself, so it needs the same real-time
+# treatment the runtime's control loop gets.
+thread-priority = { workspace = true }
 
 [dev-dependencies]
 par6-proto = { workspace = true }
