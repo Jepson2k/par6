@@ -86,6 +86,10 @@ const RING_LADDER: [f64; 5] = [1.0, 0.8, 0.64, 0.51, 0.41];
 const RING_WINDOW_TICKS: usize = 500;
 const RING_REVERSALS: usize = 8;
 
+/// How far above a joint's own measured dither a swing has to be before it is
+/// a ring rather than that joint working.
+const RING_OVER_FLOOR: f64 = 1.5;
+
 /// How long a joint is left alone after a move before anything judges it
 /// \[s\].
 ///
@@ -274,7 +278,16 @@ const SEEK_RANGE_SLACK_TICKS: i64 = 2000;
 /// Every joint is watched for oscillation on every tick, not just the one
 /// being worked on: ringing anywhere after stage 1 means stage 1 did not
 /// finish its job, wherever it shows up.
-const WATCH_WINDOW_TICKS: usize = 250;
+// Tied to the ring detector's own window deliberately. Held at 250 while
+// `ringing_now` wanted 500, the continuous check could never fire: every joint's
+// history was too short to judge, so `oscillating` always came back empty and
+// the "nothing is ringing" it produced meant nothing at all.
+const WATCH_WINDOW_TICKS: usize = RING_WINDOW_TICKS;
+const _: () = assert!(
+    WATCH_WINDOW_TICKS >= RING_WINDOW_TICKS,
+    "the per-joint history must be long enough for the ring detector to judge, \
+     or the continuous check silently passes everything"
+);
 
 /// How long the arm is held, on its configured gains, while the tool hands
 /// it back \[s\]. Long enough for a runtime to be started against it.
@@ -702,6 +715,15 @@ struct Arm {
     /// oscillation means step 1 shipped a gain set that does not hold the
     /// arm, and the run is over.
     vibration_fatal: bool,
+    /// Each joint's own dither while it is holding a pose it has been
+    /// calibrated for \[ticks\], measured rather than assumed.
+    ///
+    /// A threshold for "ringing" that sits below what the hardware does when it
+    /// is working correctly fails every run on a healthy arm. The elbow swings
+    /// 0.13 deg holding 2 A at full extension; the wrist swings a fraction of
+    /// that. One constant cannot describe both, so each joint's own figure is
+    /// taken at the moment its gravity scale is accepted and reported.
+    ring_floor: Vec<f64>,
     /// Recent encoder history for EVERY joint, refreshed on every tick. The
     /// point of monitoring all of them is that a joint left ringing by stage 1
     /// shows up wherever it is, not only while it is the one being worked on.
@@ -810,6 +832,7 @@ impl Arm {
             scales: vec![1.0; n],
             referenced: vec![false; n],
             home_ticks: vec![None; n],
+            ring_floor: vec![0.0; n],
             cadence: Cadence::default(),
             last_tick_at: None,
             motion_mark: None,
@@ -1006,6 +1029,15 @@ impl Arm {
         }
     }
 
+    /// What counts as a ring on this joint \[ticks\]: the configured bar, or
+    /// comfortably more than this joint's own measured dither, whichever is
+    /// larger.
+    fn ring_threshold(&self, joint: usize) -> i64 {
+        let absolute = self.ticks_for_deg(joint, RING_AMPLITUDE_DEG);
+        let measured = (self.ring_floor[joint] * RING_OVER_FLOOR) as i64;
+        absolute.max(measured)
+    }
+
     /// Every joint that is oscillating right now, with its excursion \[deg\].
     ///
     /// Checked continuously rather than at checkpoints: a joint that rings
@@ -1018,13 +1050,10 @@ impl Arm {
                 if h.len() < WATCH_WINDOW_TICKS {
                     return None;
                 }
-                if !ringing_now(h, self.ticks_for_deg(j, RING_AMPLITUDE_DEG)) {
+                if !ringing_now(h, self.ring_threshold(j)) {
                     return None;
                 }
-                let (lo, hi) = h.iter().fold((i64::MAX, i64::MIN), |(lo, hi), p| {
-                    (lo.min(i64::from(*p)), hi.max(i64::from(*p)))
-                });
-                Some((j, self.deg_for_ticks(j, hi - lo)))
+                Some((j, self.deg_for_ticks(j, ring_swings(h).1 as i64)))
             })
             .collect()
     }
@@ -2218,26 +2247,19 @@ fn slope_per_s(samples: &[(f64, f64)]) -> Option<f64> {
     Some(num / den)
 }
 
-/// Whether these samples are a joint shaking rather than moving.
+/// The reversals in this window, and the typical swing between them \[ticks\].
 ///
-/// Amplitude alone cannot tell the two apart — a joint crossing its target
-/// at speed covers the same ticks — so this wants both: an excursion worth
-/// caring about AND direction reversals that keep coming, which a joint
-/// tracking a profile does not do.
-fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
-    if history.len() < RING_WINDOW_TICKS {
-        return false;
-    }
-    let (lo, hi) = history
-        .iter()
-        .fold((i64::MAX, i64::MIN), |(lo, hi), p| {
-            (lo.min(i64::from(*p)), hi.max(i64::from(*p)))
-        });
-    if hi - lo < amplitude_ticks {
-        return false;
-    }
-    let mut reversals = 0;
+/// Amplitude measured BETWEEN reversals, which is what makes this independent
+/// of whatever the joint was commanded to do. Measuring the window's raw span
+/// counted a commanded 1.7 deg move as ring amplitude; measuring it about a
+/// straight-line trend still counted 1.25 deg, because the profile is a quintic
+/// and a line cannot describe its curvature. The distance a joint travels
+/// between turning points, though, is the ring itself — a profile has no
+/// turning points at all, however far or however unevenly it travels.
+fn ring_swings(history: &[i32]) -> (usize, f64) {
+    let mut turns: Vec<i64> = Vec::new();
     let mut last_dir = 0_i64;
+    let mut last_turn = history.first().map_or(0, |p| i64::from(*p));
     for pair in history.windows(2) {
         let d = i64::from(pair[1]) - i64::from(pair[0]);
         if d == 0 {
@@ -2245,11 +2267,32 @@ fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
         }
         let dir = d.signum();
         if last_dir != 0 && dir != last_dir {
-            reversals += 1;
+            turns.push((i64::from(pair[0]) - last_turn).abs());
+            last_turn = i64::from(pair[0]);
         }
         last_dir = dir;
     }
-    reversals >= RING_REVERSALS
+    if turns.is_empty() {
+        return (0, 0.0);
+    }
+    let reversals = turns.len();
+    turns.sort_unstable();
+    // The median swing, so one large excursion on the way into a pose cannot
+    // stand in for a sustained oscillation.
+    let median = turns[reversals / 2] as f64;
+    (reversals, median)
+}
+
+/// Whether these samples are a joint shaking rather than moving.
+///
+/// Both halves are needed. Reversals alone are satisfied by encoder noise on a
+/// joint standing still; amplitude alone is satisfied by any move.
+fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
+    if history.len() < RING_WINDOW_TICKS {
+        return false;
+    }
+    let (reversals, swing) = ring_swings(history);
+    reversals >= RING_REVERSALS && swing >= amplitude_ticks as f64
 }
 
 /// Whether these samples are a joint sliding one way rather than shaking.
@@ -2933,6 +2976,20 @@ fn search_gravity(
             }
         }
     let (held, drift) = best.expect("at least one attempt");
+    // This joint is holding the pose it was just calibrated for, so whatever it
+    // is doing now is what it does when it is working. That is the figure the
+    // oscillation rule has to beat.
+    let (reversals, swing) = ring_swings(&arm.history[joint]);
+    if reversals >= RING_REVERSALS {
+        arm.ring_floor[joint] = arm.ring_floor[joint].max(swing);
+        println!(
+            "  J{}: it dithers {:.4} deg holding this pose; a ring has to beat \
+             {:.4} deg",
+            joint + 1,
+            arm.deg_for_ticks(joint, swing as i64),
+            arm.deg_for_ticks(joint, arm.ring_threshold(joint))
+        );
+    }
     println!(
         "  J{}: gravity scale x{held:.3} holds it to {:+.4} deg/s",
         joint + 1,
@@ -3232,6 +3289,24 @@ mod tests {
         assert!(drifting_now(&droop, amplitude), "a sliding joint is drifting");
         assert!(!ringing_now(&droop, amplitude), "and it is not ringing");
 
+        // A COMMANDED MOVE is neither, however far it travels: the trend
+        // explains all of it. This is the case that failed a run for the wrist
+        // doing exactly what it was told.
+        let commanded: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| (k as i32) * 9 + if k % 3 == 0 { 1 } else { 0 })
+            .collect();
+        assert!(
+            !ringing_now(&commanded, amplitude),
+            "a move is not a ring, however large its span: {} ticks about trend",
+            ring_swings(&commanded).1
+        );
+        // A ring RIDING a move still is one: that is the case the continuous
+        // check exists for.
+        let both: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| (k as i32) * 9 + (60.0 * ((k as f64) * 0.35).sin()) as i32)
+            .collect();
+        assert!(ringing_now(&both, amplitude), "a ring on top of a move is a ring");
+
         // A joint sitting still is neither, however long it is watched.
         let still = vec![1234_i32; RING_WINDOW_TICKS];
         assert!(!ringing_now(&still, amplitude));
@@ -3243,6 +3318,23 @@ mod tests {
             .map(|k| if k % 2 == 0 { 0 } else { amplitude as i32 / 4 })
             .collect();
         assert!(!ringing_now(&dither, amplitude));
+    }
+
+    /// The continuous check must be able to see a ring at all.
+    ///
+    /// It could not: the per-joint history was capped at 250 samples while the
+    /// detector refused to judge fewer than 500, so every joint came back
+    /// "quiet" and the rule the tool reports on was inert. A length mismatch
+    /// like that is invisible — the output says the right thing either way.
+    #[test]
+    fn the_watch_window_is_long_enough_to_judge_a_ring() {
+        // The length relationship itself is a compile-time assertion beside the
+        // constants. What is left to check is that a full window of real
+        // shaking comes back as a ring.
+        let ring: Vec<i32> = (0..WATCH_WINDOW_TICKS)
+            .map(|k| (60.0 * ((k as f64) * 0.35).sin()) as i32)
+            .collect();
+        assert!(ringing_now(&ring, 20));
     }
 
     #[test]

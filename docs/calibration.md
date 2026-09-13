@@ -68,6 +68,12 @@ joint has actually reached a pose on it.
 - **Once a joint's feedforward is measured, any oscillation fails the run.**
   Every joint, every tick — a joint that rings only while a *different* joint
   is driven is invisible to a check that watches the joint under test.
+  Amplitude is measured between successive reversals, so a commanded move is
+  never mistaken for a ring however far it travels, and the bar is each joint's
+  own measured dither (taken where its scale is accepted) rather than one
+  constant for a whole arm: the elbow swings 0.119 deg holding 2 A at full
+  extension where the wrist swings 0.006, and a threshold below that would fail
+  every run on a healthy arm.
 
 ### Measured on this arm
 
@@ -86,7 +92,13 @@ essentially right for it — **provided the fitted gripper is in the chain**.
 Leaving the tool out of G(q) had the model asking for +25 mA at the wrist pitch
 where the drive was pulling −655 mA.
 
-One characteristic worth knowing: the elbow's drift readings scatter about
+Measured dither while holding a calibrated pose: J2 0.0009°, J3 0.1190°,
+J4 0.0055°, J5 0.0055°. The elbow is twenty times the rest, which is consistent
+with the ring that is audible from the arm at 0.204°; it is reported rather than
+chased, because no velocity gain fixes it (lower and the joint cannot move the
+load at all) and it sits below what can be heard.
+
+One more characteristic: the elbow's drift readings scatter about
 0.01–0.05 deg/s at its loaded pose, where the wrist and wrist pitch repeat to
 0.005. That is stiction in a joint carrying 2 A, and it is why the hold
 tolerance sits above that scatter and why verification re-measures rather than
