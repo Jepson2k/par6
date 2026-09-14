@@ -90,13 +90,14 @@ const RING_REVERSALS: usize = 8;
 /// points\]. Fifty ticks is 0.2 s, so anything from 2.5 Hz up.
 const RING_HALF_PERIOD_TICKS: usize = 50;
 
+/// Gravity torque below which a joint's feedforward cannot explain a ring
+/// \[Nm\]. The base and the wrist roll sit well under this at every pose.
+const GRAVITY_IRRELEVANT_NM: f64 = 0.10;
+
 /// How far above a joint's own measured dither a swing has to be before it is
 /// a ring rather than that joint working.
 const RING_OVER_FLOOR: f64 = 1.5;
 
-/// How long a ring has to persist before the run is over \[ticks\]: one whole
-/// further window of it, continuously.
-const RING_PERSIST_TICKS: usize = RING_WINDOW_TICKS;
 
 /// How long a joint is left alone after a move before anything judges it
 /// \[s\].
@@ -1104,6 +1105,13 @@ struct Arm {
     swing_scratch: Vec<i64>,
     /// The loudest thing each joint has done so far, for the report.
     noise: Vec<Noise>,
+    /// Joints the tick path found ringing, to be quietened between ticks.
+    quiet_now: Vec<bool>,
+    /// Per joint, what it was shaking by at each gain it has been tried on
+    /// \[(scale, deg)\] — the record of what was done about it.
+    quiet_trail: Vec<Vec<(f64, f64)>>,
+    /// Joints the ladder could not quieten, and why.
+    unquietable: Vec<Option<String>>,
     /// Every tick of the run.
     trace: Option<Trace>,
     /// sha256 of the config this run read, as the recording's identity.
@@ -1242,6 +1250,9 @@ impl Arm {
             current_history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
             swing_scratch: Vec::with_capacity(WATCH_WINDOW_TICKS + 1),
             noise: (0..n).map(|_| Noise::default()).collect(),
+            quiet_now: vec![false; n],
+            quiet_trail: vec![Vec::new(); n],
+            unquietable: vec![None; n],
             // Always. A run that leaves nothing behind cannot be asked
             // about afterwards, and every question worth asking about this
             // arm has come after the run.
@@ -1623,56 +1634,119 @@ impl Arm {
             .join(", ")
     }
 
-    /// The second rule: past step 1, the arm does not shake.
+    /// The second rule: the arm does not shake, and a joint that starts is
+    /// quietened where it stands.
     ///
-    /// Every tick, every joint — not at checkpoints. A joint that only rings
-    /// while a different joint is being driven is invisible to a check that
-    /// looks at the joint under test, and that is the ring that was reported
-    /// from the room while the tool reported success.
+    /// Every tick, every joint, from the first move — not at checkpoints and
+    /// not in a step at the end. A joint that rings on its way somewhere and
+    /// still arrives used to produce nothing at all: the run finished, the
+    /// summary said the gains were fine, and the arm had been shaking the
+    /// whole time in front of whoever was watching. Calibration exists to fix
+    /// that, so the response to a ring is a rung down the ladder and straight
+    /// back into the same motion.
+    ///
+    /// Marks the joint rather than retuning here: this runs inside the tick,
+    /// and pushing gains drives the bus itself.
     fn enforce_quiet(&mut self) -> Result<(), String> {
-        if !self.vibration_fatal || self.handing_over {
+        if self.handing_over {
             // Handing back is parking two joints onto their stops and letting
             // go; a verdict there stops the park and leaves the arm worse.
             return Ok(());
         }
-        // Asked as a question first, because this runs on every tick: the list
-        // is only built once something is actually wrong.
-        let mut sustained = false;
+        // Only where the tool is actually commanding the arm. A seek is
+        // hunting for a stall, so the joint is MEANT to be driven into
+        // something and stop; a limit push sends no frames at all while it
+        // waits for queue room, and a coast is the arm being left alone on
+        // purpose. Judging a joint's gains by what it does when nothing is
+        // driving it is how the simulated base walked the whole ladder down
+        // while standing still.
+        if !matches!(self.cadence.phase.as_str(), "move" | "gravity watch") {
+            return Ok(());
+        }
         let mut turns = std::mem::take(&mut self.swing_scratch);
         for j in 0..self.history.len() {
             let ringing = Some(j) != self.torque_only
-                && !self.awaiting_gravity[j]
                 && self.history[j].len() >= WATCH_WINDOW_TICKS
                 && ringing_now_into(&self.history[j], self.ring_threshold(j), &mut turns);
             self.ringing_for[j] = if ringing { self.ringing_for[j] + 1 } else { 0 };
-            sustained |= self.ringing_for[j] as usize >= RING_PERSIST_TICKS;
+            if !ringing {
+                continue;
+            }
+            if self.gravity_confounds(j) {
+                // This joint carries a load its feedforward still under-states,
+                // so it cannot sit on its target however well it is tuned, and
+                // dropping its gains here leaves it unable to move at all —
+                // the deadlock the elbow kept landing in. Step 2 measures it
+                // and the ring is judged again on the other side of that.
+                if !self.rang_while_homing[j] {
+                    println!(
+                        "    J{}: shaking, but its gravity feedforward is still a \
+                         guess — measured in step 2 and judged again there",
+                        j + 1
+                    );
+                }
+                self.rang_while_homing[j] = true;
+                continue;
+            }
+            self.quiet_now[j] = true;
         }
         self.swing_scratch = turns;
-        if !sustained {
-            return Ok(());
+        Ok(())
+    }
+
+    /// Whether a ring on this joint might be its gravity feedforward rather
+    /// than its gains.
+    ///
+    /// Only where there is a load to under-state. The base and the wrist roll
+    /// turn about their own gravity vector and carry none of it, so a ring
+    /// there is the loop and nothing else — which is why they are quietened
+    /// from the first move while the shoulder and elbow wait for step 2.
+    fn gravity_confounds(&self, joint: usize) -> bool {
+        if self.results.gravity_scale[joint].is_some() {
+            return false;
         }
-        let ringing: Vec<(usize, f64)> = self
-            .oscillating()
-            .into_iter()
-            .filter(|(j, _)| {
-                self.ringing_for[*j] as usize >= RING_PERSIST_TICKS
-                    && Some(*j) != self.torque_only
-                    && !self.awaiting_gravity[*j]
-            })
-            .collect();
-        if ringing.is_empty() {
-            return Ok(());
+        self.ma_to_torque(joint, f64::from(self.last_ff[joint])).abs() > GRAVITY_IRRELEVANT_NM
+    }
+
+    /// Quieten every joint the tick path asked to have quietened.
+    ///
+    /// Called between ticks, never inside one: [`Arm::push_scale`] sends its
+    /// own frames and waits for the drive to take them.
+    fn service_quiet(&mut self) -> Result<(), String> {
+        for j in 0..self.n() {
+            if !std::mem::take(&mut self.quiet_now[j]) {
+                continue;
+            }
+            let swing = self.deg_for_ticks(j, ring_swings(&self.history[j]).1 as i64);
+            self.quiet_trail[j].push((self.scales[j], swing));
+            println!(
+                "    J{} is shaking {swing:.3} deg at x{:.2} during '{}'",
+                j + 1,
+                self.scales[j],
+                self.cadence.phase
+            );
+            if let Err(e) = self.quieter_scale(j) {
+                // Out of rungs is a finding, not a reason to stop: the joints
+                // that have not been measured yet still can be, and the trace
+                // of the rest of the run is exactly what diagnosing this
+                // needs. The run fails at the end, with the whole story.
+                if self.unquietable[j].is_none() {
+                    println!("    {e}");
+                    self.unquietable[j] = Some(e);
+                }
+                self.quiet_now[j] = false;
+                self.history[j].clear();
+                self.error_history[j].clear();
+                self.ringing_for[j] = 0;
+                continue;
+            }
+            // Judge the new gain on what the joint does NEXT, not on the
+            // window that produced the last one.
+            self.history[j].clear();
+            self.error_history[j].clear();
+            self.ringing_for[j] = 0;
         }
-        let named: Vec<String> = ringing
-            .iter()
-            .map(|(j, deg)| format!("J{} at {deg:.3} deg", j + 1))
-            .collect();
-        Err(format!(
-            "oscillation after step 1 during '{}': {} — step 1's gains do not \
-             hold this arm",
-            self.cadence.phase,
-            named.join(", ")
-        ))
+        Ok(())
     }
 
     fn enforce_motion(&mut self) -> Result<(), String> {
@@ -1854,6 +1928,7 @@ impl Arm {
 
     /// One tick: build the standard frame into the owned buffer and send it.
     fn tick_frame(&mut self, active: Option<(usize, JointCommand)>) -> Result<(), String> {
+        self.service_quiet()?;
         let mut buf = std::mem::take(&mut self.cmds);
         buf.resize(self.n(), JointCommand::idle());
         self.fill_frame(&mut buf, active);
@@ -1867,6 +1942,7 @@ impl Arm {
         &mut self,
         mut build: impl FnMut(&Self, usize) -> JointCommand,
     ) -> Result<(), String> {
+        self.service_quiet()?;
         let mut buf = std::mem::take(&mut self.cmds);
         buf.resize(self.n(), JointCommand::idle());
         for (j, cmd) in buf.iter_mut().enumerate() {
@@ -2035,6 +2111,18 @@ impl Arm {
         println!("    J{} is under-driven: velocity gains -> x{next:.2}", joint + 1);
         self.push_scale(joint, next)?;
         Ok(next)
+    }
+
+    /// What was tried on this joint and what it shook by at each step.
+    fn quiet_story(&self, joint: usize) -> String {
+        if self.quiet_trail[joint].is_empty() {
+            return format!("J{} was never quietened", joint + 1);
+        }
+        let steps: Vec<String> = self.quiet_trail[joint]
+            .iter()
+            .map(|(scale, deg)| format!("x{scale:.2} shook {deg:.3} deg"))
+            .collect();
+        format!("J{}: {}", joint + 1, steps.join(" -> "))
     }
 
     /// Step down one rung of [`RING_LADDER`], never below what the joint has
@@ -3119,6 +3207,23 @@ fn main() {
         Some(n) => repeatability(&mut arm, n),
         None => Ok(()),
     });
+    // A joint the ladder could not quieten fails the run — after it, so the
+    // joints that could be measured still were, and the trace that says why
+    // is on disk.
+    let outcome = outcome.and_then(|()| {
+        let stuck: Vec<String> = (0..arm.n())
+            .filter_map(|j| {
+                arm.unquietable[j]
+                    .clone()
+                    .map(|why| format!("{why}\n  {}", arm.quiet_story(j)))
+            })
+            .collect();
+        if stuck.is_empty() {
+            Ok(())
+        } else {
+            Err(stuck.join("\n"))
+        }
+    });
     let scales = arm.scales.clone();
     match &outcome {
         Ok(()) => {
@@ -3169,6 +3274,22 @@ fn main() {
             }
         }
         Err(e) => eprintln!("\n{e}"),
+    }
+    let quietened: Vec<String> = (0..arm.n())
+        .filter(|j| !arm.quiet_trail[*j].is_empty())
+        .map(|j| {
+            let story = arm.quiet_story(j);
+            let now = arm.deg_for_ticks(j, arm.noise[j].moving.max(arm.noise[j].holding) as i64);
+            format!("  {story} -> kept x{:.2}, now {now:.3} deg", arm.scales[j])
+        })
+        .collect();
+    if quietened.is_empty() {
+        println!("\nnothing shook: no joint needed quietening");
+    } else {
+        println!("\nwhat was done about the shaking:");
+        for line in quietened {
+            println!("{line}");
+        }
     }
     // Printed whatever the outcome: this is evidence about what the arm
     // sounded like, and a failed run is exactly when it is wanted.
