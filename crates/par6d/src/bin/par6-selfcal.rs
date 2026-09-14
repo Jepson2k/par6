@@ -86,6 +86,10 @@ const RING_LADDER: [f64; 5] = [1.0, 0.8, 0.64, 0.51, 0.41];
 const RING_WINDOW_TICKS: usize = 500;
 const RING_REVERSALS: usize = 8;
 
+/// The slowest reversal that still counts as shaking \[ticks between turning
+/// points\]. Fifty ticks is 0.2 s, so anything from 2.5 Hz up.
+const RING_HALF_PERIOD_TICKS: usize = 50;
+
 /// How far above a joint's own measured dither a swing has to be before it is
 /// a ring rather than that joint working.
 const RING_OVER_FLOOR: f64 = 1.5;
@@ -506,14 +510,82 @@ impl Cadence {
     }
 }
 
+/// The comment written beside a gain this run raised.
+///
+/// A second run starts from the config a first run wrote, so `scale` is
+/// relative to a value that may itself already be scaled. Reading the earlier
+/// comment back keeps the total honest — otherwise the third apply still
+/// claims "x1.25 of the vendor value" while the drive is on x1.95 of it.
+fn gain_note(existing: &str, scale: f64) -> String {
+    let prior = existing
+        .split("selfcal: x")
+        .nth(1)
+        .and_then(|rest| {
+            rest.split(|c: char| !(c.is_ascii_digit() || c == '.'))
+                .next()
+                .and_then(|n| n.parse::<f64>().ok())
+        })
+        .filter(|p| *p > 0.0);
+    match prior {
+        Some(p) => format!(
+            "# selfcal: x{:.3} of the vendor value (x{scale:.3} again this run)",
+            p * scale
+        ),
+        None => format!("# selfcal: x{scale:.3} of the vendor value"),
+    }
+}
+
+/// The loudest thing a joint did, in both channels, with the phase it did it
+/// in.
+///
+/// Recorded on every joint from the first tick and never used to judge
+/// anything: the thresholds in this tool were set from one audible datum, and
+/// a run that PASSES while somebody in the room can hear the arm shaking is a
+/// run whose measurements have to be read before its bars are moved again.
+struct Noise {
+    /// Worst swing between reversals while the joint was travelling \[ticks\].
+    moving: f64,
+    moving_phase: String,
+    /// Worst swing between reversals while it was holding \[ticks\].
+    holding: f64,
+    holding_phase: String,
+    /// Worst swing between reversals in the drive current \[mA\].
+    ripple: f64,
+    ripple_phase: String,
+}
+
+impl Default for Noise {
+    fn default() -> Self {
+        Self {
+            moving: 0.0,
+            // Preallocated: these are written from the tick path, where
+            // growing a String is an allocation like any other.
+            moving_phase: String::with_capacity(PHASE_NAME_BYTES),
+            holding: 0.0,
+            holding_phase: String::with_capacity(PHASE_NAME_BYTES),
+            ripple: 0.0,
+            ripple_phase: String::with_capacity(PHASE_NAME_BYTES),
+        }
+    }
+}
+
+/// Room for the longest phase name, so recording one never reallocates.
+const PHASE_NAME_BYTES: usize = 64;
+
 /// What the run measured, accumulated as it goes so a later failure cannot
 /// take the earlier answers down with it.
 #[derive(Default)]
 struct Results {
     /// Velocity-gain scale per joint that homing needed.
     gain_scale: Vec<f64>,
-    /// Gravity scale per joint that held it at its most loaded pose.
-    gravity_scale: Vec<f64>,
+    /// Gravity scale per joint that held it at its most loaded pose, where
+    /// this run measured one.
+    ///
+    /// `None` is not "one": it is "not measured", and the two have to stay
+    /// apart. A run that fails before it reaches the elbow must leave the
+    /// elbow's scale — very likely an earlier run's measurement — exactly
+    /// where it is, instead of writing a default over it.
+    gravity_scale: Vec<Option<f64>>,
     /// Home reference per joint \[rad\], as latched.
     home_rad: Vec<Option<f64>>,
     /// Seek current per joint the arm actually needed \[mA\], where it is not
@@ -525,7 +597,7 @@ impl Results {
     fn new(n: usize) -> Self {
         Self {
             gain_scale: vec![1.0; n],
-            gravity_scale: vec![1.0; n],
+            gravity_scale: vec![None; n],
             home_rad: vec![None; n],
             seek_ma: vec![None; n],
         }
@@ -583,18 +655,19 @@ impl Results {
             let j = joint.saturating_sub(1);
             let scale = self.gain_scale.get(j).copied().unwrap_or(1.0);
             if in_gains && scale != 1.0 && j < robot.joints.len() {
-                if let Some(rest) = trimmed.strip_prefix("kpv = ") {
-                    let _ = rest;
+                if trimmed.starts_with("kpv = ") {
                     out.push_str(&format!(
-                        "kpv = {:.6}  # selfcal: x{scale:.3} of the vendor value\n",
-                        robot.joints[j].gains.kpv * scale
+                        "kpv = {:.6}  {}\n",
+                        robot.joints[j].gains.kpv * scale,
+                        gain_note(line, scale)
                     ));
                     continue;
                 }
                 if trimmed.starts_with("kiv = ") {
                     out.push_str(&format!(
-                        "kiv = {:.6}  # selfcal: x{scale:.3} of the vendor value\n",
-                        robot.joints[j].gains.kiv * scale
+                        "kiv = {:.6}  {}\n",
+                        robot.joints[j].gains.kiv * scale,
+                        gain_note(line, scale)
                     ));
                     continue;
                 }
@@ -606,10 +679,17 @@ impl Results {
         // field for exactly this: a per-joint feedforward trim that changes no
         // torque constant. Written at the top level, above the first section,
         // where a bare key has to live in TOML.
-        if self.gravity_scale.iter().any(|s| *s != 1.0) {
-            let values: Vec<String> = (0..6)
-                .map(|j| format!("{:.4}", self.gravity_scale.get(j).copied().unwrap_or(1.0)))
-                .collect();
+        // What each joint ends up on: this run's measurement where there is
+        // one, and otherwise whatever the config already carries — which on a
+        // second run is the previous run's answer.
+        let effective: Vec<f64> = (0..6).map(|j| self.gravity_for(j, robot)).collect();
+        if effective
+            .iter()
+            .enumerate()
+            .any(|(j, s)| *s != 1.0 || *s != robot.gravity_scale.get(j).copied().unwrap_or(1.0))
+        {
+            let values: Vec<String> =
+                effective.iter().map(|s| format!("{s:.4}")).collect();
             let line = format!("gravity_scale = [{}]", values.join(", "));
             let mut replaced = false;
             let mut with_scale = String::new();
@@ -630,11 +710,21 @@ impl Results {
         }
         std::fs::write(config, &out).map_err(|e| format!("writing {}: {e}", config.display()))?;
         println!(
-            "  applied to {}; the original is {}",
+            "  applied to {}; the config as it was before this run is {}",
             config.display(),
             backup.display()
         );
         Ok(())
+    }
+
+    /// The scale a joint ends a run on: measured here, or carried from the
+    /// config, which is where a previous run's answer lives.
+    fn gravity_for(&self, joint: usize, robot: &RobotConfig) -> f64 {
+        self.gravity_scale
+            .get(joint)
+            .copied()
+            .flatten()
+            .unwrap_or_else(|| robot.gravity_scale.get(joint).copied().unwrap_or(1.0))
     }
 
     /// Write what was measured as a TOML patch.
@@ -649,10 +739,16 @@ impl Results {
         s.push_str("# file is never read back by anything.\n");
         for (j, joint) in robot.joints.iter().enumerate() {
             let gain = self.gain_scale.get(j).copied().unwrap_or(1.0);
-            let grav = self.gravity_scale.get(j).copied().unwrap_or(1.0);
+            let configured = robot.gravity_scale.get(j).copied().unwrap_or(1.0);
+            let grav = self
+                .gravity_scale
+                .get(j)
+                .copied()
+                .flatten()
+                .filter(|g| *g != configured);
             let home = self.home_rad.get(j).copied().flatten();
             let seek = self.seek_ma.get(j).copied().flatten();
-            if gain == 1.0 && grav == 1.0 && home.is_none() && seek.is_none() {
+            if gain == 1.0 && grav.is_none() && home.is_none() && seek.is_none() {
                 continue;
             }
             s.push_str(&format!("\n# --- J{} ---\n", j + 1));
@@ -668,8 +764,10 @@ impl Results {
                     joint.gains.kiv * gain
                 ));
             }
-            if grav != 1.0 {
-                s.push_str(&format!("# gravity_scale = {grav:.4}\n"));
+            if let Some(g) = grav {
+                s.push_str(&format!(
+                    "# gravity_scale = {g:.4}  (the config has {configured:.4})\n"
+                ));
             }
             if let Some(ma) = seek {
                 s.push_str(&format!(
@@ -795,6 +893,26 @@ struct Arm {
     /// point of monitoring all of them is that a joint left ringing by stage 1
     /// shows up wherever it is, not only while it is the one being worked on.
     history: Vec<Vec<i32>>,
+    /// The same window of TRACKING ERROR per joint \[ticks\]: measured
+    /// position minus the position it was commanded to be at.
+    ///
+    /// Raw position cannot say whether a joint is shaking while it travels —
+    /// a nudge that reverses, or a seek that stalls and backs off, swings the
+    /// encoder by degrees on purpose. Against its own setpoint a joint doing
+    /// what it was told is flat, however far or however fast it goes, so
+    /// anything left is the joint disagreeing with the command.
+    error_history: Vec<Vec<i32>>,
+    /// The same window of drive current per joint \[mA\].
+    ///
+    /// A drive can chatter loudly while moving the encoder less than a tick,
+    /// and at 250 Hz the position channel cannot see it at all. The current it
+    /// takes to do that is visible here.
+    current_history: Vec<Vec<i16>>,
+    /// Scratch for the swing measurement, so the per-tick oscillation check
+    /// does not allocate.
+    swing_scratch: Vec<i64>,
+    /// The loudest thing each joint has done so far, for the report.
+    noise: Vec<Noise>,
     /// The next tick's absolute wake target on the monotonic clock.
     next_deadline: Duration,
     /// Where homing left the arm \[rad\]: every sweep pose is an offset from
@@ -924,6 +1042,10 @@ impl Arm {
             measuring: false,
             vibration_fatal: false,
             history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
+            error_history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
+            current_history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
+            swing_scratch: Vec::with_capacity(WATCH_WINDOW_TICKS + 1),
+            noise: (0..n).map(|_| Noise::default()).collect(),
             next_deadline: monotonic_now(),
             ready_pose: [0.0; par6_kin::NQ],
             kin: gravity_model(assets_dir, gripper)?,
@@ -1184,6 +1306,83 @@ impl Arm {
         self.enforce_motion()
     }
 
+    /// Measure one joint's noise, in both channels, and keep the worst.
+    ///
+    /// One joint per tick, round-robin: every joint is measured every six
+    /// ticks, which is twenty-four milliseconds and far finer than anything
+    /// the ear is being asked to match, at a sixth of the cost of doing all
+    /// of them every tick.
+    fn sample_noise(&mut self) {
+        let n = self.history.len();
+        if n == 0 {
+            return;
+        }
+        let j = self.tick as usize % n;
+        if self.error_history[j].len() < WATCH_WINDOW_TICKS {
+            return;
+        }
+        let mut turns = std::mem::take(&mut self.swing_scratch);
+        let pos = swings_into(&self.error_history[j], &mut turns);
+        let cur = swings_into(&self.current_history[j], &mut turns);
+        self.swing_scratch = turns;
+        // Travelling or holding, decided from the joint itself rather than
+        // from what the tool believes it asked for: an approach that has ended
+        // and a joint that was never commanded look the same from here, and
+        // both are holds.
+        let moving = span_ticks(&self.history[j]) > self.arrival_tol(j);
+        // Disjoint fields, so the phase can be read while the record is
+        // written.
+        let phase = &self.cadence.phase;
+        let noise = &mut self.noise[j];
+        if pos.reversals >= RING_REVERSALS {
+            let (worst, seen_in) = if moving {
+                (&mut noise.moving, &mut noise.moving_phase)
+            } else {
+                (&mut noise.holding, &mut noise.holding_phase)
+            };
+            if pos.worst > *worst {
+                *worst = pos.worst;
+                seen_in.clear();
+                seen_in.push_str(phase);
+            }
+        }
+        if cur.reversals >= RING_REVERSALS && cur.worst > noise.ripple {
+            noise.ripple = cur.worst;
+            noise.ripple_phase.clear();
+            noise.ripple_phase.push_str(phase);
+        }
+    }
+
+    /// The two loudest joints right now, as one line.
+    ///
+    /// Printed where the arm is standing still and somebody is listening, so
+    /// what is heard and what is measured can be put side by side.
+    fn noise_line(&mut self) -> String {
+        let mut turns = std::mem::take(&mut self.swing_scratch);
+        let mut rows: Vec<(usize, f64, f64)> = Vec::new();
+        for j in 0..self.history.len() {
+            if self.error_history[j].len() < WATCH_WINDOW_TICKS {
+                continue;
+            }
+            let pos = swings_into(&self.error_history[j], &mut turns);
+            let cur = swings_into(&self.current_history[j], &mut turns);
+            rows.push((j, pos.median, cur.median));
+        }
+        self.swing_scratch = turns;
+        rows.sort_by(|a, b| b.1.total_cmp(&a.1));
+        rows.truncate(2);
+        rows.iter()
+            .map(|(j, swing, ripple)| {
+                format!(
+                    "J{} {:.3} deg / {ripple:.0} mA",
+                    j + 1,
+                    self.deg_for_ticks(*j, *swing as i64)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
     /// The second rule: past step 1, the arm does not shake.
     ///
     /// Every tick, every joint — not at checkpoints. A joint that only rings
@@ -1199,14 +1398,16 @@ impl Arm {
         // Asked as a question first, because this runs on every tick: the list
         // is only built once something is actually wrong.
         let mut sustained = false;
+        let mut turns = std::mem::take(&mut self.swing_scratch);
         for j in 0..self.history.len() {
             let ringing = Some(j) != self.torque_only
                 && !self.awaiting_gravity[j]
                 && self.history[j].len() >= WATCH_WINDOW_TICKS
-                && ringing_now(&self.history[j], self.ring_threshold(j));
+                && ringing_now_into(&self.history[j], self.ring_threshold(j), &mut turns);
             self.ringing_for[j] = if ringing { self.ringing_for[j] + 1 } else { 0 };
             sustained |= self.ringing_for[j] as usize >= RING_PERSIST_TICKS;
         }
+        self.swing_scratch = turns;
         if !sustained {
             return Ok(());
         }
@@ -1301,8 +1502,28 @@ impl Arm {
                 if self.history[j].len() > WATCH_WINDOW_TICKS {
                     self.history[j].remove(0);
                 }
+                match cmds.get(j).and_then(|c| c.pos) {
+                    Some(target) => {
+                        self.error_history[j].push(p.saturating_sub(target));
+                        if self.error_history[j].len() > WATCH_WINDOW_TICKS {
+                            self.error_history[j].remove(0);
+                        }
+                    }
+                    // No setpoint this tick — a velocity push, or a joint let
+                    // go on torque only. There is no error to measure, and
+                    // stitching the next position-held window onto this one
+                    // would read the change of regime as a swing.
+                    None => self.error_history[j].clear(),
+                }
+            }
+            if let Some(c) = self.state.nodes[usize::from(self.robot.joints[j].node_id)].current_ma {
+                self.current_history[j].push(c);
+                if self.current_history[j].len() > WATCH_WINDOW_TICKS {
+                    self.current_history[j].remove(0);
+                }
             }
         }
+        self.sample_noise();
         self.tick_gravity();
         self.enforce_rules()?;
         self.bus
@@ -2374,29 +2595,83 @@ fn slope_per_s(samples: &[(f64, f64)]) -> Option<f64> {
 /// turning points at all, however far or however unevenly it travels.
 fn ring_swings(history: &[i32]) -> (usize, f64) {
     let mut turns: Vec<i64> = Vec::new();
+    let s = swings_into(history, &mut turns);
+    (s.reversals, s.median)
+}
+
+/// What a run of samples does between its turning points.
+#[derive(Clone, Copy, Debug, Default)]
+struct Swings {
+    reversals: usize,
+    /// The typical swing, which is what a sustained oscillation shows.
+    median: f64,
+    /// The largest swing, which is what a BURST shows — a tenth of a second
+    /// of buzz inside a two-second window leaves the median at the quiet
+    /// value, and that is a shake somebody in the room can hear.
+    worst: f64,
+}
+
+/// The swings in `samples`, using `turns` as scratch so nothing allocates.
+///
+/// Generic over the sample type because the same question is asked of encoder
+/// position and of drive current: chatter that barely moves the encoder still
+/// reverses the current hard, and that is the channel a 250 Hz position
+/// sampler cannot see.
+fn swings_into<T: Copy + Into<i64>>(samples: &[T], turns: &mut Vec<i64>) -> Swings {
+    turns.clear();
     let mut last_dir = 0_i64;
-    let mut last_turn = history.first().map_or(0, |p| i64::from(*p));
-    for pair in history.windows(2) {
-        let d = i64::from(pair[1]) - i64::from(pair[0]);
+    let mut last_turn = samples.first().map_or(0, |p| (*p).into());
+    let mut last_turn_at = 0_usize;
+    for (k, pair) in samples.windows(2).enumerate() {
+        let d: i64 = pair[1].into() - pair[0].into();
         if d == 0 {
             continue;
         }
         let dir = d.signum();
         if last_dir != 0 && dir != last_dir {
-            turns.push((i64::from(pair[0]) - last_turn).abs());
-            last_turn = i64::from(pair[0]);
+            let at: i64 = pair[0].into();
+            // Only a FAST reversal is a shake. A seek that stalls and backs
+            // off, or a move that comes back, reverses too — seconds apart —
+            // and the distance it covers between those turns is the travel
+            // itself. Unbounded, the largest swing on the base came out at 60
+            // deg, which is the base doing its job.
+            if k - last_turn_at <= RING_HALF_PERIOD_TICKS {
+                turns.push((at - last_turn).abs());
+            }
+            last_turn = at;
+            last_turn_at = k;
         }
         last_dir = dir;
     }
     if turns.is_empty() {
-        return (0, 0.0);
+        return Swings::default();
     }
     let reversals = turns.len();
     turns.sort_unstable();
-    // The median swing, so one large excursion on the way into a pose cannot
-    // stand in for a sustained oscillation.
-    let median = turns[reversals / 2] as f64;
-    (reversals, median)
+    Swings {
+        reversals,
+        // The median swing, so one large excursion on the way into a pose
+        // cannot stand in for a sustained oscillation.
+        median: turns[reversals / 2] as f64,
+        worst: turns[reversals - 1] as f64,
+    }
+}
+
+/// How far a window of samples spans end to end, which separates a joint that
+/// is travelling from one that is sitting still and shaking.
+fn span_ticks(history: &[i32]) -> i64 {
+    let mut lo = i64::MAX;
+    let mut hi = i64::MIN;
+    for p in history {
+        let v = i64::from(*p);
+        lo = lo.min(v);
+        hi = hi.max(v);
+    }
+    if lo > hi {
+        0
+    } else {
+        hi - lo
+    }
 }
 
 /// Whether these samples are a joint shaking rather than moving.
@@ -2404,11 +2679,18 @@ fn ring_swings(history: &[i32]) -> (usize, f64) {
 /// Both halves are needed. Reversals alone are satisfied by encoder noise on a
 /// joint standing still; amplitude alone is satisfied by any move.
 fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
+    let mut turns: Vec<i64> = Vec::new();
+    ringing_now_into(history, amplitude_ticks, &mut turns)
+}
+
+/// The same question asked from the tick path, where allocating is not
+/// allowed: this runs on every joint on every tick once the window is full.
+fn ringing_now_into(history: &[i32], amplitude_ticks: i64, turns: &mut Vec<i64>) -> bool {
     if history.len() < RING_WINDOW_TICKS {
         return false;
     }
-    let (reversals, swing) = ring_swings(history);
-    reversals >= RING_REVERSALS && swing >= amplitude_ticks as f64
+    let s = swings_into(history, turns);
+    s.reversals >= RING_REVERSALS && s.median >= amplitude_ticks as f64
 }
 
 /// Whether these samples are a joint sliding one way rather than shaking.
@@ -2605,7 +2887,8 @@ fn main() {
             for j in 0..arm.n() {
                 let gain = scales.get(j).copied().unwrap_or(1.0);
                 let seek = arm.results.seek_ma[j];
-                let grav = arm.results.gravity_scale.get(j).copied().unwrap_or(1.0);
+                let measured = arm.results.gravity_scale.get(j).copied().flatten();
+                let grav = measured.unwrap_or_else(|| arm.grav_scale[j]);
                 let dither = arm.deg_for_ticks(j, arm.ring_floor[j] as i64);
                 println!(
                     "  J{:<3}{:>10}{:>10}{:>10}{:>10}{:>10}",
@@ -2623,8 +2906,11 @@ fn main() {
                         .unwrap_or_else(|| "vendor".into()),
                     if grav == 1.0 {
                         "vendor".to_string()
-                    } else {
+                    } else if measured.is_some() {
                         format!("x{grav:.3}")
+                    } else {
+                        // Carried from the config, not measured this run.
+                        format!("x{grav:.3} cfg")
                     },
                     if dither > 0.0 {
                         format!("{dither:.3} deg")
@@ -2639,6 +2925,37 @@ fn main() {
         }
         Err(e) => eprintln!("\n{e}"),
     }
+    // Printed whatever the outcome: this is evidence about what the arm
+    // sounded like, and a failed run is exactly when it is wanted.
+    println!("\nwhat it sounded like, worst swing between reversals:");
+    println!(
+        "  {:<4}{:>12}{:>12}{:>12}  loudest during",
+        "", "moving", "holding", "current"
+    );
+    for j in 0..arm.n() {
+        let n = &arm.noise[j];
+        if n.moving == 0.0 && n.holding == 0.0 && n.ripple == 0.0 {
+            continue;
+        }
+        let loudest = if n.moving >= n.holding {
+            &n.moving_phase
+        } else {
+            &n.holding_phase
+        };
+        println!(
+            "  J{:<3}{:>12}{:>12}{:>12}  {}",
+            j + 1,
+            format!("{:.3} deg", arm.deg_for_ticks(j, n.moving as i64)),
+            format!("{:.3} deg", arm.deg_for_ticks(j, n.holding as i64)),
+            format!("{:.0} mA", n.ripple),
+            if loudest.is_empty() { "-" } else { loudest.as_str() },
+        );
+    }
+    println!(
+        "  reported, not judged: the bar is {:.3} deg and was set from one \
+         audible datum",
+        RING_AMPLITUDE_DEG
+    );
     if let Some((mean, p99, worst, n)) = arm.cadence.summary() {
         println!(
             "\ncommand cadence over {n} ticks: target {:.0} us, mean {mean:.0}, p99 under {p99}, \
@@ -2741,7 +3058,27 @@ fn step2(arm: &mut Arm) -> Result<(), String> {
     // Distal first: every joint carries what is beyond it, so the wrist has to
     // be right before the elbow's reading means anything.
     let order: [usize; 4] = [4, 3, 2, 1];
+    // Start from what the config carries, which after an --apply is the last
+    // run's answer. The pass/fail test is unchanged and absolute — a joint
+    // still has to HOLD — so starting nearer cannot make a wrong scale pass;
+    // it only spends the attempts refining instead of rediscovering.
     let mut scales = [1.0_f64; par6_kin::NQ];
+    for (j, s) in scales.iter_mut().enumerate().take(arm.n()) {
+        *s = arm.grav_scale[j];
+    }
+    let carried: Vec<String> = (0..arm.n())
+        .filter(|j| scales[*j] != 1.0)
+        .map(|j| format!("J{} x{:.4}", j + 1, scales[j]))
+        .collect();
+    if carried.is_empty() {
+        println!("  starting from the vendor's model on every joint");
+    } else {
+        println!(
+            "  starting from the scales already in the config ({}); this run \
+             refines them",
+            carried.join(", ")
+        );
+    }
     for joint in order {
         let pose = arm.loaded_pose(joint)?;
         println!(
@@ -2753,14 +3090,22 @@ fn step2(arm: &mut Arm) -> Result<(), String> {
             let s = arm.travel_time(j, *target);
             arm.move_to(j, *target, s)?;
         }
-        let held = search_gravity(arm, joint, &pose, &scales, 1.0)?;
+        let from = scales[joint];
+        let held = search_gravity(arm, joint, &pose, &scales, from)?;
+        if from != 1.0 {
+            println!(
+                "  J{}: the config's x{from:.4} refines to x{held:.4} ({:+.2}%)",
+                joint + 1,
+                (held / from - 1.0) * 100.0
+            );
+        }
         scales[joint] = held;
         // Every later approach move holds this joint on the scale just
         // measured, not on the config's guess — and from here it is held to
         // the no-oscillation rule like everything else.
         arm.grav_scale[joint] = held;
         arm.awaiting_gravity[joint] = false;
-        arm.results.gravity_scale[joint] = held;
+        arm.results.gravity_scale[joint] = Some(held);
     }
 
     println!("\n# measured gravity scale per joint");
@@ -2931,10 +3276,19 @@ impl Arm {
         }
         self.measuring = false;
         self.torque_only = None;
+        // Said out loud while the arm is still standing in the pose it was
+        // measured in, so what the room hears and what the encoder saw can be
+        // compared at the moment it happens.
+        let heard = self.noise_line();
+        if !heard.is_empty() {
+            println!("    loudest through that hold: {heard}");
+        }
         // What this joint did while it was let go is a measurement, not
         // evidence about its gains — and the window outlives the release, so
         // leaving it in place would have the rule judge the next move on it.
         self.history[joint].clear();
+        self.error_history[joint].clear();
+        self.current_history[joint].clear();
         Ok(sag_rate(&samples, g[joint]).unwrap_or(drift / GRAVITY_WATCH_S))
     }
 
@@ -2953,6 +3307,37 @@ impl Arm {
 /// Used by step 2 to measure it and by step 3 to refine it when verification
 /// disagrees: the same search either way, so a verification miss feeds back
 /// into the number instead of discarding it.
+/// The scale where the drift crosses zero, from a sagging probe and a lifting
+/// one.
+///
+/// `None` when the probes do not straddle zero, when the two nearest ones are
+/// the same scale, or when the crossing is close enough to `settled` that
+/// testing it would only measure the noise.
+fn bracket(probes: &[(f64, f64)], settled: f64) -> Option<f64> {
+    let sag = probes
+        .iter()
+        .filter(|(_, d)| *d > 0.0)
+        .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))?;
+    let lift = probes
+        .iter()
+        .filter(|(_, d)| *d < 0.0)
+        .min_by(|a, b| a.1.abs().total_cmp(&b.1.abs()))?;
+    let ds = lift.0 - sag.0;
+    if ds.abs() < 1.0e-6 {
+        return None;
+    }
+    let zero = sag.0 + (0.0 - sag.1) * ds / (lift.1 - sag.1);
+    let (lo, hi) = if sag.0 < lift.0 {
+        (sag.0, lift.0)
+    } else {
+        (lift.0, sag.0)
+    };
+    if zero <= lo || zero >= hi || (zero - settled).abs() < 0.005 {
+        return None;
+    }
+    Some(zero)
+}
+
 fn search_gravity(
     arm: &mut Arm,
     joint: usize,
@@ -2962,6 +3347,13 @@ fn search_gravity(
 ) -> Result<f64, String> {
         let mut scale = start;
         let mut best: Option<(f64, f64)> = None;
+    // Every (scale, drift) this search measured. The loop stops at the first
+    // scale that holds, and which one that is depends on where the search
+    // STARTED — so two runs of the same arm answer differently by as much as
+    // the accept band is wide. The pairs are what fixes that: taken together
+    // they locate the scale where the drift is zero, independent of the path
+    // taken to them.
+    let mut probes: Vec<(f64, f64)> = Vec::new();
     // The previous (scale, drift) pair, which is what makes the next step a
     // measurement rather than a guess.
         let mut last: Option<(f64, f64)> = None;
@@ -3008,6 +3400,7 @@ fn search_gravity(
                     " — lifting"
                 }
             );
+            probes.push((scale, drift));
             if best.is_none_or(|(_, d): (f64, f64)| drift.abs() < d.abs()) {
                 best = Some((scale, drift));
             }
@@ -3121,6 +3514,41 @@ fn search_gravity(
             }
         }
     let (held, drift) = best.expect("at least one attempt");
+    // Banked before anything optional runs. This scale has already held twice
+    // from fresh approaches, and the refinement below can fail on the bus like
+    // any other move — a failure there must not turn a joint that measured into
+    // a joint that did not, which is how the caller would read it and what the
+    // patch file would then leave out.
+    arm.grav_scale[joint] = held;
+    arm.results.gravity_scale[joint] = Some(held);
+    // If the search saw the joint sag at one scale and lift at another, the
+    // answer is between them, and interpolating is a measurement rather than a
+    // guess. It is only adopted if it actually holds better than the scale the
+    // search stopped on, so a bad interpolation costs one hold and nothing
+    // else.
+    let (held, drift) = match bracket(&probes, held) {
+        Some(candidate) => {
+            for (j, target) in pose.iter().enumerate().take(arm.n()) {
+                let s = arm.travel_time(j, *target);
+                arm.move_to(j, *target, s)?;
+            }
+            let d = arm.hold_on_gravity(joint, pose, candidate, settled)?;
+            println!(
+                "    J{}: the sag and the lift put zero at x{candidate:.4}; it drifts \
+                 {:+.4} deg/s there",
+                joint + 1,
+                d.to_degrees()
+            );
+            if d.abs() < drift.abs() {
+                arm.grav_scale[joint] = candidate;
+                arm.results.gravity_scale[joint] = Some(candidate);
+                (candidate, d)
+            } else {
+                (held, drift)
+            }
+        }
+        None => (held, drift),
+    };
     // This joint is holding the pose it was just calibrated for, so whatever it
     // is doing now is what it does when it is working. That is the figure the
     // oscillation rule has to beat.
@@ -3177,7 +3605,7 @@ fn step3(arm: &mut Arm, scales: &[f64; par6_kin::NQ]) -> Result<(), String> {
                         search_gravity(arm, joint, &pose, &scales, scales[joint])?;
                     scales[joint] = refined;
                     arm.grav_scale[joint] = refined;
-                    arm.results.gravity_scale[joint] = refined;
+                    arm.results.gravity_scale[joint] = Some(refined);
                 }
             }
             Err(failed) => return Err(failed.detail),
@@ -3522,6 +3950,58 @@ mod tests {
         assert!(ringing_now(&ring, 20));
     }
 
+    /// The burst figure has to survive a COMMANDED reversal.
+    ///
+    /// The report's "worst swing" exists to catch a shake too short to move a
+    /// median. Measured without a bound on how fast a reversal has to be, a
+    /// seek that drives one way and backs off the other counts the whole of
+    /// that travel as one swing: the simulated run reported 60 deg on the base
+    /// and 69 deg on the wrist, which is both joints doing exactly what they
+    /// were told.
+    #[test]
+    fn a_slow_reversal_is_travel_and_a_fast_one_is_a_shake() {
+        let mut turns: Vec<i64> = Vec::new();
+        let out_and_back: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| {
+                let half = RING_WINDOW_TICKS as i32 / 2;
+                let k = k as i32;
+                if k < half { k * 20 } else { (RING_WINDOW_TICKS as i32 - k) * 20 }
+            })
+            .collect();
+        let travel = swings_into(&out_and_back, &mut turns);
+        assert_eq!(
+            travel.worst, 0.0,
+            "a single slow reversal is travel, not a swing"
+        );
+
+        let ring: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| (60.0 * ((k as f64) * 0.35).sin()) as i32)
+            .collect();
+        let shaking = swings_into(&ring, &mut turns);
+        assert!(
+            shaking.worst >= 100.0 && shaking.reversals >= RING_REVERSALS,
+            "a 3 Hz shake is measured: {shaking:?} swings"
+        );
+        // And the burst the median hides: a short buzz on top of the single
+        // encoder tick every joint dithers by. The median is the dither,
+        // because that is most of the window; the buzz is only in the worst.
+        let burst: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| {
+                let dither = (k % 2) as i32;
+                if (100..140).contains(&k) {
+                    dither + (k % 2) as i32 * 40
+                } else {
+                    dither
+                }
+            })
+            .collect();
+        let bursting = swings_into(&burst, &mut turns);
+        assert!(
+            bursting.worst >= 40.0 && bursting.median < bursting.worst,
+            "the burst is in the worst figure and not in the median: {bursting:?}"
+        );
+    }
+
     /// The tick path allocates nothing once it is running.
     ///
     /// The house rule for an RT tick path, and this tool is one: it paces the
@@ -3535,6 +4015,11 @@ mod tests {
         let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let bundle = ConfigBundle::load(&config).expect("config");
         let mut arm = Arm::open(&bundle, &assets, true).expect("simulated arm");
+        // With the rule ARMED. Left off, the oscillation check returns on its
+        // first line and the measurement behind it — which runs on every joint
+        // on every tick — is never reached, so the test passed while that path
+        // allocated. The same shape of gap made the rule itself inert once.
+        arm.vibration_fatal = true;
 
         // Warm everything the first tick would touch: the bus's own buffers,
         // the gravity model's lazy setup, the history vectors.
@@ -3604,7 +4089,7 @@ mod tests {
         // different sections, each of which repeats per joint.
         results.gain_scale[2] = 1.25;
         results.seek_ma[1] = Some(1125.0);
-        results.gravity_scale[2] = 1.08;
+        results.gravity_scale[2] = Some(1.08);
         results.apply(&path, &robot).expect("apply");
         let patched = std::fs::read_to_string(&path).expect("read back");
 
@@ -3627,6 +4112,34 @@ mod tests {
             patched.contains(&j0) || patched.contains(&format!("kpv = {:.3}", robot.joints[0].gains.kpv)),
             "joint 1 is left alone"
         );
+        let backup = std::fs::read_to_string(dir.join("PAR6.toml.before-selfcal")).expect("backup");
+        assert_eq!(backup, original, "the backup is the file as it was");
+
+        // A SECOND run reads the config the first one wrote. Its gains are
+        // relative to that, its gravity scales carry where it measured none,
+        // and the comment has to describe the drive rather than the last edit.
+        let again = ConfigBundle::load(&path).expect("load the patched config");
+        let mut second = Results::new(again.robot.joints.len());
+        second.gain_scale[2] = 1.25;
+        second.apply(&path, &again.robot).expect("apply again");
+        let twice = std::fs::read_to_string(&path).expect("read back");
+        let compounded = format!("kpv = {:.6}", again.robot.joints[2].gains.kpv * 1.25);
+        assert!(
+            twice.contains(&compounded),
+            "the second run raises the gain the first run wrote ({compounded})"
+        );
+        // The shipped config already carries x1.250 from an earlier session,
+        // so two more steps of x1.25 put the drive on x1.953 of the vendor
+        // value — which is what the comment has to say.
+        assert!(
+            twice.contains("x1.953 of the vendor value"),
+            "and says what the drive is on, not what this run changed:\n{twice}"
+        );
+        assert!(
+            twice.contains("gravity_scale = [1.0000, 1.0000, 1.0800"),
+            "a run that measured no scale leaves the measured one alone"
+        );
+
         // Comments are the reason this is a text edit rather than a round trip
         // through a serialiser.
         let comments_before = original.lines().filter(|l| l.trim_start().starts_with('#')).count();
@@ -3638,8 +4151,11 @@ mod tests {
         // And the patched file is still a config the runtime can load.
         ConfigBundle::load(&path).expect("the patched config still validates");
 
-        let backup = std::fs::read_to_string(dir.join("PAR6.toml.before-selfcal")).expect("backup");
-        assert_eq!(backup, original, "the backup is the file as it was");
+        // The backup is one step of undo, so after the second apply it is the
+        // file the second run started from — copying it back returns the arm
+        // to the config it was just running, not to the vendor's.
+        let undo = std::fs::read_to_string(dir.join("PAR6.toml.before-selfcal")).expect("backup");
+        assert_eq!(undo, patched, "the backup undoes the run that wrote it");
         std::fs::remove_dir_all(&dir).ok();
     }
 }
