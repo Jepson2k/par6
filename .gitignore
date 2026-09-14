@@ -14,3 +14,5 @@ python/par6/*.so
 # and the config backup --apply leaves behind.
 selfcal-measurements.toml
 *.before-selfcal
+selfcal-trace.bin
+selfcal-trace-phases.csv

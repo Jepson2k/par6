@@ -445,6 +445,9 @@ struct Cadence {
     worst_at: usize,
     worst_phase: String,
     phase: String,
+    /// Where each phase started \[tick\], so a trace row can be labelled with
+    /// what the tool was doing at the time.
+    marks: Vec<(usize, String)>,
 }
 
 /// Histogram resolution and extent for the cadence record: 50 us buckets up to
@@ -462,6 +465,7 @@ impl Default for Cadence {
             worst_at: 0,
             worst_phase: String::new(),
             phase: String::new(),
+            marks: Vec::new(),
         }
     }
 }
@@ -486,7 +490,11 @@ impl Cadence {
     /// Name what the tool is doing, so a late tick can be attributed instead
     /// of guessed at.
     fn phase(&mut self, what: &str) {
+        if self.phase == what {
+            return;
+        }
         self.phase = what.to_string();
+        self.marks.push((self.count, self.phase.clone()));
     }
 
     /// Mean, p99, worst \[us\] and the sample count.
@@ -532,6 +540,189 @@ fn gain_note(existing: &str, scale: f64) -> String {
             p * scale
         ),
         None => format!("# selfcal: x{scale:.3} of the vendor value"),
+    }
+}
+
+/// Every tick of the run, written out as a PAR6CAP2 recording.
+///
+/// The report says what the worst was; it cannot say what a particular second
+/// looked like, and "it sounded bad around forty seconds in" is the most
+/// useful thing anyone has said about this arm. Until this existed a
+/// calibration run left nothing behind but its own summary, so the only
+/// hardware traces anybody could analyse came from the runtime, which is not
+/// the thing being calibrated.
+///
+/// Same format the runtime records, so every tool that reads one of those
+/// reads this — written here rather than reused from `par6d::diagnostics`
+/// because that writer takes the runtime's `ArmState`, and not depending on
+/// the runtime is the point of this tool.
+struct Trace {
+    /// Row-major, [`TRACE_FIELDS`] values per joint per tick, in wire units.
+    /// Preallocated for the whole run, because the tick path may not
+    /// allocate: full is full, and the run says so rather than growing.
+    rows: Vec<i32>,
+    ticks: usize,
+    full: bool,
+    joints: usize,
+}
+
+/// Per joint per tick: measured position, speed and current, the position,
+/// velocity and current it was commanded, and the gravity feedforward.
+const TRACE_FIELDS: usize = 7;
+const T_POS: usize = 0;
+const T_SPEED: usize = 1;
+const T_CURRENT: usize = 2;
+const T_CMD_POS: usize = 3;
+const T_CMD_VEL: usize = 4;
+const T_CMD_MA: usize = 5;
+const T_GRAVITY_MA: usize = 6;
+
+/// sha256 of a config file, hex, as a recording's identity.
+///
+/// The runtime hashes the robot TOML and every gripper beside it; this hashes
+/// the robot TOML alone, which is enough to say which config a trace was
+/// taken under and is never compared against the runtime's.
+fn config_fingerprint(config: &std::path::Path) -> String {
+    use sha2::{Digest, Sha256};
+    let mut hasher = Sha256::new();
+    hasher.update(std::fs::read(config).unwrap_or_default());
+    format!("{:x}", hasher.finalize())
+}
+
+/// Six minutes at 250 Hz, which covers a full run with room over.
+const TRACE_MAX_TICKS: usize = 90_000;
+
+/// Stands in for a value that was not commanded or not reported this tick.
+const TRACE_MISSING: i32 = i32::MIN;
+
+impl Trace {
+    fn new(joints: usize) -> Self {
+        Self {
+            rows: Vec::with_capacity(TRACE_MAX_TICKS * joints * TRACE_FIELDS),
+            ticks: 0,
+            full: false,
+            joints,
+        }
+    }
+
+    fn get(&self, tick: usize, joint: usize, field: usize) -> Option<i32> {
+        let v = self.rows[(tick * self.joints + joint) * TRACE_FIELDS + field];
+        (v != TRACE_MISSING).then_some(v)
+    }
+}
+
+impl Arm {
+    /// Write the trace as a PAR6CAP2 recording, and the phases beside it.
+    ///
+    /// The format has no field for what the tool was DOING, and that is half
+    /// of what makes a moment readable, so the phase each tick belonged to
+    /// goes in a CSV next to it.
+    fn write_trace(&self, dir: &std::path::Path) -> Result<(usize, bool), String> {
+        let Some(trace) = self.trace.as_ref() else {
+            return Ok((0, false));
+        };
+        use std::io::Write;
+        let path = dir.join("selfcal-trace.bin");
+        let file = std::fs::File::create(&path)
+            .map_err(|e| format!("creating {}: {e}", path.display()))?;
+        let mut out = std::io::BufWriter::new(file);
+        let head = |w: &mut std::io::BufWriter<std::fs::File>| -> std::io::Result<()> {
+            w.write_all(b"PAR6CAP2")?;
+            w.write_all(&self.dt.to_le_bytes())?;
+            w.write_all(self.fingerprint.as_bytes())?;
+            w.write_all(&u64::from(std::process::id()).to_le_bytes())?;
+            let started = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0);
+            w.write_all(&started.to_le_bytes())
+        };
+        head(&mut out).map_err(|e| format!("writing the trace header: {e}"))?;
+
+        let nan = f64::NAN;
+        let write_tick = |w: &mut std::io::BufWriter<std::fs::File>,
+                              t: usize|
+         -> std::io::Result<()> {
+            w.write_all(&(t as u64).to_le_bytes())?;
+            let elapsed_ns = (t as f64 * self.dt * 1.0e9) as u64;
+            w.write_all(&elapsed_ns.to_le_bytes())?;
+            // Homed once every joint has a reference; gravity is on whenever
+            // this tool is running, and it has no runtime mode to report.
+            let flags = (u64::from(self.referenced.iter().all(|r| *r)) << 1)
+                | (1_u64 << 2)
+                | (1_u64 << 4);
+            w.write_all(&flags.to_le_bytes())?;
+            for field in [
+                T_POS,
+                T_SPEED,
+                T_CURRENT,
+                T_CMD_POS,
+                T_CMD_VEL,
+                T_CMD_MA,
+                usize::MAX,
+                T_GRAVITY_MA,
+            ] {
+                for j in 0..par6_kin::NQ {
+                    let v = if j >= trace.joints || field == usize::MAX {
+                        // q_target: this tool's moves retarget per operation,
+                        // and a number that was never the target is worse
+                        // than none.
+                        nan
+                    } else {
+                        match trace.get(t, j, field) {
+                            None => nan,
+                            Some(raw) => match field {
+                                T_POS => self.conv[j].joint_rad(raw),
+                                T_CMD_POS => self.conv[j].joint_rad(raw),
+                                T_SPEED | T_CMD_VEL => {
+                                    self.deg_for_ticks(j, i64::from(raw)).to_radians()
+                                }
+                                _ => self.ma_to_torque(j, raw as f64),
+                            },
+                        }
+                    };
+                    w.write_all(&v.to_le_bytes())?;
+                }
+            }
+            for j in 0..par6_kin::NQ {
+                let v = if j < trace.joints {
+                    trace.get(t, j, T_CURRENT).map_or(nan, f64::from)
+                } else {
+                    nan
+                };
+                w.write_all(&v.to_le_bytes())?;
+            }
+            for j in 0..par6_kin::NQ {
+                let v = self.robot.joints.get(j).map_or(nan, |c| c.kt_nm_a);
+                w.write_all(&v.to_le_bytes())?;
+            }
+            for j in 0..par6_kin::NQ {
+                let v = self.robot.joints.get(j).map_or(nan, |c| c.ilim_ma);
+                w.write_all(&v.to_le_bytes())?;
+            }
+            Ok(())
+        };
+        for t in 0..trace.ticks {
+            write_tick(&mut out, t).map_err(|e| format!("writing tick {t}: {e}"))?;
+        }
+        out.flush().map_err(|e| format!("flushing the trace: {e}"))?;
+
+        let phases = dir.join("selfcal-trace-phases.csv");
+        let mut text = String::from("tick,phase\n");
+        for (tick, name) in &self.cadence.marks {
+            text.push_str(&format!("{tick},{name}\n"));
+        }
+        std::fs::write(&phases, text)
+            .map_err(|e| format!("writing {}: {e}", phases.display()))?;
+        Ok((trace.ticks, trace.full))
+    }
+
+    /// Drive current back to joint torque \[Nm\], the inverse of
+    /// [`Arm::torque_to_ma`].
+    fn ma_to_torque(&self, joint: usize, ma: f64) -> f64 {
+        let j = &self.robot.joints[joint];
+        let sign = if j.dir == 1 { -1.0 } else { 1.0 };
+        sign * ma / 1000.0 * j.kt_nm_a * j.gear_ratio * j.gear_efficiency
     }
 }
 
@@ -913,6 +1104,10 @@ struct Arm {
     swing_scratch: Vec<i64>,
     /// The loudest thing each joint has done so far, for the report.
     noise: Vec<Noise>,
+    /// Every tick of the run.
+    trace: Option<Trace>,
+    /// sha256 of the config this run read, as the recording's identity.
+    fingerprint: String,
     /// The next tick's absolute wake target on the monotonic clock.
     next_deadline: Duration,
     /// Where homing left the arm \[rad\]: every sweep pose is an offset from
@@ -946,6 +1141,7 @@ impl Arm {
     fn open(
         bundle: &ConfigBundle,
         assets_dir: &std::path::Path,
+        config_path: &std::path::Path,
         simulated: bool,
     ) -> Result<Self, String> {
         let robot = bundle.robot.clone();
@@ -1046,6 +1242,11 @@ impl Arm {
             current_history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
             swing_scratch: Vec::with_capacity(WATCH_WINDOW_TICKS + 1),
             noise: (0..n).map(|_| Noise::default()).collect(),
+            // Always. A run that leaves nothing behind cannot be asked
+            // about afterwards, and every question worth asking about this
+            // arm has come after the run.
+            trace: Some(Trace::new(n)),
+            fingerprint: config_fingerprint(config_path),
             next_deadline: monotonic_now(),
             ready_pose: [0.0; par6_kin::NQ],
             kin: gravity_model(assets_dir, gripper)?,
@@ -1306,6 +1507,45 @@ impl Arm {
         self.enforce_motion()
     }
 
+    /// Keep this tick's raw numbers, if the run was asked to.
+    fn record_trace(&mut self, cmds: &[JointCommand]) {
+        let last_ff = &self.last_ff;
+        let nodes = &self.state.nodes;
+        let joints = &self.robot.joints;
+        let Some(trace) = self.trace.as_mut() else {
+            return;
+        };
+        if trace.ticks >= TRACE_MAX_TICKS {
+            trace.full = true;
+            return;
+        }
+        for j in 0..trace.joints {
+            let node = &nodes[usize::from(joints[j].node_id)];
+            let cmd = cmds.get(j);
+            trace.rows.push(node.position_ticks.unwrap_or(TRACE_MISSING));
+            trace
+                .rows
+                .push(node.speed_ticks_s.map_or(TRACE_MISSING, i32::from));
+            trace
+                .rows
+                .push(node.current_ma.map_or(TRACE_MISSING, i32::from));
+            trace
+                .rows
+                .push(cmd.and_then(|c| c.pos).unwrap_or(TRACE_MISSING));
+            trace
+                .rows
+                .push(cmd.and_then(|c| c.vel).unwrap_or(TRACE_MISSING));
+            trace.rows.push(
+                cmd.and_then(|c| c.cur_ma)
+                    .map_or(TRACE_MISSING, i32::from),
+            );
+            trace
+                .rows
+                .push(last_ff.get(j).map_or(TRACE_MISSING, |f| i32::from(*f)));
+        }
+        trace.ticks += 1;
+    }
+
     /// Measure one joint's noise, in both channels, and keep the worst.
     ///
     /// One joint per tick, round-robin: every joint is measured every six
@@ -1523,6 +1763,7 @@ impl Arm {
                 }
             }
         }
+        self.record_trace(cmds);
         self.sample_noise();
         self.tick_gravity();
         self.enforce_rules()?;
@@ -2749,6 +2990,7 @@ to the CAN bus directly, and refuses to start while par6d is running.
   --repeat N   home N more times afterwards and report how far each joint's
                reference moves between runs
 
+
 Step 1 homes on the configured gains, raising a joint's seek current or its
 velocity gains when it will not reach its endstop. Step 2 measures each loaded
 joint's gravity feedforward scale on a torque-only hold, distal first. Step 3
@@ -2756,7 +2998,10 @@ returns every joint to its most loaded pose and checks it holds on what was
 measured; a joint that misses is measured again and re-verified.
 
 Every exit writes selfcal-measurements.toml, including a failed run: a run that
-measured four joints and failed on the fifth has still measured four joints.
+measured four joints and failed on the fifth has still measured four joints. It
+also writes selfcal-trace.bin, every tick of the run in the same PAR6CAP2 format
+the runtime records, with the phase each tick belonged to in
+selfcal-trace-phases.csv beside it.
 
 Needs CAP_SYS_NICE (or root) for SCHED_FIFO; without it the command cadence
 slips and the drives feel that as a disturbance. Takes about two minutes.
@@ -2826,7 +3071,7 @@ fn main() {
     if simulated {
         println!("--sim: the simulated bus, to prove the script with no arm attached");
     }
-    let mut arm = match Arm::open(&bundle, &assets_dir, simulated) {
+    let mut arm = match Arm::open(&bundle, &assets_dir, std::path::Path::new(&path), simulated) {
         Ok(a) => a,
         Err(e) => {
             eprintln!("{e}");
@@ -2968,6 +3213,18 @@ fn main() {
                 &arm.cadence.worst_phase
             }
         );
+    }
+    match arm.write_trace(std::path::Path::new(".")) {
+        Ok((ticks, full)) => println!(
+            "  {ticks} ticks recorded to selfcal-trace.bin (PAR6CAP2, with the \
+             phases in selfcal-trace-phases.csv){}",
+            if full {
+                " — the buffer filled, so the tail of the run is not in it"
+            } else {
+                ""
+            }
+        ),
+        Err(e) => eprintln!("  could not write the trace: {e}"),
     }
     let patch = std::path::Path::new("selfcal-measurements.toml");
     arm.results.write(patch, &arm.robot);
@@ -4002,6 +4259,63 @@ mod tests {
         );
     }
 
+    /// A run leaves a recording every tool that reads the runtime's can read.
+    ///
+    /// The format is written by hand here rather than shared with
+    /// `par6d::diagnostics`, so the thing worth testing is that it really is
+    /// the same format: header, record size, and a position that decodes back
+    /// to the angle the joint was at.
+    #[test]
+    fn a_run_records_itself_as_a_capture() {
+        let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../assets/par6_description");
+        let config =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
+        let bundle = ConfigBundle::load(&config).expect("config");
+        let mut arm = Arm::open(&bundle, &assets, &config, true).expect("simulated arm");
+        for _ in 0..50 {
+            arm.tick_frame(None).expect("tick");
+        }
+        let dir = std::env::temp_dir().join(format!("selfcal-trace-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let (ticks, full) = arm.write_trace(&dir).expect("write the trace");
+        assert_eq!(ticks, 50, "every tick is in it");
+        assert!(!full, "fifty ticks does not fill a six-minute buffer");
+
+        let raw = std::fs::read(dir.join("selfcal-trace.bin")).expect("read it back");
+        assert_eq!(&raw[..8], b"PAR6CAP2", "the magic the readers look for");
+        let dt = f64::from_le_bytes(raw[8..16].try_into().unwrap());
+        assert!((dt - arm.dt).abs() < 1e-12, "the tick period is in the header");
+        assert_eq!(
+            raw[16..80].iter().filter(|b| b.is_ascii_hexdigit()).count(),
+            64,
+            "the fingerprint is 64 hex characters, as the reader decodes it"
+        );
+        // tick, elapsed, flags, then 11 rows of 6 doubles.
+        const HEADER: usize = 96;
+        const RECORD: usize = 8 * 3 + 11 * 6 * 8;
+        assert_eq!(
+            raw.len(),
+            HEADER + RECORD * 50,
+            "record size matches the runtime's recorder"
+        );
+        // The last tick's J1 angle, decoded the way a reader would.
+        let at = HEADER + RECORD * 49 + 24;
+        let q = f64::from_le_bytes(raw[at..at + 8].try_into().unwrap());
+        let expect = arm
+            .position(0)
+            .map(|p| arm.conv[0].joint_rad(p))
+            .expect("a simulated joint reports its position");
+        assert!(
+            (q - expect).abs() < 1e-9,
+            "q decodes to the joint angle: {q} vs {expect}"
+        );
+        let phases = std::fs::read_to_string(dir.join("selfcal-trace-phases.csv"))
+            .expect("the phases beside it");
+        assert!(phases.starts_with("tick,phase"), "with a header row");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     /// The tick path allocates nothing once it is running.
     ///
     /// The house rule for an RT tick path, and this tool is one: it paces the
@@ -4014,7 +4328,7 @@ mod tests {
         let assets = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/par6_description");
         let config = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let bundle = ConfigBundle::load(&config).expect("config");
-        let mut arm = Arm::open(&bundle, &assets, true).expect("simulated arm");
+        let mut arm = Arm::open(&bundle, &assets, &config, true).expect("simulated arm");
         // With the rule ARMED. Left off, the oscillation check returns on its
         // first line and the measurement behind it — which runs on every joint
         // on every tick — is never reached, so the test passed while that path
