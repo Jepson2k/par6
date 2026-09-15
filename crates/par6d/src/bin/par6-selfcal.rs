@@ -102,10 +102,6 @@ const STRETCH_RANGE_RAD: f64 = 0.7;
 /// How far a chosen pose stays clear of a soft limit \[rad\].
 const STRETCH_MARGIN_RAD: f64 = 0.15;
 
-/// Gravity torque below which a joint's feedforward cannot explain a ring
-/// \[Nm\]. The base and the wrist roll sit well under this at every pose.
-const GRAVITY_IRRELEVANT_NM: f64 = 0.10;
-
 
 
 /// How long a joint is left alone after a move before anything judges it
@@ -140,6 +136,17 @@ const RIPPLE_SMOOTH_TICKS: usize = 25;
 
 /// The window for the audible band \[ticks\]: 20 ms, leaving roughly 50 Hz up.
 const FAST_SMOOTH_TICKS: usize = 5;
+
+/// How much of the current record a buzz is judged over \[ticks\]: 0.2 s.
+///
+/// Deliberately short. A buzz at 50 Hz and up has dozens of cycles in a fifth
+/// of a second, so there is nothing to gain by watching for longer — and
+/// everything to lose: judged over the two-second window the position rule
+/// uses, a joint gets to buzz for two seconds before anything may be done,
+/// two more after each gain step, and ten seconds of continuous noise to walk
+/// the ladder. Nobody standing next to the arm waits that long; they pull the
+/// plug, and they are right to.
+const BUZZ_WINDOW_TICKS: usize = 50;
 
 /// Fast current ripple that counts as a buzz \[mA peak to peak\].
 ///
@@ -1516,11 +1523,7 @@ impl Arm {
     fn oscillating(&self) -> Vec<(usize, f64)> {
         (0..self.current_history.len())
             .filter_map(|j| {
-                let c = &self.current_history[j];
-                if c.len() < WATCH_WINDOW_TICKS {
-                    return None;
-                }
-                let buzz = fast_ripple_p2p(c);
+                let buzz = recent_buzz(&self.current_history[j]);
                 (buzz >= BUZZ_CURRENT_MA).then_some((j, buzz))
             })
             .collect()
@@ -1731,53 +1734,23 @@ impl Arm {
             // cleared its window and started the measurement over.
             let buzzing = Some(j) != self.torque_only
                 && self.unquietable[j].is_none()
-                && self.current_history[j].len() >= WATCH_WINDOW_TICKS
-                && fast_ripple_p2p(&self.current_history[j]) >= BUZZ_CURRENT_MA;
+                && recent_buzz(&self.current_history[j]) >= BUZZ_CURRENT_MA;
             self.ringing_for[j] = if buzzing { self.ringing_for[j] + 1 } else { 0 };
             if !buzzing {
                 continue;
             }
-            if self.gravity_confounds(j) {
-                // This joint carries a load its feedforward still under-states,
-                // so it cannot sit on its target however well it is tuned, and
-                // dropping its gains here leaves it unable to move at all —
-                // the deadlock the elbow kept landing in. Step 2 measures it
-                // and the ring is judged again on the other side of that.
-                if !self.rang_while_homing[j] {
-                    println!(
-                        "    J{}: shaking, but its gravity feedforward is still a \
-                         guess — measured in step 2 and judged again there",
-                        j + 1
-                    );
-                }
-                self.rang_while_homing[j] = true;
-                continue;
-            }
+            // No deferral. A loaded joint used to wait for step 2 on the
+            // grounds that its feedforward was still a guess and cutting its
+            // gains would leave it unable to move — but that argument is about
+            // POSITION tracking, and this test is current ripple, which a
+            // wrong feedforward does not explain. Meanwhile the elbow buzzed
+            // through every second of homing untouched, and a run that died
+            // before step 2 never quietened it at all. The floor below the
+            // ladder is what stops a joint being taken past what it needs.
+            self.rang_while_homing[j] = true;
             self.quiet_now[j] = self.quieting;
         }
         Ok(())
-    }
-
-    /// Whether a ring on this joint might be its gravity feedforward rather
-    /// than its gains.
-    ///
-    /// Only where there is a load to under-state. The base and the wrist roll
-    /// turn about their own gravity vector and carry none of it, so a ring
-    /// there is the loop and nothing else — which is why they are quietened
-    /// from the first move while the shoulder and elbow wait for step 2.
-    fn gravity_confounds(&self, joint: usize) -> bool {
-        if self.results.gravity_scale[joint].is_some() {
-            return false;
-        }
-        // Before a joint has a reference, its angle is an arbitrary encoder
-        // count, so no feedforward is computed for it and the torque below
-        // reads zero for every joint — which made the shoulder and the elbow
-        // look as unloaded as the base and walked both of them to the bottom
-        // of the ladder before homing had even started.
-        if !self.referenced[joint] {
-            return true;
-        }
-        self.ma_to_torque(joint, f64::from(self.last_ff[joint])).abs() > GRAVITY_IRRELEVANT_NM
     }
 
     /// Quieten every joint the tick path asked to have quietened.
@@ -1789,7 +1762,7 @@ impl Arm {
             if !std::mem::take(&mut self.quiet_now[j]) {
                 continue;
             }
-            let buzz = fast_ripple_p2p(&self.current_history[j]);
+            let buzz = recent_buzz(&self.current_history[j]);
             let swing = self.deg_for_ticks(j, ripple_p2p(&self.history[j]) as i64);
             let here = self.scales[j];
             self.quiet_trail[j].push((here, buzz));
@@ -1815,28 +1788,25 @@ impl Arm {
                     );
                     println!("    {why}");
                     self.settle_on_quietest(j)?;
-                    if self.unquietable[j].is_none() {
-                        self.unquietable[j] = Some(why);
-                    }
-                    continue;
+                    return Err(format!("{why}\n  {}", self.quiet_story(j)));
                 }
             }
             if let Err(e) = self.quieter_scale(j) {
-                // Out of rungs is a finding, not a reason to stop: the joints
-                // that have not been measured yet still can be, and the trace
-                // of the rest of the run is exactly what diagnosing this
-                // needs. The run fails at the end, with the whole story.
-                if self.unquietable[j].is_none() {
-                    println!("    {e}");
-                    self.unquietable[j] = Some(e);
-                }
+                // Out of rungs means this arm is going to keep buzzing, and
+                // carrying on would run it for another two minutes doing
+                // exactly that in front of whoever is standing there. Stop —
+                // the measurements taken so far and the trace are written on
+                // every exit, including this one, so nothing is lost by it.
+                println!("    {e}");
                 self.settle_on_quietest(j)?;
-                continue;
+                return Err(format!("{e}\n  {}", self.quiet_story(j)));
             }
             // Judge the new gain on what the joint does NEXT, not on the
-            // window that produced the last one.
+            // window that produced the last one. Only a fifth of a second of
+            // current has to refill before the next verdict.
             self.history[j].clear();
             self.error_history[j].clear();
+            self.current_history[j].clear();
             self.ringing_for[j] = 0;
         }
         Ok(())
@@ -2311,6 +2281,7 @@ impl Arm {
         self.quiet_now[joint] = false;
         self.history[joint].clear();
         self.error_history[joint].clear();
+        self.current_history[joint].clear();
         self.ringing_for[joint] = 0;
         Ok(())
     }
@@ -3261,6 +3232,18 @@ fn fast_ripple_p2p<T: Copy + Into<i64>>(samples: &[T]) -> f64 {
     ripple_p2p_smoothed(samples, FAST_SMOOTH_TICKS)
 }
 
+/// The ripple current over the last [`BUZZ_WINDOW_TICKS`] \[mA peak to peak\].
+///
+/// The tail, not the whole record: what matters is whether the joint is
+/// buzzing NOW, and averaging that over seconds of history is how a fix takes
+/// seconds to arrive.
+fn recent_buzz(current: &[i16]) -> f64 {
+    if current.len() < BUZZ_WINDOW_TICKS {
+        return 0.0;
+    }
+    fast_ripple_p2p(&current[current.len() - BUZZ_WINDOW_TICKS..])
+}
+
 /// Whether these samples are a joint shaking rather than moving.
 fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
     history.len() >= RING_WINDOW_TICKS && ripple_p2p(history) >= amplitude_ticks as f64
@@ -3451,23 +3434,6 @@ fn main() {
         Some(n) => repeatability(&mut arm, n),
         None => Ok(()),
     });
-    // A joint the ladder could not quieten fails the run — after it, so the
-    // joints that could be measured still were, and the trace that says why
-    // is on disk.
-    let outcome = outcome.and_then(|()| {
-        let stuck: Vec<String> = (0..arm.n())
-            .filter_map(|j| {
-                arm.unquietable[j]
-                    .clone()
-                    .map(|why| format!("{why}\n  {}", arm.quiet_story(j)))
-            })
-            .collect();
-        if stuck.is_empty() {
-            Ok(())
-        } else {
-            Err(stuck.join("\n"))
-        }
-    });
     let scales = arm.scales.clone();
     match &outcome {
         Ok(()) => {
@@ -3526,7 +3492,7 @@ fn main() {
             format!(
                 "  {story} -> kept x{:.2}, now {:.0} mA",
                 arm.scales[j],
-                fast_ripple_p2p(&arm.current_history[j])
+                recent_buzz(&arm.current_history[j])
             )
         })
         .collect();
