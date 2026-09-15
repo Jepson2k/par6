@@ -94,9 +94,6 @@ const RING_HALF_PERIOD_TICKS: usize = 50;
 /// \[Nm\]. The base and the wrist roll sit well under this at every pose.
 const GRAVITY_IRRELEVANT_NM: f64 = 0.10;
 
-/// How far above a joint's own measured dither a swing has to be before it is
-/// a ring rather than that joint working.
-const RING_OVER_FLOOR: f64 = 1.5;
 
 
 /// How long a joint is left alone after a move before anything judges it
@@ -109,13 +106,25 @@ const RING_OVER_FLOOR: f64 = 1.5;
 /// transient — which is audible as a staircase that never converges.
 const SETTLE_BEFORE_JUDGING_S: f64 = 0.25;
 
-/// The excursion that counts as ringing, as an ANGLE \[deg\].
+/// The excursion that counts as ringing, peak to peak about the joint's own
+/// smoothed path \[deg\].
 ///
 /// Not a tick count: one encoder tick is a different angle on every joint,
 /// so a fixed count is 0.10 deg of slop on the base and 0.026 deg on the
 /// shoulder. The same shake would be flagged on one joint and invisible on
 /// the next, which is exactly what happened to the base.
-const RING_AMPLITUDE_DEG: f64 = 0.20;
+///
+/// Set from the first hardware run that recorded itself, against a run
+/// somebody stood next to and called bad: the elbow buzzed 0.25 deg at
+/// ~110 Hz throughout, the wrist threw 1.63 deg at 16 Hz, the base 0.22 deg
+/// at 9 Hz — and the quietest joint, which nobody complained about, sat at
+/// 0.05 deg through its moves. The bar goes between them.
+const RING_AMPLITUDE_DEG: f64 = 0.10;
+
+/// The window the trajectory is smoothed over before the residual is judged
+/// \[ticks\]: 0.1 s, so anything slower than about 10 Hz is treated as the
+/// path rather than a shake.
+const RIPPLE_SMOOTH_TICKS: usize = 25;
 // The only externally calibrated figure available: the ring that is audible
 // from this arm, standing next to it, measured 0.204 deg. Below that the
 // numbers are the drives working — the elbow swings 0.05-0.13 deg holding 2 A
@@ -1105,6 +1114,9 @@ struct Arm {
     swing_scratch: Vec<i64>,
     /// The loudest thing each joint has done so far, for the report.
     noise: Vec<Noise>,
+    /// Whether a ring is answered with a gain step. Off only where a test
+    /// needs the detection without the response.
+    quieting: bool,
     /// Joints the tick path found ringing, to be quietened between ticks.
     quiet_now: Vec<bool>,
     /// Per joint, what it was shaking by at each gain it has been tried on
@@ -1250,6 +1262,7 @@ impl Arm {
             current_history: vec![Vec::with_capacity(WATCH_WINDOW_TICKS + 1); n],
             swing_scratch: Vec::with_capacity(WATCH_WINDOW_TICKS + 1),
             noise: (0..n).map(|_| Noise::default()).collect(),
+            quieting: true,
             quiet_now: vec![false; n],
             quiet_trail: vec![Vec::new(); n],
             unquietable: vec![None; n],
@@ -1437,13 +1450,15 @@ impl Arm {
         }
     }
 
-    /// What counts as a ring on this joint \[ticks\]: the configured bar, or
-    /// comfortably more than this joint's own measured dither, whichever is
-    /// larger.
+    /// What counts as a ring on this joint \[ticks\].
+    ///
+    /// The bar, and only the bar. It used to be raised by the joint's own
+    /// measured dither, which meant a joint that always buzzed set its own
+    /// threshold above its buzz and could never fail for it — the elbow
+    /// dithered 0.118 deg and was judged against 0.204. A joint that cannot
+    /// meet the bar is a finding, not a reason to move the bar.
     fn ring_threshold(&self, joint: usize) -> i64 {
-        let absolute = self.ticks_for_deg(joint, RING_AMPLITUDE_DEG);
-        let measured = (self.ring_floor[joint] * RING_OVER_FLOOR) as i64;
-        absolute.max(measured)
+        self.ticks_for_deg(joint, RING_AMPLITUDE_DEG)
     }
 
     /// Every joint that is oscillating right now, with its excursion \[deg\].
@@ -1572,8 +1587,8 @@ impl Arm {
         if self.error_history[j].len() < WATCH_WINDOW_TICKS {
             return;
         }
+        let ripple = ripple_p2p(&self.history[j]);
         let mut turns = std::mem::take(&mut self.swing_scratch);
-        let pos = swings_into(&self.error_history[j], &mut turns);
         let cur = swings_into(&self.current_history[j], &mut turns);
         self.swing_scratch = turns;
         // Travelling or holding, decided from the joint itself rather than
@@ -1585,17 +1600,15 @@ impl Arm {
         // written.
         let phase = &self.cadence.phase;
         let noise = &mut self.noise[j];
-        if pos.reversals >= RING_REVERSALS {
-            let (worst, seen_in) = if moving {
-                (&mut noise.moving, &mut noise.moving_phase)
-            } else {
-                (&mut noise.holding, &mut noise.holding_phase)
-            };
-            if pos.worst > *worst {
-                *worst = pos.worst;
-                seen_in.clear();
-                seen_in.push_str(phase);
-            }
+        let (worst, seen_in) = if moving {
+            (&mut noise.moving, &mut noise.moving_phase)
+        } else {
+            (&mut noise.holding, &mut noise.holding_phase)
+        };
+        if ripple > *worst {
+            *worst = ripple;
+            seen_in.clear();
+            seen_in.push_str(phase);
         }
         if cur.reversals >= RING_REVERSALS && cur.worst > noise.ripple {
             noise.ripple = cur.worst;
@@ -1612,12 +1625,11 @@ impl Arm {
         let mut turns = std::mem::take(&mut self.swing_scratch);
         let mut rows: Vec<(usize, f64, f64)> = Vec::new();
         for j in 0..self.history.len() {
-            if self.error_history[j].len() < WATCH_WINDOW_TICKS {
+            if self.history[j].len() < WATCH_WINDOW_TICKS {
                 continue;
             }
-            let pos = swings_into(&self.error_history[j], &mut turns);
             let cur = swings_into(&self.current_history[j], &mut turns);
-            rows.push((j, pos.median, cur.median));
+            rows.push((j, ripple_p2p(&self.history[j]), cur.median));
         }
         self.swing_scratch = turns;
         rows.sort_by(|a, b| b.1.total_cmp(&a.1));
@@ -1653,21 +1665,19 @@ impl Arm {
             // go; a verdict there stops the park and leaves the arm worse.
             return Ok(());
         }
-        // Only where the tool is actually commanding the arm. A seek is
-        // hunting for a stall, so the joint is MEANT to be driven into
-        // something and stop; a limit push sends no frames at all while it
-        // waits for queue room, and a coast is the arm being left alone on
-        // purpose. Judging a joint's gains by what it does when nothing is
-        // driving it is how the simulated base walked the whole ladder down
-        // while standing still.
-        if !matches!(self.cadence.phase.as_str(), "move" | "gravity watch") {
+        // A seek is hunting for a stall: the joint is MEANT to be driven into
+        // something until it stops, and quietening it there takes away the one
+        // thing homing has to feel. Everything else counts. Restricting this
+        // to moves was wrong — the drives are powered and holding through a
+        // limit push and a coast too, and that is where most of the elbow's
+        // 110 Hz buzz was: judged nowhere, for a whole run.
+        if self.cadence.phase == "seek" {
             return Ok(());
         }
-        let mut turns = std::mem::take(&mut self.swing_scratch);
         for j in 0..self.history.len() {
             let ringing = Some(j) != self.torque_only
                 && self.history[j].len() >= WATCH_WINDOW_TICKS
-                && ringing_now_into(&self.history[j], self.ring_threshold(j), &mut turns);
+                && ringing_now(&self.history[j], self.ring_threshold(j));
             self.ringing_for[j] = if ringing { self.ringing_for[j] + 1 } else { 0 };
             if !ringing {
                 continue;
@@ -1688,9 +1698,8 @@ impl Arm {
                 self.rang_while_homing[j] = true;
                 continue;
             }
-            self.quiet_now[j] = true;
+            self.quiet_now[j] = self.quieting;
         }
-        self.swing_scratch = turns;
         Ok(())
     }
 
@@ -1717,7 +1726,7 @@ impl Arm {
             if !std::mem::take(&mut self.quiet_now[j]) {
                 continue;
             }
-            let swing = self.deg_for_ticks(j, ring_swings(&self.history[j]).1 as i64);
+            let swing = self.deg_for_ticks(j, ripple_p2p(&self.history[j]) as i64);
             self.quiet_trail[j].push((self.scales[j], swing));
             println!(
                 "    J{} is shaking {swing:.3} deg at x{:.2} during '{}'",
@@ -3003,23 +3012,47 @@ fn span_ticks(history: &[i32]) -> i64 {
     }
 }
 
-/// Whether these samples are a joint shaking rather than moving.
+/// How far a joint departs from its own smoothed path, peak to peak
+/// \[ticks\].
 ///
-/// Both halves are needed. Reversals alone are satisfied by encoder noise on a
-/// joint standing still; amplitude alone is satisfied by any move.
-fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
-    let mut turns: Vec<i64> = Vec::new();
-    ringing_now_into(history, amplitude_ticks, &mut turns)
+/// The trajectory is removed by subtracting a centred moving average, so a
+/// joint travelling a hundred degrees reads flat and only what it does ON TOP
+/// of that is left. This replaced the swing between turning points, which
+/// cannot see a fast buzz at all: at 110 Hz a 250 Hz sampler gets two points
+/// per cycle, so every individual swing is small while the joint is moving a
+/// quarter of a degree peak to peak and can be heard across the room. The
+/// elbow did exactly that for a whole run, in every phase, with two and a
+/// half amps of ripple behind it, and the rule said nothing.
+///
+/// Allocation-free: a running sum, and the residual judged as it goes.
+fn ripple_p2p(history: &[i32]) -> f64 {
+    let k = RIPPLE_SMOOTH_TICKS;
+    if history.len() < k * 3 {
+        return 0.0;
+    }
+    let half = k / 2;
+    let mut sum: i64 = history[..k].iter().map(|v| i64::from(*v)).sum();
+    let (mut lo, mut hi) = (f64::MAX, f64::MIN);
+    for i in half..history.len() - half {
+        // The window centred on `i` spans `i-half ..= i+half`. Stepping one
+        // sample on takes in `i+half` and drops `i-half-1`.
+        if i > half {
+            sum += i64::from(history[i + half]) - i64::from(history[i - half - 1]);
+        }
+        let r = f64::from(history[i]) - sum as f64 / k as f64;
+        lo = lo.min(r);
+        hi = hi.max(r);
+    }
+    if lo > hi {
+        0.0
+    } else {
+        hi - lo
+    }
 }
 
-/// The same question asked from the tick path, where allocating is not
-/// allowed: this runs on every joint on every tick once the window is full.
-fn ringing_now_into(history: &[i32], amplitude_ticks: i64, turns: &mut Vec<i64>) -> bool {
-    if history.len() < RING_WINDOW_TICKS {
-        return false;
-    }
-    let s = swings_into(history, turns);
-    s.reversals >= RING_REVERSALS && s.median >= amplitude_ticks as f64
+/// Whether these samples are a joint shaking rather than moving.
+fn ringing_now(history: &[i32], amplitude_ticks: i64) -> bool {
+    history.len() >= RING_WINDOW_TICKS && ripple_p2p(history) >= amplitude_ticks as f64
 }
 
 /// Whether these samples are a joint sliding one way rather than shaking.
@@ -4380,6 +4413,62 @@ mod tests {
         );
     }
 
+    /// A fast buzz is a ring, and the statistic this tool used could not see
+    /// one.
+    ///
+    /// Taken from the first recorded hardware run: the elbow buzzed about
+    /// 0.25 deg peak to peak at roughly 110 Hz for the entire run, with two
+    /// and a half amps of current ripple, while the rule reported nothing.
+    /// At 250 Hz that is barely two samples per cycle, so the distance
+    /// between consecutive turning points — what was being measured — is a
+    /// fraction of the excursion, and no bar set in those units can catch it.
+    #[test]
+    fn a_fast_buzz_is_a_ring_even_though_its_swings_are_small() {
+        // 110 Hz at 250 Hz sampling, 120 ticks peak to peak.
+        let buzz: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| {
+                let t = k as f64 * 0.004;
+                (60.0 * (2.0 * std::f64::consts::PI * 110.0 * t).sin()) as i32
+            })
+            .collect();
+        let p2p = ripple_p2p(&buzz);
+        assert!(p2p > 100.0, "the excursion is measured: {p2p} ticks");
+        assert!(ringing_now(&buzz, 40), "and it counts as a ring");
+
+        // Why it was missed. Riding on a move, a ripple smaller than the
+        // travel per sample never turns the position around at all: the
+        // encoder count rises every single tick, so a statistic built on
+        // turning points has nothing to measure and reports a joint that is
+        // shaking as perfectly clean. That is the "0.000 deg moving" the
+        // report kept printing for a joint that was buzzing.
+        let riding: Vec<i32> = (0..RING_WINDOW_TICKS)
+            .map(|k| {
+                let ripple = 10.0 * (2.0 * std::f64::consts::PI * 30.0 * k as f64 * 0.004).sin();
+                (k as f64 * 40.0 + ripple) as i32
+            })
+            .collect();
+        let (reversals, _) = ring_swings(&riding);
+        assert_eq!(
+            reversals, 0,
+            "the old statistic sees a shaking joint as a clean move"
+        );
+        assert!(
+            ripple_p2p(&riding) > 15.0,
+            "while the ripple is right there: {} ticks",
+            ripple_p2p(&riding)
+        );
+        assert!(ringing_now(&riding, 15), "and it is judged as one");
+
+        // And a joint travelling fast is still not ringing: the trajectory is
+        // removed, not the joint's right to move.
+        let travel: Vec<i32> = (0..RING_WINDOW_TICKS).map(|k| (k as i32) * 40).collect();
+        assert!(
+            !ringing_now(&travel, 40),
+            "a 4000-tick move reads flat: {} ticks",
+            ripple_p2p(&travel)
+        );
+    }
+
     /// A run leaves a recording every tool that reads the runtime's can read.
     ///
     /// The format is written by hand here rather than shared with
@@ -4455,6 +4544,10 @@ mod tests {
         // on every tick — is never reached, so the test passed while that path
         // allocated. The same shape of gap made the rule itself inert once.
         arm.vibration_fatal = true;
+        // The rule's measurement is what this test is about; answering a ring
+        // pushes gains, which happens between ticks and is allowed to
+        // allocate.
+        arm.quieting = false;
 
         // Warm everything the first tick would touch: the bus's own buffers,
         // the gravity model's lazy setup, the history vectors.
