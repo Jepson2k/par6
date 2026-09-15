@@ -90,6 +90,18 @@ const RING_REVERSALS: usize = 8;
 /// points\]. Fifty ticks is 0.2 s, so anything from 2.5 Hz up.
 const RING_HALF_PERIOD_TICKS: usize = 50;
 
+/// How much worse a rung has to read before the ladder is going the wrong
+/// way. Two measurements of the same gain differ by a few percent, so this
+/// sits above that.
+const RING_WORSE_FACTOR: f64 = 1.15;
+
+/// How far the shoulder and elbow may be taken from the homed pose to load a
+/// joint for measurement \[rad\].
+const STRETCH_RANGE_RAD: f64 = 0.7;
+
+/// How far a chosen pose stays clear of a soft limit \[rad\].
+const STRETCH_MARGIN_RAD: f64 = 0.15;
+
 /// Gravity torque below which a joint's feedforward cannot explain a ring
 /// \[Nm\]. The base and the wrist roll sit well under this at every pose.
 const GRAVITY_IRRELEVANT_NM: f64 = 0.10;
@@ -125,6 +137,15 @@ const RING_AMPLITUDE_DEG: f64 = 0.10;
 /// \[ticks\]: 0.1 s, so anything slower than about 10 Hz is treated as the
 /// path rather than a shake.
 const RIPPLE_SMOOTH_TICKS: usize = 25;
+
+/// The window for the audible band \[ticks\]: 20 ms, leaving roughly 50 Hz up.
+const FAST_SMOOTH_TICKS: usize = 5;
+
+/// Fast current ripple that counts as a buzz \[mA peak to peak\].
+///
+/// From the two runs that differ: 2597 mA on the elbow was loud across the
+/// room, 827 mA on the same joint at the same pose was not audible at all.
+const BUZZ_CURRENT_MA: f64 = 1500.0;
 // The only externally calibrated figure available: the ring that is audible
 // from this arm, standing next to it, measured 0.204 deg. Below that the
 // numbers are the drives working — the elbow swings 0.05-0.13 deg holding 2 A
@@ -587,6 +608,18 @@ const T_CMD_VEL: usize = 4;
 const T_CMD_MA: usize = 5;
 const T_GRAVITY_MA: usize = 6;
 
+/// A compact UTC stamp for naming this run's files.
+fn stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let days = secs / 86_400;
+    let rest = secs % 86_400;
+    // Days since the epoch is enough to order runs and short enough to read.
+    format!("{days}-{:02}{:02}{:02}", rest / 3600, (rest % 3600) / 60, rest % 60)
+}
+
 /// sha256 of a config file, hex, as a recording's identity.
 ///
 /// The runtime hashes the robot TOML and every gripper beside it; this hashes
@@ -632,7 +665,7 @@ impl Arm {
             return Ok((0, false));
         };
         use std::io::Write;
-        let path = dir.join("selfcal-trace.bin");
+        let path = dir.join(format!("selfcal-trace-{}.bin", self.started_at));
         let file = std::fs::File::create(&path)
             .map_err(|e| format!("creating {}: {e}", path.display()))?;
         let mut out = std::io::BufWriter::new(file);
@@ -717,7 +750,7 @@ impl Arm {
         }
         out.flush().map_err(|e| format!("flushing the trace: {e}"))?;
 
-        let phases = dir.join("selfcal-trace-phases.csv");
+        let phases = dir.join(format!("selfcal-trace-{}-phases.csv", self.started_at));
         let mut text = String::from("tick,phase\n");
         for (tick, name) in &self.cadence.marks {
             text.push_str(&format!("{tick},{name}\n"));
@@ -1122,12 +1155,18 @@ struct Arm {
     /// Per joint, what it was shaking by at each gain it has been tried on
     /// \[(scale, deg)\] — the record of what was done about it.
     quiet_trail: Vec<Vec<(f64, f64)>>,
+    /// The quietest gain each joint has been seen on \[(scale, deg)\].
+    quiet_best: Vec<Option<(f64, f64)>>,
     /// Joints the ladder could not quieten, and why.
     unquietable: Vec<Option<String>>,
     /// Every tick of the run.
     trace: Option<Trace>,
     /// sha256 of the config this run read, as the recording's identity.
     fingerprint: String,
+    /// When the run started, as a compact UTC stamp, so one run's recording
+    /// does not overwrite the last one's — the trace with the elbow's buzz in
+    /// it was lost exactly that way.
+    started_at: String,
     /// The next tick's absolute wake target on the monotonic clock.
     next_deadline: Duration,
     /// Where homing left the arm \[rad\]: every sweep pose is an offset from
@@ -1265,12 +1304,14 @@ impl Arm {
             quieting: true,
             quiet_now: vec![false; n],
             quiet_trail: vec![Vec::new(); n],
+            quiet_best: vec![None; n],
             unquietable: vec![None; n],
             // Always. A run that leaves nothing behind cannot be asked
             // about afterwards, and every question worth asking about this
             // arm has come after the run.
             trace: Some(Trace::new(n)),
             fingerprint: config_fingerprint(config_path),
+            started_at: stamp(),
             next_deadline: monotonic_now(),
             ready_pose: [0.0; par6_kin::NQ],
             kin: gravity_model(assets_dir, gripper)?,
@@ -1466,17 +1507,21 @@ impl Arm {
     /// Checked continuously rather than at checkpoints: a joint that rings
     /// only while another joint is being driven would never be caught by a
     /// test that looks at one joint at a time.
+    /// Every joint buzzing right now, with the ripple current behind it
+    /// \[mA\].
+    ///
+    /// The SAME test the continuous rule acts on. Judged on position instead,
+    /// verification could fail a run for something the tool never tries to
+    /// fix — which is the whole complaint this rule exists to answer.
     fn oscillating(&self) -> Vec<(usize, f64)> {
-        (0..self.history.len())
+        (0..self.current_history.len())
             .filter_map(|j| {
-                let h = &self.history[j];
-                if h.len() < WATCH_WINDOW_TICKS {
+                let c = &self.current_history[j];
+                if c.len() < WATCH_WINDOW_TICKS {
                     return None;
                 }
-                if !ringing_now(h, self.ring_threshold(j)) {
-                    return None;
-                }
-                Some((j, self.deg_for_ticks(j, ring_swings(h).1 as i64)))
+                let buzz = fast_ripple_p2p(c);
+                (buzz >= BUZZ_CURRENT_MA).then_some((j, buzz))
             })
             .collect()
     }
@@ -1493,7 +1538,13 @@ impl Arm {
     /// its own watch.
     fn reset_motion_watch(&mut self) {
         self.motion_mark = None;
-        self.still_mark = None;
+        // NOT `still_mark`. That one answers "has this ARM moved in the last
+        // second", and clearing it whenever an operation starts is how a run
+        // stood still for 2.6 seconds inside a move and the rule never fired:
+        // the pose was reached one joint at a time, each joint already at its
+        // target ran a full profile going nowhere, and the next joint's move
+        // reset the watch before it could ever reach a second.
+        //
         // Seeks and moves all start here, so an error that skipped a
         // measurement window's cleanup cannot leave either rule switched off.
         self.measuring = false;
@@ -1675,11 +1726,15 @@ impl Arm {
             return Ok(());
         }
         for j in 0..self.history.len() {
-            let ringing = Some(j) != self.torque_only
-                && self.history[j].len() >= WATCH_WINDOW_TICKS
-                && ringing_now(&self.history[j], self.ring_threshold(j));
-            self.ringing_for[j] = if ringing { self.ringing_for[j] + 1 } else { 0 };
-            if !ringing {
+            // A joint already given up on is not asked again: it printed the
+            // same line eighteen times in one run, and every one of them
+            // cleared its window and started the measurement over.
+            let buzzing = Some(j) != self.torque_only
+                && self.unquietable[j].is_none()
+                && self.current_history[j].len() >= WATCH_WINDOW_TICKS
+                && fast_ripple_p2p(&self.current_history[j]) >= BUZZ_CURRENT_MA;
+            self.ringing_for[j] = if buzzing { self.ringing_for[j] + 1 } else { 0 };
+            if !buzzing {
                 continue;
             }
             if self.gravity_confounds(j) {
@@ -1714,6 +1769,14 @@ impl Arm {
         if self.results.gravity_scale[joint].is_some() {
             return false;
         }
+        // Before a joint has a reference, its angle is an arbitrary encoder
+        // count, so no feedforward is computed for it and the torque below
+        // reads zero for every joint — which made the shoulder and the elbow
+        // look as unloaded as the base and walked both of them to the bottom
+        // of the ladder before homing had even started.
+        if !self.referenced[joint] {
+            return true;
+        }
         self.ma_to_torque(joint, f64::from(self.last_ff[joint])).abs() > GRAVITY_IRRELEVANT_NM
     }
 
@@ -1726,14 +1789,38 @@ impl Arm {
             if !std::mem::take(&mut self.quiet_now[j]) {
                 continue;
             }
+            let buzz = fast_ripple_p2p(&self.current_history[j]);
             let swing = self.deg_for_ticks(j, ripple_p2p(&self.history[j]) as i64);
-            self.quiet_trail[j].push((self.scales[j], swing));
+            let here = self.scales[j];
+            self.quiet_trail[j].push((here, buzz));
             println!(
-                "    J{} is shaking {swing:.3} deg at x{:.2} during '{}'",
+                "    J{} is buzzing {buzz:.0} mA at x{here:.2} during '{}' \
+                 (position ripple {swing:.3} deg)",
                 j + 1,
-                self.scales[j],
                 self.cadence.phase
             );
+            let best = self.quiet_best[j].filter(|(_, d)| *d <= buzz);
+            self.quiet_best[j] = best.or(Some((here, buzz)));
+            // Lower gains that make it WORSE say the loop is not what is
+            // shaking: a slacker joint is one the load pushes around more.
+            // Carrying on down the ladder from here only makes it worse
+            // still, which is how the elbow ended a run on its loudest gain.
+            if let Some((best_scale, best_deg)) = best {
+                if buzz > best_deg * RING_WORSE_FACTOR {
+                    let why = format!(
+                        "J{} buzzes WORSE as its gains come down ({best_deg:.0} mA at \
+                         x{best_scale:.2}, {buzz:.0} at x{here:.2}) — this is not the \
+                         velocity loop",
+                        j + 1
+                    );
+                    println!("    {why}");
+                    self.settle_on_quietest(j)?;
+                    if self.unquietable[j].is_none() {
+                        self.unquietable[j] = Some(why);
+                    }
+                    continue;
+                }
+            }
             if let Err(e) = self.quieter_scale(j) {
                 // Out of rungs is a finding, not a reason to stop: the joints
                 // that have not been measured yet still can be, and the trace
@@ -1743,10 +1830,7 @@ impl Arm {
                     println!("    {e}");
                     self.unquietable[j] = Some(e);
                 }
-                self.quiet_now[j] = false;
-                self.history[j].clear();
-                self.error_history[j].clear();
-                self.ringing_for[j] = 0;
+                self.settle_on_quietest(j)?;
                 continue;
             }
             // Judge the new gain on what the joint does NEXT, not on the
@@ -1989,6 +2073,92 @@ impl Arm {
         (distance / MOVE_RAD_S + MOVE_RAMP_S).clamp(MOVE_MIN_S, MOVE_MAX_S)
     }
 
+    /// Take every joint to `pose` in the SAME ticks.
+    ///
+    /// The poses used to be reached one joint at a time, which is what made
+    /// the arm look like it was stuttering: six profiles back to back, each
+    /// with its own limit push, and a joint already at its target still ran a
+    /// full profile going nowhere. Thirteen stretches of one to two and a half
+    /// seconds in one run had the whole arm standing still inside a `move`.
+    ///
+    /// A joint already inside its arrival window is not commanded to move at
+    /// all; it is held where it is while the others travel.
+    fn move_pose(&mut self, pose: &[f64; par6_kin::NQ]) -> Result<(), String> {
+        let n = self.n().min(par6_kin::NQ);
+        let mut starts = [0_i32; par6_kin::NQ];
+        let mut targets = [0_i32; par6_kin::NQ];
+        let mut travelling = [false; par6_kin::NQ];
+        let mut duration = 0.0_f64;
+        for j in 0..n {
+            let Some(start) = self.position(j) else {
+                return Err(format!("J{} reports no position", j + 1));
+            };
+            starts[j] = start;
+            targets[j] = self.conv[j].motor_ticks(pose[j]);
+            let off = (i64::from(targets[j]) - i64::from(start)).abs();
+            travelling[j] = off > self.arrival_tol(j);
+            if travelling[j] {
+                duration = duration.max(self.travel_time(j, pose[j]));
+            }
+        }
+        if !travelling.iter().any(|t| *t) {
+            return Ok(());
+        }
+        for (j, going) in travelling.iter().enumerate().take(n) {
+            if *going {
+                // The arm's own limits, not a seek's: a restore dropped
+                // earlier would hold this move at a seek current throughout.
+                let node = self.node(j);
+                let ilim = self.robot.joints[j].ilim_ma as f32;
+                let vel_limit = self.robot.joints[j].velocity_limit_ticks_s as f32;
+                self.insist_limits(node, vel_limit, ilim)?;
+            }
+        }
+        self.cadence.phase("move");
+        let span = (duration / self.dt).round().max(1.0) as u32;
+        let settle = (SETTLE_BEFORE_JUDGING_S / self.dt).round().max(1.0) as u64;
+        let mut next_tick = Instant::now();
+        self.reset_motion_watch();
+        for t in 1..=u64::from(span) + settle {
+            let step = t.min(u64::from(span)) as u32;
+            let dt = self.dt;
+            self.tick_each(|arm, j| {
+                if j >= n || !travelling[j] {
+                    return JointCommand::position(
+                        starts[j.min(par6_kin::NQ - 1)],
+                        0,
+                        arm.last_ff[j],
+                    );
+                }
+                let (pos, vel) = hermite(
+                    f64::from(starts[j]),
+                    f64::from(targets[j]),
+                    step,
+                    span,
+                    dt,
+                );
+                JointCommand::position(pos as i32, vel as i32, arm.last_ff[j])
+            })?;
+            self.sleep_to(&mut next_tick);
+        }
+        // Whatever missed gets the single-joint path, which knows how to give
+        // a joint more authority and try again.
+        for j in 0..n {
+            if !travelling[j] {
+                continue;
+            }
+            let off = self
+                .position(j)
+                .map(|p| (i64::from(p) - i64::from(targets[j])).abs())
+                .unwrap_or(i64::MAX);
+            if off > self.arrival_tol(j) {
+                let s = self.travel_time(j, pose[j]);
+                self.move_to(j, pose[j], s)?;
+            }
+        }
+        Ok(())
+    }
+
     /// Wait until every joint has reported a position, and no longer.
     ///
     /// The thing being waited for is a reading, so that is what is waited on.
@@ -2122,6 +2292,29 @@ impl Arm {
         Ok(next)
     }
 
+    /// Put a joint back on the quietest gain it was seen on, and stop
+    /// trying.
+    ///
+    /// The ladder is a search, and a search that ends leaves the arm on its
+    /// best answer, not on the last thing it tried.
+    fn settle_on_quietest(&mut self, joint: usize) -> Result<(), String> {
+        if let Some((scale, ma)) = self.quiet_best[joint] {
+            if (scale - self.scales[joint]).abs() > 1e-9 {
+                println!(
+                    "    J{}: back to x{scale:.2}, the quietest it was seen on \
+                     ({ma:.0} mA)",
+                    joint + 1
+                );
+                self.push_scale(joint, scale)?;
+            }
+        }
+        self.quiet_now[joint] = false;
+        self.history[joint].clear();
+        self.error_history[joint].clear();
+        self.ringing_for[joint] = 0;
+        Ok(())
+    }
+
     /// What was tried on this joint and what it shook by at each step.
     fn quiet_story(&self, joint: usize) -> String {
         if self.quiet_trail[joint].is_empty() {
@@ -2129,7 +2322,7 @@ impl Arm {
         }
         let steps: Vec<String> = self.quiet_trail[joint]
             .iter()
-            .map(|(scale, deg)| format!("x{scale:.2} shook {deg:.3} deg"))
+            .map(|(scale, ma)| format!("x{scale:.2} buzzed {ma:.0} mA"))
             .collect();
         format!("J{}: {}", joint + 1, steps.join(" -> "))
     }
@@ -3026,20 +3219,26 @@ fn span_ticks(history: &[i32]) -> i64 {
 ///
 /// Allocation-free: a running sum, and the residual judged as it goes.
 fn ripple_p2p(history: &[i32]) -> f64 {
-    let k = RIPPLE_SMOOTH_TICKS;
+    ripple_p2p_smoothed(history, RIPPLE_SMOOTH_TICKS)
+}
+
+/// The same measurement over any sample type and any smoothing window.
+fn ripple_p2p_smoothed<T: Copy + Into<i64>>(history: &[T], k: usize) -> f64 {
     if history.len() < k * 3 {
         return 0.0;
     }
     let half = k / 2;
-    let mut sum: i64 = history[..k].iter().map(|v| i64::from(*v)).sum();
+    let mut sum: i64 = history[..k].iter().map(|v| (*v).into()).sum();
     let (mut lo, mut hi) = (f64::MAX, f64::MIN);
     for i in half..history.len() - half {
         // The window centred on `i` spans `i-half ..= i+half`. Stepping one
         // sample on takes in `i+half` and drops `i-half-1`.
         if i > half {
-            sum += i64::from(history[i + half]) - i64::from(history[i - half - 1]);
+            let (add, drop): (i64, i64) = (history[i + half].into(), history[i - half - 1].into());
+            sum += add - drop;
         }
-        let r = f64::from(history[i]) - sum as f64 / k as f64;
+        let here: i64 = history[i].into();
+        let r = here as f64 - sum as f64 / k as f64;
         lo = lo.min(r);
         hi = hi.max(r);
     }
@@ -3048,6 +3247,18 @@ fn ripple_p2p(history: &[i32]) -> f64 {
     } else {
         hi - lo
     }
+}
+
+/// The fast half of the ripple: what is left after a 20 ms average, so
+/// roughly 50 Hz and up.
+///
+/// This is the band that is AUDIBLE, and position amplitude is not what makes
+/// the noise — current is. The elbow buzzed loudly at 0.25 deg with 2.6 A of
+/// ripple behind it, and went silent at 0.28 deg with 0.83 A: a metric built
+/// on the excursion called that a joint getting worse, while the room called
+/// it fixed.
+fn fast_ripple_p2p<T: Copy + Into<i64>>(samples: &[T]) -> f64 {
+    ripple_p2p_smoothed(samples, FAST_SMOOTH_TICKS)
 }
 
 /// Whether these samples are a joint shaking rather than moving.
@@ -3312,8 +3523,11 @@ fn main() {
         .filter(|j| !arm.quiet_trail[*j].is_empty())
         .map(|j| {
             let story = arm.quiet_story(j);
-            let now = arm.deg_for_ticks(j, arm.noise[j].moving.max(arm.noise[j].holding) as i64);
-            format!("  {story} -> kept x{:.2}, now {now:.3} deg", arm.scales[j])
+            format!(
+                "  {story} -> kept x{:.2}, now {:.0} mA",
+                arm.scales[j],
+                fast_ripple_p2p(&arm.current_history[j])
+            )
         })
         .collect();
     if quietened.is_empty() {
@@ -3370,8 +3584,9 @@ fn main() {
     }
     match arm.write_trace(std::path::Path::new(".")) {
         Ok((ticks, full)) => println!(
-            "  {ticks} ticks recorded to selfcal-trace.bin (PAR6CAP2, with the \
-             phases in selfcal-trace-phases.csv){}",
+            "  {ticks} ticks recorded to selfcal-trace-{}.bin (PAR6CAP2, with its \
+             phases beside it){}",
+            arm.started_at,
             if full {
                 " — the buffer filled, so the tail of the run is not in it"
             } else {
@@ -3444,7 +3659,7 @@ fn step2(arm: &mut Arm) -> Result<(), String> {
              can be measured",
             ringing
                 .iter()
-                .map(|(j, d)| format!("J{} at {d:.4} deg", j + 1))
+                .map(|(j, ma)| format!("J{} pulling {ma:.0} mA of ripple", j + 1))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -3497,10 +3712,7 @@ fn step2(arm: &mut Arm) -> Result<(), String> {
             joint + 1,
             pose.iter().map(|v| (v * 100.0).round() / 100.0).collect::<Vec<_>>()
         );
-        for (j, target) in pose.iter().enumerate().take(arm.n()) {
-            let s = arm.travel_time(j, *target);
-            arm.move_to(j, *target, s)?;
-        }
+        arm.move_pose(&pose)?;
         let from = scales[joint];
         let held = search_gravity(arm, joint, &pose, &scales, from)?;
         if from != 1.0 {
@@ -3533,7 +3745,7 @@ impl Arm {
     /// Built from the pose homing ended in, so it is reachable: only the
     /// joints that change the lever arm are moved, and the wrist is taken to
     /// level or vertical rather than to an angle chosen for no reason.
-    fn loaded_pose(&self, joint: usize) -> Result<[f64; par6_kin::NQ], String> {
+    fn loaded_pose(&mut self, joint: usize) -> Result<[f64; par6_kin::NQ], String> {
         let mut q = self.ready_pose;
         match joint {
             // Wrist pitch level: its own load is greatest across the axis.
@@ -3544,22 +3756,62 @@ impl Arm {
                 q[4] = -std::f64::consts::FRAC_PI_2;
                 q[3] = std::f64::consts::FRAC_PI_2;
             }
-            // Forearm out, wrist level: the elbow carries everything beyond.
-            2 => {
+            // Forearm and shoulder: both carry the arm beyond them, and how
+            // much depends on how far that arm is STRETCHED OUT. Left at the
+            // pose homing ends in, the elbow sits folded and the shoulder
+            // carries its load at its shortest lever — a scale that holds
+            // that says very little about holding the arm extended, which is
+            // the case anybody cares about. The reach is chosen below.
+            2 | 1 => {
                 q[3] = 0.0;
                 q[4] = 0.0;
-            }
-            // The shoulder carries everything regardless of how the elbow is
-            // folded, so the elbow stays where homing left it — holding at its
-            // own limit to extend the arm further only tests the elbow, and it
-            // failed doing exactly that.
-            1 => {
-                q[3] = 0.0;
-                q[4] = 0.0;
+                self.stretch_for(joint, &mut q);
             }
             _ => return Err(format!("J{} is not gravity-loaded", joint + 1)),
         }
         Ok(q)
+    }
+
+    /// Move the shoulder and elbow to where `joint` carries the most, within
+    /// reach of the pose homing ended in.
+    ///
+    /// Asked of the model rather than written down as angles: the gravity
+    /// term is already computed every tick, so the pose that loads a joint
+    /// most is the one that maximises it, and no sign convention has to be
+    /// remembered correctly for the test to be the right test. Bounded to
+    /// [`STRETCH_RANGE_RAD`] either side of the homed pose and to the
+    /// configured soft limits, so this reaches out rather than exploring.
+    fn stretch_for(&mut self, joint: usize, q: &mut [f64; par6_kin::NQ]) {
+        const STEPS: usize = 9;
+        let bounds = [self.limits_of(1), self.limits_of(2)];
+        let mut best = (f64::MIN, q[1], q[2]);
+        let mut probe = *q;
+        for a in 0..STEPS {
+            for b in 0..STEPS {
+                let fraction = |i: usize| (i as f64 / (STEPS - 1) as f64) * 2.0 - 1.0;
+                probe[1] = (q[1] + fraction(a) * STRETCH_RANGE_RAD).clamp(bounds[0].0, bounds[0].1);
+                probe[2] = (q[2] + fraction(b) * STRETCH_RANGE_RAD).clamp(bounds[1].0, bounds[1].1);
+                let mut g = [0.0_f64; par6_kin::NQ];
+                if self.kin.gravity(&probe, &mut g).is_err() {
+                    continue;
+                }
+                if g[joint].abs() > best.0 {
+                    best = (g[joint].abs(), probe[1], probe[2]);
+                }
+            }
+        }
+        q[1] = best.1;
+        q[2] = best.2;
+    }
+
+    /// The joint's usable range: its configured soft limits, kept clear by a
+    /// margin so a pose is never chosen ON one.
+    fn limits_of(&self, joint: usize) -> (f64, f64) {
+        let l = &self.robot.joints[joint].limits;
+        (
+            l.soft_min_rad + STRETCH_MARGIN_RAD,
+            l.soft_max_rad - STRETCH_MARGIN_RAD,
+        )
     }
 
     /// Hold `pose` with the drive's impedance frame plus `scale` times the
@@ -3773,10 +4025,7 @@ fn search_gravity(
             // last attempt is somewhere much lighter now, and holding THERE
             // says nothing about holding here.
             if attempt > 0 {
-                for (j, target) in pose.iter().enumerate().take(arm.n()) {
-                    let s = arm.travel_time(j, *target);
-                    arm.move_to(j, *target, s)?;
-                }
+                arm.move_pose(pose)?;
             }
             if attempt == 0 {
                 // Signed, both of them. A feedforward that is helping and one
@@ -3823,10 +4072,7 @@ fn search_gravity(
                 // And it has to do it twice, from a fresh approach. One hold
                 // can be the tail of the last move rather than a property of
                 // the gain.
-                for (j, target) in pose.iter().enumerate().take(arm.n()) {
-                    let s = arm.travel_time(j, *target);
-                    arm.move_to(j, *target, s)?;
-                }
+                arm.move_pose(pose)?;
                 let again = arm.hold_on_gravity(joint, pose, scale, settled)?;
                 println!(
                     "    J{} at gravity x{scale:.3}: {:+.4} deg/s on a second approach",
@@ -3939,10 +4185,7 @@ fn search_gravity(
     // else.
     let (held, drift) = match bracket(&probes, held) {
         Some(candidate) => {
-            for (j, target) in pose.iter().enumerate().take(arm.n()) {
-                let s = arm.travel_time(j, *target);
-                arm.move_to(j, *target, s)?;
-            }
+            arm.move_pose(pose)?;
             let d = arm.hold_on_gravity(joint, pose, candidate, settled)?;
             println!(
                 "    J{}: the sag and the lift put zero at x{candidate:.4}; it drifts \
@@ -4052,10 +4295,7 @@ fn verify_once(arm: &mut Arm, scales: &[f64; par6_kin::NQ]) -> Result<(), Verify
     let mut missed = Vec::new();
     for joint in [4usize, 3, 2, 1] {
         let pose = arm.loaded_pose(joint).map_err(VerifyFailure::fatal)?;
-        for (j, target) in pose.iter().enumerate().take(arm.n()) {
-            let s = arm.travel_time(j, *target);
-            arm.move_to(j, *target, s).map_err(VerifyFailure::fatal)?;
-        }
+        arm.move_pose(&pose).map_err(VerifyFailure::fatal)?;
         let drift = arm
             .hold_on_gravity(joint, &pose, scales[joint], scales)
             .map_err(VerifyFailure::fatal)?;
@@ -4084,7 +4324,7 @@ fn verify_once(arm: &mut Arm, scales: &[f64; par6_kin::NQ]) -> Result<(), Verify
             "{} still oscillating",
             ringing
                 .iter()
-                .map(|(j, d)| format!("J{} at {d:.4} deg", j + 1))
+                .map(|(j, ma)| format!("J{} pulling {ma:.0} mA of ripple", j + 1))
                 .collect::<Vec<_>>()
                 .join(", ")
         ));
@@ -4492,7 +4732,8 @@ mod tests {
         assert_eq!(ticks, 50, "every tick is in it");
         assert!(!full, "fifty ticks does not fill a six-minute buffer");
 
-        let raw = std::fs::read(dir.join("selfcal-trace.bin")).expect("read it back");
+        let raw = std::fs::read(dir.join(format!("selfcal-trace-{}.bin", arm.started_at)))
+            .expect("read it back");
         assert_eq!(&raw[..8], b"PAR6CAP2", "the magic the readers look for");
         let dt = f64::from_le_bytes(raw[8..16].try_into().unwrap());
         assert!((dt - arm.dt).abs() < 1e-12, "the tick period is in the header");
@@ -4520,8 +4761,10 @@ mod tests {
             (q - expect).abs() < 1e-9,
             "q decodes to the joint angle: {q} vs {expect}"
         );
-        let phases = std::fs::read_to_string(dir.join("selfcal-trace-phases.csv"))
-            .expect("the phases beside it");
+        let phases = std::fs::read_to_string(
+            dir.join(format!("selfcal-trace-{}-phases.csv", arm.started_at)),
+        )
+        .expect("the phases beside it");
         assert!(phases.starts_with("tick,phase"), "with a header row");
         std::fs::remove_dir_all(&dir).ok();
     }
