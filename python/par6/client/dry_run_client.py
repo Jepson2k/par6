@@ -146,6 +146,7 @@ class DryRunRobotClient:
         # the URDF and the collision meshes on its event loop. It runs on
         # the packaged model, never on whatever the machine happens to
         # have installed under /usr/share.
+        self._robot = robot
         self._engine_args = (
             config_path
             if config_path is not None
