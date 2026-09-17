@@ -1248,6 +1248,9 @@ _TABLE_ARGS: dict[str, tuple] = {
     "set_payload": (0.1,),
     "stop": (),
     "estop": (),
+    "pause": (),
+    "resume": (),
+    "set_execution_speed": (0.5,),
 }
 _TABLE_KWARGS: dict[str, dict] = {
     n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")
