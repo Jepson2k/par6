@@ -1336,10 +1336,11 @@ def test_plan_and_simulate_describe_the_same_program() -> None:
     assert "setpoint_rad" in predicted.channels
     assert commanded.digest != predicted.digest
 
-    assert following_error(commanded, commanded).max() == 0.0
+    assert float(np.max(following_error(commanded, commanded))) == 0.0
     gap = following_error(commanded, predicted)
     assert gap.shape == (predicted.rows,)
-    assert 0.0 < gap.max() < 0.1, f"the arm is not following its commands: {gap.max()}"
+    worst = float(np.max(gap))
+    assert 0.0 < worst < 0.1, f"the arm is not following its commands: {worst}"
 
     # A later command extends the commanded record; a refused one keeps its
     # place in it, with the refusal, and never counts as complete.
