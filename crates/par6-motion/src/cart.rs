@@ -17,6 +17,8 @@
 //! clamped to half of each adjacent segment, and two adjacent zones that
 //! would overlap are scaled down together until they do not.
 
+use glam::{DMat3, DQuat, DVec3};
+
 use crate::MotionError;
 
 /// Row-major 4x4 homogeneous transform; translation in metres.
@@ -38,142 +40,40 @@ const LEN_EPS: f64 = 1e-9;
 /// (`motion/geometry.py`, `compute_circle_from_3_points`).
 const FULL_CIRCLE_M: f64 = 1e-3;
 
-// ------------------------------------------------------------ quaternions
+// ---------------------------------------------------------- pose <-> glam
 
-/// Unit quaternion `[w, x, y, z]` from the rotation block of `m`
-/// (Shepperd's method: pick the largest diagonal pivot for stability).
-fn quat_from_matrix(m: &Pose) -> [f64; 4] {
-    let (r00, r01, r02) = (m[0], m[1], m[2]);
-    let (r10, r11, r12) = (m[4], m[5], m[6]);
-    let (r20, r21, r22) = (m[8], m[9], m[10]);
-    let trace = r00 + r11 + r22;
-    let q = if trace > 0.0 {
-        let s = (trace + 1.0).sqrt() * 2.0;
-        [s / 4.0, (r21 - r12) / s, (r02 - r20) / s, (r10 - r01) / s]
-    } else if r00 >= r11 && r00 >= r22 {
-        let s = (1.0 + r00 - r11 - r22).sqrt() * 2.0;
-        [(r21 - r12) / s, s / 4.0, (r01 + r10) / s, (r02 + r20) / s]
-    } else if r11 >= r22 {
-        let s = (1.0 + r11 - r00 - r22).sqrt() * 2.0;
-        [(r02 - r20) / s, (r01 + r10) / s, s / 4.0, (r12 + r21) / s]
-    } else {
-        let s = (1.0 + r22 - r00 - r11).sqrt() * 2.0;
-        [(r10 - r01) / s, (r02 + r20) / s, (r12 + r21) / s, s / 4.0]
-    };
-    let n = (q[0] * q[0] + q[1] * q[1] + q[2] * q[2] + q[3] * q[3]).sqrt();
-    [q[0] / n, q[1] / n, q[2] / n, q[3] / n]
+/// The rotation of a pose, as a unit quaternion.
+///
+/// `Pose` is row-major and glam is column-major, hence the transpose on
+/// the way in.
+fn rotation(m: &Pose) -> DQuat {
+    DQuat::from_mat3(&DMat3::from_cols(
+        DVec3::new(m[0], m[4], m[8]),
+        DVec3::new(m[1], m[5], m[9]),
+        DVec3::new(m[2], m[6], m[10]),
+    ))
+    .normalize()
 }
-
-/// Write the rotation block of `m` from a unit quaternion.
-fn quat_to_rotation(q: &[f64; 4], m: &mut Pose) {
-    let (w, x, y, z) = (q[0], q[1], q[2], q[3]);
-    m[0] = 1.0 - 2.0 * (y * y + z * z);
-    m[1] = 2.0 * (x * y - w * z);
-    m[2] = 2.0 * (x * z + w * y);
-    m[4] = 2.0 * (x * y + w * z);
-    m[5] = 1.0 - 2.0 * (x * x + z * z);
-    m[6] = 2.0 * (y * z - w * x);
-    m[8] = 2.0 * (x * z - w * y);
-    m[9] = 2.0 * (y * z + w * x);
-    m[10] = 1.0 - 2.0 * (x * x + y * y);
-}
-
-/// Angle of the relative rotation between two unit quaternions \[rad\].
-fn quat_angle(a: &[f64; 4], b: &[f64; 4]) -> f64 {
-    let dot = (a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3]).abs();
-    2.0 * dot.clamp(-1.0, 1.0).acos()
-}
-
-/// Shortest-arc slerp between unit quaternions.
-fn quat_slerp(a: &[f64; 4], b: &[f64; 4], t: f64) -> [f64; 4] {
-    let mut b = *b;
-    let mut dot = a[0] * b[0] + a[1] * b[1] + a[2] * b[2] + a[3] * b[3];
-    if dot < 0.0 {
-        for v in &mut b {
-            *v = -*v;
-        }
-        dot = -dot;
-    }
-    let dot = dot.clamp(-1.0, 1.0);
-    let theta = dot.acos();
-    if theta < ANGLE_EPS {
-        // Nearly parallel: nlerp is exact to first order.
-        let mut out = [0.0; 4];
-        for i in 0..4 {
-            out[i] = a[i] + t * (b[i] - a[i]);
-        }
-        let n = out.iter().map(|v| v * v).sum::<f64>().sqrt();
-        for v in &mut out {
-            *v /= n;
-        }
-        return out;
-    }
-    let sin_theta = theta.sin();
-    let (wa, wb) = (
-        ((1.0 - t) * theta).sin() / sin_theta,
-        (t * theta).sin() / sin_theta,
-    );
-    [
-        wa * a[0] + wb * b[0],
-        wa * a[1] + wb * b[1],
-        wa * a[2] + wb * b[2],
-        wa * a[3] + wb * b[3],
-    ]
-}
-
-// ------------------------------------------------------------ vector math
 
 /// The translation of a pose \[m\].
 pub fn translation(m: &Pose) -> [f64; 3] {
     [m[3], m[7], m[11]]
 }
 
-fn sub(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
+/// The translation of a pose as a vector \[m\].
+fn position(m: &Pose) -> DVec3 {
+    DVec3::new(m[3], m[7], m[11])
 }
 
-fn add(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
-    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
-}
-
-fn scale(a: [f64; 3], k: f64) -> [f64; 3] {
-    [a[0] * k, a[1] * k, a[2] * k]
-}
-
-fn dot(a: [f64; 3], b: [f64; 3]) -> f64 {
-    a[0] * b[0] + a[1] * b[1] + a[2] * b[2]
-}
-
-fn cross(a: [f64; 3], b: [f64; 3]) -> [f64; 3] {
+/// A pose from an orientation and a translation \[m\].
+fn pose_of(q: DQuat, p: DVec3) -> Pose {
+    let r = DMat3::from_quat(q);
     [
-        a[1] * b[2] - a[2] * b[1],
-        a[2] * b[0] - a[0] * b[2],
-        a[0] * b[1] - a[1] * b[0],
+        r.x_axis.x, r.y_axis.x, r.z_axis.x, p.x, //
+        r.x_axis.y, r.y_axis.y, r.z_axis.y, p.y, //
+        r.x_axis.z, r.y_axis.z, r.z_axis.z, p.z, //
+        0.0, 0.0, 0.0, 1.0,
     ]
-}
-
-fn norm(a: [f64; 3]) -> f64 {
-    dot(a, a).sqrt()
-}
-
-/// Rotate `v` about the unit axis `k` by `angle` (Rodrigues).
-fn rotate_about(v: [f64; 3], k: [f64; 3], angle: f64) -> [f64; 3] {
-    let (s, c) = angle.sin_cos();
-    add(
-        add(scale(v, c), scale(cross(k, v), s)),
-        scale(k, dot(k, v) * (1.0 - c)),
-    )
-}
-
-/// A pose from an orientation quaternion and a translation \[m\].
-fn pose_of(q: &[f64; 4], p: [f64; 3]) -> Pose {
-    let mut m = [0.0; 16];
-    m[15] = 1.0;
-    quat_to_rotation(q, &mut m);
-    m[3] = p[0];
-    m[7] = p[1];
-    m[11] = p[2];
-    m
 }
 
 // --------------------------------------------------------------- sampling
@@ -239,39 +139,36 @@ fn fit_budget(counts: &mut [usize], max_points: usize) {
 /// A straight cartesian segment: position lerp, orientation slerp.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct LineSegment {
-    p0: [f64; 3],
-    p1: [f64; 3],
-    q0: [f64; 4],
-    q1: [f64; 4],
+    p0: DVec3,
+    p1: DVec3,
+    q0: DQuat,
+    q1: DQuat,
 }
 
 impl LineSegment {
     /// The segment between two poses.
     pub fn new(start: &Pose, end: &Pose) -> Self {
         Self {
-            p0: translation(start),
-            p1: translation(end),
-            q0: quat_from_matrix(start),
-            q1: quat_from_matrix(end),
+            p0: position(start),
+            p1: position(end),
+            q0: rotation(start),
+            q1: rotation(end),
         }
     }
 
     /// Translation length \[m\].
     pub fn length_m(&self) -> f64 {
-        norm(sub(self.p1, self.p0))
+        (self.p1 - self.p0).length()
     }
 
     /// Rotation angle between the endpoint orientations \[rad\].
     pub fn angle_rad(&self) -> f64 {
-        quat_angle(&self.q0, &self.q1)
+        self.q0.angle_between(self.q1)
     }
 
     /// Pose at normalized position `t` in \[0, 1\].
     pub fn sample(&self, t: f64) -> Pose {
-        pose_of(
-            &quat_slerp(&self.q0, &self.q1, t),
-            add(self.p0, scale(sub(self.p1, self.p0), t)),
-        )
+        pose_of(self.q0.slerp(self.q1, t), self.p0.lerp(self.p1, t))
     }
 }
 
@@ -290,11 +187,11 @@ pub fn line(start: &Pose, end: &Pose, s: CartSampling) -> Vec<Pose> {
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Circle {
     /// Centre point \[m\].
-    pub center: [f64; 3],
+    pub center: DVec3,
     /// Radius \[m\].
     pub radius: f64,
     /// Unit normal of the plane the circle lies in.
-    pub normal: [f64; 3],
+    pub normal: DVec3,
     /// The end point came back to the start, so the client meant one whole
     /// lap. [`arc`] takes the sweep from this rather than re-deriving it
     /// from the endpoints: the two differ by the arm's settle error, which
@@ -316,33 +213,28 @@ pub struct Circle {
 ///
 /// Collinear or coincident points have no circle and are refused — never
 /// silently straightened into a line.
-pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle, MotionError> {
-    let a = sub(p2, p1);
-    let b = sub(p3, p1);
-    if norm(b) < FULL_CIRCLE_M {
-        let a_len = norm(a);
+pub fn circle_through(p1: DVec3, p2: DVec3, p3: DVec3) -> Result<Circle, MotionError> {
+    let a = p2 - p1;
+    let b = p3 - p1;
+    if b.length() < FULL_CIRCLE_M {
+        let a_len = a.length();
         if a_len < LEN_EPS {
             return Err(MotionError::InvalidInput {
                 what: "via",
                 reason: "the start, via and end points of an arc are all the same point".into(),
             });
         }
-        let d = scale(a, 1.0 / a_len);
-        let reference = if d[2].abs() < 0.9 {
-            [0.0, 0.0, 1.0]
-        } else {
-            [1.0, 0.0, 0.0]
-        };
-        let n = cross(d, reference);
+        let d = a / a_len;
+        let reference = if d.z.abs() < 0.9 { DVec3::Z } else { DVec3::X };
         return Ok(Circle {
-            center: add(p1, scale(a, 0.5)),
+            center: p1 + a * 0.5,
             radius: a_len / 2.0,
-            normal: scale(n, 1.0 / norm(n)),
+            normal: d.cross(reference).normalize(),
             full_circle: true,
         });
     }
-    let n = cross(a, b);
-    let n_len = norm(n);
+    let n = a.cross(b);
+    let n_len = n.length();
     if n_len < LEN_EPS * LEN_EPS {
         return Err(MotionError::InvalidInput {
             what: "via",
@@ -353,7 +245,7 @@ pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle
     }
     // Circumcentre C = p1 + s·a + t·b from the perpendicular bisectors:
     // (C-p1)·a = |a|²/2 and (C-p1)·b = |b|²/2.
-    let (aa, bb, ab) = (dot(a, a), dot(b, b), dot(a, b));
+    let (aa, bb, ab) = (a.dot(a), b.dot(b), a.dot(b));
     let det = aa * bb - ab * ab;
     if det.abs() < LEN_EPS * LEN_EPS {
         return Err(MotionError::InvalidInput {
@@ -365,11 +257,11 @@ pub fn circle_through(p1: [f64; 3], p2: [f64; 3], p3: [f64; 3]) -> Result<Circle
     }
     let s = (bb * aa - ab * bb) / (2.0 * det);
     let t = (aa * bb - ab * aa) / (2.0 * det);
-    let center = add(p1, add(scale(a, s), scale(b, t)));
+    let center = p1 + a * s + b * t;
     Ok(Circle {
         center,
-        radius: norm(sub(center, p1)),
-        normal: scale(n, 1.0 / n_len),
+        radius: (center - p1).length(),
+        normal: n / n_len,
         full_circle: false,
     })
 }
@@ -391,36 +283,36 @@ pub fn arc(
     end: &Pose,
     s: CartSampling,
 ) -> Result<Vec<Pose>, MotionError> {
-    let (p_start, p_via, p_end) = (translation(start), translation(via), translation(end));
+    let (p_start, p_via, p_end) = (position(start), position(via), position(end));
     let circle = circle_through(p_start, p_via, p_end)?;
-    let r1 = sub(p_start, circle.center);
-    let r2 = sub(p_end, circle.center);
-    let (n1, n2) = (norm(r1), norm(r2));
+    let r1 = p_start - circle.center;
+    let r2 = p_end - circle.center;
+    let (n1, n2) = (r1.length(), r2.length());
     if n1 < LEN_EPS || n2 < LEN_EPS {
         return Err(MotionError::InvalidInput {
             what: "via",
             reason: "the arc has no radius".into(),
         });
     }
-    let (u1, u2) = (scale(r1, 1.0 / n1), scale(r2, 1.0 / n2));
-    let mut sweep = dot(u1, u2).clamp(-1.0, 1.0).acos();
+    let (u1, u2) = (r1 / n1, r2 / n2);
+    let mut sweep = u1.dot(u2).clamp(-1.0, 1.0).acos();
     if circle.full_circle {
         sweep = std::f64::consts::TAU;
-    } else if dot(cross(u1, u2), circle.normal) < 0.0 {
+    } else if u1.cross(u2).dot(circle.normal) < 0.0 {
         sweep = std::f64::consts::TAU - sweep;
     }
 
-    let (q0, q1) = (quat_from_matrix(start), quat_from_matrix(end));
+    let (q0, q1) = (rotation(start), rotation(end));
     let arc_len = circle.radius * sweep;
     let n = s
-        .intervals(arc_len, quat_angle(&q0, &q1))
+        .intervals(arc_len, q0.angle_between(q1))
         .min(s.max_points.saturating_sub(1).max(1));
     Ok((0..=n)
         .map(|k| {
             let t = k as f64 / n as f64;
             pose_of(
-                &quat_slerp(&q0, &q1, t),
-                add(circle.center, rotate_about(r1, circle.normal, t * sweep)),
+                q0.slerp(q1, t),
+                circle.center + DQuat::from_axis_angle(circle.normal, t * sweep) * r1,
             )
         })
         .collect())
@@ -461,15 +353,15 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
     if n == 2 {
         return Ok(line(&waypoints[0], &waypoints[1], s));
     }
-    let points: Vec<[f64; 3]> = waypoints.iter().map(translation).collect();
-    let quats: Vec<[f64; 4]> = waypoints.iter().map(quat_from_matrix).collect();
+    let points: Vec<DVec3> = waypoints.iter().map(position).collect();
+    let quats: Vec<DQuat> = waypoints.iter().map(rotation).collect();
 
     // Chord-length knots; coincident neighbours would give a zero
     // interval and a singular system, so they carry a floor.
     let mut knots = Vec::with_capacity(n);
     knots.push(0.0);
     for i in 1..n {
-        let d = norm(sub(points[i], points[i - 1])).max(LEN_EPS);
+        let d = (points[i] - points[i - 1]).length().max(LEN_EPS);
         knots.push(knots[i - 1] + d);
     }
     let total = knots[n - 1];
@@ -491,7 +383,7 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
     // Sample density from the polyline length and the total rotation:
     // the spline is longer than its polyline, never shorter, so this is
     // a floor on the density, and the budget bounds the ceiling.
-    let turn: f64 = (1..n).map(|i| quat_angle(&quats[i - 1], &quats[i])).sum();
+    let turn: f64 = (1..n).map(|i| quats[i - 1].angle_between(quats[i])).sum();
     let steps = s.intervals(total, turn).min(s.max_points.max(2) - 1);
 
     let mut out = Vec::with_capacity(steps + 1);
@@ -503,7 +395,7 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
         }
         let (h, local) = (knots[seg + 1] - knots[seg], u - knots[seg]);
         let t = (local / h).clamp(0.0, 1.0);
-        let mut p = [0.0; 3];
+        let mut p = DVec3::ZERO;
         for (axis, c) in coeffs.iter().enumerate() {
             let (y, m) = (&c[0], &c[1]);
             // Cubic on [knots[seg], knots[seg+1]] from the end values and
@@ -514,7 +406,7 @@ pub fn spline(waypoints: &[Pose], s: CartSampling) -> Result<Vec<Pose>, MotionEr
                 + ((b * b * b - h * h * b) * m[seg] + (a * a * a - h * h * a) * m[seg + 1])
                     / (6.0 * h);
         }
-        out.push(pose_of(&quat_slerp(&quats[seg], &quats[seg + 1], t), p));
+        out.push(pose_of(quats[seg].slerp(quats[seg + 1], t), p));
     }
     Ok(out)
 }
@@ -696,17 +588,14 @@ pub fn blended_polyline(
             Piece::Corner { i } => {
                 let entry = segments[*i].sample(1.0 - trims[*i].exit);
                 let exit = segments[*i + 1].sample(trims[*i + 1].entry);
-                let corner = translation(&waypoints[*i + 1]);
-                let (pe, px) = (translation(&entry), translation(&exit));
-                let (qe, qx) = (quat_from_matrix(&entry), quat_from_matrix(&exit));
+                let corner = position(&waypoints[*i + 1]);
+                let (pe, px) = (position(&entry), position(&exit));
+                let (qe, qx) = (rotation(&entry), rotation(&exit));
                 for k in 0..=*steps {
                     let t = k as f64 / *steps as f64;
                     let omt = 1.0 - t;
-                    let p = add(
-                        add(scale(pe, omt * omt), scale(corner, 2.0 * omt * t)),
-                        scale(px, t * t),
-                    );
-                    push_distinct(&mut out, pose_of(&quat_slerp(&qe, &qx, t), p));
+                    let p = pe * (omt * omt) + corner * (2.0 * omt * t) + px * (t * t);
+                    push_distinct(&mut out, pose_of(qe.slerp(qx, t), p));
                 }
             }
         }
@@ -718,8 +607,8 @@ pub fn blended_polyline(
 /// shared points; a duplicate waypoint is a zero-length path step).
 fn push_distinct(out: &mut Vec<Pose>, pose: Pose) {
     if let Some(last) = out.last() {
-        if norm(sub(translation(&pose), translation(last))) < LEN_EPS
-            && quat_angle(&quat_from_matrix(&pose), &quat_from_matrix(last)) < ANGLE_EPS
+        if (position(&pose) - position(last)).length() < LEN_EPS
+            && rotation(&pose).angle_between(rotation(last)) < ANGLE_EPS
         {
             return;
         }
@@ -895,18 +784,18 @@ mod tests {
     /// path itself (its sample-to-sample segments), not just its
     /// samples — a path passes through a point even when no sample
     /// lands exactly on it.
-    fn closest(path: &[Pose], p: [f64; 3]) -> f64 {
+    fn closest(path: &[Pose], p: DVec3) -> f64 {
         path.windows(2)
             .map(|w| {
-                let (a, b) = (translation(&w[0]), translation(&w[1]));
-                let d = sub(b, a);
-                let len2 = dot(d, d);
+                let (a, b) = (position(&w[0]), position(&w[1]));
+                let d = b - a;
+                let len2 = d.dot(d);
                 let t = if len2 > 0.0 {
-                    (dot(sub(p, a), d) / len2).clamp(0.0, 1.0)
+                    ((p - a).dot(d) / len2).clamp(0.0, 1.0)
                 } else {
                     0.0
                 };
-                norm(sub(p, add(a, scale(d, t))))
+                p.distance(a + d * t)
             })
             .fold(f64::INFINITY, f64::min)
     }
@@ -923,24 +812,21 @@ mod tests {
         let path = arc(&at(0.0), &at(45.0), &at(90.0), sampling()).expect("arc");
         assert!(path.len() > 20, "arc sampled too coarsely: {}", path.len());
         for m in &path {
-            let p = translation(m);
+            let p = position(m);
             assert!(
-                (norm([p[0], p[1], 0.0]) - r).abs() < 1e-9,
+                (p.truncate().length() - r).abs() < 1e-9,
                 "point {p:?} is off the circle"
             );
-            assert!((p[2] - 0.3).abs() < 1e-9, "point {p:?} left the arc plane");
+            assert!((p.z - 0.3).abs() < 1e-9, "point {p:?} left the arc plane");
         }
-        assert!(
-            closest(&path, translation(&at(45.0))) < 1e-3,
-            "missed the via"
-        );
+        assert!(closest(&path, position(&at(45.0))) < 1e-3, "missed the via");
         // The end pose is reached exactly, and the sweep took the short
         // way (nothing beyond the quarter turn).
-        let end = translation(path.last().expect("non-empty"));
-        assert!(norm(sub(end, translation(&at(90.0)))) < 1e-9);
+        let end = position(path.last().expect("non-empty"));
+        assert!(end.distance(position(&at(90.0))) < 1e-9);
         assert!(
             path.iter()
-                .all(|m| translation(m)[0] >= -1e-9 && translation(m)[1] >= -1e-9),
+                .all(|m| position(m).x >= -1e-9 && position(m).y >= -1e-9),
             "the arc swept the long way round"
         );
     }
@@ -955,11 +841,11 @@ mod tests {
         // Via at 270°: the way from 0° to 90° through it is the LONG way.
         let long = arc(&at(0.0), &at(270.0), &at(90.0), sampling()).expect("arc");
         assert!(
-            closest(&long, translation(&at(270.0))) < 1e-3,
+            closest(&long, position(&at(270.0))) < 1e-3,
             "missed the via"
         );
         assert!(
-            closest(&long, translation(&at(180.0))) < 1e-3,
+            closest(&long, position(&at(180.0))) < 1e-3,
             "not the long way"
         );
 
@@ -968,13 +854,13 @@ mod tests {
         let full = arc(&at(0.0), &at(180.0), &at(0.0), sampling()).expect("full circle");
         for deg in [0.0, 90.0, 180.0, 270.0] {
             assert!(
-                closest(&full, translation(&at(deg))) < 2e-3,
+                closest(&full, position(&at(deg))) < 2e-3,
                 "the full circle missed {deg}°"
             );
         }
-        let end = translation(full.last().expect("non-empty"));
+        let end = position(full.last().expect("non-empty"));
         assert!(
-            norm(sub(end, translation(&at(0.0)))) < 1e-9,
+            end.distance(position(&at(0.0))) < 1e-9,
             "the circle did not close"
         );
     }
@@ -997,7 +883,7 @@ mod tests {
             let path = arc(&start, &at(180.0), &end, sampling()).expect("full circle");
             let length: f64 = path
                 .windows(2)
-                .map(|w| norm(sub(translation(&w[1]), translation(&w[0]))))
+                .map(|w| position(&w[1]).distance(position(&w[0])))
                 .sum();
             assert!(
                 (length - circumference).abs() < 0.01 * circumference,
@@ -1006,7 +892,7 @@ mod tests {
             );
             for deg in [90.0, 180.0, 270.0] {
                 assert!(
-                    closest(&path, translation(&at(deg))) < 2e-3,
+                    closest(&path, position(&at(deg))) < 2e-3,
                     "the circle missed {deg}° after a {:.1} mm miss",
                     miss * 1000.0
                 );
@@ -1040,21 +926,21 @@ mod tests {
         let path = spline(&wps, sampling()).expect("spline");
         for w in &wps {
             assert!(
-                closest(&path, translation(w)) < 1e-3,
+                closest(&path, position(w)) < 1e-3,
                 "spline missed waypoint {:?}",
-                translation(w)
+                position(w)
             );
         }
         // A spline is not the polyline: between the second and third
         // waypoints it bows away from the straight chord.
-        let (a, b) = (translation(&wps[1]), translation(&wps[2]));
+        let (a, b) = (position(&wps[1]), position(&wps[2]));
         let bow = path
             .iter()
             .map(|m| {
-                let p = translation(m);
-                let d = sub(b, a);
-                let t = (dot(sub(p, a), d) / dot(d, d)).clamp(0.0, 1.0);
-                norm(sub(p, add(a, scale(d, t))))
+                let p = position(m);
+                let d = b - a;
+                let t = ((p - a).dot(d) / d.dot(d)).clamp(0.0, 1.0);
+                p.distance(a + d * t)
             })
             .fold(0.0f64, f64::max);
         assert!(bow > 2e-3, "spline did not curve: max bow {bow} m");
@@ -1068,13 +954,13 @@ mod tests {
             pose(0.2, 0.35, 0.2, 0.0, 0.0, std::f64::consts::PI),
         ];
         let path = spline(&wps, sampling()).expect("spline");
-        let last = quat_from_matrix(path.last().expect("non-empty"));
-        assert!(quat_angle(&last, &quat_from_matrix(&wps[2])) < 1e-9);
+        let last = rotation(path.last().expect("non-empty"));
+        assert!(last.angle_between(rotation(&wps[2])) < 1e-9);
         // Monotone turn: no wrap through the short arc backwards.
-        let q0 = quat_from_matrix(&wps[0]);
+        let q0 = rotation(&wps[0]);
         let mut prev = 0.0;
         for m in &path {
-            let a = quat_angle(&q0, &quat_from_matrix(m));
+            let a = q0.angle_between(rotation(m));
             assert!(a >= prev - 1e-9, "orientation reversed: {a} after {prev}");
             prev = a;
         }
@@ -1082,10 +968,10 @@ mod tests {
 
     #[test]
     fn blend_rounds_the_corner_inside_its_radius_and_zero_radius_keeps_it_sharp() {
-        let corner = [0.1, 0.35, 0.25];
+        let corner = DVec3::new(0.1, 0.35, 0.25);
         let wps = [
             pose(0.0, 0.35, 0.25, 0.0, 0.0, 0.0),
-            pose(corner[0], corner[1], corner[2], 0.0, 0.0, 0.0),
+            pose(corner.x, corner.y, corner.z, 0.0, 0.0, 0.0),
             pose(0.1, 0.35, 0.35, 0.0, 0.0, 0.0),
         ];
         let sharp = blended_polyline(&wps, &[0.0], sampling()).expect("sharp");
@@ -1108,12 +994,12 @@ mod tests {
         // Rounding cuts the corner: the path is shorter than the polyline.
         let length: f64 = rounded
             .windows(2)
-            .map(|w| norm(sub(translation(&w[1]), translation(&w[0]))))
+            .map(|w| position(&w[1]).distance(position(&w[0])))
             .sum();
         assert!(length < 0.2 - 1e-3, "rounded path length {length} m");
         // Endpoints are never blended away.
-        assert!(closest(&rounded, translation(&wps[0])) < 1e-9);
-        assert!(closest(&rounded, translation(&wps[2])) < 1e-9);
+        assert!(closest(&rounded, position(&wps[0])) < 1e-9);
+        assert!(closest(&rounded, position(&wps[2])) < 1e-9);
     }
 
     #[test]
@@ -1218,14 +1104,9 @@ mod tests {
         // No translation at all: the rotation pitch alone sizes it.
         assert_eq!(path.len(), (1.0f64 / 0.05).ceil() as usize + 1);
         for m in &path {
-            assert!(norm(sub(translation(m), translation(&a))) < 1e-12);
+            assert!(position(m).distance(position(&a)) < 1e-12);
         }
-        assert!(
-            quat_angle(
-                &quat_from_matrix(path.last().unwrap()),
-                &quat_from_matrix(&b)
-            ) < 1e-9
-        );
+        assert!(rotation(path.last().unwrap()).angle_between(rotation(&b)) < 1e-9);
     }
 
     /// The multi-segment metric folds rotation into path length as

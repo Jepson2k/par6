@@ -1,214 +1,138 @@
 //! CLI/env surface of the `par6d` binary.
 //!
 //! Precedence: CLI flag > `PAR6_*` environment variable > robot TOML
-//! `[protocol]` defaults. Only the knobs a deployment actually needs are
-//! exposed; everything else lives in the config file.
+//! `[protocol]` defaults. Every override is an `Option`, so a flag that
+//! is not passed leaves the config file's value in place — clap
+//! `default_value`s would silently outrank the TOML. Only the knobs a
+//! deployment actually needs are exposed; everything else lives in the
+//! config file.
 
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
+use clap::builder::{BoolishValueParser, PossibleValuesParser, TypedValueParser};
+use clap::{ArgAction, Parser};
+
 pub use par6_server::StatusTransport;
 
-/// Usage text printed for `--help` and argument errors.
-pub const USAGE: &str = "\
-par6d — PAR6 runtime daemon (protocol v2 command plane + RT core)
-
-USAGE:
-    par6d [--sim] [OPTIONS]
-
-MODES:
-    (default)                  Hardware mode: the SocketCAN backend on the
-                               configured interface (brought up at the config
-                               bitrate when it is down — needs CAP_NET_ADMIN).
-    --sim                      Closed-loop simulator backend (runs anywhere).
-
-OPTIONS:
-    --config <PATH>            Robot TOML (default: $PAR6_CONFIG, then
-                               ./config/PAR6.toml, then <exe>/../../config/PAR6.toml)
-    --assets <DIR>             assets/par6_description tree with the PAR6 URDFs
-                               (default: $PAR6_ASSETS, then the tree next to the
-                               config directory). Used by the kinematics stack.
-    --package-dir <DIR>        Where `package://` mesh URIs resolve [env:
-                               PAR6_PACKAGE_DIR]. Needed when the assets tree is
-                               an installed package whose URDFs name their meshes
-                               by package URI — a pip-installed `par6` points this
-                               at its site-packages directory.
-    --port <PORT>              Command UDP port; 0 = ephemeral. The bound port is
-                               printed on stdout as `PAR6D_READY command_port=...`.
-                               [env: PAR6_COMMAND_PORT] [config: protocol.command_port]
-    --bind <IP>                Command-socket bind address [env: PAR6_BIND] [default: 0.0.0.0]
-    --status-host <IP>         Unicast status destination
-                               [env: PAR6_STATUS_HOST] [default: 127.0.0.1]
-    --status-port <PORT>       Status broadcast port [env: PAR6_STATUS_PORT]
-    --status-transport <MODE>  auto | multicast | unicast [env: PAR6_STATUS_TRANSPORT]
-    --status-rate <HZ>         STATUS broadcast rate; must divide the tick rate
-                               exactly [env: PAR6_STATUS_RATE_HZ]
-                               [config: protocol.status_rate_hz]
-    --tick-profile             Profile the RT tick per phase (one clock read per
-                               phase) and log the running maxima and the last
-                               overrun's phase times once a second.
-                               [env: PAR6_TICK_PROFILE=1]
-    --log-dir <DIR>            Also write the activity logs there: rt.log (the RT
-                               thread, 2 MiB x5) and commands.log (command plane,
-                               daemon, host vitals, 20 MiB x5). stderr is unchanged.
-                               [env: PAR6_LOG_DIR]
-    --check-config             Validate the config bundle (robot TOML + grippers)
-                               and exit: 0 = valid, 1 = invalid.
-    --parent-pid <PID>         Exit when this process is no longer the parent
-                               (the spawner's own pid; a parent that dies has
-                               its children reparented), so a runtime a client
-                               spawned never outlives it.
-    -h, --help                 Print this help
-";
-
-/// Parsed command-line + environment options.
-#[derive(Debug, Clone, Default)]
+/// PAR6 runtime daemon (protocol v2 command plane + RT core).
+///
+/// The default mode drives the SocketCAN backend on the configured
+/// interface, brought up at the config bitrate when it is down (which
+/// needs CAP_NET_ADMIN). `--sim` runs the closed-loop simulator backend
+/// instead, which runs anywhere, CI included.
+///
+/// A flag beats its `PAR6_*` environment variable, which beats the
+/// `[protocol]` section of the robot TOML.
+#[derive(Parser, Debug, Clone, Default)]
+#[command(name = "par6d", version)]
 pub struct Options {
     /// Run the closed-loop simulator backend instead of hardware.
+    #[arg(long)]
     pub sim: bool,
-    /// Explicit robot TOML path (`--config` / `PAR6_CONFIG`).
+
+    /// Robot TOML (default: ./config/PAR6.toml, then <exe>/../../config/PAR6.toml).
+    #[arg(long, value_name = "PATH", env = "PAR6_CONFIG")]
     pub config: Option<PathBuf>,
-    /// Explicit `assets/par6_description` tree (`--assets` / `PAR6_ASSETS`).
+
+    /// assets/par6_description tree with the PAR6 URDFs, used by the
+    /// kinematics stack (default: the tree next to the config directory).
+    #[arg(long, value_name = "DIR", env = "PAR6_ASSETS")]
     pub assets: Option<PathBuf>,
-    /// Where `package://` mesh URIs resolve (`--package-dir` /
-    /// `PAR6_PACKAGE_DIR`). Set when the assets tree is
-    /// an installed package whose URDFs reference their meshes by package
-    /// URI rather than a repo checkout's `<assets>/URDF` layout.
+
+    /// Where `package://` mesh URIs resolve.
+    ///
+    /// Needed when the assets tree is an installed package whose URDFs
+    /// name their meshes by package URI — a pip-installed `par6` points
+    /// this at its site-packages directory.
+    #[arg(long, value_name = "DIR", env = "PAR6_PACKAGE_DIR")]
     pub package_dir: Option<PathBuf>,
-    /// Run the RT tick's per-phase profiler (`--tick-profile` /
-    /// `PAR6_TICK_PROFILE`); the profile is logged once a second.
+
+    /// Profile the RT tick per phase (one clock read per phase) and log
+    /// the running maxima and the last overrun's phase times once a second.
+    #[arg(
+        long,
+        env = "PAR6_TICK_PROFILE",
+        action = ArgAction::SetTrue,
+        value_parser = BoolishValueParser::new(),
+    )]
     pub tick_profile: bool,
-    /// Command UDP port override (0 = ephemeral).
+
+    /// Command UDP port; 0 = ephemeral [config: protocol.command_port].
+    ///
+    /// The bound port is printed on stdout as `PAR6D_READY command_port=...`.
+    #[arg(
+        long = "port",
+        alias = "command-port",
+        value_name = "PORT",
+        env = "PAR6_COMMAND_PORT"
+    )]
     pub command_port: Option<u16>,
-    /// Command-socket bind address override.
+
+    /// Command-socket bind address [default: 0.0.0.0].
+    #[arg(long, value_name = "IP", env = "PAR6_BIND")]
     pub bind: Option<IpAddr>,
-    /// Unicast status destination override.
+
+    /// Unicast status destination [default: 127.0.0.1].
+    #[arg(long, value_name = "IP", env = "PAR6_STATUS_HOST")]
     pub status_host: Option<IpAddr>,
-    /// Status broadcast port override.
+
+    /// Status broadcast port [config: protocol.status_port].
+    #[arg(long, value_name = "PORT", env = "PAR6_STATUS_PORT")]
     pub status_port: Option<u16>,
-    /// Status transport ladder override.
+
+    /// Status transport ladder.
+    #[arg(
+        long,
+        value_name = "MODE",
+        env = "PAR6_STATUS_TRANSPORT",
+        value_parser = PossibleValuesParser::new(["auto", "multicast", "unicast"])
+            .map(|s| match s.as_str() {
+                "auto" => StatusTransport::Auto,
+                "multicast" => StatusTransport::Multicast,
+                _ => StatusTransport::Unicast,
+            }),
+    )]
     pub status_transport: Option<StatusTransport>,
-    /// STATUS broadcast rate override \[Hz\].
+
+    /// STATUS broadcast rate; must divide the tick rate exactly
+    /// [config: protocol.status_rate_hz].
+    #[arg(long = "status-rate", value_name = "HZ", env = "PAR6_STATUS_RATE_HZ")]
     pub status_rate_hz: Option<u32>,
-    /// Directory for the rotating activity logs (`--log-dir` /
-    /// `PAR6_LOG_DIR`); `None` = stderr only.
+
+    /// Also write the activity logs there; stderr is unchanged.
+    ///
+    /// rt.log carries the RT thread (2 MiB x5) and commands.log the
+    /// command plane, daemon and host vitals (20 MiB x5).
+    #[arg(long, value_name = "DIR", env = "PAR6_LOG_DIR")]
     pub log_dir: Option<PathBuf>,
-    /// `--check-config` was requested: validate the bundle and exit.
+
+    /// Validate the config bundle (robot TOML + grippers) and exit:
+    /// 0 = valid, 1 = invalid.
+    #[arg(long)]
     pub check_config: bool,
-    /// Die with this process (`--parent-pid`): the spawner's pid, compared
-    /// against `getppid` before boot and from the main loop after it.
+
+    /// Exit when this process is no longer the parent, so a runtime a
+    /// client spawned never outlives it.
+    ///
+    /// Pass the spawner's own pid; a parent that dies has its children
+    /// reparented.
+    #[arg(long, value_name = "PID", value_parser = clap::value_parser!(u32).range(1..))]
     pub parent_pid: Option<u32>,
-    /// `--help` was requested.
-    pub help: bool,
 }
 
-impl Options {
-    /// Parse CLI arguments (without the program name), then fill unset
-    /// fields from the `PAR6_*` environment.
-    pub fn parse(args: impl Iterator<Item = String>) -> Result<Self, String> {
-        let mut o = Options::default();
-        let mut args = args.peekable();
-        while let Some(arg) = args.next() {
-            match arg.as_str() {
-                "--sim" => o.sim = true,
-                "--config" => o.config = Some(PathBuf::from(value(&mut args, "--config")?)),
-                "--assets" => o.assets = Some(PathBuf::from(value(&mut args, "--assets")?)),
-                "--package-dir" => {
-                    o.package_dir = Some(PathBuf::from(value(&mut args, "--package-dir")?))
-                }
-                "--tick-profile" => o.tick_profile = true,
-                "--port" | "--command-port" => {
-                    o.command_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
-                }
-                "--bind" => o.bind = Some(parse_ip(&value(&mut args, "--bind")?, "--bind")?),
-                "--status-host" => {
-                    o.status_host = Some(parse_ip(&value(&mut args, "--status-host")?, &arg)?);
-                }
-                "--status-port" => {
-                    o.status_port = Some(parse_num(&value(&mut args, &arg)?, &arg)?);
-                }
-                "--status-transport" => {
-                    o.status_transport = Some(parse_transport(&value(&mut args, &arg)?)?);
-                }
-                "--status-rate" => {
-                    o.status_rate_hz = Some(parse_rate(&value(&mut args, &arg)?, &arg)?);
-                }
-                "--log-dir" => o.log_dir = Some(PathBuf::from(value(&mut args, "--log-dir")?)),
-                "--check-config" => o.check_config = true,
-                "--parent-pid" => {
-                    let raw = value(&mut args, &arg)?;
-                    let pid: u32 = raw
-                        .parse()
-                        .ok()
-                        .filter(|p| *p > 0)
-                        .ok_or_else(|| format!("--parent-pid: `{raw}` is not a process id"))?;
-                    o.parent_pid = Some(pid);
-                }
-                "-h" | "--help" => o.help = true,
-                other => return Err(format!("unknown argument `{other}`\n\n{USAGE}")),
-            }
-        }
-        o.fill_from_env()?;
-        Ok(o)
-    }
-
-    fn fill_from_env(&mut self) -> Result<(), String> {
-        if self.config.is_none() {
-            if let Some(v) = env_var("PAR6_CONFIG") {
-                self.config = Some(PathBuf::from(v));
-            }
-        }
-        if self.assets.is_none() {
-            if let Some(v) = env_var("PAR6_ASSETS") {
-                self.assets = Some(PathBuf::from(v));
-            }
-        }
-        if self.package_dir.is_none() {
-            if let Some(v) = env_var("PAR6_PACKAGE_DIR") {
-                self.package_dir = Some(PathBuf::from(v));
-            }
-        }
-        if !self.tick_profile {
-            if let Some(v) = env_var("PAR6_TICK_PROFILE") {
-                self.tick_profile = v == "1" || v.eq_ignore_ascii_case("true");
-            }
-        }
-        if self.command_port.is_none() {
-            if let Some(v) = env_var("PAR6_COMMAND_PORT") {
-                self.command_port = Some(parse_num(&v, "PAR6_COMMAND_PORT")?);
-            }
-        }
-        if self.bind.is_none() {
-            if let Some(v) = env_var("PAR6_BIND") {
-                self.bind = Some(parse_ip(&v, "PAR6_BIND")?);
-            }
-        }
-        if self.status_host.is_none() {
-            if let Some(v) = env_var("PAR6_STATUS_HOST") {
-                self.status_host = Some(parse_ip(&v, "PAR6_STATUS_HOST")?);
-            }
-        }
-        if self.status_port.is_none() {
-            if let Some(v) = env_var("PAR6_STATUS_PORT") {
-                self.status_port = Some(parse_num(&v, "PAR6_STATUS_PORT")?);
-            }
-        }
-        if self.status_transport.is_none() {
-            if let Some(v) = env_var("PAR6_STATUS_TRANSPORT") {
-                self.status_transport = Some(parse_transport(&v)?);
-            }
-        }
-        if self.status_rate_hz.is_none() {
-            if let Some(v) = env_var("PAR6_STATUS_RATE_HZ") {
-                self.status_rate_hz = Some(parse_rate(&v, "PAR6_STATUS_RATE_HZ")?);
-            }
-        }
-        if self.log_dir.is_none() {
-            if let Some(v) = env_var("PAR6_LOG_DIR") {
-                self.log_dir = Some(PathBuf::from(v));
-            }
-        }
-        Ok(())
+/// Drop `PAR6_*` variables that are set but empty, so they read as unset.
+///
+/// A systemd unit's `Environment=PAR6_BIND=` leaves the name present and
+/// empty, which would otherwise fail the parse and stop the daemon
+/// booting. Call before the parse, while still single-threaded.
+pub fn clear_empty_env() {
+    let empty: Vec<String> = std::env::vars()
+        .filter(|(k, v)| k.starts_with("PAR6_") && v.is_empty())
+        .map(|(k, _)| k)
+        .collect();
+    for key in empty {
+        std::env::remove_var(key);
     }
 }
 
@@ -254,68 +178,50 @@ pub fn resolve_config_path(explicit: Option<&Path>) -> Result<PathBuf, String> {
     ))
 }
 
-fn env_var(name: &str) -> Option<String> {
-    std::env::var(name).ok().filter(|v| !v.is_empty())
-}
-
-fn value(
-    args: &mut std::iter::Peekable<impl Iterator<Item = String>>,
-    flag: &str,
-) -> Result<String, String> {
-    args.next()
-        .ok_or_else(|| format!("{flag} requires a value"))
-}
-
-fn parse_num(v: &str, what: &str) -> Result<u16, String> {
-    v.parse::<u16>()
-        .map_err(|_| format!("{what}: invalid port `{v}`"))
-}
-
-fn parse_rate(v: &str, what: &str) -> Result<u32, String> {
-    v.parse::<u32>()
-        .map_err(|_| format!("{what}: invalid rate `{v}`"))
-}
-
-fn parse_ip(v: &str, what: &str) -> Result<IpAddr, String> {
-    v.parse::<IpAddr>()
-        .map_err(|_| format!("{what}: invalid IP address `{v}`"))
-}
-
-fn parse_transport(v: &str) -> Result<StatusTransport, String> {
-    match v {
-        "auto" => Ok(StatusTransport::Auto),
-        "multicast" => Ok(StatusTransport::Multicast),
-        "unicast" => Ok(StatusTransport::Unicast),
-        other => Err(format!(
-            "--status-transport: `{other}` is not auto|multicast|unicast"
-        )),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn log_dir_comes_from_the_flag_or_the_environment() {
-        let o = Options::parse(
-            ["--sim", "--log-dir", "/var/log/par6"]
-                .map(String::from)
-                .into_iter(),
-        )
+    fn flags_parse_and_a_bare_value_flag_is_a_usage_error() {
+        let o = Options::try_parse_from([
+            "par6d",
+            "--sim",
+            "--log-dir",
+            "/var/log/par6",
+            "--tick-profile",
+            "--port",
+            "0",
+            "--status-transport",
+            "unicast",
+            "--parent-pid",
+            "42",
+        ])
         .unwrap();
+        assert_eq!(o.log_dir.as_deref(), Some(Path::new("/var/log/par6")));
+        assert!(o.sim && o.tick_profile);
+        assert_eq!(o.command_port, Some(0));
+        assert_eq!(o.status_transport, Some(StatusTransport::Unicast));
+        assert_eq!(o.parent_pid, Some(42));
+        // `--command-port` is the long-form alias `--port` kept for the
+        // deploy scripts that spell it out.
         assert_eq!(
-            o.log_dir.as_deref(),
-            Some(std::path::Path::new("/var/log/par6"))
+            Options::try_parse_from(["par6d", "--command-port", "6001"])
+                .unwrap()
+                .command_port,
+            Some(6001)
         );
         assert!(
-            Options::parse(["--log-dir"].map(String::from).into_iter()).is_err(),
+            Options::try_parse_from(["par6d", "--log-dir"]).is_err(),
             "a bare --log-dir is a usage error"
         );
         assert!(
-            Options::parse(["--sim", "--tick-profile"].map(String::from).into_iter())
-                .unwrap()
-                .tick_profile
+            Options::try_parse_from(["par6d", "--status-transport", "carrier-pigeon"]).is_err(),
+            "the transport ladder has exactly three modes"
+        );
+        assert!(
+            Options::try_parse_from(["par6d", "--parent-pid", "0"]).is_err(),
+            "pid 0 is not a process to follow"
         );
     }
 }

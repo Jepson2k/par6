@@ -210,7 +210,6 @@ class LiveDaemon:
         workdir: Path,
         active_gripper: str | None = None,
         status_transport: str = "unicast",
-        sim_dynamics: bool = False,
         config_patch: Callable[[str], str] | None = None,
     ) -> "LiveDaemon":
         binary = par6d_binary()
@@ -242,7 +241,6 @@ class LiveDaemon:
                 # leave a daemon holding its ports and grant.
                 "--parent-pid",
                 str(os.getpid()),
-                *(["--sim-dynamics"] if sim_dynamics else []),
             ],
             stdout=subprocess.PIPE,
             stderr=log,
