@@ -621,13 +621,6 @@ class Robot(_RobotABC):
     def has_collision_checking(self) -> bool:
         return self._world is not None
 
-    @property
-    def has_physics_simulation(self) -> bool:
-        """par6's dry run drives the same control loop and the same MuJoCo
-        plant the simulator does, so it reports what the arm did and not
-        only what it was told."""
-        return True
-
     def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
         w = self._world
         if w is None:
@@ -759,19 +752,21 @@ class Robot(_RobotABC):
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return AsyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_sync_client(self, **kwargs: Any) -> SyncRobotClient:
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return SyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_dry_run_client(self, **kwargs: Any) -> DryRunRobotClient:
         """Offline preview client — the command stream without a runtime.
 
         Keyword args: ``initial_joints_deg`` (defaults to home),
-        ``initial_homed``, ``max_snapshot_points``, ``config_path``.
+        ``initial_homed``, ``config_path``.
 
         Always a client, never ``None``: par6 supports dry running, so a
         config the engine will not load raises and says which — the ABC's
@@ -792,6 +787,7 @@ class Robot(_RobotABC):
             kwargs["config_path"] = self._daemon_config_path() or str(
                 _cfg.data_root() / "config" / "PAR6.toml"
             )
+        kwargs.setdefault("robot", self)
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:

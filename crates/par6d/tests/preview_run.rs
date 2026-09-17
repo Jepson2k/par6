@@ -110,6 +110,7 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
 
     let mut session = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
     session.teleport_rad(park);
+    session.begin_program();
     let batch = session
         .run(&cmds, RunLimits::default())
         .expect("the run completes");
@@ -182,6 +183,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     // Reach-down pose over the stand (config frame), as in the bus tests.
     let grasp_pose = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
     session.teleport_rad(grasp_pose);
+    session.begin_program();
     let shape = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| Shape {
         attachment: None,
         kind: "box".into(),
