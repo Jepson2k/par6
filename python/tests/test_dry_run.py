@@ -1244,6 +1244,7 @@ _TABLE_ARGS: dict[str, tuple] = {
     "select_profile": ("RUCKIG",),
     "select_tool": ("<fitted>",),
     "set_tcp_offset": (0.0, 0.0, 0.0),
+    "set_tcp_transform": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     "set_payload": (0.1,),
     "stop": (),
     "estop": (),
