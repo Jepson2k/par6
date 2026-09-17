@@ -91,12 +91,12 @@ struct Files {
 
 /// Open one rotating activity log.
 ///
-/// The discarded open is a probe: `FileRotate` swallows the error and
-/// drops every record, so without it an unwritable directory logs nothing
-/// and still boots.
+/// `FileRotate::new` cannot fail — it swallows the open error and every
+/// write becomes a silent no-op — so the writability check has to happen
+/// here for `--log-dir` to keep failing loudly.
 fn open_log(dir: &Path, name: &str, max_bytes: usize) -> std::io::Result<Rotating> {
     let path = dir.join(name);
-    std::fs::OpenOptions::new()
+    let _writable = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)?;
