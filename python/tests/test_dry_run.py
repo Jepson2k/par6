@@ -22,15 +22,17 @@ from live_daemon import (
     TICK_DT_S,
     LiveDaemon,
     requires_par6d,
+    sim_config,
     teleport_to,
 )
 from waldoctl import CommandKind, command_table
 from waldoctl.skills import UnresolvedPreview
+from waldoctl.ticks import following_error
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
 from par6.client import RobotError
-from par6.client.dry_run_client import DryRunResultData, DryRunRobotClient
+from par6.client.dry_run_client import DryRunRobotClient
 from par6.protocol import IO_SLOTS, NUM_JOINTS, CompletionPolicy, ErrorCode
 from par6.protocol.wire import MAX_JOG_DURATION_S
 from par6.robot import Robot
@@ -40,15 +42,45 @@ def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
 
 
-def _planned(result: DryRunResultData | None) -> DryRunResultData:
-    """The plan a move returned, refusing the blended-away case.
+class _Block:
+    """One command's motion, read off the commanded record.
 
-    A move with ``r > 0`` is held for the one behind it and returns
-    ``None``; a test that then reads ``.duration`` off it would fail with
-    an ``AttributeError`` pointing at the read, not at the move.
+    ``tcp_poses`` and ``joint_trajectory_rad`` are the block's rows (metres
+    and radians); ``duration`` is the time they cover; ``end_joints_rad`` is
+    where the arm stands when the block ends — its last row, or the row
+    before it began for a command that moved nothing (empty when there is
+    no such row).
     """
-    assert result is not None, "the move was blended into the next one, not planned"
-    return result
+
+    def __init__(self, record, index: int) -> None:
+        block = record.blocks[index]
+        first, last = block.start_row, block.start_row + block.rows
+        self.index = index
+        self.rows = block.rows
+        self.error = block.error
+        self.move_type = block.move_type
+        self.duration = block.rows * record.row_dt_s
+        self.tcp_poses: np.ndarray = record.tcp[first:last].astype(np.float64)
+        self.joint_trajectory_rad: np.ndarray = record.joints_rad[first:last].astype(
+            np.float64
+        )
+        standing = last - 1 if block.rows else first - 1
+        self.end_joints_rad: np.ndarray = (
+            record.joints_rad[standing].astype(np.float64)
+            if standing >= 0
+            else np.empty(0)
+        )
+
+
+def _planned(client: DryRunRobotClient, index: int) -> _Block:
+    """The block *index* owns in the commanded record — closing the blend
+    hold, as reading the record does."""
+    return _Block(client.plan(), index)
+
+
+def _last(client: DryRunRobotClient) -> _Block:
+    """The block of the command submitted last."""
+    return _planned(client, client.program_length - 1)
 
 
 def _offset(pose: np.ndarray, delta: tuple[float, float, float]) -> np.ndarray:
@@ -80,7 +112,7 @@ def _polyline_gap(points: np.ndarray, corners: list[np.ndarray]) -> float:
 
 
 def _line_deviation_mm(points: np.ndarray) -> float:
-    """How far the sampled path strays from the start->end line \[mm\]."""
+    r"""How far the sampled path strays from the start->end line \[mm\]."""
     line = points[-1] - points[0]
     offsets = points - points[0]
     deviation = np.linalg.norm(
@@ -132,7 +164,7 @@ def test_execution_override_retimes_preview_and_preserves_pause():
     target[0] += 8
     normal = DryRunRobotClient(initial_joints_deg=start)
     slow = DryRunRobotClient(initial_joints_deg=start)
-    nominal = _planned(normal.move_j(target, duration=2))
+    nominal = _planned(normal, normal.move_j(target, duration=2))
     assert slow.pause() == 1
     assert slow.set_execution_speed(0.5) == 1
     assert slow.execution_speed().paused
@@ -140,15 +172,22 @@ def test_execution_override_retimes_preview_and_preserves_pause():
         slow.delay(1)
     np.testing.assert_allclose(slow.angles(), start)
     assert slow.resume() == 1
-    # The accepted dwell remains pending until the explicit resume.
-    dwell = slow.flush()
-    assert len(dwell) == 1 and dwell[0].duration == pytest.approx(1)
-    retimed = _planned(slow.move_j(target, duration=2))
-    assert retimed.duration == pytest.approx(nominal.duration * 2)
-    assert retimed.joint_trajectory_rad is not None
-    assert nominal.joint_trajectory_rad is not None
+    # The accepted dwell stays pending until the explicit resume, then
+    # fills its block: the third command, after the pause and the speed.
+    slow.flush()
+    dwell = _planned(slow, 2)
+    assert dwell.duration == pytest.approx(1, abs=2 * slow.plan().row_dt_s)
+    retimed = _planned(slow, slow.move_j(target, duration=2))
+    assert retimed.duration == pytest.approx(
+        nominal.duration * 2, abs=2 * slow.plan().row_dt_s
+    )
+    # The same plan, stretched: every other row of the retimed motion is a
+    # row of the nominal one, and both end on the target.
     np.testing.assert_allclose(
-        retimed.joint_trajectory_rad, nominal.joint_trajectory_rad
+        retimed.joint_trajectory_rad[::2], nominal.joint_trajectory_rad, atol=1e-9
+    )
+    np.testing.assert_allclose(
+        retimed.end_joints_rad, nominal.end_joints_rad, atol=1e-4
     )
     assert slow.execution_speed().applied_scale == 0.5
     for value in (0, True, 2, math.nan):
@@ -157,7 +196,7 @@ def test_execution_override_retimes_preview_and_preserves_pause():
 
 
 class TestPlannedMotion:
-    def test_plan_obeys_the_config_limits_under_every_profile(self) -> None:
+    def test_plan_obeys_the_config_limits_under_every_profile(self, tmp_path) -> None:
         """Each advertised profile must produce a plan the runtime's own limits
         admit: no tick may step a joint faster than its EXEC velocity ceiling
         (scaled by the requested speed), and every plan must land on the target.
@@ -167,26 +206,29 @@ class TestPlannedMotion:
         the runtime's own planner produces — with the config as the oracle.
         """
         cfg = _cfg.config()
-        dt = cfg.tick_dt_s()
         velocity = np.array(cfg.limits("exec")["velocity"])
         start = _cfg.homing_ready_pose_rad()
         target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
-        # Full-rate trajectories: the velocity check reads per-tick steps,
-        # which downsampling would smear across several ticks.
+        # The CI tick is slower than the record's row rate, so every tick is
+        # a row and the velocity check reads per-tick steps rather than a
+        # stride's average, which would smear a fast tick across several.
         client = Robot().create_dry_run_client(
             initial_joints_deg=np.degrees(start).tolist(),
-            max_snapshot_points=1_000_000,
+            config_path=str(sim_config(tmp_path / "config")),
         )
+        dt = client._dt
+        assert dt == pytest.approx(TICK_DT_S)
 
         for profile in DryRunProfiles.profiles():
             client.select_profile(profile)
             durations: list[float] = []
             for speed in (1.0, 0.25):
                 client.teleport(np.degrees(start).tolist())
-                planned = client.move_j(np.degrees(target).tolist(), speed=speed)
-                assert planned is not None
+                planned = _planned(
+                    client, client.move_j(np.degrees(target).tolist(), speed=speed)
+                )
+                assert planned.duration == pytest.approx(planned.rows * dt)
                 path = planned.joint_trajectory_rad
-                assert path is not None
                 np.testing.assert_allclose(path[-1], target, atol=1e-6)
                 step = np.abs(np.diff(np.vstack([start, path]), axis=0)) / dt
                 ceiling = velocity * speed
@@ -205,11 +247,11 @@ class TestPlannedMotion:
         not silently ignored: the same move at full speed is much shorter."""
         target = park_deg()
         target[0] += 20.0
-        fast = dry_run.move_j(target, speed=1.0)
+        fast = _planned(dry_run, dry_run.move_j(target, speed=1.0))
         dry_run.teleport(park_deg())
-        slow = dry_run.move_j(target, duration=4.0)
+        slow = _planned(dry_run, dry_run.move_j(target, duration=4.0))
         assert fast.duration < 1.5
-        assert slow.duration == pytest.approx(4.0, abs=2 * _cfg.config().tick_dt_s())
+        assert slow.duration == pytest.approx(4.0, abs=2 * dry_run.plan().row_dt_s)
         np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
 
@@ -225,7 +267,7 @@ class TestCartesianMotion:
         target = start.copy()
         target[2] += 40.0
 
-        result = dry_run.move_l(target.tolist(), speed=0.5)
+        result = _planned(dry_run, dry_run.move_l(target.tolist(), speed=0.5))
         assert result.error is None
         assert result.duration > 0.0
         points = result.tcp_poses[:, :3] * 1000.0
@@ -259,7 +301,7 @@ class TestCartesianMotion:
             target[1] += 50.0
             target[2] += 30.0
 
-            result = dry_run.move_l(target.tolist(), speed=0.5)
+            result = _planned(dry_run, dry_run.move_l(target.tolist(), speed=0.5))
             assert result.error is None, f"{profile}: {result.error}"
             points = result.tcp_poses[:, :3] * 1000.0
             assert np.allclose(points[-1], target[:3], atol=0.5), profile
@@ -276,7 +318,7 @@ class TestCartesianMotion:
         base = np.asarray(dry_run.pose())
         via, end = _offset(base, (30.0, 0.0, 25.0)), _offset(base, (60.0, 0.0, 0.0))
 
-        curve = dry_run.move_c(via.tolist(), end.tolist(), speed=0.4)
+        curve = _planned(dry_run, dry_run.move_c(via.tolist(), end.tolist(), speed=0.4))
         assert curve.error is None
         points = curve.tcp_poses[:, :3] * 1000.0
         centre, radius = _circle_through(base[:3], via[:3], end[:3])
@@ -292,7 +334,7 @@ class TestCartesianMotion:
             _offset(base, delta).tolist()
             for delta in ((20.0, 0.0, 25.0), (40.0, 0.0, -15.0), (60.0, 0.0, 25.0))
         ]
-        curved = dry_run.move_s(waypoints, speed=0.4)
+        curved = _planned(dry_run, dry_run.move_s(waypoints, speed=0.4))
         assert curved.error is None
         spline = curved.tcp_poses[:, :3] * 1000.0
         for w in waypoints:
@@ -304,7 +346,7 @@ class TestCartesianMotion:
         )
 
         dry_run.teleport(park_deg())
-        process = dry_run.move_p(waypoints, speed=0.4)
+        process = _planned(dry_run, dry_run.move_p(waypoints, speed=0.4))
         assert process.error is None
         swept = process.tcp_poses[:, :3] * 1000.0
         # Auto-blended corners: the interior waypoints are rounded off (the
@@ -321,8 +363,9 @@ class TestCartesianMotion:
     def test_blend_radius_folds_the_queue_into_one_motion(self, dry_run) -> None:
         """A move with ``r`` is held for the move behind it, exactly as the
         runtime's queue holds it: the two become ONE motion with a rounded
-        corner that the arm never stops in, and it is the move that closes the
-        chain (or ``flush()``) that reports it."""
+        corner that the arm never stops in. The head of the chain owns that
+        motion in the record; the move that closed it (or ``flush()``) is
+        folded into it and owns no rows."""
         dry_run.teleport(park_deg())
         base = np.asarray(dry_run.pose())
         corner, finish = (
@@ -331,18 +374,19 @@ class TestCartesianMotion:
         )
 
         sharp = [
-            dry_run.move_l(corner.tolist(), speed=0.4),
-            dry_run.move_l(finish.tolist(), speed=0.4),
+            _planned(dry_run, dry_run.move_l(corner.tolist(), speed=0.4)),
+            _planned(dry_run, dry_run.move_l(finish.tolist(), speed=0.4)),
         ]
-        assert all(r is not None for r in sharp)
         stopped = np.vstack([r.tcp_poses[:, :3] for r in sharp]) * 1000.0
 
         dry_run.teleport(park_deg())
-        held = dry_run.move_l(corner.tolist(), speed=0.4, r=15.0)
-        assert held is None, "a move that rounds a corner has no motion of its own"
-        blended = dry_run.move_l(finish.tolist(), speed=0.4)
-        assert blended is not None and blended.error is None
-        assert dry_run.flush() == [], "the chain was already closed"
+        head = dry_run.move_l(corner.tolist(), speed=0.4, r=15.0)
+        assert len(dry_run.queue()) == 1, "a corner move waits for its successor"
+        tail = dry_run.move_l(finish.tolist(), speed=0.4)
+        assert dry_run.queue() == [], "the move behind it closed the chain"
+        blended = _planned(dry_run, head)
+        assert blended.error is None
+        assert _planned(dry_run, tail).rows == 0, "the head of a chain owns its motion"
         rounded = blended.tcp_poses[:, :3] * 1000.0
 
         miss = _closest(rounded, corner[:3])
@@ -366,7 +410,7 @@ class TestCartesianMotion:
         assert cruising > 0.1 * blended_speeds.max(), (
             f"the blended motion crawled to {cruising:.2f} mm/s mid-path"
         )
-        assert at_the_corner < 0.01 * max(s.max() for s in sharp_speeds), (
+        assert at_the_corner < cruising, (
             "the un-blended pair is supposed to stop at the corner"
         )
         assert np.allclose(dry_run.angles(), np.degrees(blended.end_joints_rad))
@@ -374,10 +418,12 @@ class TestCartesianMotion:
         # A chain the program never closes is planned by flush(), which is
         # where the runtime's blend hold expires.
         dry_run.teleport(park_deg())
-        assert dry_run.move_l(corner.tolist(), speed=0.4, r=15.0) is None
-        trailing = dry_run.flush()
-        assert len(trailing) == 1 and trailing[0].error is None
-        assert np.allclose(trailing[0].tcp_poses[-1, :3] * 1000.0, corner[:3], atol=0.5)
+        head = dry_run.move_l(corner.tolist(), speed=0.4, r=15.0)
+        assert len(dry_run.queue()) == 1
+        dry_run.flush()
+        trailing = _planned(dry_run, head)
+        assert trailing.error is None
+        assert np.allclose(trailing.tcp_poses[-1, :3] * 1000.0, corner[:3], atol=0.5)
 
     def test_blended_joint_moves_run_as_one_motion(self, dry_run) -> None:
         """Joint moves blend too: the corner zone is sized from the TCP distance
@@ -389,16 +435,22 @@ class TestCartesianMotion:
         second = list(first)
         second[1] -= 15.0
 
-        apart = [dry_run.move_j(first, speed=0.5), dry_run.move_j(second, speed=0.5)]
-        assert all(r is not None for r in apart)
+        apart = [
+            _planned(dry_run, dry_run.move_j(first, speed=0.5)),
+            _planned(dry_run, dry_run.move_j(second, speed=0.5)),
+        ]
         separate = sum(r.duration for r in apart)
 
         dry_run.teleport(park_deg())
-        assert dry_run.move_j(first, speed=0.5, r=25.0) is None
-        chain = dry_run.move_j(second, speed=0.5)
-        assert chain is not None and chain.error is None
+        head = dry_run.move_j(first, speed=0.5, r=25.0)
+        assert len(dry_run.queue()) == 1
+        assert _planned(dry_run, dry_run.move_j(second, speed=0.5)).rows == 0
+        chain = _planned(dry_run, head)
+        assert chain.error is None
         assert chain.duration < separate
-        np.testing.assert_allclose(np.degrees(chain.end_joints_rad), second, atol=1e-6)
+        # The block's last row is the last kept sample, up to a stride short
+        # of the target.
+        np.testing.assert_allclose(np.degrees(chain.end_joints_rad), second, atol=0.05)
         # The corner is rounded in joint space: the chain passes close by the
         # interior target without ever reaching it.
         interior = np.abs(np.degrees(chain.joint_trajectory_rad) - first).max(axis=1)
@@ -425,9 +477,10 @@ class TestCartesianMotion:
         swing = list(roll)
         swing[0] += 30.0
 
-        assert dry_run.move_j(roll, speed=0.5, r=25.0) is None
-        chain = dry_run.move_j(swing, speed=0.5)
-        assert chain is not None and chain.error is None
+        head = dry_run.move_j(roll, speed=0.5, r=25.0)
+        dry_run.move_j(swing, speed=0.5)
+        chain = _planned(dry_run, head)
+        assert chain.error is None
 
         corners = np.radians(np.stack([start, roll, swing]))
         low, high = corners.min(axis=0), corners.max(axis=0)
@@ -496,7 +549,8 @@ class TestCartesianMotion:
             unhomed.move_j(park_deg())
         assert gate.value.code == ErrorCode.MOTN_NOT_HOMED
         # Jogging stays available while un-homed, as it does on the runtime.
-        assert _planned(unhomed.jog_j(0, 0.2, 0.2)).duration > 0.0
+        unhomed.jog_j(0, 0.2, 0.2)
+        assert _last(unhomed).duration > 0.0
 
     def test_the_preview_jogs_several_joints_at_once(self, dry_run) -> None:
         """A diagonal jog must preview as a diagonal.
@@ -507,9 +561,8 @@ class TestCartesianMotion:
         """
         dry_run.teleport(park_deg())
         start = [math.radians(a) for a in dry_run.angles()]
-        end = dry_run.jog_j(
-            joints=[0, 3], speeds=[0.4, -0.4], duration=0.4
-        ).end_joints_rad
+        dry_run.jog_j(joints=[0, 3], speeds=[0.4, -0.4], duration=0.4)
+        end = np.radians(dry_run.angles())
         assert end[0] > start[0] + 0.01, "J0 must have jogged forward"
         assert end[3] < start[3] - 0.01, "J3 must have jogged back"
         for j in (1, 2, 4, 5):
@@ -583,8 +636,10 @@ class TestCartesianMotion:
         cold = robot.create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False
         )
-        seek = _planned(cold.home())
-        assert seek.duration == 0.0
+        seek = _planned(cold, cold.home())
+        assert seek.rows == 1, (
+            "a seek's time is the arm's; the record shows the landing"
+        )
         assert seek.end_joints_rad == pytest.approx(
             _cfg.homing_ready_pose_rad(), abs=1e-6
         )
@@ -592,9 +647,9 @@ class TestCartesianMotion:
         warm = robot.create_dry_run_client(
             initial_joints_deg=np.degrees(_cfg.homing_ready_pose_rad()).tolist()
         )
-        ret = _planned(warm.home())
+        ret = _planned(warm, warm.home())
         assert ret.duration > 0.0, "a referenced HOME is a planned move, not a jump"
-        assert ret.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-6)
+        assert ret.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-3)
         assert ret.tcp_poses.shape[0] > 1, "a planned move draws a path"
 
     def test_the_preview_answers_the_queries_a_program_reads_back(self) -> None:
@@ -624,7 +679,7 @@ class TestCartesianMotion:
             client.tool.close()
         assert uncalibrated.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert "calibrat" in str(uncalibrated.value).lower()
-        calibrated = client.tool.calibrate()
+        calibrated = _planned(client, client.tool.calibrate())
         assert calibrated.duration > 0.0, (
             "a calibrate holds the arm for the driver's settle"
         )
@@ -647,22 +702,27 @@ class TestLiveParity:
 
     def test_a_state_only_command_keeps_a_held_chains_motion(self, dry_run) -> None:
         """A checkpoint (or any command with no path) closes the blend hold
-        as the runtime's queue does; the motion it released is the head of
-        the next result, never dropped."""
+        as the runtime's queue does: the held move keeps its motion under
+        its own block, runs to its target with nothing to round into, and
+        the next move starts where it ended."""
         dry_run.teleport(park_deg())
         base = np.asarray(dry_run.pose())
         corner = _offset(base, (50.0, 0.0, 0.0))
         finish = _offset(base, (50.0, 0.0, 40.0))
-        assert dry_run.move_l(corner.tolist(), speed=0.4, r=15.0) is None
-        assert dry_run.checkpoint("corner") == 0
-        result = _planned(dry_run.move_l(finish.tolist(), speed=0.4))
-        path = result.tcp_poses[:, :3] * 1000.0
+        head = dry_run.move_l(corner.tolist(), speed=0.4, r=15.0)
+        mark = dry_run.checkpoint("corner")
+        assert mark == head + 1 and dry_run.queue() == []
+        onward = dry_run.move_l(finish.tolist(), speed=0.4)
+        record = dry_run.plan()
+        first, second = _Block(record, head), _Block(record, onward)
+        assert first.error is None and second.error is None
+        assert _Block(record, mark).rows == 0, "a checkpoint moves nothing"
+        path = first.tcp_poses[:, :3] * 1000.0
         assert np.allclose(path[0], base[:3], atol=2.0), (
-            f"the chain the checkpoint closed must lead the result: {path[0]}"
+            f"the held move keeps its motion: {path[0]}"
         )
-        assert _closest(path, corner[:3]) < 15.0
-        assert np.allclose(path[-1], finish[:3], atol=0.5)
-        assert dry_run.flush() == []
+        assert np.allclose(path[-1], corner[:3], atol=0.5)
+        assert np.allclose(second.tcp_poses[-1, :3] * 1000.0, finish[:3], atol=0.5)
 
     def test_the_blend_hold_fills_at_the_runtimes_lookahead(self, dry_run) -> None:
         """The runtime's queue plans a chain once the blend lookahead is
@@ -671,14 +731,21 @@ class TestLiveParity:
         dry_run.teleport(park_deg())
         cap = dry_run._preview.blend_lookahead()
         start = list(dry_run.angles())
-        results = []
+        indices = []
         for i in range(cap):
             target = list(start)
             target[0] += 2.0 * ((i % 2) + 1)
-            results.append(dry_run.move_j(target, speed=0.5, r=5.0))
-        assert all(r is None for r in results[:-1]), "held until the lookahead fills"
-        assert results[-1] is not None, "the move that fills the hold runs the chain"
-        assert dry_run.flush() == []
+            indices.append(dry_run.move_j(target, speed=0.5, r=5.0))
+            assert len(dry_run.queue()) == (i + 1) % cap, (
+                "held until the lookahead fills"
+            )
+        record = dry_run.plan()
+        assert _Block(record, indices[0]).rows > 0, (
+            "the move that fills the hold runs the chain"
+        )
+        assert any(_Block(record, i).rows == 0 for i in indices[1:]), (
+            "a chain folds the moves behind its head"
+        )
 
     def test_delays_and_tool_actions_carry_their_duration(self, dry_run) -> None:
         """A delay holds the arm for its seconds and a calibration for the
@@ -686,15 +753,15 @@ class TestLiveParity:
         dry_run.teleport(park_deg())
         with pytest.raises(ValueError, match="positive"):
             dry_run.delay(0.0)
-        assert dry_run.delay(1.5) == 0
-        held = dry_run.flush()
-        assert len(held) == 1
-        assert held[0].duration == pytest.approx(1.5, abs=2 * dry_run._dt)
-        assert held[0].tcp_poses.shape[0] == 1, "a delay draws no path"
+        held = _planned(dry_run, dry_run.delay(1.5))
+        assert held.duration == pytest.approx(1.5, abs=2 * dry_run.plan().row_dt_s)
+        assert held.rows > 1 and np.ptp(held.tcp_poses, axis=0).max() == 0, (
+            "a delay holds one pose for its rows"
+        )
 
-        calibration = _planned(dry_run.tool.calibrate())
+        calibration = _planned(dry_run, dry_run.tool.calibrate())
         assert calibration.duration >= 2.0, "the runtime holds a calibration"
-        assert _planned(dry_run.tool.stop()).duration == 0.0
+        assert _planned(dry_run, dry_run.tool.stop()).duration == 0.0
 
     def test_tool_verbs_send_the_live_wire_actions(self) -> None:
         """``release`` is the wire's ``idle`` and ``stop`` is ``stop`` — a
@@ -710,11 +777,13 @@ class TestLiveParity:
         assert "calibrat" in uncalibrated.value.cause.lower()
         assert client.tool.is_open(), "a refused move leaves the jaws where they were"
 
-        assert client.tool.calibrate().duration >= 2.0
-        assert client.tool.close().duration == 0.0
+        assert _planned(client, client.tool.calibrate()).duration >= 2.0
+        assert _planned(client, client.tool.close()).duration > 0.0, (
+            "a jaw move holds the arm for the jaws' travel"
+        )
         assert not client.tool.is_open()
-        assert client.tool.stop().duration == 0.0
-        assert client.tool.release().duration == 0.0
+        assert _planned(client, client.tool.stop()).duration == 0.0
+        assert _planned(client, client.tool.release()).duration == 0.0
         with pytest.raises(RobotError) as past_stroke:
             client.tool.set_position(1.5)
         assert past_stroke.value.code == ErrorCode.COMM_VALIDATION_ERROR
@@ -733,7 +802,8 @@ class TestLiveParity:
             with pytest.raises(RobotError) as refused:
                 dry_run.servo_j(target, speed=speed)
             assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR, speed
-        assert dry_run.servo_j(target, speed=0.5).duration > 0.0
+        dry_run.servo_j(target, speed=0.5)
+        assert _last(dry_run).duration > 0.0
 
     def test_payload_is_validated_and_read_back(self, dry_run) -> None:
         with pytest.raises(RobotError) as negative:
@@ -753,11 +823,12 @@ class TestLiveParity:
         # Clear of the wrist singularity park folds J5 into.
         dry_run.teleport([0.0, -60.0, 150.0, 0.0, 45.0, 180.0])
         start = np.asarray(dry_run.pose())
-        jog = dry_run.jog_l("WRF", "X", speed=1.0, duration=0.5)
+        dry_run.jog_l("WRF", "X", speed=1.0, duration=0.5)
+        jog = _last(dry_run)
         end = np.asarray(dry_run.pose())
         assert end[0] - start[0] > 20.0, "half a second of full-scale +X must travel"
         assert abs(end[1] - start[1]) < 3.0 and abs(end[2] - start[2]) < 3.0
-        assert jog.duration == pytest.approx(0.5, abs=2 * dry_run._dt)
+        assert jog.duration == pytest.approx(0.5, abs=2 * dry_run.plan().row_dt_s)
         assert jog.joint_trajectory_rad.shape[1] == NUM_JOINTS
         with pytest.raises(ValueError, match="unknown axis"):
             dry_run.jog_l("WRF", "Q", speed=0.5, duration=0.2)
@@ -812,32 +883,35 @@ class TestProgramWorkflow:
         client = Robot().create_dry_run_client(
             initial_joints_deg=[0.0] * 6, initial_homed=False
         )
-        results = []
-        results.append(_planned(client.home()))
+        program = [client.home()]
         np.testing.assert_allclose(
-            results[-1].end_joints_rad, _cfg.homing_ready_pose_rad(), atol=1e-9
+            _planned(client, program[-1]).end_joints_rad,
+            _cfg.homing_ready_pose_rad(),
+            atol=1e-9,
         )
 
         above = np.asarray(client.pose())
         above[2] += 30.0
-        results.append(_planned(client.move_l(above.tolist(), speed=0.4)))
-        results.append(_planned(client.tool.calibrate()))
-        results.append(_planned(client.tool.close()))
+        program.append(client.move_l(above.tolist(), speed=0.4))
+        program.append(client.tool.calibrate())
+        program.append(client.tool.close())
         joints = list(client.angles())
         joints[0] -= 15.0
-        results.append(_planned(client.move_j(joints, speed=0.6)))
-        assert client.flush() == []
+        program.append(client.move_j(joints, speed=0.6))
+        record = client.plan()
+        assert client.queue() == []
+        results = [_Block(record, index) for index in program]
 
         assert all(r.error is None for r in results)
         for previous, following in zip(results, results[1:]):
             np.testing.assert_allclose(
                 following.tcp_poses[0][:3], previous.tcp_poses[-1][:3], atol=2e-3
             )
-        # The tool actions hold the arm still and carry no plan of their own.
+        # The tool actions hold the arm still for their time.
         for held in (results[2], results[3]):
-            assert held.tcp_poses.shape[0] == 1
+            assert held.rows > 0 and np.ptp(held.tcp_poses, axis=0).max() == 0
             np.testing.assert_allclose(
-                held.end_joints_rad, results[1].end_joints_rad, atol=1e-12
+                held.end_joints_rad, results[1].end_joints_rad, atol=1e-3
             )
         assert client.angles() == pytest.approx(np.degrees(results[-1].end_joints_rad))
         assert sum(r.duration for r in results) > 0.0
@@ -991,19 +1065,26 @@ def _shape_from(pose: list[float], deltas) -> list[list[float]]:
     return [_offset(base, delta).tolist() for delta in deltas]
 
 
-def _preview_case(preview, case: str) -> list:
-    """Plan one case offline; returns every result the preview produced."""
+def _preview_case(preview, case: str) -> list[_Block]:
+    """Plan one case offline; returns the block of every command it queued."""
     if case in ("arc", "circle"):
         via, end = _shape_from(preview.pose(), _ARC if case == "arc" else _CIRCLE)
-        return [preview.move_c(via, end, speed=_CASE_SPEED)]
-    if case == "spline":
-        return [preview.move_s(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)]
-    if case == "process":
-        return [preview.move_p(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)]
-    corner, finish = _shape_from(preview.pose(), _CHAIN)
-    held = preview.move_l(corner, speed=_CASE_SPEED, r=_CHAIN_R_MM)
-    assert held is None, "a blended move must be held for the one behind it"
-    return [preview.move_l(finish, speed=_CASE_SPEED)]
+        queued = [preview.move_c(via, end, speed=_CASE_SPEED)]
+    elif case == "spline":
+        queued = [
+            preview.move_s(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)
+        ]
+    elif case == "process":
+        queued = [
+            preview.move_p(_shape_from(preview.pose(), _CURVE), speed=_CASE_SPEED)
+        ]
+    else:
+        corner, finish = _shape_from(preview.pose(), _CHAIN)
+        queued = [preview.move_l(corner, speed=_CASE_SPEED, r=_CHAIN_R_MM)]
+        assert len(preview.queue()) == 1, "a blended move is held for the one behind it"
+        queued.append(preview.move_l(finish, speed=_CASE_SPEED))
+    record = preview.plan()
+    return [_Block(record, index) for index in queued]
 
 
 async def _queue_case(client, case: str) -> list[int]:
@@ -1096,13 +1177,13 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                 # and re-materialises it five times over.
                 preview = robot.create_dry_run_client(initial_joints_deg=live_start)
                 results = _preview_case(preview, case)
-                assert all(r is not None and r.error is None for r in results), (
-                    f"{case}: the preview refused it: "
-                    f"{[r.error for r in results if r is not None]}"
+                assert all(r.error is None for r in results), (
+                    f"{case}: the preview refused it: {[r.error for r in results]}"
                 )
+                drawn = [r for r in results if r.rows]
                 anchor = robot.fk_batch(np.radians([live_start]))[:, :3] * 1000.0
                 predicted = np.vstack(
-                    [anchor, np.vstack([r.tcp_poses[:, :3] for r in results]) * 1000.0]
+                    [anchor, np.vstack([r.tcp_poses[:, :3] for r in drawn]) * 1000.0]
                 )
                 predicted_duration = sum(r.duration for r in results)
 
@@ -1149,7 +1230,7 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                     f"predicted {predicted_duration:.3f}s"
                 )
                 if case == "chain":
-                    assert len(results) == 1, "the chain is one motion, not two"
+                    assert len(drawn) == 1, "the chain is one motion, not two"
                     assert finished[1] - finished[0] < 0.3, (
                         "a blended motion completes every command it consumed at "
                         f"the same instant, not {finished[1] - finished[0]:.3f}s apart"
@@ -1219,6 +1300,62 @@ def test_a_payload_estimate_previews_the_wrist_swing_and_measures_nothing(
     )
 
 
+def test_plan_and_simulate_describe_the_same_program() -> None:
+    """The commanded record and the predicted record are one program on one
+    row axis: block ``i`` of either is command ``i``, drawn the same way,
+    and the gap between them is the following error the plan cannot know."""
+    client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+    target = park_deg()
+    target[0] += 12.0
+    above = np.asarray(client.pose())
+    above[2] += 20.0
+    program = [
+        client.move_j(target, speed=0.5),
+        client.delay(0.5),
+        client.move_l(above.tolist(), speed=0.4),
+        client.checkpoint("there"),
+    ]
+    assert program == [0, 1, 2, 3]
+    assert all(client.wait_command(index) for index in program)
+
+    commanded = client.plan()
+    predicted = client.simulate()
+    for record in (commanded, predicted):
+        assert [b.command for b in record.blocks] == program
+        assert [b.move_type for b in record.blocks] == [
+            command_table()["move_j"].move_type,
+            None,
+            command_table()["move_l"].move_type,
+            None,
+        ]
+        assert record.stop == "completed"
+        # The delay is on both timelines, holding.
+        assert record.blocks[1].rows == pytest.approx(0.5 / record.row_dt_s, abs=3)
+    assert commanded.row_dt_s == predicted.row_dt_s
+    assert not commanded.channels, "a plan has no plant to read a setpoint off"
+    assert "setpoint_rad" in predicted.channels
+    assert commanded.digest != predicted.digest
+
+    assert following_error(commanded, commanded).max() == 0.0
+    gap = following_error(commanded, predicted)
+    assert gap.shape == (predicted.rows,)
+    assert 0.0 < gap.max() < 0.1, f"the arm is not following its commands: {gap.max()}"
+
+    # A later command extends the commanded record; a refused one keeps its
+    # place in it, with the refusal, and never counts as complete.
+    client.delay(0.25)
+    longer = client.plan()
+    assert len(longer.blocks) == 5 and longer.rows > commanded.rows
+    far = park_deg()
+    far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
+    with pytest.raises(RobotError):
+        client.move_j(far)
+    assert client.wait_command(5) is False
+    failed = client.plan()
+    assert failed.stop == "failed" and failed.blocks[5].error is not None
+    assert failed.blocks[5].rows == 0
+
+
 _TABLE_ARGS: dict[str, tuple] = {
     "move_j": ([10.0, -80.0, 160.0, 5.0, -10.0, 170.0],),
     "move_l": (None,),
@@ -1244,9 +1381,13 @@ _TABLE_ARGS: dict[str, tuple] = {
     "select_profile": ("RUCKIG",),
     "select_tool": ("<fitted>",),
     "set_tcp_offset": (0.0, 0.0, 0.0),
+    "set_tcp_transform": (0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
     "set_payload": (0.1,),
     "stop": (),
     "estop": (),
+    "pause": (),
+    "resume": (),
+    "set_execution_speed": (0.5,),
 }
 _TABLE_KWARGS: dict[str, dict] = {
     n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")
@@ -1257,11 +1398,12 @@ def test_every_table_command_answers_with_the_kind_it_declares() -> None:
     """The command table on ``RobotClient`` classifies every command; this
     preview answers each kind the way a program can rely on.
 
-    Queued work answers with the plan the runtime will run (or ``None``
-    while the blend hold keeps it) — the frontend's preview turns that into
-    the queue index the ABC promises. A system or control command has no
-    plan, so it answers with the live client's own ``1``/``0``/negative
-    code: ``if rbt.stop() < 0`` reads the same offline and on the arm.
+    Queued work answers with its index in the program — the block it owns
+    in the commanded and predicted records, the index the ABC promises a
+    program may ``wait_command`` — and the block is drawn the way the
+    table says. A system or control command has no block of its own, so it
+    answers with the live client's own ``1``/``0``/negative code:
+    ``if rbt.stop() < 0`` reads the same offline and on the arm.
     """
     client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
     park = park_deg()
@@ -1303,28 +1445,27 @@ def test_every_table_command_answers_with_the_kind_it_declares() -> None:
         client.teleport(park)
         result = getattr(client, name)(*args, **_TABLE_KWARGS.get(name, {}))
         exercised += 1
+        if name == "pause":
+            # Nothing queued answers while paused; the next command must not
+            # inherit this one's hold.
+            client.resume()
         if name == "estimate_payload":
             if result is None or not hasattr(result, "mass"):
                 problems.append(
                     f"estimate_payload answers the estimate, got {result!r}"
                 )
-        elif spec.kind in (CommandKind.MOTION, CommandKind.QUEUED):
-            # Queued work: the plan, an index, or None while the hold keeps it.
-            if isinstance(result, DryRunResultData):
-                if result.error is not None:
-                    problems.append(f"{name}: refused: {result.error}")
-            elif isinstance(result, bool) or not isinstance(result, (int, type(None))):
-                problems.append(
-                    f"{name}: queued work previews as a plan or an index, "
-                    f"got {result!r}"
-                )
-            elif isinstance(result, int) and result < 0:
-                problems.append(f"{name}: refused with {result}")
-            if name == "home" and result is None:
-                problems.append("home: the return move is a plan, not nothing")
         elif isinstance(result, bool) or not isinstance(result, int):
-            problems.append(f"{name}: {spec.kind.value} returns an int, got {result!r}")
+            problems.append(f"{name}: {spec.kind.value} answers an int, got {result!r}")
         elif result < 0:
             problems.append(f"{name}: refused with {result}")
+        elif spec.mints_index:
+            block = client.plan().blocks[result]
+            if block.error is not None:
+                problems.append(f"{name}: refused: {block.error}")
+            if block.move_type != spec.move_type:
+                problems.append(
+                    f"{name}: drawn as {block.move_type!r}, table says "
+                    f"{spec.move_type!r}"
+                )
     assert not problems, "\n".join(problems)
     assert exercised >= 20

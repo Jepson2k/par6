@@ -17,9 +17,9 @@ use super::jaw::JawJoint;
 /// Firmware jaw speed \[position bytes per second per speed-byte unit\]
 /// (the MuJoCo plant's jaw approach uses the same rate).
 pub const BYTES_PER_S_PER_SPEED_UNIT: f64 = 4.0;
-/// Firmware calibration sweep duration \[s\] (vendor waits ≥2 s, times
-/// out at 10 s).
-const CALIBRATION_S: f64 = 1.5;
+/// Firmware calibration sweep duration \[s\]: the jaws close and open
+/// again, ending fully open (vendor waits ≥2 s, times out at 10 s).
+pub const CALIBRATION_S: f64 = 1.5;
 /// Reported motor current while the jaws move freely \[mA\].
 const MOVING_CUR_MA: f64 = 100.0;
 /// Jaw-position tolerance \[bytes\] at which the firmware latches
@@ -27,6 +27,22 @@ const MOVING_CUR_MA: f64 = 100.0;
 /// in motor ticks there, a byte here — the jaw byte is the only position
 /// the firmware protocol reports).
 const POSITION_TOLERANCE: u8 = 5;
+
+/// The firmware's jaw speed \[position bytes per second\] for a speed
+/// byte, floored at one unit's worth as the firmware floors it.
+pub fn jaw_rate_bytes_s(speed_byte: u8) -> f64 {
+    f64::from(speed_byte).max(1.0) * BYTES_PER_S_PER_SPEED_UNIT
+}
+
+/// How long the firmware takes to report a move from `from_byte` to
+/// `to_byte` at `speed_byte` as at position \[s\]: constant-rate travel
+/// up to the tolerance band it latches `At_position` in. The daemon's
+/// dry run holds the arm for this on a jaw move, so a commanded record
+/// predicts the wait the plant will make a program take.
+pub fn jaw_travel_s(from_byte: f64, to_byte: f64, speed_byte: u8) -> f64 {
+    ((to_byte - from_byte).abs() - f64::from(POSITION_TOLERANCE)).max(0.0)
+        / jaw_rate_bytes_s(speed_byte)
+}
 
 /// Which drive mode owns the jaw (the two are exclusive on real hardware).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,7 +257,7 @@ impl GripperSim {
             Some(b) => b,
             None => target,
         };
-        let rate = f64::from(self.cmd.speed).max(1.0) * BYTES_PER_S_PER_SPEED_UNIT * dt;
+        let rate = jaw_rate_bytes_s(self.cmd.speed) * dt;
         let remaining = stop_at - self.pos_byte;
         if remaining.abs() > 1e-9 {
             let step = remaining.clamp(-rate, rate);

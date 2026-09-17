@@ -13,6 +13,13 @@
 //! successor that has not been queued yet. Offline the whole program is
 //! known at tick zero, so the queue is never "still growing" and the wait
 //! has nothing to wait for.
+//!
+//! Nor are the program's system commands replayed. The state they set —
+//! a profile, a payload, an output level, the collision world — lives on
+//! the planning session, which applied each one as it was submitted, and
+//! the run boots from that session's final state: a program is run
+//! against the world it ends up in. Each keeps its line in the record,
+//! with no rows, so the two records still name the same commands.
 
 use par6_bus::sim::scene::Scene;
 use par6_bus::sim::SimulationScenario;
@@ -172,9 +179,10 @@ impl Preview {
     /// arm sags, the servos lag, dropped objects fall, and a grasp holds
     /// or does not hold because of contact forces.
     ///
-    /// The session's pose does not move: a run starts from where the
-    /// session stands and leaves it there, so two runs of the same
-    /// program give the same answer.
+    /// A run starts from where the program began
+    /// ([`Preview::begin_program`]) and leaves the session where it
+    /// stands, so two runs of the same program give the same answer and
+    /// a plan and a run of it describe the same lines.
     pub fn run(&mut self, cmds: &[Command], limits: RunLimits) -> Result<TickBatch, DaemonError> {
         self.run_scenario(cmds, limits, &SimulationScenario::default())
     }
@@ -414,6 +422,11 @@ impl Preview {
                     next += 1;
                     break;
                 }
+                if command_class(cmds[next].tag()) == CommandClass::System {
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    continue;
+                }
                 if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
                 {
                     break;
@@ -485,6 +498,18 @@ impl Preview {
                 }
             }
 
+            // Nothing running and nothing left to start: the record ends
+            // on the row the last command finished on, so every row has
+            // a span that owns it.
+            if executing.is_none() && next >= cmds.len() {
+                break;
+            }
+            // Nothing running and nothing left to start: the record ends
+            // on the row the last command finished on, so every row has
+            // a span that owns it.
+            if executing.is_none() && next >= cmds.len() {
+                break;
+            }
             driver.tick();
             let (snap, bus) = driver.observe();
             rec.tick(snap, bus);

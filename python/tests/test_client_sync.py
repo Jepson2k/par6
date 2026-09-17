@@ -165,11 +165,7 @@ def test_skill_runs_nested_motion_on_the_existing_sync_connection(daemon):
 
     from par6.client import AsyncRobotClient
 
-    @skill(
-        id="test.turn",
-        version="1.0.0",
-        requires=frozenset({"motion.joint", "backend.par6"}),
-    )
+    @skill(id="test.turn", version="1.0.0")
     async def turn(rbt: AsyncRobotClient, degrees: float) -> list[float]:
         angles = await rbt.angles()
         assert angles is not None
