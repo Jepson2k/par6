@@ -14,7 +14,7 @@ import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Coroutine, Iterable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import (
@@ -39,6 +39,9 @@ from .async_client import (
     StatusResult,
 )
 from .errors import RobotError
+
+if TYPE_CHECKING:
+    from par6.robot import Robot
 
 T = TypeVar("T")
 
@@ -144,8 +147,12 @@ class RobotClient:
         return _run(invoke(self._inner))
 
     @property
-    def skill_capabilities(self) -> frozenset[str]:
-        return self._inner.skill_capabilities
+    def robot(self) -> Robot:
+        return self._inner.robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._inner.robot = value
 
     def __init__(
         self,

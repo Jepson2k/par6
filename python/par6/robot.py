@@ -744,12 +744,14 @@ class Robot(_RobotABC):
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return AsyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_sync_client(self, **kwargs: Any) -> SyncRobotClient:
         kwargs.setdefault("host", self._host)
         kwargs.setdefault("port", self._port)
         kwargs.setdefault("timeout", 5.0)
+        kwargs.setdefault("robot", self)
         return SyncRobotClient(tool_specs=self.tools.available, **kwargs)
 
     def create_dry_run_client(self, **kwargs: Any) -> DryRunRobotClient:
@@ -777,6 +779,7 @@ class Robot(_RobotABC):
             kwargs["config_path"] = self._daemon_config_path() or str(
                 _cfg.data_root() / "config" / "PAR6.toml"
             )
+        kwargs.setdefault("robot", self)
         return DryRunRobotClient(**kwargs)
 
     def _daemon_config_path(self) -> str | None:
