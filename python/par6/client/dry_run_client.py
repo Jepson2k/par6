@@ -18,7 +18,7 @@ import copy
 import hashlib
 import logging
 from collections.abc import Callable, Coroutine, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 from waldoctl.results import DryRunResultData
@@ -67,6 +67,9 @@ from ._wire import (
 from .async_client import StatusResult
 from .errors import RobotError
 
+if TYPE_CHECKING:
+    from par6.robot import Robot
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,6 +96,22 @@ class DryRunRobotClient:
     robot's live joint angles and homed state.
     """
 
+    _robot: Robot | None = None
+
+    @property
+    def robot(self) -> Robot:
+        """The backend this preview stands in for, built on first read when
+        the host constructed the client bare."""
+        if self._robot is None:
+            from par6.robot import Robot
+
+            self._robot = Robot()
+        return self._robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._robot = value
+
     def __init__(
         self,
         initial_joints_deg: list[float] | None = None,
@@ -104,6 +123,7 @@ class DryRunRobotClient:
         # offline instead of on the bench.
         initial_gripper_calibrated: bool = False,
         config_path: str | None = None,
+        robot: Robot | None = None,
     ) -> None:
         from par6.tools import build_tools
 
@@ -112,6 +132,7 @@ class DryRunRobotClient:
         # the URDF and the collision meshes on its event loop. It runs on
         # the packaged model, never on whatever the machine happens to
         # have installed under /usr/share.
+        self._robot = robot
         self._engine_args = (
             config_path
             if config_path is not None
@@ -253,12 +274,6 @@ class DryRunRobotClient:
 
     def profile(self) -> str:
         return self._preview.profile()
-
-    @property
-    def skill_capabilities(self) -> frozenset[str]:
-        return frozenset(
-            {"motion.joint", "motion.linear", "tool.gripper", "backend.par6"}
-        )
 
     def is_simulator(self) -> bool:
         return True
