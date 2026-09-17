@@ -5,11 +5,16 @@ Every method builds the same wire command the live client would send and
 hands it to the engine, which validates, gates, holds for blending, plans
 and collision-checks it with the daemon's own code.  This layer only
 adapts arguments (the waldoctl conventions: mm, degrees, duration-or-speed)
-and results (numpy arrays for ``DryRunResultData``).  A refusal is raised
-as :class:`RobotError` with the runtime's own text; the one refusal that is
-returned rather than raised is ``IK_PARTIAL_PATH`` — a preview wants to
-show how far a line gets, and the caller reads that off the result's
-``error``.
+and answers with what the live client answers: a queue index for queued
+work, a code for everything else.  What each command does to the arm is
+in the program's two records — :meth:`DryRunRobotClient.plan`, the
+*commanded* one, and :meth:`DryRunRobotClient.simulate`, the *predicted*
+one — under the block the command's index names.
+
+A refusal is raised as :class:`RobotError` with the runtime's own text;
+the one refusal that is recorded rather than raised is
+``IK_PARTIAL_PATH`` — a preview wants to show how far a line gets, and the
+caller reads that off the block's ``error``.
 """
 
 from __future__ import annotations
@@ -17,12 +22,13 @@ from __future__ import annotations
 import copy
 import hashlib
 import logging
+import math
 from collections.abc import Callable, Coroutine, Iterator
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from waldoctl.commands import command_table
 from waldoctl.execution import ExecutionSpeed, validate_execution_scale
-from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.skills import UnresolvedPreview
 from waldoctl.status import (
@@ -69,7 +75,16 @@ from ._wire import (
 from .async_client import StatusResult
 from .errors import RobotError
 
+if TYPE_CHECKING:
+    from par6.robot import Robot
+
 logger = logging.getLogger(__name__)
+
+#: The path shape a renderer draws for each MOTION method, from the shared
+#: command table; None for everything that is not a motion.
+_MOVE_TYPE: dict[str, str | None] = {
+    name: spec.move_type for name, spec in command_table().items()
+}
 
 
 def _drive(coro: Coroutine[Any, Any, Any]) -> Any:
@@ -88,17 +103,32 @@ def _drive(coro: Coroutine[Any, Any, Any]) -> Any:
 
 
 class DryRunRobotClient:
-    """Simulates the par6 command stream offline, one result per command.
+    """Simulates the par6 command stream offline, one block per command.
 
     Constructed by :meth:`par6.robot.Robot.create_dry_run_client`; a host
     running previews in a worker process constructs it directly with the
     robot's live joint angles and homed state.
     """
 
+    _robot: Robot | None = None
+
+    @property
+    def robot(self) -> Robot:
+        """The backend this preview stands in for, built on first read when
+        the host constructed the client bare."""
+        if self._robot is None:
+            from par6.robot import Robot
+
+            self._robot = Robot()
+        return self._robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._robot = value
+
     def __init__(
         self,
         initial_joints_deg: list[float] | None = None,
-        max_snapshot_points: int = 200,
         initial_homed: bool = True,
         # False by default, as an arm reads after power-on: a jaw move
         # before a calibrate is refused here exactly as the runtime
@@ -106,19 +136,21 @@ class DryRunRobotClient:
         # offline instead of on the bench.
         initial_gripper_calibrated: bool = False,
         config_path: str | None = None,
+        robot: Robot | None = None,
     ) -> None:
         from par6.tools import build_tools
 
+        self._robot = robot
         # The engine is built on first use, not here: a host that only
         # wants this class (to pickle it into a worker) must not pay for
         # the URDF and the collision meshes on its event loop. It runs on
         # the packaged model, never on whatever the machine happens to
         # have installed under /usr/share.
+        self._robot = robot
         self._engine_args = (
             config_path
             if config_path is not None
             else str(_cfg.data_root() / "config" / "PAR6.toml"),
-            max(2, int(max_snapshot_points)),
             None
             if initial_joints_deg is None
             else [float(v) for v in initial_joints_deg],
@@ -126,18 +158,15 @@ class DryRunRobotClient:
             bool(initial_gripper_calibrated),
         )
         self._engine: Preview | None = None
-        # Every command this session submitted, in order, and the pose it
-        # started from: what `simulate` replays through the engine. The
-        # planning pass answers each command as it arrives and keeps no
-        # program; a run needs the whole thing at once.
+        # Every command this session submitted, in order, and the method
+        # that submitted it: what `simulate` replays through the engine
+        # and what names each block's path shape. Block `i` of either
+        # record is `_program[i]`.
         self._program: list[dict[str, Any]] = []
-        self._start_joints_rad: list[float] = []
-        # Motion a state-only command closed out of the blend hold: nobody
-        # asked for it at the time, so it rides at the head of the next
-        # result rather than being dropped.
-        self._pending: list[DryRunResultData] = []
+        self._methods: list[str] = []
+        # The commanded record, kept until the next command changes it.
+        self._plan: TickIndex | None = None
         self._last_checkpoint = ""
-        self._completed = -1
         self._shapes: tuple[Shape, ...] = ()
         # The packaged tool specs, bound to this preview: ``tool.close()``
         # sends the same ``move`` verb and parameters the live gripper gets.
@@ -156,12 +185,11 @@ class DryRunRobotClient:
     @property
     def _preview(self) -> Preview:
         if self._engine is None:
-            config, max_points, joints_deg, homed, calibrated = self._engine_args
+            config, joints_deg, homed, calibrated = self._engine_args
             engine = Preview(
                 config=config,
                 assets=str(_cfg.data_root()),
                 package_dir=str(_cfg.package_search_dir()),
-                max_points=max_points,
             )
             if joints_deg is not None:
                 engine.place_rad(
@@ -169,7 +197,7 @@ class DryRunRobotClient:
                 )
             engine.set_homed(homed)
             engine.set_gripper_calibrated(calibrated)
-            self._start_joints_rad = list(engine.angles_rad())
+            # Seeded: the program starts here, and so does every run of it.
             engine.begin_program()
             self._engine = engine
         return self._engine
@@ -190,7 +218,7 @@ class DryRunRobotClient:
     @property
     def tool(self) -> Any:
         """The active tool, sync-wrapped: ``tool.close()`` returns the
-        previewed result."""
+        action's queue index."""
         key = self.active_tool_key
         try:
             return self._tools[key]
@@ -259,22 +287,6 @@ class DryRunRobotClient:
     def profile(self) -> str:
         return self._preview.profile()
 
-    @property
-    def skill_capabilities(self) -> frozenset[str]:
-        return frozenset(
-            {
-                "motion.joint",
-                "motion.linear",
-                "tool.gripper",
-                "backend.par6",
-                "io.digital",
-                "execution.preview",
-                "world.attachments",
-                "simulation.scenarios",
-                "execution.speed",
-            }
-        )
-
     def is_simulator(self) -> bool:
         return True
 
@@ -290,90 +302,80 @@ class DryRunRobotClient:
         except RobotWireError as e:
             raise RobotError.from_wire(e.args) from None
 
-    def _submit(self, cmd: dict[str, Any]) -> DryRunResultData | None:
-        """Submit one wire command; ``None`` while it waits in the blend
-        hold, else its result.  Raises the runtime's refusal."""
-        preview = self._preview  # builds the engine, so the start pose is set
-        self._program.append(cmd)
-        result = preview.submit(cmd)
-        if result is None and self.execution_speed().paused:
-            raise UnresolvedPreview(
-                "Queued execution is paused; preview needs an explicit resume "
-                "before it can predict completion"
-            )
-        return self._result(result)
+    def _submit(self, cmd: dict[str, Any], method: str) -> int:
+        """Submit one wire command under *method*'s name and answer with
+        its index in the program — the block it owns in both records.
 
-    def _result(self, r: dict[str, Any] | None) -> DryRunResultData | None:
-        if r is None:
-            return None
-        if r["pending"]:
-            raise UnresolvedPreview(
-                "Queued execution is paused; completion is unresolved"
-            )
-        error: RobotError | None = None
-        if r["error"] is not None:
-            error = RobotError.from_wire(r["error"])
+        Raises the runtime's refusal, except ``IK_PARTIAL_PATH``, which the
+        block carries so a preview can show how far the line gets.  A
+        command the blend hold keeps has no answer yet; its block fills
+        in when the chain closes.
+        """
+        preview = self._preview  # builds the engine, so the program has a start
+        self._program.append(cmd)
+        self._methods.append(method)
+        self._plan = None
+        index = len(self._program) - 1
+        answer = preview.submit(cmd)
+        if answer["pending"]:
+            if self.execution_speed().paused:
+                raise UnresolvedPreview(
+                    "Queued execution is paused; preview needs an explicit resume "
+                    "before it can predict completion"
+                )
+            return index
+        if answer["error"] is not None:
+            error = RobotError.from_wire(answer["error"])
             if error.code != ErrorCode.IK_PARTIAL_PATH:
                 raise error
-        traj = np.asarray(r["joint_trajectory_rad"], dtype=np.float64).reshape(
-            -1, NUM_JOINTS
-        )
-        return DryRunResultData(
-            tcp_poses=np.asarray(r["tcp_xyzrpy"], dtype=np.float64).reshape(-1, 6),
-            end_joints_rad=np.asarray(r["end_joints_rad"], dtype=np.float64),
-            duration=float(r["duration_s"]),
-            error=error,
-            joint_trajectory_rad=traj if traj.shape[0] else None,
-        )
+        return index
 
-    def _system(self, cmd: dict[str, Any]) -> int:
-        """A state-changing command: refused → raises, else 1."""
-        self._submit(cmd)
+    def _system(self, cmd: dict[str, Any], method: str) -> int:
+        """A command that answers with a code, not an index: refused →
+        raises, else 1."""
+        self._submit(cmd, method)
         return 1
 
-    def _emit(self, result: DryRunResultData | None) -> DryRunResultData | None:
-        """*result*, behind whatever motion a chain closed ahead of it."""
-        owed, self._pending = self._pending, []
-        if not owed:
-            return result
-        return _merge([*owed, result] if result is not None else owed)
-
-    def _quietly(self, cmd: dict[str, Any]) -> int:
-        """A queued command whose caller gets an index, not a result: the
-        motion it releases from the hold is owed to the next result."""
-        released = self._submit(cmd)
-        if released is not None:
-            self._pending.append(released)
-        return 0
-
-    def flush(self) -> list[DryRunResultData]:
+    def flush(self) -> None:
         """Plan whatever the blend hold is still holding.
 
         A move whose radius is positive waits for the successor it rounds a
         corner into; at the end of a program that successor never comes, and
         the runtime's blend hold expires and runs the chain as it stands (the
-        last move simply stops at its target).  Call this after the last
-        command to collect that motion.
+        last move simply stops at its target).  The chain's blocks fill in.
         """
-        owed, self._pending = self._pending, []
-        released = self._result(self._preview.flush())
-        if released is not None:
-            owed.append(released)
-        return [_merge(owed)] if owed else []
+        self._preview.flush()
+        self._plan = None
 
     # ------------------------------------------------------------------
-    # The second pass: what the arm would actually do
+    # The two records
     # ------------------------------------------------------------------
 
     @property
     def program_length(self) -> int:
         """How many commands have been recorded so far.
 
-        A host mapping a simulated row back to a source line reads this
-        after each call it makes and attributes whatever appeared to the
-        line it was on; this client cannot know the line itself.
+        A host mapping a block back to a source line reads this after
+        each call it makes and attributes whatever appeared to the line
+        it was on; this client cannot know the line itself.
         """
         return len(self._program)
+
+    def plan(self, max_seconds: float | None = None) -> TickIndex:
+        """The commanded record: what every command so far tells the arm
+        to do, the blend hold closed.
+
+        One block per command in program order, rows at the run's row
+        rate, the pose FK'd at each.  Fast enough to run behind a
+        keystroke.  ``max_seconds`` cuts it to that much SIMULATED time.
+        """
+        if max_seconds is None and self._plan is not None:
+            return self._plan
+        raw = self._call(self._preview.plan_record, max_seconds)
+        record = _tick_index(raw, self._methods)
+        if max_seconds is None:
+            self._plan = record
+        return record
 
     def simulate(
         self,
@@ -381,15 +383,15 @@ class DryRunRobotClient:
         *,
         scenario: dict[str, Any] | None = None,
     ) -> TickIndex:
-        """Run everything submitted so far through the engine and return
-        the tick record of what the arm did.
+        """The predicted record: run everything submitted so far through
+        the engine and return the tick record of what the arm did.
 
-        The planning pass answers "where is it told to go", fast enough to
-        run behind a keystroke.  This answers "where does it end up", by
-        queueing the same commands to the same planner driving the same
-        control loop against a simulated plant: servo lag, gravity sag,
-        contact, and a grasp that holds or does not hold.  The gap between
-        the two joint columns it returns is the thing worth looking at.
+        The planning pass answers "where is it told to go".  This answers
+        "where does it end up", by queueing the same commands to the same
+        planner driving the same control loop against a simulated plant:
+        servo lag, gravity sag, contact, and a grasp that holds or does not
+        hold.  The gap from :meth:`plan` at the same block is the following
+        error.
 
         Costs roughly a sixtieth of the program's own duration, so it
         belongs behind a longer idle than the planning pass, not on the
@@ -401,16 +403,17 @@ class DryRunRobotClient:
         ``scenario`` supplies deterministic observation perturbations or an
         assumed supply-loss envelope, validated by the native simulator.
         """
+        self.flush()
         raw = self._call(
             self._preview.run_program, self._program, max_seconds, scenario
         )
-        return _tick_index(raw)
+        return _tick_index(raw, self._methods)
 
     # ------------------------------------------------------------------
     # Motion
     # ------------------------------------------------------------------
 
-    def home(self, **kwargs: Any) -> DryRunResultData | None:
+    def home(self, **kwargs: Any) -> int:
         """Reference the arm, return it to the park pose when it already
         holds its references, or re-run the seek with ``calibrate=True``.
 
@@ -422,10 +425,9 @@ class DryRunRobotClient:
         to ``[robot].park_pose_rad``, planned and collision-gated like
         any other. ``calibrate=True`` asks for the seek either way.
         """
-        return self._emit(
-            self._submit(
-                {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))}
-            )
+        return self._submit(
+            {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))},
+            "home",
         )
 
     def teleport(
@@ -438,10 +440,9 @@ class DryRunRobotClient:
         checks the code reads the same offline.
         """
         # The arm runs a held blend chain before it snaps, so close the hold
-        # here: that motion belongs to the next result, not to this command,
-        # which answers with a code and has no path of its own.
-        self._pending.extend(self.flush())
-        self._submit(
+        # here: that motion belongs to the chain's own blocks.
+        self.flush()
+        return self._system(
             {
                 "type": "teleport",
                 "angles": f6(angles_deg, "angles_deg"),
@@ -450,9 +451,9 @@ class DryRunRobotClient:
                     if tool_positions is not None
                     else None
                 ),
-            }
+            },
+            "teleport",
         )
-        return 1
 
     def move_j(
         self,
@@ -465,7 +466,7 @@ class DryRunRobotClient:
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         d, s = timing(duration, speed)
         if pose is not None:
             if rel:
@@ -482,22 +483,22 @@ class DryRunRobotClient:
                     "speed": s,
                     "accel": float(accel),
                     "blend_radius": blend(r),
-                }
+                },
+                "move_j",
             )
         if angles is None:
             raise ValueError("move_j requires angles or pose=")
-        return self._emit(
-            self._submit(
-                {
-                    "type": "move_j",
-                    "angles": f6(angles, "angles"),
-                    "duration": d,
-                    "speed": s,
-                    "accel": float(accel),
-                    "blend_radius": blend(r),
-                    "rel": bool(rel),
-                }
-            )
+        return self._submit(
+            {
+                "type": "move_j",
+                "angles": f6(angles, "angles"),
+                "duration": d,
+                "speed": s,
+                "accel": float(accel),
+                "blend_radius": blend(r),
+                "rel": bool(rel),
+            },
+            "move_j",
         )
 
     def move_l(
@@ -511,21 +512,20 @@ class DryRunRobotClient:
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         d, s = timing(duration, speed)
-        return self._emit(
-            self._submit(
-                {
-                    "type": "move_l",
-                    "pose": f6(pose, "pose"),
-                    "frame": wire_frame(frame),
-                    "duration": d,
-                    "speed": s,
-                    "accel": float(accel),
-                    "blend_radius": blend(r),
-                    "rel": bool(rel),
-                }
-            )
+        return self._submit(
+            {
+                "type": "move_l",
+                "pose": f6(pose, "pose"),
+                "frame": wire_frame(frame),
+                "duration": d,
+                "speed": s,
+                "accel": float(accel),
+                "blend_radius": blend(r),
+                "rel": bool(rel),
+            },
+            "move_l",
         )
 
     def move_c(
@@ -540,22 +540,21 @@ class DryRunRobotClient:
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         d, s = timing(duration, speed)
-        return self._emit(
-            self._submit(
-                {
-                    "type": "move_c",
-                    "via": f6(via, "via"),
-                    "end": f6(end, "end"),
-                    "frame": wire_frame(frame),
-                    "duration": d,
-                    "speed": s,
-                    "accel": float(accel),
-                    "blend_radius": blend(r),
-                    "rel": bool(rel),
-                }
-            )
+        return self._submit(
+            {
+                "type": "move_c",
+                "via": f6(via, "via"),
+                "end": f6(end, "end"),
+                "frame": wire_frame(frame),
+                "duration": d,
+                "speed": s,
+                "accel": float(accel),
+                "blend_radius": blend(r),
+                "rel": bool(rel),
+            },
+            "move_c",
         )
 
     def _move_multi(
@@ -567,7 +566,7 @@ class DryRunRobotClient:
         speed: float,
         accel: float,
         rel: bool,
-    ) -> DryRunResultData | None:
+    ) -> int:
         d, s = timing(duration, speed)
         return self._submit(
             {
@@ -578,7 +577,8 @@ class DryRunRobotClient:
                 "speed": s,
                 "accel": float(accel),
                 "rel": bool(rel),
-            }
+            },
+            kind,
         )
 
     def move_s(
@@ -591,7 +591,7 @@ class DryRunRobotClient:
         accel: float = 1.0,
         rel: bool = False,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         return self._move_multi("move_s", waypoints, frame, duration, speed, accel, rel)
 
     def move_p(
@@ -604,7 +604,7 @@ class DryRunRobotClient:
         accel: float = 1.0,
         rel: bool = False,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         return self._move_multi("move_p", waypoints, frame, duration, speed, accel, rel)
 
     # ------------------------------------------------------------------
@@ -619,29 +619,29 @@ class DryRunRobotClient:
         speed: float = 1.0,
         accel: float = 1.0,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
+    ) -> int:
         """One streamed target, evaluated as if it were the last one: the
         settle onto it is previewed with the planner's own move."""
         if pose is not None:
-            return self._submit(
+            return self._system(
                 {
                     "type": "servo_j_pose",
                     "pose": f6(pose, "pose"),
                     "speed": float(speed),
                     "accel": float(accel),
-                }
+                },
+                "servo_j",
             )
         if angles is None:
             raise ValueError("servo_j requires angles or pose=")
-        return self._emit(
-            self._submit(
-                {
-                    "type": "servo_j",
-                    "angles": f6(angles, "angles"),
-                    "speed": float(speed),
-                    "accel": float(accel),
-                }
-            )
+        return self._system(
+            {
+                "type": "servo_j",
+                "angles": f6(angles, "angles"),
+                "speed": float(speed),
+                "accel": float(accel),
+            },
+            "servo_j",
         )
 
     def servo_l(
@@ -651,16 +651,15 @@ class DryRunRobotClient:
         speed: float = 1.0,
         accel: float = 1.0,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
-        return self._emit(
-            self._submit(
-                {
-                    "type": "servo_l",
-                    "pose": f6(pose, "pose"),
-                    "speed": float(speed),
-                    "accel": float(accel),
-                }
-            )
+    ) -> int:
+        return self._system(
+            {
+                "type": "servo_l",
+                "pose": f6(pose, "pose"),
+                "speed": float(speed),
+                "accel": float(accel),
+            },
+            "servo_l",
         )
 
     def jog_j(
@@ -673,14 +672,15 @@ class DryRunRobotClient:
         speeds: list[float] | None = None,
         accel: float = 1.0,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
-        return self._submit(
+    ) -> int:
+        return self._system(
             {
                 "type": "jog_j",
                 "speeds": jog_j_speeds(joint, speed, joints, speeds),
                 "duration": float(duration),
                 "accel": float(accel),
-            }
+            },
+            "jog_j",
         )
 
     def jog_l(
@@ -694,15 +694,16 @@ class DryRunRobotClient:
         speeds_list: list[float] | None = None,
         accel: float = 1.0,
         **kwargs: Any,
-    ) -> DryRunResultData | None:
-        return self._submit(
+    ) -> int:
+        return self._system(
             {
                 "type": "jog_l",
                 "velocities": jog_l_velocities(axis, speed, axes, speeds_list),
                 "duration": float(duration),
                 "frame": wire_frame(frame),
                 "accel": float(accel),
-            }
+            },
+            "jog_l",
         )
 
     # ------------------------------------------------------------------
@@ -712,14 +713,14 @@ class DryRunRobotClient:
     def select_tool(self, tool_name: str, variant_key: str = "", **kwargs: Any) -> int:
         """Select a tool — refused for any tool the runtime is not fitted
         with, matching the runtime's own rule."""
-        self._submit(
+        return self._system(
             {
                 "type": "select_tool",
                 "tool_name": _cfg.canonical_tool_key(tool_name),
                 "variant_key": variant_key or None,
-            }
+            },
+            "select_tool",
         )
-        return 0
 
     def set_tcp_transform(
         self,
@@ -730,7 +731,7 @@ class DryRunRobotClient:
         pitch: float = 0,
         yaw: float = 0,
     ) -> int:
-        return self._system(
+        return self._submit(
             {
                 "type": "set_tcp_transform",
                 "x": float(x),
@@ -739,24 +740,29 @@ class DryRunRobotClient:
                 "roll": float(roll),
                 "pitch": float(pitch),
                 "yaw": float(yaw),
-            }
+            },
+            "set_tcp_transform",
         )
 
     def set_tcp_offset(
         self, x: float = 0, y: float = 0, z: float = 0, **kwargs: Any
     ) -> int:
         return self._system(
-            {"type": "set_tcp_offset", "x": float(x), "y": float(y), "z": float(z)}
+            {"type": "set_tcp_offset", "x": float(x), "y": float(y), "z": float(z)},
+            "set_tcp_offset",
         )
 
     def select_profile(self, profile: str, **kwargs: Any) -> int:
-        return self._system({"type": "select_profile", "profile": profile.strip()})
+        return self._system(
+            {"type": "select_profile", "profile": profile.strip()}, "select_profile"
+        )
 
     def set_shapes(self, shapes: list[Shape], **kwargs: Any) -> int:
         """Replace the preview's keep-outs — and enforce them, as the
         runtime enforces the set the live client sends."""
         self._system(
-            {"type": "set_shapes", "shapes": [shape_to_wire(s) for s in shapes]}
+            {"type": "set_shapes", "shapes": [shape_to_wire(s) for s in shapes]},
+            "set_shapes",
         )
         self._shapes = tuple(shapes)
         return 1
@@ -766,7 +772,8 @@ class DryRunRobotClient:
             {
                 "type": "set_completion_policy",
                 "policy": int(CompletionPolicy(int(policy))),
-            }
+            },
+            "set_completion_policy",
         )
 
     def payload(self) -> PayloadResult:
@@ -779,18 +786,35 @@ class DryRunRobotClient:
         ridge: float = 0.01,
         declare: bool = True,
     ) -> PayloadEstimate:
-        """Preview the wrist swing an estimation makes; measure nothing.
+        """Queue the wrist swing an estimation makes; measure nothing.
 
         A dry run has no torque to read, so the estimate is empty — mass
-        0, nothing determined — and ``declare`` declares nothing. The
-        MOTION is the engine's: the same wrist poses the arm would swing
-        through from here, at the estimation protocol's speed, planned
-        against the same keep-outs and refused where the arm would be.
+        0, nothing determined — and ``declare`` declares nothing.  The
+        MOTION is the live protocol's: the same joint moves it queues,
+        through the same wrist poses from here, approached from either
+        side, at its speed, ending where the arm stood — planned against
+        the same keep-outs and refused where the arm would be.  Each
+        move is a block of the program, under this method's name.
         """
         del ridge, declare
-        raw = self._preview.estimate_payload(float(spread))
-        poses = int(raw["poses"])
-        self._result(raw)
+        poses = self._preview.estimation_poses(float(spread))
+        speed = Preview.estimation_speed()
+        for q in poses:
+            self._submit(
+                {
+                    "type": "move_j",
+                    "angles": np.degrees(np.asarray(q, dtype=np.float64)).tolist(),
+                    "duration": None,
+                    "speed": speed,
+                    "accel": 1.0,
+                    "blend_radius": None,
+                    "rel": False,
+                },
+                "estimate_payload",
+            )
+        # Four visits per measured pose, then the return to where the arm
+        # stood: the count the live report calls `poses`.
+        measured = (len(poses) - 1) // 4
         return estimate_from_dict(
             {
                 "mass": 0.0,
@@ -798,7 +822,7 @@ class DryRunRobotClient:
                 "determined": (0.0, 0.0, 0.0, 0.0),
                 "rms_nm": 0.0,
                 "rms_unloaded_nm": 0.0,
-                "poses": poses,
+                "poses": measured,
             }
         )
 
@@ -815,7 +839,8 @@ class DryRunRobotClient:
                 "mass": float(mass),
                 "com": [float(v) for v in com],
                 "inertia": [float(v) for v in inertia] if inertia is not None else None,
-            }
+            },
+            "set_payload",
         )
 
     def write_io(self, index: int = 0, value: int = 0, **kwargs: Any) -> int:
@@ -830,28 +855,29 @@ class DryRunRobotClient:
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        return self._system(
-            {"type": "write_io", "port": int(index), "value": int(value)}
+        return self._submit(
+            {"type": "write_io", "port": int(index), "value": int(value)}, "write_io"
         )
 
     def tool_action(
         self, tool_key: str, action: str, params: list | None = None, **kwargs: Any
-    ) -> DryRunResultData | None:
+    ) -> int:
         """A gripper action, admitted by the runtime's own rules (a ``move``
         needs a calibrated gripper; ``calibrate`` holds the arm for the
-        driver's minimum settle)."""
+        driver's minimum settle, a ``move`` for the jaws' travel)."""
         return self._submit(
             {
                 "type": "tool_action",
                 "tool_key": _cfg.canonical_tool_key(tool_key),
                 "action": action.strip().lower(),
                 "params": tool_params(params),
-            }
+            },
+            "tool_action",
         )
 
     async def _tool_execute(
         self, tool_key: str, action: str, params: list[Any], **kwargs: Any
-    ) -> DryRunResultData | None:
+    ) -> int:
         return self.tool_action(tool_key, action, params)
 
     def _jaws_open(self, position: float | None = None) -> bool:
@@ -878,48 +904,50 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def checkpoint(self, label: str, **kwargs: Any) -> int:
-        index = self._quietly({"type": "checkpoint", "label": label})
+        index = self._submit({"type": "checkpoint", "label": label}, "checkpoint")
         self._last_checkpoint = label
-        self._completed += 1
         return index
 
     def delay(self, seconds: float = 0.0, **kwargs: Any) -> int:
-        """A queued wait: the arm holds still for *seconds*, which the
-        preview's timeline carries at the head of the next result."""
-        if seconds <= 0:
+        """A queued wait: the arm holds still for *seconds*, rows the
+        block owns in both records."""
+        if not math.isfinite(seconds) or seconds <= 0:
             raise ValueError("Delay must be positive")
-        return self._quietly({"type": "delay", "seconds": float(seconds)})
+        return self._submit({"type": "delay", "seconds": float(seconds)}, "delay")
 
     def stop(self, clear_queue: bool = True, **kwargs: Any) -> int:
         """Halt motion.  A held blend chain is queued motion: it is dropped
         when the queue is cleared, and kept when it is not."""
-        return self._system({"type": "stop", "clear_queue": bool(clear_queue)})
+        return self._system({"type": "stop", "clear_queue": bool(clear_queue)}, "stop")
 
     def estop(self, **kwargs: Any) -> int:
-        return self._system({"type": "estop"})
+        return self._system({"type": "estop"}, "estop")
 
     def reset(self, **kwargs: Any) -> int:
-        return self._system({"type": "reset"})
+        return self._system({"type": "reset"}, "reset")
 
     def reset_state(self, **kwargs: Any) -> int:
-        return self._system({"type": "reset_state"})
+        return self._system({"type": "reset_state"}, "reset_state")
 
     def pause(self, **kwargs: Any) -> int:
-        return self._system({"type": "pause", "on": True})
+        return self._system({"type": "pause", "on": True}, "pause")
 
     def resume(self, **kwargs: Any) -> int:
-        return self._system({"type": "pause", "on": False})
+        return self._system({"type": "pause", "on": False}, "resume")
 
     def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
         return self._system(
-            {"type": "set_execution_speed", "scale": validate_execution_scale(scale)}
+            {"type": "set_execution_speed", "scale": validate_execution_scale(scale)},
+            "set_execution_speed",
         )
 
     def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
         return ExecutionSpeed(*self._preview.execution_speed())
 
     def set_gravity_comp(self, on: bool = True, **kwargs: Any) -> int:
-        return self._system({"type": "set_gravity_comp", "on": bool(on)})
+        return self._system(
+            {"type": "set_gravity_comp", "on": bool(on)}, "set_gravity_comp"
+        )
 
     def freedrive(self, enabled: bool = True, **kwargs: Any) -> int:
         return self.set_gravity_comp(enabled)
@@ -929,16 +957,20 @@ class DryRunRobotClient:
         return False
 
     def simulator(self, enabled: bool = True, **kwargs: Any) -> int:
-        return self._system({"type": "simulator", "on": bool(enabled)})
+        return self._system({"type": "simulator", "on": bool(enabled)}, "simulator")
 
     def connect_hardware(self, port_str: str = "", **kwargs: Any) -> int:
-        return self._system({"type": "connect_hardware", "port": port_str})
+        return self._system(
+            {"type": "connect_hardware", "port": port_str}, "connect_hardware"
+        )
 
     def enter_flashing(self, assertion: str, **kwargs: Any) -> int:
-        return self._system({"type": "enter_flashing", "assertion": assertion})
+        return self._system(
+            {"type": "enter_flashing", "assertion": assertion}, "enter_flashing"
+        )
 
     def exit_flashing(self, **kwargs: Any) -> int:
-        return self._system({"type": "exit_flashing"})
+        return self._system({"type": "exit_flashing"}, "exit_flashing")
 
     def set_pid_gains(
         self,
@@ -973,21 +1005,26 @@ class DryRunRobotClient:
                 "ilim_ma": float(ilim_ma),
                 "velocity_limit_ticks_s": float(velocity_limit_ticks_s),
                 "voltage_limit_mv": int(voltage_limit_mv),
-            }
+            },
+            "set_pid_gains",
         )
 
     def wait_motion(self, **kwargs: Any) -> bool:
-        self._finish_pending()
+        self.flush()
         return True
 
-    def wait_command(self, command_index: int = -1, **kwargs: Any) -> bool:
-        self._finish_pending()
-        return True
-
-    def _finish_pending(self) -> None:
-        result = self._result(self._preview.flush())
-        if result is not None:
-            self._pending.append(result)
+    def wait_command(
+        self, command_index: int = -1, timeout: float = 10.0, **kwargs: Any
+    ) -> bool:
+        """Whether the command at *command_index* (the last one by default)
+        was planned without a refusal — read off its block once the blend
+        hold it may sit in has closed."""
+        blocks = self.plan().blocks
+        if command_index < 0:
+            command_index = len(blocks) - 1
+        if not 0 <= command_index < len(blocks):
+            return False
+        return blocks[command_index].error is None
 
     def command_verdict(self, command_index: int = -1, **kwargs: Any) -> int | None:
         """Always None: a dry run has no jaw physics to produce a settle
@@ -1035,11 +1072,17 @@ class DryRunRobotClient:
         live has no cadence here."""
         yield self._status_buffer()
 
+    def _completed_index(self) -> int:
+        """The last command the planner has answered: everything submitted
+        but what the blend hold still keeps.  Read without closing the
+        hold, as a live status read leaves the queue alone."""
+        return len(self._program) - 1 - len(self._preview.queue())
+
     def queue_state(self) -> QueueResult:
         return QueueResult(
             queue=self.queue(),
             executing_index=-1,
-            completed_index=self._completed,
+            completed_index=self._completed_index(),
             last_checkpoint=self._last_checkpoint,
             queued_duration=0.0,
         )
@@ -1072,8 +1115,8 @@ class DryRunRobotClient:
         buf.enabled = True
         buf.simulator_active = True
         buf.last_checkpoint = self._last_checkpoint
-        buf.completed_index = self._completed
-        buf.accepted_index = self._completed
+        buf.completed_index = self._completed_index()
+        buf.accepted_index = len(self._program) - 1
         if status.tool_status is not None:
             buf.tool_status = status.tool_status
             buf.tool_status_present = True
@@ -1148,22 +1191,46 @@ class DryRunRobotClient:
         return None
 
 
-def _tick_index(raw: dict) -> TickIndex:
+def _tick_index(raw: dict, methods: list[str]) -> TickIndex:
     """The engine's column buffers as the shared record type.
 
     ``frombuffer`` is a view, not a copy: the engine wrote native-order
     bytes precisely so a minute of program does not become a million
-    Python floats on the way here.
+    Python floats on the way here.  The columns only a plant fills reach
+    the record as channels, keyed as the engine keyed them, so a consumer
+    finds what a record carries by looking rather than by asking which
+    pass produced it.
     """
     rows, joints = raw["rows"], raw["joints"]
 
     def f32(key: str) -> np.ndarray:
         return np.frombuffer(raw[key], dtype=np.float32)
 
+    channels: dict[str, np.ndarray] = {}
+    if "setpoint_rad" in raw:
+        # The RT's post-limiter setpoint: what went on the motor bus.
+        channels["setpoint_rad"] = f32("setpoint_rad").reshape(rows, joints)
+    if "com" in raw:
+        channels["com"] = f32("com").reshape(-1, 3)
+    if "modes" in raw:
+        # The RT mode as spans: `mode_starts[i]` is the first row
+        # `mode_names[i]` holds from. Two arrays rather than pairs
+        # because every channel is a buffer.
+        channels["mode_starts"] = np.asarray(
+            [r for r, _ in raw["modes"]], dtype=np.uint32
+        )
+        channels["mode_names"] = np.asarray([m for _, m in raw["modes"]], dtype=np.str_)
+    if "contact_starts" in raw:
+        # Ragged: row r owns contacts [starts[r]:starts[r + 1]].
+        channels["contact_pos"] = f32("contact_pos").reshape(-1, 3)
+        channels["contact_force"] = f32("contact_force").reshape(-1, 3)
+        channels["contact_starts"] = np.frombuffer(
+            raw["contact_starts"], dtype=np.uint32
+        )
+
     return TickIndex(
         row_dt_s=float(raw["row_dt_s"]),
         joints_rad=f32("q_rad").reshape(rows, joints),
-        commanded_rad=f32("q_commanded_rad").reshape(rows, joints),
         tcp=f32("tcp").reshape(rows, 6),
         tool_closed=f32("tool_closed"),
         tool_gripping=np.frombuffer(raw["tool_gripping"], dtype=np.bool_),
@@ -1173,6 +1240,9 @@ def _tick_index(raw: dict) -> TickIndex:
                 start_row=b["start_row"],
                 rows=b["rows"],
                 error=RobotError.from_wire(b["error"]) if b["error"] else None,
+                move_type=_MOVE_TYPE.get(methods[b["command"]])
+                if b["command"] < len(methods)
+                else None,
             )
             for b in raw["commands"]
         ),
@@ -1181,31 +1251,19 @@ def _tick_index(raw: dict) -> TickIndex:
                 name=o["name"],
                 poses=np.frombuffer(o["poses"], dtype=np.float32).reshape(o["rows"], 7),
             )
-            for o in raw["objects"]
+            for o in raw.get("objects", ())
         ),
         stop=str(raw["stop"]),
         digest=_digest(raw),
-        channels={
-            # Per-row, sharing the record's row axis.
-            "com": f32("com").reshape(-1, 3),
-            # The RT mode as spans: `mode_starts[i]` is the first row
-            # `mode_names[i]` holds from. Two arrays rather than pairs
-            # because every channel is a buffer.
-            "mode_starts": np.asarray([r for r, _ in raw["modes"]], dtype=np.uint32),
-            "mode_names": np.asarray([m for _, m in raw["modes"]], dtype=np.str_),
-            # Ragged: row r owns contacts [starts[r]:starts[r + 1]].
-            "contact_pos": f32("contact_pos").reshape(-1, 3),
-            "contact_force": f32("contact_force").reshape(-1, 3),
-            "contact_starts": np.frombuffer(raw["contact_starts"], dtype=np.uint32),
-        },
+        channels=channels,
     )
 
 
 def _digest(raw: dict) -> bytes:
-    """Identity of a run, over the columns that reach the screen.
+    """Identity of a record, over the columns that reach the screen.
 
     Quantised below what a display can resolve — a tenth of a milliradian
-    at the joints, ten microns at the TCP and at objects — so two runs
+    at the joints, ten microns at the TCP and at objects — so two records
     that would paint the same picture hash the same and the host can skip
     the redraw.  The engine is deterministic, so this only ever differs
     when something visible did.
@@ -1215,50 +1273,11 @@ def _digest(raw: dict) -> bytes:
     for key, scale in (("q_rad", 1e4), ("tcp", 1e5)):
         q = np.rint(np.nan_to_num(np.frombuffer(raw[key], dtype=np.float32)) * scale)
         h.update(q.astype(np.int32).tobytes())
-    for o in raw["objects"]:
+    for o in raw.get("objects", ()):
         h.update(o["name"].encode())
         poses = np.rint(np.frombuffer(o["poses"], dtype=np.float32) * 1e5)
         h.update(poses.astype(np.int32).tobytes())
     return h.digest()
-
-
-def _merge(results: list[DryRunResultData]) -> DryRunResultData:
-    """Several motions as one result, in the order they run.
-
-    A single call can close a held chain AND run a motion of its own; the
-    caller still gets one result, so the two are concatenated — same shape as
-    parol6's ``_merge_results``.
-    """
-    drawn = [r for r in results if r.tcp_poses.shape[0] > 0]
-    error = next((r.error for r in results if r.error is not None), None)
-    if not drawn:
-        return results[-1]
-    valid = (
-        np.concatenate(
-            [
-                r.valid
-                if r.valid is not None
-                else np.ones(r.tcp_poses.shape[0], dtype=np.bool_)
-                for r in drawn
-            ]
-        )
-        if any(r.valid is not None for r in drawn)
-        else None
-    )
-    # A joint trajectory is stitched only when every leg carries one: a gap
-    # would splice non-adjacent configurations into one continuous path.
-    trajectories = [r.joint_trajectory_rad for r in drawn]
-    present = [t for t in trajectories if t is not None]
-    return DryRunResultData(
-        tcp_poses=np.vstack([r.tcp_poses for r in drawn]),
-        end_joints_rad=drawn[-1].end_joints_rad,
-        duration=sum(r.duration for r in results),
-        error=error,
-        valid=valid,
-        joint_trajectory_rad=(
-            np.vstack(present) if len(present) == len(trajectories) else None
-        ),
-    )
 
 
 __all__ = ["DryRunRobotClient"]

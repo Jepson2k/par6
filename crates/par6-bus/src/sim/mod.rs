@@ -37,6 +37,7 @@ pub mod scenario;
 pub mod scene;
 
 pub use driver::FaultKind;
+pub use gripper::{jaw_rate_bytes_s, jaw_travel_s, CALIBRATION_S};
 pub use scenario::SimulationScenario;
 
 use std::collections::VecDeque;
