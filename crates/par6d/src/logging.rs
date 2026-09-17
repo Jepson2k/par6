@@ -56,9 +56,7 @@ pub fn route(target: &str) -> Lane {
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC) for a system time.
 ///
-/// Fixed millisecond precision, not jiff's default of "as many digits as
-/// the value needs": a log file whose timestamp column changes width is
-/// one `cut -c` away from unreadable.
+/// Fixed millisecond precision so the timestamp column keeps its width.
 pub fn timestamp(t: SystemTime) -> String {
     match jiff::Timestamp::try_from(t) {
         Ok(ts) => ts.strftime("%Y-%m-%dT%H:%M:%S.%3fZ").to_string(),
@@ -93,12 +91,9 @@ struct Files {
 
 /// Open one rotating activity log.
 ///
-/// `ContentLimit::BytesSurpassed` rather than `Bytes`: `Bytes` splits the
-/// write that crosses the cap across two files, and half a log line at
-/// the tail of `commands.log.1` is worse than a file that overshoots its
-/// cap by one line. The probe open is what turns an unwritable log
-/// directory into a startup failure — `FileRotate` itself swallows the
-/// error and silently drops every record.
+/// `BytesSurpassed` keeps log lines whole; `Bytes` splits the write that
+/// crosses the cap. The probe open surfaces an unwritable directory at
+/// startup, which `FileRotate` alone would swallow.
 fn open_log(dir: &Path, name: &str, max_bytes: usize) -> std::io::Result<Rotating> {
     let path = dir.join(name);
     std::fs::OpenOptions::new()
@@ -134,8 +129,7 @@ impl Log for Sink {
             Lane::Command => &files.commands,
         };
         if let Ok(mut f) = lane.lock() {
-            // A failed write is dropped: a full disk must not take the
-            // arm down, and the stderr copy has already gone out.
+            // A full disk must not take the arm down; stderr still has it.
             let _ = f.write_all(line.as_bytes()).and_then(|()| f.flush());
         }
     }

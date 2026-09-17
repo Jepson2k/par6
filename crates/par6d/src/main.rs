@@ -28,9 +28,8 @@ extern "C" fn on_signal(_sig: libc::c_int) {
 
 fn main() {
     par6d::options::clear_empty_env();
-    // clap answers `--help`/`--version` and exits 2 on a usage error
-    // from inside here, so neither reaches the log-directory creation
-    // below: `--help` must not be able to make a directory.
+    // `--help` resolves in here, ahead of the log directory it would
+    // otherwise create on the way past.
     let opts = Options::parse();
     if let Err(e) = par6d::logging::install(opts.log_dir.as_deref()) {
         eprintln!("par6d: cannot open the activity logs: {e}");

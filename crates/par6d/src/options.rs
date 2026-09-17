@@ -51,9 +51,7 @@ pub struct Options {
     /// Profile the RT tick per phase (one clock read per phase) and log
     /// the running maxima and the last overrun's phase times once a second.
     ///
-    /// The env form takes the conventional spellings (`1`, `true`, `on`,
-    /// `yes` and their negatives); clap's plain `bool` parser would take
-    /// only `true`/`false` and reject the documented `PAR6_TICK_PROFILE=1`.
+    /// `BoolishValueParser` so the env form takes `1`, not just `true`.
     #[arg(
         long,
         env = "PAR6_TICK_PROFILE",
@@ -127,11 +125,9 @@ pub struct Options {
 
 /// Drop `PAR6_*` variables that are set but empty, so they read as unset.
 ///
-/// A systemd unit's `Environment=PAR6_BIND=` and a shell's bare `export
-/// PAR6_BIND=` both leave the name present with an empty value. Parsing
-/// that as a value fails the argument and the daemon never boots, so an
-/// empty override has always meant "not set" here. Call before the parse,
-/// while the process is still single-threaded.
+/// A systemd unit's `Environment=PAR6_BIND=` leaves the name present and
+/// empty, which would otherwise fail the parse and stop the daemon
+/// booting. Call before the parse, while still single-threaded.
 pub fn clear_empty_env() {
     let empty: Vec<String> = std::env::vars()
         .filter(|(k, v)| k.starts_with("PAR6_") && v.is_empty())

@@ -40,8 +40,6 @@ par6-rt = { path = "crates/par6-rt" }
 par6-server = { path = "crates/par6-server" }
 par6-client = { path = "crates/par6-client" }
 
-# Pinned: par6-kin's FFI marshalling is written against this layout, and
-# par6-motion's path geometry shares the types across the crate boundary.
 glam = "=0.30.10"
 serde = { version = "1", features = ["derive"] }
 clap = { version = "4", features = ["derive", "env"] }
