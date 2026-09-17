@@ -15,12 +15,14 @@
 //! nothing to the tick. A write that fails is dropped — a full disk must
 //! not take the arm down — and the stderr copy still goes out.
 
-use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Mutex;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
+use file_rotate::compression::Compression;
+use file_rotate::suffix::AppendCount;
+use file_rotate::{ContentLimit, FileRotate};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 /// RT/state-transition log file name.
@@ -28,11 +30,11 @@ pub const RT_LOG: &str = "rt.log";
 /// Command log file name.
 pub const COMMAND_LOG: &str = "commands.log";
 /// Size at which `rt.log` rotates \[bytes\].
-pub const RT_LOG_BYTES: u64 = 2 << 20;
+pub const RT_LOG_BYTES: usize = 2 << 20;
 /// Size at which `commands.log` rotates \[bytes\].
-pub const COMMAND_LOG_BYTES: u64 = 20 << 20;
+pub const COMMAND_LOG_BYTES: usize = 20 << 20;
 /// Rotated copies kept per file (`name.1` newest … `name.5` oldest).
-pub const BACKUPS: u32 = 5;
+pub const BACKUPS: usize = 5;
 
 /// Which file a record goes to.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,110 +54,18 @@ pub fn route(target: &str) -> Lane {
     }
 }
 
-/// An append-only file that rotates itself when a write would carry it
-/// past `max_bytes`: `name` → `name.1`, `name.1` → `name.2`, …, the
-/// oldest copy past `backups` dropped.
-pub struct RotatingFile {
-    path: PathBuf,
-    max_bytes: u64,
-    backups: u32,
-    file: File,
-    len: u64,
-}
-
-impl RotatingFile {
-    /// Open (or create) `path` for appending.
-    pub fn open(path: impl Into<PathBuf>, max_bytes: u64, backups: u32) -> std::io::Result<Self> {
-        let path = path.into();
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
-        let len = file.metadata()?.len();
-        Ok(Self {
-            path,
-            max_bytes,
-            backups,
-            file,
-            len,
-        })
-    }
-
-    /// Append one line (a newline is added), rotating first if it would
-    /// not fit. A line larger than the cap still goes out, alone in a
-    /// fresh file.
-    pub fn write_line(&mut self, line: &str) -> std::io::Result<()> {
-        let bytes = line.len() as u64 + 1;
-        if self.len > 0 && self.len + bytes > self.max_bytes {
-            self.rotate()?;
-        }
-        self.file.write_all(line.as_bytes())?;
-        self.file.write_all(b"\n")?;
-        self.file.flush()?;
-        self.len += bytes;
-        Ok(())
-    }
-
-    fn backup(&self, n: u32) -> PathBuf {
-        let mut name = self.path.as_os_str().to_owned();
-        name.push(format!(".{n}"));
-        PathBuf::from(name)
-    }
-
-    fn rotate(&mut self) -> std::io::Result<()> {
-        if self.backups == 0 {
-            self.file = File::create(&self.path)?;
-            self.len = 0;
-            return Ok(());
-        }
-        let _ = std::fs::remove_file(self.backup(self.backups));
-        for n in (1..self.backups).rev() {
-            let (from, to) = (self.backup(n), self.backup(n + 1));
-            if from.exists() {
-                std::fs::rename(from, to)?;
-            }
-        }
-        std::fs::rename(&self.path, self.backup(1))?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
-        self.len = 0;
-        Ok(())
-    }
-
-    /// Bytes in the live file.
-    pub fn len(&self) -> u64 {
-        self.len
-    }
-
-    /// Whether the live file is empty.
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
-    }
-}
-
-/// `YYYY-MM-DDTHH:MM:SS.mmmZ` for a system time (proleptic Gregorian,
-/// the civil-from-days algorithm), so the files need no clock crate.
+/// `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC) for a system time.
+///
+/// Fixed millisecond precision, not jiff's default of "as many digits as
+/// the value needs": a log file whose timestamp column changes width is
+/// one `cut -c` away from unreadable.
 pub fn timestamp(t: SystemTime) -> String {
-    let d = t.duration_since(UNIX_EPOCH).unwrap_or_default();
-    let secs = d.as_secs();
-    let millis = d.subsec_millis();
-    let days = secs / 86_400;
-    let sod = secs % 86_400;
-    let z = days as i64 + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z.rem_euclid(146_097);
-    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let day = doy - (153 * mp + 2) / 5 + 1;
-    let month = if mp < 10 { mp + 3 } else { mp - 9 };
-    let year = if month <= 2 { y + 1 } else { y };
-    format!(
-        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}.{millis:03}Z",
-        sod / 3600,
-        (sod / 60) % 60,
-        sod % 60
-    )
+    match jiff::Timestamp::try_from(t) {
+        Ok(ts) => ts.strftime("%Y-%m-%dT%H:%M:%S.%3fZ").to_string(),
+        // Only reachable for a clock outside jiff's supported range
+        // (year 1..=9999); a line still goes out, unstamped.
+        Err(_) => "----------T--:--:--.---Z".to_owned(),
+    }
 }
 
 /// One file line for a record.
@@ -174,9 +84,34 @@ struct Sink {
     files: Option<Files>,
 }
 
+type Rotating = FileRotate<AppendCount>;
+
 struct Files {
-    rt: Mutex<RotatingFile>,
-    commands: Mutex<RotatingFile>,
+    rt: Mutex<Rotating>,
+    commands: Mutex<Rotating>,
+}
+
+/// Open one rotating activity log.
+///
+/// `ContentLimit::BytesSurpassed` rather than `Bytes`: `Bytes` splits the
+/// write that crosses the cap across two files, and half a log line at
+/// the tail of `commands.log.1` is worse than a file that overshoots its
+/// cap by one line. The probe open is what turns an unwritable log
+/// directory into a startup failure — `FileRotate` itself swallows the
+/// error and silently drops every record.
+fn open_log(dir: &Path, name: &str, max_bytes: usize) -> std::io::Result<Rotating> {
+    let path = dir.join(name);
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    Ok(FileRotate::new(
+        path,
+        AppendCount::new(BACKUPS),
+        ContentLimit::BytesSurpassed(max_bytes),
+        Compression::None,
+        None,
+    ))
 }
 
 impl Log for Sink {
@@ -192,13 +127,16 @@ impl Log for Sink {
         if record.level() > Level::Info {
             return;
         }
-        let line = format_line(record);
+        let mut line = format_line(record);
+        line.push('\n');
         let lane = match route(record.target()) {
             Lane::Rt => &files.rt,
             Lane::Command => &files.commands,
         };
         if let Ok(mut f) = lane.lock() {
-            let _ = f.write_line(&line);
+            // A failed write is dropped: a full disk must not take the
+            // arm down, and the stderr copy has already gone out.
+            let _ = f.write_all(line.as_bytes()).and_then(|()| f.flush());
         }
     }
 
@@ -219,12 +157,8 @@ pub fn install(log_dir: Option<&Path>) -> std::io::Result<()> {
             std::fs::create_dir_all(dir)?;
             max = max.max(LevelFilter::Info);
             Some(Files {
-                rt: Mutex::new(RotatingFile::open(dir.join(RT_LOG), RT_LOG_BYTES, BACKUPS)?),
-                commands: Mutex::new(RotatingFile::open(
-                    dir.join(COMMAND_LOG),
-                    COMMAND_LOG_BYTES,
-                    BACKUPS,
-                )?),
+                rt: Mutex::new(open_log(dir, RT_LOG, RT_LOG_BYTES)?),
+                commands: Mutex::new(open_log(dir, COMMAND_LOG, COMMAND_LOG_BYTES)?),
             })
         }
         None => None,
@@ -240,33 +174,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rotation_keeps_the_newest_copies_and_drops_the_oldest() {
+    fn a_rotating_log_keeps_whole_lines_and_drops_the_oldest_copy() {
         let dir = std::env::temp_dir().join(format!("par6d-rotate-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("x.log");
-        // 40-byte cap, two backups: three 15-byte lines fill a file two
-        // at a time, so seven lines produce a live file and two copies
-        // — with the very first lines gone.
-        let mut f = RotatingFile::open(&path, 40, 2).unwrap();
-        for i in 0..7 {
-            f.write_line(&format!("line-{i:02}-xxxxxx")).unwrap();
+        // A 40-byte cap takes three 15-byte lines before it rotates, so
+        // the live file plus BACKUPS copies hold 18: 30 lines is past the
+        // point where the oldest have to go.
+        let mut f = open_log(&dir, "x.log", 40).unwrap();
+        for i in 0..30 {
+            f.write_all(format!("line-{i:02}-xxxxxx\n").as_bytes())
+                .unwrap();
         }
-        let read = |p: PathBuf| std::fs::read_to_string(p).unwrap_or_default();
-        assert_eq!(read(path.clone()), "line-06-xxxxxx\n");
-        assert_eq!(
-            read(dir.join("x.log.1")),
-            "line-04-xxxxxx\nline-05-xxxxxx\n"
+        f.flush().unwrap();
+
+        let read = |name: &str| std::fs::read_to_string(dir.join(name)).unwrap_or_default();
+        let live = read("x.log");
+        // Every line that survived is intact: the cap never cuts one in
+        // half across two files, which is why the sink asks for
+        // `BytesSurpassed` rather than `Bytes`.
+        let mut kept: Vec<String> = Vec::new();
+        let oldest_first = [
+            "x.log.5", "x.log.4", "x.log.3", "x.log.2", "x.log.1", "x.log",
+        ];
+        for name in oldest_first {
+            for line in read(name).lines() {
+                assert_eq!(line.len(), 14, "a line was split across the cap: {line:?}");
+                kept.push(line.to_owned());
+            }
+        }
+        assert!(
+            live.contains("line-29-xxxxxx"),
+            "the newest line is in the live file"
+        );
+        assert!(
+            !kept.contains(&"line-00-xxxxxx".to_owned()),
+            "the oldest line rotated out"
         );
         assert_eq!(
-            read(dir.join("x.log.2")),
-            "line-02-xxxxxx\nline-03-xxxxxx\n"
+            kept.len(),
+            18,
+            "live file + {BACKUPS} copies, three lines each"
         );
-        assert!(!dir.join("x.log.3").exists(), "the oldest copy is dropped");
-        // Reopening resumes at the live size, so a restart never resets
-        // the rotation point.
-        let g = RotatingFile::open(&path, 40, 2).unwrap();
-        assert_eq!(g.len(), 15);
+        assert!(
+            kept.windows(2).all(|w| w[0] < w[1]),
+            "oldest copy first: {kept:?}"
+        );
+        assert!(
+            !dir.join(format!("x.log.{}", BACKUPS + 1)).exists(),
+            "no copy past the backup count"
+        );
+
+        // A restart picks the rotation up where it left off instead of
+        // truncating: what was live is still on disk afterwards (rotated
+        // into a copy, since it was already over the cap when reopened).
+        let mut g = open_log(&dir, "x.log", 40).unwrap();
+        g.write_all(b"after-restart\n").unwrap();
+        g.flush().unwrap();
+        let after: String = oldest_first.iter().map(|n| read(n)).collect();
+        assert!(
+            after.contains("line-29-xxxxxx"),
+            "a restart discarded what was in the live file"
+        );
+        assert!(read("x.log").contains("after-restart"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -277,8 +247,8 @@ mod tests {
         assert_eq!(route("par6_server::server"), Lane::Command);
         assert_eq!(route("par6d::vitals"), Lane::Command);
         // 2024-02-29T12:34:56.789Z — a leap day, past the era boundary.
-        let t = UNIX_EPOCH + std::time::Duration::from_millis(1_709_210_096_789);
+        let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(1_709_210_096_789);
         assert_eq!(timestamp(t), "2024-02-29T12:34:56.789Z");
-        assert_eq!(timestamp(UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
+        assert_eq!(timestamp(std::time::UNIX_EPOCH), "1970-01-01T00:00:00.000Z");
     }
 }

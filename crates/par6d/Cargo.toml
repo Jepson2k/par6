@@ -25,9 +25,18 @@ par6-kin = { workspace = true }
 # `calibrate` drives a live client through the estimation protocol.
 par6-client = { workspace = true }
 tokio = { workspace = true }
+clap = { workspace = true }
 thiserror = { workspace = true }
 env_logger = { workspace = true }
 log = { workspace = true }
+# Size-triggered rotation with the `name.1` (newest) … `name.5` suffix
+# scheme, resuming in the live file across a restart. Costs chrono and
+# flate2 transitively — it exposes date-based rotation and gzip, neither
+# of which this crate asks for and neither of which is optional upstream.
+file-rotate = "0.8"
+# The activity-log timestamps. Already in the tree as env_logger's own
+# timestamp source; same feature set, so it adds no tz database.
+jiff = { version = "0.2", default-features = false, features = ["std"] }
 sha2 = { workspace = true }
 libc = "0.2"
 
