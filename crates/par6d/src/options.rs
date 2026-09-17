@@ -50,8 +50,6 @@ pub struct Options {
 
     /// Profile the RT tick per phase (one clock read per phase) and log
     /// the running maxima and the last overrun's phase times once a second.
-    ///
-    /// `BoolishValueParser` so the env form takes `1`, not just `true`.
     #[arg(
         long,
         env = "PAR6_TICK_PROFILE",

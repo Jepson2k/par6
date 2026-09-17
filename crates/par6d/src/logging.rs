@@ -91,9 +91,9 @@ struct Files {
 
 /// Open one rotating activity log.
 ///
-/// `BytesSurpassed` keeps log lines whole; `Bytes` splits the write that
-/// crosses the cap. The probe open surfaces an unwritable directory at
-/// startup, which `FileRotate` alone would swallow.
+/// The discarded open is a probe: `FileRotate` swallows the error and
+/// drops every record, so without it an unwritable directory logs nothing
+/// and still boots.
 fn open_log(dir: &Path, name: &str, max_bytes: usize) -> std::io::Result<Rotating> {
     let path = dir.join(name);
     std::fs::OpenOptions::new()
