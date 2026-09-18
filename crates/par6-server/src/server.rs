@@ -888,12 +888,16 @@ impl<R: RtCommands> Core<R> {
                 Ok(())
             }
             C::Stop(p) => {
+                // A clearing stop drops the pause with the queue it held; a
+                // stop that keeps the queue keeps the pause holding it.
                 let dropped = if p.clear_queue {
                     self.cancel_all_motion("stop").await
                 } else {
                     self.cancel_active_motion("stop").await
                 };
-                self.clear_pause();
+                if p.clear_queue {
+                    self.clear_pause();
+                }
                 if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
@@ -1166,6 +1170,7 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         debug_assert!(is_stream(tag));
+        let mut refused_in_place = false;
         let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
@@ -1176,6 +1181,7 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
+                    refused_in_place = true;
                     if !self.runtime.rt.stop_refused_stream() {
                         self.active_stream = None;
                     }
@@ -1210,7 +1216,11 @@ impl<R: RtCommands> Core<R> {
                 // stands. The gate's own collision latch (if the refusal
                 // was a collision) reaches STATUS through
                 // `update_collision`.
-                self.latch_faf_refusal(&error);
+                if refused_in_place {
+                    self.latch_stream_refusal(&error);
+                } else {
+                    self.latch_faf_refusal(&error);
+                }
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
@@ -1849,6 +1859,17 @@ impl<R: RtCommands> Core<R> {
     fn latch_faf_refusal(&mut self, error: &WireError) {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        self.latch_refusal(error, busy);
+    }
+
+    /// A refused update of the live stream: that stream is stopped or held
+    /// in its standoff, so it is not motion the refusal would misdescribe.
+    fn latch_stream_refusal(&mut self, error: &WireError) {
+        let busy = self.executing.is_some() || !self.pending.is_empty();
+        self.latch_refusal(error, busy);
+    }
+
+    fn latch_refusal(&mut self, error: &WireError, busy: bool) {
         let attributed = self
             .standing_error
             .as_ref()
@@ -1929,15 +1950,11 @@ impl<R: RtCommands> Core<R> {
     }
 
     fn attachments_valid(&self) -> bool {
-        self.shapes.iter().all(|s| {
-            s.attachment
-                .as_ref()
-                .is_none_or(|a| a.epoch == self.attachment_epoch)
-        })
+        attachments_fresh(&self.shapes, self.attachment_epoch)
     }
 
     fn invalidate_attachments(&mut self) {
-        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+        self.attachment_epoch = next_attachment_epoch(self.attachment_epoch);
         if self.shapes.iter().any(|s| s.attachment.is_some()) {
             self.attachment_stop_pending = true;
             self.scene_epoch += 1;
@@ -1977,11 +1994,7 @@ impl<R: RtCommands> Core<R> {
                 "attachments require fresh enabled, referenced state",
             ));
         }
-        if shapes.iter().any(|s| {
-            s.attachment
-                .as_ref()
-                .is_some_and(|a| a.epoch != self.attachment_epoch)
-        }) {
+        if !attachments_fresh(shapes, self.attachment_epoch) {
             return Some(attachment_error(
                 "attachment context changed; reconcile the physical scene and reapply",
             ));
@@ -2695,14 +2708,7 @@ impl<R: RtCommands> Core<R> {
                 resume_scale: self.snap.exec.resume_scale,
             },
             C::TcpTransform => QueryResult::TcpTransform {
-                values: [
-                    self.tcp_offset_mm[0],
-                    self.tcp_offset_mm[1],
-                    self.tcp_offset_mm[2],
-                    self.tcp_rotation_deg[0],
-                    self.tcp_rotation_deg[1],
-                    self.tcp_rotation_deg[2],
-                ],
+                values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
@@ -3111,14 +3117,35 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
+/// The TCP frame a queued command sets, `[x, y, z (mm), roll, pitch, yaw
+/// (deg)]`; an offset alone sets a pure translation.
+pub fn tcp_transform_effect(cmd: &Command) -> Option<[f64; 6]> {
+    match cmd {
+        Command::SetTcpOffset(p) => Some([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
+        Command::SetTcpTransform(p) => Some([p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+        _ => None,
+    }
+}
+
+/// The TCP_TRANSFORM readback: offset (mm) then rotation (deg).
+pub fn tcp_transform_values(offset_mm: [f64; 3], rotation_deg: [f64; 3]) -> [f64; 6] {
+    [
+        offset_mm[0],
+        offset_mm[1],
+        offset_mm[2],
+        rotation_deg[0],
+        rotation_deg[1],
+        rotation_deg[2],
+    ]
+}
+
 fn post_effect(cmd: &Command) -> PostEffect {
+    if let Some(values) = tcp_transform_effect(cmd) {
+        return PostEffect::TcpTransform(values);
+    }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
-        Command::SetTcpOffset(p) => PostEffect::TcpTransform([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
-        Command::SetTcpTransform(p) => {
-            PostEffect::TcpTransform([p.x, p.y, p.z, p.roll, p.pitch, p.yaw])
-        }
         _ => PostEffect::None,
     }
 }
@@ -3220,12 +3247,27 @@ pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
 }
 
-fn attachment_error(detail: &str) -> WireError {
+/// A refusal about held geometry, with the detail the caller can act on.
+pub fn attachment_error(detail: &str) -> WireError {
     make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,
         &[("detail", detail)],
     )
+}
+
+/// Whether every attached shape was declared against `epoch`, the current
+/// attachment context.
+pub fn attachments_fresh(shapes: &[Shape], epoch: u64) -> bool {
+    shapes
+        .iter()
+        .all(|s| s.attachment.as_ref().is_none_or(|a| a.epoch == epoch))
+}
+
+/// The attachment epoch after a context change: never zero, so a shape
+/// declared with no epoch can never match it.
+pub fn next_attachment_epoch(epoch: u64) -> u64 {
+    epoch.wrapping_add(1).max(1)
 }
 
 /// Commands that change arm pose and require reconciled held geometry.

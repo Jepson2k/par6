@@ -33,9 +33,10 @@ use par6_rt::{
     Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    check_gate, cmd_name, decode_error_to_wire, pid_gains_fault, session, validate_registries,
-    validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext, Planner,
-    QueuedCommand, ServerConfig, ShapeLayer,
+    attachment_error, attachments_fresh, check_gate, cmd_name, decode_error_to_wire,
+    next_attachment_epoch, pid_gains_fault, session, tcp_transform_effect, tcp_transform_values,
+    validate_registries, validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext,
+    Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -470,14 +471,7 @@ impl Preview {
 
     /// Applied user TCP correction (mm, intrinsic XYZ degrees).
     pub fn tcp_transform(&self) -> [f64; 6] {
-        [
-            self.tcp_offset_mm[0],
-            self.tcp_offset_mm[1],
-            self.tcp_offset_mm[2],
-            self.tcp_rotation_deg[0],
-            self.tcp_rotation_deg[1],
-            self.tcp_rotation_deg[2],
-        ]
+        tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg)
     }
 
     /// The TCP offset \[mm\] on top of the tool transform.
@@ -647,19 +641,10 @@ impl Preview {
     /// than a refusal of the preview's own wording.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
         if par6_server::is_arm_motion(command.tag())
-            && self.shapes.iter().any(|s| {
-                s.attachment
-                    .as_ref()
-                    .is_some_and(|a| a.epoch != self.attachment_epoch)
-            })
+            && !attachments_fresh(&self.shapes, self.attachment_epoch)
         {
-            return Some(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "attachment context changed; reconcile and reapply",
-                )],
+            return Some(attachment_error(
+                "attachment context changed; reconcile and reapply",
             ));
         }
         check_gate(
@@ -847,6 +832,15 @@ impl Preview {
         self.held.holding_for_blend(lookahead, None, |(_, c)| c)
     }
 
+    /// The server's pause clearing: Stop, Estop and ResetState discard the
+    /// queue a pause held and the pause with it, and a resume lifts it.
+    fn unpause(&mut self) {
+        self.snap.exec.paused = false;
+        self.snap.exec.target_scale = self.snap.exec.resume_scale;
+        self.snap.exec.applied_scale = self.snap.exec.resume_scale;
+        self.publish();
+    }
+
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
@@ -946,12 +940,14 @@ impl Preview {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
                     self.held.clear();
+                    self.unpause();
                 }
                 self.latches.stop(cleared);
             }
             Command::Estop => {
                 self.invalidate_attachments();
                 self.held.clear();
+                self.unpause();
                 self.latches.estop();
             }
             Command::Reset => {
@@ -959,15 +955,21 @@ impl Preview {
                 self.latches.reset();
             }
             Command::Pause(p) => {
-                self.snap.exec.paused = p.on;
-                let scale = if p.on {
-                    0.0
+                if p.on {
+                    self.snap.exec.paused = true;
+                    self.snap.exec.target_scale = 0.0;
+                    self.snap.exec.applied_scale = 0.0;
+                    self.publish();
                 } else {
-                    self.snap.exec.resume_scale
-                };
-                self.snap.exec.target_scale = scale;
-                self.snap.exec.applied_scale = scale;
-                self.publish();
+                    self.unpause();
+                    // What the pause held runs now, unless the chain is
+                    // still waiting for the move that closes it.
+                    if !self.holding_for_blend() {
+                        if let Some(released) = self.run_held() {
+                            return released;
+                        }
+                    }
+                }
             }
             Command::SetExecutionSpeed(p) => {
                 self.snap.exec.resume_scale = p.scale;
@@ -981,6 +983,7 @@ impl Preview {
             Command::ResetState => {
                 self.invalidate_attachments();
                 self.held.clear();
+                self.unpause();
                 self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
@@ -1548,17 +1551,13 @@ impl Preview {
     /// What an accepted queued command changes besides the arm's pose —
     /// the server's post-effects and the tool state a program reads back.
     fn note_effects(&mut self, head: &Command) {
+        if let Some(v) = tcp_transform_effect(head) {
+            self.tcp_offset_mm = [v[0], v[1], v[2]];
+            self.tcp_rotation_deg = [v[3], v[4], v[5]];
+            self.sync_planner();
+            return;
+        }
         match head {
-            Command::SetTcpTransform(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.tcp_rotation_deg = [p.roll, p.pitch, p.yaw];
-                self.sync_planner();
-            }
-            Command::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.tcp_rotation_deg = [0.0; 3];
-                self.sync_planner();
-            }
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.
@@ -1604,30 +1603,19 @@ impl Preview {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<Option<u64>, WireError> {
-        if shapes.iter().any(|s| s.attachment.is_some())
-            && (!self.snap.homed || self.flashing || self.latches.estop_latched)
-        {
-            return Err(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "attachments require fresh enabled, referenced state",
-                )],
+        let attached = shapes.iter().any(|s| s.attachment.is_some());
+        if attached && (!self.snap.homed || self.flashing || self.latches.estop_latched) {
+            return Err(attachment_error(
+                "attachments require fresh enabled, referenced state",
             ));
         }
-        if shapes.iter().any(|s| {
-            s.attachment
-                .as_ref()
-                .is_some_and(|a| layer != ShapeLayer::Program || a.epoch != self.attachment_epoch)
-        }) {
-            return Err(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    "attachment context changed; reconcile and reapply",
-                )],
+        // Only the program layer holds parts; anything attached elsewhere
+        // is declared against a context that never existed.
+        if (attached && layer != ShapeLayer::Program)
+            || !attachments_fresh(shapes, self.attachment_epoch)
+        {
+            return Err(attachment_error(
+                "attachment context changed; reconcile and reapply",
             ));
         }
         let epoch = self.planner.set_shapes(layer, shapes)?;
@@ -1647,7 +1635,7 @@ impl Preview {
     }
 
     fn invalidate_attachments(&mut self) {
-        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+        self.attachment_epoch = next_attachment_epoch(self.attachment_epoch);
     }
 
     /// The applied world: the config's installation layer, the program

@@ -1712,15 +1712,9 @@ impl Par6Planner {
             InFlightKind::Delay {
                 target_tick,
                 paused_ticks_at_start,
-            } => {
-                let elapsed_pause = snap
-                    .exec
-                    .paused_ticks
-                    .saturating_sub(*paused_ticks_at_start);
-                (snap.exec.target_scale > 0.0
-                    && snap.tick.saturating_sub(elapsed_pause) >= *target_tick)
-                    .then_some(Ok(None))
-            }
+            } => (snap.exec.target_scale > 0.0
+                && delay_remaining_ticks(snap, *target_tick, *paused_ticks_at_start) == 0)
+                .then_some(Ok(None)),
             InFlightKind::Instant => Some(Ok(None)),
         }
     }
@@ -2154,15 +2148,11 @@ impl Par6Planner {
                         paused_ticks_at_start,
                     },
                 ..
-            }) => {
-                let elapsed_pause = snap
-                    .exec
-                    .paused_ticks
-                    .saturating_sub(*paused_ticks_at_start);
-                PlannedMotion::Hold(
-                    target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause)),
-                )
-            }
+            }) => PlannedMotion::Hold(delay_remaining_ticks(
+                snap,
+                *target_tick,
+                *paused_ticks_at_start,
+            )),
             _ => PlannedMotion::Still,
         }
     }
@@ -2510,11 +2500,7 @@ impl Planner for Par6Planner {
                     },
                 ..
             }) => {
-                let elapsed_pause = snap
-                    .exec
-                    .paused_ticks
-                    .saturating_sub(*paused_ticks_at_start);
-                target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause)) as f64 * self.dt
+                delay_remaining_ticks(snap, *target_tick, *paused_ticks_at_start) as f64 * self.dt
             }
             _ => 0.0,
         }
@@ -2542,6 +2528,16 @@ fn format_pairs(pairs: &[(String, String)]) -> String {
 }
 
 /// Max-norm joint distance \[rad\] between two configurations.
+/// Ticks a delay still owes: the ticks it spent paused do not count.
+fn delay_remaining_ticks(
+    snap: &StateSnapshot,
+    target_tick: u64,
+    paused_ticks_at_start: u64,
+) -> u64 {
+    let elapsed_pause = snap.exec.paused_ticks.saturating_sub(paused_ticks_at_start);
+    target_tick.saturating_sub(snap.tick.saturating_sub(elapsed_pause))
+}
+
 fn joint_distance(a: &[f64; MAX_JOINTS], b: &[f64; MAX_JOINTS]) -> f64 {
     a.iter()
         .zip(b.iter())
