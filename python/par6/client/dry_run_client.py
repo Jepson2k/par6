@@ -140,7 +140,6 @@ class DryRunRobotClient:
     ) -> None:
         from par6.tools import build_tools
 
-        self._robot = robot
         # The engine is built on first use, not here: a host that only
         # wants this class (to pickle it into a worker) must not pay for
         # the URDF and the collision meshes on its event loop. It runs on

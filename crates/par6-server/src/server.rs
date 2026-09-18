@@ -1929,15 +1929,11 @@ impl<R: RtCommands> Core<R> {
     }
 
     fn attachments_valid(&self) -> bool {
-        self.shapes.iter().all(|s| {
-            s.attachment
-                .as_ref()
-                .is_none_or(|a| a.epoch == self.attachment_epoch)
-        })
+        attachments_fresh(&self.shapes, self.attachment_epoch)
     }
 
     fn invalidate_attachments(&mut self) {
-        self.attachment_epoch = self.attachment_epoch.wrapping_add(1).max(1);
+        self.attachment_epoch = next_attachment_epoch(self.attachment_epoch);
         if self.shapes.iter().any(|s| s.attachment.is_some()) {
             self.attachment_stop_pending = true;
             self.scene_epoch += 1;
@@ -1977,11 +1973,7 @@ impl<R: RtCommands> Core<R> {
                 "attachments require fresh enabled, referenced state",
             ));
         }
-        if shapes.iter().any(|s| {
-            s.attachment
-                .as_ref()
-                .is_some_and(|a| a.epoch != self.attachment_epoch)
-        }) {
+        if !attachments_fresh(shapes, self.attachment_epoch) {
             return Some(attachment_error(
                 "attachment context changed; reconcile the physical scene and reapply",
             ));
@@ -3220,12 +3212,27 @@ pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
 }
 
-fn attachment_error(detail: &str) -> WireError {
+/// A refusal about held geometry, with the detail the caller can act on.
+pub fn attachment_error(detail: &str) -> WireError {
     make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,
         &[("detail", detail)],
     )
+}
+
+/// Whether every attached shape was declared against `epoch`, the current
+/// attachment context.
+pub fn attachments_fresh(shapes: &[Shape], epoch: u64) -> bool {
+    shapes
+        .iter()
+        .all(|s| s.attachment.as_ref().is_none_or(|a| a.epoch == epoch))
+}
+
+/// The attachment epoch after a context change: never zero, so a shape
+/// declared with no epoch can never match it.
+pub fn next_attachment_epoch(epoch: u64) -> u64 {
+    epoch.wrapping_add(1).max(1)
 }
 
 /// Commands that change arm pose and require reconciled held geometry.
