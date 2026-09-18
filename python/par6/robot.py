@@ -367,10 +367,6 @@ class Robot(_RobotABC):
         return len(_cfg.io_line_names()[0])
 
     @property
-    def has_tcp_transform(self) -> bool:
-        return True
-
-    @property
     def has_force_torque(self) -> bool:
         """Joint torques are measured every tick (motor currents through
         the torque constants), and the external-torque estimate rides the
