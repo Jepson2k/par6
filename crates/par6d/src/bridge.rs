@@ -1441,15 +1441,19 @@ impl RtCommands for RtBridge {
     }
 
     fn stop_refused_stream(&mut self) -> bool {
-        let mut shared = self.shared.lock().unwrap();
-        if shared.stream.as_ref().is_some_and(|a| a.standoff.is_some()) {
+        let in_standoff = self
+            .shared
+            .lock()
+            .unwrap()
+            .stream
+            .as_ref()
+            .is_some_and(|a| a.standoff.is_some());
+        if in_standoff {
             // The collision gate owns braking and placement. Cancelling it
             // on a late datagram would abandon the configured standoff.
             return true;
         }
-        shared.stream = None;
-        drop(shared);
-        self.stop_stream_commands();
+        self.cancel_stream();
         false
     }
 
