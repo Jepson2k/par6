@@ -19,6 +19,7 @@ use par6_proto::{
     NUM_JOINTS,
 };
 use par6d::options::StatusTransport;
+use par6d::preview::record::TickBatch;
 use par6d::{Daemon, Options};
 
 /// Ceiling on any single wait. Generous: these run a real 20-50 Hz
@@ -676,6 +677,28 @@ pub fn max_deg_error(a: &[f64; par6_proto::NUM_JOINTS], b: &[f64; par6_proto::NU
         .zip(b)
         .map(|(x, y)| (x - y).abs())
         .fold(0.0, f64::max)
+}
+
+/// A command's joint rows \[rad\] from the commanded record: the rows it
+/// owns, `start_row..start_row + rows`.
+pub fn span_joints(batch: &TickBatch, start_row: usize, rows: usize) -> Vec<[f64; NUM_JOINTS]> {
+    let joints = batch.joints;
+    (start_row..start_row + rows)
+        .map(|r| std::array::from_fn(|j| f64::from(batch.q_rad[r * joints + j])))
+        .collect()
+}
+
+/// A command's TCP rows from the commanded record as pose matrices
+/// (metres), rebuilt from the wire-convention xyzrpy the record keeps; a
+/// row whose FK failed (NaN) is skipped.
+pub fn span_tcp(batch: &TickBatch, start_row: usize, rows: usize) -> Vec<[f64; 16]> {
+    (start_row..start_row + rows)
+        .filter_map(|r| {
+            let t: [f64; 6] = std::array::from_fn(|k| f64::from(batch.tcp[r * 6 + k]));
+            (!t.iter().any(|v| v.is_nan()))
+                .then(|| par6_proto::pose_matrix([t[0], t[1], t[2]], [t[3], t[4], t[5]]))
+        })
+        .collect()
 }
 
 pub fn teleport_cmd(angles: [f64; par6_proto::NUM_JOINTS]) -> par6_proto::Command {
