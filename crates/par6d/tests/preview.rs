@@ -13,8 +13,8 @@ use par6d::preview::Preview;
 
 mod common;
 use common::{
-    max_deg_error, park_deg, rotation_angle_deg, teleport_cmd, teleport_home, to_deg, to_rad,
-    Client, Rig,
+    max_deg_error, park_deg, rotation_angle_deg, span_joints, span_tcp, teleport_cmd,
+    teleport_home, to_deg, to_rad, Client, Rig,
 };
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
@@ -114,7 +114,24 @@ fn execution_override_retimes_the_plan_and_preserves_paused_commands() {
     let slow = preview.submit(move_j_cmd(target, None));
     assert!(slow.valid());
     assert!((slow.duration_s - 2.0 * normal.duration_s).abs() < 1e-9);
-    assert_eq!(normal.joint_trajectory_rad, slow.joint_trajectory_rad);
+    // The same plan, stretched: the slow span has twice the rows, and
+    // every other row of it is a row of the normal one.
+    let record = preview.plan_record(None);
+    let normal_q = span_joints(&record, normal.start_row, normal.rows);
+    let slow_q = span_joints(&record, slow.start_row, slow.rows);
+    assert!(
+        !normal_q.is_empty() && slow_q.len() == 2 * normal_q.len(),
+        "{} rows against {}",
+        normal_q.len(),
+        slow_q.len()
+    );
+    for (k, q) in normal_q.iter().enumerate() {
+        assert_eq!(
+            &slow_q[2 * k],
+            q,
+            "row {k} of the retimed plan is not the nominal one"
+        );
+    }
     assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
     let held = preview.submit(move_j_cmd(to_deg(&start), None));
     assert!(held.pending, "pause cannot claim motion completed");
@@ -156,10 +173,14 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
         max_deg_error(&end_deg, &target) < 0.1,
         "the preview must land on the target: {end_deg:?} vs {target:?}"
     );
-    assert_eq!(
-        planned.joint_trajectory_rad.len(),
-        planned.tcp_poses.len(),
-        "every trajectory sample carries its FK pose"
+    // The record's rows are the plan: its last row is where the plan ends.
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, planned.start_row, planned.rows);
+    let last = rows.last().expect("a planned move owns rows");
+    assert!(
+        max_deg_error(&to_deg(last), &end_deg) < 0.01,
+        "the record's last row {:?} is not the plan's end {end_deg:?}",
+        to_deg(last)
     );
 
     let index = c.ok_index(&move_j_cmd(target, None));
@@ -326,7 +347,7 @@ fn the_preview_runs_the_cartesian_pipeline() {
         dz * 1e3
     );
     assert!(
-        planned.joint_trajectory_rad.len() > 5,
+        planned.rows > 5,
         "a 30 mm cartesian move is many ticks long"
     );
 
@@ -395,7 +416,7 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
 
     let held = preview.submit(move_j_cmd(a, Some(20.0)));
     assert!(held.pending && held.valid(), "{held:?}");
-    assert!(held.joint_trajectory_rad.is_empty());
+    assert_eq!(held.rows, 0);
     assert_eq!(preview.held_names(), vec!["move_j"]);
     assert_eq!(preview.angles_rad(), to_rad(&park), "nothing planned yet");
 
@@ -420,8 +441,8 @@ fn blended_moves_hold_fold_and_flush_as_the_queue_does() {
         alone
     );
     // The corner is cut: the chain never passes through A itself.
-    let nearest = chain
-        .joint_trajectory_rad
+    let record = preview.plan_record(None);
+    let nearest = span_joints(&record, chain.start_row, chain.rows)
         .iter()
         .map(|q| max_deg_error(&to_deg(q), &a))
         .fold(f64::INFINITY, f64::min);
@@ -503,7 +524,7 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
         "a referenced HOME is a planned move, not a jump"
     );
     assert!(max_deg_error(&to_deg(&ret.end_joints_rad), &park) < 0.1);
-    assert!(ret.tcp_poses.len() > 1, "a planned move draws a path");
+    assert!(ret.rows > 1, "a planned move draws a path");
 }
 
 /// The jog preview runs the runtime's own ramp: a diagonal jog moves
@@ -894,8 +915,8 @@ fn the_preview_jogs_cartesian_through_the_runtime_kinematics() {
         None,
     );
     assert!(r.valid(), "a plain +x jog previews: {:?}", r.error);
-    assert_eq!(r.joint_trajectory_rad.len(), r.tcp_poses.len());
-    let (first, last) = (r.tcp_poses[0], r.tcp_poses[r.tcp_poses.len() - 1]);
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let (first, last) = (poses[0], poses[poses.len() - 1]);
     let dx = last[3] - first[3];
     let dy = (last[7] - first[7]).abs();
     let dz = (last[11] - first[11]).abs();
@@ -940,13 +961,13 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
         "a rotate-then-translate path previews: {:?}",
         r.error
     );
-    let start = r.tcp_poses[0];
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let start = poses[0];
     let translation = |p: &[f64; 16]| {
         ((p[3] - start[3]).powi(2) + (p[7] - start[7]).powi(2) + (p[11] - start[11]).powi(2)).sqrt()
     };
     let rotation = |p: &[f64; 16]| rotation_angle_deg(&start, p);
-    let moving = r
-        .tcp_poses
+    let moving = poses
         .iter()
         .find(|p| translation(p) > 0.005)
         .expect("the path translates 50 mm");
