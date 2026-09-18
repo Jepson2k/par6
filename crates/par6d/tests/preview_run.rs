@@ -514,7 +514,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
 /// the physics replay must apply the write, end the program at Stop, and
 /// report neither as a failure of the run.
 #[test]
-fn physics_replays_io_writes_and_ends_the_program_at_stop() {
+fn physics_replays_io_writes_and_runs_on_after_a_stop() {
     use par6_proto::command::{Stop, WriteIo};
     let config = test_config();
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
@@ -527,7 +527,7 @@ fn physics_replays_io_writes_and_ends_the_program_at_stop() {
         move_j_cmd(park_deg(), 9961, 0.2),
     ];
     let run = preview
-        .run(&commands, RunLimits { max_seconds: 5.0 })
+        .run(&commands, RunLimits { max_seconds: 8.0 })
         .unwrap();
     assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
     assert!(run.commands[0].error.is_none(), "{:?}", run.commands[0]);
@@ -535,6 +535,41 @@ fn physics_replays_io_writes_and_ends_the_program_at_stop() {
         run.commands[1].rows > 0,
         "the move after the write never ran"
     );
+    // Live, a stop with nothing queued behind it cancels nothing and the
+    // program goes on: the move after it runs and lands.
+    assert_eq!(run.commands[2].rows, 0);
     assert!(run.commands[2].error.is_none(), "{:?}", run.commands[2]);
-    assert_eq!(run.commands[3].rows, 0, "Stop ends the program");
+    assert!(
+        run.commands[3].rows > 0,
+        "the move after the stop never ran"
+    );
+    let joints = run.joints;
+    let last = &run.q_rad[(run.rows - 1) * joints..run.rows * joints];
+    let park = to_rad(&park_deg());
+    for (j, (got, want)) in last.iter().zip(park.iter()).enumerate() {
+        assert!(
+            (f64::from(*got) - want).abs() < 0.05,
+            "joint {j} ended at {got} rad, not {want}: the move after the stop did not land"
+        );
+    }
+}
+
+/// A run boots its engine unpaused whatever the session's pause: the
+/// program's own pause commands are what it replays.
+#[test]
+fn a_run_starts_unpaused_from_a_paused_session() {
+    use par6_proto::command::Pause;
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    assert!(preview.submit(Command::Pause(Pause { on: true })).valid());
+    let mut target = park_deg();
+    target[0] += 5.0;
+    let run = preview
+        .run(
+            &[move_j_cmd(target, 9970, 0.5)],
+            RunLimits { max_seconds: 5.0 },
+        )
+        .unwrap();
+    assert_eq!(run.stop, StopReason::Completed, "{:?}", run.commands);
+    assert!(run.commands[0].rows > 0, "the first move never ran");
 }
