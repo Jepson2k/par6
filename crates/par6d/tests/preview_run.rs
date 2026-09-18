@@ -402,7 +402,6 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     // Reach-down pose over the stand (config frame), as in the bus tests.
     let grasp_pose = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
     session.teleport_rad(grasp_pose);
-    session.begin_program();
     let shape = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| Shape {
         attachment: None,
         kind: "box".into(),
@@ -425,6 +424,9 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
             ],
         )
         .expect("world applied");
+    // The world is one of the program's initial conditions: a run boots
+    // from what the session held when the program began.
+    session.begin_program();
 
     let tool = par6_config::RobotConfig::load(&config)
         .expect("cfg")
