@@ -28,7 +28,8 @@ use par6_proto::{
 };
 use par6_rt::{ArmState, Mode, RtCommand};
 use par6_server::{
-    check_gate, decode_error_to_wire, GateContext, PlanContext, Planner, QueuedCommand, ShapeLayer,
+    check_gate, decode_error_to_wire, next_attachment_epoch, tcp_transform_effect, GateContext,
+    PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
 use super::driver::{SimDriver, SimSetup};
@@ -528,23 +529,17 @@ impl Preview {
                 let failed = out.error.is_some();
                 spans[ex.command] = (ex.start_row, rows, out.error);
                 if !failed {
-                    match &cmds[ex.command] {
-                        Command::SetTcpOffset(p) => {
-                            context.tcp_offset_mm = [p.x, p.y, p.z];
-                            context.tcp_rotation_deg = [0.0; 3];
-                        }
-                        Command::SetTcpTransform(p) => {
-                            context.tcp_offset_mm = [p.x, p.y, p.z];
-                            context.tcp_rotation_deg = [p.roll, p.pitch, p.yaw];
-                        }
-                        Command::SelectTool(p) if p.variant_key != context.tool_variant => {
+                    if let Some(v) = tcp_transform_effect(&cmds[ex.command]) {
+                        context.tcp_offset_mm = [v[0], v[1], v[2]];
+                        context.tcp_rotation_deg = [v[3], v[4], v[5]];
+                    } else if let Command::SelectTool(p) = &cmds[ex.command] {
+                        if p.variant_key != context.tool_variant {
                             context.tool_variant = p.variant_key.clone();
                             context.attachment_epoch =
-                                context.attachment_epoch.wrapping_add(1).max(1);
+                                next_attachment_epoch(context.attachment_epoch);
                             context.tcp_offset_mm = [0.0; 3];
                             context.tcp_rotation_deg = [0.0; 3];
                         }
-                        _ => {}
                     }
                     planner.sync(context.plan_context());
                 }
