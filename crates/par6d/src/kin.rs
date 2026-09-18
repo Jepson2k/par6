@@ -204,13 +204,6 @@ impl ToolOffset {
     }
 }
 
-/// `m ← m · T(d)` — walk `d` along the pose's own axes.
-pub fn translate_local(m: &mut Pose, d: [f64; 3]) {
-    m[3] += m[0] * d[0] + m[1] * d[1] + m[2] * d[2];
-    m[7] += m[4] * d[0] + m[5] * d[1] + m[6] * d[2];
-    m[11] += m[8] * d[0] + m[9] * d[1] + m[10] * d[2];
-}
-
 // ------------------------------------------------------------- pose math
 
 /// `[x y z (m), roll pitch yaw (rad)]` from a row-major 4x4, rpy in the
@@ -274,7 +267,7 @@ pub(crate) fn axis_delta(axis: usize, amount: f64) -> Pose {
 }
 
 /// 4x4 product `a · b` (homogeneous transforms).
-pub(crate) fn mat_mul(a: &Pose, b: &Pose) -> Pose {
+pub fn mat_mul(a: &Pose, b: &Pose) -> Pose {
     let mut out = [0.0; 16];
     for r in 0..4 {
         for c in 0..4 {

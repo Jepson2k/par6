@@ -76,7 +76,12 @@ async def test_explicit_pause_preserves_queue_speed_and_standalone_deadlines(
         with pytest.raises(TimeoutError):
             await client.move_j(start, duration=2.0, wait=True, timeout=0.2)
         assert await client.stop() == 1
-        assert (await client.execution_speed()).paused
+        # The stop discards the queue the pause was holding, and the pause
+        # with it; the resume that follows is harmless.
+        deadline = time.monotonic() + 3
+        while (await client.execution_speed()).paused:
+            assert time.monotonic() < deadline, "a clearing stop left the pause"
+            await asyncio.sleep(0.02)
         assert await client.resume() == 1
         queue = await client.queue_state()
         assert (

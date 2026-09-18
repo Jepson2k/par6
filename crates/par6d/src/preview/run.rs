@@ -28,7 +28,8 @@ use par6_proto::{
 };
 use par6_rt::{ArmState, Mode, RtCommand};
 use par6_server::{
-    check_gate, decode_error_to_wire, GateContext, PlanContext, Planner, QueuedCommand, ShapeLayer,
+    check_gate, decode_error_to_wire, next_attachment_epoch, tcp_transform_effect, GateContext,
+    PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
 use super::driver::{SimDriver, SimSetup};
@@ -79,7 +80,6 @@ pub(super) struct RunStart {
     payload: par6_server::PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
     resume_scale: f64,
-    paused: bool,
     attachment_epoch: u64,
 }
 
@@ -98,7 +98,6 @@ impl RunStart {
             payload: preview.payload,
             shapes: preview.shapes.clone(),
             resume_scale: preview.snap.exec.resume_scale,
-            paused: preview.snap.exec.paused,
             attachment_epoch: preview.attachment_epoch,
         }
     }
@@ -240,9 +239,9 @@ impl Preview {
             inertia: context.payload.inertia,
         });
         driver.tick();
+        // The engine boots unpaused whatever the session's pause: the
+        // program's own pause commands are what a run replays.
         driver.send(RtCommand::ExecSetSpeedScale(context.resume_scale));
-        driver.tick();
-        driver.send(RtCommand::ExecSetPaused(context.paused));
         driver.tick();
         let mut planner = Par6Planner::new(
             ports.link,
@@ -335,11 +334,17 @@ impl Preview {
                     next += 1;
                     break;
                 }
-                if let Command::Stop(_) = &cmds[next] {
-                    // Live, Stop clears the queue: the program ends here.
+                if let Command::Stop(p) = &cmds[next] {
+                    // Nothing is running while the pump is here, so there
+                    // is nothing to cancel; a clearing stop drops the pause
+                    // as it does live, and the program goes on.
                     spans[next] = (start_row, 0, None);
-                    next = cmds.len();
-                    break;
+                    next += 1;
+                    if p.clear_queue {
+                        driver.send(RtCommand::ExecSetPaused(false));
+                        break;
+                    }
+                    continue;
                 }
                 if let Command::SetShapes(p) = &cmds[next] {
                     match planner.set_shapes(ShapeLayer::Program, &p.shapes) {
@@ -423,9 +428,12 @@ impl Preview {
                     break;
                 }
                 if command_class(cmds[next].tag()) == CommandClass::System {
-                    spans[next] = (start_row, 0, None);
-                    next += 1;
-                    continue;
+                    // Admitted but not modelled above: recording it as
+                    // nothing would pass a live effect off as a no-op.
+                    spans[next] = (start_row, 0, Some(unsupported_in_replay(&cmds[next])));
+                    stop = StopReason::Failed;
+                    next = cmds.len();
+                    break;
                 }
                 if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
                 {
@@ -464,10 +472,7 @@ impl Preview {
                                 && command_class(c.tag()) == CommandClass::Queued
                                 && !matches!(
                                     c,
-                                    Command::Pause(_)
-                                        | Command::SetExecutionSpeed(_)
-                                        | Command::SetShapes(_)
-                                        | Command::SelectTool(_)
+                                    Command::SelectTool(_)
                                         | Command::SetTcpOffset(_)
                                         | Command::SetTcpTransform(_)
                                 )
@@ -504,12 +509,6 @@ impl Preview {
             if executing.is_none() && next >= cmds.len() {
                 break;
             }
-            // Nothing running and nothing left to start: the record ends
-            // on the row the last command finished on, so every row has
-            // a span that owns it.
-            if executing.is_none() && next >= cmds.len() {
-                break;
-            }
             driver.tick();
             let (snap, bus) = driver.observe();
             rec.tick(snap, bus);
@@ -530,23 +529,17 @@ impl Preview {
                 let failed = out.error.is_some();
                 spans[ex.command] = (ex.start_row, rows, out.error);
                 if !failed {
-                    match &cmds[ex.command] {
-                        Command::SetTcpOffset(p) => {
-                            context.tcp_offset_mm = [p.x, p.y, p.z];
-                            context.tcp_rotation_deg = [0.0; 3];
-                        }
-                        Command::SetTcpTransform(p) => {
-                            context.tcp_offset_mm = [p.x, p.y, p.z];
-                            context.tcp_rotation_deg = [p.roll, p.pitch, p.yaw];
-                        }
-                        Command::SelectTool(p) if p.variant_key != context.tool_variant => {
+                    if let Some(v) = tcp_transform_effect(&cmds[ex.command]) {
+                        context.tcp_offset_mm = [v[0], v[1], v[2]];
+                        context.tcp_rotation_deg = [v[3], v[4], v[5]];
+                    } else if let Command::SelectTool(p) = &cmds[ex.command] {
+                        if p.variant_key != context.tool_variant {
                             context.tool_variant = p.variant_key.clone();
                             context.attachment_epoch =
-                                context.attachment_epoch.wrapping_add(1).max(1);
+                                next_attachment_epoch(context.attachment_epoch);
                             context.tcp_offset_mm = [0.0; 3];
                             context.tcp_rotation_deg = [0.0; 3];
                         }
-                        _ => {}
                     }
                     planner.sync(context.plan_context());
                 }
@@ -626,15 +619,19 @@ impl Preview {
                     | Command::Stop(_)
             )
         {
-            return Err(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[(
-                    "detail",
-                    &format!("{:?} is unsupported by offline physics replay", cmd.tag()),
-                )],
-            ));
+            return Err(unsupported_in_replay(cmd));
         }
         Ok(())
     }
+}
+
+fn unsupported_in_replay(cmd: &Command) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!("{:?} is unsupported by offline physics replay", cmd.tag()),
+        )],
+    )
 }
