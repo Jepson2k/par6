@@ -51,6 +51,7 @@ from par6.protocol import (
 )
 from par6.protocol.wire import StatusBuffer
 
+from ._robot import RobotOwner
 from ._wire import (
     blend,
     estimate_from_dict,
@@ -90,29 +91,13 @@ def _drive(coro: Coroutine[Any, Any, Any]) -> Any:
     raise RuntimeError("a dry-run tool verb suspended; the preview never awaits")
 
 
-class DryRunRobotClient:
+class DryRunRobotClient(RobotOwner):
     """Simulates the par6 command stream offline, one result per command.
 
     Constructed by :meth:`par6.robot.Robot.create_dry_run_client`; a host
     running previews in a worker process constructs it directly with the
     robot's live joint angles and homed state.
     """
-
-    _robot: Robot | None = None
-
-    @property
-    def robot(self) -> Robot:
-        """The backend this preview stands in for, built on first read when
-        the host constructed the client bare."""
-        if self._robot is None:
-            from par6.robot import Robot
-
-            self._robot = Robot()
-        return self._robot
-
-    @robot.setter
-    def robot(self, value: Robot | None) -> None:
-        self._robot = value
 
     def __init__(
         self,
@@ -329,8 +314,13 @@ class DryRunRobotClient:
         )
 
     def _system(self, cmd: dict[str, Any]) -> int:
-        """A state-changing command: refused → raises, else 1."""
-        self._submit(cmd)
+        """A state-changing command: refused → raises, else 1. The motion a
+        resume releases from the pause is owed to the next result."""
+        released = self._submit(cmd)
+        if released is not None and (
+            released.duration > 0 or released.joint_trajectory_rad is not None
+        ):
+            self._pending.append(released)
         return 1
 
     def _emit(self, result: DryRunResultData | None) -> DryRunResultData | None:

@@ -79,10 +79,12 @@ fn execution_override_retimes_the_plan_and_preserves_paused_commands() {
     assert!(held.pending, "pause cannot claim motion completed");
     assert_eq!(preview.angles_rad(), slow.end_joints_rad);
     assert!(preview.flush().unwrap().pending);
-    assert!(preview.submit(Command::Pause(Pause { on: false })).valid());
-    let resumed = preview.flush().unwrap();
-    assert!(resumed.valid() && !resumed.pending);
+    // The resume runs what the pause held: its result is that motion, and
+    // nothing is left for a flush.
+    let resumed = preview.submit(Command::Pause(Pause { on: false }));
+    assert!(resumed.valid() && !resumed.pending, "{resumed:?}");
     assert!(max_deg_error(&to_deg(&resumed.end_joints_rad), &to_deg(&start)) < 0.01);
+    assert!(preview.flush().is_none(), "the resume left motion held");
 }
 
 #[test]

@@ -65,6 +65,10 @@ struct RtLog {
     /// is forwarded; `Some` = refused, the way the real bridge refuses a
     /// jog its collision gate blocks.
     stream_verdict: Option<WireError>,
+    /// While true a refused update leaves the session in a standoff the
+    /// RT owns (it answers `stop_refused_stream` with true) instead of
+    /// cancelling it, the way the real bridge keeps a collision standoff.
+    standoff_on_refusal: bool,
     /// What the streaming gate answers the NEXT shape set with. `None` =
     /// mirrored; `Some` = refused, the way the real gate refuses a set
     /// it cannot convert.
@@ -112,6 +116,13 @@ impl RtCommands for TestRt {
     }
     fn cancel_stream(&mut self) {
         self.push(RtEvent::CancelStream);
+    }
+    fn stop_refused_stream(&mut self) -> bool {
+        if self.0.lock().unwrap().standoff_on_refusal {
+            return true;
+        }
+        self.cancel_stream();
+        false
     }
     fn halt(&mut self) {
         self.push(RtEvent::Halt);
@@ -2120,6 +2131,70 @@ async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
     .await;
 }
 
+/// A refused update the runtime answers with a standoff keeps the session
+/// alive while the gate brakes and places the arm. The refusal still
+/// latches — the session is stopping, not motion the verdict would
+/// misdescribe — and the next accepted setpoint clears it.
+#[tokio::test]
+async fn a_refusal_kept_in_a_standoff_still_latches() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let collision = || {
+        make_error(
+            ErrorCode::SysSelfCollision,
+            UNATTRIBUTED,
+            &[("sample", "0"), ("total", "1"), ("pairs", "[j3, keepout]")],
+        )
+    };
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+
+    {
+        let mut rt = h.rt.lock().unwrap();
+        rt.stream_verdict = Some(collision());
+        rt.standoff_on_refusal = true;
+    }
+    let err = c.expect_error(&jog_j()).await;
+    assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
+    assert!(
+        !h.rt_events().contains(&RtEvent::CancelStream),
+        "a standoff the RT keeps must not be cancelled: {:?}",
+        h.rt_events()
+    );
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysSelfCollision as u16)
+        }
+        other => panic!("the refusal must stand while the standoff runs, got {other:?}"),
+    }
+
+    h.rt.lock().unwrap().standoff_on_refusal = false;
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| {
+        ev.iter()
+            .filter(|e| **e == RtEvent::Stream(CmdType::JogJ))
+            .count()
+            >= 2
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error: None } => break,
+            QueryResult::Error { error: Some(_) } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the accepted setpoint must clear the refusal latch"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("expected ERROR result, got {other:?}"),
+        }
+    }
+}
+
 fn wire_shape(name: &str, kind: &str) -> Shape {
     Shape {
         kind: kind.to_owned(),
@@ -3463,4 +3538,43 @@ async fn stop_estop_and_reset_clear_a_standing_pause() {
         .await;
     c.request(&Command::Estop).await;
     h.wait_rt(|ev| unpaused(ev) == 3).await;
+}
+
+/// A stop that keeps the queue keeps the pause holding it: nothing is
+/// unpaused, and the retained head waits for the resume.
+#[tokio::test]
+async fn a_stop_that_keeps_the_queue_keeps_the_pause() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
+    let i1 = c.ok_index(&move_j(301)).await;
+    let _i2 = c.ok_index(&move_j(302)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: false })).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !h.rt_events().contains(&RtEvent::ExecPaused(false)),
+        "a stop that keeps the queue must keep the pause: {:?}",
+        h.rt_events()
+    );
+    assert!(
+        !h.planner
+            .lock()
+            .unwrap()
+            .started
+            .iter()
+            .any(|(i, _)| *i == i1),
+        "the retained head started without a resume"
+    );
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: false }))
+        .await;
+    h.wait_planner("the retained head starts on resume", |p| {
+        p.started.iter().any(|(i, _)| *i == i1)
+    })
+    .await;
 }
