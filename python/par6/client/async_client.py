@@ -50,6 +50,7 @@ from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ._robot import RobotOwner
 from ._wire import (
     blend as _blend,
 )
@@ -155,29 +156,21 @@ def _close_leftover_cores() -> None:
             core.close()
 
 
-class AsyncRobotClient(_RobotClientABC):
+def _validate_io_timeout(timeout: float | None) -> None:
+    """An I/O deadline is positive and finite; None means the default."""
+    if timeout is not None and (
+        isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
+    ):
+        raise ValueError("I/O timeout must be positive and finite")
+
+
+class AsyncRobotClient(RobotOwner, _RobotClientABC):
     """Async client for the par6d runtime.
 
     All network knobs default from the ``PAR6_*`` env namespace, then to the
     config defaults (command port 6001, status port 6002, multicast
     group 239.255.0.71).
     """
-
-    _robot: Robot | None = None
-
-    @property
-    def robot(self) -> Robot:
-        """The backend this client drives, built on first read when a bare
-        client (what a user script constructs) supplied none."""
-        if self._robot is None:
-            from par6.robot import Robot
-
-            self._robot = Robot()
-        return self._robot
-
-    @robot.setter
-    def robot(self, value: Robot | None) -> None:
-        self._robot = value
 
     def __init__(
         self,
@@ -1469,10 +1462,7 @@ class AsyncRobotClient(_RobotClientABC):
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        if timeout is not None and (
-            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
-        ):
-            raise ValueError("I/O timeout must be positive and finite")
+        _validate_io_timeout(timeout)
         async with asyncio.timeout(timeout):
             core = await self._ensure_core()
             return await self._call(core.write_io(index, value))
@@ -1611,10 +1601,7 @@ class AsyncRobotClient(_RobotClientABC):
         Example:
             io = rbt.io()
         """
-        if timeout is not None and (
-            isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
-        ):
-            raise ValueError("I/O timeout must be positive and finite")
+        _validate_io_timeout(timeout)
         try:
             async with asyncio.timeout(timeout):
                 core = await self._ensure_core()
