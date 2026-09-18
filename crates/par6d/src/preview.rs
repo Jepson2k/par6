@@ -29,9 +29,9 @@ use par6_rt::{
     Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    check_gate, cmd_name, decode_error_to_wire, pid_gains_fault, session, validate_registries,
-    validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext, Planner,
-    QueuedCommand, ServerConfig, ShapeLayer,
+    check_gate, cmd_name, decode_error_to_wire, pid_gains_fault, session, tcp_transform_effect,
+    tcp_transform_values, validate_registries, validate_supported, write_io_fault, GateContext,
+    PayloadSpec, PlanContext, Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -430,14 +430,7 @@ impl Preview {
 
     /// Applied user TCP correction (mm, intrinsic XYZ degrees).
     pub fn tcp_transform(&self) -> [f64; 6] {
-        [
-            self.tcp_offset_mm[0],
-            self.tcp_offset_mm[1],
-            self.tcp_offset_mm[2],
-            self.tcp_rotation_deg[0],
-            self.tcp_rotation_deg[1],
-            self.tcp_rotation_deg[2],
-        ]
+        tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg)
     }
 
     /// The TCP offset \[mm\] on top of the tool transform.
@@ -1348,17 +1341,13 @@ impl Preview {
     /// What an accepted queued command changes besides the arm's pose —
     /// the server's post-effects and the tool state a program reads back.
     fn note_effects(&mut self, head: &Command) {
+        if let Some(v) = tcp_transform_effect(head) {
+            self.tcp_offset_mm = [v[0], v[1], v[2]];
+            self.tcp_rotation_deg = [v[3], v[4], v[5]];
+            self.sync_planner();
+            return;
+        }
         match head {
-            Command::SetTcpTransform(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.tcp_rotation_deg = [p.roll, p.pitch, p.yaw];
-                self.sync_planner();
-            }
-            Command::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.tcp_rotation_deg = [0.0; 3];
-                self.sync_planner();
-            }
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.

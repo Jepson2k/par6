@@ -1137,6 +1137,7 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         debug_assert!(is_stream(tag));
+        let mut refused_in_place = false;
         let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
@@ -1147,6 +1148,7 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
+                    refused_in_place = true;
                     if !self.runtime.rt.stop_refused_stream() {
                         self.active_stream = None;
                     }
@@ -1181,7 +1183,11 @@ impl<R: RtCommands> Core<R> {
                 // stands. The gate's own collision latch (if the refusal
                 // was a collision) reaches STATUS through
                 // `update_collision`.
-                self.latch_faf_refusal(&error);
+                if refused_in_place {
+                    self.latch_stream_refusal(&error);
+                } else {
+                    self.latch_faf_refusal(&error);
+                }
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
@@ -1767,6 +1773,17 @@ impl<R: RtCommands> Core<R> {
     fn latch_faf_refusal(&mut self, error: &WireError) {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        self.latch_refusal(error, busy);
+    }
+
+    /// A refused update of the live stream: that stream is stopped or held
+    /// in its standoff, so it is not motion the refusal would misdescribe.
+    fn latch_stream_refusal(&mut self, error: &WireError) {
+        let busy = self.executing.is_some() || !self.pending.is_empty();
+        self.latch_refusal(error, busy);
+    }
+
+    fn latch_refusal(&mut self, error: &WireError, busy: bool) {
         let attributed = self
             .standing_error
             .as_ref()
@@ -2541,14 +2558,7 @@ impl<R: RtCommands> Core<R> {
                 resume_scale: self.snap.exec.resume_scale,
             },
             C::TcpTransform => QueryResult::TcpTransform {
-                values: [
-                    self.tcp_offset_mm[0],
-                    self.tcp_offset_mm[1],
-                    self.tcp_offset_mm[2],
-                    self.tcp_rotation_deg[0],
-                    self.tcp_rotation_deg[1],
-                    self.tcp_rotation_deg[2],
-                ],
+                values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
@@ -2956,14 +2966,35 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
+/// The TCP frame a queued command sets, `[x, y, z (mm), roll, pitch, yaw
+/// (deg)]`; an offset alone sets a pure translation.
+pub fn tcp_transform_effect(cmd: &Command) -> Option<[f64; 6]> {
+    match cmd {
+        Command::SetTcpOffset(p) => Some([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
+        Command::SetTcpTransform(p) => Some([p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+        _ => None,
+    }
+}
+
+/// The TCP_TRANSFORM readback: offset (mm) then rotation (deg).
+pub fn tcp_transform_values(offset_mm: [f64; 3], rotation_deg: [f64; 3]) -> [f64; 6] {
+    [
+        offset_mm[0],
+        offset_mm[1],
+        offset_mm[2],
+        rotation_deg[0],
+        rotation_deg[1],
+        rotation_deg[2],
+    ]
+}
+
 fn post_effect(cmd: &Command) -> PostEffect {
+    if let Some(values) = tcp_transform_effect(cmd) {
+        return PostEffect::TcpTransform(values);
+    }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
-        Command::SetTcpOffset(p) => PostEffect::TcpTransform([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
-        Command::SetTcpTransform(p) => {
-            PostEffect::TcpTransform([p.x, p.y, p.z, p.roll, p.pitch, p.yaw])
-        }
         _ => PostEffect::None,
     }
 }
