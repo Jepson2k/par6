@@ -329,8 +329,13 @@ class DryRunRobotClient:
         )
 
     def _system(self, cmd: dict[str, Any]) -> int:
-        """A state-changing command: refused → raises, else 1."""
-        self._submit(cmd)
+        """A state-changing command: refused → raises, else 1. The motion a
+        resume releases from the pause is owed to the next result."""
+        released = self._submit(cmd)
+        if released is not None and (
+            released.duration > 0 or released.joint_trajectory_rad is not None
+        ):
+            self._pending.append(released)
         return 1
 
     def _emit(self, result: DryRunResultData | None) -> DryRunResultData | None:

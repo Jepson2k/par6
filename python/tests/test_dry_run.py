@@ -155,6 +155,23 @@ def test_execution_override_retimes_preview_and_preserves_pause():
         with pytest.raises(ValueError):
             slow.set_execution_speed(value)
 
+    # A clearing stop discards the queue the pause held, and the pause with
+    # it: the next move plans without a resume.
+    assert slow.pause() == 1
+    assert slow.stop() == 1
+    assert not slow.execution_speed().paused
+    assert _planned(slow.move_j(start, duration=1)).duration == pytest.approx(2)
+    # A resume runs what the pause held: nothing stays queued behind it, and
+    # the released motion is owed to the next result.
+    assert slow.pause() == 1
+    with pytest.raises(UnresolvedPreview, match="paused"):
+        slow.move_j(target, duration=1)
+    assert len(slow.queue()) == 1
+    assert slow.resume() == 1
+    assert slow.queue() == []
+    released = slow.flush()
+    assert len(released) == 1 and released[0].duration == pytest.approx(2)
+
 
 class TestPlannedMotion:
     def test_plan_obeys_the_config_limits_under_every_profile(self) -> None:

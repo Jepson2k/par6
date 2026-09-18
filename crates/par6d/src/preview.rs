@@ -752,6 +752,15 @@ impl Preview {
         self.held.holding_for_blend(lookahead, None, |c| c)
     }
 
+    /// The server's pause clearing: Stop, Estop and ResetState discard the
+    /// queue a pause held and the pause with it, and a resume lifts it.
+    fn unpause(&mut self) {
+        self.snap.exec.paused = false;
+        self.snap.exec.target_scale = self.snap.exec.resume_scale;
+        self.snap.exec.applied_scale = self.snap.exec.resume_scale;
+        self.publish();
+    }
+
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
@@ -844,24 +853,32 @@ impl Preview {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
                     self.held.clear();
+                    self.unpause();
                 }
                 self.latches.stop(cleared);
             }
             Command::Estop => {
                 self.held.clear();
+                self.unpause();
                 self.latches.estop();
             }
             Command::Reset => self.latches.reset(),
             Command::Pause(p) => {
-                self.snap.exec.paused = p.on;
-                let scale = if p.on {
-                    0.0
+                if p.on {
+                    self.snap.exec.paused = true;
+                    self.snap.exec.target_scale = 0.0;
+                    self.snap.exec.applied_scale = 0.0;
+                    self.publish();
                 } else {
-                    self.snap.exec.resume_scale
-                };
-                self.snap.exec.target_scale = scale;
-                self.snap.exec.applied_scale = scale;
-                self.publish();
+                    self.unpause();
+                    // What the pause held runs now, unless the chain is
+                    // still waiting for the move that closes it.
+                    if !self.holding_for_blend() {
+                        if let Some(released) = self.run_held() {
+                            return released;
+                        }
+                    }
+                }
             }
             Command::SetExecutionSpeed(p) => {
                 self.snap.exec.resume_scale = p.scale;
@@ -874,6 +891,7 @@ impl Preview {
             Command::SetGravityComp(_) => {}
             Command::ResetState => {
                 self.held.clear();
+                self.unpause();
                 self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;

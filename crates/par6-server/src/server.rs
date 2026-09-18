@@ -859,12 +859,16 @@ impl<R: RtCommands> Core<R> {
                 Ok(())
             }
             C::Stop(p) => {
+                // A clearing stop drops the pause with the queue it held; a
+                // stop that keeps the queue keeps the pause holding it.
                 let dropped = if p.clear_queue {
                     self.cancel_all_motion("stop").await
                 } else {
                     self.cancel_active_motion("stop").await
                 };
-                self.clear_pause();
+                if p.clear_queue {
+                    self.clear_pause();
+                }
                 if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
