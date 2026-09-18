@@ -2509,14 +2509,7 @@ impl<R: RtCommands> Core<R> {
                 speed: self.tcp_speed,
             },
             C::TcpTransform => QueryResult::TcpTransform {
-                values: [
-                    self.tcp_offset_mm[0],
-                    self.tcp_offset_mm[1],
-                    self.tcp_offset_mm[2],
-                    self.tcp_rotation_deg[0],
-                    self.tcp_rotation_deg[1],
-                    self.tcp_rotation_deg[2],
-                ],
+                values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
@@ -2924,14 +2917,35 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
+/// The TCP frame a queued command sets, `[x, y, z (mm), roll, pitch, yaw
+/// (deg)]`; an offset alone sets a pure translation.
+pub fn tcp_transform_effect(cmd: &Command) -> Option<[f64; 6]> {
+    match cmd {
+        Command::SetTcpOffset(p) => Some([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
+        Command::SetTcpTransform(p) => Some([p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+        _ => None,
+    }
+}
+
+/// The TCP_TRANSFORM readback: offset (mm) then rotation (deg).
+pub fn tcp_transform_values(offset_mm: [f64; 3], rotation_deg: [f64; 3]) -> [f64; 6] {
+    [
+        offset_mm[0],
+        offset_mm[1],
+        offset_mm[2],
+        rotation_deg[0],
+        rotation_deg[1],
+        rotation_deg[2],
+    ]
+}
+
 fn post_effect(cmd: &Command) -> PostEffect {
+    if let Some(values) = tcp_transform_effect(cmd) {
+        return PostEffect::TcpTransform(values);
+    }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
-        Command::SetTcpOffset(p) => PostEffect::TcpTransform([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
-        Command::SetTcpTransform(p) => {
-            PostEffect::TcpTransform([p.x, p.y, p.z, p.roll, p.pitch, p.yaw])
-        }
         _ => PostEffect::None,
     }
 }
