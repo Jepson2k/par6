@@ -49,17 +49,13 @@ use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
 use plan::PlanRecorder;
 
-/// One submitted command's outcome: the trajectory the runtime would
-/// drive, the exact refusal it would answer with, or `pending` while
-/// the command sits in the blend hold waiting for its successor.
+/// One submitted command's outcome: where the runtime would leave the
+/// arm and the rows it owns in the commanded record, the exact refusal
+/// it would answer with, or `pending` while the command sits in the
+/// blend hold waiting for its successor. The trajectory itself, FK'd
+/// per row, is the record's ([`Preview::plan_record`]).
 #[derive(Debug, Clone)]
 pub struct PreviewResult {
-    /// Sampled joint trajectory \[rad\] at tick dt (empty for a command
-    /// that moves nothing, or a refused one).
-    pub joint_trajectory_rad: Vec<[f64; MAX_JOINTS]>,
-    /// FK pose (flattened row-major 4×4, translation in metres) per
-    /// trajectory sample.
-    pub tcp_poses: Vec<[f64; 16]>,
     /// Where the arm ends \[rad\].
     pub end_joints_rad: [f64; MAX_JOINTS],
     /// Trajectory duration \[s\].
@@ -86,8 +82,6 @@ impl PreviewResult {
 
     fn still(q: [f64; MAX_JOINTS], row: usize) -> Self {
         Self {
-            joint_trajectory_rad: Vec::new(),
-            tcp_poses: Vec::new(),
             end_joints_rad: q,
             duration_s: 0.0,
             error: None,
@@ -111,8 +105,8 @@ impl PreviewResult {
         }
     }
 
-    /// Several results as one, in the order they run: trajectories and
-    /// poses concatenated, durations summed, the end pose the last one's.
+    /// Several results as one, in the order they run: rows and durations
+    /// summed from the first one's row, the end pose the last one's.
     /// The first refusal ends the motion and is carried as the error —
     /// what a program sees when a held chain closes and the runtime
     /// refuses one of its legs.
@@ -121,8 +115,6 @@ impl PreviewResult {
         for r in results {
             let acc =
                 out.get_or_insert_with(|| PreviewResult::still(r.end_joints_rad, r.start_row));
-            acc.joint_trajectory_rad.extend(r.joint_trajectory_rad);
-            acc.tcp_poses.extend(r.tcp_poses);
             acc.duration_s += r.duration_s;
             acc.rows += r.rows;
             acc.end_joints_rad = r.end_joints_rad;
@@ -1100,16 +1092,10 @@ impl Preview {
         self.standing()
     }
 
-    /// An accepted command that moves nothing: one sample at the pose
-    /// the arm holds, so a timeline drawn from results never has a gap.
+    /// An accepted command that moves nothing: the pose the arm holds,
+    /// and no rows of its own.
     fn standing(&mut self) -> PreviewResult {
-        let q = self.snap.q;
-        let mut r = PreviewResult::still(q, self.plan.rows());
-        if let Ok(pose) = self.planner.current_pose(&q) {
-            r.joint_trajectory_rad.push(q);
-            r.tcp_poses.push(pose);
-        }
-        r
+        PreviewResult::still(self.snap.q, self.plan.rows())
     }
 
     /// Plan one command outside the queue discipline (a streamed target).
@@ -1302,7 +1288,6 @@ impl Preview {
     /// has no samples.
     fn advance(&mut self, trajectory: Vec<[f64; MAX_JOINTS]>, duration_s: f64) -> PreviewResult {
         let end = trajectory.last().copied().unwrap_or(self.snap.q);
-        let tcp_poses = self.poses_along(&trajectory);
         let ticks = (duration_s / self.dt).round() as usize;
         let jaw = self.tool_position;
         let (start_row, rows) = if trajectory.is_empty() {
@@ -1315,8 +1300,6 @@ impl Preview {
         self.snap.q = end;
         self.publish();
         PreviewResult {
-            joint_trajectory_rad: trajectory,
-            tcp_poses,
             end_joints_rad: end,
             duration_s,
             error: None,
@@ -1369,17 +1352,6 @@ impl Preview {
             Ok(pose) => matrix_to_xyzrpy(&pose),
             Err(_) => [f64::NAN; 6],
         }
-    }
-
-    fn poses_along(&mut self, trajectory: &[[f64; MAX_JOINTS]]) -> Vec<[f64; 16]> {
-        let mut poses = Vec::with_capacity(trajectory.len());
-        for q in trajectory {
-            match self.planner.current_pose(q) {
-                Ok(pose) => poses.push(pose),
-                Err(_) => break,
-            }
-        }
-        poses
     }
 
     // ------------------------------------------------------------ planner
@@ -1485,13 +1457,14 @@ impl Preview {
             };
         self.planner.cancel();
         self.note_effects(head);
+        let moved = !trajectory.is_empty();
         let mut result = self.advance(trajectory, duration_s);
         if seek {
             // The seek's own ticks belong to the physical arm; the record
             // shows where it lands.
             (result.start_row, result.rows) = self.mark();
         }
-        if result.joint_trajectory_rad.is_empty() {
+        if !moved {
             result = PreviewResult {
                 duration_s,
                 start_row: result.start_row,
