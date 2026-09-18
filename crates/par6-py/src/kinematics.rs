@@ -13,7 +13,7 @@ use crate::convert::joints;
 use pyo3::types::{PyDict, PyList};
 
 use par6_kin::{relative_pose, wrap_to_window, IkOutcome, Kin, Pose, NQ};
-use par6d::matrix_to_xyzrpy;
+use par6d::{mat_mul, matrix_to_xyzrpy};
 
 /// FK/IK on one URDF tree, resolved at `ee_frame` (the tree's last frame
 /// when `None`), optionally past a fixed `tool_transform`. Poses are
@@ -307,13 +307,7 @@ pub fn compose_tool_frame(
     }
     let a = par6_proto::pose_matrix(origin, rpy);
     let b = par6_proto::pose_matrix(offset, rotation);
-    let mut out = [0.0; 16];
-    for row in 0..4 {
-        for col in 0..4 {
-            out[row * 4 + col] = (0..4).map(|k| a[row * 4 + k] * b[k * 4 + col]).sum();
-        }
-    }
-    Ok(out.to_vec())
+    Ok(mat_mul(&a, &b).to_vec())
 }
 
 /// The fixed transform from `from_frame` to `to_frame` in `urdf`, as
