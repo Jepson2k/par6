@@ -170,6 +170,23 @@ pub fn stream_stopping_travel(v_rad_s: f64, position_loop_hz: f64, tick_dt_s: f6
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
 
+// The speed a placement's hold is dropped at is what sets the standoff's
+// error budget: IDLE only damps, so whatever the arm still carries it
+// coasts. [`STREAM_MOVING_RAD_S`] answers a different question — has
+// this stream stopped moving — and at the arm's reach allows four and a
+// half millimetres a second, which coasts about half a millimetre off
+// every standoff and is most of why
+// `a_refused_servo_stream_lands_on_the_keep_out_standoff` rests at 6.0
+// mm against a 5.0 mm clearance.
+//
+// It cannot simply be tightened. The gate can never sit below the
+// drive's own residual motion, and joint 1 hunts at 5 Hz in the
+// simulator (see `a_held_servo_target_settles`), so a 1e-3 rad/s gate is
+// never satisfied: the placement times out and leaves the arm INSIDE
+// the keep-out. With joint 1 settled that same gate places the arm on
+// the clearance and lifts the closest approach by two millimetres. This
+// is a one-line change waiting on the drive, not on a better threshold.
+
 /// How near a joint has to be to a gate-imposed standoff to count as
 /// arrived \[rad\]. Half a millimetre at the arm's reach, an order below
 /// the standoff itself, so "arrived" is a statement about the geometry

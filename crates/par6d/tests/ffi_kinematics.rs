@@ -2453,6 +2453,28 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
 /// cannot use next to its own fixtures. Two speeds an order apart,
 /// because a landing that depends on approach speed is a lag, not a
 /// standoff.
+///
+/// RED, knowingly, and downstream of the drive: the fast leg rests at
+/// 6.0 mm against 5.0 plus or minus 1.0 — repeatably, three runs of
+/// three, which is itself new (it used to scatter). The surplus is two
+/// terms. About 0.45 mm is [`STANDOFF_SETTLE_MARGIN_RAD`], which is
+/// load-bearing and measured so: zeroed, the arm reaches 0.2 mm INSIDE
+/// the keep-out on two runs of three, and once bailed out to 65 mm. The
+/// other 0.55 mm is the coast after the placement's hold is dropped,
+/// bounded by the speed the handover is gated on — and that gate cannot
+/// go below the drive's own ring, which is what
+/// `a_held_servo_target_settles` is about. Gate it at 1e-3 rad/s while
+/// joint 1 still hunts and the placement never satisfies it, times out,
+/// and leaves the arm 0.3 mm inside the keep-out having reached 4.2 mm
+/// inside on the way. With joint 1 settled the same gate lands the arm
+/// at 5.3 to 5.7 mm on three runs of three and lifts the closest
+/// approach from 2.0 mm to 4.3.
+///
+/// So this goes green when the drive does. Two things not to retry:
+/// trimming the settle margin (above), and judging a landing more
+/// tightly than an arrival — below the coast every landing reads as a
+/// miss, each retry creeps in and coasts back out, and the arm parks
+/// where the retries ran out, measured at 9.8 mm.
 #[test]
 fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
     let rig = boot_tagged("servogate");
@@ -2681,17 +2703,18 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
 /// the config declares "arrived" means — read from the config the rig
 /// booted rather than restated here.
 ///
-/// IGNORED: the requirement is real and the simulator is not what fails
-/// it. Joint 1 rings at 5 Hz, 1.39 deg peak to peak, against the config's
-/// 0.57 deg tolerance, with the commanded position pinned on the target.
+/// IGNORED, unresolved: the requirement is real, the arm meets it, and
+/// the simulator does not. Joint 1 rings at 5 Hz, 1.39 deg peak to peak
+/// against the config's 0.57 deg tolerance, with the commanded position
+/// pinned on the target. This needs bench time, not more analysis — what
+/// is known is written down here so none of it is re-derived.
 ///
 /// The drive model is the firmware's
 /// (`Source-Robotics/STEPFOC-stepper-controller`), down to the integer
 /// encoder count its velocity is differenced from, the 20-sample average
 /// the loops read, the `V_errSum` clamp that has no anti-windup, and the
 /// current loop's PI into the winding against the configured voltage
-/// limit. The ring is what those gains do on this arm, not something the
-/// sim adds: linearised, the cascade is
+/// limit. Linearised, the cascade is
 ///
 /// ```text
 /// J s^3 + Kv s^2 + (Kpp Kv + Kiv) s + Kpp Kiv
@@ -2699,21 +2722,53 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
 ///
 /// which holds only while `J < Kv^2/Kiv + Kv/Kpp`. In joint units joint 1
 /// has `Kv` 0.44 N.m.s/rad, `Kiv` 275 N.m/(rad/s)/s and `Kpp` 5.0, so it
-/// holds up to 0.088 kg.m^2 — and the arm above joint 1 is 0.25 kg.m^2 at
-/// this pose. The frequency the same polynomial predicts,
-/// `sqrt((Kpp Kv + Kiv)/J)`, is 5 Hz, which is what it rings at.
+/// holds up to 0.088 kg.m^2, against 0.25 to 0.28 in the sim at this pose
+/// (agreed two ways: the torque trace, and `J = (Kpp Kv + Kiv)/w^2` from
+/// the ring itself). The frequency that polynomial predicts is 5 Hz,
+/// which is what it rings at — the sim is an accurate model of SOMETHING,
+/// just not of this arm.
 ///
 /// Joint 1 is the only joint without margin. `Kv` goes as the SQUARE of
 /// the gear ratio (once through ticks per radian, once through torque),
 /// so its 6.4:1 leaves it fifteen times softer than joint 2's 25:1
 /// against a comparable inertia; joint 2 holds to 1.6 kg.m^2, joint 3 to
-/// 0.75. Raising joint 1's `kpv` from 0.015 to 0.06 satisfies
-/// `Kv > J Kpp` and settles this test inside the tolerance — but `kpv` is
-/// a gain a real driver runs, so that is a measurement on the arm, not a
-/// change to make from the simulator.
+/// 0.75.
+///
+/// RULED OUT, each against a measurement on the arm:
+///
+/// - The gains. `kpv` 0.06 settles it (`Kv > J Kpp`) and turns this whole
+///   file green, but the owner confirms the real arm holds still on the
+///   shipped 0.015, so the config is right and the model is wrong.
+/// - Inertia via mass. The URDF carries 5.11 kg above joint 1, 6.11 kg
+///   with the base; the arm weighs over 5 kg on a scale. The masses are
+///   not inflated.
+/// - Friction alone. Measured joint-1 breakaway is 0.19 to 0.25 N.m (110
+///   mA one way, 140 mA the other, at 1.756 N.m/A). The sim gives it only
+///   0.128 — `G * motor_tc_nm`, the motor's detent, because
+///   `drivetrain_friction` credits `holding_friction_nm` only against an
+///   external load and joint 1 is a vertical axis carrying none. So the
+///   sim DOES under-model this friction about twofold and that is worth
+///   fixing on its own, but it is not the answer: the ring only stops
+///   between 0.26 and 0.51 N.m, and breakaway is static stiction, an
+///   UPPER bound on the kinetic friction a joint already hunting would
+///   see.
+///
+/// WHAT WOULD SETTLE IT, and it needs the real arm: the ring frequency,
+/// which takes no torque constant, no efficiency, no friction and no
+/// inertia estimate — only a clock. `Kiv` dominates `Kpp Kv` (275 against
+/// 2.2), so `w^2 ~ Kiv/J`, and the stability condition `Kv > J Kpp`
+/// becomes a threshold on frequency alone: BELOW ABOUT 8.9 Hz THIS
+/// CASCADE HUNTS, ABOVE IT IT HOLDS. Hold joint 1 on a target, push the
+/// link a few degrees off it, let go, and log the angle. If the real
+/// transient rings near 10 Hz then `kt * eta / J` on the arm is about
+/// four times the sim's and one of those three is wrong here. If it rings
+/// near 5 Hz and decays, the inertia and gains are right and the real
+/// drive has damping this model lacks. If it rings near 5 Hz and does not
+/// decay, the arm hunts too, below the threshold of noticing, and the
+/// tolerance is what wants revisiting.
 #[test]
-#[ignore = "joint 1's shipped velocity gain cannot hold this arm's inertia and the \
-            cascade limit-cycles; see the doc comment"]
+#[ignore = "joint 1 hunts in the sim and not on the arm, and the cause is not yet \
+            found; needs a ring-frequency measurement on the robot — see the doc"]
 fn a_held_servo_target_settles() {
     let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
         .expect("shipped config")

@@ -609,6 +609,17 @@ motor_tc_nm = 0.02
 # Gearbox holding friction [Nm, joint side]: the load an unpowered joint
 # carries without back-driving. Sized over the worst gravity torque in the
 # joint's range, or an IDLE arm collapses under its own weight.
+#
+# NOT measured, and joint 1's entry is not even sized: its axis is
+# vertical, so gravity never back-drives it and the rule above yields
+# nothing. Treat the 1.0 as a placeholder. The sim also spends this only
+# against an external load (`drivetrain_friction`), so an unloaded joint
+# keeps just `G * motor_tc_nm` — 0.128 Nm on joint 1, against a measured
+# breakaway of 0.19 to 0.25 Nm on the arm (110 mA one way, 140 the
+# other). A drivetrain that resists back-drive resists motion unloaded
+# too, so this under-models joint 1 about twofold; what it is NOT is the
+# cause of the hunt in `a_held_servo_target_settles`, which needs 0.26 to
+# 0.51 Nm to stop and would want KINETIC friction, below that breakaway.
 holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
