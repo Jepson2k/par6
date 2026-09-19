@@ -1336,8 +1336,13 @@ fn teleport_reseeds_the_arm_without_rebooting_the_bus() {
             .current_ma
             .expect("current reply"),
     );
+    // The reply carries the current the winding is actually at, as the
+    // firmware's does (`FOC.Iq`, not the setpoint), so it trails the
+    // demand by the little the current loop cannot reject while the
+    // joint is still accelerating. The gap that matters here is the one
+    // between the pushed limit and the config ceiling.
     assert!(
-        (cur - pushed_ilim_ma).abs() < 1.0,
+        (cur - pushed_ilim_ma).abs() < 0.02 * pushed_ilim_ma,
         "J0 drove {cur} mA: the teleport reverted the runtime current limit \
          (pushed {pushed_ilim_ma} mA, config ceiling {} mA)",
         j0.ilim_ma
