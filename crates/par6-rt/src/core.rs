@@ -78,22 +78,28 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
-/// Measured joint speed \[rad/s\] under which the arm counts as at rest
-/// for a released JOG or STREAM to hand over to IDLE. The ramp reaching
-/// zero says nothing about the plant, which lags the ramp by whatever
-/// its velocity loop is still carrying; IDLE drives nothing, so an arm
-/// handed over while it still moves freewheels on its momentum, and it
-/// was the position law holding the ramp's rest point that was meant to
-/// brake it.
-const RELEASE_REST_RAD_S: f64 = 0.01;
-/// How long every joint's raw AND filtered measured speed must stay
-/// under [`RELEASE_REST_RAD_S`] before the arm counts as at rest \[s\].
-/// Neither reading alone is rest: the raw sample crosses zero twice a
-/// cycle while a drive rings, and the filtered one crosses zero a
-/// quarter cycle later, while the arm is already reversing at speed —
-/// measured on the sim rig, an arm handed to IDLE on that crossing
-/// coasted a tenth of a radian back the way it came.
-const RELEASE_REST_HOLD_S: f64 = 0.1;
+/// How far a joint may wander and still count as stopped for a released
+/// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
+/// inside that band \[s\].
+///
+/// Displacement, not speed. The ramp reaching zero says nothing about
+/// the plant, which lags it by whatever its velocity loop still carries,
+/// and IDLE drives nothing — so an arm handed over while it is still
+/// travelling freewheels on its momentum, when the position law holding
+/// the ramp's rest point was what should have braked it. But a drive
+/// holding a position rings around it without going anywhere, and a
+/// speed threshold reads that ring as motion for as long as it lasts:
+/// traced on the sim rig, a held setpoint sustains a 1.8 degree swing at
+/// 5 Hz and ±0.38 rad/s that never decays, and a mode waiting for slow
+/// joints waits for good while whatever was waiting on the arm times
+/// out. Whether the arm is still TRAVELLING is a question about where it
+/// has been, not how fast it is going this instant. The band is wider
+/// than that ring and narrower than the ground a coasting arm covers in
+/// the window, and the window restarts the moment a joint leaves it —
+/// the same displacement plateau the homing detector reads a stall
+/// from.
+const RELEASE_REST_BAND_RAD: f64 = 0.05;
+const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
@@ -587,9 +593,11 @@ pub struct RtCore<B: DriverBus> {
     /// A `StreamRelease` is braking to rest. STREAM outlives it the same
     /// way JOG outlives a release.
     stream_released: bool,
-    /// Consecutive ticks with every joint under [`RELEASE_REST_RAD_S`]
-    /// on both measured velocities, against `release_rest_needed`
-    /// ([`RELEASE_REST_HOLD_S`] in ticks).
+    /// The pose the stillness window is measured from, re-seeded
+    /// whenever a joint leaves [`RELEASE_REST_BAND_RAD`] of it.
+    release_rest_ref: Option<[f64; MAX_JOINTS]>,
+    /// Consecutive ticks with every joint inside that band, against
+    /// `release_rest_needed` ([`RELEASE_REST_WINDOW_S`] in ticks).
     release_rest_streak: u32,
     release_rest_needed: u32,
     jog_joints: u8,
@@ -805,8 +813,9 @@ impl<B: DriverBus> RtCore<B> {
             jog_active: false,
             jog_released: false,
             stream_released: false,
+            release_rest_ref: None,
             release_rest_streak: 0,
-            release_rest_needed: robot.ticks(RELEASE_REST_HOLD_S).max(1),
+            release_rest_needed: robot.ticks(RELEASE_REST_WINDOW_S).max(1),
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -881,8 +890,9 @@ impl<B: DriverBus> RtCore<B> {
         &mut self.bus
     }
 
-    /// Whether every joint has measured under [`RELEASE_REST_RAD_S`], raw
-    /// and filtered, for [`RELEASE_REST_HOLD_S`].
+    /// Whether the arm has stopped travelling: every joint inside
+    /// [`RELEASE_REST_BAND_RAD`] of where it was for
+    /// [`RELEASE_REST_WINDOW_S`].
     fn at_measured_rest(&self) -> bool {
         self.release_rest_streak >= self.release_rest_needed
     }
@@ -1823,15 +1833,18 @@ impl<B: DriverBus> RtCore<B> {
                 self.tau_filt[i] += MEAS_FILTER_ALPHA * (self.tau[i] - self.tau_filt[i]);
             }
         }
-        let still =
-            self.qd.iter().zip(self.qd_filt.iter()).all(|(raw, filt)| {
-                raw.abs() <= RELEASE_REST_RAD_S && filt.abs() <= RELEASE_REST_RAD_S
-            });
-        self.release_rest_streak = if still {
-            self.release_rest_streak.saturating_add(1)
+        let held = self.release_rest_ref.is_some_and(|reference| {
+            self.q
+                .iter()
+                .zip(reference.iter())
+                .all(|(q, r)| (q - r).abs() <= RELEASE_REST_BAND_RAD)
+        });
+        if held {
+            self.release_rest_streak = self.release_rest_streak.saturating_add(1);
         } else {
-            0
-        };
+            self.release_rest_ref = Some(self.q);
+            self.release_rest_streak = 0;
+        }
     }
 
     /// Halt the jaws where they are: re-target the freshest reported jaw
@@ -2272,7 +2285,7 @@ impl<B: DriverBus> RtCore<B> {
                 // mode outlives the release until the ramp AND the arm
                 // are at rest: the ramp's rest point is a position hold,
                 // and the hold is what brakes an arm still carrying the
-                // ramp's velocity (see [`RELEASE_REST_RAD_S`]).
+                // ramp's velocity (see [`RELEASE_REST_BAND_RAD`]).
                 if self.jog_released
                     && self.scratch_qd.iter().all(|v| *v == 0.0)
                     && self.at_measured_rest()
@@ -2366,7 +2379,7 @@ impl<B: DriverBus> RtCore<B> {
                 // the arm to IDLE while it still carries velocity is what
                 // let a refused stream coast on past the keep-out that
                 // refused it, and the ramp's rest is not the arm's (see
-                // [`RELEASE_REST_RAD_S`]).
+                // [`RELEASE_REST_BAND_RAD`]).
                 if self.stream_released
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
                     && self.at_measured_rest()
