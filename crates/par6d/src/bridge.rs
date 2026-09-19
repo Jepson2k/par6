@@ -939,6 +939,24 @@ fn projection_seed(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
     }
 }
 
+/// The velocity a stopping projection starts from.
+///
+/// The RT's filtered measurement, not the raw one. The projection prices
+/// the ground the arm's momentum covers over the next few hundred
+/// milliseconds, and the raw velocity is one tick's finite difference,
+/// which a velocity loop rings on: measured on the sim rig, a stream
+/// commanded at 0.22 rad/s read 0.55 rad/s on one tick and a fraction of
+/// that on the next. Projected from the ringing sample, the refusal fires
+/// on whichever tick read low and the arm coasts through the standoff.
+/// The filtered velocity is the momentum the arm actually carries.
+fn projection_velocity(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
+    if snap.qd_filtered.iter().all(|v| v.is_finite()) {
+        snap.qd_filtered
+    } else {
+        snap.qd
+    }
+}
+
 /// A gate refusal being worked through, in two steps.
 ///
 /// The arm cannot simply be commanded onto the standoff: a refusal
@@ -1218,7 +1236,8 @@ impl RtCommands for RtBridge {
                     // same re-check housekeeping already runs on a
                     // moving stream, moved to where the datagram is
                     // still refusable.
-                    let la = gate.motion_lookahead(&projection_seed(&snap), &snap.qd);
+                    let la =
+                        gate.motion_lookahead(&projection_seed(&snap), &projection_velocity(&snap));
                     // Which question failed decides where the arm is then
                     // put. The TARGET failing means the arm must stop
                     // before the configuration it was sent to, so the
@@ -1235,7 +1254,7 @@ impl RtCommands for RtBridge {
                     // rest. Measured on the sim rig, that is the whole
                     // of what a 1 mm/50 ms approach still had left over
                     // once the projection covered everything else.
-                    let target_stop = gate.motion_lookahead(&target, &snap.qd);
+                    let target_stop = gate.motion_lookahead(&target, &projection_velocity(&snap));
                     let verdict = match gate.blocked(&snap.q, &target_stop)? {
                         Some(pairs) => Some((pairs, target_stop)),
                         None => gate.blocked(&snap.q, &la)?.map(|pairs| (pairs, la)),
@@ -2110,7 +2129,8 @@ pub(crate) fn housekeeping_loop(
                         && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
                 {
                     let mut g = gate.lock().unwrap();
-                    let la = g.motion_lookahead(&projection_seed(&snap), &snap.qd);
+                    let la =
+                        g.motion_lookahead(&projection_seed(&snap), &projection_velocity(&snap));
                     match g.blocked(&snap.q, &la) {
                         Ok(None) => {}
                         Ok(Some(pairs)) => {
