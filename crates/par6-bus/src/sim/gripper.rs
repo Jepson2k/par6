@@ -89,7 +89,16 @@ impl GripperSim {
         let cal_ticks = (CALIBRATION_S / dt).round() as u64;
         let substep = timestep_for(dt);
         Self {
-            driver: VirtualDriver::new(dt, node, d.velocity_limit_ticks_s, d.ilim_ma, d.kt_nm_a),
+            // No datasheet constants for the gripper's motor, so its driver
+            // keeps the instant-current behaviour.
+            driver: VirtualDriver::new(
+                dt,
+                node,
+                d.velocity_limit_ticks_s,
+                d.ilim_ma,
+                d.kt_nm_a,
+                None,
+            ),
             joint: JawJoint::new(
                 substep,
                 stroke_ticks / 2.0,

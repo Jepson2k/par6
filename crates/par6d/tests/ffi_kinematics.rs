@@ -2681,26 +2681,39 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
 /// the config declares "arrived" means — read from the config the rig
 /// booted rather than restated here.
 ///
-/// IGNORED: the simulator cannot answer this yet, and the requirement is
-/// real, so it is neither deleted nor weakened. Run it with
-/// `cargo test -- --ignored` when the drive model is fixed.
+/// IGNORED: the requirement is real and the simulator is not what fails
+/// it. Joint 1 rings at 5 Hz, 1.39 deg peak to peak, against the config's
+/// 0.57 deg tolerance, with the commanded position pinned on the target.
 ///
-/// With the firmware's 160 us loop period and its velocity filter
-/// modelled (`sim::driver`), a target held on the vendor drive gains
-/// still swings 1.39 deg peak to peak in the sim at ~10 Hz, against the
-/// config's 0.57 deg settle tolerance, with the commanded position pinned
-/// on the target. That is NOT evidence the vendor mistuned the joint. The
-/// integrator is faithful — the firmware
-/// (`Source-Robotics/STEPFOC-stepper-controller`) clamps `V_errSum` to
-/// the current limit with no anti-windup, exactly as the sim does — and
-/// the scene's joint damping is not it either (0.5 to 3.0 changes
-/// nothing). What the sim lacks is the electrical side of the drive: it
-/// applies the commanded Iq instantly and has no voltage limit, motor
-/// resistance or inductance, and those constants live in each driver's
-/// EEPROM rather than in anything this repo ships.
+/// The drive model is the firmware's
+/// (`Source-Robotics/STEPFOC-stepper-controller`), down to the integer
+/// encoder count its velocity is differenced from, the 20-sample average
+/// the loops read, the `V_errSum` clamp that has no anti-windup, and the
+/// current loop's PI into the winding against the configured voltage
+/// limit. The ring is what those gains do on this arm, not something the
+/// sim adds: linearised, the cascade is
+///
+/// ```text
+/// J s^3 + Kv s^2 + (Kpp Kv + Kiv) s + Kpp Kiv
+/// ```
+///
+/// which holds only while `J < Kv^2/Kiv + Kv/Kpp`. In joint units joint 1
+/// has `Kv` 0.44 N.m.s/rad, `Kiv` 275 N.m/(rad/s)/s and `Kpp` 5.0, so it
+/// holds up to 0.088 kg.m^2 — and the arm above joint 1 is 0.25 kg.m^2 at
+/// this pose. The frequency the same polynomial predicts,
+/// `sqrt((Kpp Kv + Kiv)/J)`, is 5 Hz, which is what it rings at.
+///
+/// Joint 1 is the only joint without margin. `Kv` goes as the SQUARE of
+/// the gear ratio (once through ticks per radian, once through torque),
+/// so its 6.4:1 leaves it fifteen times softer than joint 2's 25:1
+/// against a comparable inertia; joint 2 holds to 1.6 kg.m^2, joint 3 to
+/// 0.75. Raising joint 1's `kpv` from 0.015 to 0.06 satisfies
+/// `Kv > J Kpp` and settles this test inside the tolerance — but `kpv` is
+/// a gain a real driver runs, so that is a measurement on the arm, not a
+/// change to make from the simulator.
 #[test]
-#[ignore = "the sim's drive has no electrical model and a held target swings past the \
-            settle tolerance; see the doc comment"]
+#[ignore = "joint 1's shipped velocity gain cannot hold this arm's inertia and the \
+            cascade limit-cycles; see the doc comment"]
 fn a_held_servo_target_settles() {
     let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
         .expect("shipped config")
