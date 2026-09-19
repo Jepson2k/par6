@@ -112,6 +112,28 @@ impl StreamingExecutor {
         Ok(())
     }
 
+    /// Brake to rest from wherever the arm is, under the configured
+    /// acceleration and jerk limits.
+    ///
+    /// The streaming counterpart of `JogEngine::release`. A position
+    /// target cannot express this: targeting the current pose while the
+    /// arm is moving asks Ruckig to stop AND come back, so the arm
+    /// overshoots and reverses. Switching to the velocity interface with
+    /// a zero target says "shed the velocity you have" and nothing about
+    /// where that leaves the arm, which is what a stop is.
+    ///
+    /// Whoever calls this owns the mode afterwards: the executor keeps
+    /// stepping, and the caller ends the session once the ramp reports
+    /// rest — a stream dropped straight into IDLE at speed is not
+    /// commanded to stop by anything, and coasts on its own momentum.
+    pub fn release(&mut self) {
+        self.input.control_interface = ControlInterface::Velocity;
+        for j in 0..NUM_JOINTS {
+            self.input.target_velocity[j] = 0.0;
+            self.input.target_acceleration[j] = 0.0;
+        }
+    }
+
     /// Advance one tick toward the current target.
     pub fn step(&mut self) -> Result<StreamStep, MotionError> {
         if !self.active {

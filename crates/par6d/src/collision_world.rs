@@ -79,7 +79,7 @@ impl ShapeNames {
     pub fn display<'a>(&'a self, geom: &'a str) -> &'a str {
         match self.all.iter().find(|(name, _)| name == geom) {
             Some((_, reported)) => reported,
-            None => trim_geom_index(geom),
+            None => par6_kin::link_of(geom),
         }
     }
 
@@ -95,14 +95,6 @@ impl ShapeNames {
             .pairs()
             .map(|(a, b)| (self.display_owned(a), self.display_owned(b)))
             .collect()
-    }
-}
-
-/// Drop the model's per-link geometry index: `upper_arm_0` → `upper_arm`.
-fn trim_geom_index(geom: &str) -> &str {
-    match geom.rsplit_once('_') {
-        Some((link, idx)) if !idx.is_empty() && idx.bytes().all(|b| b.is_ascii_digit()) => link,
-        _ => geom,
     }
 }
 

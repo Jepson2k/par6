@@ -170,6 +170,18 @@ impl StreamTracker for MotionStream {
         }
     }
 
+    fn release(&mut self) {
+        // Brake under the limiter rather than clamping the target to the
+        // current pose: a position target asks Ruckig to stop AND return
+        // to it, so the arm overshoots and reverses. The velocity
+        // interface sheds the speed and says nothing about where that
+        // leaves the arm, which is what stopping means.
+        self.executor.release();
+        // The refusal latches are about following a target; there is no
+        // target any more, so a brake must not inherit one.
+        self.target_refused = false;
+    }
+
     fn set_scale(&mut self, speed: f64, accel: f64) {
         let mut scaled = self.base;
         for j in 0..MAX_JOINTS {

@@ -134,6 +134,9 @@ fn a_faulted_tracker_hard_latches_stream_fault() {
         fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
             self.0.step(q_out, qd_out);
         }
+        fn release(&mut self) {
+            self.0.release();
+        }
         fn faulted(&self) -> bool {
             true
         }

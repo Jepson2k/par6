@@ -6,6 +6,7 @@
 mod client;
 mod collision;
 mod config;
+mod constants;
 mod convert;
 mod kinematics;
 mod preview;
@@ -100,10 +101,10 @@ fn _par6(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(kinematics::frame_offset, m)?)?;
     m.add("COLLISION_CLEARANCE_M", par6d::COLLISION_CLEARANCE_M)?;
     m.add("RobotWireError", py.get_type::<convert::RobotWireError>())?;
-    m.add("NUM_JOINTS", par6_proto::NUM_JOINTS)?;
     m.add(
         "MAX_JOG_DURATION_S",
         par6_proto::command::MAX_JOG_DURATION_S,
     )?;
+    constants::register(py, m)?;
     Ok(())
 }

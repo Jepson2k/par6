@@ -21,7 +21,3 @@ serde = { workspace = true }
 [dev-dependencies]
 # Drives the same `serde::Deserialize` the Python binding's dict reader uses.
 serde_json = { workspace = true }
-
-[[bin]]
-name = "gen_python"
-path = "src/bin/gen_python.rs"
