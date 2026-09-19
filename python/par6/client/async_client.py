@@ -19,6 +19,7 @@ import atexit
 import contextlib
 import copy
 import logging
+import math
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
@@ -49,6 +50,7 @@ from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ._robot import RobotOwner
 from ._wire import (
     blend as _blend,
 )
@@ -154,29 +156,21 @@ def _close_leftover_cores() -> None:
             core.close()
 
 
-class AsyncRobotClient(_RobotClientABC):
+def _validate_io_timeout(timeout: float | None) -> None:
+    """An I/O deadline is positive and finite; None means the default."""
+    if timeout is not None and (
+        isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
+    ):
+        raise ValueError("I/O timeout must be positive and finite")
+
+
+class AsyncRobotClient(RobotOwner, _RobotClientABC):
     """Async client for the par6d runtime.
 
     All network knobs default from the ``PAR6_*`` env namespace, then to the
     config defaults (command port 6001, status port 6002, multicast
     group 239.255.0.71).
     """
-
-    _robot: Robot | None = None
-
-    @property
-    def robot(self) -> Robot:
-        """The backend this client drives, built on first read when a bare
-        client (what a user script constructs) supplied none."""
-        if self._robot is None:
-            from par6.robot import Robot
-
-            self._robot = Robot()
-        return self._robot
-
-    @robot.setter
-    def robot(self, value: Robot | None) -> None:
-        self._robot = value
 
     def __init__(
         self,
@@ -1441,7 +1435,9 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
 
-    async def write_io(self, index: int, value: int) -> int:
+    async def write_io(
+        self, index: int, value: int, *, timeout: float | None = None
+    ) -> int:
         """Set digital output by logical index (0 = first output pin).
 
         *index* addresses the ``[io].outputs`` list, which is also where the
@@ -1453,6 +1449,9 @@ class AsyncRobotClient(_RobotClientABC):
         its own and refuses a port it does not have, so a box wired
         differently is caught either way.
 
+        ``timeout`` bounds command acceptance. TimeoutError leaves application
+        unconfirmed; None uses the client defaults.
+
         Category: I/O
 
         Example:
@@ -1463,8 +1462,10 @@ class AsyncRobotClient(_RobotClientABC):
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        core = await self._ensure_core()
-        return await self._call(core.write_io(index, value))
+        _validate_io_timeout(timeout)
+        async with asyncio.timeout(timeout):
+            core = await self._ensure_core()
+            return await self._call(core.write_io(index, value))
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1590,16 +1591,24 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.pose_xyzrpy(_wire_frame(frame)))
 
-    async def io(self) -> list[int] | None:
-        """Digital I/O state [in1, in2, out1, out2, estop].
+    async def io(self, *, timeout: float | None = None) -> list[int] | None:
+        """Digital I/O in configured input/output order, followed by E-stop.
+
+        ``timeout`` bounds setup, retries, and the reply; None uses client defaults.
 
         Category: Query
 
         Example:
             io = rbt.io()
         """
-        core = await self._ensure_core()
-        return await self._call(core.io())
+        _validate_io_timeout(timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                core = await self._ensure_core()
+                levels = await self._call(core.io())
+                return list(levels) if levels is not None else None
+        except TimeoutError:
+            return None
 
     async def joint_speeds(self) -> list[float] | None:
         """Current joint velocities in rad/s.
