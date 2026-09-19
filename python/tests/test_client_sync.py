@@ -11,6 +11,8 @@ from __future__ import annotations
 import asyncio
 import math
 import socket
+import subprocess
+import sys
 import time
 
 import pytest
@@ -20,6 +22,27 @@ from par6 import config as _cfg
 from par6.client import RobotClient
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
+
+
+def test_short_sync_and_async_processes_exit_cleanly_with_status_in_flight(daemon):
+    endpoint = (
+        f"host='127.0.0.1', port={daemon.command_port}, "
+        f"status_transport='UNICAST', status_port={daemon.status_port}, "
+        "status_unicast_host='127.0.0.1'"
+    )
+    programs = (
+        f"from par6 import RobotClient\ndef main():\n    with RobotClient({endpoint}) as rbt:\n        assert rbt.wait_status(lambda s: s.seq > 0, timeout=3)\nmain()\n",
+        f"import asyncio\nfrom par6 import AsyncRobotClient\nasync def main():\n    async with AsyncRobotClient({endpoint}) as rbt:\n        assert await rbt.wait_status(lambda s: s.seq > 0, timeout=3)\nasyncio.run(main())\n",
+    )
+    for source in programs:
+        for _ in range(6):
+            result = subprocess.run(
+                [sys.executable, "-c", source],
+                capture_output=True,
+                text=True,
+                timeout=15,
+            )
+            assert result.returncode == 0, result.stdout + result.stderr
 
 
 def park_deg() -> list[float]:
