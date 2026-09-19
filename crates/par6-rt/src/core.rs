@@ -708,7 +708,18 @@ impl<B: DriverBus> RtCore<B> {
             gravity: hooks.gravity,
             jog: hooks.jog,
             stream: hooks.stream,
-            exec: ExecPlayback::new(hooks.samples, hooks.settle),
+            exec: ExecPlayback::new(
+                hooks.samples,
+                hooks.settle,
+                dt,
+                robot.motion.execution_override_transition_s,
+                std::array::from_fn(|i| {
+                    robot.joints[i]
+                        .limits
+                        .for_mode(LimitMode::Exec)
+                        .acceleration_rad_s2
+                }),
+            ),
             estop: EstopMonitor::new(hooks.estop),
             io: hooks.io,
             io_lines: [0; MAX_IO_LINES],
@@ -1155,6 +1166,7 @@ impl<B: DriverBus> RtCore<B> {
         if let Some(cmd) = self.commands.poll() {
             self.apply_command(cmd);
         }
+        self.exec.clock_tick();
 
         // Phase 5b: a level this tick's command changed reaches the pins
         // in the same tick, so a client that writes and then reads the
@@ -1405,6 +1417,11 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
+            RtCommand::ExecSetSpeedScale(scale) => {
+                if !self.exec.set_speed_scale(scale) {
+                    log::warn!("invalid queued execution scale: {scale}");
+                }
+            }
             RtCommand::ExecFlush => {
                 let n = self.exec.flush();
                 log::info!("EXEC flush discarded {n} samples");
@@ -2106,6 +2123,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn dispatch_and_send(&mut self) {
+        if self.mode != Mode::Exec {
+            self.exec.at_rest();
+        }
         if self.mode != Mode::Idle {
             self.drift.reset();
         }

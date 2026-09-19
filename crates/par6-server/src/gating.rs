@@ -69,7 +69,7 @@ pub fn gate(cmd: CmdType) -> Gate {
         // longer legal is refused by the RT's own mode table rather than
         // here. Written out rather than left to the `_` arm so the choice
         // is visible instead of accidental.
-        C::Pause => {}
+        C::Pause | C::SetExecutionSpeed => {}
         C::Teleport => g.needs_simulator = true,
         // SetPayload is deliberately ungated beyond the SYSTEM default:
         // a payload change while motion runs is legal (the model updates

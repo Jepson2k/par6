@@ -16,7 +16,7 @@
 
 use par6_bus::sim::scene::Scene;
 use par6_proto::{Command, WireError};
-use par6_rt::{ArmState, Mode};
+use par6_rt::{ArmState, Mode, RtCommand};
 use par6_server::{
     check_gate, decode_error_to_wire, GateContext, PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
@@ -114,6 +114,10 @@ impl Preview {
             q0: self.snap.q,
         })
         .map_err(|e| config_error("simulation", &e.to_string()))?;
+        driver.send(RtCommand::ExecSetSpeedScale(self.snap.exec.resume_scale));
+        driver.tick();
+        driver.send(RtCommand::ExecSetPaused(self.snap.exec.paused));
+        driver.tick();
         let mut planner = Par6Planner::new(
             ports.link,
             ports.samples,
@@ -190,6 +194,22 @@ impl Preview {
                     next += 1;
                     continue;
                 }
+                let control = match &cmds[next] {
+                    Command::SetExecutionSpeed(p) => Some(RtCommand::ExecSetSpeedScale(p.scale)),
+                    Command::Pause(p) => Some(RtCommand::ExecSetPaused(p.on)),
+                    _ => None,
+                };
+                if let Some(control) = control {
+                    driver.send(control);
+                    driver.tick();
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    continue;
+                }
+                if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
+                {
+                    break;
+                }
                 if let Some(action) = tool_action(&cmds[next]) {
                     match planner.start_tool(queue_index, action) {
                         Err(error) => {
@@ -216,7 +236,10 @@ impl Preview {
                     .iter()
                     .enumerate()
                     .take_while(|(k, c)| {
-                        *k == 0 || (tool_action(c).is_none() && self.admit(c, &driver).is_ok())
+                        *k == 0
+                            || (tool_action(c).is_none()
+                                && !matches!(c, Command::Pause(_) | Command::SetExecutionSpeed(_))
+                                && self.admit(c, &driver).is_ok())
                     })
                     .map(|(k, cmd)| QueuedCommand {
                         index: queue_index + k as u64,

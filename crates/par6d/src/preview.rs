@@ -478,6 +478,15 @@ impl Preview {
         self.dt
     }
 
+    /// Planning state has no in-flight transition; a run ticks the real core.
+    pub fn execution_speed(&self) -> [f64; 3] {
+        [
+            self.snap.exec.target_scale,
+            self.snap.exec.applied_scale,
+            self.snap.exec.resume_scale,
+        ]
+    }
+
     /// Where the configured homing seek leaves the arm \[rad\].
     pub fn homing_ready_pose_rad(&self) -> [f64; MAX_JOINTS] {
         self.ready_pose
@@ -721,7 +730,7 @@ impl Preview {
         }
         self.latches.motion_accepted();
         self.held.push_back(command);
-        if self.holding_for_blend() {
+        if self.snap.exec.paused || self.holding_for_blend() {
             return PreviewResult::pending(self.snap.q);
         }
         self.run_held()
@@ -736,9 +745,21 @@ impl Preview {
         self.held.holding_for_blend(lookahead, None, |c| c)
     }
 
+    /// The server's pause clearing: Stop, Estop and ResetState discard the
+    /// queue a pause held and the pause with it, and a resume lifts it.
+    fn unpause(&mut self) {
+        self.snap.exec.paused = false;
+        self.snap.exec.target_scale = self.snap.exec.resume_scale;
+        self.snap.exec.applied_scale = self.snap.exec.resume_scale;
+        self.publish();
+    }
+
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
+        }
+        if self.snap.exec.paused {
+            return Some(PreviewResult::pending(self.snap.q));
         }
         let batch: Vec<Command> = self.held.drain(..).collect();
         let results = self.plan_batch(&batch);
@@ -825,17 +846,45 @@ impl Preview {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
                     self.held.clear();
+                    self.unpause();
                 }
                 self.latches.stop(cleared);
             }
             Command::Estop => {
                 self.held.clear();
+                self.unpause();
                 self.latches.estop();
             }
             Command::Reset => self.latches.reset(),
-            Command::Pause(_) | Command::SetGravityComp(_) => {}
+            Command::Pause(p) => {
+                if p.on {
+                    self.snap.exec.paused = true;
+                    self.snap.exec.target_scale = 0.0;
+                    self.snap.exec.applied_scale = 0.0;
+                    self.publish();
+                } else {
+                    self.unpause();
+                    // What the pause held runs now, unless the chain is
+                    // still waiting for the move that closes it.
+                    if !self.holding_for_blend() {
+                        if let Some(released) = self.run_held() {
+                            return released;
+                        }
+                    }
+                }
+            }
+            Command::SetExecutionSpeed(p) => {
+                self.snap.exec.resume_scale = p.scale;
+                if !self.snap.exec.paused {
+                    self.snap.exec.target_scale = p.scale;
+                    self.snap.exec.applied_scale = p.scale;
+                }
+                self.publish();
+            }
+            Command::SetGravityComp(_) => {}
             Command::ResetState => {
                 self.held.clear();
+                self.unpause();
                 self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
@@ -1237,10 +1286,10 @@ impl Preview {
     /// to where it ends, and cancel it (nothing executes here).
     fn collect_plan(&mut self, head: &Command) -> PreviewResult {
         let (trajectory, duration_s): (Vec<[f64; MAX_JOINTS]>, f64) =
-            match self.planner.planned_motion(self.snap.tick) {
+            match self.planner.planned_motion(&self.snap) {
                 PlannedMotion::Exec(samples) => {
                     let q: Vec<_> = samples.iter().map(|s| s.q).collect();
-                    let duration = q.len() as f64 * self.dt;
+                    let duration = q.len() as f64 * self.dt / self.snap.exec.resume_scale;
                     (q, duration)
                 }
                 // The seek establishes the references and ends where the
