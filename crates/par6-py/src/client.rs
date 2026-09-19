@@ -615,6 +615,13 @@ impl CoreClient {
         opt_future(py, async move { client.tcp_speed().await })
     }
 
+    fn tcp_transform<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        opt_future(py, async move {
+            client.tcp_transform().await.map(|v| v.to_vec())
+        })
+    }
+
     fn tcp_offset<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         let client = self.rt();
         opt_future(
@@ -747,6 +754,15 @@ impl CoreClient {
                 voltage_limit_mv,
             }),
         )
+    }
+
+    fn set_tcp_transform<'py>(
+        &self,
+        py: Python<'py>,
+        values: [f64; 6],
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        index_future(py, async move { client.set_tcp_transform(values).await })
     }
 
     fn set_tcp_offset<'py>(

@@ -306,6 +306,10 @@ impl Preview {
         self.inner.lock().unwrap().profile().to_owned()
     }
 
+    fn tcp_transform(&self) -> Vec<f64> {
+        self.inner.lock().unwrap().tcp_transform().to_vec()
+    }
+
     fn tcp_offset_mm(&self) -> Vec<f64> {
         self.inner.lock().unwrap().tcp_offset_mm().to_vec()
     }

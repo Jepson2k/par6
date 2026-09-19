@@ -236,6 +236,10 @@ wire_enum! {
         Checkpoint = 109,
         /// Generic tool action (open/close/move…), validated server-side.
         ToolAction = 110,
+        /// Queued tool-local TCP transform (mm, intrinsic XYZ degrees).
+        SetTcpTransform = 111,
+        /// Applied tool-local TCP transform readback.
+        TcpTransform = 112,
     }
 }
 
@@ -288,6 +292,8 @@ wire_enum! {
         BusScan = 22,
         /// See [`CmdType::StatusRate`].
         StatusRate = 23,
+        /// See [`CmdType::TcpTransform`].
+        TcpTransform = 24,
     }
 }
 
@@ -465,6 +471,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
@@ -493,6 +500,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Delay
         | C::Checkpoint
         | C::ToolAction
-        | C::SetTcpOffset => CommandClass::Queued,
+        | C::SetTcpOffset
+        | C::SetTcpTransform => CommandClass::Queued,
     }
 }
