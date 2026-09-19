@@ -2476,9 +2476,6 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
 /// miss, each retry creeps in and coasts back out, and the arm parks
 /// where the retries ran out, measured at 9.8 mm.
 #[test]
-#[ignore = "the fast leg rests 1 mm outside the standoff because the handover gate \
-            cannot sit below the drive's ring; goes green when a_held_servo_target_settles \
-            does — see the doc comment"]
 fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
     let rig = boot_tagged("servogate");
     let mut c = Client::new(rig.addr());
