@@ -1217,12 +1217,20 @@ impl RtCommands for RtBridge {
                         Some(pairs) => Some((pairs, target_stop)),
                         None => gate.blocked(&snap.q, &la)?.map(|pairs| (pairs, la)),
                     };
+                    let moving = snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S);
                     match verdict {
                         None => (None, epoch),
-                        Some((pairs, goal)) => (Some((gate.refuse(pairs), goal)), epoch),
+                        Some((pairs, goal)) => (Some((gate.refuse(pairs), goal, moving)), epoch),
                     }
                 };
-                if let Some((refusal, goal)) = refusal {
+                if let Some((refusal, goal, moving)) = refusal {
+                    // A standoff sheds momentum. An arm already at rest has
+                    // none: the refusal is the whole answer, and driving it
+                    // toward the keep-out it was refused would be motion
+                    // the client was just told it did not get.
+                    if !moving {
+                        return Err(refusal);
+                    }
                     log::warn!("servo: collision predicted; stopping on the standoff");
                     // A release, not a position hold. The drive closes a
                     // position error against the arm's own momentum, and
