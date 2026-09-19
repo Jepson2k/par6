@@ -1557,6 +1557,18 @@ impl<B: DriverBus> RtCore<B> {
     /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
         if target == self.mode {
+            // A STREAM request while STREAM is braking to rest resumes
+            // the session where the tracker is, rather than bouncing
+            // through IDLE and re-seeding the tracker at the measured
+            // pose: the measurement trails what the drive is holding by
+            // its settle, and a re-seed there is a position step the
+            // drive rings on — measured on the sim rig, that ring is
+            // what kept a standoff placement from ever reading as
+            // arrived.
+            if target == Mode::Stream && self.stream_released {
+                self.stream_released = false;
+                self.stream_last_rx_tick = self.tick;
+            }
             return Ok(());
         }
         // Never request targets: BOOTING is boot-only, ACTIVE_ERROR is a
