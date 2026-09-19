@@ -351,6 +351,20 @@ fn the_status_stream_falls_back_to_the_configured_unicast_host() {
             client.wait_status(|_| true, BUDGET).await,
             "STATUS must reach the fallback socket bound on the configured host"
         );
+        let before = client.latest_status().expect("received status");
+        assert_ne!(before.session_id, 0);
+        assert!(
+            client
+                .wait_status(
+                    |next| {
+                        next.session_id == before.session_id
+                            && next.seq > before.seq
+                            && next.mono_time_ns > before.mono_time_ns
+                    },
+                    BUDGET,
+                )
+                .await
+        );
     });
 }
 
