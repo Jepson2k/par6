@@ -104,6 +104,7 @@ mod tests {
 
     fn shape(name: &str, collision: bool) -> par6_kin::Shape {
         par6_kin::Shape {
+            attachment: None,
             name: name.to_owned(),
             kind: par6_kin::ShapeKind::Sphere,
             params: [0.05, 0.0, 0.0],

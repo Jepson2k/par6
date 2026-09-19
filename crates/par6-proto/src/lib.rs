@@ -42,7 +42,8 @@ pub use chunk::{
     Reassembler,
 };
 pub use command::{
-    decode_command, encode_command, validate_shape, Command, Layer, Physical, Shape, ToolParam,
+    decode_command, encode_command, validate_shape, Attachment, Command, Layer, Physical, Shape,
+    ToolParam,
 };
 pub use enums::{
     command_class, ActionState, CmdType, CommandClass, CompletionPolicy, ControllerMode,
@@ -59,7 +60,7 @@ pub use status::{
 };
 
 /// Protocol version carried in the STATUS header.
-pub const PROTO_VERSION: u8 = 4;
+pub const PROTO_VERSION: u8 = 5;
 /// Number of arm joints.
 pub const NUM_JOINTS: usize = 6;
 /// Elements in a flattened 4×4 row-major pose.

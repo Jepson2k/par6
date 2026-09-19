@@ -357,6 +357,8 @@ pub enum QueryResult {
         program: Vec<crate::command::Shape>,
         /// Scene epoch this readback represents.
         epoch: u64,
+        /// Context identifier required by attached geometry declarations.
+        attachment_epoch: u64,
     },
     /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
     /// client can run previews from exactly the daemon's numbers.
@@ -739,12 +741,14 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             installation,
             program,
             epoch,
+            attachment_epoch,
         } => {
-            w_array(buf, 4);
+            w_array(buf, 5);
             w_uint(buf, u64::from(tag));
             w_shapes(buf, installation);
             w_shapes(buf, program);
             w_uint(buf, *epoch);
+            w_uint(buf, *attachment_epoch);
         }
     }
 }
@@ -1215,11 +1219,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::Shapes => {
-            expect_arity("shapes result", n, 4)?;
+            expect_arity("shapes result", n, 5)?;
             QueryResult::Shapes {
                 installation: r_shapes(r)?,
                 program: r_shapes(r)?,
                 epoch: r.uint()?,
+                attachment_epoch: r.uint()?,
             }
         }
     };

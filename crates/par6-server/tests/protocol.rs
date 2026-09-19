@@ -2222,6 +2222,7 @@ async fn a_refusal_kept_in_a_standoff_still_latches() {
 
 fn wire_shape(name: &str, kind: &str) -> Shape {
     Shape {
+        attachment: None,
         kind: kind.to_owned(),
         params: vec![0.2, 0.2, 0.2],
         pose: vec![0.3, 0.0, 0.1, 0.0, 0.0, 0.0],
@@ -2281,6 +2282,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
             installation,
             program: p,
             epoch,
+            ..
         } => {
             assert_eq!(installation, vec![install.clone()]);
             assert_eq!(p, program);
