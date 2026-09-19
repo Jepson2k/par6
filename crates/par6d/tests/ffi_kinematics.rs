@@ -29,7 +29,10 @@ use par6d::options::StatusTransport;
 use par6d::{Daemon, Options};
 
 mod common;
-use common::{shipped_config, Client, Rig, BUDGET};
+use common::{
+    distance, distance_to_segment, path_misses, process_corner, progress_along, shipped_config,
+    spline_waypoints, wire_pose_at, Client, Rig, ARC_RADIUS_MM, BUDGET, CURVE_START_DEG,
+};
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
 /// not share a temp config directory.
@@ -42,8 +45,14 @@ fn boot_tagged(tag: &str) -> Rig {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    common::retimed_config(&format!("ffi-{tag}"), 0.02)
+    common::retimed_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
 }
+
+/// The tick period every rig in this file boots at. Anything that has to
+/// agree with the runtime's own tick-derived arithmetic — the streaming
+/// gate's stopping projection, for one — has to read THIS, not the
+/// shipped config's period.
+const TEST_TICK_DT_S: f64 = 0.02;
 
 /// [`test_config`] with the active (MSG) gripper's `[kinematics] mass_kg`
 /// replaced — the knob the gravity-wiring test turns.
@@ -162,51 +171,6 @@ fn reference_case() -> ReferenceCase {
 
 fn tcp_mm(s: &Status) -> [f64; 3] {
     [s.pose[3], s.pose[7], s.pose[11]]
-}
-
-/// Distance \[mm\] from `p` to the segment `a`→`b`.
-fn distance_to_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
-    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-    let t = ((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2).clamp(0.0, 1.0);
-    let e = [w[0] - t * d[0], w[1] - t * d[1], w[2] - t * d[2]];
-    (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
-}
-
-/// Euclidean distance \[mm\] between two TCP positions.
-fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
-    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
-}
-
-/// Fraction of the segment `a`→`b` covered by `p`'s projection.
-fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
-    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
-    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
-    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
-    (w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2
-}
-
-/// Wire pose `[x y z mm, rx ry rz deg]` from a STATUS pose matrix
-/// (row-major 4x4, mm) with the translation replaced.
-///
-/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
-/// convention, written out here
-/// rather than borrowed from the runtime so the two halves of the
-/// round trip cannot agree on the wrong thing.
-fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
-    let (r00, r01, r02) = (pose[0], pose[1], pose[2]);
-    let (r12, r22) = (pose[6], pose[10]);
-    let cp = r12.hypot(r22);
-    [
-        xyz_mm[0],
-        xyz_mm[1],
-        xyz_mm[2],
-        (-r12).atan2(r22).to_degrees(),
-        r02.atan2(cp).to_degrees(),
-        (-r01).atan2(r00).to_degrees(),
-    ]
 }
 
 /// Largest absolute difference between the rotation blocks of two STATUS
@@ -336,7 +300,7 @@ fn cartesian_surface_over_protocol_v2() {
     });
     let i = c.ok_index(&move_l);
     let path: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
+        .collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0))
         .iter()
         .map(tcp_mm)
         .collect();
@@ -401,7 +365,7 @@ fn cartesian_surface_over_protocol_v2() {
         blend_radius: None,
     }));
     let joint_path: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
+        .collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0))
         .iter()
         .map(tcp_mm)
         .collect();
@@ -1100,28 +1064,101 @@ fn jog_j(joint: usize, signed_pct: f64, duration_s: f64) -> Command {
     })
 }
 
-/// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
-/// loads — where a keep-out has to go to sit on the swept path.
-fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
-    let mut kin = par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
-        .expect("kin model");
-    let mut q = [0.0; NUM_JOINTS];
+/// Signed distance from the arm's collision geometry to the keep-out at
+/// `angles_deg` \[m\], through the same model the daemon gates on.
+///
+/// This is the only honest clearance number in this test. A flange-to-box
+/// distance is not one: the bodies that get refused are `gripper` and
+/// `jaw2`, which reach the box while the flange is still ~100 mm away,
+/// so a flange measurement reports the tool's length as if it were the
+/// gate's margin.
+fn keepout_world(keepout_centre_m: [f64; 3]) -> par6_kin::Collision {
+    let mut col = par6_kin::Collision::load(
+        &common::assets_dir(),
+        par6_kin::GripperVariant::Msg,
+        par6d::COLLISION_CLEARANCE_M,
+    )
+    .expect("reference collision model");
+    col.set_layer(
+        par6_kin::Layer::Program,
+        &[par6_kin::Shape {
+            name: "keepout".to_owned(),
+            kind: par6_kin::ShapeKind::Box,
+            params: [KEEPOUT_M, KEEPOUT_M, KEEPOUT_M],
+            pose: [
+                keepout_centre_m[0],
+                keepout_centre_m[1],
+                keepout_centre_m[2],
+                0.0,
+                0.0,
+                0.0,
+            ],
+            collision: true,
+            margin: None,
+        }],
+    )
+    .expect("keep-out into the reference world");
+    col
+}
+
+/// Signed distance from the arm's collision geometry to the keep-out at
+/// `angles_deg` \[m\], through a world built by [`keepout_world`].
+fn world_gap_m(col: &mut par6_kin::Collision, angles_deg: [f64; NUM_JOINTS]) -> f64 {
+    let mut q = [0.0; par6_kin::NQ];
     for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
         *out = deg.to_radians();
     }
-    let mut pose = [0.0; 16];
-    kin.fk(&q, &mut pose).expect("fk");
-    [pose[3], pose[7], pose[11]]
+    col.world_distance(&q).expect("world distance")
 }
 
-/// The configured JOG-mode velocity limit of J0 \[rad/s\] — what a jog
-/// `speeds` fraction commands, and what the gate's lookahead projects.
-fn j0_jog_velocity() -> f64 {
+/// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
+/// loads — where a keep-out has to go to sit on the swept path.
+fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
+    // One model per thread: a status-rate sampler cannot afford a URDF
+    // load per frame.
+    thread_local! {
+        static KIN: std::cell::RefCell<Option<par6_kin::Kin>> =
+            const { std::cell::RefCell::new(None) };
+    }
+    KIN.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        let kin = slot.get_or_insert_with(|| {
+            par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
+                .expect("kin model")
+        });
+        let mut q = [0.0; NUM_JOINTS];
+        for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+            *out = deg.to_radians();
+        }
+        let mut pose = [0.0; 16];
+        kin.fk(&q, &mut pose).expect("fk");
+        [pose[3], pose[7], pose[11]]
+    })
+}
+
+/// The J0 jog `speeds` fraction whose stopping projection covers
+/// `travel_rad` — the inverse of [`par6d::stream_stopping_travel`],
+/// found by bisection rather than by restating the gate's arithmetic
+/// here (a test that recomputes the projection cannot catch it being
+/// wrong).
+fn j0_speed_reaching(travel_rad: f64) -> f64 {
     let cfg = par6_config::RobotConfig::load(&shipped_config()).expect("PAR6 config");
-    cfg.joints[0]
-        .limits
-        .for_mode(par6_config::LimitMode::Jog)
-        .velocity_rad_s
+    let lim = cfg.joints[0].limits.for_mode(par6_config::LimitMode::Jog);
+    // The rig's period, not the shipped one: the projection is counted
+    // in ticks, so a helper that inverts it against a different tick
+    // rate asks for a speed whose lookahead lands somewhere else
+    // entirely.
+    let (v_max, accel, dt) = (lim.velocity_rad_s, lim.acceleration_rad_s2, TEST_TICK_DT_S);
+    let (mut lo, mut hi) = (0.0, v_max);
+    for _ in 0..60 {
+        let mid = 0.5 * (lo + hi);
+        if par6d::stream_stopping_travel(mid, accel, dt) < travel_rad {
+            lo = mid;
+        } else {
+            hi = mid;
+        }
+    }
+    (0.5 * (lo + hi) / v_max).clamp(0.01, 1.0)
 }
 
 /// Streaming motion is gated by the same collision world as planned
@@ -1150,7 +1187,6 @@ fn streaming_is_gated_by_the_collision_world() {
     // The J0 arc the TCP travels on: converts arc metres to J0 radians.
     let radius_m = (mid_m[0].powi(2) + mid_m[1].powi(2)).sqrt();
     let deg_per_m = 1.0_f64.to_degrees() / radius_m;
-    let v0 = j0_jog_velocity();
 
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout.clone()]));
@@ -1221,7 +1257,7 @@ fn streaming_is_gated_by_the_collision_world() {
     // tolerance — the centre is where the measured drop is unambiguous.
     // The refusal still cannot be excused as "the far side is shallower
     // again": the centre is the depth extremum, not past it.
-    let pct = (0.8 * (KEEPOUT_M / 2.0) / radius_m / (v0 * 0.15)).clamp(0.01, 1.0);
+    let pct = j0_speed_reaching(0.8 * (KEEPOUT_M / 2.0) / radius_m);
     let err = c.expect_error(&jog_j(0, pct, 5.0));
     assert_eq!(
         err.code,
@@ -1500,23 +1536,30 @@ fn tcp_offset_retargets_the_cartesian_surface_over_protocol_v2() {
         flange.angles,
         offset.angles
     );
-    // The plant can drift between broadcasts. Each revolute joint's
-    // observed rotation bounds its contribution to any rotation-matrix
-    // element, so an offset may not add rotation beyond that physical motion.
-    let rotation_bound: f64 = offset
+    // A pure translation in the tool frame: the orientation block is
+    // untouched, so only the point the runtime resolves at has changed.
+    //
+    // The bound is the arm's OWN motion between the two broadcasts, not a
+    // constant. These are two STATUS frames from a live plant holding a
+    // target, and a rotation-matrix element drifts with the joints under
+    // it — the check right above admits 0.1 deg of exactly that, so a
+    // fixed 1e-6 here asserted something its sibling already allowed to be
+    // false, and did until the plant became a contact simulation. A tool
+    // rotation is orders of magnitude past this; drift cannot be.
+    let arm_moved_rad: f64 = offset
         .angles
         .iter()
-        .zip(&flange.angles)
-        .map(|(after, before)| (after - before).abs().to_radians())
-        .sum::<f64>()
-        + 1e-6;
+        .zip(flange.angles.iter())
+        .map(|(a, b)| (a - b).abs().to_radians())
+        .sum();
+    let tol = arm_moved_rad + 1e-6;
     for k in [0, 1, 2, 4, 5, 6, 8, 9, 10] {
+        let drift = (offset.pose[k] - flange.pose[k]).abs();
         assert!(
-            (offset.pose[k] - flange.pose[k]).abs() < rotation_bound,
-            "the offset rotated the reported pose at element {k} beyond joint motion: \
-             {} -> {}, bound {rotation_bound}",
-            flange.pose[k],
-            offset.pose[k],
+            drift < tol,
+            "the offset rotated the reported pose at element {k}: {drift:.3e}, \
+             past the {tol:.3e} the arm's own {:.4} deg of motion allows",
+            arm_moved_rad.to_degrees()
         );
     }
     let readback = tcp_offset_readback(&mut c);
@@ -1719,13 +1762,6 @@ fn cartesian_enablement_measures_the_real_workspace() {
 
 // ---- curved and blended moves ----------------------------------------------
 
-/// Start posture for the curved and blended moves: the same kind of
-/// well-conditioned pose as [`CART_START_DEG`], chosen (by the same
-/// soft-limit-box sweep) for room around it — 120 mm of straight-line
-/// travel is IK-feasible in every axis direction and along the diagonals
-/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
-/// soft window.
-const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
 /// Duration of the spline move \[s\]. Slower than [`MOVE_S`] because the
 /// sim's tracking lag is proportional to speed AND to path curvature,
 /// and a wave has far more of the second than a straight line does.
@@ -1846,356 +1882,6 @@ fn corner_and_mean_speed(path: &[Status], corner: [f64; 3], radius_mm: f64) -> (
         .map(|(_, v)| *v)
         .fold(f64::INFINITY, f64::min);
     (at_corner, mean)
-}
-
-/// Closest the measured TCP path came to `p` \[mm\], measured against the
-/// path (its frame-to-frame segments), not just the sampled points.
-fn path_misses(path: &[[f64; 3]], p: [f64; 3]) -> f64 {
-    path.windows(2)
-        .map(|w| distance_to_segment(p, w[0], w[1]))
-        .fold(f64::INFINITY, f64::min)
-}
-
-/// Arc, spline and process moves trace the geometry they name.
-///
-/// All three were `MOTN_SETUP_FAILED "arc/spline/process moves are not
-/// implemented yet"` before this landed, so completion alone would be a
-/// result — but completion is not the claim. The claims are geometric
-/// and are measured off the STATUS broadcast:
-///
-/// - `move_c` puts every point of the path on the circle through
-///   start / via / end, in that circle's plane, and passes through the
-///   via point — while bowing far off the straight chord a `move_l`
-///   would have taken;
-/// - `move_s` passes through every waypoint it was given, and curves
-///   between them (a polyline through the same waypoints would not);
-/// - `move_p` rounds its interior corner instead of stopping in it: the
-///   path stays inside the auto-blend zone and the TCP is still moving
-///   when it goes through.
-#[test]
-fn curved_moves_trace_their_geometry() {
-    let rig = boot_tagged("curved");
-    let mut c = Client::new(rig.addr());
-    rig.wait_status("link_ok", |s| s.link_ok == 1);
-    c.ok(&Command::Reset);
-
-    // --- move_c: a half circle of radius R in the world XZ plane,
-    // from the start pose, up over the top, and down to +2R in x.
-    const R: f64 = 60.0;
-    let s = curve_start(&rig, &mut c);
-    let start = tcp_mm(&s);
-    let center = [start[0] + R, start[1], start[2]];
-    let via = [center[0], center[1], center[2] - R];
-    let end = [center[0] + R, center[1], center[2]];
-    let i = c.ok_index(&Command::MoveC(MoveC {
-        key: 4001,
-        via: wire_pose_at(&s.pose, via),
-        end: wire_pose_at(&s.pose, end),
-        frame: Frame::Wrf,
-        duration: Some(MOVE_S),
-        speed: None,
-        accel: None,
-        blend_radius: None,
-        rel: false,
-    }));
-    let arc: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
-        .iter()
-        .map(tcp_mm)
-        .collect();
-    let (ok, detail) = c.wait_complete(i);
-    assert!(ok, "move_c must complete ok, got {detail:?}");
-
-    let moving: Vec<[f64; 3]> = arc
-        .iter()
-        .copied()
-        .filter(|p| distance(*p, start) > 3.0)
-        .collect();
-    assert!(
-        moving.len() > 50,
-        "expected a sampled arc, got {} moving samples",
-        moving.len()
-    );
-    let radial = moving
-        .iter()
-        .map(|p| (distance(*p, center) - R).abs())
-        .fold(0.0f64, f64::max);
-    let out_of_plane = moving
-        .iter()
-        .map(|p| (p[1] - center[1]).abs())
-        .fold(0.0f64, f64::max);
-    assert!(
-        radial < 8.0,
-        "move_c left its circle by {radial:.2} mm (radius {R} mm about {center:?})"
-    );
-    assert!(
-        out_of_plane < 8.0,
-        "move_c left the arc plane by {out_of_plane:.2} mm"
-    );
-    let via_miss = path_misses(&arc, via);
-    assert!(
-        via_miss < 8.0,
-        "move_c missed its via point by {via_miss:.2} mm"
-    );
-    let chord_dev = moving
-        .iter()
-        .map(|p| distance_to_segment(*p, start, end))
-        .fold(0.0f64, f64::max);
-    assert!(
-        chord_dev > R / 2.0,
-        "move_c hugged the straight chord ({chord_dev:.2} mm off it): that is a move_l, not an arc"
-    );
-    // Where the arm comes to rest, within the rig's own steady-state
-    // tracking error — the same ~10 mm the joint-space cartesian move
-    // above is held to.
-    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_c")), end);
-    assert!(
-        end_miss < 15.0,
-        "move_c ended {end_miss:.1} mm off its end pose"
-    );
-
-    // --- the same half circle as DELTAS: rel = true resolves via/end
-    // against the pose the move starts at, and the rel arc must land
-    // where its absolute twin did. (Treated as absolute, these deltas
-    // are millimetres from the world origin — far outside the arm.)
-    let s = curve_start(&rig, &mut c);
-    let start = tcp_mm(&s);
-    let rel_end = [start[0] + 2.0 * R, start[1], start[2]];
-    let i = c.ok_index(&Command::MoveC(MoveC {
-        key: 4005,
-        via: [R, 0.0, -R, 0.0, 0.0, 0.0],
-        end: [2.0 * R, 0.0, 0.0, 0.0, 0.0, 0.0],
-        frame: Frame::Wrf,
-        duration: Some(MOVE_S),
-        speed: None,
-        accel: None,
-        blend_radius: None,
-        rel: true,
-    }));
-    rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
-    let (ok, detail) = c.wait_complete(i);
-    assert!(ok, "the rel move_c must complete ok, got {detail:?}");
-    let rel_miss = distance(
-        tcp_mm(&settled_tcp(&rig, "settled after rel move_c")),
-        rel_end,
-    );
-    assert!(
-        rel_miss < 15.0,
-        "the rel arc ended {rel_miss:.1} mm from where its absolute twin lands"
-    );
-
-    // --- move_s: a wave through four waypoints.
-    let s = curve_start(&rig, &mut c);
-    let start = tcp_mm(&s);
-    let waypoints: Vec<[f64; 3]> = [[45.0, 0.0, 45.0], [90.0, 0.0, -45.0], [135.0, 0.0, 30.0]]
-        .iter()
-        .map(|d| [start[0] + d[0], start[1] + d[1], start[2] + d[2]])
-        .collect();
-    let i = c.ok_index(&Command::MoveS(MoveS {
-        key: 4002,
-        waypoints: waypoints
-            .iter()
-            .map(|p| wire_pose_at(&s.pose, *p))
-            .collect(),
-        frame: Frame::Wrf,
-        duration: Some(SPLINE_S),
-        speed: None,
-        accel: None,
-        rel: false,
-    }));
-    let spline: Vec<[f64; 3]> = rig
-        .collect_status(Duration::from_secs_f64(SPLINE_S + 1.0))
-        .iter()
-        .map(tcp_mm)
-        .collect();
-    let (ok, detail) = c.wait_complete(i);
-    assert!(ok, "move_s must complete ok, got {detail:?}");
-    // The spline geometry itself passes within 0.1 mm of every
-    // waypoint (`par6-motion`'s own tests measure that); what is
-    // measured here is the arm ON it, so the bound is the sim's
-    // tracking lag at a curvature peak. It is meaningful because the
-    // straight line joining the same endpoints misses these waypoints
-    // by more than twice as much — asserted right below.
-    let last = *waypoints.last().expect("waypoints");
-    for (k, w) in waypoints.iter().enumerate() {
-        let miss = path_misses(&spline, *w);
-        assert!(
-            miss < 12.0,
-            "move_s missed waypoint {k} ({w:?}) by {miss:.2} mm"
-        );
-        // The bound above is only worth something because the straight
-        // route between the same endpoints comes nowhere near these
-        // waypoints.
-        if k + 1 < waypoints.len() {
-            let straight = distance_to_segment(*w, start, last);
-            assert!(
-                straight > 25.0,
-                "waypoint {k} sits {straight:.1} mm off the straight route: \
-                 passing near it proves nothing"
-            );
-        }
-    }
-    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_s")), last);
-    assert!(
-        end_miss < 15.0,
-        "move_s ended {end_miss:.1} mm off its last waypoint"
-    );
-    // A spline is not a polyline: between the second and third waypoints
-    // it leaves the chord that joins them.
-    let bow = spline
-        .iter()
-        .filter(|p| {
-            let t = progress_along(**p, waypoints[0], waypoints[1]);
-            (0.1..0.9).contains(&t)
-        })
-        .map(|p| distance_to_segment(*p, waypoints[0], waypoints[1]))
-        .fold(0.0f64, f64::max);
-    assert!(
-        bow > 3.0,
-        "move_s ran straight between its waypoints ({bow:.2} mm of bow)"
-    );
-
-    // --- move_p: a right-angle corner, auto-blended.
-    let s = curve_start(&rig, &mut c);
-    let start = tcp_mm(&s);
-    let corner = [start[0] + 100.0, start[1], start[2]];
-    let finish = [corner[0], corner[1], corner[2] - 100.0];
-    let i = c.ok_index(&Command::MoveP(MoveP {
-        key: 4003,
-        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
-        frame: Frame::Wrf,
-        duration: Some(MOVE_S),
-        speed: None,
-        accel: None,
-        rel: false,
-    }));
-    let process = rig.collect_status(Duration::from_secs_f64(MOVE_S + 1.0));
-    let (ok, detail) = c.wait_complete(i);
-    assert!(ok, "move_p must complete ok, got {detail:?}");
-    let points: Vec<[f64; 3]> = process.iter().map(tcp_mm).collect();
-    // 25 mm of auto-blend on 100 mm segments, so the corner is cut by
-    // something under that and by more than the tracking error.
-    let corner_miss = path_misses(&points, corner);
-    assert!(
-        (2.0..25.0).contains(&corner_miss),
-        "move_p's corner was not rounded into its blend zone: closest approach {corner_miss:.2} mm"
-    );
-    let (at_corner, mean) = corner_and_mean_speed(&process, corner, 30.0);
-    assert!(
-        at_corner > 0.25 * mean,
-        "move_p slowed to {at_corner:.2} mm/s at the corner against a mean of {mean:.2} mm/s: \
-         a blend that stops is not a blend"
-    );
-
-    // The promise the command is named for: the TCP holds ONE speed
-    // along the path. Sampled across the cruise, away from the ramps at
-    // either end, the spread has to stay small — a time-optimal timing
-    // runs fast on the straights and drops through the corner, which is
-    // the behaviour this replaced. Measured here: 1.18 spread with the
-    // arc-length timing against 2.76 with the time-optimal one.
-    //
-    // The window is four times the corner test's, because a five-frame
-    // one carries a ±20% read error of its own: the broadcast repeats a
-    // snapshot whenever the status rate and the tick rate beat against
-    // each other, and a repeat at a window edge reads as a slow patch
-    // that is not in the motion. ~0.4 s averages that out while still
-    // resolving the corner, which takes about two seconds to cross at
-    // this speed — the time-optimal dip is fully visible at this width.
-    const CRUISE_WINDOW: usize = 21;
-    let cruise: Vec<f64> = {
-        let all = tcp_speeds_over(&process, CRUISE_WINDOW);
-        let moving: Vec<f64> = all.iter().map(|(_, v)| *v).filter(|v| *v > 0.5).collect();
-        let skip = moving.len() / 5; // drop the accelerate/decelerate ends
-        moving[skip..moving.len().saturating_sub(skip).max(skip + 1)].to_vec()
-    };
-    assert!(
-        cruise.len() > 100,
-        "expected a sampled cruise, got {} windows",
-        cruise.len()
-    );
-    let fastest = cruise.iter().copied().fold(0.0f64, f64::max);
-    let slowest = cruise.iter().copied().fold(f64::INFINITY, f64::min);
-    // The COMMANDED speed is what the planner holds flat; this reads the
-    // MEASURED one, which carries the servo's tracking ripple on top —
-    // the plant integrates contacts and drivetrain friction rather than
-    // following the command exactly. The bound is on the shape of the
-    // profile (no ramp, no dip mid-cruise), not on servo noise: the
-    // ripple alone measures about 1.35 here and reaches 1.47 on a loaded
-    // box, while a profile that ramped or held a different speed across
-    // the cruise would be far past this.
-    assert!(
-        fastest <= slowest * 1.6,
-        "move_p's TCP speed swung from {slowest:.1} to {fastest:.1} mm/s across its cruise: \
-         a process move that changes speed mid-path is not holding one"
-    );
-    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_p")), finish);
-    assert!(
-        end_miss < 15.0,
-        "move_p ended {end_miss:.1} mm off its last waypoint"
-    );
-
-    // --- the same corner asked for at FULL speed, which is the case
-    // the timing has to price rather than assume away. Free to run as
-    // fast as the joints allow ALONG the path, it would take the corner
-    // far faster than the joints can turn through it — and the stream
-    // it emits is checked against the joint acceleration limits before
-    // anything is queued. So the two ways to fail here are a refusal
-    // and a queued over-limit stream, and the move has to come back at
-    // a speed it can actually turn at instead.
-    let s = curve_start(&rig, &mut c);
-    let start = tcp_mm(&s);
-    let corner = [start[0] + 100.0, start[1], start[2]];
-    let finish = [corner[0], corner[1], corner[2] - 100.0];
-    let i = c.ok_index(&Command::MoveP(MoveP {
-        key: 4004,
-        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
-        frame: Frame::Wrf,
-        duration: None,
-        speed: Some(1.0),
-        accel: None,
-        rel: false,
-    }));
-    let fast = rig.collect_status(Duration::from_secs_f64(MOVE_S));
-    let (ok, detail) = c.wait_complete(i);
-    assert!(
-        ok,
-        "a full-speed move_p must run at a speed it can turn at, not be refused: {detail:?}"
-    );
-    // Travel time off the broadcast's own clock: first frame away from
-    // the start to last frame short of the finish.
-    let left = fast
-        .iter()
-        .position(|st| distance(tcp_mm(st), start) > 3.0)
-        .expect("the arm has to leave the start pose");
-    let arrived = fast
-        .iter()
-        .rposition(|st| distance(tcp_mm(st), finish) > 3.0)
-        .expect("the arm has to approach the finish pose");
-    let took = fast[arrived]
-        .mono_time_ns
-        .saturating_sub(fast[left].mono_time_ns) as f64
-        * 1e-9;
-    assert!(
-        took < 0.5 * MOVE_S,
-        "the full-speed move crossed the corner in {took:.1} s against the {MOVE_S:.0} s the \
-         parameterised one took: pricing the corner must slow the move, not stop it"
-    );
-    let fast_points: Vec<[f64; 3]> = fast.iter().map(tcp_mm).collect();
-    let corner_miss = path_misses(&fast_points, corner);
-    assert!(
-        (2.0..25.0).contains(&corner_miss),
-        "the fast move_p left its blend zone: closest approach {corner_miss:.2} mm"
-    );
-    let end_miss = distance(
-        tcp_mm(&settled_tcp(&rig, "settled after the fast move_p")),
-        finish,
-    );
-    assert!(
-        end_miss < 15.0,
-        "the fast move_p ended {end_miss:.1} mm off its last waypoint"
-    );
-
-    rig.shutdown();
 }
 
 /// A TCP-offset change can never be folded into a blend chain.
@@ -2359,7 +2045,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     let (first, corner, finish) = leg(&s, 5001, None);
     let i1 = c.ok_index(&first);
     let i2 = c.ok_index(&second(&s, 5002, finish));
-    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let sharp = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(
         ok,
@@ -2394,7 +2080,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     let indices = c.ok_indices(&[first.clone(), second(&s, 5004, finish)]);
     let (i1, i2) = (indices[0], indices[1]);
     let send_gap = sent_first.elapsed();
-    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let blended = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(ok, "the blended first leg must complete ok, got {detail:?}");
     let (ok, detail) = c.wait_complete(i2);
@@ -2527,7 +2213,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6001, corner_deg, None));
     let i2 = c.ok_index(&move_j(6002, finish_deg, None));
-    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let sharp = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
@@ -2549,7 +2235,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6003, corner_deg, Some(BLEND_MM)));
     let i2 = c.ok_index(&move_j(6004, finish_deg, None));
-    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let blended = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
@@ -2727,20 +2413,32 @@ fn ik_solutions_are_wrapped_into_their_soft_window() {
     rig.shutdown();
 }
 
+/// A stream driven into a keep-out stays OUT of it and LANDS ON THE
+/// STANDOFF — the same distance whatever speed it arrived at.
+///
 /// A position stream carries a target, not a rate, and the arm cannot
 /// stop dead. Every datagram of a stepping stream is admissible on its
-/// own target, so the arm builds speed toward the keep-out; when a target
-/// finally lands inside it, the braking distance carries the TCP on. A
-/// single held target never shows this — the limiter decelerates to stop
-/// AT it — so the stream here advances the way a UI's does.
+/// own target, so the arm builds speed toward the keep-out; when a
+/// target finally lands inside it, the braking distance carries the TCP
+/// on. A single held target never shows this — the limiter decelerates
+/// to stop AT it — so the stream here advances the way a UI's does.
 ///
-/// The bound is the keep-out itself, sampled through the coast after the
-/// refusal: whatever speed the stream built, the TCP must never end up
-/// inside the box. A reference run cannot serve as the bound — a slow
-/// approach stops where its own lag left it rather than where the
-/// geometry is, so comparing the two compares two lags.
+/// Refusing says only that the arm must not finish where it was asked
+/// to. Left at that, where it ACTUALLY finishes is whatever the
+/// executor's tracking lag and the datagram timing happened to leave:
+/// measured on this rig at anywhere from 2.7 mm to 24 mm from a keep-out
+/// whose standoff is 5 mm, varying run to run at one speed. So the
+/// refusal is answered instead — the arm is brought to rest and then
+/// placed on the standoff — and this asserts the result of that.
+///
+/// Both bounds bite. Below the clearance the arm has entered ground it
+/// was configured to keep out of. Above it the gate is imposing a
+/// standoff nobody asked for, and that surplus is workspace an arm
+/// cannot use next to its own fixtures. Two speeds an order apart,
+/// because a landing that depends on approach speed is a lag, not a
+/// standoff.
 #[test]
-fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
+fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
     let rig = boot_tagged("servogate");
     let mut c = Client::new(rig.addr());
     rig.wait_status("link_ok", |s| s.link_ok == 1);
@@ -2753,25 +2451,38 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
     let keepout = keepout_at("keepout", [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3]);
     c.ok(&set_shapes(vec![keepout]));
 
-    let start_deg = with_j0(mid_deg, -2.0 * KEEPOUT_M * deg_per_m);
-
     /// Stream the target toward the box `step_mm` at a time until the
     /// gate latches, then report how close the TCP ever got to the box
     /// centre \[m\].
+    /// Each run picks its own run-up: at 1 mm a datagram the fast run's
+    /// full approach is thousands of datagrams of nothing happening, and
+    /// the gate's answer does not depend on how much clear space came
+    /// before it.
     struct Scene {
-        start_deg: [f64; NUM_JOINTS],
         mid_deg: [f64; NUM_JOINTS],
-        mid_m: [f64; 3],
         deg_per_m: f64,
     }
 
-    fn approach(rig: &Rig, c: &mut Client, scene: &Scene, step_mm: f64, speed: Option<f64>) -> f64 {
-        let Scene {
-            start_deg,
-            mid_deg,
-            mid_m,
-            deg_per_m,
-        } = *scene;
+    fn approach(
+        rig: &Rig,
+        c: &mut Client,
+        scene: &Scene,
+        col: &mut par6_kin::Collision,
+        step_mm: f64,
+        speed: Option<f64>,
+        run_up_m: f64,
+    ) -> (f64, f64) {
+        let Scene { mid_deg, deg_per_m } = *scene;
+        let start_deg = with_j0(mid_deg, -run_up_m * deg_per_m);
+        // The gripper reaches ~96 mm past the TCP, so a run-up measured
+        // from the box CENTRE can start the jaw already inside it — and
+        // an approach that begins in the keep-out measures nothing about
+        // approaching one.
+        assert!(
+            world_gap_m(col, start_deg) > par6d::COLLISION_CLEARANCE_M,
+            "the run-up starts {:.1} mm from the keep-out, inside the standoff",
+            world_gap_m(col, start_deg) * 1e3
+        );
         enable_and_teleport(rig, c, start_deg);
         rig.drain_status();
         // `collision_active` is LATCHED: it describes the configuration
@@ -2786,12 +2497,15 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
         let deadline = Instant::now() + BUDGET;
         let mut gated = false;
         let mut closest = f64::INFINITY;
-        let sample = |s: &Status, closest: &mut f64| {
-            let tcp = tcp_at_m(s.angles);
-            let d = ((tcp[0] - mid_m[0]).powi(2) + (tcp[1] - mid_m[1]).powi(2)).sqrt();
-            *closest = closest.min(d);
-        };
-        while Instant::now() < deadline && !gated {
+        let mut last_seen = f64::NAN;
+        // Kept up until the target reaches the box CENTRE, not stopped at
+        // the first refusal. An operator dragging a jog does not let go
+        // the instant a warning appears — they keep pulling, and the
+        // question this test asks is where the arm ends up when they do.
+        // Stopping at the first refusal instead measures the last place
+        // the client happened to ask for, which on a fast host is well
+        // outside the keep-out and says nothing about the standoff.
+        while Instant::now() < deadline && target[0] < mid_deg[0] {
             target[0] = (target[0] + step_deg).min(mid_deg[0]);
             c.send(&Command::ServoJ(par6_proto::command::ServoJ {
                 angles: target,
@@ -2801,64 +2515,507 @@ fn a_stepping_servo_stream_never_coasts_into_the_keep_out() {
             let window = Instant::now() + Duration::from_millis(50);
             while Instant::now() < window {
                 if let Some(s) = rig.recv_status() {
-                    sample(&s, &mut closest);
-                    if s.collision_active {
-                        gated = true;
-                        break;
-                    }
+                    closest = closest.min(world_gap_m(col, s.angles));
+                    last_seen = s.angles[0];
+                    gated |= s.collision_active;
                 }
             }
         }
-        assert!(gated, "a stream driven into a keep-out was never gated");
-        // The coast after the refusal is the whole point, so keep
-        // sampling until the arm is at rest.
-        let settle = Instant::now() + Duration::from_secs(3);
-        while Instant::now() < settle {
-            if let Some(s) = rig.recv_status() {
-                sample(&s, &mut closest);
-                if s.speeds.iter().all(|v| v.abs() < 0.05) {
-                    break;
-                }
+        assert!(
+            gated,
+            "a stream driven into a keep-out was never gated: target reached \
+             j0={:.3} deg of {:.3}, arm {:.3} deg, closest {:.2} mm",
+            target[0],
+            mid_deg[0],
+            last_seen,
+            closest * 1e3
+        );
+        // The travel after the refusal is the whole point, so keep
+        // sampling until the arm has actually finished moving. A single
+        // slow frame is not rest: the executor re-plans onto the
+        // standoff and its velocity passes through zero on the way, so
+        // rest is only believable once the arm has held still across
+        // several consecutive frames.
+        // A refusal is answered in two steps — the arm is brought to
+        // rest, then placed on the standoff — so a pause is not the end
+        // of the motion. Rest is only believable once the arm has held
+        // still across a window WIDER than that pause.
+        let settle = Instant::now() + Duration::from_secs(20);
+        // Wider than the whole refusal sequence's travel budget, so a
+        // pause between braking and placement cannot be read as the end
+        // of the motion.
+        let quiet = Duration::from_secs(4);
+        let mut rest = f64::NAN;
+        let mut last = f64::NAN;
+        let mut moved_at = Instant::now();
+        while Instant::now() < settle && moved_at.elapsed() < quiet {
+            let Some(s) = rig.recv_status() else { continue };
+            let gap = world_gap_m(col, s.angles);
+            closest = closest.min(gap);
+            rest = gap;
+            if s.speeds.iter().any(|v| v.abs() >= 0.005) || (s.angles[0] - last).abs() >= 1e-4 {
+                moved_at = Instant::now();
             }
+            last = s.angles[0];
         }
-        closest
+        assert!(
+            moved_at.elapsed() >= quiet,
+            "the arm never came to rest after the refusal"
+        );
+        (closest, rest)
     }
 
-    let scene = Scene {
-        start_deg,
-        mid_deg,
-        mid_m,
-        deg_per_m,
-    };
-    let started_at = 2.0 * KEEPOUT_M;
-    let streamed = approach(&rig, &mut c, &scene, 5.0, None);
+    let scene = Scene { mid_deg, deg_per_m };
+    let mut col = keepout_world(mid_m);
+    let (fast_closest, streamed) =
+        approach(&rig, &mut c, &scene, &mut col, 5.0, None, 2.0 * KEEPOUT_M);
     println!(
-        "closest approach: {:.1} mm from the box centre (started {:.1} mm out)",
+        "fast stream: rest {:.1} mm, closest {:.1} mm",
         streamed * 1e3,
-        started_at * 1e3
+        fast_closest * 1e3
     );
-    // Half the box's side: inside this the TCP is in the keep-out, which
-    // is the one thing the gate exists to prevent.
-    let inside = KEEPOUT_M / 2.0;
-    assert!(
-        streamed > inside,
-        "the stream coasted {:.1} mm INTO the keep-out ({:.1} mm from the \
-         centre of a {:.0} mm box): the gate admitted targets the arm \
-         could not stop short of",
-        (inside - streamed) * 1e3,
-        streamed * 1e3,
-        KEEPOUT_M * 1e3
+    // The same rig, crawling: slow enough that its stopping distance is
+    // nearly nothing, so where it is refused is where the geometry alone
+    // forbids the next step.
+    //
+    // On a rig of its own, because an approach ends with the arm held
+    // inside the gate's refusal and a teleport back out of that never
+    // takes — a second run in the same daemon cannot be positioned to
+    // start. The first rig has to go DOWN before the second comes up:
+    // `RT_SLOT` admits one daemon at a time, so two live rigs deadlock.
+    rig.shutdown();
+    let floor_rig = boot_tagged("servofloor");
+    let mut floor_c = Client::new(floor_rig.addr());
+    floor_rig.wait_status("link_ok", |s| s.link_ok == 1);
+    floor_c.ok(&Command::Reset);
+    floor_c.ok(&set_shapes(vec![keepout_at(
+        "keepout",
+        [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3],
+    )]));
+    let (crawl_closest, crawled) = approach(
+        &floor_rig,
+        &mut floor_c,
+        &scene,
+        &mut col,
+        1.0,
+        None,
+        2.0 * KEEPOUT_M,
     );
-    // And it must have actually approached: an arm refused before it
-    // moved would clear the bound above without testing anything.
-    assert!(
-        streamed < started_at - 0.02,
-        "the stream never approached the keep-out (closest {:.1} mm, \
-         started {:.1} mm out), so nothing about the coast was measured",
-        streamed * 1e3,
-        started_at * 1e3
+    floor_rig.shutdown();
+    println!(
+        "crawl: rest {:.1} mm, closest {:.1} mm",
+        crawled * 1e3,
+        crawl_closest * 1e3
     );
 
+    // THE REQUIREMENT: a motion driven into a keep-out lands on the
+    // clearance. Not "outside it somewhere" — on it. The clearance is
+    // the standoff the machine is configured to hold, so where the arm
+    // finishes is a property of the geometry, and approach speed must
+    // not change it.
+    //
+    // Both bounds bite. Below the clearance the arm has entered ground
+    // it was configured to keep out of. Above it the gate is imposing a
+    // standoff nobody asked for, and that surplus is workspace an arm
+    // cannot use next to its own fixtures.
+    let clearance = par6d::COLLISION_CLEARANCE_M;
+    let tol = 0.001;
+    // The keep-out itself, not just the resting place: whatever speed the
+    // stream built, the arm must never be inside the box on the way. The
+    // clearance is the budget for the coast, and it has to be a budget
+    // rather than an overdraft.
+    println!(
+        "closest approach: fast {:.1} mm, crawl {:.1} mm",
+        fast_closest * 1e3,
+        crawl_closest * 1e3
+    );
+    for (what, closest) in [("fast stream", fast_closest), ("crawl", crawl_closest)] {
+        assert!(
+            closest > 0.0,
+            "the {what} put the arm {:.1} mm INSIDE the keep-out on its way to rest",
+            -closest * 1e3
+        );
+    }
+    for (what, rest) in [("fast stream", streamed), ("crawl", crawled)] {
+        assert!(
+            (rest - clearance).abs() <= tol,
+            "the {what} came to rest {:.1} mm from the keep-out; it must \
+             land on the {:.1} mm clearance (within {:.1} mm). {}",
+            rest * 1e3,
+            clearance * 1e3,
+            tol * 1e3,
+            if rest < clearance {
+                "The gate stopped it too late and it entered the standoff."
+            } else {
+                "The gate stopped it early, costing usable workspace."
+            }
+        );
+    }
+}
+
+/// A servo target the client holds is a position the arm SETTLES on.
+///
+/// Every promise the streaming collision gate makes is a promise about
+/// where the arm ends up, and none of them can hold if a held setpoint
+/// is not a place the arm can rest. This is the floor under all of them,
+/// and it is asserted here rather than inside a gate test so a failure
+/// names the control loop instead of the keep-out.
+///
+/// The bound is the machine's own `[motion] settle_tolerance_rad` — what
+/// the config declares "arrived" means — read from the config the rig
+/// booted rather than restated here.
+///
+/// IGNORED: the simulator cannot answer this yet, and the requirement is
+/// real, so it is neither deleted nor weakened. Run it with
+/// `cargo test -- --ignored` when the drive model is fixed.
+///
+/// Against the vendor drive gains the sim does NOT hold: the joint
+/// limit-cycles at ~10 Hz with a 9.3 deg peak-to-peak swing that neither
+/// grows nor decays, at every tick rate, with the commanded position
+/// pinned on the target. Bisecting on the sim rig puts the stability edge
+/// between `kpp` 2.5 (8.1 deg spread) and 2.0 (0.18 deg); at 1.5 the hold
+/// settles to 0.012 deg.
+///
+/// That is NOT evidence the vendor mistuned J1, because the sim's drive
+/// model differs from the firmware
+/// (`Source-Robotics/STEPFOC-stepper-controller`) in two ways that act
+/// directly on stability margin:
+///
+/// - `constants.h` sets `LOOP_TIME 0.00016` — the cascade closes at
+///   6.25 kHz. `sim::driver::FW_LOOP_DT` assumes 1 ms, and the loop is
+///   evaluated once per physics substep, so the sim runs it ~6x slower
+///   and carries ~6x the phase lag.
+/// - `Position_mode()` feeds back `controller.Velocity_Filter`, a moving
+///   average of the measured velocity; the sim feeds back the raw value.
+///
+/// The one mechanism that WOULD have been ours is ruled out: the firmware
+/// clamps `V_errSum` to the current limit and has no anti-windup, exactly
+/// as the sim does, so the integrator behaviour is faithful.
+///
+/// Raising `FW_LOOP_DT` alone would make this worse and would wrongly
+/// convict the vendor: it models the destabilising half of a faster loop
+/// (6.25x the integral accumulation) without the stabilising half (less
+/// phase lag). The fix is to iterate the driver loop at 160 us between
+/// physics steps and filter the velocity feedback.
+#[test]
+#[ignore = "the sim's drive model runs the firmware cascade ~6x too slowly; \
+            see the doc comment and the sim-fidelity issue"]
+fn a_held_servo_target_settles() {
+    let tol_rad = par6_config::RobotConfig::load(&common::shipped_config())
+        .expect("shipped config")
+        .motion
+        .settle_tolerance_rad;
+    let rig = boot_tagged("servosettle");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    rig.drain_status();
+
+    let target = with_j0(SWEEP_START_DEG, 20.0);
+    let end = Instant::now() + Duration::from_secs(5);
+    let mut sent = Instant::now() - Duration::from_secs(1);
+    let mut trace: Vec<f64> = Vec::new();
+    while Instant::now() < end {
+        if sent.elapsed() >= Duration::from_millis(50) {
+            c.send(&Command::ServoJ(par6_proto::command::ServoJ {
+                angles: target,
+                speed: None,
+                accel: None,
+            }));
+            sent = Instant::now();
+        }
+        if let Some(s) = rig.recv_status() {
+            trace.push(s.angles[0]);
+        }
+    }
+    rig.shutdown();
+
+    // The last second of a five-second hold: by then the arm has had
+    // four seconds to cover twenty degrees.
+    assert!(trace.len() > 40, "no status stream to judge");
+    let tail = &trace[trace.len() - 30..];
+    let lo = tail.iter().cloned().fold(f64::INFINITY, f64::min);
+    let hi = tail.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let tol_deg = tol_rad.to_degrees();
+    assert!(
+        hi - lo <= tol_deg,
+        "a held servo target left the joint swinging {:.3} deg peak to peak \
+         (settle tolerance {tol_deg:.3} deg): the arm is not resting on it",
+        hi - lo
+    );
+    assert!(
+        (tail[tail.len() - 1] - target[0]).abs() <= tol_deg,
+        "a held servo target left the joint {:.3} deg away from it \
+         (settle tolerance {tol_deg:.3} deg)",
+        tail[tail.len() - 1] - target[0]
+    );
+}
+
+// ---- curved moves: the arm ON the plan ------------------------------------
+// The GEOMETRY these moves name is asserted on the planner's own output in
+// `curved_geometry.rs`, to a tenth of the tolerance a live measurement can
+// carry and in milliseconds. What is left here is the half that needs an
+// arm: that the runtime drives the plan it made, end to end over the wire,
+// and the TCP arrives where the plan said. One motion per family.
+
+/// The bound on a live path measurement: the simulated arm's steady-state
+/// tracking lag at a curvature peak, not the planner's error.
+const TRACK_TOL_MM: f64 = 12.0;
+
+/// `move_c` drives the arm around the circle it planned.
+#[test]
+fn move_c_tracks_its_planned_arc() {
+    const R: f64 = ARC_RADIUS_MM;
+    let rig = boot_tagged("curved-arc");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let center = [start[0] + R, start[1], start[2]];
+    let via = [center[0], center[1], center[2] - R];
+    let end = [center[0] + R, center[1], center[2]];
+    let i = c.ok_index(&Command::MoveC(MoveC {
+        key: 4001,
+        via: wire_pose_at(&s.pose, via),
+        end: wire_pose_at(&s.pose, end),
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    let arc: Vec<[f64; 3]> = rig
+        .collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0))
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_c must complete ok, got {detail:?}");
+
+    let moving: Vec<[f64; 3]> = arc
+        .iter()
+        .copied()
+        .filter(|p| distance(*p, start) > 3.0)
+        .collect();
+    assert!(
+        moving.len() > 50,
+        "expected a sampled arc, got {} moving samples",
+        moving.len()
+    );
+    let radial = moving
+        .iter()
+        .map(|p| (distance(*p, center) - R).abs())
+        .fold(0.0f64, f64::max);
+    assert!(
+        radial < TRACK_TOL_MM,
+        "the arm left the planned circle by {radial:.2} mm (radius {R} mm about {center:?})"
+    );
+    let via_miss = path_misses(&arc, via);
+    assert!(
+        via_miss < TRACK_TOL_MM,
+        "the arm passed {via_miss:.2} mm from the planned via point"
+    );
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_c")), end);
+    assert!(
+        end_miss < 15.0,
+        "move_c ended {end_miss:.1} mm off its end pose"
+    );
+    rig.shutdown();
+}
+
+/// `move_s` drives the arm through the waypoints it planned.
+#[test]
+fn move_s_tracks_its_planned_spline() {
+    let rig = boot_tagged("curved-spline");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let waypoints = spline_waypoints(start);
+    let i = c.ok_index(&Command::MoveS(MoveS {
+        key: 4002,
+        waypoints: waypoints
+            .iter()
+            .map(|p| wire_pose_at(&s.pose, *p))
+            .collect(),
+        frame: Frame::Wrf,
+        duration: Some(SPLINE_S),
+        speed: None,
+        accel: None,
+        rel: false,
+    }));
+    let spline: Vec<[f64; 3]> = rig
+        .collect_through(i, Duration::from_secs_f64(SPLINE_S + 1.0))
+        .iter()
+        .map(tcp_mm)
+        .collect();
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_s must complete ok, got {detail:?}");
+
+    let last = *waypoints.last().expect("waypoints");
+    for (k, w) in waypoints.iter().enumerate() {
+        let miss = path_misses(&spline, *w);
+        assert!(
+            miss < TRACK_TOL_MM,
+            "the arm passed {miss:.2} mm from planned waypoint {k} ({w:?})"
+        );
+    }
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_s")), last);
+    assert!(
+        end_miss < 15.0,
+        "move_s ended {end_miss:.1} mm off its last waypoint"
+    );
+    rig.shutdown();
+}
+
+/// `move_p` drives the arm through its rounded corner without stopping in
+/// it — the one claim that needs a moving arm rather than a plan, since a
+/// blend that decelerates to zero still traces the right shape.
+#[test]
+fn move_p_tracks_its_corner_without_stopping_in_it() {
+    let rig = boot_tagged("curved-process");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+
+    let s = curve_start(&rig, &mut c);
+    let start = tcp_mm(&s);
+    let (corner, finish) = process_corner(start);
+    let i = c.ok_index(&Command::MoveP(MoveP {
+        key: 4003,
+        waypoints: vec![wire_pose_at(&s.pose, corner), wire_pose_at(&s.pose, finish)],
+        frame: Frame::Wrf,
+        duration: Some(MOVE_S),
+        speed: None,
+        accel: None,
+        rel: false,
+    }));
+    let process = rig.collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "move_p must complete ok, got {detail:?}");
+
+    let points: Vec<[f64; 3]> = process.iter().map(tcp_mm).collect();
+    let corner_miss = path_misses(&points, corner);
+    assert!(
+        (2.0..25.0).contains(&corner_miss),
+        "the arm did not track the planned rounding: closest approach to the corner \
+         {corner_miss:.2} mm"
+    );
+    let (at_corner, mean) = corner_and_mean_speed(&process, corner, 30.0);
+    assert!(
+        at_corner > 0.25 * mean,
+        "move_p slowed to {at_corner:.2} mm/s at the corner against a mean of {mean:.2} mm/s: \
+         a blend that stops is not a blend"
+    );
+    let end_miss = distance(tcp_mm(&settled_tcp(&rig, "settled after move_p")), finish);
+    assert!(
+        end_miss < 15.0,
+        "move_p ended {end_miss:.1} mm off its last waypoint"
+    );
+    rig.shutdown();
+}
+
+/// A world change during a move does not manufacture a failure: a
+/// keep-out that stays clear of the remaining path leaves the move to
+/// complete, with no verdict and no standing error.
+///
+/// The control for the mid-flight re-guard beside it: without this, a
+/// runtime that failed every running move on ANY world change would
+/// pass the keep-out-on-the-path test just the same.
+#[test]
+fn an_off_path_world_change_leaves_a_running_move_alone() {
+    let rig = boot_tagged("collision-offpath");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i = c.ok_index(&move_j(8101, end_deg, SWEEP_S));
+    rig.drain_status();
+    rig.wait_status("the sweep is under way", |s| {
+        s.executing_index == i as i64 && s.angles[0] > SWEEP_START_DEG[0] + 3.0
+    });
+    c.ok(&set_shapes(vec![keepout_at("far", [900.0, 900.0, 900.0])]));
+    let (program, _) = shapes_readback(&mut c);
+    assert_eq!(program.len(), 1, "the far box must be applied, not ignored");
+
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "a world change clear of the path must not stop the move, got {detail:?}"
+    );
+    let s = settled_tcp(&rig, "the arm at rest at the end of the sweep");
+    assert!(
+        angles_close(&s.angles, &end_deg, 1.0),
+        "the move must run to its target: {:?}",
+        s.angles
+    );
+    assert!(
+        !s.collision_active && s.collision_pairs.is_empty() && s.error.is_none(),
+        "an off-path change must leave no verdict behind: active={} pairs={:?} error={:?}",
+        s.collision_active,
+        s.collision_pairs,
+        s.error
+    );
+    rig.shutdown();
+}
+
+/// A move queued behind another is re-guarded when it ACTIVATES, not
+/// only when it was accepted.
+///
+/// The first move runs clear; the keep-out lands on the second's path
+/// while the first is still under way. Accepted against an empty world,
+/// the second must still be refused where it would have started, and
+/// the arm must stay where the first move left it.
+#[test]
+fn a_queued_move_is_re_guarded_against_the_world_when_it_activates() {
+    let rig = boot_tagged("collision-queued");
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let quarter_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 4.0);
+    let mid_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG / 2.0);
+    let end_deg = with_j0(SWEEP_START_DEG, SWEEP_DEG);
+
+    let mid_m = tcp_at_m(mid_deg);
+    let mid_tcp = [mid_m[0] * 1e3, mid_m[1] * 1e3, mid_m[2] * 1e3];
+
+    enable_and_teleport(&rig, &mut c, SWEEP_START_DEG);
+    let i1 = c.ok_index(&move_j(8201, quarter_deg, SWEEP_S / 2.0));
+    let i2 = c.ok_index(&move_j(8202, end_deg, SWEEP_S));
+    rig.drain_status();
+    rig.wait_status("the first move is under way", |s| {
+        s.executing_index == i1 as i64 && s.angles[0] > SWEEP_START_DEG[0] + 2.0
+    });
+    c.ok(&set_shapes(vec![keepout_at("late-wall", mid_tcp)]));
+
+    let (ok, detail) = c.wait_complete(i1);
+    assert!(ok, "the clear first move must complete, got {detail:?}");
+    let (ok, detail) = c.wait_complete(i2);
+    assert!(
+        !ok,
+        "the second move was accepted against an empty world and must be refused \
+         against the one it starts in"
+    );
+    let e = detail.expect("a failed COMPLETE carries the error");
+    assert_eq!(e.code, ErrorCode::SysSelfCollision as u16, "{e:?}");
+    assert!(
+        e.cause.contains("late-wall"),
+        "the refusal must name the keep-out that arrived late: {e:?}"
+    );
+    let s = settled_tcp(&rig, "the arm at rest");
+    assert!(
+        angles_close(&s.angles, &quarter_deg, 1.0),
+        "the arm must stay where the first move left it, not stream the second: {:?}",
+        s.angles
+    );
     rig.shutdown();
 }
 

@@ -11,6 +11,7 @@ turns those values into paths and waldoctl dataclasses.
 from __future__ import annotations
 
 import hashlib
+import tomllib
 from functools import cache
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -83,6 +84,28 @@ def _leaf_name(raw: object, what: str) -> str:
     if name in ("", ".", ".."):
         raise ValueError(f"config bundle {what} is not a file name: {raw!r}")
     return name
+
+
+#: Where the arm is when the config does not say.
+DEFAULT_CAN_INTERFACE = "can0"
+
+
+def can_interface(robot_toml: str | None) -> str:
+    """The SocketCAN interface ``[bus].interface`` names.
+
+    The engine's own loader does not carry this one out to Python, so it
+    is read here and only here: a control box with two interfaces is
+    exactly where a second reader with its own idea of the default
+    flashes the wrong arm.
+    """
+    try:
+        parsed = tomllib.loads(robot_toml) if robot_toml else {}
+    except (tomllib.TOMLDecodeError, TypeError):
+        return DEFAULT_CAN_INTERFACE
+    bus = parsed.get("bus")
+    if isinstance(bus, dict) and isinstance(bus.get("interface"), str):
+        return bus["interface"]
+    return DEFAULT_CAN_INTERFACE
 
 
 # ---------------------------------------------------------------------------

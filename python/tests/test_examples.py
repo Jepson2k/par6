@@ -20,25 +20,43 @@ pytestmark = [pytest.mark.examples, pytest.mark.slow, requires_par6d]
 
 EXAMPLES = sorted((Path(__file__).resolve().parents[2] / "examples").glob("*.py"))
 
+#: What each script must be seen to have done. Exit 0 is not enough: an
+#: example that reaches its point and one that returns early on a premise
+#: that did not hold both exit 0, and the second is the failure worth
+#: catching — `keepout_preview` used to report "preview and runtime
+#: DISAGREE" and still pass.
+EXPECTED = {
+    "sync_quickstart": ("ping:", "angles:", "pose:", "after move:"),
+    "async_quickstart": ("queued as command", "seq="),
+    "keepout_preview": ("preview refused:", "runtime refused:", "cleared:"),
+}
+
 
 def example_ids() -> list[str]:
     return [p.stem for p in EXAMPLES]
 
 
-def test_every_example_is_covered() -> None:
-    """A new example must not be able to arrive untested."""
-    assert EXAMPLES, "examples/ has no scripts — did the tree move?"
+def test_every_example_declares_what_it_must_print() -> None:
+    """A new example must not be able to arrive without an expectation.
+
+    Without this, adding `examples/foo.py` silently gets the weakest
+    possible assertion — that it exited 0.
+    """
+    assert {p.stem for p in EXAMPLES} == set(EXPECTED), (
+        f"examples/ holds {sorted(p.stem for p in EXAMPLES)} but EXPECTED "
+        f"covers {sorted(EXPECTED)}"
+    )
 
 
 @pytest.mark.timeout(400)
 @pytest.mark.parametrize("script", EXAMPLES, ids=example_ids())
-def test_example_runs(script: Path) -> None:
-    """The script must exit 0 and print something.
+def test_example_runs(script: Path, tmp_path: Path) -> None:
+    """The script must exit 0 having done what it advertises.
 
     Each example spawns its own `par6d --sim`, so the assertion is the one
     a reader cares about: copy this file, run it, and it works.
     """
-    env = daemon_env()
+    env = daemon_env(tmp_path / "shm")
     env["PATH"] = os.environ.get("PATH", "")
     binary = par6d_binary()
     assert binary is not None
@@ -56,4 +74,8 @@ def test_example_runs(script: Path) -> None:
         f"{script.name} exited {proc.returncode}\n"
         f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
     )
-    assert proc.stdout.strip(), f"{script.name} printed nothing"
+    missing = [m for m in EXPECTED[script.stem] if m not in proc.stdout]
+    assert not missing, (
+        f"{script.name} exited 0 without {missing}\n"
+        f"--- stdout ---\n{proc.stdout}\n--- stderr ---\n{proc.stderr}"
+    )

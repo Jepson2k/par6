@@ -348,8 +348,6 @@ mod tests {
         let j1 = &robot.joints[0];
         let f1 = torque_to_ma_factor(j1.gear_ratio, j1.gear_efficiency, j1.kt_nm_a, j1.dir);
         assert!(f1 > 0.0);
-        let trq = 0.8f64;
-        assert!((trq * f1 / f1 - trq).abs() < 1e-12);
     }
 
     #[test]

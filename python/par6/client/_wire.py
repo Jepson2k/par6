@@ -13,7 +13,7 @@ from waldoctl.tools import ToolState as WToolState
 from waldoctl.tools import ToolStatus
 
 from ..config import canonical_tool_key
-from ..protocol.constants import NUM_JOINTS, Frame
+from ..protocol import NUM_JOINTS, Frame
 
 AXIS_INDEX: dict[str, int] = {"X": 0, "Y": 1, "Z": 2, "RX": 3, "RY": 4, "RZ": 5}
 _FRAMES: dict[str, Frame] = {"WRF": Frame.WRF, "TRF": Frame.TRF}

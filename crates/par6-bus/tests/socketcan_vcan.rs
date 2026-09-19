@@ -15,8 +15,11 @@
 //! checkout without vcan stays green. Set `PAR6_REQUIRE_VCAN=1` to turn
 //! absence into a hard failure instead — the `socketcan (vcan)` CI job
 //! sets it after creating vcan0, so the job can never silently degrade
-//! to a no-op. Run with `--test-threads=1` when the interface exists:
-//! every test observes the same wire and asserts exact frame sequences.
+//! to a no-op.
+//!
+//! The tests share one interface and each asserts an exact frame sequence, so
+//! they take a lock for the duration of the body — see [`VCAN_BUS`]. Plain
+//! `cargo test` is correct; no `--test-threads` flag is needed.
 //!
 //! There is no simulated driver here on purpose: a fake that answered
 //! frames would be re-implementing the protocol. RX is written onto the
@@ -78,6 +81,50 @@ fn allocs() -> u64 {
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
 
+/// Serialises the tests in this binary.
+///
+/// A CAN interface is a broadcast bus: every socket bound to it receives
+/// every frame written to it, which is the whole point of CAN and what vcan
+/// faithfully emulates. These tests each open an observer socket on the same
+/// interface and assert an *exact* frame sequence, so two running at once
+/// each legitimately receive the other's traffic and both assertions fail on
+/// frames neither sent.
+///
+/// Holding this for the body of each test is what lets plain `cargo test`
+/// pass. It costs the ~2 s these six take end to end; every other test binary
+/// in the workspace still runs in parallel with them and with each other.
+///
+/// The alternative — one vcan interface per test — is real isolation rather
+/// than queuing, but it needs `ip link add` per interface on every machine
+/// that runs the suite, which is a worse trade for two seconds.
+static VCAN_BUS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The interface name, holding the bus lock for as long as it is alive.
+pub struct VcanLock {
+    name: String,
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+impl std::ops::Deref for VcanLock {
+    type Target = str;
+    fn deref(&self) -> &str {
+        &self.name
+    }
+}
+
+impl std::fmt::Display for VcanLock {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// Take the bus lock. Poisoning is ignored: a panicking test leaves no state
+/// behind on the interface, and refusing to run the rest would turn one
+/// failure into six.
+fn lock_bus() -> std::sync::MutexGuard<'static, ()> {
+    VCAN_BUS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 /// The vcan interface to test on, or `None` when there is none.
 fn vcan() -> Option<String> {
     let name = std::env::var("PAR6_VCAN_IFACE").unwrap_or_else(|_| "vcan0".to_string());
@@ -89,7 +136,10 @@ fn vcan() -> Option<String> {
 macro_rules! require_vcan {
     () => {
         match vcan() {
-            Some(name) => name,
+            Some(name) => VcanLock {
+                name,
+                _guard: lock_bus(),
+            },
             None => {
                 // PAR6_REQUIRE_VCAN=1 is the CI job's setting: there the
                 // interface is supposed to exist, so its absence means the

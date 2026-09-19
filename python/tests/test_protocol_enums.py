@@ -8,7 +8,7 @@ import pytest
 from waldoctl.status import ActionState as WActionState
 from waldoctl.tools import ToolState as WToolState
 
-from par6.protocol.constants import ActionState, ToolState
+from par6.protocol import ActionState, ToolState
 
 
 @pytest.mark.parametrize(

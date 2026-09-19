@@ -321,6 +321,15 @@ pub enum QueryResult {
         /// Every node id's row.
         nodes: Vec<BusNode>,
     },
+    /// STATUS_RATE result: the broadcast rate and the loop it divides.
+    StatusRate {
+        /// Rate STATUS is broadcast at now \[Hz\].
+        hz: f64,
+        /// Tick rate the broadcast divides \[Hz\]. Achievable rates are
+        /// `tick_hz / N`, so a caller derives the legal set from this
+        /// instead of probing for it.
+        tick_hz: f64,
+    },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
         /// Installation-layer shapes (persistent keep-outs).
@@ -373,6 +382,7 @@ impl QueryResult {
             Q::Payload { .. } => QueryType::Payload,
             Q::Shapes { .. } => QueryType::Shapes,
             Q::BusScan { .. } => QueryType::BusScan,
+            Q::StatusRate { .. } => QueryType::StatusRate,
         }
     }
 }
@@ -656,6 +666,12 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             for v in inertia {
                 w_f64(buf, *v);
             }
+        }
+        Q::StatusRate { hz, tick_hz } => {
+            w_array(buf, 3);
+            w_uint(buf, u64::from(tag));
+            w_f64(buf, *hz);
+            w_f64(buf, *tick_hz);
         }
         Q::BusScan { nodes } => {
             w_array(buf, 2);
@@ -1088,6 +1104,13 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 mass: r.f64()?,
                 com: r_f64_fixed(r, "payload.com")?,
                 inertia: r_f64_fixed(r, "payload.inertia")?,
+            }
+        }
+        T::StatusRate => {
+            expect_arity("status rate result", n, 3)?;
+            QueryResult::StatusRate {
+                hz: r.f64()?,
+                tick_hz: r.f64()?,
             }
         }
         T::BusScan => {

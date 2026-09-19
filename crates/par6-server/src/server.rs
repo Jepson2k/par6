@@ -129,6 +129,17 @@ impl ServerHandle {
     pub fn shutdown(&self) {
         self.shutdown.notify_one();
     }
+
+    /// Whether the server task has ended.
+    ///
+    /// It is expected to be running until it is asked to stop, so a `true`
+    /// here that nobody asked for means the command plane is gone — the
+    /// planner thread died and took its channels with it, or the task
+    /// panicked. The supervisor treats that as fatal rather than leaving an
+    /// arm powered, ticking, and unable to be commanded or stopped.
+    pub fn is_finished(&self) -> bool {
+        self.task.is_finished()
+    }
 }
 
 impl Drop for ServerHandle {
@@ -379,6 +390,9 @@ struct Core<R: RtCommands> {
     status_seq: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
+    /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
+    /// stays the boot value: SET_STATUS_RATE moves this one for a session.
+    status_rate_hz: u32,
 }
 
 enum Event {
@@ -409,6 +423,7 @@ impl<R: RtCommands> Core<R> {
             pending_scans: Vec::new(),
             simulator: cfg.simulator,
             tool: cfg.fitted_tool.clone(),
+            status_rate_hz: cfg.status_rate_hz,
             cfg,
             runtime,
             socket,
@@ -459,12 +474,20 @@ impl<R: RtCommands> Core<R> {
     async fn run(mut self, shutdown: Arc<Notify>) {
         let mut rxbuf = vec![0u8; 65535];
         let mut poll_iv = tokio::time::interval(self.cfg.poll_interval);
-        let mut status_iv = tokio::time::interval(rate_period(self.cfg.status_rate_hz));
+        let mut iv_hz = self.status_rate_hz;
+        let mut status_iv = tokio::time::interval(rate_period(iv_hz));
         for iv in [&mut poll_iv, &mut status_iv] {
             iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
         }
         self.sync_planner();
         loop {
+            // Rebuilt rather than reconfigured: a tokio interval's period is
+            // fixed at construction, so a rate change has to make a new one.
+            if iv_hz != self.status_rate_hz {
+                iv_hz = self.status_rate_hz;
+                status_iv = tokio::time::interval(rate_period(iv_hz));
+                status_iv.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            }
             let ev = tokio::select! {
                 r = self.socket.recv_from(&mut rxbuf) => match r {
                     Ok((n, addr)) => Event::Datagram(n, addr),
@@ -638,6 +661,10 @@ impl<R: RtCommands> Core<R> {
     // ---- command classes ---------------------------------------------------
 
     async fn on_query(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, Command::BusScan) {
             // Answered from `answer_scans` once the RT's rescan has
             // settled (or the deadline passes): a scan is a round trip
@@ -788,6 +815,10 @@ impl<R: RtCommands> Core<R> {
             cmd_name(cmd.tag()),
             params_summary(cmd)
         );
+        if let Some(error) = self.check_gate(cmd.tag()) {
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
         if matches!(cmd, C::Reset) {
             self.on_reset(req_id, addr).await;
             return;
@@ -927,6 +958,15 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetStatusRate(p) => {
+                match status_rate_fault(1.0 / self.cfg.config_info.tick_dt_s, p.hz) {
+                    Some(error) => Err(error),
+                    None => {
+                        self.status_rate_hz = p.hz as u32;
+                        Ok(())
+                    }
+                }
+            }
             C::SetCompletionPolicy(p) => {
                 self.completion_policy = p.policy;
                 self.sync_planner();
@@ -1241,7 +1281,22 @@ impl<R: RtCommands> Core<R> {
         // Depth one, as the reference runtime has it. The superseded
         // action was acked and something may be waiting on it, so it is
         // completed rather than dropped in silence.
-        if let Some(prev) = self.tool_executing.take() {
+        //
+        // BOTH states count. An action that has been sent to the planner
+        // but not yet confirmed sits in `pending_tool`, not
+        // `tool_executing` — so a second action arriving inside that round
+        // trip used to find nothing to supersede, and both would land under
+        // different tags. `on_tool_started` then overwrote `tool_executing`
+        // with whichever answered last, and the first was never completed:
+        // its client waited out its timeout on an action the server had
+        // silently forgotten.
+        let superseded: Vec<ToolExecuting> = self
+            .pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .collect();
+        for prev in superseded {
             let error = make_error(
                 ErrorCode::MotnCancelled,
                 prev.index as i64,
@@ -1286,9 +1341,13 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// Drain the tool side channel. Runs before the motion lane's
-    /// outcomes and before `pump`, so a finished tool action is reported
-    /// on the same tick it settles rather than behind a motion.
+    /// Report a finished tool action.
+    ///
+    /// The two lanes are polled in one planner pass and arrive as two
+    /// events, the motion outcome first. That order does not matter here
+    /// the way it did when both were drained inline: the side channel
+    /// shares no state with the motion lane, and a tool outcome is spoken
+    /// to its own client the moment its event is routed.
     async fn on_tool_outcome(&mut self, out: CommandOutcome) {
         let Some(ex) = &self.tool_executing else {
             return; // outcome of a cancelled action
@@ -1402,7 +1461,14 @@ impl<R: RtCommands> Core<R> {
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
-            PlanEvent::Outcome(out) => self.on_outcome(out).await,
+            PlanEvent::Outcome(out) => {
+                self.on_outcome(out).await;
+                // The slot the finished motion held is free now. Waiting
+                // for the next poll to notice leaves the arm standing
+                // still for a tick between two queued moves that did not
+                // blend.
+                self.pump().await;
+            }
             PlanEvent::ToolOutcome(out) => self.on_tool_outcome(out).await,
             PlanEvent::ToolStarted { tag, result } => self.on_tool_started(tag, result).await,
             PlanEvent::ShapesApplied { tag, result } => self.on_shapes_applied(tag, result).await,
@@ -1647,12 +1713,24 @@ impl<R: RtCommands> Core<R> {
     /// Take the tool action off the side channel so the caller can speak
     /// its cancellation. `halt` asks the tool to stop where it is.
     ///
+    /// An action still inside the `StartTool` round trip is parked in
+    /// `pending_tool`, and the `CancelTool` above reaches the planner
+    /// either way — so taking only `tool_executing` cancelled the parked
+    /// action on the planner while the server went on believing it was
+    /// live, and its client waited out a timeout on a COMPLETE nobody
+    /// was left to speak.
+    ///
     /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
     /// arriving cancels planned motion, but a gripper closing under it
     /// is exactly the overlap the side channel exists to allow.
-    fn drop_tool_action(&mut self, halt: bool) -> Option<(u64, SocketAddr)> {
+    fn drop_tool_action(&mut self, halt: bool) -> Vec<(u64, SocketAddr)> {
         self.runtime.planner.send(PlanRequest::CancelTool { halt });
-        self.tool_executing.take().map(|t| (t.index, t.addr))
+        self.pending_tool
+            .drain()
+            .map(|(_, ex)| ex)
+            .chain(self.tool_executing.take())
+            .map(|t| (t.index, t.addr))
+            .collect()
     }
 
     /// A streamable arrived: planned motion (active AND pending) is
@@ -1944,9 +2022,16 @@ impl<R: RtCommands> Core<R> {
     ///
     /// Two gates latch one: the planner's (a refused or invalidated
     /// planned move) and the streaming gate's (a refused or stopped
-    /// jog/servo). At most one motion pipeline is active at a time and
-    /// accepting a motion clears both, so they never disagree — the
-    /// merge simply reports whichever is active.
+    /// jog/servo). At most one motion pipeline is active at a time, so
+    /// at most one of them is meaningfully latched — but they are no
+    /// longer read from the same place. The streaming latch is the RT's,
+    /// live; the planner's arrives in a report published at the end of
+    /// the planner's pass, and the `ClearCollision` that drops it is a
+    /// request that pass has to service. So accepting a motion clears
+    /// the streaming latch at once and the planner's a pass later, and
+    /// for that pass the two can disagree. Preferring whichever reads
+    /// active is what makes the stale one harmless: it holds the warning
+    /// up a beat longer rather than dropping a live one.
     fn update_collision(&mut self) {
         let stream = self.runtime.rt.collision().filter(|s| s.active);
         if let Some(state) = self.runtime.planner.report().collision.clone() {
@@ -2132,10 +2217,12 @@ impl<R: RtCommands> Core<R> {
             })
             .collect();
         // Pricing a queue is real planning, so it is asked for rather
-        // than taken: the answer lands in the next report, which makes
-        // the estimate at most one planner pass old. It is a duration
-        // estimate on a queue that has just changed — nothing reads it
-        // for a decision.
+        // than taken. The answer lands in the report of whichever pass
+        // services it — the next one if the planner is free, later if an
+        // earlier expensive request is already holding the batch, since
+        // a pass takes only one. It is a duration estimate on a queue
+        // that has just changed and nothing reads it for a decision, so
+        // there is no bound worth paying for.
         self.runtime
             .planner
             .send(PlanRequest::QueueEstimate { pending });
@@ -2263,10 +2350,17 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
-    /// The drives' analog readings, per node and arm joints first, with
+    /// The drives' readings and faults, per node and arm joints first, with
     /// `NaN` for a node that has not answered that register yet. The bus
     /// voltage is the lowest any node reports: a sagging supply shows up
     /// first at whichever drive is pulling on it.
+    ///
+    /// Faults are gated on the node's live error bit, which every reply
+    /// carries while a fault is active; the flag register itself is only
+    /// refreshed on the round-robin poll, so trusting it alone would keep
+    /// reporting a fault the drive has already cleared. Which bits those
+    /// are and what each is called is [`par6_bus::ErrorFlags::faults`],
+    /// the same list the RT core latches from.
     fn wire_drive_health(snap: &par6_rt::StateSnapshot) -> par6_proto::DriveHealthWire {
         let read = |f: fn(&par6_rt::NodeState) -> Option<f64>| -> Vec<f64> {
             snap.nodes
@@ -2280,10 +2374,21 @@ impl<R: RtCommands> Core<R> {
             .filter_map(|n| n.voltage_mv)
             .map(|mv| f64::from(mv) / 1000.0)
             .reduce(f64::min);
+        let faults = snap
+            .nodes
+            .iter()
+            .map(|n| match n.error_flags {
+                Some(f) if n.live_error_bit => {
+                    f.faults().map(|fault| fault.name().to_owned()).collect()
+                }
+                _ => Vec::new(),
+            })
+            .collect();
         par6_proto::DriveHealthWire {
             temperatures_c: read(|n| n.temperature_c.map(f64::from)),
             currents_ma: read(|n| n.current_ma.map(f64::from)),
             bus_voltage_v,
+            faults,
         }
     }
 
@@ -2470,6 +2575,10 @@ impl<R: RtCommands> Core<R> {
                 mass: self.payload.mass,
                 com: self.payload.com,
                 inertia: self.payload.inertia.unwrap_or_default(),
+            },
+            C::StatusRate => QueryResult::StatusRate {
+                hz: f64::from(self.status_rate_hz),
+                tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
             },
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
@@ -2705,6 +2814,40 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
     unsupported.and_then(refuse)
 }
 
+/// Whether a requested STATUS rate can be served, and why not if it cannot.
+///
+/// STATUS is emitted every Nth tick and the rate is held as a whole
+/// number of Hz, so the servable rates are the whole divisors of the tick
+/// rate and nothing else. A near miss is refused rather than rounded to
+/// the nearest one: a capture taken at a rate nobody asked for is wrong in
+/// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
+/// set is built once and both answered from and printed, so what is
+/// accepted and what the remedy offers cannot disagree.
+fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+    let ticks = tick_hz.round() as u32;
+    let allowed: Vec<u32> = (1..=ticks)
+        .filter(|d| ticks.is_multiple_of(*d))
+        .map(|d| ticks / d)
+        .collect();
+    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
+        return None;
+    }
+    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
+    Some(make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!(
+                "set_status_rate {hz} Hz is not one of the whole-Hz rates the \
+                 {tick_hz} Hz tick rate divides into; STATUS is emitted every \
+                 Nth tick, so the achievable rates are: {}",
+                listed.join(", ")
+            ),
+        )],
+    ))
+}
+
 /// Whether a drive tune names a configured node and stays inside that
 /// node's configured ceilings.
 ///
@@ -2855,6 +2998,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPidGains => "set_pid_gains",
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
+        T::SetStatusRate => "set_status_rate",
+        T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",
         T::Ping => "ping",
         T::Status => "status",

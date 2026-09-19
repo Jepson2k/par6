@@ -270,6 +270,73 @@ pub struct ErrorFlags {
     pub watchdog: bool,
 }
 
+/// One drive fault bit, named the way the whole stack reports it.
+///
+/// The names are the [`ErrorFlags`] register's own, in the spelling the
+/// RT latch keys use, so a fault an operator sees on a joint error and
+/// the same fault in a drive-health label cannot be two different words.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fault {
+    /// Driver over-temperature.
+    Temperature,
+    /// Encoder fault.
+    Encoder,
+    /// VBUS fault.
+    Vbus,
+    /// Driver fault.
+    Driver,
+    /// Velocity fault.
+    Velocity,
+    /// Current fault.
+    Current,
+    /// Motor-side e-stop.
+    EstopMotor,
+    /// Driver watchdog fired.
+    Watchdog,
+}
+
+impl Fault {
+    /// The label this fault is reported under.
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Temperature => "temperature",
+            Self::Encoder => "encoder",
+            Self::Vbus => "vbus",
+            Self::Driver => "driver",
+            Self::Velocity => "velocity",
+            Self::Current => "current",
+            Self::EstopMotor => "estop_motor",
+            Self::Watchdog => "watchdog",
+        }
+    }
+}
+
+impl ErrorFlags {
+    /// The fault bits that are set, most significant first.
+    ///
+    /// The one table both consumers read: the RT core latches an error
+    /// per entry and the server labels one per entry, so a new bit cannot
+    /// be threaded through only one of them, and the aggregate `error`
+    /// bit stays out of it — it says only that one of these is set.
+    ///
+    /// Allocation-free: the pairs live in a fixed array the iterator owns,
+    /// so the RT tick path may call it.
+    pub fn faults(self) -> impl Iterator<Item = Fault> {
+        [
+            (self.temperature, Fault::Temperature),
+            (self.encoder, Fault::Encoder),
+            (self.vbus, Fault::Vbus),
+            (self.driver, Fault::Driver),
+            (self.velocity, Fault::Velocity),
+            (self.current, Fault::Current),
+            (self.estop, Fault::EstopMotor),
+            (self.watchdog, Fault::Watchdog),
+        ]
+        .into_iter()
+        .filter_map(|(set, fault)| set.then_some(fault))
+    }
+}
+
 /// Device identity (cmd 25 reply, DLC 7).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DeviceInfo {
