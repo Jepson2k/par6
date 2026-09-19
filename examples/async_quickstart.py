@@ -1,9 +1,8 @@
 """Async client quickstart: drive the runtime and follow its STATUS stream.
 
-Run from the repository root, with the shim on the loader path::
+Run from the repository root::
 
-    source .ffi/env.sh
-    python examples/async_quickstart.py
+    pixi run python examples/async_quickstart.py
 """
 
 import asyncio
