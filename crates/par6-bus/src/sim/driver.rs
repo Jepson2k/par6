@@ -7,29 +7,32 @@
 
 use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
+use std::collections::VecDeque;
 
-/// Firmware velocity-loop period the sim assumes \[s\]. The config `kiv`
-/// is a per-loop-iteration gain; the firmware loop runs much faster than
-/// the bus tick, so the sim integrates `kiv · err` once per firmware
-/// iteration (`dt / FW_LOOP_DT` times per tick). Without this the
-/// integral unwinds so slowly that a homing backoff cannot break the
-/// endstop seat within the vendor-configured backoff window.
+/// Firmware control-loop period \[s\]: STEPFOC's `LOOP_TIME`
+/// (`constants.h:56`). Position loop, velocity PI and current loop all
+/// run once per iteration of that loop, so the config `kiv` is a
+/// per-iteration gain and the sim integrates `kiv · err` once per
+/// firmware iteration rather than once per plant substep.
 ///
-/// KNOWN WRONG, and do not "fix" it by editing this number alone. The
-/// firmware (`Source-Robotics/STEPFOC-stepper-controller`,
-/// `src/constants.h`) sets `LOOP_TIME 0.00016`: the real cascade closes
-/// at 6.25 kHz, not 1 kHz. But the sim evaluates the loop ONCE per
-/// physics substep and only scales the integral by `fw_steps`, so
-/// lowering this models the destabilising half of a faster loop — 6.25x
-/// the integral accumulation — without the stabilising half, which is the
-/// phase lag a faster loop does not have. The result oscillates harder
-/// and reads as a drive-tuning problem that is not there;
-/// `a_held_servo_target_settles` is ignored for exactly this reason.
+/// A 1 ms plant substep is 6.25 iterations, which is why [`loop_step`]
+/// takes the count as a fraction: a whole-number count winds the
+/// velocity integral at the wrong rate, and every `kiv`- or
+/// `kpp`-dependent behaviour is then measured against a drive the vendor
+/// does not ship.
 ///
-/// Fixing it properly means iterating the driver loop at `LOOP_TIME`
-/// between physics steps, and feeding back a moving average of the
-/// measured velocity as `Position_mode()` does.
-pub(crate) const FW_LOOP_DT: f64 = 0.001;
+/// [`loop_step`]: VirtualDriver::loop_step
+pub(crate) const FW_LOOP_DT: f64 = 0.00016;
+
+/// Samples in the firmware's velocity moving average (`movingAverage`,
+/// `utils.cpp:177`), which is what the velocity PI reads — NOT the raw
+/// finite difference.
+///
+/// The lag matters, the sample rate does not: the sim cannot afford a
+/// 160 us plant substep, so `loop_step` averages over the same WINDOW of
+/// time at whatever rate the plant runs. An exact instantaneous velocity
+/// would hand the PI derivative information no drive has.
+const FW_VEL_AVG_SAMPLES: f64 = 20.0;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -94,8 +97,6 @@ pub(crate) enum ReplyKind {
 
 pub(crate) struct VirtualDriver {
     dt: f64,
-    /// Firmware velocity-loop iterations per bus tick (≥ 1).
-    fw_steps: f64,
     // -- pushed configuration (updated live by config frames) --
     kpp: f64,
     kpv: f64,
@@ -109,6 +110,10 @@ pub(crate) struct VirtualDriver {
     // -- control state --
     mode: Mode,
     integral_ma: f64,
+    /// Rolling window behind the firmware's `Velocity_Filter`.
+    vel_window: VecDeque<f64>,
+    vel_window_len: usize,
+    vel_sum: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
@@ -128,7 +133,6 @@ impl VirtualDriver {
     pub fn new(dt: f64, node: NodeId, vel_limit: f64, ilim_ma: f64, kt_nm_a: f64) -> Self {
         Self {
             dt,
-            fw_steps: (dt / FW_LOOP_DT).round().max(1.0),
             kpp: 0.0,
             kpv: 0.0,
             kiv: 0.0,
@@ -140,6 +144,9 @@ impl VirtualDriver {
             kt_nm_a: kt_nm_a as f32,
             mode: Mode::Idle,
             integral_ma: 0.0,
+            vel_window: VecDeque::new(),
+            vel_window_len: 1,
+            vel_sum: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
@@ -306,27 +313,26 @@ impl VirtualDriver {
         self.ticks_since_data = 0;
     }
 
-    /// One control-loop step at the measured plant state. Ages the
-    /// watchdog first (a fire drops to Idle and latches the watchdog
-    /// flag), then computes the mode's Ilim-saturated current output.
+    /// One control-loop step at the measured plant state: the mode's
+    /// Ilim-saturated current output, integrating the velocity loop over
+    /// `fw_steps` firmware iterations. The watchdog ages separately, once
+    /// per bus tick ([`Self::age_watchdog`]), so a plant can close the
+    /// loops at its physics substep rate (the firmware's own loops run at
+    /// ~6 kHz; a current held over a whole coarse bus tick destabilizes a
+    /// strongly-driven joint).
     ///
     /// A latched fault removes drive authority entirely, as it does on the
     /// arm: firmware runs its mode switch only while `Error == 0`, and the
     /// else branch forces `Controller_mode = 0` and drops SLEEP/RESET
     /// until `Clear_Error`.
-    pub fn control_step(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
-        self.age_watchdog();
-        let fw_steps = self.fw_steps;
-        self.loop_step(pos_ticks, vel_ticks_s, fw_steps)
-    }
-
-    /// The control law alone, integrating the velocity loop over
-    /// `fw_steps` firmware iterations — separated from the per-tick
-    /// watchdog aging so the dynamics plant can close the loops at its
-    /// physics substep rate (the firmware's own loops run at ~1 kHz; a
-    /// current held over a whole coarse bus tick destabilizes a
-    /// strongly-driven joint).
     pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
+        // The firmware's loops read `Velocity_Filter`, never the raw
+        // difference, so the filter is inside the loop and its lag is part
+        // of the plant the gains were tuned against. One plant substep
+        // stands for `fw_steps` firmware iterations, so the firmware's
+        // 20-sample window is that many substeps wide.
+        self.vel_window_len = (FW_VEL_AVG_SAMPLES / fw_steps).round().max(1.0) as usize;
+        let vel_ticks_s = self.filter_velocity(vel_ticks_s);
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
@@ -405,6 +411,7 @@ impl VirtualDriver {
     /// friction back-drive a degree before the feedforward arrives.
     pub fn reseed_hold(&mut self, pos_ticks: f64) {
         self.integral_ma = 0.0;
+        self.reset_velocity_filter();
         self.cur_out_ma = 0.0;
         self.mode = Mode::Position {
             pos: pos_ticks,
@@ -440,6 +447,28 @@ impl VirtualDriver {
     /// firmware gripper to halt jaw motion on command silence).
     pub fn watchdog_fired(&self) -> bool {
         self.armed && self.ticks_since_data >= self.watchdog_ticks
+    }
+
+    /// The firmware's `Velocity_Filter`: a moving average over
+    /// [`FW_VEL_AVG_SAMPLES`] firmware samples of measurement, resampled to the plant's substep.
+    ///
+    /// The window is sized from the substep the plant actually calls with,
+    /// so a scene timestep change keeps the firmware's averaging TIME
+    /// rather than its sample count.
+    fn filter_velocity(&mut self, vel_ticks_s: f64) -> f64 {
+        self.vel_sum += vel_ticks_s;
+        self.vel_window.push_back(vel_ticks_s);
+        while self.vel_window.len() > self.vel_window_len {
+            self.vel_sum -= self.vel_window.pop_front().expect("len checked");
+        }
+        self.vel_sum / self.vel_window.len() as f64
+    }
+
+    /// Drop the velocity history: a re-seeded pose makes every sample in
+    /// it a difference across a teleport, which is not a speed.
+    fn reset_velocity_filter(&mut self) {
+        self.vel_window.clear();
+        self.vel_sum = 0.0;
     }
 
     fn velocity_pi(&mut self, vel_target: f64, vel_meas: f64, cur_ff: f64, fw_steps: f64) -> f64 {
