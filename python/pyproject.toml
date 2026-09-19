@@ -4,7 +4,7 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.5.0"
+version = "0.6.0"
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]

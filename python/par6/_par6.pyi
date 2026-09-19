@@ -464,5 +464,8 @@ class Preview:
     def set_shapes(self, layer: str, shapes: list[dict[str, Any]]) -> int | None: ...
     def shapes(self) -> dict[str, Any]: ...
     def run_program(
-        self, cmds: list[dict[str, Any]], max_seconds: float | None = None
+        self,
+        cmds: list[dict[str, Any]],
+        max_seconds: float | None = None,
+        scenario: dict[str, Any] | None = None,
     ) -> dict[str, Any]: ...

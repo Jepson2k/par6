@@ -22,10 +22,14 @@
 //! with no rows, so the two records still name the same commands.
 
 use par6_bus::sim::scene::Scene;
-use par6_proto::{command_class, Command, CommandClass, WireError};
+use par6_bus::sim::SimulationScenario;
+use par6_proto::{
+    command_class, make_error, Command, CommandClass, ErrorCode, WireError, UNATTRIBUTED,
+};
 use par6_rt::{ArmState, Mode, RtCommand};
 use par6_server::{
-    check_gate, decode_error_to_wire, GateContext, PlanContext, Planner, QueuedCommand, ShapeLayer,
+    check_gate, decode_error_to_wire, next_attachment_epoch, tcp_transform_effect, GateContext,
+    PlanContext, Planner, QueuedCommand, ShapeLayer,
 };
 
 use super::driver::{SimDriver, SimSetup};
@@ -59,6 +63,84 @@ fn config_error(field: &str, reason: &str) -> DaemonError {
         field: field.into(),
         reason: reason.into(),
     })
+}
+
+/// The program's initial conditions, independent of its planning result.
+#[derive(Clone)]
+pub(super) struct RunStart {
+    q: [f64; par6_rt::MAX_JOINTS],
+    homed: bool,
+    calibrated: bool,
+    profile: String,
+    tool: String,
+    tool_variant: Option<String>,
+    tcp_offset_mm: [f64; 3],
+    tcp_rotation_deg: [f64; 3],
+    policy: par6_proto::CompletionPolicy,
+    payload: par6_server::PayloadSpec,
+    shapes: Vec<par6_proto::Shape>,
+    resume_scale: f64,
+    attachment_epoch: u64,
+}
+
+impl RunStart {
+    pub(super) fn capture(preview: &Preview) -> Self {
+        Self {
+            q: preview.snap.q,
+            homed: preview.snap.homed,
+            calibrated: preview.snap.gripper.reply.is_some_and(|r| r.calibrated),
+            profile: preview.profile.clone(),
+            tool: preview.tool.clone(),
+            tool_variant: preview.tool_variant.clone(),
+            tcp_offset_mm: preview.tcp_offset_mm,
+            tcp_rotation_deg: preview.tcp_rotation_deg,
+            policy: preview.policy,
+            payload: preview.payload,
+            shapes: preview.shapes.clone(),
+            resume_scale: preview.snap.exec.resume_scale,
+            attachment_epoch: preview.attachment_epoch,
+        }
+    }
+
+    fn plan_context(&self) -> PlanContext<'_> {
+        PlanContext {
+            profile: &self.profile,
+            tool: &self.tool,
+            tool_variant: self.tool_variant.as_deref(),
+            tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
+            completion_policy: self.policy,
+            payload: self.payload,
+        }
+    }
+
+    fn attachment_error(&self, cmd: &Command, driver: &SimDriver) -> Option<WireError> {
+        let snap = driver.snapshot();
+        let fresh = |shapes: &[par6_proto::Shape]| {
+            shapes.iter().all(|s| {
+                s.attachment
+                    .as_ref()
+                    .is_none_or(|a| a.epoch == self.attachment_epoch)
+            })
+        };
+        let invalid = if let Command::SetShapes(p) = cmd {
+            !fresh(&p.shapes)
+                || (p.shapes.iter().any(|s| s.attachment.is_some())
+                    && (!snap.homed || snap.state != ArmState::Enabled))
+        } else {
+            par6_server::is_arm_motion(cmd.tag()) && !fresh(&self.shapes)
+        };
+        invalid.then(|| {
+            make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    "attachment context changed or is unreferenced; reconcile and reapply",
+                )],
+            )
+        })
+    }
 }
 
 /// A command the queue engine is working through.
@@ -101,6 +183,33 @@ impl Preview {
     /// stands, so two runs of the same program give the same answer and
     /// a plan and a run of it describe the same lines.
     pub fn run(&mut self, cmds: &[Command], limits: RunLimits) -> Result<TickBatch, DaemonError> {
+        self.run_scenario(cmds, limits, &SimulationScenario::default())
+    }
+
+    /// Run against an explicit offline observation/supply scenario. Its clock
+    /// starts after the private engine has booted and acquired its reference.
+    pub fn run_scenario(
+        &mut self,
+        cmds: &[Command],
+        limits: RunLimits,
+        scenario: &SimulationScenario,
+    ) -> Result<TickBatch, DaemonError> {
+        let mut context = self
+            .run_origin
+            .clone()
+            .unwrap_or_else(|| RunStart::capture(self));
+        scenario
+            .validate()
+            .map_err(|e| config_error("scenario", &e))?;
+        if !limits.max_seconds.is_finite()
+            || !(0.0..=3600.0).contains(&limits.max_seconds)
+            || limits.max_seconds == 0.0
+        {
+            return Err(config_error(
+                "max_seconds",
+                "must be finite and in (0, 3600]",
+            ));
+        }
         let bundle = par6_config::ConfigBundle::load(&self.config_path)?;
         let stack = load_kin_stack(
             &self.opts,
@@ -116,15 +225,23 @@ impl Preview {
             bundle: &bundle,
             scene,
             installation: &self.cfg.installation_shapes,
-            program: &self.shapes,
+            program: &context.shapes,
             fk: stack.fk,
             gravity: stack.gravity,
-            q0: self.origin.q,
+            q0: context.q,
+            homed: context.homed,
+            calibrated: context.calibrated,
         })
         .map_err(|e| config_error("simulation", &e.to_string()))?;
-        driver.send(RtCommand::ExecSetSpeedScale(self.origin.resume_scale));
+        driver.send(RtCommand::SetPayload {
+            mass: context.payload.mass,
+            com: context.payload.com,
+            inertia: context.payload.inertia,
+        });
         driver.tick();
-        driver.send(RtCommand::ExecSetPaused(self.origin.paused));
+        // The engine boots unpaused whatever the session's pause: the
+        // program's own pause commands are what a run replays.
+        driver.send(RtCommand::ExecSetSpeedScale(context.resume_scale));
         driver.tick();
         let mut planner = Par6Planner::new(
             ports.link,
@@ -141,21 +258,13 @@ impl Preview {
         // Nothing offline serves STATUS or answers REACHABLE, and the
         // probe is the single most expensive thing on the poll loop.
         planner.set_enablement_probe(false);
-        planner.sync(PlanContext {
-            profile: &self.profile,
-            tool: &self.tool,
-            tool_variant: self.tool_variant.as_deref(),
-            tcp_offset_mm: self.tcp_offset_mm,
-            tcp_rotation_deg: self.tcp_rotation_deg,
-            completion_policy: self.policy,
-            payload: self.payload,
-        });
+        planner.sync(context.plan_context());
 
         // The plant already has the world (it booted with it); the
         // planner needs it as keep-outs to refuse against.
         for (layer, shapes) in [
             (ShapeLayer::Installation, &self.cfg.installation_shapes),
-            (ShapeLayer::Program, &self.shapes),
+            (ShapeLayer::Program, &context.shapes),
         ] {
             if !shapes.is_empty() {
                 // Unreachable in practice: this world is the one the
@@ -168,19 +277,31 @@ impl Preview {
             }
         }
 
-        let object_names = driver
+        let mut object_names = driver
             .bus_mut()
             .sim_mut()
             .map(|s| s.object_names())
             .unwrap_or_default();
+        for command in cmds {
+            if let Command::SetShapes(p) = command {
+                object_names.extend(par6_bus::sim::scene::free_object_names(&[&[], &p.shapes]));
+            }
+        }
+        object_names.sort();
+        object_names.dedup();
         let mut rec = Recorder::new(driver.dt(), bundle.robot.joints.len(), object_names);
+        driver
+            .bus_mut()
+            .sim_mut()
+            .expect("offline driver has a simulated bus")
+            .set_scenario(scenario)
+            .map_err(|e| config_error("scenario", &e))?;
 
         let budget_ticks = (limits.max_seconds / driver.dt()).ceil() as u64;
         // One span per command, in order, whatever happens: a command
         // that never ran reports no rows and no error, which is what
         // "the run stopped before this line" looks like.
-        let mut spans: Vec<(usize, usize, Option<WireError>)> =
-            (0..cmds.len()).map(|i| (i, 0, None)).collect();
+        let mut spans: Vec<(usize, usize, Option<WireError>)> = vec![(0, 0, None); cmds.len()];
         let mut next = 0usize;
         let mut queue_index = self.next_index;
         let mut executing: Option<Executing> = None;
@@ -190,17 +311,110 @@ impl Preview {
             // ---- pump: start the next command when nothing is running.
             while executing.is_none() && next < cmds.len() {
                 let start_row = rec.rows();
-                // Refused before anything started, so the arm has not
-                // moved and the rest of the program still runs from a
-                // pose the user expects. Live, the server clears the
-                // queue here; a preview whose job is to show every
-                // mistake in the file does not, and reports each one
-                // against its own line.
-                if let Err(error) = self.admit(&cmds[next], &driver) {
+                // Admission failures end the run just as they clear the live
+                // queue — for the commands that queue. A fire-and-forget
+                // command's refusal answers only its own datagram live, so
+                // here it is reported on its own line and the run goes on.
+                if let Err(error) = self.admit(&cmds[next], &driver, &context) {
                     spans[next] = (start_row, 0, Some(error));
+                    if command_class(cmds[next].tag()) == CommandClass::FireAndForget {
+                        next += 1;
+                        continue;
+                    }
                     stop = StopReason::Failed;
+                    next = cmds.len();
+                    break;
+                }
+                if let Command::WriteIo(p) = &cmds[next] {
+                    driver.send(RtCommand::WriteIo {
+                        port: p.port,
+                        value: p.value,
+                    });
+                    spans[next] = (start_row, 0, None);
                     next += 1;
+                    break;
+                }
+                if let Command::Stop(p) = &cmds[next] {
+                    // Nothing is running while the pump is here, so there
+                    // is nothing to cancel; a clearing stop drops the pause
+                    // as it does live, and the program goes on.
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    if p.clear_queue {
+                        driver.send(RtCommand::ExecSetPaused(false));
+                        break;
+                    }
                     continue;
+                }
+                if let Command::SetShapes(p) = &cmds[next] {
+                    match planner.set_shapes(ShapeLayer::Program, &p.shapes) {
+                        Ok(_) => {
+                            driver
+                                .bus_mut()
+                                .sim_mut()
+                                .expect("offline simulated bus")
+                                .set_world(par6_proto::Layer::Program, &p.shapes);
+                            context.shapes.clone_from(&p.shapes);
+                            spans[next] = (start_row, 0, None);
+                        }
+                        Err(error) => {
+                            spans[next] = (start_row, 0, Some(error));
+                            stop = StopReason::Failed;
+                            next = cmds.len();
+                            break;
+                        }
+                    }
+                    next += 1;
+                    break;
+                }
+                let configured = match &cmds[next] {
+                    Command::SelectProfile(p) => {
+                        let Some(name) = self
+                            .cfg
+                            .profiles
+                            .iter()
+                            .find(|name| name.eq_ignore_ascii_case(&p.profile))
+                        else {
+                            spans[next] = (
+                                start_row,
+                                0,
+                                Some(make_error(
+                                    ErrorCode::SysProfileInvalid,
+                                    UNATTRIBUTED,
+                                    &[("detail", &p.profile)],
+                                )),
+                            );
+                            stop = StopReason::Failed;
+                            next = cmds.len();
+                            break;
+                        };
+                        context.profile.clone_from(name);
+                        true
+                    }
+                    Command::SetPayload(p) => {
+                        context.payload = par6_server::PayloadSpec {
+                            mass: p.mass,
+                            com: p.com,
+                            inertia: p.inertia,
+                        };
+                        driver.send(RtCommand::SetPayload {
+                            mass: p.mass,
+                            com: p.com,
+                            inertia: p.inertia,
+                        });
+                        true
+                    }
+                    Command::SetCompletionPolicy(p) => {
+                        context.policy = p.policy;
+                        true
+                    }
+                    _ => false,
+                };
+                if configured {
+                    planner.sync(context.plan_context());
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    break;
                 }
                 let control = match &cmds[next] {
                     Command::SetExecutionSpeed(p) => Some(RtCommand::ExecSetSpeedScale(p.scale)),
@@ -209,15 +423,17 @@ impl Preview {
                 };
                 if let Some(control) = control {
                     driver.send(control);
-                    driver.tick();
                     spans[next] = (start_row, 0, None);
                     next += 1;
-                    continue;
+                    break;
                 }
                 if command_class(cmds[next].tag()) == CommandClass::System {
-                    spans[next] = (start_row, 0, None);
-                    next += 1;
-                    continue;
+                    // Admitted but not modelled above: recording it as
+                    // nothing would pass a live effect off as a no-op.
+                    spans[next] = (start_row, 0, Some(unsupported_in_replay(&cmds[next])));
+                    stop = StopReason::Failed;
+                    next = cmds.len();
+                    break;
                 }
                 if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
                 {
@@ -228,6 +444,8 @@ impl Preview {
                         Err(error) => {
                             spans[next] = (start_row, 0, Some(error));
                             stop = StopReason::Failed;
+                            next = cmds.len();
+                            break;
                         }
                         Ok(()) => {
                             executing = Some(Executing {
@@ -251,8 +469,14 @@ impl Preview {
                     .take_while(|(k, c)| {
                         *k == 0
                             || (tool_action(c).is_none()
-                                && command_class(c.tag()) != CommandClass::System
-                                && self.admit(c, &driver).is_ok())
+                                && command_class(c.tag()) == CommandClass::Queued
+                                && !matches!(
+                                    c,
+                                    Command::SelectTool(_)
+                                        | Command::SetTcpOffset(_)
+                                        | Command::SetTcpTransform(_)
+                                )
+                                && self.admit(c, &driver, &context).is_ok())
                     })
                     .map(|(k, cmd)| QueuedCommand {
                         index: queue_index + k as u64,
@@ -263,7 +487,7 @@ impl Preview {
                     Err(error) => {
                         spans[next] = (start_row, 0, Some(error));
                         stop = StopReason::Failed;
-                        next += 1;
+                        next = cmds.len();
                     }
                     Ok(taken) => {
                         let taken = taken.clamp(1, batch.len());
@@ -304,6 +528,21 @@ impl Preview {
                 let rows = rec.rows().saturating_sub(ex.start_row);
                 let failed = out.error.is_some();
                 spans[ex.command] = (ex.start_row, rows, out.error);
+                if !failed {
+                    if let Some(v) = tcp_transform_effect(&cmds[ex.command]) {
+                        context.tcp_offset_mm = [v[0], v[1], v[2]];
+                        context.tcp_rotation_deg = [v[3], v[4], v[5]];
+                    } else if let Command::SelectTool(p) = &cmds[ex.command] {
+                        if p.variant_key != context.tool_variant {
+                            context.tool_variant = p.variant_key.clone();
+                            context.attachment_epoch =
+                                next_attachment_epoch(context.attachment_epoch);
+                            context.tcp_offset_mm = [0.0; 3];
+                            context.tcp_rotation_deg = [0.0; 3];
+                        }
+                    }
+                    planner.sync(context.plan_context());
+                }
                 // A blended-away command has no motion of its own; it
                 // finished inside this one, at its end.
                 for c in ex.blended {
@@ -340,7 +579,15 @@ impl Preview {
     /// a run boots its own engine: whether the arm is enabled and homed
     /// is a fact about the run in progress, and a program that stops it
     /// mid-way is refused from there on exactly as the runtime would.
-    fn admit(&self, cmd: &Command, driver: &SimDriver) -> Result<(), WireError> {
+    fn admit(
+        &self,
+        cmd: &Command,
+        driver: &SimDriver,
+        context: &RunStart,
+    ) -> Result<(), WireError> {
+        if let Some(error) = context.attachment_error(cmd, driver) {
+            return Err(error);
+        }
         if let Err(e) = cmd.validate() {
             return Err(decode_error_to_wire(&e));
         }
@@ -359,6 +606,32 @@ impl Preview {
         if let Some(error) = par6_server::validate_supported(&self.cfg, cmd) {
             return Err(error);
         }
+        if command_class(cmd.tag()) != CommandClass::Queued
+            && !matches!(
+                cmd,
+                Command::SetShapes(_)
+                    | Command::SetExecutionSpeed(_)
+                    | Command::Pause(_)
+                    | Command::SelectProfile(_)
+                    | Command::SetPayload(_)
+                    | Command::SetCompletionPolicy(_)
+                    | Command::WriteIo(_)
+                    | Command::Stop(_)
+            )
+        {
+            return Err(unsupported_in_replay(cmd));
+        }
         Ok(())
     }
+}
+
+fn unsupported_in_replay(cmd: &Command) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[(
+            "detail",
+            &format!("{:?} is unsupported by offline physics replay", cmd.tag()),
+        )],
+    )
 }

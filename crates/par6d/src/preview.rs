@@ -142,19 +142,11 @@ pub struct ServoPreview {
     pub finished_tick: Option<usize>,
 }
 
-/// Where a program starts: the session state [`Preview::begin_program`]
-/// captured, which every [`Preview::run`] boots from.
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct RunStart {
-    pub(crate) q: [f64; MAX_JOINTS],
-    pub(crate) resume_scale: f64,
-    pub(crate) paused: bool,
-}
-
 /// The offline session: a virtual arm plus the runtime's planner,
 /// server-side validation and state (profile, TCP offset, completion
 /// policy, IO levels, tool state) — everything a program can observe.
 pub struct Preview {
+    run_origin: Option<run::RunStart>,
     planner: Par6Planner,
     jog: MotionJog,
     /// The housekeeping loop's own cartesian solver, so a `jog_l` preview
@@ -233,7 +225,6 @@ pub struct Preview {
     /// submitted command, and the state the program started from, which
     /// a run boots from so the session's own pose never moves.
     plan: PlanRecorder,
-    origin: RunStart,
     /// The span of the joint-jog stream in progress, so its ramp-down
     /// rows are recorded under it when the next command ends the stream.
     jog_span: Option<usize>,
@@ -315,12 +306,8 @@ impl Preview {
         let jog_limits = MotionLimits::from_config(robot, par6_config::LimitMode::Jog)?;
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let cfg = crate::daemon::server_config(&opts, &bundle);
-        let origin = RunStart {
-            q: snap.q,
-            resume_scale: snap.exec.resume_scale,
-            paused: snap.exec.paused,
-        };
         let mut preview = Self {
+            run_origin: None,
             planner,
             jog,
             cart: stack.cart,
@@ -370,7 +357,6 @@ impl Preview {
                 .hash_one(std::time::SystemTime::now())
                 .max(1),
             plan: PlanRecorder::new(robot.robot.tick_dt_s, robot.joints.len()),
-            origin,
             jog_span: None,
             config_path,
             opts,
@@ -617,18 +603,15 @@ impl Preview {
     }
 
     /// Start the program here: the commanded record begins empty, and a
-    /// run boots from the state the session stands in now. Whatever the
-    /// blend hold still holds is planned first, under the old record.
+    /// run boots from the state the session stands in now, however far
+    /// later submissions advance it. Whatever the blend hold still holds
+    /// is planned first, under the old record.
     pub fn begin_program(&mut self) {
         self.run_held();
         self.drain_stubs();
         self.plan.reset();
         self.jog_span = None;
-        self.origin = RunStart {
-            q: self.snap.q,
-            resume_scale: self.snap.exec.resume_scale,
-            paused: self.snap.exec.paused,
-        };
+        self.run_origin = Some(run::RunStart::capture(self));
     }
 
     /// The commanded record of every command submitted since

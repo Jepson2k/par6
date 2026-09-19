@@ -624,6 +624,7 @@ dependencies = [
  "par6-kin",
  "par6-proto",
  "roxmltree",
+ "serde",
  "socketcan",
  "thiserror 2.0.20",
 ]

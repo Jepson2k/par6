@@ -452,12 +452,13 @@ impl Preview {
     /// The GIL is released for the run: at roughly sixty times real time
     /// a ten minute program is some ten seconds of computing, and the
     /// caller's event loop must not stop for it.
-    #[pyo3(signature = (cmds, max_seconds=None))]
+    #[pyo3(signature = (cmds, max_seconds=None, scenario=None))]
     fn run_program(
         &self,
         py: Python<'_>,
         cmds: Vec<Bound<'_, PyDict>>,
         max_seconds: Option<f64>,
+        scenario: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
         let commands = cmds
             .iter()
@@ -467,11 +468,15 @@ impl Preview {
             Some(max_seconds) => RunLimits { max_seconds },
             None => RunLimits::default(),
         };
+        let scenario: par6_bus::sim::SimulationScenario = match scenario {
+            Some(value) => pythonize::depythonize(value.as_any())?,
+            None => Default::default(),
+        };
         let batch = py.allow_threads(|| {
             self.inner
                 .lock()
                 .unwrap()
-                .run(&commands, limits)
+                .run_scenario(&commands, limits, &scenario)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         batch_dict(py, &batch)

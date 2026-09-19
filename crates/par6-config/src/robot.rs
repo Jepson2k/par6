@@ -458,10 +458,10 @@ pub struct SimConfig {
     pub motor_b_nm_s: f64,
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
-    /// Gearbox holding friction per joint \[Nm, joint side\]: the load
-    /// the unpowered drivetrain holds without back-driving. Must cover
-    /// the joint's worst gravity torque or an IDLE arm collapses.
-    pub holding_friction_nm: Vec<f64>,
+    /// Assumed powered load support per joint \[Nm, joint side\]. This
+    /// empirical fit is not a measured passive-friction or brake parameter.
+    /// Supply-loss scenarios remove it when their supply envelope reaches zero.
+    pub powered_support_nm: Vec<f64>,
 }
 
 impl Default for SimConfig {
@@ -470,7 +470,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
-            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
 }
@@ -1184,18 +1184,17 @@ impl RobotConfig {
 
     fn validate_sim(&self) -> Result<(), ConfigError> {
         let sim = &self.sim;
-        if sim.motor_jm_kg_m2.len() != self.joints.len() {
-            return Err(invalid(
-                "sim.motor_jm_kg_m2",
-                "must carry one entry per joint",
-            ));
-        }
-        for (j, v) in sim.motor_jm_kg_m2.iter().enumerate() {
-            if !(v.is_finite() && *v >= 0.0) {
-                return Err(invalid(
-                    "sim.motor_jm_kg_m2",
-                    format!("entry {j} must be finite and >= 0"),
-                ));
+        for (values, name) in [
+            (&sim.motor_jm_kg_m2, "sim.motor_jm_kg_m2"),
+            (&sim.powered_support_nm, "sim.powered_support_nm"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !(v.is_finite() && *v >= 0.0) {
+                    return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
+                }
             }
         }
         for (v, name) in [
