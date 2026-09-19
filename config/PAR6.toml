@@ -33,6 +33,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.28
 ilim_ma = 1800.0
 voltage_limit_mv = 6000
+# 17HS24-2104S datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 1.6
+phase_inductance_mh = 3.0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -82,6 +86,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.31
 ilim_ma = 2500.0
 voltage_limit_mv = 6000
+# 17HS24-2104S datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 1.6
+phase_inductance_mh = 3.0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -135,6 +143,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.3
 ilim_ma = 2500.0
 voltage_limit_mv = 6000
+# 17HS24-2104S datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 1.6
+phase_inductance_mh = 3.0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -182,6 +194,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.183
 ilim_ma = 2100.0
 voltage_limit_mv = 6000
+# 17HS16-2004S1 datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 1.3
+phase_inductance_mh = 2.6
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -229,6 +245,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.183
 ilim_ma = 2100.0
 voltage_limit_mv = 6000
+# 17HS16-2004S1 datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 1.3
+phase_inductance_mh = 2.6
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -276,6 +296,10 @@ driver_type = "stepfoc"
 kt_nm_a = 0.151
 ilim_ma = 1200.0
 voltage_limit_mv = 6000
+# 17HS08-1004S datasheet phase values; the driver's own `Cal` measures both
+# and keeps them in EEPROM, so a commissioned arm can overwrite these.
+phase_resistance_ohm = 3.7
+phase_inductance_mh = 4.5
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 encoder_bits = 14
@@ -585,6 +609,17 @@ motor_tc_nm = 0.02
 # Gearbox holding friction [Nm, joint side]: the load an unpowered joint
 # carries without back-driving. Sized over the worst gravity torque in the
 # joint's range, or an IDLE arm collapses under its own weight.
+#
+# NOT measured, and joint 1's entry is not even sized: its axis is
+# vertical, so gravity never back-drives it and the rule above yields
+# nothing. Treat the 1.0 as a placeholder. The sim also spends this only
+# against an external load (`drivetrain_friction`), so an unloaded joint
+# keeps just `G * motor_tc_nm` — 0.128 Nm on joint 1, against a measured
+# breakaway of 0.19 to 0.25 Nm on the arm (110 mA one way, 140 the
+# other). A drivetrain that resists back-drive resists motion unloaded
+# too, so this under-models joint 1 about twofold; what it is NOT is the
+# cause of the hunt in `a_held_servo_target_settles`, which needs 0.26 to
+# 0.51 Nm to stop and would want KINETIC friction, below that breakaway.
 holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
 
 [stream]
