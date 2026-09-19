@@ -15,12 +15,13 @@ use std::collections::VecDeque;
 /// per-iteration gain and the sim integrates `kiv · err` once per
 /// firmware iteration rather than once per plant substep.
 ///
-/// This was 0.001 — a guess at "much faster than the bus tick" — which
-/// is 6.25x too slow. Against a 1 ms plant substep it rounded the count
-/// to ONE, so the velocity integral wound up at a sixth of the rate the
-/// drives actually use, and every conclusion drawn about a `kiv`- or
-/// `kpp`-dependent behaviour was drawn against a drive the vendor does
-/// not ship.
+/// A 1 ms plant substep is 6.25 iterations, which is why [`loop_step`]
+/// takes the count as a fraction: a whole-number count winds the
+/// velocity integral at the wrong rate, and every `kiv`- or
+/// `kpp`-dependent behaviour is then measured against a drive the vendor
+/// does not ship.
+///
+/// [`loop_step`]: VirtualDriver::loop_step
 pub(crate) const FW_LOOP_DT: f64 = 0.00016;
 
 /// Samples in the firmware's velocity moving average (`movingAverage`,
@@ -29,9 +30,8 @@ pub(crate) const FW_LOOP_DT: f64 = 0.00016;
 ///
 /// The lag matters, the sample rate does not: the sim cannot afford a
 /// 160 us plant substep, so `loop_step` averages over the same WINDOW of
-/// time at whatever rate the plant runs. Feeding the PI an exact
-/// instantaneous velocity instead gave the loop derivative information no
-/// drive has.
+/// time at whatever rate the plant runs. An exact instantaneous velocity
+/// would hand the PI derivative information no drive has.
 const FW_VEL_AVG_SAMPLES: f64 = 20.0;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
@@ -97,8 +97,6 @@ pub(crate) enum ReplyKind {
 
 pub(crate) struct VirtualDriver {
     dt: f64,
-    /// Firmware velocity-loop iterations per bus tick (≥ 1).
-    fw_steps: f64,
     // -- pushed configuration (updated live by config frames) --
     kpp: f64,
     kpv: f64,
@@ -135,7 +133,6 @@ impl VirtualDriver {
     pub fn new(dt: f64, node: NodeId, vel_limit: f64, ilim_ma: f64, kt_nm_a: f64) -> Self {
         Self {
             dt,
-            fw_steps: (dt / FW_LOOP_DT).round().max(1.0),
             kpp: 0.0,
             kpv: 0.0,
             kiv: 0.0,
@@ -316,26 +313,18 @@ impl VirtualDriver {
         self.ticks_since_data = 0;
     }
 
-    /// One control-loop step at the measured plant state. Ages the
-    /// watchdog first (a fire drops to Idle and latches the watchdog
-    /// flag), then computes the mode's Ilim-saturated current output.
+    /// One control-loop step at the measured plant state: the mode's
+    /// Ilim-saturated current output, integrating the velocity loop over
+    /// `fw_steps` firmware iterations. The watchdog ages separately, once
+    /// per bus tick ([`Self::age_watchdog`]), so a plant can close the
+    /// loops at its physics substep rate (the firmware's own loops run at
+    /// ~6 kHz; a current held over a whole coarse bus tick destabilizes a
+    /// strongly-driven joint).
     ///
     /// A latched fault removes drive authority entirely, as it does on the
     /// arm: firmware runs its mode switch only while `Error == 0`, and the
     /// else branch forces `Controller_mode = 0` and drops SLEEP/RESET
     /// until `Clear_Error`.
-    pub fn control_step(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
-        self.age_watchdog();
-        let fw_steps = self.fw_steps;
-        self.loop_step(pos_ticks, vel_ticks_s, fw_steps)
-    }
-
-    /// The control law alone, integrating the velocity loop over
-    /// `fw_steps` firmware iterations — separated from the per-tick
-    /// watchdog aging so the dynamics plant can close the loops at its
-    /// physics substep rate (the firmware's own loops run at ~1 kHz; a
-    /// current held over a whole coarse bus tick destabilizes a
-    /// strongly-driven joint).
     pub fn loop_step(&mut self, pos_ticks: f64, vel_ticks_s: f64, fw_steps: f64) -> PlantCmd {
         // The firmware's loops read `Velocity_Filter`, never the raw
         // difference, so the filter is inside the loop and its lag is part
