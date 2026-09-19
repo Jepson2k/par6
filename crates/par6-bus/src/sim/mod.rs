@@ -59,6 +59,7 @@ use crate::types::{
     GripperCommand, HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
 };
 
+use driver::Electrical;
 use driver::{ReplyKind, VirtualDriver};
 use gripper::GripperSim;
 use map::JointMap;
@@ -1134,6 +1135,9 @@ impl DriverBus for SimBus {
                     j.velocity_limit_ticks_s,
                     j.ilim_ma,
                     j.kt_nm_a,
+                    j.phase_resistance_ohm
+                        .zip(j.phase_inductance_mh)
+                        .map(|(r, l)| Electrical::new(r, l, j.kt_nm_a, j.encoder_bits)),
                 )
             })
             .collect();
