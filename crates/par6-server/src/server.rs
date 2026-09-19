@@ -1133,6 +1133,7 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         debug_assert!(is_stream(tag));
+        let mut refused_in_place = false;
         let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
@@ -1143,8 +1144,10 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
-                    self.active_stream = None;
-                    self.runtime.rt.cancel_stream();
+                    refused_in_place = true;
+                    if !self.runtime.rt.stop_refused_stream() {
+                        self.active_stream = None;
+                    }
                 }
                 outcome
             }
@@ -1176,7 +1179,11 @@ impl<R: RtCommands> Core<R> {
                 // stands. The gate's own collision latch (if the refusal
                 // was a collision) reaches STATUS through
                 // `update_collision`.
-                self.latch_faf_refusal(&error);
+                if refused_in_place {
+                    self.latch_stream_refusal(&error);
+                } else {
+                    self.latch_faf_refusal(&error);
+                }
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
@@ -1785,6 +1792,17 @@ impl<R: RtCommands> Core<R> {
     fn latch_faf_refusal(&mut self, error: &WireError) {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        self.latch_refusal(error, busy);
+    }
+
+    /// A refused update of the live stream: that stream is stopped or held
+    /// in its standoff, so it is not motion the refusal would misdescribe.
+    fn latch_stream_refusal(&mut self, error: &WireError) {
+        let busy = self.executing.is_some() || !self.pending.is_empty();
+        self.latch_refusal(error, busy);
+    }
+
+    fn latch_refusal(&mut self, error: &WireError, busy: bool) {
         let attributed = self
             .standing_error
             .as_ref()

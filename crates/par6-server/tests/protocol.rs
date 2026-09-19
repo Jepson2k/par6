@@ -764,6 +764,28 @@ async fn recv_status(sock: &UdpSocket) -> par6_proto::Status {
     decode_status(&buf[..n]).expect("decodable status")
 }
 
+/// The first STATUS frame satisfying `pred`, within `BUDGET`. The socket
+/// holds every frame broadcast since it was last read, so the next frame
+/// out of it can predate the change under test; `what` names the
+/// condition in the failure.
+async fn status_where(
+    sock: &UdpSocket,
+    what: &str,
+    pred: impl Fn(&par6_proto::Status) -> bool,
+) -> par6_proto::Status {
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let status = recv_status(sock).await;
+        if pred(&status) {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no STATUS frame where {what} within {BUDGET:?}"
+        );
+    }
+}
+
 /// A TCP rotation with three substantial components \[rad\] — the only
 /// kind that tells the wire's rotation convention apart from the
 /// fixed-axis reading of the same three numbers.
@@ -2461,10 +2483,14 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let status = recv_status(&h.status_rx).await;
+    let status = status_where(
+        &h.status_rx,
+        "joint_en carries the planner's verdict",
+        |s| s.joint_en == joints,
+    )
+    .await;
     assert_eq!(status.cart_en_wrf, [0; 12], "STATUS agrees with REACHABLE");
     assert_eq!(status.cart_en_trf, [0; 12]);
-    assert_eq!(status.joint_en, joints);
 
     // With kinematics the planner's verdict is what goes on the wire —
     // the narrowing is conditional, not a blanket zero.
