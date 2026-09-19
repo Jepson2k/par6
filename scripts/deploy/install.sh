@@ -2,11 +2,12 @@
 # Install par6d + its config + the systemd unit onto the PAR6 control box.
 #
 #   # on the box, from a native build (the normal path — see README):
-#   scripts/deploy/install.sh --stage-only /tmp/par6-bundle --runtime-libs .ffi/stage/lib
-#   sudo /tmp/par6-bundle/install.sh --local --bundle /tmp/par6-bundle
+#   pixi run bundle                       # -> dist/par6d-<arch>.tar.gz
+#   sudo tar -C /tmp -xzf dist/par6d-aarch64.tar.gz
+#   sudo /tmp/bundle/install.sh --local --bundle /tmp/bundle
 #
 #   # from another machine (optional; needs ssh/scp access; sudo on the box):
-#   scripts/deploy/build-aarch64.sh
+#   pixi run bundle
 #   scripts/deploy/install.sh --host pi@par6-box
 #
 #   # just build the bundle (what CI checks; no ssh, no box):
@@ -37,20 +38,10 @@ FORCE_CONFIG=0
 BINARY="$ROOT/target/$TARGET_TRIPLE/release/par6d"
 CONFIG_DIR="$ROOT/config"
 ASSETS_DIR="$ROOT/assets/par6_description"
-# The staged shim + dependency closure scripts/ffi/setup.sh --target aarch64
+# The staged shim + dependency closure scripts/deploy/pack-bundle.sh
 # produced. par6d is linked with an rpath pointing at $LIBS_DEST, so these
 # have to arrive with the binary or it will not start.
 RUNTIME_LIBS="${PAR6_RUNTIME_LIB_SRC:-}"
-# libmujoco ships too: par6d links it for the simulator, and mujoco-rs
-# downloads it into its own directory rather than into the shim's closure,
-# so it is not covered by the staging above. The glob follows the mujoco-rs
-# pin, which decides the version directory's name.
-MUJOCO_LIBS="${PAR6_MUJOCO_LIB_SRC:-}"
-if [ -z "$MUJOCO_LIBS" ] && [ -n "${MUJOCO_DOWNLOAD_DIR:-}" ]; then
-  for d in "$MUJOCO_DOWNLOAD_DIR"/mujoco-*/lib; do
-    [ -d "$d" ] && MUJOCO_LIBS="$d"
-  done
-fi
 UNIT="$ROOT/scripts/deploy/par6d.service"
 
 STAGE_DIR=""
@@ -77,7 +68,6 @@ while [ $# -gt 0 ]; do
     --config) CONFIG_DIR="${2:?--config needs a directory}"; shift 2;;
     --assets) ASSETS_DIR="${2:?--assets needs a directory}"; shift 2;;
     --runtime-libs) RUNTIME_LIBS="${2:?--runtime-libs needs a directory}"; shift 2;;
-    --mujoco-libs) MUJOCO_LIBS="${2:?--mujoco-libs needs a directory}"; shift 2;;
     --bundle) BUNDLE="${2:?--bundle needs a directory}"; shift 2;;
     --stage-only) STAGE_ONLY="${2:?--stage-only needs a directory}"; shift 2;;
     --local) LOCAL=1; shift;;
@@ -98,8 +88,7 @@ install_local() {
   [ -f "$bundle/par6d.service" ] || die "no unit file in $bundle"
   [ -d "$bundle/lib" ] || die "no lib/ in $bundle — this bundle was staged without the
   Pinocchio shim, and par6d does not run without it. Rebuild with:
-    scripts/ffi/setup.sh --target aarch64 && source .ffi/env-aarch64.sh
-    scripts/deploy/build-aarch64.sh"
+    pixi run bundle"
 
   if command -v file >/dev/null && [ "$(uname -m)" = "aarch64" ]; then
     file -b "$bundle/par6d" | grep -q "ARM aarch64" \
@@ -190,18 +179,14 @@ install_config() {
 stage_bundle() {
   local dir="$1"
   [ -f "$BINARY" ] || die "binary not found: $BINARY
-  build it first: scripts/deploy/build-aarch64.sh"
+  build it first: pixi run bundle"
   [ -f "$CONFIG_DIR/PAR6.toml" ] || die "no PAR6.toml under $CONFIG_DIR"
   [ -d "$CONFIG_DIR/grippers" ] || die "no grippers/ under $CONFIG_DIR"
   [ -n "$RUNTIME_LIBS" ] || die "no runtime library directory
-  (set PAR6_RUNTIME_LIB_SRC by sourcing .ffi/env-aarch64.sh, or pass
+  (pass
    --runtime-libs DIR)"
   [ -e "$RUNTIME_LIBS/libpar6_shim.so" ] \
     || die "no libpar6_shim.so under $RUNTIME_LIBS"
-  [ -n "$MUJOCO_LIBS" ] || die "no libmujoco directory
-  (source .ffi/env-aarch64.sh so MUJOCO_DOWNLOAD_DIR is set and build par6d
-   first, or pass --mujoco-libs DIR)"
-  [ -e "$MUJOCO_LIBS/libmujoco.so" ] || die "no libmujoco.so under $MUJOCO_LIBS"
   [ -d "$ASSETS_DIR" ] || die "no assets tree at $ASSETS_DIR"
   mkdir -p "$dir/config/grippers"
   cp "$BINARY" "$dir/par6d"
@@ -211,9 +196,6 @@ stage_bundle() {
   cp "$CONFIG_DIR"/grippers/*.toml "$dir/config/grippers/"
   mkdir -p "$dir/lib"
   cp "$RUNTIME_LIBS"/*.so* "$dir/lib/"
-  # -a: the vendor ships libmujoco.so as a symlink to the versioned file, and
-  # the loader follows the SONAME, so both have to arrive intact.
-  cp -a "$MUJOCO_LIBS"/libmujoco.so* "$dir/lib/"
   cp -a "$ASSETS_DIR" "$dir/par6_description"
 }
 

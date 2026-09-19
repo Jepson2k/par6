@@ -16,6 +16,10 @@ dependencies = [
 
 [project.scripts]
 par6 = "par6.cli:main"
+# A wheel carries the runtime beside the extension, so `pip install par6` is
+# enough to run a simulator (issue #33). The shim execs it, which is what
+# lets one command serve a terminal, a systemd unit and `Robot().start()`.
+par6d = "par6._daemon:main"
 par6-panel = "par6.panel.service:main"
 par6-preflight = "par6.panel.preflight:main"
 

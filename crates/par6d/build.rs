@@ -4,8 +4,8 @@
 //! directory comes from the crate that links the library: par6-kin
 //! publishes the shim's as `DEP_PAR6_SHIM_RPATH` and par6-bus libmujoco's
 //! as `DEP_MUJOCO_RPATH`, through their `links` keys, so a path is derived
-//! in one place. Deploy builds replace both (`build-aarch64.sh` sets the
-//! install prefix's rpath with patchelf).
+//! in one place. The deploy bundle replaces both: `pack-bundle.sh` points
+//! the shipped binary at the directory install.sh fills.
 fn main() {
     for var in ["DEP_PAR6_SHIM_RPATH", "DEP_MUJOCO_RPATH"] {
         if let Ok(dir) = std::env::var(var) {

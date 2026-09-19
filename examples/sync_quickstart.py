@@ -1,9 +1,8 @@
 """Sync client quickstart: spawn a simulated runtime and drive it.
 
-Run from the repository root, with the shim on the loader path::
+Run from the repository root::
 
-    source .ffi/env.sh
-    python examples/sync_quickstart.py
+    pixi run python examples/sync_quickstart.py
 """
 
 from par6 import Robot
