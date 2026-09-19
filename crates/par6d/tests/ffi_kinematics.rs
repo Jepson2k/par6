@@ -2264,13 +2264,29 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
         "expected the corner region to be sampled, got {} frames",
         mid.len()
     );
-    let slowest = mid
-        .iter()
-        .map(|s| s.speeds.iter().fold(0.0f64, |m, v| m.max(v.abs())))
-        .fold(f64::INFINITY, f64::min);
+    // The floor is on progress over a window, not on one frame's speed:
+    // STATUS carries the drive's instantaneous velocity, and a velocity
+    // loop rings through a corner — measured on the sim rig at 0.02 to
+    // 0.15 rad/s on alternate frames while the joints advanced steadily.
+    // A blend that stops is a window in which nothing moved.
+    const WINDOW_S: f64 = 0.25;
+    let mut slowest = f64::INFINITY;
+    for (a, s0) in mid.iter().enumerate() {
+        let span = |s: &Status| (s.mono_time_ns.saturating_sub(s0.mono_time_ns)) as f64 * 1e-9;
+        if let Some(s1) = mid[a..].iter().find(|s| span(s) >= WINDOW_S) {
+            let moved = s0
+                .angles
+                .iter()
+                .zip(s1.angles.iter())
+                .map(|(p, q)| (q - p).abs().to_radians())
+                .fold(0.0f64, f64::max);
+            slowest = slowest.min(moved / span(s1));
+        }
+    }
     assert!(
         slowest > 0.02,
-        "the blended joint corner slowed to {slowest:.4} rad/s: a blend that stops is not a blend"
+        "the blended joint corner slowed to {slowest:.4} rad/s over {WINDOW_S} s: \
+         a blend that stops is not a blend"
     );
     rig.wait_status(
         "the blended joint chain reports both commands complete",
