@@ -154,3 +154,46 @@ fn lifecycle_and_input_validation() {
     let s = exec.step().unwrap();
     assert_eq!(s.q, HOME);
 }
+
+#[test]
+fn a_target_set_after_a_release_is_tracked_again() {
+    let (mut exec, _, _) = stream_setup();
+    exec.activate(&HOME);
+    let t1: [f64; NUM_JOINTS] = std::array::from_fn(|j| HOME[j] + DELTA[j]);
+    exec.set_target(&t1).unwrap();
+    for _ in 0..50 {
+        exec.step().unwrap();
+    }
+
+    // Braked to rest somewhere short of t1.
+    exec.release();
+    let mut rest = None;
+    for _ in 0..20_000 {
+        let s = exec.step().unwrap();
+        if s.qd.iter().all(|v| v.abs() < 1e-9) {
+            rest = Some(s.q);
+            break;
+        }
+    }
+    let rest = rest.expect("the release brakes to rest");
+    assert!(
+        max_err(&rest, &t1) > 1e-3,
+        "the release did not stop short of t1"
+    );
+
+    // A session resumed after the brake follows its next target.
+    let t2: [f64; NUM_JOINTS] = std::array::from_fn(|j| rest[j] - DELTA[j]);
+    exec.set_target(&t2).unwrap();
+    let mut last = rest;
+    for _ in 0..20_000 {
+        let s = exec.step().unwrap();
+        last = s.q;
+        if s.finished {
+            break;
+        }
+    }
+    assert!(
+        max_err(&last, &t2) < 1e-6,
+        "a target set after a release was not tracked: rest {rest:?}, final {last:?}, target {t2:?}"
+    );
+}
