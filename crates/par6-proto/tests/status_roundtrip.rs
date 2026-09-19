@@ -76,3 +76,65 @@ fn a_bus_with_no_drives_still_round_trips() {
     assert!(got.drive_health.faults.is_empty());
     assert!(got.drive_health.temperatures_c.is_empty());
 }
+
+/// A STATUS from an OLDER daemon must still yield its protocol version.
+///
+/// This is the whole point of `peek_status_proto_version`. Adding fields
+/// grows the array, so a v3 producer sends fewer elements than a v4 client
+/// requires and `decode_status` refuses it on ARITY — before it has read the
+/// version. A client holding only `decode_status` therefore cannot tell a
+/// version skew from a corrupt datagram and reports neither: it drops the
+/// frame at debug level and goes quiet, which is the failure this exists to
+/// explain.
+///
+/// The fixture is a real encoding with its array header shortened rather
+/// than hand-written bytes, so it stays honest if the header layout moves.
+#[test]
+fn an_older_daemons_status_still_reports_its_version() {
+    let mut buf = Vec::new();
+    par6_proto::encode_status_into(
+        &Status {
+            proto_version: 3,
+            ..populated()
+        },
+        &mut buf,
+    );
+    assert_eq!(
+        par6_proto::peek_status_proto_version(&buf),
+        Some(3),
+        "the version must be readable from a STATUS that DOES decode"
+    );
+
+    // Now the skew itself: an older producer sends fewer elements. The
+    // header is msgpack array16 — 0xDC then a big-endian count.
+    assert_eq!(buf[0], 0xDC, "STATUS_LEN no longer encodes as array16");
+    let short = (par6_proto::STATUS_LEN as u16) - 1;
+    buf[1..3].copy_from_slice(&short.to_be_bytes());
+
+    assert!(
+        decode_status(&buf).is_err(),
+        "a short STATUS must not decode; if it did, this test is not \
+         exercising the skew case at all"
+    );
+    assert_eq!(
+        par6_proto::peek_status_proto_version(&buf),
+        Some(3),
+        "the version must be readable from the datagram decode_status refused"
+    );
+}
+
+/// The peek claims nothing for a datagram that is not a STATUS.
+#[test]
+fn peeking_a_version_rejects_other_messages() {
+    assert_eq!(par6_proto::peek_status_proto_version(&[]), None);
+    assert_eq!(
+        par6_proto::peek_status_proto_version(&[0x90]),
+        None,
+        "an empty array carries no tag"
+    );
+    assert_eq!(
+        par6_proto::peek_status_proto_version(&[0x92, 0x7F, 0x04]),
+        None,
+        "a two-element array whose tag is not Status"
+    );
+}
