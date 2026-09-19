@@ -104,6 +104,11 @@ impl StreamingExecutor {
                 reason: format!("joint positions must be finite, got {q_target:?}"),
             });
         }
+        // A position target is a position-interface request. After a
+        // `release` the executor is on the velocity interface, where a
+        // target position is never read: a session resumed there would
+        // hold at rest and ignore every target it was handed.
+        self.input.control_interface = ControlInterface::Position;
         for (j, &q) in q_target.iter().enumerate() {
             self.input.target_position[j] = q;
             self.input.target_velocity[j] = 0.0;
