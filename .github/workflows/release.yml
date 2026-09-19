@@ -1,0 +1,133 @@
+# Release artifacts: the aarch64 daemon bundle and the `par6` wheel, built
+# natively on the platform the arm runs on, validated outside the build
+# environment, and published exactly as validated — the release job attaches
+# the files the smoke test passed on rather than rebuilding them.
+#
+# A tag builds and publishes. `workflow_dispatch` builds and validates
+# without publishing, which is how a release candidate is rehearsed: an
+# `-rc` tag would match `refs/tags/v` and cut a real public release.
+name: release
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # The primary platform. Wheel and bundle come out of one job so the
+  # manifest and the checksums describe a single build of a single commit.
+  build-arm64:
+    name: build (aarch64)
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - run: pixi run wheel-with-runtime
+      - run: pixi run bundle
+      - uses: actions/upload-artifact@v4
+        with:
+          name: par6-aarch64
+          path: |
+            dist/*.whl
+            dist/par6d-aarch64.tar.gz
+            dist/manifest.json
+            dist/SHA256SUMS
+
+  # x86_64 gets a wheel so a developer can `pip install par6` on a laptop.
+  # No daemon bundle: nothing deploys to an x86_64 control box.
+  build-x86:
+    name: build (x86_64, wheel only)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - run: pixi run wheel-with-runtime
+      - name: checksums
+        run: cd dist && sha256sum ./*.whl > SHA256SUMS-x86_64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: par6-x86_64
+          path: |
+            dist/*.whl
+            dist/SHA256SUMS-x86_64
+
+  sdist:
+    name: sdist
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/pixi
+        with:
+          cache-key: default
+      - run: pixi run sdist
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+
+  # The gate. Installs and exercises the artifacts build-arm64 produced,
+  # with no pixi, no cargo, no .ffi and no LD_LIBRARY_PATH, and resolves
+  # the python package's DECLARED dependencies — no branch overrides, which
+  # belong to ci.yml and development testing only.
+  validate-arm64:
+    name: validate (aarch64)
+    needs: build-arm64
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: par6-aarch64
+          path: dist
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: scripts/deploy/validate-bundle.sh dist
+      - name: assert the manifest describes THIS commit
+        run: |
+          built="$(python3 -c "import json;print(json.load(open('dist/manifest.json'))['commit'])")"
+          [ "$built" = "${{ github.sha }}" ] \
+            || { echo "manifest names $built, not ${{ github.sha }}"; exit 1; }
+      - name: upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: validate-aarch64-logs
+          path: /tmp/par6-validate/**
+          if-no-files-found: ignore
+
+  # Publishes the downloaded artifacts unchanged. Nothing is built here, so
+  # what a user downloads is byte-for-byte what validate-arm64 installed and
+  # ran — the checksums in SHA256SUMS are checkable against the release.
+  release:
+    name: attach to release
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [validate-arm64, build-x86, sdist]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+      - run: ls -l dist && cat dist/manifest.json
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          fail_on_unmatched_files: true

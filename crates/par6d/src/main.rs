@@ -97,6 +97,18 @@ fn main() {
             log::info!("parent process is gone; shutting down");
             break;
         }
+        // A planner-thread death closes the channels the command plane
+        // reads, so the server task returns on its own. Without this the
+        // process would keep running: RT ticking, status broadcasting, and
+        // every command refused with silence.
+        if daemon.command_plane_gone() {
+            log::error!(
+                "the command plane stopped on its own; the runtime can no \
+                 longer be commanded, so it is shutting down rather than \
+                 leaving the arm powered and unreachable"
+            );
+            break;
+        }
         std::thread::sleep(Duration::from_millis(50));
     }
     daemon.shutdown();

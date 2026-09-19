@@ -54,8 +54,8 @@ pub use reply::{
     decode_reply, encode_reply, BusNode, LoopStatsResult, QueryResult, Reply, ToolStatusWire,
 };
 pub use status::{
-    decode_status, encode_status_into, DriveHealthWire, HomingWire, LinkHealthWire, LoopHealthWire,
-    Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
+    decode_status, encode_status_into, peek_status_proto_version, DriveHealthWire, HomingWire,
+    LinkHealthWire, LoopHealthWire, Status, StatusEncoder, STATUS_HEADER_LEN, STATUS_LEN,
 };
 
 /// Protocol version carried in the STATUS header.
