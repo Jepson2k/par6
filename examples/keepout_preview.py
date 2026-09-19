@@ -4,10 +4,9 @@ Places a keep-out across a move, shows the preview refusing it before any
 runtime is involved, then shows the runtime refusing the same move — same
 error code, same colliding pair.
 
-Run from the repository root, with the shim on the loader path::
+Run from the repository root::
 
-    source .ffi/env.sh
-    python examples/keepout_preview.py
+    pixi run python examples/keepout_preview.py
 """
 
 from waldoctl.shapes import Box
