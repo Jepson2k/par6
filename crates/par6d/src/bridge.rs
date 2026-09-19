@@ -939,28 +939,27 @@ fn projection_seed(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
     }
 }
 
-/// The velocity a stopping projection starts from: per joint, the
-/// larger in magnitude of the RT's raw and filtered measurements.
+/// The velocity a stopping projection starts from.
 ///
-/// The projection prices the ground the arm's momentum covers over the
-/// next few hundred milliseconds, and neither reading alone is that
-/// momentum. The raw velocity is the drive's own sample, which a velocity
-/// loop rings on: measured on the sim rig, a stream commanded at
+/// The RT's filtered measurement, not the raw one. The projection prices
+/// the ground the arm's momentum covers over the next few hundred
+/// milliseconds, and the raw velocity is the drive's own sample, which a
+/// velocity loop rings on: measured on the sim rig, a stream commanded at
 /// 0.22 rad/s read 0.55 rad/s on one tick and a fraction of that on the
-/// next, and a refusal projected from the low tick lets the arm coast
-/// through the standoff. The filtered velocity is what the arm carries
-/// through the ring, but it lags the raw one while the arm is still
-/// accelerating, and a refusal projected from the lagging value fires a
-/// tick late. Starting from the larger can only refuse earlier, and the
-/// placement step lands the arm on the standoff from wherever it stops.
+/// next. Projected from the low sample the refusal fires late; projected
+/// from the high one a descent 60 mm above the floor is refused against
+/// it, and taking the larger of the two readings does exactly that. The
+/// filtered velocity is the momentum the arm carries through the ring.
+/// It lags a tick or two behind an arm still accelerating, and that lag
+/// is priced by the RT holding a released stream under its position law
+/// until the arm is at rest rather than handing it to IDLE: the coast
+/// after a refusal is the loop's settle, not a freewheel.
 fn projection_velocity(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
-    let mut v = snap.qd;
-    for (out, filtered) in v.iter_mut().zip(snap.qd_filtered.iter()) {
-        if filtered.is_finite() && filtered.abs() > out.abs() {
-            *out = *filtered;
-        }
+    if snap.qd_filtered.iter().all(|v| v.is_finite()) {
+        snap.qd_filtered
+    } else {
+        snap.qd
     }
-    v
 }
 
 /// A gate refusal being worked through, in two steps.
