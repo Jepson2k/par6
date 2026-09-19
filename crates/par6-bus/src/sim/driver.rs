@@ -26,15 +26,13 @@ pub(crate) const FW_LOOP_DT: f64 = 0.00016;
 /// Samples in the firmware's velocity moving average (`movingAverage`,
 /// `utils.cpp:177`), which is what the velocity PI reads — NOT the raw
 /// finite difference.
-const FW_VEL_AVG_SAMPLES: f64 = 20.0;
-
-/// Time the firmware's velocity estimate is averaged over \[s\].
 ///
 /// The lag matters, the sample rate does not: the sim cannot afford a
-/// 160 us plant substep, so it averages over the same WINDOW at whatever
-/// rate the plant runs. Feeding the PI an exact instantaneous velocity
-/// instead gave the loop derivative information no drive has.
-pub(crate) const FW_VEL_AVG_S: f64 = FW_VEL_AVG_SAMPLES * FW_LOOP_DT;
+/// 160 us plant substep, so `loop_step` averages over the same WINDOW of
+/// time at whatever rate the plant runs. Feeding the PI an exact
+/// instantaneous velocity instead gave the loop derivative information no
+/// drive has.
+const FW_VEL_AVG_SAMPLES: f64 = 20.0;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -463,7 +461,7 @@ impl VirtualDriver {
     }
 
     /// The firmware's `Velocity_Filter`: a moving average over
-    /// [`FW_VEL_AVG_S`] of measurement, resampled to the plant's substep.
+    /// [`FW_VEL_AVG_SAMPLES`] firmware samples of measurement, resampled to the plant's substep.
     ///
     /// The window is sized from the substep the plant actually calls with,
     /// so a scene timestep change keeps the firmware's averaging TIME
