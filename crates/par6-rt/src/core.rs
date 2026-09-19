@@ -78,6 +78,15 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+/// Measured joint speed \[rad/s\] under which the arm counts as at rest
+/// for a released JOG or STREAM to hand over to IDLE. The ramp reaching
+/// zero says nothing about the plant, which lags the ramp by whatever
+/// its velocity loop is still carrying; IDLE drives nothing, so an arm
+/// handed over while it still moves freewheels on its momentum, and it
+/// was the position law holding the ramp's rest point that was meant to
+/// brake it. Read off the filtered measurement, which a ringing drive
+/// cannot zero on a single tick.
+const RELEASE_REST_RAD_S: f64 = 0.01;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
@@ -856,6 +865,12 @@ impl<B: DriverBus> RtCore<B> {
     /// The bus backend (sim scenario hooks, backend switching in `par6d`).
     pub fn bus_mut(&mut self) -> &mut B {
         &mut self.bus
+    }
+
+    /// Whether every joint's filtered measured speed is under
+    /// [`RELEASE_REST_RAD_S`].
+    fn at_measured_rest(&self) -> bool {
+        self.qd_filt.iter().all(|v| v.abs() <= RELEASE_REST_RAD_S)
     }
 
     /// Measured joint positions \[rad\] — what a backend swap seeds the
@@ -2219,8 +2234,14 @@ impl<B: DriverBus> RtCore<B> {
                 );
                 // A released jog ramps down instead of stopping dead,
                 // and JOG is the only mode that ticks the engine, so the
-                // mode outlives the release until the ramp is at rest.
-                if self.jog_released && self.scratch_qd.iter().all(|v| *v == 0.0) {
+                // mode outlives the release until the ramp AND the arm
+                // are at rest: the ramp's rest point is a position hold,
+                // and the hold is what brakes an arm still carrying the
+                // ramp's velocity (see [`RELEASE_REST_RAD_S`]).
+                if self.jog_released
+                    && self.scratch_qd.iter().all(|v| *v == 0.0)
+                    && self.at_measured_rest()
+                {
                     self.mode = Mode::Idle;
                 }
             }
@@ -2305,13 +2326,15 @@ impl<B: DriverBus> RtCore<B> {
                 );
                 // A released stream brakes instead of stopping dead, and
                 // STREAM is the only mode that ticks this executor, so
-                // the mode outlives the release until the ramp is at
-                // rest — the same contract JOG has. Handing the arm to
-                // IDLE while it still carries velocity is what let a
-                // refused stream coast on past the keep-out that
-                // refused it.
+                // the mode outlives the release until the ramp AND the
+                // arm are at rest — the same contract JOG has. Handing
+                // the arm to IDLE while it still carries velocity is what
+                // let a refused stream coast on past the keep-out that
+                // refused it, and the ramp's rest is not the arm's (see
+                // [`RELEASE_REST_RAD_S`]).
                 if self.stream_released
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
+                    && self.at_measured_rest()
                 {
                     self.mode = Mode::Idle;
                 }
