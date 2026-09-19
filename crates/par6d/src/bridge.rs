@@ -94,7 +94,39 @@ fn jog_deadline(duration_s: f64) -> Instant {
 /// tick, and an RT that drains one command per tick. Counted in ticks
 /// because that is what those stages are made of — a flat wall-clock
 /// horizon was a different number of pipeline stages at every tick rate.
-const STOP_PIPELINE_TICKS: f64 = 24.0;
+///
+/// Four, because that is how many stages the paragraph above names once
+/// the housekeeping pass is counted honestly. It was three, calibrated
+/// while that pass ran flat out — its loop returned to the top past its
+/// own wait, 553 passes per tick measured on the sim rig — so the pass
+/// contributed no latency and the margin covered the coast. Pacing the
+/// loop as designed handed that tick back, and the arm spent it
+/// travelling: the same fast approach that had stopped 3 mm clear of a
+/// keep-out reached 0.3 mm inside it, one tick of travel at the speed
+/// it was refused at.
+///
+/// This was 24, which is not a stage count: it is eight times the
+/// pipeline, and because the term is multiplied by the tick period it
+/// bought a different horizon at every rate -- 0.096 s on the shipped
+/// 250 Hz robot, but 1.2 SECONDS on a 20 Hz test rig, which projected
+/// the elbow 58 degrees ahead and refused an ordinary descent against a
+/// floor the arm was never going to reach.
+///
+/// Measured by logging each gate refusal's projection beside the travel
+/// the arm actually made before coming to rest (rad):
+///
+/// | joint | v      | predicted | actual | ratio |
+/// |-------|--------|-----------|--------|-------|
+/// | J2    |  0.093 |  0.190    |  0.037 | 0.19  |
+/// | J3    | -0.473 | -0.801    | -0.076 | 0.10  |
+/// | J5    |  0.399 |  0.702    |  0.128 | 0.18  |
+///
+/// The arm stops in well under the settling term below, so the pipeline
+/// has nothing left to stand in for. At the shipped tick rate this
+/// barely moves the projection -- the settling term dominates there
+/// either way -- and at a slow rig it removes an order of magnitude of
+/// phantom lookahead.
+const STOP_PIPELINE_TICKS: f64 = 4.0;
 
 /// First-order lags the settling term counts.
 ///
@@ -137,6 +169,23 @@ pub fn stream_stopping_travel(v_rad_s: f64, position_loop_hz: f64, tick_dt_s: f6
 /// against its projection every period \[rad/s\]. Below it the arm is
 /// settling on a held target and the projection would be noise.
 const STREAM_MOVING_RAD_S: f64 = 0.01;
+
+// The speed a placement's hold is dropped at is what sets the standoff's
+// error budget: IDLE only damps, so whatever the arm still carries it
+// coasts. [`STREAM_MOVING_RAD_S`] answers a different question — has
+// this stream stopped moving — and at the arm's reach allows four and a
+// half millimetres a second, which coasts about half a millimetre off
+// every standoff and is most of why
+// `a_refused_servo_stream_lands_on_the_keep_out_standoff` rests at 6.0
+// mm against a 5.0 mm clearance.
+//
+// It cannot simply be tightened. The gate can never sit below the
+// drive's own residual motion, and joint 1 hunts at 5 Hz in the
+// simulator (see `a_held_servo_target_settles`), so a 1e-3 rad/s gate is
+// never satisfied: the placement times out and leaves the arm INSIDE
+// the keep-out. With joint 1 settled that same gate places the arm on
+// the clearance and lifts the closest approach by two millimetres. This
+// is a one-line change waiting on the drive, not on a better threshold.
 
 /// How near a joint has to be to a gate-imposed standoff to count as
 /// arrived \[rad\]. Half a millimetre at the arm's reach, an order below
@@ -185,13 +234,50 @@ const STANDOFF_PLACEMENT_SCALE: (f64, f64) = (0.05, 0.05);
 const STANDOFF_STILL_TICKS: u8 = 8;
 
 /// How long the arm is given to reach a standoff before the stream is
-/// ended anyway.
+/// ended anyway \[s\], counted in RT ticks.
 ///
 /// The refeed exists because the client has stopped sending — its
 /// motion was refused — so nothing else would keep the stream alive
 /// across the travel. That makes it the one place a stuck executor
 /// could hold a stream open forever, and this is the backstop.
-const STANDOFF_TRAVEL_BUDGET: Duration = Duration::from_secs(3);
+///
+/// Ticks, not wall time: the braking and the placement are paced by the
+/// RT, and on a starved host the RT falls behind the clock. A wall
+/// budget then expires with the arm still in transit and idles it
+/// wherever it is — measured under load on the sim rig, that was inside
+/// the keep-out the refusal was about.
+const STANDOFF_TRAVEL_BUDGET_S: f64 = 3.0;
+
+/// How many placements one refusal may spend landing the arm on its
+/// standoff.
+///
+/// A placement ends by letting go, and letting go moves the arm (see
+/// [`Standoff::Settling`]); each retry starts from rest and from nearer,
+/// so it disturbs the arm less than the one before and the landings
+/// converge. The cap is what stops a drive that cannot hold still from
+/// retrying for ever — it is spent, and the arm is left on the last
+/// landing, which is still outside the keep-out.
+const STANDOFF_PLACEMENT_TRIES: u8 = 4;
+
+/// [`STANDOFF_TRAVEL_BUDGET_S`] in ticks of `tick_dt_s`.
+fn standoff_budget_ticks(tick_dt_s: f64) -> u64 {
+    (STANDOFF_TRAVEL_BUDGET_S / tick_dt_s).round() as u64
+}
+
+/// `from` advanced toward `to` by at most [`STANDOFF_CREEP_RAD`] on each
+/// joint; exactly `to` once within reach of it.
+fn creep_toward(from: &[f64; MAX_JOINTS], to: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+    let mut next = *from;
+    for j in 0..par6_kin::NQ {
+        let step = to[j] - from[j];
+        next[j] = if step.abs() <= STANDOFF_CREEP_RAD {
+            to[j]
+        } else {
+            from[j] + step.signum() * STANDOFF_CREEP_RAD
+        };
+    }
+    next
+}
 /// Escape-depth tolerance \[m\]: a min-distance drop smaller than this
 /// counts as "no deeper" (absorbs signed-distance jitter between two
 /// nearby configurations; parol6's escape tolerance). Used by the
@@ -730,6 +816,11 @@ impl StreamGate {
         STOP_PIPELINE_TICKS * self.tick_dt_s
     }
 
+    /// The RT period the gate was built for \[s\].
+    pub(crate) fn tick_dt_s(&self) -> f64 {
+        self.tick_dt_s
+    }
+
     /// The braking half of [`stream_stopping_travel`] \[rad\] — the
     /// cartesian paths integrate the reaction half through the jacobian
     /// instead, so they add only this.
@@ -916,6 +1007,43 @@ fn projection_seed(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
     }
 }
 
+/// The velocity a stopping projection starts from.
+///
+/// The RT's filtered measurement, not the raw one. The projection prices
+/// the ground the arm's momentum covers over the next few hundred
+/// milliseconds, and the raw velocity is the drive's own sample, which a
+/// velocity loop rings on: measured on the sim rig, a stream commanded at
+/// 0.22 rad/s read 0.55 rad/s on one tick and a fraction of that on the
+/// next. Projected from the low sample the refusal fires late; projected
+/// from the high one a descent 60 mm above the floor is refused against
+/// it, and taking the larger of the two readings does exactly that. The
+/// filtered velocity is the momentum the arm carries through the ring.
+/// It lags a tick or two behind an arm still accelerating, and that lag
+/// is priced by the RT holding a released stream under its position law
+/// until the arm is at rest rather than handing it to IDLE: the coast
+/// after a refusal is the loop's settle, not a freewheel.
+///
+/// The same lag reads a reversal as its old motion: for a tick or two
+/// after a client turns a stream around, the filtered velocity still
+/// points the way the arm came, and a projection from it refused a
+/// stream climbing away from the floor against the floor — and then
+/// placed the arm on the floor's clearance. A joint whose commanded
+/// velocity opposes its measured one is being braked by the tracker at
+/// the stream's full deceleration, so it projects no travel.
+fn projection_velocity(snap: &StateSnapshot) -> [f64; MAX_JOINTS] {
+    let mut v = if snap.qd_filtered.iter().all(|f| f.is_finite()) {
+        snap.qd_filtered
+    } else {
+        snap.qd
+    };
+    for (out, commanded) in v.iter_mut().zip(snap.qd_commanded.iter()) {
+        if commanded.is_finite() && *commanded * *out < 0.0 {
+            *out = 0.0;
+        }
+    }
+    v
+}
+
 /// A gate refusal being worked through, in two steps.
 ///
 /// The arm cannot simply be commanded onto the standoff: a refusal
@@ -930,9 +1058,46 @@ enum Standoff {
     /// refused target, kept because the standoff has to be solved from
     /// wherever the arm actually stops: short of it after a gentle
     /// refusal, past it and inside the keep-out after a fast one.
-    Braking { goal: [f64; MAX_JOINTS] },
-    /// Travelling the last stretch onto the solved standoff.
-    Placing { stop: [f64; MAX_JOINTS] },
+    /// `until_tick` is the RT tick the phase must be over by
+    /// ([`STANDOFF_TRAVEL_BUDGET_S`]).
+    Braking {
+        goal: [f64; MAX_JOINTS],
+        until_tick: u64,
+    },
+    /// Travelling the last stretch onto the solved standoff, by
+    /// `until_tick`. `tries` counts the placements spent on this
+    /// refusal.
+    Placing {
+        stop: [f64; MAX_JOINTS],
+        tries: u8,
+        until_tick: u64,
+    },
+    /// Let go of the standoff and watching where that left the arm.
+    ///
+    /// IDLE has no position authority, so the arm leaves a hold carrying
+    /// whatever the drive still had, and how far that takes it is not
+    /// knowable from the moment the hold is dropped — measured on the sim
+    /// rig, a placement that arrived within half a millimetre of the
+    /// standoff drifted 1.7 degrees off it, 10 mm of the very clearance
+    /// the gate had just measured out. So the landing is measured rather
+    /// than assumed: once the arm is still under IDLE's own damping, a
+    /// placement that did not hold is simply run again, this time from
+    /// rest.
+    Settling {
+        stop: [f64; MAX_JOINTS],
+        tries: u8,
+        until_tick: u64,
+    },
+}
+
+impl Standoff {
+    fn until_tick(&self) -> u64 {
+        match self {
+            Standoff::Braking { until_tick, .. }
+            | Standoff::Placing { until_tick, .. }
+            | Standoff::Settling { until_tick, .. } => *until_tick,
+        }
+    }
 }
 
 /// An enable request in flight, retried by housekeeping until the RT
@@ -1161,10 +1326,12 @@ impl RtCommands for RtBridge {
                         // restart the sequence under a client that has
                         // not stopped sending.
                         if matches!(phase, Standoff::Braking { .. }) {
-                            let q = self.cart.snapshots.latest().q;
-                            if gate.blocked(&q, &target)?.is_some() {
-                                a.standoff = Some(Standoff::Braking { goal: target });
-                                a.deadline = Instant::now() + STANDOFF_TRAVEL_BUDGET;
+                            let snap = self.cart.snapshots.latest();
+                            if gate.blocked(&snap.q, &target)?.is_some() {
+                                a.standoff = Some(Standoff::Braking {
+                                    goal: target,
+                                    until_tick: snap.tick + standoff_budget_ticks(gate.tick_dt_s()),
+                                });
                             }
                         }
                         return Err(gate.standing_refusal());
@@ -1195,7 +1362,8 @@ impl RtCommands for RtBridge {
                     // same re-check housekeeping already runs on a
                     // moving stream, moved to where the datagram is
                     // still refusable.
-                    let la = gate.motion_lookahead(&projection_seed(&snap), &snap.qd);
+                    let la =
+                        gate.motion_lookahead(&projection_seed(&snap), &projection_velocity(&snap));
                     // Which question failed decides where the arm is then
                     // put. The TARGET failing means the arm must stop
                     // before the configuration it was sent to, so the
@@ -1212,12 +1380,12 @@ impl RtCommands for RtBridge {
                     // rest. Measured on the sim rig, that is the whole
                     // of what a 1 mm/50 ms approach still had left over
                     // once the projection covered everything else.
-                    let target_stop = gate.motion_lookahead(&target, &snap.qd);
+                    let moving = snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S);
+                    let target_stop = gate.motion_lookahead(&target, &projection_velocity(&snap));
                     let verdict = match gate.blocked(&snap.q, &target_stop)? {
                         Some(pairs) => Some((pairs, target_stop)),
                         None => gate.blocked(&snap.q, &la)?.map(|pairs| (pairs, la)),
                     };
-                    let moving = snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S);
                     match verdict {
                         None => (None, epoch),
                         Some((pairs, goal)) => (Some((gate.refuse(pairs), goal, moving)), epoch),
@@ -1232,6 +1400,8 @@ impl RtCommands for RtBridge {
                         return Err(refusal);
                     }
                     log::warn!("servo: collision predicted; stopping on the standoff");
+                    let until_tick = self.cart.snapshots.latest().tick
+                        + standoff_budget_ticks(self.cart.gate.lock().unwrap().tick_dt_s());
                     // A release, not a position hold. The drive closes a
                     // position error against the arm's own momentum, and
                     // handing it a hold while the arm still carries
@@ -1247,10 +1417,12 @@ impl RtCommands for RtBridge {
                         // A refused stream outlives the client's
                         // silence: the refusal is why it stopped
                         // sending, and the arm still has to be stopped
-                        // and placed.
-                        deadline: Instant::now() + STANDOFF_TRAVEL_BUDGET,
+                        // and placed; the standoff carries its own
+                        // budget, and the grace only starts once the
+                        // arm is parked on it.
+                        deadline: Instant::now() + self.servo_grace(),
                         servo_target: None,
-                        standoff: Some(Standoff::Braking { goal }),
+                        standoff: Some(Standoff::Braking { goal, until_tick }),
                         jog: [0.0; MAX_JOINTS],
                         world_epoch,
                         cart: None,
@@ -1330,7 +1502,6 @@ impl RtCommands for RtBridge {
                 for (j, v) in target.iter_mut().enumerate() {
                     *v = v.clamp(self.cart.soft_min[j], self.cart.soft_max[j]);
                 }
-                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
                 let world_epoch = {
                     let q = self.cart.snapshots.latest().q;
                     let mut gate = self.cart.gate.lock().unwrap();
@@ -1348,6 +1519,7 @@ impl RtCommands for RtBridge {
                 ) {
                     self.enter_stream_mode(Mode::Stream);
                 }
+                let scale = (speed.unwrap_or(1.0), accel.unwrap_or(1.0));
                 self.stream_input.lock().unwrap().send(&StreamSetpoint {
                     q: target,
                     speed: scale.0,
@@ -1846,7 +2018,17 @@ pub(crate) fn housekeeping_loop(
                           gate: &Arc<Mutex<StreamGate>>,
                           what: &str,
                           pairs: Vec<(String, String)>| {
-        log::warn!("{what}: collision predicted; stopping the stream");
+        // Name the pairs: "collision predicted" without them leaves an
+        // operator (or a failing test) no way to tell a keep-out from a
+        // self-collision, and the gate has them right here.
+        log::warn!(
+            "{what}: collision predicted; stopping the stream: {}",
+            pairs
+                .iter()
+                .map(|(a, b)| format!("[{a}, {b}]"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
         gate.lock().unwrap().refuse(pairs);
         // Both releases, because either mode may be the one running and
         // each ignores the release that is not its own. They ramp the
@@ -1867,6 +2049,13 @@ pub(crate) fn housekeeping_loop(
     let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
     let mut profile_logged = Instant::now();
     'housekeeping: while !shutdown.load(Ordering::SeqCst) {
+        // One pass per RT tick, paced at the TOP because the arms below
+        // return here with `continue`: with the wait at the bottom every
+        // one of those paths — the whole refusal sequence among them —
+        // spun this thread flat out, measured at 553 passes per tick on
+        // the sim rig, against an RT thread that has a deadline to make
+        // and, on a two-core host, its core to share.
+        std::thread::sleep(housekeeping_period(dt));
         let now = Instant::now();
         let snap = snapshots.latest();
         if now.duration_since(profile_logged) >= Duration::from_secs(1) {
@@ -1885,9 +2074,9 @@ pub(crate) fn housekeeping_loop(
         {
             let mut sh = shared.lock().unwrap();
             // The standoff arm leaves through the block label, not
-            // `continue`: the enable/flashing bookkeeping below and the
-            // period sleep must run on every iteration, however long a
-            // brake-and-place takes.
+            // `continue`: the enable and flashing bookkeeping below must
+            // run on every iteration, however long a brake-and-place
+            // takes. Every other arm ends the iteration as before.
             'stream: {
                 match &mut sh.stream {
                     // The ramp reached rest and the RT left JOG on its own:
@@ -1903,9 +2092,9 @@ pub(crate) fn housekeeping_loop(
                     // to stop it.
                     Some(a) if a.standoff.is_some() => {
                         let phase = a.standoff.expect("checked by the guard");
-                        let expired = now >= a.deadline;
+                        let expired = snap.tick >= phase.until_tick();
                         match phase {
-                            Standoff::Braking { goal } => {
+                            Standoff::Braking { goal, .. } => {
                                 if snap.tick != a.still_tick {
                                     a.still_tick = snap.tick;
                                     a.still =
@@ -1964,20 +2153,28 @@ pub(crate) fn housekeeping_loop(
                                     sh.stream = None;
                                     break 'stream;
                                 }
-                                link.send(RtCommand::SetMode(Mode::Idle));
+                                // Resumed in place when the RT is still in
+                                // STREAM from the release, entered afresh if
+                                // it has already dropped to IDLE. Not bounced
+                                // through IDLE: that re-seeds the tracker at
+                                // the measured pose, a step off what the
+                                // drive was holding that it rings on.
                                 link.send(RtCommand::SetMode(Mode::Stream));
                                 stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: stop,
+                                    q: creep_toward(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
                                 });
-                                a.standoff = Some(Standoff::Placing { stop });
-                                a.deadline = now + STANDOFF_TRAVEL_BUDGET;
+                                a.standoff = Some(Standoff::Placing {
+                                    stop,
+                                    tries: 1,
+                                    until_tick: snap.tick + standoff_budget_ticks(dt),
+                                });
                                 a.still = 0;
                                 a.still_tick = 0;
                                 break 'stream;
                             }
-                            Standoff::Placing { stop } => {
+                            Standoff::Placing { stop, tries, .. } => {
                                 // Arrival is measured in POSITION, not in
                                 // speed: a snapshot's velocity passes through
                                 // zero whenever the executor re-plans, and
@@ -1995,44 +2192,101 @@ pub(crate) fn housekeeping_loop(
                                     .iter()
                                     .zip(stop.iter())
                                     .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD)
-                                    && snap.qd.iter().all(|v| v.abs() <= STREAM_MOVING_RAD_S);
+                                    && snap
+                                        .qd_filtered
+                                        .iter()
+                                        .all(|v| v.abs() <= STREAM_MOVING_RAD_S);
                                 if arrived {
-                                    // Held, not idled. IDLE has no position
-                                    // authority — it holds against gravity and
-                                    // nothing else — so an arm handed to it
-                                    // settles back off the standoff under
-                                    // drivetrain friction. Handing the stream
-                                    // its own target instead leaves the arm
-                                    // exactly where a client commanding the
-                                    // standoff would have left it, and the
-                                    // normal servo lifecycle ends it.
-                                    a.standoff = None;
-                                    a.servo_target = Some(stop);
-                                    a.deadline = now + servo_grace;
+                                    // Let go, then look. The hold is what was
+                                    // keeping the arm here, and dropping it
+                                    // hands the arm back whatever the drive
+                                    // still carries; where that leaves it is
+                                    // measured, not assumed (see
+                                    // [`Standoff::Settling`]).
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    a.standoff = Some(Standoff::Settling {
+                                        stop,
+                                        tries,
+                                        until_tick: snap.tick + standoff_budget_ticks(dt),
+                                    });
+                                    a.still = 0;
+                                    a.still_tick = 0;
                                     break 'stream;
                                 }
                                 if expired {
                                     log::warn!(
-                                    "the standoff was not reached within the travel budget; idling"
-                                );
-                                    // The RT is still in STREAM, and a stream
-                                    // left unfed trips the streaming watchdog
-                                    // and latches a fault on an arm that did
-                                    // exactly what the gate told it to.
-                                    link.send(RtCommand::SetMode(Mode::Idle));
-                                    sh.stream = None;
+                                        "the standoff was not reached within the travel budget; \
+                                         holding the placement"
+                                    );
+                                    // Parked on the placement, not idled: an
+                                    // arm that has not settled is still
+                                    // moving, and IDLE has no velocity
+                                    // authority — handed over mid-settle it
+                                    // coasts, and measured on the sim rig
+                                    // that coast ended inside the keep-out.
+                                    // The refeed keeps the placement's own
+                                    // limits, and the servo lifecycle ends
+                                    // the stream as it would after arrival.
+                                    a.standoff = None;
+                                    a.parked = true;
+                                    a.servo_target = Some(stop);
+                                    a.scale = STANDOFF_PLACEMENT_SCALE;
+                                    a.deadline = now + servo_grace;
                                     break 'stream;
                                 }
-                                let mut next = snap.q;
-                                for j in 0..par6_kin::NQ {
-                                    next[j] = snap.q[j]
-                                        + (stop[j] - snap.q[j])
-                                            .clamp(-STANDOFF_CREEP_RAD, STANDOFF_CREEP_RAD);
-                                }
                                 stream_input.lock().unwrap().send(&StreamSetpoint {
-                                    q: next,
+                                    q: creep_toward(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
+                                });
+                                break 'stream;
+                            }
+                            Standoff::Settling { stop, tries, .. } => {
+                                // IDLE damps rather than holds, so an arm let
+                                // go here does come to a stop, and where it
+                                // stops is the answer this phase is waiting
+                                // for.
+                                if snap.tick != a.still_tick {
+                                    a.still_tick = snap.tick;
+                                    a.still =
+                                        if snap.qd.iter().all(|v| v.abs() <= STREAM_MOVING_RAD_S) {
+                                            a.still.saturating_add(1)
+                                        } else {
+                                            0
+                                        };
+                                }
+                                if a.still < STANDOFF_STILL_TICKS && !expired {
+                                    break 'stream;
+                                }
+                                let landed = snap
+                                    .q
+                                    .iter()
+                                    .zip(stop.iter())
+                                    .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD);
+                                if landed || expired || tries >= STANDOFF_PLACEMENT_TRIES {
+                                    if !landed {
+                                        log::warn!(
+                                            "the arm settled off its standoff and would not hold it"
+                                        );
+                                    }
+                                    a.standoff = None;
+                                    a.parked = true;
+                                    a.servo_target = Some(stop);
+                                    a.deadline = now + servo_grace;
+                                    break 'stream;
+                                }
+                                // Off the standoff: place it again, from rest
+                                // and from nearer than the last one started.
+                                link.send(RtCommand::SetMode(Mode::Stream));
+                                stream_input.lock().unwrap().send(&StreamSetpoint {
+                                    q: creep_toward(&snap.q, &stop),
+                                    speed: STANDOFF_PLACEMENT_SCALE.0,
+                                    accel: STANDOFF_PLACEMENT_SCALE.1,
+                                });
+                                a.standoff = Some(Standoff::Placing {
+                                    stop,
+                                    tries: tries + 1,
+                                    until_tick: snap.tick + standoff_budget_ticks(dt),
                                 });
                                 break 'stream;
                             }
@@ -2107,12 +2361,18 @@ pub(crate) fn housekeeping_loop(
                     // the braking distance. The measured motion is projected
                     // to where it would come to rest and re-tested every
                     // period, which is the same promise the jog path makes.
+                    // Not a parked one: it is held on a gate-solved standoff,
+                    // and an arm settling onto a boundary reads as moving
+                    // into it. Releasing the hold on that reading is what put
+                    // the arm off the standoff, measured on the sim rig.
                     Some(a)
                         if a.kind == StreamKind::Servo
+                            && !a.parked
                             && snap.qd.iter().any(|v| v.abs() > STREAM_MOVING_RAD_S) =>
                     {
                         let mut g = gate.lock().unwrap();
-                        let la = g.motion_lookahead(&projection_seed(&snap), &snap.qd);
+                        let la = g
+                            .motion_lookahead(&projection_seed(&snap), &projection_velocity(&snap));
                         match g.blocked(&snap.q, &la) {
                             Ok(None) => {}
                             Ok(Some(pairs)) => {
@@ -2126,9 +2386,11 @@ pub(crate) fn housekeeping_loop(
                                 // standoff itself.
                                 drop(g);
                                 collision_stop(&link, &gate, "servo", pairs);
-                                a.standoff = Some(Standoff::Braking { goal: la });
+                                a.standoff = Some(Standoff::Braking {
+                                    goal: la,
+                                    until_tick: snap.tick + standoff_budget_ticks(dt),
+                                });
                                 a.servo_target = None;
-                                a.deadline = now + STANDOFF_TRAVEL_BUDGET;
                                 continue 'housekeeping;
                             }
                             Err(e) => {
@@ -2302,7 +2564,6 @@ pub(crate) fn housekeeping_loop(
                 }
             }
         }
-        std::thread::sleep(housekeeping_period(dt));
     }
 }
 

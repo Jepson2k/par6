@@ -191,6 +191,18 @@ pub struct JointConfig {
     /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS. Old firmware
     /// ignores the frame.
     pub voltage_limit_mv: u32,
+    /// Motor phase resistance \[ohm\] and inductance \[mH\].
+    ///
+    /// The motor's own electrical constants, from its datasheet or from
+    /// the driver's `Cal` routine, which measures both and keeps them in
+    /// EEPROM. The simulator needs them to model the current loop
+    /// against `voltage_limit_mv`: without them it applies the commanded
+    /// current instantly, which is a drive with unlimited authority.
+    /// Omitted on a motor whose constants are not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_resistance_ohm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_inductance_mh: Option<f64>,
     /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
     pub velocity_limit_ticks_s: f64,
     /// Driver watchdog timeout \[ms\] (cmd 15, wire unit is ms). Fires
@@ -951,6 +963,22 @@ impl RobotConfig {
         }
         if j.dir > 1 {
             return Err(invalid(f("dir"), "must be 0 or 1"));
+        }
+        for (name, v) in [
+            ("phase_resistance_ohm", j.phase_resistance_ohm),
+            ("phase_inductance_mh", j.phase_inductance_mh),
+        ] {
+            if let Some(v) = v {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(invalid(f(name), "must be finite and > 0"));
+                }
+            }
+        }
+        if j.phase_resistance_ohm.is_some() != j.phase_inductance_mh.is_some() {
+            return Err(invalid(
+                f("phase_resistance_ohm"),
+                "resistance and inductance are a pair: give both or neither",
+            ));
         }
         if j.kt_nm_a <= 0.0 {
             return Err(invalid(f("kt_nm_a"), "must be > 0"));

@@ -1708,8 +1708,17 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
          {gentle:.3} deg vs {brisk:.3} at full accel"
     );
 
-    // Servo: one far target held for a fixed window, so the constant-speed
-    // stretch dominates and the fraction shows up as distance covered.
+    // Servo: one far target held for a fixed window, so the fraction shows
+    // up as distance covered.
+    //
+    // Both legs are well under half speed because that is the only regime
+    // where the fraction is what limits the arm. Above it this joint runs
+    // into its current limit and covers the same ground whatever it is
+    // asked for — measured on the sim rig at 81, 82 and 80 deg for half,
+    // three-quarter and full speed, against the 160 deg per unit fraction
+    // the scaling regime gives. A reference taken up there is a measure of
+    // the motor, not of the setting under test, so halving IT proves
+    // nothing about whether the fraction arrived.
     let mut target = park_deg();
     target[0] += 90.0;
     let servo = |speed: Option<f64>| {
@@ -1722,16 +1731,21 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
         }
     };
     let cruise = Duration::from_millis(600);
-    let full = travel(&rig, &mut c, cruise, servo(None));
-    let quarter = travel(&rig, &mut c, cruise, servo(Some(0.25)));
+    let faster = travel(&rig, &mut c, cruise, servo(Some(0.30)));
+    let slower = travel(&rig, &mut c, cruise, servo(Some(0.15)));
     assert!(
-        full > 1.0,
-        "the full-speed stream barely moved ({full:.3} deg); nothing to compare"
+        faster > 1.0,
+        "the 0.30 stream barely moved ({faster:.3} deg); nothing to compare"
     );
+    // Proportionality, not just "less": half the fraction, half the ground,
+    // with room for the shared acceleration ramp that both legs pay and
+    // the slower one amortises over more of the window.
+    let ratio = slower / faster;
     assert!(
-        quarter < full * 0.5,
-        "a quarter-speed stream must cover far less ground in {cruise:?}: \
-         {quarter:.3} deg vs {full:.3} at full speed"
+        (0.40..=0.65).contains(&ratio),
+        "halving the speed fraction must halve the ground covered in \
+         {cruise:?}: {slower:.3} deg at 0.15 against {faster:.3} at 0.30 \
+         (ratio {ratio:.3})"
     );
 
     rig.shutdown();
