@@ -1133,6 +1133,7 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         debug_assert!(is_stream(tag));
+        let mut refused_in_place = false;
         let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
@@ -1143,8 +1144,10 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
-                    self.active_stream = None;
-                    self.runtime.rt.cancel_stream();
+                    refused_in_place = true;
+                    if !self.runtime.rt.stop_refused_stream() {
+                        self.active_stream = None;
+                    }
                 }
                 outcome
             }
@@ -1176,7 +1179,11 @@ impl<R: RtCommands> Core<R> {
                 // stands. The gate's own collision latch (if the refusal
                 // was a collision) reaches STATUS through
                 // `update_collision`.
-                self.latch_faf_refusal(&error);
+                if refused_in_place {
+                    self.latch_stream_refusal(&error);
+                } else {
+                    self.latch_faf_refusal(&error);
+                }
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
@@ -1785,6 +1792,17 @@ impl<R: RtCommands> Core<R> {
     fn latch_faf_refusal(&mut self, error: &WireError) {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        self.latch_refusal(error, busy);
+    }
+
+    /// A refused update of the live stream: that stream is stopped or held
+    /// in its standoff, so it is not motion the refusal would misdescribe.
+    fn latch_stream_refusal(&mut self, error: &WireError) {
+        let busy = self.executing.is_some() || !self.pending.is_empty();
+        self.latch_refusal(error, busy);
+    }
+
+    fn latch_refusal(&mut self, error: &WireError, busy: bool) {
         let attributed = self
             .standing_error
             .as_ref()
@@ -2576,10 +2594,17 @@ impl<R: RtCommands> Core<R> {
                 com: self.payload.com,
                 inertia: self.payload.inertia.unwrap_or_default(),
             },
-            C::StatusRate => QueryResult::StatusRate {
-                hz: f64::from(self.status_rate_hz),
-                tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
-            },
+            C::StatusRate => {
+                let tick_hz = 1.0 / self.cfg.config_info.tick_dt_s;
+                QueryResult::StatusRate {
+                    hz: f64::from(self.status_rate_hz),
+                    tick_hz,
+                    // The runtime's own set, from the same helper
+                    // SET_STATUS_RATE is checked against, so what a caller is
+                    // offered and what is accepted cannot disagree.
+                    servable: servable_status_rates(tick_hz),
+                }
+            }
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -2823,16 +2848,20 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
 /// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
 /// set is built once and both answered from and printed, so what is
 /// accepted and what the remedy offers cannot disagree.
-fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+pub(crate) fn servable_status_rates(tick_hz: f64) -> Vec<f64> {
     let ticks = tick_hz.round() as u32;
-    let allowed: Vec<u32> = (1..=ticks)
+    (1..=ticks)
         .filter(|d| ticks.is_multiple_of(*d))
-        .map(|d| ticks / d)
-        .collect();
-    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
+        .map(|d| f64::from(ticks / d))
+        .collect()
+}
+
+fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+    let allowed = servable_status_rates(tick_hz);
+    if allowed.contains(&hz) {
         return None;
     }
-    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
+    let listed: Vec<String> = allowed.iter().map(|rate| format!("{rate}")).collect();
     Some(make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,

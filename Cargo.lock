@@ -621,6 +621,7 @@ dependencies = [
  "log",
  "mujoco-rs",
  "par6-config",
+ "par6-kin",
  "par6-proto",
  "roxmltree",
  "socketcan",
@@ -715,6 +716,7 @@ dependencies = [
  "log",
  "par6-bus",
  "par6-config",
+ "par6-kin",
  "thiserror 2.0.20",
  "thread-priority",
 ]

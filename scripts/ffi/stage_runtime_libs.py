@@ -264,11 +264,10 @@ def main() -> int:
                     f"{soname}, which the staged copy does not provide"
                 )
     # 3. anything with a dependency inside the staged set has to be able to
-    #    find it after the directory moves — i.e. from $ORIGIN (or from the
-    #    install directory a binary is linked against), since DT_RUNPATH
-    #    does not reach transitive dependencies.
+    #    find it after the directory moves — i.e. from $ORIGIN, since
+    #    DT_RUNPATH does not reach transitive dependencies.
     accepted = {os.path.normpath(p) for p in args.accepted_rpaths}
-    for path in [p.resolve() for p in args.roots] + list(staged.values()):
+    for path in objects:
         if not any(n in staged for n in needed(args.readelf, path)):
             continue
         entries = runpath(args.readelf, path)
