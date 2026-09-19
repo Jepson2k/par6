@@ -48,7 +48,7 @@ sector_home_offset_rad = 1.570796327
 
 [joints.gains]
 kpp = 5.0
-kpv = 0.015
+kpv = 0.06
 kiv = 0.0015
 kpiq = 7.0
 kiiq = 0.9

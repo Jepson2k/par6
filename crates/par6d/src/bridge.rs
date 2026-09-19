@@ -176,6 +176,24 @@ const STREAM_MOVING_RAD_S: f64 = 0.01;
 /// rather than about the executor's last increment.
 const STANDOFF_ARRIVED_RAD: f64 = 2.0e-3;
 
+/// How slowly the arm must be moving before a placement's hold is
+/// dropped \[rad/s\].
+///
+/// Dropping the hold hands the arm back whatever speed it still
+/// carries, and IDLE only damps it — so the handover speed IS the
+/// standoff's error budget. [`STREAM_MOVING_RAD_S`] answers a different
+/// question (has this stream stopped moving) and at the arm's reach
+/// allows four and a half millimetres a second, which coasts half a
+/// millimetre off a standoff measured in single millimetres. Under a
+/// millimetre a second the coast is inside the arrival tolerance, so
+/// what the arm lands on is what it was placed on.
+///
+/// Tightening the ACCEPTANCE instead does not work: below the coast
+/// every landing reads as a miss, each retry creeps back in and coasts
+/// back out, and the arm parks wherever the retries ran out — measured
+/// on the sim rig at 9.8 mm against a 5 mm standoff.
+const STANDOFF_HANDOVER_RAD_S: f64 = 1.0e-3;
+
 /// How far short of the solved boundary the placement is commanded
 /// \[rad\], on the fastest joint.
 ///
@@ -2159,7 +2177,7 @@ pub(crate) fn housekeeping_loop(
                                 && snap
                                     .qd_filtered
                                     .iter()
-                                    .all(|v| v.abs() <= STREAM_MOVING_RAD_S);
+                                    .all(|v| v.abs() <= STANDOFF_HANDOVER_RAD_S);
                             if arrived {
                                 // Let go, then look. The hold is what was
                                 // keeping the arm here, and dropping it
