@@ -515,7 +515,11 @@ impl MujocoPlant {
             self.jaw_cmd_byte = byte;
         }
         let h = self.ts;
-        let fw_steps = (h / FW_LOOP_DT).round().max(1.0);
+        // Not rounded: this scales a continuous integral, so a substep
+        // worth 6.25 firmware iterations is worth exactly that. Rounding
+        // it to 6 (or, at a 0.25 ms substep, 1.5625 up to 2) mis-rates
+        // the wind-up by a few percent for nothing.
+        let fw_steps = h / FW_LOOP_DT;
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {
