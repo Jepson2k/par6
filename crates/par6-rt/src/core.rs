@@ -84,9 +84,16 @@ const STREAM_REST_RAD_S: f64 = 1e-9;
 /// its velocity loop is still carrying; IDLE drives nothing, so an arm
 /// handed over while it still moves freewheels on its momentum, and it
 /// was the position law holding the ramp's rest point that was meant to
-/// brake it. Read off the filtered measurement, which a ringing drive
-/// cannot zero on a single tick.
+/// brake it.
 const RELEASE_REST_RAD_S: f64 = 0.01;
+/// How long every joint's raw AND filtered measured speed must stay
+/// under [`RELEASE_REST_RAD_S`] before the arm counts as at rest \[s\].
+/// Neither reading alone is rest: the raw sample crosses zero twice a
+/// cycle while a drive rings, and the filtered one crosses zero a
+/// quarter cycle later, while the arm is already reversing at speed —
+/// measured on the sim rig, an arm handed to IDLE on that crossing
+/// coasted a tenth of a radian back the way it came.
+const RELEASE_REST_HOLD_S: f64 = 0.1;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
@@ -580,6 +587,11 @@ pub struct RtCore<B: DriverBus> {
     /// A `StreamRelease` is braking to rest. STREAM outlives it the same
     /// way JOG outlives a release.
     stream_released: bool,
+    /// Consecutive ticks with every joint under [`RELEASE_REST_RAD_S`]
+    /// on both measured velocities, against `release_rest_needed`
+    /// ([`RELEASE_REST_HOLD_S`] in ticks).
+    release_rest_streak: u32,
+    release_rest_needed: u32,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -793,6 +805,8 @@ impl<B: DriverBus> RtCore<B> {
             jog_active: false,
             jog_released: false,
             stream_released: false,
+            release_rest_streak: 0,
+            release_rest_needed: robot.ticks(RELEASE_REST_HOLD_S).max(1),
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -867,10 +881,10 @@ impl<B: DriverBus> RtCore<B> {
         &mut self.bus
     }
 
-    /// Whether every joint's filtered measured speed is under
-    /// [`RELEASE_REST_RAD_S`].
+    /// Whether every joint has measured under [`RELEASE_REST_RAD_S`], raw
+    /// and filtered, for [`RELEASE_REST_HOLD_S`].
     fn at_measured_rest(&self) -> bool {
-        self.qd_filt.iter().all(|v| v.abs() <= RELEASE_REST_RAD_S)
+        self.release_rest_streak >= self.release_rest_needed
     }
 
     /// Measured joint positions \[rad\] — what a backend swap seeds the
@@ -1809,6 +1823,15 @@ impl<B: DriverBus> RtCore<B> {
                 self.tau_filt[i] += MEAS_FILTER_ALPHA * (self.tau[i] - self.tau_filt[i]);
             }
         }
+        let still =
+            self.qd.iter().zip(self.qd_filt.iter()).all(|(raw, filt)| {
+                raw.abs() <= RELEASE_REST_RAD_S && filt.abs() <= RELEASE_REST_RAD_S
+            });
+        self.release_rest_streak = if still {
+            self.release_rest_streak.saturating_add(1)
+        } else {
+            0
+        };
     }
 
     /// Halt the jaws where they are: re-target the freshest reported jaw
