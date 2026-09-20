@@ -847,8 +847,24 @@ class TestLiveParity:
         end = np.asarray(dry_run.pose())
         assert end[0] - start[0] > 20.0, "half a second of full-scale +X must travel"
         assert abs(end[1] - start[1]) < 3.0 and abs(end[2] - start[2]) < 3.0
-        assert jog.duration == pytest.approx(0.5, abs=2 * dry_run.plan().row_dt_s)
-        assert jog.joint_trajectory_rad.shape[1] == NUM_JOINTS
+        # The watchdog releases the tool rather than stopping it dead, so
+        # the jog occupies the arm for its window PLUS the ramp down —
+        # which covers real ground, and a preview that stopped at the
+        # window would under-predict where the runtime leaves the arm.
+        # What is pinned here is the shape of that: longer than the
+        # window, bounded, and finished at rest.
+        assert jog.duration > 0.5, f"the window alone is 0.5 s, got {jog.duration}"
+        assert jog.duration < 1.5, f"the ramp should be short, got {jog.duration}"
+        traj = jog.joint_trajectory_rad
+        assert traj.shape[1] == NUM_JOINTS
+        # At rest means the arm has stopped, not that two rows match to
+        # machine precision: the limiter settles to its own tolerance.
+        # The runtime calls a joint stopped under 0.05 rad/s, so hold the
+        # tail of the ramp well inside that.
+        rest_rad_s = np.abs(traj[-1] - traj[-2]).max() / dry_run.plan().row_dt_s
+        assert rest_rad_s < 0.01, (
+            f"the previewed jog must end at rest, got {rest_rad_s} rad/s"
+        )
         with pytest.raises(ValueError, match="unknown axis"):
             dry_run.jog_l("WRF", "Q", speed=0.5, duration=0.2)
         with pytest.raises(ValueError, match="axes and"):

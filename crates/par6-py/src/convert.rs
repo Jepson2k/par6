@@ -506,7 +506,7 @@ pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
 /// optional key (NaN on the wire) is `None`.
 pub(crate) fn motion_dict<'py>(
     py: Python<'py>,
-    values: &[f64; 14],
+    values: &[f64; 18],
 ) -> PyResult<Bound<'py, PyDict>> {
     let m = PyDict::new(py);
     for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {

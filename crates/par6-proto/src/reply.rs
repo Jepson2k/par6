@@ -313,9 +313,9 @@ pub enum QueryResult {
         /// RT tick period \[s\].
         tick_dt_s: f64,
         /// Every `[motion]` key in declaration order; the labels are
-        /// `MotionConfig::KEYS` in par6-config (14 entries), and an
+        /// `MotionConfig::KEYS` in par6-config (18 entries), and an
         /// omitted optional key (`joint_step_rad`) rides as NaN.
-        motion: [f64; 14],
+        motion: [f64; 18],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,

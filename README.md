@@ -24,6 +24,7 @@ below works on a laptop and in CI.
 - [Motion profiles](#motion-profiles)
 - [Collision world](#collision-world)
 - [Kinematics and tools](#kinematics-and-tools)
+- [Payload and gravity](#payload-and-gravity)
 - [The Pinocchio shim](#the-pinocchio-shim)
 - [Ports and environment variables](#ports-and-environment-variables)
 - [Development setup](#development-setup)
@@ -518,6 +519,49 @@ connection failures explicitly.
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See
 `assets/par6_description/CHANGELOG.md` for the derivation and the equivalence check.
+
+## Payload and gravity
+
+The runtime computes `G(q)` every tick and feeds it forward, so the arm only
+holds itself up as well as its model knows what it is carrying. A load of KNOWN
+mass needs no measurement — declare it:
+
+```python
+rbt.set_payload(0.75, com=(0.0, 0.0, 0.04))
+```
+
+A load you do NOT know the mass of is measured from the torque the arm holds it
+with. `estimate_payload()` swings the **wrist** through a handful of poses where
+the arm already stands, reads the torques it rests in each one with, and solves
+for the four parameters that describe the load — mass and the three components
+of `m·c`:
+
+```python
+found = rbt.estimate_payload()          # declare=True by default
+print(f"holding {found.mass:.3f} kg")
+```
+
+Only the wrist moves, because the payload's lever arm about the wrist is what
+makes its first moment observable. Nothing below travels, so a pick is not
+disturbed and a program can run this mid-cycle after closing on a part. Each
+pose is measured twice, approached from either side and averaged, so joint
+friction enters with opposite signs and cancels. The runtime's declared payload
+is cleared first — the load is whatever the *unloaded* model cannot account for
+— and put back on every exit that does not declare, failures included.
+
+`found.determined` is the part to read before trusting a result: one number per
+parameter, from 0 (the poses said nothing and the ridge supplied it) to 1 (the
+poses fixed it outright). A wrist with no room to swing comes back near zero.
+`estimate_payload(declare=True)` refuses to declare a mass the poses did not
+actually measure rather than pushing noise into the gravity model.
+
+The arm's own links are never fitted. Their inertials are the vendor's and stay
+that way: gravity cannot observe every inertial parameter, so a fit that
+corrected the observable directions would leave the rest wrong while reporting a
+good residual. Anything that physically changes a link needs new nominal data,
+not a measurement.
+
+Worked example: [`examples/payload_estimate.py`](examples/payload_estimate.py).
 
 ## The Pinocchio shim
 

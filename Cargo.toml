@@ -18,7 +18,7 @@ members = [
 # it with `version.workspace = true`, and the `par6` wheel declares
 # `dynamic = ["version"]` so maturin reads it from here too. A `v*` tag is
 # what release.yml publishes, so it names this number.
-version = "0.6.0"
+version = "0.7.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Jepson2k/par6"

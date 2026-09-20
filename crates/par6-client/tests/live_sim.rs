@@ -603,3 +603,187 @@ fn a_moving_cartesian_servo_stream_stops_outside_the_keep_out() {
         client.set_shapes(vec![]).await.expect("keep-out clears");
     })
 }
+
+/// Perpendicular distance of `p` from the line `a`→`b`, in the wire's
+/// millimetres (translation components only).
+fn off_line(a: &[f64; 6], b: &[f64; 6], p: &[f64; 6]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let u = [d[0] / len, d[1] / len, d[2] / len];
+    let r = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let along = r[0] * u[0] + r[1] * u[1] + r[2] * u[2];
+    let perp = [
+        r[0] - along * u[0],
+        r[1] - along * u[1],
+        r[2] - along * u[2],
+    ];
+    (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt()
+}
+
+/// `servo_l` means the TOOL travels the straight line to the target.
+///
+/// That is its whole difference from `servo_j_pose`, which also ends in
+/// the right place — by interpolating in JOINT space, which bows the
+/// tool off the line on the way. Limiting in joint space does the same
+/// thing, so this pins down both: a `servo_l` aliased onto
+/// `servo_j_pose`, and one whose cartesian profile is re-planned by the
+/// joint limiter downstream.
+///
+/// The residual is the drives following the command, not the command
+/// bending: it scales with the speed fraction (about 1 mm here, ~8 mm
+/// at full speed and acceleration), while the joint-interpolated path
+/// leaves the line by tens of millimetres whatever the speed.
+#[test]
+fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
+    run_session("servo-l-line", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+
+        // Off the wrist singularity: at park the tool points straight
+        // down, pitch sits at -90 deg and the [x, y, z, r, p, y] wire
+        // form degenerates — roll and yaw stop being separable, so a
+        // target built by round-tripping through it carries a rotation
+        // nobody asked for and the move is a screw, not a line.
+        let mut from = common::park_deg();
+        from[3] += 25.0;
+        from[4] += 35.0;
+
+        // A diagonal in all three axes: a move along one axis alone
+        // cannot tell a straight path from a bowed one.
+        let offsets = [60.0, -45.0, 30.0];
+
+        let mut worst = [0.0f64; 2];
+        for (mode, out) in worst.iter_mut().enumerate() {
+            settle_at(&client, from).await;
+            let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+            let mut target = start;
+            for (axis, d) in offsets.iter().enumerate() {
+                target[axis] += d;
+            }
+
+            let mut samples = 0u32;
+            let mut arrived = false;
+            for _ in 0..250 {
+                if mode == 0 {
+                    client.servo_l(target, Some(0.3), Some(0.3)).await
+                } else {
+                    client.servo_j_pose(target, Some(0.3), Some(0.3)).await
+                }
+                .expect("fire-and-forget sends");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let here = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+                let travelled = ((here[0] - start[0]).powi(2)
+                    + (here[1] - start[1]).powi(2)
+                    + (here[2] - start[2]).powi(2))
+                .sqrt();
+                let remaining = ((target[0] - here[0]).powi(2)
+                    + (target[1] - here[1]).powi(2)
+                    + (target[2] - here[2]).powi(2))
+                .sqrt();
+                // Judge only the part of the path actually under way: at
+                // the very start every point is trivially on the line.
+                if travelled > 2.0 {
+                    *out = out.max(off_line(&start, &target, &here));
+                    samples += 1;
+                }
+                if remaining < 1.0 {
+                    arrived = true;
+                    break;
+                }
+            }
+            assert!(arrived, "mode {mode} never reached its target");
+            assert!(
+                samples > 20,
+                "mode {mode}: only {samples} samples along the path"
+            );
+        }
+        let (cartesian, joint) = (worst[0], worst[1]);
+        println!("off the line — servo_l {cartesian:.2} mm, servo_j_pose {joint:.2} mm");
+        assert!(
+            cartesian < 2.0,
+            "servo_l left the line by {cartesian:.2} mm"
+        );
+        assert!(
+            joint > 5.0 * cartesian,
+            "servo_j_pose ({joint:.2} mm) tracked the line as well as servo_l \
+             ({cartesian:.2} mm) — servo_l is not running the cartesian limiter"
+        );
+    })
+}
+
+/// `jog_l` is a TCP velocity command, so the tool travels along the axis
+/// it was given and accelerates onto it rather than having the twist
+/// applied whole.
+///
+/// The axis is what pins this down: smoothing the twist in joint space
+/// shapes each joint's own ramp, and the tool wanders off the commanded
+/// direction while they are out of step with each other.
+///
+/// The residual is the drives following the command rather than the
+/// command leaving the axis — it scales with the commanded rate, about
+/// 1 mm at these fractions and 2.5 mm at double them. The executor's own
+/// output holds the axis to 1e-9 m (`par6-motion`, `cart_stream`).
+#[test]
+fn jog_l_drives_the_tool_along_the_axis_it_was_given() {
+    run_session("jog-l-axis", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        // Off the wrist singularity, as the servo_l line test is.
+        let mut from = common::park_deg();
+        from[3] += 25.0;
+        from[4] += 35.0;
+        settle_at(&client, from).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+
+        // A diagonal in world axes: a single-axis jog cannot tell a
+        // straight travel from a wandering one. The fractions set the
+        // rate; the unit vector they point along is what the travel is
+        // judged against.
+        let fractions = [0.3f64, -0.4, 0.0];
+        let norm = (fractions[0] * fractions[0]
+            + fractions[1] * fractions[1]
+            + fractions[2] * fractions[2])
+            .sqrt();
+        let axis = [
+            fractions[0] / norm,
+            fractions[1] / norm,
+            fractions[2] / norm,
+        ];
+        let mut worst_off = 0.0f64;
+        let mut samples = 0u32;
+        let mut travelled = 0.0f64;
+        for _ in 0..60 {
+            client
+                .jog_l(
+                    [fractions[0], fractions[1], fractions[2], 0.0, 0.0, 0.0],
+                    0.3,
+                    Frame::Wrf,
+                    Some(1.0),
+                )
+                .await
+                .expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let here = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+            let rel = [here[0] - start[0], here[1] - start[1], here[2] - start[2]];
+            travelled = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt();
+            if travelled > 2.0 {
+                let along = rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2];
+                let perp = [
+                    rel[0] - along * axis[0],
+                    rel[1] - along * axis[1],
+                    rel[2] - along * axis[2],
+                ];
+                worst_off = worst_off
+                    .max((perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt());
+                samples += 1;
+            }
+        }
+        assert!(travelled > 10.0, "the jog only moved {travelled:.2} mm");
+        assert!(samples > 10, "only {samples} samples along the travel");
+        println!(
+            "jog_l off the commanded axis: {worst_off:.2} mm over {travelled:.1} mm travelled"
+        );
+        assert!(
+            worst_off < 2.0,
+            "the tool wandered {worst_off:.2} mm off the axis it was jogged along"
+        );
+    })
+}
