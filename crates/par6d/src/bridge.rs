@@ -2330,7 +2330,20 @@ pub(crate) fn housekeeping_loop(
                 match &mut sh.stream {
                     // The ramp reached rest and the RT left JOG on its own:
                     // the session is over.
-                    Some(a) if a.releasing && snap.mode != Mode::Jog => {
+                    // The joint jog's ramp belongs to the RT: it runs in
+                    // JOG mode, so the mode leaving JOG is what says the
+                    // ramp is done and the session is over.
+                    //
+                    // A cartesian stream's ramp is this loop's own, run
+                    // through the cartesian limiter in STREAM mode — which
+                    // never enters JOG, so this guard would be true on the
+                    // first tick and drop the stream before the ramp took a
+                    // single step. Nothing would feed STREAM after that, and
+                    // half a second later the watchdog would latch
+                    // RTI_LINK_LOST on a brake the daemon itself started.
+                    Some(a)
+                        if a.releasing && a.kind == StreamKind::Jog && snap.mode != Mode::Jog =>
+                    {
                         sh.stream = None;
                     }
                     // Working through a gate refusal: brake to rest, then
