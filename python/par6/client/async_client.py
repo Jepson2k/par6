@@ -23,7 +23,7 @@ import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from waldoctl import RobotClient as _RobotClientABC
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
@@ -65,6 +65,9 @@ from ._wire import timing as _timing
 from ._wire import tool_status_from_dict as _tool_status_from_dict
 from ._wire import wire_frame as _wire_frame
 from .errors import RobotError
+
+if TYPE_CHECKING:
+    from par6.robot import Robot
 
 logger = logging.getLogger(__name__)
 
@@ -159,6 +162,22 @@ class AsyncRobotClient(_RobotClientABC):
     group 239.255.0.71).
     """
 
+    _robot: Robot | None = None
+
+    @property
+    def robot(self) -> Robot:
+        """The backend this client drives, built on first read when a bare
+        client (what a user script constructs) supplied none."""
+        if self._robot is None:
+            from par6.robot import Robot
+
+            self._robot = Robot()
+        return self._robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._robot = value
+
     def __init__(
         self,
         host: str | None = None,
@@ -173,6 +192,7 @@ class AsyncRobotClient(_RobotClientABC):
         status_unicast_host: str | None = None,
         mtu: int | None = None,
         tool_specs: Iterable[ToolSpec] | None = None,
+        robot: Robot | None = None,
     ) -> None:
         # Every None falls through to the engine client's own ladder
         # (``PAR6_*`` environment, then the shipped defaults).
@@ -186,6 +206,7 @@ class AsyncRobotClient(_RobotClientABC):
         self._mcast_iface = mcast_iface
         self._status_unicast_host = status_unicast_host
         self.mtu = mtu
+        self._robot = robot
 
         self._core: CoreClient | None = None
         self._core_lock = asyncio.Lock()

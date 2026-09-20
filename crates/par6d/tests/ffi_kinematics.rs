@@ -1876,11 +1876,29 @@ fn corner_and_mean_speed(path: &[Status], corner: [f64; 3], radius_mm: f64) -> (
     } else {
         moving.iter().sum::<f64>() / moving.len() as f64
     };
-    let at_corner = speeds
+    // The SLOWEST the corner sustains, not the slowest single sample. One
+    // tick the daemon could not hold reads as a stop and sinks a
+    // per-sample minimum, which is a measurement of the host rather than
+    // of the blend — it failed on a CI runner at 5.21 mm/s against a 5.36
+    // bar while the loop reported no overruns and a p99 of 20.08 ms
+    // against a 20.00 ms budget, i.e. at its deadline but not past it.
+    // Three consecutive samples cannot all be that tick, and a blend that
+    // actually stops is slow across all of them: the unblended corner
+    // this is measured against reads 0.05 mm/s either way.
+    let through: Vec<f64> = speeds
         .iter()
         .filter(|(p, _)| distance(*p, corner) < radius_mm)
         .map(|(_, v)| *v)
-        .fold(f64::INFINITY, f64::min);
+        .collect();
+    const SUSTAINED: usize = 3;
+    let at_corner = if through.len() < SUSTAINED {
+        through.iter().copied().fold(f64::INFINITY, f64::min)
+    } else {
+        through
+            .windows(SUSTAINED)
+            .map(|w| w.iter().sum::<f64>() / w.len() as f64)
+            .fold(f64::INFINITY, f64::min)
+    };
     (at_corner, mean)
 }
 
