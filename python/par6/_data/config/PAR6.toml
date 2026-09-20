@@ -661,6 +661,14 @@ integral_limit_nm = 0.3
 # same file, so a tuned deployment previews the way it runs.
 jog_l_linear_max_m_s = 0.08
 jog_l_angular_max_rad_s = 0.6
+# TCP acceleration and jerk for the cartesian streaming limiter, whose
+# velocity ceiling is the two jog_l rates above (servo_l and jog_l share
+# one executor, as they do in parol6). Derived from those rates at
+# parol6's ratios: accel = 2.75x velocity, jerk = 10x accel.
+cart_linear_accel_max_m_s2 = 0.22
+cart_angular_accel_max_rad_s2 = 1.65
+cart_linear_jerk_max_m_s3 = 2.2
+cart_angular_jerk_max_rad_s3 = 16.5
 cart_step_m = 0.01          # move_l pitch (vendor 10 mm / 2 deg)
 cart_step_rad = 0.034906585
 path_step_m = 0.002         # arc/spline/process pitch on sqrt(t^2 + (w*rot)^2)
