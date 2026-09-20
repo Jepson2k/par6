@@ -1044,6 +1044,12 @@ impl<B: DriverBus> RtCore<B> {
     /// channel is only a feedforward, so a hold left aimed at the
     /// pre-teleport pose would actively drag the arm back to it.
     pub fn reseed_motion_targets(&mut self) {
+        // Whatever is waiting in the streaming slot was computed for the
+        // pose the arm has just stopped being in. The slot is
+        // latest-wins, so leaving it would apply that stale target on the
+        // very next tick — and a shaped setpoint is commanded through a
+        // clamp, which moves the arm the whole way there in one tick.
+        let _ = self.stream_rx.take();
         let q = self.q;
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
