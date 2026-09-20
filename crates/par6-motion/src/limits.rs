@@ -55,6 +55,28 @@ impl MotionLimits {
         Ok(out)
     }
 
+    /// The worst joint's share of its per-tick travel budget for `dq`:
+    /// 1.0 means exactly at its velocity limit, above means over.
+    ///
+    /// This is how a cartesian stream keeps its line straight. A joint
+    /// over budget is never clamped on its own — that moves the arm in a
+    /// different joint-space direction and bends the tool path. Instead
+    /// EVERY joint's step is divided by this one ratio, so the arm
+    /// advances the same way, just less far, and the cartesian limiter
+    /// upstream is slowed by the same factor so the next tick asks for
+    /// something the joints can deliver. The move takes longer; the line
+    /// does not move.
+    pub fn step_ratio(&self, dq: &[f64; NUM_JOINTS], dt: f64) -> f64 {
+        let mut worst = 0.0f64;
+        for (j, &d) in dq.iter().enumerate() {
+            let budget = self.velocity[j] * dt;
+            if budget > 0.0 {
+                worst = worst.max(d.abs() / budget);
+            }
+        }
+        worst
+    }
+
     /// Error unless every joint carries a finite jerk limit.
     pub(crate) fn require_finite_jerk(&self) -> Result<(), MotionError> {
         for (j, &jerk) in self.jerk.iter().enumerate() {

@@ -167,57 +167,6 @@ fn a_move_that_turns_follows_the_screw_and_lands_on_both_endpoints() {
     );
 }
 
-/// When the joint layer holds a tick back — a per-tick delta over a
-/// joint's velocity limit gets scaled down — the limiter has to be told,
-/// or the pose it commands walks away from the one the arm can reach and
-/// never comes back.
-#[test]
-fn correcting_the_position_keeps_a_clamped_stream_from_running_away() {
-    // The joint layer only ever delivers this share of a tick's motion.
-    const DELIVERED: f64 = 0.4;
-
-    let run = |correct: bool| -> f64 {
-        let (mut exec, _limits, _dt) = setup();
-        let start = at(0.35, 0.10, 0.20);
-        let end = at(0.47, 0.10, 0.20);
-        exec.activate(&start);
-        exec.set_target(&end).unwrap();
-        let mut achieved = cart::translation(&start);
-        let mut worst_gap = 0.0f64;
-        for _ in 0..4_000 {
-            let s = exec.step().unwrap();
-            let commanded = cart::translation(&s.pose);
-            // What the joints actually managed this tick.
-            for k in 0..3 {
-                achieved[k] += DELIVERED * (commanded[k] - achieved[k]);
-            }
-            worst_gap = worst_gap.max(dist(commanded, achieved));
-            if correct {
-                let mut pose = s.pose;
-                pose[3] = achieved[0];
-                pose[7] = achieved[1];
-                pose[11] = achieved[2];
-                exec.correct_position(&pose);
-            }
-            if s.finished {
-                break;
-            }
-        }
-        worst_gap
-    };
-
-    let uncorrected = run(false);
-    let corrected = run(true);
-    assert!(
-        corrected < uncorrected / 2.0,
-        "correction left a {corrected} m gap against {uncorrected} m uncorrected"
-    );
-    assert!(
-        corrected < 5e-3,
-        "corrected stream still ran {corrected} m ahead of the arm"
-    );
-}
-
 /// A stop sheds the velocity the TCP has; it does not go back for the
 /// ground it covered.
 #[test]

@@ -269,6 +269,10 @@ impl Daemon {
             gravity: gravity_hook,
             jog: Box::new(jog),
             stream: Box::new(stream),
+            // A cartesian stream arrives already limited in cartesian
+            // space; this side clamps it to the soft window and
+            // commands it, and must not reshape it.
+            stream_shaped: Box::new(par6_rt::hooks::ClampStream::new(&bundle.robot)),
             settle: Box::new(SpecSettle::new(
                 CompletionPolicy::Settled,
                 dt,

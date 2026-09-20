@@ -414,23 +414,6 @@ impl CartesianStreamingExecutor {
         Ok(())
     }
 
-    /// Move the limiter's own position to `actual` without touching its
-    /// velocity or acceleration.
-    ///
-    /// The joint layer is allowed to hold back a tick's motion — a
-    /// per-tick delta over a joint's velocity limit gets scaled down —
-    /// and the limiter has no other way to learn that. Left uncorrected
-    /// the commanded TCP walks ahead of the reachable one for as long as
-    /// the clamp lasts, and the gap does not close when it releases.
-    /// The arm is still moving, so velocity and acceleration stay as
-    /// they are and the OTG re-plans from the corrected state.
-    pub fn correct_position(&mut self, actual: &Pose) {
-        let tangent = cart::se3_log(&cart::se3_mul(&cart::se3_inverse(&self.reference), actual));
-        for (k, &v) in tangent.iter().enumerate() {
-            self.input.current_position[k] = v;
-        }
-    }
-
     /// Brake the TCP to rest from wherever it is, under the configured
     /// acceleration and jerk.
     ///

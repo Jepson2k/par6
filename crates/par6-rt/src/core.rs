@@ -352,8 +352,12 @@ pub struct RtHooks {
     pub gravity: Box<dyn GravityModel>,
     /// Jog ramp engine.
     pub jog: Box<dyn JogEngine>,
-    /// Streaming target tracker (rate limiter).
+    /// Streaming target tracker (rate limiter) for joint-space targets.
     pub stream: Box<dyn StreamTracker>,
+    /// Tracker for targets that arrive already rate-limited
+    /// ([`StreamSetpoint::shaped`]) — clamps to the soft limits and
+    /// commands what it was given, without re-planning it.
+    pub stream_shaped: Box<dyn StreamTracker>,
     /// EXEC completion policy.
     pub settle: Box<dyn SettlePolicy>,
     /// ESTOP_1 GPIO line.
@@ -406,6 +410,18 @@ pub struct StreamSetpoint {
     pub speed: f64,
     /// Acceleration fraction of the STREAM limits, in `(0, 1]`.
     pub accel: f64,
+    /// Whether this target already sits on a rate-limited profile and
+    /// must be tracked as given rather than re-planned.
+    ///
+    /// A cartesian stream is limited in CARTESIAN space, upstream: the
+    /// tool path is the thing being held to, and joint limits are met by
+    /// slowing the whole move along it. Re-planning those targets here
+    /// would give each joint its own time-optimal route to its own
+    /// target-at-rest, which is precisely the joint-space interpolation
+    /// the cartesian limiter exists to avoid — the tool would leave the
+    /// line. Such a setpoint goes to a clamp-only tracker instead, so
+    /// the soft limits still bind and nothing reshapes the path.
+    pub shaped: bool,
 }
 
 impl Default for StreamSetpoint {
@@ -414,6 +430,7 @@ impl Default for StreamSetpoint {
             q: [0.0; MAX_JOINTS],
             speed: 1.0,
             accel: 1.0,
+            shaped: false,
         }
     }
 }
@@ -481,6 +498,7 @@ pub struct RtCore<B: DriverBus> {
     gravity: Box<dyn GravityModel>,
     jog: Box<dyn JogEngine>,
     stream: Box<dyn StreamTracker>,
+    stream_shaped: Box<dyn StreamTracker>,
     exec: ExecPlayback,
     estop: EstopMonitor,
     io: Box<dyn DigitalIo>,
@@ -610,6 +628,12 @@ pub struct RtCore<B: DriverBus> {
 
     // Streaming.
     stream_rx: SnapshotReader<StreamSetpoint>,
+    /// Which tracker is live: the clamp-only one while shaped setpoints
+    /// are arriving, the rate limiter otherwise.
+    stream_is_shaped: bool,
+    /// The joint target the live tracker last commanded, so a handover
+    /// between the two starts where the arm was actually sent.
+    stream_commanded: [f64; MAX_JOINTS],
     /// Fractions currently applied to the streaming executor's limits.
     stream_scale: (f64, f64),
     /// Acceleration fraction currently applied to the jog engine.
@@ -737,6 +761,9 @@ impl<B: DriverBus> RtCore<B> {
             gravity: hooks.gravity,
             jog: hooks.jog,
             stream: hooks.stream,
+            stream_shaped: hooks.stream_shaped,
+            stream_is_shaped: false,
+            stream_commanded: [0.0; MAX_JOINTS],
             exec: ExecPlayback::new(
                 hooks.samples,
                 hooks.settle,
@@ -1020,6 +1047,8 @@ impl<B: DriverBus> RtCore<B> {
         let q = self.q;
         self.exec.reseed_hold(&q);
         self.stream.activate(&q);
+        self.stream_shaped.activate(&q);
+        self.stream_commanded = q;
         self.jog.activate(&q);
         self.q_target = q;
     }
@@ -1103,6 +1132,13 @@ impl<B: DriverBus> RtCore<B> {
             return false;
         }
         self.park.saved_scale = self.stream_scale;
+        // The retreat is a joint-space move to a fixed pose, so it runs
+        // on the rate limiter even if a cartesian stream was live: the
+        // mode request above is a no-op when STREAM is already the mode,
+        // and would leave the clamp-only tracker holding the path.
+        self.stream_is_shaped = false;
+        self.stream.activate(&self.q);
+        self.stream_commanded = self.q;
         let f = self.park.speed_fraction;
         self.stream.set_scale(f, 1.0);
         self.stream_scale = (f, 1.0);
@@ -1451,7 +1487,11 @@ impl<B: DriverBus> RtCore<B> {
             }
             RtCommand::StreamRelease => {
                 if self.mode == Mode::Stream {
-                    self.stream.release();
+                    if self.stream_is_shaped {
+                        self.stream_shaped.release();
+                    } else {
+                        self.stream.release();
+                    }
                     self.stream_released = true;
                 }
             }
@@ -1687,6 +1727,11 @@ impl<B: DriverBus> RtCore<B> {
             }
             Mode::Stream => {
                 self.stream.activate(&self.q);
+                self.stream_shaped.activate(&self.q);
+                self.stream_commanded = self.q;
+                // Until a setpoint says otherwise, a stream is
+                // joint-space and gets the rate limiter.
+                self.stream_is_shaped = false;
                 self.stream_released = false;
                 self.stream_last_rx_tick = self.tick;
                 self.stream_window_pos = 0;
@@ -2351,24 +2396,54 @@ impl<B: DriverBus> RtCore<B> {
                 if self.stream_released {
                     let _ = self.stream_rx.take();
                 } else if let Some(sp) = self.stream_rx.take() {
+                    if sp.shaped != self.stream_is_shaped {
+                        // Handover: the incoming tracker starts from the
+                        // target the outgoing one last commanded, so the
+                        // switch does not step the arm.
+                        let from = self.stream_commanded;
+                        if sp.shaped {
+                            self.stream_shaped.activate(&from);
+                        } else {
+                            self.stream.activate(&from);
+                        }
+                        self.stream_is_shaped = sp.shaped;
+                        // The fractions belong to the tracker, so the
+                        // new one has to be told them again.
+                        self.stream_scale = (f64::NAN, f64::NAN);
+                    }
                     // Scale first: the limits have to be in force for
                     // the tick that consumes this target, not the one
                     // after. Only on a change — `set_limits` rewrites
                     // the OTG's whole input block and most streams
                     // never move the sliders at all.
                     if self.stream_scale != (sp.speed, sp.accel) {
-                        self.stream.set_scale(sp.speed, sp.accel);
+                        if self.stream_is_shaped {
+                            self.stream_shaped.set_scale(sp.speed, sp.accel);
+                        } else {
+                            self.stream.set_scale(sp.speed, sp.accel);
+                        }
                         self.stream_scale = (sp.speed, sp.accel);
                     }
                     // `q_target` carries the raw request; the filter
                     // sits between it and the executor, so the pair
                     // makes the smoothing visible.
                     self.q_target = sp.q;
-                    let target = self.filtered_target(&sp.q);
-                    self.stream.set_target(&target);
+                    // A shaped target is already on its profile: the
+                    // low-pass would lag it off the path it was computed
+                    // to follow, so it goes through untouched.
+                    let target = if sp.shaped {
+                        sp.q
+                    } else {
+                        self.filtered_target(&sp.q)
+                    };
+                    if self.stream_is_shaped {
+                        self.stream_shaped.set_target(&target);
+                    } else {
+                        self.stream.set_target(&target);
+                    }
                     self.stream_last_rx_tick = self.tick;
                     applied = true;
-                } else if self.stream_lp_alpha != 0.0 {
+                } else if self.stream_lp_alpha != 0.0 && !self.stream_is_shaped {
                     // The filter is a per-tick coefficient: it keeps
                     // converging on the latest request between setpoints,
                     // so the realized cutoff does not scale with the
@@ -2378,8 +2453,14 @@ impl<B: DriverBus> RtCore<B> {
                     self.stream.set_target(&target);
                 }
                 self.stream_window(applied);
-                self.stream.step(&mut self.scratch_q, &mut self.scratch_qd);
-                if self.stream.faulted() {
+                let live: &mut dyn StreamTracker = if self.stream_is_shaped {
+                    self.stream_shaped.as_mut()
+                } else {
+                    self.stream.as_mut()
+                };
+                live.step(&mut self.scratch_q, &mut self.scratch_qd);
+                self.stream_commanded = self.scratch_q;
+                if self.stream_faulted() {
                     // The limiter is holding in place instead of
                     // tracking; a stream that silently stops following
                     // its setpoints must become a visible hard error.
@@ -2497,6 +2578,15 @@ impl<B: DriverBus> RtCore<B> {
             *y += self.stream_lp_alpha * (x - *y);
         }
         self.stream_filt
+    }
+
+    /// Whether the live stream tracker is failing to track.
+    fn stream_faulted(&self) -> bool {
+        if self.stream_is_shaped {
+            self.stream_shaped.faulted()
+        } else {
+            self.stream.faulted()
+        }
     }
 
     fn stream_window(&mut self, applied: bool) {

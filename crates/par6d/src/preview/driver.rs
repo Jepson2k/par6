@@ -156,6 +156,7 @@ impl SimDriver {
                 stream_limits,
                 robot.stream.fault_latch_s,
             )),
+            stream_shaped: Box::new(par6_rt::hooks::ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(CompletionPolicy::Settled, dt, robot.motion)),
             estop: Box::new(estop),
             io: Box::new(io),

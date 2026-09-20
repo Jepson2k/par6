@@ -163,6 +163,7 @@ impl Rig {
             gravity,
             jog: Box::new(RampJog::new(robot)),
             stream: stream.unwrap_or_else(|| Box::new(ClampStream::new(robot))),
+            stream_shaped: Box::new(ClampStream::new(robot)),
             settle: Box::new(SpecSettle::new(policy, dt, robot.motion)),
             estop: Box::new(gpio),
             io: Box::new(io),

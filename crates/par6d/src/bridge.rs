@@ -1451,6 +1451,7 @@ impl RtCommands for RtBridge {
                     q: target,
                     speed: scale.0,
                     accel: scale.1,
+                    shaped: false,
                 });
                 sh.stream = Some(ActiveStream {
                     releasing: false,
@@ -2131,6 +2132,7 @@ pub(crate) fn housekeeping_loop(
                                     q: creep_toward(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
+                                    shaped: false,
                                 });
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
@@ -2205,6 +2207,7 @@ pub(crate) fn housekeeping_loop(
                                     q: creep_toward(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
+                                    shaped: false,
                                 });
                                 break 'stream;
                             }
@@ -2249,6 +2252,7 @@ pub(crate) fn housekeeping_loop(
                                     q: creep_toward(&snap.q, &stop),
                                     speed: STANDOFF_PLACEMENT_SCALE.0,
                                     accel: STANDOFF_PLACEMENT_SCALE.1,
+                                    shaped: false,
                                 });
                                 a.standoff = Some(Standoff::Placing {
                                     stop,
@@ -2410,6 +2414,7 @@ pub(crate) fn housekeeping_loop(
                                 q: t,
                                 speed: a.scale.0,
                                 accel: a.scale.1,
+                                shaped: false,
                             });
                         }
                     }
@@ -2436,6 +2441,7 @@ pub(crate) fn housekeeping_loop(
                                                 q: target,
                                                 speed: a.scale.0,
                                                 accel: a.scale.1,
+                                                shaped: false,
                                             })
                                         }
                                         Ok(Some(pairs)) => {
@@ -2463,6 +2469,7 @@ pub(crate) fn housekeeping_loop(
                                         q: state.q,
                                         speed: a.scale.0,
                                         accel: a.scale.1,
+                                        shaped: false,
                                     });
                                 }
                             }
