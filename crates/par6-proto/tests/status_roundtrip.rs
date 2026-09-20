@@ -14,6 +14,7 @@ use par6_proto::{decode_status, DriveHealthWire, Status, StatusEncoder};
 fn populated() -> Status {
     Status {
         seq: 4242,
+        session_id: u64::MAX - 1,
         angles: [1.0, -2.0, 3.5, -4.25, 5.125, -6.0625],
         torques: [0.1, 0.2, 0.3, 0.4, 0.5, 0.6],
         torques_ext: [-0.1, -0.2, -0.3, -0.4, -0.5, -0.6],
@@ -42,6 +43,7 @@ fn every_status_slot_survives_encode_and_decode() {
     let got = decode_status(bytes).expect("the encoder's own output must decode");
 
     assert_eq!(got.seq, sent.seq);
+    assert_eq!(got.session_id, sent.session_id);
     assert_eq!(got.angles, sent.angles);
     assert_eq!(got.torques_ext, sent.torques_ext);
     assert_eq!(got.io, sent.io);
@@ -77,10 +79,23 @@ fn a_bus_with_no_drives_still_round_trips() {
     assert!(got.drive_health.temperatures_c.is_empty());
 }
 
+#[test]
+fn session_metadata_requires_an_unsigned_integer_and_complete_field() {
+    let mut encoder = StatusEncoder::new();
+    let mut prefix = encoder.encode(&Status::default()).to_vec();
+    prefix.pop();
+    assert!(decode_status(&prefix).is_err());
+    for invalid in [vec![0xc0], vec![0xc3], vec![0xff], vec![0xa1, b'1']] {
+        let mut packet = prefix.clone();
+        packet.extend_from_slice(&invalid);
+        assert!(decode_status(&packet).is_err());
+    }
+}
+
 /// A STATUS from an OLDER daemon must still yield its protocol version.
 ///
 /// This is the whole point of `peek_status_proto_version`. Adding fields
-/// grows the array, so a v3 producer sends fewer elements than a v4 client
+/// grows the array, so a v4 producer sends fewer elements than a v5 client
 /// requires and `decode_status` refuses it on ARITY — before it has read the
 /// version. A client holding only `decode_status` therefore cannot tell a
 /// version skew from a corrupt datagram and reports neither: it drops the
@@ -94,14 +109,14 @@ fn an_older_daemons_status_still_reports_its_version() {
     let mut buf = Vec::new();
     par6_proto::encode_status_into(
         &Status {
-            proto_version: 3,
+            proto_version: 4,
             ..populated()
         },
         &mut buf,
     );
     assert_eq!(
         par6_proto::peek_status_proto_version(&buf),
-        Some(3),
+        Some(4),
         "the version must be readable from a STATUS that DOES decode"
     );
 
@@ -118,7 +133,7 @@ fn an_older_daemons_status_still_reports_its_version() {
     );
     assert_eq!(
         par6_proto::peek_status_proto_version(&buf),
-        Some(3),
+        Some(4),
         "the version must be readable from the datagram decode_status refused"
     );
 }
