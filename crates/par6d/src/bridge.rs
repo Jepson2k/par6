@@ -2741,19 +2741,7 @@ pub(crate) fn housekeeping_loop(
                         if let Some(st) = &mut a.cart {
                             let before = st.commanded();
                             match step_cart_jog(&mut kin, st, &stream_limits, dt, &snap.q) {
-                                // A teleport (or anything else that moves
-                                // the arm) retires the stream: whatever
-                                // this side commanded next would fight it.
-                                Ok(CartStep::Superseded) => {
-                                    // The stream is over: say so before asking for the
-                                    // mode, or the RT's watchdog can latch
-                                    // RTI_LINK_LOST in the ticks before IDLE lands.
-                                    link.send(RtCommand::StreamRelease);
-                                    link.send(RtCommand::SetMode(Mode::Idle));
-                                    sh.stream = None;
-                                    continue 'housekeeping;
-                                }
-                                Ok(CartStep::Step(target, at_rest)) => {
+                                Ok((target, at_rest)) => {
                                     let qd: [f64; NQ] =
                                         std::array::from_fn(|j| (target[j] - before[j]) / dt);
                                     // Where the arm comes to rest if this
@@ -2831,19 +2819,7 @@ pub(crate) fn housekeeping_loop(
                         if let Some(st) = &mut a.servo {
                             let before = st.commanded();
                             match step_cart_servo(&mut kin, st, &stream_limits, dt, &snap.q) {
-                                // A teleport (or anything else that moves
-                                // the arm) retires the stream: whatever
-                                // this side commanded next would fight it.
-                                Ok(CartStep::Superseded) => {
-                                    // The stream is over: say so before asking for the
-                                    // mode, or the RT's watchdog can latch
-                                    // RTI_LINK_LOST in the ticks before IDLE lands.
-                                    link.send(RtCommand::StreamRelease);
-                                    link.send(RtCommand::SetMode(Mode::Idle));
-                                    sh.stream = None;
-                                    continue 'housekeeping;
-                                }
-                                Ok(CartStep::Step(target, finished)) => {
+                                Ok((target, finished)) => {
                                     let qd: [f64; NQ] =
                                         std::array::from_fn(|j| (target[j] - before[j]) / dt);
                                     let mut la = target;
@@ -2978,41 +2954,6 @@ pub(crate) fn housekeeping_loop(
     }
 }
 
-/// Ticks of full-speed travel the measured pose may fall behind the
-/// commanded one before a cartesian stream reseeds itself.
-///
-/// The drives follow within a fraction of a tick's travel, so a gap this
-/// size is not tracking error — something moved the arm out from under
-/// the stream. A teleport is the reachable case: it preempts the stream
-/// server-side, but a jog braking past its watchdog can still be holding
-/// a pre-teleport target when one lands, and commanding it would drag
-/// the arm back.
-const RESEED_TICKS: f64 = 50.0;
-
-/// What one cartesian step produced.
-pub(crate) enum CartStep {
-    /// Command this joint target; the flag says the motion has come to
-    /// rest, which is what a released stream waits for before idling.
-    Step([f64; NQ], bool),
-    /// The arm was moved out from under the stream, so the stream is
-    /// over. Holding position would be no better than commanding the
-    /// stale target: a teleport lands while the stream is still feeding
-    /// setpoints, and anything this side commands fights it.
-    Superseded,
-}
-
-/// Whether the arm has been moved out from under a stream commanding
-/// `q_commanded`.
-fn moved_underneath(
-    limits: &MotionLimits,
-    dt: f64,
-    q_commanded: &[f64; NQ],
-    q_meas: &[f64; NQ],
-) -> bool {
-    let gap: [f64; NQ] = std::array::from_fn(|j| q_commanded[j] - q_meas[j]);
-    limits.step_ratio(&gap, dt) > RESEED_TICKS
-}
-
 /// One cartesian-jog step: ramp the tool's twist under the cartesian
 /// envelope, solve the smoothed pose to joints, and hold the result to
 /// the joints' per-tick budget without bending the tool off its axis.
@@ -3031,11 +2972,7 @@ pub(crate) fn step_cart_jog(
     limits: &MotionLimits,
     dt: f64,
     q_meas: &[f64; NQ],
-) -> Result<CartStep, String> {
-    if moved_underneath(limits, dt, &st.q_commanded, q_meas) {
-        log::info!("jog_l: the arm moved underneath the stream; ending it");
-        return Ok(CartStep::Superseded);
-    }
+) -> Result<([f64; NQ], bool), String> {
     // The limiter works in world axes; a tool-frame twist is resolved
     // through the pose the arm is actually in, as the admission
     // projection resolves it.
@@ -3079,7 +3016,7 @@ pub(crate) fn step_cart_jog(
                 st.vel_ratio = 1.0;
                 st.ik_stopping = false;
                 log::info!("jog_l: IK recovered, resuming");
-                return Ok(CartStep::Step(st.q_commanded, false));
+                return Ok((st.q_commanded, false));
             }
             st.seed = q;
             let dq: [f64; NQ] = std::array::from_fn(|j| q[j] - st.q_commanded[j]);
@@ -3096,7 +3033,7 @@ pub(crate) fn step_cart_jog(
             for (j, out) in st.q_commanded.iter_mut().enumerate() {
                 *out = out.clamp(st.soft_min[j], st.soft_max[j]);
             }
-            Ok(CartStep::Step(st.q_commanded, step.finished))
+            Ok((st.q_commanded, step.finished))
         }
         unreachable => {
             if !st.ik_stopping {
@@ -3108,7 +3045,7 @@ pub(crate) fn step_cart_jog(
                 st.exec.release();
                 st.ik_stopping = true;
             }
-            Ok(CartStep::Step(st.q_commanded, step.finished))
+            Ok((st.q_commanded, step.finished))
         }
     }
 }
@@ -3134,11 +3071,7 @@ pub(crate) fn step_cart_servo(
     limits: &MotionLimits,
     dt: f64,
     q_meas: &[f64; NQ],
-) -> Result<CartStep, String> {
-    if moved_underneath(limits, dt, &st.q_commanded, q_meas) {
-        log::info!("servo_l: the arm moved underneath the stream; ending it");
-        return Ok(CartStep::Superseded);
-    }
+) -> Result<([f64; NQ], bool), String> {
     st.exec
         .set_target(&st.target)
         .map_err(|e| format!("cartesian retarget: {e}"))?;
@@ -3157,7 +3090,7 @@ pub(crate) fn step_cart_servo(
                 st.seed = *q_meas;
                 st.ik_stopping = false;
                 log::info!("servo_l: IK recovered, resuming");
-                return Ok(CartStep::Step(st.q_commanded, false));
+                return Ok((st.q_commanded, false));
             }
             st.seed = q;
             let dq: [f64; NQ] = std::array::from_fn(|j| q[j] - st.q_commanded[j]);
@@ -3171,7 +3104,7 @@ pub(crate) fn step_cart_servo(
                 st.q_commanded = q;
                 st.exec.set_scale(st.speed, st.accel);
             }
-            Ok(CartStep::Step(st.q_commanded, step.finished))
+            Ok((st.q_commanded, step.finished))
         }
         unreachable => {
             if !st.ik_stopping {
@@ -3188,7 +3121,7 @@ pub(crate) fn step_cart_servo(
             // Keep commanding the last good target while the limiter
             // sheds its velocity: the arm holds rather than jumping to a
             // pose nothing solved.
-            Ok(CartStep::Step(st.q_commanded, step.finished))
+            Ok((st.q_commanded, step.finished))
         }
     }
 }

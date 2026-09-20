@@ -41,8 +41,8 @@ use par6_server::{
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
-    housekeeping_period, project_cart_jog, step_cart_jog, CartJogProbe, CartJogState, CartStep,
-    CoreLink, CoreOp, StreamGate,
+    housekeeping_period, project_cart_jog, step_cart_jog, CartJogProbe, CartJogState, CoreLink,
+    CoreOp, StreamGate,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
@@ -1238,12 +1238,10 @@ impl Preview {
                 period,
                 &q_meas,
             ) {
-                Ok(CartStep::Step(target, _)) => target,
-                // Nothing moves the arm under a preview, so a superseded
-                // stream cannot arise here; a step the limiter or the
-                // solver cannot produce holds in place, as housekeeping
-                // holds on a failure.
-                Ok(CartStep::Superseded) | Err(_) => state.commanded(),
+                Ok((target, _)) => target,
+                // A step the limiter or the solver cannot produce holds
+                // in place, as housekeeping holds on a failure.
+                Err(_) => state.commanded(),
             };
             for _ in 0..ticks_per_step {
                 trajectory.push(target);
