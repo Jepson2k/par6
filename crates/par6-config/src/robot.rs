@@ -562,6 +562,17 @@ pub struct MotionConfig {
     pub jog_l_linear_max_m_s: f64,
     /// Full-scale `jog_l` angular TCP speed \[rad/s\].
     pub jog_l_angular_max_rad_s: f64,
+    /// Linear TCP acceleration ceiling for the cartesian streaming
+    /// limiter \[m/s²\]. The two full-scale `jog_l` rates above are its
+    /// velocity ceiling, as parol6 does — `servo_l` and `jog_l` share
+    /// one executor, so they share one envelope.
+    pub cart_linear_accel_max_m_s2: f64,
+    /// Angular TCP acceleration ceiling for the same limiter \[rad/s²\].
+    pub cart_angular_accel_max_rad_s2: f64,
+    /// Linear TCP jerk ceiling for the same limiter \[m/s³\].
+    pub cart_linear_jerk_max_m_s3: f64,
+    /// Angular TCP jerk ceiling for the same limiter \[rad/s³\].
+    pub cart_angular_jerk_max_rad_s3: f64,
     /// MOVE_L sampling pitch: one IK waypoint per this much
     /// translation \[m\] …
     pub cart_step_m: f64,
@@ -606,9 +617,13 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 14] = [
+    pub const KEYS: [&'static str; 18] = [
         "jog_l_linear_max_m_s",
         "jog_l_angular_max_rad_s",
+        "cart_linear_accel_max_m_s2",
+        "cart_angular_accel_max_rad_s2",
+        "cart_linear_jerk_max_m_s3",
+        "cart_angular_jerk_max_rad_s3",
         "cart_step_m",
         "cart_step_rad",
         "path_step_m",
@@ -625,10 +640,14 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 14] {
+    pub fn as_array(&self) -> [f64; 18] {
         [
             self.jog_l_linear_max_m_s,
             self.jog_l_angular_max_rad_s,
+            self.cart_linear_accel_max_m_s2,
+            self.cart_angular_accel_max_rad_s2,
+            self.cart_linear_jerk_max_m_s3,
+            self.cart_angular_jerk_max_rad_s3,
             self.cart_step_m,
             self.cart_step_rad,
             self.path_step_m,
@@ -650,6 +669,10 @@ impl Default for MotionConfig {
         Self {
             jog_l_linear_max_m_s: 0.08,
             jog_l_angular_max_rad_s: 0.6,
+            cart_linear_accel_max_m_s2: 0.22,
+            cart_angular_accel_max_rad_s2: 1.65,
+            cart_linear_jerk_max_m_s3: 2.2,
+            cart_angular_jerk_max_rad_s3: 16.5,
             cart_step_m: 0.01,
             cart_step_rad: 0.034906585,
             path_step_m: 0.002,
@@ -1343,6 +1366,22 @@ impl RobotConfig {
         for (v, name) in [
             (m.jog_l_linear_max_m_s, "motion.jog_l_linear_max_m_s"),
             (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
+            (
+                m.cart_linear_accel_max_m_s2,
+                "motion.cart_linear_accel_max_m_s2",
+            ),
+            (
+                m.cart_angular_accel_max_rad_s2,
+                "motion.cart_angular_accel_max_rad_s2",
+            ),
+            (
+                m.cart_linear_jerk_max_m_s3,
+                "motion.cart_linear_jerk_max_m_s3",
+            ),
+            (
+                m.cart_angular_jerk_max_rad_s3,
+                "motion.cart_angular_jerk_max_rad_s3",
+            ),
             (m.cart_step_m, "motion.cart_step_m"),
             (m.cart_step_rad, "motion.cart_step_rad"),
             (m.path_step_m, "motion.path_step_m"),

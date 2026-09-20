@@ -18,6 +18,16 @@ pub fn motion_dict<'py>(py: Python<'py>, m: &MotionConfig) -> PyResult<Bound<'py
     let d = PyDict::new(py);
     d.set_item("jog_l_linear_max_m_s", m.jog_l_linear_max_m_s)?;
     d.set_item("jog_l_angular_max_rad_s", m.jog_l_angular_max_rad_s)?;
+    d.set_item("cart_linear_accel_max_m_s2", m.cart_linear_accel_max_m_s2)?;
+    d.set_item(
+        "cart_angular_accel_max_rad_s2",
+        m.cart_angular_accel_max_rad_s2,
+    )?;
+    d.set_item("cart_linear_jerk_max_m_s3", m.cart_linear_jerk_max_m_s3)?;
+    d.set_item(
+        "cart_angular_jerk_max_rad_s3",
+        m.cart_angular_jerk_max_rad_s3,
+    )?;
     d.set_item("cart_step_m", m.cart_step_m)?;
     d.set_item("cart_step_rad", m.cart_step_rad)?;
     d.set_item("path_step_m", m.path_step_m)?;

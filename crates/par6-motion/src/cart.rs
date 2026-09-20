@@ -24,6 +24,14 @@ use crate::MotionError;
 /// Row-major 4x4 homogeneous transform; translation in metres.
 pub type Pose = [f64; 16];
 
+/// The pose that leaves a frame where it is.
+pub const IDENTITY_POSE: Pose = [
+    1.0, 0.0, 0.0, 0.0, //
+    0.0, 1.0, 0.0, 0.0, //
+    0.0, 0.0, 1.0, 0.0, //
+    0.0, 0.0, 0.0, 1.0,
+];
+
 /// Rotation-angle threshold below which two orientations count as equal
 /// (slerp degenerates) \[rad\].
 const ANGLE_EPS: f64 = 1e-9;
@@ -74,6 +82,102 @@ fn pose_of(q: DQuat, p: DVec3) -> Pose {
         r.x_axis.z, r.y_axis.z, r.z_axis.z, p.z, //
         0.0, 0.0, 0.0, 1.0,
     ]
+}
+
+// ------------------------------------------------------- SE(3) tangent
+
+/// Below this rotation angle the closed forms below are replaced by
+/// their Taylor expansions: the `1/θ²` and `1/θ³` factors lose every
+/// significant digit as `θ` approaches zero \[rad\].
+const SMALL_ANGLE: f64 = 1e-6;
+
+/// `a · b`.
+pub fn se3_mul(a: &Pose, b: &Pose) -> Pose {
+    let ra = rotation(a);
+    pose_of(ra * rotation(b), position(a) + ra * position(b))
+}
+
+/// `m⁻¹`.
+pub fn se3_inverse(m: &Pose) -> Pose {
+    let inv = rotation(m).conjugate();
+    pose_of(inv, -(inv * position(m)))
+}
+
+/// A rotation as an axis-angle vector \[rad\], to full precision at
+/// every magnitude.
+///
+/// `DQuat::to_axis_angle` normalizes the vector part, so it has to give
+/// up below an epsilon and returns no rotation at all there — which
+/// silently rounds a small correction away rather than applying it.
+/// Scaling the vector part by `2·atan2(s, w)/s` needs no normalization,
+/// and that factor tends to `2/w` as the angle vanishes, so the small
+/// case is a limit rather than a cliff.
+fn rotation_vector(q: DQuat) -> DVec3 {
+    let v = DVec3::new(q.x, q.y, q.z);
+    let s = v.length();
+    // `q` arrives on the shortest arc (`w >= 0`), so `w` is only zero
+    // at exactly half a turn — where the vector part carries the whole
+    // rotation and the ratio below is well conditioned anyway.
+    let factor = if s < 1e-8 && q.w != 0.0 {
+        2.0 / q.w
+    } else {
+        2.0 * s.atan2(q.w) / s
+    };
+    v * factor
+}
+
+/// The twist whose exponential is `m`: `[v, ω]`, translation first.
+///
+/// `ω` is the rotation as an axis-angle vector \[rad\] and `v` \[m\] is
+/// the translation of the SCREW, which is the pose's own translation
+/// only when the rotation is zero. Interpolating this six-vector
+/// linearly and exponentiating it back is what traces the screw
+/// geodesic between two poses — the shortest path in SE(3), and the
+/// straight TCP line whenever the rotation is zero.
+///
+/// The rotation is taken on the shortest arc, so `ω` never exceeds π;
+/// a relative rotation AT π is a geodesic with two equal answers and
+/// this returns one of them.
+pub fn se3_log(m: &Pose) -> [f64; 6] {
+    let q = rotation(m);
+    // Quaternions double-cover SO(3): -q is the same rotation reached
+    // the long way round, and the geodesic has to be the short one.
+    let q = if q.w < 0.0 { -q } else { q };
+    let t = position(m);
+    let w = rotation_vector(q);
+    let angle = w.length();
+    // v = V⁻¹t, with V the left jacobian of SO(3).
+    let wxt = w.cross(t);
+    let wxwxt = w.cross(wxt);
+    let c = if angle < SMALL_ANGLE {
+        // (1 - (θ/2)cot(θ/2))/θ² → 1/12.
+        1.0 / 12.0
+    } else {
+        let half = 0.5 * angle;
+        (1.0 - half * half.cos() / half.sin()) / (angle * angle)
+    };
+    let v = t - 0.5 * wxt + c * wxwxt;
+    [v.x, v.y, v.z, w.x, w.y, w.z]
+}
+
+/// The pose `twist` exponentiates to — the inverse of [`se3_log`].
+pub fn se3_exp(twist: &[f64; 6]) -> Pose {
+    let v = DVec3::new(twist[0], twist[1], twist[2]);
+    let w = DVec3::new(twist[3], twist[4], twist[5]);
+    let angle = w.length();
+    let wxv = w.cross(v);
+    let wxwxv = w.cross(wxv);
+    // V = I + a[ω]ₓ + b[ω]ₓ², the left jacobian of SO(3).
+    let (a, b) = if angle < SMALL_ANGLE {
+        (0.5, 1.0 / 6.0)
+    } else {
+        let sq = angle * angle;
+        (
+            (1.0 - angle.cos()) / sq,
+            (angle - angle.sin()) / (sq * angle),
+        )
+    };
+    pose_of(DQuat::from_scaled_axis(w), v + a * wxv + b * wxwxv)
 }
 
 // --------------------------------------------------------------- sampling
@@ -1160,5 +1264,71 @@ mod tests {
             "budgeted path has {} points",
             path.len()
         );
+    }
+
+    /// `exp` and `log` must invert each other across the range the
+    /// streaming limiter drives them over, including the two places the
+    /// closed forms break down: `θ → 0`, where the `1/θ²` and `1/θ³`
+    /// factors lose their digits, and `θ → π`, where the axis flips.
+    #[test]
+    fn se3_log_and_exp_invert_each_other() {
+        use std::f64::consts::PI;
+        let cases = [
+            pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0),
+            pose(0.3, -0.2, 0.15, 0.0, 0.0, 0.0),
+            // Below SMALL_ANGLE: the Taylor branch.
+            pose(0.1, 0.0, 0.0, 1e-9, 0.0, 0.0),
+            pose(0.0, 0.1, 0.0, 0.0, 1e-7, 0.0),
+            // Straddling the branch cutoff.
+            pose(0.05, 0.05, 0.05, 9e-7, 0.0, 1.1e-6),
+            pose(0.2, 0.1, -0.3, 0.4, -0.7, 1.2),
+            // Near half a turn, where the axis is worst conditioned.
+            pose(0.1, 0.2, 0.3, 0.0, 0.0, PI - 1e-6),
+            pose(-0.4, 0.25, 0.1, PI - 1e-3, 0.0, 0.0),
+        ];
+        for (i, m) in cases.iter().enumerate() {
+            let back = se3_exp(&se3_log(m));
+            let worst = m
+                .iter()
+                .zip(back.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f64::max);
+            assert!(worst < 1e-9, "case {i}: round trip off by {worst}");
+        }
+    }
+
+    /// The tangent is a screw: scaling it traces a path that starts at
+    /// the identity, ends at the pose, and — for a pure translation —
+    /// stays exactly on the straight line between them. This is the
+    /// property the cartesian streaming limiter is built on.
+    #[test]
+    fn scaling_a_tangent_traces_the_screw_between_its_endpoints() {
+        let target = pose(0.3, -0.2, 0.1, 0.0, 0.0, 0.0);
+        let tangent = se3_log(&target);
+        for k in 0..=10 {
+            let s = k as f64 / 10.0;
+            let scaled: [f64; 6] = std::array::from_fn(|i| s * tangent[i]);
+            let p = translation(&se3_exp(&scaled));
+            // Exactly on the chord, because there is no rotation.
+            for (axis, &end) in [0.3, -0.2, 0.1].iter().enumerate() {
+                assert!(
+                    (p[axis] - s * end).abs() < 1e-12,
+                    "s={s} axis {axis}: {} is off the line",
+                    p[axis]
+                );
+            }
+        }
+        // With rotation the screw still has to land on both endpoints.
+        let turned = pose(0.3, -0.2, 0.1, 0.4, -0.3, 0.9);
+        let t2 = se3_log(&turned);
+        let zero: [f64; 6] = [0.0; 6];
+        assert_eq!(translation(&se3_exp(&zero)), [0.0, 0.0, 0.0]);
+        let end = se3_exp(&t2);
+        let worst = turned
+            .iter()
+            .zip(end.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0, f64::max);
+        assert!(worst < 1e-12, "screw misses its endpoint by {worst}");
     }
 }
