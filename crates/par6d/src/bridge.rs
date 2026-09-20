@@ -2024,10 +2024,17 @@ impl RtCommands for RtBridge {
         // cartesian stream's setpoints are already rate-limited and the
         // RT commands them through a clamp, so ONE stale setpoint
         // arriving after the re-seed moves the arm the whole way back in
-        // a single tick. `cancel_stream` only runs when the server still
-        // has a stream registered, and a jog braking past its watchdog
-        // no longer does.
-        self.shared.lock().unwrap().stream = None;
+        // a single tick. The server's own `cancel_stream` only runs
+        // while it still has a stream registered, and a jog braking past
+        // its watchdog no longer does.
+        //
+        // Dropping the record is not enough on its own: the RT's stream
+        // watchdog latches RTI_LINK_LOST when STREAM goes quiet without
+        // a release, and a hard error drops the arm — so the mode has to
+        // come back to IDLE with it.
+        if self.shared.lock().unwrap().stream.take().is_some() {
+            self.stop_stream_commands();
+        }
         let tool_closed = tool_positions.and_then(|p| p.first().copied());
         if let Some(closed) = tool_closed {
             let hold_ma = self
