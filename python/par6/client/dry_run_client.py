@@ -361,7 +361,12 @@ class DryRunRobotClient(RobotOwner):
             self._plan = record
         return record
 
-    def simulate(self, max_seconds: float | None = None) -> TickIndex:
+    def simulate(
+        self,
+        max_seconds: float | None = None,
+        *,
+        scenario: dict[str, Any] | None = None,
+    ) -> TickIndex:
         """The predicted record: run everything submitted so far through
         the engine and return the tick record of what the arm did.
 
@@ -377,12 +382,15 @@ class DryRunRobotClient(RobotOwner):
         typing path.  ``max_seconds`` bounds SIMULATED time, so a program
         that never terminates still comes back.
 
-        The world is the one applied NOW: a program that edits the
-        collision world part-way through is replayed against its final
-        state, not the state it had at each command.
+        World changes are replayed at their command boundaries. A free-body
+        object track contains NaN rows while that object has no free body.
+        ``scenario`` supplies deterministic observation perturbations or an
+        assumed supply-loss envelope, validated by the native simulator.
         """
         self.flush()
-        raw = self._call(self._preview.run_program, self._program, max_seconds)
+        raw = self._call(
+            self._preview.run_program, self._program, max_seconds, scenario
+        )
         return _tick_index(raw, self._methods)
 
     # ------------------------------------------------------------------

@@ -82,7 +82,8 @@ impl Electrical {
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
 /// aggregate `error` flag and the per-frame live err bit until Clear_Error.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum FaultKind {
     /// Over-temperature (byte 0 b6).
     Temperature,
