@@ -25,6 +25,7 @@ from live_daemon import (
     teleport_to,
 )
 from waldoctl import CommandKind, command_table
+from waldoctl.skills import UnresolvedPreview
 
 from par6 import config as _cfg
 from par6._par6 import Preview as DryRunProfiles
@@ -123,6 +124,53 @@ def _circle_through(
 @pytest.fixture(scope="module")
 def dry_run() -> DryRunRobotClient:
     return Robot().create_dry_run_client(initial_joints_deg=park_deg())
+
+
+def test_execution_override_retimes_preview_and_preserves_pause():
+    start = park_deg()
+    target = list(start)
+    target[0] += 8
+    normal = DryRunRobotClient(initial_joints_deg=start)
+    slow = DryRunRobotClient(initial_joints_deg=start)
+    nominal = _planned(normal.move_j(target, duration=2))
+    assert slow.pause() == 1
+    assert slow.set_execution_speed(0.5) == 1
+    assert slow.execution_speed().paused
+    with pytest.raises(UnresolvedPreview, match="paused"):
+        slow.delay(1)
+    np.testing.assert_allclose(slow.angles(), start)
+    assert slow.resume() == 1
+    # The accepted dwell remains pending until the explicit resume.
+    dwell = slow.flush()
+    assert len(dwell) == 1 and dwell[0].duration == pytest.approx(1)
+    retimed = _planned(slow.move_j(target, duration=2))
+    assert retimed.duration == pytest.approx(nominal.duration * 2)
+    assert retimed.joint_trajectory_rad is not None
+    assert nominal.joint_trajectory_rad is not None
+    np.testing.assert_allclose(
+        retimed.joint_trajectory_rad, nominal.joint_trajectory_rad
+    )
+    assert slow.execution_speed().applied_scale == 0.5
+    for value in (0, True, 2, math.nan):
+        with pytest.raises(ValueError):
+            slow.set_execution_speed(value)
+
+    # A clearing stop discards the queue the pause held, and the pause with
+    # it: the next move plans without a resume.
+    assert slow.pause() == 1
+    assert slow.stop() == 1
+    assert not slow.execution_speed().paused
+    assert _planned(slow.move_j(start, duration=1)).duration == pytest.approx(2)
+    # A resume runs what the pause held: nothing stays queued behind it, and
+    # the released motion is owed to the next result.
+    assert slow.pause() == 1
+    with pytest.raises(UnresolvedPreview, match="paused"):
+        slow.move_j(target, duration=1)
+    assert len(slow.queue()) == 1
+    assert slow.resume() == 1
+    assert slow.queue() == []
+    released = slow.flush()
+    assert len(released) == 1 and released[0].duration == pytest.approx(2)
 
 
 class TestPlannedMotion:
@@ -1217,6 +1265,9 @@ _TABLE_ARGS: dict[str, tuple] = {
     "set_payload": (0.1,),
     "stop": (),
     "estop": (),
+    "pause": (),
+    "resume": (),
+    "set_execution_speed": (0.5,),
 }
 _TABLE_KWARGS: dict[str, dict] = {
     n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")

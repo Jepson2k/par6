@@ -44,6 +44,7 @@ enum RtEvent {
     SetGravityComp(bool),
     SetPayload(f64),
     ExecPaused(bool),
+    ExecSpeed(f64),
     SetEnabled(bool),
     Teleport([f64; 6]),
     EnterFlashing,
@@ -145,6 +146,9 @@ impl RtCommands for TestRt {
         self.push(RtEvent::SetPayload(payload.mass));
     }
 
+    fn set_exec_speed(&mut self, scale: f64) {
+        self.push(RtEvent::ExecSpeed(scale));
+    }
     fn set_exec_paused(&mut self, paused: bool) {
         self.push(RtEvent::ExecPaused(paused));
     }
@@ -3695,4 +3699,85 @@ async fn a_stop_completes_a_tool_action_still_inside_its_start_round_trip() {
         "a stop completes the parked action with a cancellation: \
          ok={ok} detail={detail:?}"
     );
+}
+
+/// A pause holds the queue it interrupted. Stop, Estop and ResetState
+/// discard that queue, so they clear the pause with it: the next queued
+/// command is planned without a resume instead of being withheld by
+/// `pump()` with nothing to say why.
+#[tokio::test]
+async fn stop_estop_and_reset_clear_a_standing_pause() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let unpaused = |ev: &[RtEvent]| {
+        ev.iter()
+            .filter(|e| **e == RtEvent::ExecPaused(false))
+            .count()
+    };
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
+    c.request(&Command::Stop(Stop { clear_queue: true })).await;
+    h.wait_rt(|ev| unpaused(ev) == 1).await;
+    let i1 = c.ok_index(&move_j(101)).await;
+    h.wait_planner("a move queued after Stop starts without a resume", |p| {
+        p.started.iter().any(|(i, _)| *i == i1)
+    })
+    .await;
+    h.complete_ok(i1);
+    let (ok, detail) = c.wait_complete(i1).await;
+    assert!(ok, "{detail:?}");
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    c.request(&Command::ResetState).await;
+    h.wait_rt(|ev| unpaused(ev) == 2).await;
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    c.request(&Command::Estop).await;
+    h.wait_rt(|ev| unpaused(ev) == 3).await;
+}
+
+/// A stop that keeps the queue keeps the pause holding it: nothing is
+/// unpaused, and the retained head waits for the resume.
+#[tokio::test]
+async fn a_stop_that_keeps_the_queue_keeps_the_pause() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
+    let i1 = c.ok_index(&move_j(301)).await;
+    let _i2 = c.ok_index(&move_j(302)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: false })).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !h.rt_events().contains(&RtEvent::ExecPaused(false)),
+        "a stop that keeps the queue must keep the pause: {:?}",
+        h.rt_events()
+    );
+    assert!(
+        !h.planner
+            .lock()
+            .unwrap()
+            .started
+            .iter()
+            .any(|(i, _)| *i == i1),
+        "the retained head started without a resume"
+    );
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: false }))
+        .await;
+    h.wait_planner("the retained head starts on resume", |p| {
+        p.started.iter().any(|(i, _)| *i == i1)
+    })
+    .await;
 }

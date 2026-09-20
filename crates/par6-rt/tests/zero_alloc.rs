@@ -145,6 +145,8 @@ fn steady_state_ticks_allocate_nothing() {
             q,
             qd: [0.0; MAX_JOINTS],
             tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
             meta: SampleMeta::default(),
         };
         assert!(producer.try_push(&s));
@@ -163,6 +165,28 @@ fn steady_state_ticks_allocate_nothing() {
         handles.snapshots.latest().exec.samples_remaining < 1000,
         "playback actually consumed samples"
     );
+
+    for (command, expected_scale) in [
+        (RtCommand::ExecSetSpeedScale(0.5), 0.5),
+        (RtCommand::ExecSetPaused(true), 0.0),
+        (RtCommand::ExecSetSpeedScale(0.6), 0.0),
+        (RtCommand::ExecSetPaused(false), 0.6),
+    ] {
+        tx.send(command).unwrap();
+        assert_no_allocs(
+            || {
+                for _ in 0..robot.ticks(robot.motion.execution_override_transition_s * 1.1) {
+                    hb.feed();
+                    core.tick(dt, false);
+                }
+            },
+            "EXEC speed and pause transitions",
+        );
+        assert_eq!(
+            handles.snapshots.latest().exec.applied_scale,
+            expected_scale
+        );
+    }
 
     // HOMING window: mid-approach of step 1 (pre-moves are 4 s = 1000
     // ticks; J0's approach runs for several seconds after that). The FSM

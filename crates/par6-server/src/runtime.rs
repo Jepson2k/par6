@@ -357,6 +357,9 @@ pub trait RtCommands: Send {
     /// intact so a resume continues rather than restarts.
     fn set_exec_paused(&mut self, paused: bool);
 
+    /// Select queued execution speed without releasing a pause.
+    fn set_exec_speed(&mut self, scale: f64);
+
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up
     /// ENABLED, `Some(Err(..))` when it refused or was superseded, `None`

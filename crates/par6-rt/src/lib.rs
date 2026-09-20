@@ -72,7 +72,9 @@ pub use hooks::{
     RtCommand, SettlePolicy, SharedFlashMarker, SpecSettle, StreamTracker,
 };
 pub use par6_bus::{Freshness, LinkHealth, LinkState, NodeState};
-pub use ring::{sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer};
+pub use ring::{
+    sample_ring, FlushMarker, Sample, SampleConsumer, SampleMeta, SampleProducer, SampleStart,
+};
 pub use rt::RunOptions;
 pub use snapshot::{snapshot_channel, SnapshotReader, SnapshotWriter};
 pub use state::{

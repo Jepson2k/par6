@@ -299,6 +299,15 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("program", prog)?;
             d.set_item("epoch", *epoch)?;
         }
+        QueryResult::ExecutionSpeed {
+            target_scale,
+            applied_scale,
+            resume_scale,
+        } => {
+            d.set_item("target_scale", *target_scale)?;
+            d.set_item("applied_scale", *applied_scale)?;
+            d.set_item("resume_scale", *resume_scale)?;
+        }
         QueryResult::Payload { mass, com, inertia } => {
             fill_payload(&d, *mass, *com, *inertia)?;
         }
@@ -476,7 +485,7 @@ pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
 /// optional key (NaN on the wire) is `None`.
 pub(crate) fn motion_dict<'py>(
     py: Python<'py>,
-    values: &[f64; 13],
+    values: &[f64; 14],
 ) -> PyResult<Bound<'py, PyDict>> {
     let m = PyDict::new(py);
     for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {

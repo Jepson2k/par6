@@ -49,6 +49,13 @@ pytestmark = [pytest.mark.e2e, requires_par6d]
 
 #: Wall-clock ceiling for one session step (boot, settle, a short move).
 STEP_BUDGET_S = 20.0
+"""TCP speed under which the arm counts as stopped, not merely settling
+\[mm/s\]. The streaming loops finish at 5 mm/s, which is close enough to
+call a target reached and far enough from zero that the arm is still
+creeping."""
+REST_TCP_SPEED_MM_S = 0.5
+"""Consecutive frames under it that count as stopped."""
+REST_FRAMES = 3
 
 #: Fraction of the cartesian ceiling the streamed servo_l tests drive at.
 SERVO_L_SPEED = 0.6
@@ -1316,7 +1323,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         below = list(here)
         below[2] -= 60.0
         keepout = Box(
-            name="floor",
+            name="stream_keepout",
             x=0.4,
             y=0.4,
             z=0.1,
@@ -1329,6 +1336,34 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # deeper in the shape, so the latch outlives a missed status frame.
         # Every frame's height is kept so an excursion into the shape cannot
         # hide between assertions.
+        # The gated phase has to open on a RESTING arm. A refusal to a
+        # stream that is still moving does not simply refuse: it arms the
+        # standoff, which brakes and then places the arm, and the braking
+        # excursion is what `min(z_seen)` below would measure. That path
+        # is real and is covered by
+        # `a_refused_servo_stream_lands_on_the_keep_out_standoff`; what
+        # this test is for is the refusal itself. `stream_toward` finishes
+        # at 5 mm/s, which is settled enough to call the target reached
+        # and still creeping, so without this wait which of the two paths
+        # runs is a race — measured on the sim rig as two clean modes,
+        # refusing within 4-7 status frames with ~39 mm to spare, or
+        # within 13-18 with as little as 10 mm, and on a loaded CI runner
+        # the second one lands inside the shape.
+        # Three consecutive frames, not one: a single reading dips below
+        # the threshold whenever the arm's speed passes through zero, and
+        # one frame under it left the old two modes still showing, 7 runs
+        # in 8 against 1. Three in a row is rest, and makes it 10 in 10.
+        still = 0
+
+        def at_rest_before_gate(s) -> bool:
+            nonlocal still
+            still = still + 1 if s.tcp_speed < REST_TCP_SPEED_MM_S else 0
+            return still >= REST_FRAMES
+
+        assert await client.wait_status(at_rest_before_gate, timeout=STEP_BUDGET_S), (
+            "the arm never came to rest before the gated phase"
+        )
+
         floor = below[2] + 20.0
         z_seen: list[float] = []
 

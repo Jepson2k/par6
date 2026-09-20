@@ -38,6 +38,46 @@ fn move_j_cmd(angles_deg: [f64; NUM_JOINTS], key: u64, speed: f64) -> Command {
     })
 }
 
+#[test]
+fn execution_controls_reach_the_simulated_runtime() {
+    use par6_proto::command::{Pause, SetExecutionSpeed};
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).unwrap();
+    let mut target = park_deg();
+    target[0] += 8.0;
+    let normal = preview
+        .run(&[move_j_cmd(target, 9901, 0.5)], RunLimits::default())
+        .unwrap();
+    assert_eq!(normal.stop, StopReason::Completed);
+    let slow = preview
+        .run(
+            &[
+                Command::Pause(Pause { on: true }),
+                Command::SetExecutionSpeed(SetExecutionSpeed { scale: 0.5 }),
+                Command::Pause(Pause { on: false }),
+                move_j_cmd(target, 9902, 0.5),
+            ],
+            RunLimits::default(),
+        )
+        .unwrap();
+    assert_eq!(slow.stop, StopReason::Completed, "{:?}", slow.commands);
+    assert!(
+        slow.rows > normal.rows * 3 / 2,
+        "override did not slow the simulated motion"
+    );
+    let held = preview
+        .run(
+            &[
+                Command::Pause(Pause { on: true }),
+                move_j_cmd(target, 9903, 0.5),
+            ],
+            RunLimits { max_seconds: 0.2 },
+        )
+        .unwrap();
+    assert_eq!(held.stop, StopReason::BudgetExhausted);
+    assert_eq!(held.commands[1].rows, 0);
+}
+
 /// The simulated run against the planner it replaces.
 ///
 /// The planner says where the arm is *told* to go; the run says where it

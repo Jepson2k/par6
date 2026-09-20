@@ -21,8 +21,10 @@ from collections.abc import Callable, Coroutine, Iterator
 from typing import TYPE_CHECKING, Any
 
 import numpy as np
+from waldoctl.execution import ExecutionSpeed, validate_execution_scale
 from waldoctl.results import DryRunResultData
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
+from waldoctl.skills import UnresolvedPreview
 from waldoctl.status import (
     ActionState,
     ActivityResult,
@@ -280,11 +282,21 @@ class DryRunRobotClient(RobotOwner):
         hold, else its result.  Raises the runtime's refusal."""
         preview = self._preview  # builds the engine, so the start pose is set
         self._program.append(cmd)
-        return self._result(preview.submit(cmd))
+        result = preview.submit(cmd)
+        if result is None and self.execution_speed().paused:
+            raise UnresolvedPreview(
+                "Queued execution is paused; preview needs an explicit resume "
+                "before it can predict completion"
+            )
+        return self._result(result)
 
     def _result(self, r: dict[str, Any] | None) -> DryRunResultData | None:
         if r is None:
             return None
+        if r["pending"]:
+            raise UnresolvedPreview(
+                "Queued execution is paused; completion is unresolved"
+            )
         error: RobotError | None = None
         if r["error"] is not None:
             error = RobotError.from_wire(r["error"])
@@ -302,8 +314,13 @@ class DryRunRobotClient(RobotOwner):
         )
 
     def _system(self, cmd: dict[str, Any]) -> int:
-        """A state-changing command: refused → raises, else 1."""
-        self._submit(cmd)
+        """A state-changing command: refused → raises, else 1. The motion a
+        resume releases from the pause is owed to the next result."""
+        released = self._submit(cmd)
+        if released is not None and (
+            released.duration > 0 or released.joint_trajectory_rad is not None
+        ):
+            self._pending.append(released)
         return 1
 
     def _emit(self, result: DryRunResultData | None) -> DryRunResultData | None:
@@ -372,7 +389,10 @@ class DryRunRobotClient(RobotOwner):
         """
         preview = self._preview
         here = list(preview.angles_rad())
+        execution = self.execution_speed()
         preview.teleport_rad(self._start_joints_rad)
+        preview.submit({"type": "pause", "on": False})
+        preview.submit({"type": "set_execution_speed", "scale": 1.0})
         try:
             raw = self._call(preview.run_program, self._program, max_seconds)
             return _tick_index(raw)
@@ -380,6 +400,10 @@ class DryRunRobotClient(RobotOwner):
             # The planning session goes on from where it was; a run is a
             # question about the program, not a move.
             preview.teleport_rad(here)
+            preview.submit(
+                {"type": "set_execution_speed", "scale": execution.resume_scale}
+            )
+            preview.submit({"type": "pause", "on": execution.paused})
 
     # ------------------------------------------------------------------
     # Motion
@@ -849,7 +873,7 @@ class DryRunRobotClient(RobotOwner):
         )
 
     # ------------------------------------------------------------------
-    # Commands with no effect on an offline plan
+    # Queued waits and controller state
     # ------------------------------------------------------------------
 
     def checkpoint(self, label: str, **kwargs: Any) -> int:
@@ -884,6 +908,14 @@ class DryRunRobotClient(RobotOwner):
 
     def resume(self, **kwargs: Any) -> int:
         return self._system({"type": "pause", "on": False})
+
+    def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        return self._system(
+            {"type": "set_execution_speed", "scale": validate_execution_scale(scale)}
+        )
+
+    def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        return ExecutionSpeed(*self._preview.execution_speed())
 
     def set_gravity_comp(self, on: bool = True, **kwargs: Any) -> int:
         return self._system({"type": "set_gravity_comp", "on": bool(on)})
@@ -944,10 +976,17 @@ class DryRunRobotClient(RobotOwner):
         )
 
     def wait_motion(self, **kwargs: Any) -> bool:
+        self._finish_pending()
         return True
 
     def wait_command(self, command_index: int = -1, **kwargs: Any) -> bool:
+        self._finish_pending()
         return True
+
+    def _finish_pending(self) -> None:
+        result = self._result(self._preview.flush())
+        if result is not None:
+            self._pending.append(result)
 
     def command_verdict(self, command_index: int = -1, **kwargs: Any) -> int | None:
         """Always None: a dry run has no jaw physics to produce a settle
