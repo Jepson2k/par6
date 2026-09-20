@@ -1868,6 +1868,17 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
 
+        Raises ``TimeoutError`` when the controller does not answer,
+        because ``[0, 0, 0]`` is a legitimate offset -- a tool deliberately
+        cleared -- and returning it as a not-answered sentinel leaves the
+        caller unable to tell "the offset is zero" from "there is no
+        controller". A host that adopts the readback then quietly erases
+        the offset the user just set.
+
+        The sibling queries return ``None`` for the same condition, which
+        is unambiguous where they do it: no real answer is ``None``. This
+        one cannot, because its type is a plain list of three.
+
         Category: Configuration
 
         Example:
