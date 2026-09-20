@@ -4,7 +4,10 @@ build-backend = "maturin"
 
 [project]
 name = "par6"
-version = "0.6.0"
+# maturin reads the version from the workspace manifest the extension crate
+# belongs to, so the wheel and the daemon it carries can never disagree
+# about what they are.
+dynamic = ["version"]
 description = "PAR6 robot backend for Waldo Commander: waldoctl client for the par6d Rust runtime"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
