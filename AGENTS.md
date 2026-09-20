@@ -99,6 +99,8 @@ resolving that enum everywhere it is used.
 
 ## Code style
 
+- **Use the ecosystem when appropriate.** There is no dependency budget in this repo.
+  Reach for a well-maintained crate or library before writing your own.
 - **Comments:** a short WHY is fine; never describe WHAT the code does, and describe the
   final implementation, not the change ("changed X to Y" is review noise).
 - **Never ship declared-but-unimplemented API surface.** No "reserved" fields or params,
