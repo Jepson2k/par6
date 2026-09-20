@@ -857,8 +857,13 @@ class TestLiveParity:
         assert jog.duration < 1.5, f"the ramp should be short, got {jog.duration}"
         traj = jog.joint_trajectory_rad
         assert traj.shape[1] == NUM_JOINTS
-        assert np.allclose(traj[-1], traj[-2], atol=1e-9), (
-            "the previewed jog must end at rest, not mid-ramp"
+        # At rest means the arm has stopped, not that two rows match to
+        # machine precision: the limiter settles to its own tolerance.
+        # The runtime calls a joint stopped under 0.05 rad/s, so hold the
+        # tail of the ramp well inside that.
+        rest_rad_s = np.abs(traj[-1] - traj[-2]).max() / dry_run.plan().row_dt_s
+        assert rest_rad_s < 0.01, (
+            f"the previewed jog must end at rest, got {rest_rad_s} rad/s"
         )
         with pytest.raises(ValueError, match="unknown axis"):
             dry_run.jog_l("WRF", "Q", speed=0.5, duration=0.2)
