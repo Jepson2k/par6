@@ -78,8 +78,8 @@ async def test_full_tcp_transform_agrees_across_wire_fk_preview_and_motion(daemo
         assert local_matrix == pytest.approx(expected, abs=0.001)
         preview.set_tcp_transform(*values)
         assert preview.tcp_transform() == pytest.approx(values)
-        predicted = preview.move_l([0, 0, 5, 0, 0, 0], frame="TRF", rel=True, speed=0.2)
-        assert predicted is not None and predicted.error is None
+        planned = preview.move_l([0, 0, 5, 0, 0, 0], frame="TRF", rel=True, speed=0.2)
+        assert planned >= 0 and preview.wait_command(planned)
         target = expected @ Pose((0, 0, 5, 0, 0, 0)).matrix()
         predicted_pose = Pose(cast(PoseValues, tuple(preview.pose()))).matrix()
         assert predicted_pose == pytest.approx(target, abs=0.01)

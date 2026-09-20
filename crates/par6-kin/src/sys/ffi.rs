@@ -65,6 +65,16 @@ pub const PAR6_SHAPE_PLANE: par6_shape_kind = 6;
 /// Capacity of [`par6_shape::params`] (`PAR6_SHAPE_MAX_PARAMS`).
 pub const PAR6_SHAPE_MAX_PARAMS: usize = 4;
 
+/// Optional named placement and scoped contacts, parallel to a shape layer.
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+pub struct par6_shape_placement {
+    pub name: *const c_char,
+    pub parent_frame: *const c_char,
+    pub allowed_contacts: *const *const c_char,
+    pub n_allowed_contacts: i32,
+}
+
 /// Mirror of `par6_shape`: one world collision shape. `params` holds the
 /// coal constructor arguments for `kind` (only the first `n_params` are
 /// read); `pose` is `[x, y, z, rx, ry, rz]` in metres/radians with
@@ -249,6 +259,7 @@ extern "C" {
         layer: i32,
         shapes: *const par6_shape,
         n_shapes: i32,
+        placements: *const par6_shape_placement,
         err_buf: *mut c_char,
         err_len: i32,
     ) -> par6_status;

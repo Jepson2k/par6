@@ -109,21 +109,21 @@ Raspberry Pi OS bookworm ships GCC 12 (`GLIBCXX_3.4.30`). A wheel therefore
 targets a host with a modern toolchain; **the box installs the bundle**,
 which carries its own `libstdc++.so.6`.
 
-And it does **not** contain `par6d`:
+Release wheels include `par6d`. `Robot().start()` resolves an explicit
+`PAR6D_BIN`, then `par6d` on `PATH`, then the bundled runtime. The `par6d`
+console command uses that same resolver.
+
+A source install still compiles the extension and needs the Rust toolchain
+and C++ dependencies:
 
 ```bash
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
-A git URL never consumes a wheel, so that form compiles the extension from
-source and needs the toolchain and the C++ closure — build it from a checkout
-under `pixi run`. Either way you get the client, the offline preview and the
-kinematics — but **not** the `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
-client-only install has nothing to spawn until either the workspace above is built or
-a runtime is already listening — which is the normal case on the control box, where
-Waldo Commander, this client and `par6d` all run on the same machine and the runtime
-is a systemd service. Shipping a per-platform runtime wheel is
-[#33](https://github.com/Jepson2k/par6/issues/33).
+Build from a checkout under `pixi run`. A source install supplies the client,
+offline preview, and kinematics; build `par6d` separately or connect to an
+existing runtime. On the control box, the runtime normally runs as a systemd
+service alongside Waldo Commander.
 
 Deploying to a control box (Raspberry Pi 5, aarch64, PREEMPT_RT) is covered in
 [Deploying to the control box](#deploying-to-the-control-box).
@@ -460,6 +460,26 @@ Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names fo
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
 
+Program shapes may declare `attachment=Attachment(epoch=world.attachment_epoch,
+allowed_contacts=(...))`, using a fresh `world = rbt.shapes()` readback. Their
+pose is then relative to the `gripper` flange frame, in metres and extrinsic-XYZ
+radians (`Rz @ Ry @ Rx`), independently of TCP offsets. `shape.attach(...)` and
+`shape.detach(world_pose=...)` construct declarations; `set_shapes(...)` applies
+the complete program layer and confirms it. Changing attachments requires idle,
+referenced motion. Attached shapes require collision checking and cannot also
+declare physical simulation properties.
+
+Allowed contacts name exact collision-report partners, up to 32 unique names.
+Only pairs involving that attached shape are exempted; unknown names and
+wildcards are rejected, leaving the existing world unchanged. Declarations do
+not actuate a gripper or confirm a grasp. Context loss, controller reset,
+reference loss and source/tool changes invalidate held assumptions. Readback
+retains the old declarations with `attachments_valid=False`; arm motion is
+refused until they are cleared or explicitly reconciled against the new epoch.
+Saved world files do not restore a fresh context. The offline preview uses the
+same reference/context gates. Generic confirmed attach/detach skills and UI
+controls are available in Waldo Commander.
+
 The client side runs the same world. `Robot.in_collision` / `colliding_pairs` /
 `check_trajectory` / `min_distance` / `apply_shapes` drive the engine's `CollisionWorld`
 (`par6_kin::Collision` through `par6._par6`) on the active tool's own URDF tree with its
@@ -511,7 +531,7 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
   second-guess.
 - **coal / hpp-fcl** (collision) — `par6_col_*`: a two-layer world (installation keep-outs
   and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
-  parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).
+  parent/child-adjacent ones, shapes in metres and radians (`R = Rz·Ry·Rx`).
 - **toppra-cpp** (time-optimal path parameterization) — `par6_traj_*`. Built from source
   by `crates/par6-kin/build.rs` (conda-forge ships no C++ toppra), pinned to commit
   `142456f3` (v0.6.9), with its bundled Seidel LP solver — no qpOASES, no GPL GLPK.

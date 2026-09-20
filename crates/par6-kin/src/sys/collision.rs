@@ -41,6 +41,14 @@ impl ShapeDesc {
     }
 }
 
+/// Names and optional flange attachment for one applied collision shape.
+#[derive(Clone, Debug)]
+pub struct ShapePlacement {
+    pub name: String,
+    pub parent_frame: Option<String>,
+    pub allowed_contacts: Vec<String>,
+}
+
 /// Pinocchio geometry model over a URDF's `<collision>` meshes plus two
 /// replaceable world shape layers, answering "is `q` in collision, and
 /// which geometry pairs?".
@@ -198,6 +206,55 @@ impl CollisionModel {
     /// robot geometry are untouched. A malformed shape leaves the previous
     /// world in place. Allocates — keep it off the query path.
     pub fn set_layer(&mut self, layer: Layer, shapes: &[ShapeDesc]) -> Result<(), Error> {
+        self.set_layer_placed(layer, shapes, &[])
+    }
+
+    /// Apply named placements atomically with geometry; an empty metadata slice
+    /// selects fixed world placement and synthetic names for every shape.
+    pub fn set_layer_placed(
+        &mut self,
+        layer: Layer,
+        shapes: &[ShapeDesc],
+        placements: &[ShapePlacement],
+    ) -> Result<(), Error> {
+        if !placements.is_empty() && placements.len() != shapes.len() {
+            return Err(Error::Dimension {
+                expected: shapes.len(),
+                got: placements.len(),
+            });
+        }
+        let string = |s: &str| CString::new(s).map_err(|_| Error::InvalidString);
+        let names = placements
+            .iter()
+            .map(|p| string(&p.name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let frames = placements
+            .iter()
+            .map(|p| p.parent_frame.as_deref().map(string).transpose())
+            .collect::<Result<Vec<_>, _>>()?;
+        let contacts = placements
+            .iter()
+            .map(|p| {
+                p.allowed_contacts
+                    .iter()
+                    .map(|s| string(s))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let pointers = contacts
+            .iter()
+            .map(|names| names.iter().map(|s| s.as_ptr()).collect::<Vec<_>>())
+            .collect::<Vec<_>>();
+        let metadata = placements
+            .iter()
+            .enumerate()
+            .map(|(i, _)| ffi::par6_shape_placement {
+                name: names[i].as_ptr(),
+                parent_frame: frames[i].as_ref().map_or(std::ptr::null(), |s| s.as_ptr()),
+                allowed_contacts: pointers[i].as_ptr(),
+                n_allowed_contacts: pointers[i].len() as i32,
+            })
+            .collect::<Vec<_>>();
         let raw_shapes: Vec<ffi::par6_shape> = shapes.iter().map(ShapeDesc::as_raw).collect();
         let mut err_buf = [0u8; 512];
         let status = unsafe {
@@ -206,6 +263,11 @@ impl CollisionModel {
                 layer.as_raw(),
                 raw_shapes.as_ptr(),
                 raw_shapes.len() as i32,
+                if metadata.is_empty() {
+                    std::ptr::null()
+                } else {
+                    metadata.as_ptr()
+                },
                 err_buf.as_mut_ptr().cast(),
                 err_buf.len() as i32,
             )

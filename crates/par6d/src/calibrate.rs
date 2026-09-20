@@ -134,6 +134,25 @@ fn offset(q: &[f64; NQ], by: f64) -> [f64; NQ] {
     out
 }
 
+/// The joint targets one pose is driven through, in order: reached from
+/// either side, so a joint's friction enters the two readings with
+/// opposite signs and cancels. The pose itself is every odd entry; the
+/// approaches are passed through, not read.
+pub fn approaches(q: &[f64; NQ], approach_rad: f64) -> [[f64; NQ]; 4] {
+    [offset(q, approach_rad), *q, offset(q, -approach_rad), *q]
+}
+
+/// Every joint target the identification drives to, in order: each
+/// pose's [`approaches`], then `start` — the pose the arm was left in.
+/// A dry run submits these as the joint moves the live protocol queues.
+pub fn visit_order(start: &[f64; NQ], poses: &[[f64; NQ]], approach_rad: f64) -> Vec<[f64; NQ]> {
+    poses
+        .iter()
+        .flat_map(|q| approaches(q, approach_rad))
+        .chain(std::iter::once(*start))
+        .collect()
+}
+
 fn to_deg(q: &[f64; NQ]) -> [f64; NQ] {
     let mut out = [0.0; NQ];
     for (o, r) in out.iter_mut().zip(q) {
@@ -246,9 +265,11 @@ pub async fn measure_pose(
         q: [0.0; NQ],
         tau: [0.0; NQ],
     };
-    for dir in [1.0, -1.0] {
-        move_to(client, &offset(q, dir * protocol.approach_rad), protocol).await?;
-        move_to(client, q, protocol).await?;
+    for (k, target) in approaches(q, protocol.approach_rad).iter().enumerate() {
+        move_to(client, target, protocol).await?;
+        if k % 2 == 0 {
+            continue;
+        }
         let s = read_held(client, protocol).await?;
         for j in 0..NQ {
             mean.q[j] += 0.5 * s.q[j];

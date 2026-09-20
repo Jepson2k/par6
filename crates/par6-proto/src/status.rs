@@ -20,7 +20,7 @@
 //!  loop_health [p99_period_s f64, overruns u64], session_id u64]
 //! ```
 //!
-//! 42 elements total. STATUS is broadcast even when the bus link is down —
+//! 43 elements total. STATUS is broadcast even when the bus link is down —
 //! `link_ok`/`data_age_ms` report staleness instead of going silent. Decoders
 //! must tolerate a LONGER array (future fields append at the tail) but never a
 //! shorter one.
@@ -33,7 +33,7 @@ use crate::wire::{w_array, w_bool, w_f64, w_int, w_nil, w_str, w_uint, Reader};
 use crate::{DecodeError, EN_SLOTS, IO_SLOTS, MAX_IO_SLOTS, NUM_JOINTS, POSE_ELEMS, PROTO_VERSION};
 use crate::{HomingJointState, HomingPhase, LinkState};
 
-/// Total number of elements in a v2 STATUS array (including the tag).
+/// Total number of elements in a v5 STATUS array (including the tag).
 pub const STATUS_LEN: usize = 43;
 /// Decode cap on the `warnings` list (the RT latch holds at most 32
 /// entries; a longer claim is hostile input).

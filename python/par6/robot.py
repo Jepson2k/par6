@@ -617,13 +617,6 @@ class Robot(_RobotABC):
     def has_collision_checking(self) -> bool:
         return self._world is not None
 
-    @property
-    def has_physics_simulation(self) -> bool:
-        """par6's dry run drives the same control loop and the same MuJoCo
-        plant the simulator does, so it reports what the arm did and not
-        only what it was told."""
-        return True
-
     def in_collision(self, q_rad: NDArray[np.float64]) -> bool:
         w = self._world
         if w is None:
@@ -769,7 +762,7 @@ class Robot(_RobotABC):
         """Offline preview client — the command stream without a runtime.
 
         Keyword args: ``initial_joints_deg`` (defaults to home),
-        ``initial_homed``, ``max_snapshot_points``, ``config_path``.
+        ``initial_homed``, ``config_path``.
 
         Always a client, never ``None``: par6 supports dry running, so a
         config the engine will not load raises and says which — the ABC's

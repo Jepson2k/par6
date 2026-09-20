@@ -13,9 +13,16 @@
 //! successor that has not been queued yet. Offline the whole program is
 //! known at tick zero, so the queue is never "still growing" and the wait
 //! has nothing to wait for.
+//!
+//! Nor are the program's system commands replayed. The state they set —
+//! a profile, a payload, an output level, the collision world — lives on
+//! the planning session, which applied each one as it was submitted, and
+//! the run boots from that session's final state: a program is run
+//! against the world it ends up in. Each keeps its line in the record,
+//! with no rows, so the two records still name the same commands.
 
 use par6_bus::sim::scene::Scene;
-use par6_proto::{Command, WireError};
+use par6_proto::{command_class, Command, CommandClass, WireError};
 use par6_rt::{ArmState, Mode, RtCommand};
 use par6_server::{
     check_gate, decode_error_to_wire, GateContext, PlanContext, Planner, QueuedCommand, ShapeLayer,
@@ -89,9 +96,10 @@ impl Preview {
     /// arm sags, the servos lag, dropped objects fall, and a grasp holds
     /// or does not hold because of contact forces.
     ///
-    /// The session's pose does not move: a run starts from where the
-    /// session stands and leaves it there, so two runs of the same
-    /// program give the same answer.
+    /// A run starts from where the program began
+    /// ([`Preview::begin_program`]) and leaves the session where it
+    /// stands, so two runs of the same program give the same answer and
+    /// a plan and a run of it describe the same lines.
     pub fn run(&mut self, cmds: &[Command], limits: RunLimits) -> Result<TickBatch, DaemonError> {
         let bundle = par6_config::ConfigBundle::load(&self.config_path)?;
         let stack = load_kin_stack(
@@ -111,12 +119,12 @@ impl Preview {
             program: &self.shapes,
             fk: stack.fk,
             gravity: stack.gravity,
-            q0: self.snap.q,
+            q0: self.origin.q,
         })
         .map_err(|e| config_error("simulation", &e.to_string()))?;
-        driver.send(RtCommand::ExecSetSpeedScale(self.snap.exec.resume_scale));
+        driver.send(RtCommand::ExecSetSpeedScale(self.origin.resume_scale));
         driver.tick();
-        driver.send(RtCommand::ExecSetPaused(self.snap.exec.paused));
+        driver.send(RtCommand::ExecSetPaused(self.origin.paused));
         driver.tick();
         let mut planner = Par6Planner::new(
             ports.link,
@@ -206,6 +214,11 @@ impl Preview {
                     next += 1;
                     continue;
                 }
+                if command_class(cmds[next].tag()) == CommandClass::System {
+                    spans[next] = (start_row, 0, None);
+                    next += 1;
+                    continue;
+                }
                 if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
                 {
                     break;
@@ -238,7 +251,7 @@ impl Preview {
                     .take_while(|(k, c)| {
                         *k == 0
                             || (tool_action(c).is_none()
-                                && !matches!(c, Command::Pause(_) | Command::SetExecutionSpeed(_))
+                                && command_class(c.tag()) != CommandClass::System
                                 && self.admit(c, &driver).is_ok())
                     })
                     .map(|(k, cmd)| QueuedCommand {
@@ -266,6 +279,12 @@ impl Preview {
                 }
             }
 
+            // Nothing running and nothing left to start: the record ends
+            // on the row the last command finished on, so every row has
+            // a span that owns it.
+            if executing.is_none() && next >= cmds.len() {
+                break;
+            }
             driver.tick();
             let (snap, bus) = driver.observe();
             rec.tick(snap, bus);

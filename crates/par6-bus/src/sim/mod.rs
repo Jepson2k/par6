@@ -36,6 +36,7 @@ mod mujoco;
 pub mod scene;
 
 pub use driver::FaultKind;
+pub use gripper::{jaw_rate_bytes_s, jaw_travel_s, CALIBRATION_S};
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};

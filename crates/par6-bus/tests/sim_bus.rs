@@ -44,6 +44,7 @@ fn shape(
     mass: Option<Option<f64>>,
 ) -> Shape {
     Shape {
+        attachment: None,
         kind: kind.to_owned(),
         params: params.to_vec(),
         pose: pose.to_vec(),
@@ -1785,6 +1786,7 @@ fn world_changes_rebuild_the_scene_around_the_running_arm() {
         ),
     ];
     world.push(Shape {
+        attachment: None,
         collision: false,
         ..shape(
             "marker",

@@ -91,6 +91,34 @@ pub fn validate_shape(s: &Shape) -> Result<(), (&'static str, String)> {
             return Err(("shape.margin", format!("must be finite and >= 0, got {m}")));
         }
     }
+    if let Some(a) = &s.attachment {
+        let fail = |detail: &str| ("shape.attachment", detail.to_owned());
+        if !s.collision || s.physics.is_some() {
+            return Err(fail(
+                "attached shapes require collision geometry without physics",
+            ));
+        }
+        if a.epoch == 0 || s.name.is_empty() || s.name.len() > 128 {
+            return Err(fail(
+                "attachment requires a nonzero epoch and a bounded name",
+            ));
+        }
+        if a.allowed_contacts.len() > 32 {
+            return Err(fail("at most 32 allowed contacts"));
+        }
+        for (i, name) in a.allowed_contacts.iter().enumerate() {
+            if name.is_empty()
+                || name.len() > 128
+                || name.contains(['*', '?', '[', ']', '\0'])
+                || name == &format!("shape:{}", s.name)
+                || a.allowed_contacts[..i].contains(name)
+            {
+                return Err(fail(
+                    "contacts must be distinct exact reporting names, excluding self",
+                ));
+            }
+        }
+    }
     let Some(physics) = &s.physics else {
         return Ok(());
     };
@@ -137,14 +165,14 @@ pub fn validate_shape(s: &Shape) -> Result<(), (&'static str, String)> {
 pub struct Shape {
     /// Shape kind (`"box"`, `"sphere"`, …) — interpreted by the server layer.
     pub kind: String,
-    /// Kind-specific dimensions (mm).
+    /// Kind-specific dimensions (metres).
     pub params: Vec<f64>,
-    /// Shape pose (mm / degrees), kind-specific length.
+    /// World or flange-relative shape pose (metres / radians), extrinsic XYZ.
     pub pose: Vec<f64>,
     /// Whether the shape participates in collision checking.
     #[serde(default = "yes")]
     pub collision: bool,
-    /// Optional safety margin (mm); `None` = server default.
+    /// Optional clearance margin (metres); `None` = server default.
     #[serde(default)]
     pub margin: Option<f64>,
     /// Display name.
@@ -153,6 +181,20 @@ pub struct Shape {
     /// geometry only — drawn, and a keep-out, but nothing rests on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physics: Option<Physical>,
+    /// Flange-relative geometry bound to the current attachment context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
+}
+
+/// A declared attachment; sensing remains a separate observation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    /// Current SHAPES attachment context, invalidated by reference/tool/source loss.
+    pub epoch: u64,
+    /// Exact reporting names of this shape's exempted collision partners.
+    #[serde(default)]
+    pub allowed_contacts: Vec<String>,
 }
 
 /// A shape with no `collision` key is a collision shape.
@@ -1035,12 +1077,8 @@ impl Command {
                 for s in &p.shapes {
                     str_len("shape.kind", &s.kind, 1, 32)?;
                     str_len("shape.name", &s.name, 0, 128)?;
-                    finite_all("shape.params", &s.params)?;
-                    finite_all("shape.pose", &s.pose)?;
-                    if let Some(m) = s.margin {
-                        finite("shape.margin", m)?;
-                        check(m >= 0.0, "shape.margin", "must be >= 0")?;
-                    }
+                    validate_shape(s)
+                        .map_err(|(what, why)| DecodeError::Validation { what, why })?;
                 }
                 Ok(())
             }
@@ -1405,7 +1443,7 @@ fn w_opt_f64(buf: &mut Vec<u8>, v: Option<f64>) {
 }
 
 pub(crate) fn w_shape(buf: &mut Vec<u8>, s: &Shape) {
-    w_array(buf, 7);
+    w_array(buf, 8);
     w_str(buf, &s.kind);
     w_fixed(buf, &s.params);
     w_fixed(buf, &s.pose);
@@ -1417,6 +1455,17 @@ pub(crate) fn w_shape(buf: &mut Vec<u8>, s: &Shape) {
             w_array(buf, 2);
             w_opt_f64(buf, p.mass);
             w_fixed(buf, &p.friction);
+        }
+        None => w_nil(buf),
+    }
+    match &s.attachment {
+        Some(a) => {
+            w_array(buf, 2);
+            w_uint(buf, a.epoch);
+            w_array(buf, a.allowed_contacts.len());
+            for name in &a.allowed_contacts {
+                w_str(buf, name);
+            }
         }
         None => w_nil(buf),
     }
@@ -1766,10 +1815,10 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     let n = r.array_len()?;
     // The older six-element form is still accepted: a client that predates
     // physics describes geometry, which is exactly `physics: None`.
-    if n != 6 && n != 7 {
+    if !(6..=8).contains(&n) {
         return Err(DecodeError::Arity {
             what: "shape",
-            expected: 7,
+            expected: 8,
             got: n,
         });
     }
@@ -1779,8 +1828,33 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     let collision = r.bool()?;
     let margin = r.opt_f64()?;
     let name = r.str()?.to_owned();
-    let physics = if n == 7 { r_physics(r)? } else { None };
-    Ok(Shape {
+    let physics = if n >= 7 { r_physics(r)? } else { None };
+    let attachment = if n == 8 && !r.peek_nil() {
+        let len = r.array_len()?;
+        if len != 2 {
+            return Err(DecodeError::Arity {
+                what: "shape.attachment",
+                expected: 2,
+                got: len,
+            });
+        }
+        let epoch = r.uint()?;
+        let count = r_len(r, "shape.attachment.allowed_contacts", 32)?;
+        let mut allowed_contacts = Vec::with_capacity(count);
+        for _ in 0..count {
+            allowed_contacts.push(r.str()?.to_owned());
+        }
+        Some(Attachment {
+            epoch,
+            allowed_contacts,
+        })
+    } else {
+        if n == 8 {
+            r.nil()?;
+        }
+        None
+    };
+    let shape = Shape {
         kind,
         params,
         pose,
@@ -1788,7 +1862,10 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
         margin,
         name,
         physics,
-    })
+        attachment,
+    };
+    validate_shape(&shape).map_err(|(what, why)| DecodeError::Validation { what, why })?;
+    Ok(shape)
 }
 
 fn r_physics(r: &mut Reader<'_>) -> Result<Option<Physical>, DecodeError> {

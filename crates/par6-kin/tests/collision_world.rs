@@ -45,8 +45,89 @@ fn tcp_at(variant: GripperVariant, q: &[f64; NQ]) -> [f64; 3] {
     [tcp[0], tcp[1], tcp[2]]
 }
 
+#[test]
+fn attached_geometry_follows_the_flange_and_exempts_only_named_partners() {
+    let variant = GripperVariant::Flange;
+    let mut kin = Kin::load(&assets_dir(), variant).unwrap();
+    let mut flange = [0.0; 16];
+    kin.fk(&REACH, &mut flange).unwrap();
+    let local = [0.0, 0.0, 0.25];
+    let at = std::array::from_fn(|i| flange[4 * i + 3] + flange[4 * i + 2] * local[2]);
+    let mut part = sphere("part", 0.025, local, None);
+    part.attachment = Some(par6_proto::Attachment {
+        epoch: 1,
+        allowed_contacts: vec![],
+    });
+    let fixture = sphere("fixture", 0.025, at, None);
+    let fence = sphere("fence", 0.025, at, None);
+    let mut col = load(variant, 0.0);
+    col.set_layer(Layer::Installation, std::slice::from_ref(&fence))
+        .unwrap();
+    col.set_layer(Layer::Program, &[fixture.clone(), part.clone()])
+        .unwrap();
+    let pairs = pair_set(&mut col, &REACH);
+    assert!(
+        pairs.contains(&("fixture".into(), "part".into())),
+        "{pairs:?}"
+    );
+    assert!(
+        pairs.contains(&("fence".into(), "part".into())),
+        "{pairs:?}"
+    );
+
+    let mut turned = REACH;
+    turned[0] += 1.0;
+    let moved = pair_set(&mut col, &turned);
+    assert!(
+        !moved.contains(&("fixture".into(), "part".into())),
+        "{moved:?}"
+    );
+    assert!(
+        !moved.contains(&("fence".into(), "part".into())),
+        "{moved:?}"
+    );
+
+    part.attachment
+        .as_mut()
+        .unwrap()
+        .allowed_contacts
+        .push("shape:fixture".into());
+    col.set_layer(Layer::Program, &[fixture.clone(), part.clone()])
+        .unwrap();
+    let allowed = pair_set(&mut col, &REACH);
+    assert!(
+        !allowed.contains(&("fixture".into(), "part".into())),
+        "{allowed:?}"
+    );
+    assert!(
+        allowed.contains(&("fence".into(), "part".into())),
+        "{allowed:?}"
+    );
+    let epoch = col.scene_epoch();
+    part.attachment
+        .as_mut()
+        .unwrap()
+        .allowed_contacts
+        .push("shape:typo".into());
+    assert!(col
+        .set_layer(Layer::Program, &[fixture.clone(), part.clone()])
+        .is_err());
+    assert_eq!(col.scene_epoch(), epoch);
+    assert_eq!(pair_set(&mut col, &REACH), allowed);
+
+    part.attachment = None;
+    part.pose = [at[0], at[1], at[2], 0.0, 0.0, 0.0];
+    col.set_layer(Layer::Program, &[fixture, part]).unwrap();
+    let detached = pair_set(&mut col, &REACH);
+    assert!(
+        !detached.iter().any(|(a, b)| a == "part" || b == "part"),
+        "{detached:?}"
+    );
+}
+
 fn box_shape(name: &str, half: f64, at: [f64; 3], margin: Option<f64>) -> Shape {
     Shape {
+        attachment: None,
         name: name.to_owned(),
         kind: ShapeKind::Box,
         params: [2.0 * half, 2.0 * half, 2.0 * half],
@@ -58,6 +139,7 @@ fn box_shape(name: &str, half: f64, at: [f64; 3], margin: Option<f64>) -> Shape 
 
 fn sphere(name: &str, radius: f64, at: [f64; 3], margin: Option<f64>) -> Shape {
     Shape {
+        attachment: None,
         name: name.to_owned(),
         kind: ShapeKind::Sphere,
         params: [radius, 0.0, 0.0],
@@ -209,6 +291,7 @@ fn verdicts_follow_the_world_on_every_variant() {
 
         // The floor is an installation keep-out the base stands on.
         let floor = Shape {
+            attachment: None,
             name: "floor".to_owned(),
             kind: ShapeKind::Box,
             params: [2.0, 2.0, 0.04],
@@ -277,6 +360,7 @@ fn layers_are_independent_and_epoch_tracks_the_applied_world() {
 
     // Installation keep-out: the arm's own floor, always in contact.
     let floor = Shape {
+        attachment: None,
         name: "floor".to_owned(),
         kind: ShapeKind::Box,
         params: [2.0, 2.0, 0.04],
@@ -417,6 +501,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
 
     // Wire-level: a kind waldoctl does not define, and an arity mismatch.
     assert!(Shape::from_proto(&par6_proto::Shape {
+        attachment: None,
         kind: "torus".to_owned(),
         params: vec![1.0, 2.0],
         pose: vec![0.0; 6],
@@ -427,6 +512,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
+        attachment: None,
         kind: "box".to_owned(),
         params: vec![1.0, 2.0],
         pose: vec![0.0; 6],
@@ -437,6 +523,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
     })
     .is_err());
     assert!(Shape::from_proto(&par6_proto::Shape {
+        attachment: None,
         kind: "box".to_owned(),
         params: vec![1.0, 2.0, 3.0],
         pose: vec![0.0; 3],
@@ -450,6 +537,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
     // Value-level, refused when the layer is applied.
     for bad in [
         Shape {
+            attachment: None,
             name: "zero_box".to_owned(),
             kind: ShapeKind::Box,
             params: [0.1, 0.0, 0.1],
@@ -458,6 +546,7 @@ fn refuses_malformed_shapes_and_non_finite_configurations() {
             margin: None,
         },
         Shape {
+            attachment: None,
             name: "nan_box".to_owned(),
             kind: ShapeKind::Box,
             params: [0.1, f64::NAN, 0.1],
