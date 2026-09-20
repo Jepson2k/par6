@@ -170,6 +170,11 @@ impl StreamingExecutor {
     }
 }
 
+/// Below this the remaining tangent delta is too small to take a
+/// direction from: metres and radians mixed, so it is a magnitude, not
+/// a tolerance on either.
+const DIRECTION_EPS: f64 = 1e-12;
+
 /// TCP kinodynamic ceilings for [`CartesianStreamingExecutor`], split
 /// into the linear and angular halves of the SE(3) tangent.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -405,11 +410,14 @@ impl CartesianStreamingExecutor {
             norm += delta[k] * delta[k];
         }
         let norm = norm.sqrt();
-        self.direction = if norm > 0.0 {
-            std::array::from_fn(|k| delta[k] / norm)
-        } else {
-            [0.0; 6]
-        };
+        // Retargeting every tick is normal for a servo stream, and the
+        // remaining delta shrinks to nothing as the move lands. Keeping
+        // the last direction there stops the envelope flipping back to
+        // isotropic on the final approach, where it would change the
+        // limits under a move that is still running.
+        if norm > DIRECTION_EPS {
+            self.direction = std::array::from_fn(|k| delta[k] / norm);
+        }
         self.apply_limits();
         Ok(())
     }

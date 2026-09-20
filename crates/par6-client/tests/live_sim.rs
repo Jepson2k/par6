@@ -603,3 +603,109 @@ fn a_moving_cartesian_servo_stream_stops_outside_the_keep_out() {
         client.set_shapes(vec![]).await.expect("keep-out clears");
     })
 }
+
+/// Perpendicular distance of `p` from the line `a`→`b`, in the wire's
+/// millimetres (translation components only).
+fn off_line(a: &[f64; 6], b: &[f64; 6], p: &[f64; 6]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+    let u = [d[0] / len, d[1] / len, d[2] / len];
+    let r = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let along = r[0] * u[0] + r[1] * u[1] + r[2] * u[2];
+    let perp = [
+        r[0] - along * u[0],
+        r[1] - along * u[1],
+        r[2] - along * u[2],
+    ];
+    (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt()
+}
+
+/// `servo_l` means the TOOL travels the straight line to the target.
+///
+/// That is its whole difference from `servo_j_pose`, which also ends in
+/// the right place — by interpolating in JOINT space, which bows the
+/// tool off the line on the way. Limiting in joint space does the same
+/// thing, so this pins down both: a `servo_l` aliased onto
+/// `servo_j_pose`, and one whose cartesian profile is re-planned by the
+/// joint limiter downstream.
+///
+/// The residual is the drives following the command, not the command
+/// bending: it scales with the speed fraction (about 1 mm here, ~8 mm
+/// at full speed and acceleration), while the joint-interpolated path
+/// leaves the line by tens of millimetres whatever the speed.
+#[test]
+fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
+    run_session("servo-l-line", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+
+        // Off the wrist singularity: at park the tool points straight
+        // down, pitch sits at -90 deg and the [x, y, z, r, p, y] wire
+        // form degenerates — roll and yaw stop being separable, so a
+        // target built by round-tripping through it carries a rotation
+        // nobody asked for and the move is a screw, not a line.
+        let mut from = common::park_deg();
+        from[3] += 25.0;
+        from[4] += 35.0;
+
+        // A diagonal in all three axes: a move along one axis alone
+        // cannot tell a straight path from a bowed one.
+        let offsets = [60.0, -45.0, 30.0];
+
+        let mut worst = [0.0f64; 2];
+        for (mode, out) in worst.iter_mut().enumerate() {
+            settle_at(&client, from).await;
+            let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+            let mut target = start;
+            for (axis, d) in offsets.iter().enumerate() {
+                target[axis] += d;
+            }
+
+            let mut samples = 0u32;
+            let mut arrived = false;
+            for _ in 0..250 {
+                if mode == 0 {
+                    client.servo_l(target, Some(0.3), Some(0.3)).await
+                } else {
+                    client.servo_j_pose(target, Some(0.3), Some(0.3)).await
+                }
+                .expect("fire-and-forget sends");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let here = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+                let travelled = ((here[0] - start[0]).powi(2)
+                    + (here[1] - start[1]).powi(2)
+                    + (here[2] - start[2]).powi(2))
+                .sqrt();
+                let remaining = ((target[0] - here[0]).powi(2)
+                    + (target[1] - here[1]).powi(2)
+                    + (target[2] - here[2]).powi(2))
+                .sqrt();
+                // Judge only the part of the path actually under way: at
+                // the very start every point is trivially on the line.
+                if travelled > 2.0 {
+                    *out = out.max(off_line(&start, &target, &here));
+                    samples += 1;
+                }
+                if remaining < 1.0 {
+                    arrived = true;
+                    break;
+                }
+            }
+            assert!(arrived, "mode {mode} never reached its target");
+            assert!(
+                samples > 20,
+                "mode {mode}: only {samples} samples along the path"
+            );
+        }
+        let (cartesian, joint) = (worst[0], worst[1]);
+        println!("off the line — servo_l {cartesian:.2} mm, servo_j_pose {joint:.2} mm");
+        assert!(
+            cartesian < 2.0,
+            "servo_l left the line by {cartesian:.2} mm"
+        );
+        assert!(
+            joint > 5.0 * cartesian,
+            "servo_j_pose ({joint:.2} mm) tracked the line as well as servo_l \
+             ({cartesian:.2} mm) — servo_l is not running the cartesian limiter"
+        );
+    })
+}
