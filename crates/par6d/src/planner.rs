@@ -1548,9 +1548,10 @@ impl Par6Planner {
                     target_tick: snap.tick + ticks,
                 }
             }
-            Command::Checkpoint(_) | Command::SelectTool(_) | Command::SetTcpOffset(_) => {
-                InFlightKind::Instant
-            }
+            Command::Checkpoint(_)
+            | Command::SelectTool(_)
+            | Command::SetTcpOffset(_)
+            | Command::SetTcpTransform(_) => InFlightKind::Instant,
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -2327,17 +2328,14 @@ impl Planner for Par6Planner {
                 ctx.profile
             ),
         }
-        // The offset composes AFTER the variant's own TCP frame, which
-        // the URDF already carries — so publishing the commanded
-        // translation is the whole application. The cell is shared with
-        // the bridge's and housekeeping's models and with the RT FK hook,
-        // so planning, streaming and the reported pose all resolve at the
-        // same point; `TCP_OFFSET` still reads back the COMMANDED value,
-        // which the server owns.
+        // Every kinematics consumer shares this correction; the registered
+        // physical tool geometry and its inertial frame remain unchanged.
         {
             let mm = ctx.tcp_offset_mm;
-            self.tool_offset
-                .set([mm[0] / 1000.0, mm[1] / 1000.0, mm[2] / 1000.0]);
+            self.tool_offset.set_transform(par6_proto::pose_matrix(
+                [mm[0] / 1000.0, mm[1] / 1000.0, mm[2] / 1000.0],
+                ctx.tcp_rotation_deg.map(f64::to_radians),
+            ));
             // The workspace the enablement probe measured is the old TCP's.
             self.probe.invalidate();
         }

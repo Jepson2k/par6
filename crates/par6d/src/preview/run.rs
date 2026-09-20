@@ -134,6 +134,7 @@ impl Preview {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
             completion_policy: self.policy,
             payload: self.payload,
         });

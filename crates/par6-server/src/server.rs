@@ -189,7 +189,7 @@ enum PostEffect {
     /// before it were planned against the old frame, moves after it are
     /// planned against the new one, and a blend chain can never fold
     /// across it.
-    TcpOffset([f64; 3]),
+    TcpTransform([f64; 6]),
 }
 
 /// The first command index the server hands out. Nothing is index 0:
@@ -368,6 +368,7 @@ struct Core<R: RtCommands> {
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    tcp_rotation_deg: [f64; 3],
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
@@ -457,6 +458,7 @@ impl<R: RtCommands> Core<R> {
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
             shapes: Vec::new(),
             scene_epoch: 0,
@@ -1585,12 +1587,14 @@ impl<R: RtCommands> Core<R> {
                         // and it is what the parol6 runtime does).
                         if variant != self.tool_variant {
                             self.tcp_offset_mm = [0.0; 3];
+                            self.tcp_rotation_deg = [0.0; 3];
                         }
                         self.tool_variant = variant;
                         self.sync_planner();
                     }
-                    PostEffect::TcpOffset(mm) => {
-                        self.tcp_offset_mm = mm;
+                    PostEffect::TcpTransform(v) => {
+                        self.tcp_offset_mm = [v[0], v[1], v[2]];
+                        self.tcp_rotation_deg = [v[3], v[4], v[5]];
                         self.sync_planner();
                     }
                 }
@@ -1932,6 +1936,7 @@ impl<R: RtCommands> Core<R> {
                 tool: self.tool.clone(),
                 tool_variant: self.tool_variant.clone(),
                 tcp_offset_mm: self.tcp_offset_mm,
+                tcp_rotation_deg: self.tcp_rotation_deg,
                 completion_policy: self.completion_policy,
                 payload: self.payload,
             }));
@@ -1986,6 +1991,7 @@ impl<R: RtCommands> Core<R> {
         self.tool.clone_from(&self.cfg.fitted_tool);
         self.tool_variant = None;
         self.tcp_offset_mm = [0.0; 3];
+        self.tcp_rotation_deg = [0.0; 3];
         self.completion_policy = CompletionPolicy::Settled;
         self.profile = self.cfg.initial_profile.clone();
         self.runtime.rt.reset_state();
@@ -2577,6 +2583,9 @@ impl<R: RtCommands> Core<R> {
             C::TcpSpeed => QueryResult::TcpSpeed {
                 speed: self.tcp_speed,
             },
+            C::TcpTransform => QueryResult::TcpTransform {
+                values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
+            },
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
                 y: self.tcp_offset_mm[1],
@@ -2983,11 +2992,35 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
+/// The TCP frame a queued command sets, `[x, y, z (mm), roll, pitch, yaw
+/// (deg)]`; an offset alone sets a pure translation.
+pub fn tcp_transform_effect(cmd: &Command) -> Option<[f64; 6]> {
+    match cmd {
+        Command::SetTcpOffset(p) => Some([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
+        Command::SetTcpTransform(p) => Some([p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+        _ => None,
+    }
+}
+
+/// The TCP_TRANSFORM readback: offset (mm) then rotation (deg).
+pub fn tcp_transform_values(offset_mm: [f64; 3], rotation_deg: [f64; 3]) -> [f64; 6] {
+    [
+        offset_mm[0],
+        offset_mm[1],
+        offset_mm[2],
+        rotation_deg[0],
+        rotation_deg[1],
+        rotation_deg[2],
+    ]
+}
+
 fn post_effect(cmd: &Command) -> PostEffect {
+    if let Some(values) = tcp_transform_effect(cmd) {
+        return PostEffect::TcpTransform(values);
+    }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
-        Command::SetTcpOffset(p) => PostEffect::TcpOffset([p.x, p.y, p.z]),
         _ => PostEffect::None,
     }
 }
@@ -3019,6 +3052,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::ResetState => "reset_state",
         T::ConnectHardware => "connect_hardware",
         T::SetTcpOffset => "set_tcp_offset",
+        T::SetTcpTransform => "set_tcp_transform",
         T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
@@ -3045,6 +3079,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Error => "error",
         T::TcpSpeed => "tcp_speed",
         T::TcpOffset => "tcp_offset",
+        T::TcpTransform => "tcp_transform",
         T::ToolStatus => "tool_status",
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
