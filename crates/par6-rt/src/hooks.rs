@@ -72,6 +72,8 @@ pub enum RtCommand {
     StreamRelease,
     /// Pause/resume EXEC playback (pause holds in place, ring untouched).
     ExecSetPaused(bool),
+    /// Queued trajectory scale in [0.1, 1], preserving the explicit pause state.
+    ExecSetSpeedScale(f64),
     /// Discard the EXEC ring samples the planner marked for discard
     /// (stop/flush — NOT pause). The bound rides the ring itself
     /// ([`FlushMarker::mark`](crate::FlushMarker::mark)), because this

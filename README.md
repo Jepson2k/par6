@@ -109,21 +109,21 @@ Raspberry Pi OS bookworm ships GCC 12 (`GLIBCXX_3.4.30`). A wheel therefore
 targets a host with a modern toolchain; **the box installs the bundle**,
 which carries its own `libstdc++.so.6`.
 
-And it does **not** contain `par6d`:
+Release wheels include `par6d`. `Robot().start()` resolves an explicit
+`PAR6D_BIN`, then `par6d` on `PATH`, then the bundled runtime. The `par6d`
+console command uses that same resolver.
+
+A source install still compiles the extension and needs the Rust toolchain
+and C++ dependencies:
 
 ```bash
 pip install "par6 @ git+https://github.com/Jepson2k/par6.git@main#subdirectory=python"
 ```
 
-A git URL never consumes a wheel, so that form compiles the extension from
-source and needs the toolchain and the C++ closure — build it from a checkout
-under `pixi run`. Either way you get the client, the offline preview and the
-kinematics — but **not** the `par6d` binary. `Robot().start()` spawns `$PAR6D_BIN`, or `par6d` on `PATH`, so a
-client-only install has nothing to spawn until either the workspace above is built or
-a runtime is already listening — which is the normal case on the control box, where
-Waldo Commander, this client and `par6d` all run on the same machine and the runtime
-is a systemd service. Shipping a per-platform runtime wheel is
-[#33](https://github.com/Jepson2k/par6/issues/33).
+Build from a checkout under `pixi run`. A source install supplies the client,
+offline preview, and kinematics; build `par6d` separately or connect to an
+existing runtime. On the control box, the runtime normally runs as a systemd
+service alongside Waldo Commander.
 
 Deploying to a control box (Raspberry Pi 5, aarch64, PREEMPT_RT) is covered in
 [Deploying to the control box](#deploying-to-the-control-box).
@@ -234,6 +234,7 @@ daemon runs, so a preview cannot disagree with the runtime — it *is* the runti
 | `crates/par6-py` | the `par6._par6` Python extension (PyO3 over par6-client + the preview) |
 | `cpp/` | the Pinocchio/coal/TOPPRA C-ABI shim |
 | `python/` | the `par6` pip package (waldoctl backend) |
+| `python/par6/_data/` | generated copy of `config/` + the URDF/MJCF assets, written by `scripts/sync_pkg_data.py` and enforced fresh by a test: edit `config/PAR6.toml`, never this. A consumer hashing the packaged model (WC's simulation case reports do) sees those hashes change whenever the config does, including when a stale copy is brought back into line |
 | `python/par6/panel/` | the control box front panel service (`par6-panel`) and the preflight check (`par6-preflight`) |
 | `assets/` | PAR6 URDF, SRDF and meshes from Source Robotics — see `assets/NOTICE` |
 
@@ -415,6 +416,27 @@ spline for `move_s`, an auto-rounded polyline for `move_p`.
 `duration` acts as a **minimum** the plan is stretched to meet. The two are mutually
 exclusive.
 
+`set_execution_speed(scale)` separately scales queued trajectory execution from
+0.1 through 1.0 without replanning its path. `pause()` retains the queue and
+decelerates queued motion to a hold; `resume()` restores the selected positive
+scale. Selecting a different scale while paused preserves the pause. Zero is
+rejected by the speed setter. Jog and servo streams keep their own timing.
+
+Override transitions use a separate rate ramp and acceleration checks. The
+nominal motion profile's jerk ceiling is not guaranteed during a transition.
+
+These controls return 1 when the request is confirmed and 0 if confirmation
+times out. `execution_speed()` returns fresh `target_scale`, `applied_scale` and
+`resume_scale`; its `paused` property confirms that the applied scale reached
+zero. A pause acknowledgement can precede that hold. Queued dwell time stops
+during a pause but is unaffected by positive speed overrides.
+
+Standalone completion waits keep wall-clock deadlines while motion is paused:
+`wait_command()` returns false on timeout, and blocking motion methods raise
+`TimeoutError`. A wait timing out does not cancel queued motion; use `stop()` to
+discard it. Planning preview scales trajectory durations and reports paused
+queued operations as `UnresolvedPreview` until an explicit resume.
+
 A move with a positive blend radius `r` is **held** until the command after it decides
 what the corner looks like; consecutive same-family moves fold into one motion that
 completes every command it consumed at the same instant.
@@ -427,13 +449,37 @@ in two layers: `installation` (from the robot TOML, immutable from the wire) and
 
 The rule, for planned and streamed motion alike: a configuration may **keep** a pair the
 start is already in — an arm inside a keep-out has to be able to move its way out — but
-may not **add** one. Planned paths are walked at 0.02 rad joint pitch; streams are
+may not **add** one. Planned paths are walked at 0.02 rad joint pitch along the
+same interpolant used for fractional-speed playback, including every joint
+turning point. Soft limits are checked at those extrema as well as the stored
+samples. World changes recheck the remaining interpolated path, including while
+paused. Streams are
 projected one velocity-scaled lookahead ahead, so a faster jog stops further from
 contact.
 
 Colliding geometry is reported in waldoctl's vocabulary: bare URDF link names for the
 arm and tool, `shape:<name>` for a program keep-out, `install:<name>` for an
 installation one.
+
+Program shapes may declare `attachment=Attachment(epoch=world.attachment_epoch,
+allowed_contacts=(...))`, using a fresh `world = rbt.shapes()` readback. Their
+pose is then relative to the `gripper` flange frame, in metres and extrinsic-XYZ
+radians (`Rz @ Ry @ Rx`), independently of TCP offsets. `shape.attach(...)` and
+`shape.detach(world_pose=...)` construct declarations; `set_shapes(...)` applies
+the complete program layer and confirms it. Changing attachments requires idle,
+referenced motion. Attached shapes require collision checking and cannot also
+declare physical simulation properties.
+
+Allowed contacts name exact collision-report partners, up to 32 unique names.
+Only pairs involving that attached shape are exempted; unknown names and
+wildcards are rejected, leaving the existing world unchanged. Declarations do
+not actuate a gripper or confirm a grasp. Context loss, controller reset,
+reference loss and source/tool changes invalidate held assumptions. Readback
+retains the old declarations with `attachments_valid=False`; arm motion is
+refused until they are cleared or explicitly reconciled against the new epoch.
+Saved world files do not restore a fresh context. The offline preview uses the
+same reference/context gates. Generic confirmed attach/detach skills and UI
+controls are available in Waldo Commander.
 
 The client side runs the same world. `Robot.in_collision` / `colliding_pairs` /
 `check_trajectory` / `min_distance` / `apply_shapes` drive the engine's `CollisionWorld`
@@ -449,13 +495,25 @@ other. A tool's TCP is not modelled separately: it is the `tcp` link of that too
 tree, so selecting a tool selects the tree the runtime is fitted with and FK resolves
 exactly where `par6d` does.
 
-`set_tcp_offset` composes after the tool transform, in the tool-local frame. A variant
-change clears it, because an offset measured against the old TCP describes nothing once
-the frame moves. It is a queued command: the offset lands at its turn, so moves queued
-before it keep the old frame, moves after it are planned against the new one, and a
-blend chain never folds across it. `SELECT_TOOL` and `SET_TCP_OFFSET` therefore apply in
-program order, and the `TCP_OFFSET` query reports the new value only once the command
-has completed — the same lag `TOOLS` has after `select_tool`.
+`set_tcp_transform(x, y, z, roll, pitch, yaw)` composes a full user correction
+after the registered tool frame, using millimetres and intrinsic XYZ degrees
+(`Rx · Ry · Rz`). FK, inverse kinematics, streaming frame conversion and native
+preview use this same correction. Physical tool meshes, collision geometry and
+inertia stay attached to the registered tool links. Calibration changes the
+commanded tip and axes; it does not rotate the fitted gripper mesh.
+
+Both TCP setters are queued: earlier moves keep their original frame and later
+moves use the new one, with blend chains split at the configuration change.
+Wait for the returned index before querying `tcp_transform()`. A cancelled
+pending correction leaves the applied value unchanged. Selecting a different
+variant or resetting the controller clears the correction; reselecting the
+same variant preserves it.
+
+The existing `set_tcp_offset(x, y, z)` remains the translation-only API and clears
+user rotation. `tcp_offset()` returns three translations; `tcp_transform()`
+returns all six values. Both raise on an unanswered query. This readback change
+requires callers that previously treated missing replies as zeros to handle
+connection failures explicitly.
 
 The trees are re-based onto the vendor motor convention: URDF `q` equals the runtime's
 `theta`, so config angle values apply to the model verbatim. See
@@ -474,7 +532,7 @@ The trees are re-based onto the vendor motor convention: URDF `q` equals the run
   second-guess.
 - **coal / hpp-fcl** (collision) — `par6_col_*`: a two-layer world (installation keep-outs
   and `SET_SHAPES`) over the URDF's `<collision>` meshes, self pairs minus same-joint and
-  parent/child-adjacent ones, shapes in metres and radians (`R = Rx·Ry·Rz`).
+  parent/child-adjacent ones, shapes in metres and radians (`R = Rz·Ry·Rx`).
 - **toppra-cpp** (time-optimal path parameterization) — `par6_traj_*`. Built from source
   by `crates/par6-kin/build.rs` (conda-forge ships no C++ toppra), pinned to commit
   `142456f3` (v0.6.9), with its bundled Seidel LP solver — no qpOASES, no GPL GLPK.
@@ -535,6 +593,22 @@ and one check costs ~35 ms against 25 µs for a box.
 
 conda-forge ships `linux-aarch64` Pinocchio, so the control box builds the shim natively
 with the same script; cross-compiling it from x86_64 is not supported.
+
+## Timed observations
+
+STATUS carries `session_id`, `seq` and `mono_time_ns`. `controller_id` identifies
+the configured controller; `session_id` identifies this running publisher and
+changes on restart. The client accepts a new session even when its sequence
+starts below the previous one, and ignores duplicate/out-of-order sequence
+numbers within one session. The timestamp belongs to the controller's monotonic
+snapshot clock, not a synchronized host clock or guaranteed common sensor
+acquisition time. The Python client advertises `observation.timed`.
+
+Waldo Commander can retain these joint/tool observations, their source cadence
+and gaps. Its conservative replay uses the existing native joint planner and
+delays, with ordinary limits, collision checks and completion behavior. It stops
+at observed waypoints and can take substantially longer than the demonstration.
+The Python client and daemon must both include this STATUS extension.
 
 ## Ports and environment variables
 
@@ -629,6 +703,15 @@ worth looking at. An interrupted write leaves the drive waiting in its
 bootloader, which a second `par6 flash` recovers. What CAN cannot do — read a
 drive's parameters back, presets, calibration — is UART-only and stays with the
 vendor's tool over a bench connection.
+
+The page state machine itself — the ack ladder, the page window, the reboot
+handshake — is only tested on a drive: `par6 flash` against a board on the
+bench, which reports the retries it needed. A scripted bootloader would test
+the host against our reading of the drive rather than against the drive, which
+is the misreading a test is there to catch, so `python/tests/test_firmware.py`
+covers the CRC, the frame layout and what a release must refuse, and stops
+there. A bench flash is part of bringing up a new drive; treat an image that
+has never been flashed on hardware as untested.
 
 ### The bus-grant signal
 
@@ -956,3 +1039,15 @@ Open gaps are tracked as [issues](https://github.com/Jepson2k/par6/issues).
 Apache-2.0 (`LICENSE`). `assets/par6_description/` derives from Source Robotics' PAR6
 repository under a licence upstream states two ways — see `assets/NOTICE`, which records
 what is verbatim, what par6 modified, and what par6 authored.
+
+The Python client advertises `io.digital` and accepts per-call deadlines:
+`await rbt.io(timeout=1.0)` returns `None` without a reply;
+`await rbt.write_io(0, 1, timeout=1.0)` raises `TimeoutError` when acceptance
+remains unconfirmed. Deadlines include connection setup and retries, and the
+sync facade accepts the same options. Omitted deadlines keep client defaults.
+Named read/wait/write skills are available in `waldo_commander.skills` using
+`waldoctl.signals.DigitalSignal` mappings. Native preview clients advertise
+`execution.preview` so those skills require explicit observation fixtures.
+
+Offline reproducible observation and supply-loss cases are documented in
+[Simulation scenarios](docs/simulation-scenarios.md).

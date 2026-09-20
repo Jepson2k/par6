@@ -78,6 +78,28 @@ struct BootConfig {
 /// equality test there leaves STREAM open forever on an arm that has
 /// visibly stopped.
 const STREAM_REST_RAD_S: f64 = 1e-9;
+/// How far a joint may wander and still count as stopped for a released
+/// JOG or STREAM to hand over to IDLE \[rad\], and how long it must stay
+/// inside that band \[s\].
+///
+/// Displacement, not speed. The ramp reaching zero says nothing about
+/// the plant, which lags it by whatever its velocity loop still carries,
+/// and IDLE drives nothing — so an arm handed over while it is still
+/// travelling freewheels on its momentum, when the position law holding
+/// the ramp's rest point was what should have braked it. But a drive
+/// holding a position rings around it without going anywhere, and a
+/// speed threshold reads that ring as motion for as long as it lasts:
+/// traced on the sim rig, a held setpoint sustains a 1.8 degree swing at
+/// 5 Hz and ±0.38 rad/s that never decays, and a mode waiting for slow
+/// joints waits for good while whatever was waiting on the arm times
+/// out. Whether the arm is still TRAVELLING is a question about where it
+/// has been, not how fast it is going this instant. The band is wider
+/// than that ring and narrower than the ground a coasting arm covers in
+/// the window, and the window restarts the moment a joint leaves it —
+/// the same displacement plateau the homing detector reads a stall
+/// from.
+const RELEASE_REST_BAND_RAD: f64 = 0.05;
+const RELEASE_REST_WINDOW_S: f64 = 0.2;
 
 const BOOT_SELFCHECK_S: f64 = 0.032;
 /// Clear_Error frame repeats per faulted node during the clear sequence.
@@ -571,6 +593,13 @@ pub struct RtCore<B: DriverBus> {
     /// A `StreamRelease` is braking to rest. STREAM outlives it the same
     /// way JOG outlives a release.
     stream_released: bool,
+    /// The pose the stillness window is measured from, re-seeded
+    /// whenever a joint leaves [`RELEASE_REST_BAND_RAD`] of it.
+    release_rest_ref: Option<[f64; MAX_JOINTS]>,
+    /// Consecutive ticks with every joint inside that band, against
+    /// `release_rest_needed` ([`RELEASE_REST_WINDOW_S`] in ticks).
+    release_rest_streak: u32,
+    release_rest_needed: u32,
     jog_joints: u8,
     jog_blocked: u16,
 
@@ -708,7 +737,18 @@ impl<B: DriverBus> RtCore<B> {
             gravity: hooks.gravity,
             jog: hooks.jog,
             stream: hooks.stream,
-            exec: ExecPlayback::new(hooks.samples, hooks.settle),
+            exec: ExecPlayback::new(
+                hooks.samples,
+                hooks.settle,
+                dt,
+                robot.motion.execution_override_transition_s,
+                std::array::from_fn(|i| {
+                    robot.joints[i]
+                        .limits
+                        .for_mode(LimitMode::Exec)
+                        .acceleration_rad_s2
+                }),
+            ),
             estop: EstopMonitor::new(hooks.estop),
             io: hooks.io,
             io_lines: [0; MAX_IO_LINES],
@@ -784,6 +824,9 @@ impl<B: DriverBus> RtCore<B> {
             jog_active: false,
             jog_released: false,
             stream_released: false,
+            release_rest_ref: None,
+            release_rest_streak: 0,
+            release_rest_needed: robot.ticks(RELEASE_REST_WINDOW_S).max(1),
             jog_joints: 0,
             jog_blocked: 0,
             heartbeat: heartbeat.clone(),
@@ -856,6 +899,13 @@ impl<B: DriverBus> RtCore<B> {
     /// The bus backend (sim scenario hooks, backend switching in `par6d`).
     pub fn bus_mut(&mut self) -> &mut B {
         &mut self.bus
+    }
+
+    /// Whether the arm has stopped travelling: every joint inside
+    /// [`RELEASE_REST_BAND_RAD`] of where it was for
+    /// [`RELEASE_REST_WINDOW_S`].
+    fn at_measured_rest(&self) -> bool {
+        self.release_rest_streak >= self.release_rest_needed
     }
 
     /// Measured joint positions \[rad\] — what a backend swap seeds the
@@ -1155,6 +1205,7 @@ impl<B: DriverBus> RtCore<B> {
         if let Some(cmd) = self.commands.poll() {
             self.apply_command(cmd);
         }
+        self.exec.clock_tick();
 
         // Phase 5b: a level this tick's command changed reaches the pins
         // in the same tick, so a client that writes and then reads the
@@ -1405,6 +1456,11 @@ impl<B: DriverBus> RtCore<B> {
                 }
             }
             RtCommand::ExecSetPaused(paused) => self.exec.set_paused(paused),
+            RtCommand::ExecSetSpeedScale(scale) => {
+                if !self.exec.set_speed_scale(scale) {
+                    log::warn!("invalid queued execution scale: {scale}");
+                }
+            }
             RtCommand::ExecFlush => {
                 let n = self.exec.flush();
                 log::info!("EXEC flush discarded {n} samples");
@@ -1542,6 +1598,18 @@ impl<B: DriverBus> RtCore<B> {
     /// reachability, then enabled ∧ no-errors ∧ homed-if-motion.
     fn request_mode(&mut self, target: Mode) -> Result<(), GateRefusal> {
         if target == self.mode {
+            // A STREAM request while STREAM is braking to rest resumes
+            // the session where the tracker is, rather than bouncing
+            // through IDLE and re-seeding the tracker at the measured
+            // pose: the measurement trails what the drive is holding by
+            // its settle, and a re-seed there is a position step the
+            // drive rings on — measured on the sim rig, that ring is
+            // what kept a standoff placement from ever reading as
+            // arrived.
+            if target == Mode::Stream && self.stream_released {
+                self.stream_released = false;
+                self.stream_last_rx_tick = self.tick;
+            }
             return Ok(());
         }
         // Never request targets: BOOTING is boot-only, ACTIVE_ERROR is a
@@ -1781,6 +1849,18 @@ impl<B: DriverBus> RtCore<B> {
                 self.qd_filt[i] += MEAS_FILTER_ALPHA * (self.qd[i] - self.qd_filt[i]);
                 self.tau_filt[i] += MEAS_FILTER_ALPHA * (self.tau[i] - self.tau_filt[i]);
             }
+        }
+        let held = self.release_rest_ref.is_some_and(|reference| {
+            self.q
+                .iter()
+                .zip(reference.iter())
+                .all(|(q, r)| (q - r).abs() <= RELEASE_REST_BAND_RAD)
+        });
+        if held {
+            self.release_rest_streak = self.release_rest_streak.saturating_add(1);
+        } else {
+            self.release_rest_ref = Some(self.q);
+            self.release_rest_streak = 0;
         }
     }
 
@@ -2106,6 +2186,9 @@ impl<B: DriverBus> RtCore<B> {
     }
 
     fn dispatch_and_send(&mut self) {
+        if self.mode != Mode::Exec {
+            self.exec.at_rest();
+        }
         if self.mode != Mode::Idle {
             self.drift.reset();
         }
@@ -2219,8 +2302,14 @@ impl<B: DriverBus> RtCore<B> {
                 );
                 // A released jog ramps down instead of stopping dead,
                 // and JOG is the only mode that ticks the engine, so the
-                // mode outlives the release until the ramp is at rest.
-                if self.jog_released && self.scratch_qd.iter().all(|v| *v == 0.0) {
+                // mode outlives the release until the ramp AND the arm
+                // are at rest: the ramp's rest point is a position hold,
+                // and the hold is what brakes an arm still carrying the
+                // ramp's velocity (see [`RELEASE_REST_BAND_RAD`]).
+                if self.jog_released
+                    && self.scratch_qd.iter().all(|v| *v == 0.0)
+                    && self.at_measured_rest()
+                {
                     self.mode = Mode::Idle;
                 }
             }
@@ -2305,13 +2394,15 @@ impl<B: DriverBus> RtCore<B> {
                 );
                 // A released stream brakes instead of stopping dead, and
                 // STREAM is the only mode that ticks this executor, so
-                // the mode outlives the release until the ramp is at
-                // rest — the same contract JOG has. Handing the arm to
-                // IDLE while it still carries velocity is what let a
-                // refused stream coast on past the keep-out that
-                // refused it.
+                // the mode outlives the release until the ramp AND the
+                // arm are at rest — the same contract JOG has. Handing
+                // the arm to IDLE while it still carries velocity is what
+                // let a refused stream coast on past the keep-out that
+                // refused it, and the ramp's rest is not the arm's (see
+                // [`RELEASE_REST_BAND_RAD`]).
                 if self.stream_released
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
+                    && self.at_measured_rest()
                 {
                     self.mode = Mode::Idle;
                 }

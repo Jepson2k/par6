@@ -108,12 +108,12 @@ cwd = "python"
 cmd = "cargo build -p par6d --release"
 
 [tasks.test-e2e]
-cmd = "pytest -m e2e"
+cmd = "pytest -m e2e --junitxml=test-results-e2e.xml"
 cwd = "python"
 depends-on = ["build-daemon"]
 
 [tasks.test-examples]
-cmd = "pytest -m examples --examples"
+cmd = "pytest -m examples --examples --junitxml=test-results-examples.xml"
 cwd = "python"
 depends-on = ["build-daemon"]
 

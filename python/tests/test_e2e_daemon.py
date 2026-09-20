@@ -49,6 +49,64 @@ pytestmark = [pytest.mark.e2e, requires_par6d]
 
 #: Wall-clock ceiling for one session step (boot, settle, a short move).
 STEP_BUDGET_S = 20.0
+"""TCP speed under which the arm counts as stopped, not merely settling
+\[mm/s\]. The streaming loops finish at 5 mm/s, which is close enough to
+call a target reached and far enough from zero that the arm is still
+creeping."""
+REST_TCP_SPEED_MM_S = 0.5
+"""Consecutive frames under it that count as stopped."""
+REST_FRAMES = 3
+
+
+@pytest.mark.timeout(90)
+async def test_attachments_require_reconciliation_after_context_loss(
+    daemon: LiveDaemon,
+):
+    from waldoctl.shapes import Sphere
+
+    async with daemon.client() as client:
+        assert await client.wait_ready(timeout=STEP_BUDGET_S)
+        await settle_at(client, TILTED_POSTURE_DEG)
+        world = await client.shapes()
+        assert world is not None
+        local = (0.0, 0.0, 0.3, 0.0, 0.0, 0.0)
+        part = Sphere(name="part", radius=0.01).attach(
+            flange_pose=local,
+            epoch=world.attachment_epoch,
+        )
+        assert await client.set_shapes([part]) == 1
+        applied = await client.shapes()
+        assert applied is not None and applied.program == (part,)
+        target = list(TILTED_POSTURE_DEG)
+        target[0] += 3
+        await client.move_j(target, duration=1.5, wait=True, timeout=STEP_BUDGET_S)
+
+        assert await client.estop() == 1
+        async with asyncio.timeout(STEP_BUDGET_S):
+            while True:
+                current = await client.shapes()
+                assert current is not None
+                if not current.attachments_valid:
+                    break
+                await asyncio.sleep(0)
+        assert current.attachment_epoch != world.attachment_epoch
+        assert await client.reset() == 1
+        with pytest.raises(RobotError, match="attachment context"):
+            await client.move_j(TILTED_POSTURE_DEG, duration=1.5)
+        with pytest.raises(RobotError, match="attachment context"):
+            await client.set_shapes([part])
+        fresh = await client.shapes()
+        assert fresh is not None
+        reconciled = part.attach(flange_pose=local, epoch=fresh.attachment_epoch)
+        assert await client.set_shapes([reconciled]) == 1
+        applied = await client.shapes()
+        assert applied is not None and applied.attachments_valid
+        released = reconciled.detach(world_pose=(1.0, 1.0, 1.0, 0.0, 0.0, 0.0))
+        assert await client.set_shapes([released]) == 1
+        await client.move_j(
+            TILTED_POSTURE_DEG, duration=1.5, wait=True, timeout=STEP_BUDGET_S
+        )
+
 
 #: Fraction of the cartesian ceiling the streamed servo_l tests drive at.
 SERVO_L_SPEED = 0.6
@@ -129,6 +187,8 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
                 if len(frames) == 5:
                     break
         assert [f.proto_version for f in frames] == [PROTO_VERSION] * 5
+        assert frames[0].session_id > 0
+        assert all(f.session_id == frames[0].session_id for f in frames)
         assert all(b.seq > a.seq for a, b in zip(frames, frames[1:]))
         assert all(b.mono_time_ns > a.mono_time_ns for a, b in zip(frames, frames[1:]))
         assert all(f.link_ok == 1 and f.simulator_active for f in frames)
@@ -926,10 +986,13 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
             @ np.array([[cy, 0.0, sy], [0.0, 1.0, 0.0], [-sy, 0.0, cy]])
             @ np.array([[cz, -sz, 0.0], [sz, cz, 0.0], [0.0, 0.0, 1.0]])
         )
-        assert np.allclose(T_status[:3, 3], taught[:3], atol=1e-6), (
+        # These queries sample separate physics ticks; settling can move the
+        # TCP by micrometres between them. The bounds remain far below the
+        # orientation error caused by interpreting intrinsic XYZ as fixed axes.
+        assert np.allclose(T_status[:3, 3], taught[:3], atol=0.05, rtol=0), (
             f"pose() and STATUS disagree on the TCP position: {taught[:3]} vs {T_status[:3, 3]}"
         )
-        assert np.allclose(T_status[:3, :3], R, atol=1e-6), (
+        assert np.allclose(T_status[:3, :3], R, atol=0.001, rtol=0), (
             f"the client's rpy decode does not re-compose into the STATUS matrix:\n"
             f"{taught[3:]} ->\n{R}\nvs\n{T_status[:3, :3]}"
         )
@@ -1250,8 +1313,8 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
 
     class Streamer:
         """UI-style streaming: each datagram advances the COMMANDED target
-        a few mm, the way a 50 Hz frontend integrates a gesture. Stepping
-        from the measurement instead feeds the plant's tracking lag back
+        5 mm, paced by the 50 ms status wait. Stepping from the
+        measurement instead feeds the plant's tracking lag back
         into the target and limit-cycles the arm."""
 
         def __init__(self, client, goal, send):
@@ -1296,7 +1359,8 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         )
         assert arrived, (
             f"servo_l never reached the streamed target: "
-            f"{(await pose_now(client))[:3]} vs {goal[:3]}"
+            f"{(await pose_now(client))[:3]} vs {goal[:3]}; "
+            f"controller error: {await client.error()}; daemon log:\n{daemon.log()}"
         )
 
         # --- servo_j(pose=...): the same target through the joint-space
@@ -1313,7 +1377,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         below = list(here)
         below[2] -= 60.0
         keepout = Box(
-            name="floor",
+            name="stream_keepout",
             x=0.4,
             y=0.4,
             z=0.1,
@@ -1326,6 +1390,34 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # deeper in the shape, so the latch outlives a missed status frame.
         # Every frame's height is kept so an excursion into the shape cannot
         # hide between assertions.
+        # The gated phase has to open on a RESTING arm. A refusal to a
+        # stream that is still moving does not simply refuse: it arms the
+        # standoff, which brakes and then places the arm, and the braking
+        # excursion is what `min(z_seen)` below would measure. That path
+        # is real and is covered by
+        # `a_refused_servo_stream_lands_on_the_keep_out_standoff`; what
+        # this test is for is the refusal itself. `stream_toward` finishes
+        # at 5 mm/s, which is settled enough to call the target reached
+        # and still creeping, so without this wait which of the two paths
+        # runs is a race — measured on the sim rig as two clean modes,
+        # refusing within 4-7 status frames with ~39 mm to spare, or
+        # within 13-18 with as little as 10 mm, and on a loaded CI runner
+        # the second one lands inside the shape.
+        # Three consecutive frames, not one: a single reading dips below
+        # the threshold whenever the arm's speed passes through zero, and
+        # one frame under it left the old two modes still showing, 7 runs
+        # in 8 against 1. Three in a row is rest, and makes it 10 in 10.
+        still = 0
+
+        def at_rest_before_gate(s) -> bool:
+            nonlocal still
+            still = still + 1 if s.tcp_speed < REST_TCP_SPEED_MM_S else 0
+            return still >= REST_FRAMES
+
+        assert await client.wait_status(at_rest_before_gate, timeout=STEP_BUDGET_S), (
+            "the arm never came to rest before the gated phase"
+        )
+
         floor = below[2] + 20.0
         z_seen: list[float] = []
 

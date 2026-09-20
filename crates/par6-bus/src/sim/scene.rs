@@ -219,7 +219,8 @@ pub(crate) fn load_lock() -> std::sync::MutexGuard<'static, ()> {
 /// | `physics`, no mass | static geom | on |
 /// | `physics` with mass | free body + geom | on |
 ///
-/// Pose is the shape's world pose (`R = Rz·Ry·Rx`); sizes follow coal's
+/// Pose is world-relative, or flange-relative for an attachment
+/// (`R = Rz·Ry·Rx`); sizes follow coal's
 /// constructor conventions (full box sides, cylinder/capsule `radius,
 /// length`). MuJoCo has no cone: a cone gets its enclosing cylinder.
 pub fn inject_world(spec: &mut MjSpec, world: &World) -> Result<(), SceneError> {
@@ -235,7 +236,17 @@ pub fn inject_world(spec: &mut MjSpec, world: &World) -> Result<(), SceneError> 
         let obj = WorldGeom::from_shape(shape)?;
         let name = format!("{WORLD_PREFIX}{}", shape.name);
         let (pos, quat) = obj.placement;
-        let world_body = spec.world_body_mut();
+        let world_body = if shape.attachment.is_some() {
+            if shape.physics.is_some() {
+                return Err(SceneError::World(
+                    "attached declarations cannot specify physical-body simulation".into(),
+                ));
+            }
+            spec.body_mut("gripper")
+                .ok_or_else(|| SceneError::World("attachment flange is missing".into()))?
+        } else {
+            spec.world_body_mut()
+        };
         let dynamic = obj.mass.is_some();
         let geom = if dynamic {
             let body = world_body.add_body().with_name(&name);
@@ -258,6 +269,9 @@ pub fn inject_world(spec: &mut MjSpec, world: &World) -> Result<(), SceneError> 
         geom.with_type(obj.kind);
         geom.with_size(obj.size);
         geom.with_rgba(obj.rgba);
+        if shape.attachment.is_some() {
+            geom.set_mass(0.0);
+        }
         let contact = i32::from(obj.contact);
         geom.set_contype(contact);
         geom.set_conaffinity(contact);

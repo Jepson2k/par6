@@ -137,6 +137,8 @@ wire_enum! {
         /// every Nth tick, so only divisors of the tick rate can be served;
         /// anything else is refused rather than rounded to a neighbour.
         SetStatusRate = 31,
+        /// Select 10–100% of planned execution speed, preserving pause.
+        SetExecutionSpeed = 32,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -191,6 +193,8 @@ wire_enum! {
         BusScan = 61,
         /// Current STATUS rate, and the tick rate it divides.
         StatusRate = 62,
+        /// Fresh queued-execution timing readback.
+        ExecutionSpeed = 63,
 
         // -- FIRE_AND_FORGET: no reply --
         /// Streaming joint position target (degrees).
@@ -236,6 +240,10 @@ wire_enum! {
         Checkpoint = 109,
         /// Generic tool action (open/close/move…), validated server-side.
         ToolAction = 110,
+        /// Queued tool-local TCP transform (mm, intrinsic XYZ degrees).
+        SetTcpTransform = 111,
+        /// Applied tool-local TCP transform readback.
+        TcpTransform = 112,
     }
 }
 
@@ -288,6 +296,10 @@ wire_enum! {
         BusScan = 22,
         /// See [`CmdType::StatusRate`].
         StatusRate = 23,
+        /// See [`CmdType::TcpTransform`].
+        TcpTransform = 24,
+        /// Requested, applied, and retained positive execution scales.
+        ExecutionSpeed = 25,
     }
 }
 
@@ -448,6 +460,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetPidGains
         | C::SetCanId
         | C::SaveConfig
+        | C::SetExecutionSpeed
         | C::SetStatusRate => CommandClass::System,
 
         C::Ping
@@ -465,6 +478,8 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::ExecutionSpeed
+        | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
@@ -493,6 +508,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::Delay
         | C::Checkpoint
         | C::ToolAction
-        | C::SetTcpOffset => CommandClass::Queued,
+        | C::SetTcpOffset
+        | C::SetTcpTransform => CommandClass::Queued,
     }
 }

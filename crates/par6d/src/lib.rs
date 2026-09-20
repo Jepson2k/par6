@@ -31,6 +31,7 @@ mod bridge;
 pub mod calibrate;
 pub mod collision_world;
 pub mod daemon;
+mod execution_path;
 mod grant;
 pub mod kin;
 pub mod logging;
@@ -41,6 +42,6 @@ pub mod vitals;
 
 pub use bridge::stream_stopping_travel;
 pub use daemon::{Daemon, DaemonError};
-pub use kin::{matrix_to_xyzrpy, translate_local};
+pub use kin::{mat_mul, matrix_to_xyzrpy};
 pub use options::Options;
 pub use par6_kin::COLLISION_CLEARANCE_M;

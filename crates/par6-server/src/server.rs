@@ -50,7 +50,8 @@
 //!   `reset_state` resets world/tool/errors but NOT the e-stop latch and
 //!   NOT the index allocator.
 
-use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::collections::{hash_map::RandomState, BTreeSet, HashMap, VecDeque};
+use std::hash::BuildHasher;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
@@ -189,7 +190,7 @@ enum PostEffect {
     /// before it were planned against the old frame, moves after it are
     /// planned against the new one, and a blend chain can never fold
     /// across it.
-    TcpOffset([f64; 3]),
+    TcpTransform([f64; 6]),
 }
 
 /// The first command index the server hands out. Nothing is index 0:
@@ -368,12 +369,16 @@ struct Core<R: RtCommands> {
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    tcp_rotation_deg: [f64; 3],
     /// The commanded runtime payload — served back by the PAYLOAD query.
     payload: PayloadSpec,
     shapes: Vec<par6_proto::Shape>,
+    attachment_epoch: u64,
+    attachment_stop_pending: bool,
     scene_epoch: u64,
     collision: CollisionState,
     completion_policy: CompletionPolicy,
+    execution_paused: bool,
     /// The RT latch last written to the activity log, so the latch is
     /// logged on its edges and never once per poll.
     rt_error_logged: Option<u16>,
@@ -388,6 +393,7 @@ struct Core<R: RtCommands> {
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
+    session_id: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
     /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
@@ -457,15 +463,24 @@ impl<R: RtCommands> Core<R> {
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            tcp_rotation_deg: [0.0; 3],
             payload: PayloadSpec::default(),
             shapes: Vec::new(),
+            attachment_epoch: RandomState::new()
+                .hash_one((std::process::id(), std::time::SystemTime::now()))
+                .max(1),
+            attachment_stop_pending: false,
             scene_epoch: 0,
             collision: CollisionState::default(),
             completion_policy: CompletionPolicy::Settled,
+            execution_paused: false,
             queue_estimate_for: (0, 0),
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
+            session_id: RandomState::new()
+                .hash_one((std::process::id(), std::time::SystemTime::now()))
+                .max(1),
             tcp_speed: 0.0,
             prev_tcp: None,
         }
@@ -529,6 +544,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_datagram(&mut self, data: &[u8], addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match peek_tag(data) {
             Ok(t) if t == MsgType::Chunk as u8 as i64 => self.on_chunk(data, addr).await,
             _ => self.on_command_bytes(data, addr).await,
@@ -615,6 +631,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
@@ -649,6 +666,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_status(&mut self) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         self.update_tcp_speed();
         self.update_collision();
         self.refresh_queue_estimate();
@@ -831,6 +849,10 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         if let C::SetShapes(p) = cmd {
+            if let Some(error) = self.attachment_shapes_error(&p.shapes) {
+                self.reply(addr, &Reply::Error { req_id, error }).await;
+                return;
+            }
             self.defer_program_shapes(req_id, addr, p.shapes.clone());
             return;
         }
@@ -849,9 +871,15 @@ impl<R: RtCommands> Core<R> {
                 self.standing_error =
                     Some(make_error(ErrorCode::SysEstopActive, UNATTRIBUTED, &[]));
                 self.cancel_all_motion("estop").await;
+                self.clear_pause();
+                Ok(())
+            }
+            C::SetExecutionSpeed(p) => {
+                self.runtime.rt.set_exec_speed(p.scale);
                 Ok(())
             }
             C::Pause(p) => {
+                self.execution_paused = p.on;
                 self.runtime.rt.set_exec_paused(p.on);
                 Ok(())
             }
@@ -860,11 +888,16 @@ impl<R: RtCommands> Core<R> {
                 Ok(())
             }
             C::Stop(p) => {
+                // A clearing stop drops the pause with the queue it held; a
+                // stop that keeps the queue keeps the pause holding it.
                 let dropped = if p.clear_queue {
                     self.cancel_all_motion("stop").await
                 } else {
                     self.cancel_active_motion("stop").await
                 };
+                if p.clear_queue {
+                    self.clear_pause();
+                }
                 if p.clear_queue && dropped > 0 {
                     // A cleared program is a fact the operator has to
                     // see; the next accepted motion wipes it.
@@ -894,6 +927,7 @@ impl<R: RtCommands> Core<R> {
                 }
             },
             C::Simulator(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the simulator switch").await;
                 self.runtime.rt.set_simulator(p.on).map(|()| {
                     self.simulator = p.on;
@@ -926,6 +960,7 @@ impl<R: RtCommands> Core<R> {
             // move resumed against one whose position is not yet known
             // is a move to somewhere nobody asked for.
             C::ConnectHardware(p) => {
+                self.invalidate_attachments();
                 self.cancel_all_motion("the hardware connect").await;
                 self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
                     self.simulator = false;
@@ -995,6 +1030,7 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
+        self.invalidate_attachments();
         self.estop_latched = false;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1038,6 +1074,7 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_flashing(&mut self, req_id: u32, enter: bool, addr: SocketAddr) {
         self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         // An exit from any mode but FLASHING is refused HERE: it would
         // dispatch `SetMode(Idle)`, which from a working mode cancels
         // motion the client never asked to stop.
@@ -1133,6 +1170,7 @@ impl<R: RtCommands> Core<R> {
             return;
         }
         debug_assert!(is_stream(tag));
+        let mut refused_in_place = false;
         let outcome = match self.active_stream {
             Some(active) if active == tag => {
                 // Same type: update the active command in place — no new
@@ -1143,8 +1181,10 @@ impl<R: RtCommands> Core<R> {
                     // the client asked for a direction the gate blocks,
                     // and letting the PREVIOUS setpoint keep driving
                     // would carry the arm on while the refusal is read.
-                    self.active_stream = None;
-                    self.runtime.rt.cancel_stream();
+                    refused_in_place = true;
+                    if !self.runtime.rt.stop_refused_stream() {
+                        self.active_stream = None;
+                    }
                 }
                 outcome
             }
@@ -1176,7 +1216,11 @@ impl<R: RtCommands> Core<R> {
                 // stands. The gate's own collision latch (if the refusal
                 // was a collision) reaches STATUS through
                 // `update_collision`.
-                self.latch_faf_refusal(&error);
+                if refused_in_place {
+                    self.latch_stream_refusal(&error);
+                } else {
+                    self.latch_faf_refusal(&error);
+                }
                 self.reply(addr, &Reply::Error { req_id, error }).await;
             }
         }
@@ -1398,6 +1442,17 @@ impl<R: RtCommands> Core<R> {
     }
 
     fn check_gate(&self, tag: CmdType) -> Option<WireError> {
+        if is_arm_motion(tag)
+            && (!self.attachments_valid()
+                || self
+                    .pending_shapes
+                    .values()
+                    .any(|(_, _, shapes)| shapes.iter().any(|s| s.attachment.is_some())))
+        {
+            return Some(attachment_error(
+                "attachment context changed or apply is pending; reconcile and reapply",
+            ));
+        }
         let ctx = GateContext {
             estop_latched: self.estop_latched,
             enabled: self.snap.state == ArmState::Enabled,
@@ -1424,6 +1479,10 @@ impl<R: RtCommands> Core<R> {
     /// says how much of it the started motion covers. One plan is
     /// outstanding at a time, which is what makes that pop exact.
     async fn pump(&mut self) {
+        self.stop_invalid_attachments().await;
+        if self.execution_paused || self.snap.exec.target_scale == 0.0 {
+            return;
+        }
         if self.executing.is_some() || self.planning.is_some() || self.active_stream.is_some() {
             return;
         }
@@ -1458,6 +1517,8 @@ impl<R: RtCommands> Core<R> {
 
     /// Route what the planner had to say.
     async fn on_plan_event(&mut self, ev: PlanEvent) {
+        self.refresh_snapshot();
+        self.stop_invalid_attachments().await;
         match ev {
             PlanEvent::Started { index, taken } => self.on_plan_started(index, taken).await,
             PlanEvent::StartRejected { index, error } => self.on_plan_rejected(index, error).await,
@@ -1577,13 +1638,16 @@ impl<R: RtCommands> Core<R> {
                         // it alone (the client API documents the reset,
                         // and it is what the parol6 runtime does).
                         if variant != self.tool_variant {
+                            self.invalidate_attachments();
                             self.tcp_offset_mm = [0.0; 3];
+                            self.tcp_rotation_deg = [0.0; 3];
                         }
                         self.tool_variant = variant;
                         self.sync_planner();
                     }
-                    PostEffect::TcpOffset(mm) => {
-                        self.tcp_offset_mm = mm;
+                    PostEffect::TcpTransform(v) => {
+                        self.tcp_offset_mm = [v[0], v[1], v[2]];
+                        self.tcp_rotation_deg = [v[3], v[4], v[5]];
                         self.sync_planner();
                     }
                 }
@@ -1752,6 +1816,16 @@ impl<R: RtCommands> Core<R> {
 
     /// estop / reset_state / simulator-toggle scope: everything, each
     /// dropped command's COMPLETE spoken.
+    /// A pause holds the queue it interrupted. Stop, Estop and reset
+    /// discard that queue, so a standing pause would otherwise withhold
+    /// every command queued afterwards with nothing to say why.
+    fn clear_pause(&mut self) {
+        if self.execution_paused {
+            self.execution_paused = false;
+            self.runtime.rt.set_exec_paused(false);
+        }
+    }
+
     async fn cancel_all_motion(&mut self, scope: &'static str) -> usize {
         let mut dropped = self.drop_active_motion();
         dropped.extend(self.drop_pending());
@@ -1785,6 +1859,17 @@ impl<R: RtCommands> Core<R> {
     fn latch_faf_refusal(&mut self, error: &WireError) {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
+        self.latch_refusal(error, busy);
+    }
+
+    /// A refused update of the live stream: that stream is stopped or held
+    /// in its standoff, so it is not motion the refusal would misdescribe.
+    fn latch_stream_refusal(&mut self, error: &WireError) {
+        let busy = self.executing.is_some() || !self.pending.is_empty();
+        self.latch_refusal(error, busy);
+    }
+
+    fn latch_refusal(&mut self, error: &WireError, busy: bool) {
         let attributed = self
             .standing_error
             .as_ref()
@@ -1864,6 +1949,59 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
+    fn attachments_valid(&self) -> bool {
+        attachments_fresh(&self.shapes, self.attachment_epoch)
+    }
+
+    fn invalidate_attachments(&mut self) {
+        self.attachment_epoch = next_attachment_epoch(self.attachment_epoch);
+        if self.shapes.iter().any(|s| s.attachment.is_some()) {
+            self.attachment_stop_pending = true;
+            self.scene_epoch += 1;
+        }
+    }
+
+    async fn stop_invalid_attachments(&mut self) {
+        if self.attachments_valid()
+            && self.shapes.iter().any(|s| s.attachment.is_some())
+            && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            self.invalidate_attachments();
+        }
+        if self.attachment_stop_pending {
+            self.attachment_stop_pending = false;
+            self.cancel_all_motion("attachment context changed").await;
+            self.standing_error = Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+    }
+
+    fn attachment_shapes_error(&self, shapes: &[Shape]) -> Option<WireError> {
+        let attached = shapes.iter().any(|s| s.attachment.is_some());
+        if (attached || self.shapes.iter().any(|s| s.attachment.is_some()))
+            && (self.executing.is_some()
+                || self.planning.is_some()
+                || self.active_stream.is_some()
+                || !self.pending.is_empty()
+                || !self.pending_shapes.is_empty())
+        {
+            return Some(attachment_error("stop motion before changing attachments"));
+        }
+        if attached && (self.snap.state != ArmState::Enabled || !self.snap.homed || !self.link_ok())
+        {
+            return Some(attachment_error(
+                "attachments require fresh enabled, referenced state",
+            ));
+        }
+        if !attachments_fresh(shapes, self.attachment_epoch) {
+            return Some(attachment_error(
+                "attachment context changed; reconcile the physical scene and reapply",
+            ));
+        }
+        None
+    }
+
     /// Age of the freshest MOTOR-BUS data \[ms, saturating\]: the youngest
     /// node age the RT snapshot carries (ticks → ms) plus the wall age of
     /// the snapshot itself. `u16::MAX` = no node has ever answered — the
@@ -1914,6 +2052,7 @@ impl<R: RtCommands> Core<R> {
                 tool: self.tool.clone(),
                 tool_variant: self.tool_variant.clone(),
                 tcp_offset_mm: self.tcp_offset_mm,
+                tcp_rotation_deg: self.tcp_rotation_deg,
                 completion_policy: self.completion_policy,
                 payload: self.payload,
             }));
@@ -1961,6 +2100,7 @@ impl<R: RtCommands> Core<R> {
     /// clear of the program keep-outs — which is the planner's, so the
     /// client is answered when that lands.
     async fn on_reset_state(&mut self, req_id: u32, addr: SocketAddr) {
+        self.invalidate_attachments();
         self.cancel_all_motion("reset").await;
         self.standing_error = None;
         self.action_state = ActionState::Idle;
@@ -1968,8 +2108,10 @@ impl<R: RtCommands> Core<R> {
         self.tool.clone_from(&self.cfg.fitted_tool);
         self.tool_variant = None;
         self.tcp_offset_mm = [0.0; 3];
+        self.tcp_rotation_deg = [0.0; 3];
         self.completion_policy = CompletionPolicy::Settled;
         self.profile = self.cfg.initial_profile.clone();
+        self.clear_pause();
         self.runtime.rt.reset_state();
         self.sync_planner();
         // The program layer only: installation keep-outs are the
@@ -1989,7 +2131,7 @@ impl<R: RtCommands> Core<R> {
         let outcome = match result {
             Ok(epoch) => {
                 match epoch {
-                    Some(e) => self.scene_epoch = e,
+                    Some(e) => self.scene_epoch = e.max(self.scene_epoch + 1),
                     // No collision world to adopt an epoch from: the
                     // server's own counter still has to move, or a
                     // readback cannot be tied to the world it describes.
@@ -2272,6 +2414,7 @@ impl<R: RtCommands> Core<R> {
         Status {
             proto_version: PROTO_VERSION,
             controller_id: self.cfg.controller_id,
+            session_id: self.session_id,
             seq: self.status_seq,
             mono_time_ns: self.mono_ns(),
             link_ok: u8::from(self.link_ok()),
@@ -2559,6 +2702,14 @@ impl<R: RtCommands> Core<R> {
             C::TcpSpeed => QueryResult::TcpSpeed {
                 speed: self.tcp_speed,
             },
+            C::ExecutionSpeed => QueryResult::ExecutionSpeed {
+                target_scale: self.snap.exec.target_scale,
+                applied_scale: self.snap.exec.applied_scale,
+                resume_scale: self.snap.exec.resume_scale,
+            },
+            C::TcpTransform => QueryResult::TcpTransform {
+                values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
+            },
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
                 y: self.tcp_offset_mm[1],
@@ -2576,10 +2727,17 @@ impl<R: RtCommands> Core<R> {
                 com: self.payload.com,
                 inertia: self.payload.inertia.unwrap_or_default(),
             },
-            C::StatusRate => QueryResult::StatusRate {
-                hz: f64::from(self.status_rate_hz),
-                tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
-            },
+            C::StatusRate => {
+                let tick_hz = 1.0 / self.cfg.config_info.tick_dt_s;
+                QueryResult::StatusRate {
+                    hz: f64::from(self.status_rate_hz),
+                    tick_hz,
+                    // The runtime's own set, from the same helper
+                    // SET_STATUS_RATE is checked against, so what a caller is
+                    // offered and what is accepted cannot disagree.
+                    servable: servable_status_rates(tick_hz),
+                }
+            }
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -2594,6 +2752,7 @@ impl<R: RtCommands> Core<R> {
                 installation: self.cfg.installation_shapes.clone(),
                 program: self.shapes.clone(),
                 epoch: self.scene_epoch,
+                attachment_epoch: self.attachment_epoch,
             },
             C::ConfigBundle => {
                 let ci = &self.cfg.config_info;
@@ -2823,16 +2982,20 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
 /// a way nothing reports, and 62.5 Hz stored as 62 is exactly that. The
 /// set is built once and both answered from and printed, so what is
 /// accepted and what the remedy offers cannot disagree.
-fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+pub(crate) fn servable_status_rates(tick_hz: f64) -> Vec<f64> {
     let ticks = tick_hz.round() as u32;
-    let allowed: Vec<u32> = (1..=ticks)
+    (1..=ticks)
         .filter(|d| ticks.is_multiple_of(*d))
-        .map(|d| ticks / d)
-        .collect();
-    if allowed.iter().any(|rate| f64::from(*rate) == hz) {
+        .map(|d| f64::from(ticks / d))
+        .collect()
+}
+
+fn status_rate_fault(tick_hz: f64, hz: f64) -> Option<WireError> {
+    let allowed = servable_status_rates(tick_hz);
+    if allowed.contains(&hz) {
         return None;
     }
-    let listed: Vec<String> = allowed.iter().map(u32::to_string).collect();
+    let listed: Vec<String> = allowed.iter().map(|rate| format!("{rate}")).collect();
     Some(make_error(
         ErrorCode::CommValidationError,
         UNATTRIBUTED,
@@ -2954,11 +3117,35 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
     None
 }
 
+/// The TCP frame a queued command sets, `[x, y, z (mm), roll, pitch, yaw
+/// (deg)]`; an offset alone sets a pure translation.
+pub fn tcp_transform_effect(cmd: &Command) -> Option<[f64; 6]> {
+    match cmd {
+        Command::SetTcpOffset(p) => Some([p.x, p.y, p.z, 0.0, 0.0, 0.0]),
+        Command::SetTcpTransform(p) => Some([p.x, p.y, p.z, p.roll, p.pitch, p.yaw]),
+        _ => None,
+    }
+}
+
+/// The TCP_TRANSFORM readback: offset (mm) then rotation (deg).
+pub fn tcp_transform_values(offset_mm: [f64; 3], rotation_deg: [f64; 3]) -> [f64; 6] {
+    [
+        offset_mm[0],
+        offset_mm[1],
+        offset_mm[2],
+        rotation_deg[0],
+        rotation_deg[1],
+        rotation_deg[2],
+    ]
+}
+
 fn post_effect(cmd: &Command) -> PostEffect {
+    if let Some(values) = tcp_transform_effect(cmd) {
+        return PostEffect::TcpTransform(values);
+    }
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
-        Command::SetTcpOffset(p) => PostEffect::TcpOffset([p.x, p.y, p.z]),
         _ => PostEffect::None,
     }
 }
@@ -2983,6 +3170,8 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Estop => "estop",
         T::SetGravityComp => "set_gravity_comp",
         T::Pause => "pause",
+        T::SetExecutionSpeed => "set_execution_speed",
+        T::ExecutionSpeed => "execution_speed",
         T::Stop => "stop",
         T::WriteIo => "write_io",
         T::Simulator => "simulator",
@@ -2990,6 +3179,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::ResetState => "reset_state",
         T::ConnectHardware => "connect_hardware",
         T::SetTcpOffset => "set_tcp_offset",
+        T::SetTcpTransform => "set_tcp_transform",
         T::SetPayload => "set_payload",
         T::SetShapes => "set_shapes",
         T::SetCompletionPolicy => "set_completion_policy",
@@ -3016,6 +3206,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::Error => "error",
         T::TcpSpeed => "tcp_speed",
         T::TcpOffset => "tcp_offset",
+        T::TcpTransform => "tcp_transform",
         T::ToolStatus => "tool_status",
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
@@ -3054,4 +3245,46 @@ pub fn decode_error_to_wire(e: &DecodeError) -> WireError {
         _ => ErrorCode::CommDecodeError,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
+}
+
+/// A refusal about held geometry, with the detail the caller can act on.
+pub fn attachment_error(detail: &str) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", detail)],
+    )
+}
+
+/// Whether every attached shape was declared against `epoch`, the current
+/// attachment context.
+pub fn attachments_fresh(shapes: &[Shape], epoch: u64) -> bool {
+    shapes
+        .iter()
+        .all(|s| s.attachment.as_ref().is_none_or(|a| a.epoch == epoch))
+}
+
+/// The attachment epoch after a context change: never zero, so a shape
+/// declared with no epoch can never match it.
+pub fn next_attachment_epoch(epoch: u64) -> u64 {
+    epoch.wrapping_add(1).max(1)
+}
+
+/// Commands that change arm pose and require reconciled held geometry.
+pub fn is_arm_motion(tag: CmdType) -> bool {
+    matches!(
+        tag,
+        CmdType::MoveJ
+            | CmdType::MoveJPose
+            | CmdType::MoveL
+            | CmdType::MoveC
+            | CmdType::MoveS
+            | CmdType::MoveP
+            | CmdType::JogJ
+            | CmdType::JogL
+            | CmdType::ServoJ
+            | CmdType::ServoJPose
+            | CmdType::ServoL
+            | CmdType::Teleport
+    )
 }

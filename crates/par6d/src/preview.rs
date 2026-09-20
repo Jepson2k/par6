@@ -7,16 +7,20 @@
 //! every refusal is the server's own text.
 
 mod driver;
+mod plan;
 pub mod record;
 mod run;
 
 pub use record::TickBatch;
 pub use run::RunLimits;
 
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
 
+use par6_bus::sim::{jaw_rate_bytes_s, jaw_travel_s, CALIBRATION_S};
 use par6_kin::NQ;
 use par6_motion::{JogEngine, MotionLimits};
 use par6_proto::command::{self as cmd, JogJ, ToolParam};
@@ -29,9 +33,10 @@ use par6_rt::{
     Mode, SampleConsumer, SnapshotWriter, StateSnapshot, MAX_JOINTS,
 };
 use par6_server::{
-    check_gate, cmd_name, decode_error_to_wire, pid_gains_fault, session, validate_registries,
-    validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext, Planner,
-    QueuedCommand, ServerConfig, ShapeLayer,
+    attachment_error, attachments_fresh, check_gate, cmd_name, decode_error_to_wire,
+    next_attachment_epoch, pid_gains_fault, session, tcp_transform_effect, tcp_transform_values,
+    validate_registries, validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext,
+    Planner, QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -39,21 +44,18 @@ use crate::bridge::{
     housekeeping_period, step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
-use crate::kin::CartKin;
+use crate::kin::{matrix_to_xyzrpy, CartKin};
 use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
+use plan::PlanRecorder;
 
-/// One submitted command's outcome: the trajectory the runtime would
-/// drive, the exact refusal it would answer with, or `pending` while
-/// the command sits in the blend hold waiting for its successor.
+/// One submitted command's outcome: where the runtime would leave the
+/// arm and the rows it owns in the commanded record, the exact refusal
+/// it would answer with, or `pending` while the command sits in the
+/// blend hold waiting for its successor. The trajectory itself, FK'd
+/// per row, is the record's ([`Preview::plan_record`]).
 #[derive(Debug, Clone)]
 pub struct PreviewResult {
-    /// Sampled joint trajectory \[rad\] at tick dt (empty for a command
-    /// that moves nothing, or a refused one).
-    pub joint_trajectory_rad: Vec<[f64; MAX_JOINTS]>,
-    /// FK pose (flattened row-major 4×4, translation in metres) per
-    /// trajectory sample.
-    pub tcp_poses: Vec<[f64; 16]>,
     /// Where the arm ends \[rad\].
     pub end_joints_rad: [f64; MAX_JOINTS],
     /// Trajectory duration \[s\].
@@ -64,6 +66,12 @@ pub struct PreviewResult {
     /// planned yet, and its motion arrives with the command that closes
     /// the chain (or with [`Preview::flush`]).
     pub pending: bool,
+    /// The first row this command owns in the commanded record
+    /// ([`Preview::plan_record`]).
+    pub start_row: usize,
+    /// How many rows it owns there: none for a refusal, a command that
+    /// moves nothing, or one still pending.
+    pub rows: usize,
 }
 
 impl PreviewResult {
@@ -72,43 +80,43 @@ impl PreviewResult {
         self.error.is_none()
     }
 
-    fn still(q: [f64; MAX_JOINTS]) -> Self {
+    fn still(q: [f64; MAX_JOINTS], row: usize) -> Self {
         Self {
-            joint_trajectory_rad: Vec::new(),
-            tcp_poses: Vec::new(),
             end_joints_rad: q,
             duration_s: 0.0,
             error: None,
             pending: false,
+            start_row: row,
+            rows: 0,
         }
     }
 
-    fn refusal(q: [f64; MAX_JOINTS], error: WireError) -> Self {
+    fn refusal(q: [f64; MAX_JOINTS], row: usize, error: WireError) -> Self {
         Self {
             error: Some(error),
-            ..Self::still(q)
+            ..Self::still(q, row)
         }
     }
 
-    fn pending(q: [f64; MAX_JOINTS]) -> Self {
+    fn pending(q: [f64; MAX_JOINTS], row: usize) -> Self {
         Self {
             pending: true,
-            ..Self::still(q)
+            ..Self::still(q, row)
         }
     }
 
-    /// Several results as one, in the order they run: trajectories and
-    /// poses concatenated, durations summed, the end pose the last one's.
+    /// Several results as one, in the order they run: rows and durations
+    /// summed from the first one's row, the end pose the last one's.
     /// The first refusal ends the motion and is carried as the error —
     /// what a program sees when a held chain closes and the runtime
     /// refuses one of its legs.
     pub fn concat(results: Vec<PreviewResult>) -> Option<PreviewResult> {
         let mut out: Option<PreviewResult> = None;
         for r in results {
-            let acc = out.get_or_insert_with(|| PreviewResult::still(r.end_joints_rad));
-            acc.joint_trajectory_rad.extend(r.joint_trajectory_rad);
-            acc.tcp_poses.extend(r.tcp_poses);
+            let acc =
+                out.get_or_insert_with(|| PreviewResult::still(r.end_joints_rad, r.start_row));
             acc.duration_s += r.duration_s;
+            acc.rows += r.rows;
             acc.end_joints_rad = r.end_joints_rad;
             if r.error.is_some() {
                 acc.error = r.error;
@@ -138,6 +146,7 @@ pub struct ServoPreview {
 /// server-side validation and state (profile, TCP offset, completion
 /// policy, IO levels, tool state) — everything a program can observe.
 pub struct Preview {
+    run_origin: Option<run::RunStart>,
     planner: Par6Planner,
     jog: MotionJog,
     /// The housekeeping loop's own cartesian solver, so a `jog_l` preview
@@ -160,12 +169,18 @@ pub struct Preview {
     /// `driver.settle.calibrate_min_wait_s`, and a preview that reported
     /// zero would predict a program shorter than the arm can run it.
     tool_calibrate_hold_ticks: u64,
-    /// Queued moves waiting for the successor they blend into.
-    held: session::BlendQueue<Command>,
+    /// Ticks the runtime waits before it reads a jaw move's first reply
+    /// (`driver.settle.command_grace_s`, at least two): the floor on how
+    /// long any tool action takes, however short its travel.
+    tool_grace_ticks: u64,
+    /// Queued moves waiting for the successor they blend into, each with
+    /// its span in the commanded record.
+    held: session::BlendQueue<(usize, Command)>,
     profile: String,
     tool: String,
     tool_variant: Option<String>,
     tcp_offset_mm: [f64; 3],
+    tcp_rotation_deg: [f64; 3],
     policy: CompletionPolicy,
     payload: PayloadSpec,
     io_levels: Vec<u8>,
@@ -205,6 +220,14 @@ pub struct Preview {
     /// config. The installation layer is config and lives on `cfg`.
     shapes: Vec<par6_proto::Shape>,
     scene_epoch: u64,
+    attachment_epoch: u64,
+    /// The commanded record of the program so far, one span per
+    /// submitted command, and the state the program started from, which
+    /// a run boots from so the session's own pose never moves.
+    plan: PlanRecorder,
+    /// The span of the joint-jog stream in progress, so its ramp-down
+    /// rows are recorded under it when the next command ends the stream.
+    jog_span: Option<usize>,
     /// What a run rebuilds its kinematics, its scene and its engine
     /// from. A dry run boots a second engine from the same bundle, so
     /// it needs the file rather than the models this session holds.
@@ -239,12 +262,13 @@ impl Preview {
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
         let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
-        let tool_calibrate_hold_ticks = bundle
-            .active_gripper()
-            .and_then(|g| g.driver.as_ref())
-            .map_or(0, |d| {
-                (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
-            });
+        let gripper_driver = bundle.active_gripper().and_then(|g| g.driver.as_ref());
+        let tool_calibrate_hold_ticks = gripper_driver.map_or(0, |d| {
+            (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
+        });
+        let tool_grace_ticks = gripper_driver.map_or(0, |d| {
+            ((d.settle.command_grace_s / robot.robot.tick_dt_s).round() as u64).max(2)
+        });
 
         let (cmds_tx, cmds_rx) = mpsc::channel();
         let (ops_tx, ops_rx) = mpsc::channel();
@@ -283,6 +307,7 @@ impl Preview {
         let jog = MotionJog::new(JogEngine::new(robot)?, robot.jog.accel_time_s);
         let cfg = crate::daemon::server_config(&opts, &bundle);
         let mut preview = Self {
+            run_origin: None,
             planner,
             jog,
             cart: stack.cart,
@@ -295,11 +320,13 @@ impl Preview {
             motion: robot.motion,
             ready_pose,
             tool_calibrate_hold_ticks,
+            tool_grace_ticks,
             held: session::BlendQueue::default(),
             profile: cfg.initial_profile.clone(),
             tool: cfg.fitted_tool.clone(),
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
+            tcp_rotation_deg: [0.0; 3],
             policy: CompletionPolicy::Settled,
             payload: PayloadSpec::default(),
             io_levels: vec![0; cfg.digital_outputs.len()],
@@ -326,6 +353,11 @@ impl Preview {
             ),
             shapes: Vec::new(),
             scene_epoch: 0,
+            attachment_epoch: RandomState::new()
+                .hash_one(std::time::SystemTime::now())
+                .max(1),
+            plan: PlanRecorder::new(robot.robot.tick_dt_s, robot.joints.len()),
+            jog_span: None,
             config_path,
             opts,
             cfg,
@@ -360,6 +392,7 @@ impl Preview {
             tool: &self.tool,
             tool_variant: self.tool_variant.as_deref(),
             tcp_offset_mm: self.tcp_offset_mm,
+            tcp_rotation_deg: self.tcp_rotation_deg,
             completion_policy: self.policy,
             payload: self.payload,
         });
@@ -388,6 +421,9 @@ impl Preview {
     /// and HOME previews as the referencing seek instead of a planned
     /// park return.
     pub fn set_homed(&mut self, homed: bool) {
+        if self.snap.homed != homed {
+            self.invalidate_attachments();
+        }
         self.snap.homed = homed;
         self.publish();
     }
@@ -425,6 +461,11 @@ impl Preview {
         &self.profile
     }
 
+    /// Applied user TCP correction (mm, intrinsic XYZ degrees).
+    pub fn tcp_transform(&self) -> [f64; 6] {
+        tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg)
+    }
+
     /// The TCP offset \[mm\] on top of the tool transform.
     pub fn tcp_offset_mm(&self) -> [f64; 3] {
         self.tcp_offset_mm
@@ -457,7 +498,7 @@ impl Preview {
 
     /// Wire names of the commands waiting in the blend hold.
     pub fn held_names(&self) -> Vec<&'static str> {
-        self.held.iter().map(|c| cmd_name(c.tag())).collect()
+        self.held.iter().map(|(_, c)| cmd_name(c.tag())).collect()
     }
 
     /// The effective `[motion]` feel constants the preview plans with.
@@ -468,6 +509,15 @@ impl Preview {
     /// The tick period \[s\] trajectories are sampled at.
     pub fn tick_dt_s(&self) -> f64 {
         self.dt
+    }
+
+    /// Planning state has no in-flight transition; a run ticks the real core.
+    pub fn execution_speed(&self) -> [f64; 3] {
+        [
+            self.snap.exec.target_scale,
+            self.snap.exec.applied_scale,
+            self.snap.exec.resume_scale,
+        ]
     }
 
     /// Where the configured homing seek leaves the arm \[rad\].
@@ -503,7 +553,10 @@ impl Preview {
 
     fn submit_inner(&mut self, command: Command) -> PreviewResult {
         if let Err(e) = command.validate() {
-            return self.refuse(decode_error_to_wire(&e));
+            let index = self.plan.open();
+            let result = self.refuse(decode_error_to_wire(&e));
+            self.close_span(index, &result);
+            return result;
         }
         if !matches!(command, Command::JogJ(_)) {
             self.end_jog_stream();
@@ -511,8 +564,15 @@ impl Preview {
         if !matches!(command, Command::JogL(_)) {
             self.cart_streaming = false;
         }
-        match command_class(command.tag()) {
-            CommandClass::Queued => self.submit_queued(command),
+        // Every submitted command owns one span of the commanded record,
+        // opened once the previous stream's ramp-down is recorded so
+        // those rows land under the jog rather than under this command.
+        let index = self.plan.open();
+        let joint_jog = matches!(command, Command::JogJ(_));
+        let result = match command_class(command.tag()) {
+            // A queued command closes its own span inside the hold — or
+            // several, when it closes a blend chain.
+            CommandClass::Queued => return self.submit_queued(index, command),
             CommandClass::FireAndForget => self.submit_stream(command),
             CommandClass::System => self.submit_system(command),
             CommandClass::Query => self.refuse(make_error(
@@ -523,7 +583,17 @@ impl Preview {
                     &format!("{:?} is a query, not a previewable command", command.tag()),
                 )],
             )),
+        };
+        self.close_span(index, &result);
+        if joint_jog && result.error.is_none() {
+            self.jog_span = Some(index);
         }
+        result
+    }
+
+    fn close_span(&mut self, index: usize, result: &PreviewResult) {
+        self.plan
+            .close(index, result.start_row, result.rows, result.error.clone());
     }
 
     /// Plan whatever the blend hold still holds, as the runtime's hold
@@ -532,14 +602,43 @@ impl Preview {
         self.run_held()
     }
 
+    /// Start the program here: the commanded record begins empty, and a
+    /// run boots from the state the session stands in now, however far
+    /// later submissions advance it. Whatever the blend hold still holds
+    /// is planned first, under the old record.
+    pub fn begin_program(&mut self) {
+        self.run_held();
+        self.drain_stubs();
+        self.plan.reset();
+        self.jog_span = None;
+        self.run_origin = Some(run::RunStart::capture(self));
+    }
+
+    /// The commanded record of every command submitted since
+    /// [`Self::begin_program`], the blend hold closed: one span per
+    /// command in submission order, rows at the run's row rate. Cut to
+    /// `max_seconds` of simulated time when given, and marked so.
+    pub fn plan_record(&mut self, max_seconds: Option<f64>) -> TickBatch {
+        self.run_held();
+        self.drain_stubs();
+        self.plan.snapshot(max_seconds)
+    }
+
     fn refuse(&self, error: WireError) -> PreviewResult {
-        PreviewResult::refusal(self.snap.q, error)
+        PreviewResult::refusal(self.snap.q, self.plan.rows(), error)
     }
 
     /// The server's gate table, through the server's own check. A
     /// FLASHING window is what the RT reports it as — disabled — rather
     /// than a refusal of the preview's own wording.
     fn check_gate(&self, command: &Command) -> Option<WireError> {
+        if par6_server::is_arm_motion(command.tag())
+            && !attachments_fresh(&self.shapes, self.attachment_epoch)
+        {
+            return Some(attachment_error(
+                "attachment context changed; reconcile and reapply",
+            ));
+        }
         check_gate(
             command.tag(),
             &GateContext {
@@ -608,12 +707,15 @@ impl Preview {
         self.payload
     }
 
-    /// The motion a payload estimation makes from the virtual arm's
-    /// pose: the wrist poses `calibrate` would plan, swept at its
-    /// protocol's speed and ending back where the arm stood, planned and
-    /// gated like any other move. Measures nothing — a preview has no
-    /// torque — so what comes back is the swing.
-    pub fn preview_estimation(&mut self, spread: f64) -> Result<(usize, PreviewResult), String> {
+    /// The joint targets \[rad\] a payload estimation drives the arm
+    /// through from here, in order: every wrist pose `calibrate` plans,
+    /// approached from either side as the live protocol approaches it,
+    /// and the pose the arm stood in to end on. A client submits them as
+    /// the joint moves the estimation would queue, at
+    /// [`Self::estimation_speed`], so a program's estimate shows in its
+    /// record as the swing it is. Measures nothing — a preview has no
+    /// torque.
+    pub fn estimation_poses(&mut self, spread: f64) -> Result<Vec<[f64; NQ]>, String> {
         let mut start = [0.0; NQ];
         start.copy_from_slice(&self.snap.q[..NQ]);
         let window: [(f64, f64); NQ] =
@@ -626,35 +728,16 @@ impl Preview {
             spread,
             protocol.approach_rad,
         )?;
-        let to_deg = |q: &[f64; NQ]| -> [f64; par6_proto::NUM_JOINTS] {
-            std::array::from_fn(|j| q[j].to_degrees())
-        };
-        let moves: Vec<Command> = poses
-            .iter()
-            .chain(std::iter::once(&start))
-            .map(|q| {
-                Command::MoveJ(cmd::MoveJ {
-                    key: 0,
-                    angles: to_deg(q),
-                    duration: None,
-                    speed: Some(protocol.speed),
-                    accel: None,
-                    blend_radius: None,
-                    rel: false,
-                })
-            })
-            .collect();
-        let results = self.plan_batch(&moves);
-        if let Some(refused) = results.iter().find(|r| r.error.is_some()) {
-            return Err(refused
-                .error
-                .as_ref()
-                .map(|e| e.cause.clone())
-                .unwrap_or_default());
-        }
-        PreviewResult::concat(results)
-            .map(|r| (poses.len(), r))
-            .ok_or_else(|| "nothing to swing".to_owned())
+        Ok(crate::calibrate::visit_order(
+            &start,
+            &poses,
+            protocol.approach_rad,
+        ))
+    }
+
+    /// The joint-move speed fraction the estimation protocol drives at.
+    pub fn estimation_speed() -> f64 {
+        crate::calibrate::Protocol::default().speed
     }
 
     /// The refusal the runtime would leave standing, or `None`.
@@ -682,11 +765,13 @@ impl Preview {
         let cap = ((4.0 * ramp_s / self.dt).ceil() as usize).max(1);
         let mut q = self.snap.q;
         let mut at_rest = false;
+        let mut ramp = Vec::with_capacity(cap);
         for _ in 0..cap {
             let mut q_out = [0.0; MAX_JOINTS];
             let mut qd_out = [0.0; MAX_JOINTS];
             self.jog.tick(&q, &mut q_out, &mut qd_out);
             q = q_out;
+            ramp.push(q);
             if qd_out.iter().all(|v| *v == 0.0) {
                 at_rest = true;
                 break;
@@ -698,26 +783,37 @@ impl Preview {
                  placed where the ramp was cut"
             );
         }
+        // The ramp is ground the jog covers after its datagram, so its
+        // rows are the jog's and not the command that ended the stream.
+        let ended_at = self.plan.rows();
+        let jaw = self.tool_position;
+        let (_, added) = self.record(ramp.len(), |k| ramp[k], |_| jaw);
+        if let Some(span) = self.jog_span.take() {
+            self.plan.extend(span, ended_at, added);
+        }
         self.snap.q = q;
         self.jog_streaming = false;
         self.publish();
     }
 
-    fn submit_queued(&mut self, command: Command) -> PreviewResult {
+    fn submit_queued(&mut self, index: usize, command: Command) -> PreviewResult {
         if let Some(error) = self
             .check_gate(&command)
             .or_else(|| validate_registries(&self.cfg, &command))
             .or_else(|| validate_supported(&self.cfg, &command))
         {
-            return self.refuse(error);
+            let result = self.refuse(error);
+            self.close_span(index, &result);
+            return result;
         }
         self.latches.motion_accepted();
-        self.held.push_back(command);
-        if self.holding_for_blend() {
-            return PreviewResult::pending(self.snap.q);
+        self.held.push_back((index, command));
+        if self.snap.exec.paused || self.holding_for_blend() {
+            return PreviewResult::pending(self.snap.q, self.plan.rows());
         }
+        let row = self.plan.rows();
         self.run_held()
-            .unwrap_or_else(|| PreviewResult::still(self.snap.q))
+            .unwrap_or_else(|| PreviewResult::still(self.snap.q, row))
     }
 
     /// The server's hold rule, with no expiry: offline there is no clock,
@@ -725,15 +821,32 @@ impl Preview {
     /// [`Self::flush`].
     fn holding_for_blend(&mut self) -> bool {
         let lookahead = self.cfg.blend_lookahead;
-        self.held.holding_for_blend(lookahead, None, |c| c)
+        self.held.holding_for_blend(lookahead, None, |(_, c)| c)
+    }
+
+    /// The server's pause clearing: Stop, Estop and ResetState discard the
+    /// queue a pause held and the pause with it, and a resume lifts it.
+    fn unpause(&mut self) {
+        self.snap.exec.paused = false;
+        self.snap.exec.target_scale = self.snap.exec.resume_scale;
+        self.snap.exec.applied_scale = self.snap.exec.resume_scale;
+        self.publish();
     }
 
     fn run_held(&mut self) -> Option<PreviewResult> {
         if self.held.is_empty() {
             return None;
         }
-        let batch: Vec<Command> = self.held.drain(..).collect();
+        if self.snap.exec.paused {
+            return Some(PreviewResult::pending(self.snap.q, self.plan.rows()));
+        }
+        let (indices, batch): (Vec<usize>, Vec<Command>) = self.held.drain(..).unzip();
         let results = self.plan_batch(&batch);
+        // A command the batch stopped short of, behind a refusal, keeps
+        // the zero-row span it was opened with: it never ran.
+        for (index, result) in indices.iter().zip(&results) {
+            self.close_span(*index, result);
+        }
         PreviewResult::concat(results)
     }
 
@@ -760,7 +873,9 @@ impl Preview {
                     self.tool_position = *pos;
                 }
                 self.publish();
-                self.standing()
+                let mut result = self.standing();
+                (result.start_row, result.rows) = self.mark();
+                result
             }
             Command::JogJ(p) => self.preview_jog(p.speeds, p.duration, p.accel),
             Command::JogL(p) => self.preview_jog_l(p.velocities, p.frame, p.duration, p.accel),
@@ -817,21 +932,55 @@ impl Preview {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
                     self.held.clear();
+                    self.unpause();
                 }
                 self.latches.stop(cleared);
             }
             Command::Estop => {
+                self.invalidate_attachments();
                 self.held.clear();
+                self.unpause();
                 self.latches.estop();
             }
-            Command::Reset => self.latches.reset(),
-            Command::Pause(_) | Command::SetGravityComp(_) => {}
+            Command::Reset => {
+                self.invalidate_attachments();
+                self.latches.reset();
+            }
+            Command::Pause(p) => {
+                if p.on {
+                    self.snap.exec.paused = true;
+                    self.snap.exec.target_scale = 0.0;
+                    self.snap.exec.applied_scale = 0.0;
+                    self.publish();
+                } else {
+                    self.unpause();
+                    // What the pause held runs now, unless the chain is
+                    // still waiting for the move that closes it.
+                    if !self.holding_for_blend() {
+                        if let Some(released) = self.run_held() {
+                            return released;
+                        }
+                    }
+                }
+            }
+            Command::SetExecutionSpeed(p) => {
+                self.snap.exec.resume_scale = p.scale;
+                if !self.snap.exec.paused {
+                    self.snap.exec.target_scale = p.scale;
+                    self.snap.exec.applied_scale = p.scale;
+                }
+                self.publish();
+            }
+            Command::SetGravityComp(_) => {}
             Command::ResetState => {
+                self.invalidate_attachments();
                 self.held.clear();
+                self.unpause();
                 self.latches.reset();
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
+                self.tcp_rotation_deg = [0.0; 3];
                 self.policy = CompletionPolicy::Settled;
                 self.profile = self.cfg.initial_profile.clone();
                 self.sync_planner();
@@ -849,12 +998,14 @@ impl Preview {
             // (`swap_to_sim` sets homed), while real hardware knows
             // nothing until it seeks (`swap_to_hardware` un-homes).
             Command::Simulator(p) => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.simulator = p.on;
                 self.snap.homed = p.on;
                 self.publish();
             }
             Command::ConnectHardware(_) => {
+                self.invalidate_attachments();
                 self.held.clear();
                 self.simulator = false;
                 self.snap.homed = false;
@@ -880,10 +1031,6 @@ impl Preview {
                         ))
                     }
                 }
-            }
-            Command::SetTcpOffset(p) => {
-                self.tcp_offset_mm = [p.x, p.y, p.z];
-                self.sync_planner();
             }
             Command::SetPayload(p) => {
                 self.payload = PayloadSpec {
@@ -928,16 +1075,10 @@ impl Preview {
         self.standing()
     }
 
-    /// An accepted command that moves nothing: one sample at the pose
-    /// the arm holds, so a timeline drawn from results never has a gap.
+    /// An accepted command that moves nothing: the pose the arm holds,
+    /// and no rows of its own.
     fn standing(&mut self) -> PreviewResult {
-        let q = self.snap.q;
-        let mut r = PreviewResult::still(q);
-        if let Ok(pose) = self.planner.current_pose(&q) {
-            r.joint_trajectory_rad.push(q);
-            r.tcp_poses.push(pose);
-        }
-        r
+        PreviewResult::still(self.snap.q, self.plan.rows())
     }
 
     /// Plan one command outside the queue discipline (a streamed target).
@@ -1123,31 +1264,77 @@ impl Preview {
         self.advance(trajectory, duration_s)
     }
 
-    /// Move the virtual arm along `trajectory` and report the motion.
+    /// Move the virtual arm along `trajectory`, record it, and report
+    /// the motion. The record gets `duration_s` of ticks: the samples
+    /// themselves for a stream, the samples stretched to the execution
+    /// override for a planned move, the standing pose for a hold that
+    /// has no samples.
     fn advance(&mut self, trajectory: Vec<[f64; MAX_JOINTS]>, duration_s: f64) -> PreviewResult {
         let end = trajectory.last().copied().unwrap_or(self.snap.q);
-        let tcp_poses = self.poses_along(&trajectory);
+        let ticks = (duration_s / self.dt).round() as usize;
+        let jaw = self.tool_position;
+        let (start_row, rows) = if trajectory.is_empty() {
+            let q = self.snap.q;
+            self.record(ticks, |_| q, |_| jaw)
+        } else {
+            let n = trajectory.len();
+            self.record(ticks, |k| trajectory[(k * n / ticks).min(n - 1)], |_| jaw)
+        };
         self.snap.q = end;
         self.publish();
         PreviewResult {
-            joint_trajectory_rad: trajectory,
-            tcp_poses,
             end_joints_rad: end,
             duration_s,
             error: None,
             pending: false,
+            start_row,
+            rows,
         }
     }
 
-    fn poses_along(&mut self, trajectory: &[[f64; MAX_JOINTS]]) -> Vec<[f64; 16]> {
-        let mut poses = Vec::with_capacity(trajectory.len());
-        for q in trajectory {
-            match self.planner.current_pose(q) {
-                Ok(pose) => poses.push(pose),
-                Err(_) => break,
+    /// Append `ticks` ticks to the commanded record — `q_at(k)` the pose
+    /// and `jaw_at(k)` the jaw closure on tick `k` — FK'd at every row
+    /// kept, and report the rows they became.
+    fn record(
+        &mut self,
+        ticks: usize,
+        q_at: impl Fn(usize) -> [f64; MAX_JOINTS],
+        jaw_at: impl Fn(usize) -> f64,
+    ) -> (usize, usize) {
+        let start = self.plan.rows();
+        let mut last: Option<([f64; MAX_JOINTS], [f64; 6])> = None;
+        for k in 0..ticks {
+            if !self.plan.wants_row() {
+                continue;
             }
+            let q = q_at(k);
+            // A hold FK's its pose once.
+            let tcp = match last {
+                Some((held, tcp)) if held == q => tcp,
+                _ => self.tcp_at(&q),
+            };
+            last = Some((q, tcp));
+            self.plan.push_row(&q, tcp, jaw_at(k));
         }
-        poses
+        (start, self.plan.rows() - start)
+    }
+
+    /// One row now, at the standing pose: an arrival that took no ticks
+    /// the record could count (a seek's landing, a teleport).
+    fn mark(&mut self) -> (usize, usize) {
+        let start = self.plan.rows();
+        let q = self.snap.q;
+        let tcp = self.tcp_at(&q);
+        self.plan.mark(&q, tcp, self.tool_position);
+        (start, 1)
+    }
+
+    /// The TCP the record stores, in the run's convention.
+    fn tcp_at(&mut self, q: &[f64; MAX_JOINTS]) -> [f64; 6] {
+        match self.planner.current_pose(q) {
+            Ok(pose) => matrix_to_xyzrpy(&pose),
+            Err(_) => [f64::NAN; 6],
+        }
     }
 
     // ------------------------------------------------------------ planner
@@ -1214,7 +1401,7 @@ impl Preview {
             let refused = result.error.is_some();
             results.push(result);
             for _ in 0..folded {
-                results.push(PreviewResult::still(end));
+                results.push(PreviewResult::still(end, self.plan.rows()));
             }
             rest = &rest[consumed..];
             if refused {
@@ -1231,11 +1418,12 @@ impl Preview {
     /// Read the in-flight plan off the planner, advance the virtual arm
     /// to where it ends, and cancel it (nothing executes here).
     fn collect_plan(&mut self, head: &Command) -> PreviewResult {
+        let mut seek = false;
         let (trajectory, duration_s): (Vec<[f64; MAX_JOINTS]>, f64) =
-            match self.planner.planned_motion(self.snap.tick) {
+            match self.planner.planned_motion(&self.snap) {
                 PlannedMotion::Exec(samples) => {
                     let q: Vec<_> = samples.iter().map(|s| s.q).collect();
-                    let duration = q.len() as f64 * self.dt;
+                    let duration = q.len() as f64 * self.dt / self.snap.exec.resume_scale;
                     (q, duration)
                 }
                 // The seek establishes the references and ends where the
@@ -1244,6 +1432,7 @@ impl Preview {
                 // not to a plan.
                 PlannedMotion::Home => {
                     self.snap.homed = true;
+                    seek = true;
                     (vec![self.ready_pose], 0.0)
                 }
                 PlannedMotion::Hold(ticks) => (Vec::new(), ticks as f64 * self.dt),
@@ -1251,10 +1440,18 @@ impl Preview {
             };
         self.planner.cancel();
         self.note_effects(head);
+        let moved = !trajectory.is_empty();
         let mut result = self.advance(trajectory, duration_s);
-        if result.joint_trajectory_rad.is_empty() {
+        if seek {
+            // The seek's own ticks belong to the physical arm; the record
+            // shows where it lands.
+            (result.start_row, result.rows) = self.mark();
+        }
+        if !moved {
             result = PreviewResult {
                 duration_s,
+                start_row: result.start_row,
+                rows: result.rows,
                 ..self.standing()
             };
         }
@@ -1264,22 +1461,62 @@ impl Preview {
     /// One tool action through the planner's tool lane — the same
     /// admission the live daemon runs, so an unsupported verb, a missing
     /// driver or an uncalibrated jaw move previews as the refusal the
-    /// arm would answer with. The arm holds still throughout; only a
-    /// `calibrate` takes measurable time the config can predict.
+    /// arm would answer with. The arm holds still for as long as the
+    /// runtime waits on the jaws: a calibration's minimum wait, or a
+    /// move's travel at the firmware's constant byte rate, never less
+    /// than the grace the runtime gives a reply — with the jaws drawn on
+    /// their way.
     fn preview_tool_action(&mut self, action: &par6_proto::command::ToolAction) -> PreviewResult {
         self.publish();
         if let Err(error) = self.planner.start_tool(self.next_index, action) {
             return self.refuse(error);
         }
         self.planner.cancel_tool(false);
+        let from = self.tool_position;
         self.note_effects(&Command::ToolAction(action.clone()));
-        let hold = if action.action == "calibrate" {
-            self.tool_calibrate_hold_ticks
-        } else {
-            0
+        let to = self.tool_position;
+        let dt = self.dt;
+        let q = self.snap.q;
+        let (ticks, jaw_at): (usize, Box<dyn Fn(usize) -> f64>) = match action.action.as_str() {
+            "calibrate" => {
+                let sweep = (CALIBRATION_S / dt).round().max(1.0);
+                (
+                    self.tool_calibrate_hold_ticks as usize,
+                    // Close, open, and stay open, as the firmware sweeps.
+                    Box::new(move |k| {
+                        let progress = k as f64 / sweep;
+                        if progress >= 1.0 {
+                            0.0
+                        } else {
+                            1.0 - (2.0 * progress - 1.0).abs()
+                        }
+                    }),
+                )
+            }
+            "move" => {
+                let speed = match action.params.get(1) {
+                    Some(ToolParam::Float(v)) => *v,
+                    Some(ToolParam::Int(v)) => *v as f64,
+                    _ => 1.0,
+                };
+                let byte = |v: f64| (v.clamp(0.0, 1.0) * 255.0).round();
+                let speed_byte = byte(speed) as u8;
+                let travel = ((byte(to) - byte(from)).abs() / jaw_rate_bytes_s(speed_byte) / dt)
+                    .round()
+                    .max(1.0);
+                let reported = (jaw_travel_s(byte(from), byte(to), speed_byte) / dt).round() as u64;
+                (
+                    reported.max(self.tool_grace_ticks) as usize,
+                    Box::new(move |k| from + (to - from) * (k as f64 / travel).min(1.0)),
+                )
+            }
+            _ => (0, Box::new(move |_| to)),
         };
+        let (start_row, rows) = self.record(ticks, |_| q, jaw_at);
         PreviewResult {
-            duration_s: hold as f64 * self.dt,
+            duration_s: ticks as f64 * dt,
+            start_row,
+            rows,
             ..self.standing()
         }
     }
@@ -1287,12 +1524,20 @@ impl Preview {
     /// What an accepted queued command changes besides the arm's pose —
     /// the server's post-effects and the tool state a program reads back.
     fn note_effects(&mut self, head: &Command) {
+        if let Some(v) = tcp_transform_effect(head) {
+            self.tcp_offset_mm = [v[0], v[1], v[2]];
+            self.tcp_rotation_deg = [v[3], v[4], v[5]];
+            self.sync_planner();
+            return;
+        }
         match head {
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.
                 if p.variant_key != self.tool_variant {
+                    self.invalidate_attachments();
                     self.tcp_offset_mm = [0.0; 3];
+                    self.tcp_rotation_deg = [0.0; 3];
                 }
                 self.tool_variant = p.variant_key.clone();
                 self.sync_planner();
@@ -1331,6 +1576,21 @@ impl Preview {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<Option<u64>, WireError> {
+        let attached = shapes.iter().any(|s| s.attachment.is_some());
+        if attached && (!self.snap.homed || self.flashing || self.latches.estop_latched) {
+            return Err(attachment_error(
+                "attachments require fresh enabled, referenced state",
+            ));
+        }
+        // Only the program layer holds parts; anything attached elsewhere
+        // is declared against a context that never existed.
+        if (attached && layer != ShapeLayer::Program)
+            || !attachments_fresh(shapes, self.attachment_epoch)
+        {
+            return Err(attachment_error(
+                "attachment context changed; reconcile and reapply",
+            ));
+        }
         let epoch = self.planner.set_shapes(layer, shapes)?;
         // The streaming gate keeps its own world, and only a set the
         // planner accepted reaches it — the same order the server uses.
@@ -1347,14 +1607,19 @@ impl Preview {
         Ok(epoch)
     }
 
+    fn invalidate_attachments(&mut self) {
+        self.attachment_epoch = next_attachment_epoch(self.attachment_epoch);
+    }
+
     /// The applied world: the config's installation layer, the program
     /// layer this session set, and the epoch — the runtime's own SHAPES
     /// readback, for the same config.
-    pub fn shapes(&self) -> (&[par6_proto::Shape], &[par6_proto::Shape], u64) {
+    pub fn shapes(&self) -> (&[par6_proto::Shape], &[par6_proto::Shape], u64, u64) {
         (
             &self.cfg.installation_shapes,
             &self.shapes,
             self.scene_epoch,
+            self.attachment_epoch,
         )
     }
 }

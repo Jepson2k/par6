@@ -277,6 +277,20 @@ pub enum QueryResult {
         /// Z offset (mm).
         z: f64,
     },
+    /// Applied tool-local TCP transform (mm, intrinsic XYZ degrees).
+    TcpTransform {
+        /// Translation followed by orientation.
+        values: [f64; 6],
+    },
+    /// Fresh queued-execution timing from the real-time loop.
+    ExecutionSpeed {
+        /// Zero when pause is requested; otherwise the selected speed.
+        target_scale: f64,
+        /// Applied trajectory-clock rate, including transitions to rest.
+        applied_scale: f64,
+        /// Selected positive speed, retained while paused.
+        resume_scale: f64,
+    },
     /// TOOL_STATUS result.
     ToolStatus {
         /// Tool status, if a tool is selected.
@@ -299,9 +313,9 @@ pub enum QueryResult {
         /// RT tick period \[s\].
         tick_dt_s: f64,
         /// Every `[motion]` key in declaration order; the labels are
-        /// `MotionConfig::KEYS` in par6-config (13 entries), and an
+        /// `MotionConfig::KEYS` in par6-config (14 entries), and an
         /// omitted optional key (`joint_step_rad`) rides as NaN.
-        motion: [f64; 13],
+        motion: [f64; 14],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
@@ -321,14 +335,19 @@ pub enum QueryResult {
         /// Every node id's row.
         nodes: Vec<BusNode>,
     },
-    /// STATUS_RATE result: the broadcast rate and the loop it divides.
+    /// STATUS_RATE result: the broadcast rate, the loop it divides, and the
+    /// rates this runtime will accept.
     StatusRate {
         /// Rate STATUS is broadcast at now \[Hz\].
         hz: f64,
-        /// Tick rate the broadcast divides \[Hz\]. Achievable rates are
-        /// `tick_hz / N`, so a caller derives the legal set from this
-        /// instead of probing for it.
+        /// Tick rate the broadcast divides \[Hz\].
         tick_hz: f64,
+        /// Rates this runtime accepts, highest first \[Hz\]. The runtime's own
+        /// answer, from the same set SET_STATUS_RATE is checked against: a
+        /// caller deriving it from `tick_hz` has to re-implement the rule,
+        /// and gets nothing at all for a tick rate that is not a whole
+        /// number of Hz.
+        servable: Vec<f64>,
     },
     /// SHAPES result: the applied collision world by layer.
     Shapes {
@@ -338,6 +357,8 @@ pub enum QueryResult {
         program: Vec<crate::command::Shape>,
         /// Scene epoch this readback represents.
         epoch: u64,
+        /// Context identifier required by attached geometry declarations.
+        attachment_epoch: u64,
     },
     /// CONFIG_BUNDLE result: the loaded config files verbatim, so a
     /// client can run previews from exactly the daemon's numbers.
@@ -375,6 +396,8 @@ impl QueryResult {
             Q::Error { .. } => QueryType::Error,
             Q::TcpSpeed { .. } => QueryType::TcpSpeed,
             Q::TcpOffset { .. } => QueryType::TcpOffset,
+            Q::TcpTransform { .. } => QueryType::TcpTransform,
+            Q::ExecutionSpeed { .. } => QueryType::ExecutionSpeed,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
             Q::ConfigInfo { .. } => QueryType::ConfigInfo,
@@ -593,6 +616,24 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, u64::from(tag));
             w_f64(buf, *speed);
         }
+        Q::ExecutionSpeed {
+            target_scale,
+            applied_scale,
+            resume_scale,
+        } => {
+            w_array(buf, 4);
+            w_uint(buf, u64::from(tag));
+            w_f64(buf, *target_scale);
+            w_f64(buf, *applied_scale);
+            w_f64(buf, *resume_scale);
+        }
+        Q::TcpTransform { values } => {
+            w_array(buf, 7);
+            w_uint(buf, u64::from(tag));
+            for v in values {
+                w_f64(buf, *v);
+            }
+        }
         Q::TcpOffset { x, y, z } => {
             w_array(buf, 4);
             w_uint(buf, u64::from(tag));
@@ -667,11 +708,19 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 w_f64(buf, *v);
             }
         }
-        Q::StatusRate { hz, tick_hz } => {
-            w_array(buf, 3);
+        Q::StatusRate {
+            hz,
+            tick_hz,
+            servable,
+        } => {
+            w_array(buf, 4);
             w_uint(buf, u64::from(tag));
             w_f64(buf, *hz);
             w_f64(buf, *tick_hz);
+            w_array(buf, servable.len());
+            for rate in servable {
+                w_f64(buf, *rate);
+            }
         }
         Q::BusScan { nodes } => {
             w_array(buf, 2);
@@ -692,12 +741,14 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             installation,
             program,
             epoch,
+            attachment_epoch,
         } => {
-            w_array(buf, 4);
+            w_array(buf, 5);
             w_uint(buf, u64::from(tag));
             w_shapes(buf, installation);
             w_shapes(buf, program);
             w_uint(buf, *epoch);
+            w_uint(buf, *attachment_epoch);
         }
     }
 }
@@ -754,6 +805,19 @@ pub fn encode_reply(reply: &Reply, buf: &mut Vec<u8>) {
             }
         }
     }
+}
+
+/// The servable-rate list: a whole-Hz divisor set, so one entry per Hz of the
+/// tick rate bounds it before anything is reserved on the length's word.
+const MAX_SERVABLE_RATES: usize = 4096;
+
+fn r_f64_vec(r: &mut Reader<'_>, what: &'static str) -> Result<Vec<f64>, DecodeError> {
+    let n = crate::command::r_len(r, what, MAX_SERVABLE_RATES)?;
+    let mut out = Vec::with_capacity(n);
+    for _ in 0..n {
+        out.push(r.f64()?);
+    }
+    Ok(out)
 }
 
 fn r_f64_fixed<const N: usize>(
@@ -1023,6 +1087,40 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             expect_arity("tcp_speed result", n, 2)?;
             QueryResult::TcpSpeed { speed: r.f64()? }
         }
+        T::ExecutionSpeed => {
+            expect_arity("execution_speed result", n, 4)?;
+            let target_scale = r.f64()?;
+            let applied_scale = r.f64()?;
+            let resume_scale = r.f64()?;
+            if !(0.0..=1.0).contains(&applied_scale)
+                || !(0.1..=1.0).contains(&resume_scale)
+                || !(target_scale == 0.0 || target_scale == resume_scale)
+            {
+                return Err(DecodeError::Validation {
+                    what: "execution_speed result",
+                    why: "invalid or inconsistent execution scales".to_owned(),
+                });
+            }
+            QueryResult::ExecutionSpeed {
+                target_scale,
+                applied_scale,
+                resume_scale,
+            }
+        }
+        T::TcpTransform => {
+            expect_arity("tcp_transform result", n, 7)?;
+            let mut values = [0.0; 6];
+            for v in &mut values {
+                *v = r.f64()?;
+                if !v.is_finite() {
+                    return Err(DecodeError::Validation {
+                        what: "tcp_transform result",
+                        why: "must be finite".to_owned(),
+                    });
+                }
+            }
+            QueryResult::TcpTransform { values }
+        }
         T::TcpOffset => {
             expect_arity("tcp_offset result", n, 4)?;
             QueryResult::TcpOffset {
@@ -1107,10 +1205,11 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::StatusRate => {
-            expect_arity("status rate result", n, 3)?;
+            expect_arity("status rate result", n, 4)?;
             QueryResult::StatusRate {
                 hz: r.f64()?,
                 tick_hz: r.f64()?,
+                servable: r_f64_vec(r, "status rate servable")?,
             }
         }
         T::BusScan => {
@@ -1120,11 +1219,12 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             }
         }
         T::Shapes => {
-            expect_arity("shapes result", n, 4)?;
+            expect_arity("shapes result", n, 5)?;
             QueryResult::Shapes {
                 installation: r_shapes(r)?,
                 program: r_shapes(r)?,
                 epoch: r.uint()?,
+                attachment_epoch: r.uint()?,
             }
         }
     };

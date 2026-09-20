@@ -19,13 +19,15 @@ import atexit
 import contextlib
 import copy
 import logging
+import math
 import time
 import weakref
 from collections.abc import AsyncGenerator, Callable, Iterable
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 from waldoctl import RobotClient as _RobotClientABC
+from waldoctl.execution import ExecutionSpeed, validate_execution_scale
 from waldoctl.shapes import Shape, ShapeWorld, shape_from_wire
 from waldoctl.status import (
     ActionState as WActionState,
@@ -49,6 +51,7 @@ from .. import config as _cfg
 from ..config import canonical_tool_key, io_line_names
 from ..protocol import CompletionPolicy
 from ..protocol.wire import StatusBuffer, update_status_from_dict
+from ._robot import RobotOwner
 from ._wire import (
     blend as _blend,
 )
@@ -65,6 +68,9 @@ from ._wire import timing as _timing
 from ._wire import tool_status_from_dict as _tool_status_from_dict
 from ._wire import wire_frame as _wire_frame
 from .errors import RobotError
+
+if TYPE_CHECKING:
+    from par6.robot import Robot
 
 logger = logging.getLogger(__name__)
 
@@ -151,7 +157,15 @@ def _close_leftover_cores() -> None:
             core.close()
 
 
-class AsyncRobotClient(_RobotClientABC):
+def _validate_io_timeout(timeout: float | None) -> None:
+    """An I/O deadline is positive and finite; None means the default."""
+    if timeout is not None and (
+        isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0
+    ):
+        raise ValueError("I/O timeout must be positive and finite")
+
+
+class AsyncRobotClient(RobotOwner, _RobotClientABC):
     """Async client for the par6d runtime.
 
     All network knobs default from the ``PAR6_*`` env namespace, then to the
@@ -173,6 +187,7 @@ class AsyncRobotClient(_RobotClientABC):
         status_unicast_host: str | None = None,
         mtu: int | None = None,
         tool_specs: Iterable[ToolSpec] | None = None,
+        robot: Robot | None = None,
     ) -> None:
         # Every None falls through to the engine client's own ladder
         # (``PAR6_*`` environment, then the shipped defaults).
@@ -186,6 +201,7 @@ class AsyncRobotClient(_RobotClientABC):
         self._mcast_iface = mcast_iface
         self._status_unicast_host = status_unicast_host
         self.mtu = mtu
+        self._robot = robot
 
         self._core: CoreClient | None = None
         self._core_lock = asyncio.Lock()
@@ -315,13 +331,16 @@ class AsyncRobotClient(_RobotClientABC):
             return
         self._closed = True
         self._status_event.set()
-        if self._status_task is not None:
-            self._status_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await self._status_task
-            self._status_task = None
         if self._core is not None:
             self._core.close()
+        try:
+            if self._status_task is not None:
+                # Cancellation finishes the Python Future before its Rust
+                # callback; normal completion drains that bridge before exit.
+                with contextlib.suppress(asyncio.CancelledError):
+                    await self._status_task
+        finally:
+            self._status_task = None
             self._core = None
 
     async def __aenter__(self) -> "AsyncRobotClient":
@@ -543,7 +562,11 @@ class AsyncRobotClient(_RobotClientABC):
         result = await self._call(core.status_rate())
         if result is None:
             return None
-        return StatusRate(hz=result["hz"], control_hz=result["tick_hz"])
+        return StatusRate(
+            hz=result["hz"],
+            control_hz=result["tick_hz"],
+            servable=tuple(float(rate) for rate in result["servable"]),
+        )
 
     async def set_can_id(self, node: int, new_id: int, *, force: bool = False) -> int:
         """Commissioning: tell drive *node* to answer as *new_id* from now on.
@@ -1159,31 +1182,93 @@ class AsyncRobotClient(_RobotClientABC):
         raw = await self._call(core.payload())
         return None if raw is None else payload_from_dict(raw)
 
-    async def pause(self) -> int:
-        """Hold the executing trajectory where it is.
+    @staticmethod
+    def _validate_execution_timeout(timeout: float) -> None:
+        if isinstance(timeout, bool) or not math.isfinite(timeout) or timeout <= 0:
+            raise ValueError("Execution control timeout must be positive and finite")
 
-        Unlike :meth:`stop`, the queued samples are left intact, so
-        :meth:`resume` continues the move rather than requiring the caller
-        to re-issue it.
+    async def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        """Fresh requested, applied, and retained execution scales.
+
+        Category: Query
+
+        Example:
+            speed = rbt.execution_speed()
+        """
+        self._validate_execution_timeout(timeout)
+        async with asyncio.timeout(timeout):
+            core = await self._ensure_core()
+            raw = await self._call(core.execution_speed())
+            if raw is None:
+                raise ConnectionError("Controller execution speed is unavailable")
+            return ExecutionSpeed(**raw)
+
+    async def _request_execution_state(
+        self, *, timeout: float, scale: float | None = None, paused: bool = False
+    ) -> int:
+        self._validate_execution_timeout(timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                core = await self._ensure_core()
+                request = (
+                    core.set_execution_speed(scale)
+                    if scale is not None
+                    else core.pause(paused)
+                )
+                if not await self._call(request):
+                    return 0
+                while True:
+                    state = await self.execution_speed(timeout=timeout)
+                    confirmed = (
+                        state.resume_scale == scale
+                        if scale is not None
+                        else (state.target_scale == 0) == paused
+                    )
+                    if confirmed:
+                        return 1
+                    await asyncio.sleep(0.01)
+        except TimeoutError:
+            return 0
+
+    async def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        """Select 10–100% of planned queued-motion speed without resuming.
+
+        Return 1 after controller readback confirms the selection, 0 on
+        timeout. Applied speed transitions under the backend motion limits.
+        Jog and externally streamed servo targets retain their own timing.
+
+        Category: Control
+
+        Example:
+            rbt.set_execution_speed(0.5)
+        """
+        return await self._request_execution_state(
+            scale=validate_execution_scale(scale), timeout=timeout
+        )
+
+    async def pause(self, *, timeout: float = 3.0) -> int:
+        """Request a controlled hold while retaining the queued trajectory.
+
+        Return 1 when the controller confirms the request. Read
+        ``execution_speed().paused`` to confirm that deceleration has ended.
+        Python execution and standalone completion timeouts are unchanged.
 
         Category: Control
 
         Example:
             rbt.pause()
         """
-        core = await self._ensure_core()
-        return await self._call(core.pause(True))
+        return await self._request_execution_state(paused=True, timeout=timeout)
 
-    async def resume(self) -> int:
-        """Continue a trajectory held by :meth:`pause`.
+    async def resume(self, *, timeout: float = 3.0) -> int:
+        """Resume the retained trajectory at the selected positive speed.
 
         Category: Control
 
         Example:
             rbt.resume()
         """
-        core = await self._ensure_core()
-        return await self._call(core.pause(False))
+        return await self._request_execution_state(paused=False, timeout=timeout)
 
     async def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive (hand-guiding).
@@ -1355,9 +1440,35 @@ class AsyncRobotClient(_RobotClientABC):
             )
         )
 
+    async def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        """Queue a tool-local TCP correction (mm, intrinsic XYZ degrees).
+
+        Wait for the returned command index before reading the applied transform.
+        Changing tool or variant clears the correction.
+
+        Category: Configuration
+
+        Example:
+            index = rbt.set_tcp_transform(0, 0, 20, 0, 90, 0)
+            rbt.wait_command(index)
+        """
+        core = await self._ensure_core()
+        return await self._call(
+            core.set_tcp_transform([float(v) for v in (x, y, z, roll, pitch, yaw)])
+        )
+
     async def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm, composed on top of the current tool
-        transform.  (0, 0, 0) resets; changing tools resets it too.
+        transform, clearing any user orientation correction. Wait for the
+        returned command index before readback. Changing tool/variant resets it.
 
         Category: Configuration
 
@@ -1390,7 +1501,9 @@ class AsyncRobotClient(_RobotClientABC):
             core.set_completion_policy(int(CompletionPolicy(policy)))
         )
 
-    async def write_io(self, index: int, value: int) -> int:
+    async def write_io(
+        self, index: int, value: int, *, timeout: float | None = None
+    ) -> int:
         """Set digital output by logical index (0 = first output pin).
 
         *index* addresses the ``[io].outputs`` list, which is also where the
@@ -1402,6 +1515,9 @@ class AsyncRobotClient(_RobotClientABC):
         its own and refuses a port it does not have, so a box wired
         differently is caught either way.
 
+        ``timeout`` bounds command acceptance. TimeoutError leaves application
+        unconfirmed; None uses the client defaults.
+
         Category: I/O
 
         Example:
@@ -1412,8 +1528,10 @@ class AsyncRobotClient(_RobotClientABC):
             raise ValueError(f"Output index must be in 0..{outputs - 1}")
         if value not in (0, 1):
             raise ValueError("I/O value must be 0 or 1")
-        core = await self._ensure_core()
-        return await self._call(core.write_io(index, value))
+        _validate_io_timeout(timeout)
+        async with asyncio.timeout(timeout):
+            core = await self._ensure_core()
+            return await self._call(core.write_io(index, value))
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1539,16 +1657,24 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.pose_xyzrpy(_wire_frame(frame)))
 
-    async def io(self) -> list[int] | None:
-        """Digital I/O state [in1, in2, out1, out2, estop].
+    async def io(self, *, timeout: float | None = None) -> list[int] | None:
+        """Digital I/O in configured input/output order, followed by E-stop.
+
+        ``timeout`` bounds setup, retries, and the reply; None uses client defaults.
 
         Category: Query
 
         Example:
             io = rbt.io()
         """
-        core = await self._ensure_core()
-        return await self._call(core.io())
+        _validate_io_timeout(timeout)
+        try:
+            async with asyncio.timeout(timeout):
+                core = await self._ensure_core()
+                levels = await self._call(core.io())
+                return list(levels) if levels is not None else None
+        except TimeoutError:
+            return None
 
     async def joint_speeds(self) -> list[float] | None:
         """Current joint velocities in rad/s.
@@ -1725,16 +1851,29 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         return await self._call(core.is_robot_stopped(float(threshold_speed)))
 
+    async def tcp_transform(self) -> list[float]:
+        """Read the applied TCP correction (mm, intrinsic XYZ degrees).
+
+        Category: Configuration
+
+        Example:
+            transform = rbt.tcp_transform()
+        """
+        core = await self._ensure_core()
+        result = await self._call(core.tcp_transform())
+        if result is None:
+            raise TimeoutError("TCP transform readback was not confirmed")
+        return list(result)
+
     async def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z].
 
-        Raises ``ConnectionError`` when the controller does not answer,
+        Raises ``TimeoutError`` when the controller does not answer,
         because ``[0, 0, 0]`` is a legitimate offset -- a tool deliberately
         cleared -- and returning it as a not-answered sentinel leaves the
         caller unable to tell "the offset is zero" from "there is no
         controller". A host that adopts the readback then quietly erases
-        the offset the user just set. The waldoctl contract spells this
-        out; this used to return the sentinel.
+        the offset the user just set.
 
         The sibling queries return ``None`` for the same condition, which
         is unambiguous where they do it: no real answer is ``None``. This
@@ -1748,7 +1887,7 @@ class AsyncRobotClient(_RobotClientABC):
         core = await self._ensure_core()
         result = await self._call(core.tcp_offset())
         if result is None:
-            raise ConnectionError("the controller did not answer tcp_offset()")
+            raise TimeoutError("TCP offset readback was not confirmed")
         return list(result)
 
     async def is_simulator(self) -> bool:
@@ -1802,9 +1941,11 @@ class AsyncRobotClient(_RobotClientABC):
                 w["margin"],
                 w["name"],
                 w.get("physics"),
+                w.get("attachment"),
             )
 
         return ShapeWorld(
+            attachment_epoch=result["attachment_epoch"],
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
         )

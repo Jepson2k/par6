@@ -26,6 +26,10 @@ pub fn motion_dict<'py>(py: Python<'py>, m: &MotionConfig) -> PyResult<Bound<'py
     d.set_item("dls_lambda", m.dls_lambda)?;
     d.set_item("settle_tolerance_rad", m.settle_tolerance_rad)?;
     d.set_item("settle_timeout_s", m.settle_timeout_s)?;
+    d.set_item(
+        "execution_override_transition_s",
+        m.execution_override_transition_s,
+    )?;
     Ok(d)
 }
 

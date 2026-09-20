@@ -20,6 +20,8 @@ fn push_cmd(rig: &mut Rig, index: u32, from: f64, step: f64, n: usize, blend: bo
             q,
             qd: [0.0; MAX_JOINTS],
             tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
             meta: SampleMeta {
                 command_index: index,
                 checkpoint_id: index,
@@ -215,12 +217,23 @@ fn pause_holds_in_place_with_the_ring_untouched() {
     let mut rig = Rig::new();
     enter_exec(&mut rig);
     let q0 = rig.pose[0];
-    push_cmd(&mut rig, 1, q0, 0.001, 100, false, false);
+    push_cmd(&mut rig, 1, q0, 0.0, 1000, false, false);
     rig.tick_n(10);
-    let before = rig.snap().exec.samples_remaining;
-    let held = rig.last_joints()[0].pos.unwrap();
 
     rig.cmd(RtCommand::ExecSetPaused(true));
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        if rig.snap().exec.paused {
+            break;
+        }
+    }
+    assert!(
+        rig.snap().exec.paused,
+        "bounded deceleration reaches a hold"
+    );
+    let before = rig.snap().exec.samples_remaining;
+    let held = rig.last_joints()[0].pos.unwrap();
     rig.tick_n(30);
     let s = rig.snap();
     assert!(s.exec.paused);
@@ -232,7 +245,10 @@ fn pause_holds_in_place_with_the_ring_untouched() {
     assert_eq!(rig.last_joints()[0].vel, Some(0), "zero velocity hold");
 
     rig.cmd(RtCommand::ExecSetPaused(false));
-    rig.tick_n(5);
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
     assert!(
         rig.snap().exec.samples_remaining < before,
         "playback resumed"
@@ -358,7 +374,13 @@ fn a_pause_requested_while_idle_holds_the_next_program() {
     );
 
     rig.cmd(RtCommand::ExecSetPaused(false));
-    rig.tick_n(5);
+    for _ in 0..300 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        if rig.snap().exec.samples_remaining < before {
+            break;
+        }
+    }
     assert!(
         rig.snap().exec.samples_remaining < before,
         "un-pausing resumes playback"
