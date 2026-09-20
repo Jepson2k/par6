@@ -253,6 +253,9 @@ pub struct CartesianStreamingExecutor {
     /// Unit direction of the tangent to the current target; all zeroes
     /// when there is no target, which leaves the envelope isotropic.
     direction: [f64; 6],
+    /// The target currently being tracked, so setting the same one
+    /// again can be recognized and skipped.
+    last_target: Option<Pose>,
     speed: f64,
     accel: f64,
     active: bool,
@@ -289,6 +292,7 @@ impl CartesianStreamingExecutor {
             limits,
             reference: IDENTITY_POSE,
             direction: [0.0; 6],
+            last_target: None,
             speed: 1.0,
             accel: 1.0,
             active: false,
@@ -372,6 +376,7 @@ impl CartesianStreamingExecutor {
         }
         self.input.control_interface = ControlInterface::Position;
         self.otg.reset();
+        self.last_target = None;
         self.active = true;
     }
 
@@ -390,6 +395,18 @@ impl CartesianStreamingExecutor {
                 reason: "target pose must be finite".into(),
             });
         }
+        // Re-planning a target the OTG is already tracking costs the
+        // phase synchronization that keeps the tool on its line: the
+        // re-plan tests the current velocity and acceleration against a
+        // fresh profile and drops to time synchronization unless they
+        // line up exactly, and once out of phase the state drifts
+        // further out, so the next tick fails the test too. A servo
+        // stream repeats its target at the tick rate, so this is the
+        // common case rather than an edge one.
+        if self.last_target == Some(*target) {
+            return Ok(());
+        }
+        self.last_target = Some(*target);
         let tangent = cart::se3_log(&cart::se3_mul(&cart::se3_inverse(&self.reference), target));
         // As in `StreamingExecutor::set_target`: a pose target is a
         // position-interface request, and a stream resumed after a
@@ -431,6 +448,9 @@ impl CartesianStreamingExecutor {
     /// reverses. The velocity interface with a zero target says only
     /// "shed the velocity you have", which is what a stop is.
     pub fn release(&mut self) {
+        // Braking leaves the position interface, so the target it was
+        // tracking no longer holds.
+        self.last_target = None;
         self.input.control_interface = ControlInterface::Velocity;
         for k in 0..6 {
             self.input.target_velocity[k] = 0.0;
