@@ -30,8 +30,8 @@ use par6d::{Daemon, Options};
 
 mod common;
 use common::{
-    distance, distance_to_segment, path_misses, process_corner, progress_along, shipped_config,
-    spline_waypoints, wire_pose_at, Client, Rig, ARC_RADIUS_MM, BUDGET, CURVE_START_DEG,
+    path_misses, process_corner, shipped_config, spline_waypoints, Client, Rig, ARC_RADIUS_MM,
+    BUDGET,
 };
 
 /// Boot on a config patched for this test's `tag`, so parallel tests do
@@ -173,6 +173,51 @@ fn tcp_mm(s: &Status) -> [f64; 3] {
     [s.pose[3], s.pose[7], s.pose[11]]
 }
 
+/// Distance \[mm\] from `p` to the segment `a`→`b`.
+fn distance_to_segment(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    let t = ((w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2).clamp(0.0, 1.0);
+    let e = [w[0] - t * d[0], w[1] - t * d[1], w[2] - t * d[2]];
+    (e[0] * e[0] + e[1] * e[1] + e[2] * e[2]).sqrt()
+}
+
+/// Euclidean distance \[mm\] between two TCP positions.
+fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt()
+}
+
+/// Fraction of the segment `a`→`b` covered by `p`'s projection.
+fn progress_along(p: [f64; 3], a: [f64; 3], b: [f64; 3]) -> f64 {
+    let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+    let len2 = d[0] * d[0] + d[1] * d[1] + d[2] * d[2];
+    let w = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+    (w[0] * d[0] + w[1] * d[1] + w[2] * d[2]) / len2
+}
+
+/// Wire pose `[x y z mm, rx ry rz deg]` from a STATUS pose matrix
+/// (row-major 4x4, mm) with the translation replaced.
+///
+/// Decoded the way a client decodes it — the wire's intrinsic-XYZ
+/// convention, written out here
+/// rather than borrowed from the runtime so the two halves of the
+/// round trip cannot agree on the wrong thing.
+fn wire_pose_at(pose: &[f64; 16], xyz_mm: [f64; 3]) -> [f64; 6] {
+    let (r00, r01, r02) = (pose[0], pose[1], pose[2]);
+    let (r12, r22) = (pose[6], pose[10]);
+    let cp = r12.hypot(r22);
+    [
+        xyz_mm[0],
+        xyz_mm[1],
+        xyz_mm[2],
+        (-r12).atan2(r22).to_degrees(),
+        r02.atan2(cp).to_degrees(),
+        (-r01).atan2(r00).to_degrees(),
+    ]
+}
+
 /// Largest absolute difference between the rotation blocks of two STATUS
 /// pose matrices — the orientation held (or not) across a move.
 fn rotation_drift(a: &[f64; 16], b: &[f64; 16]) -> f64 {
@@ -300,7 +345,7 @@ fn cartesian_surface_over_protocol_v2() {
     });
     let i = c.ok_index(&move_l);
     let path: Vec<[f64; 3]> = rig
-        .collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0))
+        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
         .iter()
         .map(tcp_mm)
         .collect();
@@ -365,7 +410,7 @@ fn cartesian_surface_over_protocol_v2() {
         blend_radius: None,
     }));
     let joint_path: Vec<[f64; 3]> = rig
-        .collect_through(i, Duration::from_secs_f64(MOVE_S + 1.0))
+        .collect_status(Duration::from_secs_f64(MOVE_S + 1.0))
         .iter()
         .map(tcp_mm)
         .collect();
@@ -1114,26 +1159,15 @@ fn world_gap_m(col: &mut par6_kin::Collision, angles_deg: [f64; NUM_JOINTS]) -> 
 /// The TCP position at `angles_deg` \[m\], from the same URDF the runtime
 /// loads — where a keep-out has to go to sit on the swept path.
 fn tcp_at_m(angles_deg: [f64; NUM_JOINTS]) -> [f64; 3] {
-    // One model per thread: a status-rate sampler cannot afford a URDF
-    // load per frame.
-    thread_local! {
-        static KIN: std::cell::RefCell<Option<par6_kin::Kin>> =
-            const { std::cell::RefCell::new(None) };
+    let mut kin = par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
+        .expect("kin model");
+    let mut q = [0.0; NUM_JOINTS];
+    for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
+        *out = deg.to_radians();
     }
-    KIN.with(|cell| {
-        let mut slot = cell.borrow_mut();
-        let kin = slot.get_or_insert_with(|| {
-            par6_kin::Kin::load(&common::assets_dir(), par6_kin::GripperVariant::Msg)
-                .expect("kin model")
-        });
-        let mut q = [0.0; NUM_JOINTS];
-        for (out, deg) in q.iter_mut().zip(angles_deg.iter()) {
-            *out = deg.to_radians();
-        }
-        let mut pose = [0.0; 16];
-        kin.fk(&q, &mut pose).expect("fk");
-        [pose[3], pose[7], pose[11]]
-    })
+    let mut pose = [0.0; 16];
+    kin.fk(&q, &mut pose).expect("fk");
+    [pose[3], pose[7], pose[11]]
 }
 
 /// The J0 jog `speeds` fraction whose stopping projection covers
@@ -1148,11 +1182,17 @@ fn j0_speed_reaching(travel_rad: f64) -> f64 {
     // in ticks, so a helper that inverts it against a different tick
     // rate asks for a speed whose lookahead lands somewhere else
     // entirely.
-    let (v_max, accel, dt) = (lim.velocity_rad_s, lim.acceleration_rad_s2, TEST_TICK_DT_S);
+    // The settling term the gate projects is `v / kpp`, the position loop's
+    // own gain -- not an acceleration. Inverting it against the jog
+    // acceleration limit (an order larger) asks for a speed whose real
+    // projection is many times the travel, so the helper's contract ("the
+    // speed whose stop covers `travel_rad`") would not hold.
+    let kpp = cfg.joints[0].gains.kpp;
+    let (v_max, dt) = (lim.velocity_rad_s, TEST_TICK_DT_S);
     let (mut lo, mut hi) = (0.0, v_max);
     for _ in 0..60 {
         let mid = 0.5 * (lo + hi);
-        if par6d::stream_stopping_travel(mid, accel, dt) < travel_rad {
+        if par6d::stream_stopping_travel(mid, kpp, dt) < travel_rad {
             lo = mid;
         } else {
             hi = mid;
@@ -1762,6 +1802,13 @@ fn cartesian_enablement_measures_the_real_workspace() {
 
 // ---- curved and blended moves ----------------------------------------------
 
+/// Start posture for the curved and blended moves: the same kind of
+/// well-conditioned pose as [`CART_START_DEG`], chosen (by the same
+/// soft-limit-box sweep) for room around it — 120 mm of straight-line
+/// travel is IK-feasible in every axis direction and along the diagonals
+/// from here, so a 120 mm arc and two 120 mm legs fit without touching a
+/// soft window.
+const CURVE_START_DEG: [f64; NUM_JOINTS] = [-125.0, -80.0, 175.0, 0.0, -40.0, 180.0];
 /// Duration of the spline move \[s\]. Slower than [`MOVE_S`] because the
 /// sim's tracking lag is proportional to speed AND to path curvature,
 /// and a wave has far more of the second than a straight line does.
@@ -2063,7 +2110,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     let (first, corner, finish) = leg(&s, 5001, None);
     let i1 = c.ok_index(&first);
     let i2 = c.ok_index(&second(&s, 5002, finish));
-    let sharp = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(
         ok,
@@ -2098,7 +2145,7 @@ fn a_blend_radius_rounds_the_corner_into_the_next_queued_move() {
     let indices = c.ok_indices(&[first.clone(), second(&s, 5004, finish)]);
     let (i1, i2) = (indices[0], indices[1]);
     let send_gap = sent_first.elapsed();
-    let blended = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     let (ok, detail) = c.wait_complete(i1);
     assert!(ok, "the blended first leg must complete ok, got {detail:?}");
     let (ok, detail) = c.wait_complete(i2);
@@ -2231,7 +2278,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6001, corner_deg, None));
     let i2 = c.ok_index(&move_j(6002, finish_deg, None));
-    let sharp = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let sharp = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
@@ -2253,7 +2300,7 @@ fn a_blend_radius_rounds_a_joint_chain_too() {
     curve_start(&rig, &mut c);
     let i1 = c.ok_index(&move_j(6003, corner_deg, Some(BLEND_MM)));
     let i2 = c.ok_index(&move_j(6004, finish_deg, None));
-    let blended = rig.collect_through(i2, Duration::from_secs_f64(2.0 * LEG_S + 2.0));
+    let blended = rig.collect_status(Duration::from_secs_f64(2.0 * LEG_S + 2.0));
     for i in [i1, i2] {
         let (ok, detail) = c.wait_complete(i);
         assert!(
