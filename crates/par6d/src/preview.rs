@@ -1247,9 +1247,35 @@ impl Preview {
                 trajectory.push(target);
             }
         }
+        // The watchdog does not stop the tool dead: it ramps down along
+        // the axis it is travelling, and that ramp covers real ground —
+        // so a preview that ended with the commanded window would
+        // under-predict where the runtime leaves the arm.
+        state.release();
+        let mut braking = 0usize;
+        let cap = (4.0 / period).round() as usize;
+        for _ in 0..cap {
+            let (target, at_rest) = match step_cart_jog(
+                &mut self.cart,
+                &mut state,
+                &self.stream_limits,
+                period,
+                &q_meas,
+            ) {
+                Ok(step) => step,
+                Err(_) => (state.commanded(), true),
+            };
+            for _ in 0..ticks_per_step {
+                trajectory.push(target);
+            }
+            braking += 1;
+            if at_rest {
+                break;
+            }
+        }
         self.finish_stream(
             trajectory,
-            trajectory_duration(steps * ticks_per_step, self.dt),
+            trajectory_duration((steps + braking) * ticks_per_step, self.dt),
         )
     }
 
