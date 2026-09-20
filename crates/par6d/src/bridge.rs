@@ -1370,6 +1370,14 @@ impl RtBridge {
 
     fn stop_stream_commands(&self) {
         self.link.send(RtCommand::JogRelease);
+        // Say the stream is over before asking for the mode. The RT
+        // latches RTI_LINK_LOST when STREAM goes quiet without a
+        // release, and it drains one command per tick, so between this
+        // side's last setpoint and SetMode(Idle) arriving there is a
+        // window the watchdog can expire in — which drops the arm on a
+        // stream the daemon itself stopped. `StreamRelease` sets the
+        // exemption on the tick it lands.
+        self.link.send(RtCommand::StreamRelease);
         self.link.send(RtCommand::SetMode(Mode::Idle));
     }
 }
@@ -2576,6 +2584,10 @@ pub(crate) fn housekeeping_loop(
                             }
                             StreamKind::CartJog => {
                                 log::warn!("jog_l ramp never reported rest; idling");
+                                // The stream is over: say so before asking for the
+                                // mode, or the RT's watchdog can latch
+                                // RTI_LINK_LOST in the ticks before IDLE lands.
+                                link.send(RtCommand::StreamRelease);
                                 link.send(RtCommand::SetMode(Mode::Idle));
                             }
                             // The tool brakes ALONG its line rather than
@@ -2593,6 +2605,10 @@ pub(crate) fn housekeeping_loop(
                             }
                             StreamKind::CartServo => {
                                 log::warn!("servo_l brake never reported rest; idling");
+                                // The stream is over: say so before asking for the
+                                // mode, or the RT's watchdog can latch
+                                // RTI_LINK_LOST in the ticks before IDLE lands.
+                                link.send(RtCommand::StreamRelease);
                                 link.send(RtCommand::SetMode(Mode::Idle));
                             }
                         }
@@ -2729,6 +2745,10 @@ pub(crate) fn housekeeping_loop(
                                 // the arm) retires the stream: whatever
                                 // this side commanded next would fight it.
                                 Ok(CartStep::Superseded) => {
+                                    // The stream is over: say so before asking for the
+                                    // mode, or the RT's watchdog can latch
+                                    // RTI_LINK_LOST in the ticks before IDLE lands.
+                                    link.send(RtCommand::StreamRelease);
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                     sh.stream = None;
                                     continue 'housekeeping;
@@ -2763,6 +2783,10 @@ pub(crate) fn housekeeping_loop(
                                             // The ramp has run out and the
                                             // tool is stopped.
                                             if a.releasing && at_rest {
+                                                // The stream is over: say so before asking for the
+                                                // mode, or the RT's watchdog can latch
+                                                // RTI_LINK_LOST in the ticks before IDLE lands.
+                                                link.send(RtCommand::StreamRelease);
                                                 link.send(RtCommand::SetMode(Mode::Idle));
                                                 sh.stream = None;
                                                 continue 'housekeeping;
@@ -2778,6 +2802,10 @@ pub(crate) fn housekeeping_loop(
                                             // this is a model failure, not a
                                             // predicted contact.
                                             log::error!("jog_l gate check failed: {}", e.cause);
+                                            // The stream is over: say so before asking for the
+                                            // mode, or the RT's watchdog can latch
+                                            // RTI_LINK_LOST in the ticks before IDLE lands.
+                                            link.send(RtCommand::StreamRelease);
                                             link.send(RtCommand::SetMode(Mode::Idle));
                                             sh.stream = None;
                                             continue 'housekeeping;
@@ -2807,6 +2835,10 @@ pub(crate) fn housekeeping_loop(
                                 // the arm) retires the stream: whatever
                                 // this side commanded next would fight it.
                                 Ok(CartStep::Superseded) => {
+                                    // The stream is over: say so before asking for the
+                                    // mode, or the RT's watchdog can latch
+                                    // RTI_LINK_LOST in the ticks before IDLE lands.
+                                    link.send(RtCommand::StreamRelease);
                                     link.send(RtCommand::SetMode(Mode::Idle));
                                     sh.stream = None;
                                     continue 'housekeeping;
@@ -2840,6 +2872,10 @@ pub(crate) fn housekeeping_loop(
                                             // The brake has run out; the
                                             // tool is at rest on its line.
                                             if a.releasing && finished {
+                                                // The stream is over: say so before asking for the
+                                                // mode, or the RT's watchdog can latch
+                                                // RTI_LINK_LOST in the ticks before IDLE lands.
+                                                link.send(RtCommand::StreamRelease);
                                                 link.send(RtCommand::SetMode(Mode::Idle));
                                                 sh.stream = None;
                                                 continue 'housekeeping;
@@ -2852,6 +2888,10 @@ pub(crate) fn housekeeping_loop(
                                         }
                                         Err(e) => {
                                             log::error!("servo_l gate check failed: {}", e.cause);
+                                            // The stream is over: say so before asking for the
+                                            // mode, or the RT's watchdog can latch
+                                            // RTI_LINK_LOST in the ticks before IDLE lands.
+                                            link.send(RtCommand::StreamRelease);
                                             link.send(RtCommand::SetMode(Mode::Idle));
                                             sh.stream = None;
                                             continue 'housekeeping;
