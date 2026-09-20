@@ -141,7 +141,7 @@ pub struct ConfigInfoData {
     /// RT tick period \[s\].
     pub tick_dt_s: f64,
     /// Every `[motion]` key in declaration order (`MotionConfig::KEYS`).
-    pub motion: [f64; 13],
+    pub motion: [f64; 14],
     /// Per-joint effective EXEC limits: `[soft_min_rad, soft_max_rad,
     /// velocity_rad_s, acceleration_rad_s2]`.
     pub joints: Vec<[f64; 4]>,

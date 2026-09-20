@@ -44,6 +44,7 @@ enum RtEvent {
     SetGravityComp(bool),
     SetPayload(f64),
     ExecPaused(bool),
+    ExecSpeed(f64),
     SetEnabled(bool),
     Teleport([f64; 6]),
     EnterFlashing,
@@ -73,6 +74,10 @@ struct RtLog {
     /// is forwarded; `Some` = refused, the way the real bridge refuses a
     /// jog its collision gate blocks.
     stream_verdict: Option<WireError>,
+    /// While true a refused update leaves the session in a standoff the
+    /// RT owns (it answers `stop_refused_stream` with true) instead of
+    /// cancelling it, the way the real bridge keeps a collision standoff.
+    standoff_on_refusal: bool,
     /// What the streaming gate answers the NEXT shape set with. `None` =
     /// mirrored; `Some` = refused, the way the real gate refuses a set
     /// it cannot convert.
@@ -124,6 +129,13 @@ impl RtCommands for TestRt {
     fn cancel_stream(&mut self) {
         self.push(RtEvent::CancelStream);
     }
+    fn stop_refused_stream(&mut self) -> bool {
+        if self.0.lock().unwrap().standoff_on_refusal {
+            return true;
+        }
+        self.cancel_stream();
+        false
+    }
     fn halt(&mut self) {
         self.push(RtEvent::Halt);
     }
@@ -134,6 +146,9 @@ impl RtCommands for TestRt {
         self.push(RtEvent::SetPayload(payload.mass));
     }
 
+    fn set_exec_speed(&mut self, scale: f64) {
+        self.push(RtEvent::ExecSpeed(scale));
+    }
     fn set_exec_paused(&mut self, paused: bool) {
         self.push(RtEvent::ExecPaused(paused));
     }
@@ -762,6 +777,45 @@ async fn recv_status(sock: &UdpSocket) -> par6_proto::Status {
         .expect("status within budget")
         .expect("recv");
     decode_status(&buf[..n]).expect("decodable status")
+}
+
+/// The first STATUS frame satisfying `pred`, within `BUDGET`. The socket
+/// holds every frame broadcast since it was last read, so the next frame
+/// out of it can predate the change under test; `what` names the
+/// condition in the failure.
+async fn status_where(
+    sock: &UdpSocket,
+    what: &str,
+    pred: impl Fn(&par6_proto::Status) -> bool,
+) -> par6_proto::Status {
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let status = recv_status(sock).await;
+        if pred(&status) {
+            return status;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no STATUS frame where {what} within {BUDGET:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn status_identifies_new_publisher_sessions_and_actual_snapshot_times() {
+    let first = start(|_| {}).await;
+    let before = recv_status(&first.status_rx).await;
+    let after = recv_status(&first.status_rx).await;
+    assert_ne!(before.session_id, 0);
+    assert_eq!(before.session_id, after.session_id);
+    assert!(after.seq > before.seq);
+    assert!(after.mono_time_ns > before.mono_time_ns);
+    drop(first);
+
+    let restarted = start(|_| {}).await;
+    let next = recv_status(&restarted.status_rx).await;
+    assert_eq!(next.controller_id, before.controller_id);
+    assert_ne!(next.session_id, before.session_id);
 }
 
 /// A TCP rotation with three substantial components \[rad\] — the only
@@ -2124,8 +2178,73 @@ async fn a_stream_the_runtime_refuses_answers_error_and_stops_the_session() {
     .await;
 }
 
+/// A refused update the runtime answers with a standoff keeps the session
+/// alive while the gate brakes and places the arm. The refusal still
+/// latches — the session is stopping, not motion the verdict would
+/// misdescribe — and the next accepted setpoint clears it.
+#[tokio::test]
+async fn a_refusal_kept_in_a_standoff_still_latches() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let collision = || {
+        make_error(
+            ErrorCode::SysSelfCollision,
+            UNATTRIBUTED,
+            &[("sample", "0"), ("total", "1"), ("pairs", "[j3, keepout]")],
+        )
+    };
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Stream(CmdType::JogJ)))
+        .await;
+
+    {
+        let mut rt = h.rt.lock().unwrap();
+        rt.stream_verdict = Some(collision());
+        rt.standoff_on_refusal = true;
+    }
+    let err = c.expect_error(&jog_j()).await;
+    assert_eq!(err.code, ErrorCode::SysSelfCollision as u16);
+    assert!(
+        !h.rt_events().contains(&RtEvent::CancelStream),
+        "a standoff the RT keeps must not be cancelled: {:?}",
+        h.rt_events()
+    );
+    match c.query(&Command::Error).await {
+        QueryResult::Error { error: Some(e) } => {
+            assert_eq!(e.code, ErrorCode::SysSelfCollision as u16)
+        }
+        other => panic!("the refusal must stand while the standoff runs, got {other:?}"),
+    }
+
+    h.rt.lock().unwrap().standoff_on_refusal = false;
+    c.send(&jog_j()).await;
+    h.wait_rt(|ev| {
+        ev.iter()
+            .filter(|e| **e == RtEvent::Stream(CmdType::JogJ))
+            .count()
+            >= 2
+    })
+    .await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        match c.query(&Command::Error).await {
+            QueryResult::Error { error: None } => break,
+            QueryResult::Error { error: Some(_) } => {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the accepted setpoint must clear the refusal latch"
+                );
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            other => panic!("expected ERROR result, got {other:?}"),
+        }
+    }
+}
+
 fn wire_shape(name: &str, kind: &str) -> Shape {
     Shape {
+        attachment: None,
         kind: kind.to_owned(),
         params: vec![0.2, 0.2, 0.2],
         pose: vec![0.3, 0.0, 0.1, 0.0, 0.0, 0.0],
@@ -2185,6 +2304,7 @@ async fn shape_layers_epoch_adoption_and_collision_status() {
             installation,
             program: p,
             epoch,
+            ..
         } => {
             assert_eq!(installation, vec![install.clone()]);
             assert_eq!(p, program);
@@ -2461,10 +2581,14 @@ async fn cartesian_freedom_is_reported_only_where_kinematics_exist() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let status = recv_status(&h.status_rx).await;
+    let status = status_where(
+        &h.status_rx,
+        "joint_en carries the planner's verdict",
+        |s| s.joint_en == joints,
+    )
+    .await;
     assert_eq!(status.cart_en_wrf, [0; 12], "STATUS agrees with REACHABLE");
     assert_eq!(status.cart_en_trf, [0; 12]);
-    assert_eq!(status.joint_en, joints);
 
     // With kinematics the planner's verdict is what goes on the wire —
     // the narrowing is conditional, not a blanket zero.
@@ -3594,4 +3718,85 @@ async fn a_stop_completes_a_tool_action_still_inside_its_start_round_trip() {
         "a stop completes the parked action with a cancellation: \
          ok={ok} detail={detail:?}"
     );
+}
+
+/// A pause holds the queue it interrupted. Stop, Estop and ResetState
+/// discard that queue, so they clear the pause with it: the next queued
+/// command is planned without a resume instead of being withheld by
+/// `pump()` with nothing to say why.
+#[tokio::test]
+async fn stop_estop_and_reset_clear_a_standing_pause() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    let unpaused = |ev: &[RtEvent]| {
+        ev.iter()
+            .filter(|e| **e == RtEvent::ExecPaused(false))
+            .count()
+    };
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
+    c.request(&Command::Stop(Stop { clear_queue: true })).await;
+    h.wait_rt(|ev| unpaused(ev) == 1).await;
+    let i1 = c.ok_index(&move_j(101)).await;
+    h.wait_planner("a move queued after Stop starts without a resume", |p| {
+        p.started.iter().any(|(i, _)| *i == i1)
+    })
+    .await;
+    h.complete_ok(i1);
+    let (ok, detail) = c.wait_complete(i1).await;
+    assert!(ok, "{detail:?}");
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    c.request(&Command::ResetState).await;
+    h.wait_rt(|ev| unpaused(ev) == 2).await;
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    c.request(&Command::Estop).await;
+    h.wait_rt(|ev| unpaused(ev) == 3).await;
+}
+
+/// A stop that keeps the queue keeps the pause holding it: nothing is
+/// unpaused, and the retained head waits for the resume.
+#[tokio::test]
+async fn a_stop_that_keeps_the_queue_keeps_the_pause() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: true }))
+        .await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::ExecPaused(true)))
+        .await;
+    let i1 = c.ok_index(&move_j(301)).await;
+    let _i2 = c.ok_index(&move_j(302)).await;
+    c.ok(&Command::Stop(Stop { clear_queue: false })).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert!(
+        !h.rt_events().contains(&RtEvent::ExecPaused(false)),
+        "a stop that keeps the queue must keep the pause: {:?}",
+        h.rt_events()
+    );
+    assert!(
+        !h.planner
+            .lock()
+            .unwrap()
+            .started
+            .iter()
+            .any(|(i, _)| *i == i1),
+        "the retained head started without a resume"
+    );
+
+    c.request(&Command::Pause(par6_proto::command::Pause { on: false }))
+        .await;
+    h.wait_planner("the retained head starts on resume", |p| {
+        p.started.iter().any(|(i, _)| *i == i1)
+    })
+    .await;
 }

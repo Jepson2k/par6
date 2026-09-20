@@ -91,6 +91,34 @@ pub fn validate_shape(s: &Shape) -> Result<(), (&'static str, String)> {
             return Err(("shape.margin", format!("must be finite and >= 0, got {m}")));
         }
     }
+    if let Some(a) = &s.attachment {
+        let fail = |detail: &str| ("shape.attachment", detail.to_owned());
+        if !s.collision || s.physics.is_some() {
+            return Err(fail(
+                "attached shapes require collision geometry without physics",
+            ));
+        }
+        if a.epoch == 0 || s.name.is_empty() || s.name.len() > 128 {
+            return Err(fail(
+                "attachment requires a nonzero epoch and a bounded name",
+            ));
+        }
+        if a.allowed_contacts.len() > 32 {
+            return Err(fail("at most 32 allowed contacts"));
+        }
+        for (i, name) in a.allowed_contacts.iter().enumerate() {
+            if name.is_empty()
+                || name.len() > 128
+                || name.contains(['*', '?', '[', ']', '\0'])
+                || name == &format!("shape:{}", s.name)
+                || a.allowed_contacts[..i].contains(name)
+            {
+                return Err(fail(
+                    "contacts must be distinct exact reporting names, excluding self",
+                ));
+            }
+        }
+    }
     let Some(physics) = &s.physics else {
         return Ok(());
     };
@@ -137,14 +165,14 @@ pub fn validate_shape(s: &Shape) -> Result<(), (&'static str, String)> {
 pub struct Shape {
     /// Shape kind (`"box"`, `"sphere"`, …) — interpreted by the server layer.
     pub kind: String,
-    /// Kind-specific dimensions (mm).
+    /// Kind-specific dimensions (metres).
     pub params: Vec<f64>,
-    /// Shape pose (mm / degrees), kind-specific length.
+    /// World or flange-relative shape pose (metres / radians), extrinsic XYZ.
     pub pose: Vec<f64>,
     /// Whether the shape participates in collision checking.
     #[serde(default = "yes")]
     pub collision: bool,
-    /// Optional safety margin (mm); `None` = server default.
+    /// Optional clearance margin (metres); `None` = server default.
     #[serde(default)]
     pub margin: Option<f64>,
     /// Display name.
@@ -153,6 +181,20 @@ pub struct Shape {
     /// geometry only — drawn, and a keep-out, but nothing rests on it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub physics: Option<Physical>,
+    /// Flange-relative geometry bound to the current attachment context.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<Attachment>,
+}
+
+/// A declared attachment; sensing remains a separate observation.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Attachment {
+    /// Current SHAPES attachment context, invalidated by reference/tool/source loss.
+    pub epoch: u64,
+    /// Exact reporting names of this shape's exempted collision partners.
+    #[serde(default)]
+    pub allowed_contacts: Vec<String>,
 }
 
 /// A shape with no `collision` key is a collision shape.
@@ -243,11 +285,15 @@ pub struct Simulator {
     pub on: bool,
 }
 
-/// PAUSE: hold or resume the executing trajectory.
-///
-/// Distinct from STOP: the sample ring is left intact, so resuming
-/// continues the move from where it paused instead of requiring the
-/// caller to re-issue it.
+/// Select queued-execution speed while preserving the explicit pause state.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetExecutionSpeed {
+    /// Positive fraction of the original plan, in [0.1, 1].
+    pub scale: f64,
+}
+
+/// Explicit pause or resume, retaining the selected execution speed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Pause {
@@ -286,6 +332,7 @@ pub struct ConnectHardware {
 #[serde(deny_unknown_fields)]
 pub struct SetTcpOffset {
     /// Idempotency key.
+    #[serde(default)]
     pub key: u64,
     /// X offset (mm).
     pub x: f64,
@@ -293,6 +340,28 @@ pub struct SetTcpOffset {
     pub y: f64,
     /// Z offset (mm).
     pub z: f64,
+}
+
+/// SET_TCP_TRANSFORM: queued tool-local TCP correction, composed after the
+/// registered tool frame. Translation is mm; orientation is intrinsic XYZ degrees.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SetTcpTransform {
+    /// Idempotency key.
+    #[serde(default)]
+    pub key: u64,
+    /// X translation (mm).
+    pub x: f64,
+    /// Y translation (mm).
+    pub y: f64,
+    /// Z translation (mm).
+    pub z: f64,
+    /// Intrinsic X rotation (degrees).
+    pub roll: f64,
+    /// Intrinsic Y rotation (degrees).
+    pub pitch: f64,
+    /// Intrinsic Z rotation (degrees).
+    pub yaw: f64,
 }
 
 /// SET_PAYLOAD: replace the runtime payload carried at the TCP frame.
@@ -735,6 +804,8 @@ pub enum Command {
     SetGravityComp(SetGravityComp),
     /// Hold or resume the executing trajectory.
     Pause(Pause),
+    /// Select queued-execution speed without changing pause.
+    SetExecutionSpeed(SetExecutionSpeed),
     Stop(Stop),
     WriteIo(WriteIo),
     Simulator(Simulator),
@@ -742,6 +813,7 @@ pub enum Command {
     ResetState,
     ConnectHardware(ConnectHardware),
     SetTcpOffset(SetTcpOffset),
+    SetTcpTransform(SetTcpTransform),
     SetPayload(SetPayload),
     SetShapes(SetShapes),
     SetCompletionPolicy(SetCompletionPolicy),
@@ -767,6 +839,9 @@ pub enum Command {
     Error,
     TcpSpeed,
     TcpOffset,
+    TcpTransform,
+    /// Read controller-owned execution timing.
+    ExecutionSpeed,
     ToolStatus,
     IsSimulator,
     Shapes,
@@ -806,6 +881,7 @@ impl Command {
             C::Estop => CmdType::Estop,
             C::SetGravityComp(_) => CmdType::SetGravityComp,
             C::Pause(_) => CmdType::Pause,
+            C::SetExecutionSpeed(_) => CmdType::SetExecutionSpeed,
             C::Stop(_) => CmdType::Stop,
             C::WriteIo(_) => CmdType::WriteIo,
             C::Simulator(_) => CmdType::Simulator,
@@ -813,6 +889,7 @@ impl Command {
             C::ResetState => CmdType::ResetState,
             C::ConnectHardware(_) => CmdType::ConnectHardware,
             C::SetTcpOffset(_) => CmdType::SetTcpOffset,
+            C::SetTcpTransform(_) => CmdType::SetTcpTransform,
             C::SetPayload(_) => CmdType::SetPayload,
             C::SetShapes(_) => CmdType::SetShapes,
             C::SetCompletionPolicy(_) => CmdType::SetCompletionPolicy,
@@ -837,6 +914,8 @@ impl Command {
             C::Error => CmdType::Error,
             C::TcpSpeed => CmdType::TcpSpeed,
             C::TcpOffset => CmdType::TcpOffset,
+            C::TcpTransform => CmdType::TcpTransform,
+            C::ExecutionSpeed => CmdType::ExecutionSpeed,
             C::ToolStatus => CmdType::ToolStatus,
             C::IsSimulator => CmdType::IsSimulator,
             C::Shapes => CmdType::Shapes,
@@ -882,6 +961,7 @@ impl Command {
             C::Checkpoint(p) => Some(p.key),
             C::ToolAction(p) => Some(p.key),
             C::SetTcpOffset(p) => Some(p.key),
+            C::SetTcpTransform(p) => Some(p.key),
             _ => None,
         }
     }
@@ -914,6 +994,8 @@ impl Command {
             | C::Error
             | C::TcpSpeed
             | C::TcpOffset
+            | C::ExecutionSpeed
+            | C::TcpTransform
             | C::ToolStatus
             | C::IsSimulator
             | C::Shapes
@@ -945,6 +1027,11 @@ impl Command {
                 "save_config.node",
                 "must be a CAN node id (0..=15)",
             ),
+            C::SetExecutionSpeed(p) => check(
+                p.scale.is_finite() && (0.1..=1.0).contains(&p.scale),
+                "set_execution_speed.scale",
+                "must be finite and in [0.1, 1]; use Pause to pause",
+            ),
             C::SetStatusRate(p) => check(
                 p.hz.is_finite() && p.hz > 0.0,
                 "set_status_rate.hz",
@@ -956,6 +1043,12 @@ impl Command {
             }
             C::SelectProfile(p) => str_len("select_profile.profile", &p.profile, 1, 32),
             C::ConnectHardware(p) => str_len("connect_hardware.port", &p.port, 1, 256),
+            C::SetTcpTransform(p) => {
+                for v in [p.x, p.y, p.z, p.roll, p.pitch, p.yaw] {
+                    finite("set_tcp_transform", v)?;
+                }
+                Ok(())
+            }
             C::SetTcpOffset(p) => {
                 finite("set_tcp_offset.x", p.x)?;
                 finite("set_tcp_offset.y", p.y)?;
@@ -984,12 +1077,8 @@ impl Command {
                 for s in &p.shapes {
                     str_len("shape.kind", &s.kind, 1, 32)?;
                     str_len("shape.name", &s.name, 0, 128)?;
-                    finite_all("shape.params", &s.params)?;
-                    finite_all("shape.pose", &s.pose)?;
-                    if let Some(m) = s.margin {
-                        finite("shape.margin", m)?;
-                        check(m >= 0.0, "shape.margin", "must be >= 0")?;
-                    }
+                    validate_shape(s)
+                        .map_err(|(what, why)| DecodeError::Validation { what, why })?;
                 }
                 Ok(())
             }
@@ -1294,6 +1383,8 @@ fn arity(tag: CmdType) -> usize {
         | T::Error
         | T::TcpSpeed
         | T::TcpOffset
+        | T::ExecutionSpeed
+        | T::TcpTransform
         | T::ToolStatus
         | T::IsSimulator
         | T::Shapes
@@ -1314,11 +1405,12 @@ fn arity(tag: CmdType) -> usize {
         | T::Pose => 3,
         T::WriteIo => 4,
         T::SetTcpOffset => 6,
+        T::SetTcpTransform => 9,
         T::SetPayload => 5,
         T::SetPidGains => 13,
         T::SetCanId => 5,
         T::SaveConfig => 4,
-        T::SetStatusRate => 3,
+        T::SetStatusRate | T::SetExecutionSpeed => 3,
         T::ServoJ | T::ServoJPose | T::ServoL => 5,
         T::JogJ => 5,
         T::JogL => 6,
@@ -1351,7 +1443,7 @@ fn w_opt_f64(buf: &mut Vec<u8>, v: Option<f64>) {
 }
 
 pub(crate) fn w_shape(buf: &mut Vec<u8>, s: &Shape) {
-    w_array(buf, 7);
+    w_array(buf, 8);
     w_str(buf, &s.kind);
     w_fixed(buf, &s.params);
     w_fixed(buf, &s.pose);
@@ -1363,6 +1455,17 @@ pub(crate) fn w_shape(buf: &mut Vec<u8>, s: &Shape) {
             w_array(buf, 2);
             w_opt_f64(buf, p.mass);
             w_fixed(buf, &p.friction);
+        }
+        None => w_nil(buf),
+    }
+    match &s.attachment {
+        Some(a) => {
+            w_array(buf, 2);
+            w_uint(buf, a.epoch);
+            w_array(buf, a.allowed_contacts.len());
+            for name in &a.allowed_contacts {
+                w_str(buf, name);
+            }
         }
         None => w_nil(buf),
     }
@@ -1399,6 +1502,8 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Error
         | C::TcpSpeed
         | C::TcpOffset
+        | C::ExecutionSpeed
+        | C::TcpTransform
         | C::ToolStatus
         | C::IsSimulator
         | C::Shapes
@@ -1425,8 +1530,15 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         C::Simulator(p) => w_bool(buf, p.on),
         C::SetGravityComp(p) => w_bool(buf, p.on),
         C::Pause(p) => w_bool(buf, p.on),
+        C::SetExecutionSpeed(p) => w_f64(buf, p.scale),
         C::SelectProfile(p) => w_str(buf, &p.profile),
         C::ConnectHardware(p) => w_str(buf, &p.port),
+        C::SetTcpTransform(p) => {
+            w_uint(buf, p.key);
+            for v in [p.x, p.y, p.z, p.roll, p.pitch, p.yaw] {
+                w_f64(buf, v);
+            }
+        }
         C::SetTcpOffset(p) => {
             w_uint(buf, p.key);
             w_f64(buf, p.x);
@@ -1703,10 +1815,10 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     let n = r.array_len()?;
     // The older six-element form is still accepted: a client that predates
     // physics describes geometry, which is exactly `physics: None`.
-    if n != 6 && n != 7 {
+    if !(6..=8).contains(&n) {
         return Err(DecodeError::Arity {
             what: "shape",
-            expected: 7,
+            expected: 8,
             got: n,
         });
     }
@@ -1716,8 +1828,33 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
     let collision = r.bool()?;
     let margin = r.opt_f64()?;
     let name = r.str()?.to_owned();
-    let physics = if n == 7 { r_physics(r)? } else { None };
-    Ok(Shape {
+    let physics = if n >= 7 { r_physics(r)? } else { None };
+    let attachment = if n == 8 && !r.peek_nil() {
+        let len = r.array_len()?;
+        if len != 2 {
+            return Err(DecodeError::Arity {
+                what: "shape.attachment",
+                expected: 2,
+                got: len,
+            });
+        }
+        let epoch = r.uint()?;
+        let count = r_len(r, "shape.attachment.allowed_contacts", 32)?;
+        let mut allowed_contacts = Vec::with_capacity(count);
+        for _ in 0..count {
+            allowed_contacts.push(r.str()?.to_owned());
+        }
+        Some(Attachment {
+            epoch,
+            allowed_contacts,
+        })
+    } else {
+        if n == 8 {
+            r.nil()?;
+        }
+        None
+    };
+    let shape = Shape {
         kind,
         params,
         pose,
@@ -1725,7 +1862,10 @@ pub(crate) fn r_shape(r: &mut Reader<'_>) -> Result<Shape, DecodeError> {
         margin,
         name,
         physics,
-    })
+        attachment,
+    };
+    validate_shape(&shape).map_err(|(what, why)| DecodeError::Validation { what, why })?;
+    Ok(shape)
 }
 
 fn r_physics(r: &mut Reader<'_>) -> Result<Option<Physical>, DecodeError> {
@@ -1813,12 +1953,22 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::Simulator => Command::Simulator(Simulator { on: r.bool()? }),
         T::SetGravityComp => Command::SetGravityComp(SetGravityComp { on: r.bool()? }),
         T::Pause => Command::Pause(Pause { on: r.bool()? }),
+        T::SetExecutionSpeed => Command::SetExecutionSpeed(SetExecutionSpeed { scale: r.f64()? }),
         T::SelectProfile => Command::SelectProfile(SelectProfile {
             profile: r.str()?.to_owned(),
         }),
         T::ResetState => Command::ResetState,
         T::ConnectHardware => Command::ConnectHardware(ConnectHardware {
             port: r.str()?.to_owned(),
+        }),
+        T::SetTcpTransform => Command::SetTcpTransform(SetTcpTransform {
+            key: r.uint()?,
+            x: r.f64()?,
+            y: r.f64()?,
+            z: r.f64()?,
+            roll: r.f64()?,
+            pitch: r.f64()?,
+            yaw: r.f64()?,
         }),
         T::SetTcpOffset => Command::SetTcpOffset(SetTcpOffset {
             key: r.uint()?,
@@ -1904,6 +2054,8 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::Error => Command::Error,
         T::TcpSpeed => Command::TcpSpeed,
         T::TcpOffset => Command::TcpOffset,
+        T::TcpTransform => Command::TcpTransform,
+        T::ExecutionSpeed => Command::ExecutionSpeed,
         T::ToolStatus => Command::ToolStatus,
         T::IsSimulator => Command::IsSimulator,
         T::Shapes => Command::Shapes,

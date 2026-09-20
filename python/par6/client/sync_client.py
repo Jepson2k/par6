@@ -14,8 +14,9 @@ import contextlib
 import threading
 import weakref
 from collections.abc import Callable, Coroutine, Iterable
-from typing import Any, TypeVar
+from typing import TYPE_CHECKING, Any, TypeVar
 
+from waldoctl.execution import ExecutionSpeed
 from waldoctl.shapes import Shape, ShapeWorld
 from waldoctl.status import (
     ActivityResult,
@@ -39,6 +40,9 @@ from .async_client import (
     StatusResult,
 )
 from .errors import RobotError
+
+if TYPE_CHECKING:
+    from par6.robot import Robot
 
 T = TypeVar("T")
 
@@ -136,6 +140,20 @@ class RobotClient:
         with RobotClient() as rbt:
             rbt.home(wait=True)
     """
+
+    def run_skill(
+        self, invoke: Callable[[AsyncRobotClient], Coroutine[Any, Any, T]]
+    ) -> T:
+        """Run a skill on this facade's loop with the connected async client."""
+        return _run(invoke(self._inner))
+
+    @property
+    def robot(self) -> Robot:
+        return self._inner.robot
+
+    @robot.setter
+    def robot(self, value: Robot | None) -> None:
+        self._inner.robot = value
 
     def __init__(
         self,
@@ -422,13 +440,21 @@ class RobotClient:
         """Protective stop: latch the controller disabled until ``reset()``."""
         return _run(self._inner.estop())
 
-    def pause(self) -> int:
-        """Hold the executing trajectory; the queue survives."""
-        return _run(self._inner.pause())
+    def execution_speed(self, *, timeout: float = 3.0) -> ExecutionSpeed:
+        """Read the controller's selected and applied execution speed."""
+        return _run(self._inner.execution_speed(timeout=timeout))
 
-    def resume(self) -> int:
+    def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
+        """Select queued-motion speed without releasing pause."""
+        return _run(self._inner.set_execution_speed(scale, timeout=timeout))
+
+    def pause(self, *, timeout: float = 3.0) -> int:
+        """Hold the executing trajectory; the queue survives."""
+        return _run(self._inner.pause(timeout=timeout))
+
+    def resume(self, *, timeout: float = 3.0) -> int:
         """Continue a trajectory held by :meth:`pause`."""
-        return _run(self._inner.resume())
+        return _run(self._inner.resume(timeout=timeout))
 
     def freedrive(self, enabled: bool) -> int:
         """Enter or leave freedrive: IDLE under G(q) with no position hold."""
@@ -556,6 +582,18 @@ class RobotClient:
         """Set the active end-effector tool on the controller."""
         return _run(self._inner.select_tool(tool_name, variant_key=variant_key))
 
+    def set_tcp_transform(
+        self,
+        x: float = 0,
+        y: float = 0,
+        z: float = 0,
+        roll: float = 0,
+        pitch: float = 0,
+        yaw: float = 0,
+    ) -> int:
+        """Queue the TCP transform; wait for its returned command index."""
+        return _run(self._inner.set_tcp_transform(x, y, z, roll, pitch, yaw))
+
     def set_tcp_offset(self, x: float = 0, y: float = 0, z: float = 0) -> int:
         """Set TCP offset in mm on top of the current tool transform."""
         return _run(self._inner.set_tcp_offset(x=x, y=y, z=z))
@@ -665,6 +703,10 @@ class RobotClient:
     def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
         """Whether every joint is below *threshold_speed* (rad/s)."""
         return _run(self._inner.is_robot_stopped(threshold_speed))
+
+    def tcp_transform(self) -> list[float]:
+        """Read the applied TCP correction (mm, intrinsic XYZ degrees)."""
+        return _run(self._inner.tcp_transform())
 
     def tcp_offset(self) -> list[float]:
         """Current TCP offset in mm [x, y, z]."""

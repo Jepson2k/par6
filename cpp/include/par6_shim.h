@@ -343,8 +343,20 @@ par6_status par6_col_geom_name(const par6_col *h, int32_t idx,
  * kind, wrong n_params for the kind, non-finite or non-positive dimensions,
  * non-finite pose or margin, zero plane normal. On failure the previous
  * world is left in place. Allocates; call it off the query path. */
+/* Optional metadata parallel to shapes. Names use collision-report vocabulary.
+ * parent_frame NULL means fixed world geometry; otherwise pose is relative to
+ * that URDF frame. Only an attached shape's listed partner pairs are excluded.
+ * Strings and arrays need only outlive the set-layer call. */
+typedef struct par6_shape_placement {
+    const char *name;
+    const char *parent_frame;
+    const char *const *allowed_contacts;
+    int32_t n_allowed_contacts;
+} par6_shape_placement;
+
 par6_status par6_col_set_layer(par6_col *h, int32_t layer,
                                const par6_shape *shapes, int32_t n_shapes,
+                               const par6_shape_placement *placements,
                                char *err_buf, int32_t err_len);
 
 /* Test configuration `q` (nq doubles) against the current world.
@@ -435,7 +447,7 @@ par6_status par6_kin_set_tool(par6_kin *h, double mass, const double *com3,
  *     end-effector frame). Purely additive; a stale v9 library fails to
  *     link it. */
 int32_t par6_shim_abi_version(void);
-#define PAR6_SHIM_ABI_VERSION 11
+#define PAR6_SHIM_ABI_VERSION 12
 
 #ifdef __cplusplus
 } /* extern "C" */

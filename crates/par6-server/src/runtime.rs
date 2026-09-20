@@ -99,6 +99,8 @@ pub struct PlanContext<'a> {
     pub tool_variant: Option<&'a str>,
     /// TCP offset in the tool-local frame (mm).
     pub tcp_offset_mm: [f64; 3],
+    /// Tool-local intrinsic XYZ orientation correction (degrees).
+    pub tcp_rotation_deg: [f64; 3],
     /// Controller-side completion policy for queued motion.
     pub completion_policy: CompletionPolicy,
     /// The runtime payload the torque feedforward must carry.
@@ -316,6 +318,14 @@ pub trait RtCommands: Send {
     /// Stop the active streaming session (hold in place). Idempotent.
     fn cancel_stream(&mut self);
 
+    /// Stop continuation of a stream whose update was refused. Return true
+    /// while the runtime owns a bounded stopping sequence, so a later stop
+    /// or preemption can still cancel that sequence.
+    fn stop_refused_stream(&mut self) -> bool {
+        self.cancel_stream();
+        false
+    }
+
     /// Halt all motion now (stop/estop scope). Idempotent.
     fn halt(&mut self);
 
@@ -346,6 +356,9 @@ pub trait RtCommands: Send {
     /// Hold or resume the executing trajectory, leaving the sample ring
     /// intact so a resume continues rather than restarts.
     fn set_exec_paused(&mut self, paused: bool);
+
+    /// Select queued execution speed without releasing a pause.
+    fn set_exec_speed(&mut self, scale: f64);
 
     /// Take the outcome of the last `set_enabled(true)` request, once the
     /// RT has actually answered it: `Some(Ok(()))` when the core came up

@@ -2,8 +2,8 @@
 //! path the planner produces.
 //!
 //! These claims are about the PLAN, so they are measured on the plan:
-//! `PreviewResult::tcp_poses` is the same planner the daemon runs,
-//! sampled at tick dt with no arm in the loop. That buys two things over
+//! the commanded record (`Preview::plan_record`) is the same planner the
+//! daemon runs, one FK'd row per tick with no arm in the loop. That buys two things over
 //! measuring the same claims off a live STATUS broadcast — the tolerance
 //! stops being the simulated arm's tracking lag (8-12 mm) and becomes
 //! the planner's own error, and the whole file runs in milliseconds
@@ -19,8 +19,8 @@ use par6d::preview::{Preview, PreviewResult};
 mod common;
 use common::{
     assets_dir, distance, distance_to_segment, path_misses, process_corner, progress_along,
-    retimed_config, rotation_angle_deg, spline_waypoints, to_rad, wire_pose_at, ARC_RADIUS_MM,
-    CURVE_START_DEG,
+    retimed_config, rotation_angle_deg, span_tcp, spline_waypoints, to_rad, wire_pose_at,
+    ARC_RADIUS_MM, CURVE_START_DEG,
 };
 
 /// The planner's own path error. Two orders tighter than the live suite's
@@ -56,14 +56,19 @@ fn tcp_mm(pose: &[f64; 16]) -> [f64; 3] {
     [pose[3] * 1000.0, pose[7] * 1000.0, pose[11] * 1000.0]
 }
 
-/// The planned TCP path \[mm\], one point per tick.
-fn path_of(r: &PreviewResult) -> Vec<[f64; 3]> {
+/// The planned TCP path \[mm\] of `r`, one point per row of the commanded
+/// record it owns.
+fn path_of(preview: &mut Preview, r: &PreviewResult) -> Vec<[f64; 3]> {
     assert!(
         r.error.is_none(),
         "the move must be accepted, got {:?}",
         r.error
     );
-    let path: Vec<[f64; 3]> = r.tcp_poses.iter().map(tcp_mm).collect();
+    let record = preview.plan_record(None);
+    let path: Vec<[f64; 3]> = span_tcp(&record, r.start_row, r.rows)
+        .iter()
+        .map(tcp_mm)
+        .collect();
     assert!(
         path.len() > 50,
         "expected a sampled path, got {} points",
@@ -84,7 +89,7 @@ fn move_c_traces_the_circle_through_its_via_point() {
     let via = [center[0], center[1], center[2] - ARC_RADIUS_MM];
     let end = [center[0] + ARC_RADIUS_MM, center[1], center[2]];
 
-    let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
+    let r = p.preview.submit(Command::MoveC(MoveC {
         key: 4001,
         via: wire_pose_at(&p.pose, via),
         end: wire_pose_at(&p.pose, end),
@@ -94,7 +99,8 @@ fn move_c_traces_the_circle_through_its_via_point() {
         accel: None,
         blend_radius: None,
         rel: false,
-    })));
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let radial = path
         .iter()
@@ -144,7 +150,7 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
     let mut p = planned("curve-arc-rel");
     let end = [p.start[0] + 2.0 * ARC_RADIUS_MM, p.start[1], p.start[2]];
 
-    let path = path_of(&p.preview.submit(Command::MoveC(MoveC {
+    let r = p.preview.submit(Command::MoveC(MoveC {
         key: 4005,
         via: [ARC_RADIUS_MM, 0.0, -ARC_RADIUS_MM, 0.0, 0.0, 0.0],
         end: [2.0 * ARC_RADIUS_MM, 0.0, 0.0, 0.0, 0.0, 0.0],
@@ -154,7 +160,8 @@ fn a_relative_move_c_lands_where_its_absolute_twin_lands() {
         accel: None,
         blend_radius: None,
         rel: true,
-    })));
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let miss = distance(*path.last().expect("path"), end);
     assert!(
@@ -179,20 +186,19 @@ fn move_s_passes_through_every_waypoint_and_curves_between_them() {
     let mut p = planned("curve-spline");
     let waypoints = spline_waypoints(p.start);
 
-    let path = path_of(
-        &p.preview.submit(Command::MoveS(MoveS {
-            key: 4002,
-            waypoints: waypoints
-                .iter()
-                .map(|w| wire_pose_at(&p.pose, *w))
-                .collect(),
-            frame: Frame::Wrf,
-            duration: Some(6.0),
-            speed: None,
-            accel: None,
-            rel: false,
-        })),
-    );
+    let r = p.preview.submit(Command::MoveS(MoveS {
+        key: 4002,
+        waypoints: waypoints
+            .iter()
+            .map(|w| wire_pose_at(&p.pose, *w))
+            .collect(),
+        frame: Frame::Wrf,
+        duration: Some(6.0),
+        speed: None,
+        accel: None,
+        rel: false,
+    }));
+    let path = path_of(&mut p.preview, &r);
 
     let last = *waypoints.last().expect("waypoints");
     for (k, w) in waypoints.iter().enumerate() {
@@ -250,8 +256,8 @@ fn move_p_rounds_its_corner_and_holds_one_tool_speed() {
         accel: None,
         rel: false,
     }));
-    let dt = p.preview.tick_dt_s();
-    let path = path_of(&result);
+    let dt = p.preview.plan_record(None).row_dt_s;
+    let path = path_of(&mut p.preview, &result);
 
     // 25 mm of auto-blend on 100 mm segments: the corner is cut, by less
     // than the blend zone and by more than nothing.
@@ -334,7 +340,7 @@ fn a_full_speed_move_p_prices_its_corner_instead_of_refusing() {
         fast.duration_s,
         paced.duration_s
     );
-    let path = path_of(&fast);
+    let path = path_of(&mut p.preview, &fast);
     let corner_miss = path_misses(&path, corner);
     assert!(
         (1.0..25.0).contains(&corner_miss),
@@ -386,15 +392,16 @@ fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
     results.extend(p.preview.flush());
     let motion = PreviewResult::concat(results.into_iter().filter(|r| !r.pending).collect())
         .expect("the closed chain plans a motion");
+    let poses = span_tcp(&p.preview.plan_record(None), motion.start_row, motion.rows);
     assert!(
-        motion.tcp_poses.len() > 100,
+        poses.len() > 100,
         "expected a sampled contour, got {} poses",
-        motion.tcp_poses.len()
+        poses.len()
     );
 
     // Every corner rounded: the path passes near each one but not
     // through it, and lands on the last.
-    let path: Vec<[f64; 3]> = motion.tcp_poses.iter().map(tcp_mm).collect();
+    let path: Vec<[f64; 3]> = poses.iter().map(tcp_mm).collect();
     for (k, c) in corners[..4].iter().enumerate() {
         let miss = path_misses(&path, *c);
         assert!(
@@ -408,8 +415,7 @@ fn a_rounded_square_holds_the_tool_orientation_through_every_corner() {
         "the chain planned to end {end_miss:.3} mm off its last pose"
     );
 
-    let drift = motion
-        .tcp_poses
+    let drift = poses
         .iter()
         .map(|pose| rotation_angle_deg(&p.pose, pose))
         .fold(0.0f64, f64::max);

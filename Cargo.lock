@@ -784,21 +784,23 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "par6-bus"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "libc",
  "log",
  "mujoco-rs",
  "par6-config",
+ "par6-kin",
  "par6-proto",
  "roxmltree",
+ "serde",
  "socketcan",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "par6-client"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "env_logger",
  "log",
@@ -813,7 +815,7 @@ dependencies = [
 
 [[package]]
 name = "par6-config"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "log",
  "par6-proto",
@@ -824,7 +826,7 @@ dependencies = [
 
 [[package]]
 name = "par6-kin"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "glam",
  "par6-config",
@@ -838,7 +840,7 @@ dependencies = [
 
 [[package]]
 name = "par6-motion"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "glam",
  "par6-config",
@@ -849,15 +851,16 @@ dependencies = [
 
 [[package]]
 name = "par6-proto"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "serde",
+ "serde_json",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "par6-py"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "log",
  "par6-bus",
@@ -877,20 +880,21 @@ dependencies = [
 
 [[package]]
 name = "par6-rt"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "gpiocdev",
  "libc",
  "log",
  "par6-bus",
  "par6-config",
+ "par6-kin",
  "thiserror 2.0.20",
  "thread-priority",
 ]
 
 [[package]]
 name = "par6-server"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "log",
  "par6-config",
@@ -903,7 +907,7 @@ dependencies = [
 
 [[package]]
 name = "par6d"
-version = "0.3.0"
+version = "0.6.0"
 dependencies = [
  "clap",
  "env_logger",

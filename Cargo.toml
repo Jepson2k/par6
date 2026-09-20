@@ -14,7 +14,11 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+# The single version for everything this repo publishes: every crate takes
+# it with `version.workspace = true`, and the `par6` wheel declares
+# `dynamic = ["version"]` so maturin reads it from here too. A `v*` tag is
+# what release.yml publishes, so it names this number.
+version = "0.6.0"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Jepson2k/par6"
@@ -22,6 +26,20 @@ repository = "https://github.com/Jepson2k/par6"
 # (edition 2024, rust-version 1.95); before it, rsruckig 3.0's use of
 # `is_multiple_of` needed 1.87.
 rust-version = "1.95"
+
+# `cargo release` owns the bump and the tag, so the tag name is generated
+# from the version above rather than typed: `cargo release version <x.y.z>`
+# edits the manifest (and the lock) for a normal PR, and once that is on
+# main `cargo release tag && cargo release push` cuts `v<x.y.z>`, which is
+# what release.yml builds and publishes. Nothing goes to crates.io.
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+# The default interpolates a crate name, which means nothing for a tag the
+# whole workspace shares.
+tag-message = "par6 {{version}}"
+publish = false
+push = false
 
 [workspace.dependencies]
 # The simulator's physics: bindings only. libmujoco comes from the same
@@ -42,6 +60,7 @@ par6-client = { path = "crates/par6-client" }
 
 glam = "=0.30.10"
 serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 clap = { version = "4", features = ["derive", "env"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "time", "macros"] }
 socketcan = "3.6"

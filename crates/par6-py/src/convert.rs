@@ -108,6 +108,7 @@ pub fn status_dict(py: Python<'_>, s: &Status) -> PyResult<PyObject> {
     let d = PyDict::new(py);
     d.set_item("proto_version", s.proto_version)?;
     d.set_item("controller_id", s.controller_id)?;
+    d.set_item("session_id", s.session_id)?;
     d.set_item("seq", s.seq)?;
     d.set_item("mono_time_ns", s.mono_time_ns)?;
     d.set_item("link_ok", s.link_ok)?;
@@ -192,6 +193,10 @@ pub(crate) fn shape_dict(py: Python<'_>, s: &Shape) -> PyResult<PyObject> {
         Some(ph) => d.set_item("physics", (ph.mass, ph.friction.to_vec()))?,
         None => d.set_item("physics", py.None())?,
     }
+    match &s.attachment {
+        Some(a) => d.set_item("attachment", (a.epoch, a.allowed_contacts.clone()))?,
+        None => d.set_item("attachment", py.None())?,
+    }
     Ok(d.into_any().unbind())
 }
 
@@ -246,9 +251,14 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("next", next)?;
             d.set_item("params", params)?;
         }
-        QueryResult::StatusRate { hz, tick_hz } => {
+        QueryResult::StatusRate {
+            hz,
+            tick_hz,
+            servable,
+        } => {
             d.set_item("hz", hz)?;
             d.set_item("tick_hz", tick_hz)?;
+            d.set_item("servable", servable.clone())?;
         }
         QueryResult::LoopStats(s) => {
             d.set_item("target_hz", s.target_hz)?;
@@ -281,6 +291,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             installation,
             program,
             epoch,
+            attachment_epoch,
         } => {
             let inst = PyList::empty(py);
             for s in installation {
@@ -293,6 +304,16 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             d.set_item("installation", inst)?;
             d.set_item("program", prog)?;
             d.set_item("epoch", *epoch)?;
+            d.set_item("attachment_epoch", *attachment_epoch)?;
+        }
+        QueryResult::ExecutionSpeed {
+            target_scale,
+            applied_scale,
+            resume_scale,
+        } => {
+            d.set_item("target_scale", *target_scale)?;
+            d.set_item("applied_scale", *applied_scale)?;
+            d.set_item("resume_scale", *resume_scale)?;
         }
         QueryResult::Payload { mass, com, inertia } => {
             fill_payload(&d, *mass, *com, *inertia)?;
@@ -377,11 +398,25 @@ pub fn shape_from_py(d: &Bound<'_, PyDict>) -> PyResult<Shape> {
         Some(v) if !v.is_none() => Some(physical_from_py(&v)?),
         _ => None,
     };
+    let attachment = match d.get_item("attachment")? {
+        Some(v) if !v.is_none() => {
+            if v.len()? != 2 {
+                return Err(PyRuntimeError::new_err("bad shape attachment"));
+            }
+            Some(par6_proto::Attachment {
+                epoch: v.get_item(0)?.extract()?,
+                allowed_contacts: v.get_item(1)?.extract()?,
+            })
+        }
+        _ => None,
+    };
     let rest = d.copy()?;
     rest.del_item("physics").ok();
+    rest.del_item("attachment").ok();
     let mut shape: Shape = pythonize::depythonize(&rest)
         .map_err(|e| PyRuntimeError::new_err(format!("bad shape: {e}")))?;
     shape.physics = physics;
+    shape.attachment = attachment;
     Ok(shape)
 }
 
@@ -471,7 +506,7 @@ pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
 /// optional key (NaN on the wire) is `None`.
 pub(crate) fn motion_dict<'py>(
     py: Python<'py>,
-    values: &[f64; 13],
+    values: &[f64; 14],
 ) -> PyResult<Bound<'py, PyDict>> {
     let m = PyDict::new(py);
     for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {

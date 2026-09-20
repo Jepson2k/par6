@@ -1,11 +1,15 @@
 //! The offline dry-run binding over `par6d::preview`.
 //!
-//! Two passes, and the difference between them is the point.
-//! [`Preview::submit`] plans: it asks the daemon's own planner, server
-//! rules and streaming integrator what they would drive, fast enough to
-//! run behind a keystroke. [`Preview::run_program`] *runs*: it ticks the
-//! same engine the simulator ticks, and what comes back is what the arm
-//! did, sag and servo lag and contact included.
+//! Two records of one program, and the difference between them is the
+//! point. [`Preview::submit`] plans: it asks the daemon's own planner,
+//! server rules and streaming integrator what they would drive, fast
+//! enough to run behind a keystroke, and [`Preview::plan_record`] is
+//! what they have said so far — the *commanded* record.
+//! [`Preview::run_program`] *runs*: it ticks the same engine the
+//! simulator ticks, and what comes back is what the arm did, sag and
+//! servo lag and contact included — the *predicted* record. Both are the
+//! same tick record with one span per program command, so a consumer
+//! lays them on one row axis and reads the following error off the gap.
 //!
 //! A tick record crosses as raw column buffers rather than lists of
 //! lists. A minute of program is a few hundred thousand numbers, and
@@ -21,7 +25,7 @@ use pyo3::types::{PyBytes, PyDict, PyList};
 use par6_proto::NUM_JOINTS;
 use par6d::matrix_to_xyzrpy;
 use par6d::preview::record::{mode_name, TickBatch};
-use par6d::preview::{Preview as EnginePreview, PreviewResult, RunLimits};
+use par6d::preview::{Preview as EnginePreview, RunLimits};
 
 use crate::config::motion_dict;
 use crate::convert::{
@@ -54,6 +58,12 @@ fn bool_col<'py>(py: Python<'py>, v: &[bool]) -> PyResult<Bound<'py, PyBytes>> {
 /// A [`TickBatch`] as the shim's `np.frombuffer` reads it. Shapes are
 /// implied by `rows` and `joints`; the byte order is the machine's,
 /// which is the only one either side runs on.
+///
+/// The columns every record carries are always present. The ones only a
+/// plant can fill — the post-limiter setpoint, the centre of mass, the
+/// contacts, the RT modes, the object tracks — are present only when the
+/// record has them, so a consumer keys what it can show on the keys it
+/// finds rather than on which engine produced the record.
 fn batch_dict(py: Python<'_>, b: &TickBatch) -> PyResult<PyObject> {
     let d = PyDict::new(py);
     d.set_item("row_dt_s", b.row_dt_s)?;
@@ -62,24 +72,10 @@ fn batch_dict(py: Python<'_>, b: &TickBatch) -> PyResult<PyObject> {
     d.set_item("joints", b.joints)?;
     d.set_item("rows", b.rows)?;
     d.set_item("q_rad", f32_col(py, &b.q_rad)?)?;
-    d.set_item("q_commanded_rad", f32_col(py, &b.q_commanded_rad)?)?;
     d.set_item("tcp", f32_col(py, &b.tcp)?)?;
     d.set_item("tool_closed", f32_col(py, &b.tool_closed)?)?;
     d.set_item("tool_gripping", bool_col(py, &b.tool_gripping)?)?;
-    d.set_item("com", f32_col(py, &b.com)?)?;
-    d.set_item("contact_pos", f32_col(py, &b.contact_pos)?)?;
-    d.set_item("contact_force", f32_col(py, &b.contact_force)?)?;
-    d.set_item(
-        "contact_starts",
-        col(py, &b.contact_starts, u32::to_ne_bytes)?,
-    )?;
     d.set_item("stop", b.stop.as_str())?;
-
-    let modes = PyList::empty(py);
-    for span in &b.modes {
-        modes.append((span.start_row, mode_name(span.value)))?;
-    }
-    d.set_item("modes", modes)?;
 
     let commands = PyList::empty(py);
     for span in &b.commands {
@@ -95,51 +91,37 @@ fn batch_dict(py: Python<'_>, b: &TickBatch) -> PyResult<PyObject> {
     }
     d.set_item("commands", commands)?;
 
-    let objects = PyList::empty(py);
-    for t in &b.objects {
-        let od = PyDict::new(py);
-        od.set_item("name", &t.name)?;
-        od.set_item("rows", t.poses.len())?;
-        od.set_item("poses", f32_col(py, t.poses.as_flattened())?)?;
-        objects.append(od)?;
+    if !b.q_commanded_rad.is_empty() {
+        d.set_item("setpoint_rad", f32_col(py, &b.q_commanded_rad)?)?;
     }
-    d.set_item("objects", objects)?;
-    Ok(d.into_any().unbind())
-}
-
-/// Sample indices that keep a trajectory under `max_points` with both
-/// endpoints retained.
-/// At most `max_points` sample indices, evenly spread, both endpoints kept.
-fn sample_indices(len: usize, max_points: usize) -> Vec<usize> {
-    if len == 0 {
-        return Vec::new();
+    if !b.com.is_empty() {
+        d.set_item("com", f32_col(py, &b.com)?)?;
     }
-    let cap = max_points.max(2);
-    if len <= cap {
-        return (0..len).collect();
+    if !b.contact_starts.is_empty() {
+        d.set_item("contact_pos", f32_col(py, &b.contact_pos)?)?;
+        d.set_item("contact_force", f32_col(py, &b.contact_force)?)?;
+        d.set_item(
+            "contact_starts",
+            col(py, &b.contact_starts, u32::to_ne_bytes)?,
+        )?;
     }
-    (0..cap).map(|k| k * (len - 1) / (cap - 1)).collect()
-}
-
-fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: usize) -> PyResult<PyObject> {
-    let d = PyDict::new(py);
-    let idx = sample_indices(r.joint_trajectory_rad.len(), max_points);
-    let traj = PyList::empty(py);
-    let xyzrpy = PyList::empty(py);
-    for &i in &idx {
-        traj.append(r.joint_trajectory_rad[i].to_vec())?;
-        if let Some(p) = r.tcp_poses.get(i) {
-            xyzrpy.append(matrix_to_xyzrpy(p).to_vec())?;
+    if !b.modes.is_empty() {
+        let modes = PyList::empty(py);
+        for span in &b.modes {
+            modes.append((span.start_row, mode_name(span.value)))?;
         }
+        d.set_item("modes", modes)?;
     }
-    d.set_item("joint_trajectory_rad", traj)?;
-    d.set_item("tcp_xyzrpy", xyzrpy)?;
-    d.set_item("end_joints_rad", r.end_joints_rad.to_vec())?;
-    d.set_item("duration_s", r.duration_s)?;
-    d.set_item("pending", r.pending)?;
-    match &r.error {
-        Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
-        None => d.set_item("error", py.None())?,
+    if !b.objects.is_empty() {
+        let objects = PyList::empty(py);
+        for t in &b.objects {
+            let od = PyDict::new(py);
+            od.set_item("name", &t.name)?;
+            od.set_item("rows", t.poses.len())?;
+            od.set_item("poses", f32_col(py, t.poses.as_flattened())?)?;
+            objects.append(od)?;
+        }
+        d.set_item("objects", objects)?;
     }
     Ok(d.into_any().unbind())
 }
@@ -148,7 +130,6 @@ fn result_dict(py: Python<'_>, r: &PreviewResult, max_points: usize) -> PyResult
 #[pyclass(module = "par6._par6")]
 pub struct Preview {
     inner: Mutex<EnginePreview>,
-    max_points: usize,
 }
 
 #[pymethods]
@@ -156,15 +137,13 @@ impl Preview {
     /// Build a session from a robot config path (the runtime's own
     /// search when `None`), an assets tree and the directory
     /// `package://` mesh URIs resolve under, starting referenced at the
-    /// park pose. Trajectories are downsampled to `max_points` samples
-    /// (endpoints kept) on the way out.
+    /// park pose.
     #[new]
-    #[pyo3(signature = (config=None, assets=None, package_dir=None, max_points=200))]
+    #[pyo3(signature = (config=None, assets=None, package_dir=None))]
     fn new(
         config: Option<String>,
         assets: Option<String>,
         package_dir: Option<String>,
-        max_points: usize,
     ) -> PyResult<Self> {
         let inner = EnginePreview::new(
             config.map(std::path::PathBuf::from).as_deref(),
@@ -174,29 +153,48 @@ impl Preview {
         .map_err(|e| PyRuntimeError::new_err(e.to_string()))?;
         Ok(Self {
             inner: Mutex::new(inner),
-            max_points: max_points.max(2),
         })
     }
 
     /// Submit one command dict (`type` selects the family; the other
-    /// keys mirror the wire fields): the result dict, or `None` while
-    /// the command waits in the blend hold. A refusal comes back as the
-    /// result's `error` six-tuple — the runtime's own text.
-    fn submit(&self, py: Python<'_>, command: &Bound<'_, PyDict>) -> PyResult<Option<PyObject>> {
+    /// keys mirror the wire fields). The answer is `{"pending", "error"}`:
+    /// `pending` while the command waits in the blend hold, else the
+    /// refusal as the runtime's own six-tuple or `None`. What the command
+    /// does to the arm is in the commanded record (`plan_record`), under
+    /// the span the submission opened.
+    fn submit(&self, py: Python<'_>, command: &Bound<'_, PyDict>) -> PyResult<PyObject> {
         let cmd = command_from_py(command)?;
         let r = self.inner.lock().unwrap().submit(cmd);
-        if r.pending {
-            return Ok(None);
+        let d = PyDict::new(py);
+        d.set_item("pending", r.pending)?;
+        match &r.error {
+            Some(e) => d.set_item("error", wire_error_tuple(py, e))?,
+            None => d.set_item("error", py.None())?,
         }
-        result_dict(py, &r, self.max_points).map(Some)
+        Ok(d.into_any().unbind())
     }
 
-    /// Plan whatever the blend hold still holds; `None` when nothing waits.
-    fn flush(&self, py: Python<'_>) -> PyResult<Option<PyObject>> {
-        match self.inner.lock().unwrap().flush() {
-            Some(r) => result_dict(py, &r, self.max_points).map(Some),
-            None => Ok(None),
-        }
+    /// Plan whatever the blend hold still holds, as the runtime's hold
+    /// expiry would at the end of a program. A refused chain is reported
+    /// on its spans in the commanded record.
+    fn flush(&self) {
+        self.inner.lock().unwrap().flush();
+    }
+
+    /// Start the program here: the commanded record begins empty, and a
+    /// run boots from the state the session stands in now.
+    fn begin_program(&self) {
+        self.inner.lock().unwrap().begin_program();
+    }
+
+    /// The commanded record of every command submitted since
+    /// `begin_program`, the blend hold closed — see `batch_dict` for the
+    /// columns. `max_seconds` cuts it to that much SIMULATED time, marked
+    /// `stop = "budget_exhausted"`.
+    #[pyo3(signature = (max_seconds=None))]
+    fn plan_record(&self, py: Python<'_>, max_seconds: Option<f64>) -> PyResult<PyObject> {
+        let batch = self.inner.lock().unwrap().plan_record(max_seconds);
+        batch_dict(py, &batch)
     }
 
     /// The virtual arm pose \[rad\].
@@ -306,6 +304,10 @@ impl Preview {
         self.inner.lock().unwrap().profile().to_owned()
     }
 
+    fn tcp_transform(&self) -> Vec<f64> {
+        self.inner.lock().unwrap().tcp_transform().to_vec()
+    }
+
     fn tcp_offset_mm(&self) -> Vec<f64> {
         self.inner.lock().unwrap().tcp_offset_mm().to_vec()
     }
@@ -360,13 +362,16 @@ impl Preview {
         self.inner.lock().unwrap().tick_dt_s()
     }
 
+    fn execution_speed(&self) -> [f64; 3] {
+        self.inner.lock().unwrap().execution_speed()
+    }
+
     /// The effective `[motion]` feel constants, keyed by config name.
     fn motion<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let m = self.inner.lock().unwrap().motion();
         motion_dict(py, &m)
     }
 
-    /// Where the configured homing seek leaves the arm \[rad\].
     /// What the virtual arm carries: `mass`, `com`, `inertia` (zeros = none).
     fn payload<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
         let p = self.inner.lock().unwrap().payload();
@@ -375,23 +380,29 @@ impl Preview {
         Ok(d)
     }
 
-    /// The motion a payload estimation makes from here — the wrist swing
-    /// `calibrate` plans, at its speed, ending where the arm stood —
-    /// as one result dict like any other previewed command. Measures
-    /// nothing.
+    /// The joint targets \[rad\] a payload estimation drives the arm
+    /// through from here, in the order the live protocol visits them,
+    /// ending where the arm stands. Submitted as joint moves at
+    /// `estimation_speed`, they are the estimation's motion — measured
+    /// nothing, a preview has no torque. Raises when the wrist has no
+    /// room to swing, as the live estimation would.
     #[pyo3(signature = (spread=0.5))]
-    fn estimate_payload(&self, py: Python<'_>, spread: f64) -> PyResult<PyObject> {
-        let (poses, r) = self
-            .inner
+    fn estimation_poses(&self, spread: f64) -> PyResult<Vec<Vec<f64>>> {
+        self.inner
             .lock()
             .unwrap()
-            .preview_estimation(spread)
-            .map_err(PyRuntimeError::new_err)?;
-        let d = result_dict(py, &r, self.max_points)?;
-        d.bind(py).downcast::<PyDict>()?.set_item("poses", poses)?;
-        Ok(d)
+            .estimation_poses(spread)
+            .map(|poses| poses.iter().map(|q| q.to_vec()).collect())
+            .map_err(PyRuntimeError::new_err)
     }
 
+    /// The joint-move speed fraction the estimation protocol drives at.
+    #[staticmethod]
+    fn estimation_speed() -> f64 {
+        EnginePreview::estimation_speed()
+    }
+
+    /// Where the configured homing seek leaves the arm \[rad\].
     fn homing_ready_pose_rad(&self) -> Vec<f64> {
         self.inner.lock().unwrap().homing_ready_pose_rad().to_vec()
     }
@@ -417,7 +428,7 @@ impl Preview {
     /// SHAPES readback, for the same file.
     fn shapes(&self, py: Python<'_>) -> PyResult<PyObject> {
         let inner = self.inner.lock().unwrap();
-        let (installation, program, epoch) = inner.shapes();
+        let (installation, program, epoch, attachment_epoch) = inner.shapes();
         let layer = |shapes: &[par6_proto::Shape]| -> PyResult<Vec<PyObject>> {
             shapes.iter().map(|s| shape_dict(py, s)).collect()
         };
@@ -425,13 +436,15 @@ impl Preview {
         d.set_item("installation", layer(installation)?)?;
         d.set_item("program", layer(program)?)?;
         d.set_item("epoch", epoch)?;
+        d.set_item("attachment_epoch", attachment_epoch)?;
         Ok(d.into_any().unbind())
     }
 
-    /// Run a program through the engine: the same planner driving a real
-    /// control loop against the simulated plant, ticked flat out. What
-    /// comes back is a tick record of what the arm DID — see
-    /// `batch_dict` for the columns — not a plan of what it was told to.
+    /// Run a program through the engine from where `begin_program` left
+    /// it: the same planner driving a real control loop against the
+    /// simulated plant, ticked flat out. What comes back is a tick record
+    /// of what the arm DID — see `batch_dict` for the columns — not a
+    /// plan of what it was told to. The session's own pose does not move.
     ///
     /// `max_seconds` bounds the SIMULATED time, so a program that never
     /// terminates still returns, with `stop = "budget_exhausted"`.
@@ -439,12 +452,13 @@ impl Preview {
     /// The GIL is released for the run: at roughly sixty times real time
     /// a ten minute program is some ten seconds of computing, and the
     /// caller's event loop must not stop for it.
-    #[pyo3(signature = (cmds, max_seconds=None))]
+    #[pyo3(signature = (cmds, max_seconds=None, scenario=None))]
     fn run_program(
         &self,
         py: Python<'_>,
         cmds: Vec<Bound<'_, PyDict>>,
         max_seconds: Option<f64>,
+        scenario: Option<&Bound<'_, PyDict>>,
     ) -> PyResult<PyObject> {
         let commands = cmds
             .iter()
@@ -454,46 +468,17 @@ impl Preview {
             Some(max_seconds) => RunLimits { max_seconds },
             None => RunLimits::default(),
         };
+        let scenario: par6_bus::sim::SimulationScenario = match scenario {
+            Some(value) => pythonize::depythonize(value.as_any())?,
+            None => Default::default(),
+        };
         let batch = py.allow_threads(|| {
             self.inner
                 .lock()
                 .unwrap()
-                .run(&commands, limits)
+                .run_scenario(&commands, limits, &scenario)
                 .map_err(|e| PyRuntimeError::new_err(e.to_string()))
         })?;
         batch_dict(py, &batch)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::sample_indices;
-
-    /// The limit is a limit: a caller sizing a payload gets no more than
-    /// it asked for, at any length, and always both ends of the motion.
-    #[test]
-    fn downsampling_never_exceeds_the_limit_and_keeps_the_endpoints() {
-        for len in [0usize, 1, 2, 3, 199, 200, 201, 399, 400, 601, 5000] {
-            for cap in [2usize, 3, 200, 1000] {
-                let idx = sample_indices(len, cap);
-                assert!(
-                    idx.len() <= cap.max(2),
-                    "len {len} cap {cap}: {} samples",
-                    idx.len()
-                );
-                if len == 0 {
-                    assert!(idx.is_empty());
-                    continue;
-                }
-                assert_eq!(idx[0], 0, "len {len} cap {cap}: first sample");
-                assert_eq!(idx[idx.len() - 1], len - 1, "len {len} cap {cap}: last");
-                assert!(
-                    idx.windows(2).all(|w| w[0] < w[1]),
-                    "len {len} cap {cap}: samples must advance, got {idx:?}"
-                );
-                // Nothing is dropped that did not have to be.
-                assert_eq!(idx.len(), len.min(cap.max(2)), "len {len} cap {cap}");
-            }
-        }
     }
 }

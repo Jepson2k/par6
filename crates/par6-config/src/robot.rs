@@ -191,6 +191,18 @@ pub struct JointConfig {
     /// Driver voltage limit \[mV\] (cmd 34); 0 = use VBUS. Old firmware
     /// ignores the frame.
     pub voltage_limit_mv: u32,
+    /// Motor phase resistance \[ohm\] and inductance \[mH\].
+    ///
+    /// The motor's own electrical constants, from its datasheet or from
+    /// the driver's `Cal` routine, which measures both and keeps them in
+    /// EEPROM. The simulator needs them to model the current loop
+    /// against `voltage_limit_mv`: without them it applies the commanded
+    /// current instantly, which is a drive with unlimited authority.
+    /// Omitted on a motor whose constants are not known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_resistance_ohm: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub phase_inductance_mh: Option<f64>,
     /// Motor velocity limit \[encoder ticks/s\] (cmd 20).
     pub velocity_limit_ticks_s: f64,
     /// Driver watchdog timeout \[ms\] (cmd 15, wire unit is ms). Fires
@@ -458,10 +470,10 @@ pub struct SimConfig {
     pub motor_b_nm_s: f64,
     /// Motor Coulomb friction \[Nm, motor side\], shared.
     pub motor_tc_nm: f64,
-    /// Gearbox holding friction per joint \[Nm, joint side\]: the load
-    /// the unpowered drivetrain holds without back-driving. Must cover
-    /// the joint's worst gravity torque or an IDLE arm collapses.
-    pub holding_friction_nm: Vec<f64>,
+    /// Assumed powered load support per joint \[Nm, joint side\]. This
+    /// empirical fit is not a measured passive-friction or brake parameter.
+    /// Supply-loss scenarios remove it when their supply envelope reaches zero.
+    pub powered_support_nm: Vec<f64>,
 }
 
 impl Default for SimConfig {
@@ -470,7 +482,7 @@ impl Default for SimConfig {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
             motor_b_nm_s: 1.0e-4,
             motor_tc_nm: 0.02,
-            holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            powered_support_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
 }
@@ -578,6 +590,9 @@ pub struct MotionConfig {
     pub settle_tolerance_rad: f64,
     /// Settle timeout \[s\].
     pub settle_timeout_s: f64,
+    /// Minimum time for a unit change of queued execution scale [s].
+    /// Joint acceleration constraints may extend a transition.
+    pub execution_override_transition_s: f64,
     /// Rotation weight `w` in the multi-segment path metric
     /// √(t² + (w·θ)²) \[m/rad\] (vendor: 0.15).
     pub path_rot_weight_m_per_rad: f64,
@@ -591,7 +606,7 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 13] = [
+    pub const KEYS: [&'static str; 14] = [
         "jog_l_linear_max_m_s",
         "jog_l_angular_max_rad_s",
         "cart_step_m",
@@ -602,6 +617,7 @@ impl MotionConfig {
         "dls_lambda",
         "settle_tolerance_rad",
         "settle_timeout_s",
+        "execution_override_transition_s",
         "path_rot_weight_m_per_rad",
         "singularity_cond_max",
         "singularity_sigma_min",
@@ -609,7 +625,7 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 13] {
+    pub fn as_array(&self) -> [f64; 14] {
         [
             self.jog_l_linear_max_m_s,
             self.jog_l_angular_max_rad_s,
@@ -621,6 +637,7 @@ impl MotionConfig {
             self.dls_lambda,
             self.settle_tolerance_rad,
             self.settle_timeout_s,
+            self.execution_override_transition_s,
             self.path_rot_weight_m_per_rad,
             self.singularity_cond_max,
             self.singularity_sigma_min,
@@ -641,6 +658,7 @@ impl Default for MotionConfig {
             dls_lambda: 0.05,
             settle_tolerance_rad: 0.01,
             settle_timeout_s: 2.0,
+            execution_override_transition_s: 1.0,
             path_rot_weight_m_per_rad: 0.15,
             singularity_cond_max: 1000.0,
             singularity_sigma_min: 1e-4,
@@ -946,6 +964,22 @@ impl RobotConfig {
         if j.dir > 1 {
             return Err(invalid(f("dir"), "must be 0 or 1"));
         }
+        for (name, v) in [
+            ("phase_resistance_ohm", j.phase_resistance_ohm),
+            ("phase_inductance_mh", j.phase_inductance_mh),
+        ] {
+            if let Some(v) = v {
+                if !(v.is_finite() && v > 0.0) {
+                    return Err(invalid(f(name), "must be finite and > 0"));
+                }
+            }
+        }
+        if j.phase_resistance_ohm.is_some() != j.phase_inductance_mh.is_some() {
+            return Err(invalid(
+                f("phase_resistance_ohm"),
+                "resistance and inductance are a pair: give both or neither",
+            ));
+        }
         if j.kt_nm_a <= 0.0 {
             return Err(invalid(f("kt_nm_a"), "must be > 0"));
         }
@@ -1178,18 +1212,17 @@ impl RobotConfig {
 
     fn validate_sim(&self) -> Result<(), ConfigError> {
         let sim = &self.sim;
-        if sim.motor_jm_kg_m2.len() != self.joints.len() {
-            return Err(invalid(
-                "sim.motor_jm_kg_m2",
-                "must carry one entry per joint",
-            ));
-        }
-        for (j, v) in sim.motor_jm_kg_m2.iter().enumerate() {
-            if !(v.is_finite() && *v >= 0.0) {
-                return Err(invalid(
-                    "sim.motor_jm_kg_m2",
-                    format!("entry {j} must be finite and >= 0"),
-                ));
+        for (values, name) in [
+            (&sim.motor_jm_kg_m2, "sim.motor_jm_kg_m2"),
+            (&sim.powered_support_nm, "sim.powered_support_nm"),
+        ] {
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !(v.is_finite() && *v >= 0.0) {
+                    return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
+                }
             }
         }
         for (v, name) in [
@@ -1321,6 +1354,10 @@ impl RobotConfig {
             (m.dls_lambda, "motion.dls_lambda"),
             (m.settle_tolerance_rad, "motion.settle_tolerance_rad"),
             (m.settle_timeout_s, "motion.settle_timeout_s"),
+            (
+                m.execution_override_transition_s,
+                "motion.execution_override_transition_s",
+            ),
             (
                 m.path_rot_weight_m_per_rad,
                 "motion.path_rot_weight_m_per_rad",

@@ -11,15 +11,16 @@ use par6_config::GripperConfig;
 use crate::spectral::codec::CommandId;
 use crate::types::{FirmwareGripperCommand, NodeId, ObjectDetection};
 
-use super::driver::{ReplyKind, VirtualDriver};
+use super::driver::{ReplyKind, VirtualDriver, FW_LOOP_DT};
 use super::jaw::JawJoint;
+use super::scene::timestep_for;
 
 /// Firmware jaw speed \[position bytes per second per speed-byte unit\]
 /// (the MuJoCo plant's jaw approach uses the same rate).
 pub const BYTES_PER_S_PER_SPEED_UNIT: f64 = 4.0;
-/// Firmware calibration sweep duration \[s\] (vendor waits ≥2 s, times
-/// out at 10 s).
-const CALIBRATION_S: f64 = 1.5;
+/// Firmware calibration sweep duration \[s\]: the jaws close and open
+/// again, ending fully open (vendor waits ≥2 s, times out at 10 s).
+pub const CALIBRATION_S: f64 = 1.5;
 /// Reported motor current while the jaws move freely \[mA\].
 const MOVING_CUR_MA: f64 = 100.0;
 /// Jaw-position tolerance \[bytes\] at which the firmware latches
@@ -27,6 +28,22 @@ const MOVING_CUR_MA: f64 = 100.0;
 /// in motor ticks there, a byte here — the jaw byte is the only position
 /// the firmware protocol reports).
 const POSITION_TOLERANCE: u8 = 5;
+
+/// The firmware's jaw speed \[position bytes per second\] for a speed
+/// byte, floored at one unit's worth as the firmware floors it.
+pub fn jaw_rate_bytes_s(speed_byte: u8) -> f64 {
+    f64::from(speed_byte).max(1.0) * BYTES_PER_S_PER_SPEED_UNIT
+}
+
+/// How long the firmware takes to report a move from `from_byte` to
+/// `to_byte` at `speed_byte` as at position \[s\]: constant-rate travel
+/// up to the tolerance band it latches `At_position` in. The daemon's
+/// dry run holds the arm for this on a jaw move, so a commanded record
+/// predicts the wait the plant will make a program take.
+pub fn jaw_travel_s(from_byte: f64, to_byte: f64, speed_byte: u8) -> f64 {
+    ((to_byte - from_byte).abs() - f64::from(POSITION_TOLERANCE)).max(0.0)
+        / jaw_rate_bytes_s(speed_byte)
+}
 
 /// Which drive mode owns the jaw (the two are exclusive on real hardware).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +58,14 @@ pub(crate) struct GripperSim {
     /// fully open (`ticks_per_meter = 2^14 / (4π · gear_r)`).
     pub joint: JawJoint,
     stroke_ticks: f64,
+    /// Motor-mode plant substep \[s\]: the driver's loops close at the
+    /// rate the scene closes the arm's, not once per bus tick. Their
+    /// velocity integral is a per-firmware-iteration gain, and a whole
+    /// tick's worth of iterations applied in one step against a plant
+    /// that then coasts on that current for the whole tick is a
+    /// bang-bang loop — at a 50 ms tick the jaw never seats on its
+    /// endstop.
+    substep: f64,
     ctrl: Ctrl,
     // -- firmware-mode state --
     /// Jaw position byte, 0 = open … 255 = closed.
@@ -78,10 +103,20 @@ impl GripperSim {
         // consistent with the arm joints.
         let accel_max = d.velocity_limit_ticks_s * 20.0;
         let cal_ticks = (CALIBRATION_S / dt).round() as u64;
+        let substep = timestep_for(dt);
         Self {
-            driver: VirtualDriver::new(dt, node, d.velocity_limit_ticks_s, d.ilim_ma, d.kt_nm_a),
-            joint: JawJoint::new(
+            // No datasheet constants for the gripper's motor, so its driver
+            // keeps the instant-current behaviour.
+            driver: VirtualDriver::new(
                 dt,
+                node,
+                d.velocity_limit_ticks_s,
+                d.ilim_ma,
+                d.kt_nm_a,
+                None,
+            ),
+            joint: JawJoint::new(
+                substep,
                 stroke_ticks / 2.0,
                 0.0,
                 stroke_ticks,
@@ -89,6 +124,7 @@ impl GripperSim {
                 d.ilim_ma,
             ),
             stroke_ticks,
+            substep,
             ctrl: Ctrl::Motor,
             pos_byte: 127.5,
             cmd: FirmwareGripperCommand::default(),
@@ -175,14 +211,19 @@ impl GripperSim {
         self.detection = ObjectDetection::ReachedNoObject;
     }
 
-    /// One fixed step of whichever controller owns the jaw.
+    /// One bus tick of whichever controller owns the jaw.
     pub fn step(&mut self, dt: f64) {
         match self.ctrl {
             Ctrl::Motor => {
-                let cmd = self
-                    .driver
-                    .control_step(self.joint.pos, self.joint.reported_vel);
-                self.joint.step(dt, &cmd, self.load_ma);
+                self.driver.age_watchdog();
+                let h = self.substep;
+                let fw_steps = h / FW_LOOP_DT;
+                for _ in 0..(dt / h).round() as u32 {
+                    let cmd =
+                        self.driver
+                            .loop_step(self.joint.pos, self.joint.reported_vel, fw_steps);
+                    self.joint.step(h, &cmd, self.load_ma);
+                }
                 self.pos_byte =
                     255.0 * (1.0 - (self.joint.pos / self.stroke_ticks).clamp(0.0, 1.0));
             }
@@ -241,7 +282,7 @@ impl GripperSim {
             Some(b) => b,
             None => target,
         };
-        let rate = f64::from(self.cmd.speed).max(1.0) * BYTES_PER_S_PER_SPEED_UNIT * dt;
+        let rate = jaw_rate_bytes_s(self.cmd.speed) * dt;
         let remaining = stop_at - self.pos_byte;
         if remaining.abs() > 1e-9 {
             let step = remaining.clamp(-rate, rate);

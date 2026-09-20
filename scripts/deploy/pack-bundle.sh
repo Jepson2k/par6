@@ -96,10 +96,12 @@ tarball="$DIST/par6d-$ARCH.tar.gz"
 tar -C "$(dirname "$BUNDLE")" -czf "$tarball" "$(basename "$BUNDLE")"
 
 # The manifest is what ties a published artifact to the commit and the
-# versions it was built from, so a box can be asked what it is running and
-# a release can be checked against what was validated.
-daemon_version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
-client_version="$(sed -n 's/^version = "\(.*\)"/\1/p' "$ROOT/python/pyproject.toml" | head -1)"
+# version it was built from, so a box can be asked what it is running and
+# a release can be checked against what was validated. One version covers
+# the daemon and the wheel: the workspace manifest is the only place it is
+# written, and the wheel's is dynamic so maturin reads the same number.
+version="$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' "$ROOT/Cargo.toml" | head -1)"
+[ -n "$version" ] || die "no version in $ROOT/Cargo.toml [workspace.package]"
 waldoctl_pin="$(sed -n 's#.*waldoctl.git@\([^"]*\).*#\1#p' "$ROOT/python/pyproject.toml" | head -1)"
 glibc_floor="$(readelf -V "$staged_bin" 2>/dev/null \
   | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sort -uV | tail -1)"
@@ -112,8 +114,7 @@ import json, sys
 json.dump({
     "commit": "${GITHUB_SHA:-$(git -C "$ROOT" rev-parse HEAD)}",
     "arch": "$ARCH",
-    "daemon_version": "$daemon_version",
-    "client_version": "$client_version",
+    "version": "$version",
     "waldoctl_pin": "$waldoctl_pin",
     "mujoco": "$(basename "$(readlink -f "$CONDA_PREFIX/lib/libmujoco.so")")",
     "glibc_floor": "$glibc_floor",

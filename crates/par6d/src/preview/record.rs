@@ -29,7 +29,9 @@ use par6_rt::{Mode, StateSnapshot};
 
 /// Rows are kept at roughly this rate \[Hz\] — the fastest any consumer
 /// paints. Faster storage would be discarded on the way to the screen.
-const ROW_RATE_HZ: f64 = 50.0;
+/// The commanded record ([`super::Preview::plan_record`]) keeps rows at
+/// the same rate, so a plan and a run of one program share a row axis.
+pub(crate) const ROW_RATE_HZ: f64 = 50.0;
 
 /// Why the run stopped.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -78,7 +80,10 @@ pub struct Span<T> {
     pub value: T,
 }
 
-/// The record of a run.
+/// The record of a run — or of a plan, which fills the same columns with
+/// what the arm was told rather than what it did, and leaves the plant's
+/// own columns (`q_commanded_rad`, `com`, the contacts, the modes, the
+/// objects) empty.
 ///
 /// Sampled columns are flat and row-major, `rows` long in their outer
 /// dimension; `joints` is the arm's joint count, so `q_rad[r * joints
@@ -95,7 +100,8 @@ pub struct TickBatch {
     pub joints: usize,
     /// Recorded rows, the outer dimension of every sampled column.
     pub rows: usize,
-    /// Achieved joint positions \[rad\].
+    /// Joint positions \[rad\]: what the arm did on a run, what it was
+    /// told on a plan.
     pub q_rad: Vec<f32>,
     /// Commanded joint positions \[rad\], post-limiter — what went on the
     /// motor bus. The difference from `q_rad` is the tracking error.
@@ -106,7 +112,7 @@ pub struct TickBatch {
     /// achieved column to diverge from; a consumer drawing the gap
     /// should draw none over those rows rather than invent one.
     pub q_commanded_rad: Vec<f32>,
-    /// Achieved TCP `[x y z (m), roll pitch yaw (rad)]`, `rows × 6`,
+    /// TCP `[x y z (m), roll pitch yaw (rad)]` at `q_rad`, `rows × 6`,
     /// in the wire's intrinsic-XYZ convention.
     pub tcp: Vec<f32>,
     /// Jaw closure, 0 = open … 1 = closed, one per row.
@@ -185,8 +191,6 @@ pub(crate) struct Recorder {
     /// Per object, the rows recorded so far. Collapsed to a single row
     /// at the end when nothing moved.
     tracks: Vec<Vec<[f32; 7]>>,
-    /// Scratch the object read fills, sized once.
-    poses: Vec<[f64; 7]>,
     contact_pos: Vec<[f64; 3]>,
     contact_force: Vec<[f64; 3]>,
     out: TickBatch,
@@ -208,7 +212,6 @@ impl Recorder {
             joints,
             object_names,
             tracks: vec![Vec::new(); n],
-            poses: vec![[0.0; 7]; n],
             contact_pos: Vec::new(),
             contact_force: Vec::new(),
             out: TickBatch {
@@ -267,11 +270,11 @@ impl Recorder {
                 .is_some_and(|r| r.object_detection == ObjectDetection::DetectedClosing),
         );
         if let Some(sim) = bus.sim_mut() {
-            let n = sim.object_poses_into(&mut self.poses);
-            for (track, pose) in self.tracks.iter_mut().zip(&self.poses[..n]) {
+            for (name, track) in self.object_names.iter().zip(&mut self.tracks) {
+                let pose = sim.world_object_pose(name).unwrap_or([f64::NAN; 7]);
                 let mut row = [0.0f32; 7];
                 for (o, v) in row.iter_mut().zip(pose) {
-                    *o = *v as f32;
+                    *o = v as f32;
                 }
                 track.push(row);
             }
