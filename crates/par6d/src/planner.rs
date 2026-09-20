@@ -2389,6 +2389,14 @@ impl Planner for Par6Planner {
         if let Some(dup) = first_duplicate(&converted) {
             return Err(refuse(format!("duplicate shape name {dup:?}")));
         }
+        if let Some(dup) = self
+            .shape_names
+            .first_shared_with_other_layer(layer, &converted)
+        {
+            return Err(refuse(format!(
+                "shape name {dup:?} is already applied on the other keep-out layer"
+            )));
+        }
         // The epoch is the collision world's, not a parallel counter:
         // `set_layer` moves it only for a world it actually applied.
         let epoch = self

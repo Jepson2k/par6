@@ -72,6 +72,34 @@ impl ShapeNames {
         self.all = self.layers.concat();
     }
 
+    /// The first name in `shapes` the OTHER layer already applies.
+    ///
+    /// [`ShapeNames::display`] resolves a geometry name by scanning both
+    /// layers, installation first, so a name the two layers share always
+    /// renders with the installation prefix: a program keep-out's own
+    /// collision is then reported as an installation one, and a frontend
+    /// that tints by the prefix points at the wrong shape. Measured on
+    /// the sim rig with a program box named `floor` against the shipped
+    /// installation floor — every refusal it caused named
+    /// `install:floor`. [`first_duplicate`] refuses that ambiguity inside
+    /// a layer; a layer boundary does not make it any less ambiguous.
+    pub fn first_shared_with_other_layer(
+        &self,
+        layer: ShapeLayer,
+        shapes: &[par6_kin::Shape],
+    ) -> Option<String> {
+        let other = match layer {
+            ShapeLayer::Installation => 1,
+            ShapeLayer::Program => 0,
+        };
+        shapes.iter().filter(|s| s.collision).find_map(|s| {
+            self.layers[other]
+                .iter()
+                .any(|(name, _)| *name == s.name)
+                .then(|| s.name.clone())
+        })
+    }
+
     /// The reporting name of one colliding geometry: a keep-out takes its
     /// layer prefix, robot geometry drops the per-link index the model
     /// appends (`upper_arm_0` → `upper_arm`) so pairs name URDF links,
@@ -154,5 +182,33 @@ mod tests {
             Some("a")
         );
         assert_eq!(first_duplicate(&[shape("a", true), shape("b", true)]), None);
+    }
+
+    /// A program keep-out may not take a name the installation layer
+    /// already uses: the reporting vocabulary cannot then say which
+    /// layer a collision was against.
+    #[test]
+    fn a_name_the_other_layer_already_uses_is_reported() {
+        let mut names = ShapeNames::default();
+        names.set_layer(ShapeLayer::Installation, &[shape("floor", true)]);
+        assert_eq!(
+            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("floor", true)]),
+            Some("floor".to_owned())
+        );
+        // A different name is free, and so is replacing the SAME layer.
+        assert_eq!(
+            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("keepout", true)]),
+            None
+        );
+        assert_eq!(
+            names.first_shared_with_other_layer(ShapeLayer::Installation, &[shape("floor", true)]),
+            None
+        );
+        // A visualization-only shape never appears in a pair, so its
+        // name cannot make a pair ambiguous.
+        assert_eq!(
+            names.first_shared_with_other_layer(ShapeLayer::Program, &[shape("floor", false)]),
+            None
+        );
     }
 }
