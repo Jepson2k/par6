@@ -50,9 +50,9 @@ def main() -> None:
             # A wrist with no room to swing reads near zero here. The
             # fit still returns, but those numbers are the ridge's, not
             # the arm's — widen `spread` or move somewhere with room.
-            print("not measured by these poses:", ", ".join(weak))
+            print("determined: all but", ", ".join(weak))
         else:
-            print("every parameter measured")
+            print("determined: every parameter")
 
 
 if __name__ == "__main__":
