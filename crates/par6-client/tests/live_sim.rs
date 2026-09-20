@@ -709,3 +709,81 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
         );
     })
 }
+
+/// `jog_l` is a TCP velocity command, so the tool travels along the axis
+/// it was given and accelerates onto it rather than having the twist
+/// applied whole.
+///
+/// The axis is what pins this down: smoothing the twist in joint space
+/// shapes each joint's own ramp, and the tool wanders off the commanded
+/// direction while they are out of step with each other.
+///
+/// The residual is the drives following the command rather than the
+/// command leaving the axis — it scales with the commanded rate, about
+/// 1 mm at these fractions and 2.5 mm at double them. The executor's own
+/// output holds the axis to 1e-9 m (`par6-motion`, `cart_stream`).
+#[test]
+fn jog_l_drives_the_tool_along_the_axis_it_was_given() {
+    run_session("jog-l-axis", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        // Off the wrist singularity, as the servo_l line test is.
+        let mut from = common::park_deg();
+        from[3] += 25.0;
+        from[4] += 35.0;
+        settle_at(&client, from).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+
+        // A diagonal in world axes: a single-axis jog cannot tell a
+        // straight travel from a wandering one. The fractions set the
+        // rate; the unit vector they point along is what the travel is
+        // judged against.
+        let fractions = [0.3f64, -0.4, 0.0];
+        let norm = (fractions[0] * fractions[0]
+            + fractions[1] * fractions[1]
+            + fractions[2] * fractions[2])
+            .sqrt();
+        let axis = [
+            fractions[0] / norm,
+            fractions[1] / norm,
+            fractions[2] / norm,
+        ];
+        let mut worst_off = 0.0f64;
+        let mut samples = 0u32;
+        let mut travelled = 0.0f64;
+        for _ in 0..60 {
+            client
+                .jog_l(
+                    [fractions[0], fractions[1], fractions[2], 0.0, 0.0, 0.0],
+                    0.3,
+                    Frame::Wrf,
+                    Some(1.0),
+                )
+                .await
+                .expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            let here = wire_pose(&client.pose(Frame::Wrf).await.expect("pose"));
+            let rel = [here[0] - start[0], here[1] - start[1], here[2] - start[2]];
+            travelled = (rel[0] * rel[0] + rel[1] * rel[1] + rel[2] * rel[2]).sqrt();
+            if travelled > 2.0 {
+                let along = rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2];
+                let perp = [
+                    rel[0] - along * axis[0],
+                    rel[1] - along * axis[1],
+                    rel[2] - along * axis[2],
+                ];
+                worst_off = worst_off
+                    .max((perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt());
+                samples += 1;
+            }
+        }
+        assert!(travelled > 10.0, "the jog only moved {travelled:.2} mm");
+        assert!(samples > 10, "only {samples} samples along the travel");
+        println!(
+            "jog_l off the commanded axis: {worst_off:.2} mm over {travelled:.1} mm travelled"
+        );
+        assert!(
+            worst_off < 2.0,
+            "the tool wandered {worst_off:.2} mm off the axis it was jogged along"
+        );
+    })
+}

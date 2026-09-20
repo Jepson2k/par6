@@ -7,7 +7,7 @@
 //! is the RT streaming pipeline's job (it clamps unconditionally, before
 //! and after this limiter) — this type owns only the OTG step.
 
-use par6_config::RobotConfig;
+use par6_config::MotionConfig;
 use rsruckig::prelude::*;
 
 use crate::cart::{self, Pose, IDENTITY_POSE};
@@ -175,6 +175,19 @@ impl StreamingExecutor {
 /// a tolerance on either.
 const DIRECTION_EPS: f64 = 1e-12;
 
+/// Tangent rotation at which a velocity stream re-pins its reference
+/// \[rad\]. Tangent coordinates degenerate as the relative rotation
+/// approaches π, and a jog has no target to bound how far it travels —
+/// it can run for the full 60 s watchdog, which at the angular ceiling
+/// is many turns.
+const REPIN_RAD: f64 = 0.5;
+
+/// Translation at which a velocity stream re-pins its reference \[m\].
+/// Nothing degenerates in the translation half, but a tangent taken far
+/// from its reference loses precision in the rotation coupling, and a
+/// jog can cover metres.
+const REPIN_M: f64 = 0.5;
+
 /// TCP kinodynamic ceilings for [`CartesianStreamingExecutor`], split
 /// into the linear and angular halves of the SE(3) tangent.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -194,9 +207,8 @@ pub struct CartLimits {
 }
 
 impl CartLimits {
-    /// Read the `[motion]` cartesian envelope from a validated config.
-    pub fn from_config(cfg: &RobotConfig) -> Self {
-        let m = &cfg.motion;
+    /// Read the cartesian envelope from a validated `[motion]` section.
+    pub fn from_motion(m: &MotionConfig) -> Self {
         Self {
             linear_velocity: m.jog_l_linear_max_m_s,
             angular_velocity: m.jog_l_angular_max_rad_s,
@@ -256,6 +268,9 @@ pub struct CartesianStreamingExecutor {
     /// The target currently being tracked, so setting the same one
     /// again can be recognized and skipped.
     last_target: Option<Pose>,
+    /// Whether the OTG is on the velocity interface (a jog or a brake)
+    /// rather than tracking a pose.
+    velocity_mode: bool,
     speed: f64,
     accel: f64,
     active: bool,
@@ -293,6 +308,7 @@ impl CartesianStreamingExecutor {
             reference: IDENTITY_POSE,
             direction: [0.0; 6],
             last_target: None,
+            velocity_mode: false,
             speed: 1.0,
             accel: 1.0,
             active: false,
@@ -377,6 +393,7 @@ impl CartesianStreamingExecutor {
         self.input.control_interface = ControlInterface::Position;
         self.otg.reset();
         self.last_target = None;
+        self.velocity_mode = false;
         self.active = true;
     }
 
@@ -407,6 +424,7 @@ impl CartesianStreamingExecutor {
             return Ok(());
         }
         self.last_target = Some(*target);
+        self.velocity_mode = false;
         let tangent = cart::se3_log(&cart::se3_mul(&cart::se3_inverse(&self.reference), target));
         // As in `StreamingExecutor::set_target`: a pose target is a
         // position-interface request, and a stream resumed after a
@@ -439,6 +457,78 @@ impl CartesianStreamingExecutor {
         Ok(())
     }
 
+    /// Drive the TCP at `twist` — `[vx, vy, vz, wx, wy, wz]` in WORLD
+    /// axes — ramping to it under the configured acceleration and jerk.
+    ///
+    /// The tangent is taken about the reference pose, so the twist is
+    /// resolved into that frame here: the caller works in world axes and
+    /// never has to know where the reference currently sits, which
+    /// matters because [`step`] moves it.
+    ///
+    /// This is what makes `jog_l` a CARTESIAN jog: the tool accelerates
+    /// along its commanded direction under a TCP envelope, rather than
+    /// the twist being applied whole and the smoothing happening in
+    /// joint space, where it shapes the joints and lets the tool wander
+    /// off the axis that was asked for.
+    ///
+    /// Unlike a pose target there is nothing to arrive at, so the tangent
+    /// grows for as long as the jog runs; [`step`] re-pins the reference
+    /// to keep it away from the π where the coordinates degenerate.
+    ///
+    /// [`step`]: CartesianStreamingExecutor::step
+    pub fn set_twist(&mut self, twist: &[f64; 6]) -> Result<(), MotionError> {
+        if !self.active {
+            return Err(MotionError::InvalidInput {
+                what: "set_twist",
+                reason: "cartesian streaming executor is not activated".into(),
+            });
+        }
+        if twist.iter().any(|v| !v.is_finite()) {
+            return Err(MotionError::InvalidInput {
+                what: "twist",
+                reason: "twist components must be finite".into(),
+            });
+        }
+        // Rᵀv, with R the reference's rotation: world axes into the
+        // frame the tangent is expressed in.
+        let r = &self.reference;
+        let into_reference = |v: &[f64]| {
+            [
+                r[0] * v[0] + r[4] * v[1] + r[8] * v[2],
+                r[1] * v[0] + r[5] * v[1] + r[9] * v[2],
+                r[2] * v[0] + r[6] * v[1] + r[10] * v[2],
+            ]
+        };
+        let lin = into_reference(&twist[..3]);
+        let ang = into_reference(&twist[3..]);
+        self.drive(&[lin[0], lin[1], lin[2], ang[0], ang[1], ang[2]]);
+        Ok(())
+    }
+
+    /// Put the OTG on the velocity interface aimed at `twist`, which is
+    /// in the reference frame's axes.
+    fn drive(&mut self, twist: &[f64; 6]) {
+        // A pose target no longer holds once the interface changes.
+        self.last_target = None;
+        self.velocity_mode = true;
+        self.input.control_interface = ControlInterface::Velocity;
+        for (k, &v) in twist.iter().enumerate() {
+            self.input.target_velocity[k] = v;
+            self.input.target_acceleration[k] = 0.0;
+        }
+        // A zero twist is a brake: it says nothing about direction, so
+        // the envelope keeps the one the motion is already on.
+        let mut norm = 0.0;
+        for &v in twist.iter() {
+            norm += v * v;
+        }
+        if norm.sqrt() > DIRECTION_EPS {
+            let inv = 1.0 / norm.sqrt();
+            self.direction = std::array::from_fn(|k| twist[k] * inv);
+        }
+        self.apply_limits();
+    }
+
     /// Brake the TCP to rest from wherever it is, under the configured
     /// acceleration and jerk.
     ///
@@ -448,14 +538,7 @@ impl CartesianStreamingExecutor {
     /// reverses. The velocity interface with a zero target says only
     /// "shed the velocity you have", which is what a stop is.
     pub fn release(&mut self) {
-        // Braking leaves the position interface, so the target it was
-        // tracking no longer holds.
-        self.last_target = None;
-        self.input.control_interface = ControlInterface::Velocity;
-        for k in 0..6 {
-            self.input.target_velocity[k] = 0.0;
-            self.input.target_acceleration[k] = 0.0;
-        }
+        self.drive(&[0.0; 6]);
     }
 
     /// Advance one tick along the geodesic toward the current target.
@@ -481,9 +564,29 @@ impl CartesianStreamingExecutor {
             *out = self.output.new_position[k];
         }
         self.output.pass_to_input(&mut self.input);
-        Ok(CartStep {
-            pose: cart::se3_mul(&self.reference, &cart::se3_exp(&tangent)),
-            finished,
-        })
+        let pose = cart::se3_mul(&self.reference, &cart::se3_exp(&tangent));
+
+        // A jog has nowhere to arrive, so its tangent grows for as long
+        // as it runs and would eventually reach the π where log and exp
+        // stop being well conditioned. Moving the origin to where the
+        // tool is keeps it near zero. The velocity interface integrates
+        // the position but never reads it back into the profile, so the
+        // shift changes nothing about the motion — which is why this is
+        // only safe here, and never under a pose target, whose tangent
+        // is expressed in the very frame being moved.
+        if self.velocity_mode {
+            let rot = (tangent[3] * tangent[3] + tangent[4] * tangent[4] + tangent[5] * tangent[5])
+                .sqrt();
+            let lin = (tangent[0] * tangent[0] + tangent[1] * tangent[1] + tangent[2] * tangent[2])
+                .sqrt();
+            if rot > REPIN_RAD || lin > REPIN_M {
+                self.reference = pose;
+                for k in 0..6 {
+                    self.input.current_position[k] = 0.0;
+                }
+            }
+        }
+
+        Ok(CartStep { pose, finished })
     }
 }

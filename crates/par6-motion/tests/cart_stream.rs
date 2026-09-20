@@ -26,7 +26,7 @@ fn dist(a: [f64; 3], b: [f64; 3]) -> f64 {
 
 fn setup() -> (CartesianStreamingExecutor, CartLimits, f64) {
     let cfg = par6_config();
-    let limits = CartLimits::from_config(&cfg);
+    let limits = CartLimits::from_motion(&cfg.motion);
     let dt = cfg.robot.tick_dt_s;
     (
         CartesianStreamingExecutor::new(dt, limits).unwrap(),
@@ -203,4 +203,88 @@ fn release_brakes_to_rest_without_reversing() {
         prev[0] > at_release[0],
         "braking has to cover ground, not freeze"
     );
+}
+
+/// A cartesian jog is a TCP velocity command, so the tool has to
+/// accelerate under the TCP acceleration ceiling and travel along the
+/// axis it was given — not have the twist applied whole and the
+/// smoothing happen somewhere that shapes the joints instead.
+#[test]
+fn a_jog_ramps_the_tool_under_its_ceilings_and_holds_its_axis() {
+    let (mut exec, limits, dt) = setup();
+    let start = at(0.35, 0.10, 0.20);
+    exec.activate(&start);
+
+    // Two thirds of the linear ceiling, on a diagonal.
+    let axis = [0.6, -0.8, 0.0];
+    let speed = limits.linear_velocity * (2.0 / 3.0);
+    let twist = [
+        axis[0] * speed,
+        axis[1] * speed,
+        axis[2] * speed,
+        0.0,
+        0.0,
+        0.0,
+    ];
+    exec.set_twist(&twist).unwrap();
+
+    let a = cart::translation(&start);
+    let mut prev = a;
+    let mut prev_speed = 0.0;
+    let (mut worst_accel, mut peak, mut worst_off_axis) = (0.0f64, 0.0f64, 0.0f64);
+    for _ in 0..4_000 {
+        let p = cart::translation(&exec.step().unwrap().pose);
+        let v = dist(p, prev) / dt;
+        worst_accel = worst_accel.max((v - prev_speed).abs() / dt);
+        peak = peak.max(v);
+        // Travel has to stay on the commanded axis.
+        let rel = [p[0] - a[0], p[1] - a[1], p[2] - a[2]];
+        let along = rel[0] * axis[0] + rel[1] * axis[1] + rel[2] * axis[2];
+        let foot = [
+            a[0] + along * axis[0],
+            a[1] + along * axis[1],
+            a[2] + along * axis[2],
+        ];
+        worst_off_axis = worst_off_axis.max(dist(p, foot));
+        prev_speed = v;
+        prev = p;
+        if (v - speed).abs() < 1e-9 {
+            break;
+        }
+    }
+    assert!(
+        (prev_speed - speed).abs() < 1e-6,
+        "the tool settled at {prev_speed} m/s, not the commanded {speed}"
+    );
+    assert!(
+        worst_accel <= limits.linear_acceleration * 1.05,
+        "the tool accelerated at {worst_accel} m/s² over a {} m/s² ceiling",
+        limits.linear_acceleration
+    );
+    assert!(
+        peak <= limits.linear_velocity * 1.01,
+        "the tool ran at {peak} m/s over a {} m/s ceiling",
+        limits.linear_velocity
+    );
+    assert!(
+        worst_off_axis < 1e-9,
+        "the tool wandered {worst_off_axis} m off its commanded axis"
+    );
+
+    // Releasing brings it to rest the same way, without reversing.
+    exec.release();
+    let mut last = prev;
+    let mut at_rest = false;
+    for _ in 0..4_000 {
+        let p = cart::translation(&exec.step().unwrap().pose);
+        let along = (p[0] - last[0]) * axis[0] + (p[1] - last[1]) * axis[1];
+        assert!(along >= -1e-12, "the tool reversed while braking");
+        let v = dist(p, last) / dt;
+        last = p;
+        if v < 1e-9 {
+            at_rest = true;
+            break;
+        }
+    }
+    assert!(at_rest, "the jog never came to rest");
 }

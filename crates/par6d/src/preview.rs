@@ -41,7 +41,8 @@ use par6_server::{
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
-    housekeeping_period, step_cart_jog, CartJogState, CoreLink, CoreOp, StreamGate,
+    housekeeping_period, project_cart_jog, step_cart_jog, CartJogProbe, CartJogState, CartStep,
+    CoreLink, CoreOp, StreamGate,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
@@ -153,6 +154,9 @@ pub struct Preview {
     /// integrates through the identical damped jacobian.
     cart: CartKin,
     soft_min: [f64; MAX_JOINTS],
+    /// STREAM joint envelope, which a cartesian jog holds its per-tick
+    /// step to.
+    stream_limits: MotionLimits,
     soft_max: [f64; MAX_JOINTS],
     snap: StateSnapshot,
     snap_w: SnapshotWriter<StateSnapshot>,
@@ -311,6 +315,7 @@ impl Preview {
             planner,
             jog,
             cart: stack.cart,
+            stream_limits,
             soft_min: stream_limits.soft_min,
             soft_max: stream_limits.soft_max,
             snap,
@@ -1175,41 +1180,73 @@ impl Preview {
             };
             *out = frac * full;
         }
-        let mut state = CartJogState {
+        let mut probe = CartJogProbe {
             twist,
             frame,
             q: self.snap.q,
             soft_min: self.soft_min,
             soft_max: self.soft_max,
         };
-        if let Some(error) = self.cart_jog_blocked(&mut state.clone()) {
+        if let Some(error) = self.cart_jog_blocked(&mut probe) {
             return self.refuse(error);
         }
-        // Housekeeping emits a setpoint every period and the RT tracks it
-        // at the tick — so that is what runs here, on the runtime's own
-        // executor rather than on the raw setpoints.
+        let at = match self.cart.fk(&self.snap.q) {
+            Ok(pose) => pose,
+            Err(e) => {
+                return self.refuse(make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                ))
+            }
+        };
+        let mut state = match CartJogState::new(
+            self.dt,
+            par6_motion::CartLimits::from_motion(&self.motion),
+            &at,
+            &self.snap.q,
+            twist,
+            frame,
+            accel.unwrap_or(1.0),
+            self.soft_min,
+            self.soft_max,
+        ) {
+            Ok(st) => st,
+            Err(e) => {
+                return self.refuse(make_error(
+                    ErrorCode::CommValidationError,
+                    UNATTRIBUTED,
+                    &[("detail", &e.to_string())],
+                ))
+            }
+        };
+        // Housekeeping emits a setpoint every period; a cartesian jog's
+        // setpoints arrive shaped, so the RT clamps and commands them
+        // rather than tracking them through its joint limiter. That is
+        // what runs here.
         let period = housekeeping_period(self.dt).as_secs_f64();
         let steps = ((duration_s / period).round() as usize).max(1);
         let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
-        if !self.cart_streaming {
-            self.stream.activate(&self.snap.q);
-            self.cart_streaming = true;
-        }
-        self.stream.set_scale(1.0, accel.unwrap_or(1.0));
+        self.cart_streaming = true;
         let mut trajectory = Vec::with_capacity(steps * ticks_per_step);
-        let mut q = self.snap.q;
+        let q_meas = self.snap.q;
         for _ in 0..steps {
-            let target = match step_cart_jog(&mut self.cart, &mut state, period) {
-                Ok((target, _)) => target,
-                // A twist the jacobian cannot resolve holds in place, as
-                // housekeeping holds on every failed solve.
-                Err(_) => state.q,
+            let target = match step_cart_jog(
+                &mut self.cart,
+                &mut state,
+                &self.stream_limits,
+                period,
+                &q_meas,
+            ) {
+                Ok(CartStep::Step(target, _)) => target,
+                // Nothing moves the arm under a preview, so a superseded
+                // stream cannot arise here; a step the limiter or the
+                // solver cannot produce holds in place, as housekeeping
+                // holds on a failure.
+                Ok(CartStep::Superseded) | Err(_) => state.commanded(),
             };
-            self.stream.set_target(&target);
             for _ in 0..ticks_per_step {
-                let mut qd_out = [0.0; MAX_JOINTS];
-                self.stream.step(&mut q, &mut qd_out);
-                trajectory.push(q);
+                trajectory.push(target);
             }
         }
         self.finish_stream(
@@ -1233,11 +1270,11 @@ impl Preview {
 
     /// The same admission check for a cartesian jog, projected through
     /// the jacobian exactly as the bridge projects it.
-    fn cart_jog_blocked(&mut self, probe: &mut CartJogState) -> Option<WireError> {
+    fn cart_jog_blocked(&mut self, probe: &mut CartJogProbe) -> Option<WireError> {
         let q = self.snap.q;
         // A twist the jacobian cannot resolve is admitted: housekeeping
         // holds in place on a failed solve, so nothing unchecked streams.
-        let la = match step_cart_jog(&mut self.cart, probe, self.gate.reaction_s()) {
+        let la = match project_cart_jog(&mut self.cart, probe, self.gate.reaction_s()) {
             Ok((la, qd)) => {
                 let mut la = la;
                 for (j, v) in la.iter_mut().enumerate() {

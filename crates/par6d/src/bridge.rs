@@ -967,9 +967,9 @@ pub(crate) struct CartServoState {
     accel: f64,
 }
 
-/// Live state of a cartesian jog, advanced by housekeeping each period.
+/// The inputs of one admission projection ([`project_cart_jog`]).
 #[derive(Clone, Copy)]
-pub(crate) struct CartJogState {
+pub(crate) struct CartJogProbe {
     /// Commanded TCP twist `[vx vy vz (m/s), wx wy wz (rad/s)]` in the
     /// commanded frame's axes.
     pub(crate) twist: [f64; 6],
@@ -1026,6 +1026,82 @@ struct ActiveStream {
     /// keep-alive refeeds the setpoint the client asked for rather than
     /// silently restoring full-speed limits between datagrams.
     scale: (f64, f64),
+}
+
+/// Live state of a cartesian velocity jog.
+///
+/// parol6's `JogLCommand` (`commands/cartesian_commands.py`) and the
+/// servo stream's twin: the limiter ramps the TOOL's twist under a
+/// cartesian envelope, each smoothed pose is solved to joints, and a
+/// joint over its per-tick budget divides every joint's step by one
+/// ratio while the commanded twist is divided by the same, so the tool
+/// keeps travelling along the axis that was asked for instead of
+/// drifting off it as the joints are held back.
+pub(crate) struct CartJogState {
+    exec: Box<CartesianStreamingExecutor>,
+    /// The twist the client asked for, in `frame` axes \[m/s, rad/s\].
+    twist: [f64; 6],
+    frame: par6_proto::Frame,
+    q_commanded: [f64; NQ],
+    seed: [f64; NQ],
+    ik_stopping: bool,
+    /// Last tick's joint-budget ratio. The commanded twist is divided by
+    /// it, which is how the cartesian limiter is told the joints could
+    /// not keep up — the tool slows along its axis rather than the axis
+    /// bending.
+    vel_ratio: f64,
+    soft_min: [f64; NQ],
+    soft_max: [f64; NQ],
+}
+
+impl CartJogState {
+    /// Claim a cartesian jog at the arm's current pose.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(
+        dt: f64,
+        limits: CartLimits,
+        at: &Pose,
+        q: &[f64; NQ],
+        twist: [f64; 6],
+        frame: par6_proto::Frame,
+        accel: f64,
+        soft_min: [f64; NQ],
+        soft_max: [f64; NQ],
+    ) -> Result<Self, String> {
+        let mut exec = Box::new(
+            CartesianStreamingExecutor::new(dt, limits)
+                .map_err(|e| format!("cartesian limiter: {e}"))?,
+        );
+        exec.activate(at);
+        exec.set_scale(1.0, accel);
+        Ok(Self {
+            exec,
+            twist,
+            frame,
+            q_commanded: *q,
+            seed: *q,
+            ik_stopping: false,
+            vel_ratio: 1.0,
+            soft_min,
+            soft_max,
+        })
+    }
+
+    /// Point the jog at a new twist, keeping the ramp already underway.
+    pub(crate) fn retwist(&mut self, twist: [f64; 6], frame: par6_proto::Frame) {
+        self.twist = twist;
+        self.frame = frame;
+    }
+
+    /// The joint target last commanded.
+    pub(crate) fn commanded(&self) -> [f64; NQ] {
+        self.q_commanded
+    }
+
+    /// Ramp the tool to rest along the axis it is travelling.
+    pub(crate) fn release(&mut self) {
+        self.twist = [0.0; 6];
+    }
 }
 
 impl CartServoState {
@@ -1593,7 +1669,7 @@ impl RtCommands for RtBridge {
                 };
                 let state = match CartServoState::new(
                     self.bundle.robot.robot.tick_dt_s,
-                    CartLimits::from_config(&self.bundle.robot),
+                    CartLimits::from_motion(&self.bundle.robot.motion),
                     &at,
                     &q,
                     target,
@@ -1674,7 +1750,7 @@ impl RtCommands for RtBridge {
                         still: 0,
                         still_tick: 0,
                         ..
-                    }) => state.q,
+                    }) => state.commanded(),
                     _ => self.cart.snapshots.latest().q,
                 };
                 let mut twist = [0.0; 6];
@@ -1691,7 +1767,7 @@ impl RtCommands for RtBridge {
                 // jacobian cannot resolve is admitted — housekeeping
                 // holds in place on every failed solve, so nothing
                 // unchecked ever streams.
-                let mut probe = CartJogState {
+                let mut probe = CartJogProbe {
                     twist,
                     frame: p.frame,
                     q,
@@ -1699,7 +1775,8 @@ impl RtCommands for RtBridge {
                     soft_max: self.cart.soft_max,
                 };
                 let reaction_s = self.cart.gate.lock().unwrap().reaction_s();
-                if let Ok((mut la, qd)) = step_cart_jog(&mut self.cart.kin, &mut probe, reaction_s)
+                if let Ok((mut la, qd)) =
+                    project_cart_jog(&mut self.cart.kin, &mut probe, reaction_s)
                 {
                     let mut gate = self.cart.gate.lock().unwrap();
                     for (j, v) in la.iter_mut().enumerate() {
@@ -1710,15 +1787,46 @@ impl RtCommands for RtBridge {
                         return Err(gate.refuse(pairs));
                     }
                 }
-                if !matches!(
-                    sh.stream,
-                    Some(ActiveStream {
-                        kind: StreamKind::CartJog,
-                        ..
-                    })
-                ) {
-                    self.enter_stream_mode(Mode::Stream);
+                // A jog already running keeps its limiter: the ramp it
+                // is on is the state that makes the next twist smooth,
+                // and rebuilding it would restart from rest.
+                if let Some(a) = &mut sh.stream {
+                    if a.kind == StreamKind::CartJog && !a.releasing {
+                        if let Some(state) = &mut a.cart {
+                            state.retwist(twist, p.frame);
+                        }
+                        a.deadline = jog_deadline(p.duration);
+                        a.scale = (1.0, p.accel.unwrap_or(1.0));
+                        return Ok(());
+                    }
                 }
+                drop(sh);
+                let at = match self.cart.kin.fk(&q) {
+                    Ok(pose) => pose,
+                    Err(e) => {
+                        log::warn!("JOG_L: FK failed ({e}); dropped");
+                        return Ok(());
+                    }
+                };
+                let state = match CartJogState::new(
+                    self.bundle.robot.robot.tick_dt_s,
+                    CartLimits::from_motion(&self.bundle.robot.motion),
+                    &at,
+                    &q,
+                    twist,
+                    p.frame,
+                    p.accel.unwrap_or(1.0),
+                    self.cart.soft_min,
+                    self.cart.soft_max,
+                ) {
+                    Ok(st) => st,
+                    Err(e) => {
+                        log::warn!("JOG_L: {e}; dropped");
+                        return Ok(());
+                    }
+                };
+                let mut sh = self.shared.lock().unwrap();
+                self.enter_stream_mode(Mode::Stream);
                 sh.stream = Some(ActiveStream {
                     releasing: false,
                     kind: StreamKind::CartJog,
@@ -1730,13 +1838,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
-                    cart: Some(CartJogState {
-                        twist,
-                        frame: p.frame,
-                        q,
-                        soft_min: self.cart.soft_min,
-                        soft_max: self.cart.soft_max,
-                    }),
+                    cart: Some(state),
                     servo: None,
                     // A cartesian jog is integrated into joint targets and
                     // then tracked by the streaming executor, so its accel
@@ -1917,6 +2019,15 @@ impl RtCommands for RtBridge {
         // standing firmware frame is re-aimed at where it landed so the
         // onboard controller holds it there instead of driving back to
         // the previous target. The server validates count and range.
+        // The arm is about to be somewhere else, so any stream still
+        // feeding setpoints is over. This is not belt and braces: a
+        // cartesian stream's setpoints are already rate-limited and the
+        // RT commands them through a clamp, so ONE stale setpoint
+        // arriving after the re-seed moves the arm the whole way back in
+        // a single tick. `cancel_stream` only runs when the server still
+        // has a stream registered, and a jog braking past its watchdog
+        // no longer does.
+        self.shared.lock().unwrap().stream = None;
         let tool_closed = tool_positions.and_then(|p| p.first().copied());
         if let Some(closed) = tool_closed {
             let hold_ma = self
@@ -2443,8 +2554,21 @@ pub(crate) fn housekeeping_loop(
                                 log::debug!("servo stream went silent; stopping");
                                 link.send(RtCommand::SetMode(Mode::Idle));
                             }
+                            // The tool ramps down along the axis it is
+                            // travelling. The clamp-only tracker does no
+                            // rate limiting, so cutting to IDLE here
+                            // would stop the arm dead from jog speed.
+                            StreamKind::CartJog if !a.releasing => {
+                                log::debug!("jog_l duration elapsed; ramping the tool to rest");
+                                if let Some(st) = &mut a.cart {
+                                    st.release();
+                                }
+                                a.releasing = true;
+                                a.deadline = now + jog_ramp_cap;
+                                continue 'housekeeping;
+                            }
                             StreamKind::CartJog => {
-                                log::debug!("jog_l duration elapsed; stopping");
+                                log::warn!("jog_l ramp never reported rest; idling");
                                 link.send(RtCommand::SetMode(Mode::Idle));
                             }
                             // The tool brakes ALONG its line rather than
@@ -2591,10 +2715,20 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartJog => {
-                        if let Some(state) = &mut a.cart {
-                            let before = state.q;
-                            match step_cart_jog(&mut kin, state, dt) {
-                                Ok((target, qd)) => {
+                        if let Some(st) = &mut a.cart {
+                            let before = st.commanded();
+                            match step_cart_jog(&mut kin, st, &stream_limits, dt, &snap.q) {
+                                // A teleport (or anything else that moves
+                                // the arm) retires the stream: whatever
+                                // this side commanded next would fight it.
+                                Ok(CartStep::Superseded) => {
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    continue 'housekeeping;
+                                }
+                                Ok(CartStep::Step(target, at_rest)) => {
+                                    let qd: [f64; NQ] =
+                                        std::array::from_fn(|j| (target[j] - before[j]) / dt);
                                     // Where the arm comes to rest if this
                                     // step turns out to be the last one
                                     // admitted.
@@ -2602,8 +2736,10 @@ pub(crate) fn housekeeping_loop(
                                     let verdict = {
                                         let mut g = gate.lock().unwrap();
                                         for (j, v) in la.iter_mut().enumerate() {
-                                            *v = (*v + g.stopping_travel(j, qd[j]))
-                                                .clamp(state.soft_min[j], state.soft_max[j]);
+                                            *v = (*v + g.stopping_travel(j, qd[j])).clamp(
+                                                stream_limits.soft_min[j],
+                                                stream_limits.soft_max[j],
+                                            );
                                         }
                                         g.blocked(&before, &la)
                                     };
@@ -2613,8 +2749,17 @@ pub(crate) fn housekeeping_loop(
                                                 q: target,
                                                 speed: a.scale.0,
                                                 accel: a.scale.1,
-                                                shaped: false,
-                                            })
+                                                // Already limited in
+                                                // cartesian space.
+                                                shaped: true,
+                                            });
+                                            // The ramp has run out and the
+                                            // tool is stopped.
+                                            if a.releasing && at_rest {
+                                                link.send(RtCommand::SetMode(Mode::Idle));
+                                                sh.stream = None;
+                                                continue 'housekeeping;
+                                            }
                                         }
                                         Ok(Some(pairs)) => {
                                             collision_stop(&link, &gate, "jog_l", pairs);
@@ -2633,15 +2778,15 @@ pub(crate) fn housekeeping_loop(
                                     }
                                 }
                                 Err(e) => {
-                                    // Hold in place rather than integrate on a
-                                    // failed solve; the stream watchdog still
-                                    // needs feeding.
+                                    // Hold the last good target rather than
+                                    // command one nothing produced; the
+                                    // stream watchdog still needs feeding.
                                     log::warn!("jog_l step failed ({e}); holding");
                                     stream_input.lock().unwrap().send(&StreamSetpoint {
-                                        q: state.q,
+                                        q: before,
                                         speed: a.scale.0,
                                         accel: a.scale.1,
-                                        shaped: false,
+                                        shaped: true,
                                     });
                                 }
                             }
@@ -2651,7 +2796,15 @@ pub(crate) fn housekeeping_loop(
                         if let Some(st) = &mut a.servo {
                             let before = st.commanded();
                             match step_cart_servo(&mut kin, st, &stream_limits, dt, &snap.q) {
-                                Ok((target, finished)) => {
+                                // A teleport (or anything else that moves
+                                // the arm) retires the stream: whatever
+                                // this side commanded next would fight it.
+                                Ok(CartStep::Superseded) => {
+                                    link.send(RtCommand::SetMode(Mode::Idle));
+                                    sh.stream = None;
+                                    continue 'housekeeping;
+                                }
+                                Ok(CartStep::Step(target, finished)) => {
                                     let qd: [f64; NQ] =
                                         std::array::from_fn(|j| (target[j] - before[j]) / dt);
                                     let mut la = target;
@@ -2778,6 +2931,141 @@ pub(crate) fn housekeeping_loop(
     }
 }
 
+/// Ticks of full-speed travel the measured pose may fall behind the
+/// commanded one before a cartesian stream reseeds itself.
+///
+/// The drives follow within a fraction of a tick's travel, so a gap this
+/// size is not tracking error — something moved the arm out from under
+/// the stream. A teleport is the reachable case: it preempts the stream
+/// server-side, but a jog braking past its watchdog can still be holding
+/// a pre-teleport target when one lands, and commanding it would drag
+/// the arm back.
+const RESEED_TICKS: f64 = 50.0;
+
+/// What one cartesian step produced.
+pub(crate) enum CartStep {
+    /// Command this joint target; the flag says the motion has come to
+    /// rest, which is what a released stream waits for before idling.
+    Step([f64; NQ], bool),
+    /// The arm was moved out from under the stream, so the stream is
+    /// over. Holding position would be no better than commanding the
+    /// stale target: a teleport lands while the stream is still feeding
+    /// setpoints, and anything this side commands fights it.
+    Superseded,
+}
+
+/// Whether the arm has been moved out from under a stream commanding
+/// `q_commanded`.
+fn moved_underneath(
+    limits: &MotionLimits,
+    dt: f64,
+    q_commanded: &[f64; NQ],
+    q_meas: &[f64; NQ],
+) -> bool {
+    let gap: [f64; NQ] = std::array::from_fn(|j| q_commanded[j] - q_meas[j]);
+    limits.step_ratio(&gap, dt) > RESEED_TICKS
+}
+
+/// One cartesian-jog step: ramp the tool's twist under the cartesian
+/// envelope, solve the smoothed pose to joints, and hold the result to
+/// the joints' per-tick budget without bending the tool off its axis.
+///
+/// The servo step's twin — the only differences are that a jog aims at a
+/// velocity rather than a pose, so there is nothing to arrive at, and
+/// that the ratio is fed back into the COMMANDED TWIST as well as the
+/// joint step, which is how the tool slows along its axis instead of the
+/// limiter running ahead of joints that cannot keep up.
+///
+/// Returns the joint target to command and whether the tool has come to
+/// rest — which is what a released jog waits for before idling.
+pub(crate) fn step_cart_jog(
+    kin: &mut crate::kin::CartKin,
+    st: &mut CartJogState,
+    limits: &MotionLimits,
+    dt: f64,
+    q_meas: &[f64; NQ],
+) -> Result<CartStep, String> {
+    if moved_underneath(limits, dt, &st.q_commanded, q_meas) {
+        log::info!("jog_l: the arm moved underneath the stream; ending it");
+        return Ok(CartStep::Superseded);
+    }
+    // The limiter works in world axes; a tool-frame twist is resolved
+    // through the pose the arm is actually in, as the admission
+    // projection resolves it.
+    let mut world = st.twist;
+    if st.frame == par6_proto::Frame::Trf {
+        let pose = kin.fk(&st.q_commanded)?;
+        let rot = |v: &[f64]| {
+            [
+                pose[0] * v[0] + pose[1] * v[1] + pose[2] * v[2],
+                pose[4] * v[0] + pose[5] * v[1] + pose[6] * v[2],
+                pose[8] * v[0] + pose[9] * v[1] + pose[10] * v[2],
+            ]
+        };
+        let lin = rot(&st.twist[..3]);
+        let ang = rot(&st.twist[3..]);
+        world = [lin[0], lin[1], lin[2], ang[0], ang[1], ang[2]];
+    }
+    // Held back by the same factor the joints were: the tool keeps its
+    // direction and loses only speed.
+    if st.vel_ratio > 1.0 {
+        for v in world.iter_mut() {
+            *v /= st.vel_ratio;
+        }
+    }
+    // While braking the target stays at zero — re-commanding the twist
+    // every tick would undo the ramp.
+    if !st.ik_stopping {
+        st.exec
+            .set_twist(&world)
+            .map_err(|e| format!("cartesian twist: {e}"))?;
+    }
+    let step = st.exec.step().map_err(|e| format!("cartesian step: {e}"))?;
+
+    match kin.ik(&st.seed, &step.pose) {
+        IkResult::Solved(q) => {
+            if st.ik_stopping {
+                let pose = kin.fk(q_meas)?;
+                st.exec.activate(&pose);
+                st.q_commanded = *q_meas;
+                st.seed = *q_meas;
+                st.vel_ratio = 1.0;
+                st.ik_stopping = false;
+                log::info!("jog_l: IK recovered, resuming");
+                return Ok(CartStep::Step(st.q_commanded, false));
+            }
+            st.seed = q;
+            let dq: [f64; NQ] = std::array::from_fn(|j| q[j] - st.q_commanded[j]);
+            let ratio = limits.step_ratio(&dq, dt);
+            if ratio > 1.0 {
+                for (j, out) in st.q_commanded.iter_mut().enumerate() {
+                    *out += dq[j] / ratio;
+                }
+                st.vel_ratio = ratio;
+            } else {
+                st.q_commanded = q;
+                st.vel_ratio = 1.0;
+            }
+            for (j, out) in st.q_commanded.iter_mut().enumerate() {
+                *out = out.clamp(st.soft_min[j], st.soft_max[j]);
+            }
+            Ok(CartStep::Step(st.q_commanded, step.finished))
+        }
+        unreachable => {
+            if !st.ik_stopping {
+                match &unreachable {
+                    IkResult::Unreachable => log::warn!("jog_l: pose unreachable; braking"),
+                    IkResult::Failed(e) => log::warn!("jog_l: IK failed ({e}); braking"),
+                    IkResult::Solved(_) => unreachable!(),
+                }
+                st.exec.release();
+                st.ik_stopping = true;
+            }
+            Ok(CartStep::Step(st.q_commanded, step.finished))
+        }
+    }
+}
+
 /// One cartesian-servo step: advance the cartesian limiter along the
 /// line, solve the smoothed pose to joints, and hold the result to the
 /// joints' per-tick budget without letting the tool off the line.
@@ -2799,7 +3087,11 @@ pub(crate) fn step_cart_servo(
     limits: &MotionLimits,
     dt: f64,
     q_meas: &[f64; NQ],
-) -> Result<([f64; NQ], bool), String> {
+) -> Result<CartStep, String> {
+    if moved_underneath(limits, dt, &st.q_commanded, q_meas) {
+        log::info!("servo_l: the arm moved underneath the stream; ending it");
+        return Ok(CartStep::Superseded);
+    }
     st.exec
         .set_target(&st.target)
         .map_err(|e| format!("cartesian retarget: {e}"))?;
@@ -2818,7 +3110,7 @@ pub(crate) fn step_cart_servo(
                 st.seed = *q_meas;
                 st.ik_stopping = false;
                 log::info!("servo_l: IK recovered, resuming");
-                return Ok((st.q_commanded, false));
+                return Ok(CartStep::Step(st.q_commanded, false));
             }
             st.seed = q;
             let dq: [f64; NQ] = std::array::from_fn(|j| q[j] - st.q_commanded[j]);
@@ -2832,7 +3124,7 @@ pub(crate) fn step_cart_servo(
                 st.q_commanded = q;
                 st.exec.set_scale(st.speed, st.accel);
             }
-            Ok((st.q_commanded, step.finished))
+            Ok(CartStep::Step(st.q_commanded, step.finished))
         }
         unreachable => {
             if !st.ik_stopping {
@@ -2849,24 +3141,28 @@ pub(crate) fn step_cart_servo(
             // Keep commanding the last good target while the limiter
             // sheds its velocity: the arm holds rather than jumping to a
             // pose nothing solved.
-            Ok((st.q_commanded, step.finished))
+            Ok(CartStep::Step(st.q_commanded, step.finished))
         }
     }
 }
 
-/// One cartesian-jog integration step: resolve the twist into world
-/// axes, solve joint velocities through the damped jacobian, integrate
-/// the joint target and clamp it inside the soft window. Returns the
-/// integrated target and the joint velocity it moved at — what the
-/// collision gate projects its lookahead with.
-pub(crate) fn step_cart_jog(
+/// Where a twist would put the arm `dt_s` from here: resolve it into
+/// world axes, solve joint velocities through the damped jacobian,
+/// integrate and clamp inside the soft window.
+///
+/// This is the ADMISSION projection, not the commanded motion — a cheap
+/// estimate the collision gate places its lookahead with. What the arm
+/// is actually driven along comes from the cartesian limiter in
+/// [`step_cart_jog`], which holds the tool to the twist it was given
+/// instead of to the jacobian's first-order picture of it.
+pub(crate) fn project_cart_jog(
     kin: &mut crate::kin::CartKin,
-    state: &mut CartJogState,
+    probe: &mut CartJogProbe,
     dt_s: f64,
 ) -> Result<([f64; MAX_JOINTS], [f64; MAX_JOINTS]), String> {
-    let mut v = state.twist;
-    if state.frame == par6_proto::Frame::Trf {
-        let pose = kin.fk(&state.q)?;
+    let mut v = probe.twist;
+    if probe.frame == par6_proto::Frame::Trf {
+        let pose = kin.fk(&probe.q)?;
         let rot = |vec: [f64; 3]| {
             [
                 pose[0] * vec[0] + pose[1] * vec[1] + pose[2] * vec[2],
@@ -2878,11 +3174,11 @@ pub(crate) fn step_cart_jog(
         let ang = rot([v[3], v[4], v[5]]);
         v = [lin[0], lin[1], lin[2], ang[0], ang[1], ang[2]];
     }
-    let qd = kin.twist_to_qd(&state.q, &v)?;
-    for (j, q) in state.q.iter_mut().enumerate() {
-        *q = (*q + qd[j] * dt_s).clamp(state.soft_min[j], state.soft_max[j]);
+    let qd = kin.twist_to_qd(&probe.q, &v)?;
+    for (j, q) in probe.q.iter_mut().enumerate() {
+        *q = (*q + qd[j] * dt_s).clamp(probe.soft_min[j], probe.soft_max[j]);
     }
-    Ok((state.q, qd))
+    Ok((probe.q, qd))
 }
 
 #[cfg(test)]
