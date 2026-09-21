@@ -38,8 +38,8 @@ pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
     BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
     JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
-    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig, SimConfig,
-    StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
+    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig,
+    SelfcalConfig, SimConfig, StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
 };
 
 use std::path::Path;
@@ -182,9 +182,13 @@ impl ConfigBundle {
     /// both gripper homing modes with a warning
     /// (`rcb-runtime/robotics/homing.py`).
     ///
-    /// A home group left with no joints and no gripper is a no-op step
-    /// the FSM walks straight through, so the surrounding sequence and
-    /// its arm-joint references are untouched.
+    /// Stripping can empty a step completely — the two gripper-homing
+    /// steps do nothing else. An empty group, and an empty step, are both
+    /// config errors when someone writes them by hand, and
+    /// [`Self::validate`] says so, so the emptied ones are removed rather
+    /// than left behind. Steps are addressed by order and never by index,
+    /// and the joints they home are named inside them, so dropping one
+    /// leaves the remaining sequence and its arm-joint references intact.
     fn drop_gripper_homing_without_a_gripper(&mut self) {
         if self.active_gripper().is_none_or(|g| g.driver.is_some()) {
             return;
@@ -207,6 +211,9 @@ impl ConfigBundle {
                      tool `{tool}` has no CAN driver"
                 );
             }
+            if step.home.as_ref().is_some_and(|h| h.joints.is_empty()) {
+                step.home = None;
+            }
             strip(
                 format!("homing.sequence[{i}].pre_moves"),
                 &mut step.pre_moves,
@@ -220,6 +227,12 @@ impl ConfigBundle {
             "homing.post_moves".into(),
             &mut self.robot.homing.post_moves,
         );
+        self.robot.homing.sequence.retain(|step| {
+            !(step.pre_moves.is_empty()
+                && step.home.is_none()
+                && step.move_to.is_empty()
+                && step.post_moves.is_empty())
+        });
     }
 
     fn validate(&self) -> Result<(), ConfigError> {
@@ -369,10 +382,17 @@ mod tests {
     fn select_tool(name: &str) -> impl Fn(&str, &str) -> String + '_ {
         move |file, text| {
             if file == "PAR6.toml" {
-                text.replace(
-                    "active_gripper = \"MSG_small_motor_150mm_rail\"",
-                    &format!("active_gripper = \"{name}\""),
-                )
+                // By line, so the shipped tool can change (and carry a
+                // trailing comment) without silently selecting nothing.
+                text.split_inclusive('\n')
+                    .map(|line| {
+                        if line.trim_start().starts_with("active_gripper") {
+                            format!("active_gripper = \"{name}\"\n")
+                        } else {
+                            line.to_owned()
+                        }
+                    })
+                    .collect()
             } else {
                 text.to_owned()
             }
@@ -455,8 +475,8 @@ mod tests {
         assert_eq!(names.len(), distinct, "gripper names collide: {names:?}");
 
         let active = bundle.active_gripper().expect("active gripper");
-        assert_eq!(active.name, "MSG_small_motor_150mm_rail");
-        assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 106.0);
+        assert_eq!(active.name, "MSG_small_motor_200mm_rail");
+        assert_eq!(active.driver.as_ref().unwrap().stroke_mm, 200.0);
         // J4 (index 4) is gripper-dependent and overridden by the MSG gripper.
         assert_eq!(bundle.effective_home_offset(4), Some(-2.070));
         // J3 (index 3) is gripper-dependent but no gripper overrides it → fallback.
@@ -504,6 +524,15 @@ mod tests {
             bundle.active_gripper().map(|g| g.name.as_str()),
             Some("Flange")
         );
+        // Loading is not enough: the daemon and par6-selfcal both re-check
+        // the stripped robot config on startup, so whatever stripping
+        // leaves behind has to satisfy that check too. Leaving an emptied
+        // home group (or an emptied step) behind stopped both of them from
+        // starting with nothing on the flange.
+        bundle
+            .robot
+            .validate()
+            .expect("the stripped sequence must still satisfy RobotConfig::validate");
         assert!(
             bundle
                 .robot

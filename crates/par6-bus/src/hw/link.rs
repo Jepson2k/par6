@@ -137,9 +137,10 @@ fn bring_up_timed(
 /// Bring the configured interface into its operating state (up at the
 /// configured bitrate), if it is not already there.
 ///
-/// An interface that is already up is left running: only its bitrate is
-/// checked (mismatch is an error, not a silent re-time). A down
-/// interface is taken through down → bitrate/restart-ms → up →
+/// An interface that is already up is left running: its bitrate is
+/// checked (mismatch is an error, not a silent re-time) and its TX queue
+/// is raised to the configured length, which carries no timing meaning.
+/// A down interface is taken through down → bitrate/restart-ms → up →
 /// txqueuelen. Virtual interfaces (vcan) report no bit timing at all;
 /// they are accepted as-is.
 pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
@@ -167,6 +168,13 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
                 });
             }
         }
+        // The queue length is not a timing property, so unlike the
+        // bitrate it is safe to set on a running bus — and it has to be:
+        // an interface someone else brought up carries whatever default
+        // they left, and a 10-frame queue drops the boot configuration
+        // burst outright ("TX queue full", seen on this arm 2026-09-19
+        // after can0 came back up outside this process).
+        set_txqueuelen(&cfg.interface, cfg.txqueuelen);
         log::info!(
             "CAN interface '{}' already up ({} bps)",
             cfg.interface,

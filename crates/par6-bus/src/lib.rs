@@ -43,6 +43,7 @@ mod types;
 
 pub use backend::RuntimeBus;
 pub use bus::DriverBus;
+pub use hw::sched::ConfigKind;
 pub use hw::{OpenError, SocketCanBus};
 pub use loopback::{LoopbackBus, Reply, TxRecord};
 pub use types::{

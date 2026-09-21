@@ -599,6 +599,12 @@ impl DriverBus for SocketCanBus {
             PollStep::Override(PollAction::ResendConfig { node }) => {
                 self.resend_node_config(node, 1)
             }
+            PollStep::Override(PollAction::ConfigFrame { node, kind }) => {
+                let c = self.node_config(node).ok_or(BusError::InvalidCommand {
+                    reason: "configuration poll for a node with no stored configuration",
+                })?;
+                self.send(&config_frame(kind, &c))
+            }
             PollStep::Poll { target, kind } => {
                 let node = self.poll_nodes[target];
                 let f = encode_poll(node, kind);

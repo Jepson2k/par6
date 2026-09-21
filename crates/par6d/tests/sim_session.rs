@@ -1646,16 +1646,15 @@ fn the_rt_jog_latch_greys_the_enablement_flag() {
 /// and friends decoded, validated, and were then dropped on the floor —
 /// every slider in a UI moved and none of them did anything.
 ///
-/// Both halves measure DISPLACEMENT over a fixed window rather than the
-/// time to reach a mark. Time-to-mark carries the fixed command→RT→sim
-/// latency in every sample, which dilutes the ratio and moves with how
-/// loaded the box is; distance covered in a fixed window is the quantity
-/// the fraction scales directly. Against the unwired code both fractions
-/// produce the same displacement, so either assertion fails.
+/// Acceleration is measured by displacement during the ramp. The servo speed
+/// fraction is measured by peak speed over a complete long move: a short
+/// opening window is dominated by jerk/acceleration limits, not the speed cap.
+/// Ignoring either fraction makes its two measurements equal.
 #[test]
 fn stream_speed_and_accel_fractions_reach_the_arm() {
     let rig = Rig::boot(common::shipped_config());
     let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
 
     /// How far J0 travels in `window` while `command` is streamed at it.
     fn travel(
@@ -1708,30 +1707,53 @@ fn stream_speed_and_accel_fractions_reach_the_arm() {
          {gentle:.3} deg vs {brisk:.3} at full accel"
     );
 
-    // Servo: one far target held for a fixed window, so the constant-speed
-    // stretch dominates and the fraction shows up as distance covered.
-    let mut target = park_deg();
-    target[0] += 90.0;
-    let servo = |speed: Option<f64>| {
-        move || {
-            Command::ServoJ(par6_proto::command::ServoJ {
-                angles: target,
-                speed,
-                accel: None,
-            })
+    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("config");
+    let limits = &cfg.joints[0].limits;
+    let mut start = park_deg();
+    start[0] = (limits.soft_min_rad + 0.2).to_degrees();
+    let mut target = start;
+    target[0] = (limits.soft_max_rad - 0.2).to_degrees();
+    let mut peak_speed = |speed: Option<f64>| {
+        c.ok(&Command::Reset);
+        rig.drain_status();
+        teleport_home(&rig, &mut c, start);
+        rig.wait_status("the servo probe starts at rest", |s| {
+            s.mode == ControllerMode::Idle && s.speeds[0].abs() < 0.01
+        });
+        let command = Command::ServoJ(par6_proto::command::ServoJ {
+            angles: target,
+            speed,
+            accel: None,
+        });
+        let deadline = Instant::now() + common::BUDGET;
+        let mut peak = 0.0_f64;
+        loop {
+            assert!(Instant::now() < deadline, "the servo probe did not arrive");
+            c.send(&command);
+            let Some(s) = rig.recv_status() else { continue };
+            peak = peak.max(s.speeds[0].abs());
+            if (s.angles[0] - target[0]).abs() < 1.0 && s.speeds[0].abs() < 0.05 {
+                return peak;
+            }
         }
     };
-    let cruise = Duration::from_millis(600);
-    let full = travel(&rig, &mut c, cruise, servo(None));
-    let quarter = travel(&rig, &mut c, cruise, servo(Some(0.25)));
+    let full = peak_speed(None);
+    let quarter = peak_speed(Some(0.25));
+    let ceiling = limits
+        .for_mode(par6_config::LimitMode::Stream)
+        .velocity_rad_s;
     assert!(
-        full > 1.0,
-        "the full-speed stream barely moved ({full:.3} deg); nothing to compare"
+        full > 0.5 * ceiling,
+        "the full-speed probe must reach cruise: {full:.3} rad/s"
+    );
+    assert!(
+        quarter > 0.1 * ceiling,
+        "the quarter-speed probe must move: {quarter:.3} rad/s"
     );
     assert!(
         quarter < full * 0.5,
-        "a quarter-speed stream must cover far less ground in {cruise:?}: \
-         {quarter:.3} deg vs {full:.3} at full speed"
+        "a quarter-speed stream must have a lower cruising speed: \
+         {quarter:.3} rad/s vs {full:.3} at full speed"
     );
 
     rig.shutdown();

@@ -770,10 +770,77 @@ impl Default for FreedriveConfig {
     }
 }
 
+/// Shutdown policy for standalone calibration.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SelfcalConfig {
+    /// Permit current release if incomplete homing prevents parking.
+    pub release_on_failure: bool,
+    /// How long each identification pose is held while its torque is
+    /// measured \[s\].
+    #[serde(default = "default_hold_s")]
+    pub hold_s: f64,
+    /// Identification poses per run. Gravity fixes only about half a
+    /// six-axis arm's parameters, and reaching that much takes roughly
+    /// twenty well-spread poses.
+    #[serde(default = "default_identification_poses")]
+    pub identification_poses: usize,
+    /// Fraction of each joint's EXEC velocity and acceleration limits
+    /// used for identification moves. These are ordinary moves, not the
+    /// parking retreat, so they run at each joint's own rate rather than
+    /// the deliberately slow speed in `[shutdown]`.
+    #[serde(default = "default_move_speed_fraction")]
+    pub move_speed_fraction: f64,
+    /// Ridge weight for the identification solve: it holds a parameter
+    /// the poses say nothing about near the model's own value instead of
+    /// letting the solve run away with it.
+    #[serde(default = "default_ridge")]
+    pub ridge: f64,
+    /// How far each identification pose is approached from, on the joint
+    /// side \[rad\]. Only the direction of travel matters: the pair of
+    /// approaches cancels Coulomb friction by averaging, and friction is
+    /// fully developed within a fraction of a degree. This used to borrow
+    /// the homing release distance, which is sized to free an endstop —
+    /// on J4/J5's 4:1 reduction that came to 22 degrees of swing at every
+    /// pose, for nothing.
+    #[serde(default = "default_approach_rad")]
+    pub approach_rad: f64,
+    /// How long a drive may stay silent before the run calls it a fault
+    /// \[s\]. A STEPFOC drive runs its CAN protocol in `loop()` and its
+    /// current loop in a timer interrupt, so a starved `loop()` answers
+    /// nothing while the motor stays controlled; this arm had J1 go quiet
+    /// for 10.5 s with no error flag and every other drive replying. The
+    /// run holds position for this long before giving up on a drive.
+    #[serde(default = "default_stale_recovery_s")]
+    pub stale_recovery_s: f64,
+}
+fn default_approach_rad() -> f64 {
+    0.05
+}
+fn default_stale_recovery_s() -> f64 {
+    // Measured on this arm: J1's silences run 10.2-14.7 s.
+    30.0
+}
+fn default_hold_s() -> f64 {
+    2.0
+}
+fn default_identification_poses() -> usize {
+    20
+}
+fn default_move_speed_fraction() -> f64 {
+    0.5
+}
+fn default_ridge() -> f64 {
+    1e-6
+}
+
 /// Root of a robot TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RobotConfig {
+    /// Standalone calibration experiment settings.
+    #[serde(default)]
+    pub selfcal: SelfcalConfig,
     /// Observable gravity correction [mass, mx, my, mz] per moving body.
     /// Does not change nominal inertias or the declared payload.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -886,6 +953,34 @@ impl RobotConfig {
 
     /// Validate the whole tree; every error names its field.
     pub fn validate(&self) -> Result<(), ConfigError> {
+        if !(self.selfcal.hold_s.is_finite() && self.selfcal.hold_s > 0.0) {
+            return Err(invalid("selfcal.hold_s", "must be finite and > 0"));
+        }
+        if self.selfcal.identification_poses == 0 {
+            return Err(invalid("selfcal.identification_poses", "must be > 0"));
+        }
+        if !is_positive(self.selfcal.move_speed_fraction) || self.selfcal.move_speed_fraction > 1.0
+        {
+            return Err(invalid(
+                "selfcal.move_speed_fraction",
+                "must be finite and in (0, 1]",
+            ));
+        }
+        if !is_positive(self.selfcal.approach_rad) || self.selfcal.approach_rad > 0.5 {
+            return Err(invalid(
+                "selfcal.approach_rad",
+                "must be finite and in (0, 0.5]",
+            ));
+        }
+        if !(self.selfcal.stale_recovery_s.is_finite() && self.selfcal.stale_recovery_s > 0.0) {
+            return Err(invalid(
+                "selfcal.stale_recovery_s",
+                "must be finite and > 0",
+            ));
+        }
+        if !(self.selfcal.ridge.is_finite() && self.selfcal.ridge > 0.0) {
+            return Err(invalid("selfcal.ridge", "must be finite and > 0"));
+        }
         if (!self.gravity_correction.is_empty() && self.gravity_correction.len() != 24)
             || self
                 .gravity_correction

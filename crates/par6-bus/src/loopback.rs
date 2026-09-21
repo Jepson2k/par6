@@ -103,6 +103,13 @@ impl Reply {
 /// One frame everything the loopback transmitted, for test assertions.
 #[derive(Debug, Clone, PartialEq)]
 pub enum TxRecord {
+    /// One configuration field sent through the poll slot.
+    ConfigFrame {
+        /// Target node.
+        node: NodeId,
+        /// Configuration field.
+        kind: crate::ConfigKind,
+    },
     /// One motion frame per arm joint, config order.
     Joints(Vec<JointCommand>),
     /// The gripper-slot frame (`NoGripper` = RTR ping to the timing
@@ -395,6 +402,18 @@ impl DriverBus for LoopbackBus {
                     self.tx_log.push((tick, TxRecord::ClearError { node }));
                 }
                 PollAction::ResendConfig { node } => self.record_config_pass(node),
+                PollAction::ConfigFrame { node, kind } => {
+                    if !self.joint_nodes.contains(&node) && node != self.gripper_node {
+                        return Err(BusError::InvalidCommand {
+                            reason: "configuration poll for a node with no stored configuration",
+                        });
+                    }
+                    if self.refuse_config_sends & (1 << node) != 0 {
+                        return Err(BusError::TxQueueFull);
+                    }
+                    self.tx_log
+                        .push((self.tick, TxRecord::ConfigFrame { node, kind }));
+                }
             }
             if repeats > 1 {
                 self.override_slot = Some((action, repeats - 1));

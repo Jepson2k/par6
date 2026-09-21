@@ -874,13 +874,27 @@ fn apply_tool_inertial(
     }
     let body_com: [f64; 3] =
         std::array::from_fn(|k| (tool.mass_kg * com[k] - jaw_moment[k]) / mass);
-    let (moments, iquat) = principal_axes(inertia);
     let body = spec
         .body_mut("gripper")
         .ok_or_else(|| SceneError::Missing {
             kind: "body",
             name: "gripper".to_owned(),
         })?;
+    // A passive tool's config states its mass and where it sits and stops
+    // there: the base attachment carries no tensor at all. Writing those
+    // zeros in would leave a moving body MuJoCo refuses to compile, so an
+    // unstated tensor keeps the variant's own, rescaled to the config mass.
+    let (moments, iquat) = if inertia.iter().all(|i| *i == 0.0) {
+        let scale = if body.mass() > 0.0 {
+            mass / body.mass()
+        } else {
+            1.0
+        };
+        let scaled: [f64; 3] = std::array::from_fn(|k| body.inertia()[k] * scale);
+        (scaled, *body.iquat())
+    } else {
+        principal_axes(inertia)
+    };
     body.set_mass(mass);
     body.with_ipos(body_com);
     body.with_iquat(iquat);

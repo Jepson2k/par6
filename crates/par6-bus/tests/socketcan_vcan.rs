@@ -208,10 +208,14 @@ impl Wire {
 fn configs(iface: &str) -> (RobotConfig, GripperConfig) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let bundle = ConfigBundle::load(&root.join("config/PAR6.toml")).expect("PAR6 config bundle");
+    // What is on the wire is the subject here, not which tool the shipped
+    // config selects: a passive attachment is a valid thing to ship, and
+    // these tests still need a gripper node to talk to.
     let gripper = bundle
-        .active_gripper()
-        .filter(|g| g.driver.is_some())
-        .expect("the active gripper has a CAN driver")
+        .grippers
+        .iter()
+        .find(|g| g.driver.is_some())
+        .expect("a gripper with a CAN driver")
         .clone();
     let mut robot = bundle.robot;
     robot.bus.interface = iface.to_string();

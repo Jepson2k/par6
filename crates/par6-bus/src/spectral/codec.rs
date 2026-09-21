@@ -642,7 +642,7 @@ pub enum Payload {
         /// Motor speed \[ticks/s\].
         speed_ticks_s: i32,
     },
-    /// cmd 32: i24 position latched at trigger + hall bits.
+    /// cmd 32: live i24 position + hall bits; firmware holds its target at the edge.
     Hall {
         /// Latched motor position \[encoder ticks\].
         position_ticks: i32,

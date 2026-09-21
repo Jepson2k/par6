@@ -414,115 +414,86 @@ fn stall_endstop_signatures_and_release_preload() {
 #[test]
 fn hall_joint_trigger_edge_and_latched_position() {
     let robot = par6();
-    let dt = robot.robot.tick_dt_s;
-    let j = 5usize; // J5: the hall-strategy joint
-    let jc = &robot.joints[j];
-    let h = &robot.homing.joints[j];
-    assert_eq!(h.strategy, HomingStrategy::Hall);
-    let node = usize::from(jc.node_id);
-    let conv = JointConversion::from_config(jc);
-    let tau = std::f64::consts::TAU;
-
-    // The shipped PAR6 sequence nudges J5 to ~+0.6 and homes it from
-    // there with the DEFAULT config: direction 0 (positive motor, dir=1
-    // joint) moves the joint DOWN, away from `home_offset` itself — the
-    // physical sensor is met at its circular alias `home_offset − 2π`.
-    // Boot in the sequence's approach region — J1/J2 at the mid pose the
-    // sequence moves them to before the wrist homes, so the gripper sweeps
-    // clear of the pedestal — to prove the default band is reachable
-    // exactly as the vendor sequence drives it.
-    let sensor_alias = h.home_offset_rad - tau;
-    let mut q0 = calibration_pose(&robot);
-    q0[1] = -1.85;
-    q0[2] = 2.85;
-    q0[j] = 0.6;
-    let mut rig = Rig::boot(&robot, None, Some(&q0));
-    let true0 = conv.motor_ticks(q0[j]);
-    let emax = 1i32 << jc.encoder_bits;
-    let wrap_off = true0.rem_euclid(emax) - true0;
-
-    let sign = if h.direction == 1 { -1.0 } else { 1.0 };
-    let mut cmds = rig.idle_cmds();
-    cmds[j] = JointCommand::hall((sign * h.speed_ticks_s) as i32, 2);
-
-    // Phase 1 — default band from the homing config: approach off-sensor,
-    // then trigger with an edge and a latched position near the sensor.
-    let mut recs: Vec<(i32, bool, bool)> = Vec::new(); // (pos, trigger, edge)
-    let mut post_exit = 0u32;
-    for _ in 0..u64::from(robot.ticks(h.timeout_s)) {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-        let ns = &rig.state.nodes[node];
-        let (Some(pos), Some(hall)) = (ns.position_ticks, ns.hall) else {
-            continue;
-        };
-        recs.push((pos, hall.trigger, hall.edge));
-        // Stop a few replies after the drive has crossed and left the band.
-        if hall.trigger && recs.iter().any(|(_, t, _)| !t) {
-            post_exit += 1;
-            if post_exit >= 5 {
-                break;
+    let joint = 5;
+    let node = usize::from(robot.joints[joint].node_id);
+    let speed = robot.homing.joints[joint].speed_ticks_s as i32;
+    let half_width = 0.04;
+    for starts_inside in [false, true] {
+        let mut pose = calibration_pose(&robot);
+        pose[1] = -1.85;
+        pose[2] = 2.85;
+        pose[joint] = 0.6;
+        let center = if starts_inside { 0.6 } else { 0.3 };
+        let expected_edge = center
+            + if starts_inside {
+                -half_width
+            } else {
+                half_width
+            };
+        let mut rig = Rig::boot(&robot, None, Some(&pose));
+        rig.bus.set_hall_trigger(joint, center, half_width);
+        let mut commands = rig.idle_cmds();
+        commands[joint] = JointCommand::hall(speed, 2);
+        let mut hit = false;
+        for _ in 0..robot.ticks(3.0) {
+            rig.state.nodes[node].hall = None;
+            rig.step(&commands, &GripperCommand::NoGripper);
+            if let Some(hall) = rig.state.nodes[node].hall {
+                if hall.edge && !hall.trigger {
+                    hit = true;
+                    break;
+                }
             }
         }
-    }
-    let hit = recs
-        .iter()
-        .position(|(_, trigger, _)| !trigger)
-        .expect("hall never triggered within the homing timeout");
-    assert!(hit > 5, "started on the sensor — no off-sensor approach");
-    assert!(
-        recs[..hit]
-            .iter()
-            .all(|(_, trigger, edge)| *trigger && !edge),
-        "trigger/edge asserted during the off-sensor approach"
-    );
-    let (latched, _, edge) = recs[hit];
-    assert!(edge, "no edge bit on the band-entry reply");
-    assert_eq!(
-        recs.iter().filter(|(_, _, e)| *e).count(),
-        1,
-        "edge must be a one-shot on band entry"
-    );
-    // Position is latched AT trigger: frozen while the trigger is active
-    // even though the drive keeps moving through the band.
-    let in_band: Vec<_> = recs[hit..].iter().take_while(|(_, t, _)| !t).collect();
-    assert!(
-        in_band.iter().all(|(p, _, _)| *p == latched),
-        "in-band replies did not hold the latched position {latched}"
-    );
-    // The latch sits at the sensor (loose bound: the exact band half-width
-    // is the sim's default, asserted precisely in phase 2).
-    let latched_joint = conv.joint_rad(latched - wrap_off);
-    assert!(
-        (latched_joint - sensor_alias).abs() < 0.05,
-        "latched at {latched_joint} rad, sensor at {sensor_alias} rad"
-    );
-    // After the band, live positions resume past the latch.
-    let after = recs.last().unwrap();
-    assert!(after.1 && after.0 > latched, "live position did not resume");
-
-    // Phase 2 — a moved sensor (set_hall_trigger) triggers at the exact
-    // band-entry edge: joint decreasing enters at `center + half`.
-    let cur_joint = conv.joint_rad(recs.last().unwrap().0 - wrap_off);
-    let (center, half) = (cur_joint - 0.1, 0.02);
-    rig.bus.set_hall_trigger(j, center, half);
-    let mut latched2 = None;
-    for _ in 0..u64::from(robot.ticks(2.0)) {
-        rig.step(&cmds, &GripperCommand::NoGripper);
-        let ns = &rig.state.nodes[node];
-        if let (Some(pos), Some(hall)) = (ns.position_ticks, ns.hall) {
-            if hall.edge {
-                latched2 = Some(pos);
-                break;
+        assert!(
+            hit,
+            "any-edge mode must find an edge starting inside or outside the band"
+        );
+        let hit_angle = rig.bus.true_joint_rad()[joint];
+        assert!((hit_angle - expected_edge).abs() < 0.04,
+            "triggered at {hit_angle}, expected physical edge {expected_edge}; inside={starts_inside}");
+        for tick in 0..robot.ticks(0.5) {
+            // Updating Hall-mode speed cannot re-arm an already latched edge.
+            commands[joint] = JointCommand::hall(if tick % 2 == 0 { speed } else { -speed }, 2);
+            rig.step(&commands, &GripperCommand::NoGripper);
+            let hall = rig.state.nodes[node].hall.unwrap();
+            assert!(
+                hall.edge && !hall.trigger,
+                "the edge remains latched until mode exit"
+            );
+        }
+        assert!(
+            (rig.bus.true_joint_rad()[joint] - hit_angle).abs() < 0.10,
+            "the firmware holds at the edge instead of driving through it"
+        );
+        commands[joint] = JointCommand::velocity(-speed, 0);
+        for _ in 0..robot.ticks(0.3) {
+            rig.step(&commands, &GripperCommand::NoGripper);
+        }
+        assert!(
+            rig.bus.true_joint_rad()[joint] > hit_angle + 0.1,
+            "leaving Hall mode permits an ordinary velocity backoff"
+        );
+        commands[joint] = JointCommand::hall(speed, 2);
+        let mut saw_armed = false;
+        let mut hit_again = false;
+        for _ in 0..robot.ticks(3.0) {
+            rig.state.nodes[node].hall = None;
+            rig.step(&commands, &GripperCommand::NoGripper);
+            if let Some(hall) = rig.state.nodes[node].hall {
+                saw_armed |= hall.trigger && !hall.edge;
+                if hall.edge && !hall.trigger {
+                    assert!(saw_armed, "re-entering Hall mode clears the old edge");
+                    hit_again = true;
+                    break;
+                }
             }
         }
+        assert!(
+            hit_again,
+            "a new approach finds a fresh edge after mode exit"
+        );
     }
-    let latched2 = latched2.expect("moved hall band never triggered");
-    let expected = conv.motor_ticks(center + half) + wrap_off;
-    let tol = h.speed_ticks_s * dt + 2.0; // one control step of travel
-    assert!(
-        f64::from((latched2 - expected).abs()) <= tol,
-        "latched {latched2}, expected band entry at {expected} (±{tol})"
-    );
 }
 
 // ---------------------------------------------------------------------------

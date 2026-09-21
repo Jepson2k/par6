@@ -237,6 +237,13 @@ pub enum PollAction {
         /// Target node.
         node: NodeId,
     },
+    /// One stored configuration field, consuming exactly one poll slot.
+    ConfigFrame {
+        /// Target node.
+        node: NodeId,
+        /// Field to transmit.
+        kind: crate::ConfigKind,
+    },
 }
 
 /// Per-type driver fault flags (cmd 26 reply, DLC 2; list index 0 = bit 7).
@@ -353,12 +360,11 @@ pub struct DeviceInfo {
 /// HALL homing reply bits (cmd 32, DLC 4).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct HallState {
-    /// HALL_trigger bit (b7). Vendor hit condition: trigger == 0 or
-    /// `edge` set; position is latched AT trigger.
+    /// HALL_trigger bit (b7): true while searching, false while holding the hit.
     pub trigger: bool,
     /// Pin-2 state (b6).
     pub pin2: bool,
-    /// Hall index / edge bit (b5).
+    /// Hall index / edge bit (b5), retained until a new Hall-mode entry.
     pub edge: bool,
 }
 

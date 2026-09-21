@@ -45,7 +45,7 @@ fn boot_tagged(tag: &str) -> Rig {
 /// LOOP_CRITICAL. Every RT time constant derives from config seconds, so
 /// the wiring under test is identical.
 fn test_config(tag: &str) -> PathBuf {
-    common::retimed_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
+    common::nominal_gravity_config(&format!("ffi-{tag}"), TEST_TICK_DT_S)
 }
 
 /// The tick period every rig in this file boots at. Anything that has to
@@ -58,18 +58,31 @@ const TEST_TICK_DT_S: f64 = 0.02;
 /// replaced — the knob the gravity-wiring test turns.
 fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
     let dst = test_config(tag);
-    let toml = dst
-        .parent()
-        .unwrap()
-        .join("grippers/MSG_small_motor_150mm_rail.toml");
+    // Whichever tool the config selects: pinning one variant's file name
+    // patches a file the run never loads once the shipped tool changes,
+    // and the test then compares two identical arms.
+    let robot = std::fs::read_to_string(&dst).expect("robot toml");
+    let name = robot
+        .lines()
+        .find_map(|line| line.trim_start().strip_prefix("active_gripper"))
+        .and_then(|rest| rest.split('"').nth(1))
+        .expect("the config names an active gripper");
+    let toml = dst.parent().unwrap().join(format!("grippers/{name}.toml"));
     let text = std::fs::read_to_string(&toml).expect("gripper toml");
-    // contains(), not assert_ne on the output: the baseline call passes
-    // the default 0.37, whose patch is a no-op by construction.
     assert!(
-        text.contains("mass_kg = 0.37"),
-        "mass_kg patch point must exist"
+        text.lines().any(|l| l.trim_start().starts_with("mass_kg")),
+        "{name} has no mass_kg to patch"
     );
-    let patched = text.replace("mass_kg = 0.37", &format!("mass_kg = {mass_kg}"));
+    let patched: String = text
+        .split_inclusive('\n')
+        .map(|line| {
+            if line.trim_start().starts_with("mass_kg") {
+                format!("mass_kg = {mass_kg}\n")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect();
     std::fs::write(&toml, patched).expect("write gripper toml");
     dst
 }
@@ -2579,9 +2592,8 @@ fn a_refused_servo_stream_lands_on_the_keep_out_standoff() {
         // of the motion. Rest is only believable once the arm has held
         // still across a window WIDER than that pause.
         let settle = Instant::now() + Duration::from_secs(20);
-        // Wider than the whole refusal sequence's travel budget, so a
-        // pause between braking and placement cannot be read as the end
-        // of the motion.
+        // Wider than the measured-braking phase budget, so a pause before
+        // a residual correction cannot be read as the end of the motion.
         let quiet = Duration::from_secs(4);
         let mut rest = f64::NAN;
         let mut last = f64::NAN;

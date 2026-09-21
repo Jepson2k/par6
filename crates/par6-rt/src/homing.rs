@@ -161,6 +161,7 @@ impl HomerParams {
     fn from_config(
         node: NodeId,
         jh: &JointHoming,
+        seek_timeout_s: f64,
         normal_vel_limit: f64,
         normal_ilim: f64,
         dt: f64,
@@ -173,7 +174,7 @@ impl HomerParams {
             strategy: jh.strategy,
             speed: dir_sign * jh.speed_ticks_s,
             current_ma: jh.current_ma,
-            timeout_ticks: ticks(jh.timeout_s).max(1),
+            timeout_ticks: ticks(seek_timeout_s).max(1),
             backoff_ticks: ticks(jh.backoff_s),
             two_pass: jh.two_pass && jh.strategy == HomingStrategy::Stall,
             max_diff_ticks: i64::from(jh.two_pass_max_diff_ticks),
@@ -761,6 +762,7 @@ impl HomingSystem {
             HomerParams::from_config(
                 robot.joints[i].node_id,
                 &robot.homing.joints[i],
+                robot.homing.joints[i].seek_timeout_s(&robot.joints[i]),
                 robot.joints[i].velocity_limit_ticks_s,
                 robot.joints[i].ilim_ma,
                 dt,
@@ -773,6 +775,7 @@ impl HomingSystem {
             Some(HomerParams::from_config(
                 robot.bus.gripper_node,
                 h,
+                h.timeout_s,
                 d.velocity_limit_ticks_s,
                 d.ilim_ma,
                 dt,

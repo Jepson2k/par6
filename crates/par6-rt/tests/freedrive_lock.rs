@@ -14,6 +14,11 @@ use par6_rt::{CompletionPolicy, RtCommand, MAX_JOINTS};
 
 const G: [f64; MAX_JOINTS] = [0.5, -1.2, 0.8, 0.05, -0.02, 0.01];
 
+fn trimmed_gravity() -> [f64; MAX_JOINTS] {
+    let scales = bundle().robot.gravity_scale;
+    std::array::from_fn(|i| G[i] * scales[i])
+}
+
 fn lock_cfg() -> FreedriveConfig {
     FreedriveConfig {
         drift_lock: true,
@@ -51,7 +56,11 @@ fn tick_until_armed(rig: &mut Rig) -> u32 {
         if s.drift_lock.armed {
             return n;
         }
-        assert_torque_only(&rig.last_joints(), &torque_only_ma(&G), "before arming");
+        assert_torque_only(
+            &rig.last_joints(),
+            &torque_only_ma(&trimmed_gravity()),
+            "before arming",
+        );
     }
     panic!("lock never armed within the settle window ({limit} ticks)");
 }
@@ -119,7 +128,12 @@ fn arms_after_the_settle_window_holds_and_dissolves_on_the_first_tick_of_motion(
         s.drift_lock.integral_nm, [0.0; MAX_JOINTS],
         "no error, no integral"
     );
-    assert_pd_hold(&mut rig, &s.drift_lock.hold_rad, &G, "armed");
+    assert_pd_hold(
+        &mut rig,
+        &s.drift_lock.hold_rad,
+        &trimmed_gravity(),
+        "armed",
+    );
 
     // The arm sags 0.02 rad on J0 without ever moving fast: the drive
     // keeps holding the captured pose and the integral accumulates the
@@ -139,7 +153,7 @@ fn arms_after_the_settle_window_holds_and_dissolves_on_the_first_tick_of_motion(
         [0.0; MAX_JOINTS - 1],
         "other joints carry no error"
     );
-    let mut ff = G;
+    let mut ff = trimmed_gravity();
     ff[0] += s.drift_lock.integral_nm[0];
     assert_pd_hold(
         &mut rig,
@@ -168,7 +182,11 @@ fn arms_after_the_settle_window_holds_and_dissolves_on_the_first_tick_of_motion(
         s.drift_lock.integral_nm, [0.0; MAX_JOINTS],
         "integral zeroed with it"
     );
-    assert_torque_only(&rig.last_joints(), &torque_only_ma(&G), "pushed: pure G(q)");
+    assert_torque_only(
+        &rig.last_joints(),
+        &torque_only_ma(&trimmed_gravity()),
+        "pushed: pure G(q)",
+    );
     rig.tick_n(settle_ticks(&rig) * 2);
     assert!(!rig.snap().drift_lock.armed, "never re-arms while moving");
 
@@ -182,7 +200,7 @@ fn arms_after_the_settle_window_holds_and_dissolves_on_the_first_tick_of_motion(
         s.drift_lock.integral_nm, [0.0; MAX_JOINTS],
         "nothing toward the old pose"
     );
-    assert_pd_hold(&mut rig, &s.q, &G, "re-armed");
+    assert_pd_hold(&mut rig, &s.q, &trimmed_gravity(), "re-armed");
 }
 
 #[test]
@@ -206,7 +224,7 @@ fn the_integral_clamp_is_hit_exactly_and_never_exceeded() {
     );
     assert_eq!(peak, limit, "integral never exceeded the clamp");
     // ... and the wire carries the hold with G(q) plus exactly the clamp.
-    let mut ff = G;
+    let mut ff = trimmed_gravity();
     ff[1] += limit;
     assert_pd_hold(&mut rig, &s.drift_lock.hold_rad, &ff, "clamped");
 }
@@ -222,7 +240,7 @@ fn the_lock_adds_nothing_when_off_or_outside_freedrive() {
     assert!(!rig.snap().drift_lock.armed);
     assert_torque_only(
         &rig.last_joints(),
-        &torque_only_ma(&G),
+        &torque_only_ma(&trimmed_gravity()),
         "lock off: pure G(q)",
     );
 

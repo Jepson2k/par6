@@ -63,7 +63,7 @@ enum Mode {
     Velocity { vel: f64, cur_ff: f64 },
     Current { cur: f64 },
     Pd { pos: f64, vel: f64, cur_ff: f64 },
-    Hall { vel: f64 },
+    Hall { vel: f64, trigger_value: u8 },
 }
 
 /// What the bus must transmit back for a delivered data frame.
@@ -105,7 +105,9 @@ pub(crate) struct VirtualDriver {
     flags: ErrorFlags,
     // -- HALL sensor runtime (band logic evaluated by the bus) --
     pub hall_in_band: bool,
-    pub hall_edge_pending: bool,
+    pub hall_trigger: bool,
+    pub hall_edge: bool,
+    hall_needs_initial_sample: bool,
     pub hall_latched_ticks: Option<i32>,
     // -- telemetry constants --
     pub temperature_c: i16,
@@ -148,7 +150,9 @@ impl VirtualDriver {
                 ..ErrorFlags::default()
             },
             hall_in_band: false,
-            hall_edge_pending: false,
+            hall_trigger: true,
+            hall_edge: false,
+            hall_needs_initial_sample: true,
             hall_latched_ticks: None,
             temperature_c: 32 + i16::from(node),
             voltage_mv: 24_000,
@@ -211,8 +215,15 @@ impl VirtualDriver {
                 ReplyKind::Motion
             }
             (DataPackHall, 4) => {
+                if !matches!(self.mode, Mode::Hall { .. }) {
+                    self.hall_trigger = true;
+                    self.hall_edge = false;
+                    self.hall_latched_ticks = None;
+                    self.hall_needs_initial_sample = true;
+                }
                 self.mode = Mode::Hall {
                     vel: f64::from(unpack_i24([d[0], d[1], d[2]])),
+                    trigger_value: d[3],
                 };
                 self.armed = true;
                 ReplyKind::Hall
@@ -288,6 +299,33 @@ impl VirtualDriver {
             self.ticks_since_data = 0;
         }
         reply
+    }
+
+    /// Edge mode latches either transition until the host leaves Hall mode.
+    pub fn sample_hall(&mut self, in_band: bool, position_ticks: i32) {
+        let changed = self.hall_in_band != in_band;
+        self.hall_in_band = in_band;
+        let Mode::Hall { trigger_value, .. } = self.mode else {
+            return;
+        };
+        if self.hall_needs_initial_sample {
+            self.hall_needs_initial_sample = false;
+            if trigger_value == 2 {
+                return;
+            }
+        }
+        let hit = if trigger_value == 2 {
+            changed
+        } else {
+            u8::from(in_band) == trigger_value
+        };
+        if hit && self.hall_trigger {
+            self.hall_latched_ticks = Some(position_ticks);
+            self.hall_trigger = false;
+            self.hall_edge = true;
+        } else if !hit && trigger_value != 2 {
+            self.hall_trigger = true;
+        }
     }
 
     /// Feed the watchdog for an answered RTR telemetry poll.
@@ -375,8 +413,15 @@ impl VirtualDriver {
                 let vt = vel.clamp(-self.vel_limit, self.vel_limit);
                 self.velocity_pi(vt, vel_ticks_s, cur_ff, fw_steps)
             }
-            Mode::Hall { vel } => {
-                let vt = vel.clamp(-self.vel_limit, self.vel_limit);
+            Mode::Hall { vel, .. } => {
+                let target = if self.hall_trigger {
+                    vel
+                } else {
+                    self.kpp
+                        * (f64::from(self.hall_latched_ticks.unwrap_or(pos_ticks as i32))
+                            - pos_ticks)
+                };
+                let vt = target.clamp(-self.vel_limit, self.vel_limit);
                 self.velocity_pi(vt, vel_ticks_s, 0.0, fw_steps)
             }
             Mode::Current { cur } => cur,

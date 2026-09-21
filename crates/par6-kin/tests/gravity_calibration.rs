@@ -326,3 +326,190 @@ fn arm_correction_changes_gravity_without_corrupting_payload_or_dynamics() {
     assert!(fitted.set_gravity_correction(&[f64::NAN; 28]).is_err());
     assert!(fitted.set_gravity_correction(&[0.; 4]).is_err());
 }
+
+/// The two calibrations compose: a one-time fit of this arm's own
+/// (printed, so off-table) links is installed as a correction, and a
+/// later payload identification must charge the payload for the payload
+/// only — not for the arm's modelling error as well.
+#[test]
+fn a_payload_fit_does_not_reabsorb_an_installed_arm_correction() {
+    let mut kin = Kin::load_arm(&assets_dir(), None).unwrap();
+    let bodies = kin.body_count();
+
+    // The arm's links are heavier than the table says, the way a printed
+    // arm is: every body up to the wrist off by a few percent of a kilo.
+    let mut correction = vec![0.0; 4 * bodies];
+    for b in 0..bodies - 1 {
+        correction[4 * b] = 0.05;
+        correction[4 * b + 3] = 0.05 * 0.04;
+    }
+
+    const MASS: f64 = 0.8;
+    const COM: [f64; 3] = [0.01, -0.02, 0.05];
+    let start = [-2.007, -0.698, 3.491, 0.0, 1.047, 3.1416];
+
+    // Measured torque: the corrected arm, carrying the part.
+    kin.set_gravity_correction(&correction).unwrap();
+    kin.set_tool(MASS, COM, None).unwrap();
+    let samples: Vec<GravitySample> = wrist_poses(start, 0.5)
+        .into_iter()
+        .map(|q| {
+            let mut tau = [0.0; NQ];
+            kin.gravity(&q, &mut tau).unwrap();
+            GravitySample { q, tau }
+        })
+        .collect();
+
+    // Put the part down. The correction stays installed, as it does in
+    // service: it describes the arm, not the load.
+    kin.set_tool(0.0, [0.0; 3], None).unwrap();
+    let fit = gravity::fit_payload(&mut kin, &samples, 1e-6).unwrap();
+    assert!(
+        (fit.mass - MASS).abs() < 0.01,
+        "identified {:.4} kg against {MASS} kg carried; the arm correction leaked into the payload",
+        fit.mass
+    );
+    assert!(
+        max_abs_diff(&fit.com, &COM) < 0.005,
+        "identified com {:?} against {COM:?} carried",
+        fit.com
+    );
+}
+
+/// Poses spread across the joint limits, deterministic.
+fn spread_poses(n: usize) -> Vec<[f64; NQ]> {
+    const LO: [f64; NQ] = [-2.8647335, -2.4407335, 1.9912665, -2.6147335, -1.73, -0.85];
+    const HI: [f64; NQ] = [2.8647335, -0.1122665, 6.5627335, 2.5547335, 1.6, 7.14];
+    let mut seed = 0x2545_F491_4F6C_DD1Du64;
+    let mut rnd = move || {
+        seed ^= seed << 13;
+        seed ^= seed >> 7;
+        seed ^= seed << 17;
+        (seed >> 11) as f64 / (1u64 << 53) as f64
+    };
+    (0..n)
+        .map(|_| std::array::from_fn(|j| LO[j] + rnd() * (HI[j] - LO[j])))
+        .collect()
+}
+
+/// The arm's own links are identified from static torque: a printed arm
+/// weighs what it weighs, and this recovers the difference from the
+/// table. Gravity fixes only part of the parameter set, so what has to
+/// come back right is the TORQUE the corrected model predicts, not every
+/// individual number — and the ones the poses cannot fix must say so
+/// rather than drift.
+#[test]
+fn the_arms_own_links_are_identified_from_static_torque() {
+    let mut truth = Kin::load_arm(&assets_dir(), None).unwrap();
+    let bodies = truth.body_count();
+
+    // This arm is not the table: every link off by its own amount, the
+    // way parts printed to different slicer settings are.
+    let mut actual = vec![0.0; 4 * bodies];
+    for b in 0..bodies {
+        let off = 0.02 + 0.03 * (b as f64 / bodies as f64);
+        actual[4 * b] = off;
+        actual[4 * b + 1] = off * 0.01;
+        actual[4 * b + 3] = off * 0.05;
+    }
+    truth.set_gravity_correction(&actual).unwrap();
+
+    let poses = spread_poses(24);
+    let samples: Vec<GravitySample> = poses
+        .iter()
+        .map(|q| {
+            let mut tau = [0.0; NQ];
+            truth.gravity(q, &mut tau).unwrap();
+            GravitySample { q: *q, tau }
+        })
+        .collect();
+
+    let mut model = Kin::load_arm(&assets_dir(), None).unwrap();
+    let fit = gravity::fit_arm(&mut model, &samples, 1e-9).unwrap();
+
+    assert!(
+        fit.rms_nm < fit.rms_before_nm / 20.0,
+        "fit left {:.5} Nm against {:.5} Nm uncorrected",
+        fit.rms_nm,
+        fit.rms_before_nm
+    );
+
+    // Installed, the correction must reproduce the real arm's torque at
+    // poses the fit never saw.
+    model.set_gravity_correction(&fit.correction).unwrap();
+    for q in spread_poses(40).iter().skip(24) {
+        let (mut want, mut got) = ([0.0; NQ], [0.0; NQ]);
+        truth.gravity(q, &mut want).unwrap();
+        model.gravity(q, &mut got).unwrap();
+        assert!(
+            max_abs_diff(&want, &got) < 0.01,
+            "unseen pose {q:?}: predicted {got:?} against {want:?}"
+        );
+    }
+
+    // The base link turns about gravity, so no pose can weigh it. That
+    // has to be reported, not quietly guessed at.
+    assert!(
+        fit.determined[0] < 0.01,
+        "the base link cannot be identified from gravity, got {}",
+        fit.determined[0]
+    );
+    assert!(
+        fit.determined.iter().filter(|d| **d > 0.5).count() >= 8,
+        "too little was fixed: {:?}",
+        fit.determined
+    );
+}
+
+/// Friction is what limits this on real hardware. Averaging a pose's two
+/// approach directions cancels the symmetric part, but not all of it, so
+/// the fit has to stay useful under what is left rather than chase it.
+#[test]
+fn the_arm_fit_survives_the_friction_that_averaging_leaves_behind() {
+    let mut truth = Kin::load_arm(&assets_dir(), None).unwrap();
+    let bodies = truth.body_count();
+    let mut actual = vec![0.0; 4 * bodies];
+    for b in 0..bodies {
+        actual[4 * b] = 0.03;
+        actual[4 * b + 3] = 0.03 * 0.05;
+    }
+    truth.set_gravity_correction(&actual).unwrap();
+
+    // 0.05 Nm residual per joint: a twentieth of this arm's measured
+    // elbow friction, which is what is left when the two directions
+    // cancel to a few percent rather than exactly.
+    let mut noise = noise_seq();
+    let samples: Vec<GravitySample> = spread_poses(24)
+        .iter()
+        .map(|q| {
+            let mut tau = [0.0; NQ];
+            truth.gravity(q, &mut tau).unwrap();
+            for t in &mut tau {
+                *t += 0.05 * noise();
+            }
+            GravitySample { q: *q, tau }
+        })
+        .collect();
+
+    let mut model = Kin::load_arm(&assets_dir(), None).unwrap();
+    let fit = gravity::fit_arm(&mut model, &samples, 1e-6).unwrap();
+    model.set_gravity_correction(&fit.correction).unwrap();
+
+    // What matters is the torque at poses it never saw, against the
+    // error it started with.
+    let mut worst_before = 0.0f64;
+    let mut worst_after = 0.0f64;
+    let mut plain = Kin::load_arm(&assets_dir(), None).unwrap();
+    for q in spread_poses(40).iter().skip(24) {
+        let (mut want, mut got, mut before) = ([0.0; NQ], [0.0; NQ], [0.0; NQ]);
+        truth.gravity(q, &mut want).unwrap();
+        model.gravity(q, &mut got).unwrap();
+        plain.gravity(q, &mut before).unwrap();
+        worst_after = worst_after.max(max_abs_diff(&want, &got));
+        worst_before = worst_before.max(max_abs_diff(&want, &before));
+    }
+    assert!(
+        worst_after < worst_before / 4.0,
+        "worst unseen-pose error {worst_after:.4} Nm against {worst_before:.4} Nm uncorrected"
+    );
+}

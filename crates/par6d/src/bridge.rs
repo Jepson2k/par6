@@ -184,8 +184,8 @@ const STANDOFF_PLACEMENT_SCALE: (f64, f64) = (0.05, 0.05);
 /// the RT publishes, so the count only advances on a new tick.
 const STANDOFF_STILL_TICKS: u8 = 8;
 
-/// How long the arm is given to reach a standoff before the stream is
-/// ended anyway.
+/// Per-phase budget for placement and measured braking. Their shared
+/// placement/correction deadline gets both budgets once, without renewal.
 ///
 /// The refeed exists because the client has stopped sending — its
 /// motion was refused — so nothing else would keep the stream alive
@@ -1949,12 +1949,15 @@ pub(crate) fn housekeeping_loop(
                             link.send(RtCommand::SetMode(Mode::Idle));
                             link.send(RtCommand::SetMode(Mode::Stream));
                             stream_input.lock().unwrap().send(&StreamSetpoint {
-                                q: stop,
+                                q: standoff_target(&snap.q, &stop),
                                 speed: STANDOFF_PLACEMENT_SCALE.0,
                                 accel: STANDOFF_PLACEMENT_SCALE.1,
                             });
+                            log::debug!("standoff placement: q={:?} stop={stop:?}", snap.q);
                             a.standoff = Some(Standoff::Placing { stop });
-                            a.deadline = now + STANDOFF_TRAVEL_BUDGET;
+                            // Placement and measured braking share one deadline. Allow
+                            // both phases before a residual correction loses its budget.
+                            a.deadline = now + STANDOFF_TRAVEL_BUDGET * 2;
                             a.still = 0;
                             a.still_tick = 0;
                             continue;
@@ -1970,6 +1973,12 @@ pub(crate) fn housekeeping_loop(
                                 .zip(stop.iter())
                                 .all(|(q, s)| (q - s).abs() <= STANDOFF_ARRIVED_RAD);
                             if arrived {
+                                log::debug!(
+                                    "standoff arriving: q={:?} v={:?} remaining={:?}",
+                                    snap.q,
+                                    snap.qd,
+                                    a.deadline.saturating_duration_since(now)
+                                );
                                 link.send(RtCommand::StreamRelease);
                                 a.standoff = Some(Standoff::Settling {
                                     stop,
@@ -1984,14 +1993,8 @@ pub(crate) fn housekeeping_loop(
                                 sh.stream = None;
                                 continue;
                             }
-                            let mut next = snap.q;
-                            for j in 0..par6_kin::NQ {
-                                next[j] = snap.q[j]
-                                    + (stop[j] - snap.q[j])
-                                        .clamp(-STANDOFF_CREEP_RAD, STANDOFF_CREEP_RAD);
-                            }
                             stream_input.lock().unwrap().send(&StreamSetpoint {
-                                q: next,
+                                q: standoff_target(&snap.q, &stop),
                                 speed: STANDOFF_PLACEMENT_SCALE.0,
                                 accel: STANDOFF_PLACEMENT_SCALE.1,
                             });
@@ -2002,6 +2005,11 @@ pub(crate) fn housekeeping_loop(
                             placement_deadline,
                         } => {
                             if snap.mode == Mode::Idle {
+                                log::debug!(
+                                    "standoff settled: q={:?} stop={stop:?} remaining={:?}",
+                                    snap.q,
+                                    placement_deadline.saturating_duration_since(now)
+                                );
                                 if snap
                                     .q
                                     .iter()
@@ -2018,7 +2026,7 @@ pub(crate) fn housekeeping_loop(
                                     // budget rather than renewing it each time.
                                     link.send(RtCommand::SetMode(Mode::Stream));
                                     stream_input.lock().unwrap().send(&StreamSetpoint {
-                                        q: stop,
+                                        q: standoff_target(&snap.q, &stop),
                                         speed: STANDOFF_PLACEMENT_SCALE.0,
                                         accel: STANDOFF_PLACEMENT_SCALE.1,
                                     });
@@ -2305,6 +2313,11 @@ pub(crate) fn housekeeping_loop(
         }
         std::thread::sleep(housekeeping_period(dt));
     }
+}
+
+/// Every placement frame, including entry and retries, has the same lead bound.
+fn standoff_target(q: &[f64; MAX_JOINTS], stop: &[f64; MAX_JOINTS]) -> [f64; MAX_JOINTS] {
+    std::array::from_fn(|j| q[j] + (stop[j] - q[j]).clamp(-STANDOFF_CREEP_RAD, STANDOFF_CREEP_RAD))
 }
 
 /// One cartesian-jog integration step: resolve the twist into world

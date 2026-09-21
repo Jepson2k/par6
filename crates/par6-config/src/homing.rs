@@ -4,7 +4,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{invalid, ConfigError};
+use crate::{invalid, robot::JointConfig, ConfigError};
+
+/// Ramp-up and stall-confirmation allowance added to the full-range
+/// crossing time when deriving a seek budget.
+const SEEK_MARGIN: f64 = 1.25;
 
 /// Endstop detection strategy for one actuator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -219,6 +223,25 @@ pub struct HomingConfig {
 }
 
 impl JointHoming {
+    /// Seek budget \[s\] for one approach leg on `joint`.
+    ///
+    /// `timeout_s` alone is a fixed number that says nothing about how far
+    /// the joint may have to travel, so a joint left near the far end of
+    /// its range times out before reaching the endstop and homing becomes
+    /// a function of where the arm was parked. This arm did exactly that
+    /// on 2026-09-20: J1 swept 196 deg of its 338 deg range in the
+    /// configured 13 s and stopped short of the switch. The budget is
+    /// therefore at least one full-range crossing at the seek speed, with
+    /// `SEEK_MARGIN` covering the velocity ramp and stall confirmation;
+    /// `timeout_s` remains a floor for joints whose configured value is
+    /// already more generous.
+    pub fn seek_timeout_s(&self, joint: &JointConfig) -> f64 {
+        let ticks_per_rad =
+            f64::from(1u32 << joint.encoder_bits) / std::f64::consts::TAU * joint.gear_ratio;
+        let span_ticks = (joint.limits.hard_max_rad - joint.limits.hard_min_rad) * ticks_per_rad;
+        self.timeout_s
+            .max(span_ticks / self.speed_ticks_s * SEEK_MARGIN)
+    }
     pub(crate) fn validate(&self, field_prefix: &str) -> Result<(), ConfigError> {
         let f = |name: &str| format!("{field_prefix}.{name}");
         if self.speed_ticks_s <= 0.0 {

@@ -269,7 +269,7 @@ impl FreshnessClock {
 /// One pass = these seven frames to one node; one paced batch = one
 /// message type to every node.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ConfigKind {
+pub enum ConfigKind {
     Watchdog,
     Limits,
     VoltageLimit,
@@ -277,6 +277,11 @@ pub(super) enum ConfigKind {
     CurrentGains,
     VelocityGains,
     PositionGains,
+}
+
+impl ConfigKind {
+    /// All configuration fields in the drive's boot order.
+    pub const ALL: [Self; 7] = CONFIG_ORDER;
 }
 
 /// The order the boot config load sends message types in.
@@ -291,7 +296,7 @@ pub(super) const CONFIG_ORDER: [ConfigKind; 7] = [
 ];
 
 /// Encode one configuration frame.
-pub(super) fn config_frame(kind: ConfigKind, c: &NodeConfig) -> CanFrame {
+pub(crate) fn config_frame(kind: ConfigKind, c: &NodeConfig) -> CanFrame {
     let node = c.node;
     match kind {
         ConfigKind::Watchdog => encode_watchdog(node, c.watchdog_ms, c.watchdog_action),

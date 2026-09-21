@@ -113,6 +113,13 @@ pub struct SimBus {
     /// Test hook: the bus swallows every reply, as a controller that
     /// came up error-passive does, until `recover_link` cycles it.
     deaf: bool,
+    /// Test hook: `(node, first tick, last tick)` over which one drive
+    /// answers nothing, as a STEPFOC whose `loop()` is starved does
+    /// while its timer interrupt keeps the motor under control.
+    mute: Option<(NodeId, u64, u64)>,
+    tx_failure_after: Option<usize>,
+    tx_frames_this_tick: usize,
+    peak_tx_frames_per_tick: usize,
     configured: bool,
     joint_nodes: Vec<NodeId>,
     node_to_joint: [Option<usize>; MAX_NODES],
@@ -173,6 +180,10 @@ impl SimBus {
             dt: 0.004,
             silent: false,
             deaf: false,
+            mute: None,
+            tx_failure_after: None,
+            tx_frames_this_tick: 0,
+            peak_tx_frames_per_tick: 0,
             configured: false,
             joint_nodes: Vec::new(),
             node_to_joint: [None; MAX_NODES],
@@ -441,6 +452,45 @@ impl SimBus {
         None
     }
 
+    /// Reject one per-tick send with `TxQueueFull` after this many successful
+    /// per-tick sends. Earlier joint commands still reach the native drivers.
+    /// Direct boot/configuration writes bypass this hook; scheduled writes
+    /// consume it through their poll slot.
+    pub fn fail_tx_after(&mut self, frames: usize) {
+        self.tx_failure_after = Some(frames);
+    }
+
+    /// Maximum host frames in one tick since the last reset, including
+    /// configuration writes and polls as well as motion commands.
+    pub fn peak_tx_frames_per_tick(&self) -> usize {
+        self.peak_tx_frames_per_tick
+    }
+
+    /// Exclude boot traffic when measuring the running controller's bus load.
+    pub fn reset_tx_peak(&mut self) {
+        self.peak_tx_frames_per_tick = self.tx_frames_this_tick;
+    }
+
+    fn count_tx(&mut self) {
+        self.tx_frames_this_tick += 1;
+        self.peak_tx_frames_per_tick = self.peak_tx_frames_per_tick.max(self.tx_frames_this_tick);
+    }
+
+    fn admit_tick_tx(&mut self) -> Result<(), BusError> {
+        match self.tx_failure_after {
+            Some(0) => {
+                self.tx_failure_after = None;
+                self.health.tx_errors += 1;
+                Err(BusError::TxQueueFull)
+            }
+            Some(remaining) => {
+                self.tx_failure_after = Some(remaining - 1);
+                Ok(())
+            }
+            None => Ok(()),
+        }
+    }
+
     fn ensure_ready(&self) -> Result<(), BusError> {
         if !self.configured {
             return Err(BusError::NotConfigured);
@@ -551,12 +601,7 @@ impl SimBus {
             // band check is circular.
             let d = (self.maps[j].joint_rad(pos) - center).rem_euclid(std::f64::consts::TAU);
             let in_band = d.min(std::f64::consts::TAU - d) <= half;
-            let d = &mut self.drivers[j];
-            if in_band && !d.hall_in_band {
-                d.hall_latched_ticks = Some(self.maps[j].report_pos(pos));
-                d.hall_edge_pending = true;
-            }
-            d.hall_in_band = in_band;
+            self.drivers[j].sample_hall(in_band, self.maps[j].report_pos(pos));
         }
     }
 
@@ -623,6 +668,7 @@ impl SimBus {
     /// Deliver an RTR telemetry poll to `node` and enqueue its reply.
     /// Nodes without a driver (the timing dummy) stay silent.
     fn deliver_rtr(&mut self, node: NodeId, kind: PollKind) {
+        self.count_tx();
         let joint = self.node_to_joint[usize::from(node)];
         let motion = joint.map(|j| self.joint_reply_values(j)).or_else(|| {
             if node == self.gripper_node {
@@ -714,6 +760,7 @@ impl SimBus {
     /// Deliver one host→driver DATA frame to its node and enqueue
     /// whatever the driver replies.
     fn deliver_data(&mut self, frame: &CanFrame) {
+        self.count_tx();
         let (node, raw_cmd, _) = unpack_can_id(frame.id);
         let Some(cmd) = CommandId::from_raw(raw_cmd) else {
             return;
@@ -737,19 +784,13 @@ impl SimBus {
             ReplyKind::Hall => {
                 let err = self.drivers[j].err_bit();
                 let (live_pos, _, _) = self.joint_reply_values(j);
-                let d = &mut self.drivers[j];
+                let d = &self.drivers[j];
                 let state = HallState {
-                    trigger: !d.hall_in_band,
-                    pin2: false,
-                    edge: d.hall_edge_pending,
+                    trigger: d.hall_trigger,
+                    pin2: d.hall_in_band,
+                    edge: d.hall_edge,
                 };
-                d.hall_edge_pending = false;
-                let pos = if d.hall_in_band {
-                    d.hall_latched_ticks.unwrap_or(live_pos)
-                } else {
-                    live_pos
-                };
-                let f = Self::hall_reply(node, err, pos, state);
+                let f = Self::hall_reply(node, err, live_pos, state);
                 self.enqueue(f);
             }
         }
@@ -928,6 +969,7 @@ impl DriverBus for SimBus {
         }
         self.tick = tick;
         self.joints_sent_this_tick = false;
+        self.tx_frames_this_tick = 0;
         if !self.silent {
             self.fresh.latch_lost(tick);
         }
@@ -960,13 +1002,21 @@ impl DriverBus for SimBus {
             age_max = age_max.max(age);
             // Harvest node + err bit BEFORE payload dispatch; refused
             // frames still count for freshness and the live fault bit.
-            let (node, err_bit) = match decode_frame(&frame) {
-                Ok(d) => {
-                    Self::apply(&d, state);
-                    (d.node, d.err_bit)
-                }
+            let decoded = decode_frame(&frame);
+            let (node, err_bit) = match &decoded {
+                Ok(d) => (d.node, d.err_bit),
                 Err(e) => (e.node(), e.err_bit()),
             };
+            if self.mute.is_some_and(|(muted, from, to)| {
+                muted == node && self.tick >= from && self.tick <= to
+            }) {
+                // The drive never sent this: no payload, no freshness, no
+                // error bit, exactly as a silent controller looks.
+                continue;
+            }
+            if let Ok(d) = &decoded {
+                Self::apply(d, state);
+            }
             let n = usize::from(node);
             state.nodes[n].live_error_bit = err_bit;
             // A node already on `connected` has booted, so its first frame
@@ -1014,6 +1064,7 @@ impl DriverBus for SimBus {
                 }
             })?;
             if let Some(f) = frame {
+                self.admit_tick_tx()?;
                 self.deliver_frame(&f);
             }
         }
@@ -1031,6 +1082,7 @@ impl DriverBus for SimBus {
         };
         // NoGripper's RTR ping targets the driverless timing dummy, so it
         // goes unanswered like on the real bus.
+        self.admit_tick_tx()?;
         self.deliver_frame(&f);
         Ok(())
     }
@@ -1042,6 +1094,7 @@ impl DriverBus for SimBus {
         if self.silent {
             return Ok(());
         }
+        self.admit_tick_tx()?;
         if let Some((action, repeats)) = self.override_slot.take() {
             match action {
                 PollAction::Poll { node, kind } => self.deliver_rtr(node, kind),
@@ -1050,6 +1103,15 @@ impl DriverBus for SimBus {
                     self.deliver_data(&f);
                 }
                 PollAction::ResendConfig { node } => self.apply_node_config(node, 1),
+                PollAction::ConfigFrame { node, kind } => {
+                    let c = self.node_configs.iter().find(|c| c.node == node).ok_or(
+                        BusError::InvalidCommand {
+                            reason: "configuration poll for a node with no stored configuration",
+                        },
+                    )?;
+                    let frame = crate::hw::sched::config_frame(kind, c);
+                    self.deliver_data(&frame);
+                }
             }
             if repeats > 1 {
                 self.override_slot = Some((action, repeats - 1));
@@ -1339,6 +1401,15 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
+    /// Test hook: silence one drive from `from_tick` for `ticks` ticks.
+    ///
+    /// The rest of the bus keeps answering, which is what a starved
+    /// STEPFOC `loop()` looks like from the host: one node stops
+    /// replying while its motor stays controlled from the timer
+    /// interrupt and no error flag is ever set.
+    pub fn silence_node(&mut self, node: NodeId, from_tick: u64, ticks: u64) {
+        self.mute = Some((node, from_tick, from_tick + ticks.saturating_sub(1)));
+    }
     /// Test hook: make the link deaf (every reply is dropped undecoded,
     /// the way an error-passive controller hears nobody) until the
     /// runtime cycles it through `recover_link`. The link reports

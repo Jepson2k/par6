@@ -92,6 +92,11 @@ fn land_at(
     tol: f64,
     compensated: bool,
 ) {
+    // These torque oracles describe the simulated load itself; applying a
+    // hardware calibration trim would deliberately overcompensate that load.
+    let mut nominal = bundle.clone();
+    nominal.robot.gravity_scale = [1.0; MAX_JOINTS];
+    let bundle = &nominal;
     let (mut core, mut handles, tx, _line) = boot_core(gravity, bundle);
     let dt = core.tick_dt_s();
     for _ in 0..10 {
@@ -149,11 +154,17 @@ fn a_teleport_lands_the_plant_on_the_reference_from_the_first_tick() {
 /// With the gravity feedforward live — a constant model carrying the
 /// golden pose's torques, since the phantom-pose kick, not the model, is
 /// under test — the landing at that pose holds from the first tick.
+///
+/// par6-rt does not depend on the kinematics, so these torques are pinned
+/// rather than computed, and they describe the tool the config selects.
+/// Change the active tool and they go stale silently — the joint simply
+/// sags by whatever the model no longer accounts for. Regenerate with
+/// `cargo run -p par6-kin --example golden_gravity`.
 #[test]
 fn a_teleport_lands_under_gravity_comp() {
     land_at(
         Box::new(common::ConstGravity([
-            0.0, -7.3006, 2.5588, 0.0390, 0.1111, 0.0035,
+            0.0, -7.5128, 2.6929, 0.0553, 0.1384, -0.0005,
         ])),
         &common::bundle(),
         &POSES_DEG[..1],
@@ -162,10 +173,17 @@ fn a_teleport_lands_under_gravity_comp() {
     );
 }
 
-/// A tool two kilos heavier than stock puts 1.4 Nm on the wrist pitch,
-/// so the joint needs the drivers to hold it. The tick after a teleport, before the runtime's
-/// next frames arrive, the drivers must already hold the landed pose: a
-/// re-seed that left them limp let the wrist back-drive a degree.
+/// A two-kilo tool puts 1.35 Nm on the wrist pitch — far past the 0.5 Nm
+/// the drivetrain holds by itself, and 89% of the 1.51 Nm J5 can make at
+/// its current limit. So the joint needs the drivers, and can still
+/// obey them. The tick after a teleport, before the runtime's next frames
+/// arrive, the drivers must already hold the landed pose: a re-seed that
+/// left them limp let the wrist back-drive a degree.
+///
+/// The load is deliberately under the joint's ceiling: ask for more than
+/// J5 can produce and it back-drives no matter how right the re-seed is,
+/// which tests nothing. `cargo run -p par6-kin --example golden_gravity`
+/// prints both the torque and the ceiling.
 #[test]
 fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
     let mut bundle = common::bundle();
@@ -175,10 +193,10 @@ fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
         .iter_mut()
         .find(|g| g.name == name)
         .expect("active gripper");
-    gripper.kinematics.mass_kg = 2.37;
+    gripper.kinematics.mass_kg = 2.0;
     land_at(
         Box::new(common::ConstGravity([
-            0.0, -13.4916, 7.1872, -0.0608, 1.3843, 0.0246,
+            0.0, -12.3190, 6.5151, -0.0875, 1.3475, -0.0020,
         ])),
         &bundle,
         &POSES_DEG[1..2],

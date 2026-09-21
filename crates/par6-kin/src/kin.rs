@@ -327,6 +327,16 @@ impl Kin {
         Ok(())
     }
 
+    /// The correction [`set_gravity_correction`] installed, empty when
+    /// none is. Anything reasoning about what the model carries has to
+    /// add this to [`Self::body_inertial`]: the correction lives beside
+    /// the model's own inertials, not inside them.
+    ///
+    /// [`set_gravity_correction`]: Self::set_gravity_correction
+    pub fn gravity_correction(&self) -> &[f64] {
+        &self.gravity_correction
+    }
+
     /// Install an identified gravity-only correction outside the RT tick.
     pub fn set_gravity_correction(&mut self, delta: &[f64]) -> Result<(), KinError> {
         if (!delta.is_empty() && delta.len() != 4 * self.body_count())

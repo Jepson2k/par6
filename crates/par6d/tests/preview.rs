@@ -813,8 +813,11 @@ fn the_servo_preview_runs_the_limiter_from_the_virtual_pose() {
 fn the_preview_jogs_cartesian_through_the_runtime_kinematics() {
     let config = test_config();
     let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
-    preview.teleport_rad(to_rad(&wrist_clear_deg()));
-
+    let mut start = wrist_clear_deg();
+    // World +x is tangential here. A radial push at this folded pose is
+    // poorly resolved by the damped Jacobian and couples into vertical travel.
+    start[0] = 90.0;
+    preview.teleport_rad(to_rad(&start));
     let r = preview.preview_jog_l(
         [1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         par6_proto::Frame::Wrf,

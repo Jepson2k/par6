@@ -110,7 +110,9 @@ pub trait DriverBus {
     /// limit; the watchdog is untouched) and push it now, `repeats`
     /// passes — the live half of `SET_PID_GAINS`. Because the STORED
     /// config changes, every later resend (reconnect, FLASHING exit)
-    /// carries the new tune too. Unknown nodes are refused.
+    /// carries the new tune too. Unknown nodes are refused. With `repeats = 0`,
+    /// only update the stored tune; callers can send each field through
+    /// [`PollAction::ConfigFrame`] without bursting onto the motion bus.
     fn retune_node(&mut self, node: NodeId, tune: &DriveTune, repeats: u8) -> Result<(), BusError>;
 
     /// Commissioning: rename `node` to `new_id` (cmd 11), one frame. The

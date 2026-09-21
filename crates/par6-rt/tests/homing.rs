@@ -826,7 +826,7 @@ fn a_forty_percent_current_duty_is_not_a_stall() {
 // ------------------------------------------------------------------
 
 /// A free-running joint (detached endstop: normal travel, low current,
-/// nothing ever stalls) must fail at exactly `round(timeout_s / dt)`
+/// nothing ever stalls) must fail at exactly `round(seek_timeout_s / dt)`
 /// approach ticks — not before — with the joint marked Failed and the
 /// full node config (normal current limits included) resent. Run at two
 /// tick rates so the seconds→ticks conversion is pinned, not an
@@ -836,7 +836,8 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
     for dt in [0.004, 0.01] {
         let mut bundle = single_joint_bundle(0);
         bundle.robot.robot.tick_dt_s = dt;
-        let timeout_ticks = (bundle.robot.homing.joints[0].timeout_s / dt).round() as u64;
+        let seek_s = bundle.robot.homing.joints[0].seek_timeout_s(&bundle.robot.joints[0]);
+        let timeout_ticks = (seek_s / dt).round() as u64;
         let mut h = HomingHarness::new(&bundle);
         let n0 = usize::from(bundle.robot.joints[0].node_id);
 
@@ -871,10 +872,16 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
         let first_drive = first_drive.expect("the approach must drive");
         let failed_at = failed_at.unwrap_or_else(|| panic!("dt {dt}: timeout never fired"));
         // elapsed == timeout is still within budget; the tick after is
-        // the failure — exactly `round(timeout_s / dt)` driven ticks.
-        // 13.0 is the shipped J0 timeout (config/PAR6.toml), spelled out
-        // so the conversion is pinned against the config seconds.
-        assert_eq!(timeout_ticks, (13.0f64 / dt).round() as u64, "dt {dt}");
+        // the failure — exactly `round(seek_timeout_s / dt)` driven ticks.
+        // The shipped J0 `timeout_s` is 13.0 s, but a full sweep of its
+        // 5.904 rad range at 4500 ticks/s takes 21.90 s, so the derived
+        // budget is 27.37 s. Spelled out so the conversion is pinned
+        // against seconds rather than restating the implementation.
+        assert!(
+            (seek_s - 27.37).abs() < 0.01,
+            "dt {dt}: J0 seek budget is {seek_s:.2} s"
+        );
+        assert_eq!(timeout_ticks, (27.3693f64 / dt).round() as u64, "dt {dt}");
         assert_eq!(
             failed_at - first_drive,
             timeout_ticks,

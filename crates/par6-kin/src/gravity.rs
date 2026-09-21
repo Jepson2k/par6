@@ -168,7 +168,14 @@ pub fn fit_payload(
     // the last four columns of the regressor.
     let base = cols - 4;
 
-    let theta_unloaded = flatten(&model_params(kin)?);
+    // The baseline must be everything the arm already accounts for,
+    // including an installed correction — a selfcal fit of this arm's own
+    // (printed, so off-table) links. Leaving it out would charge the
+    // payload for the arm's own modelling error.
+    let mut theta_unloaded = flatten(&model_params(kin)?);
+    for (t, d) in theta_unloaded.iter_mut().zip(kin.gravity_correction()) {
+        *t += d;
+    }
     // One regressor evaluation per sample, kept: the unloaded torque, the
     // normal equations and both residuals are all products of it.
     let mut rows: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
@@ -247,6 +254,126 @@ pub fn fit_payload(
         determined,
         rms_nm: rms_of(&loaded),
         rms_unloaded_nm: rms_of(&theta_unloaded),
+    })
+}
+
+/// What identifying the arm's own links found.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ArmFit {
+    /// Correction to install with [`Kin::set_gravity_correction`]:
+    /// `[Δm, Δm·cx, Δm·cy, Δm·cz]` per body, in that body's frame.
+    ///
+    /// [`Kin::set_gravity_correction`]: crate::Kin::set_gravity_correction
+    pub correction: Vec<f64>,
+    /// Share of each parameter the DATA fixed, from zero (the poses said
+    /// nothing and the value is the model's own) to one (fixed outright).
+    /// Gravity leaves roughly half of a six-axis arm's parameters
+    /// unobservable at any pose — the base link turns about the gravity
+    /// vector and never appears in a gravity torque — so a low number
+    /// here is the normal answer for those, not a failure.
+    pub determined: Vec<f64>,
+    /// RMS torque residual of the corrected model over `samples` \[Nm\].
+    pub rms_nm: f64,
+    /// RMS residual of the model as it stood \[Nm\] — what the arm was
+    /// wrong by before the correction.
+    pub rms_before_nm: f64,
+}
+
+/// Identify this arm's own link masses and first moments from static
+/// torque, as a correction to the model it already carries.
+///
+/// The vendor's inertial table describes the design; a printed arm is
+/// built to slicer settings that differ from it, so the links weigh what
+/// they weigh and no table can say. This fits that difference.
+///
+/// Run it with NOTHING on the flange but the base attachment, and leave
+/// the tool's declared parameters alone. A tool is rigidly joined to the
+/// last link and enters the regressor through the same columns, so
+/// gravity cannot separate the two: anything fitted while a gripper is
+/// on describes that gripper as much as the arm, and stops being true
+/// when the gripper comes off.
+///
+/// `ridge` holds a parameter the poses say nothing about near the value
+/// the model already has, rather than letting the solve run away with
+/// it. Check [`ArmFit::determined`] to see which ones that was.
+pub fn fit_arm(kin: &mut Kin, samples: &[GravitySample], ridge: f64) -> Result<ArmFit, KinError> {
+    if samples.is_empty() || !ridge.is_finite() || ridge <= 0.0 {
+        return Err(KinError::Load(format!(
+            "arm fit needs samples and a positive ridge (got {} samples, ridge {ridge})",
+            samples.len()
+        )));
+    }
+    let cols = 4 * kin.body_count();
+    // The baseline is everything the model already accounts for, an
+    // installed correction included, so re-fitting refines rather than
+    // double-counts.
+    let mut baseline = flatten(&model_params(kin)?);
+    for (b, d) in baseline.iter_mut().zip(kin.gravity_correction()) {
+        *b += d;
+    }
+
+    let mut ata = vec![0.0; cols * cols];
+    let mut atb = vec![0.0; cols];
+    let mut scale = 0.0f64;
+    let mut rows: Vec<Vec<f64>> = Vec::with_capacity(samples.len());
+    for s in samples {
+        let mut y = vec![0.0; NQ * cols];
+        kin.gravity_regressor(&s.q, &mut y)?;
+        for r in 0..NQ {
+            let row = &y[r * cols..(r + 1) * cols];
+            let modelled: f64 = row.iter().zip(&baseline).map(|(a, b)| a * b).sum();
+            let residual = s.tau[r] - modelled;
+            for a in 0..cols {
+                scale = scale.max(row[a].abs());
+                atb[a] += row[a] * residual;
+                for b in 0..cols {
+                    ata[a * cols + b] += row[a] * row[b];
+                }
+            }
+        }
+        rows.push(y);
+    }
+    // Scaled by the regressor's own magnitude, so the ridge means the
+    // same thing whatever the arm's size — as the payload fit does.
+    let lambda = ridge * scale * scale * (samples.len() * NQ) as f64;
+    for a in 0..cols {
+        ata[a * cols + a] += lambda;
+    }
+    let l = cholesky_factor(&ata, cols)
+        .ok_or_else(|| KinError::Load("arm fit normal matrix is not solvable".into()))?;
+    let correction = cholesky_apply(&l, &atb, cols);
+
+    let mut determined = vec![0.0; cols];
+    for (a, out) in determined.iter_mut().enumerate() {
+        let mut e = vec![0.0; cols];
+        e[a] = 1.0;
+        *out = (1.0 - lambda * cholesky_apply(&l, &e, cols)[a]).clamp(0.0, 1.0);
+    }
+
+    let rms_of = |theta: &[f64]| {
+        let mut sum = 0.0;
+        for (y, s) in rows.iter().zip(samples) {
+            for r in 0..NQ {
+                let tau: f64 = y[r * cols..(r + 1) * cols]
+                    .iter()
+                    .zip(theta)
+                    .map(|(a, b)| a * b)
+                    .sum();
+                sum += (tau - s.tau[r]) * (tau - s.tau[r]);
+            }
+        }
+        (sum / (samples.len() * NQ) as f64).sqrt()
+    };
+    let corrected: Vec<f64> = baseline
+        .iter()
+        .zip(&correction)
+        .map(|(b, d)| b + d)
+        .collect();
+    Ok(ArmFit {
+        rms_nm: rms_of(&corrected),
+        rms_before_nm: rms_of(&baseline),
+        correction,
+        determined,
     })
 }
 

@@ -64,18 +64,24 @@ fn idle_gravity_hold_is_torque_only_and_gated() {
     let expect: [i16; MAX_JOINTS] = std::array::from_fn(|i| {
         let j = &robot.joints[i];
         let f = torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, j.kt_nm_a, j.dir);
-        trunc_to_wire(g[i] * f) as i16
+        trunc_to_wire(g[i] * robot.gravity_scale[i] * f) as i16
     });
     assert_torque_only(&rig.last_joints(), &expect, "IDLE gravity hold");
-    // The published gravity vector carries the model output regardless.
-    assert_eq!(rig.snap().gravity_torque_nm, g);
+    // The published gravity vector includes the configured trim.
+    assert_eq!(
+        rig.snap().gravity_torque_nm,
+        std::array::from_fn(|i| g[i] * robot.gravity_scale[i])
+    );
 
     // Compensation off ⇒ back to the active zero-velocity idle.
     rig.cmd(RtCommand::SetGravityComp(false));
     rig.tick();
     assert_zero_velocity(&rig.last_joints(), "IDLE grav-off");
     // ... and still published.
-    assert_eq!(rig.snap().gravity_torque_nm, g);
+    assert_eq!(
+        rig.snap().gravity_torque_nm,
+        std::array::from_fn(|i| g[i] * robot.gravity_scale[i])
+    );
 }
 
 /// `kt_source = "auto"` means the DRIVER's torque constant governs and
@@ -142,7 +148,7 @@ fn boot_adopts_each_drivers_own_kt_and_falls_back_per_joint() {
             j.kt_nm_a
         };
         let f = torque_to_ma_factor(j.gear_ratio, j.gear_efficiency, kt, j.dir);
-        trunc_to_wire(g[i] * f) as i16
+        trunc_to_wire(g[i] * robot.gravity_scale[i] * f) as i16
     });
     assert_torque_only(&rig.last_joints(), &expect, "IDLE hold on the resolved kt");
 
