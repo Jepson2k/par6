@@ -11,7 +11,8 @@
 //! at construction — never hardcoded tick counts. Use
 //! [`RobotConfig::ticks`] for the conversion.
 //!
-//! Layout on disk (repo `config/` directory):
+//! Layout on disk (repo `config/`, a symlink to `python/par6/_data/config/`
+//! so the pip package ships the same files rather than a copy):
 //!
 //! ```text
 //! config/PAR6.toml            robot + homing + bus + protocol

@@ -15,7 +15,7 @@ repos:
         name: cargo clippy (workspace)
         entry: cargo clippy --workspace --all-targets -- -D warnings
         language: system
-        files: \.(rs|toml)$
+        files: ^(crates/|cpp/|Cargo\.(toml|lock)$|rust-toolchain\.toml$)
         pass_filenames: false
         stages: [pre-push]
 
@@ -36,7 +36,7 @@ repos:
         name: ty (par6 python)
         entry: bash -c 'cd python && ty check .'
         language: system
-        files: ^python/
+        files: ^python/.*\.pyi?$
         pass_filenames: false
 
   # Built-in hooks for file quality. The asset trees and the packaged data
@@ -45,9 +45,9 @@ repos:
     rev: v6.0.0
     hooks:
       - id: trailing-whitespace
-        exclude: ^(assets/|python/par6/_data/|crates/par6-bus/sim-assets/)
+        exclude: ^(assets/|python/par6/_data/(?!config/)|crates/par6-bus/sim-assets/)
       - id: end-of-file-fixer
-        exclude: ^(assets/|python/par6/_data/|crates/par6-bus/sim-assets/)
+        exclude: ^(assets/|python/par6/_data/(?!config/)|crates/par6-bus/sim-assets/)
       - id: check-yaml
       - id: check-json
       - id: check-added-large-files

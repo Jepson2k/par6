@@ -471,19 +471,17 @@ def _tree_digest(
 
 
 class TestPackagedData:
-    def test_config_copies_are_fresh(self) -> None:
-        """python/par6/_data must match what scripts/sync_pkg_data.py produces
-        from the repo sources (same pattern as protocol/constants.py).  TOMLs
-        and meshes are byte copies; ``.urdf`` files go through the script's
-        ``packaged_bytes`` rewrite, so the guard compares against that."""
-        if not (REPO_ROOT / "config").is_dir():
-            pytest.skip("repo-root config/ not present (installed package)")
-        stale_msg = "packaged data is stale — run scripts/sync_pkg_data.py"
-        assert _tree_digest(DATA_DIR / "config", ("*.toml",)) == _tree_digest(
-            REPO_ROOT / "config", ("*.toml",)
-        ), stale_msg
-        packaged_bytes = _sync_script().packaged_bytes
+    def test_packaged_urdfs_are_fresh(self) -> None:
+        """python/par6/_data/URDF must match what scripts/sync_pkg_data.py
+        produces from the repo assets (same pattern as protocol/constants.py).
+        Meshes are byte copies; ``.urdf`` files go through the script's
+        ``packaged_bytes`` rewrite, so the guard compares against that.  The
+        config needs no guard: the package holds its only copy."""
         src_urdf = REPO_ROOT / "assets" / "par6_description" / "URDF"
+        if not src_urdf.is_dir():
+            pytest.skip("repo assets not present (installed package)")
+        stale_msg = "packaged data is stale — run scripts/sync_pkg_data.py"
+        packaged_bytes = _sync_script().packaged_bytes
         for tree in TREES:
             # Only urdf/, srdf/ + meshes/ are packaged (the URDFs reference
             # nothing outside meshes/); ROS scaffolding and alternate jaw

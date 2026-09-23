@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
-"""Sync runtime config + URDF assets into the pip package data directory.
+"""Sync the URDF assets into the pip package data directory.
 
-The pip package builds from ``python/``, so the repo-root ``config/`` TOMLs
-and the URDF trees the backend needs must be copied INSIDE the package
-(``python/par6/_data/``) — sdists don't reliably follow symlinks.  Run this
-after editing ``config/`` or ``assets/par6_description/URDF/``; the
-freshness-guard test in ``python/tests/test_robot.py`` fails when the copies
-are stale (same pattern as the generated ``protocol/constants.py``).
+The pip package builds from ``python/``, so the URDF trees the backend
+needs must be copied INSIDE the package (``python/par6/_data/``) — sdists
+don't reliably follow symlinks.  Run this after editing
+``assets/par6_description/URDF/``; the freshness-guard test in
+``python/tests/test_robot.py`` fails when the copies are stale (same pattern
+as the generated ``protocol/constants.py``).  The runtime config is not
+synced: ``python/par6/_data/config/`` is its only copy, and the repo-root
+``config`` is a symlink to it.
 
 The packaged tree keeps the assets layout (the vendor MJCFs beside
 ``assets/`` and ``URDF/<tree>/{urdf,srdf,meshes}``) so the engine's own
@@ -74,12 +76,8 @@ def packaged_bytes(src: Path, tree: str) -> bytes:
 
 def manifest() -> list[tuple[Path, Path, str]]:
     """``(source, destination, tree)`` for every packaged data file (``tree``
-    is empty for config files)."""
+    is empty for files outside the URDF trees)."""
     triples: list[tuple[Path, Path, str]] = []
-    for src in sorted((REPO / "config").glob("*.toml")):
-        triples.append((src, DATA / "config" / src.name, ""))
-    for src in sorted((REPO / "config" / "grippers").glob("*.toml")):
-        triples.append((src, DATA / "config" / "grippers" / src.name, ""))
     assets_root = REPO / "assets" / "par6_description"
     for src in sorted(assets_root.glob("PAR6_*_gripper.xml")):
         triples.append((src, DATA / src.name, ""))
@@ -104,8 +102,12 @@ def main() -> int:
     if missing:
         print(f"missing sources: {missing}", file=sys.stderr)
         return 1
-    if DATA.exists():
-        shutil.rmtree(DATA)
+    # Only the derived trees are rebuilt; DATA/config is the real config.
+    for stale in (DATA / "URDF", DATA / "assets"):
+        if stale.exists():
+            shutil.rmtree(stale)
+    for stale in DATA.glob("*.xml"):
+        stale.unlink()
     for src, dst, tree in triples:
         dst.parent.mkdir(parents=True, exist_ok=True)
         if src.suffix.lower() == ".urdf":

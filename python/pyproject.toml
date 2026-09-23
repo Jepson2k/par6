@@ -53,9 +53,10 @@ par6-drives = "par6.gui.drives:DrivesPanel"
 
 [tool.maturin]
 # The extension crate (the engine binding); the pure-Python shim package
-# lives right here and is bundled alongside it. `par6/_data` (runtime
-# config + URDF trees mirrored by scripts/sync_pkg_data.py) rides along as
-# ordinary package files.
+# lives right here and is bundled alongside it. `par6/_data` rides along as
+# ordinary package files: `_data/config` is the runtime config itself (the
+# repo-root `config` is a symlink to it), `_data/URDF` and `_data/assets`
+# are mirrored from the repo assets by scripts/sync_pkg_data.py.
 manifest-path = "../crates/par6-py/Cargo.toml"
 python-source = "."
 module-name = "par6._par6"
