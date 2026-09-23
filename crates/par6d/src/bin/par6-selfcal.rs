@@ -32,6 +32,7 @@ use par6_config::{ConfigBundle, Gains, LimitMode, PreMove};
 use par6_motion::{SSeptic, SEPTIC_PEAK_ACC, SEPTIC_PEAK_VEL};
 use par6_rt::homing::{Homer, HomerEvent, HomerParams};
 use std::{
+    collections::VecDeque,
     fmt::Write as _,
     fs,
     io::Write as _,
@@ -189,6 +190,31 @@ const GAINS_MIN_IMPROVEMENT: f64 = 0.05;
 /// 77 deg/s for single samples, the J1 buzz sat at +-240 deg/s.
 const RUNAWAY_RAD_S: f64 = 90.0 * std::f64::consts::PI / 180.0;
 const RUNAWAY_TICKS: u32 = 3;
+/// The breakaway ramp: current climbs from the gravity balance at this
+/// share of the joint's current limit per second, slow enough that the
+/// encoder reports the first movement within a few mA of the current
+/// that caused it, and gives up at `STICTION_MAX_ILIM` of the limit
+/// beyond the balance.
+const STICTION_RAMP_ILIM_PER_S: f64 = 0.05;
+const STICTION_MAX_ILIM: f64 = 0.6;
+/// Sustained sliding: the encoder advancing at this rate \[motor
+/// ticks/s\] over `STICTION_WINDOW_S` is the link moving. The ramp winds a
+/// transmission at only a few ticks per second on every joint (its torque
+/// rate over a stiffness of hundreds of Nm/rad), and a joint that has
+/// broken away accelerates past this within a fraction of a second.
+const STICTION_SLIDE_TICKS_PER_S: f64 = 100.0;
+const STICTION_WINDOW_S: f64 = 0.2;
+/// Total encoder travel a breakaway must also show, past position noise.
+const STICTION_BREAK_TICKS: i32 = 40;
+/// A joint is still when its encoder stays within this over the window;
+/// each ramp waits for that, up to the timeout, before it starts.
+const STICTION_STILL_TICKS: i32 = 2;
+const STICTION_STILL_TIMEOUT_S: f64 = 5.0;
+/// No breakaway counts before the ramp has advanced this share of the
+/// current limit: whatever moves at the balance current is not friction.
+const STICTION_MIN_RAMP_ILIM: f64 = 0.01;
+/// Rest between breakaways, so the last one's motion has died.
+const STICTION_REST_S: f64 = 1.0;
 
 /// Velocity, acceleration and jerk caps for one joint's moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -298,6 +324,14 @@ struct Args {
     /// Home, then run only the gains stage.
     #[arg(long)]
     gains_only: bool,
+    /// Also measure each joint's static friction: the current at which it
+    /// breaks away from rest, ramped up and down from the gravity balance,
+    /// at the ready pose and with the arm out. Reported, not written.
+    #[arg(long)]
+    stiction: bool,
+    /// Home, then run only the stiction stage.
+    #[arg(long)]
+    stiction_only: bool,
     /// The tool fitted on the arm now, by its config name (e.g. `Flange`).
     /// Defaults to the config's `active_tool`; the file is not changed.
     #[arg(long)]
@@ -318,6 +352,12 @@ enum Event {
     FeedbackGap(u64, usize, f64),
     Drag(u64, usize, f64, f64, f64),
     Mechanics(u64, usize, f64, f64, f64),
+    /// Breakaway at a labelled pose: the currents up and down \[mA\], the
+    /// static friction they straddle \[Nm\], the gravity current the model
+    /// predicted against the one the pair measured \[mA\], the transmission
+    /// wind-up before the link moved \[motor ticks\] and the stiffness that
+    /// implies \[Nm/rad, joint side\].
+    Stiction(u64, usize, &'static str, f64, f64, f64, f64, f64, f64, f64),
     LimitsStep(u64, usize, Caps, Option<&'static str>),
     Limits(u64, usize, Found),
     GainsStep(u64, usize, Gains, Option<f64>, &'static str),
@@ -389,6 +429,12 @@ fn describe(event: &Event) -> Option<String> {
         ),
         Event::Mechanics(tick, j, inertia, b, tc) => format!(
             "tick={tick} J{} MECHANICS J={inertia:.6}kg.m2 b={b:.6}Nm.s tc={tc:.4}Nm",
+            j + 1
+        ),
+        Event::Stiction(tick, j, label, up, down, s, model, measured, windup, k) => format!(
+            "tick={tick} J{} STICTION {label} up={up:.0}mA down={down:.0}mA static={s:.4}Nm \
+             gravity model={model:.0}mA measured={measured:.0}mA windup={windup:.0}ticks \
+             stiffness={k:.0}Nm/rad",
             j + 1
         ),
         Event::LimitsStep(tick, j, c, failed) => format!(
@@ -1818,6 +1864,138 @@ impl Arm {
         }
         Ok(friction)
     }
+
+    /// The current at which joint `j` breaks away from rest at the pose the
+    /// arm holds, ramped from the model's gravity balance in `sign`'s
+    /// direction, and the transmission's wind-up when it did \[mA, motor
+    /// ticks\]; `None` when the ramp reached its ceiling with the joint
+    /// still.
+    ///
+    /// The encoder is on the motor, and a belt or gear train winds up
+    /// before the link moves: on the first arm the geared joints "broke
+    /// away" a few ticks in with nothing but the gearbox flexing. Breakaway
+    /// is therefore sustained sliding -- the encoder advancing faster over
+    /// the last `STICTION_WINDOW_S` than the ramp can wind a transmission --
+    /// and the current is the one at the start of that window. The joint
+    /// is caught there, held, then eased back to where it started.
+    fn breakaway(&mut self, j: usize, sign: f64) -> Result<Option<(f64, i64)>> {
+        self.settle(STICTION_REST_S)?;
+        // Still first: the previous breakaway's return was still settling
+        // when J3's ramp began, and the sliding test read that as a
+        // breakaway at the balance current.
+        let window = self.ticks(STICTION_WINDOW_S);
+        let mut seen: VecDeque<(u64, i32)> = VecDeque::new();
+        for _ in 0..self.ticks(STICTION_STILL_TIMEOUT_S) {
+            self.frame(None)?;
+            seen.push_back((self.tick, self.pos(j)?));
+            while seen
+                .front()
+                .is_some_and(|(tick, _)| self.tick.saturating_sub(*tick) > window)
+            {
+                seen.pop_front();
+            }
+            let (lo, hi) = seen.iter().fold((i32::MAX, i32::MIN), |(lo, hi), &(_, p)| {
+                (lo.min(p), hi.max(p))
+            });
+            if seen.len() >= window as usize / 2 && hi - lo <= STICTION_STILL_TICKS {
+                break;
+            }
+        }
+        let start = self.pos(j)?;
+        // The ramp starts from the current the drive is holding with, not
+        // the model's balance: the position loop parks a joint against its
+        // own stiction with a push of its own (J3 held with 100 mA past the
+        // model), and dropping that at the switch to current mode sprang the
+        // joint most of a degree before any ramp had begun.
+        let node = self.node(j);
+        let balance = self.state.nodes[node]
+            .current_ma
+            .map_or(f64::from(self.gravity_feedforward()[j]), f64::from);
+        let ilim = self.bundle.robot.joints[j].ilim_ma;
+        let rate = STICTION_RAMP_ILIM_PER_S * ilim;
+        let ceiling = STICTION_MAX_ILIM * ilim;
+        let mut generation = self.generation[j];
+        let mut recent: VecDeque<(u64, i64, f64)> = VecDeque::new();
+        let mut found = None;
+        for t in 0.. {
+            let ramp = sign * rate * t as f64 * self.dt;
+            if ramp.abs() > ceiling {
+                break;
+            }
+            let current = (balance + ramp).clamp(-ilim, ilim);
+            self.frame(Some((j, JointCommand::current(current.round() as i16))))?;
+            if self.generation[j] == generation {
+                continue;
+            }
+            generation = self.generation[j];
+            let moved = i64::from(self.pos(j)?) - i64::from(start);
+            recent.push_back((self.tick, moved, current));
+            while recent
+                .front()
+                .is_some_and(|(tick, _, _)| self.tick.saturating_sub(*tick) > window)
+            {
+                recent.pop_front();
+            }
+            let Some(&(oldest_tick, oldest_moved, oldest_current)) = recent.front() else {
+                continue;
+            };
+            let span_s = (self.tick - oldest_tick) as f64 * self.dt;
+            if span_s < 0.5 * STICTION_WINDOW_S {
+                continue;
+            }
+            let ticks_per_s = (moved - oldest_moved) as f64 / span_s;
+            if ticks_per_s.abs() >= STICTION_SLIDE_TICKS_PER_S
+                && moved.abs() >= i64::from(STICTION_BREAK_TICKS)
+                && ramp.abs() >= STICTION_MIN_RAMP_ILIM * ilim
+            {
+                found = Some((oldest_current, oldest_moved));
+                break;
+            }
+        }
+        self.adopt(j)?;
+        self.settle(STICTION_REST_S)?;
+        self.hold[j] = start;
+        self.settle(STICTION_REST_S)?;
+        Ok(found)
+    }
+
+    /// Static friction per joint at the pose the arm holds \[Nm\]. The two
+    /// ramps, up and down from the balance, meet static friction on
+    /// opposite sides of gravity, so half their difference is the friction
+    /// and their mean is the gravity current the joint really carries --
+    /// reported beside the model's, which is what the ramps started from.
+    fn stiction(&mut self, label: &'static str) -> Result<[Option<f64>; N]> {
+        let mut out = [None; N];
+        for j in 0..N {
+            if self.only.is_some_and(|o| o != j) {
+                continue;
+            }
+            self.emit(Event::Phase("stiction", j));
+            let cfg = &self.bundle.robot.joints[j];
+            let factor =
+                torque_to_ma_factor(cfg.gear_ratio, cfg.gear_efficiency, cfg.kt_nm_a, cfg.dir)
+                    .abs();
+            let model = f64::from(self.gravity_feedforward()[j]);
+            let up = self.breakaway(j, 1.0)?;
+            let down = self.breakaway(j, -1.0)?;
+            let (Some((up, up_windup)), Some((down, down_windup))) = (up, down) else {
+                self.emit(Event::Phase("no breakaway within the ramp", j));
+                continue;
+            };
+            let static_nm = (up - down).abs() / 2.0 / factor;
+            let measured = (up + down) / 2.0;
+            // The motor turned this far, against the static friction, before
+            // the link moved: the transmission's wind-up, and the torque over
+            // it is the transmission's stiffness, joint side.
+            let windup = (up_windup.abs() + down_windup.abs()) as f64 / 2.0;
+            let stiffness = static_nm / (windup * self.per_tick(j).abs()).max(f64::MIN_POSITIVE);
+            self.emit(Event::Stiction(
+                self.tick, j, label, up, down, static_nm, model, measured, windup, stiffness,
+            ));
+            out[j] = Some(static_nm);
+        }
+        Ok(out)
+    }
 }
 
 impl Arm {
@@ -3075,7 +3253,28 @@ fn run(args: Args) -> Result<()> {
         .collect();
     let limits_stage = args.limits || args.limits_only;
     let gains_stage = args.gains || args.gains_only;
-    let only = args.limits_only || args.gains_only;
+    let stiction_stage = args.stiction || args.stiction_only;
+    let only = args.limits_only || args.gains_only || args.stiction_only;
+    // The stiction stage's second pose, the arm out level, where the base's
+    // bearings carry the most overturning moment: taken only if the
+    // straight path there and back is clear.
+    let out_pose = if stiction_stage {
+        let mut out = ready;
+        out[1] = (-40.0_f64).to_radians();
+        out[2] = 185.0_f64.to_radians();
+        out[4] = (-60.0_f64).to_radians();
+        let mut world = collision_world(&bundle, &assets)?;
+        if world.check_segment(&ready, &out, 40)?.is_some() {
+            println!(
+                "stiction: the arm-out pose is not reachable from ready; measuring at ready only"
+            );
+            None
+        } else {
+            Some(out)
+        }
+    } else {
+        None
+    };
     let spans = if limits_stage || gains_stage {
         Some(limit_spans(&bundle, &assets, ready)?)
     } else {
@@ -3090,8 +3289,18 @@ fn run(args: Args) -> Result<()> {
     let mut friction = None;
     let mut tuned = None;
     let mut limits = None;
+    let mut stiction_ready = None;
+    let mut stiction_out = None;
     let outcome = arm.initialize().and_then(|()| {
         arm.home()?;
+        if stiction_stage {
+            stiction_ready = Some(arm.stiction("ready")?);
+            if let Some(out) = out_pose {
+                arm.pose(out)?;
+                stiction_out = Some(arm.stiction("arm out")?);
+                arm.pose(ready)?;
+            }
+        }
         if !only {
             friction = Some(arm.measure_mechanics()?);
             fit = Some(arm.identify(&poses, ready)?);
@@ -3195,6 +3404,16 @@ fn run(args: Args) -> Result<()> {
                     j + 1
                 ),
             }
+        }
+    }
+    for (label, table) in [("ready", &stiction_ready), ("arm out", &stiction_out)] {
+        if let Some(table) = table {
+            let joints: Vec<String> = table
+                .iter()
+                .enumerate()
+                .filter_map(|(j, s)| s.map(|s| format!("J{} {s:.3}", j + 1)))
+                .collect();
+            println!("stiction at {label}: {} Nm", joints.join(", "));
         }
     }
     if let Some(tuned) = &tuned {
