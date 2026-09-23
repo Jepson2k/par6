@@ -386,3 +386,106 @@ fn a_pause_requested_while_idle_holds_the_next_program() {
         "un-pausing resumes playback"
     );
 }
+
+/// `stop()` on a moving program: the arm brakes ALONG the path — never
+/// reversing, never stepping — at no more than the joint acceleration
+/// limit, then holds where the brake ended with the rest of the program
+/// discarded. A flush alone stops the setpoint dead from full speed.
+#[test]
+fn a_stop_brakes_along_the_path_within_the_acceleration_limit_then_holds() {
+    let mut rig = Rig::new();
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    let limits = common::bundle().robot.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec);
+    let ticks_per_rad = f64::from(rig.conv[0].motor_ticks(q0 + 1.0) - rig.conv[0].motor_ticks(q0));
+    // A cruise far from both ends of a long program, its samples carrying
+    // the velocity their spacing implies (as the planner's do: EXEC
+    // interpolates Hermite, so zero sample velocities would be a
+    // stop-start at every sample, not a cruise).
+    let step = 0.002;
+    let mut q = rig.pose;
+    for k in 0..2000 {
+        q[0] = q0 + step * (k + 1) as f64;
+        let mut qd = [0.0; MAX_JOINTS];
+        qd[0] = step / rig.dt;
+        let s = Sample {
+            q,
+            qd,
+            tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
+            meta: SampleMeta {
+                command_index: 1,
+                checkpoint_id: 1,
+                blend_continues: false,
+                is_last: k == 1999,
+            },
+        };
+        assert!(rig.producer.try_push(&s), "ring capacity");
+    }
+    for _ in 0..40 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    let stop_tick = rig.snap().tick;
+    rig.producer.flush_marker().mark();
+    rig.send(RtCommand::ExecStop);
+    let mut ended = None;
+    for _ in 0..2000 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+        let s = rig.snap();
+        if s.tick > stop_tick + 1 && !s.exec.stopping {
+            ended = Some(s);
+            break;
+        }
+    }
+    let s = ended.expect("the stop brake finishes");
+    assert_eq!(
+        s.mode,
+        Mode::Exec,
+        "a stopped program rests in the EXEC hold"
+    );
+    assert_eq!(
+        s.exec.samples_remaining, 0,
+        "the rest of the program is gone"
+    );
+
+    let pos: Vec<f64> = j0_positions(&mut rig, stop_tick)
+        .into_iter()
+        .map(f64::from)
+        .collect();
+    let deltas: Vec<f64> = pos.windows(2).map(|w| w[1] - w[0]).collect();
+    assert!(
+        deltas.iter().all(|d| *d >= -1.0),
+        "the brake follows the path forward, never back: {deltas:?}"
+    );
+    let a_ticks = limits.acceleration_rad_s2 * ticks_per_rad * rig.dt * rig.dt;
+    for w in deltas.windows(2) {
+        // One motor tick of quantization on each of the two deltas.
+        assert!(
+            (w[1] - w[0]).abs() <= a_ticks * 1.05 + 2.0,
+            "deceleration {} ticks/tick² over the limit {a_ticks}",
+            (w[1] - w[0]).abs()
+        );
+    }
+    let v = step / rig.dt;
+    let travel = (pos[pos.len() - 1] - pos[0]) / ticks_per_rad;
+    let floor = v * v / (2.0 * limits.acceleration_rad_s2);
+    assert!(
+        travel >= 0.9 * floor,
+        "stopped in {travel} rad from {v} rad/s: faster than the limit allows ({floor} rad)"
+    );
+    assert!(
+        travel <= 4.0 * floor + 2.0 * step,
+        "braked far softer than the limit: {travel} rad against {floor} rad"
+    );
+
+    let held = rig.last_joints()[0];
+    rig.tick_n(30);
+    let f = rig.last_joints()[0];
+    assert_eq!(f.vel, Some(0), "held still");
+    assert_eq!(f.pos, held.pos, "held in place");
+}

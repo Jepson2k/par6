@@ -47,6 +47,7 @@ pub struct ExecPlayback {
     completed: u32,
     paused: bool,
     paused_ticks: u64,
+    stopping: bool,
     faulted: bool,
     dt: f64,
     scale_rate_limit: f64,
@@ -82,6 +83,7 @@ impl ExecPlayback {
             completed: 0,
             paused: false,
             paused_ticks: 0,
+            stopping: false,
             faulted: false,
             dt,
             scale_rate_limit: 1.0 / transition_s,
@@ -105,6 +107,7 @@ impl ExecPlayback {
         self.settling = false;
         self.active_cmd = 0;
         self.completed = 0;
+        self.stopping = false;
         self.faulted = false;
         self.phase = 0.0;
         self.left = Sample {
@@ -137,11 +140,31 @@ impl ExecPlayback {
     }
 
     fn target_scale(&self) -> f64 {
-        if self.paused {
+        if self.paused || self.stopping {
             0.0
         } else {
             self.requested_scale
         }
+    }
+
+    /// Brake the program along its path and end it (the `stop()` path):
+    /// the clock decelerates to zero as fast as the joint acceleration
+    /// limits allow — not at the operator-override pace a pause uses —
+    /// and once it is still, the marked samples are discarded and the
+    /// engine holds where the brake ended. Idempotent while braking.
+    pub fn begin_stop(&mut self) {
+        self.stopping = true;
+    }
+
+    /// Whether a [`Self::begin_stop`] brake is still running.
+    pub fn is_stopping(&self) -> bool {
+        self.stopping
+    }
+
+    fn finish_stop(&mut self) {
+        self.stopping = false;
+        let n = self.flush();
+        log::info!("EXEC stop braked to rest; discarded {n} samples");
     }
 
     /// Readback also advances in modes without queued motion.
@@ -199,6 +222,16 @@ impl ExecPlayback {
         *q = self.hold_q;
         qd.fill(0.0);
         tau_ff.fill(0.0);
+        // Nothing left to brake: the clock is still, the arm is holding a
+        // boundary target, or there is no path ahead to follow.
+        if self.stopping
+            && (self.applied_scale == 0.0
+                || self.faulted
+                || self.settling
+                || (self.owe_boundary.is_none() && self.consumer.peek().is_none()))
+        {
+            self.finish_stop();
+        }
         if self.faulted {
             return ExecTick::Ok;
         }
@@ -278,8 +311,15 @@ impl ExecPlayback {
         }
         let target = self.target_scale();
         let old_scale = self.applied_scale;
-        let mut low = -self.scale_rate_limit;
-        let mut high = self.scale_rate_limit;
+        // A stop brakes as hard as the joints allow: only the acceleration
+        // admissibility below bounds it, not the override transition pace.
+        let (rate_limit, clock_acceleration_limit) = if self.stopping {
+            (f64::INFINITY, f64::INFINITY)
+        } else {
+            (self.scale_rate_limit, self.scale_acceleration_limit)
+        };
+        let mut low = -rate_limit;
+        let mut high = rate_limit;
         for i in 0..MAX_JOINTS {
             if velocity[i].abs() > 1e-12 {
                 let base = old_scale * old_scale * acceleration[i];
@@ -291,13 +331,10 @@ impl ExecPlayback {
         }
         // A speed selection must not step the clock's first derivative:
         // that would step joint acceleration even on a smooth path.
-        let frequency = (8.0 * self.scale_rate_limit).min(0.5 / self.dt);
+        let frequency = (8.0 * rate_limit).min(0.5 / self.dt);
         let clock_acceleration = (frequency * frequency * (target - old_scale)
             - 2.0 * frequency * self.scale_rate)
-            .clamp(
-                -self.scale_acceleration_limit,
-                self.scale_acceleration_limit,
-            );
+            .clamp(-clock_acceleration_limit, clock_acceleration_limit);
         let requested_rate = self.scale_rate + clock_acceleration * self.dt;
         let rate = if requested_rate == 0.0 {
             0.0
@@ -334,10 +371,26 @@ impl ExecPlayback {
                 self.applied_scale = old_scale + allowed * (candidate - old_scale);
             }
         }
+        // A stop ends the moment stopping outright is within the joints'
+        // acceleration limits: the asymptotic tail would otherwise hold a
+        // physically stationary arm in "stopping" for the better part of a
+        // second.
+        if self.stopping
+            && self.applied_scale != 0.0
+            && self.rate_is_admissible(
+                old_scale,
+                0.0,
+                &velocity,
+                &next,
+                self.consumer.peek_offset(1).as_ref(),
+            )
+        {
+            self.applied_scale = 0.0;
+        }
         // Use the readback's scale resolution, so an asymptotic filter
         // tail cannot leave a physically stationary program "pausing".
         if (self.applied_scale - target).abs() < 1e-6
-            && (target - old_scale).abs() <= self.scale_rate_limit * self.dt
+            && (target - old_scale).abs() <= rate_limit * self.dt
             && self.rate_is_admissible(
                 old_scale,
                 target,
@@ -459,7 +512,14 @@ impl ExecPlayback {
             completed_index: self.completed,
             settling: self.settling,
             paused: self.paused && self.applied_scale == 0.0,
-            target_scale: self.target_scale(),
+            // The operator's request, not the stop's: a braking stop is
+            // not a pause, and reads as one nowhere.
+            target_scale: if self.paused {
+                0.0
+            } else {
+                self.requested_scale
+            },
+            stopping: self.stopping,
             applied_scale: self.applied_scale,
             resume_scale: self.requested_scale,
             paused_ticks: self.paused_ticks,

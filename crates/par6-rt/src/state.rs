@@ -359,6 +359,9 @@ pub struct ExecStatus {
     pub resume_scale: f64,
     /// RT ticks spent under an explicit pause request, across all modes.
     pub paused_ticks: u64,
+    /// A `stop()` brake is still decelerating the program along its path;
+    /// the ring is discarded and the arm held once it is still.
+    pub stopping: bool,
 }
 
 impl Default for ExecStatus {
@@ -373,6 +376,7 @@ impl Default for ExecStatus {
             applied_scale: 1.0,
             resume_scale: 1.0,
             paused_ticks: 0,
+            stopping: false,
         }
     }
 }

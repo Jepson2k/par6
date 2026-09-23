@@ -783,23 +783,51 @@ impl<R: RtCommands> Core<R> {
         QueryResult::BusScan { nodes }
     }
 
-    /// Commissioning commands rename or rewrite a drive: refused while
-    /// anything could be moving (only IDLE or ACTIVE_ERROR, nothing
-    /// executing, queued or streaming), and refused for an id the config
-    /// does not list unless `force` says a fresh drive is meant.
-    fn commissioning_gate(&self, node: u8, force: bool, what: &str) -> Result<(), WireError> {
+    /// The arm is still being brought to rest: a jog or stream session
+    /// (released or not) owns it, or a stop is braking the program along
+    /// its path. A snapshot taken before the RT saw the stop still shows the
+    /// old ring, which reads as braking too, so a stale view waits rather
+    /// than starting early.
+    fn arm_braking(&self) -> bool {
+        match self.snap.mode {
+            Mode::Jog | Mode::Stream => true,
+            Mode::Exec => self.snap.exec.stopping || self.snap.exec.samples_remaining > 0,
+            _ => false,
+        }
+    }
+
+    /// Nothing is moving and nothing is waiting to: no command executing,
+    /// queued or streaming, and the arm idle, faulted, or holding in EXEC
+    /// with its ring drained — where every stop and finished move rests.
+    fn arm_at_rest(&self) -> bool {
         let busy =
             self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
-        if busy || !matches!(self.snap.mode, Mode::Idle | Mode::ActiveError) {
+        let resting = match self.snap.mode {
+            Mode::Idle | Mode::ActiveError => true,
+            Mode::Exec => self.snap.exec.samples_remaining == 0 && !self.snap.exec.stopping,
+            _ => false,
+        };
+        !busy && resting
+    }
+
+    /// Commissioning commands rename or rewrite a drive: refused while
+    /// anything could be moving (see [`Self::arm_at_rest`]), and refused
+    /// for an id the config does not list unless `force` says a fresh
+    /// drive is meant.
+    fn commissioning_gate(&self, node: u8, force: bool, what: &str) -> Result<(), WireError> {
+        if !self.arm_at_rest() {
             return Err(make_error(
                 ErrorCode::CommValidationError,
                 UNATTRIBUTED,
                 &[(
                     "detail",
                     &format!(
-                        "{what} needs an idle arm: mode {:?}, {}",
+                        "{what} needs an arm at rest: mode {:?}, {}",
                         self.snap.mode,
-                        if busy {
+                        if self.executing.is_some()
+                            || !self.pending.is_empty()
+                            || self.active_stream.is_some()
+                        {
                             "motion in flight"
                         } else {
                             "nothing in flight"
@@ -1087,6 +1115,30 @@ impl<R: RtCommands> Core<R> {
                     &format!(
                         "exit_flashing while the controller mode is {:?}, not FLASHING",
                         self.snap.mode
+                    ),
+                )],
+            );
+            self.reply(addr, &Reply::Error { req_id, error }).await;
+            return;
+        }
+        // Entering drops the arm to IDLE first (FLASHING opens only from
+        // there), which would cut a running program: only an arm at rest
+        // may go.
+        if enter && !self.arm_at_rest() {
+            let error = make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!(
+                        "enter_flashing needs an arm at rest: mode {:?}, {} queued, {}",
+                        self.snap.mode,
+                        self.pending.len(),
+                        if self.executing.is_some() || self.active_stream.is_some() {
+                            "moving"
+                        } else {
+                            "nothing moving"
+                        }
                     ),
                 )],
             );
@@ -1496,6 +1548,13 @@ impl<R: RtCommands> Core<R> {
         if gate(head.cmd.tag()).needs_enabled
             && (self.estop_latched || self.snap.state != ArmState::Enabled)
         {
+            return;
+        }
+        // A planned move is planned from the pose the arm is at when it
+        // starts, so it waits out a brake: a stop decelerates along the old
+        // path and a released jog or stream ramps down, and a plan taken
+        // mid-brake would start from where the arm no longer is.
+        if plans_from_pose(head.cmd.tag()) && self.arm_braking() {
             return;
         }
         if self.holding_for_blend() {
@@ -2818,6 +2877,15 @@ impl<R: RtCommands> Core<R> {
 }
 
 // ---- free helpers ----------------------------------------------------------
+
+/// Queued commands the planner plans from the arm's measured pose.
+fn plans_from_pose(cmd: CmdType) -> bool {
+    use CmdType as C;
+    matches!(
+        cmd,
+        C::MoveJ | C::MoveJPose | C::MoveL | C::MoveC | C::MoveS | C::MoveP | C::Home
+    )
+}
 
 fn rate_period(hz: u32) -> std::time::Duration {
     std::time::Duration::from_secs_f64(1.0 / f64::from(hz.max(1)))

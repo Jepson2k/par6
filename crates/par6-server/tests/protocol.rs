@@ -1203,10 +1203,19 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
     assert!(ev.contains(&RtEvent::SetCanId { node: 9, new_id: 3 }));
     assert!(ev.contains(&RtEvent::SaveConfig(2)));
 
-    // A moving arm refuses both, whatever the target.
-    h.publish(|s| s.mode = Mode::Exec);
+    // A moving arm refuses both, whatever the target: a program still
+    // playing, or a stop still braking one.
+    h.publish(|s| {
+        s.mode = Mode::Exec;
+        s.exec.samples_remaining = 40;
+    });
     let err = c.expect_error(&rename(2, 9, false)).await;
-    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    assert!(err.cause.contains("arm at rest"), "{}", err.cause);
+    h.publish(|s| {
+        s.mode = Mode::Exec;
+        s.exec.samples_remaining = 0;
+        s.exec.stopping = true;
+    });
     let err = c
         .expect_error(&Command::SaveConfig(SaveConfig {
             node: 2,
@@ -1214,6 +1223,14 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
         }))
         .await;
     assert!(err.cause.contains("Exec"), "{}", err.cause);
+    // An arm resting in the EXEC hold — where every stop and finished move
+    // leaves it — has nothing moving, so it may be commissioned.
+    h.publish(|s| {
+        s.mode = Mode::Exec;
+        s.exec.samples_remaining = 0;
+        s.exec.stopping = false;
+    });
+    c.ok(&rename(2, 9, false)).await;
     // ... and a latched one accepts them: commissioning under e-stop is
     // the normal way to rename a drive.
     h.publish(|s| {

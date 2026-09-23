@@ -66,9 +66,10 @@ pub enum RtCommand {
     JogRelease,
     /// End a STREAM session by braking to rest, rather than abandoning
     /// the arm at speed. STREAM outlives this until the ramp is at rest,
-    /// then the mode goes IDLE on its own — IDLE holds against gravity
-    /// and has no velocity authority, so a moving arm dropped into it
-    /// coasts on its own momentum.
+    /// then the core holds the rest pose on its own (see
+    /// [`RtCommand::Hold`]) — IDLE holds against gravity and has no
+    /// velocity authority, so a moving arm dropped into it coasts on its
+    /// own momentum, and a resting one floats.
     StreamRelease,
     /// Pause/resume EXEC playback (pause holds in place, ring untouched).
     ExecSetPaused(bool),
@@ -82,6 +83,21 @@ pub enum RtCommand {
     /// queued behind the stop. Marking is the sender's job — an
     /// unmarked flush discards nothing.
     ExecFlush,
+    /// Stop EXEC playback the way `stop()` promises: brake ALONG the
+    /// planned path at the joint acceleration limits, then discard the
+    /// marked samples (as [`RtCommand::ExecFlush`]) and hold where the
+    /// brake ended. A running HOMING sequence is aborted to IDLE — it has
+    /// no path to brake along and leaves the arm unreferenced. Anywhere
+    /// else nothing is moving under the ring, so the marked samples are
+    /// discarded at once.
+    ExecStop,
+    /// End a jog or stream session where it stands: hold the last
+    /// commanded pose under EXEC's position loop when the arm may be held
+    /// (homed, enabled, no hard error), IDLE otherwise. For the cut a
+    /// session cannot brake out of — a ramp that never reported rest, a
+    /// gate that cannot be queried — where IDLE would hand a homed arm to
+    /// the gravity float. A no-op outside JOG and STREAM.
+    Hold,
     /// Firmware gripper command for the per-tick gripper slot; replaces
     /// the standing gripper frame until the next one.
     Gripper(FirmwareGripperCommand),

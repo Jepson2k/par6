@@ -369,15 +369,26 @@ fn jog_law_ramps_integrates_and_latches_direction_block_at_soft_limit() {
     );
 
     // Releasing ends the jog session: the ramp runs down and JOG goes
-    // with it, so the latch stands for a UI to read but the mode has to
-    // be re-entered to jog again.
+    // with it, and the arm is HELD where the ramp ended — a homed,
+    // enabled arm at rest is never handed to the gravity float. The latch
+    // stands for a UI to read, but the mode has to be re-entered to jog
+    // again.
     rig.cmd(RtCommand::JogRelease);
     rig.tick_n(5);
     let s = rig.snap();
     assert!(s.jog.blocked_mask & 0b10 != 0, "block survives release");
-    assert_eq!(s.mode, Mode::Idle, "a released jog leaves JOG at rest");
+    assert_eq!(s.mode, Mode::Exec, "a released jog rests in the EXEC hold");
+    rig.tick_n(10);
+    let f = rig.last_joints();
+    assert_eq!(f[0].vel, Some(0), "held still");
+    assert!(
+        (f[0].pos.unwrap() - soft_max_ticks).abs() <= 1,
+        "held where the ramp ended"
+    );
 
-    // A fresh session starts unblocked and the opposite direction runs.
+    // A fresh session starts unblocked and the opposite direction runs —
+    // entered through IDLE, as the bridge enters every session.
+    rig.cmd(RtCommand::SetMode(Mode::Idle));
     rig.cmd(RtCommand::SetMode(Mode::Jog));
     assert_eq!(
         rig.snap().jog.blocked_mask & 0b10,

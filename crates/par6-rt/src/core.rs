@@ -1511,6 +1511,33 @@ impl<B: DriverBus> RtCore<B> {
                 let n = self.exec.flush();
                 log::info!("EXEC flush discarded {n} samples");
             }
+            RtCommand::ExecStop => match self.mode {
+                Mode::Exec => self.exec.begin_stop(),
+                // A referencing seek has no path to brake along, and it
+                // leaves the arm unreferenced: a stop aborts it to IDLE,
+                // whose law is zero-velocity on an unhomed arm.
+                Mode::Homing => {
+                    if let Err(e) = self.request_mode(Mode::Idle) {
+                        log::warn!("stop: HOMING → IDLE refused: {e:?}");
+                    }
+                    self.exec.flush();
+                }
+                _ => {
+                    let n = self.exec.flush();
+                    log::info!("EXEC stop outside EXEC discarded {n} samples");
+                }
+            },
+            RtCommand::Hold => match self.mode {
+                Mode::Jog => {
+                    let at = self.q_target;
+                    self.rest_into_hold(&at);
+                }
+                Mode::Stream => {
+                    let at = self.stream_commanded;
+                    self.rest_into_hold(&at);
+                }
+                _ => {}
+            },
             RtCommand::Gripper(fw) => {
                 if self.has_can_gripper {
                     let at = self.bus_state.gripper.reply.map_or(0, |r| r.position);
@@ -1711,6 +1738,26 @@ impl<B: DriverBus> RtCore<B> {
         }
         self.enter_mode(target);
         Ok(())
+    }
+
+    /// Where a jog or stream session ends: holding `at` — the pose the
+    /// session last commanded, which is what the drive is already holding
+    /// (re-seeding at the measurement instead is a position step the drive
+    /// rings on) — under EXEC's position loop, the same hold a finished
+    /// program rests in. IDLE instead when the arm may not be held: its
+    /// law is zero-velocity there, because the gravity float needs homed ∧
+    /// enabled. A deliberate float is `SetGravityComp(true)`, which lets a
+    /// resting EXEC go.
+    fn rest_into_hold(&mut self, at: &[f64; MAX_JOINTS]) {
+        let may_hold = self.homed && self.state == ArmState::Enabled && !self.errors.any_hard();
+        if !may_hold {
+            self.enter_mode(Mode::Idle);
+            return;
+        }
+        self.leave_mode(Mode::Exec);
+        self.exec.activate(at);
+        self.hb_silence = 0;
+        self.mode = Mode::Exec;
     }
 
     fn enter_mode(&mut self, target: Mode) {
@@ -2096,14 +2143,21 @@ impl<B: DriverBus> RtCore<B> {
             }
         }
 
-        // EXEC link watchdog: heartbeat silence while samples pending.
+        // EXEC link watchdog: heartbeat silence while samples pending. Not
+        // while a stop brakes: the planner stopped feeding a program it
+        // cancelled, and the samples still in the ring are the ones the
+        // brake is about to discard — a link fault there would drop the
+        // arm on a stop the daemon itself asked for.
         if self.mode == Mode::Exec {
             if self.heartbeat.swap(false, Ordering::Relaxed) {
                 self.hb_silence = 0;
             } else {
                 self.hb_silence = self.hb_silence.saturating_add(1);
             }
-            if self.exec.samples_remaining() > 0 && self.hb_silence >= self.hb_timeout_ticks {
+            if self.exec.samples_remaining() > 0
+                && !self.exec.is_stopping()
+                && self.hb_silence >= self.hb_timeout_ticks
+            {
                 self.errors.latch(ErrorCode::ExecLinkLost, None);
             }
         }
@@ -2361,7 +2415,8 @@ impl<B: DriverBus> RtCore<B> {
                     && self.scratch_qd.iter().all(|v| *v == 0.0)
                     && self.at_measured_rest()
                 {
-                    self.mode = Mode::Idle;
+                    let at = self.scratch_q;
+                    self.rest_into_hold(&at);
                 }
             }
             Mode::Exec => {
@@ -2491,7 +2546,8 @@ impl<B: DriverBus> RtCore<B> {
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
                     && self.at_measured_rest()
                 {
-                    self.mode = Mode::Idle;
+                    let at = self.scratch_q;
+                    self.rest_into_hold(&at);
                 }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and

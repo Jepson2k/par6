@@ -1647,8 +1647,10 @@ impl Par6Planner {
         // is pinned to what is queued now and cannot swallow the fill of
         // whatever the client sends next.
         self.producer.flush_marker().mark();
-        self.link.send(RtCommand::ExecFlush);
-        self.link.send(RtCommand::SetMode(Mode::Idle));
+        // Braked along the path and held, not cut to IDLE: IDLE has no
+        // velocity authority, so an arm dropped into it mid-move coasts on
+        // its own momentum — past whatever invalidated the move.
+        self.link.send(RtCommand::ExecStop);
     }
 
     /// Poll-time verdict for the in-flight command; `None` = keep going,

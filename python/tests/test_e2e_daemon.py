@@ -1438,12 +1438,14 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
             "gate let the arm drive at the shape"
         )
 
-        # The refusal ends the session, so the arm brakes to rest in IDLE
-        # instead of carrying on to the streamed goal at the shape's centre.
+        # The refusal ends the session, so the arm brakes to rest and is
+        # held there, instead of carrying on to the streamed goal at the
+        # shape's centre — and instead of being handed to the gravity
+        # float once it has stopped.
         def at_rest(s) -> bool:
             z_seen.append(float(s.pose[11]))
             resting = max(abs(v) for v in s.speeds) < 0.05
-            return s.mode == ControllerMode.IDLE and resting
+            return s.mode == ControllerMode.EXEC and not s.freedrive and resting
 
         assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
             "the gate refused the datagram but never cancelled the session"

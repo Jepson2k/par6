@@ -669,6 +669,52 @@ fn stop_then_move_completes_without_losing_samples() {
     rig.shutdown();
 }
 
+/// `stop()` promises an arm HELD where it stopped: braked along its path
+/// and then kept under position control — enabled, and not
+/// back-driveable. It used to cut to IDLE, which on a homed arm is the
+/// gravity float: no velocity authority to brake with, and nothing
+/// holding the pose once the arm had stopped.
+#[test]
+fn a_stop_brakes_the_arm_and_then_holds_it() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+
+    let i = c.ok_index(&move_j(3101, with_j0(park, 60.0), 2.0));
+    rig.wait_status("J0 is under way", |s| {
+        s.executing_index == i as i64 && s.speeds[0].abs() > 0.2
+    });
+    c.ok(&Command::Stop(Stop { clear_queue: true }));
+    let (ok, _) = c.wait_complete(i);
+    assert!(!ok, "the stopped move reports its cancellation");
+
+    let rest = rig.wait_status("the arm at rest after the stop", |s| {
+        s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
+    let floating = |s: &Status| s.mode == ControllerMode::Idle && s.homed && s.gravity_comp;
+    assert!(rest.enabled, "a stop leaves the controller enabled");
+    assert!(
+        !floating(&rest),
+        "a stopped arm must be held, not handed to the gravity float: {:?}",
+        rest.mode
+    );
+    let window = rig.collect_status(Duration::from_secs(1));
+    for s in &window {
+        assert!(!floating(s), "the hold must not lapse into the float");
+        assert!(
+            max_deg_error(&s.angles, &rest.angles) < 0.06,
+            "a held arm stays put: {:?} drifted from {:?}",
+            s.angles,
+            rest.angles
+        );
+    }
+
+    rig.shutdown();
+}
+
 /// Move size for the profile probe: short enough that the whole move is
 /// ramping, where a jerk limit costs the most against a profile without
 /// one (long moves are cruise-dominated and converge).
@@ -714,9 +760,11 @@ fn flashing_window_over_protocol_v2() {
     assert_eq!(err.code, ErrorCode::CommValidationError as u16);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
     c.drain();
-    rig.wait_status("idle after the stop", |s| s.mode == ControllerMode::Idle);
+    rig.wait_status("at rest after the stop", |s| {
+        s.executing_index < 0 && s.speeds.iter().all(|v| v.abs() < 1e-3)
+    });
 
-    // From IDLE with the assertion: acked once the mode is FLASHING, and
+    // From rest with the assertion: acked once the mode is FLASHING, and
     // the silent bus reads as a stale link — the wire really is handed
     // to the flasher.
     c.ok(&enter);
@@ -1878,7 +1926,7 @@ fn bus_scan_and_a_commissioning_rename_on_the_simulator() {
         new_id: free_id,
         force: false,
     }));
-    assert!(err.cause.contains("idle arm"), "{}", err.cause);
+    assert!(err.cause.contains("arm at rest"), "{}", err.cause);
     c.ok(&Command::Stop(Stop { clear_queue: true }));
 
     // Under e-stop the arm cannot move: the rename goes through.

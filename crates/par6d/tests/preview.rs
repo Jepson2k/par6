@@ -978,3 +978,128 @@ fn a_pure_reorientation_first_waypoint_is_not_dropped() {
         rotation(moving)
     );
 }
+
+/// Distance \[m\] from `p` to the line through `a` along the unit `dir`.
+fn off_axis(p: &[f64; 16], a: &[f64; 16], dir: [f64; 3]) -> f64 {
+    let rel = [p[3] - a[3], p[7] - a[7], p[11] - a[11]];
+    let along = rel[0] * dir[0] + rel[1] * dir[1] + rel[2] * dir[2];
+    let perp = [
+        rel[0] - along * dir[0],
+        rel[1] - along * dir[1],
+        rel[2] - along * dir[2],
+    ];
+    (perp[0] * perp[0] + perp[1] * perp[1] + perp[2] * perp[2]).sqrt()
+}
+
+/// A `jog_l` that drives a joint into its soft limit brakes the tool ON
+/// the axis it was jogging, as parol6's does — a solution past a limit
+/// is a pose out of reach. It used to clamp that one joint and let the
+/// others carry on, which pinned the joint and bent the tool off the
+/// axis.
+#[test]
+fn a_jog_l_into_a_joint_limit_brakes_on_its_axis() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    let soft_max = par6_config::ConfigBundle::load(&config)
+        .expect("config")
+        .robot
+        .joints[0]
+        .limits
+        .soft_max_rad;
+    let mut start = wrist_clear_deg();
+    start[0] = soft_max.to_degrees() - 4.0;
+    preview.teleport_rad(to_rad(&start));
+    let at = preview.pose().expect("pose at start");
+
+    // Tangential to the base rotation through the tool: the direction +J1
+    // carries it, so the jog walks J1 straight into its limit.
+    let norm = (at[3] * at[3] + at[7] * at[7]).sqrt();
+    let dir = [-at[7] / norm, at[3] / norm, 0.0];
+    let r = preview.preview_jog_l([dir[0], dir[1], 0.0, 0.0, 0.0, 0.0], Frame::Wrf, 1.5, None);
+    assert!(r.valid(), "the jog previews: {:?}", r.error);
+    let record = preview.plan_record(None);
+    let joints = span_joints(&record, r.start_row, r.rows);
+    let poses = span_tcp(&record, r.start_row, r.rows);
+
+    assert!(
+        joints.iter().all(|q| q[0] <= soft_max + 1e-6),
+        "J1 crossed its soft limit"
+    );
+    let reached = joints.iter().map(|q| q[0]).fold(f64::MIN, f64::max);
+    assert!(
+        soft_max - reached < 2f64.to_radians(),
+        "the jog must run up to the limit before braking: stopped {:.2} deg short",
+        (soft_max - reached).to_degrees()
+    );
+    let worst = poses
+        .iter()
+        .map(|p| off_axis(p, &at, dir))
+        .fold(0.0f64, f64::max);
+    assert!(
+        worst < 0.001,
+        "the tool left its axis by {:.2} mm at the limit",
+        worst * 1e3
+    );
+}
+
+/// The dry-run preview of `servo_l` draws the straight line the runtime
+/// drives. It used to settle onto the target as a joint-interpolated
+/// move — the exact joint-space substitution the runtime fix removed —
+/// so a program checked in preview saw a bowed path the arm never takes.
+#[test]
+fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
+    let config = test_config();
+    let mut preview = Preview::new(Some(&config), Some(&assets()), None).expect("preview boots");
+    let mut from = park_deg();
+    from[3] += 25.0;
+    from[4] += 35.0;
+    preview.teleport_rad(to_rad(&from));
+    let at = preview.pose().expect("pose at start");
+    let start = [at[3] * 1e3, at[7] * 1e3, at[11] * 1e3];
+    let target_mm = [start[0] + 60.0, start[1] - 45.0, start[2] + 30.0];
+    let rpy = wire_rpy_deg(&at);
+
+    let r = preview.submit(Command::ServoL(par6_proto::command::ServoL {
+        pose: [
+            target_mm[0],
+            target_mm[1],
+            target_mm[2],
+            rpy[0],
+            rpy[1],
+            rpy[2],
+        ],
+        speed: Some(0.3),
+        accel: Some(0.3),
+    }));
+    assert!(r.valid(), "a reachable servo_l previews: {:?}", r.error);
+    let poses = span_tcp(&preview.plan_record(None), r.start_row, r.rows);
+    let length = ((60.0f64).powi(2) + 45.0f64.powi(2) + 30.0f64.powi(2)).sqrt();
+    let dir = [60.0 / length, -45.0 / length, 30.0 / length];
+    let worst = poses
+        .iter()
+        .map(|p| off_axis(p, &at, dir))
+        .fold(0.0f64, f64::max);
+    let end = poses.last().expect("rows");
+    let landed = ((end[3] * 1e3 - target_mm[0]).powi(2)
+        + (end[7] * 1e3 - target_mm[1]).powi(2)
+        + (end[11] * 1e3 - target_mm[2]).powi(2))
+    .sqrt();
+    assert!(
+        landed < 1.0,
+        "the preview ends {landed:.2} mm from the target"
+    );
+    assert!(
+        worst < 0.0005,
+        "the servo_l preview left the line by {:.2} mm",
+        worst * 1e3
+    );
+}
+
+/// The wire's roll/pitch/yaw (degrees) of a pose matrix — the inverse of
+/// `par6_proto::pose_matrix`'s rotation.
+fn wire_rpy_deg(m: &[f64; 16]) -> [f64; 3] {
+    let pitch = m[2].clamp(-1.0, 1.0).asin();
+    let roll = (-m[6]).atan2(m[10]);
+    let yaw = (-m[1]).atan2(m[0]);
+    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+}

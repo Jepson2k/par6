@@ -41,8 +41,8 @@ use par6_server::{
 
 use crate::adapters::{MotionJog, MotionStream};
 use crate::bridge::{
-    housekeeping_period, project_cart_jog, step_cart_jog, CartJogProbe, CartJogState, CoreLink,
-    CoreOp, StreamGate,
+    housekeeping_period, project_cart_jog, step_cart_jog, step_cart_servo, CartJogProbe,
+    CartJogState, CartServoState, CoreLink, CoreOp, StreamGate,
 };
 use crate::daemon::{load_preview_kin, DaemonError};
 use crate::kin::{matrix_to_xyzrpy, CartKin};
@@ -897,7 +897,7 @@ impl Preview {
                 rel: false,
             })),
             Command::ServoJPose(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
-            Command::ServoL(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
+            Command::ServoL(p) => self.preview_servo_l(p.pose, p.speed, p.accel),
             other => self.refuse(make_error(
                 ErrorCode::CommValidationError,
                 UNATTRIBUTED,
@@ -906,8 +906,99 @@ impl Preview {
         }
     }
 
+    /// A `servo_l` target: the housekeeping loop's own cartesian limiter
+    /// (`step_cart_servo`) at its own period, each step gated as
+    /// housekeeping gates it, until the tool lands — so the preview draws
+    /// the straight line the runtime drives, not a joint-interpolated
+    /// move onto the same pose.
+    fn preview_servo_l(
+        &mut self,
+        pose: [f64; 6],
+        speed: Option<f64>,
+        accel: Option<f64>,
+    ) -> PreviewResult {
+        let invalid = |detail: &str| {
+            make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[("detail", detail)],
+            )
+        };
+        let at = match self.cart.fk(&self.snap.q) {
+            Ok(pose) => pose,
+            Err(e) => return self.refuse(invalid(&e.to_string())),
+        };
+        let mut state = match CartServoState::new(
+            self.dt,
+            par6_motion::CartLimits::from_motion(&self.motion),
+            &at,
+            &self.snap.q,
+            crate::kin::wire_pose_to_matrix(&pose),
+            speed.unwrap_or(1.0),
+            accel.unwrap_or(1.0),
+            self.soft_min,
+            self.soft_max,
+        ) {
+            Ok(st) => st,
+            Err(e) => return self.refuse(invalid(&e)),
+        };
+        let period = housekeeping_period(self.dt).as_secs_f64();
+        let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
+        // A reachable target lands in about its distance over the
+        // limiter's ceiling; an unreachable one brakes and holds forever,
+        // so the preview stops at twice that plus the braking allowance
+        // the jog preview gives a ramp.
+        let line =
+            par6_motion::cart::LineSegment::new(&at, &crate::kin::wire_pose_to_matrix(&pose));
+        let scale = speed.unwrap_or(1.0).max(1e-3);
+        let travel_s = (line.length_m() / (self.motion.jog_l_linear_max_m_s * scale))
+            .max(line.angle_rad() / (self.motion.jog_l_angular_max_rad_s * scale));
+        let cap = ((2.0 * travel_s + 4.0) / period).round() as usize;
+        self.cart_streaming = true;
+        let mut trajectory = Vec::new();
+        let q_meas = self.snap.q;
+        for _ in 0..cap.max(1) {
+            let before = state.commanded();
+            let (target, landed) = match step_cart_servo(
+                &mut self.cart,
+                &mut state,
+                &self.stream_limits,
+                period,
+                &q_meas,
+            ) {
+                Ok(step) => step,
+                Err(_) => (before, true),
+            };
+            let mut la = target;
+            for (j, v) in la.iter_mut().enumerate() {
+                let qd = (target[j] - before[j]) / period;
+                *v = (*v + self.gate.stopping_travel(j, qd)).clamp(
+                    self.stream_limits.soft_min[j],
+                    self.stream_limits.soft_max[j],
+                );
+            }
+            match self.gate.blocked(&before, &la) {
+                Ok(None) => {}
+                Ok(Some(pairs)) => {
+                    let error = self.gate.refuse(pairs);
+                    return self.refuse(error);
+                }
+                Err(e) => return self.refuse(e),
+            }
+            for _ in 0..ticks_per_step {
+                trajectory.push(target);
+            }
+            if landed {
+                break;
+            }
+        }
+        let ticks = trajectory.len();
+        self.finish_stream(trajectory, trajectory_duration(ticks, self.dt))
+    }
+
     /// A streamed cartesian target settles as the planner's joint move
-    /// onto it — the same rule for every servo family.
+    /// onto it — joint-space, which is right for `servo_j_pose` and only
+    /// for it.
     fn settle_on_pose(
         &mut self,
         pose: [f64; 6],
