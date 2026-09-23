@@ -161,6 +161,34 @@ const LIMITS_SPAN_STEP_RAD: f64 = 0.02;
 /// J6 passed the following-error rule at 16.8% and audibly rumbled (user,
 /// 2026-09-23); the joints that run quietly sit under 8%.
 const LIMITS_RIPPLE_CEILING: f64 = 0.10;
+/// Fraction of a joint's EXEC caps the gains probe moves at: fast enough
+/// for a loop that hunts to show it, slow enough that a joint at its
+/// limits is not what is being scored.
+const GAINS_PROBE_FRACTION: f64 = 0.5;
+/// Integral gain steps: halve going down, one and a half going up. Every
+/// gain that was hand-tuned on 2026-09-23 moved by a factor in that range
+/// (J1 kiv x2, J6 kiv /3); a doubling of kpv with a quadrupling of kiv in
+/// one step is what buzzed J1.
+const GAINS_STEP_DOWN: f64 = 0.5;
+const GAINS_STEP_UP: f64 = 1.5;
+/// Proportional gain steps, gentler: kpv changes the loop's crossover.
+const GAINS_KPV_STEP_DOWN: f64 = 0.75;
+const GAINS_KPV_STEP_UP: f64 = 1.25;
+/// How far a search may walk from the configured value, either way.
+const GAINS_MIN_FACTOR: f64 = 0.1;
+const GAINS_MAX_FACTOR: f64 = 3.0;
+/// Least a gains probe move lasts \[s\]: at half caps a wrist's short probe
+/// is under 0.5 s, inside the scoring guard, and scores nothing.
+const GAINS_PROBE_MIN_S: f64 = 1.5;
+/// A step must beat the best score by this fraction to count: on the
+/// simulator J3's trials differ by under 1%, which is repeat noise, and a
+/// search that follows noise walks the gains for nothing.
+const GAINS_MIN_IMPROVEMENT: f64 = 0.05;
+/// A speed error this large for `RUNAWAY_TICKS` in a row is a loop that
+/// has gone unstable, not a rough joint: J2's backlash chatter spikes to
+/// 77 deg/s for single samples, the J1 buzz sat at +-240 deg/s.
+const RUNAWAY_RAD_S: f64 = 90.0 * std::f64::consts::PI / 180.0;
+const RUNAWAY_TICKS: u32 = 3;
 
 /// Velocity, acceleration and jerk caps for one joint's moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -209,6 +237,17 @@ struct Found {
     ripple: f64,
 }
 
+/// What the gains stage settled on for one joint.
+#[derive(Clone, Copy, Debug)]
+struct Tuned {
+    before: Gains,
+    after: Gains,
+    /// Speed RMS off the profile on the probe move, before and after
+    /// \[rad/s\].
+    score_before: f64,
+    score_after: f64,
+}
+
 /// Waiting out one silent drive is normal; a run that spends its time doing
 /// nothing else has a bus problem no amount of waiting will fix.
 const MAX_RECOVERIES: u32 = 24;
@@ -246,6 +285,14 @@ struct Args {
     /// identification, and leave the gravity correction as configured.
     #[arg(long)]
     limits_only: bool,
+    /// Also tune each joint's velocity-loop gains (kiv, then kpv) on a probe
+    /// move, and with `--apply` write them. Runs before the limits stage,
+    /// which depends on them. Off by default.
+    #[arg(long)]
+    gains: bool,
+    /// Home, then run only the gains stage.
+    #[arg(long)]
+    gains_only: bool,
     /// The tool fitted on the arm now, by its config name (e.g. `Flange`).
     /// Defaults to the config's `active_tool`; the file is not changed.
     #[arg(long)]
@@ -268,6 +315,8 @@ enum Event {
     Mechanics(u64, usize, f64, f64, f64),
     LimitsStep(u64, usize, Caps, Option<&'static str>),
     Limits(u64, usize, Found),
+    GainsStep(u64, usize, Gains, Option<f64>, &'static str),
+    Gains(u64, usize, Tuned),
     IdentPose(usize, usize, [f64; N]),
     IdentTorque(usize, [f64; N]),
     ArmFit(f64, f64),
@@ -346,6 +395,26 @@ fn describe(event: &Event) -> Option<String> {
             c.jerk,
             failed.map_or("passed".to_owned(), |why| format!("failed: {why}"))
         ),
+        Event::GainsStep(tick, j, g, score, verdict) => format!(
+            "tick={tick} J{} GAINS step kpv={:.5} kiv={:.5} {} {verdict}",
+            j + 1,
+            g.kpv,
+            g.kiv,
+            score.map_or("unstable".to_owned(), |s| format!(
+                "score={:.3}deg/s",
+                s.to_degrees()
+            ))
+        ),
+        Event::Gains(tick, j, t) => format!(
+            "tick={tick} J{} GAINS kpv={:.5}->{:.5} kiv={:.5}->{:.5} score={:.3}->{:.3}deg/s",
+            j + 1,
+            t.before.kpv,
+            t.after.kpv,
+            t.before.kiv,
+            t.after.kiv,
+            t.score_before.to_degrees(),
+            t.score_after.to_degrees()
+        ),
         Event::Limits(tick, j, f) => format!(
             "tick={tick} J{} LIMITS velocity={:.4}rad/s{} acceleration={:.4}rad/s2 \
              jerk={:.4}rad/s3{} ripple={:.1}%",
@@ -415,6 +484,9 @@ enum Outcome {
     Complete,
     /// The joint stopped while loaded: a mechanical stop.
     Blocked,
+    /// The loop ran away under trial gains; the move finished under the
+    /// last sane ones.
+    Unstable,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -537,6 +609,9 @@ struct Arm {
     /// A contact this joint is at. Samples within `ENDSTOP_EXCLUSION_RAD` of
     /// it are not scored.
     endstop_guard: [Option<i32>; N],
+    /// While the gains stage trials a joint: the last gains that tracked,
+    /// restored within a tick if the trial runs away.
+    sane_gains: [Option<Gains>; N],
     recoveries: u32,
     /// Homing drives unreferenced joints toward the stop at the configured
     /// homing current, not the operating one.
@@ -615,6 +690,7 @@ impl Arm {
             generation: [0; N],
             seen: [0; N],
             endstop_guard: [None; N],
+            sane_gains: [None; N],
             recoveries: 0,
             homing: false,
             only: None,
@@ -1161,6 +1237,8 @@ impl Arm {
         let speed_window = self.ticks(SPEED_WINDOW_S);
         let mut generation = self.generation[j];
         let started = self.tick;
+        let mut runaway_ticks = 0u32;
+        let mut unstable = false;
         for t in 0..self.ticks(duration) {
             let reference = expected;
             let reference_speed = commanded_speed;
@@ -1206,6 +1284,22 @@ impl Arm {
                 if let Some(v) = measured {
                     let speed_error = (v - f64::from(reference_speed)) * per_tick;
                     out.speed_sq += speed_error * speed_error;
+                    // A trial gain that runs away is caught here, and the
+                    // last sane gains are back on the drive before the
+                    // next frame; the move goes on to its landing under
+                    // them, scored as unstable.
+                    runaway_ticks = if speed_error.abs() > RUNAWAY_RAD_S {
+                        runaway_ticks + 1
+                    } else {
+                        0
+                    };
+                    if runaway_ticks >= RUNAWAY_TICKS && !unstable {
+                        if let Some(sane) = self.sane_gains[j] {
+                            unstable = true;
+                            self.gains[j] = sane;
+                            self.retune(j, limit)?;
+                        }
+                    }
                 }
                 let q = self.angles()?;
                 self.kin.gravity(&q, &mut gravity)?;
@@ -1217,6 +1311,9 @@ impl Arm {
                 && ((f64::from(p) - f64::from(target)) * per_tick).abs() <= tolerance
             {
                 out.outcome_complete(p);
+                if unstable {
+                    out.outcome = Outcome::Unstable;
+                }
                 break;
             }
             if t < guard {
@@ -1736,6 +1833,138 @@ impl Arm {
 impl Arm {
     // ------------------------------------------------------------ limits
 
+    /// Tune each joint's velocity loop on one probe move: the septic at
+    /// `GAINS_PROBE_FRACTION` of its EXEC caps, out and back, scored by how
+    /// far the drive's own speed strays from the profile (speed RMS off the
+    /// commanded speed, the same number the limits stage reports as ripple).
+    ///
+    /// This is a search, not a placement: a 250 Hz bus cannot see the
+    /// 6250 Hz loop it is tuning, but it can see whether a move got
+    /// smoother. Hand-tuned on 2026-09-23 this way, J6 went from 37 to
+    /// 2.6 deg/s off the profile (kiv /3) and J1 halved its 12 Hz surge (kiv
+    /// x2, kpv x1.33). kiv first, then kpv; each walks down from the
+    /// configured value while the score improves, up only when down did
+    /// not help, never past `GAINS_MIN_FACTOR`/`GAINS_MAX_FACTOR`. A trial
+    /// that runs away is caught inside the move (`RUNAWAY_RAD_S`), the last
+    /// sane gains go back on the drive within a tick, and that direction
+    /// ends.
+    fn gains(&mut self, ready: [f64; N], spans: &[(f64, f64); N]) -> Result<[Option<Tuned>; N]> {
+        let mut tuned = [None; N];
+        for (j, slot) in tuned.iter_mut().enumerate() {
+            self.pose(ready)?;
+            self.emit(Event::Phase("gains", j));
+            *slot = Some(self.joint_gains(j, ready[j], spans[j])?);
+            if let Some(t) = *slot {
+                self.emit(Event::Gains(self.tick, j, t));
+            }
+        }
+        self.pose(ready)?;
+        Ok(tuned)
+    }
+
+    fn joint_gains(&mut self, j: usize, home: f64, span: (f64, f64)) -> Result<Tuned> {
+        let caps = self
+            .exec_caps(j)
+            .scaled(GAINS_PROBE_FRACTION, &self.ceiling_caps(j));
+        let (target, _) = self.probe_short(home, span, caps);
+        let before = self.gains[j];
+        let score_before = self
+            .gains_trial(j, home, target, caps, before)?
+            .ok_or_else(|| format!("J{} runs away on its configured gains", j + 1))?;
+        let mut best = (before, score_before);
+        for field in [GainField::Kiv, GainField::Kpv] {
+            let base = field.get(&before);
+            let (down, up) = field.steps();
+            // Down first: the safe direction. Up only when down did not help.
+            let mut improved = false;
+            loop {
+                let value = field.get(&best.0) * down;
+                if value < base * GAINS_MIN_FACTOR {
+                    break;
+                }
+                let g = field.with(best.0, value);
+                match self.gains_trial(j, home, target, caps, g)? {
+                    Some(score) if score < best.1 * (1.0 - GAINS_MIN_IMPROVEMENT) => {
+                        best = (g, score);
+                        improved = true;
+                    }
+                    _ => break,
+                }
+            }
+            if improved {
+                continue;
+            }
+            loop {
+                let value = field.get(&best.0) * up;
+                if value > base * GAINS_MAX_FACTOR {
+                    break;
+                }
+                let g = field.with(best.0, value);
+                match self.gains_trial(j, home, target, caps, g)? {
+                    Some(score) if score < best.1 * (1.0 - GAINS_MIN_IMPROVEMENT) => {
+                        best = (g, score);
+                    }
+                    _ => break,
+                }
+            }
+        }
+        self.gains[j] = best.0;
+        self.retune(j, self.bundle.robot.joints[j].ilim_ma)?;
+        Ok(Tuned {
+            before,
+            after: best.0,
+            score_before,
+            score_after: best.1,
+        })
+    }
+
+    /// One trial: the probe out and back under `gains`, the joint left at
+    /// `home`. `None` when the loop ran away, in which case the drive is
+    /// already back on the last sane gains.
+    fn gains_trial(
+        &mut self,
+        j: usize,
+        home: f64,
+        target: f64,
+        caps: Caps,
+        gains: Gains,
+    ) -> Result<Option<f64>> {
+        let sane = self.sane_gains[j].unwrap_or(self.gains[j]);
+        self.sane_gains[j] = Some(sane);
+        self.gains[j] = gains;
+        let mut score = 0.0_f64;
+        let mut stable = true;
+        for point in [target, home] {
+            let ticks = self.conv[j].motor_ticks(point);
+            let m = self.run_motion_capped(j, ticks, GAINS_PROBE_MIN_S, false, caps)?;
+            if m.outcome != Outcome::Complete {
+                stable = false;
+            }
+            score = score.max(m.rms_speed());
+        }
+        if stable {
+            self.sane_gains[j] = Some(gains);
+        } else {
+            // Whatever ran away, the drive holds the sane gains now; make
+            // the bookkeeping say the same.
+            self.gains[j] = sane;
+            self.run_motion_capped(j, self.conv[j].motor_ticks(home), self.dt, false, caps)?;
+        }
+        let verdict = if !stable {
+            "runaway; last sane gains restored"
+        } else {
+            "scored"
+        };
+        self.emit(Event::GainsStep(
+            self.tick,
+            j,
+            gains,
+            stable.then_some(score),
+            verdict,
+        ));
+        Ok(stable.then_some(score))
+    }
+
     /// The fastest each joint moves while still meeting the tracking
     /// requirements, found joint by joint: each carries its own inertia and
     /// gets its own limits. A joint's EXEC caps are scaled together by
@@ -1945,6 +2174,36 @@ impl Arm {
 /// Every joint's probe span, planned before anything moves: loading the
 /// collision world and sweeping each span takes far longer than a control
 /// tick, and on the arm the loop would miss its deadline doing it.
+/// The two velocity-loop gains the gains stage searches, in search order.
+#[derive(Clone, Copy)]
+enum GainField {
+    Kiv,
+    Kpv,
+}
+
+impl GainField {
+    fn get(self, g: &Gains) -> f64 {
+        match self {
+            GainField::Kiv => g.kiv,
+            GainField::Kpv => g.kpv,
+        }
+    }
+    fn with(self, mut g: Gains, value: f64) -> Gains {
+        match self {
+            GainField::Kiv => g.kiv = value,
+            GainField::Kpv => g.kpv = value,
+        }
+        g
+    }
+    /// (down, up) step factors.
+    fn steps(self) -> (f64, f64) {
+        match self {
+            GainField::Kiv => (GAINS_STEP_DOWN, GAINS_STEP_UP),
+            GainField::Kpv => (GAINS_KPV_STEP_DOWN, GAINS_KPV_STEP_UP),
+        }
+    }
+}
+
 fn limit_spans(bundle: &ConfigBundle, assets: &Path, ready: [f64; N]) -> Result<[(f64, f64); N]> {
     let mut world = collision_world(bundle, assets)?;
     let mut spans = [(0.0, 0.0); N];
@@ -2502,6 +2761,7 @@ fn patch_array(text: &mut String, key: &str, values: &[f64]) -> Result<()> {
 fn patch_config(
     original: &str,
     correction: Option<&[f64]>,
+    tuned: Option<&[Option<Tuned>; N]>,
     limits: Option<&[Option<Found>; N]>,
 ) -> Result<String> {
     let mut text = original.to_owned();
@@ -2510,6 +2770,22 @@ fn patch_config(
         // Identification measures the true torque, so any per-joint trim from
         // an older calibration is superseded and would otherwise multiply it.
         patch_array(&mut text, "gravity_scale", &[1.0; N])?;
+    }
+    for (j, t) in tuned.into_iter().flatten().enumerate() {
+        // Only what the search moved: a joint it left alone keeps its lines
+        // byte for byte, comments and all.
+        if let Some(t) = t {
+            let mut values = Vec::new();
+            if t.after.kpv != t.before.kpv {
+                values.push(("kpv", t.after.kpv));
+            }
+            if t.after.kiv != t.before.kiv {
+                values.push(("kiv", t.after.kiv));
+            }
+            if !values.is_empty() {
+                patch_joint_table(&mut text, j, "[joints.gains]", &values)?;
+            }
+        }
     }
     for (j, found) in limits.into_iter().flatten().enumerate() {
         if let Some(found) = found {
@@ -2523,13 +2799,30 @@ fn patch_config(
 /// table; a jerk it only bounded keeps its configured value.
 fn patch_exec_limits(text: &mut String, j: usize, found: &Found) -> Result<()> {
     let caps = &found.caps;
+    let mut values = vec![
+        ("velocity_rad_s", caps.velocity),
+        ("acceleration_rad_s2", caps.acceleration),
+    ];
+    if found.jerk_measured {
+        values.push(("jerk_rad_s3", caps.jerk));
+    }
+    patch_joint_table(text, j, "[joints.limits.exec]", &values)
+}
+
+/// Set `values` inside joint `j`'s `header` table, keeping everything else
+/// in the file byte for byte.
+fn patch_joint_table(
+    text: &mut String,
+    j: usize,
+    header: &str,
+    values: &[(&str, f64)],
+) -> Result<()> {
     let name = text
         .find(&format!("name = \"joint{}\"", j + 1))
         .ok_or_else(|| format!("configuration has no joint{}", j + 1))?;
     let next_joint = text[name..]
         .find("[[joints]]")
         .map_or(text.len(), |i| name + i);
-    let header = "[joints.limits.exec]";
     let table = text[name..next_joint]
         .find(header)
         .map(|i| name + i)
@@ -2540,15 +2833,8 @@ fn patch_exec_limits(text: &mut String, j: usize, found: &Found) -> Result<()> {
             .find("\n[")
             .map_or(text.len() - body, |i| i + 1);
     let mut block = text[body..end].to_owned();
-    let mut values = vec![
-        ("velocity_rad_s", caps.velocity),
-        ("acceleration_rad_s2", caps.acceleration),
-    ];
-    if found.jerk_measured {
-        values.push(("jerk_rad_s3", caps.jerk));
-    }
     for (key, value) in values {
-        block = set_value(&block, key, &format!("{value:.4}"));
+        block = set_value(&block, key, &format!("{value:.5}"));
     }
     text.replace_range(body..end, &block);
     Ok(())
@@ -2665,7 +2951,9 @@ fn run(args: Args) -> Result<()> {
         .map(|(j, _)| j + 1)
         .collect();
     let limits_stage = args.limits || args.limits_only;
-    let spans = if limits_stage {
+    let gains_stage = args.gains || args.gains_only;
+    let only = args.limits_only || args.gains_only;
+    let spans = if limits_stage || gains_stage {
         Some(limit_spans(&bundle, &assets, ready)?)
     } else {
         None
@@ -2676,14 +2964,18 @@ fn run(args: Args) -> Result<()> {
     }
 
     let mut fit = None;
+    let mut tuned = None;
     let mut limits = None;
     let outcome = arm.initialize().and_then(|()| {
         arm.home()?;
-        if !args.limits_only {
+        if !only {
             arm.measure_mechanics()?;
             fit = Some(arm.identify(&poses, ready)?);
         }
-        if let Some(spans) = &spans {
+        if let (true, Some(spans)) = (gains_stage, &spans) {
+            tuned = Some(arm.gains(ready, spans)?);
+        }
+        if let (true, Some(spans)) = (limits_stage, &spans) {
             limits = Some(arm.limits(&poses, ready, spans)?);
         }
         Ok(())
@@ -2781,7 +3073,28 @@ fn run(args: Args) -> Result<()> {
             }
         }
     }
-    let patched = patch_config(&original, correction.as_deref(), limits.as_ref())?;
+    if let Some(tuned) = &tuned {
+        for (j, t) in tuned.iter().enumerate() {
+            if let Some(t) = t {
+                println!(
+                    "gains J{}: kpv {:.5} -> {:.5}, kiv {:.5} -> {:.5}, off the profile {:.2} -> {:.2} deg/s",
+                    j + 1,
+                    t.before.kpv,
+                    t.after.kpv,
+                    t.before.kiv,
+                    t.after.kiv,
+                    t.score_before.to_degrees(),
+                    t.score_after.to_degrees()
+                );
+            }
+        }
+    }
+    let patched = patch_config(
+        &original,
+        correction.as_deref(),
+        tuned.as_ref(),
+        limits.as_ref(),
+    )?;
     // Refuse to write something that will not load.
     par6_config::RobotConfig::from_toml_str(&patched)?.validate()?;
     fs::write(directory.join("calibrated.toml"), &patched)?;

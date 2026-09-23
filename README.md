@@ -641,7 +641,13 @@ inertia and friction, and identifies the arm's own link masses from the torque
 it holds at a set of poses. The links are 3D printed, so they do not weigh what
 the vendor CAD says. `--apply` writes the identified `gravity_correction` into
 the config, keeping a backup; `--sim` runs it against the simulator and refuses
-`--apply`. `--limits` (off by default) also finds each joint's velocity,
+`--apply`. `--gains` (off by default) tunes each joint's velocity loop on one
+probe move — kiv then kpv, walking down from the configured value while the
+drive's speed strays less from the profile, up only when down did not help — and
+writes them with `--apply`; a trial that runs away is caught mid-move and the
+last sane gains are back on the drive within a tick. It is a search on what the
+bus can see, not a placement: the 6250 Hz loop itself is out of reach.
+`--limits` (off by default) also finds each joint's velocity,
 acceleration and jerk limits: it scales the joint's EXEC limits up towards its
 hardware ceiling until a move's following error, landing or hold misses its
 requirement, or the current it needs plus the worst gravity the joint carries
