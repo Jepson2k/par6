@@ -14,7 +14,8 @@ stroke_mm = 106.0 # vendor value, and it disagrees with the rail name —
                   # only MSG_large_motor_150mm_rail declares 150.
 kt_nm_a = 0.111
 ilim_ma = 1700.0
-voltage_limit_mv = 6000
+# 0 = the bus (~24 V), as on the arm joints.
+voltage_limit_mv = 0
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000
 gear_r_m = 0.0083

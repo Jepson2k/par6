@@ -235,6 +235,9 @@ struct Found {
     /// Worst speed ripple of the step's probe moves, as a fraction of each
     /// move's peak commanded speed.
     ripple: f64,
+    /// The EXEC caps the search started from, so `--apply` writes only what
+    /// it moved.
+    configured: Caps,
 }
 
 /// What the gains stage settled on for one joint.
@@ -2167,6 +2170,7 @@ impl Arm {
             velocity_reached,
             jerk_measured: false,
             ripple,
+            configured: self.exec_caps(j),
         }))
     }
 }
@@ -2795,16 +2799,24 @@ fn patch_config(
     Ok(text)
 }
 
-/// Write what the limits stage found as joint `j`'s `[joints.limits.exec]`
-/// table; a jerk it only bounded keeps its configured value.
+/// Write what the limits stage moved in joint `j`'s `[joints.limits.exec]`
+/// table: a cap the search left where the file had it keeps its line byte
+/// for byte, and a jerk it only bounded keeps its configured value.
 fn patch_exec_limits(text: &mut String, j: usize, found: &Found) -> Result<()> {
     let caps = &found.caps;
-    let mut values = vec![
-        ("velocity_rad_s", caps.velocity),
-        ("acceleration_rad_s2", caps.acceleration),
-    ];
-    if found.jerk_measured {
+    let was = &found.configured;
+    let mut values = Vec::new();
+    if caps.velocity != was.velocity {
+        values.push(("velocity_rad_s", caps.velocity));
+    }
+    if caps.acceleration != was.acceleration {
+        values.push(("acceleration_rad_s2", caps.acceleration));
+    }
+    if found.jerk_measured && caps.jerk != was.jerk {
         values.push(("jerk_rad_s3", caps.jerk));
+    }
+    if values.is_empty() {
+        return Ok(());
     }
     patch_joint_table(text, j, "[joints.limits.exec]", &values)
 }

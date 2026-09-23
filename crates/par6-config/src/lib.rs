@@ -462,13 +462,14 @@ mod tests {
         assert_eq!(cfg.joints[1].gains.kpp, 3.0);
         assert_eq!(cfg.joints[2].dir, 1);
         assert_eq!(cfg.joints[5].limits.soft_max_rad, 7.14);
-        // Per-mode limits: exec is the pre-liberal set, stream the ceiling.
-        let exec = cfg.joints[0].limits.for_mode(LimitMode::Exec);
-        assert_eq!(exec.acceleration_rad_s2, 9.6);
-        assert_eq!(exec.jerk_rad_s3, Some(28.8));
-        let jog = cfg.joints[0].limits.for_mode(LimitMode::Jog);
-        assert_eq!(jog.acceleration_rad_s2, 32.0); // falls back to ceiling
-                                                   // Homing values (robots/PAR6.xml homing fields).
+        // Per-mode limits: exec is what selfcal found, jog falls back to the
+        // ceiling. J2's exec table sits well under its ceiling on every axis.
+        let exec = cfg.joints[1].limits.for_mode(LimitMode::Exec);
+        assert_eq!(exec.acceleration_rad_s2, 1.536);
+        assert_eq!(exec.jerk_rad_s3, Some(4.608));
+        let jog = cfg.joints[1].limits.for_mode(LimitMode::Jog);
+        assert_eq!(jog.acceleration_rad_s2, 10.0);
+        // Homing values (robots/PAR6.xml homing fields).
         assert_eq!(cfg.homing.joints[0].timeout_s, 13.0);
         assert_eq!(cfg.homing.joints[0].two_pass_max_diff_ticks, 3500);
         assert_eq!(

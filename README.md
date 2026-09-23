@@ -651,8 +651,8 @@ bus can see, not a placement: the 6250 Hz loop itself is out of reach.
 acceleration and jerk limits: it scales the joint's EXEC limits up towards its
 hardware ceiling until a move's following error, landing or hold misses its
 requirement, or the current it needs plus the worst gravity the joint carries
-would exceed its current limit; with `--apply` those become the EXEC limits.
-Speed ripple is reported beside each result and only fails a step past 10% of
+would exceed its current limit; with `--apply` those become the EXEC limits,
+written only where the search moved them. Speed ripple is reported beside each result and only fails a step past 10% of
 the commanded speed, because it does not grow with the limits. A jerk no probe move was
 limited by is only a lower bound, so it is reported and left as configured. It
 tunes no drive gains: those loops run inside the drives at
