@@ -76,7 +76,7 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
 
     async def set_position(self, position: float, **kwargs: float | int) -> int:
         speed = float(kwargs.get("speed", 0.5))
-        current = int(kwargs.get("current", self.current_range[1]))
+        current = int(kwargs.get("current", self.default_current))
         return await self._cmd("move", [float(position), speed, current])
 
     async def calibrate(self, **kwargs: object) -> int:
@@ -189,6 +189,7 @@ def build_tools() -> ToolsCollection:
                 position_range=(0.0, 1.0),
                 speed_range=(0.0, 1.0),
                 current_range=(0, int(driver["ilim_ma"])),
+                default_current=int(driver["default_current_ma"]),
                 motions=(
                     LinearMotion(
                         role=MeshRole.JAW,

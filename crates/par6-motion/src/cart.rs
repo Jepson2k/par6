@@ -274,6 +274,11 @@ impl LineSegment {
     pub fn sample(&self, t: f64) -> Pose {
         pose_of(self.q0.slerp(self.q1, t), self.p0.lerp(self.p1, t))
     }
+
+    /// Unit direction of travel, the same everywhere on a line.
+    pub fn tangent(&self, _t: f64) -> DVec3 {
+        (self.p1 - self.p0).normalize_or_zero()
+    }
 }
 
 /// Waypoints along a straight segment, `start` first and `end` last.
@@ -387,39 +392,125 @@ pub fn arc(
     end: &Pose,
     s: CartSampling,
 ) -> Result<Vec<Pose>, MotionError> {
-    let (p_start, p_via, p_end) = (position(start), position(via), position(end));
-    let circle = circle_through(p_start, p_via, p_end)?;
-    let r1 = p_start - circle.center;
-    let r2 = p_end - circle.center;
-    let (n1, n2) = (r1.length(), r2.length());
-    if n1 < LEN_EPS || n2 < LEN_EPS {
-        return Err(MotionError::InvalidInput {
-            what: "via",
-            reason: "the arc has no radius".into(),
-        });
-    }
-    let (u1, u2) = (r1 / n1, r2 / n2);
-    let mut sweep = u1.dot(u2).clamp(-1.0, 1.0).acos();
-    if circle.full_circle {
-        sweep = std::f64::consts::TAU;
-    } else if u1.cross(u2).dot(circle.normal) < 0.0 {
-        sweep = std::f64::consts::TAU - sweep;
+    let seg = ArcSegment::new(start, via, end)?;
+    let n = s
+        .intervals(seg.length_m(), seg.angle_rad())
+        .min(s.max_points.saturating_sub(1).max(1));
+    Ok((0..=n).map(|k| seg.sample(k as f64 / n as f64)).collect())
+}
+
+/// A circular arc as a segment: position sweeps the circle through the
+/// via point from `start` to `end`, orientation slerps between the two.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct ArcSegment {
+    circle: Circle,
+    /// The start point, relative to the centre.
+    r1: DVec3,
+    /// Sweep about the plane normal \[rad\], always in the positive
+    /// sense; a whole lap for a full circle.
+    sweep: f64,
+    q0: DQuat,
+    q1: DQuat,
+}
+
+impl ArcSegment {
+    /// The arc through `via` from `start` to `end`; see [`circle_through`]
+    /// for the circle it lies on and what is refused.
+    pub fn new(start: &Pose, via: &Pose, end: &Pose) -> Result<Self, MotionError> {
+        let (p_start, p_via, p_end) = (position(start), position(via), position(end));
+        let circle = circle_through(p_start, p_via, p_end)?;
+        let r1 = p_start - circle.center;
+        let r2 = p_end - circle.center;
+        let (n1, n2) = (r1.length(), r2.length());
+        if n1 < LEN_EPS || n2 < LEN_EPS {
+            return Err(MotionError::InvalidInput {
+                what: "via",
+                reason: "the arc has no radius".into(),
+            });
+        }
+        let (u1, u2) = (r1 / n1, r2 / n2);
+        let mut sweep = u1.dot(u2).clamp(-1.0, 1.0).acos();
+        if circle.full_circle {
+            sweep = std::f64::consts::TAU;
+        } else if u1.cross(u2).dot(circle.normal) < 0.0 {
+            sweep = std::f64::consts::TAU - sweep;
+        }
+        Ok(Self {
+            circle,
+            r1,
+            sweep,
+            q0: rotation(start),
+            q1: rotation(end),
+        })
     }
 
-    let (q0, q1) = (rotation(start), rotation(end));
-    let arc_len = circle.radius * sweep;
-    let n = s
-        .intervals(arc_len, q0.angle_between(q1))
-        .min(s.max_points.saturating_sub(1).max(1));
-    Ok((0..=n)
-        .map(|k| {
-            let t = k as f64 / n as f64;
-            pose_of(
-                q0.slerp(q1, t),
-                circle.center + DQuat::from_axis_angle(circle.normal, t * sweep) * r1,
-            )
-        })
-        .collect())
+    /// Arc length \[m\].
+    pub fn length_m(&self) -> f64 {
+        self.circle.radius * self.sweep
+    }
+
+    /// Rotation angle between the endpoint orientations \[rad\].
+    pub fn angle_rad(&self) -> f64 {
+        self.q0.angle_between(self.q1)
+    }
+
+    /// Pose at normalized arc length `t` in \[0, 1\].
+    pub fn sample(&self, t: f64) -> Pose {
+        pose_of(
+            self.q0.slerp(self.q1, t),
+            self.circle.center
+                + DQuat::from_axis_angle(self.circle.normal, t * self.sweep) * self.r1,
+        )
+    }
+
+    /// Unit direction of travel at normalized arc length `t`.
+    pub fn tangent(&self, t: f64) -> DVec3 {
+        let r = DQuat::from_axis_angle(self.circle.normal, t * self.sweep) * self.r1;
+        self.circle.normal.cross(r).normalize_or_zero()
+    }
+}
+
+/// One piece of a cartesian path, straight or circular.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CartSegment {
+    /// A straight run.
+    Line(LineSegment),
+    /// A circular arc.
+    Arc(ArcSegment),
+}
+
+impl CartSegment {
+    /// Translation length \[m\].
+    pub fn length_m(&self) -> f64 {
+        match self {
+            Self::Line(l) => l.length_m(),
+            Self::Arc(a) => a.length_m(),
+        }
+    }
+
+    /// Rotation angle between the endpoint orientations \[rad\].
+    pub fn angle_rad(&self) -> f64 {
+        match self {
+            Self::Line(l) => l.angle_rad(),
+            Self::Arc(a) => a.angle_rad(),
+        }
+    }
+
+    /// Pose at normalized length `t` in \[0, 1\].
+    pub fn sample(&self, t: f64) -> Pose {
+        match self {
+            Self::Line(l) => l.sample(t),
+            Self::Arc(a) => a.sample(t),
+        }
+    }
+
+    /// Unit direction of travel at normalized length `t`.
+    pub fn tangent(&self, t: f64) -> DVec3 {
+        match self {
+            Self::Line(l) => l.tangent(t),
+            Self::Arc(a) => a.tangent(t),
+        }
+    }
 }
 
 // ----------------------------------------------------------------- spline
@@ -613,55 +704,78 @@ pub fn corner_trims(
 }
 
 /// Waypoints along a polyline whose interior corners are rounded by
-/// quadratic Bézier zones of the given radii \[m\].
-///
-/// `waypoints[0]` is the start pose; `radii` has one entry per interior
-/// waypoint, and `0` there means "stop at this corner" (the path still
-/// passes exactly through it). Each rounded corner is tangent to the
-/// incoming segment where the zone starts and to the outgoing one where
-/// it ends, so position is C1 across the corner: the arm never has to
-/// come to rest to change direction.
+/// Bézier zones of the given radii \[m\] — [`blended_path`] over
+/// straight segments.
 pub fn blended_polyline(
     waypoints: &[Pose],
     radii: &[f64],
     s: CartSampling,
 ) -> Result<Vec<Pose>, MotionError> {
-    let n = waypoints.len();
-    if n < 2 {
+    if waypoints.len() < 2 {
         return Err(MotionError::InvalidInput {
             what: "waypoints",
-            reason: format!("a path needs at least 2 waypoints, got {n}"),
+            reason: format!("a path needs at least 2 waypoints, got {}", waypoints.len()),
         });
     }
-    if n == 2 {
-        return Ok(line(&waypoints[0], &waypoints[1], s));
-    }
-    let segments: Vec<LineSegment> = (0..n - 1)
-        .map(|i| LineSegment::new(&waypoints[i], &waypoints[i + 1]))
+    let segments: Vec<CartSegment> = waypoints
+        .windows(2)
+        .map(|w| CartSegment::Line(LineSegment::new(&w[0], &w[1])))
         .collect();
-    let lengths: Vec<f64> = segments.iter().map(LineSegment::length_m).collect();
+    blended_path(&segments, radii, s)
+}
+
+/// Waypoints along a chain of segments whose junctions are rounded by
+/// zones of the given radii \[m\].
+///
+/// `radii` has one entry per junction (`segments.len() - 1`), and `0`
+/// there means "stop at this junction" (the path still passes exactly
+/// through it). A zone trims each adjoining segment by the radius,
+/// measured along the segment — arc length on an arc — and joins the
+/// two trim points with a cubic Bézier whose handles lie along the
+/// segments' directions of travel there, two thirds of the trim long.
+/// The zone is therefore tangent to the incoming segment where it
+/// starts and to the outgoing one where it ends, so position is C1
+/// across the corner: the arm never has to come to rest to change
+/// direction. Between two lines the cubic is exactly the degree-raised
+/// quadratic through the corner point, so a chain of `move_l`s rounds
+/// the way it always has; an arc's zone follows its curvature into and
+/// out of the corner instead.
+pub fn blended_path(
+    segments: &[CartSegment],
+    radii: &[f64],
+    s: CartSampling,
+) -> Result<Vec<Pose>, MotionError> {
+    let n = segments.len();
+    if n == 0 {
+        return Err(MotionError::InvalidInput {
+            what: "segments",
+            reason: "a path needs at least one segment".into(),
+        });
+    }
+    let lengths: Vec<f64> = segments.iter().map(CartSegment::length_m).collect();
     let (trims, clamped) = corner_trims(&lengths, radii)?;
 
     // Two passes: size every piece first so the density budget is spread
     // over the whole path, then emit.
     enum Piece {
-        /// Straight run of segment `i` from `a` to `b` in its own
-        /// normalized coordinate.
-        Line { i: usize, a: f64, b: f64 },
-        /// Bézier corner rounding waypoint `i + 1`.
+        /// Run of segment `i` from `a` to `b` in its own normalized
+        /// coordinate.
+        Run { i: usize, a: f64, b: f64 },
+        /// Bézier corner rounding the junction after segment `i`.
         Corner { i: usize },
     }
     let mut pieces = Vec::with_capacity(2 * n);
     let mut counts = Vec::with_capacity(2 * n);
-    for i in 0..n - 1 {
+    for i in 0..n {
         let (a, b) = (trims[i].entry, 1.0 - trims[i].exit);
         if b > a + 1e-12 {
             let seg = &segments[i];
             counts.push(s.intervals((b - a) * lengths[i], (b - a) * seg.angle_rad()));
-            pieces.push(Piece::Line { i, a, b });
+            pieces.push(Piece::Run { i, a, b });
         }
-        if i + 1 < n - 1 && clamped[i] > 0.0 {
-            // The corner's control polygon is 2r long; its arc is shorter.
+        if i + 1 < n && clamped[i] > 0.0 {
+            // The corner's control polygon is about 2r long; its arc is
+            // shorter.
             let entry = segments[i].sample(1.0 - trims[i].exit);
             let exit = segments[i + 1].sample(trims[i + 1].entry);
             counts.push(s.intervals(
@@ -682,7 +796,7 @@ pub fn blended_polyline(
     let mut out: Vec<Pose> = Vec::with_capacity(counts.iter().sum::<usize>() + 1);
     for (piece, steps) in pieces.iter().zip(counts.iter()) {
         match piece {
-            Piece::Line { i, a, b } => {
+            Piece::Run { i, a, b } => {
                 let seg = &segments[*i];
                 for k in 0..=*steps {
                     let t = a + (b - a) * k as f64 / *steps as f64;
@@ -690,15 +804,21 @@ pub fn blended_polyline(
                 }
             }
             Piece::Corner { i } => {
-                let entry = segments[*i].sample(1.0 - trims[*i].exit);
-                let exit = segments[*i + 1].sample(trims[*i + 1].entry);
-                let corner = position(&waypoints[*i + 1]);
+                let (t_in, t_out) = (1.0 - trims[*i].exit, trims[*i + 1].entry);
+                let entry = segments[*i].sample(t_in);
+                let exit = segments[*i + 1].sample(t_out);
                 let (pe, px) = (position(&entry), position(&exit));
                 let (qe, qx) = (rotation(&entry), rotation(&exit));
+                let handle = 2.0 / 3.0 * clamped[*i];
+                let p1 = pe + segments[*i].tangent(t_in) * handle;
+                let p2 = px - segments[*i + 1].tangent(t_out) * handle;
                 for k in 0..=*steps {
                     let t = k as f64 / *steps as f64;
                     let omt = 1.0 - t;
-                    let p = pe * (omt * omt) + corner * (2.0 * omt * t) + px * (t * t);
+                    let p = pe * (omt * omt * omt)
+                        + p1 * (3.0 * omt * omt * t)
+                        + p2 * (3.0 * omt * t * t)
+                        + px * (t * t * t);
                     push_distinct(&mut out, pose_of(qe.slerp(qx, t), p));
                 }
             }
@@ -1330,5 +1450,55 @@ mod tests {
             .map(|(a, b)| (a - b).abs())
             .fold(0.0, f64::max);
         assert!(worst < 1e-12, "screw misses its endpoint by {worst}");
+    }
+
+    /// Between two straight segments the cubic corner is the quadratic
+    /// through the corner point, degree-raised: a chain of `move_l`s
+    /// rounds exactly as it did before arcs could join one.
+    #[test]
+    fn a_line_line_corner_is_the_quadratic_bezier_through_the_corner() {
+        let a = pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let corner = pose(0.1, 0.0, 0.0, 0.0, 0.0, 0.0);
+        let b = pose(0.1, 0.1, 0.0, 0.0, 0.0, 0.0);
+        let s = CartSampling {
+            step_m: 0.002,
+            rotation: RotationPitch::Weighted(0.15),
+            max_points: 4096,
+        };
+        let r = 0.02;
+        let path = blended_polyline(&[a, corner, b], &[r], s).expect("a rounded corner");
+        let (pc, pa, pb) = (position(&corner), position(&a), position(&b));
+        let entry = pc + (pa - pc).normalize() * r;
+        let exit = pc + (pb - pc).normalize() * r;
+        // Every sample inside the zone lies on the quadratic Bézier
+        // (entry, corner, exit): the closest point of that curve is within
+        // sampling noise of it.
+        let mut in_zone = 0;
+        for pose in &path {
+            let p = position(pose);
+            if (p - pc).length() >= r - 1e-9 && ((p - pa).length() < r || (p - pb).length() < r) {
+                continue;
+            }
+            if (p - pc).length() > r {
+                continue;
+            }
+            in_zone += 1;
+            let miss = (0..=2000)
+                .map(|k| {
+                    let t = k as f64 / 2000.0;
+                    let omt = 1.0 - t;
+                    let q = entry * (omt * omt) + pc * (2.0 * omt * t) + exit * (t * t);
+                    (q - p).length()
+                })
+                .fold(f64::INFINITY, f64::min);
+            assert!(
+                miss < 1e-6,
+                "a zone sample left the quadratic by {miss:e} m"
+            );
+        }
+        assert!(
+            in_zone > 10,
+            "expected a sampled zone, got {in_zone} samples"
+        );
     }
 }

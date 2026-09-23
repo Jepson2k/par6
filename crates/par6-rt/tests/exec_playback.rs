@@ -183,6 +183,59 @@ fn settled_timeout_completes_without_error_strict_timeout_latches() {
     assert!(f.iter().all(|c| c.pos.is_none() && c.vel == Some(0)));
 }
 
+/// The settle timeout is "no progress for this long", not "this long
+/// since the ring ran out": a joint still closing on its target under
+/// `strict` is settling, not stuck, however long it takes — while one
+/// that only twitches by less than a tenth of the tolerance is.
+#[test]
+fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
+    let mut rig = Rig::with_policy(CompletionPolicy::Strict);
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    rig.tick_n(4);
+    assert!(rig.snap().exec.settling, "the ring has run out: settling");
+    // Closing by 0.002 rad every 300 ticks: every step clears the
+    // progress floor (0.001 rad) inside the 500-tick timeout, so the
+    // clock keeps restarting although the move takes 9000 ticks.
+    for k in 1..=30 {
+        rig.pose[0] = q0 + 0.002 * f64::from(k);
+        rig.tick_n(300);
+        let s = rig.snap();
+        assert!(
+            !s.error_active,
+            "faulted at step {k} while the joint was still closing"
+        );
+        assert_eq!(s.exec.completed_index, 0, "not within tolerance yet");
+    }
+    rig.pose[0] = q0 + 0.08;
+    rig.tick_n(10);
+    let s = rig.snap();
+    assert_eq!(s.exec.completed_index, 1, "the slow settle completes");
+    assert!(!s.error_active);
+
+    // Dithering by 0.0004 rad about the same spot never clears the floor:
+    // no progress, and the timeout latches as before.
+    let mut rig = Rig::with_policy(CompletionPolicy::Strict);
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    push_cmd(&mut rig, 1, q0 + 0.05, 0.01, 3, false, true);
+    rig.tick_n(4);
+    for k in 1..=6 {
+        rig.pose[0] = q0 + 0.0004 * f64::from(k % 2);
+        rig.tick_n(100);
+    }
+    let s = rig.snap();
+    assert!(
+        s.errors
+            .as_slice()
+            .iter()
+            .any(|e| e.code == ErrorCode::ExecSettleTimeout),
+        "noise-level creep is not progress: the strict timeout must latch"
+    );
+    assert_eq!(s.exec.completed_index, 0);
+}
+
 #[test]
 fn blend_continues_bypasses_settling_across_the_boundary() {
     let mut rig = Rig::new(); // Settled policy — the bypass must win

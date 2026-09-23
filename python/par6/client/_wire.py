@@ -38,13 +38,14 @@ def timing(
     duration: float | None, speed: float | None
 ) -> tuple[float | None, float | None]:
     """Map the waldoctl duration/speed pair (0/None = unset) onto the wire's
-    exactly-one-of convention.  Neither set means full profile speed."""
+    exactly-one-of convention. A planned move names its timing: neither is
+    a mistake, not a request for full speed."""
     d = float(duration) if duration else None
     s = float(speed) if speed else None
     if d is not None and s is not None:
         raise ValueError("duration and speed are mutually exclusive")
     if d is None and s is None:
-        s = 1.0
+        raise ValueError("a planned move needs either duration or speed")
     return d, s
 
 
@@ -132,9 +133,11 @@ def shape_to_wire(shape: Shape) -> dict[str, Any]:
     }
 
 
-def tool_status_from_dict(raw: dict | None) -> ToolStatus | None:
+def tool_status_from_dict(raw: dict | None) -> ToolStatus:
+    """The runtime's tool status; with no tool fitted, a ``ToolStatus``
+    whose key is ``"NONE"`` rather than nothing."""
     if raw is None:
-        return None
+        return ToolStatus()
     return ToolStatus(
         key=canonical_tool_key(raw["key"]),
         variant_key=raw["variant_key"],

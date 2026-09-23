@@ -15,7 +15,7 @@ use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, MoveC, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
+    EnterFlashing, JogJ, MoveJ, SaveConfig, SelectProfile, SelectTool, SetCanId,
     SetCompletionPolicy, Stop, Teleport, ToolAction, ToolParam,
 };
 use par6_proto::{
@@ -883,27 +883,9 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     let park = park_deg();
     teleport_home(&rig, &mut c, park);
 
-    // ---- parameters that cannot be honoured are refused, never ignored.
-    // A corner radius on an ARC is one of them: par6d rounds corners
-    // between straight cartesian moves and between joint moves, but an
-    // arc ends at its end pose, and a radius that quietly did nothing
-    // would be the silent alteration this surface exists to prevent.
-    let err = c.expect_error(&Command::MoveC(MoveC {
-        key: 5001,
-        via: [0.0; 6],
-        end: [0.0; 6],
-        frame: Frame::Wrf,
-        duration: Some(0.5),
-        speed: None,
-        accel: None,
-        blend_radius: Some(5.0),
-        rel: false,
-    }));
-    assert_eq!(
-        err.code,
-        ErrorCode::CommValidationError as u16,
-        "a blend radius par6d cannot honour must be refused, got {err:?}"
-    );
+    // ---- parameters that cannot be honoured are refused, never ignored:
+    // a jaw position on a tool with no jaws would quietly do nothing,
+    // which is the silent alteration this surface exists to prevent.
     let err = c.expect_error(&Command::Teleport(Teleport {
         angles: park,
         tool_positions: Some(vec![0.5, 0.5]),
@@ -2060,6 +2042,73 @@ fn a_backend_swap_that_cannot_open_its_bus_is_refused_and_changes_nothing() {
         "a refused swap moved the arm: {:?} -> {:?}",
         before.angles,
         after.angles
+    );
+    rig.shutdown();
+}
+
+/// A program's physics shapes are in the live simulator's world, not
+/// only in the collision gate's: a block declared with a mass is
+/// something the jaws close ON, so a grip runs against it here the way
+/// it does in a preview run and on the arm.
+#[test]
+fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    teleport_home(&rig, &mut c, park_deg());
+    let tool = fitted_tool();
+    let i = c.ok_index(&tool_action(7101, &tool, "calibrate", &[]));
+    let (ok, detail, _) = c.wait_complete_full(i);
+    assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
+
+    // The reach-down pose over the stand, and the stand and block under
+    // it, as the preview run grasps them.
+    let grasp_rad: [f64; NUM_JOINTS] = [0.0, -0.25, 4.35, 0.0, -1.28, 0.0];
+    let grasp: [f64; NUM_JOINTS] = std::array::from_fn(|i| grasp_rad[i].to_degrees());
+    c.ok(&teleport(grasp));
+    rig.wait_status("the arm is over the stand", |s| {
+        s.angles
+            .iter()
+            .zip(grasp.iter())
+            .all(|(a, b)| (a - b).abs() < 0.5)
+    });
+    let block = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| par6_proto::Shape {
+        attachment: None,
+        kind: "box".into(),
+        params: params.to_vec(),
+        pose: vec![0.3713, 0.0, z, 0.0, 0.0, 0.0],
+        collision: true,
+        margin: None,
+        name: name.into(),
+        physics: Some(par6_proto::Physical {
+            mass,
+            friction: [1.0, 0.005, 0.0001],
+        }),
+    };
+    c.ok(&Command::SetShapes(par6_proto::command::SetShapes {
+        shapes: vec![
+            block("stand", [0.04, 0.04, 0.01], 0.005, None),
+            block("block", [0.036, 0.036, 0.06], 0.04, Some(0.05)),
+        ],
+    }));
+
+    // Closing meets the block: the jaws stop on it, and the settle
+    // verdict says an object was found while closing.
+    let i = c.ok_index(&tool_action(7102, &tool, "move", &[1.0, 0.5, 500.0]));
+    let (ok, detail, verdict) = c.wait_complete_full(i);
+    assert!(ok, "the grip must complete, got {detail:?}");
+    assert_eq!(
+        verdict,
+        Some(1),
+        "closing on the block must report an object while closing"
+    );
+    let s = rig.wait_status("the jaws rest on the block", |_| true);
+    assert!(
+        jaw(&s) < 0.9,
+        "the jaws closed through the block: {} — the program world never reached the simulator",
+        jaw(&s)
     );
     rig.shutdown();
 }

@@ -28,7 +28,8 @@ import pytest
 
 from par6 import _daemon
 from par6 import config as _cfg
-from par6.client import AsyncRobotClient
+from par6.client import AsyncRobotClient, RobotError
+from par6.protocol import ErrorCode
 
 #: Boot budget for the daemon's ``PAR6D_READY`` line.
 READY_TIMEOUT_S = 30.0
@@ -340,13 +341,18 @@ async def teleport_to(
 ) -> None:
     """Leave the sim arm standing at *angles_deg*.
 
-    Teleport is unacked and gated on ENABLED, so it is re-sent until the
-    broadcast shows the arm there — the same loop a UI runs. Raises when
-    the arm never arrives within *budget_s*.
+    Teleport is gated on ENABLED, which the boot's clear sequence reaches
+    on its own time, so a refusal for a DISABLED controller is re-sent
+    until the broadcast shows the arm there — the same loop a UI runs.
+    Raises when the arm never arrives within *budget_s*.
     """
     deadline = time.monotonic() + budget_s
     while time.monotonic() < deadline:
-        await client.teleport(angles_deg)
+        try:
+            await client.teleport(angles_deg)
+        except RobotError as refused:
+            if refused.code != ErrorCode.SYS_CONTROLLER_DISABLED:
+                raise
         arrived = await client.wait_status(
             lambda s: (
                 s.homed

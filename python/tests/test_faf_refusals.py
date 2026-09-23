@@ -73,14 +73,14 @@ async def error_clears(
 
 
 @pytest.mark.timeout(120)
-async def test_rejected_teleport_surfaces_as_error(daemon: LiveDaemon):
-    """A refused fire-and-forget reaches the caller, against the live runtime.
+async def test_rejected_teleport_is_refused_in_its_reply(daemon: LiveDaemon):
+    """A teleport is acked: a refusal reaches the caller as the reply.
 
-    A teleport outside the joint travel window is refused server-side; the
-    refusal must reach a caller that never awaits a reply — through
-    ``error()`` AND through the STATUS broadcast (the surface Waldo
-    Commander renders) — while the arm stays exactly where it was.  An
-    accepted motion command then clears it.
+    A teleport outside the joint travel window is refused server-side, and
+    the caller hears it as the structured error of the call itself — not
+    as a standing error it would have to go and read — while the arm
+    stays exactly where it was and the session's error surface stays
+    clean.
     """
     park = park_deg()
     async with daemon.client() as client:
@@ -88,39 +88,21 @@ async def test_rejected_teleport_surfaces_as_error(daemon: LiveDaemon):
         await settle_at(client, park)
         assert await client.error() is None
 
-        # -- out-of-range teleport ----------------------------------------
         bad = list(park)
         bad[0] = 1.0e5  # outside any joint's travel window
-        assert await client.teleport(bad) == 1  # fire-and-forget send "succeeds"
+        with pytest.raises(RobotError) as refused:
+            await client.teleport(bad)
+        assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR, str(refused.value)
+        assert "angles[0]" in refused.value.cause, str(refused.value)
 
-        err = await standing_error(client)
-        assert err is not None, (
-            "a refused teleport must surface through error(); "
-            f"daemon log:\n{daemon.log()}"
-        )
-        assert err.code == ErrorCode.COMM_VALIDATION_ERROR, str(err)
-        assert "angles[0]" in err.cause, str(err)
-        assert err.command_index == -1, "a refusal is not attributable to a queue index"
-
-        # The broadcast carries the same refusal — what a UI banner shows.
-        assert await client.wait_status(
-            lambda s: (
-                s.error is not None and s.error[1] == ErrorCode.COMM_VALIDATION_ERROR
-            ),
-            timeout=STEP_BUDGET_S,
-        ), "the refusal never reached the STATUS broadcast"
-
-        # The arm did not move.
+        # The arm did not move, and nothing is left standing.
         angles = await client.angles()
         assert angles is not None
         assert max_abs_delta(angles, park) < 1.0, (
             f"a REFUSED teleport must not move the arm: {angles} vs {park}"
         )
-
-        # An accepted motion command clears the refusal, like any
-        # standing error.
-        await client.teleport(park)
-        assert await error_clears(client), "acceptance must clear the refusal"
+        assert await client.error() is None
+        assert await client.teleport(park) == 1
 
 
 @pytest.mark.timeout(120)

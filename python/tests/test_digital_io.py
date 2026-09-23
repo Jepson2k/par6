@@ -44,6 +44,8 @@ async def test_output_write_readback_and_native_preview(daemon):
     offset = len(config.io_line_names()[0])
     preview = DryRunRobotClient(config_path=str(daemon.config))
     async with daemon.client() as client:
+        # The lines are the RT's: they read once its bus is up.
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=20)
         before = await client.io(timeout=2)
         assert before is not None
         assert json.loads(json.dumps(before)) == preview.io()

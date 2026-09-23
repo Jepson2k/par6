@@ -661,6 +661,10 @@ integral_limit_nm = 0.3
 # same file, so a tuned deployment previews the way it runs.
 jog_l_linear_max_m_s = 0.08
 jog_l_angular_max_rad_s = 0.6
+# TCP speed ceiling of a planned cartesian move at speed = 1.0; the
+# fraction scales it. parol6's value, so a script runs at one tool speed
+# on either arm.
+planned_linear_max_m_s = 0.2
 # TCP acceleration and jerk for the cartesian streaming limiter, whose
 # velocity ceiling is the two jog_l rates above (servo_l and jog_l share
 # one executor, as they do in parol6). Derived from those rates at

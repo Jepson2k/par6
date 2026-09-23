@@ -35,8 +35,8 @@ use par6_rt::{
 use par6_server::{
     attachment_error, attachments_fresh, check_gate, cmd_name, decode_error_to_wire,
     next_attachment_epoch, pid_gains_fault, session, tcp_transform_effect, tcp_transform_values,
-    validate_registries, validate_supported, write_io_fault, GateContext, PayloadSpec, PlanContext,
-    Planner, QueuedCommand, ServerConfig, ShapeLayer,
+    validate_registries, validate_supported, GateContext, PayloadSpec, PlanContext, Planner,
+    QueuedCommand, ServerConfig, ShapeLayer,
 };
 
 use crate::adapters::{MotionJog, MotionStream};
@@ -745,6 +745,11 @@ impl Preview {
         crate::calibrate::Protocol::default().speed
     }
 
+    /// The motion profile the estimation protocol swings on.
+    pub fn estimation_profile() -> &'static str {
+        crate::calibrate::MEASUREMENT_PROFILE
+    }
+
     /// The refusal the runtime would leave standing, or `None`.
     pub fn error(&self) -> Option<&WireError> {
         self.latches.standing_error.as_ref()
@@ -865,23 +870,6 @@ impl Preview {
         // A streamable preempts planned motion, pending queue included.
         self.held.clear();
         match command {
-            Command::Teleport(p) => {
-                // The travel check already ran: `validate_supported` calls
-                // `teleport_angle_fault` above.
-                let mut q = self.snap.q;
-                for (out, deg) in q.iter_mut().zip(p.angles.iter()) {
-                    *out = deg.to_radians();
-                }
-                self.snap.q = q;
-                self.snap.homed = true;
-                if let Some(pos) = p.tool_positions.as_ref().and_then(|v| v.first()) {
-                    self.tool_position = *pos;
-                }
-                self.publish();
-                let mut result = self.standing();
-                (result.start_row, result.rows) = self.mark();
-                result
-            }
             Command::JogJ(p) => self.preview_jog(p.speeds, p.duration, p.accel),
             Command::JogL(p) => self.preview_jog_l(p.velocities, p.frame, p.duration, p.accel),
             // A streamed target is tracked by the RT's own OTG at the
@@ -1024,6 +1012,32 @@ impl Preview {
             )
         };
         match command {
+            // Acked like the system command it is, and gated like the
+            // motion it is: the travel window (`teleport_angle_fault`,
+            // through `validate_supported`) and the arm's state.
+            Command::Teleport(ref p) => {
+                if let Some(error) = self
+                    .check_gate(&command)
+                    .or_else(|| validate_supported(&self.cfg, &command))
+                {
+                    return self.refuse(error);
+                }
+                // A jump preempts planned motion, pending queue included.
+                self.held.clear();
+                let mut q = self.snap.q;
+                for (out, deg) in q.iter_mut().zip(p.angles.iter()) {
+                    *out = deg.to_radians();
+                }
+                self.snap.q = q;
+                self.snap.homed = true;
+                if let Some(pos) = p.tool_positions.as_ref().and_then(|v| v.first()) {
+                    self.tool_position = *pos;
+                }
+                self.publish();
+                let mut result = self.standing();
+                (result.start_row, result.rows) = self.mark();
+                return result;
+            }
             Command::Stop(p) => {
                 let cleared = p.clear_queue && !self.held.is_empty();
                 if p.clear_queue {
@@ -1072,7 +1086,10 @@ impl Preview {
                 self.invalidate_attachments();
                 self.held.clear();
                 self.unpause();
-                self.latches.reset();
+                // The program-level state only: a latched e-stop is the
+                // controller's, and `reset` alone clears it — as the
+                // runtime's `reset_state` leaves its latch standing.
+                self.latches.standing_error = None;
                 self.tool.clone_from(&self.cfg.fitted_tool);
                 self.tool_variant = None;
                 self.tcp_offset_mm = [0.0; 3];
@@ -1084,10 +1101,6 @@ impl Preview {
                     return self.refuse(e);
                 }
             }
-            Command::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
-                None => self.io_levels[usize::from(p.port)] = p.value,
-                Some(e) => return self.refuse(e),
-            },
             // A bus swap cancels every motion in flight (`Server`'s
             // `cancel_all_motion`), the held blend chain included — and
             // decides the references: the simulator is born referenced
@@ -1598,6 +1611,23 @@ impl Preview {
             // The seek's own ticks belong to the physical arm; the record
             // shows where it lands.
             (result.start_row, result.rows) = self.mark();
+            // Then the return the runtime plans once the references are
+            // established: the command ends at the home pose, held, as
+            // it does on the already-referenced fast path.
+            let park = Command::Home(par6_proto::command::Home {
+                key: 0,
+                calibrate: false,
+            });
+            let batch = [QueuedCommand {
+                index: self.next_index,
+                cmd: &park,
+            }];
+            if self.planner.start(&batch).is_ok() {
+                let tail = self.collect_plan(&park);
+                result.rows += tail.rows;
+                result.duration_s += tail.duration_s;
+                result.end_joints_rad = tail.end_joints_rad;
+            }
         }
         if !moved {
             result = PreviewResult {
@@ -1683,6 +1713,9 @@ impl Preview {
             return;
         }
         match head {
+            // Validated at admission (`validate_supported`); at its turn
+            // the line changes, as the runtime's post-effect drives it.
+            Command::WriteIo(p) => self.io_levels[usize::from(p.port)] = p.value,
             Command::SelectTool(p) => {
                 // A variant carries its own TCP frame: a real change clears
                 // the offset, a re-selection leaves it alone.

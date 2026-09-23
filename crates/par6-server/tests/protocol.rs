@@ -98,6 +98,11 @@ struct RtLog {
     flashing_verdict: Option<WireError>,
     /// The pending answer, collected exactly once by the server.
     flashing_outcome: Option<Result<(), WireError>>,
+    /// The pending backend-swap answer, collected exactly once.
+    bus_outcome: Option<Result<(), WireError>>,
+    /// While true the RT is "still installing the bus": `take_bus_outcome`
+    /// answers `None`.
+    hold_bus_outcome: bool,
 }
 
 #[derive(Clone)]
@@ -210,11 +215,20 @@ impl RtCommands for TestRt {
     }
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError> {
         self.push(RtEvent::Simulator(on));
+        self.0.lock().unwrap().bus_outcome = Some(Ok(()));
         Ok(())
     }
     fn connect_hardware(&mut self, port: &str) -> Result<(), WireError> {
         self.push(RtEvent::ConnectHardware(port.to_owned()));
+        self.0.lock().unwrap().bus_outcome = Some(Ok(()));
         Ok(())
+    }
+    fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>> {
+        let mut log = self.0.lock().unwrap();
+        if log.hold_bus_outcome {
+            return None;
+        }
+        log.bus_outcome.take()
     }
     fn reset_state(&mut self) {
         self.push(RtEvent::ResetState);
@@ -1098,6 +1112,164 @@ async fn reset_waiter_overflow_names_itself_in_the_refusal() {
             Reply::Ok { index: None, .. } => {}
             other => panic!("held reset waiters must be answered, got {other:?}"),
         }
+    }
+}
+
+/// COMMAND_COMPLETION answers what a COMPLETE push carried, for the
+/// client whose push went missing; an index nothing finished under reads
+/// unfinished.
+#[tokio::test]
+async fn a_completion_is_kept_for_the_client_that_missed_its_push() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let move_j = |key: u64| {
+        Command::MoveJ(par6_proto::command::MoveJ {
+            key,
+            angles: [0.0; 6],
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        })
+    };
+
+    match c.query(&Command::CommandCompletion { index: 999 }).await {
+        QueryResult::CommandCompletion {
+            finished: false, ..
+        } => {}
+        other => panic!("an index nothing finished under must read unfinished: {other:?}"),
+    }
+
+    let landed = c.ok_index(&move_j(951)).await;
+    let cancelled = c.ok_index(&move_j(952)).await;
+    match c.query(&Command::CommandCompletion { index: landed }).await {
+        QueryResult::CommandCompletion {
+            finished: false, ..
+        } => {}
+        other => panic!("a running command must read unfinished: {other:?}"),
+    }
+    h.complete_ok(landed);
+    c.wait_complete(landed).await;
+    h.complete_err(
+        cancelled,
+        make_error(ErrorCode::MotnCancelled, cancelled as i64, &[]),
+    );
+    c.wait_complete(cancelled).await;
+
+    match c.query(&Command::CommandCompletion { index: landed }).await {
+        QueryResult::CommandCompletion {
+            index,
+            finished: true,
+            ok: true,
+            detail: None,
+            ..
+        } => assert_eq!(index, landed),
+        other => panic!("a landed command must read finished and ok: {other:?}"),
+    }
+    match c
+        .query(&Command::CommandCompletion { index: cancelled })
+        .await
+    {
+        QueryResult::CommandCompletion {
+            finished: true,
+            ok: false,
+            detail: Some(e),
+            ..
+        } => assert_eq!(e.code, ErrorCode::MotnCancelled as u16),
+        other => panic!("a cancelled command must read finished with its detail: {other:?}"),
+    }
+}
+
+/// STATUS frames ride the RT's ticks: one per stride of ticks, none for a
+/// tick the stride skips, and never two for one tick — a timer that
+/// sampled the snapshot at its own phase did both.
+#[tokio::test]
+async fn status_frames_map_one_to_one_onto_every_nth_tick() {
+    // A 100 Hz tick under the harness's 100 Hz STATUS rate: one frame
+    // per tick, which is the mapping at its most exacting.
+    let mut h = start(|cfg| cfg.config_info.tick_dt_s = 0.01).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let tick_dt_s = match c.query(&Command::ConfigInfo).await {
+        QueryResult::ConfigInfo { tick_dt_s, .. } => tick_dt_s,
+        other => panic!("unexpected {other:?}"),
+    };
+    let stride = ((1.0 / tick_dt_s) / 100.0).round().max(1.0) as u64;
+
+    // A still RT is reported by the timer; take its last frame as the
+    // baseline, then make the ticks flow, spaced so every one is polled.
+    // The frames that arrive while they flow are the stride crossings,
+    // consecutive in seq, and nothing else: the timer stands down.
+    let settle = tokio::time::Instant::now() + Duration::from_millis(60);
+    let mut latest = recv_status(&h.status_rx).await;
+    while let Ok(s) = tokio::time::timeout_at(settle, recv_status(&h.status_rx)).await {
+        latest = s;
+    }
+    let first_seq = latest.seq;
+    let crossings = 4;
+    for _ in 0..(crossings * stride) {
+        h.publish(|_| {});
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    // Frames still in flight from the burst land within a poll or two;
+    // the timer resumes only after a period and a half of quiet.
+    let mut seqs = Vec::new();
+    let grace = tokio::time::Instant::now() + Duration::from_millis(5);
+    while let Ok(s) = tokio::time::timeout_at(grace, recv_status(&h.status_rx)).await {
+        seqs.push(s.seq);
+    }
+    let ticked: Vec<u64> = seqs.iter().copied().filter(|s| *s > first_seq).collect();
+    assert_eq!(
+        ticked.len() as u64,
+        crossings,
+        "one frame per stride of ticks, no more, no fewer: {seqs:?} after {first_seq}"
+    );
+    assert!(
+        ticked.windows(2).all(|w| w[1] == w[0] + 1),
+        "the frames are consecutive: {ticked:?}"
+    );
+}
+
+/// A backend swap is answered when the RT has installed the bus, not
+/// when it was asked to; IS_SIMULATOR reads the new backend only then.
+#[tokio::test]
+async fn a_backend_swap_answers_once_the_bus_is_installed() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let before = match c.query(&Command::IsSimulator).await {
+        QueryResult::IsSimulator { active } => active,
+        other => panic!("unexpected {other:?}"),
+    };
+
+    h.rt.lock().unwrap().hold_bus_outcome = true;
+    c.send(&Command::Simulator(Simulator { on: !before })).await;
+    h.wait_rt(|ev| ev.contains(&RtEvent::Simulator(!before)))
+        .await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), c.recv())
+            .await
+            .is_err(),
+        "the swap must not be answered before the RT installs the bus"
+    );
+    match c.query(&Command::IsSimulator).await {
+        QueryResult::IsSimulator { active } => assert_eq!(
+            active, before,
+            "the backend reads swapped before the install landed"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    h.rt.lock().unwrap().hold_bus_outcome = false;
+    match c.recv().await {
+        Reply::Ok { index: None, .. } => {}
+        other => panic!("the installed swap must answer OK, got {other:?}"),
+    }
+    match c.query(&Command::IsSimulator).await {
+        QueryResult::IsSimulator { active } => assert_eq!(active, !before),
+        other => panic!("unexpected {other:?}"),
     }
 }
 
@@ -2050,20 +2222,17 @@ async fn refused_fire_and_forget_latches_the_standing_error_until_motion_is_acce
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
 
-    // Teleport outside sim mode: refused with a real ERROR reply...
-    let err = c
-        .expect_error(&Command::Teleport(Teleport {
-            angles: [0.0; 6],
-            tool_positions: None,
-        }))
-        .await;
-    assert_eq!(err.code, ErrorCode::SysNotSimulator as u16);
+    // A cartesian jog on an unreferenced arm: refused with a real ERROR
+    // reply...
+    h.publish(|s| s.homed = false);
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
 
     // ...and the refusal stands where a client that never awaited the
     // reply looks: the ERROR query and the broadcast.
     match c.query(&Command::Error).await {
         QueryResult::Error { error: Some(e) } => {
-            assert_eq!(e.code, ErrorCode::SysNotSimulator as u16)
+            assert_eq!(e.code, ErrorCode::MotnNotHomed as u16)
         }
         other => panic!("the refusal must stand in the ERROR query, got {other:?}"),
     }
@@ -2072,7 +2241,7 @@ async fn refused_fire_and_forget_latches_the_standing_error_until_motion_is_acce
         let s = recv_status(&h.status_rx).await;
         if s.error
             .as_ref()
-            .is_some_and(|e| e.code == ErrorCode::SysNotSimulator as u16)
+            .is_some_and(|e| e.code == ErrorCode::MotnNotHomed as u16)
         {
             break;
         }
@@ -2103,13 +2272,8 @@ async fn refused_fire_and_forget_latches_the_standing_error_until_motion_is_acce
 
     // While a stream is live, a stray refusal answers ERROR but does NOT
     // latch — it must not poison the running session's error surface.
-    let err = c
-        .expect_error(&Command::Teleport(Teleport {
-            angles: [0.0; 6],
-            tool_positions: None,
-        }))
-        .await;
-    assert_eq!(err.code, ErrorCode::SysNotSimulator as u16);
+    let err = c.expect_error(&jog_l()).await;
+    assert_eq!(err.code, ErrorCode::MotnNotHomed as u16);
     match c.query(&Command::Error).await {
         QueryResult::Error { error: None } => {}
         other => panic!("a refusal over live motion must not latch, got {other:?}"),
@@ -2502,22 +2666,49 @@ async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
     });
     let mut c = Client::new(&h).await;
 
-    match c
-        .request(&Command::WriteIo(WriteIo { port: 1, value: 1 }))
-        .await
-    {
-        Reply::Ok { .. } => {}
-        other => panic!("port 1 is declared, expected OK: {other:?}"),
-    }
+    // Queued: the write lands at its turn, behind the move ahead of it,
+    // and its index completes when the level is applied.
+    let ahead = c
+        .ok_index(&Command::MoveJ(par6_proto::command::MoveJ {
+            key: 901,
+            angles: [0.0; 6],
+            duration: None,
+            speed: Some(0.5),
+            accel: None,
+            blend_radius: None,
+            rel: false,
+        }))
+        .await;
+    let write = c
+        .ok_index(&Command::WriteIo(WriteIo {
+            key: 902,
+            port: 1,
+            value: 1,
+        }))
+        .await;
+    assert!(
+        !h.rt_events().contains(&RtEvent::WriteIo(1, 1)),
+        "a write queued behind a running move must not drive the line early: {:?}",
+        h.rt_events()
+    );
+    h.complete_ok(ahead);
+    c.wait_complete(ahead).await;
+    h.complete_ok(write);
+    let (ok, _) = c.wait_complete(write).await;
+    assert!(ok);
     assert!(
         h.rt_events().contains(&RtEvent::WriteIo(1, 1)),
-        "the accepted write reaches the backend: {:?}",
+        "the write reaches the backend at its turn: {:?}",
         h.rt_events()
     );
 
     for port in [2u8, 7] {
         let err = c
-            .expect_error(&Command::WriteIo(WriteIo { port, value: 1 }))
+            .expect_error(&Command::WriteIo(WriteIo {
+                key: 0,
+                port,
+                value: 1,
+            }))
             .await;
         assert_eq!(err.code, ErrorCode::CommValidationError as u16);
         assert!(
@@ -2549,12 +2740,20 @@ async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
         }
         other => panic!("unexpected {other:?}"),
     }
-    let status = recv_status(&h.status_rx).await;
-    assert_eq!(
-        status.io,
-        vec![1, 0, 0, 1, 1],
-        "STATUS agrees with the query"
-    );
+    // Statuses queued during the waits above carry the earlier lines;
+    // the one built from this publication agrees with the query.
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let status = recv_status(&h.status_rx).await;
+        if status.io == vec![1, 0, 0, 1, 1] {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "STATUS never agreed with the query: {:?}",
+            status.io
+        );
+    }
 }
 
 /// Cartesian freedom is reported only where a model backs it.

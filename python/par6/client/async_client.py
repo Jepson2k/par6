@@ -109,8 +109,8 @@ class StatusResult:
     """Digital I/O: the configured inputs, then the outputs, then the
     e-stop — which is ALWAYS the last element. The width follows the
     `[io]` config block, so index by role, never by a fixed position."""
-    tool_status: ToolStatus | None
-    """Tool status, if a tool is selected."""
+    tool_status: ToolStatus
+    """The fitted tool's status; key ``"NONE"`` when no tool is fitted."""
 
 
 @dataclass
@@ -428,11 +428,21 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     async def wait_status(
         self, predicate: Callable[[StatusBuffer], bool], timeout: float = 5.0
     ) -> bool:
-        """Block until *predicate* is True for a status snapshot."""
-        await self._ensure_core()
+        """Block until *predicate* is True for a status snapshot.
+
+        Raises ConnectionError when the status stream has latched a
+        protocol mismatch: no frame from that runtime will ever be read,
+        so the wait would only ever time out.
+        """
+        core = await self._ensure_core()
         last_gen = 0
         deadline = time.monotonic() + timeout
         while not self._closed:
+            mismatch = core.protocol_mismatch()
+            if mismatch is not None:
+                raise ConnectionError(
+                    f"the runtime speaks protocol v{mismatch[0]}, this client v{mismatch[1]}"
+                )
             self._status_event.clear()
             if self._status_generation != last_gen:
                 last_gen = self._status_generation
@@ -1007,13 +1017,23 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         angles_deg: list[float],
         tool_positions: list[float] | None = None,
     ) -> int:
-        """Instantly set joint angles (simulator only; the runtime rejects it
-        outside sim mode with a real error).
+        """Instantly set joint angles and optional tool positions (simulator only).
+
+        The pose is exact, so the arm counts as homed afterwards and
+        planned motion may follow; whatever was driving the arm is
+        cancelled. Answers 1 once the runtime has applied the pose, 0
+        when no reply arrives.
 
         Category: Control
 
         Example:
             rbt.teleport([0, -90, 0, 0, 0, 0])
+            rbt.teleport([0, -90, 0, 0, 0, 0], tool_positions=[1.0])
+
+        Raises:
+            RobotError: off the simulator (``SYS_NOT_SIMULATOR``), for an
+                angle outside the travel window, or for tool positions
+                that do not match the fitted tool or leave ``[0, 1]``.
         """
         positions = (
             [float(p) for p in tool_positions] if tool_positions is not None else None
@@ -1227,7 +1247,9 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
                     if confirmed:
                         return 1
                     await asyncio.sleep(0.01)
-        except TimeoutError:
+        except (TimeoutError, ConnectionError):
+            # No confirmation is no application: unreachable answers 0,
+            # as a timeout does.
             return 0
 
     async def set_execution_speed(self, scale: float, *, timeout: float = 3.0) -> int:
@@ -1506,6 +1528,11 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     ) -> int:
         """Set digital output by logical index (0 = first output pin).
 
+        Queued: the level lands at its turn, after every command queued
+        before it has finished, so an output written after a move changes
+        when the move is done. Returns the command index, which
+        ``wait_command`` resolves once the level is applied.
+
         *index* addresses the ``[io].outputs`` list, which is also where the
         STATUS ``io`` array carries the level back — at
         ``io[digital_inputs + index]``. The level persists until the next
@@ -1531,7 +1558,8 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         _validate_io_timeout(timeout)
         async with asyncio.timeout(timeout):
             core = await self._ensure_core()
-            return await self._call(core.write_io(index, value))
+            index_ = await self._call(core.write_io(index, value))
+        return await self._finish_queued(index_, False, 0.0)
 
     # ------------------------------------------------------------------
     # Queued non-motion commands
@@ -1561,8 +1589,9 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         # selection (the runtime is fitted with a different tool) would
         # otherwise leave ``client.tool`` and the tool_action key pointing
         # at hardware that is not on the arm.
-        self._active_tool_key = key
-        self._active_variant_key = variant_key
+        if index is not None and index >= 0:
+            self._active_tool_key = key
+            self._active_variant_key = variant_key
         return await self._finish_queued(index, False, 0.0)
 
     async def checkpoint(self, label: str) -> int:
@@ -1987,10 +2016,11 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         return await self._call(core.config_bundle())
 
     async def _tool_status(self) -> ToolStatus | None:
-        """Query tool status (internal — use ``rbt.tool.status()``)."""
+        """Query tool status (internal — use ``rbt.tool.status()``); None
+        when nothing answers."""
         core = await self._ensure_core()
         result = await self._call(core.tool_status())
-        return _tool_status_from_dict(result)
+        return _tool_status_from_dict(result) if result is not None else None
 
 
 # Re-exported for callers that type against the concrete buffer.

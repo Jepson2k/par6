@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use pyo3::exceptions::{PyRuntimeError, PyValueError};
+use pyo3::exceptions::{PyConnectionError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
 
@@ -64,6 +64,11 @@ pub fn robot_err(e: &WireError) -> PyErr {
 pub fn client_err(e: ClientError) -> PyErr {
     match e {
         ClientError::Robot(err) => robot_err(&err),
+        // The runtime is not the one this client was talking to, or not
+        // one it can talk to at all: a connection fault, not a refusal.
+        other @ (ClientError::SessionChanged { .. } | ClientError::ProtocolMismatch { .. }) => {
+            PyConnectionError::new_err(other.to_string())
+        }
         other => PyRuntimeError::new_err(other.to_string()),
     }
 }
@@ -506,7 +511,7 @@ pub(crate) fn joints(q: &[f64], what: &str) -> PyResult<[f64; par6_kin::NQ]> {
 /// optional key (NaN on the wire) is `None`.
 pub(crate) fn motion_dict<'py>(
     py: Python<'py>,
-    values: &[f64; 18],
+    values: &[f64; 19],
 ) -> PyResult<Bound<'py, PyDict>> {
     let m = PyDict::new(py);
     for (key, v) in par6_config::MotionConfig::KEYS.iter().zip(values) {

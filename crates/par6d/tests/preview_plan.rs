@@ -102,7 +102,11 @@ fn the_plan_records_every_command_and_a_run_of_it_lands_on_the_same_lines() {
             key: 6,
             label: "done".into(),
         }),
-        Command::WriteIo(WriteIo { port: 0, value: 1 }),
+        Command::WriteIo(WriteIo {
+            key: 0,
+            port: 0,
+            value: 1,
+        }),
     ];
     let results: Vec<_> = cmds.iter().cloned().map(|c| session.submit(c)).collect();
     assert!(

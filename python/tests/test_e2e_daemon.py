@@ -334,8 +334,9 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
     daemon: LiveDaemon,
 ):
     """The shipped PAR6 homing sequence, run for real: stall detection on
-    J0-J4, the hall edge on J5, per-joint references applied, and the arm
-    parked at the ready pose the config's ``move_to`` steps command.
+    J0-J4, the hall edge on J5, per-joint references applied, the arm
+    driven through the ready pose the config's ``move_to`` steps command,
+    and then — like every ``home`` — returned to the park pose, held.
 
     A flag flip cannot satisfy this — the boot pose (every joint reading
     its ``sector_home_offset``) is nowhere near the ready pose.
@@ -361,20 +362,34 @@ async def test_homing_sequence_drives_the_sim_to_the_configured_ready_pose(
             timeout=STEP_BUDGET_S,
         ), f"homing never started executing; daemon log:\n{daemon.log()}"
 
+        # The sequence's last steps leave the arm at the configured ready
+        # pose, which is where the seek hands over to the park return.
+        ready = ready_pose_deg()
+        at_ready: list[float] = []
+
+        def reached_ready(s) -> bool:
+            if max_deg_error(s.angles, ready) < 2.5:
+                at_ready[:] = list(s.angles)
+                return True
+            return False
+
+        assert await client.wait_status(reached_ready, timeout=HOMING_BUDGET_S), (
+            f"the seek never reached the ready pose {ready}; daemon log:\n{daemon.log()}"
+        )
+        assert max_deg_error(at_ready, boot) > 10.0, (
+            "the sequence must physically re-reference the arm, not just set a flag"
+        )
+
         assert await client.wait_command(home_index, timeout=HOMING_BUDGET_S) is True, (
             f"homing did not complete; daemon log:\n{daemon.log()}"
         )
-
         assert await client.wait_status(lambda s: s.homed, timeout=STEP_BUDGET_S)
 
         homed = await client.angles()
         assert homed is not None
-        ready = ready_pose_deg()
-        assert max_deg_error(homed, ready) < 2.5, (
-            f"homed pose {homed} is not the configured ready pose {ready}"
-        )
-        assert max_deg_error(homed, boot) > 10.0, (
-            "the sequence must physically re-reference the arm, not just set a flag"
+        home = np.degrees(Robot().joints.home.rad).tolist()
+        assert max_deg_error(homed, home) < 2.5, (
+            f"home ended at {homed}, not at the park pose {home}"
         )
 
         # home(calibrate=True) on an already-referenced arm re-runs the seek
@@ -657,6 +672,11 @@ async def test_tool_identity_agrees_with_the_runtime(daemon: LiveDaemon):
         assert broadcast
         streamed_key = client._shared_status.tool_status.key
         assert robot.tools[streamed_key] is fitted
+        snapshot = await client.status()
+        assert snapshot is not None
+        assert snapshot.tool_status.key == streamed_key, (
+            "status() names the fitted tool the way the stream does"
+        )
 
         # The runtime accepts the key it reported, and the bound tool of a
         # client built without any specs is that same tool.  Queued commands
@@ -770,9 +790,15 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
 
         await client.estop()
         assert await client.wait_status(
-            lambda s: s.io[-1] == 0, timeout=STEP_BUDGET_S
-        ), "the e-stop never reached the I/O surface"
-        assert await client.is_estop_pressed() is True
+            lambda s: not s.enabled, timeout=STEP_BUDGET_S
+        ), "the e-stop never disabled the controller"
+        # A software e-stop is the controller's latch, reported as its
+        # standing error; the I/O surface's e-stop slot is the physical
+        # chain, which nobody pressed.
+        latched = await client.error()
+        assert latched is not None and latched.code == ErrorCode.SYS_ESTOP_ACTIVE
+        assert (await client.io())[-1] == 1
+        assert await client.is_estop_pressed() is False
 
         # The latch and the arm are two different facts, and they do not
         # become true in the same tick: the e-stop is visible on the I/O
@@ -795,7 +821,8 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert streak >= 3, "the arm never came to rest under the e-stop latch"
 
         assert await client.reset() == 1
-        assert await client.wait_status(lambda s: s.io[-1] == 1, timeout=STEP_BUDGET_S)
+        assert await client.wait_status(lambda s: s.enabled, timeout=STEP_BUDGET_S)
+        assert await client.error() is None
         assert await client.is_estop_pressed() is False
 
 
@@ -1001,7 +1028,7 @@ async def test_tcp_pose_survives_the_client_runtime_client_round_trip(
         # reads the numbers the way they were written has a null move to
         # run; one that reads them the other way round swings the wrist to
         # an orientation nobody commanded (or fails the solve outright).
-        index = await client.move_j(pose=taught)
+        index = await client.move_j(pose=taught, speed=1.0)
         assert index >= 0
         assert await client.wait_command(index, timeout=STEP_BUDGET_S) is True
         replayed = await client.pose()
@@ -1171,7 +1198,7 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         assert await client.set_shapes([keepout])
 
         with pytest.raises(RobotError) as preview_refusal:
-            preview.move_j(angles=target)
+            preview.move_j(angles=target, speed=1.0)
         assert preview.angles() == pytest.approx(SWEEP_START_DEG, abs=1e-6), (
             "a refused preview must not advance the previewed pose"
         )
@@ -1179,7 +1206,7 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         # The runtime's collision gate runs at dispatch, so the refusal
         # rides the COMPLETE push, not the queue ack.
         with pytest.raises(RobotError) as live_refusal:
-            await client.move_j(target, wait=True, timeout=STEP_BUDGET_S)
+            await client.move_j(target, speed=1.0, wait=True, timeout=STEP_BUDGET_S)
 
         assert preview_refusal.value.code == live_refusal.value.code, (
             f"preview refused with {preview_refusal.value.code}, runtime with "
@@ -1231,9 +1258,9 @@ async def test_preview_refuses_the_move_the_runtime_refuses(daemon: LiveDaemon):
         # Same move, no keep-out: both sides run it.
         assert preview.set_shapes([])
         assert await client.set_shapes([])
-        assert preview.move_j(angles=target) is not None
+        assert preview.move_j(angles=target, speed=1.0) is not None
         assert preview.angles() == pytest.approx(target, abs=1e-6)
-        await client.move_j(target, wait=True, timeout=STEP_BUDGET_S)
+        await client.move_j(target, speed=1.0, wait=True, timeout=STEP_BUDGET_S)
         assert await client.wait_status(
             lambda s: max_deg_error(s.angles, target) < 2.0, timeout=STEP_BUDGET_S
         ), "the move the keep-out was blocking never ran once it was cleared"
@@ -1607,6 +1634,31 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
             lambda s: bool(s.io[n_in + n_out - 1] == 0), timeout=STEP_BUDGET_S
         )
         assert cleared, "the output never went back low"
+
+        # Queued: a write sent behind a move lands when the move has
+        # finished, and its index completes when the level is applied.
+        standing = await angles_now(client)
+        away = list(standing)
+        away[0] += 15.0
+        assert await client.move_j(away, duration=2.0) >= 0
+        write = await client.write_io(n_out - 1, 1)
+        assert write >= 0
+        assert not await client.wait_status(
+            lambda s: bool(s.io[n_in + n_out - 1] == 1), timeout=0.5
+        ), "a write queued behind a running move drove the line early"
+        assert await client.wait_command(write, timeout=STEP_BUDGET_S) is True
+        # The completion is the command's; the RT drives the line on its
+        # next tick, so the published level follows within a frame or two.
+        assert await client.wait_status(
+            lambda s: bool(s.io[n_in + n_out - 1] == 1), timeout=1.0
+        ), "the completed write did not drive the line"
+        assert await client.wait_status(
+            lambda s: abs(s.angles[0] - away[0]) < 1.0, timeout=STEP_BUDGET_S
+        ), "the move ahead of the write did not land"
+        await client.write_io(n_out - 1, 0)
+        assert await client.wait_status(
+            lambda s: bool(s.io[n_in + n_out - 1] == 0), timeout=STEP_BUDGET_S
+        )
 
         # The wire will carry the port; the box will not — sent through the
         # engine client directly, past the shim's own bound check, so the

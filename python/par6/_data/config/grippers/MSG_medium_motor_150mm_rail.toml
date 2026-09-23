@@ -14,6 +14,8 @@ stroke_mm = 106.0 # vendor value, and it disagrees with the rail name —
                   # only MSG_large_motor_150mm_rail declares 150.
 kt_nm_a = 0.111
 ilim_ma = 1700.0
+# The grip current a move runs at when the caller names none.
+default_current_ma = 500.0
 voltage_limit_mv = 6000
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000

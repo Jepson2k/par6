@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hashlib
 import tomllib
+import os
 from functools import cache
 from importlib.resources import files as pkg_files
 from pathlib import Path
@@ -181,10 +182,25 @@ def package_search_dir() -> Path:
     return package_path().parent
 
 
+def config_path() -> Path:
+    """The robot config this process describes: ``PAR6_CONFIG`` when set,
+    else the control box's installed config, else the packaged copy —
+    the front of ``par6d``'s own search order, so the arm a client
+    describes is the arm its daemon runs (its I/O lines, joints, tools),
+    not the stock one."""
+    env = os.environ.get("PAR6_CONFIG")
+    if env:
+        return Path(env)
+    installed = Path("/etc/par6/PAR6.toml")
+    if installed.is_file():
+        return installed
+    return data_root() / "config" / "PAR6.toml"
+
+
 @cache
 def config() -> Config:
-    """The packaged runtime config, loaded once."""
-    return Config(str(data_root() / "config" / "PAR6.toml"))
+    """The runtime config at :func:`config_path`, loaded once."""
+    return Config(str(config_path()))
 
 
 # ---------------------------------------------------------------------------

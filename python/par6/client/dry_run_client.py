@@ -776,13 +776,16 @@ class DryRunRobotClient(RobotOwner):
         0, nothing determined — and ``declare`` declares nothing.  The
         MOTION is the live protocol's: the same joint moves it queues,
         through the same wrist poses from here, approached from either
-        side, at its speed, ending where the arm stood — planned against
-        the same keep-outs and refused where the arm would be.  Each
-        move is a block of the program, under this method's name.
+        side, at its speed and on its profile, ending where the arm stood
+        — planned against the same keep-outs and refused where the arm
+        would be.  Each move is a block of the program, under this
+        method's name, and the profile selected before is back afterwards.
         """
         del ridge, declare
         poses = self._preview.estimation_poses(float(spread))
         speed = Preview.estimation_speed()
+        previous_profile = self.profile()
+        self.select_profile(Preview.estimation_profile())
         for q in poses:
             self._submit(
                 {
@@ -796,6 +799,7 @@ class DryRunRobotClient(RobotOwner):
                 },
                 "estimate_payload",
             )
+        self.select_profile(previous_profile)
         # Four visits per measured pose, then the return to where the arm
         # stood: the count the live report calls `poses`.
         measured = (len(poses) - 1) // 4

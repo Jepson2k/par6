@@ -400,6 +400,13 @@ pub trait RtCommands: Send {
     /// window closed without it. Each outcome is delivered exactly once.
     fn take_flashing_outcome(&mut self) -> Option<Result<(), WireError>>;
 
+    /// Take the outcome of the last `set_simulator`/`connect_hardware`
+    /// once the RT has installed (or refused) the bus: the open is
+    /// synchronous and answers the request directly, the install is the
+    /// RT thread's, and the server holds the reply for it. Each outcome
+    /// is delivered exactly once.
+    fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>>;
+
     /// Push one node's drive tuning through the stored boot-config path
     /// (`SET_PID_GAINS`). The server has already validated the values
     /// (codec) and the node id (config), so this only forwards.

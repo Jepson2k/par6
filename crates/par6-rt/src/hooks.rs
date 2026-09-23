@@ -543,7 +543,10 @@ pub struct SpecSettle {
     policy: CompletionPolicy,
     tolerance_rad: f64,
     timeout_ticks: u32,
+    /// Ticks since the error last improved on `best_err`.
     elapsed: u32,
+    /// The smallest worst-joint error seen since arming.
+    best_err: f64,
 }
 
 impl SpecSettle {
@@ -555,6 +558,7 @@ impl SpecSettle {
             tolerance_rad: motion.settle_tolerance_rad,
             timeout_ticks: ((motion.settle_timeout_s / dt).round() as u32).max(1),
             elapsed: 0,
+            best_err: f64::INFINITY,
         }
     }
 
@@ -567,6 +571,7 @@ impl SpecSettle {
 impl SettlePolicy for SpecSettle {
     fn arm(&mut self, blend_continues: bool) -> bool {
         self.elapsed = 0;
+        self.best_err = f64::INFINITY;
         blend_continues || self.policy == CompletionPolicy::Commanded
     }
 
@@ -582,6 +587,14 @@ impl SettlePolicy for SpecSettle {
             );
         if max_err <= self.tolerance_rad {
             return SettleVerdict::Complete;
+        }
+        // The timeout is "no progress for this long", not "this long
+        // since arming": a joint still closing on its target is settling,
+        // not stuck. Progress has to clear a tenth of the tolerance so
+        // encoder noise cannot keep resetting the clock.
+        if max_err + self.tolerance_rad * 0.1 <= self.best_err {
+            self.best_err = max_err;
+            self.elapsed = 0;
         }
         self.elapsed += 1;
         if self.elapsed >= self.timeout_ticks {

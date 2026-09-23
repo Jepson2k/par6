@@ -624,3 +624,35 @@ def test_materialize_bundle_confines_hostile_filenames_to_the_cache(
     assert sorted(p.name for p in (tmp_path / "par6" / "daemon-config").iterdir()) == [
         "deadbeef"
     ], "a refused bundle leaves no directory behind"
+
+
+def test_the_client_describes_the_config_the_daemon_runs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """``PAR6_CONFIG`` names the robot for ``Robot()`` the way it names it
+    for ``par6d``: a control box with its own I/O wiring shows that wiring
+    to the client, not the stock file's."""
+    import shutil
+
+    from par6 import config as _cfg
+    from par6.robot import Robot
+
+    stock = _cfg.data_root() / "config"
+    custom = tmp_path / "config"
+    shutil.copytree(stock, custom)
+    robot_toml = custom / "PAR6.toml"
+    text = robot_toml.read_text()
+    assert 'name = "isolated_in_1"' in text
+    robot_toml.write_text(text.replace('name = "isolated_in_1"', 'name = "door_switch"'))
+
+    monkeypatch.setenv("PAR6_CONFIG", str(robot_toml))
+    _cfg.config.cache_clear()
+    try:
+        inputs, _outputs = _cfg.io_line_names()
+        assert "door_switch" in inputs and "isolated_in_1" not in inputs
+        assert Robot().digital_inputs == len(inputs)
+    finally:
+        _cfg.config.cache_clear()
+    monkeypatch.delenv("PAR6_CONFIG")
+    _cfg.config.cache_clear()
+    assert "isolated_in_1" in _cfg.io_line_names()[0]

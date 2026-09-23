@@ -23,6 +23,11 @@ use par6_proto::CompletionPolicy;
 /// stay small.
 pub const WRIST_JOINTS: [usize; 3] = [3, 4, 5];
 
+/// The profile the swings between poses run on: jerk-limited, so every
+/// arrival is monotonic and the two-sided approach can cancel friction
+/// (see [`measure`]).
+pub const MEASUREMENT_PROFILE: &str = "RUCKIG";
+
 /// How a run rests and reads the arm.
 #[derive(Debug, Clone, Copy)]
 pub struct Protocol {
@@ -297,6 +302,20 @@ pub async fn measure(
         .set_completion_policy(CompletionPolicy::Settled)
         .await
         .map_err(|e| format!("set_completion_policy: {e}"))?;
+    // The two-sided approach cancels friction only when each arrival is
+    // monotonic: a move that overshoots its pose and comes back has
+    // entered it from the OTHER side, and the readings then add the
+    // friction band instead of cancelling it. So the swings run on the
+    // jerk-limited profile, whatever the session has selected, and the
+    // session's own choice is put back with the policy.
+    let previous_profile = client
+        .profile()
+        .await
+        .map_err(|e| format!("profile: {e}"))?;
+    client
+        .select_profile(MEASUREMENT_PROFILE)
+        .await
+        .map_err(|e| format!("select_profile: {e}"))?;
     let run = async {
         let mut samples = Vec::with_capacity(poses.len());
         for (i, q) in poses.iter().enumerate() {
@@ -306,6 +325,10 @@ pub async fn measure(
         Ok::<_, String>(samples)
     };
     let result = run.await;
+    client
+        .select_profile(&previous_profile)
+        .await
+        .map_err(|e| format!("restoring the motion profile: {e}"))?;
     client
         .set_completion_policy(previous)
         .await

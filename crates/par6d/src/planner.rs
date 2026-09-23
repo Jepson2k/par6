@@ -131,7 +131,6 @@ pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum Profile {
     /// Jerk-limited point-to-point (rsruckig).
-    #[default]
     Ruckig,
     /// Trapezoid on the path coordinate; no jerk limiting.
     Trapezoid,
@@ -139,8 +138,13 @@ pub(crate) enum Profile {
     /// both ends, no cruise, no jerk limiting, point-to-point only.
     Quintic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
-    /// acceleration limits bind, nothing else.
+    /// acceleration limits bind, nothing else. The default.
+    #[default]
     Toppra,
+    /// Constant velocity along a degree-1 joint path, with ramps at the
+    /// acceleration limit at either end: parol6's LINEAR, which is the
+    /// trapezoid shape under the name a script written for it uses.
+    Linear,
 }
 
 impl Profile {
@@ -150,6 +154,7 @@ impl Profile {
             "TRAPEZOID" => Some(Self::Trapezoid),
             "QUINTIC" => Some(Self::Quintic),
             "TOPPRA" => Some(Self::Toppra),
+            "LINEAR" => Some(Self::Linear),
             _ => None,
         }
     }
@@ -158,22 +163,64 @@ impl Profile {
 /// The profile registry the command plane advertises and validates
 /// `select_profile` against.
 pub(crate) fn profile_names() -> Vec<String> {
-    let mut names = vec![
-        "RUCKIG".to_owned(),
-        "TRAPEZOID".to_owned(),
-        "QUINTIC".to_owned(),
-    ];
-    names.push("TOPPRA".to_owned());
-    names
+    ["TOPPRA", "RUCKIG", "TRAPEZOID", "QUINTIC", "LINEAR"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect()
 }
 
 /// Name of the profile a fresh runtime plans with.
-pub(crate) const DEFAULT_PROFILE: &str = "RUCKIG";
+pub(crate) const DEFAULT_PROFILE: &str = "TOPPRA";
 
 /// What the planner needs to know about the fitted CAN gripper.
 struct ToolSpec {
     /// Current limit \[mA\] — the ceiling for a `move` action.
     ilim_ma: f64,
+}
+
+/// A cartesian move as a link of a blend chain: a straight run or an arc.
+#[derive(Debug, Clone, Copy)]
+enum CartMove<'a> {
+    Line(&'a par6_proto::command::MoveL),
+    Arc(&'a par6_proto::command::MoveC),
+}
+
+impl<'a> CartMove<'a> {
+    fn of(cmd: &'a Command) -> Option<Self> {
+        match cmd {
+            Command::MoveL(p) => Some(Self::Line(p)),
+            Command::MoveC(p) => Some(Self::Arc(p)),
+            _ => None,
+        }
+    }
+
+    fn speed(&self) -> Option<f64> {
+        match self {
+            Self::Line(p) => p.speed,
+            Self::Arc(p) => p.speed,
+        }
+    }
+
+    fn accel(&self) -> Option<f64> {
+        match self {
+            Self::Line(p) => p.accel,
+            Self::Arc(p) => p.accel,
+        }
+    }
+
+    fn duration(&self) -> Option<f64> {
+        match self {
+            Self::Line(p) => p.duration,
+            Self::Arc(p) => p.duration,
+        }
+    }
+
+    fn blend_radius(&self) -> Option<f64> {
+        match self {
+            Self::Line(p) => p.blend_radius,
+            Self::Arc(p) => p.blend_radius,
+        }
+    }
 }
 
 enum InFlightKind {
@@ -212,11 +259,12 @@ struct ToolInFlight {
 /// Which coordinate a cartesian path is timed against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CartTiming {
-    /// As fast as the joint limits allow (TOPPRA). What `move_l`,
-    /// `move_c` and `move_s` promise.
+    /// As fast as the joint limits allow (TOPPRA), under the TCP speed
+    /// ceiling. What `move_l`, `move_c` and `move_s` promise.
     TimeOptimal,
-    /// At a constant tool speed along the path. What `move_p` promises,
-    /// and the reason it is a separate command.
+    /// At one constant tool speed along the whole path, under the same
+    /// ceiling. What `move_p` promises, and the reason it is a separate
+    /// command.
     ConstantToolSpeed,
 }
 
@@ -680,7 +728,7 @@ impl Par6Planner {
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         let kind = match self.profile {
             Profile::Ruckig => ProfileKind::Ruckig,
-            Profile::Trapezoid => ProfileKind::Trapezoid,
+            Profile::Trapezoid | Profile::Linear => ProfileKind::Trapezoid,
             Profile::Quintic => ProfileKind::Quintic,
             // TOPPRA times the straight joint-space path instead of
             // shaping a point-to-point profile: same waypoints, a
@@ -782,14 +830,17 @@ impl Par6Planner {
         )
     }
 
-    /// The one solver call both cartesian lanes go through.
+    /// The one solver call every planned path goes through.
     ///
     /// `knots` places each waypoint on the path parameter (`None` spaces
-    /// them evenly) and `max_path_speed` caps `ds/dt`. The path is
-    /// degree-1 by default: the poses are already spaced a couple of
-    /// millimetres apart by the resampler, and a spline through them
-    /// would bow off the chain IK actually solved — inventing curvature,
-    /// which is acceleration, between the samples that were checked.
+    /// them evenly) and `max_path_speed` caps `ds/dt`. The path is a cubic
+    /// spline through the waypoints. Its knots sit on the poses IK solved,
+    /// and between knots a couple of millimetres apart the bow off the
+    /// straight chain is far below the sampling pitch; what the spline
+    /// buys is a continuous joint velocity. A degree-1 path would turn at
+    /// every knot inside one tick, and the commanded-acceleration gate
+    /// reads that as an impulse many times the joint limits and refuses
+    /// the move (parol6 times a degree-1 path, and has no such gate).
     #[allow(clippy::too_many_arguments)]
     fn toppra_samples_with(
         &self,
@@ -1147,12 +1198,7 @@ impl Par6Planner {
         // collision refusal below runs nothing, and a warning standing
         // in STATUS with nothing in flight would be attributed to
         // whatever move runs next.
-        let samples = match timing {
-            CartTiming::TimeOptimal => self.toppra_samples(&waypoints, speed, accel, duration)?,
-            CartTiming::ConstantToolSpeed => {
-                self.arclen_samples(&waypoints, poses, speed, accel, duration)?
-            }
-        };
+        let samples = self.arclen_samples(&waypoints, poses, speed, accel, duration, timing)?;
         let kind = self.start_exec(snap.q, samples, snap.mode == Mode::Exec)?;
         self.near_singularity = singularity_verdict(&self.motion, worst_sigma, worst_cond);
         Ok(kind)
@@ -1264,18 +1310,21 @@ impl Par6Planner {
         )
     }
 
-    /// Time a cartesian path so the TOOL crosses it at a constant
-    /// speed, rather than as fast as the joints allow.
+    /// Time a cartesian path against the distance the TOOL travels.
     ///
-    /// Same solver as every other cartesian move; two things differ.
     /// The knots sit at cumulative tool distance rather than at even
-    /// spacing, so the path parameter IS tool distance — and `ds/dt` is
-    /// then capped at one value for the whole path, which is what holds
-    /// the tool to a single speed instead of letting it run away over
-    /// the stretches where the joints have room. That cap is the
-    /// fastest constant the steepest part of the path allows, so this is
-    /// never faster than the time-optimal answer and usually slower.
-    /// That is what MOVE_P promises and what the others do not.
+    /// spacing, so the path parameter IS tool distance and a ceiling on
+    /// `ds/dt` is a ceiling on tool speed: `speed` times the configured
+    /// planned-move linear maximum, which is what keeps a full-speed
+    /// `move_l` from sweeping the tool as fast as the joints happen to
+    /// allow. Under `TimeOptimal` the solver runs the joints as hard as
+    /// they go beneath that ceiling; under `ConstantToolSpeed` the
+    /// ceiling is also brought down to the fastest constant the steepest
+    /// part of the path allows, which holds the tool to a single speed
+    /// instead of letting it run away over the stretches where the
+    /// joints have room. That is what MOVE_P promises and the others do
+    /// not.
+    #[allow(clippy::too_many_arguments)]
     fn arclen_samples(
         &self,
         waypoints: &[f64],
@@ -1283,6 +1332,7 @@ impl Par6Planner {
         speed: Option<f64>,
         accel: Option<f64>,
         duration: Option<f64>,
+        timing: CartTiming,
     ) -> Result<Vec<[f64; 3 * MAX_JOINTS]>, WireError> {
         use par6_motion::cart::LineSegment;
         let steps: Vec<(f64, f64)> = poses
@@ -1316,12 +1366,18 @@ impl Par6Planner {
             )
         };
         let knots = par6_motion::arclen::ArcKnots::new(&q, &cart_s).ok_or_else(no_extent)?;
-        let cap = par6_motion::arclen::max_path_speed(
-            &knots.max_slope(),
-            &self.exec_limits,
-            speed.unwrap_or(1.0),
-        )
-        .ok_or_else(no_extent)?;
+        // Normalized: the path parameter runs 0..1 over `length_m`.
+        let tool_cap = self.motion.planned_linear_max_m_s * speed.unwrap_or(1.0) / knots.length_m();
+        let cap = match timing {
+            CartTiming::TimeOptimal => tool_cap,
+            CartTiming::ConstantToolSpeed => par6_motion::arclen::max_path_speed(
+                &knots.max_slope(),
+                &self.exec_limits,
+                speed.unwrap_or(1.0),
+            )
+            .ok_or_else(no_extent)?
+            .min(tool_cap),
+        };
         self.toppra_samples_with(
             &knots.waypoints_flat(),
             speed,
@@ -1333,53 +1389,61 @@ impl Par6Planner {
         )
     }
 
-    /// A chain of `move_l`s linked by blend radii, planned as ONE
-    /// cartesian path whose interior corners are rounded.
+    /// A chain of cartesian moves (`move_l` / `move_c`) linked by blend
+    /// radii, planned as ONE cartesian path whose junctions are rounded.
     ///
     /// Each move's target resolves against its PREDECESSOR's target, not
     /// against the live pose: a relative or tool-frame move in the
     /// middle of a chain means "from where the move before it ends",
     /// which is where the arm will be (parol6 does the same in
-    /// `commands/cartesian_commands.py`, `do_setup_with_blend`).
+    /// `commands/cartesian_commands.py`, `do_setup_with_blend`). An arc
+    /// runs from its predecessor's end through its via pose to its end.
     ///
     /// The chain runs under the slowest speed and acceleration fraction
     /// in it; durations add up when every move carries one, and are
     /// dropped when they are mixed with speed-parameterised moves —
     /// there is no meaningful total otherwise.
-    fn start_move_l_chain(
-        &mut self,
-        chain: &[&par6_proto::command::MoveL],
-    ) -> Result<InFlightKind, WireError> {
-        use par6_motion::cart::LineSegment;
+    fn start_cart_chain(&mut self, chain: &[CartMove<'_>]) -> Result<InFlightKind, WireError> {
+        use par6_motion::cart::{ArcSegment, CartSegment, LineSegment};
 
         let snap = self.snapshots.latest();
-        let start_pose = self.current_pose(&snap.q)?;
-        let mut waypoints = Vec::with_capacity(chain.len() + 1);
-        waypoints.push(start_pose);
+        let mut previous = self.current_pose(&snap.q)?;
+        let mut segments = Vec::with_capacity(chain.len());
         for cmd in chain {
-            let previous = *waypoints.last().expect("seeded with the start pose");
-            waypoints.push(target_pose(&previous, &cmd.pose, cmd.frame, cmd.rel));
+            let (segment, end) = match cmd {
+                CartMove::Line(p) => {
+                    let end = target_pose(&previous, &p.pose, p.frame, p.rel);
+                    (CartSegment::Line(LineSegment::new(&previous, &end)), end)
+                }
+                CartMove::Arc(p) => {
+                    let via = target_pose(&previous, &p.via, p.frame, p.rel);
+                    let end = target_pose(&previous, &p.end, p.frame, p.rel);
+                    let arc = ArcSegment::new(&previous, &via, &end).map_err(planning_error)?;
+                    (CartSegment::Arc(arc), end)
+                }
+            };
+            segments.push(segment);
+            previous = end;
         }
         let radii: Vec<f64> = chain[..chain.len() - 1]
             .iter()
-            .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
+            .map(|c| c.blend_radius().unwrap_or(0.0).max(0.0) / 1000.0)
             .collect();
-        let poses =
-            par6_motion::cart::blended_polyline(&waypoints, &radii, path_sampling(&self.motion))
-                .map_err(planning_error)?;
+        let poses = par6_motion::cart::blended_path(&segments, &radii, path_sampling(&self.motion))
+            .map_err(planning_error)?;
 
         let speed = chain
             .iter()
-            .filter_map(|c| c.speed)
+            .filter_map(|c| c.speed())
             .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
         let accel = chain
             .iter()
-            .filter_map(|c| c.accel)
+            .filter_map(|c| c.accel())
             .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
         let duration = chain
             .iter()
-            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
-            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+            .try_fold(0.0, |acc, c| c.duration().map(|d| acc + d))
+            .filter(|_| chain.iter().all(|c| c.duration().is_some()));
         log::debug!(
             "blended cartesian chain: {} moves, {} poses, {:.1} mm of path",
             chain.len(),
@@ -1494,16 +1558,15 @@ impl Par6Planner {
         // Rounding a corner means re-planning both of its segments as
         // one path, which takes IK and TOPPRA.
         if let Some(consumed) = self.blend_chain_len(cmd, rest) {
-            let kind = match cmd {
-                Command::MoveL(head) => {
+            let kind = match CartMove::of(cmd) {
+                Some(head) => {
                     let mut chain = vec![head];
-                    chain.extend(rest[..consumed].iter().map(|q| match q.cmd {
-                        Command::MoveL(p) => p,
-                        _ => unreachable!("the chain only accepts move_l"),
+                    chain.extend(rest[..consumed].iter().map(|q| {
+                        CartMove::of(q.cmd).expect("the chain only accepts cartesian moves")
                     }));
-                    self.start_move_l_chain(&chain)?
+                    self.start_cart_chain(&chain)?
                 }
-                _ => {
+                None => {
                     let mut chain = vec![JointTarget::of(cmd).expect("a joint move")];
                     chain.extend(
                         rest[..consumed]
@@ -1563,7 +1626,8 @@ impl Par6Planner {
             Command::Checkpoint(_)
             | Command::SelectTool(_)
             | Command::SetTcpOffset(_)
-            | Command::SetTcpTransform(_) => InFlightKind::Instant,
+            | Command::SetTcpTransform(_)
+            | Command::WriteIo(_) => InFlightKind::Instant,
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -1602,10 +1666,10 @@ impl Par6Planner {
     /// target like any other. That is also what a lone blended move
     /// does after the server's blend hold expires.
     fn blend_chain_len(&self, cmd: &Command, rest: &[QueuedCommand<'_>]) -> Option<usize> {
-        let cartesian = matches!(cmd, Command::MoveL(_));
+        let cartesian = CartMove::of(cmd).is_some();
         let same_family = |c: &Command| {
             if cartesian {
-                matches!(c, Command::MoveL(_))
+                CartMove::of(c).is_some()
             } else {
                 matches!(c, Command::MoveJ(_) | Command::MoveJPose(_))
             }
@@ -2207,7 +2271,31 @@ impl Planner for Par6Planner {
         // command is taken out of `self` for the call and put back.
         let mut fl = self.inflight.take()?;
         let index = fl.server_index;
-        let verdict = self.verdict(&mut fl, &snap);
+        let mut verdict = self.verdict(&mut fl, &snap);
+        // A completed seek leaves the arm where the referencing sequence
+        // ends; the command ends where the already-referenced fast path
+        // ends — at the home pose, held — so `home` lands in one place
+        // whichever route it took.
+        if let (Some(Ok(_)), InFlightKind::Home { .. }) = (&verdict, &fl.kind) {
+            match self.start_joint_move(
+                &snap,
+                self.home_pose_rad,
+                None,
+                Some(HOME_RETURN_SPEED_FRAC),
+                None,
+            ) {
+                Ok(InFlightKind::Instant) => {}
+                Ok(kind) => {
+                    // The mode grace is measured from THIS move's start,
+                    // not from the seek's, which may have run for minutes.
+                    fl.started = Instant::now();
+                    fl.kind = kind;
+                    self.inflight = Some(fl);
+                    return None;
+                }
+                Err(e) => verdict = Some(Err(e)),
+            }
+        }
         self.inflight = Some(fl);
         match verdict {
             None => None,

@@ -244,7 +244,7 @@ impl Config {
     /// wire spelling), `urdf_variant`, `kinematics` (the vendor DH row and
     /// tool mass: `d_m`, `a_m`, `alpha_rad`, `mass_kg`) and `driver`
     /// (`None` for a passive tool, else `driver_type`, `stroke_mm`,
-    /// `ilim_ma`).
+    /// `ilim_ma`, `default_current_ma`).
     fn grippers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
         for g in &self.bundle.grippers {
@@ -264,6 +264,7 @@ impl Config {
                     dd.set_item("driver_type", format!("{:?}", drv.driver_type))?;
                     dd.set_item("stroke_mm", drv.stroke_mm)?;
                     dd.set_item("ilim_ma", drv.ilim_ma)?;
+                    dd.set_item("default_current_ma", drv.default_current_ma)?;
                     d.set_item("driver", dd)?;
                 }
                 None => d.set_item("driver", py.None())?,

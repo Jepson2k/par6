@@ -85,7 +85,8 @@ fn close_deg(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol: f64) -> bool {
 async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
     let deadline = tokio::time::Instant::now() + BUDGET;
     loop {
-        client.teleport(target, None).await.expect("teleport sends");
+        // Refused until the boot enable lands; the loop re-sends.
+        let _ = client.teleport(target, None).await;
         let landed = client
             .wait_status(
                 move |s| s.homed && close_deg(&s.angles, &target, 1.0),
@@ -100,6 +101,60 @@ async fn settle_at(client: &Client, target: [f64; NUM_JOINTS]) {
             "teleport did not take effect within budget"
         );
     }
+}
+
+/// A COMPLETE push that never arrives does not leave the wait guessing:
+/// STATUS shows the command finished, and the runtime is asked what it
+/// finished as — a landing as much as a cancellation.
+#[test]
+fn a_missing_complete_push_is_recovered_from_the_runtime() {
+    run_session("recover", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let park = common::park_deg();
+        settle_at(&client, park).await;
+        client.drop_complete_pushes_for_test(true);
+
+        let mut target = park;
+        target[0] += 8.0;
+        let landed = client
+            .move_j(target, None, Some(1.0), None, None, false)
+            .await
+            .expect("move_j accepted")
+            .expect("move_j acked with an index");
+        assert!(
+            client
+                .wait_command(landed, BUDGET)
+                .await
+                .expect("recovered"),
+            "the landing must be recovered without its push"
+        );
+        assert_eq!(
+            client.command_completion(landed).await.expect("query"),
+            (true, true, None, None)
+        );
+
+        let mut far = park;
+        far[0] -= 30.0;
+        let cancelled = client
+            .move_j(far, Some(6.0), None, None, None, false)
+            .await
+            .expect("move_j accepted")
+            .expect("move_j acked with an index");
+        assert!(
+            client
+                .wait_status(|s| s.speeds.iter().any(|v| v.abs() > 0.02), BUDGET)
+                .await,
+            "the long move never started"
+        );
+        client.stop(true).await.expect("stop");
+        match client.wait_command(cancelled, BUDGET).await {
+            Err(ClientError::Robot(e)) => {
+                assert_eq!(e.code, ErrorCode::MotnCancelled as u16, "{e:?}")
+            }
+            other => panic!("the cancellation must be recovered without its push: {other:?}"),
+        }
+        client.drop_complete_pushes_for_test(false);
+    });
 }
 
 #[test]
@@ -153,20 +208,26 @@ fn a_full_session_over_the_rust_client() {
             "the arm never came to rest after stop"
         );
 
-        // A refused fire-and-forget surfaces through the standing error
-        // (issue #23): out-of-range teleport, then acceptance clears it.
+        // A teleport is acked: an out-of-range one is refused in the
+        // reply, and the arm stays where the stop left it.
+        let resting = client.angles().await.expect("angles");
         let mut bad = park;
         bad[0] = 1.0e5;
-        client.teleport(bad, None).await.expect("send succeeds");
+        let refused = client
+            .teleport(bad, None)
+            .await
+            .expect_err("an out-of-range teleport is refused");
         assert!(
-            client.wait_status(|s| s.error.is_some(), BUDGET).await,
-            "the refused teleport never latched a standing error"
+            matches!(&refused, ClientError::Robot(e) if e.code == ErrorCode::CommValidationError as u16),
+            "{refused:?}"
+        );
+        assert!(
+            client
+                .wait_status(move |s| close_deg(&s.angles, &resting, 0.5), BUDGET)
+                .await,
+            "the refused teleport moved the arm"
         );
         settle_at(&client, park).await;
-        assert!(
-            client.wait_status(|s| s.error.is_none(), BUDGET).await,
-            "acceptance must clear the refusal"
-        );
 
         // Chunked transfer: a shape world too large for one datagram.
         let shapes: Vec<Shape> = (0..64)

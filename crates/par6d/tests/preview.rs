@@ -203,7 +203,11 @@ fn the_preview_and_the_runtime_agree_on_moves_and_refusals() {
     beyond[0] += 400.0;
     for cmd in [
         teleport_cmd(beyond),
-        Command::WriteIo(WriteIo { port: 7, value: 1 }),
+        Command::WriteIo(WriteIo {
+            key: 0,
+            port: 7,
+            value: 1,
+        }),
         Command::SelectProfile(SelectProfile {
             profile: "BANG_BANG".into(),
         }),
@@ -510,10 +514,21 @@ fn home_previews_as_a_seek_until_referenced_and_a_return_afterwards() {
         calibrate: false,
     }));
     assert!(seek.valid(), "{seek:?}");
-    assert_eq!(seek.end_joints_rad, ready);
-    assert_eq!(seek.duration_s, 0.0);
+    // The seek lands at the ready pose — its own time is the arm's — and
+    // the return to park that follows it is planned and timed.
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, seek.start_row, seek.rows);
+    assert!(
+        max_deg_error(&to_deg(&rows[0]), &to_deg(&ready)) < 1e-4,
+        "the seek lands at the ready pose: {:?} vs {ready:?}",
+        rows[0]
+    );
+    assert!(max_deg_error(&to_deg(&seek.end_joints_rad), &park) < 0.1);
+    assert!(seek.duration_s > 0.1 && seek.rows > 1, "{seek:?}");
     assert!(preview.homed());
 
+    // Referenced and away from park, HOME is the planned return alone.
+    preview.place_rad(ready);
     let ret = preview.submit(Command::Home(Home {
         key: 2,
         calibrate: false,
@@ -607,6 +622,21 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
         mine.end_joints_rad,
         to_rad(&park),
         "a refused move must not advance the virtual arm"
+    );
+
+    // reset_state is the program's reset, not the controller's: the
+    // e-stop latch stands through it, on the preview as on the runtime.
+    preview.submit(Command::ResetState);
+    c.ok(&Command::ResetState);
+    let still_mine = preview.submit(move_j_cmd(target, None));
+    let still_theirs = c.expect_error(&move_j_cmd(target, None));
+    let still = still_mine
+        .error
+        .as_ref()
+        .expect("reset_state must not clear a latched e-stop");
+    assert_eq!(
+        still.code, still_theirs.code,
+        "{still:?} vs {still_theirs:?}"
     );
 
     preview.submit(Command::Reset);
@@ -726,8 +756,10 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
     }));
     assert!(plain.valid(), "{plain:?}");
 
-    // Referenced, but asked to calibrate: the seek runs instead, ending
-    // where the homing sequence leaves the arm rather than at park.
+    // Referenced, but asked to calibrate: the seek runs instead. The
+    // record shows it landing where the homing sequence leaves the arm,
+    // then the return to park the runtime plans once referenced — the
+    // only part of a calibrating home a plan can time.
     let mut off = park;
     off[0] += 20.0;
     preview.place_rad(to_rad(&off));
@@ -737,15 +769,22 @@ fn a_calibrating_home_seeks_even_when_the_arm_is_already_referenced() {
     }));
     assert!(seek.valid(), "{seek:?}");
     let ready = to_deg(&preview.homing_ready_pose_rad());
+    let record = preview.plan_record(None);
+    let rows = span_joints(&record, seek.start_row, seek.rows);
+    // The record stores single-precision rows.
     assert!(
-        max_deg_error(&to_deg(&seek.end_joints_rad), &ready) < 1e-6,
-        "a calibrating home must end where the seek ends: {:?} vs {ready:?}",
+        max_deg_error(&to_deg(&rows[0]), &ready) < 1e-4,
+        "a calibrating home seeks first: the record must land at the ready pose, got {:?} vs {ready:?}",
+        to_deg(&rows[0])
+    );
+    assert!(
+        max_deg_error(&to_deg(&seek.end_joints_rad), &park) < 0.1,
+        "home ends at the park pose whichever route it took: {:?}",
         to_deg(&seek.end_joints_rad)
     );
     assert!(
-        seek.duration_s == 0.0,
-        "the seek's duration belongs to the physical sequence, not to a plan: {}",
-        seek.duration_s
+        seek.duration_s > 0.1 && seek.rows > 1,
+        "the return from the ready pose is a planned move: {seek:?}"
     );
 }
 
@@ -1102,4 +1141,71 @@ fn wire_rpy_deg(m: &[f64; 16]) -> [f64; 3] {
     let roll = (-m[6]).atan2(m[10]);
     let yaw = (-m[1]).atan2(m[0]);
     [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
+}
+
+/// `LINEAR` is a profile this runtime plans with, and it is what its
+/// name says: a constant-velocity joint path with ramps at the
+/// acceleration limit, so a script written for parol6's default profile
+/// runs here unchanged.
+#[test]
+fn the_linear_profile_cruises_at_one_speed_between_its_ramps() {
+    let mut preview =
+        Preview::new(Some(&test_config()), Some(&assets()), None).expect("the preview boots");
+    preview.set_homed(true);
+    preview.teleport_rad(to_rad(&wrist_clear_deg()));
+    let selected = preview.submit(Command::SelectProfile(SelectProfile {
+        profile: "LINEAR".into(),
+    }));
+    assert!(
+        selected.error.is_none(),
+        "LINEAR is refused: {:?}",
+        selected.error
+    );
+
+    // Far enough, and slow enough, to spend most of the move cruising:
+    // at 30% of the velocity limit the ramps to it are short.
+    let mut target = wrist_clear_deg();
+    target[0] += 90.0;
+    let r = preview.submit(Command::MoveJ(MoveJ {
+        key: 4343,
+        angles: target,
+        duration: None,
+        speed: Some(0.3),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    assert!(r.error.is_none(), "{:?}", r.error);
+    let record = preview.plan_record(None);
+    let joints = span_joints(&record, r.start_row, r.rows);
+    let dt = record.row_dt_s;
+    let speeds: Vec<f64> = joints
+        .windows(2)
+        .map(|w| ((w[1][0] - w[0][0]) / dt).abs())
+        .collect();
+    let peak = speeds.iter().copied().fold(0.0f64, f64::max);
+    assert!(peak > 0.1, "J1 never got up to speed: {peak:.3} rad/s");
+    let cruising = speeds.iter().filter(|v| **v > peak * 0.98).count();
+    assert!(
+        cruising * 2 > speeds.len(),
+        "a LINEAR move cruises at one speed: only {cruising} of {} rows are within 2% of the \
+         {peak:.3} rad/s peak",
+        speeds.len()
+    );
+    // The ramps are ramps, not steps: no row changes speed by more than
+    // the acceleration limit allows (0.5 rad/s² per tick would be a jump
+    // of 0.01 rad/s at this row rate; the real limit is far lower).
+    let jump = speeds
+        .windows(2)
+        .map(|w| (w[1] - w[0]).abs() / dt)
+        .fold(0.0f64, f64::max);
+    assert!(
+        jump < peak / dt / 4.0,
+        "the profile steps its velocity: {jump:.2} rad/s² in one row"
+    );
+    assert!(
+        max_deg_error(&to_deg(&joints[joints.len() - 1]), &target) < 1e-3,
+        "the move lands on its target: {:?} vs {target:?}",
+        to_deg(&joints[joints.len() - 1])
+    );
 }

@@ -155,6 +155,12 @@ pub(crate) struct Inner {
     seq_gaps: AtomicU64,
     unclaimed: Mutex<HashMap<u16, std::time::Instant>>,
     pub(crate) last_command_index: AtomicI64,
+    /// The protocol version a STATUS frame declared when it was not this
+    /// client's; latched, because nothing later can be read either.
+    skew: Mutex<Option<u8>>,
+    /// Fault injection for the client's own tests: discard COMPLETE
+    /// pushes as they arrive, so a wait has to finish the other way.
+    drop_complete_pushes: AtomicBool,
     /// The completion policy this client last set on its session, if
     /// any — the wire has no query for it, and a routine that changes it
     /// for its own run has to know what to put back.
@@ -224,6 +230,8 @@ impl Client {
             seq_gaps: AtomicU64::new(0),
             unclaimed: Mutex::new(HashMap::new()),
             last_command_index: AtomicI64::new(-1),
+            skew: Mutex::new(None),
+            drop_complete_pushes: AtomicBool::new(false),
             completion_policy: Mutex::new(None),
             closed: AtomicBool::new(false),
         });
@@ -471,7 +479,28 @@ impl Client {
         self.inner.status_tx.borrow().clone()
     }
 
+    /// The protocol skew the status stream has latched, as `(daemon,
+    /// client)` versions: STATUS from that runtime cannot be read, so
+    /// every wait on it answers false at once rather than at its timeout.
+    pub fn protocol_mismatch(&self) -> Option<(u8, u8)> {
+        self.inner
+            .skew
+            .lock()
+            .unwrap()
+            .map(|daemon| (daemon, par6_proto::PROTO_VERSION))
+    }
+
+    /// Fault injection for tests: discard COMPLETE pushes as they arrive.
+    #[doc(hidden)]
+    pub fn drop_complete_pushes_for_test(&self, drop: bool) {
+        self.inner
+            .drop_complete_pushes
+            .store(drop, Ordering::SeqCst);
+    }
+
     /// Block until `pred` holds for a STATUS frame, or `timeout` expires.
+    /// False at once under a latched protocol mismatch: no frame from
+    /// that runtime will ever be read.
     pub async fn wait_status(
         &self,
         mut pred: impl FnMut(&Status) -> bool,
@@ -480,6 +509,9 @@ impl Client {
         let mut rx = self.subscribe_status();
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
+            if self.protocol_mismatch().is_some() {
+                return false;
+            }
             if let Some(s) = rx.borrow_and_update().clone() {
                 if pred(&s) {
                     return true;
@@ -580,10 +612,16 @@ impl Client {
         rx: &mut oneshot::Receiver<Completion>,
         timeout: Duration,
     ) -> Result<Option<Completion>, ClientError> {
+        // The session the wait began in: a runtime that restarts mid-wait
+        // starts its indexes over, and the one awaited names nothing then.
+        let session = self.latest_status().map(|s| s.session_id);
+        let restarted = move |s: &Status| session.is_some_and(|s0| s.session_id != s0);
         let hit = {
             let via_status = self.wait_status(
                 move |s| {
-                    s.completed_index >= index as i64 || Self::blocking_error(s, index).is_some()
+                    restarted(s)
+                        || s.completed_index >= index as i64
+                        || Self::blocking_error(s, index).is_some()
                 },
                 timeout,
             );
@@ -594,19 +632,53 @@ impl Client {
             }
         };
         if !hit {
+            if let Some((daemon, client)) = self.protocol_mismatch() {
+                return Err(ClientError::ProtocolMismatch { daemon, client });
+            }
             return Ok(None);
         }
         if let Some(s) = self.latest_status() {
+            if restarted(&s) {
+                return Err(ClientError::SessionChanged { index });
+            }
             if let Some(err) = Self::blocking_error(&s, index) {
                 return Err(ClientError::Robot(err));
             }
         }
         match tokio::time::timeout(COMPLETE_GRACE, rx).await {
             Ok(Ok(done)) => Ok(Some(done)),
-            _ => {
+            _ => self.recover_completion(index).await,
+        }
+    }
+
+    /// STATUS says `index` finished but its COMPLETE push never came: the
+    /// runtime keeps what the push carried, so ask for it rather than
+    /// declare the verdict unknown. `None` only when the runtime has no
+    /// record of it either.
+    async fn recover_completion(&self, index: u64) -> Result<Option<Completion>, ClientError> {
+        match self.query(Command::CommandCompletion { index }).await {
+            Ok(par6_proto::QueryResult::CommandCompletion {
+                finished: true,
+                ok,
+                detail,
+                verdict,
+                ..
+            }) => {
+                let done: Completion = (ok, detail, verdict);
+                record_completion(&self.inner, index, &done);
+                Ok(Some(done))
+            }
+            Ok(_) => {
                 log::warn!(
-                    "command {index} finished per STATUS but its COMPLETE push never arrived; \
-                     verdict unknown"
+                    "command {index} finished per STATUS but the runtime has no record of \
+                     its completion; verdict unknown"
+                );
+                Ok(None)
+            }
+            Err(e) => {
+                log::warn!(
+                    "command {index} finished per STATUS, its COMPLETE push never arrived \
+                     and the runtime could not be asked ({e}); verdict unknown"
                 );
                 Ok(None)
             }
@@ -657,22 +729,10 @@ async fn reply_rx(inner: Arc<Inner>) {
                 detail,
                 verdict,
             } => {
-                let mut comp = inner.completions.lock().unwrap();
-                if comp
-                    .log
-                    .insert(index, (ok, detail.clone(), verdict))
-                    .is_none()
-                {
-                    comp.order.push_back(index);
+                if inner.drop_complete_pushes.load(Ordering::SeqCst) {
+                    continue;
                 }
-                while comp.order.len() > COMPLETIONS_KEPT {
-                    if let Some(old) = comp.order.pop_front() {
-                        comp.log.remove(&old);
-                    }
-                }
-                for tx in comp.waiters.remove(&index).unwrap_or_default() {
-                    let _ = tx.send((ok, detail.clone(), verdict));
-                }
+                record_completion(&inner, index, &(ok, detail, verdict));
             }
             other => {
                 let req_id = match &other {
@@ -717,6 +777,22 @@ fn log_unclaimed(inner: &Inner, error: &WireError) {
 }
 
 /// The protocol-skew warning fires once per process, not per frame.
+/// A finished command, logged and handed to whoever is waiting on it.
+fn record_completion(inner: &Inner, index: u64, done: &Completion) {
+    let mut comp = inner.completions.lock().unwrap();
+    if comp.log.insert(index, done.clone()).is_none() {
+        comp.order.push_back(index);
+    }
+    while comp.order.len() > COMPLETIONS_KEPT {
+        if let Some(old) = comp.order.pop_front() {
+            comp.log.remove(&old);
+        }
+    }
+    for tx in comp.waiters.remove(&index).unwrap_or_default() {
+        let _ = tx.send(done.clone());
+    }
+}
+
 static VERSION_SKEW_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -724,10 +800,14 @@ static VERSION_SKEW_WARNED: std::sync::atomic::AtomicBool =
 ///
 /// `None` is a datagram we could not even identify as a STATUS, which says
 /// nothing about versions and is left to the caller's debug line.
-fn warn_once_on_skew(daemon: Option<u8>) {
+fn warn_once_on_skew(inner: &Inner, daemon: Option<u8>) {
     let Some(daemon) = daemon.filter(|v| *v != par6_proto::PROTO_VERSION) else {
         return;
     };
+    // Latched for the waits: a frame that cannot be read now will not
+    // be readable later either, and a wait that ran out its timeout
+    // instead would report the runtime silent rather than foreign.
+    *inner.skew.lock().unwrap() = Some(daemon);
     if VERSION_SKEW_WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -761,17 +841,27 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
                 // ever reads the version — which is to say the check below
                 // could never fire in the one case it exists for, and the
                 // client went silent with a debug line as its only account.
-                warn_once_on_skew(par6_proto::peek_status_proto_version(&buf[..n]));
+                warn_once_on_skew(&inner, par6_proto::peek_status_proto_version(&buf[..n]));
                 log::debug!("ignoring undecodable status datagram: {e}");
                 continue;
             }
         };
-        warn_once_on_skew(Some(status.proto_version));
+        warn_once_on_skew(&inner, Some(status.proto_version));
         {
             let mut last = inner.last_seq.lock().unwrap();
             if let Some((session, prev)) = *last {
                 if session == status.session_id && status.seq <= prev {
                     continue;
+                }
+                if session != status.session_id {
+                    // A restarted runtime numbers its queue from the start
+                    // again: what was logged names other commands now, and
+                    // whoever waits on one learns of the restart, not of a
+                    // stranger's completion.
+                    let mut comp = inner.completions.lock().unwrap();
+                    comp.log.clear();
+                    comp.order.clear();
+                    comp.waiters.clear();
                 }
                 if session == status.session_id && status.seq > prev.saturating_add(1) {
                     inner

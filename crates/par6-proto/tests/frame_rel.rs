@@ -1,10 +1,11 @@
-//! A tool-frame pose is relative to the tool frame the move starts in;
-//! `rel = false` with TRF has no meaning, and silently performing a
-//! relative move for it would leave the caller believing an absolute one
-//! was made. The codec refuses the pair.
+//! A tool-frame pose is an offset in the tool frame the move starts in,
+//! whether or not `rel` is set: the flag only changes what a WORLD-frame
+//! pose means. `move_c`, `move_s` and `move_p` carry a frame but no
+//! `rel`, so a TRF pose that needed the flag could not be sent through
+//! them at all.
 
-use par6_proto::command::MoveL;
-use par6_proto::{encode_command, Command, Frame};
+use par6_proto::command::{MoveC, MoveL};
+use par6_proto::{decode_command, encode_command, Command, Frame};
 
 fn move_l(frame: Frame, rel: bool) -> Command {
     Command::MoveL(MoveL {
@@ -20,14 +21,30 @@ fn move_l(frame: Frame, rel: bool) -> Command {
 }
 
 #[test]
-fn a_tool_frame_pose_must_be_relative() {
+fn a_tool_frame_pose_needs_no_rel_flag() {
+    for (frame, rel) in [
+        (Frame::Trf, false),
+        (Frame::Trf, true),
+        (Frame::Wrf, false),
+        (Frame::Wrf, true),
+    ] {
+        let mut buf = Vec::new();
+        encode_command(&move_l(frame, rel), 1, &mut buf)
+            .unwrap_or_else(|e| panic!("{frame:?} with rel = {rel} must encode: {e}"));
+        let (_, decoded) = decode_command(&buf).expect("round trip");
+        assert_eq!(decoded, move_l(frame, rel));
+    }
     let mut buf = Vec::new();
-    let err = encode_command(&move_l(Frame::Trf, false), 1, &mut buf)
-        .expect_err("TRF with rel = false must be refused");
-    assert!(
-        format!("{err}").contains("rel"),
-        "the refusal names the flag: {err}"
-    );
-    assert!(encode_command(&move_l(Frame::Trf, true), 1, &mut buf).is_ok());
-    assert!(encode_command(&move_l(Frame::Wrf, false), 1, &mut buf).is_ok());
+    let arc = Command::MoveC(MoveC {
+        key: 2,
+        via: [0.0, 20.0, 0.0, 0.0, 0.0, 0.0],
+        end: [0.0, 40.0, 0.0, 0.0, 0.0, 0.0],
+        frame: Frame::Trf,
+        duration: None,
+        speed: Some(0.5),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    });
+    encode_command(&arc, 1, &mut buf).expect("a TRF arc encodes");
 }

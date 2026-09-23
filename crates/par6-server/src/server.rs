@@ -104,6 +104,10 @@ struct PendingScan {
 /// still deciding. A client that keeps re-sending past this is not
 /// waiting for an answer, and the queue must stay bounded.
 const MAX_RESET_WAITERS: usize = 16;
+
+/// How many COMPLETE pushes COMMAND_COMPLETION can answer for: the same
+/// window the client keeps.
+const COMPLETION_LOG_KEPT: usize = 1024;
 /// Requests awaiting the RT's FLASHING verdict, bounded the same way.
 const MAX_FLASHING_WAITERS: usize = 16;
 /// Largest CONFIG_BUNDLE reply sent: one UDP datagram (65 507 payload
@@ -191,6 +195,10 @@ enum PostEffect {
     /// planned against the new one, and a blend chain can never fold
     /// across it.
     TcpTransform([f64; 6]),
+    /// `write_io` lands at its turn in the queue: an output written after
+    /// a move changes when that move has finished, not when the datagram
+    /// arrived mid-motion.
+    WriteIo(u8, u8),
 }
 
 /// The first command index the server hands out. Nothing is index 0:
@@ -340,6 +348,9 @@ struct Core<R: RtCommands> {
     /// order — but a tool action runs beside the motion queue and can
     /// finish while a lower motion index is still executing.
     finished: BTreeSet<u64>,
+    /// The last COMPLETE pushes, oldest first, for COMMAND_COMPLETION: a
+    /// client whose push went missing asks here instead of guessing.
+    completion_log: VecDeque<(u64, bool, Option<WireError>, Option<u8>)>,
     last_checkpoint: String,
     standing_error: Option<WireError>,
     action_state: ActionState,
@@ -362,6 +373,10 @@ struct Core<R: RtCommands> {
     /// Clients whose `enter_flashing`/`exit_flashing` is still waiting
     /// for the RT's mode change.
     flashing_waiters: Waiters,
+    bus_waiters: Waiters,
+    /// The backend a swap in flight installs (`true` = simulator), written
+    /// to `simulator` once the RT confirms the install.
+    pending_simulator: Option<bool>,
     /// Whether the boot-time enable has been requested yet.
     booted: bool,
 
@@ -393,6 +408,13 @@ struct Core<R: RtCommands> {
     snap: StateSnapshot,
     last_fresh: Option<Instant>,
     status_seq: u64,
+    /// The RT tick the last STATUS frame described; frames ride the
+    /// ticks, one per stride, and the timer only fills in for a stalled
+    /// RT.
+    last_status_tick: Option<u64>,
+    /// When the last STATUS frame went out, on the emission clock: the
+    /// timer fills in only after the ticks have stopped delivering.
+    last_status_at: Instant,
     session_id: u64,
     tcp_speed: f64,
     prev_tcp: Option<([f64; 3], Instant)>,
@@ -450,6 +472,7 @@ impl<R: RtCommands> Core<R> {
             tool_executing: None,
             completed_index: -1,
             finished: BTreeSet::new(),
+            completion_log: VecDeque::with_capacity(COMPLETION_LOG_KEPT),
             last_checkpoint: String::new(),
             standing_error: None,
             action_state: ActionState::Idle,
@@ -460,6 +483,8 @@ impl<R: RtCommands> Core<R> {
             drainbuf: vec![0u8; 65535],
             reset_waiters: Waiters::new(MAX_RESET_WAITERS, "reset"),
             flashing_waiters: Waiters::new(MAX_FLASHING_WAITERS, "FLASHING"),
+            bus_waiters: Waiters::new(MAX_RESET_WAITERS, "backend swap"),
+            pending_simulator: None,
             booted: false,
             tool_variant: None,
             tcp_offset_mm: [0.0; 3],
@@ -478,6 +503,8 @@ impl<R: RtCommands> Core<R> {
             snap: StateSnapshot::default(),
             last_fresh: None,
             status_seq: 0,
+            last_status_tick: None,
+            last_status_at: Instant::now(),
             session_id: RandomState::new()
                 .hash_one((std::process::id(), std::time::SystemTime::now()))
                 .max(1),
@@ -631,12 +658,14 @@ impl<R: RtCommands> Core<R> {
 
     async fn on_poll(&mut self) {
         self.refresh_snapshot();
+        self.emit_status_on_tick().await;
         self.stop_invalid_attachments().await;
         self.log_rt_latch_edges();
         self.answer_scans().await;
         self.request_boot_enable();
         self.settle_enable().await;
         self.settle_flashing().await;
+        self.settle_bus().await;
         self.expire_chunks().await;
         self.pump().await;
     }
@@ -664,8 +693,48 @@ impl<R: RtCommands> Core<R> {
         self.rt_error_logged = code;
     }
 
+    /// STATUS rides the RT's ticks: one frame every `tick_hz /
+    /// status_rate_hz` ticks, built from that tick's snapshot. A timer
+    /// sampling the snapshot at its own phase described the same tick
+    /// twice and skipped others — a TCP speed of zero out of a repeated
+    /// pose, a jog step nobody saw — which no frame here can do.
+    async fn emit_status_on_tick(&mut self) {
+        let stride = self.status_stride();
+        let tick = self.snap.tick;
+        if self
+            .last_status_tick
+            .is_some_and(|last| tick / stride == last / stride)
+        {
+            return;
+        }
+        self.last_status_tick = Some(tick);
+        self.emit_status().await;
+    }
+
+    /// Ticks between STATUS frames at the rate in force.
+    fn status_stride(&self) -> u64 {
+        let tick_hz = 1.0 / self.cfg.config_info.tick_dt_s;
+        ((tick_hz / f64::from(self.status_rate_hz.max(1))).round() as u64).max(1)
+    }
+
+    /// The timer's turn: a frame at the configured rate while the RT is
+    /// not ticking (a stalled core, a bus being swapped), so a client
+    /// still sees the controller's state and its link go stale. Ticks
+    /// that flow are reported by [`Self::emit_status_on_tick`], and the
+    /// timer stands down while they do — judged on the emission clock,
+    /// since a timer and a tick stride at the same rate drift into phase
+    /// and would otherwise describe every stride twice.
     async fn on_status(&mut self) {
+        let period = rate_period(self.status_rate_hz.max(1));
+        if self.last_status_at.elapsed() < period.mul_f64(1.5) {
+            return;
+        }
         self.refresh_snapshot();
+        self.emit_status().await;
+    }
+
+    async fn emit_status(&mut self) {
+        self.last_status_at = Instant::now();
         self.stop_invalid_attachments().await;
         self.update_tcp_speed();
         self.update_collision();
@@ -889,6 +958,10 @@ impl<R: RtCommands> Core<R> {
                 .await;
             return;
         }
+        if let C::Simulator(_) | C::ConnectHardware(_) = cmd {
+            self.on_bus_swap(req_id, cmd, addr).await;
+            return;
+        }
         let result: Result<(), WireError> = match cmd {
             C::Estop => {
                 // Latch and disable before anything awaits: the drive
@@ -941,26 +1014,28 @@ impl<R: RtCommands> Core<R> {
             // own 0..=7 bound is not the answer here: a port past the
             // end names no line, and acking it would report a level the
             // arm never drove.
-            C::WriteIo(p) => match write_io_fault(p.port, &self.cfg) {
+            // Acked once the pose is applied: a caller that scrubs a
+            // recording through it learns of a refusal (off the
+            // simulator, outside the travel window) from the reply, not
+            // from a standing error it never reads. It preempts the
+            // active stream and the planned queue, as a jump must, but
+            // is not itself a continuing stream.
+            C::Teleport(p) => match self.validate_supported(cmd) {
                 Some(error) => Err(error),
                 None => {
-                    log::debug!(
-                        "write_io {} (port {}) = {}",
-                        self.cfg.digital_outputs[usize::from(p.port)],
-                        p.port,
-                        p.value
-                    );
-                    self.runtime.rt.write_io(p.port, p.value);
+                    if let Some(superseded) = self.active_stream.take() {
+                        self.runtime.rt.cancel_stream();
+                        self.drain_stream_backlog(superseded);
+                    }
+                    self.cancel_planned("a teleport").await;
+                    self.runtime
+                        .rt
+                        .teleport(&p.angles, p.tool_positions.as_deref());
+                    self.teleport_homed = true;
+                    self.on_motion_accepted();
                     Ok(())
                 }
             },
-            C::Simulator(p) => {
-                self.invalidate_attachments();
-                self.cancel_all_motion("the simulator switch").await;
-                self.runtime.rt.set_simulator(p.on).map(|()| {
-                    self.simulator = p.on;
-                })
-            }
             C::SelectProfile(p) => {
                 // Matched case-insensitively, stored in the registry's
                 // spelling — the planner keys its behaviour off that.
@@ -982,17 +1057,6 @@ impl<R: RtCommands> Core<R> {
                         &[("detail", &p.profile)],
                     )),
                 }
-            }
-            // Same reason `simulator` cancels first: the bus under a
-            // running move is about to become a different arm, and a
-            // move resumed against one whose position is not yet known
-            // is a move to somewhere nobody asked for.
-            C::ConnectHardware(p) => {
-                self.invalidate_attachments();
-                self.cancel_all_motion("the hardware connect").await;
-                self.runtime.rt.connect_hardware(&p.port).inspect(|()| {
-                    self.simulator = false;
-                })
             }
             C::SetPayload(p) => {
                 let payload = PayloadSpec {
@@ -1164,6 +1228,55 @@ impl<R: RtCommands> Core<R> {
         self.answer_waiters(waiting, &outcome).await;
     }
 
+    /// A backend swap (`simulator` / `connect_hardware`) is answered once
+    /// the RT has the new bus installed. The open happens here, so a bus
+    /// that cannot be opened is this request's own error; the install
+    /// runs on the RT thread, and OK on the strength of having asked for
+    /// it is the unconfirmed success the client contract forbids.
+    ///
+    /// The motion is cancelled first: the bus under a running move is
+    /// about to become a different arm, and a move resumed against one
+    /// whose position is not yet known is a move to somewhere nobody
+    /// asked for.
+    async fn on_bus_swap(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
+        use Command as C;
+        self.invalidate_attachments();
+        let (scope, started) = match cmd {
+            C::Simulator(p) => (
+                "the simulator switch",
+                self.runtime.rt.set_simulator(p.on).map(|()| p.on),
+            ),
+            C::ConnectHardware(p) => (
+                "the hardware connect",
+                self.runtime.rt.connect_hardware(&p.port).map(|()| false),
+            ),
+            _ => unreachable!("only backend swaps are answered here"),
+        };
+        self.cancel_all_motion(scope).await;
+        match started {
+            Err(error) => self.reply(addr, &Reply::Error { req_id, error }).await,
+            Ok(simulator) => {
+                self.pending_simulator = Some(simulator);
+                if let Err(error) = self.bus_waiters.try_push(req_id, addr) {
+                    self.reply(addr, &Reply::Error { req_id, error }).await;
+                }
+            }
+        }
+    }
+
+    async fn settle_bus(&mut self) {
+        let Some(outcome) = self.runtime.rt.take_bus_outcome() else {
+            return;
+        };
+        if let Some(simulator) = self.pending_simulator.take() {
+            if outcome.is_ok() {
+                self.simulator = simulator;
+            }
+        }
+        let waiting = self.bus_waiters.take();
+        self.answer_waiters(waiting, &outcome).await;
+    }
+
     /// Come up ready to accept motion, the way parol6's controller does
     /// (`server/state.py`, `enabled = True`): its `enabled` flag is a
     /// PROTECTIVE-STOP latch, and nothing is latched on a clean boot.
@@ -1204,21 +1317,6 @@ impl<R: RtCommands> Core<R> {
             // silently refuses to move (issue #23).
             self.latch_faf_refusal(&error);
             self.reply(addr, &Reply::Error { req_id, error }).await;
-            return;
-        }
-        if let Command::Teleport(p) = &cmd {
-            // Streamable-class: preempts the active stream and planned
-            // motion, but is not itself a continuing stream.
-            if let Some(superseded) = self.active_stream.take() {
-                self.runtime.rt.cancel_stream();
-                self.drain_stream_backlog(superseded);
-            }
-            self.cancel_planned("a streaming preemption").await;
-            self.runtime
-                .rt
-                .teleport(&p.angles, p.tool_positions.as_deref());
-            self.teleport_homed = true;
-            self.on_motion_accepted();
             return;
         }
         debug_assert!(is_stream(tag));
@@ -1708,6 +1806,15 @@ impl<R: RtCommands> Core<R> {
                         self.tcp_offset_mm = [v[0], v[1], v[2]];
                         self.tcp_rotation_deg = [v[3], v[4], v[5]];
                         self.sync_planner();
+                    }
+                    PostEffect::WriteIo(port, value) => {
+                        log::debug!(
+                            "write_io {} (port {}) = {}",
+                            self.cfg.digital_outputs[usize::from(port)],
+                            port,
+                            value
+                        );
+                        self.runtime.rt.write_io(port, value);
                     }
                 }
                 self.push_complete(ex.addr, ex.index, None, out.verdict)
@@ -2262,31 +2369,31 @@ impl<R: RtCommands> Core<R> {
         self.prev_tcp = Some((pos, now));
     }
 
-    fn estop_pressed(&self) -> bool {
+    /// The physical safety chain alone: what the e-stop LINE reads, not
+    /// the software latch a `estop()` sets (that is `error()`'s and the
+    /// enable gate's to report).
+    fn hardware_estop_pressed(&self) -> bool {
         use par6_rt::ErrorCode as RtErr;
-        self.estop_latched
-            || self
-                .snap
-                .errors
-                .as_slice()
-                .iter()
-                .any(|e| matches!(e.code, RtErr::Estop | RtErr::SwEstop))
+        self.snap
+            .errors
+            .as_slice()
+            .iter()
+            .any(|e| matches!(e.code, RtErr::Estop))
     }
 
     /// `inputs ++ outputs ++ [estop]`, in `[io]` config order — the
     /// declared lines as the RT thread last read and drove them, with
     /// the e-stop always last.
     ///
-    /// The e-stop slot is not a line level: it is the whole e-stop
-    /// CONDITION, hardware chain and software flag together, which is
-    /// what an operator watching this array needs to see.
+    /// The e-stop slot reads the physical chain, like every other slot
+    /// reads a line: a software `estop()` never sets it, on any backend.
     fn io(&self) -> Vec<u8> {
         let inputs = self.snap.io_input_levels();
         let outputs = self.snap.io_output_levels();
         let mut io = Vec::with_capacity(inputs.len() + outputs.len() + 1);
         io.extend_from_slice(inputs);
         io.extend_from_slice(outputs);
-        io.push(u8::from(!self.estop_pressed()));
+        io.push(u8::from(!self.hardware_estop_pressed()));
         io
     }
 
@@ -2769,6 +2876,24 @@ impl<R: RtCommands> Core<R> {
             C::TcpTransform => QueryResult::TcpTransform {
                 values: tcp_transform_values(self.tcp_offset_mm, self.tcp_rotation_deg),
             },
+            C::CommandCompletion { index } => {
+                match self.completion_log.iter().rev().find(|c| c.0 == *index) {
+                    Some((_, ok, detail, verdict)) => QueryResult::CommandCompletion {
+                        index: *index,
+                        finished: true,
+                        ok: *ok,
+                        detail: detail.clone(),
+                        verdict: *verdict,
+                    },
+                    None => QueryResult::CommandCompletion {
+                        index: *index,
+                        finished: false,
+                        ok: false,
+                        detail: None,
+                        verdict: None,
+                    },
+                }
+            }
             C::TcpOffset => QueryResult::TcpOffset {
                 x: self.tcp_offset_mm[0],
                 y: self.tcp_offset_mm[1],
@@ -2866,6 +2991,11 @@ impl<R: RtCommands> Core<R> {
                 e.remedy
             ),
         }
+        if self.completion_log.len() >= COMPLETION_LOG_KEPT {
+            self.completion_log.pop_front();
+        }
+        self.completion_log
+            .push_back((index, detail.is_none(), detail.clone(), verdict));
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
@@ -2980,21 +3110,14 @@ pub fn validate_supported(cfg: &ServerConfig, cmd: &Command) -> Option<WireError
             )
         })
     };
+    if let Command::WriteIo(p) = cmd {
+        return write_io_fault(p.port, cfg);
+    }
     let unsupported = match cmd {
         Command::MoveJ(p) => blend(p.blend_radius),
         Command::MoveJPose(p) => blend(p.blend_radius),
         Command::MoveL(p) => blend(p.blend_radius),
-        // An arc ends where its `end` pose is: par6d rounds corners
-        // between straight segments and between joint moves, but has
-        // no arc-to-successor blend, and a radius that quietly did
-        // nothing would be the silent alteration this function
-        // exists to prevent.
-        Command::MoveC(p) => p.blend_radius.filter(|r| *r > 0.0).map(|r| {
-            format!(
-                "blend radius {r} mm is not supported on move_c: an arc stops at \
-                 its end pose; send r = nil"
-            )
-        }),
+        Command::MoveC(p) => blend(p.blend_radius),
         // A pose the runtime cannot place the arm at is refused, not
         // clamped: clamping landed the arm tens of degrees from where
         // the client asked and answered success, which is the silent
@@ -3214,6 +3337,7 @@ fn post_effect(cmd: &Command) -> PostEffect {
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
         Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
+        Command::WriteIo(p) => PostEffect::WriteIo(p.port, p.value),
         _ => PostEffect::None,
     }
 }
@@ -3275,6 +3399,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::TcpSpeed => "tcp_speed",
         T::TcpOffset => "tcp_offset",
         T::TcpTransform => "tcp_transform",
+        T::CommandCompletion => "command_completion",
         T::ToolStatus => "tool_status",
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",

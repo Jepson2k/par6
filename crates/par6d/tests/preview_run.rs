@@ -381,8 +381,11 @@ fn the_simulated_run_lands_where_the_plan_says_and_shows_the_tracking_error() {
         worst > 1e-5,
         "q and q_commanded are the same column: the plant is not being simulated"
     );
+    // TOPPRA, the startup profile, runs the joints at their acceleration
+    // limit with no jerk limit, which the plant follows a little less
+    // closely than a jerk-limited profile.
     assert!(
-        worst < 0.05,
+        worst < 0.06,
         "the arm is not following its commands: worst tracking error {worst} rad"
     );
 }
@@ -523,7 +526,11 @@ fn physics_replays_io_writes_and_runs_on_after_a_stop() {
     let mut target = park_deg();
     target[0] += 5.0;
     let commands = [
-        Command::WriteIo(WriteIo { port: 0, value: 1 }),
+        Command::WriteIo(WriteIo {
+            key: 0,
+            port: 0,
+            value: 1,
+        }),
         move_j_cmd(target, 9960, 0.2),
         Command::Stop(Stop { clear_queue: true }),
         move_j_cmd(park_deg(), 9961, 0.2),

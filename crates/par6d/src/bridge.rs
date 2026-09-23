@@ -1029,6 +1029,10 @@ struct ActiveStream {
     /// The tick `still` last counted, so housekeeping running faster than
     /// the RT publishes cannot count one frame eight times.
     still_tick: u64,
+    /// The RT tick a cartesian stream's limiter was last stepped up to,
+    /// so a pass steps it once per tick the RT has taken — not once per
+    /// sleep, which straddles two ticks or none as the scheduler pleases.
+    stepped_tick: u64,
     /// The stream's `(speed, accel)` fractions, carried so housekeeping's
     /// keep-alive refeeds the setpoint the client asked for rather than
     /// silently restoring full-speed limits between datagrams.
@@ -1316,6 +1320,10 @@ pub(crate) struct SharedState {
     flashing: Option<FlashingRequest>,
     /// Resolved FLASHING outcome, waiting to be collected by the server.
     flashing_outcome: Option<Result<(), WireError>>,
+    /// Resolved backend-swap outcome (`simulator` / `connect_hardware`),
+    /// waiting to be collected by the server: the install runs on the RT
+    /// thread, and the reply waits for it.
+    bus_outcome: Option<Result<(), WireError>>,
 }
 
 /// The bridge's kinematics kit (feature `ffi`): its own model instance,
@@ -1338,11 +1346,18 @@ pub(crate) struct RtBridge {
     flush: FlushMarker,
     bundle: Arc<ConfigBundle>,
     sim: bool,
+    /// The CAN interface hardware runs on: the configured one until a
+    /// `connect_hardware` names another, which `simulator(false)` then
+    /// returns to.
+    hardware_interface: String,
     /// The scene a simulator swap boots on.
     scene: Scene,
     /// Where the running simulator takes world layers from; `None` on
     /// hardware.
     sim_world: Option<WorldMailbox>,
+    /// The accepted world, installation then program layer: what the
+    /// simulator is given, and given again when a swap boots a new one.
+    world_layers: [Vec<par6_proto::Shape>; 2],
     cart: CartStream,
 }
 
@@ -1359,6 +1374,7 @@ impl RtBridge {
         sim_world: Option<WorldMailbox>,
         cart: CartStream,
     ) -> Self {
+        let hardware_interface = bundle.robot.bus.interface.clone();
         Self {
             link,
             stream_input,
@@ -1366,8 +1382,10 @@ impl RtBridge {
             flush,
             bundle,
             sim,
+            hardware_interface,
             scene,
             sim_world,
+            world_layers: [Vec::new(), Vec::new()],
             cart,
         }
     }
@@ -1488,6 +1506,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     // JOG runs on the RT jog engine, not the streaming
                     // executor; its accel rides `RtCommand::Jog`. Kept
                     // here so a change of accel alone still resends.
@@ -1631,6 +1650,7 @@ impl RtCommands for RtBridge {
                         parked: false,
                         still: 0,
                         still_tick: 0,
+                        stepped_tick: 0,
                         scale,
                     });
                     // Reported, not swallowed. A command the server
@@ -1668,6 +1688,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     scale,
                 });
             }
@@ -1739,6 +1760,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     scale: (speed, accel),
                 });
             }
@@ -1802,6 +1824,7 @@ impl RtCommands for RtBridge {
                         parked: false,
                         still: 0,
                         still_tick: 0,
+                        stepped_tick: 0,
                         ..
                     }) => state.commanded(),
                     _ => self.cart.snapshots.latest().q,
@@ -1896,6 +1919,7 @@ impl RtCommands for RtBridge {
                     parked: false,
                     still: 0,
                     still_tick: 0,
+                    stepped_tick: 0,
                     cart: Some(state),
                     servo: None,
                     // A cartesian jog is integrated into joint targets and
@@ -2168,17 +2192,26 @@ impl RtCommands for RtBridge {
 
     fn set_simulator(&mut self, on: bool) -> Result<(), WireError> {
         if on == self.sim {
+            // Nothing to install; the server's waiter is answered at once.
+            self.shared.lock().unwrap().bus_outcome = Some(Ok(()));
             return Ok(());
         }
         if on {
             self.swap_to_sim()
         } else {
-            self.swap_to_hardware(&self.bundle.robot.bus.interface.clone())
+            let interface = self.hardware_interface.clone();
+            self.swap_to_hardware(&interface)
         }
     }
 
     fn connect_hardware(&mut self, port: &str) -> Result<(), WireError> {
-        self.swap_to_hardware(port)
+        self.swap_to_hardware(port)?;
+        port.clone_into(&mut self.hardware_interface);
+        Ok(())
+    }
+
+    fn take_bus_outcome(&mut self) -> Option<Result<(), WireError>> {
+        self.shared.lock().unwrap().bus_outcome.take()
     }
 
     fn reset_state(&mut self) {
@@ -2197,7 +2230,21 @@ impl RtCommands for RtBridge {
         layer: ShapeLayer,
         shapes: &[par6_proto::Shape],
     ) -> Result<(), WireError> {
-        self.cart.gate.lock().unwrap().set_layer(layer, shapes)
+        self.cart.gate.lock().unwrap().set_layer(layer, shapes)?;
+        // The world the gate keeps the arm out of is the world the
+        // simulator rests things on: a physics box a program declares
+        // has to be there for the jaws to close on, on the live sim as
+        // in a preview run. Hardware needs no copy — the real world
+        // provides the contact.
+        let (index, posted) = match layer {
+            ShapeLayer::Installation => (0, par6_proto::Layer::Installation),
+            ShapeLayer::Program => (1, par6_proto::Layer::Program),
+        };
+        self.world_layers[index] = shapes.to_vec();
+        if let Some(world) = &self.sim_world {
+            world.post(posted, shapes.to_vec());
+        }
+        Ok(())
     }
 
     fn collision(&mut self) -> Option<CollisionState> {
@@ -2227,23 +2274,39 @@ impl RtBridge {
     /// LOOKING at the arm, not a way to park it.
     fn swap_to_sim(&mut self) -> Result<(), WireError> {
         let sim = SimBus::new(self.scene.clone());
-        self.sim_world = Some(sim.mailbox());
+        let world = sim.mailbox();
+        // A fresh simulator knows nothing of the world the last one was
+        // given; the accepted layers are posted again before it boots.
+        world.post(
+            par6_proto::Layer::Installation,
+            self.world_layers[0].clone(),
+        );
+        world.post(par6_proto::Layer::Program, self.world_layers[1].clone());
+        self.sim_world = Some(world);
         let bundle = self.bundle.clone();
         self.sim = true;
+        let shared = self.shared.clone();
+        shared.lock().unwrap().bus_outcome = None;
         self.link.op(Box::new(move |core| {
             let q = core.measured_q();
             if let Err(e) = core.replace_bus(RuntimeBus::from(sim)) {
-                log::error!("simulator swap refused: {e}");
+                swap_failed(&shared, format!("simulator swap refused: {e}"));
                 return;
             }
             let robot = &bundle.robot;
             let n = robot.joints.len();
             let Some(bus) = core.bus_mut().sim_mut() else {
-                log::error!("the simulator swap did not install a simulator");
+                swap_failed(
+                    &shared,
+                    "the simulator swap did not install a simulator".to_owned(),
+                );
                 return;
             };
             if let Err(e) = bus.teleport_joint_rad(&q[..n]) {
-                log::error!("simulator swap: plant re-seed failed: {e}");
+                swap_failed(
+                    &shared,
+                    format!("simulator swap: plant re-seed failed: {e}"),
+                );
                 return;
             }
             for (i, joint) in robot.joints.iter().enumerate() {
@@ -2259,6 +2322,7 @@ impl RtBridge {
             core.reseed_motion_targets();
             core.set_homed(true);
             log::info!("bus backend: simulator, seeded at {q:?} rad");
+            shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
         Ok(())
     }
@@ -2295,15 +2359,29 @@ impl RtBridge {
         })?;
         self.sim = false;
         let name = cfg.interface.clone();
+        let shared = self.shared.clone();
+        shared.lock().unwrap().bus_outcome = None;
         self.link.op(Box::new(move |core| {
             if let Err(e) = core.replace_bus(RuntimeBus::from(hw)) {
-                log::error!("hardware swap refused: {e}");
+                swap_failed(&shared, format!("hardware swap refused: {e}"));
                 return;
             }
             log::info!("bus backend: SocketCAN on '{name}' (un-homed)");
+            shared.lock().unwrap().bus_outcome = Some(Ok(()));
         }));
         Ok(())
     }
+}
+
+/// A backend swap the RT could not complete: logged where it happened,
+/// and left for the server to answer the client with.
+fn swap_failed(shared: &Arc<Mutex<SharedState>>, detail: String) {
+    log::error!("{detail}");
+    shared.lock().unwrap().bus_outcome = Some(Err(make_error(
+        ErrorCode::MotnSetupFailed,
+        UNATTRIBUTED,
+        &[("detail", &detail)],
+    )));
 }
 
 /// Timed follow-throughs that the datagram-driven bridge cannot run
@@ -2821,12 +2899,17 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartJog => {
+                        let owed = steps_owed(a, snap.tick);
+                        if owed == 0 {
+                            continue 'housekeeping;
+                        }
                         if let Some(st) = &mut a.cart {
                             let before = st.commanded();
-                            match step_cart_jog(&mut kin, st, &stream_limits, dt, &snap.q) {
+                            match step_cart_jog_n(&mut kin, st, &stream_limits, dt, &snap.q, owed) {
                                 Ok((target, at_rest)) => {
+                                    let span = dt * owed as f64;
                                     let qd: [f64; NQ] =
-                                        std::array::from_fn(|j| (target[j] - before[j]) / dt);
+                                        std::array::from_fn(|j| (target[j] - before[j]) / span);
                                     // Where the arm comes to rest if this
                                     // step turns out to be the last one
                                     // admitted.
@@ -2899,12 +2982,18 @@ pub(crate) fn housekeeping_loop(
                         }
                     }
                     Some(a) if a.kind == StreamKind::CartServo => {
+                        let owed = steps_owed(a, snap.tick);
+                        if owed == 0 {
+                            continue 'housekeeping;
+                        }
                         if let Some(st) = &mut a.servo {
                             let before = st.commanded();
-                            match step_cart_servo(&mut kin, st, &stream_limits, dt, &snap.q) {
+                            match step_cart_servo_n(&mut kin, st, &stream_limits, dt, &snap.q, owed)
+                            {
                                 Ok((target, finished)) => {
+                                    let span = dt * owed as f64;
                                     let qd: [f64; NQ] =
-                                        std::array::from_fn(|j| (target[j] - before[j]) / dt);
+                                        std::array::from_fn(|j| (target[j] - before[j]) / span);
                                     let mut la = target;
                                     let verdict = {
                                         let mut g = gate.lock().unwrap();
@@ -3168,6 +3257,62 @@ pub(crate) fn step_cart_jog(
             Ok((st.q_commanded, step.finished))
         }
     }
+}
+
+/// A stalled RT (a bus swap, a blocked core) must not turn into a lurch
+/// when it resumes: more ticks than this are stepped as this many.
+const MAX_CATCHUP_STEPS: u64 = 4;
+
+/// How many limiter steps a cartesian stream is owed this pass: one per
+/// RT tick since the last pass, the first pass one.
+fn steps_owed(a: &mut ActiveStream, tick: u64) -> usize {
+    let owed = if a.stepped_tick == 0 {
+        1
+    } else {
+        tick.saturating_sub(a.stepped_tick).min(MAX_CATCHUP_STEPS)
+    };
+    a.stepped_tick = tick;
+    owed as usize
+}
+
+/// [`step_cart_servo`] `n` times over one measured pose, stopping early
+/// on landing; the last step's result.
+pub(crate) fn step_cart_servo_n(
+    kin: &mut crate::kin::CartKin,
+    st: &mut CartServoState,
+    limits: &MotionLimits,
+    dt: f64,
+    q_meas: &[f64; NQ],
+    n: usize,
+) -> Result<([f64; NQ], bool), String> {
+    let mut out = (st.commanded(), false);
+    for _ in 0..n.max(1) {
+        out = step_cart_servo(kin, st, limits, dt, q_meas)?;
+        if out.1 {
+            break;
+        }
+    }
+    Ok(out)
+}
+
+/// [`step_cart_jog`] `n` times over one measured pose, stopping early at
+/// rest; the last step's result.
+pub(crate) fn step_cart_jog_n(
+    kin: &mut crate::kin::CartKin,
+    st: &mut CartJogState,
+    limits: &MotionLimits,
+    dt: f64,
+    q_meas: &[f64; NQ],
+    n: usize,
+) -> Result<([f64; NQ], bool), String> {
+    let mut out = (st.commanded(), false);
+    for _ in 0..n.max(1) {
+        out = step_cart_jog(kin, st, limits, dt, q_meas)?;
+        if out.1 {
+            break;
+        }
+    }
+    Ok(out)
 }
 
 /// One cartesian-servo step: advance the cartesian limiter along the

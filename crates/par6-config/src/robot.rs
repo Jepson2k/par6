@@ -560,6 +560,12 @@ pub struct MotionConfig {
     /// Full-scale `jog_l` linear TCP speed \[m/s\] (a `velocities`
     /// fraction of ±1 maps to this).
     pub jog_l_linear_max_m_s: f64,
+    /// TCP linear speed ceiling of a planned cartesian move (`move_l`,
+    /// `move_c`, `move_s`, `move_p`) \[m/s\]: a move's `speed` fraction
+    /// scales this as well as the joint limits, so a full-speed `move_l`
+    /// never sweeps the tool faster than this however much room the
+    /// joints have (parol6's `CARTESIAN_LINEAR_VELOCITY_MAX`).
+    pub planned_linear_max_m_s: f64,
     /// Full-scale `jog_l` angular TCP speed \[rad/s\].
     pub jog_l_angular_max_rad_s: f64,
     /// Linear TCP acceleration ceiling for the cartesian streaming
@@ -617,8 +623,9 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 18] = [
+    pub const KEYS: [&'static str; 19] = [
         "jog_l_linear_max_m_s",
+        "planned_linear_max_m_s",
         "jog_l_angular_max_rad_s",
         "cart_linear_accel_max_m_s2",
         "cart_angular_accel_max_rad_s2",
@@ -640,9 +647,10 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 18] {
+    pub fn as_array(&self) -> [f64; 19] {
         [
             self.jog_l_linear_max_m_s,
+            self.planned_linear_max_m_s,
             self.jog_l_angular_max_rad_s,
             self.cart_linear_accel_max_m_s2,
             self.cart_angular_accel_max_rad_s2,
@@ -668,6 +676,7 @@ impl Default for MotionConfig {
     fn default() -> Self {
         Self {
             jog_l_linear_max_m_s: 0.08,
+            planned_linear_max_m_s: 0.2,
             jog_l_angular_max_rad_s: 0.6,
             cart_linear_accel_max_m_s2: 0.22,
             cart_angular_accel_max_rad_s2: 1.65,
@@ -1365,6 +1374,7 @@ impl RobotConfig {
         let m = &self.motion;
         for (v, name) in [
             (m.jog_l_linear_max_m_s, "motion.jog_l_linear_max_m_s"),
+            (m.planned_linear_max_m_s, "motion.planned_linear_max_m_s"),
             (m.jog_l_angular_max_rad_s, "motion.jog_l_angular_max_rad_s"),
             (
                 m.cart_linear_accel_max_m_s2,

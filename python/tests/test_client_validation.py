@@ -66,3 +66,28 @@ def test_a_passive_tools_status_on_the_sync_facade_is_a_query_not_a_recursion():
         assert tool.status() is None
     finally:
         client.close()
+
+
+def test_an_execution_state_request_the_runtime_stops_answering_is_a_zero():
+    """``set_execution_speed`` and ``pause`` answer 0 when no confirmation
+    arrives — a runtime that goes away between the request and its
+    readback answers the same 0 a timeout does, never an exception."""
+
+    async def run():
+        client = _dead_client()
+        try:
+
+            async def accepted(_request):
+                return True
+
+            async def gone(**_kwargs):
+                raise ConnectionError("Controller execution speed is unavailable")
+
+            client._call = accepted  # type: ignore[method-assign]
+            client.execution_speed = gone  # type: ignore[method-assign]
+            assert await client.set_execution_speed(0.5) == 0
+            assert await client.pause() == 0
+        finally:
+            await client.close()
+
+    asyncio.run(run())

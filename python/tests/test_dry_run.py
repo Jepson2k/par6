@@ -306,7 +306,9 @@ class TestCartesianMotion:
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
-    @pytest.mark.parametrize("profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA"])
+    @pytest.mark.parametrize(
+        "profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA", "LINEAR"]
+    )
     def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
         """The profile decides how a linear move is timed, not where it goes:
         every profile must keep the TCP on the start->end line. A profile
@@ -518,13 +520,6 @@ class TestCartesianMotion:
         """Parameters and commands ``par6d`` rejects must be rejected here with
         the same code, so a preview never promises motion the arm will refuse."""
         dry_run.teleport(park_deg())
-        # An arc ends where its end pose is: par6d rounds corners between
-        # straight moves and between joint moves, but has no arc-to-successor
-        # blend, so a radius on move_c is refused rather than ignored.
-        with pytest.raises(RobotError) as arc_blend:
-            dry_run.move_c(dry_run.pose(), dry_run.pose(), r=5.0)
-        assert arc_blend.value.code == ErrorCode.COMM_VALIDATION_ERROR
-
         # Geometry the runtime cannot turn into a path is a validation error,
         # never silently straightened into a line.
         base = np.asarray(dry_run.pose())
@@ -532,10 +527,11 @@ class TestCartesianMotion:
             dry_run.move_c(
                 _offset(base, (20.0, 0.0, 0.0)).tolist(),
                 _offset(base, (40.0, 0.0, 0.0)).tolist(),
+                speed=1.0,
             )
         assert collinear.value.code == ErrorCode.COMM_VALIDATION_ERROR
         with pytest.raises(RobotError) as empty:
-            dry_run.move_s([])
+            dry_run.move_s([], speed=1.0)
         assert empty.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as tool:
@@ -551,12 +547,12 @@ class TestCartesianMotion:
         # planned the absolute move would validate a program the arm
         # then refuses with this very ValueError.
         with pytest.raises(ValueError, match="rel=True"):
-            dry_run.move_j(pose=dry_run.pose(), rel=True)
+            dry_run.move_j(pose=dry_run.pose(), rel=True, speed=1.0)
 
         far = list(dry_run.angles())
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
         with pytest.raises(RobotError) as outside:
-            dry_run.move_j(far)
+            dry_run.move_j(far, speed=1.0)
         # A target outside the soft window is invalid input to the planner
         # (``planning_error``), the same class the runtime answers with.
         assert outside.value.code == ErrorCode.COMM_VALIDATION_ERROR
@@ -565,7 +561,7 @@ class TestCartesianMotion:
             initial_joints_deg=park_deg(), initial_homed=False
         )
         with pytest.raises(RobotError) as gate:
-            unhomed.move_j(park_deg())
+            unhomed.move_j(park_deg(), speed=1.0)
         assert gate.value.code == ErrorCode.MOTN_NOT_HOMED
         # Jogging stays available while un-homed, as it does on the runtime.
         unhomed.jog_j(0, 0.2, 0.2)
@@ -611,7 +607,13 @@ class TestCartesianMotion:
         # A wrong-length list is refused by the live client itself, before
         # any datagram, with ValueError — the preview raises the same.
         with pytest.raises(ValueError, match="requires"):
-            dry_run.move_j([0.0, 0.0, 0.0])
+            dry_run.move_j([0.0, 0.0, 0.0], speed=1.0)
+        # A planned move names its timing: neither speed nor duration is
+        # not a request for full speed, and nothing is submitted.
+        submitted = dry_run.program_length
+        with pytest.raises(ValueError, match="duration or speed"):
+            dry_run.move_j(dry_run.angles())
+        assert dry_run.program_length == submitted
         with pytest.raises(ValueError, match="requires"):
             dry_run.teleport([0.0, 0.0, 0.0])
 
@@ -646,22 +648,23 @@ class TestCartesianMotion:
         """HOME is two commands wearing one name, and the preview has to know
         which one it is drawing.
 
-        Un-referenced it is the seek, which ends wherever the configured
-        sequence's ``move_to`` steps leave the arm and reports no duration.
-        Referenced it is an ordinary planned move to the park pose — which is
-        what makes a Home button cost seconds rather than a full seek.
+        Un-referenced it is the seek, whose own time is the arm's: the
+        record shows it landing wherever the configured sequence's
+        ``move_to`` steps leave the arm, then the planned return to the park
+        pose the runtime runs once the references are established.
+        Referenced it is only that return — which is what makes a Home
+        button cost seconds rather than a full seek.
         """
         robot = Robot()
         cold = robot.create_dry_run_client(
             initial_joints_deg=park_deg(), initial_homed=False
         )
         seek = _planned(cold, cold.home())
-        assert seek.rows == 1, (
-            "a seek's time is the arm's; the record shows the landing"
+        assert seek.rows > 1, "the seek's landing, then the return to park"
+        np.testing.assert_allclose(
+            seek.joint_trajectory_rad[0], _cfg.homing_ready_pose_rad(), atol=1e-6
         )
-        assert seek.end_joints_rad == pytest.approx(
-            _cfg.homing_ready_pose_rad(), abs=1e-6
-        )
+        assert seek.end_joints_rad == pytest.approx(robot.joints.home.rad, abs=1e-3)
 
         warm = robot.create_dry_run_client(
             initial_joints_deg=np.degrees(_cfg.homing_ready_pose_rad()).tolist()
@@ -680,10 +683,9 @@ class TestCartesianMotion:
         assert client.queue() == []
         # The mirror must report what the ENGINE plans with from the
         # first preview: the runtime's own startup profile
-        # (par6d::planner::DEFAULT_PROFILE). A mirror that said TOPPRA
-        # while the engine ran RUCKIG timed every pre-sync preview with
-        # the wrong profile.
-        assert client.profile() == "RUCKIG"
+        # (par6d::planner::DEFAULT_PROFILE). A mirror that disagreed with
+        # the engine timed every pre-sync preview with the wrong profile.
+        assert client.profile() == "TOPPRA"
 
         # STATUS builds its pose from the 4x4 the engine returns; pose()
         # reads the engine's own xyzrpy. The two must describe one arm.
@@ -797,10 +799,19 @@ class TestLiveParity:
         assert client.tool.is_open(), "a refused move leaves the jaws where they were"
 
         assert _planned(client, client.tool.calibrate()).duration >= 2.0
-        assert _planned(client, client.tool.close()).duration > 0.0, (
+        close = client.tool.close()
+        assert _planned(client, close).duration > 0.0, (
             "a jaw move holds the arm for the jaws' travel"
         )
         assert not client.tool.is_open()
+        # A move that names no current grips with the tool's configured
+        # default, which is what the runtime's wire sees.
+        assert client._program[close]["params"] == [
+            1.0,
+            0.5,
+            client.tool.default_current,
+        ]
+        assert 0 < client.tool.default_current <= client.tool.current_range[1]
         assert _planned(client, client.tool.stop()).duration == 0.0
         assert _planned(client, client.tool.release()).duration == 0.0
         with pytest.raises(RobotError) as past_stroke:
@@ -908,7 +919,7 @@ class TestProgramWorkflow:
     def test_a_program_previews_as_one_continuous_timeline(self) -> None:
         """Drive a whole program the way the editor does and check the results
         chain: every segment starts where the previous one ended, the tool
-        action holds position, and home lands on the configured ready pose.
+        action holds position, and home ends at the park pose.
 
         Un-referenced to start with, because that is the state an editor
         opens on and it is why a program's first line is ``home()``. Seeding
@@ -921,8 +932,8 @@ class TestProgramWorkflow:
         program = [client.home()]
         np.testing.assert_allclose(
             _planned(client, program[-1]).end_joints_rad,
-            _cfg.homing_ready_pose_rad(),
-            atol=1e-9,
+            _cfg.config().park_pose_rad(),
+            atol=1e-4,
         )
 
         above = np.asarray(client.pose())
@@ -948,7 +959,12 @@ class TestProgramWorkflow:
             np.testing.assert_allclose(
                 held.end_joints_rad, results[1].end_joints_rad, atol=1e-3
             )
-        assert client.angles() == pytest.approx(np.degrees(results[-1].end_joints_rad))
+        # The record keeps every stride-th sample, so its last row is up to
+        # one row short of the landing the virtual arm is placed on — a
+        # profile's last stride, at rest by then.
+        assert client.angles() == pytest.approx(
+            np.degrees(results[-1].end_joints_rad), abs=0.05
+        )
         assert sum(r.duration for r in results) > 0.0
 
 
@@ -1385,7 +1401,7 @@ def test_plan_and_simulate_describe_the_same_program() -> None:
     far = park_deg()
     far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
     with pytest.raises(RobotError):
-        client.move_j(far)
+        client.move_j(far, speed=1.0)
     assert client.wait_command(5) is False
     failed = client.plan()
     assert failed.stop == "failed" and failed.blocks[5].error is not None
@@ -1426,7 +1442,7 @@ _TABLE_ARGS: dict[str, tuple] = {
     "set_execution_speed": (0.5,),
 }
 _TABLE_KWARGS: dict[str, dict] = {
-    n: {"speed": 0.3} for n in ("move_l", "move_c", "move_s", "move_p")
+    n: {"speed": 0.3} for n in ("move_j", "move_l", "move_c", "move_s", "move_p")
 }
 
 
@@ -1505,3 +1521,20 @@ def test_every_table_command_answers_with_the_kind_it_declares() -> None:
                 )
     assert not problems, "\n".join(problems)
     assert exercised >= 20
+
+
+def test_reset_state_keeps_a_latched_estop_and_reset_clears_it() -> None:
+    """``reset_state`` resets the program, not the controller: a latched
+    e-stop still refuses motion after it, and only ``reset`` re-enables."""
+    client = Robot().create_dry_run_client(initial_joints_deg=park_deg())
+    target = park_deg()
+    target[0] += 10.0
+    assert client.estop() == 1
+    assert client.reset_state() == 1
+    with pytest.raises(RobotError) as refused:
+        client.move_j(target, speed=0.5)
+    assert refused.value.code == ErrorCode.SYS_ESTOP_ACTIVE
+    assert client.angles() == pytest.approx(park_deg())
+    assert client.reset() == 1
+    assert client.move_j(target, speed=0.5) >= 0
+    assert client.angles() == pytest.approx(target, abs=1e-6)

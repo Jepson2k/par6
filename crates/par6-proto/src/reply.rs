@@ -282,6 +282,22 @@ pub enum QueryResult {
         /// Translation followed by orientation.
         values: [f64; 6],
     },
+    /// COMMAND_COMPLETION result: the COMPLETE push's content for one
+    /// queue index, or `finished == false` when the runtime has no record
+    /// of it finishing (still running, never accepted, or older than the
+    /// 1024 completions it keeps).
+    CommandCompletion {
+        /// The queue index asked about.
+        index: u64,
+        /// Whether the runtime has this command finishing.
+        finished: bool,
+        /// Whether it finished successfully (meaningful when `finished`).
+        ok: bool,
+        /// Failure detail when it finished in error.
+        detail: Option<WireError>,
+        /// Settle verdict on a successful tool move, as on COMPLETE.
+        verdict: Option<u8>,
+    },
     /// Fresh queued-execution timing from the real-time loop.
     ExecutionSpeed {
         /// Zero when pause is requested; otherwise the selected speed.
@@ -313,9 +329,9 @@ pub enum QueryResult {
         /// RT tick period \[s\].
         tick_dt_s: f64,
         /// Every `[motion]` key in declaration order; the labels are
-        /// `MotionConfig::KEYS` in par6-config (18 entries), and an
+        /// `MotionConfig::KEYS` in par6-config (19 entries), and an
         /// omitted optional key (`joint_step_rad`) rides as NaN.
-        motion: [f64; 18],
+        motion: [f64; 19],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
@@ -397,6 +413,7 @@ impl QueryResult {
             Q::TcpSpeed { .. } => QueryType::TcpSpeed,
             Q::TcpOffset { .. } => QueryType::TcpOffset,
             Q::TcpTransform { .. } => QueryType::TcpTransform,
+            Q::CommandCompletion { .. } => QueryType::CommandCompletion,
             Q::ExecutionSpeed { .. } => QueryType::ExecutionSpeed,
             Q::ToolStatus { .. } => QueryType::ToolStatus,
             Q::IsSimulator { .. } => QueryType::IsSimulator,
@@ -632,6 +649,26 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, u64::from(tag));
             for v in values {
                 w_f64(buf, *v);
+            }
+        }
+        Q::CommandCompletion {
+            index,
+            finished,
+            ok,
+            detail,
+            verdict,
+        } => {
+            // The fifth element is keyed on `ok`, as COMPLETE's is: the
+            // failure detail when false, the settle verdict when true.
+            w_array(buf, 6);
+            w_uint(buf, u64::from(tag));
+            w_uint(buf, *index);
+            w_bool(buf, *finished);
+            w_bool(buf, *ok);
+            match (ok, detail, verdict) {
+                (false, Some(e), _) => e.encode(buf),
+                (true, _, Some(v)) => w_uint(buf, u64::from(*v)),
+                _ => w_nil(buf),
             }
         }
         Q::TcpOffset { x, y, z } => {
@@ -1120,6 +1157,34 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
                 }
             }
             QueryResult::TcpTransform { values }
+        }
+        T::CommandCompletion => {
+            expect_arity("command_completion result", n, 6)?;
+            let index = r.uint()?;
+            let finished = r.bool()?;
+            let ok = r.bool()?;
+            let (mut detail, mut verdict) = (None, None);
+            if r.peek_nil() {
+                r.nil()?;
+            } else if ok {
+                let v = r.uint()?;
+                if !(1..=3).contains(&v) {
+                    return Err(DecodeError::Validation {
+                        what: "command_completion verdict",
+                        why: format!("settle verdict must be 1..=3, got {v}"),
+                    });
+                }
+                verdict = Some(v as u8);
+            } else {
+                detail = Some(WireError::decode(r)?);
+            }
+            QueryResult::CommandCompletion {
+                index,
+                finished,
+                ok,
+                detail,
+                verdict,
+            }
         }
         T::TcpOffset => {
             expect_arity("tcp_offset result", n, 4)?;

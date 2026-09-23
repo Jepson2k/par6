@@ -607,7 +607,9 @@ class RobotClient:
         return _run(self._inner.set_completion_policy(policy))
 
     def write_io(self, index: int, value: int) -> int:
-        """Set digital output by logical index (0 = first output pin)."""
+        """Queue a digital output level by logical index (0 = first output
+        pin); it lands at its turn between the commands around it, and
+        the returned index completes when it does."""
         return _run(self._inner.write_io(index, value))
 
     def tool_action(
