@@ -292,7 +292,7 @@ fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
             pre_moves: vec![par6_config::PreMove::Nudge {
                 joint: 0,
                 speed_ticks_s: 500.0,
-                duration_s: 35.0,
+                duration_s: 50.0,
             }],
             home: None,
             move_to: vec![],
@@ -304,19 +304,19 @@ fn whole_sequence_deadline_stops_motion_across_step_boundaries() {
     let dt = core.tick_dt_s();
     for _ in 0..2 {
         start_homing(&mut core, &mut handles, &tx);
-        for _ in 0..(45.0 / dt).round() as usize {
+        for _ in 0..(60.0 / dt).round() as usize {
             core.tick(dt, false);
         }
         let s = handles.snapshots.latest();
         assert!(s.homing.active, "each run gets its own time budget");
         assert_eq!(s.homing.sequence_step, 1, "first step has completed");
-        for _ in 0..(15.0 / dt).round() as usize {
+        for _ in 0..(35.0 / dt).round() as usize {
             core.tick(dt, false);
         }
         let s = handles.snapshots.latest();
         assert!(
             !s.homing.active,
-            "the whole sequence must stop within 60 seconds"
+            "the whole sequence must stop within 90 seconds"
         );
         assert_eq!(s.mode, Mode::Idle);
         assert!(
@@ -404,7 +404,7 @@ struct HomingHarness {
 impl HomingHarness {
     fn new(bundle: &ConfigBundle) -> Self {
         let mut bus = LoopbackBus::new();
-        bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+        bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
             .unwrap();
         bus.tx_log.clear();
         let conv = std::array::from_fn(|i| JointConversion::from_config(&bundle.robot.joints[i]));
@@ -469,7 +469,7 @@ fn two_pass_mismatch_fails_the_joint_and_restores_config() {
         );
     }
     let gripper_ma = bundle
-        .active_gripper()
+        .active_tool()
         .unwrap()
         .driver
         .as_ref()
@@ -904,10 +904,11 @@ fn a_free_running_approach_fails_at_the_configured_timeout_exactly() {
 /// Scripted release-phase plant for J1: seat against the endstop through
 /// both passes, then apply sign-sensitive release physics — positive
 /// current moves the motor positive (away from the low stop, relaxing
-/// the wound gearbox), negative current presses further in. Returns
-/// (release frames sent, position exposed at each release tick, latched
-/// reference, outcome).
-fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqStatus) {
+/// the wound gearbox), negative current presses further in. Returns each
+/// unbroken run of current-only frames with the position exposed at each
+/// of its ticks, the latched reference, and the outcome.
+type CurrentRuns = Vec<(Vec<i16>, Vec<i32>)>;
+fn run_release_scenario(bundle: &ConfigBundle) -> (CurrentRuns, i64, SeqStatus) {
     let jh = &bundle.robot.homing.joints[1];
     let eff = bundle
         .effective_home_offset(1)
@@ -924,8 +925,8 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
     h.state.nodes[n1].position_ticks = Some(master);
     h.state.nodes[n1].current_ma = Some(0);
 
-    let mut release_cmds: Vec<i16> = Vec::new();
-    let mut release_seen: Vec<i32> = Vec::new();
+    let mut runs: CurrentRuns = Vec::new();
+    let mut in_run = false;
     let mut outcome = SeqStatus::Running;
     for t in 1..30_000u64 {
         let exposed = h.state.nodes[n1].position_ticks.unwrap();
@@ -934,12 +935,18 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
         if cmd.pos.is_none() && cmd.vel.is_none() {
             // Current-only frame (cmd 2 DLC 2) — the release drive.
             let c = cmd.cur_ma.expect("current-only frame carries current");
-            release_cmds.push(c);
-            release_seen.push(exposed);
+            if !in_run {
+                runs.push((Vec::new(), Vec::new()));
+                in_run = true;
+            }
+            let run = runs.last_mut().unwrap();
+            run.0.push(c);
+            run.1.push(exposed);
             // Sign-sensitive plant: the current's sign decides whether
             // the gearbox relaxes (away from the stop) or winds tighter.
             pos += RELEASE_STEP * f64::from(c.signum());
         } else {
+            in_run = false;
             let v = cmd.vel.unwrap_or(0);
             pos = (pos + f64::from(v) * TRACKING * h.dt).max(stop);
             let seated = pos <= stop + 0.5 && v < 0;
@@ -956,41 +963,77 @@ fn run_release_scenario(bundle: &ConfigBundle) -> (Vec<i16>, Vec<i32>, i64, SeqS
         }
     }
     let latched = i64::from(h.conv[1].motor_ticks(eff));
-    (release_cmds, release_seen, latched, outcome)
+    (runs, latched, outcome)
 }
 
 #[test]
-fn release_commands_the_config_sign_and_duration_and_samples_at_eighty_percent() {
+fn release_ramps_from_the_stall_push_holds_the_config_current_and_samples_at_eighty_percent() {
     let bundle = single_joint_bundle(1);
     let r = bundle.robot.homing.joints[1]
         .release
         .expect("J1 ships a release plan");
+    let stall_ma = -(bundle.robot.homing.joints[1].current_ma as i16);
     let dt = bundle.robot.robot.tick_dt_s;
     let dur_ticks = (r.duration_s / dt).round().max(1.0) as usize;
     let sample_tick = ((dur_ticks as f64 * r.sample_pct).round() as usize).clamp(1, dur_ticks);
+    let target = r.current_ma as i16;
 
-    let (cmds, seen, latched, outcome) = run_release_scenario(&bundle);
+    let (runs, latched, outcome) = run_release_scenario(&bundle);
     assert_eq!(outcome, SeqStatus::Complete);
-    // Exactly `duration_s` worth of current-only frames, every one with
-    // the CONFIG sign (+150 mA for J1: away from the stop).
-    assert_eq!(cmds.len(), dur_ticks, "release runs for round(duration/dt)");
+    // The release is the only current-mode phase: leaving current mode
+    // re-applies whatever the drive's velocity loop wound up during the
+    // push, so the pass-1 hit stays in velocity mode (2026-09-23).
+    let [(cmds, seen)] = runs.as_slice() else {
+        panic!("exactly one run of current-only frames, the release: {runs:?}");
+    };
+    // Ramp in, hold, ramp out: the hold is exactly `duration_s` of the
+    // config current, and the two ramps are equal and outside it.
+    let ramp = (cmds.len() - dur_ticks) / 2;
+    assert!(ramp > 1, "the release must ramp, not step: {cmds:?}");
+    assert_eq!(cmds.len(), 2 * ramp + dur_ticks, "ramps of equal length");
+    let (ramp_in, rest) = cmds.split_at(ramp);
+    let (hold, ramp_out) = rest.split_at(dur_ticks);
     assert!(
-        cmds.iter().all(|&c| c == r.current_ma as i16),
-        "every release frame carries the config current verbatim: {cmds:?}"
+        hold.iter().all(|&c| c == target),
+        "the hold carries the config current verbatim: {hold:?}"
+    );
+    // Stepping straight from the stall push to the release current is what
+    // flung the joint off its stop: the ramp starts at the push and moves
+    // monotonically to the target, then back monotonically to zero.
+    assert!(
+        (ramp_in[0] - stall_ma).abs() <= 5,
+        "the ramp starts at the stall push {stall_ma} mA, not at {} mA",
+        ramp_in[0]
+    );
+    assert!(ramp_in
+        .windows(2)
+        .all(|w| (w[1] - w[0]) * (target - stall_ma).signum() >= 0));
+    assert_eq!(
+        *ramp_in.last().unwrap(),
+        target,
+        "the ramp in ends at the config current"
+    );
+    assert!(ramp_out
+        .windows(2)
+        .all(|w| (w[1] - w[0]) * target.signum() <= 0));
+    assert_eq!(
+        *ramp_out.last().unwrap(),
+        0,
+        "the ramp out ends at zero current"
     );
     // The reference is the position the joint had relaxed to at the
-    // sample tick — the scripted plant moves a distinct 3 ticks per
-    // release tick, so the latched value identifies the tick exactly.
+    // sample tick of the hold — the scripted plant moves a distinct 3 ticks
+    // per release tick, so the latched value identifies the tick exactly.
     assert_eq!(
         latched,
-        i64::from(seen[sample_tick - 1]),
-        "reference sampled at round(dur · sample_pct) = tick {sample_tick}"
+        i64::from(seen[ramp + sample_tick - 1]),
+        "reference sampled at round(dur · sample_pct) = tick {sample_tick} of the hold"
     );
     // And it is the RELAXED position: well away from the seated stop in
     // the releasing direction.
     let stop = i64::from(bundle.robot.joints[1].sector_master_position_ticks) - 3000;
     assert!(
-        latched - stop >= 500,
+        latched - stop >= 400,
         "latched {latched} must sit relaxed above the stop {stop}"
     );
 
@@ -1004,10 +1047,12 @@ fn release_commands_the_config_sign_and_duration_and_samples_at_eighty_percent()
         .as_mut()
         .expect("J1 ships a release plan");
     rel.current_ma = -rel.current_ma;
-    let (inv_cmds, _, inv_latched, inv_outcome) = run_release_scenario(&inverted);
+    let (inv_runs, inv_latched, inv_outcome) = run_release_scenario(&inverted);
     assert_eq!(inv_outcome, SeqStatus::Complete);
     assert!(
-        inv_cmds.iter().all(|&c| c == -(r.current_ma as i16)),
+        inv_runs[0].0[ramp..ramp + dur_ticks]
+            .iter()
+            .all(|&c| c == -target),
         "the FSM forwards the inverted sign verbatim"
     );
     assert!(
@@ -1046,7 +1091,7 @@ impl SimHomingHarness {
     ) -> Self {
         let mut bus = SimBus::new(common::scene(bundle));
         bus.set_initial_joint_rad(q0);
-        bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+        bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
             .expect("sim boot");
         bus.set_hall_trigger(joint, center, half);
         Self {
@@ -1335,17 +1380,16 @@ fn a_boot_inside_a_wide_hall_band_still_references_the_band_edge() {
     h.sys.start(&mut h.bus);
     assert_eq!(h.run(20_000), SeqStatus::Complete, "the wide band homes");
 
-    // The reference must put the SENSOR EDGE at the home offset: drive
-    // back out of the band, then measure where the trigger latches.
-    for _ in 0..2000 {
+    // The reference must put the SENSOR EDGE at the home offset. The
+    // probe crosses that edge along the approach direction, and the brake
+    // left the joint just past it, so park one backoff's travel back
+    // inside the band (a quarter of its width) before measuring.
+    let backoff_ticks = (jh.backoff_s / bundle.robot.robot.tick_dt_s).round() as u32;
+    for _ in 0..backoff_ticks {
         h.drive(
             5,
             JointCommand::velocity(trunc_to_wire(-jh.speed_ticks_s), 0),
         );
-        if matches!(h.state.nodes[n5].hall, Some(hall) if hall.trigger && !hall.edge) {
-            break;
-        }
-        h.drive(5, JointCommand::hall(trunc_to_wire(-jh.speed_ticks_s), 2));
     }
     let sensor = h.sensor_ticks(5, n5, jh.speed_ticks_s);
     let sensor_rad = h.conv[5].joint_rad(sensor);

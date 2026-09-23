@@ -92,9 +92,9 @@ impl Config {
         self.bundle.robot.robot.park_pose_rad.clone()
     }
 
-    /// The fitted gripper's name as the robot TOML spells it.
-    fn active_gripper(&self) -> String {
-        self.bundle.robot.robot.active_gripper.clone()
+    /// The tool the runtime boots fitted with, as the robot TOML spells it.
+    fn active_tool(&self) -> String {
+        self.bundle.robot.robot.active_tool.clone()
     }
 
     /// `(min, max)` software travel per joint \[rad\] — what motion may use.
@@ -233,7 +233,7 @@ impl Config {
     /// `ilim_ma`).
     fn grippers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyList>> {
         let out = PyList::empty(py);
-        for g in &self.bundle.grippers {
+        for g in &self.bundle.tools {
             let d = PyDict::new(py);
             d.set_item("name", &g.name)?;
             d.set_item("key", g.name.trim().to_ascii_uppercase())?;
@@ -266,7 +266,7 @@ impl Config {
     fn variant<'py>(&self, py: Python<'py>, gripper_name: &str) -> PyResult<Bound<'py, PyDict>> {
         let urdf_variant = self
             .bundle
-            .grippers
+            .tools
             .iter()
             .find(|g| g.name.eq_ignore_ascii_case(gripper_name.trim()))
             .and_then(|g| g.urdf_variant.as_deref());

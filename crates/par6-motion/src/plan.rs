@@ -1,7 +1,7 @@
 //! Planned-move trajectory generation: a queued program of joint-space
 //! moves compiled into a tick-rate [`Sample`] stream for the EXEC ring.
 //!
-//! Two profiles ([`ProfileKind`]):
+//! Four profiles ([`ProfileKind`]):
 //!
 //! - **Trapezoid**: accel–cruise–decel run on the normalized path
 //!   coordinate `s`, which synchronizes all joints on the slowest one
@@ -16,6 +16,9 @@
 //!   `intermediate_positions` (pass-through waypoints, velocity-continuous
 //!   corners, limits enforced by the solver); per-move speed fractions and
 //!   minimum durations map to per-section limits.
+//! - **Quintic** and **Septic**: one polynomial on the path coordinate,
+//!   point-to-point. The quintic starts and stops at rest in velocity and
+//!   acceleration; the septic in jerk too, and holds the jerk limit.
 //!
 //! Sample metadata carries the ring contract: `command_index` per queued
 //! move, `checkpoint_id` boundaries, `blend_continues` on every sample of
@@ -49,6 +52,12 @@ pub enum ProfileKind {
     /// peak jerk is `60/T³` over a unit distance, bounded by nothing but
     /// the duration. Point-to-point only: see [`MotionError::ProfileCannotBlend`].
     Quintic,
+    /// Septic polynomial on the path coordinate: velocity, acceleration
+    /// AND jerk are zero at both ends, so unlike the quintic there is no
+    /// jerk step when the move starts or stops. Peak jerk, `52.5/T³` over
+    /// a unit distance, is held under the jerk limit where one is set.
+    /// Point-to-point only: see [`MotionError::ProfileCannotBlend`].
+    Septic,
 }
 
 /// Per-move parameters.
@@ -223,8 +232,8 @@ impl ProgramBuilder {
                 ProfileKind::Ruckig => {
                     self.emit_ruckig_chain(&mut samples, &chain_start, chain, i as u32)?;
                 }
-                ProfileKind::Quintic => {
-                    self.emit_quintic_chain(&mut samples, &chain_start, chain, i as u32)?;
+                ProfileKind::Quintic | ProfileKind::Septic => {
+                    self.emit_polynomial_chain(&mut samples, &chain_start, chain, i as u32)?;
                 }
             }
             chain_start = self.moves[j].target;
@@ -318,39 +327,43 @@ impl ProgramBuilder {
         }
     }
 
-    /// A quintic is point-to-point. The trapezoid's corner splice adds
-    /// the tail of one segment to the head of the next, and that is
+    /// A polynomial move is point-to-point. The trapezoid's corner splice
+    /// adds the tail of one segment to the head of the next, and that is
     /// limit-safe there because two complementary LINEAR ramps sum to a
-    /// constant. Two complementary quintic halves do not: their sum peaks
-    /// at `2.109/T` against the profile's own `1.875/T`, a 12.5% velocity
-    /// overshoot at the corner. So a blend request is refused rather
-    /// than honoured over the limit or silently ignored.
-    fn emit_quintic_chain(
+    /// constant. Two complementary polynomial halves do not: quintic
+    /// halves sum to a velocity of `2.109/T` against the profile's own
+    /// `1.875/T`, and on a joint that reverses at the corner septic halves
+    /// sum to an acceleration of `14.77/T²` against its own `7.513/T²`.
+    /// So a blend request is refused rather than honoured over the limit
+    /// or silently ignored.
+    fn emit_polynomial_chain(
         &self,
         out: &mut Vec<Sample>,
         start: &[f64; NUM_JOINTS],
         chain: &[MoveSpec],
         chain_offset: u32,
     ) -> Result<(), MotionError> {
+        let mv = &chain[0];
+        let septic = mv.params.profile == ProfileKind::Septic;
         if chain.len() > 1 {
             return Err(MotionError::ProfileCannotBlend {
-                profile: "quintic",
+                profile: if septic { "septic" } else { "quintic" },
                 first: chain_offset as usize,
                 second: chain_offset as usize + 1,
             });
         }
-        let mv = &chain[0];
         let path = JointLinePath::new(*start, mv.target);
         let mut scale = [0.0; NUM_JOINTS];
         for (s, (a, b)) in scale.iter_mut().zip(start.iter().zip(mv.target.iter())) {
             *s = (b - a).abs();
         }
-        let seg = quintic_segment(
+        let seg = polynomial_segment(
             &path,
             &scale,
             &self.limits,
             mv.params.speed_fraction,
             mv.params.min_duration_s,
+            septic,
             self.dt,
         );
         let meta = self.meta_for(chain, chain_offset, 0);
@@ -524,7 +537,7 @@ impl STrapezoid {
     }
 
     /// `(s, ds/dt, d²s/dt²)` at time `t`, clamped to the profile ends.
-    fn sample(&self, t: f64) -> (f64, f64, f64) {
+    pub fn sample(&self, t: f64) -> (f64, f64, f64) {
         if t <= 0.0 {
             return (0.0, 0.0, 0.0);
         }
@@ -595,28 +608,105 @@ impl SQuintic {
     }
 }
 
-/// One quintic move along `path`, scaled per joint exactly as
-/// [`trapezoid_segment`] scales the trapezoid: the scalar caps are the
-/// tightest `limit_j / scale_j` across the joints that move, so one
-/// duration serves every joint and they all start and stop together.
+/// Peak `ds/dt` of the unit septic `35τ⁴ − 84τ⁵ + 70τ⁶ − 20τ⁷`, at
+/// `τ = 1/2`: exactly `35/16`.
+pub const SEPTIC_PEAK_VEL: f64 = 2.1875;
+/// Peak `d²s/dt²` of the unit septic, at `τ = (5 ∓ √5)/10`: exactly
+/// `84√5/25`.
+pub const SEPTIC_PEAK_ACC: f64 = 7.513_188_404_399_293;
+/// Peak `|d³s/dt³|` of the unit septic, at `τ = 1/2`: exactly `105/2`.
+pub const SEPTIC_PEAK_JERK: f64 = 52.5;
+
+/// Scalar septic over a unit distance: `s(τ) = 35τ⁴ − 84τ⁵ + 70τ⁶ − 20τ⁷`
+/// with `τ = t/T`.
+///
+/// Velocity, acceleration AND jerk are zero at both ends. The quintic
+/// stops at acceleration: its jerk is `60/T³` at `τ = 0` and `τ = 1`,
+/// stepping there from zero the instant a move starts and again the
+/// instant it stops, and a hand on the arm reads that step as a jolt
+/// however small the move's acceleration is. Here jerk ramps in and out,
+/// and its peak — `52.5/T³`, mid-move — is lower than the quintic's.
+///
+/// A scalar time-scaling, so a multi-joint move sampled through it stays
+/// on the straight joint-space line between its endpoints; a jerk-limited
+/// time-synchronized profile does not, and a path checked for collision
+/// as a straight line has to be driven as one.
+#[derive(Debug, Clone, Copy)]
+pub struct SSeptic {
+    t_total: f64,
+}
+
+impl SSeptic {
+    /// The shortest `T` that keeps the peak velocity under `v_max`, the
+    /// peak acceleration under `a_max` and the peak jerk under `j_max` —
+    /// all per unit distance, `INFINITY` meaning unconstrained — stretched
+    /// to `min_duration` when that is longer, and never under `floor`.
+    pub fn new(v_max: f64, a_max: f64, j_max: f64, min_duration: Option<f64>, floor: f64) -> Self {
+        let t_v = SEPTIC_PEAK_VEL / v_max;
+        let t_a = (SEPTIC_PEAK_ACC / a_max).sqrt();
+        let t_j = (SEPTIC_PEAK_JERK / j_max).cbrt();
+        let mut t = t_v.max(t_a).max(t_j).max(floor);
+        if let Some(td) = min_duration {
+            t = t.max(td);
+        }
+        Self { t_total: t }
+    }
+
+    /// Total profile duration \[s\].
+    pub fn duration(&self) -> f64 {
+        self.t_total
+    }
+
+    /// `(s, ds/dt, d²s/dt²)` at time `t`, clamped to the profile ends.
+    pub fn sample(&self, t: f64) -> (f64, f64, f64) {
+        if t <= 0.0 {
+            return (0.0, 0.0, 0.0);
+        }
+        if t >= self.t_total {
+            return (1.0, 0.0, 0.0);
+        }
+        let tt = self.t_total;
+        let u = t / tt;
+        let w = 1.0 - u;
+        let u2 = u * u;
+        let s = u2 * u2 * (35.0 - 84.0 * u + 70.0 * u2 - 20.0 * u2 * u);
+        let s_dot = 140.0 * u2 * u * w * w * w / tt;
+        let s_ddot = 420.0 * u2 * w * w * (1.0 - 2.0 * u) / (tt * tt);
+        (s, s_dot, s_ddot)
+    }
+}
+
+/// `t ↦ (s, ds/dt, d²s/dt²)` of a unit time scaling.
+type UnitSampler = Box<dyn Fn(f64) -> (f64, f64, f64)>;
+
+/// One polynomial move along `path` — the septic when `septic`, else the
+/// quintic — scaled per joint exactly as [`trapezoid_segment`] scales the
+/// trapezoid: the scalar caps are the tightest `limit_j / scale_j` across
+/// the joints that move, so one duration serves every joint and they all
+/// start and stop together.
 ///
 /// That reduction makes the duration `max_j` of the per-joint closed
-/// forms `1.875·Δ_j / v_j` and `√(10/√3 · Δ_j / a_j)` — the two peaks
-/// of the unit quintic, each scaled by that joint's displacement.
-fn quintic_segment(
+/// forms — for the quintic `1.875·Δ_j / v_j` and `√(10/√3 · Δ_j / a_j)`,
+/// the two peaks of the unit profile each scaled by that joint's
+/// displacement; the septic adds its jerk peak `∛(52.5 · Δ_j / j_j)`.
+#[allow(clippy::too_many_arguments)]
+fn polynomial_segment(
     path: &dyn PathSampler,
     scale: &[f64; NUM_JOINTS],
     limits: &MotionLimits,
     speed_fraction: f64,
     min_duration_s: Option<f64>,
+    septic: bool,
     dt: f64,
 ) -> SegSamples {
     let mut v_s = f64::INFINITY;
     let mut a_s = f64::INFINITY;
+    let mut j_s = f64::INFINITY;
     for (j, &sc) in scale.iter().enumerate() {
         if sc > ZERO_DELTA {
             v_s = v_s.min(limits.velocity[j] * speed_fraction / sc);
             a_s = a_s.min(limits.acceleration[j] / sc);
+            j_s = j_s.min(limits.jerk[j] / sc);
         }
     }
     if !v_s.is_finite() {
@@ -632,14 +722,20 @@ fn quintic_segment(
             exit_ticks: 0,
         };
     }
-    let prof = SQuintic::new(v_s, a_s, min_duration_s, 2.0 * dt);
-    let n = ((prof.t_total / dt).ceil() as usize).max(1);
+    let (t_total, sample): (f64, UnitSampler) = if septic {
+        let prof = SSeptic::new(v_s, a_s, j_s, min_duration_s, 2.0 * dt);
+        (prof.duration(), Box::new(move |t| prof.sample(t)))
+    } else {
+        let prof = SQuintic::new(v_s, a_s, min_duration_s, 2.0 * dt);
+        (prof.t_total, Box::new(move |t| prof.sample(t)))
+    };
+    let n = ((t_total / dt).ceil() as usize).max(1);
     let mut qs = Vec::with_capacity(n);
     let mut qds = Vec::with_capacity(n);
     let mut qdds = Vec::with_capacity(n);
     let mut dq_ds = [0.0; NUM_JOINTS];
     for k in 1..=n {
-        let (s, s_dot, s_ddot) = prof.sample(k as f64 * dt);
+        let (s, s_dot, s_ddot) = sample(k as f64 * dt);
         let mut q = [0.0; NUM_JOINTS];
         let mut qd = [0.0; NUM_JOINTS];
         let mut qdd = [0.0; NUM_JOINTS];

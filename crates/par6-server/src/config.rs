@@ -82,9 +82,14 @@ pub struct ServerConfig {
     /// Tool registry keys (`select_tool` / `tool_action` validation and
     /// the TOOLS query). Matched case-insensitively on the wire.
     pub tools: Vec<String>,
-    /// The tool the runtime is actually fitted with — active from startup
-    /// (and after `reset_state`), and the only key `select_tool` accepts:
-    /// swapping a tool changes the kinematic model, which is a restart.
+    /// Of [`tools`](Self::tools), the ones carrying a driver — what
+    /// `select_tool` sets [`tool_dof`](Self::tool_dof) from when it fits a
+    /// different tool. Matched case-insensitively, like `tools`.
+    pub driven_tools: Vec<String>,
+    /// The tool the runtime is fitted with now: the configured one from
+    /// startup, then whichever `select_tool` last fitted (see
+    /// [`fit_tool`](Self::fit_tool)). `reset_state` keeps it — the tool on
+    /// the arm does not change because a program's state was cleared.
     /// Empty = no tool.
     pub fitted_tool: String,
     /// Controllable degrees of freedom of the fitted tool. 0 = passive:
@@ -125,8 +130,6 @@ pub struct ServerConfig {
     /// Effective-configuration readback served for the CONFIG_INFO
     /// query. The daemon fills it from the loaded bundle at startup.
     pub config_info: ConfigInfoData,
-    /// Optional recorder identity, shared with the native capture header.
-    pub capture_identity: Option<par6_proto::CaptureIdentity>,
 }
 
 /// The CONFIG_INFO payload: where the runtime's config came from, what
@@ -153,7 +156,7 @@ pub struct ConfigInfoData {
     pub robot_toml: String,
     /// Gripper TOMLs as `(file name, content)`, sorted by file name,
     /// served by CONFIG_BUNDLE.
-    pub grippers: Vec<(String, String)>,
+    pub tools: Vec<(String, String)>,
 }
 
 /// A drive `set_pid_gains` may retune, with the limits its configured
@@ -200,6 +203,7 @@ impl Default for ServerConfig {
             blend_hold: Duration::from_millis(100),
             simulator: false,
             tools: Vec::new(),
+            driven_tools: Vec::new(),
             fitted_tool: String::new(),
             tool_dof: 0,
             cartesian: true,
@@ -210,12 +214,33 @@ impl Default for ServerConfig {
             joint_hard_limits_deg: [(f64::NEG_INFINITY, f64::INFINITY); NUM_JOINTS],
             installation_shapes: Vec::new(),
             config_info: ConfigInfoData::default(),
-            capture_identity: None,
         }
     }
 }
 
 impl ServerConfig {
+    /// Record `name` as the fitted tool and return the spelling stored.
+    ///
+    /// Clients canonicalise registry keys to upper case, so the name is
+    /// matched case-insensitively, but what is stored is the registry's own
+    /// spelling — everything downstream looks the tool up by it. The tool
+    /// DOF follows, since tool actions are gated on it.
+    pub fn fit_tool(&mut self, name: &str) -> String {
+        let tool = self
+            .tools
+            .iter()
+            .find(|t| t.eq_ignore_ascii_case(name))
+            .cloned()
+            .unwrap_or_else(|| name.to_owned());
+        self.tool_dof = usize::from(
+            self.driven_tools
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&tool)),
+        );
+        self.fitted_tool.clone_from(&tool);
+        tool
+    }
+
     /// Build a config from the robot TOML `[protocol]` section, leaving
     /// every other knob at its default.
     pub fn from_protocol(p: &ProtocolConfig) -> Self {

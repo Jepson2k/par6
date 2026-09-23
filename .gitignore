@@ -16,3 +16,6 @@ selfcal-measurements.toml
 *.before-selfcal
 selfcal-trace-*.bin
 selfcal-trace-*-phases.csv
+
+# par6-selfcal run directories (root-owned on hardware runs)
+calibration-runs/

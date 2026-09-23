@@ -143,7 +143,7 @@ fn park_and_away(f: &Rig) -> ([f64; MAX_JOINTS], [f64; MAX_JOINTS]) {
     let cfg = bundle_at(f.dt).robot;
     let mut park = [0.0; MAX_JOINTS];
     for (p, q) in park.iter_mut().zip(cfg.safe_park_q()) {
-        *p = *q;
+        *p = q;
     }
     let mut away = park;
     for (a, j) in away.iter_mut().zip(&cfg.joints) {
@@ -255,6 +255,36 @@ fn the_exit_retreats_to_the_rest_pose_holding_the_jaws_then_idles() {
         last.iter().all(|c| c.pos.is_none() && c.cur_ma == Some(0)),
         "the terminal frame must still idle every drive: {last:?}"
     );
+}
+
+/// The exit arrives in whatever mode the last command left: EXEC after a
+/// finished move, JOG after a jog. A working mode can only leave for IDLE,
+/// so a retreat that asked for STREAM directly was refused and the arm
+/// went limp mid-air (2026-09-23, on the real arm after a move_j).
+#[test]
+fn the_retreat_starts_from_a_working_mode_too() {
+    for mode in [Mode::Exec, Mode::Jog] {
+        let mut f = parking_rig(0.004);
+        f.ready();
+        let (park, away) = park_and_away(&f);
+        f.pose = away;
+        f.tick_n(3);
+        f.cmd(RtCommand::SetMode(mode));
+        f.tick();
+        assert_eq!(f.snap().mode, mode, "the exit finds the arm in {mode:?}");
+
+        let (reached, _) = retreat(&mut f, true);
+        assert!(
+            reached,
+            "the retreat from {mode:?} must reach the rest pose"
+        );
+        for (j, (pose, target)) in f.pose.iter().zip(&park).enumerate() {
+            assert!(
+                (pose - target).abs() < 0.03,
+                "J{j} from {mode:?}: {pose} vs {target}"
+            );
+        }
+    }
 }
 
 /// A retreat that never arrives — the plant does not follow — expires at

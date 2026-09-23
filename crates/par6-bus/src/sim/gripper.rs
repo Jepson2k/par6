@@ -6,7 +6,7 @@
 //! calibration sequence and object-detection codes from jaw travel vs
 //! the commanded position.
 
-use par6_config::GripperConfig;
+use par6_config::ToolConfig;
 
 use crate::spectral::codec::CommandId;
 use crate::types::{FirmwareGripperCommand, NodeId, ObjectDetection};
@@ -66,7 +66,7 @@ pub(crate) struct GripperSim {
 }
 
 impl GripperSim {
-    pub fn new(dt: f64, node: NodeId, cfg: &GripperConfig) -> Self {
+    pub fn new(dt: f64, node: NodeId, cfg: &ToolConfig) -> Self {
         let d = cfg
             .driver
             .as_ref()

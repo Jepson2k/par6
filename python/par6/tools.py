@@ -143,18 +143,18 @@ def _describe(driver: dict | None) -> str:
 
 
 def build_tools() -> ToolsCollection:
-    """Typed tool specs from the packaged gripper TOMLs.
+    """Typed tool specs from the packaged tool TOMLs.
 
-    Ordered flange first; the default is the gripper the runtime config is
-    fitted with (``[robot].active_gripper``), which is the only tool
-    ``SELECT_TOOL`` accepts, so a UI that renders the default before the
-    first STATUS renders the tool that is actually on the arm.
+    Ordered flange first; the default is the tool the runtime boots fitted
+    with (``[robot].active_tool``), so a UI that renders the default before
+    the first STATUS renders the tool that is on the arm. ``SELECT_TOOL``
+    fits any of them after that.
     """
     grippers = {g["key"]: g for g in _cfg.config().grippers()}
     fitted = _cfg.fitted_tool_key()
     if fitted not in grippers:
         raise RuntimeError(
-            f"[robot].active_gripper is {fitted!r}, which has no "
+            f"[robot].active_tool is {fitted!r}, which has no "
             f"config/grippers TOML (have {sorted(grippers)})"
         )
     flange = _cfg.canonical_tool_key("Flange")

@@ -743,7 +743,6 @@ dependencies = [
  "pythonize",
  "serde",
  "tokio",
- "toml",
 ]
 
 [[package]]

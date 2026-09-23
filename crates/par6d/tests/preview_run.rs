@@ -167,7 +167,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
     let tool = par6_config::RobotConfig::load(&config)
         .expect("cfg")
         .robot
-        .active_gripper;
+        .active_tool;
     let tool_move = |key: u64, closed: f64| {
         Command::ToolAction(ToolAction {
             key,

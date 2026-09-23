@@ -40,7 +40,7 @@ fn the_idle_pre_move_drops_the_driver_then_polls_the_encoder() {
     let dur_ticks = (0.2 / dt).round() as u32;
 
     let mut bus = LoopbackBus::new();
-    bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+    bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
         .unwrap();
     let mut sys = HomingSystem::new(&bundle);
     sys.start(&mut bus);
@@ -107,8 +107,7 @@ fn a_dropped_driver_holds_its_detent_and_yields_past_it_while_polls_keep_it_fres
     let bundle = common::bundle();
     let robot = &bundle.robot;
     let mut bus = SimBus::new(common::scene(&bundle));
-    bus.boot_configure(robot, bundle.active_gripper(), 1)
-        .unwrap();
+    bus.boot_configure(robot, bundle.active_tool(), 1).unwrap();
     let jc = &robot.joints[0];
     let node1 = jc.node_id;
     let n1 = usize::from(node1);
@@ -196,7 +195,7 @@ fn a_joint_waiting_for_its_homing_turn_keeps_its_holding_authority() {
     }];
     bundle.robot.homing.post_moves.clear();
     let mut bus = SimBus::new(common::scene(&bundle));
-    bus.boot_configure(&bundle.robot, bundle.active_gripper(), 1)
+    bus.boot_configure(&bundle.robot, bundle.active_tool(), 1)
         .unwrap();
     let node = bundle.robot.joints[0].node_id;
     // Inside the normal current budget, above the seeking budget plus

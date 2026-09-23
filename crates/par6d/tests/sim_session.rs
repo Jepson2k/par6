@@ -149,14 +149,36 @@ fn teleport(angles_deg: [f64; NUM_JOINTS]) -> Command {
         tool_positions: None,
     })
 }
-
-/// The gripper `par6d` is actually fitted with, in the canonical
-/// (upper-case) spelling the python client sends.
-fn fitted_tool() -> String {
+/// The tool the runtime booted wearing.
+///
+/// Read once so the case can put it back: `select_tool` really does fit a
+/// different tool, so a case that swaps has to swap back before it goes on
+/// to drive the jaw. Swapping to a DIFFERENT driven tool additionally
+/// needs the gripper node re-provisioned for it, which is not this.
+fn boot_tool() -> String {
     par6_config::RobotConfig::load(&common::shipped_config())
         .expect("PAR6 config")
         .robot
-        .active_gripper
+        .active_tool
+        .to_uppercase()
+}
+
+/// Another driven tool, different from the one the runtime booted with.
+///
+/// Discovered rather than named: which tools the config ships is the
+/// operator's business, and a case that hard-codes one breaks the moment
+/// a tool file is added or renamed.
+fn other_driven_tool(boot: &str) -> String {
+    par6_config::ConfigBundle::load(&common::shipped_config())
+        .expect("PAR6 config")
+        .tools
+        .iter()
+        .find(|g| {
+            g.driver.as_ref().is_some_and(|d| d.gear_r_m > 0.0)
+                && !g.name.eq_ignore_ascii_case(boot)
+        })
+        .expect("the config carries a second driven tool")
+        .name
         .to_uppercase()
 }
 
@@ -931,6 +953,14 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "the QUINTIC selection did not reach the planner: peak speed \
          QUINTIC {quintic:.3} vs RUCKIG {ruckig:.3} rad/s"
     );
+    // SEPTIC holds the jerk limit the quintic ignores, so over the same
+    // probe it is held under the quintic just as ruckig is.
+    let septic = peak_speed_under(&rig, &mut c, "SEPTIC", 5104);
+    assert!(
+        septic * 1.4 < quintic,
+        "the SEPTIC selection did not reach the planner: peak speed \
+         SEPTIC {septic:.3} vs QUINTIC {quintic:.3} rad/s"
+    );
     let toppra = peak_speed_under(&rig, &mut c, "TOPPRA", 5102);
     assert!(
         toppra > ruckig,
@@ -938,22 +968,17 @@ fn tool_actions_profiles_and_unsupported_parameters() {
          jerk-limited RUCKIG: peak speed {toppra:.3} vs {ruckig:.3} rad/s"
     );
 
-    // ---- tools. The fitted tool reports from boot — a client does not
-    // have to ask for the tool the runtime is physically wearing — and
-    // no other tool can be selected.
-    let tool = fitted_tool();
+    // ---- tools. The tool the runtime boots wearing reports from boot; a
+    // client does not have to ask for what the arm is physically wearing.
+    // Fitting a DIFFERENT tool is `select_tool_fits_a_different_tool`.
+    let tool = boot_tool();
     let s = rig.wait_status("tool status reaches STATUS", |s| s.tool_status.is_some());
-    let ts = tool_status(&s);
-    assert_eq!(ts.key.to_uppercase(), tool);
-    assert_eq!(ts.fault_code, 0, "a healthy gripper must report no fault");
-    let err = c.expect_error(&select_tool(6001, "FLANGE", None));
+    assert_eq!(tool_status(&s).key.to_uppercase(), tool);
     assert_eq!(
-        err.code,
-        ErrorCode::CommValidationError as u16,
-        "selecting a tool the runtime is not fitted with must be refused, got {err:?}"
+        tool_status(&s).fault_code,
+        0,
+        "a healthy gripper must report no fault"
     );
-    // The key is matched case-insensitively (clients canonicalise it),
-    // and the variant does reach STATUS.
     let i = c.ok_index(&select_tool(6002, &tool, Some("wide")));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "select_tool must complete, got {detail:?}");
@@ -962,7 +987,6 @@ fn tool_actions_profiles_and_unsupported_parameters() {
             .as_ref()
             .is_some_and(|t| t.variant_key == "wide")
     });
-
     // ---- a move before calibration is refused: the RT send gate never
     // streams to an uncalibrated gripper (the firmware's own gate drops
     // it), so admitting the move could only pretend.
@@ -2171,5 +2195,98 @@ fn a_move_sent_right_behind_a_teleport_is_not_refused_as_unhomed() {
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move behind a teleport must run, got {detail:?}");
 
+    rig.shutdown();
+}
+
+/// `select_tool` fits a different tool, which is what waldoctl's
+/// "set the active end-effector tool on the controller" means.
+///
+/// It used to accept only the tool already named in `robot.active_gripper`
+/// — anything else was refused with "change robot.active_gripper and
+/// restart par6d" — so a tool change was an edit-and-restart and every
+/// test that wanted a particular tool had to pin the shipped config.
+///
+/// A real swap moves together: the load the gravity feedforward carries,
+/// the frame FK resolves at, the collision geometry, the home offsets on
+/// the joints whose reference is tool-dependent, and whether the tool has
+/// a jaw to actuate at all. The last of those is what this observes from
+/// outside — a passive tool refuses the actions a driven one accepts.
+#[test]
+fn select_tool_fits_a_different_tool() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    rig.wait_status("enabled", |s| s.enabled);
+    let boot = boot_tool();
+    rig.wait_status("tool status reaches STATUS", |s| s.tool_status.is_some());
+
+    // A tool this runtime does not carry is refused, and naming one it
+    // does is not enough on its own to be a no-op.
+    let err = c.expect_error(&select_tool(7001, "NO_SUCH_TOOL", None));
+    assert_eq!(
+        err.code,
+        ErrorCode::CommValidationError as u16,
+        "an unknown tool must be refused, got {err:?}"
+    );
+
+    // Fit the bare flange. It is genuinely fitted: STATUS reports it, and
+    // it has no jaw, so the actions the boot tool accepts are now refused.
+    let i = c.ok_index(&select_tool(7002, "FLANGE", None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting the bare flange must complete, got {detail:?}"
+    );
+    rig.wait_status("the bare flange reaches STATUS", |s| {
+        s.tool_status
+            .as_ref()
+            .is_some_and(|t| t.key.eq_ignore_ascii_case("FLANGE"))
+    });
+    let err = c.expect_error(&tool_action(7003, "FLANGE", "calibrate", &[]));
+    assert_eq!(
+        err.code,
+        ErrorCode::CommValidationError as u16,
+        "a passive tool must refuse an action, got {err:?}"
+    );
+
+    // And back. The swap is not one-way, and the jaw comes back with it.
+    let i = c.ok_index(&select_tool(7004, &boot, None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting the boot tool back must complete, got {detail:?}"
+    );
+    rig.wait_status("the boot tool is fitted again", |s| {
+        s.tool_status
+            .as_ref()
+            .is_some_and(|t| t.key.to_uppercase() == boot)
+    });
+    let i = c.ok_index(&tool_action(7005, &boot, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the driven tool's jaw must work again, got {detail:?}");
+
+    // A different DRIVEN tool: the jaw itself changes, so the gripper node
+    // is re-tuned to the new tool's limits and the reference it homed
+    // against the old jaw is dropped. What this observes is the visible
+    // half — the tool is fitted and its jaw still drives. The re-tune
+    // itself is not observable here: the simulated driver keeps its own
+    // calibrated flag across the swap, so only hardware shows the
+    // difference.
+    let other = other_driven_tool(&boot);
+    let i = c.ok_index(&select_tool(7006, &other, None));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(
+        ok,
+        "selecting another driven tool must complete, got {detail:?}"
+    );
+    rig.wait_status("the second driven tool is fitted", |s| {
+        s.tool_status
+            .as_ref()
+            .is_some_and(|t| t.key.to_uppercase() == other)
+    });
+    let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "the second driven tool's jaw must work, got {detail:?}");
     rig.shutdown();
 }

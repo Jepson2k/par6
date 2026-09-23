@@ -34,7 +34,7 @@ const TOL_RAD: f64 = 1e-3;
 /// millirad.
 const TOL_LOADED_RAD: f64 = 2.5e-3;
 
-/// Poses spanning the joint windows: a golden kinematics case, the
+/// Poses spanning the joint windows: a known kinematics case, the
 /// cartesian test start and a near-vertical hold.
 const POSES_DEG: [[f64; MAX_JOINTS]; 3] = [
     [-133.228, -8.746, 261.687, 61.133, -22.625, 119.764],
@@ -151,53 +151,66 @@ fn a_teleport_lands_the_plant_on_the_reference_from_the_first_tick() {
     );
 }
 
-/// With the gravity feedforward live — a constant model carrying the
-/// golden pose's torques, since the phantom-pose kick, not the model, is
-/// under test — the landing at that pose holds from the first tick.
-///
-/// par6-rt does not depend on the kinematics, so these torques are pinned
-/// rather than computed, and they describe the tool the config selects.
-/// Change the active tool and they go stale silently — the joint simply
-/// sags by whatever the model no longer accounts for. Regenerate with
-/// `cargo run -p par6-kin --example golden_gravity`.
+/// With the gravity feedforward live — the plant's own torques at the landing
+/// pose, since the phantom-pose kick, not the model, is under test — the
+/// landing at that pose holds from the first tick.
 #[test]
 fn a_teleport_lands_under_gravity_comp() {
+    let bundle = common::bundle();
+    let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| POSES_DEG[0][i].to_radians());
+    let tau = common::plant_gravity(&bundle, &q);
     land_at(
-        Box::new(common::ConstGravity([
-            0.0, -7.5128, 2.6929, 0.0553, 0.1384, -0.0005,
-        ])),
-        &common::bundle(),
+        Box::new(common::ConstGravity(tau)),
+        &bundle,
         &POSES_DEG[..1],
         TOL_RAD,
         true,
     );
 }
 
-/// A two-kilo tool puts 1.35 Nm on the wrist pitch — far past the 0.5 Nm
-/// the drivetrain holds by itself, and 89% of the 1.51 Nm J5 can make at
-/// its current limit. So the joint needs the drivers, and can still
-/// obey them. The tick after a teleport, before the runtime's next frames
-/// arrive, the drivers must already hold the landed pose: a re-seed that
-/// left them limp let the wrist back-drive a degree.
+/// A two-kilo tool puts well over a newton-metre on the wrist pitch — past
+/// the 0.5 Nm the drivetrain holds by itself, but under what J5 can make at
+/// its current limit. So the joint needs the drivers, and can still obey
+/// them. The tick after a teleport, before the runtime's next frames arrive,
+/// the drivers must already hold the landed pose: a re-seed that left them
+/// limp let the wrist back-drive a degree.
 ///
-/// The load is deliberately under the joint's ceiling: ask for more than
-/// J5 can produce and it back-drives no matter how right the re-seed is,
-/// which tests nothing. `cargo run -p par6-kin --example golden_gravity`
-/// prints both the torque and the ceiling.
+/// Ask for more than J5 can produce and it back-drives no matter how right
+/// the re-seed is, which tests nothing — so the load is asserted to stay
+/// under the joint's own ceiling rather than assumed to.
 #[test]
 fn a_teleport_under_a_load_past_the_holding_friction_is_held() {
     let mut bundle = common::bundle();
-    let name = bundle.robot.robot.active_gripper.clone();
+    let name = bundle.robot.robot.active_tool.clone();
     let gripper = bundle
-        .grippers
+        .tools
         .iter_mut()
         .find(|g| g.name == name)
         .expect("active gripper");
     gripper.kinematics.mass_kg = 2.0;
+    let q: [f64; MAX_JOINTS] = std::array::from_fn(|i| POSES_DEG[1][i].to_radians());
+    let tau = common::plant_gravity(&bundle, &q);
+    // The premise of the case, checked rather than asserted in prose: the
+    // wrist is loaded past what the drivetrain holds unpowered, and not past
+    // what its own current limit can produce.
+    let wrist = tau[4].abs();
+    let held_unpowered = bundle.robot.sim.holding_friction_nm[4];
+    let ceiling = {
+        let c = &bundle.robot.joints[4];
+        c.kt_nm_a * (c.ilim_ma / 1000.0) * c.gear_ratio * c.gear_efficiency
+    };
+    assert!(
+        wrist > held_unpowered,
+        "J5 carries {wrist:.3} Nm, inside the {held_unpowered:.3} Nm the drivetrain \
+         holds unpowered: the case would pass with the drivers limp"
+    );
+    assert!(
+        wrist < ceiling,
+        "J5 carries {wrist:.3} Nm, past the {ceiling:.3} Nm it can make: it back-drives \
+         however right the re-seed is"
+    );
     land_at(
-        Box::new(common::ConstGravity([
-            0.0, -12.3190, 6.5151, -0.0875, 1.3475, -0.0020,
-        ])),
+        Box::new(common::ConstGravity(tau)),
         &bundle,
         &POSES_DEG[1..2],
         TOL_LOADED_RAD,

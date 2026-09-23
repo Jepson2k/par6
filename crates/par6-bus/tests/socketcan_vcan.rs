@@ -35,7 +35,7 @@ use par6_bus::spectral::{pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32, Co
 use par6_bus::{
     BusState, DriverBus, Freshness, GripperCommand, JointCommand, NodeId, PollKind, SocketCanBus,
 };
-use par6_config::{ConfigBundle, GripperConfig, KtSource, RobotConfig};
+use par6_config::{ConfigBundle, KtSource, RobotConfig, ToolConfig};
 use socketcan::{CanSocket, EmbeddedFrame, Frame, Socket};
 
 // Per-thread so concurrently running tests in this binary cannot pollute
@@ -205,14 +205,14 @@ impl Wire {
     }
 }
 
-fn configs(iface: &str) -> (RobotConfig, GripperConfig) {
+fn configs(iface: &str) -> (RobotConfig, ToolConfig) {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..");
     let bundle = ConfigBundle::load(&root.join("config/PAR6.toml")).expect("PAR6 config bundle");
     // What is on the wire is the subject here, not which tool the shipped
     // config selects: a passive attachment is a valid thing to ship, and
     // these tests still need a gripper node to talk to.
     let gripper = bundle
-        .grippers
+        .tools
         .iter()
         .find(|g| g.driver.is_some())
         .expect("a gripper with a CAN driver")
@@ -258,7 +258,7 @@ fn encoder_reply(node: NodeId, pos: i32, spd: i32) -> (u16, Vec<u8>) {
 
 /// Bring a bus up with the boot phases that need a responder switched
 /// off, so tests that care about the tick can start from a silent wire.
-fn quiet_bus(iface: &str) -> (SocketCanBus, RobotConfig, GripperConfig) {
+fn quiet_bus(iface: &str) -> (SocketCanBus, RobotConfig, ToolConfig) {
     let (mut robot, gripper) = configs(iface);
     robot.robot.kt_source = KtSource::Config;
     robot.bus.scan.rounds = 0;

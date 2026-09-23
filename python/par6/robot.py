@@ -40,6 +40,7 @@ from par6._par6 import (
     COLLISION_CLEARANCE_M,
     CollisionWorld,
     Kinematics,
+    Preview,
     compose_tool_frame,
     ping_blocking,
 )
@@ -402,13 +403,15 @@ class Robot(_RobotABC):
 
     @property
     def motion_profiles(self) -> tuple[str, ...]:
-        """Profile names ``par6d`` plans queued moves with.
+        """Profile names ``par6d`` plans queued moves with, read from the
+        runtime's own registry so the list cannot drift from it.
 
         ``RUCKIG`` (the runtime's startup default) is jerk-limited
-        point-to-point, ``TRAPEZOID`` drops the jerk limit, and ``TOPPRA``
-        time-optimally parameterizes the path.
+        point-to-point, ``TRAPEZOID`` drops the jerk limit, ``QUINTIC``
+        starts and stops at rest in acceleration, ``SEPTIC`` in jerk too,
+        and ``TOPPRA`` time-optimally parameterizes the path.
         """
-        return ("RUCKIG", "TRAPEZOID", "TOPPRA")
+        return tuple(Preview.profiles())
 
     # -- Backend injection --------------------------------------------------
 

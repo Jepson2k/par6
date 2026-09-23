@@ -213,7 +213,9 @@ class TestCartesianMotion:
         # The arm must not have moved: the runtime rejects the whole command.
         np.testing.assert_allclose(dry_run.angles(), before, atol=1e-9)
 
-    @pytest.mark.parametrize("profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "TOPPRA"])
+    @pytest.mark.parametrize(
+        "profile", ["RUCKIG", "TRAPEZOID", "QUINTIC", "SEPTIC", "TOPPRA"]
+    )
     def test_move_l_is_straight_under_every_profile(self, dry_run, profile) -> None:
         """The profile decides how a linear move is timed, not where it goes:
         every profile must keep the TCP on the start->end line. A profile
@@ -435,7 +437,7 @@ class TestCartesianMotion:
         assert empty.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as tool:
-            dry_run.select_tool("SSG48")
+            dry_run.select_tool("NO_SUCH_TOOL")
         assert tool.value.code == ErrorCode.COMM_VALIDATION_ERROR
 
         with pytest.raises(RobotError) as profile:
@@ -721,9 +723,21 @@ class TestLiveParity:
         # Clear of the wrist singularity park folds J5 into.
         dry_run.teleport([0.0, -60.0, 150.0, 0.0, 45.0, 180.0])
         start = np.asarray(dry_run.pose())
-        jog = dry_run.jog_l("WRF", "X", speed=1.0, duration=0.5)
+        duration = 0.5
+        jog = dry_run.jog_l("WRF", "X", speed=1.0, duration=duration)
         end = np.asarray(dry_run.pose())
-        assert end[0] - start[0] > 20.0, "half a second of full-scale +X must travel"
+        # Full scale is the configured TCP rate, reached over the jog ramp. A
+        # straight ramp would cover `straight`; the S-curve the engine runs
+        # lags it slightly, and a jog that stalled or ran unramped would not.
+        full_mm_s = _cfg.config().motion()["jog_l_linear_max_m_s"] * 1000.0
+        ramp = _cfg.config().jog_defaults()["accel_time_s"]
+        inside = min(duration, ramp)
+        straight = full_mm_s * (inside**2 / (2.0 * ramp) + max(0.0, duration - ramp))
+        travel = end[0] - start[0]
+        assert 0.8 * straight < travel <= 1.05 * straight, (
+            f"half a second of full-scale +X travelled {travel:.2f} mm; "
+            f"a straight ramp covers {straight:.2f} mm"
+        )
         assert abs(end[1] - start[1]) < 3.0 and abs(end[2] - start[2]) < 3.0
         assert jog.duration == pytest.approx(0.5, abs=2 * dry_run._dt)
         assert jog.joint_trajectory_rad.shape[1] == NUM_JOINTS

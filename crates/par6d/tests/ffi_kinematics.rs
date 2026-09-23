@@ -64,7 +64,7 @@ fn test_config_with_tool_mass(tag: &str, mass_kg: f64) -> PathBuf {
     let robot = std::fs::read_to_string(&dst).expect("robot toml");
     let name = robot
         .lines()
-        .find_map(|line| line.trim_start().strip_prefix("active_gripper"))
+        .find_map(|line| line.trim_start().strip_prefix("active_tool"))
         .and_then(|rest| rest.split('"').nth(1))
         .expect("the config names an active gripper");
     let toml = dst.parent().unwrap().join(format!("grippers/{name}.toml"));
@@ -153,17 +153,10 @@ struct ReferenceCase {
 /// carry once the arm is teleported there.
 fn reference_case() -> ReferenceCase {
     let bundle = par6_config::ConfigBundle::load(&shipped_config()).expect("PAR6 config");
-    let gripper = bundle
-        .robot
-        .robot
-        .active_gripper
-        .trim()
-        .to_ascii_uppercase();
+    let gripper = bundle.robot.robot.active_tool.trim().to_ascii_uppercase();
     let variant = par6_kin::GripperVariant::resolve(
         &gripper,
-        bundle
-            .active_gripper()
-            .and_then(|g| g.urdf_variant.as_deref()),
+        bundle.active_tool().and_then(|g| g.urdf_variant.as_deref()),
     );
     let mut kin = par6_kin::Kin::load(&common::assets_dir(), variant).expect("reference model");
     let mut q = [0.0; NUM_JOINTS];

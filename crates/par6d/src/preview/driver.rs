@@ -291,7 +291,7 @@ mod tests {
         };
         let bundle = ConfigBundle::load(&config).expect("bundle");
         let stack =
-            crate::daemon::load_kin_stack(&opts, &config, &bundle.robot, bundle.active_gripper())
+            crate::daemon::load_kin_stack(&opts, &config, &bundle.robot, bundle.active_tool())
                 .expect("kinematics");
         let scene = Scene {
             tool: crate::daemon::scene_tool(stack.variant),

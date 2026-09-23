@@ -231,7 +231,11 @@ async fn read_moving(
             last_frame = tokio::time::Instant::now();
         }
         if s.error.is_some() || !s.enabled || !s.homed || s.link_ok != 1 {
-            return Err(format!("gravity sweep lost readiness: {:?}", s.error));
+            return Err(format!(
+                "gravity sweep lost readiness: error {:?}, enabled {}, homed {}, link {}, \
+                 data age {} ms",
+                s.error, s.enabled, s.homed, s.link_ok, s.data_age_ms
+            ));
         }
         if !(0..NQ)
             .all(|j| s.angles[j].is_finite() && s.speeds[j].is_finite() && s.torques[j].is_finite())

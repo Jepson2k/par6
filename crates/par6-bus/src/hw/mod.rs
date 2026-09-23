@@ -39,7 +39,7 @@ mod xstats;
 use std::io::ErrorKind;
 use std::time::{Duration, Instant, SystemTime};
 
-use par6_config::{GripperConfig, KtSource, RobotConfig};
+use par6_config::{KtSource, RobotConfig, ToolConfig};
 use socketcan::{CanSocket, EmbeddedFrame, Frame as _, Socket, SocketOptions};
 
 use crate::bus::DriverBus;
@@ -620,7 +620,7 @@ impl DriverBus for SocketCanBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.dt = robot.robot.tick_dt_s;

@@ -393,6 +393,14 @@ pub trait StreamTracker: Send {
     /// when a setpoint changes them, so an implementation may treat it as
     /// the cold path.
     fn set_scale(&mut self, speed: f64, accel: f64);
+    /// [`Self::set_scale`] with a velocity fraction per joint: the
+    /// shutdown retreat caps every joint at one speed, which is a
+    /// different fraction of each joint's own ceiling.
+    fn set_scale_per_joint(&mut self, speed: &[f64; MAX_JOINTS], accel: f64);
+    /// Replace the per-joint position bounds targets are clamped to. The
+    /// soft limits by default; the shutdown retreat widens them to the
+    /// hard limits so a joint can be parked on its mechanical stop.
+    fn set_bounds(&mut self, min: &[f64; MAX_JOINTS], max: &[f64; MAX_JOINTS]);
     /// One tick: write the post-limiter position/velocity setpoint.
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]);
     /// Stop: shed whatever velocity the tracker is carrying, under its
@@ -464,6 +472,13 @@ impl StreamTracker for ClampStream {
     /// ceiling for a fraction to scale. It exists to prove the soft-limit
     /// clamp survives with limiting off.
     fn set_scale(&mut self, _speed: f64, _accel: f64) {}
+
+    fn set_scale_per_joint(&mut self, _speed: &[f64; MAX_JOINTS], _accel: f64) {}
+
+    fn set_bounds(&mut self, min: &[f64; MAX_JOINTS], max: &[f64; MAX_JOINTS]) {
+        self.soft_min = *min;
+        self.soft_max = *max;
+    }
 
     fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
         for (i, (q, qd)) in q_out.iter_mut().zip(qd_out.iter_mut()).enumerate() {

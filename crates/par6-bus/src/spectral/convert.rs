@@ -160,6 +160,18 @@ impl JointConversion {
         self.sector_shift_ticks = 0;
     }
 
+    /// Re-base only the home OFFSET, keeping the latched reference tick.
+    ///
+    /// A tool change moves where "home" is on the joints whose home offset
+    /// is tool-dependent, but it does not move the endstop the arm latched
+    /// against. Re-homing to apply a new offset would be a mechanical
+    /// operation standing in for arithmetic, so `select_tool` re-bases the
+    /// offset in place and every joint angle shifts by exactly the
+    /// difference between the two tools' offsets.
+    pub fn set_home_offset(&mut self, home_offset_rad: f64) {
+        self.offset_ticks = self.offset_ticks_for(home_offset_rad);
+    }
+
     /// Motor position → joint angle \[rad\].
     pub fn joint_rad(&self, motor_ticks: i32) -> f64 {
         let joint_ticks =

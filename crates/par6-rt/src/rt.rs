@@ -196,7 +196,7 @@ fn setup_realtime(opts: &RunOptions) -> (bool, bool) {
 /// would then run at ordinary priority — the one thing this setup exists
 /// to prevent. The ceiling the box allows is worth far more than the
 /// number the config named.
-fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
+pub fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
     match ceiling {
         Some(0) => {
             log::error!(
@@ -219,11 +219,24 @@ fn permitted_priority(asked: u8, ceiling: Option<u8>) -> u8 {
 }
 
 /// The highest SCHED_FIFO priority this process may ask for, from its
-/// soft `RLIMIT_RTPRIO`. `None` when the limit cannot be read, which is
-/// not a reason to refuse the request — it is only a reason not to lower
-/// it. An unlimited process reports the highest priority Linux has.
+/// soft `RLIMIT_RTPRIO`. `None` when the limit cannot be read or does not
+/// bind, which is not a reason to refuse the request — it is only a
+/// reason not to lower it. An unlimited process reports the highest
+/// priority Linux has.
+///
+/// Root reports `None` whatever the limit says, because `RLIMIT_RTPRIO`
+/// does not apply to a process holding CAP_SYS_NICE. That is not a corner
+/// case: `sudo` on this box hands the child `RLIMIT_RTPRIO` 0 where the
+/// invoking user had 98, so reading the limit literally would clamp every
+/// privileged run to priority 0 — which `setup_realtime` then declines to
+/// ask for, leaving the control loop at ordinary scheduling priority. A
+/// hardware run is exactly the case that is privileged.
 #[cfg(target_os = "linux")]
-fn rtprio_ceiling() -> Option<u8> {
+pub fn rtprio_ceiling() -> Option<u8> {
+    // SAFETY: geteuid reads process credentials and cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        return None;
+    }
     let mut lim = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,
@@ -239,12 +252,12 @@ fn rtprio_ceiling() -> Option<u8> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn rtprio_ceiling() -> Option<u8> {
+pub fn rtprio_ceiling() -> Option<u8> {
     None
 }
 
 #[cfg(unix)]
-fn set_fifo_priority(prio: u8) -> Result<(), String> {
+pub fn set_fifo_priority(prio: u8) -> Result<(), String> {
     use thread_priority::{
         set_thread_priority_and_policy, thread_native_id, RealtimeThreadSchedulePolicy,
         ThreadPriority, ThreadPriorityValue, ThreadSchedulePolicy,
@@ -259,12 +272,12 @@ fn set_fifo_priority(prio: u8) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn set_fifo_priority(_prio: u8) -> Result<(), String> {
+pub fn set_fifo_priority(_prio: u8) -> Result<(), String> {
     Err("SCHED_FIFO is unix-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn lock_memory() -> Result<(), String> {
+pub fn lock_memory() -> Result<(), String> {
     // SAFETY: mlockall takes only flags and touches no caller memory.
     if unsafe { libc::mlockall(libc::MCL_CURRENT | libc::MCL_FUTURE) } == 0 {
         Ok(())
@@ -274,12 +287,12 @@ fn lock_memory() -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn lock_memory() -> Result<(), String> {
+pub fn lock_memory() -> Result<(), String> {
     Err("mlockall is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn pin_to_cpu(cpu: usize) -> Result<(), String> {
+pub fn pin_to_cpu(cpu: usize) -> Result<(), String> {
     // SAFETY: CPU_* macros operate on a locally owned, zeroed cpu_set_t;
     // sched_setaffinity(0, …) targets the calling thread only.
     unsafe {
@@ -295,12 +308,12 @@ fn pin_to_cpu(cpu: usize) -> Result<(), String> {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn pin_to_cpu(_cpu: usize) -> Result<(), String> {
+pub fn pin_to_cpu(_cpu: usize) -> Result<(), String> {
     Err("CPU pinning is linux-only".into())
 }
 
 #[cfg(target_os = "linux")]
-fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     let mut ts = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -311,7 +324,7 @@ fn monotonic_ns() -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn sleep_until(deadline_ns: u64) {
+pub fn sleep_until(deadline_ns: u64) {
     let ts = libc::timespec {
         tv_sec: (deadline_ns / 1_000_000_000) as libc::time_t,
         tv_nsec: (deadline_ns % 1_000_000_000) as libc::c_long,
@@ -330,7 +343,7 @@ fn sleep_until(deadline_ns: u64) {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn monotonic_ns() -> u64 {
+pub fn monotonic_ns() -> u64 {
     use std::time::Instant;
     static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
     let start = *START.get_or_init(Instant::now);
@@ -338,7 +351,7 @@ fn monotonic_ns() -> u64 {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn sleep_until(deadline_ns: u64) {
+pub fn sleep_until(deadline_ns: u64) {
     let now = monotonic_ns();
     if deadline_ns > now {
         std::thread::sleep(std::time::Duration::from_nanos(deadline_ns - now));

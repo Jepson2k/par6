@@ -131,6 +131,12 @@ fn a_faulted_tracker_hard_latches_stream_fault() {
         fn set_scale(&mut self, speed: f64, accel: f64) {
             self.0.set_scale(speed, accel);
         }
+        fn set_scale_per_joint(&mut self, speed: &[f64; MAX_JOINTS], accel: f64) {
+            self.0.set_scale_per_joint(speed, accel);
+        }
+        fn set_bounds(&mut self, min: &[f64; MAX_JOINTS], max: &[f64; MAX_JOINTS]) {
+            self.0.set_bounds(min, max);
+        }
         fn step(&mut self, q_out: &mut [f64; MAX_JOINTS], qd_out: &mut [f64; MAX_JOINTS]) {
             self.0.step(q_out, qd_out);
         }

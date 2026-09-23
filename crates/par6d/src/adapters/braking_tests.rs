@@ -28,7 +28,7 @@ impl Rig {
             config: Some(path.clone()),
             ..Default::default()
         };
-        let stack = crate::daemon::load_kin_stack(&opts, &path, robot, bundle.active_gripper())
+        let stack = crate::daemon::load_kin_stack(&opts, &path, robot, bundle.active_tool())
             .expect("kinematics");
         let scene = Scene {
             tool: crate::daemon::scene_tool(stack.variant),

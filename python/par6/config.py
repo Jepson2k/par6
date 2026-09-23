@@ -344,5 +344,5 @@ def canonical_tool_key(name: str) -> str:
 
 
 def fitted_tool_key() -> str:
-    """Canonical key of the gripper the runtime is configured with."""
-    return canonical_tool_key(config().active_gripper())
+    """Canonical key of the tool the runtime boots fitted with."""
+    return canonical_tool_key(config().active_tool())

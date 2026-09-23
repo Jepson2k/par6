@@ -21,7 +21,7 @@ use par6_bus::{
     BusError, BusState, DriverBus, Freshness, GripperCommand, GripperReply, JointCommand,
     LinkHealth, LoopbackBus, NodeId, PollAction, Reply,
 };
-use par6_config::{ConfigBundle, GripperConfig, RobotConfig};
+use par6_config::{ConfigBundle, RobotConfig, ToolConfig};
 use par6_rt::hooks::{ClampStream, RampJog};
 use par6_rt::{
     sample_ring, ArmState, CompletionPolicy, ErrorCode, Mode, NoFk, RtCommand, RtCore, RtHandles,
@@ -126,7 +126,7 @@ impl DriverBus for FailingBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.inner.boot_configure(robot, gripper, repeats)

@@ -259,9 +259,10 @@ pub enum HomingPhase {
     Backoff = 3,
     /// Pausing between passes.
     Pause = 4,
-    /// Releasing to the reference position.
+    /// Easing off the endstop under the configured release current.
     Release = 5,
-    /// Waiting for the reading to settle / latch.
+    /// Coming to rest after the hit, then waiting for the reading to
+    /// settle / latch.
     Settle = 6,
     /// Driving the configured post-home move.
     PostMove = 7,

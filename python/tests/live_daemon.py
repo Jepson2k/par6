@@ -159,16 +159,14 @@ def _set_scalar(text: str, key: str, value: object) -> str:
 
 def sim_config(
     dest: Path,
-    active_gripper: str | None = None,
     config_patch: Callable[[str], str] | None = None,
 ) -> Path:
     """The packaged PAR6 config re-ticked for CI, written under *dest*.
 
     Sourced from ``par6/_data`` (the same tree the client reads), so the
     daemon under test runs the joints, limits and homing sequence the
-    Python package advertises.  *active_gripper* fits the daemon with a
-    different tool than the packaged config names — the runtime picks its
-    URDF variant, its gravity model and its TCP frame from that one key.
+    Python package advertises.  It boots fitted with the packaged tool; a
+    test that needs another fits it with ``select_tool``, as a user does.
     """
     src = _cfg.data_root() / "config"
     dest.mkdir(parents=True, exist_ok=True)
@@ -176,14 +174,6 @@ def sim_config(
     text = (src / "PAR6.toml").read_text()
     patched = _set_scalar(text, "tick_dt_s", TICK_DT_S)
     patched = _set_scalar(patched, "status_rate_hz", STATUS_RATE_HZ)
-    if active_gripper is not None:
-        fitted = _cfg.config().active_gripper()
-        swapped = patched.replace(
-            f'active_gripper = "{fitted}"', f'active_gripper = "{active_gripper}"'
-        )
-        if swapped == patched and active_gripper != fitted:
-            raise RuntimeError("PAR6.toml patch point (active_gripper) missing")
-        patched = swapped
     if config_patch is not None:
         patched = config_patch(patched)
     out = dest / "PAR6.toml"
@@ -208,7 +198,6 @@ class LiveDaemon:
     def start(
         cls,
         workdir: Path,
-        active_gripper: str | None = None,
         status_transport: str = "unicast",
         sim_dynamics: bool = False,
         config_patch: Callable[[str], str] | None = None,
@@ -217,7 +206,7 @@ class LiveDaemon:
         if binary is None:
             raise RuntimeError("par6d binary not available")
         workdir.mkdir(parents=True, exist_ok=True)
-        config = sim_config(workdir / "config", active_gripper, config_patch)
+        config = sim_config(workdir / "config", config_patch)
         status_port = free_udp_port()
         shm_dir = Path(tempfile.mkdtemp(prefix="shm-", dir=workdir))
         log_path = workdir / "par6d.log"

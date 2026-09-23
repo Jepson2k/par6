@@ -161,7 +161,7 @@ impl Daemon {
         if !opts.sim {
             let budget = par6_bus::budget::bus_budget(
                 robot.joints.len(),
-                bundle.active_gripper().is_some_and(|g| g.driver.is_some()),
+                bundle.active_tool().is_some_and(|g| g.driver.is_some()),
                 robot.bus.bitrate,
                 robot.robot.tick_dt_s,
             );
@@ -217,7 +217,8 @@ impl Daemon {
             tool_offset,
             assets_dir,
             variant,
-        } = load_kin_stack(opts, &config_path, robot, bundle.active_gripper())?;
+            source: kin_source,
+        } = load_kin_stack(opts, &config_path, robot, bundle.active_tool())?;
 
         let dt = robot.robot.tick_dt_s;
         let stream_limits = MotionLimits::from_config(robot, LimitMode::Stream)?;
@@ -281,7 +282,7 @@ impl Daemon {
             fk: fk_hook,
             samples: consumer,
         };
-        let (mut core, handles) = RtCore::new(&bundle, bus, hooks)?;
+        let (core, handles) = RtCore::new(&bundle, bus, hooks)?;
 
         // The RT snapshot channel is single-reader; the tee fans it out.
         let (srv_w, srv_r) = snapshot_channel::<StateSnapshot>();
@@ -300,6 +301,9 @@ impl Daemon {
         };
 
         let link = CoreLink::new(cmds_tx, ops_tx, rt_break.clone());
+        // Where a select_tool leaves rebuilt models for the threads that own
+        // one: filled by the planner, drained by each owner in turn.
+        let tools: crate::bridge::ToolMailbox = Default::default();
         let planner = Par6Planner::new(
             link.clone(),
             producer,
@@ -310,6 +314,11 @@ impl Daemon {
                 kin: kin_planner,
                 collision,
                 tool_offset,
+            },
+            crate::planner::PlannerSwap {
+                source: Some(kin_source),
+                bundle: bundle.clone(),
+                tools: tools.clone(),
             },
         )?;
         let stream_input = Arc::new(Mutex::new(handles.stream));
@@ -333,6 +342,7 @@ impl Daemon {
             opts.sim,
             sim_scene,
             sim_world,
+            tools.clone(),
             crate::bridge::CartStream {
                 kin: kin_bridge,
                 snapshots: bridge_snapshots,
@@ -349,21 +359,6 @@ impl Daemon {
             .enable_all()
             .build()?;
         let mut threads: Vec<JoinHandle<()>> = Vec::new();
-        if let Some(path) = std::env::var_os("PAR6_DIAGNOSTICS") {
-            let (writer, reader) = par6_rt::diagnostics::capture_channel(2048);
-            core.set_capture(writer);
-            let (thread, identity) = crate::diagnostics::spawn(
-                std::path::Path::new(&path),
-                reader,
-                &cfg.config_info.fingerprint,
-                dt,
-                shutdown.clone(),
-                opts.diagnostics_max_samples
-                    .unwrap_or(crate::diagnostics::DEFAULT_MAX_SAMPLES),
-            )?;
-            cfg.capture_identity = Some(identity);
-            threads.push(thread);
-        }
 
         // The installation layer is applied here, while the planner is
         // still in hand: it is immutable from the wire, and a keep-out
@@ -468,6 +463,7 @@ impl Daemon {
                             shutdown,
                             kin_hk,
                             stream_gate,
+                            tools.clone(),
                         );
                     })?,
             );
@@ -695,7 +691,7 @@ struct ConfigFiles {
     fingerprint: String,
     robot_filename: String,
     robot_toml: String,
-    grippers: Vec<(String, String)>,
+    tools: Vec<(String, String)>,
 }
 
 fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFiles> {
@@ -726,7 +722,7 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
         Err(_) => Vec::new(),
     };
     paths.sort();
-    let grippers = paths
+    let tools = paths
         .iter()
         .map(|g| read(g))
         .collect::<std::io::Result<Vec<_>>>()?;
@@ -734,7 +730,7 @@ fn read_config_files(robot_toml: &std::path::Path) -> std::io::Result<ConfigFile
         fingerprint: format!("{:x}", hasher.finalize()),
         robot_filename,
         robot_toml: robot_content,
-        grippers,
+        tools,
     })
 }
 
@@ -746,7 +742,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
             fingerprint: String::new(),
             robot_filename: String::new(),
             robot_toml: String::new(),
-            grippers: Vec::new(),
+            tools: Vec::new(),
         }
     });
     ConfigInfoData {
@@ -769,7 +765,7 @@ fn config_info(config_path: &std::path::Path, robot: &par6_config::RobotConfig) 
             .collect(),
         robot_filename: files.robot_filename,
         robot_toml: files.robot_toml,
-        grippers: files.grippers,
+        tools: files.tools,
     }
 }
 
@@ -779,12 +775,18 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
     cfg.rt_tick_rate_hz = robot.tick_rate_hz();
     cfg.digital_outputs = robot.io.outputs.iter().map(|l| l.name.clone()).collect();
     cfg.simulator = opts.sim;
-    cfg.tools = bundle.grippers.iter().map(|g| g.name.clone()).collect();
+    cfg.tools = bundle.tools.iter().map(|g| g.name.clone()).collect();
+    cfg.driven_tools = bundle
+        .tools
+        .iter()
+        .filter(|g| g.driver.is_some())
+        .map(|g| g.name.clone())
+        .collect();
     // The fitted tool is the one the kinematics, gravity model and bus
     // were built around at startup; a passive tool (no CAN driver) has no
     // controllable DOF.
-    cfg.fitted_tool = robot.robot.active_gripper.clone();
-    cfg.tool_dof = usize::from(bundle.active_gripper().is_some_and(|g| g.driver.is_some()));
+    cfg.fitted_tool = robot.robot.active_tool.clone();
+    cfg.tool_dof = usize::from(bundle.active_tool().is_some_and(|g| g.driver.is_some()));
     cfg.cartesian = true;
     // The drives `set_pid_gains` may retune: every joint node, plus the
     // gripper motor when the fitted tool drives one over CAN.
@@ -798,7 +800,7 @@ pub(crate) fn server_config(opts: &Options, bundle: &ConfigBundle) -> ServerConf
             voltage_limit_mv: j.voltage_limit_mv,
         })
         .collect();
-    if let Some(d) = bundle.active_gripper().and_then(|g| g.driver.as_ref()) {
+    if let Some(d) = bundle.active_tool().and_then(|g| g.driver.as_ref()) {
         cfg.tunable_nodes.push(par6_server::TunableNode {
             node: robot.bus.gripper_node,
             ilim_ma: d.ilim_ma,
@@ -861,6 +863,9 @@ pub(crate) struct KinStack {
     /// The URDF variant the models were built for; the sim scene carries
     /// the same tool.
     pub(crate) variant: par6_kin::GripperVariant,
+    /// The sources the models were built from, so a `select_tool` can
+    /// rebuild them for a different tool.
+    pub(crate) source: KinSource,
 }
 
 /// The sim scene tool matching a kinematics variant.
@@ -876,6 +881,7 @@ pub(crate) fn scene_tool(variant: par6_kin::GripperVariant) -> Tool {
 /// (missing tree, bad URDF) is a clean startup error.
 /// What every kinematics object is built from: the resolved assets
 /// directory and URDF variant, plus the config-derived solver settings.
+#[derive(Clone)]
 pub(crate) struct KinSource {
     assets_dir: std::path::PathBuf,
     /// Where `package://` mesh URIs resolve, when the assets tree is an
@@ -891,14 +897,14 @@ impl KinSource {
         opts: &Options,
         config_path: &std::path::Path,
         robot: &par6_config::RobotConfig,
-        active_gripper: Option<&par6_config::GripperConfig>,
+        active_tool: Option<&par6_config::ToolConfig>,
     ) -> Result<Self, DaemonError> {
         use crate::kin::{resolve_assets_dir, variant_for, SoftWindow};
         let assets_dir = resolve_assets_dir(opts.assets.as_deref(), config_path)
             .map_err(DaemonError::Kinematics)?;
         let variant = variant_for(
-            &robot.robot.active_gripper,
-            active_gripper.and_then(|g| g.urdf_variant.as_deref()),
+            &robot.robot.active_tool,
+            active_tool.and_then(|g| g.urdf_variant.as_deref()),
         );
         log::info!(
             "kinematics: {} from {}",
@@ -914,6 +920,24 @@ impl KinSource {
         })
     }
 
+    /// The same sources, resolved for a different tool.
+    ///
+    /// Only the URDF variant depends on which tool is fitted, so a
+    /// `select_tool` rebuild is this plus the gripper's own DH/inertial
+    /// params — the assets tree, the soft window and the damping are
+    /// properties of the arm and do not move.
+    pub(crate) fn for_gripper(&self, gripper: Option<&par6_config::ToolConfig>) -> Self {
+        Self {
+            assets_dir: self.assets_dir.clone(),
+            package_dir: self.package_dir.clone(),
+            variant: crate::kin::variant_for(
+                gripper.map_or("", |g| g.name.as_str()),
+                gripper.and_then(|g| g.urdf_variant.as_deref()),
+            ),
+            window: self.window,
+            dls_lambda: self.dls_lambda,
+        }
+    }
     fn kin(&self) -> Result<par6_kin::Kin, DaemonError> {
         crate::kin::load_kin(&self.assets_dir, self.variant).map_err(DaemonError::Kinematics)
     }
@@ -930,6 +954,17 @@ impl KinSource {
         ))
     }
 
+    pub(crate) fn assets_dir(&self) -> &std::path::Path {
+        &self.assets_dir
+    }
+
+    /// The RT's forward-kinematics hook for this tool.
+    pub(crate) fn kin_fk(
+        &self,
+        offset: &crate::kin::ToolOffset,
+    ) -> Result<crate::kin::KinFk, DaemonError> {
+        Ok(crate::kin::KinFk::new(self.kin()?, offset.clone()))
+    }
     pub(crate) fn collision(&self) -> Result<par6_kin::Collision, DaemonError> {
         crate::kin::load_collision(
             &self.assets_dir,
@@ -951,17 +986,18 @@ pub(crate) fn load_kin_stack(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
-    active_gripper: Option<&par6_config::GripperConfig>,
+    active_tool: Option<&par6_config::ToolConfig>,
 ) -> Result<KinStack, DaemonError> {
     use crate::kin::{KinFk, KinGravity, ToolOffset};
-    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
-    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_gripper)
+    let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
+    let mut gravity_kin = crate::kin::load_gravity_kin(&src.assets_dir, active_tool)
         .map_err(DaemonError::Kinematics)?;
     gravity_kin
         .set_gravity_correction(&robot.gravity_correction)
         .map_err(|e| DaemonError::Kinematics(e.to_string()))?;
     let tool_offset = ToolOffset::new();
     Ok(KinStack {
+        source: src.clone(),
         fk: KinFk::new(src.kin()?, tool_offset.clone()),
         gravity: KinGravity::new(gravity_kin),
         planner: src.cart_kin(&tool_offset)?,
@@ -993,9 +1029,9 @@ pub(crate) fn load_preview_kin(
     opts: &Options,
     config_path: &std::path::Path,
     robot: &par6_config::RobotConfig,
-    active_gripper: Option<&par6_config::GripperConfig>,
+    active_tool: Option<&par6_config::ToolConfig>,
 ) -> Result<PreviewKin, DaemonError> {
-    let src = KinSource::resolve(opts, config_path, robot, active_gripper)?;
+    let src = KinSource::resolve(opts, config_path, robot, active_tool)?;
     let tool_offset = crate::kin::ToolOffset::new();
     Ok(PreviewKin {
         planner: src.cart_kin(&tool_offset)?,

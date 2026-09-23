@@ -11,7 +11,7 @@
 
 use std::collections::VecDeque;
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::FreshnessClock;
@@ -443,7 +443,7 @@ impl DriverBus for LoopbackBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         self.joint_nodes = robot.joints.iter().map(|j| j.node_id).collect();
@@ -589,7 +589,7 @@ mod tests {
         let robot = RobotConfig::load(&path).expect("PAR6.toml");
         let gpath =
             PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/grippers/SSG48.toml");
-        let gripper = GripperConfig::load(&gpath).expect("SSG48.toml");
+        let gripper = ToolConfig::load(&gpath).expect("SSG48.toml");
         let mut bus = LoopbackBus::new();
         bus.boot_configure(&robot, Some(&gripper), 3).unwrap();
         (bus, robot)

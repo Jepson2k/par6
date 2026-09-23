@@ -1422,12 +1422,11 @@ class AsyncRobotClient(_RobotClientABC):
     async def select_tool(self, tool_name: str, variant_key: str = "") -> int:
         """Set the active end-effector tool on the controller.
 
-        A runtime is built around ONE fitted gripper and refuses any other
-        key, so this selects the tool the box is already wearing — read the
-        available one from ``robot.tools`` rather than naming it literally.
-        No par6 tool declares variants, so ``variant_key`` selects no
-        geometry; it rides through to STATUS and clears the TCP offset when
-        it changes.
+        Any tool in ``robot.tools`` can be fitted; the runtime rebuilds its
+        kinematics, gravity and collision models around it, and an unknown
+        key is refused. No par6 tool declares variants, so ``variant_key``
+        selects no geometry; it rides through to STATUS and clears the TCP
+        offset when it changes.
 
         Category: Configuration
 
@@ -1440,9 +1439,9 @@ class AsyncRobotClient(_RobotClientABC):
             core.select_tool(key, variant_key if variant_key else None)
         )
         # Only a tool the runtime accepted is the active one: a refused
-        # selection (the runtime is fitted with a different tool) would
-        # otherwise leave ``client.tool`` and the tool_action key pointing
-        # at hardware that is not on the arm.
+        # selection (a key the runtime does not know) would otherwise leave
+        # ``client.tool`` and the tool_action key pointing at hardware that
+        # is not on the arm.
         self._active_tool_key = key
         self._active_variant_key = variant_key
         return await self._finish_queued(index, False, 0.0)
@@ -1796,14 +1795,6 @@ class AsyncRobotClient(_RobotClientABC):
             installation=tuple(_shape(w) for w in result["installation"]),
             program=tuple(_shape(w) for w in result["program"]),
         )
-
-    async def capture_info(self) -> dict | None:
-        """Native recorder identity, or identity=None when recording is disabled.
-
-        Category: Query
-        """
-        core = await self._ensure_core()
-        return await self._call(core.capture_info())
 
     async def config_info(self) -> dict | None:
         """The runtime's effective configuration.

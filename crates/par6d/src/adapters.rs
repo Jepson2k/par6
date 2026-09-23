@@ -156,6 +156,11 @@ impl StreamTracker for MotionStream {
         self.scale_refused = false;
     }
 
+    fn set_bounds(&mut self, min: &[f64; MAX_JOINTS], max: &[f64; MAX_JOINTS]) {
+        self.soft_min = *min;
+        self.soft_max = *max;
+    }
+
     fn set_target(&mut self, q_target: &[f64; MAX_JOINTS]) {
         let mut clamped = *q_target;
         self.clamp(&mut clamped);
@@ -183,9 +188,13 @@ impl StreamTracker for MotionStream {
     }
 
     fn set_scale(&mut self, speed: f64, accel: f64) {
+        self.set_scale_per_joint(&[speed; MAX_JOINTS], accel);
+    }
+
+    fn set_scale_per_joint(&mut self, speed: &[f64; MAX_JOINTS], accel: f64) {
         let mut scaled = self.base;
-        for j in 0..MAX_JOINTS {
-            scaled.velocity[j] = self.base.velocity[j] * speed;
+        for (j, fraction) in speed.iter().enumerate() {
+            scaled.velocity[j] = self.base.velocity[j] * fraction;
             scaled.acceleration[j] = self.base.acceleration[j] * accel;
             // Jerk rides the acceleration fraction: a stream asked to
             // accelerate gently that kept the full jerk ceiling would
@@ -198,7 +207,7 @@ impl StreamTracker for MotionStream {
             Err(e) => {
                 if !self.scale_refused {
                     log::warn!(
-                        "stream limit scale ({speed}, {accel}) refused: {e} (repeats suppressed)"
+                        "stream limit scale ({speed:?}, {accel}) refused: {e} (repeats suppressed)"
                     );
                 }
                 self.scale_refused = true;

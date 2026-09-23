@@ -404,6 +404,7 @@ re-freeze. See `CLAUDE.md`.
 | `RUCKIG` (default) | jerk-limited point-to-point and streaming; the profile blends are built on |
 | `TRAPEZOID` | velocity-limited point-to-point |
 | `QUINTIC` | point-to-point with zero velocity **and** acceleration at both ends; no cruise, does not blend |
+| `SEPTIC` | point-to-point with zero velocity, acceleration **and** jerk at both ends, jerk-limited; no cruise, does not blend |
 | `TOPPRA` | time-optimal retiming of a cartesian waypoint path |
 
 Every cartesian move rides one pipeline: the geometry produces a pose list, seeded IK
@@ -563,7 +564,6 @@ Precedence throughout is **CLI flag > `PAR6_*` environment variable > robot TOML
 | `PAR6_TICK_PROFILE` | per-phase RT tick profiler, logged once a second (`--tick-profile`) |
 | `PAR6_GPIO_CHIP` | gpiochip device for the e-stop line |
 | `PAR6_SHM_DIR` | where the bus-grant segments go (default `/dev/shm`) — see below |
-| `PAR6_DIAGNOSTICS` | write a 250 Hz native recording (PAR6CAP2) of every RT snapshot to this new file; `PAR6_DIAGNOSTICS_MAX_SAMPLES` / `--diagnostics-max-samples` bound it (default one hour). Calibration reads it. |
 
 ### Activity logs
 
@@ -633,20 +633,30 @@ vendor's tool over a bench connection.
 
 ### Calibrating the arm
 
-`par6-selfcal` is what to run on a new arm. One binary, about two minutes,
-`par6d` stopped: it homes the arm, raises a joint's seek current or velocity
-gains where it will not reach its endstop, measures each loaded joint's gravity
-feedforward on a torque-only hold, and then returns every joint to its worst
-pose and proves it holds there. `--apply` writes what it measured into the
-config, keeping a backup, and only ever after that proof passes.
+There are two, for two different things.
 
-`par6-calibrate limits` (or the Calibration section of Commander's Diagnostics
-tab) is the separate one-off velocity/acceleration sweep, against a running
-`par6d` with `PAR6_DIAGNOSTICS` set; it stages a candidate config plus rollback
-that a restart with `PAR6_CONFIG` activates.
+**The arm: `par6-selfcal`.** Run it on a new arm, with `par6d` stopped and the
+tool off (the passive flange fitted). It homes the arm, measures each joint's
+inertia and friction, and identifies the arm's own link masses from the torque
+it holds at a set of poses. The links are 3D printed, so they do not weigh what
+the vendor CAD says. `--apply` writes the identified `gravity_correction` into
+the config, keeping a backup; `--sim` runs it against the simulator and refuses
+`--apply`. `--limits` (off by default) also finds each joint's velocity,
+acceleration and jerk limits: it scales the joint's EXEC limits up towards its
+hardware ceiling until a move's following error, landing or hold misses its
+requirement, or the current it needs plus the worst gravity the joint carries
+would exceed its current limit; with `--apply` those become the EXEC limits.
+Speed ripple is reported beside each result and only fails a step past 10% of
+the commanded speed, because it does not grow with the limits. A jerk no probe move was
+limited by is only a lower bound, so it is reported and left as configured. It
+tunes no drive gains: those loops run inside the drives at
+6250 Hz, which the 250 Hz bus cannot observe, so the configured gains stand.
+Hardware runs need `sudo`.
 
-See [`docs/calibration.md`](docs/calibration.md) for both, their acceptance
-rules, and what the evidence does not show.
+**The tool: `estimate_payload()`.** With the tool fitted and `par6d` running,
+the client call holds a few wrist poses and fits the mass and centre of mass it
+is carrying, then declares them to the runtime. Run it whenever the tool or the
+load changes.
 
 ### The bus-grant signal
 

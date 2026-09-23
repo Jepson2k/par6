@@ -330,18 +330,6 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             }
             d.set_item("nodes", rows)?;
         }
-        QueryResult::CaptureInfo { identity } => {
-            if let Some(info) = identity {
-                let recording = PyDict::new(py);
-                recording.set_item("pid", info.pid)?;
-                recording.set_item("started", info.started)?;
-                recording.set_item("dt", info.dt)?;
-                recording.set_item("fingerprint", &info.fingerprint)?;
-                d.set_item("identity", recording)?;
-            } else {
-                d.set_item("identity", py.None())?;
-            }
-        }
         QueryResult::ConfigInfo {
             path,
             fingerprint,
@@ -369,19 +357,22 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
             fingerprint,
             robot_filename,
             robot_toml,
-            grippers,
+            tools,
         } => {
             d.set_item("path", path)?;
             d.set_item("fingerprint", fingerprint)?;
             d.set_item("robot_filename", robot_filename)?;
             d.set_item("robot_toml", robot_toml)?;
             let gs = PyList::empty(py);
-            for (name, content) in grippers {
+            for (name, content) in tools {
                 let gd = PyDict::new(py);
                 gd.set_item("filename", name)?;
                 gd.set_item("content", content)?;
                 gs.append(gd)?;
             }
+            // "tools" is the name; "grippers" stays because waldoctl and
+            // Waldo-Commander read it, and those move on their own branches.
+            d.set_item("tools", &gs)?;
             d.set_item("grippers", gs)?;
         }
         other => {

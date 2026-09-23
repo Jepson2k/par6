@@ -123,8 +123,8 @@ pub struct ToolKinematics {
 /// Root of a gripper TOML file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct GripperConfig {
-    /// Tool name — what `robot.active_gripper` selects.
+pub struct ToolConfig {
+    /// Tool name — what `robot.active_tool` selects.
     pub name: String,
     /// Which URDF variant models this tool ("flange", "msg", "ssg48").
     /// Absent = the name-prefix rule decides (with a warning), which is
@@ -147,7 +147,7 @@ pub struct GripperConfig {
     pub kinematics: ToolKinematics,
 }
 
-impl GripperConfig {
+impl ToolConfig {
     /// Parse and validate a gripper config from a TOML string.
     pub fn from_toml_str(text: &str) -> Result<Self, ConfigError> {
         let cfg: Self = toml::from_str(text).map_err(|source| ConfigError::Parse {

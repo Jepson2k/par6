@@ -48,6 +48,9 @@ pub use error::MotionError;
 pub use jog::{JogDirection, JogEngine, JogTick, MIN_ACCEL_TIME_S, MIN_JERK_FACTOR};
 pub use limits::MotionLimits;
 pub use path::{JointLinePath, PathSampler};
-pub use plan::{MoveParams, Plan, ProfileKind, ProgramBuilder};
+pub use plan::{
+    MoveParams, Plan, ProfileKind, ProgramBuilder, SSeptic, SEPTIC_PEAK_ACC, SEPTIC_PEAK_JERK,
+    SEPTIC_PEAK_VEL,
+};
 pub use sample::{Sample, SampleMeta, NUM_JOINTS};
 pub use stream::{StreamStep, StreamingExecutor};

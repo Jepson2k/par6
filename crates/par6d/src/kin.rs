@@ -111,7 +111,7 @@ pub(crate) fn load_kin(assets_dir: &Path, variant: GripperVariant) -> Result<Kin
 /// gravity compensation instead of a parsed-and-ignored field.
 pub fn load_gravity_kin(
     assets_dir: &Path,
-    gripper: Option<&par6_config::GripperConfig>,
+    gripper: Option<&par6_config::ToolConfig>,
 ) -> Result<Kin, String> {
     let tool = gripper.map(|g| {
         let k = &g.kinematics;
@@ -718,9 +718,9 @@ pub fn estimation_model(
     let bundle = par6_config::ConfigBundle::load(&config_path).map_err(|e| e.to_string())?;
     let robot = &bundle.robot;
     let assets_dir = resolve_assets_dir(assets, &config_path)?;
-    let gripper = bundle.active_gripper();
+    let gripper = bundle.active_tool();
     let variant = variant_for(
-        &robot.robot.active_gripper,
+        &robot.robot.active_tool,
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
     let kin = load_gravity_kin(&assets_dir, gripper)?;
@@ -790,9 +790,9 @@ mod tests {
             std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
         let assets = resolve_assets_dir(None, &config).expect("assets tree");
         let bundle = par6_config::ConfigBundle::load(&config).expect("bundle");
-        assert!(bundle.grippers.len() > 3, "the shipped tools are all here");
+        assert!(bundle.tools.len() > 3, "the shipped tools are all here");
 
-        for g in &bundle.grippers {
+        for g in &bundle.tools {
             assert!(
                 g.urdf_variant.is_some(),
                 "{}: shipped gripper TOMLs declare urdf_variant explicitly",

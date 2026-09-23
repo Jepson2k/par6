@@ -2,7 +2,7 @@
 //! instantiates, so `--sim` and hardware share a single monomorphized RT
 //! core instead of duplicating the whole startup path per backend.
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
 use crate::bus::DriverBus;
 use crate::hw::SocketCanBus;
@@ -90,7 +90,7 @@ impl DriverBus for RuntimeBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         dispatch!(self, boot_configure(robot, gripper, repeats))

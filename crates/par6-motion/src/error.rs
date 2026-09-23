@@ -46,7 +46,7 @@ pub enum MotionError {
     },
     /// A blend was requested on a profile that is point-to-point by
     /// construction, and honouring it would mean either running the
-    /// corner over the velocity limit or stopping there anyway while
+    /// corner over a limit or stopping there anyway while
     /// reporting a blend. Neither is done; the program is refused.
     #[error("moves {first} and {second} blend on the {profile} profile, which is point-to-point; use trapezoid or ruckig to blend")]
     ProfileCannotBlend {

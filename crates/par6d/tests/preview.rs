@@ -567,13 +567,18 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
          {streamed_deg} deg streamed vs {single_deg} deg in one"
     );
 
-    // Against the runtime, one datagram of the same total duration: the
-    // stream is already known to travel the same distance, and a single
-    // send keeps wall-clock jitter out of the comparison. The ramp down
-    // is included on both sides — releasing the jog leaves the RT in JOG
-    // until the velocity reaches rest.
+    // Against the runtime, one longer datagram: the stream is already known
+    // to travel what one jog travels. The runtime ends a jog on its
+    // wall-clock watchdog, which is what keeps a streamed jog alive, while
+    // the preview counts ticks, so the runtime loses whatever release
+    // latency the host adds. That is a few ticks: a tenth of the 48-tick
+    // stream above on a loaded test run, a couple of percent of this one,
+    // inside what servo lag already allows. The ramp down is included on
+    // both sides — releasing the jog leaves the RT in JOG until the
+    // velocity reaches rest.
+    const RUNTIME_JOG_S: f64 = 1.2;
     preview.place_rad(to_rad(&park));
-    let whole = preview.submit(jog_j_cmd(speeds, FRAMES as f64 * frame_s));
+    let whole = preview.submit(jog_j_cmd(speeds, RUNTIME_JOG_S));
     assert!(whole.valid(), "{whole:?}");
     preview.submit(Command::Reset);
     let settled_deg = to_deg(&preview.angles_rad())[0] - park[0];
@@ -586,8 +591,8 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
     let start = rig.wait_status("runtime at rest", |s| {
         s.speeds.iter().all(|v| v.abs() < 0.05)
     });
-    c.send(&jog_j_cmd(speeds, FRAMES as f64 * frame_s));
-    std::thread::sleep(Duration::from_millis(600));
+    c.send(&jog_j_cmd(speeds, RUNTIME_JOG_S));
+    std::thread::sleep(Duration::from_secs_f64(RUNTIME_JOG_S));
     rig.drain_status();
     let rest = rig.wait_status("jog watchdog expired", |s| {
         s.seq > start.seq && s.speeds.iter().all(|v| v.abs() < 0.05)

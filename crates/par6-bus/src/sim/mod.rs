@@ -40,7 +40,7 @@ pub use driver::FaultKind;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
 
-use par6_config::{GripperConfig, KtSource, RobotConfig};
+use par6_config::{KtSource, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Shape};
 
 use crate::bus::DriverBus;
@@ -113,10 +113,6 @@ pub struct SimBus {
     /// Test hook: the bus swallows every reply, as a controller that
     /// came up error-passive does, until `recover_link` cycles it.
     deaf: bool,
-    /// Test hook: `(node, first tick, last tick)` over which one drive
-    /// answers nothing, as a STEPFOC whose `loop()` is starved does
-    /// while its timer interrupt keeps the motor under control.
-    mute: Option<(NodeId, u64, u64)>,
     tx_failure_after: Option<usize>,
     tx_frames_this_tick: usize,
     peak_tx_frames_per_tick: usize,
@@ -148,6 +144,9 @@ pub struct SimBus {
     scene: scene::Scene,
     /// The active tool's config inertials (`None` = the variant URDF's).
     tool: Option<scene::ToolInertial>,
+    /// `RobotConfig::gravity_correction`, which the plant adds as a
+    /// gravity-only load.
+    gravity_correction: Vec<f64>,
     /// The compiled-once base spec (arm, tool, floor — no world objects);
     /// every world change injects into a clone of it.
     base_spec: Option<scene::BaseSpec>,
@@ -180,7 +179,6 @@ impl SimBus {
             dt: 0.004,
             silent: false,
             deaf: false,
-            mute: None,
             tx_failure_after: None,
             tx_frames_this_tick: 0,
             peak_tx_frames_per_tick: 0,
@@ -210,6 +208,7 @@ impl SimBus {
             initial_q: None,
             scene,
             tool: None,
+            gravity_correction: Vec::new(),
             base_spec: None,
             world: [Vec::new(), Vec::new()],
             world_dirty: false,
@@ -572,6 +571,7 @@ impl SimBus {
             .plant
             .as_mut()
             .expect("the plant exists once boot_configure ran");
+        let probe_t = std::time::Instant::now();
         plant.step(
             dt,
             &mut self.drivers,
@@ -580,6 +580,10 @@ impl SimBus {
             jaw_drive,
             self.landed_unheld,
         );
+        let probe_ms = probe_t.elapsed().as_secs_f64() * 1e3;
+        if probe_ms > 15.0 {
+            eprintln!("PROBE slow plant step {probe_ms:.1} ms");
+        }
         // The scene owns the object positions unless a test declared them:
         // whatever physically jammed the jaws becomes the front end's
         // obstruction.
@@ -1002,21 +1006,13 @@ impl DriverBus for SimBus {
             age_max = age_max.max(age);
             // Harvest node + err bit BEFORE payload dispatch; refused
             // frames still count for freshness and the live fault bit.
-            let decoded = decode_frame(&frame);
-            let (node, err_bit) = match &decoded {
-                Ok(d) => (d.node, d.err_bit),
+            let (node, err_bit) = match decode_frame(&frame) {
+                Ok(d) => {
+                    Self::apply(&d, state);
+                    (d.node, d.err_bit)
+                }
                 Err(e) => (e.node(), e.err_bit()),
             };
-            if self.mute.is_some_and(|(muted, from, to)| {
-                muted == node && self.tick >= from && self.tick <= to
-            }) {
-                // The drive never sent this: no payload, no freshness, no
-                // error bit, exactly as a silent controller looks.
-                continue;
-            }
-            if let Ok(d) = &decoded {
-                Self::apply(d, state);
-            }
             let n = usize::from(node);
             state.nodes[n].live_error_bit = err_bit;
             // A node already on `connected` has booted, so its first frame
@@ -1151,7 +1147,7 @@ impl DriverBus for SimBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError> {
         let n = robot.joints.len();
@@ -1223,6 +1219,8 @@ impl DriverBus for SimBus {
             com_m: g.kinematics.com_m,
             inertia_kg_m2: g.kinematics.inertia_kg_m2,
         });
+        self.gravity_correction
+            .clone_from(&robot.gravity_correction);
         self.plant = Some(self.make_plant(robot, &q0));
         self.mj_jaw_cmd = None;
         self.gripper_object_override = None;
@@ -1401,15 +1399,6 @@ impl DriverBus for SimBus {
 }
 
 impl SimBus {
-    /// Test hook: silence one drive from `from_tick` for `ticks` ticks.
-    ///
-    /// The rest of the bus keeps answering, which is what a starved
-    /// STEPFOC `loop()` looks like from the host: one node stops
-    /// replying while its motor stays controlled from the timer
-    /// interrupt and no error flag is ever set.
-    pub fn silence_node(&mut self, node: NodeId, from_tick: u64, ticks: u64) {
-        self.mute = Some((node, from_tick, from_tick + ticks.saturating_sub(1)));
-    }
     /// Test hook: make the link deaf (every reply is dropped undecoded,
     /// the way an error-passive controller hears nobody) until the
     /// runtime cycles it through `recover_link`. The link reports
@@ -1447,7 +1436,13 @@ impl SimBus {
         let model = scene::compile(&mut spec).unwrap_or_else(|e| panic!("sim scene: {e}"));
         self.base_spec = Some(base);
         self.world_dirty = false;
-        mujoco::MujocoPlant::new(model, &self.maps, q0, &robot.sim.holding_friction_nm)
+        mujoco::MujocoPlant::new(
+            model,
+            &self.maps,
+            q0,
+            &robot.sim.holding_friction_nm,
+            &self.gravity_correction,
+        )
     }
 
     /// Rebuild the scene around the current world layers, in place.

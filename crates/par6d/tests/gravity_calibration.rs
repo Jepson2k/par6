@@ -40,9 +40,13 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
     let config = test_config();
     let bundle = par6_config::ConfigBundle::load(&config).expect("config");
     let robot = &bundle.robot;
-    let gripper = bundle.active_gripper();
-    // No tool: the gripper the plant swings is the unknown load.
+    let gripper = bundle.active_tool();
+    // No tool: the gripper the plant swings is the unknown load. The arm's
+    // identified correction is part of the arm, in this model as in the
+    // daemon's, so the fit is left only the tool to find.
     let mut kin = Kin::load_arm(&assets_dir(), None).expect("gravity model");
+    kin.set_gravity_correction(&robot.gravity_correction)
+        .expect("the config's gravity correction");
     let carried_kg = gripper
         .map(|g| g.kinematics.mass_kg)
         .expect("a fitted gripper");
@@ -51,7 +55,7 @@ fn a_fit_from_the_plants_held_torques_predicts_poses_it_never_rested_in() {
         "the fitted gripper must have mass to find"
     );
     let variant = GripperVariant::resolve(
-        &robot.robot.active_gripper.to_ascii_uppercase(),
+        &robot.robot.active_tool.to_ascii_uppercase(),
         gripper.and_then(|g| g.urdf_variant.as_deref()),
     );
     let mut collision = Collision::load(&assets_dir(), variant, 0.0).expect("collision world");
@@ -348,7 +352,7 @@ fn diagnose_slow_sweep_torque() {
 
     let config = test_config();
     let bundle = par6_config::ConfigBundle::load(&config).unwrap();
-    let mut truth = par6d::kin::load_gravity_kin(&assets_dir(), bundle.active_gripper()).unwrap();
+    let mut truth = par6d::kin::load_gravity_kin(&assets_dir(), bundle.active_tool()).unwrap();
     let status_port = free_udp_port();
     let daemon = boot_for_client(config, status_port).unwrap();
     let cmd = daemon.command_addr();

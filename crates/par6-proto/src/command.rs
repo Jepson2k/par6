@@ -775,7 +775,6 @@ pub enum Command {
     ConfigBundle,
     BusScan,
     StatusRate,
-    CaptureInfo,
     // FIRE_AND_FORGET
     ServoJ(ServoJ),
     ServoJPose(ServoJPose),
@@ -846,7 +845,6 @@ impl Command {
             C::ConfigBundle => CmdType::ConfigBundle,
             C::BusScan => CmdType::BusScan,
             C::StatusRate => CmdType::StatusRate,
-            C::CaptureInfo => CmdType::CaptureInfo,
             C::ServoJ(_) => CmdType::ServoJ,
             C::ServoJPose(_) => CmdType::ServoJPose,
             C::ServoL(_) => CmdType::ServoL,
@@ -924,7 +922,6 @@ impl Command {
             | C::ConfigBundle
             | C::BusScan
             | C::StatusRate
-            | C::CaptureInfo
             | C::ResetLoopStats => Ok(()),
             C::SetCanId(p) => {
                 check(
@@ -1304,8 +1301,7 @@ fn arity(tag: CmdType) -> usize {
         | T::Payload
         | T::ConfigBundle
         | T::BusScan
-        | T::StatusRate
-        | T::CaptureInfo => 2,
+        | T::StatusRate => 2,
         T::Stop
         | T::Simulator
         | T::SetGravityComp
@@ -1410,8 +1406,7 @@ pub fn encode_command(cmd: &Command, req_id: u32, buf: &mut Vec<u8>) -> Result<(
         | C::Payload
         | C::ConfigBundle
         | C::BusScan
-        | C::StatusRate
-        | C::CaptureInfo => {}
+        | C::StatusRate => {}
         C::SetCanId(p) => {
             w_uint(buf, u64::from(p.node));
             w_uint(buf, u64::from(p.new_id));
@@ -1917,7 +1912,6 @@ pub fn decode_command(data: &[u8]) -> Result<(u32, Command), DecodeError> {
         T::ConfigBundle => Command::ConfigBundle,
         T::BusScan => Command::BusScan,
         T::StatusRate => Command::StatusRate,
-        T::CaptureInfo => Command::CaptureInfo,
         T::SetCanId => Command::SetCanId(SetCanId {
             node: r_node_id(&mut r, "set_can_id.node")?,
             new_id: r_node_id(&mut r, "set_can_id.new_id")?,

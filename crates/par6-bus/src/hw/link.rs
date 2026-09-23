@@ -49,6 +49,26 @@ pub enum OpenError {
         /// Netlink failure detail.
         detail: String,
     },
+    /// The TX queue is shorter than the configured length and could not be
+    /// raised. Fatal rather than a warning: the boot configuration burst is
+    /// longer than a short queue, so the run would start, home the arm, and
+    /// then fail mid-motion with "TX queue full" -- which on 2026-09-21 left
+    /// the shoulder and elbow unparked.
+    #[error(
+        "CAN interface '{iface}' has a {found}-frame TX queue, under the {want} configured, \
+             and it could not be raised ({detail}); the configuration burst would be dropped. \
+             Run with CAP_NET_ADMIN, or `ip link set {iface} txqueuelen {want}`"
+    )]
+    TxQueue {
+        /// Interface name from the config.
+        iface: String,
+        /// What the kernel reports now.
+        found: u32,
+        /// What the config asks for.
+        want: u32,
+        /// Why raising it failed.
+        detail: String,
+    },
     /// The interface is down and bringing it up failed (bring-up needs
     /// `CAP_NET_ADMIN`).
     #[error(
@@ -130,8 +150,7 @@ fn bring_up_timed(
     iface
         .bring_up()
         .map_err(|e| fail(format!("link up: {e}")))?;
-    set_txqueuelen(&cfg.interface, cfg.txqueuelen);
-    Ok(())
+    ensure_txqueuelen(cfg)
 }
 
 /// Bring the configured interface into its operating state (up at the
@@ -174,7 +193,7 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
         // they left, and a 10-frame queue drops the boot configuration
         // burst outright ("TX queue full", seen on this arm 2026-09-19
         // after can0 came back up outside this process).
-        set_txqueuelen(&cfg.interface, cfg.txqueuelen);
+        ensure_txqueuelen(cfg)?;
         log::info!(
             "CAN interface '{}' already up ({} bps)",
             cfg.interface,
@@ -208,14 +227,68 @@ pub(super) fn ensure_up(cfg: &BusConfig) -> Result<(), OpenError> {
 /// root-owned, so an unprivileged service user is refused before its
 /// `CAP_NET_ADMIN` is even consulted, while the ioctl honours the
 /// capability — the same path `ifconfig txqueuelen` takes.
-fn set_txqueuelen(iface: &str, len: u32) {
-    match txqueuelen_ioctl(iface, len) {
-        Ok(()) => log::info!("CAN interface '{iface}': txqueuelen {len}"),
-        Err(e) => log::warn!(
-            "CAN interface '{iface}': could not set txqueuelen to {len} ({e}); \
-             a long config burst may be dropped by the kernel TX queue"
-        ),
+/// Raise the TX queue and then read it back, because setting it is
+/// best-effort and its failure is not visible until the bus is busy.
+///
+/// An interface someone else brought up carries whatever default they left,
+/// and a 10-frame queue drops the boot configuration burst outright. Setting
+/// it and only logging the failure meant the run started anyway, homed the
+/// arm, and died mid-motion with "TX queue full" -- on 2026-09-21 that left
+/// the shoulder and elbow unparked. Refuse before anything moves instead.
+fn ensure_txqueuelen(cfg: &BusConfig) -> Result<(), OpenError> {
+    let want = cfg.txqueuelen;
+    let iface = &cfg.interface;
+    let detail = match txqueuelen_ioctl(iface, want) {
+        Ok(()) => String::new(),
+        Err(e) => e.to_string(),
+    };
+    match txqueuelen_get(iface) {
+        Ok(found) if found >= want => {
+            log::info!("CAN interface '{iface}': txqueuelen {found}");
+            Ok(())
+        }
+        Ok(found) => Err(OpenError::TxQueue {
+            iface: iface.clone(),
+            found,
+            want,
+            detail: if detail.is_empty() {
+                "read back short".to_owned()
+            } else {
+                detail
+            },
+        }),
+        // The queue cannot be read: trust the set, and let a short queue
+        // announce itself the old way rather than refusing to run at all.
+        Err(e) => {
+            log::warn!("CAN interface '{iface}': could not read back txqueuelen ({e})");
+            Ok(())
+        }
     }
+}
+
+fn txqueuelen_get(iface: &str) -> std::io::Result<u32> {
+    use std::os::fd::AsRawFd;
+
+    let name = iface.as_bytes();
+    // SAFETY: ifreq is plain data; a zeroed value is a valid (empty) request.
+    let mut req: libc::ifreq = unsafe { std::mem::zeroed() };
+    if name.len() >= req.ifr_name.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "interface name too long",
+        ));
+    }
+    for (dst, src) in req.ifr_name.iter_mut().zip(name) {
+        *dst = *src as libc::c_char;
+    }
+    let sock = std::net::UdpSocket::bind("127.0.0.1:0")?;
+    // SAFETY: SIOCGIFTXQLEN fills a fully initialised ifreq that outlives it.
+    let rc = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFTXQLEN, &mut req) };
+    if rc < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: the kernel wrote the length into the union's leading int.
+    Ok(unsafe { req.ifr_ifru.ifru_metric } as u32)
 }
 
 fn txqueuelen_ioctl(iface: &str, len: u32) -> std::io::Result<()> {

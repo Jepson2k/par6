@@ -182,9 +182,16 @@ struct Pending {
 enum PostEffect {
     None,
     Checkpoint(String),
-    /// `select_tool` can only ever name the fitted tool (validated at
-    /// accept time), so the variant is the part that actually changes.
-    SelectVariant(Option<String>),
+    /// `select_tool` names the tool to fit and, optionally, the variant$
+    /// within it. Both land at their turn in the queue, so moves admitted
+    /// before the swap were planned against the old tool and moves after
+    /// it against the new one.
+    SelectTool {
+        /// Registry key of the tool to fit.
+        tool: String,
+        /// Jaw/variant key within it; `None` = the tool default.
+        variant: Option<String>,
+    },
     /// `set_tcp_offset` lands at its turn in the queue: moves admitted
     /// before it were planned against the old frame, moves after it are
     /// planned against the new one, and a blend chain can never fold
@@ -682,7 +689,7 @@ impl<R: RtCommands> Core<R> {
         if matches!(cmd, Command::ConfigBundle) {
             let ci = &self.cfg.config_info;
             let bytes = ci.robot_toml.len()
-                + ci.grippers
+                + ci.tools
                     .iter()
                     .map(|(name, text)| name.len() + text.len())
                     .sum::<usize>();
@@ -1569,17 +1576,23 @@ impl<R: RtCommands> Core<R> {
                 match ex.effect {
                     PostEffect::None => {}
                     PostEffect::Checkpoint(label) => self.last_checkpoint = label,
-                    PostEffect::SelectVariant(variant) => {
-                        // A variant carries its own TCP frame, so an
-                        // offset measured against the old one describes
-                        // nothing once it changes — a real change clears
-                        // it, a re-selection of the same variant leaves
-                        // it alone (the client API documents the reset,
-                        // and it is what the parol6 runtime does).
-                        if variant != self.tool_variant {
+                    PostEffect::SelectTool { tool, variant } => {
+                        // The planner has already swapped the models; this
+                        // is the command plane catching up. STATUS, the
+                        // tool-action gate and every later `select_tool`
+                        // compare against it.
+                        let tool = self.cfg.fit_tool(&tool);
+                        // A different tool, or a different variant of the
+                        // same one, carries its own TCP frame, so an offset
+                        // measured against the old one describes nothing —
+                        // a real change clears it, a re-selection leaves it
+                        // alone (the client API documents the reset, and it
+                        // is what the parol6 runtime does).
+                        if variant != self.tool_variant || tool != self.tool {
                             self.tcp_offset_mm = [0.0; 3];
                         }
                         self.tool_variant = variant;
+                        self.tool = tool;
                         self.sync_planner();
                     }
                     PostEffect::TcpOffset(mm) => {
@@ -2580,9 +2593,6 @@ impl<R: RtCommands> Core<R> {
                 hz: f64::from(self.status_rate_hz),
                 tick_hz: 1.0 / self.cfg.config_info.tick_dt_s,
             },
-            C::CaptureInfo => QueryResult::CaptureInfo {
-                identity: self.cfg.capture_identity.clone(),
-            },
             C::ConfigInfo => {
                 let ci = &self.cfg.config_info;
                 QueryResult::ConfigInfo {
@@ -2605,7 +2615,7 @@ impl<R: RtCommands> Core<R> {
                     fingerprint: ci.fingerprint.clone(),
                     robot_filename: ci.robot_filename.clone(),
                     robot_toml: ci.robot_toml.clone(),
-                    grippers: ci.grippers.clone(),
+                    tools: ci.tools.clone(),
                 }
             }
             _ => unreachable!("dispatch routes only QUERY commands here"),
@@ -2715,10 +2725,12 @@ pub fn validate_registries(cfg: &ServerConfig, cmd: &Command) -> Option<WireErro
         .any(|t| t.eq_ignore_ascii_case(name.as_str()))
     {
         format!("unknown tool '{name}'; this runtime knows {:?}", cfg.tools)
-    } else if !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str()) {
+    } else if matches!(cmd, Command::ToolAction(_))
+        && !cfg.fitted_tool.eq_ignore_ascii_case(name.as_str())
+    {
         format!(
             "tool '{name}' is not fitted; this runtime is running '{}' \
-             (change robot.active_gripper and restart par6d)",
+             (select it first)",
             cfg.fitted_tool
         )
     } else {
@@ -2960,7 +2972,10 @@ pub fn teleport_angle_fault(angles: &[f64; NUM_JOINTS], cfg: &ServerConfig) -> O
 fn post_effect(cmd: &Command) -> PostEffect {
     match cmd {
         Command::Checkpoint(p) => PostEffect::Checkpoint(p.label.clone()),
-        Command::SelectTool(p) => PostEffect::SelectVariant(p.variant_key.clone()),
+        Command::SelectTool(p) => PostEffect::SelectTool {
+            tool: p.tool_name.clone(),
+            variant: p.variant_key.clone(),
+        },
         Command::SetTcpOffset(p) => PostEffect::TcpOffset([p.x, p.y, p.z]),
         _ => PostEffect::None,
     }
@@ -3023,7 +3038,6 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::IsSimulator => "is_simulator",
         T::Shapes => "shapes",
         T::ConfigInfo => "config_info",
-        T::CaptureInfo => "capture_info",
         T::ConfigBundle => "config_bundle",
         T::Payload => "payload",
         T::ServoJ => "servo_j",

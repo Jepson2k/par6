@@ -666,8 +666,8 @@ class DryRunRobotClient:
     # ------------------------------------------------------------------
 
     def select_tool(self, tool_name: str, variant_key: str = "", **kwargs: Any) -> int:
-        """Select a tool — refused for any tool the runtime is not fitted
-        with, matching the runtime's own rule."""
+        """Fit a tool in the preview as the runtime fits one: any
+        configured tool, an unknown key refused."""
         self._submit(
             {
                 "type": "select_tool",
@@ -998,10 +998,6 @@ class DryRunRobotClient:
             buf.tool_status = status.tool_status
             buf.tool_status_present = True
         return buf
-
-    def capture_info(self) -> dict:
-        """Offline preview has no native diagnostic recorder."""
-        return {"identity": None}
 
     def config_info(self) -> dict:
         """The effective configuration in the live query's shape, from the

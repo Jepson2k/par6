@@ -10,6 +10,9 @@
 //!   damping. The config hard limits are MuJoCo joint limits, and the
 //!   drivetrain friction is MuJoCo `frictionloss`, set every substep by
 //!   the law below;
+//! - the config's identified `gravity_correction` acts on the arm bodies as
+//!   a gravity-only load, so the plant weighs what the runtime
+//!   compensates;
 //! - the jaw DOF runs a stiff PD servo. In firmware mode the plant
 //!   rate-limits its own approach to the RAW cmd-61 target (mirroring the
 //!   front end's byte kinematics) and reports physical obstructions from
@@ -124,6 +127,14 @@ pub(crate) struct MujocoPlant {
     cmds: Vec<PlantCmd>,
     /// Last substep's bias torques (gravity + velocity terms), all DOFs.
     bias: Vec<f64>,
+    /// `RobotConfig::gravity_correction` per arm joint's body, `[mass, mx,
+    /// my, mz]` in that body's frame: gravity the runtime's model carries
+    /// beyond the URDF's. Applied as a load rather than as mass, because
+    /// the controller adds it to gravity alone and leaves inertia nominal;
+    /// moving the bodies' COM instead would change the plant's inertia too.
+    correction: Vec<[f64; 4]>,
+    /// This tick's generalized force of gravity on `correction`, all DOFs.
+    correction_qfrc: Vec<f64>,
     /// Free world objects by shape name: `(joint id, qpos address, dof
     /// address)`, re-indexed whenever the model is compiled.
     objects: BTreeMap<String, (usize, usize, usize)>,
@@ -165,7 +176,13 @@ impl MujocoPlant {
     /// holding friction per arm joint. Panics with a descriptive message
     /// on a layout the plant cannot drive (a sim construction bug, not a
     /// runtime error).
-    pub fn new(model: MjModel, maps: &[JointMap], q0: &[f64], holding_nm: &[f64]) -> Self {
+    pub fn new(
+        model: MjModel,
+        maps: &[JointMap],
+        q0: &[f64],
+        holding_nm: &[f64],
+        gravity_correction: &[f64],
+    ) -> Self {
         let n = maps.len();
         assert_eq!(
             holding_nm.len(),
@@ -241,6 +258,14 @@ impl MujocoPlant {
                 n
             ],
             bias: vec![0.0; nv],
+            correction: gravity_correction
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(n)
+                .copied()
+                .collect(),
+            correction_qfrc: vec![0.0; nv],
             objects: BTreeMap::new(),
             jaw_cmd_byte: JAW_INIT_BYTE,
             close_at: None,
@@ -314,6 +339,7 @@ impl MujocoPlant {
         self.qvel.resize(nv, 0.0);
         self.qfrc.resize(nv, 0.0);
         self.bias.resize(nv, 0.0);
+        self.correction_qfrc.resize(nv, 0.0);
         let joints: Vec<(String, usize, usize, usize, usize)> = self.joints().collect();
         for (name, qadr, nq, dadr, nv) in joints {
             if let Some((_, q, v)) = saved.iter().find(|(n, _, _)| *n == name) {
@@ -433,7 +459,36 @@ impl MujocoPlant {
         self.reseed(q);
         self.data.qvel_mut().fill(0.0);
         self.data.forward();
-        self.data.qfrc_bias()[..self.n].to_vec()
+        self.correction_load();
+        (0..self.n)
+            .map(|j| self.data.qfrc_bias()[j] - self.correction_qfrc[j])
+            .collect()
+    }
+
+    /// Gravity's generalized force on the `correction`, at the kinematics
+    /// MuJoCo last computed, into `correction_qfrc`. Per body, the added
+    /// mass is a force at the body origin and the added first moment `h`
+    /// (rotated into the world) a pure torque `h × g` about it.
+    fn correction_load(&mut self) {
+        self.correction_qfrc.fill(0.0);
+        let g = self.data.model().ffi().opt.gravity;
+        for (j, delta) in self.correction.iter().enumerate() {
+            let body = self.data.model().jnt_bodyid()[j] as usize;
+            let r = self.data.xmat()[body];
+            let p = self.data.xpos()[body];
+            let h: [f64; 3] = std::array::from_fn(|k| {
+                r[3 * k] * delta[1] + r[3 * k + 1] * delta[2] + r[3 * k + 2] * delta[3]
+            });
+            let force = g.map(|gk| delta[0] * gk);
+            let torque = [
+                h[1] * g[2] - h[2] * g[1],
+                h[2] * g[0] - h[0] * g[2],
+                h[0] * g[1] - h[1] * g[0],
+            ];
+            self.data
+                .apply_ft(&force, &torque, &p, body, &mut self.correction_qfrc)
+                .expect("an arm joint's body and a full-length force vector");
+        }
     }
 
     /// Measured motor state of arm joint `j` (position ticks, speed
@@ -513,6 +568,10 @@ impl MujocoPlant {
         }
         let h = self.ts;
         let fw_steps = h / FW_LOOP_DT;
+        // Once a tick: gravity moves with the pose, which a tick barely
+        // changes, and the Jacobians behind it cost more than the physics
+        // they would refine.
+        self.correction_load();
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {
@@ -529,9 +588,9 @@ impl MujocoPlant {
                 }
                 self.qfrc[j] = t;
                 // The load is what acts on the joint besides the motor:
-                // MuJoCo's bias (its sign is the force that cancels it)
-                // and the injected external load.
-                let load = external - self.bias[j];
+                // MuJoCo's bias (its sign is the force that cancels it),
+                // the gravity correction and the injected external load.
+                let load = external - self.bias[j] + self.correction_qfrc[j];
                 self.friction[j] = if clamp_arm {
                     LANDING_CLAMP_NM
                 } else {
@@ -559,6 +618,9 @@ impl MujocoPlant {
                 let f = (JAW_KP * (x_t - self.qpos[jaw]) + JAW_KD * (jaw_vt - self.qvel[jaw]))
                     .clamp(-JAW_FMAX, JAW_FMAX);
                 self.qfrc[jaw] = f;
+            }
+            for (f, c) in self.qfrc.iter_mut().zip(&self.correction_qfrc) {
+                *f += c;
             }
             self.data.qfrc_applied_mut().copy_from_slice(&self.qfrc);
             self.data.step();

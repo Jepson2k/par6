@@ -513,10 +513,6 @@ impl CoreClient {
         query_future(py, self.rt(), Command::Shapes)
     }
 
-    fn capture_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        query_future(py, self.rt(), Command::CaptureInfo)
-    }
-
     fn config_info<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
         query_future(py, self.rt(), Command::ConfigInfo)
     }

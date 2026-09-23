@@ -4,8 +4,8 @@
 //! `move_j` is planned from the latest measured pose under the selected
 //! [`Profile`] (EXEC limits), converted sample-for-sample into the RT
 //! ring format, and fed into the SPSC ring under backpressure —
-//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID/QUINTIC, the TOPPRA path parameterizer
-//! for TOPPRA. Completion is observed through the RT snapshot: the
+//! [`ProgramBuilder`] for RUCKIG/TRAPEZOID/QUINTIC/SEPTIC, the TOPPRA
+//! path parameterizer for TOPPRA. Completion is observed through the RT snapshot: the
 //! EXEC playback publishes a high-water `completed_index` over the
 //! per-command ring indexes this planner allocates, and the settle
 //! policy (commanded/settled/strict) runs RT-side — so a `poll()`
@@ -50,6 +50,8 @@
 //!
 //! [`cart`]: par6_motion::cart
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use par6_config::ConfigBundle;
@@ -138,6 +140,9 @@ pub(crate) enum Profile {
     /// Quintic on the path coordinate: zero velocity AND acceleration at
     /// both ends, no cruise, no jerk limiting, point-to-point only.
     Quintic,
+    /// Septic on the path coordinate: zero velocity, acceleration AND
+    /// jerk at both ends, jerk-limited, point-to-point only.
+    Septic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
     /// acceleration limits bind, nothing else.
     Toppra,
@@ -149,6 +154,7 @@ impl Profile {
             "RUCKIG" => Some(Self::Ruckig),
             "TRAPEZOID" => Some(Self::Trapezoid),
             "QUINTIC" => Some(Self::Quintic),
+            "SEPTIC" => Some(Self::Septic),
             "TOPPRA" => Some(Self::Toppra),
             _ => None,
         }
@@ -162,6 +168,7 @@ pub(crate) fn profile_names() -> Vec<String> {
         "RUCKIG".to_owned(),
         "TRAPEZOID".to_owned(),
         "QUINTIC".to_owned(),
+        "SEPTIC".to_owned(),
     ];
     names.push("TOPPRA".to_owned());
     names
@@ -188,6 +195,10 @@ enum InFlightKind {
     },
     Delay {
         target_tick: u64,
+    },
+    /// A tool swap, done when the RT core has applied it.
+    ToolSwap {
+        applied: Arc<AtomicBool>,
     },
     Instant,
 }
@@ -219,6 +230,11 @@ enum CartTiming {
     ConstantToolSpeed,
 }
 
+/// Config passes the gripper node gets when a `select_tool` fits a new
+/// tool. Four, the same as the boot sequence and every reconnect resend:
+/// the node has to hear its new current limit before anything drives the
+/// jaw, and a single frame on a busy bus is a frame that can be missed.
+const GRIPPER_RETUNE_REPEATS: u8 = 4;
 /// The planner's kinematics kit (feature `ffi`): its own model instance,
 /// the enforced collision world, and the shared TCP-offset cell it
 /// publishes into.
@@ -226,6 +242,16 @@ pub(crate) struct PlannerKin {
     pub(crate) kin: crate::kin::CartKin,
     pub(crate) collision: par6_kin::Collision,
     pub(crate) tool_offset: crate::kin::ToolOffset,
+}
+
+/// What the planner needs to rebuild its models when the tool changes.
+///
+/// `source` is `None` offline: the preview has no assets tree to reload
+/// from, so it tracks the selected tool without swapping geometry.
+pub(crate) struct PlannerSwap {
+    pub(crate) source: Option<crate::daemon::KinSource>,
+    pub(crate) bundle: std::sync::Arc<ConfigBundle>,
+    pub(crate) tools: crate::bridge::ToolMailbox,
 }
 
 /// The `Planner` implementation `par6d` hands to the server.
@@ -276,6 +302,13 @@ pub(crate) struct Par6Planner {
     /// The applied runtime payload, mirrored so `sync` only touches the
     /// model on a change.
     payload: par6_server::PayloadSpec,
+    /// Everything a `select_tool` rebuild needs: where the models come
+    /// from, the tool registry to look the new one up in, the name in
+    /// force, and the drop box the other model owners read.
+    source: Option<crate::daemon::KinSource>,
+    bundle: std::sync::Arc<ConfigBundle>,
+    fitted_tool: String,
+    tools: crate::bridge::ToolMailbox,
 }
 
 impl Par6Planner {
@@ -285,6 +318,115 @@ impl Par6Planner {
     pub(crate) fn set_enablement_probe(&mut self, on: bool) {
         self.probe.enabled = on;
     }
+    /// Adopt a newly selected tool.
+    ///
+    /// Everything a tool decides has to move together: the load the
+    /// gravity feedforward carries, the frame FK resolves at, the geometry
+    /// the collision world checks, and the home offsets on the joints
+    /// whose reference is tool-dependent. Half a swap is worse than none —
+    /// a feedforward for one tool against the geometry of another holds
+    /// the arm against a load that is not there.
+    ///
+    /// The RT models go through a `CoreOp`, so they land between ticks
+    /// rather than inside one; the returned flag is raised once they have,
+    /// which is when `select_tool` completes — STATUS reports the new TCP
+    /// from then on. `None` means there was nothing to swap. The other
+    /// owners take theirs from the mailbox at their own next safe point.
+    /// Home offsets are re-based in place: the endstop the arm latched has
+    /// not moved, only what that reading means, so this is arithmetic
+    /// rather than a re-home.
+    fn adopt_tool(&mut self, name: &str) -> Result<Option<Arc<AtomicBool>>, WireError> {
+        if name.eq_ignore_ascii_case(&self.fitted_tool) {
+            return Ok(None);
+        }
+        let refused = |detail: String| {
+            make_error(
+                ErrorCode::MotnSetupFailed,
+                UNATTRIBUTED,
+                &[("detail", &detail)],
+            )
+        };
+        let Some(gripper) = self
+            .bundle
+            .tools
+            .iter()
+            .find(|g| g.name.eq_ignore_ascii_case(name))
+        else {
+            return Err(refused(format!("no tool named '{name}'")));
+        };
+        let Some(source) = self.source.as_ref() else {
+            // Offline: no assets tree to rebuild from, so track the
+            // selection without pretending the geometry changed.
+            self.fitted_tool.clone_from(&gripper.name);
+            return Ok(None);
+        };
+        let source = source.for_gripper(Some(gripper));
+        let rebuilt = (|| {
+            Ok::<_, crate::daemon::DaemonError>((
+                source.cart_kin(&self.tool_offset)?,
+                source.cart_kin(&self.tool_offset)?,
+                source.cart_kin(&self.tool_offset)?,
+                source.collision()?,
+                source.collision()?,
+                crate::kin::load_gravity_kin(source.assets_dir(), Some(gripper))
+                    .map_err(crate::daemon::DaemonError::Kinematics)?,
+                source.kin_fk(&self.tool_offset)?,
+            ))
+        })();
+        let (planner, bridge, housekeeping, collision, gate_collision, mut gravity, fk) =
+            rebuilt.map_err(|e| refused(format!("cannot load tool '{name}': {e}")))?;
+        gravity
+            .set_gravity_correction(&self.bundle.robot.gravity_correction)
+            .map_err(|e| refused(format!("tool '{name}': gravity correction refused: {e}")))?;
+        // The offsets the new tool declares, for the joints whose home
+        // reference is tool-dependent.
+        let mut offsets: Vec<(usize, f64)> = Vec::new();
+        for j in 0..self.bundle.robot.homing.joints.len().min(MAX_JOINTS) {
+            if self.bundle.robot.homing.joints[j].home_offset_gripper_dependent {
+                let offset = gripper
+                    .arm_joint_home_offsets
+                    .iter()
+                    .find(|o| usize::from(o.joint) == j)
+                    .map_or(self.bundle.robot.homing.joints[j].home_offset_rad, |o| {
+                        o.home_offset_rad
+                    });
+                offsets.push((j, offset));
+            }
+        }
+        let gripper_node = self.bundle.robot.bus.gripper_node;
+        let fitted = gripper.clone();
+        let applied = Arc::new(AtomicBool::new(false));
+        let raised = Arc::clone(&applied);
+        self.link.op(Box::new(move |core| {
+            core.set_gravity(Box::new(crate::kin::KinGravity::new(gravity)));
+            core.set_fk(Box::new(fk));
+            // The jaw is part of the tool: its limits, its pinion and the
+            // reference it homed against all belong to the one that just
+            // came off.
+            core.set_gripper_tool(Some(&fitted), gripper_node, GRIPPER_RETUNE_REPEATS);
+            for (j, offset) in offsets {
+                core.set_tool_home_offset(j, offset);
+            }
+            // The targets every mode holds are joint angles, and the
+            // angles just moved under them.
+            core.reseed_motion_targets();
+            raised.store(true, Ordering::Release);
+        }));
+        if let Ok(mut swap) = self.tools.lock() {
+            swap.bridge = Some(bridge);
+            swap.housekeeping = Some(housekeeping);
+            swap.gate_collision = Some(gate_collision);
+        }
+        self.kin = planner;
+        self.collision = collision;
+        self.tool = gripper
+            .driver
+            .as_ref()
+            .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
+        self.fitted_tool.clone_from(&gripper.name);
+        log::info!("select_tool: now running '{name}'");
+        Ok(Some(applied))
+    }
 
     pub(crate) fn new(
         link: CoreLink,
@@ -293,6 +435,7 @@ impl Par6Planner {
         snapshots: SnapshotReader<StateSnapshot>,
         bundle: &ConfigBundle,
         models: PlannerKin,
+        swap: PlannerSwap,
     ) -> Result<Self, MotionError> {
         let exec_limits = MotionLimits::from_config(&bundle.robot, par6_config::LimitMode::Exec)?;
         let PlannerKin {
@@ -302,7 +445,7 @@ impl Par6Planner {
         } = models;
         let dt = bundle.robot.robot.tick_dt_s;
         let tool = bundle
-            .active_gripper()
+            .active_tool()
             .and_then(|g| g.driver.as_ref())
             .map(|d| ToolSpec { ilim_ma: d.ilim_ma });
         let mut home_pose_rad = [0.0; MAX_JOINTS];
@@ -345,6 +488,10 @@ impl Par6Planner {
             collision_latch: CollisionState::default(),
             invalidated: None,
             motion,
+            source: swap.source,
+            fitted_tool: swap.bundle.robot.robot.active_tool.clone(),
+            tools: swap.tools,
+            bundle: swap.bundle,
             payload: par6_server::PayloadSpec::default(),
         })
     }
@@ -671,6 +818,7 @@ impl Par6Planner {
             Profile::Ruckig => ProfileKind::Ruckig,
             Profile::Trapezoid => ProfileKind::Trapezoid,
             Profile::Quintic => ProfileKind::Quintic,
+            Profile::Septic => ProfileKind::Septic,
             // TOPPRA times the straight joint-space path instead of
             // shaping a point-to-point profile: same waypoints, a
             // different (time-optimal) parameterization.
@@ -1548,9 +1696,11 @@ impl Par6Planner {
                     target_tick: snap.tick + ticks,
                 }
             }
-            Command::Checkpoint(_) | Command::SelectTool(_) | Command::SetTcpOffset(_) => {
-                InFlightKind::Instant
-            }
+            Command::SelectTool(p) => match self.adopt_tool(&p.tool_name)? {
+                Some(applied) => InFlightKind::ToolSwap { applied },
+                None => InFlightKind::Instant,
+            },
+            Command::Checkpoint(_) | Command::SetTcpOffset(_) => InFlightKind::Instant,
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -1697,6 +1847,9 @@ impl Par6Planner {
                 }
             }
             InFlightKind::Delay { target_tick } => (snap.tick >= *target_tick).then_some(Ok(None)),
+            InFlightKind::ToolSwap { applied } => {
+                applied.load(Ordering::Acquire).then_some(Ok(None))
+            }
             InFlightKind::Instant => Some(Ok(None)),
         }
     }

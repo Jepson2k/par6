@@ -13,6 +13,7 @@ mod run;
 pub use record::TickBatch;
 pub use run::RunLimits;
 
+use crate::planner::PlannerSwap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{atomic::AtomicBool, Arc};
@@ -242,9 +243,9 @@ impl Preview {
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let bundle = par6_config::ConfigBundle::load(&config_path)?;
         let robot = &bundle.robot;
-        let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_gripper())?;
+        let stack = load_preview_kin(&opts, &config_path, robot, bundle.active_tool())?;
         let tool_calibrate_hold_ticks = bundle
-            .active_gripper()
+            .active_tool()
             .and_then(|g| g.driver.as_ref())
             .map_or(0, |d| {
                 (d.settle.calibrate_min_wait_s / robot.robot.tick_dt_s).round() as u64
@@ -265,6 +266,11 @@ impl Preview {
                 kin: stack.planner,
                 collision: stack.collision,
                 tool_offset: stack.tool_offset,
+            },
+            PlannerSwap {
+                source: None,
+                bundle: std::sync::Arc::new(bundle.clone()),
+                tools: Default::default(),
             },
         )?;
 
@@ -1305,12 +1311,14 @@ impl Preview {
     fn note_effects(&mut self, head: &Command) {
         match head {
             Command::SelectTool(p) => {
-                // A variant carries its own TCP frame: a real change clears
-                // the offset, a re-selection leaves it alone.
-                if p.variant_key != self.tool_variant {
+                let tool = self.cfg.fit_tool(&p.tool_name);
+                // A tool or variant carries its own TCP frame: a real change
+                // clears the offset, a re-selection leaves it alone.
+                if p.variant_key != self.tool_variant || tool != self.tool {
                     self.tcp_offset_mm = [0.0; 3];
                 }
                 self.tool_variant = p.variant_key.clone();
+                self.tool = tool;
                 self.sync_planner();
             }
             Command::ToolAction(p) => match p.action.as_str() {

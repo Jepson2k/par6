@@ -61,7 +61,7 @@ use crate::MAX_JOINTS;
 /// The `boot_configure` arguments, retained for a live bus swap.
 struct BootConfig {
     robot: par6_config::RobotConfig,
-    gripper: Option<par6_config::GripperConfig>,
+    gripper: Option<par6_config::ToolConfig>,
     config_repeats: u8,
 }
 
@@ -102,12 +102,19 @@ struct ShutdownPark {
     tolerance_rad: f64,
     timeout_ticks: u32,
     target: [f64; MAX_JOINTS],
-    /// The fraction of the STREAM velocity limits under which no joint
-    /// exceeds the configured retreat speed: `min_j(v_park / v_j)`,
-    /// capped at 1.
-    speed_fraction: f64,
+    /// Per joint, the fraction of its STREAM velocity limit that is the
+    /// configured retreat speed, capped at 1. One shared fraction — the
+    /// wrists' — left the shoulder crawling at 3 deg/s and timing out
+    /// short of its endstop (2026-09-23).
+    speed_fractions: [f64; MAX_JOINTS],
     saved_scale: (f64, f64),
     running: bool,
+    /// The stream tracker's normal (soft) clamp, restored when the
+    /// retreat ends.
+    soft_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
+    /// The clamp the retreat runs under: the hard limits, so a joint
+    /// parked on its homing endstop can reach it.
+    hard_bounds: ([f64; MAX_JOINTS], [f64; MAX_JOINTS]),
 }
 
 impl ShutdownPark {
@@ -115,21 +122,31 @@ impl ShutdownPark {
         let cfg = &robot.shutdown;
         let mut target = [0.0; MAX_JOINTS];
         for (t, q) in target.iter_mut().zip(robot.safe_park_q()) {
-            *t = *q;
+            *t = q;
         }
-        let speed_fraction = robot
-            .joints
-            .iter()
-            .map(|j| cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
-            .fold(1.0, f64::min);
+        let mut soft = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        let mut hard = ([0.0; MAX_JOINTS], [0.0; MAX_JOINTS]);
+        for (i, j) in robot.joints.iter().enumerate().take(MAX_JOINTS) {
+            soft.0[i] = j.limits.soft_min_rad;
+            soft.1[i] = j.limits.soft_max_rad;
+            hard.0[i] = j.limits.hard_min_rad;
+            hard.1[i] = j.limits.hard_max_rad;
+        }
+        let mut speed_fractions = [1.0; MAX_JOINTS];
+        for (f, j) in speed_fractions.iter_mut().zip(&robot.joints) {
+            *f = (cfg.velocity_limit_rad_s / j.limits.for_mode(LimitMode::Stream).velocity_rad_s)
+                .min(1.0);
+        }
         Self {
             enabled: cfg.safe_park,
             tolerance_rad: cfg.tolerance_rad,
             timeout_ticks: robot.ticks(cfg.timeout_s).max(1),
             target,
-            speed_fraction,
+            speed_fractions,
             saved_scale: (1.0, 1.0),
             running: false,
+            soft_bounds: soft,
+            hard_bounds: hard,
         }
     }
 }
@@ -645,7 +662,6 @@ pub struct RtCore<B: DriverBus> {
 
     // Snapshot.
     writer: SnapshotWriter<StateSnapshot>,
-    capture: Option<crate::diagnostics::CaptureWriter>,
     snap: StateSnapshot,
 }
 
@@ -666,7 +682,7 @@ impl<B: DriverBus> RtCore<B> {
             });
         }
         let dt = robot.robot.tick_dt_s;
-        let gripper = bundle.active_gripper().filter(|g| g.driver.is_some());
+        let gripper = bundle.active_tool().filter(|g| g.driver.is_some());
         bus.boot_configure(robot, gripper, robot.bus.boot_config_repeats)?;
 
         let conv: [JointConversion; MAX_JOINTS] =
@@ -863,7 +879,6 @@ impl<B: DriverBus> RtCore<B> {
             profile: TickProfile::default(),
             writer,
             snap: StateSnapshot::default(),
-            capture: None,
         };
         Ok((
             core,
@@ -876,11 +891,6 @@ impl<B: DriverBus> RtCore<B> {
                 },
             },
         ))
-    }
-
-    /// Attach a bounded recorder before running the control loop.
-    pub fn set_capture(&mut self, writer: crate::diagnostics::CaptureWriter) {
-        self.capture = Some(writer);
     }
 
     /// Current operating mode.
@@ -901,6 +911,36 @@ impl<B: DriverBus> RtCore<B> {
     /// The bus backend (sim scenario hooks, backend switching in `par6d`).
     pub fn bus_mut(&mut self) -> &mut B {
         &mut self.bus
+    }
+
+    /// Adopt a newly fitted tool's gripper — the `select_tool`
+    /// follow-through for the jaw.
+    ///
+    /// The homing system takes the new pinion radius and homing plan and
+    /// drops the reference latched against the jaw that came off. A driven
+    /// tool also has its own current, velocity and voltage limits, which
+    /// have to reach the node before anything drives it: the limits stored
+    /// for that node are replaced too, so every later resend (reconnect,
+    /// FLASHING exit) carries them as well.
+    pub fn set_gripper_tool(
+        &mut self,
+        gripper: Option<&par6_config::ToolConfig>,
+        gripper_node: par6_bus::NodeId,
+        repeats: u8,
+    ) {
+        let dt = self.dt;
+        self.homing.set_gripper(gripper, dt);
+        if let Some(d) = gripper.and_then(|g| g.driver.as_ref()) {
+            let tune = par6_bus::DriveTune {
+                gains: d.gains,
+                ilim_ma: d.ilim_ma,
+                velocity_limit_ticks_s: d.velocity_limit_ticks_s,
+                voltage_limit_mv: d.voltage_limit_mv,
+            };
+            if let Err(e) = self.bus.retune_node(gripper_node, &tune, repeats) {
+                log::error!("select_tool: the gripper node refused its new limits: {e}");
+            }
+        }
     }
 
     /// Measured joint positions \[rad\] — what a backend swap seeds the
@@ -1028,6 +1068,44 @@ impl<B: DriverBus> RtCore<B> {
         self.exec.set_policy(policy);
     }
 
+    /// Swap the gravity model — the `select_tool` follow-through.
+    ///
+    /// A different tool is a different load on every gravity-loaded joint,
+    /// so the feedforward has to come from a model built for it. Applied
+    /// off-tick through a `CoreOp`, like every other core mutation.
+    pub fn set_gravity(&mut self, gravity: Box<dyn GravityModel>) {
+        self.gravity = gravity;
+    }
+
+    /// Swap the forward-kinematics model — the `select_tool`
+    /// follow-through for everything that reads a TCP pose.
+    pub fn set_fk(&mut self, fk: Box<dyn ForwardKin>) {
+        self.fk = fk;
+    }
+
+    /// Re-base one joint's home OFFSET for a tool change, keeping the
+    /// reference tick homing latched.
+    ///
+    /// A tool-dependent home offset means the same encoder reading is a
+    /// different joint angle under a different tool. The arm has not
+    /// moved, so the reading stands and only its interpretation changes;
+    /// the cached mirrors are refreshed from the live reading under the
+    /// new mapping. The caller re-seeds motion targets once it has done
+    /// every joint — leaving them aimed at pre-swap angles would drag the
+    /// arm to a pose that no longer means what it did.
+    pub fn set_tool_home_offset(&mut self, joint: usize, offset_rad: f64) {
+        if joint >= MAX_JOINTS {
+            return;
+        }
+        self.conv[joint].set_home_offset(offset_rad);
+        let ticks = self.bus_state.nodes[usize::from(self.node_of[joint])].position_ticks;
+        if let Some(ticks) = ticks {
+            let rad = self.conv[joint].joint_rad(ticks);
+            self.q[joint] = rad;
+            self.q_filt[joint] = rad;
+        }
+    }
+
     /// Reset the loop timing statistics (the `reset_loop_stats`
     /// follow-through); the warmup gate re-arms. The scheduling flags are
     /// state, not statistics, and survive.
@@ -1095,17 +1173,26 @@ impl<B: DriverBus> RtCore<B> {
         if self.has_can_gripper {
             self.apply_command(RtCommand::GripperStop);
         }
-        if let Err(refusal) = self.request_mode(Mode::Stream) {
+        // A working mode can only leave for IDLE, and the exit arrives in
+        // whatever mode the last command left behind — EXEC after a
+        // finished move, JOG after a jog. Idling first abandons that work,
+        // which is what a shutdown means anyway.
+        if let Err(refusal) = self
+            .request_mode(Mode::Idle)
+            .and_then(|()| self.request_mode(Mode::Stream))
+        {
             log::warn!("shutdown: retreat refused ({refusal:?}); halting in place");
             return false;
         }
         self.park.saved_scale = self.stream_scale;
-        let f = self.park.speed_fraction;
-        self.stream.set_scale(f, 1.0);
-        self.stream_scale = (f, 1.0);
+        let f = self.park.speed_fractions;
+        self.stream.set_scale_per_joint(&f, 1.0);
+        self.stream_scale = (f.iter().copied().fold(1.0, f64::min), 1.0);
+        let (min, max) = self.park.hard_bounds;
+        self.stream.set_bounds(&min, &max);
         log::info!(
-            "shutdown: retreating to the rest pose at {:.3} of the STREAM limits",
-            f
+            "shutdown: retreating to the rest pose at {:?} of the STREAM velocity limits",
+            f.map(|v| (v * 1000.0).round() / 1000.0)
         );
         self.park.running = true;
         true
@@ -1146,6 +1233,8 @@ impl<B: DriverBus> RtCore<B> {
         let (v, a) = self.park.saved_scale;
         self.stream.set_scale(v, a);
         self.stream_scale = (v, a);
+        let (min, max) = self.park.soft_bounds;
+        self.stream.set_bounds(&min, &max);
     }
 
     /// Whether every joint's measured speed is inside the shutdown rest
@@ -2641,8 +2730,5 @@ impl<B: DriverBus> RtCore<B> {
             discard_pct: self.stream_discard,
         };
         self.writer.publish(&self.snap);
-        if let Some(w) = self.capture.as_mut() {
-            let _ = w.push(&self.snap);
-        }
     }
 }

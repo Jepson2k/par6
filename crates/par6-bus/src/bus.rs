@@ -2,7 +2,7 @@
 //! to talk to motor drivers, backend-agnostic (SocketCAN, closed-loop
 //! sim, loopback).
 
-use par6_config::{GripperConfig, RobotConfig};
+use par6_config::{RobotConfig, ToolConfig};
 
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
@@ -97,7 +97,7 @@ pub trait DriverBus {
     fn boot_configure(
         &mut self,
         robot: &RobotConfig,
-        gripper: Option<&GripperConfig>,
+        gripper: Option<&ToolConfig>,
         repeats: u8,
     ) -> Result<(), BusError>;
 

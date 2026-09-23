@@ -14,6 +14,7 @@
 //! known at tick zero, so the queue is never "still growing" and the wait
 //! has nothing to wait for.
 
+use crate::planner::PlannerSwap;
 use par6_bus::sim::scene::Scene;
 use par6_proto::{Command, WireError};
 use par6_rt::{ArmState, Mode};
@@ -93,12 +94,15 @@ impl Preview {
     /// session stands and leaves it there, so two runs of the same
     /// program give the same answer.
     pub fn run(&mut self, cmds: &[Command], limits: RunLimits) -> Result<TickBatch, DaemonError> {
-        let bundle = par6_config::ConfigBundle::load(&self.config_path)?;
+        let mut bundle = par6_config::ConfigBundle::load(&self.config_path)?;
+        // The engine this run boots is fitted with the tool the session has
+        // now, which a `select_tool` may have changed since startup.
+        bundle.robot.robot.active_tool.clone_from(&self.tool);
         let stack = load_kin_stack(
             &self.opts,
             &self.config_path,
             &bundle.robot,
-            bundle.active_gripper(),
+            bundle.active_tool(),
         )?;
         let scene = Scene {
             tool: scene_tool(stack.variant),
@@ -124,6 +128,11 @@ impl Preview {
                 kin: stack.planner,
                 collision: stack.collision,
                 tool_offset: stack.tool_offset,
+            },
+            PlannerSwap {
+                source: Some(stack.source),
+                bundle: std::sync::Arc::new(bundle.clone()),
+                tools: Default::default(),
             },
         )?;
         // Nothing offline serves STATUS or answers REACHABLE, and the

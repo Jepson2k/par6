@@ -42,6 +42,24 @@ use crate::collision_world::{is_world_name, kin_layer, ShapeNames};
 /// sessions.
 pub(crate) type CoreOp = Box<dyn FnOnce(&mut RtCore<RuntimeBus>) + Send>;
 
+/// Models rebuilt for a newly selected tool, waiting for the threads that
+/// own one to adopt them.
+///
+/// A tool change has to reach four kinematic models — the planner's, the
+/// bridge's, housekeeping's and the streaming gate's collision world — and
+/// three of them live on threads that must not block. Each owner takes its
+/// own slot at its next safe point, so the swap costs no lock contention
+/// on the status path and no model is ever half-replaced mid-use.
+#[derive(Default)]
+pub(crate) struct ToolSwap {
+    pub(crate) bridge: Option<crate::kin::CartKin>,
+    pub(crate) housekeeping: Option<crate::kin::CartKin>,
+    pub(crate) gate_collision: Option<par6_kin::Collision>,
+}
+
+/// Shared drop box for [`ToolSwap`].
+pub(crate) type ToolMailbox = Arc<Mutex<ToolSwap>>;
+
 /// How long the enable retry keeps trying after `reset` (covers the RT
 /// clear-sequence settle window with margin, even on a loaded host).
 const ENABLE_RETRY_WINDOW: Duration = Duration::from_secs(5);
@@ -312,6 +330,13 @@ impl StreamGate {
     /// same shapes the gate admits jogs against.
     pub(crate) fn collision_mut(&mut self) -> &mut par6_kin::Collision {
         &mut self.collision
+    }
+
+    /// Adopt a collision world rebuilt for a newly selected tool. The
+    /// keep-out layers the operator applied ride on the world, so they are
+    /// carried across rather than dropped with the old geometry.
+    pub(crate) fn set_collision(&mut self, collision: par6_kin::Collision) {
+        self.collision = collision;
     }
 
     pub(crate) fn new(
@@ -1002,6 +1027,8 @@ pub(crate) struct RtBridge {
     /// hardware.
     sim_world: Option<WorldMailbox>,
     cart: CartStream,
+    /// Rebuilt models a `select_tool` left for this thread.
+    tools: ToolMailbox,
     // Reading STATUS must not wait for the geometry model's mutex.
     collision_latch: Arc<Mutex<CollisionState>>,
 }
@@ -1017,11 +1044,13 @@ impl RtBridge {
         sim: bool,
         scene: Scene,
         sim_world: Option<WorldMailbox>,
+        tools: ToolMailbox,
         cart: CartStream,
     ) -> Self {
         let collision_latch = Arc::clone(&cart.gate.lock().unwrap().latch);
         Self {
             collision_latch,
+            tools,
             link,
             stream_input,
             shared,
@@ -1031,6 +1060,17 @@ impl RtBridge {
             scene,
             sim_world,
             cart,
+        }
+    }
+
+    /// Adopt a model a `select_tool` rebuilt for this thread, if one is
+    /// waiting. Called before anything resolves a TCP pose, so the bridge
+    /// never plans a stream step against the tool that just came off.
+    fn adopt_tool(&mut self) {
+        if let Ok(mut swap) = self.tools.lock() {
+            if let Some(kin) = swap.bridge.take() {
+                self.cart.kin = kin;
+            }
         }
     }
 
@@ -1056,6 +1096,7 @@ impl RtBridge {
 
 impl RtCommands for RtBridge {
     fn stream(&mut self, cmd: &Command) -> Result<(), WireError> {
+        self.adopt_tool();
         match cmd {
             Command::JogJ(p) => {
                 let mut speeds = [0.0; MAX_JOINTS];
@@ -1605,7 +1646,7 @@ impl RtCommands for RtBridge {
         if let Some(closed) = tool_closed {
             let hold_ma = self
                 .bundle
-                .active_gripper()
+                .active_tool()
                 .and_then(|g| g.driver.as_ref())
                 .map(|d| d.ilim_ma)
                 .unwrap_or(0.0);
@@ -1815,6 +1856,7 @@ pub(crate) fn housekeeping_loop(
     shutdown: Arc<AtomicBool>,
     mut kin: crate::kin::CartKin,
     gate: Arc<Mutex<StreamGate>>,
+    tools: ToolMailbox,
 ) {
     // Stops the live stream because its next step is collision-blocked:
     // latch the verdict for STATUS and put the RT back to IDLE. The
@@ -1845,6 +1887,16 @@ pub(crate) fn housekeeping_loop(
     let jog_ramp_cap = Duration::from_secs_f64(4.0 * jog_accel_time_s);
     let mut profile_logged = Instant::now();
     while !shutdown.load(Ordering::SeqCst) {
+        // Adopt whatever a select_tool rebuilt for this thread before any
+        // pose is resolved against the tool that just came off.
+        if let Ok(mut swap) = tools.lock() {
+            if let Some(k) = swap.housekeeping.take() {
+                kin = k;
+            }
+            if let Some(c) = swap.gate_collision.take() {
+                gate.lock().unwrap().set_collision(c);
+            }
+        }
         let now = Instant::now();
         let snap = snapshots.latest();
         if now.duration_since(profile_logged) >= Duration::from_secs(1) {

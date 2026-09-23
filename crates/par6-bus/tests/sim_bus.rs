@@ -20,7 +20,7 @@ use par6_bus::{
     BusState, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand, JointCommand,
     ObjectDetection, PollAction, PollKind,
 };
-use par6_config::{GripperConfig, HomingStrategy, RobotConfig};
+use par6_config::{HomingStrategy, RobotConfig, ToolConfig};
 use par6_proto::{Layer, Physical, Shape};
 
 fn par6() -> RobotConfig {
@@ -28,10 +28,10 @@ fn par6() -> RobotConfig {
     RobotConfig::load(&path).expect("PAR6.toml")
 }
 
-fn msg_gripper() -> GripperConfig {
+fn msg_gripper() -> ToolConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
-    GripperConfig::load(&path).expect("MSG gripper TOML")
+    ToolConfig::load(&path).expect("MSG gripper TOML")
 }
 
 /// A world shape at a world pose; `mass` `Some(None)` is a fixture,
@@ -105,7 +105,7 @@ struct Rig {
 }
 
 impl Rig {
-    fn boot(robot: &RobotConfig, gripper: Option<&GripperConfig>, q0: Option<&[f64]>) -> Self {
+    fn boot(robot: &RobotConfig, gripper: Option<&ToolConfig>, q0: Option<&[f64]>) -> Self {
         let mut bus = SimBus::new(scene());
         if let Some(q) = q0 {
             bus.set_initial_joint_rad(q);

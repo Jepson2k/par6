@@ -235,10 +235,15 @@ pub struct RobotSection {
     /// Standby pose the arm is parked in before torque-losing maintenance
     /// (firmware flashing) \[rad\], one entry per joint.
     pub park_pose_rad: Vec<f64>,
-    /// Name of the active gripper — must match a `grippers/*.toml` name.
-    /// Drives kt/stroke/homing offsets AND the driver type that firmware
-    /// flashing checks against.
-    pub active_gripper: String,
+    /// Name of the fitted tool — must match a `tools/*.toml` name. Drives
+    /// kt/stroke/homing offsets AND the driver type that firmware flashing
+    /// checks against.
+    ///
+    /// Not every tool is a gripper: the bare flange is a tool with no jaw
+    /// and no driver. The old `active_gripper` spelling still loads, so a
+    /// config already on disk keeps working.
+    #[serde(alias = "active_gripper")]
+    pub active_tool: String,
     /// Where torque constants come from at boot.
     pub kt_source: KtSource,
 }
@@ -700,6 +705,11 @@ pub struct ShutdownConfig {
     /// `robot.park_pose_rad` the homing return targets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub safe_park_q: Option<Vec<f64>>,
+    /// Joints parked on their homing endstop instead of at the rest pose:
+    /// the ones that hold the arm up, so that going limp afterwards lets
+    /// them rest on the stop instead of dropping.
+    #[serde(default)]
+    pub endstop_joints: Vec<u8>,
 }
 
 impl Default for ShutdownConfig {
@@ -710,6 +720,7 @@ impl Default for ShutdownConfig {
             timeout_s: 15.0,
             velocity_limit_rad_s: 0.25,
             safe_park_q: None,
+            endstop_joints: Vec::new(),
         }
     }
 }
@@ -771,7 +782,7 @@ impl Default for FreedriveConfig {
 }
 
 /// Shutdown policy for standalone calibration.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct SelfcalConfig {
     /// Permit current release if incomplete homing prevents parking.
@@ -814,6 +825,23 @@ pub struct SelfcalConfig {
     #[serde(default = "default_stale_recovery_s")]
     pub stale_recovery_s: f64,
 }
+
+/// The same values a present-but-empty `[selfcal]` table gets: serde fills
+/// an ABSENT table from this, not from the per-field defaults.
+impl Default for SelfcalConfig {
+    fn default() -> Self {
+        Self {
+            release_on_failure: false,
+            hold_s: default_hold_s(),
+            identification_poses: default_identification_poses(),
+            move_speed_fraction: default_move_speed_fraction(),
+            ridge: default_ridge(),
+            approach_rad: default_approach_rad(),
+            stale_recovery_s: default_stale_recovery_s(),
+        }
+    }
+}
+
 fn default_approach_rad() -> f64 {
     0.05
 }
@@ -931,12 +959,30 @@ impl RobotConfig {
     }
 
     /// The pose the shutdown retreat drives to \[rad\]: `shutdown.safe_park_q`
-    /// when set, else `robot.park_pose_rad`.
-    pub fn safe_park_q(&self) -> &[f64] {
-        self.shutdown
+    /// when set, else `robot.park_pose_rad`, with every
+    /// `shutdown.endstop_joints` entry replaced by that joint's homing
+    /// endstop (its `home_offset_rad`).
+    pub fn safe_park_q(&self) -> Vec<f64> {
+        let mut q = self
+            .shutdown
             .safe_park_q
-            .as_deref()
-            .unwrap_or(&self.robot.park_pose_rad)
+            .clone()
+            .unwrap_or_else(|| self.robot.park_pose_rad.clone());
+        for &j in &self.shutdown.endstop_joints {
+            let j = usize::from(j);
+            if let (Some(slot), Some(h)) = (q.get_mut(j), self.homing.joints.get(j)) {
+                *slot = h.home_offset_rad;
+            }
+        }
+        q
+    }
+
+    /// Whether the shutdown retreat parks `joint` on its homing endstop.
+    pub fn parks_on_endstop(&self, joint: usize) -> bool {
+        self.shutdown
+            .endstop_joints
+            .iter()
+            .any(|&j| usize::from(j) == joint)
     }
 
     /// Convert a config time constant in seconds to ticks:
@@ -1387,6 +1433,20 @@ impl RobotConfig {
                 return Err(invalid(name, "must be > 0"));
             }
         }
+        for &j in &s.endstop_joints {
+            let jh = self.homing.joints.get(usize::from(j)).ok_or_else(|| {
+                invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j} does not exist ({} joints)", self.joints.len()),
+                )
+            })?;
+            if jh.home_offset_gripper_dependent {
+                return Err(invalid(
+                    "shutdown.endstop_joints",
+                    format!("joint {j}: its endstop depends on the fitted tool; only a fixed home_offset_rad can be a rest"),
+                ));
+            }
+        }
         let q = self.safe_park_q();
         if q.len() != self.joints.len() {
             return Err(invalid(
@@ -1399,13 +1459,17 @@ impl RobotConfig {
             ));
         }
         for (i, (v, j)) in q.iter().zip(&self.joints).enumerate() {
-            if !v.is_finite() || *v < j.limits.soft_min_rad || *v > j.limits.soft_max_rad {
+            // An endstop is the mechanical stop itself, outside the soft
+            // range by design; anything else rests inside it.
+            let (lo, hi, band) = if self.parks_on_endstop(i) {
+                (j.limits.hard_min_rad, j.limits.hard_max_rad, "hard")
+            } else {
+                (j.limits.soft_min_rad, j.limits.soft_max_rad, "soft")
+            };
+            if !v.is_finite() || *v < lo || *v > hi {
                 return Err(invalid(
                     "shutdown.safe_park_q",
-                    format!(
-                        "joint {i}: {v} rad is outside the soft limits [{}, {}]",
-                        j.limits.soft_min_rad, j.limits.soft_max_rad
-                    ),
+                    format!("joint {i}: {v} rad is outside the {band} limits [{lo}, {hi}]"),
                 ));
             }
         }
