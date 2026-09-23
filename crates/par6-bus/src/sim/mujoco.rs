@@ -289,6 +289,12 @@ impl MujocoPlant {
         self.data.qvel_mut()[..n].fill(0.0);
     }
 
+    /// The physical angle \[rad\] of arm joint `j`, straight from the
+    /// plant's state rather than back through the encoder conversion.
+    pub fn joint_rad(&self, j: usize) -> f64 {
+        self.qpos[j]
+    }
+
     /// Rebuild the model from `spec` in place (MuJoCo's `mj_recompile`),
     /// carrying the position and velocity of every joint that survives by
     /// name: the arm and jaws carry on, objects that stay keep their pose,

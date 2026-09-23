@@ -63,7 +63,7 @@ fn shutdown_seconds(config: PathBuf, delta_deg: f64) -> f64 {
 /// the arm back to the rest pose through the real streaming executor
 /// under the configured velocity ceiling, so a shutdown from 30° off
 /// the pose takes the time that distance costs at 0.25 rad/s. The
-/// shipped default retreats nowhere and exits at once.
+/// rig's config switches the retreat off, so its exit is the baseline.
 #[test]
 fn a_shutdown_retreats_to_the_rest_pose_under_the_configured_speed() {
     const DELTA_DEG: f64 = 30.0;

@@ -123,6 +123,14 @@ pub struct Rig {
     pub dt: f64,
 }
 
+/// The shipped config with the shutdown retreat off: a rig exits limp,
+/// so a test's exit is the halt-settle-limp sequence and nothing else.
+/// The retreat has rigs of its own that ask for it.
+pub fn limp(mut bundle: ConfigBundle) -> ConfigBundle {
+    bundle.robot.shutdown.safe_park = false;
+    bundle
+}
+
 impl Rig {
     pub fn new() -> Self {
         Self::build(CompletionPolicy::Settled, Box::new(ZeroGravity), true)
@@ -143,7 +151,7 @@ impl Rig {
     /// The rig at an arbitrary tick period (rate-dependent timing tests).
     pub fn at_tick_dt(dt: f64) -> Self {
         Self::build_bundle(
-            bundle_at(dt),
+            limp(bundle_at(dt)),
             CompletionPolicy::Settled,
             Box::new(ZeroGravity),
             true,
@@ -155,7 +163,7 @@ impl Rig {
         gravity: Box<dyn GravityModel>,
         line_high: bool,
     ) -> Self {
-        Self::build_bundle(bundle(), policy, gravity, line_high)
+        Self::build_bundle(limp(bundle()), policy, gravity, line_high)
     }
 
     pub fn build_bundle(

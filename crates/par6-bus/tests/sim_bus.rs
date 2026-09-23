@@ -28,6 +28,18 @@ fn par6() -> RobotConfig {
     RobotConfig::load(&path).expect("PAR6.toml")
 }
 
+/// [`par6`] with the base joint's velocity loop at the vendor's gains.
+/// The arm holds still on its tuned kpv/kiv; on the simulated joint,
+/// rigidly coupled to the whole arm's inertia, that loop is marginal at
+/// its crossover and a base driven at speed limit-cycles in place. These
+/// tests are about driver semantics, not the base's tune.
+fn par6_stable_base() -> RobotConfig {
+    let mut robot = par6();
+    robot.joints[0].gains.kpv = 0.015;
+    robot.joints[0].gains.kiv = 0.0015;
+    robot
+}
+
 fn msg_gripper() -> ToolConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../../config/grippers/MSG_small_motor_150mm_rail.toml");
@@ -502,7 +514,7 @@ fn hall_joint_trigger_edge_and_latched_position() {
 
 #[test]
 fn watchdog_silence_drops_driver_to_idle() {
-    let mut robot = par6();
+    let mut robot = par6_stable_base();
     robot.joints[0].watchdog_timeout_ms = 200; // 50 ticks at 250 Hz
     let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
     let mut rig = Rig::boot(&robot, None, None);
@@ -822,7 +834,7 @@ fn wrong_dlc_frames_discarded_whole() {
 
 #[test]
 fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
-    let robot = par6();
+    let robot = par6_stable_base();
     // J0 (gear 6.4, master 3969): a pose 0.24 rad below the calibration
     // pose puts the true motor position just below zero, so the boot
     // reading wraps to the top of the 14-bit range.
@@ -1789,7 +1801,7 @@ fn only_motion_frames_and_answered_polls_feed_the_watchdog() {
 /// against an arm that simply freewheels.
 #[test]
 fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
-    let robot = par6();
+    let robot = par6_stable_base();
     let mut rig = Rig::boot(&robot, None, None);
     let mut cmds = rig.idle_cmds();
 

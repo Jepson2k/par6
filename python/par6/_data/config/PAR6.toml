@@ -1,4 +1,4 @@
-gravity_correction = [0.0, 0.0, 0.0, 0.0, 2.8170375009600924e-16, -0.00748569810200439, -0.08102093386071382, 4.290304927330001e-15, 0.014583768094828382, -0.017385745553143515, -0.020404780827688773, -3.223595978366174e-14, 0.013827488163251083, 0.009654782702466351, -0.00032165147890819034, -0.020404780827429667, 0.01743913436938069, -0.00861591314133112, -0.002946479795103661, -0.00032165147878671194, 0.017439134369366126, -0.0021982558615959427, 0.0007275392680751273, 0.0029464797949152414]  # selfcal: measured
+gravity_correction = [0.0, 0.0, 0.0, 0.0, -4.667418833536804e-15, 0.01111075448939712, 0.039335087452834566, -3.708455473867685e-15, -0.007080315741406669, -0.007836847357426287, 0.007700880094793167, -6.310868168319682e-15, -0.007421218601257976, -0.005831398910000497, 0.00161885638390711, 0.007700880100727177, -0.008784274379580764, 0.0047541743144688675, 0.0031132801248437087, 0.0016188563839864155, -0.008784274378971675, 4.851830500910304e-5, 4.0804129601295595e-5, -0.0031132801258935043]  # selfcal: measured
 gravity_scale = [1.0, 1.0, 1.0, 1.0, 1.0, 1.0]  # selfcal: measured per joint
 # PAR6 robot configuration.
 #
@@ -590,11 +590,16 @@ pose = [0.0, 0.0, -0.11, 0.0, 0.0, 0.0]
 
 [sim]
 # Torque-level plant only (par6d --sim with the kinematics stack):
-# motor-referred rotor dynamics from the vendor dynamics table, reflected
-# through each joint's dynamics gear ratio as G^2*jm, G^2*b and G*tc.
+# motor-referred rotor inertia from the vendor dynamics table, reflected
+# through each joint's dynamics gear ratio as G^2*jm, and the friction
+# each joint shows its drive, joint side, as par6-selfcal measures it
+# (--apply writes it). Friction is the damping the drives' velocity loops
+# live on: with one motor-side guess for every joint, an eighth of what
+# the base has, the simulated base limit-cycled at its current limit
+# whenever the arm was held extended, where the arm itself holds still.
 motor_jm_kg_m2 = [1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]
-motor_b_nm_s = 1.0e-4
-motor_tc_nm = 0.02
+viscous_nm_s = [0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957]  # selfcal: measured
+coulomb_nm = [0.2314, 0.903, 2.2047, 0.1279, 0.0521, 0.0854]  # selfcal: measured
 # Gearbox holding friction [Nm, joint side]: the load an unpowered joint
 # carries without back-driving (stepper detent through the reduction).
 # An estimate, not a measurement: verify on the arm by idling one driver
@@ -613,10 +618,9 @@ servo_grace_s = 0.25        # client silence that ends a servo stream (sim floor
 [shutdown]
 # Retreat to a rest pose on process exit, before the drives are idled,
 # so an arm left mid-air does not drop when the terminal limp frame
-# lands. Off by default: a motion on shutdown must be asked for. Only a
-# homed, enabled, error-free arm retreats; the timeout is logged and the
-# exit continues from wherever the arm is.
-safe_park = false
+# lands. Only a homed, enabled, error-free arm retreats; the timeout is
+# logged and the exit continues from wherever the arm is.
+safe_park = true
 tolerance_rad = 0.03
 timeout_s = 15.0
 velocity_limit_rad_s = 0.25

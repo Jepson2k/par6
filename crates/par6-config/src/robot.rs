@@ -448,21 +448,25 @@ fn default_config_resend_offsets_s() -> Vec<f64> {
 /// per-second attempt count from it.
 pub const MAX_OPEN_RETRY_S: f64 = 3600.0;
 
-/// Torque-level sim plant parameters (feature `sim-dynamics`): the
-/// motor-referred rotor dynamics the vendor models
-/// (robots/PAR6.py dynamics table — values only, no code). Reflected
-/// through each joint's dynamics gear ratio G as G²·jm (inertia),
-/// G²·b (viscous) and G·tc (Coulomb). Ignored by the kinematic plant
-/// and by hardware.
+/// Torque-level sim plant parameters (feature `sim-dynamics`): the rotor
+/// inertia the vendor models (robots/PAR6.py dynamics table — values
+/// only, no code), reflected through each joint's dynamics gear ratio G
+/// as G²·jm, and the friction each joint shows its drive, joint side, as
+/// `par6-selfcal` measures it. Ignored by the kinematic plant and by
+/// hardware.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SimConfig {
     /// Motor rotor inertia per joint \[kg·m², motor side\].
     pub motor_jm_kg_m2: Vec<f64>,
-    /// Motor viscous friction \[Nm·s/rad, motor side\], shared.
-    pub motor_b_nm_s: f64,
-    /// Motor Coulomb friction \[Nm, motor side\], shared.
-    pub motor_tc_nm: f64,
+    /// Viscous friction per joint \[Nm·s/rad, joint side\]. What damps a
+    /// velocity loop that is only marginal on inertia: with a shared
+    /// motor-side guess an eighth of the arm's, the simulated base
+    /// limit-cycled at the current rails whenever the arm was held
+    /// extended, where the arm itself holds still.
+    pub viscous_nm_s: Vec<f64>,
+    /// Coulomb friction per joint \[Nm, joint side\].
+    pub coulomb_nm: Vec<f64>,
     /// Gearbox holding friction per joint \[Nm, joint side\]: the load
     /// the unpowered drivetrain holds without back-driving (stepper detent
     /// through the reduction). An estimate until measured on the arm; it
@@ -474,8 +478,9 @@ impl Default for SimConfig {
     fn default() -> Self {
         Self {
             motor_jm_kg_m2: vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6],
-            motor_b_nm_s: 1.0e-4,
-            motor_tc_nm: 0.02,
+            // Measured on the test arm by par6-selfcal, 2026-09-23.
+            viscous_nm_s: vec![0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957],
+            coulomb_nm: vec![0.2314, 0.9030, 2.2047, 0.1279, 0.0521, 0.0854],
             holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
         }
     }
@@ -679,13 +684,13 @@ impl Default for LimitsSection {
     }
 }
 
-/// The shutdown retreat: an opt-in slow drive to a rest pose before the
-/// drives are idled, so an arm left mid-air by a process exit does not
-/// drop from wherever it was when the terminal limp frame lands.
+/// The shutdown retreat: a slow drive to a rest pose before the drives
+/// are idled, so an arm left mid-air by a process exit does not drop
+/// from wherever it was when the terminal limp frame lands.
 ///
-/// Off by default: a retreat is a motion, and a motion on shutdown must
-/// be asked for. Durations are seconds; the runtime converts with
-/// `round(s / dt)`.
+/// On by default: an exit that leaves the arm limp where it stands is
+/// the exception to ask for. Durations are seconds; the runtime converts
+/// with `round(s / dt)`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct ShutdownConfig {
@@ -715,7 +720,7 @@ pub struct ShutdownConfig {
 impl Default for ShutdownConfig {
     fn default() -> Self {
         Self {
-            safe_park: false,
+            safe_park: true,
             tolerance_rad: 0.03,
             timeout_s: 15.0,
             velocity_limit_rad_s: 0.25,
@@ -1366,12 +1371,17 @@ impl RobotConfig {
                 ));
             }
         }
-        for (v, name) in [
-            (sim.motor_b_nm_s, "sim.motor_b_nm_s"),
-            (sim.motor_tc_nm, "sim.motor_tc_nm"),
+        for (values, name) in [
+            (&sim.viscous_nm_s, "sim.viscous_nm_s"),
+            (&sim.coulomb_nm, "sim.coulomb_nm"),
         ] {
-            if !(v.is_finite() && v >= 0.0) {
-                return Err(invalid(name, "must be finite and >= 0"));
+            if values.len() != self.joints.len() {
+                return Err(invalid(name, "must carry one entry per joint"));
+            }
+            for (j, v) in values.iter().enumerate() {
+                if !(v.is_finite() && *v >= 0.0) {
+                    return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
+                }
             }
         }
         for (i, j) in self.joints.iter().enumerate() {

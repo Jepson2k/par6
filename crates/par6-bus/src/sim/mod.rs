@@ -424,7 +424,7 @@ impl SimBus {
     /// on the wire can reach it.
     pub fn true_joint_rad(&self) -> Vec<f64> {
         (0..self.drivers.len())
-            .map(|j| self.maps[j].joint_rad(self.motor_state(j).0))
+            .map(|j| self.plant().joint_rad(j))
             .collect()
     }
 
@@ -1415,11 +1415,13 @@ impl SimBus {
     /// Compile the scene for this robot config with the current world and
     /// place the arm at `q0`; keeps the base spec for later world changes.
     fn make_plant(&mut self, robot: &RobotConfig, q0: &[f64]) -> mujoco::MujocoPlant {
+        let sim = &robot.sim;
         let tuning: Vec<scene::JointTuning> = self
             .maps
             .iter()
-            .zip(&robot.sim.motor_jm_kg_m2)
-            .map(|(map, jm)| scene::JointTuning::from_config(map, *jm, &robot.sim))
+            .zip(&sim.motor_jm_kg_m2)
+            .zip(sim.viscous_nm_s.iter().zip(&sim.coulomb_nm))
+            .map(|((map, jm), (b, tc))| scene::JointTuning::from_config(map, *jm, *b, *tc))
             .collect();
         let build = scene::Build {
             timestep: scene::timestep_for(self.dt),

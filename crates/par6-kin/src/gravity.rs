@@ -377,6 +377,97 @@ pub fn fit_arm(kin: &mut Kin, samples: &[GravitySample], ridge: f64) -> Result<A
     })
 }
 
+/// What a set of poses can pin before any torque is measured: the normal
+/// matrix of their gravity regressors, scored the way [`fit_arm`] will
+/// score the fit -- same ridge, same shrinkage -- so a plan is judged on
+/// the count the fit will report.
+#[derive(Debug, Clone)]
+pub struct PoseDesign {
+    cols: usize,
+    ata: Vec<f64>,
+    scale: f64,
+    poses: usize,
+}
+
+impl PoseDesign {
+    /// An empty design for `kin`'s bodies.
+    pub fn new(kin: &Kin) -> Self {
+        let cols = 4 * kin.body_count();
+        Self {
+            cols,
+            ata: vec![0.0; cols * cols],
+            scale: 0.0,
+            poses: 0,
+        }
+    }
+
+    /// One pose's regressor, as [`Self::gain`] and [`Self::add`] take it.
+    pub fn regressor(kin: &mut Kin, q: &[f64; NQ]) -> Result<Vec<f64>, KinError> {
+        let mut y = vec![0.0; NQ * 4 * kin.body_count()];
+        kin.gravity_regressor(q, &mut y)?;
+        Ok(y)
+    }
+
+    /// The log-determinant of the ridged normal matrix once `y` is added:
+    /// the D-optimal score, higher when the pose tightens what the set
+    /// pins. `None` when the matrix is not solvable.
+    pub fn gain(&self, y: &[f64], ridge: f64) -> Option<f64> {
+        let mut with = self.clone();
+        with.add(y);
+        let l = cholesky_factor(&with.ridged(ridge), self.cols)?;
+        Some(
+            (0..self.cols)
+                .map(|i| 2.0 * l[i * self.cols + i].ln())
+                .sum(),
+        )
+    }
+
+    /// Add a pose's regressor to the set.
+    pub fn add(&mut self, y: &[f64]) {
+        let cols = self.cols;
+        for r in 0..NQ {
+            let row = &y[r * cols..(r + 1) * cols];
+            for a in 0..cols {
+                self.scale = self.scale.max(row[a].abs());
+                for b in 0..cols {
+                    self.ata[a * cols + b] += row[a] * row[b];
+                }
+            }
+        }
+        self.poses += 1;
+    }
+
+    /// Share of each parameter this set would fix, zero to one, as
+    /// [`fit_arm`] will report it for the same poses and ridge.
+    pub fn determined(&self, ridge: f64) -> Vec<f64> {
+        let cols = self.cols;
+        let lambda = self.lambda(ridge);
+        let Some(l) = cholesky_factor(&self.ridged(ridge), cols) else {
+            return vec![0.0; cols];
+        };
+        (0..cols)
+            .map(|a| {
+                let mut e = vec![0.0; cols];
+                e[a] = 1.0;
+                (1.0 - lambda * cholesky_apply(&l, &e, cols)[a]).clamp(0.0, 1.0)
+            })
+            .collect()
+    }
+
+    fn lambda(&self, ridge: f64) -> f64 {
+        ridge * self.scale * self.scale * (self.poses * NQ) as f64
+    }
+
+    fn ridged(&self, ridge: f64) -> Vec<f64> {
+        let lambda = self.lambda(ridge);
+        let mut a = self.ata.clone();
+        for i in 0..self.cols {
+            a[i * self.cols + i] += lambda;
+        }
+        a
+    }
+}
+
 fn cholesky_factor(a: &[f64], n: usize) -> Option<Vec<f64>> {
     let mut l = vec![0.0; n * n];
     for i in 0..n {

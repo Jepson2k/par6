@@ -29,10 +29,11 @@ const TOL_RAD: f64 = 1e-3;
 ///
 /// The joint is held by the position loop rather than by the drivetrain,
 /// and a loop with finite stiffness holds a load at a small steady
-/// offset — about a tenth of a degree on the wrist. What this still
-/// catches is a landing that did not take: that is degrees out, not
-/// millirad.
-const TOL_LOADED_RAD: f64 = 2.5e-3;
+/// offset — about a third of a degree on the wrist with the friction the
+/// arm was measured to have, a third less than the guess it had, which
+/// used to hide part of the offset. What this still catches is a
+/// landing that did not take: that is a degree out, not millirad.
+const TOL_LOADED_RAD: f64 = 1e-2;
 
 /// Poses spanning the joint windows: a known kinematics case, the
 /// cartesian test start and a near-vertical hold.

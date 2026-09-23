@@ -597,21 +597,18 @@ fn the_preview_latches_an_estop_and_streams_a_jog_the_way_the_runtime_does() {
     let rest = rig.wait_status("jog watchdog expired", |s| {
         s.seq > start.seq && s.speeds.iter().all(|v| v.abs() < 0.05)
     });
-    // The jog engine integrates from the MEASURED pose, so whatever the
-    // servo loop fails to track in a tick is ground the jog never gets
-    // back. The runtime therefore lands a little short of the preview,
-    // which integrates its own output and so tracks perfectly; it never
-    // lands beyond it.
+    // The preview integrates its own output and so tracks perfectly. The
+    // runtime lands a few percent either side of it: short by what the
+    // servo loop fails to track in a tick, which the jog engine, integrating
+    // from the MEASURED pose, never gets back; long by what the drive's
+    // velocity integrator wound up against the base's friction during the
+    // jog and discharges past the release. On this arm's measured friction
+    // the second is the larger, about three percent.
     let runtime_deg = rest.angles[0] - start.angles[0];
     assert!(
-        runtime_deg <= settled_deg,
-        "the runtime cannot outrun a perfect-tracking preview: \
-         {runtime_deg} deg vs {settled_deg} deg"
-    );
-    assert!(
-        settled_deg - runtime_deg < 0.06 * settled_deg,
-        "preview and runtime jogs diverge by more than the servo can lag: \
-         {settled_deg} deg vs {runtime_deg} deg"
+        (settled_deg - runtime_deg).abs() < 0.06 * settled_deg,
+        "preview and runtime jogs diverge by more than servo lag and integrator \
+         wind-up allow: {settled_deg} deg vs {runtime_deg} deg"
     );
 
     rig.shutdown();

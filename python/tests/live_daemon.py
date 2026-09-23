@@ -174,6 +174,9 @@ def sim_config(
     text = (src / "PAR6.toml").read_text()
     patched = _set_scalar(text, "tick_dt_s", TICK_DT_S)
     patched = _set_scalar(patched, "status_rate_hz", STATUS_RATE_HZ)
+    # The rig exits limp: a retreat on every test's shutdown is a wait per
+    # test that proves nothing, and the retreat has a test of its own.
+    patched = _set_scalar(patched, "safe_park", "false")
     if config_patch is not None:
         patched = config_patch(patched)
     out = dest / "PAR6.toml"

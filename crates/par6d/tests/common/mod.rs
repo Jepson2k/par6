@@ -149,6 +149,9 @@ fn simulator_config(tag: &str, dt: f64, nominal_gravity: bool) -> PathBuf {
     std::fs::create_dir_all(&grippers).expect("test config dir");
     let text = std::fs::read_to_string(&src).expect("read PAR6.toml");
     let mut patched = set_scalar(&text, "tick_dt_s", &dt.to_string());
+    // A rig exits limp: a retreat on every test's shutdown is a wait per
+    // test that proves nothing, and the retreat has a test of its own.
+    patched = set_scalar(&patched, "safe_park", "false");
     if nominal_gravity {
         patched = set_scalar(&patched, "gravity_scale", "[1.0, 1.0, 1.0, 1.0, 1.0, 1.0]");
     }

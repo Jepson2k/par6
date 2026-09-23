@@ -254,12 +254,14 @@ struct Tuned {
 /// Waiting out one silent drive is normal; a run that spends its time doing
 /// nothing else has a bus problem no amount of waiting will fix.
 const MAX_RECOVERIES: u32 = 24;
-/// The band around the ready pose the identification poses are drawn from. At
-/// +/-15% of each joint's travel the set is already fully determined with the
-/// same conditioning as a full sweep (measured against this arm's model,
-/// 2026-09-19), and the arm stays well clear of its stops. How many poses is
-/// `selfcal.identification_poses`.
-const IDENT_BAND: f64 = 0.3;
+/// Candidate poses drawn over each joint's whole window, from which the
+/// identification plan keeps the ones that pin the gravity parameters best.
+/// How many it keeps is `selfcal.identification_poses`.
+const IDENT_CANDIDATES: usize = 300;
+/// The share of a joint's current limit a candidate pose may need just to
+/// hold itself against gravity: the hold has to leave room for friction and
+/// the two approaches. The ready pose needs about a tenth on this arm.
+const IDENT_HOLD_FRACTION: f64 = 0.6;
 
 // ---------------------------------------------------------------- CLI
 
@@ -648,24 +650,7 @@ impl Arm {
         } else {
             RuntimeBus::from(SocketCanBus::open(&bundle.robot.bus)?)
         };
-        let kin = {
-            let params = tool.map(|g| {
-                let k = &g.kinematics;
-                par6_kin::Kin::dh_tool_params(
-                    k.d_m,
-                    k.a_m,
-                    k.alpha_rad,
-                    k.mass_kg,
-                    k.com_m,
-                    k.inertia_kg_m2,
-                )
-            });
-            let mut kin = par6_kin::Kin::load_arm(assets, params.as_ref())?;
-            // The daemon installs this, so identifying against a model without
-            // it would refit what the runtime already carries.
-            kin.set_gravity_correction(&bundle.robot.gravity_correction)?;
-            kin
-        };
+        let kin = arm_kin(&bundle, assets)?;
         // Begin holding with a zero current cap, then raise it in the paced
         // startup ramp. STEPFOC IN_LIMITS sets Iq_current_limit without
         // touching the gains.
@@ -1818,18 +1803,20 @@ impl Arm {
     /// What this replaces is a relay that measured the 250 Hz CAN round trip
     /// rather than the joint (identical `Tu` on joints an order of magnitude
     /// apart in inertia) and handed the result to a loop closed at 6250 Hz.
-    fn measure_mechanics(&mut self) -> Result<()> {
+    fn measure_mechanics(&mut self) -> Result<[Option<(f64, f64)>; N]> {
         let legs: Vec<usize> = (0..N)
             .filter(|j| self.only.is_none_or(|o| o == *j))
             .collect();
         let q = self.angles()?;
         let inertia = self.inertia(q)?;
+        let mut friction = [None; N];
         for &j in &legs {
             self.emit(Event::Phase("friction", j));
             let (b, tc) = self.friction(j)?;
             self.emit(Event::Mechanics(self.tick, j, inertia[j], b, tc));
+            friction[j] = Some((b, tc));
         }
-        Ok(())
+        Ok(friction)
     }
 }
 
@@ -2595,22 +2582,59 @@ fn collision_world(bundle: &ConfigBundle, assets: &Path) -> Result<par6_kin::Col
     Ok(world)
 }
 
-/// Poses for identifying the arm's own links, spread deterministically so a
-/// run is repeatable.
+/// The identification plan: the poses in visiting order, and the share of
+/// each parameter they would pin.
+struct IdentPlan {
+    poses: Vec<[f64; N]>,
+    determined: Vec<f64>,
+}
+
+/// The model the run identifies against: the arm with the fitted tool,
+/// carrying the correction the daemon already installs, so a fit refines
+/// rather than refits.
+fn arm_kin(bundle: &ConfigBundle, assets: &Path) -> Result<par6_kin::Kin> {
+    let params = bundle.active_tool().map(|g| {
+        let k = &g.kinematics;
+        par6_kin::Kin::dh_tool_params(
+            k.d_m,
+            k.a_m,
+            k.alpha_rad,
+            k.mass_kg,
+            k.com_m,
+            k.inertia_kg_m2,
+        )
+    });
+    let mut kin = par6_kin::Kin::load_arm(assets, params.as_ref())?;
+    kin.set_gravity_correction(&bundle.robot.gravity_correction)?;
+    Ok(kin)
+}
+
+/// Poses for identifying the arm's own links, chosen for what they pin.
 ///
-/// A candidate is kept only if it, and the two approach offsets the
-/// measurement uses, are inside both limit sets and clear of the collision
-/// world, and if the straight joint-space path from the previous kept pose is
-/// clear too. Both limit sets because this arm's J6 declares a soft range
-/// wider than its hard one, and a pose drawn from the soft range alone drove
-/// it into the mechanical stop at full current.
+/// Candidates are drawn deterministically over each joint's whole window,
+/// so a run is repeatable, and kept only if the pose and the two approach
+/// offsets the measurement uses are inside both limit sets, clear of the
+/// collision world, and holdable with `IDENT_HOLD_FRACTION` of every
+/// joint's current limit. From those the plan takes, one at a time, the
+/// pose that raises the log-determinant of the set's ridged normal matrix
+/// the most -- the D-optimal pick, scored exactly as `fit_arm` will score
+/// the result -- among the candidates whose legs from the previous pick
+/// are clear. A band around the ready pose used to bound the draw; on the
+/// arm it pinned 7 of 24 parameters, and the model sagged with the arm
+/// horizontal, where nothing had been measured.
+///
+/// Both limit sets because this arm's J6 declares a soft range wider than
+/// its hard one, and a pose drawn from the soft range alone drove it into
+/// the mechanical stop at full current.
 fn identification_poses(
     bundle: &ConfigBundle,
     assets: &Path,
     ready: [f64; N],
-) -> Result<Vec<[f64; N]>> {
+) -> Result<IdentPlan> {
     let mut world = collision_world(bundle, assets)?;
+    let mut kin = arm_kin(bundle, assets)?;
     let backoff = bundle.robot.selfcal.approach_rad;
+    let ridge = bundle.robot.selfcal.ridge;
     let mut seed = 0x2545_F491_4F6C_DD1Du64;
     let mut unit = move || {
         seed ^= seed << 13;
@@ -2618,9 +2642,6 @@ fn identification_poses(
         seed ^= seed << 17;
         (seed >> 11) as f64 / (1u64 << 53) as f64
     };
-    // `f64::clamp` asserts min <= max, so the emptiness check has to come
-    // first: calling it to make that very check panicked instead of printing
-    // the sentence written for it.
     let window = |j: usize| {
         let l = &bundle.robot.joints[j].limits;
         let lo = l.soft_min_rad.max(l.hard_min_rad) + backoff;
@@ -2637,98 +2658,152 @@ fn identification_poses(
         )
         .into());
     }
-    let bounds = |j: usize| {
-        let (lo, hi) = window(j);
-        let span = (hi - lo) * IDENT_BAND / 2.0;
-        (
-            (ready[j] - span).clamp(lo, hi),
-            (ready[j] + span).clamp(lo, hi),
+    // Gravity torque a pose may ask of each joint, from its current limit.
+    let budget: [f64; N] = std::array::from_fn(|j| {
+        let joint = &bundle.robot.joints[j];
+        let ma_per_nm = par6_bus::spectral::torque_to_ma_factor(
+            joint.gear_ratio,
+            joint.gear_efficiency,
+            joint.kt_nm_a,
+            joint.dir,
         )
-    };
-    let wanted = bundle.robot.selfcal.identification_poses;
-    let mut poses: Vec<[f64; N]> = Vec::with_capacity(wanted);
-    let mut previous = ready;
-    // Bounded: a pose set that cannot be filled says so rather than spinning
-    // on a scene that refuses everything.
-    for _ in 0..wanted * 200 {
-        if poses.len() == wanted {
-            break;
-        }
-        let q: [f64; N] = std::array::from_fn(|j| {
-            let (lo, hi) = bounds(j);
-            lo + unit() * (hi - lo)
-        });
-        let approaches: [[f64; N]; 2] = [
+        .abs();
+        IDENT_HOLD_FRACTION * joint.ilim_ma / ma_per_nm
+    });
+    let approaches = |q: &[f64; N]| -> [[f64; N]; 2] {
+        [
             std::array::from_fn(|j| q[j] - backoff),
             std::array::from_fn(|j| q[j] + backoff),
-        ];
-        if [&q]
-            .into_iter()
-            .chain(&approaches)
-            .any(|p| world.check(p, true).map(|r| r.active()).unwrap_or(true))
-        {
+        ]
+    };
+    let clear = |world: &mut par6_kin::Collision, p: &[f64; N]| -> bool {
+        !world.check(p, true).map(|r| r.active()).unwrap_or(true)
+    };
+    // Every leg the measurement will actually drive from `from` to `q`.
+    let legs_clear = |world: &mut par6_kin::Collision, from: &[f64; N], q: &[f64; N]| -> bool {
+        let [below, above] = approaches(q);
+        [(*from, below), (below, *q), (*q, above), (above, *q)]
+            .iter()
+            .all(|(a, b)| {
+                world
+                    .check_segment(a, b, 40)
+                    .map(|c| c.is_none())
+                    .unwrap_or(false)
+            })
+    };
+
+    let wanted = bundle.robot.selfcal.identification_poses;
+    let mut candidates: Vec<([f64; N], Vec<f64>)> = Vec::with_capacity(IDENT_CANDIDATES);
+    let mut tau = [0.0; N];
+    // Bounded: a scene that refuses everything says so rather than spinning.
+    for _ in 0..IDENT_CANDIDATES * 20 {
+        if candidates.len() == IDENT_CANDIDATES {
+            break;
+        }
+        // Gravity does not see the base joint, so the plan does not swing
+        // it: every pose keeps J1 where the ready pose has it.
+        let q: [f64; N] = std::array::from_fn(|j| {
+            let (lo, hi) = window(j);
+            if j == 0 {
+                ready[j].clamp(lo, hi)
+            } else {
+                lo + unit() * (hi - lo)
+            }
+        });
+        let [below, above] = approaches(&q);
+        if !(clear(&mut world, &q) && clear(&mut world, &below) && clear(&mut world, &above)) {
             continue;
         }
-        // Every leg the measurement will actually drive.
-        let legs = [
-            (previous, approaches[0]),
-            (approaches[0], q),
-            (q, approaches[1]),
-            (approaches[1], q),
-        ];
-        if legs.iter().any(|(a, b)| {
-            world
-                .check_segment(a, b, 40)
-                .map(|c| c.is_some())
-                .unwrap_or(true)
-        }) {
+        kin.gravity(&q, &mut tau)?;
+        if (0..N).any(|j| tau[j].abs() > budget[j]) {
             continue;
         }
-        poses.push(q);
-        previous = q;
+        candidates.push((q, par6_kin::gravity::PoseDesign::regressor(&mut kin, &q)?));
     }
-    if poses.len() < wanted {
+    if candidates.len() < wanted {
         return Err(format!(
-            "only {} of {wanted} identification poses cleared the limits and the collision \
-             world",
-            poses.len()
+            "only {} of the {wanted} identification poses wanted cleared the limits, the \
+             collision world and the holding budget",
+            candidates.len()
         )
         .into());
     }
-    // Visit them nearest-first: a random order spends most of the run
+
+    let mut design = par6_kin::gravity::PoseDesign::new(&kin);
+    let mut picked: Vec<[f64; N]> = Vec::with_capacity(wanted);
+    let mut previous = ready;
+    while picked.len() < wanted {
+        // The score is cheap and the leg sweep is not: rank every candidate,
+        // then sweep down the ranking only until one clears.
+        let mut ranked: Vec<(usize, f64)> = candidates
+            .iter()
+            .enumerate()
+            .filter_map(|(i, (_, y))| design.gain(y, ridge).map(|g| (i, g)))
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let Some(pick) = ranked
+            .iter()
+            .map(|(i, _)| *i)
+            .find(|&i| legs_clear(&mut world, &previous, &candidates[i].0))
+        else {
+            return Err(format!(
+                "no candidate pose can be reached from identification pose {}",
+                picked.len()
+            )
+            .into());
+        };
+        let (q, y) = candidates.swap_remove(pick);
+        design.add(&y);
+        previous = q;
+        picked.push(q);
+    }
+    let determined = design.determined(ridge);
+
+    // Visit them nearest-first: the pick order spends most of the run
     // travelling, and the poses are equally informative in any order.
-    let mut ordered = Vec::with_capacity(poses.len());
+    let mut remaining = picked.clone();
+    let mut ordered = Vec::with_capacity(remaining.len());
     let mut at = ready;
-    while !poses.is_empty() {
-        let (i, _) = poses
+    while !remaining.is_empty() {
+        let (i, _) = remaining
             .iter()
             .enumerate()
             .map(|(i, q)| (i, (0..N).map(|j| (q[j] - at[j]).abs()).sum::<f64>()))
             .min_by(|a, b| a.1.total_cmp(&b.1))
             .ok_or("no poses")?;
-        at = poses.remove(i);
+        at = remaining.remove(i);
         ordered.push(at);
     }
-    // Sweep the legs the run will actually drive. The checks above were
-    // made against each pose's generation-order predecessor, and the
-    // nearest-first pass just permuted the list, so the transitions between
-    // consecutive ORDERED poses -- which is what `Arm::pose` drives, without
-    // a check of its own -- had never been swept at all.
-    let mut at = ready;
-    for q in &ordered {
-        let first = std::array::from_fn::<f64, N, _>(|j| q[j] - backoff);
-        for (a, b) in [(at, first), (first, *q)] {
-            if world.check_segment(&a, &b, 40)?.is_some() {
-                return Err("an identification leg in the visiting order collides".into());
+    // Sweep the legs the run will actually drive, in the order it drives
+    // them -- `Arm::pose` makes no check of its own -- and the return to
+    // the ready pose, so the run finishes where parking expects. Nearest-
+    // first permuted the list, so a leg it introduced may collide where
+    // the pick order, swept above, did not; that order is the fallback.
+    let mut sweep = |order: &[[f64; N]]| -> Result<bool> {
+        let mut at = ready;
+        for q in order {
+            let first = std::array::from_fn::<f64, N, _>(|j| q[j] - backoff);
+            for (a, b) in [(at, first), (first, *q)] {
+                if world.check_segment(&a, &b, 40)?.is_some() {
+                    return Ok(false);
+                }
             }
+            at = *q;
         }
-        at = *q;
-    }
-    // Home again at the end, so the run finishes where parking expects.
-    if world.check_segment(&at, &ready, 40)?.is_some() {
-        return Err("the return to the ready pose collides".into());
-    }
-    Ok(ordered)
+        Ok(world.check_segment(&at, &ready, 40)?.is_none())
+    };
+    let poses = if sweep(&ordered)? {
+        ordered
+    } else if sweep(&picked)? {
+        picked
+    } else {
+        return Err(
+            "no visiting order of the identification poses is clear of the collision \
+                    world, the return to the ready pose included"
+                .into(),
+        );
+    };
+    Ok(IdentPlan { poses, determined })
 }
 
 // ---------------------------------------------------------------- applying
@@ -2765,6 +2840,8 @@ fn patch_array(text: &mut String, key: &str, values: &[f64]) -> Result<()> {
 fn patch_config(
     original: &str,
     correction: Option<&[f64]>,
+    friction: Option<&[Option<(f64, f64)>; N]>,
+    sim: &par6_config::SimConfig,
     tuned: Option<&[Option<Tuned>; N]>,
     limits: Option<&[Option<Found>; N]>,
 ) -> Result<String> {
@@ -2774,6 +2851,21 @@ fn patch_config(
         // Identification measures the true torque, so any per-joint trim from
         // an older calibration is superseded and would otherwise multiply it.
         patch_array(&mut text, "gravity_scale", &[1.0; N])?;
+    }
+    if let Some(friction) = friction {
+        // The friction the simulator's joints show their drives: measured
+        // joint by joint, a joint the run skipped keeps the file's value.
+        let measured = |pick: fn(&(f64, f64)) -> f64, current: &[f64]| -> Vec<f64> {
+            friction
+                .iter()
+                .zip(current)
+                .map(|(m, c)| m.as_ref().map_or(*c, pick))
+                .collect()
+        };
+        let viscous = measured(|m| m.0, &sim.viscous_nm_s);
+        let coulomb = measured(|m| m.1, &sim.coulomb_nm);
+        patch_array(&mut text, "viscous_nm_s", &viscous)?;
+        patch_array(&mut text, "coulomb_nm", &coulomb)?;
     }
     for (j, t) in tuned.into_iter().flatten().enumerate() {
         // Only what the search moved: a joint it left alone keeps its lines
@@ -2905,15 +2997,34 @@ fn run(args: Args) -> Result<()> {
         None => ConfigBundle::load(&args.config)?,
     };
     bundle.robot.validate()?;
-    let assets = args
-        .config
-        .parent()
-        .ok_or("configuration has no directory")?
-        .join("../assets/par6_description");
+    // The file's own friction, for joints a partial run leaves unmeasured.
+    let sim = bundle.robot.sim.clone();
+    // Resolved the way the daemon resolves it: a lexical step up from the
+    // config directory, never `config/..` through the filesystem, which
+    // follows the `config` symlink into the package and lands beside it.
+    let assets = par6d::kin::resolve_assets_dir(None, &args.config)?;
     let ready = planned_ready(&bundle)?;
     // Plan the poses before anything moves: a scene that cannot be covered
     // should say so with the arm still parked.
-    let poses = identification_poses(&bundle, &assets, ready)?;
+    let plan = identification_poses(&bundle, &assets, ready)?;
+    let poses = plan.poses;
+    // What the fit will report is a rank, the same for any non-degenerate
+    // set; what the plan buys is coverage, so that is what it prints.
+    let coverage: Vec<String> = (1..N)
+        .map(|j| {
+            let lo = poses.iter().map(|q| q[j]).fold(f64::INFINITY, f64::min);
+            let hi = poses.iter().map(|q| q[j]).fold(f64::NEG_INFINITY, f64::max);
+            format!("J{} {:.0}..{:.0}", j + 1, lo.to_degrees(), hi.to_degrees())
+        })
+        .collect();
+    println!(
+        "identification plan: {} poses, J1 held at ready, {} deg; {:.1} of {} parameters \
+         observable",
+        poses.len(),
+        coverage.join(", "),
+        plan.determined.iter().sum::<f64>(),
+        plan.determined.len()
+    );
 
     let directory = args.output_dir.join(format!(
         "selfcal-{}",
@@ -2976,12 +3087,13 @@ fn run(args: Args) -> Result<()> {
     }
 
     let mut fit = None;
+    let mut friction = None;
     let mut tuned = None;
     let mut limits = None;
     let outcome = arm.initialize().and_then(|()| {
         arm.home()?;
         if !only {
-            arm.measure_mechanics()?;
+            friction = Some(arm.measure_mechanics()?);
             fit = Some(arm.identify(&poses, ready)?);
         }
         if let (true, Some(spans)) = (gains_stage, &spans) {
@@ -3104,6 +3216,8 @@ fn run(args: Args) -> Result<()> {
     let patched = patch_config(
         &original,
         correction.as_deref(),
+        friction.as_ref(),
+        &sim,
         tuned.as_ref(),
         limits.as_ref(),
     )?;

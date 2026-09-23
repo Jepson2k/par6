@@ -996,8 +996,10 @@ mod tests {
             .map(|v| v.as_float().expect("sim.motor_jm_kg_m2 holds floats"))
             .collect();
         assert_eq!(jm, vec![1.02e-5, 1.02e-5, 5.7e-6, 5.7e-6, 5.7e-6, 1.5e-6]);
-        assert_eq!(sim["motor_b_nm_s"].as_float(), Some(1.0e-4));
-        assert_eq!(sim["motor_tc_nm"].as_float(), Some(0.02));
+        for key in ["viscous_nm_s", "coulomb_nm"] {
+            let entries = sim[key].as_array().expect("sim friction is an array");
+            assert_eq!(entries.len(), 6, "sim.{key} carries one entry per joint");
+        }
         let robot = RobotConfig::load(&path).expect("shipped PAR6 config");
         assert_eq!(robot.joints[1].gear_ratio, 25.0, "wire conversion keeps 25");
         assert_eq!(

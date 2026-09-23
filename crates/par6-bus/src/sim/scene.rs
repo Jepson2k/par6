@@ -24,7 +24,6 @@ use std::sync::Mutex;
 
 use mujoco_rs::prelude::{MjModel, MjSpec, MjtGeom, MjtJoint, SpecItem, SpecObject};
 use mujoco_rs::wrappers::mj_editing::MjsGeom;
-use par6_config::SimConfig;
 use par6_proto::{Physical, Shape};
 
 use super::map::JointMap;
@@ -98,22 +97,27 @@ pub struct Scene {
 pub struct JointTuning {
     /// Reflected rotor inertia `G² · Jm` \[kg·m²\].
     pub armature: f64,
-    /// Reflected viscous friction `G² · b` \[N·m·s\].
+    /// Viscous friction at the joint \[N·m·s\], as measured there.
     pub damping: f64,
-    /// Reflected Coulomb friction `G · tc` \[N·m\].
+    /// Coulomb friction at the joint \[N·m\], as measured there.
     pub frictionloss: f64,
     /// Config hard limits \[rad\].
     pub range: [f64; 2],
 }
 
 impl JointTuning {
-    /// From the config's `[sim]` motor constants and one joint's map.
-    pub(crate) fn from_config(map: &JointMap, motor_jm_kg_m2: f64, sim: &SimConfig) -> Self {
+    /// From the config's `[sim]` constants for one joint and its map.
+    pub(crate) fn from_config(
+        map: &JointMap,
+        motor_jm_kg_m2: f64,
+        viscous_nm_s: f64,
+        coulomb_nm: f64,
+    ) -> Self {
         let g = map.dyn_gear;
         Self {
             armature: g * g * motor_jm_kg_m2,
-            damping: g * g * sim.motor_b_nm_s,
-            frictionloss: g * sim.motor_tc_nm,
+            damping: viscous_nm_s,
+            frictionloss: coulomb_nm,
             range: [map.hard_lo_rad, map.hard_hi_rad],
         }
     }
