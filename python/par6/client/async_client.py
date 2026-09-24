@@ -64,6 +64,7 @@ from ._wire import (
     tool_params,
 )
 from ._wire import f6 as _f6
+from ._wire import refuse_unknown_keywords as _refuse_unknown_keywords
 from ._wire import timing as _timing
 from ._wire import tool_status_from_dict as _tool_status_from_dict
 from ._wire import wire_frame as _wire_frame
@@ -683,6 +684,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         Example:
             rbt.home()
         """
+        _refuse_unknown_keywords(wait_kwargs)
         core = await self._ensure_core()
         index = await self._call(core.home(calibrate))
         if index >= 0:
@@ -696,8 +698,8 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
         rel: bool = False,
@@ -715,6 +717,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         Example:
             rbt.move_j(<joint_angles_deg>, speed=0.5)
         """
+        _refuse_unknown_keywords(wait_kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         if pose is not None:
@@ -746,8 +749,8 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         pose: list[float],
         *,
         frame: WFrame = "WRF",
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
         rel: bool = False,
@@ -764,6 +767,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         Example:
             rbt.move_l(<tcp_pose_mm_deg>, speed=0.5)
         """
+        _refuse_unknown_keywords(wait_kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         index = await self._call(
@@ -789,21 +793,18 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
-        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Circular arc through *via* to *end*.
 
-        With ``rel=True``, *via* and *end* are deltas from the pose the
-        move starts at (each against the start, not chained).
-
         Category: Motion
 
         Example:
             rbt.move_c(<via_pose>, <end_pose>, speed=0.5)
         """
+        _refuse_unknown_keywords(wait_kwargs)
         core = await self._ensure_core()
         d, s = _timing(duration, speed)
         index = await self._call(
@@ -815,7 +816,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
                 s,
                 float(accel),
                 _blend(r),
-                bool(rel),
+                False,
             )
         )
         return await self._finish_queued(index, wait, timeout)
@@ -828,7 +829,6 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         duration: float | None,
         speed: float | None,
         accel: float,
-        rel: bool,
         wait: bool,
         timeout: float,
     ) -> int:
@@ -836,9 +836,7 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         d, s = _timing(duration, speed)
         wps = [_f6(wp, "waypoint") for wp in waypoints]
         index = await self._call(
-            getattr(core, method)(
-                wps, _wire_frame(frame), d, s, float(accel), bool(rel)
-            )
+            getattr(core, method)(wps, _wire_frame(frame), d, s, float(accel), False)
         )
         return await self._finish_queued(index, wait, timeout)
 
@@ -850,23 +848,20 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
-        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Cubic spline move through waypoints (auto-chunked when large).
 
-        With ``rel=True``, every waypoint is a delta from the pose the
-        move starts at (each against the start, not chained).
-
         Category: Motion
 
         Example:
             rbt.move_s(<waypoints>, speed=0.5)
         """
+        _refuse_unknown_keywords(wait_kwargs)
         return await self._move_multi(
-            "move_s", waypoints, frame, duration, speed, accel, rel, wait, timeout
+            "move_s", waypoints, frame, duration, speed, accel, wait, timeout
         )
 
     async def move_p(
@@ -877,23 +872,20 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
         duration: float | None = None,
         speed: float | None = None,
         accel: float = 1.0,
-        rel: bool = False,
         wait: bool = False,
         timeout: float = 10.0,
         **wait_kwargs: Any,
     ) -> int:
         """Process move with auto-blending through waypoints (auto-chunked).
 
-        With ``rel=True``, every waypoint is a delta from the pose the
-        move starts at (each against the start, not chained).
-
         Category: Motion
 
         Example:
             rbt.move_p(<waypoints>, speed=0.5)
         """
+        _refuse_unknown_keywords(wait_kwargs)
         return await self._move_multi(
-            "move_p", waypoints, frame, duration, speed, accel, rel, wait, timeout
+            "move_p", waypoints, frame, duration, speed, accel, wait, timeout
         )
 
     # ------------------------------------------------------------------

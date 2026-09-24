@@ -1,27 +1,12 @@
-"""End-to-end: refused fire-and-forget commands reach the caller (issue #23).
-
-Before the fix, a refused fire-and-forget "succeeded" at the client while
-the arm stood still: the runtime answered a real ERROR datagram, but
-nothing awaits a fire-and-forget reply, so the refusal evaporated —
-``error()`` stayed ``None`` and STATUS carried nothing.  The runtime now
-latches such a refusal as the standing error (while the pipeline is idle),
-so it surfaces through the ERROR query and the STATUS broadcast, and the
-next accepted motion command clears it.
-
-The repro here is an out-of-range ``teleport`` — a runtime-side range
-check no client-side validation mirrors.  The other daemon-only
-fire-and-forget refusal, a jog the collision gate turns away, exercises
-the same latch in ``test_e2e_daemon.py::
-test_jog_streams_are_gated_by_the_collision_world``.
+"""End-to-end against a real ``par6d --sim``: a refused teleport answers in
+its own reply, and an accepted jog stream stays fire-and-forget.
 
 Everything here drives a real ``par6d --sim`` over real UDP with the real
-client — no fakes, no scripted peer.  These tests fail against the pre-fix
-runtime: ``error()`` then answers ``None`` after the refusal.
+client — no fakes, no scripted peer.
 """
 
 from __future__ import annotations
 
-import asyncio
 import math
 import time
 
@@ -29,7 +14,7 @@ import pytest
 from live_daemon import LiveDaemon, angles_now, requires_par6d, settle_at
 
 from par6 import config as _cfg
-from par6.client import AsyncRobotClient, RobotError
+from par6.client import RobotError
 from par6.protocol import ErrorCode
 
 pytestmark = [pytest.mark.e2e, requires_par6d]
@@ -45,31 +30,6 @@ def park_deg() -> list[float]:
 
 def max_abs_delta(actual, expected) -> float:
     return max(abs(a - b) for a, b in zip(actual, expected))
-
-
-async def standing_error(
-    client: AsyncRobotClient, budget_s: float = STEP_BUDGET_S
-) -> RobotError | None:
-    """Poll ``error()`` until a standing error appears, or the budget ends."""
-    deadline = time.monotonic() + budget_s
-    while time.monotonic() < deadline:
-        err = await client.error()
-        if err is not None:
-            return err
-        await asyncio.sleep(0.05)
-    return None
-
-
-async def error_clears(
-    client: AsyncRobotClient, budget_s: float = STEP_BUDGET_S
-) -> bool:
-    """Poll ``error()`` until it answers ``None``, or the budget ends."""
-    deadline = time.monotonic() + budget_s
-    while time.monotonic() < deadline:
-        if await client.error() is None:
-            return True
-        await asyncio.sleep(0.05)
-    return False
 
 
 @pytest.mark.timeout(120)

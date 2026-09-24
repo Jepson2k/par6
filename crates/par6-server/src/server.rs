@@ -105,9 +105,6 @@ struct PendingScan {
 /// waiting for an answer, and the queue must stay bounded.
 const MAX_RESET_WAITERS: usize = 16;
 
-/// How many COMPLETE pushes COMMAND_COMPLETION can answer for: the same
-/// window the client keeps.
-const COMPLETION_LOG_KEPT: usize = 1024;
 /// Requests awaiting the RT's FLASHING verdict, bounded the same way.
 const MAX_FLASHING_WAITERS: usize = 16;
 /// Largest CONFIG_BUNDLE reply sent: one UDP datagram (65 507 payload
@@ -350,7 +347,7 @@ struct Core<R: RtCommands> {
     finished: BTreeSet<u64>,
     /// The last COMPLETE pushes, oldest first, for COMMAND_COMPLETION: a
     /// client whose push went missing asks here instead of guessing.
-    completion_log: VecDeque<(u64, bool, Option<WireError>, Option<u8>)>,
+    completion_log: VecDeque<(u64, Option<WireError>, Option<u8>)>,
     last_checkpoint: String,
     standing_error: Option<WireError>,
     action_state: ActionState,
@@ -417,7 +414,7 @@ struct Core<R: RtCommands> {
     last_status_at: Instant,
     session_id: u64,
     tcp_speed: f64,
-    prev_tcp: Option<([f64; 3], Instant)>,
+    prev_tcp: Option<([f64; 3], u64)>,
     /// STATUS rate in force now. Separate from `cfg.status_rate_hz`, which
     /// stays the boot value: SET_STATUS_RATE moves this one for a session.
     status_rate_hz: u32,
@@ -472,7 +469,7 @@ impl<R: RtCommands> Core<R> {
             tool_executing: None,
             completed_index: -1,
             finished: BTreeSet::new(),
-            completion_log: VecDeque::with_capacity(COMPLETION_LOG_KEPT),
+            completion_log: VecDeque::with_capacity(par6_proto::COMPLETIONS_KEPT),
             last_checkpoint: String::new(),
             standing_error: None,
             action_state: ActionState::Idle,
@@ -694,10 +691,8 @@ impl<R: RtCommands> Core<R> {
     }
 
     /// STATUS rides the RT's ticks: one frame every `tick_hz /
-    /// status_rate_hz` ticks, built from that tick's snapshot. A timer
-    /// sampling the snapshot at its own phase described the same tick
-    /// twice and skipped others — a TCP speed of zero out of a repeated
-    /// pose, a jog step nobody saw — which no frame here can do.
+    /// status_rate_hz` ticks, built from that tick's snapshot, so no tick
+    /// is described twice and none is skipped.
     async fn emit_status_on_tick(&mut self) {
         let stride = self.status_stride();
         let tick = self.snap.tick;
@@ -707,7 +702,6 @@ impl<R: RtCommands> Core<R> {
         {
             return;
         }
-        self.last_status_tick = Some(tick);
         self.emit_status().await;
     }
 
@@ -725,7 +719,7 @@ impl<R: RtCommands> Core<R> {
     /// since a timer and a tick stride at the same rate drift into phase
     /// and would otherwise describe every stride twice.
     async fn on_status(&mut self) {
-        let period = rate_period(self.status_rate_hz.max(1));
+        let period = rate_period(self.status_rate_hz);
         if self.last_status_at.elapsed() < period.mul_f64(1.5) {
             return;
         }
@@ -734,7 +728,11 @@ impl<R: RtCommands> Core<R> {
     }
 
     async fn emit_status(&mut self) {
+        // Both clocks, whichever path emits: a timer frame that did not
+        // record the tick it described would be followed by a tick frame
+        // for the same stride as soon as the RT resumed.
         self.last_status_at = Instant::now();
+        self.last_status_tick = Some(self.snap.tick);
         self.stop_invalid_attachments().await;
         self.update_tcp_speed();
         self.update_collision();
@@ -869,14 +867,17 @@ impl<R: RtCommands> Core<R> {
     /// queued or streaming, and the arm idle, faulted, or holding in EXEC
     /// with its ring drained — where every stop and finished move rests.
     fn arm_at_rest(&self) -> bool {
-        let busy =
-            self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
         let resting = match self.snap.mode {
             Mode::Idle | Mode::ActiveError => true,
-            Mode::Exec => self.snap.exec.samples_remaining == 0 && !self.snap.exec.stopping,
+            Mode::Exec => !self.arm_braking(),
             _ => false,
         };
-        !busy && resting
+        !self.motion_in_flight() && resting
+    }
+
+    /// A command executing, queued behind it, or streaming.
+    fn motion_in_flight(&self) -> bool {
+        self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some()
     }
 
     /// Commissioning commands rename or rewrite a drive: refused while
@@ -893,10 +894,7 @@ impl<R: RtCommands> Core<R> {
                     &format!(
                         "{what} needs an arm at rest: mode {:?}, {}",
                         self.snap.mode,
-                        if self.executing.is_some()
-                            || !self.pending.is_empty()
-                            || self.active_stream.is_some()
-                        {
+                        if self.motion_in_flight() {
                             "motion in flight"
                         } else {
                             "nothing in flight"
@@ -1010,10 +1008,6 @@ impl<R: RtCommands> Core<R> {
                 }
                 Ok(())
             }
-            // `port` indexes the box's DECLARED outputs, so the wire's
-            // own 0..=7 bound is not the answer here: a port past the
-            // end names no line, and acking it would report a level the
-            // arm never drove.
             // Acked once the pose is applied: a caller that scrubs a
             // recording through it learns of a refusal (off the
             // simulator, outside the travel window) from the reply, not
@@ -1241,18 +1235,17 @@ impl<R: RtCommands> Core<R> {
     async fn on_bus_swap(&mut self, req_id: u32, cmd: &Command, addr: SocketAddr) {
         use Command as C;
         self.invalidate_attachments();
-        let (scope, started) = match cmd {
-            C::Simulator(p) => (
-                "the simulator switch",
-                self.runtime.rt.set_simulator(p.on).map(|()| p.on),
-            ),
-            C::ConnectHardware(p) => (
-                "the hardware connect",
-                self.runtime.rt.connect_hardware(&p.port).map(|()| false),
-            ),
+        let scope = match cmd {
+            C::Simulator(_) => "the simulator switch",
+            C::ConnectHardware(_) => "the hardware connect",
             _ => unreachable!("only backend swaps are answered here"),
         };
         self.cancel_all_motion(scope).await;
+        let started = match cmd {
+            C::Simulator(p) => self.runtime.rt.set_simulator(p.on).map(|()| p.on),
+            C::ConnectHardware(p) => self.runtime.rt.connect_hardware(&p.port).map(|()| false),
+            _ => unreachable!("only backend swaps are answered here"),
+        };
         match started {
             Err(error) => self.reply(addr, &Reply::Error { req_id, error }).await,
             Ok(simulator) => {
@@ -2023,9 +2016,7 @@ impl<R: RtCommands> Core<R> {
     /// Cleared like every standing error: by the next ACCEPTED motion
     /// command ([`Self::on_motion_accepted`]) or by `reset`/`reset_state`.
     fn latch_faf_refusal(&mut self, error: &WireError) {
-        let busy =
-            self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some();
-        self.latch_refusal(error, busy);
+        self.latch_refusal(error, self.motion_in_flight());
     }
 
     /// A refused update of the live stream: that stream is stopped or held
@@ -2353,20 +2344,23 @@ impl<R: RtCommands> Core<R> {
         }
     }
 
+    /// Differentiated over the RT's ticks, the clock the positions were
+    /// sampled on: a snapshot described a second time adds no sample.
     fn update_tcp_speed(&mut self) {
-        let now = Instant::now();
+        let tick = self.snap.tick;
         let pos = [self.snap.tcp[0], self.snap.tcp[1], self.snap.tcp[2]];
-        if let Some((prev, t)) = self.prev_tcp {
-            let dt = now.duration_since(t).as_secs_f64();
-            if dt > 0.0 {
-                let d = ((pos[0] - prev[0]).powi(2)
-                    + (pos[1] - prev[1]).powi(2)
-                    + (pos[2] - prev[2]).powi(2))
-                .sqrt();
-                self.tcp_speed = d * 1000.0 / dt;
+        if let Some((prev, prev_tick)) = self.prev_tcp {
+            if tick <= prev_tick {
+                return;
             }
+            let dt = (tick - prev_tick) as f64 * self.cfg.config_info.tick_dt_s;
+            let d = ((pos[0] - prev[0]).powi(2)
+                + (pos[1] - prev[1]).powi(2)
+                + (pos[2] - prev[2]).powi(2))
+            .sqrt();
+            self.tcp_speed = d * 1000.0 / dt;
         }
-        self.prev_tcp = Some((pos, now));
+        self.prev_tcp = Some((pos, tick));
     }
 
     /// The physical safety chain alone: what the e-stop LINE reads, not
@@ -2878,10 +2872,10 @@ impl<R: RtCommands> Core<R> {
             },
             C::CommandCompletion { index } => {
                 match self.completion_log.iter().rev().find(|c| c.0 == *index) {
-                    Some((_, ok, detail, verdict)) => QueryResult::CommandCompletion {
+                    Some((_, detail, verdict)) => QueryResult::CommandCompletion {
                         index: *index,
                         finished: true,
-                        ok: *ok,
+                        ok: detail.is_none(),
                         detail: detail.clone(),
                         verdict: *verdict,
                     },
@@ -2991,11 +2985,11 @@ impl<R: RtCommands> Core<R> {
                 e.remedy
             ),
         }
-        if self.completion_log.len() >= COMPLETION_LOG_KEPT {
+        if self.completion_log.len() >= par6_proto::COMPLETIONS_KEPT {
             self.completion_log.pop_front();
         }
         self.completion_log
-            .push_back((index, detail.is_none(), detail.clone(), verdict));
+            .push_back((index, detail.clone(), verdict));
         let reply = Reply::Complete {
             index,
             ok: detail.is_none(),
@@ -3354,7 +3348,9 @@ fn params_summary(cmd: &Command) -> String {
     s
 }
 
-/// Wire name of a command (STATUS `action_current`, QUEUE listing).
+/// The waldoctl method a command came from, as STATUS `action_current`
+/// and the QUEUE listing report it: a pose target reads as the `move_j`
+/// or `servo_j` call that sent it.
 pub fn cmd_name(tag: CmdType) -> &'static str {
     use CmdType as T;
     match tag {
@@ -3407,7 +3403,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::ConfigBundle => "config_bundle",
         T::Payload => "payload",
         T::ServoJ => "servo_j",
-        T::ServoJPose => "servo_j_pose",
+        T::ServoJPose => "servo_j",
         T::ServoL => "servo_l",
         T::JogJ => "jog_j",
         T::JogL => "jog_l",
@@ -3415,7 +3411,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::ResetLoopStats => "reset_loop_stats",
         T::Home => "home",
         T::MoveJ => "move_j",
-        T::MoveJPose => "move_j_pose",
+        T::MoveJPose => "move_j",
         T::MoveL => "move_l",
         T::MoveC => "move_c",
         T::MoveS => "move_s",

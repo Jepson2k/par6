@@ -603,14 +603,13 @@ def _await_records(caplog, logger_name: str, budget_s: float) -> list:
 async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
     daemon: LiveDaemon,
 ):
-    """``Robot.motion_profiles`` must name the runtime's real registry.
+    """``Robot.motion_profiles`` names the runtime's registry exactly.
 
     Every advertised profile is driven through ``select_profile`` and read
-    back from the PROFILE query, so the list cannot drift from what the
-    command plane accepts; a name outside it is refused, so the list is not
-    vacuously true.  TOPPRA is registered only by a ``par6d`` built with
-    the C++ shim — whichever build is under test, the advertisement and the
-    runtime have to agree about it.
+    back from the PROFILE query, so none is advertised that the command
+    plane refuses; a name outside the list is refused, so the list is not
+    vacuously true. ``reset_state`` puts the default back: TOPPRA, as on
+    parol6.
     """
     advertised = Robot().motion_profiles
     async with daemon.client() as client:
@@ -619,24 +618,44 @@ async def test_advertised_motion_profiles_are_the_ones_the_runtime_plans_with(
         assert unknown.value.code == ErrorCode.SYS_PROFILE_INVALID
 
         for name in advertised:
-            try:
-                await client.select_profile(name)
-            except RobotError as e:
-                assert e.code == ErrorCode.SYS_PROFILE_INVALID
-                assert name == "TOPPRA", f"{name} must be plannable on every build"
-                # Documented consequence of a build without the shim: the
-                # refusal leaves the previous profile running.
-                continue
+            await client.select_profile(name)
             assert await client.profile() == name
 
-        # The reverse direction: a runtime that plans with TOPPRA must not
-        # be talking to a client that hides it.
-        try:
-            await client.select_profile("TOPPRA")
-        except RobotError:
-            pass
-        else:
-            assert "TOPPRA" in advertised
+        await client.select_profile("LINEAR")
+        await client.reset_state()
+        assert await client.profile() == "TOPPRA"
+
+
+@pytest.mark.timeout(120)
+async def test_a_stopped_arm_is_held_and_still_floats_on_request(daemon: LiveDaemon):
+    """``stop()`` leaves the arm held, not back-driveable; ``freedrive(True)``
+    afterwards still lets it go — the hold is a pose kept under control,
+    not a state that locks out hand-guiding."""
+    park = park_deg()
+    async with daemon.client() as client:
+        assert await client.wait_status(lambda s: s.link_ok == 1, timeout=STEP_BUDGET_S)
+        await teleport_to(client, park)
+        target = list(park)
+        target[0] += 20.0
+
+        async def start_move():
+            assert await client.move_j(target, duration=6.0) >= 0
+
+        assert await enable(client, start_move) is None
+        assert await client.wait_status(
+            lambda s: abs(s.speeds[0]) > 0.05, timeout=STEP_BUDGET_S
+        ), "the move never moved the arm"
+        await client.stop()
+        assert await client.wait_status(
+            lambda s: max(abs(v) for v in s.speeds) < 0.01, timeout=STEP_BUDGET_S
+        ), "the stop never brought the arm to rest"
+        assert await client.is_freedrive() is False, "a stopped arm is held"
+
+        assert await client.freedrive(True) == 1
+        assert await client.wait_status(lambda s: s.freedrive, timeout=STEP_BUDGET_S), (
+            "freedrive after a stop never let the arm go"
+        )
+        assert await client.freedrive(False) == 1
 
 
 @pytest.mark.timeout(120)
@@ -797,7 +816,8 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         # chain, which nobody pressed.
         latched = await client.error()
         assert latched is not None and latched.code == ErrorCode.SYS_ESTOP_ACTIVE
-        assert (await client.io())[-1] == 1
+        io = await client.io()
+        assert io is not None and io[-1] == 1
         assert await client.is_estop_pressed() is False
 
         # The latch and the arm are two different facts, and they do not
@@ -2024,14 +2044,18 @@ def test_the_cli_speaks_refusals_and_never_fakes_a_stop(daemon: LiveDaemon, caps
     # move is refused either way, and the shell speaks the refusal.
     assert main([*addr, "move-j", "0", "0", "0", "0", "0", "0"]) == EXIT_REFUSED
 
-    # The e-stop line reads clear on a fresh boot and engaged after an
-    # estop: `status` must say so in those words, not the inverse.
+    # `status` reports the physical e-stop line, clear on a fresh boot. A
+    # software estop latches the controller without touching that line:
+    # the line still reads clear, and the latch is what refuses motion
+    # until `reset`.
     assert main([*addr, "--json", "status"]) == 0
     assert json.loads(capsys.readouterr().out)["estop"] is False
     assert main([*addr, "estop"]) == 0
     capsys.readouterr()
     assert main([*addr, "--json", "status"]) == 0
-    assert json.loads(capsys.readouterr().out)["estop"] is True
+    assert json.loads(capsys.readouterr().out)["estop"] is False
+    assert main([*addr, "move-j", "0", "0", "0", "0", "0", "0"]) == EXIT_REFUSED
+    capsys.readouterr()
     assert main([*addr, "reset"]) == 0
     capsys.readouterr()
 

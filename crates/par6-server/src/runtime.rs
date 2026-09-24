@@ -438,15 +438,16 @@ pub trait RtCommands: Send {
     /// Reset loop timing statistics (truly unacked fire-and-forget).
     fn reset_loop_stats(&mut self);
 
-    /// Discard whatever planned motion the RT still holds: flush the
-    /// sample ring and put the loop back to IDLE.
+    /// Discard whatever planned motion the RT still holds: brake the
+    /// program along its path, then discard the ring and hold
+    /// (`RtCommand::ExecStop`).
     ///
     /// The SERVER owns this, not the planner, and the ordering is why.
     /// A jog that preempts a queued move drops the planned motion and
     /// then streams itself, both in one datagram handler; if the RT-side
     /// discard travelled with the planner's cancel it would arrive after
-    /// the jog had already entered JOG mode and put the loop straight
-    /// back to IDLE. parol6 splits it the same way — its main loop
+    /// the jog had already entered JOG mode and stop it under the jog.
+    /// parol6 splits it the same way — its main loop
     /// cancels the segment player itself and leaves the planner
     /// subprocess to its own buffers.
     ///

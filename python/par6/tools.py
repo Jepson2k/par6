@@ -189,7 +189,6 @@ def build_tools() -> ToolsCollection:
                 position_range=(0.0, 1.0),
                 speed_range=(0.0, 1.0),
                 current_range=(0, int(driver["ilim_ma"])),
-                default_current=int(driver["default_current_ma"]),
                 motions=(
                     LinearMotion(
                         role=MeshRole.JAW,

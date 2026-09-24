@@ -623,7 +623,7 @@ pub struct MotionConfig {
 
 impl MotionConfig {
     /// Every key, in declaration order — the labels of [`Self::as_array`].
-    pub const KEYS: [&'static str; 19] = [
+    pub const KEYS: [&'static str; par6_proto::MOTION_KEYS] = [
         "jog_l_linear_max_m_s",
         "planned_linear_max_m_s",
         "jog_l_angular_max_rad_s",
@@ -647,7 +647,7 @@ impl MotionConfig {
 
     /// Every value in [`Self::KEYS`] order; an omitted `joint_step_rad`
     /// is NaN.
-    pub fn as_array(&self) -> [f64; 19] {
+    pub fn as_array(&self) -> [f64; par6_proto::MOTION_KEYS] {
         [
             self.jog_l_linear_max_m_s,
             self.planned_linear_max_m_s,

@@ -128,7 +128,7 @@ pub(crate) const COLLISION_STEP_RAD: f64 = 0.02;
 /// upper-case spelling clients use on the wire. The server refuses any
 /// name outside [`profile_names`], so a stored profile is always one of
 /// these.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Profile {
     /// Jerk-limited point-to-point (rsruckig).
     Ruckig,
@@ -139,7 +139,6 @@ pub(crate) enum Profile {
     Quintic,
     /// Time-optimal path parameterization (toppra-cpp): the velocity and
     /// acceleration limits bind, nothing else. The default.
-    #[default]
     Toppra,
     /// Constant velocity along a degree-1 joint path, with ramps at the
     /// acceleration limit at either end: parol6's LINEAR, which is the
@@ -147,30 +146,35 @@ pub(crate) enum Profile {
     Linear,
 }
 
+/// Every profile by its wire name, the default first.
+const PROFILES: [(&str, Profile); 5] = [
+    ("TOPPRA", Profile::Toppra),
+    ("RUCKIG", Profile::Ruckig),
+    ("TRAPEZOID", Profile::Trapezoid),
+    ("QUINTIC", Profile::Quintic),
+    ("LINEAR", Profile::Linear),
+];
+
 impl Profile {
     fn from_name(name: &str) -> Option<Self> {
-        match name {
-            "RUCKIG" => Some(Self::Ruckig),
-            "TRAPEZOID" => Some(Self::Trapezoid),
-            "QUINTIC" => Some(Self::Quintic),
-            "TOPPRA" => Some(Self::Toppra),
-            "LINEAR" => Some(Self::Linear),
-            _ => None,
-        }
+        PROFILES.iter().find(|(n, _)| *n == name).map(|&(_, p)| p)
+    }
+}
+
+impl Default for Profile {
+    fn default() -> Self {
+        PROFILES[0].1
     }
 }
 
 /// The profile registry the command plane advertises and validates
 /// `select_profile` against.
 pub(crate) fn profile_names() -> Vec<String> {
-    ["TOPPRA", "RUCKIG", "TRAPEZOID", "QUINTIC", "LINEAR"]
-        .into_iter()
-        .map(str::to_owned)
-        .collect()
+    PROFILES.iter().map(|(n, _)| (*n).to_owned()).collect()
 }
 
 /// Name of the profile a fresh runtime plans with.
-pub(crate) const DEFAULT_PROFILE: &str = "TOPPRA";
+pub(crate) const DEFAULT_PROFILE: &str = PROFILES[0].0;
 
 /// What the planner needs to know about the fitted CAN gripper.
 struct ToolSpec {
@@ -178,9 +182,20 @@ struct ToolSpec {
     ilim_ma: f64,
 }
 
-/// A cartesian move as a link of a blend chain: a straight run or an arc.
-#[derive(Debug, Clone, Copy)]
-enum CartMove<'a> {
+/// One move of a cartesian blend chain: its geometry, and the parameters
+/// the chain has to reconcile.
+#[derive(Clone, Copy)]
+struct CartMove<'a> {
+    geometry: CartGeometry<'a>,
+    blend_radius: Option<f64>,
+    speed: Option<f64>,
+    accel: Option<f64>,
+    duration: Option<f64>,
+}
+
+/// A straight run or an arc.
+#[derive(Clone, Copy)]
+enum CartGeometry<'a> {
     Line(&'a par6_proto::command::MoveL),
     Arc(&'a par6_proto::command::MoveC),
 }
@@ -188,39 +203,35 @@ enum CartMove<'a> {
 impl<'a> CartMove<'a> {
     fn of(cmd: &'a Command) -> Option<Self> {
         match cmd {
-            Command::MoveL(p) => Some(Self::Line(p)),
-            Command::MoveC(p) => Some(Self::Arc(p)),
+            Command::MoveL(p) => Some(Self {
+                geometry: CartGeometry::Line(p),
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
+            Command::MoveC(p) => Some(Self {
+                geometry: CartGeometry::Arc(p),
+                blend_radius: p.blend_radius,
+                speed: p.speed,
+                accel: p.accel,
+                duration: p.duration,
+            }),
             _ => None,
         }
     }
+}
 
-    fn speed(&self) -> Option<f64> {
-        match self {
-            Self::Line(p) => p.speed,
-            Self::Arc(p) => p.speed,
-        }
-    }
-
-    fn accel(&self) -> Option<f64> {
-        match self {
-            Self::Line(p) => p.accel,
-            Self::Arc(p) => p.accel,
-        }
-    }
-
-    fn duration(&self) -> Option<f64> {
-        match self {
-            Self::Line(p) => p.duration,
-            Self::Arc(p) => p.duration,
-        }
-    }
-
-    fn blend_radius(&self) -> Option<f64> {
-        match self {
-            Self::Line(p) => p.blend_radius,
-            Self::Arc(p) => p.blend_radius,
-        }
-    }
+/// A blend chain's timing: the slowest speed and acceleration fraction any
+/// move in it asks for, and the durations' sum when every move carries
+/// one (mixed with speed-parameterised moves there is no meaningful total).
+fn chain_timing(
+    mut moves: impl Iterator<Item = (Option<f64>, Option<f64>, Option<f64>)> + Clone,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let speed = moves.clone().filter_map(|(s, _, _)| s).reduce(f64::min);
+    let accel = moves.clone().filter_map(|(_, a, _)| a).reduce(f64::min);
+    let duration = moves.try_fold(0.0, |acc, (_, _, d)| d.map(|d| acc + d));
+    (speed, accel, duration)
 }
 
 enum InFlightKind {
@@ -1366,17 +1377,28 @@ impl Par6Planner {
             )
         };
         let knots = par6_motion::arclen::ArcKnots::new(&q, &cart_s).ok_or_else(no_extent)?;
-        // Normalized: the path parameter runs 0..1 over `length_m`.
-        let tool_cap = self.motion.planned_linear_max_m_s * speed.unwrap_or(1.0) / knots.length_m();
+        let fraction = speed.unwrap_or(1.0);
+        // The ceiling is on the tool's linear speed, as parol6's is: the
+        // path parameter runs 0..1 over `length_m`, and the step that
+        // translates most per unit of it sets the bound. A path that only
+        // turns the tool has no linear speed to cap.
+        let share = par6_motion::arclen::max_translation_share(
+            &steps,
+            self.motion.path_rot_weight_m_per_rad,
+        );
+        let tool_cap = (share > 0.0)
+            .then(|| self.motion.planned_linear_max_m_s * fraction / (knots.length_m() * share));
         let cap = match timing {
             CartTiming::TimeOptimal => tool_cap,
-            CartTiming::ConstantToolSpeed => par6_motion::arclen::max_path_speed(
-                &knots.max_slope(),
-                &self.exec_limits,
-                speed.unwrap_or(1.0),
-            )
-            .ok_or_else(no_extent)?
-            .min(tool_cap),
+            CartTiming::ConstantToolSpeed => {
+                let joint_cap = par6_motion::arclen::max_path_speed(
+                    &knots.max_slope(),
+                    &self.exec_limits,
+                    fraction,
+                )
+                .ok_or_else(no_extent)?;
+                Some(tool_cap.map_or(joint_cap, |c| c.min(joint_cap)))
+            }
         };
         self.toppra_samples_with(
             &knots.waypoints_flat(),
@@ -1385,7 +1407,19 @@ impl Par6Planner {
             duration,
             Some(knots.knots()),
             par6_kin::PathDegree::Cubic,
-            Some(cap),
+            cap,
+        )
+    }
+
+    /// The planned return to the home pose both `home` routes end with,
+    /// held there.
+    fn start_home_return(&mut self, snap: &StateSnapshot) -> Result<InFlightKind, WireError> {
+        self.start_joint_move(
+            snap,
+            self.home_pose_rad,
+            None,
+            Some(HOME_RETURN_SPEED_FRAC),
+            None,
         )
     }
 
@@ -1410,12 +1444,12 @@ impl Par6Planner {
         let mut previous = self.current_pose(&snap.q)?;
         let mut segments = Vec::with_capacity(chain.len());
         for cmd in chain {
-            let (segment, end) = match cmd {
-                CartMove::Line(p) => {
+            let (segment, end) = match cmd.geometry {
+                CartGeometry::Line(p) => {
                     let end = target_pose(&previous, &p.pose, p.frame, p.rel);
                     (CartSegment::Line(LineSegment::new(&previous, &end)), end)
                 }
-                CartMove::Arc(p) => {
+                CartGeometry::Arc(p) => {
                     let via = target_pose(&previous, &p.via, p.frame, p.rel);
                     let end = target_pose(&previous, &p.end, p.frame, p.rel);
                     let arc = ArcSegment::new(&previous, &via, &end).map_err(planning_error)?;
@@ -1427,23 +1461,13 @@ impl Par6Planner {
         }
         let radii: Vec<f64> = chain[..chain.len() - 1]
             .iter()
-            .map(|c| c.blend_radius().unwrap_or(0.0).max(0.0) / 1000.0)
+            .map(|c| c.blend_radius.unwrap_or(0.0).max(0.0) / 1000.0)
             .collect();
         let poses = par6_motion::cart::blended_path(&segments, &radii, path_sampling(&self.motion))
             .map_err(planning_error)?;
 
-        let speed = chain
-            .iter()
-            .filter_map(|c| c.speed())
-            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
-        let accel = chain
-            .iter()
-            .filter_map(|c| c.accel())
-            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
-        let duration = chain
-            .iter()
-            .try_fold(0.0, |acc, c| c.duration().map(|d| acc + d))
-            .filter(|_| chain.iter().all(|c| c.duration().is_some()));
+        let (speed, accel, duration) =
+            chain_timing(chain.iter().map(|c| (c.speed, c.accel, c.duration)));
         log::debug!(
             "blended cartesian chain: {} moves, {} poses, {:.1} mm of path",
             chain.len(),
@@ -1531,18 +1555,8 @@ impl Par6Planner {
         for q in &path {
             flat.extend_from_slice(q);
         }
-        let speed = chain
-            .iter()
-            .filter_map(|c| c.speed)
-            .fold(None::<f64>, |acc, s| Some(acc.map_or(s, |a: f64| a.min(s))));
-        let accel = chain
-            .iter()
-            .filter_map(|c| c.accel)
-            .fold(None::<f64>, |acc, a| Some(acc.map_or(a, |x: f64| x.min(a))));
-        let duration = chain
-            .iter()
-            .try_fold(0.0, |acc, c| c.duration.map(|d| acc + d))
-            .filter(|_| chain.iter().all(|c| c.duration.is_some()));
+        let (speed, accel, duration) =
+            chain_timing(chain.iter().map(|c| (c.speed, c.accel, c.duration)));
         let samples = self.toppra_samples(&flat, speed, accel, duration)?;
         self.start_exec(snap.q, samples, snap.mode == Mode::Exec)
     }
@@ -1600,13 +1614,7 @@ impl Par6Planner {
                     // already-referenced `HomeCmd` to exactly this move,
                     // `server/motion_planner.py:239-241`). `calibrate`
                     // asks for the seek regardless.
-                    self.start_joint_move(
-                        &snap,
-                        self.home_pose_rad,
-                        None,
-                        Some(HOME_RETURN_SPEED_FRAC),
-                        None,
-                    )?
+                    self.start_home_return(&snap)?
                 } else {
                     // The RT core only enters Homing from Idle; after a
                     // completed planned move it is still holding in Exec.
@@ -2277,13 +2285,7 @@ impl Planner for Par6Planner {
         // ends — at the home pose, held — so `home` lands in one place
         // whichever route it took.
         if let (Some(Ok(_)), InFlightKind::Home { .. }) = (&verdict, &fl.kind) {
-            match self.start_joint_move(
-                &snap,
-                self.home_pose_rad,
-                None,
-                Some(HOME_RETURN_SPEED_FRAC),
-                None,
-            ) {
+            match self.start_home_return(&snap) {
                 Ok(InFlightKind::Instant) => {}
                 Ok(kind) => {
                     // The mode grace is measured from THIS move's start,
@@ -2322,8 +2324,8 @@ impl Planner for Par6Planner {
 
     fn cancel(&mut self) {
         // Only this planner's own state. The RT half of a cancellation —
-        // flushing the ring, putting the loop back to IDLE — is the
-        // server's `RtCommands::discard_exec`, because it has to be
+        // braking the program and flushing the ring — is the server's
+        // `RtCommands::discard_exec`, because it has to be
         // ordered against the stream that may be replacing this motion,
         // and an answer arriving from another thread cannot be.
         self.inflight = None;

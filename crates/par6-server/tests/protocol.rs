@@ -10,12 +10,12 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use par6_proto::command::{
-    EnterFlashing, JogJ, JogL, MoveJ, MoveS, SaveConfig, SetCanId, SetPayload, SetPidGains,
-    SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    EnterFlashing, JogJ, JogL, MoveJ, MoveJPose, MoveS, SaveConfig, SetCanId, SetPayload,
+    SetPidGains, SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
-    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply,
+    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply, Status,
     WireError, UNATTRIBUTED,
 };
 use par6_rt::{
@@ -968,6 +968,47 @@ async fn request_reply_correlation_with_interleaved_clients() {
     }
 }
 
+/// A pose target is reported as the waldoctl call that sent it: the queue
+/// listing and STATUS both say `move_j`, the method a script wrote, as
+/// parol6 reports it — there is no `move_j_pose` method to look up.
+#[tokio::test]
+async fn a_pose_target_is_reported_as_the_move_j_that_sent_it() {
+    let mut h = start(|_| {}).await;
+    h.publish(|_| {});
+    let mut c = Client::new(&h).await;
+    let pose_move = |key| {
+        Command::MoveJPose(MoveJPose {
+            key,
+            pose: [200.0, 0.0, 300.0, 180.0, 0.0, 0.0],
+            duration: Some(0.5),
+            speed: None,
+            accel: None,
+            blend_radius: None,
+        })
+    };
+
+    let first = c.ok_index(&move_j(501)).await;
+    let second = c.ok_index(&pose_move(502)).await;
+    match c.query(&Command::Queue).await {
+        QueryResult::Queue { queue, .. } => assert_eq!(queue, ["move_j", "move_j"]),
+        other => panic!("unexpected {other:?}"),
+    }
+    h.complete_ok(first);
+    c.wait_complete(first).await;
+    let deadline = tokio::time::Instant::now() + BUDGET;
+    loop {
+        let s = recv_status(&h.status_rx).await;
+        if s.executing_index == second as i64 {
+            assert_eq!(s.action_current, "move_j");
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the pose move never started"
+        );
+    }
+}
+
 /// Queued lifecycle: ack carries the index, idempotent retry re-acks the
 /// ORIGINAL index without re-queueing, COMPLETE pushes on ok and error,
 /// error latches attributed and acceptance clears it.
@@ -1123,17 +1164,6 @@ async fn a_completion_is_kept_for_the_client_that_missed_its_push() {
     let mut h = start(|_| {}).await;
     h.publish(|_| {});
     let mut c = Client::new(&h).await;
-    let move_j = |key: u64| {
-        Command::MoveJ(par6_proto::command::MoveJ {
-            key,
-            angles: [0.0; 6],
-            duration: None,
-            speed: Some(0.5),
-            accel: None,
-            blend_radius: None,
-            rel: false,
-        })
-    };
 
     match c.query(&Command::CommandCompletion { index: 999 }).await {
         QueryResult::CommandCompletion {
@@ -1183,8 +1213,7 @@ async fn a_completion_is_kept_for_the_client_that_missed_its_push() {
 }
 
 /// STATUS frames ride the RT's ticks: one per stride of ticks, none for a
-/// tick the stride skips, and never two for one tick — a timer that
-/// sampled the snapshot at its own phase did both.
+/// tick the stride skips, and never two for one tick.
 #[tokio::test]
 async fn status_frames_map_one_to_one_onto_every_nth_tick() {
     // A 100 Hz tick under the harness's 100 Hz STATUS rate: one frame
@@ -1230,6 +1259,41 @@ async fn status_frames_map_one_to_one_onto_every_nth_tick() {
         ticked.windows(2).all(|w| w[1] == w[0] + 1),
         "the frames are consecutive: {ticked:?}"
     );
+}
+
+/// A frame the timer re-sends while the RT is stalled describes the last
+/// tick again, so it carries the TCP speed that tick had: a repeated pose
+/// is not the arm stopping.
+#[tokio::test]
+async fn a_stalled_rt_reports_the_tcp_speed_of_its_last_tick() {
+    let mut h = start(|cfg| cfg.config_info.tick_dt_s = 0.01).await;
+    h.publish(|_| {});
+
+    // The tool advances 1 mm every 10 ms tick: 100 mm/s.
+    for k in 1..=10 {
+        h.publish(|s| s.tcp[0] = k as f64 * 1e-3);
+        tokio::time::sleep(Duration::from_millis(3)).await;
+    }
+    let mut moving = None;
+    let settle = tokio::time::Instant::now() + Duration::from_millis(5);
+    while let Ok(s) = tokio::time::timeout_at(settle, recv_status(&h.status_rx)).await {
+        moving = Some(s);
+    }
+    let moving = moving.expect("the ticks were reported");
+    assert!(
+        (moving.tcp_speed - 100.0).abs() < 1.0,
+        "the tool was moving at 100 mm/s: {}",
+        moving.tcp_speed
+    );
+
+    // Stalled: the timer takes over, describing the last tick again.
+    let mut repeats = 0;
+    let stall = tokio::time::Instant::now() + Duration::from_millis(80);
+    while let Ok(s) = tokio::time::timeout_at(stall, recv_status(&h.status_rx)).await {
+        repeats += 1;
+        assert_eq!(s.tcp_speed, moving.tcp_speed, "a stall is not a stop");
+    }
+    assert!(repeats > 0, "the timer never reported the stalled RT");
 }
 
 /// A backend swap is answered when the RT has installed the bus, not
@@ -2668,17 +2732,7 @@ async fn write_io_reaches_declared_ports_and_is_refused_past_them() {
 
     // Queued: the write lands at its turn, behind the move ahead of it,
     // and its index completes when the level is applied.
-    let ahead = c
-        .ok_index(&Command::MoveJ(par6_proto::command::MoveJ {
-            key: 901,
-            angles: [0.0; 6],
-            duration: None,
-            speed: Some(0.5),
-            accel: None,
-            blend_radius: None,
-            rel: false,
-        }))
-        .await;
+    let ahead = c.ok_index(&move_j(901)).await;
     let write = c
         .ok_index(&Command::WriteIo(WriteIo {
             key: 902,

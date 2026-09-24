@@ -64,9 +64,6 @@ pub struct GripperDriverConfig {
     pub kt_nm_a: f64,
     /// Current limit \[mA\].
     pub ilim_ma: f64,
-    /// The current a `move` runs at when the caller names none \[mA\]:
-    /// what `open`, `close` and `set_position` grip with by default.
-    pub default_current_ma: f64,
     /// Voltage limit \[mV\]; 0 = use VBUS.
     pub voltage_limit_mv: u32,
     /// Motor velocity limit \[ticks/s\].
@@ -191,12 +188,6 @@ impl GripperConfig {
             }
             if d.watchdog_timeout_ms == 0 {
                 return Err(invalid("driver.watchdog_timeout_ms", "must be > 0"));
-            }
-            if d.default_current_ma <= 0.0 || d.default_current_ma > d.ilim_ma {
-                return Err(invalid(
-                    "driver.default_current_ma",
-                    "must be > 0 and no more than driver.ilim_ma",
-                ));
             }
             for (v, name) in [
                 (d.settle.command_grace_s, "driver.settle.command_grace_s"),

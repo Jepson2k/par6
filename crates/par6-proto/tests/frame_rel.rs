@@ -1,8 +1,6 @@
 //! A tool-frame pose is an offset in the tool frame the move starts in,
 //! whether or not `rel` is set: the flag only changes what a WORLD-frame
-//! pose means. `move_c`, `move_s` and `move_p` carry a frame but no
-//! `rel`, so a TRF pose that needed the flag could not be sent through
-//! them at all.
+//! pose means.
 
 use par6_proto::command::{MoveC, MoveL};
 use par6_proto::{decode_command, encode_command, Command, Frame};

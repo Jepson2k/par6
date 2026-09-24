@@ -75,6 +75,16 @@ where
     run_with(daemon, cfg, body);
 }
 
+/// Park with the wrist turned off its singularity: at park J5 sits at
+/// zero, where the pose's roll/pitch/yaw form degenerates and a target
+/// built by round-tripping through it carries a rotation nobody asked for.
+fn clear_of_the_wrist_deg() -> [f64; NUM_JOINTS] {
+    let mut q = common::park_deg();
+    q[3] += 25.0;
+    q[4] += 35.0;
+    q
+}
+
 fn close_deg(a: &[f64; NUM_JOINTS], b: &[f64; NUM_JOINTS], tol: f64) -> bool {
     a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < tol)
 }
@@ -704,9 +714,7 @@ fn servo_l_holds_the_line_where_servo_j_pose_does_not() {
         // form degenerates — roll and yaw stop being separable, so a
         // target built by round-tripping through it carries a rotation
         // nobody asked for and the move is a screw, not a line.
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
 
         // A diagonal in all three axes: a move along one axis alone
         // cannot tell a straight path from a bowed one.
@@ -788,9 +796,7 @@ fn jog_l_drives_the_tool_along_the_axis_it_was_given() {
     run_session("jog-l-axis", |client| async move {
         assert!(client.wait_ready(Duration::from_secs(15)).await);
         // Off the wrist singularity, as the servo_l line test is.
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
         settle_at(&client, from).await;
         let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
 
@@ -875,18 +881,93 @@ async fn pose_at_rest(client: &Client) -> [f64; 6] {
     last
 }
 
+/// A STATUS in another protocol version that still decodes — a newer
+/// daemon's frame, or a second daemon on a shared group — does not stop
+/// the waits: the client warns and goes on reading the runtime it talks
+/// to. Only a frame that cannot be read at all latches the mismatch.
+#[test]
+fn a_readable_status_in_another_version_does_not_stop_the_waits() {
+    let (daemon, cfg) = boot_daemon("skew", Ipv4Addr::LOCALHOST);
+    let status_port = cfg.status_port;
+    run_with(daemon, cfg, |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        assert!(
+            client.wait_status(|_| true, BUDGET).await,
+            "no STATUS arrived"
+        );
+        let mut foreign = (*client.latest_status().expect("status")).clone();
+        foreign.proto_version = foreign.proto_version.wrapping_add(1);
+        let mut frame = Vec::new();
+        par6_proto::encode_status_into(&foreign, &mut frame);
+        let sender = UdpSocket::bind("127.0.0.1:0").expect("sender socket");
+        sender
+            .send_to(&frame, ("127.0.0.1", status_port))
+            .expect("the foreign frame is sent");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(client.protocol_mismatch(), None);
+        let seen = client.latest_status().expect("status").seq;
+        assert!(
+            client.wait_status(|s| s.seq > seen, BUDGET).await,
+            "one readable foreign frame stopped every wait"
+        );
+    });
+}
+
+/// A runtime that restarts while a command is awaited numbers its queue
+/// from the start again, so the index waited on names nothing: the wait
+/// says the session changed, every time, never a plain `false` that reads
+/// as a timeout. Several restarts, because which of the two signals the
+/// client sees first is a race it must win whichever way it goes.
+#[test]
+fn a_restart_mid_wait_is_reported_as_the_session_changing() {
+    let (first, cfg) = boot_daemon("restart", Ipv4Addr::LOCALHOST);
+    let status_port = cfg.status_port;
+    let command_port = cfg.port;
+    let rt = tokio::runtime::Runtime::new().expect("client runtime");
+    let client = rt.block_on(Client::connect(cfg)).expect("client connects");
+    let mut daemon = first;
+    for round in 0..5 {
+        let index = rt.block_on(async {
+            assert!(client.wait_ready(Duration::from_secs(15)).await);
+            let park = common::park_deg();
+            settle_at(&client, park).await;
+            let mut far = park;
+            far[0] -= 30.0;
+            client
+                .move_j(far, Some(6.0), None, None, None, false)
+                .await
+                .expect("move_j accepted")
+                .expect("move_j acked with an index")
+        });
+        let waiting = {
+            let client = client.clone();
+            rt.spawn(async move { client.wait_command(index, BUDGET).await })
+        };
+        daemon.shutdown();
+        let mut opts =
+            common::sim_options(common::retimed_config("client-restart", 0.02), status_port);
+        opts.command_port = Some(command_port);
+        daemon = Daemon::start(&opts).expect("the daemon restarts");
+        match rt.block_on(waiting).expect("the wait ran") {
+            Err(ClientError::SessionChanged { index: i }) => assert_eq!(i, index),
+            other => panic!("round {round}: a restart mid-wait must read as one: {other:?}"),
+        }
+    }
+    client.close();
+    drop(rt);
+    daemon.shutdown();
+}
+
 /// A `servo_l` stream that goes silent brakes the tool ALONG its line and
-/// stops it well short of the pose it was last sent. The brake used to
-/// last one housekeeping step: releasing the limiter cleared the target
-/// it tracked, and the next step re-planned straight back onto it — so
-/// the tool drove on to the goal of a stream nobody was sending.
+/// stops it well short of the pose it was last sent. The brake owns the
+/// limiter until a new target arrives, so the tool never drives on toward
+/// the goal of a stream nobody is sending.
 #[test]
 fn a_servo_l_stream_that_goes_silent_brakes_short_of_its_target() {
     run_session("servo-l-silence", |client| async move {
         assert!(client.wait_ready(Duration::from_secs(15)).await);
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
         settle_at(&client, from).await;
         let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
         let mut target = start;
@@ -924,8 +1005,8 @@ fn a_servo_l_stream_that_goes_silent_brakes_short_of_its_target() {
 /// A servo target nothing can reach is REFUSED — a standing error the
 /// client can read — never dropped as if it had been accepted. An
 /// accepted datagram wipes the standing error and the collision verdict,
-/// so the silent drop read as a stream running normally while the arm
-/// sat still.
+/// so a dropped target would read as a stream running normally while the
+/// arm sat still.
 #[test]
 fn an_unreachable_servo_target_is_refused_not_dropped() {
     run_session("servo-unreachable", |client| async move {
@@ -995,10 +1076,63 @@ impl JointSpeedTrace {
     }
 }
 
+/// `stop()` during a `jog_l` brakes the tool ALONG the axis it was
+/// travelling and then holds it, as a stop does for every other motion:
+/// the cartesian limiter ramps it down, instead of the arm stopping dead
+/// from jog speed wherever the stream was cut.
+#[test]
+fn a_stop_mid_jog_l_brakes_along_the_axis_and_then_holds() {
+    run_session("jog-l-stop", |client| async move {
+        assert!(client.wait_ready(Duration::from_secs(15)).await);
+        let from = clear_of_the_wrist_deg();
+        settle_at(&client, from).await;
+        let start = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at start"));
+        // A quarter of the acceleration: a ramp of a few tenths of a
+        // second, long against the 20 ms between samples.
+        let press = || client.jog_l([0.3, -0.4, 0.0, 0.0, 0.0, 0.0], 0.3, Frame::Wrf, Some(0.25));
+        let mut trace = JointSpeedTrace::new();
+        let mut cruise = 0.0;
+        for _ in 0..50 {
+            press().await.expect("fire-and-forget sends");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            cruise = trace.sample(&client).await;
+        }
+        assert!(
+            cruise > 0.01,
+            "the jog never got up to speed: {cruise:.4} rad/s"
+        );
+        let at_stop = wire_pose(&client.pose(Frame::Wrf).await.expect("pose at the stop"));
+
+        client.stop(true).await.expect("the stop is acked");
+        // Stopped dead, the plant is at rest well inside 100 ms of the
+        // stop; braked at a quarter of the acceleration it is still
+        // travelling at most of its cruise speed at 150 ms.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        let braking = client
+            .joint_speeds()
+            .await
+            .expect("joint speeds")
+            .iter()
+            .fold(0.0_f64, |m, v| m.max(v.abs()));
+        assert!(
+            braking > 0.3 * cruise,
+            "the stop cut the jog dead: {braking:.4} rad/s 150 ms in, against a \
+             {cruise:.4} rad/s cruise"
+        );
+
+        let rest = pose_at_rest(&client).await;
+        assert!(
+            distance_mm(&at_stop, &rest) > 1.0,
+            "the brake covered no ground past the stop"
+        );
+        let off = off_line(&start, &at_stop, &rest);
+        assert!(off < 2.0, "the brake left the jog axis by {off:.2} mm");
+    })
+}
+
 /// A `jog_l` pressed again while the ramp from the previous press is still
 /// running resumes from the speed the tool still carries, as parol6's
-/// does. It used to rebuild the limiter from rest while the arm was still
-/// moving, and the tool stopped dead between presses.
+/// does.
 #[test]
 fn a_jog_l_pressed_again_mid_ramp_carries_on_without_stopping() {
     run_session("jog-l-repress", |client| async move {
@@ -1006,9 +1140,7 @@ fn a_jog_l_pressed_again_mid_ramp_carries_on_without_stopping() {
         // The pose and diagonal the axis test jogs along: clear of the
         // wrist singularity, and short enough that the joint speeds a
         // given tool speed needs stay put.
-        let mut from = common::park_deg();
-        from[3] += 25.0;
-        from[4] += 35.0;
+        let from = clear_of_the_wrist_deg();
         settle_at(&client, from).await;
         // A quarter of the rates: a ramp long enough to press into, with
         // ticks to spare either side of the moment the ramp begins.

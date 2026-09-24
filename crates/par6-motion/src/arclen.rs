@@ -44,6 +44,24 @@ pub fn tool_arc_lengths(steps: &[(f64, f64)], rot_weight_m_per_rad: f64) -> Vec<
     out
 }
 
+/// The largest share of any step's arc length that is translation, in
+/// `0..=1`: `0` for a path that only turns the tool. A linear speed limit
+/// on the tool bounds the rate along the arc length by the limit over this
+/// share, so the rotation-weighted part of the length is not held to it.
+pub fn max_translation_share(steps: &[(f64, f64)], rot_weight_m_per_rad: f64) -> f64 {
+    steps
+        .iter()
+        .map(|&(d_trans, d_rot)| {
+            let span = d_trans.hypot(rot_weight_m_per_rad * d_rot);
+            if span > MIN_SPAN {
+                d_trans / span
+            } else {
+                0.0
+            }
+        })
+        .fold(0.0, f64::max)
+}
+
 /// A joint chain keyed to the normalized tool distance at each waypoint.
 pub struct ArcKnots {
     /// Normalized cumulative tool arc length per knot, strictly

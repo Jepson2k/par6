@@ -473,6 +473,52 @@ fn a_full_speed_move_l_runs_at_the_tcp_ceiling_not_the_joints() {
     );
 }
 
+/// The planned ceiling is on the tool's LINEAR speed, as parol6's is: a
+/// `move_l` that only turns the tool about its own axis has no linear
+/// speed to cap, and runs as fast as the wrist allows rather than at the
+/// ceiling over the rotation weight (0.2 m/s / 0.15 m/rad ≈ 1.33 rad/s).
+#[test]
+fn a_move_l_that_only_turns_the_tool_is_not_held_to_the_linear_ceiling() {
+    let mut p = planned("curve-turn-in-place");
+    let mut target = wire_pose_at(&p.pose, p.start);
+    target[5] += 90.0;
+    let result = p.preview.submit(Command::MoveL(MoveL {
+        key: 4151,
+        pose: target,
+        frame: Frame::Wrf,
+        duration: None,
+        speed: Some(1.0),
+        accel: None,
+        blend_radius: None,
+        rel: false,
+    }));
+    assert!(
+        result.error.is_none(),
+        "the move must be accepted, got {:?}",
+        result.error
+    );
+    let record = p.preview.plan_record(None);
+    let dt = record.row_dt_s;
+    let poses = span_tcp(&record, result.start_row, result.rows);
+    let drift = poses
+        .iter()
+        .map(|pose| distance(tcp_mm(pose), p.start))
+        .fold(0.0f64, f64::max);
+    assert!(
+        drift < PLAN_TOL_MM,
+        "the TCP moved {drift:.3} mm turning in place"
+    );
+    let fastest = poses
+        .windows(2)
+        .map(|w| rotation_angle_deg(&w[0], &w[1]).to_radians() / dt)
+        .fold(0.0f64, f64::max);
+    let old_ceiling = 0.2 / 0.15;
+    assert!(
+        fastest > 1.3 * old_ceiling,
+        "the tool turned at no more than {fastest:.2} rad/s: the linear ceiling is holding a rotation"
+    );
+}
+
 /// `move_l` → `move_c` → `move_l` with blend radii: one C¹ path, the
 /// corners rounded inside their zones, the arc still an arc where no
 /// zone touches it.

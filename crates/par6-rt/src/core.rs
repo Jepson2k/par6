@@ -1528,14 +1528,8 @@ impl<B: DriverBus> RtCore<B> {
                 }
             },
             RtCommand::Hold => match self.mode {
-                Mode::Jog => {
-                    let at = self.q_target;
-                    self.rest_into_hold(&at);
-                }
-                Mode::Stream => {
-                    let at = self.stream_commanded;
-                    self.rest_into_hold(&at);
-                }
+                Mode::Jog => self.rest_into_hold(self.q_target),
+                Mode::Stream => self.rest_into_hold(self.stream_commanded),
                 _ => {}
             },
             RtCommand::Gripper(fw) => {
@@ -1748,14 +1742,14 @@ impl<B: DriverBus> RtCore<B> {
     /// law is zero-velocity there, because the gravity float needs homed ∧
     /// enabled. A deliberate float is `SetGravityComp(true)`, which lets a
     /// resting EXEC go.
-    fn rest_into_hold(&mut self, at: &[f64; MAX_JOINTS]) {
+    fn rest_into_hold(&mut self, at: [f64; MAX_JOINTS]) {
         let may_hold = self.homed && self.state == ArmState::Enabled && !self.errors.any_hard();
         if !may_hold {
             self.enter_mode(Mode::Idle);
             return;
         }
         self.leave_mode(Mode::Exec);
-        self.exec.activate(at);
+        self.exec.activate(&at);
         self.hb_silence = 0;
         self.mode = Mode::Exec;
     }
@@ -2415,8 +2409,7 @@ impl<B: DriverBus> RtCore<B> {
                     && self.scratch_qd.iter().all(|v| *v == 0.0)
                     && self.at_measured_rest()
                 {
-                    let at = self.scratch_q;
-                    self.rest_into_hold(&at);
+                    self.rest_into_hold(self.scratch_q);
                 }
             }
             Mode::Exec => {
@@ -2546,8 +2539,7 @@ impl<B: DriverBus> RtCore<B> {
                     && self.scratch_qd.iter().all(|v| v.abs() <= STREAM_REST_RAD_S)
                     && self.at_measured_rest()
                 {
-                    let at = self.scratch_q;
-                    self.rest_into_hold(&at);
+                    self.rest_into_hold(self.scratch_q);
                 }
             }
             // HAND_GUIDING/IMPEDANCE are refused at the gate; HOMING and

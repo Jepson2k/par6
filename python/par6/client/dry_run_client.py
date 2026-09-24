@@ -65,6 +65,7 @@ from ._wire import (
     jog_j_speeds,
     jog_l_velocities,
     payload_from_dict,
+    refuse_unknown_keywords,
     shape_to_wire,
     timing,
     tool_params,
@@ -78,6 +79,10 @@ from .errors import RobotError
 
 if TYPE_CHECKING:
     from par6.robot import Robot
+
+#: What a planned move takes through ``**kwargs`` here: the live client's
+#: wait keywords, which a preview accepts and has nothing to wait on for.
+_WAIT_KEYWORDS = frozenset({"wait", "timeout"})
 
 logger = logging.getLogger(__name__)
 
@@ -409,6 +414,7 @@ class DryRunRobotClient(RobotOwner):
         to ``[robot].park_pose_rad``, planned and collision-gated like
         any other. ``calibrate=True`` asks for the seek either way.
         """
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS | {"calibrate"})
         return self._submit(
             {"type": "home", "calibrate": bool(kwargs.get("calibrate", False))},
             "home",
@@ -444,13 +450,14 @@ class DryRunRobotClient(RobotOwner):
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
     ) -> int:
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
         d, s = timing(duration, speed)
         if pose is not None:
             if rel:
@@ -490,13 +497,14 @@ class DryRunRobotClient(RobotOwner):
         pose: list[float],
         *,
         frame: str = "WRF",
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
     ) -> int:
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
         d, s = timing(duration, speed)
         return self._submit(
             {
@@ -518,13 +526,13 @@ class DryRunRobotClient(RobotOwner):
         end: list[float],
         *,
         frame: str = "WRF",
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
         r: float = 0.0,
-        rel: bool = False,
         **kwargs: Any,
     ) -> int:
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
         d, s = timing(duration, speed)
         return self._submit(
             {
@@ -536,7 +544,7 @@ class DryRunRobotClient(RobotOwner):
                 "speed": s,
                 "accel": float(accel),
                 "blend_radius": blend(r),
-                "rel": bool(rel),
+                "rel": False,
             },
             "move_c",
         )
@@ -546,10 +554,9 @@ class DryRunRobotClient(RobotOwner):
         kind: str,
         waypoints: list[list[float]],
         frame: str,
-        duration: float,
-        speed: float,
+        duration: float | None,
+        speed: float | None,
         accel: float,
-        rel: bool,
     ) -> int:
         d, s = timing(duration, speed)
         return self._submit(
@@ -560,7 +567,7 @@ class DryRunRobotClient(RobotOwner):
                 "duration": d,
                 "speed": s,
                 "accel": float(accel),
-                "rel": bool(rel),
+                "rel": False,
             },
             kind,
         )
@@ -570,26 +577,26 @@ class DryRunRobotClient(RobotOwner):
         waypoints: list[list[float]],
         *,
         frame: str = "WRF",
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
-        rel: bool = False,
         **kwargs: Any,
     ) -> int:
-        return self._move_multi("move_s", waypoints, frame, duration, speed, accel, rel)
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
+        return self._move_multi("move_s", waypoints, frame, duration, speed, accel)
 
     def move_p(
         self,
         waypoints: list[list[float]],
         *,
         frame: str = "WRF",
-        duration: float = 0.0,
-        speed: float = 0.0,
+        duration: float | None = None,
+        speed: float | None = None,
         accel: float = 1.0,
-        rel: bool = False,
         **kwargs: Any,
     ) -> int:
-        return self._move_multi("move_p", waypoints, frame, duration, speed, accel, rel)
+        refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
+        return self._move_multi("move_p", waypoints, frame, duration, speed, accel)
 
     # ------------------------------------------------------------------
     # Streaming

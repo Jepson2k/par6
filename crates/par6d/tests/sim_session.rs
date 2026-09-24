@@ -671,9 +671,9 @@ fn stop_then_move_completes_without_losing_samples() {
 
 /// `stop()` promises an arm HELD where it stopped: braked along its path
 /// and then kept under position control — enabled, and not
-/// back-driveable. It used to cut to IDLE, which on a homed arm is the
-/// gravity float: no velocity authority to brake with, and nothing
-/// holding the pose once the arm had stopped.
+/// back-driveable. IDLE would be the gravity float on a homed arm: no
+/// velocity authority to brake with, and nothing holding the pose once
+/// stopped.
 #[test]
 fn a_stop_brakes_the_arm_and_then_holds_it() {
     let rig = Rig::boot(test_config());
@@ -2069,10 +2069,7 @@ fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
     let grasp: [f64; NUM_JOINTS] = std::array::from_fn(|i| grasp_rad[i].to_degrees());
     c.ok(&teleport(grasp));
     rig.wait_status("the arm is over the stand", |s| {
-        s.angles
-            .iter()
-            .zip(grasp.iter())
-            .all(|(a, b)| (a - b).abs() < 0.5)
+        max_deg_error(&s.angles, &grasp) < 0.5
     });
     let block = |name: &str, params: [f64; 3], z: f64, mass: Option<f64>| par6_proto::Shape {
         attachment: None,

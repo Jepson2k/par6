@@ -50,6 +50,19 @@ use crate::options::{resolve_config_path, Options};
 use crate::planner::{profile_names, Par6Planner, PlannedMotion, PlannerKin};
 use plan::PlanRecorder;
 
+/// Braking time a stream preview allows beyond the motion itself before it
+/// calls the stream ended: the jog ramp and the servo brake run inside it.
+const PREVIEW_BRAKE_ALLOWANCE_S: f64 = 4.0;
+
+/// The runtime's answer to input it cannot act on.
+fn validation_error(detail: &str) -> WireError {
+    make_error(
+        ErrorCode::CommValidationError,
+        UNATTRIBUTED,
+        &[("detail", detail)],
+    )
+}
+
 /// One submitted command's outcome: where the runtime would leave the
 /// arm and the rows it owns in the commanded record, the exact refusal
 /// it would answer with, or `pending` while the command sits in the
@@ -886,11 +899,10 @@ impl Preview {
             })),
             Command::ServoJPose(p) => self.settle_on_pose(p.pose, p.speed, p.accel),
             Command::ServoL(p) => self.preview_servo_l(p.pose, p.speed, p.accel),
-            other => self.refuse(make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &format!("{:?} cannot be previewed", other.tag()))],
-            )),
+            other => self.refuse(validation_error(&format!(
+                "{:?} cannot be previewed",
+                other.tag()
+            ))),
         }
     }
 
@@ -905,30 +917,23 @@ impl Preview {
         speed: Option<f64>,
         accel: Option<f64>,
     ) -> PreviewResult {
-        let invalid = |detail: &str| {
-            make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", detail)],
-            )
-        };
         let at = match self.cart.fk(&self.snap.q) {
             Ok(pose) => pose,
-            Err(e) => return self.refuse(invalid(&e.to_string())),
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
         };
+        let target = crate::kin::wire_pose_to_matrix(&pose);
+        let speed = speed.unwrap_or(1.0);
         let mut state = match CartServoState::new(
             self.dt,
             par6_motion::CartLimits::from_motion(&self.motion),
             &at,
             &self.snap.q,
-            crate::kin::wire_pose_to_matrix(&pose),
-            speed.unwrap_or(1.0),
+            target,
+            speed,
             accel.unwrap_or(1.0),
-            self.soft_min,
-            self.soft_max,
         ) {
             Ok(st) => st,
-            Err(e) => return self.refuse(invalid(&e)),
+            Err(e) => return self.refuse(validation_error(&e)),
         };
         let period = housekeeping_period(self.dt).as_secs_f64();
         let ticks_per_step = (period / self.dt).round().max(1.0) as usize;
@@ -936,12 +941,11 @@ impl Preview {
         // limiter's ceiling; an unreachable one brakes and holds forever,
         // so the preview stops at twice that plus the braking allowance
         // the jog preview gives a ramp.
-        let line =
-            par6_motion::cart::LineSegment::new(&at, &crate::kin::wire_pose_to_matrix(&pose));
-        let scale = speed.unwrap_or(1.0).max(1e-3);
+        let line = par6_motion::cart::LineSegment::new(&at, &target);
+        let scale = speed.max(1e-3);
         let travel_s = (line.length_m() / (self.motion.jog_l_linear_max_m_s * scale))
             .max(line.angle_rad() / (self.motion.jog_l_angular_max_rad_s * scale));
-        let cap = ((2.0 * travel_s + 4.0) / period).round() as usize;
+        let cap = ((2.0 * travel_s + PREVIEW_BRAKE_ALLOWANCE_S) / period).round() as usize;
         self.cart_streaming = true;
         let mut trajectory = Vec::new();
         let q_meas = self.snap.q;
@@ -1004,13 +1008,6 @@ impl Preview {
     }
 
     fn submit_system(&mut self, command: Command) -> PreviewResult {
-        let detail = |d: String| {
-            make_error(
-                ErrorCode::CommValidationError,
-                UNATTRIBUTED,
-                &[("detail", &d)],
-            )
-        };
         match command {
             // Acked like the system command it is, and gated like the
             // motion it is: the travel window (`teleport_angle_fault`,
@@ -1024,11 +1021,9 @@ impl Preview {
                 }
                 // A jump preempts planned motion, pending queue included.
                 self.held.clear();
-                let mut q = self.snap.q;
-                for (out, deg) in q.iter_mut().zip(p.angles.iter()) {
+                for (out, deg) in self.snap.q.iter_mut().zip(&p.angles) {
                     *out = deg.to_radians();
                 }
-                self.snap.q = q;
                 self.snap.homed = true;
                 if let Some(pos) = p.tool_positions.as_ref().and_then(|v| v.first()) {
                     self.tool_position = *pos;
@@ -1172,14 +1167,19 @@ impl Preview {
             // never does, so the reference survives the window.
             Command::ExitFlashing => {
                 if !self.flashing {
-                    return self.refuse(detail(format!(
+                    return self.refuse(validation_error(&format!(
                         "exit_flashing while the controller mode is {:?}, not FLASHING",
                         self.snap.mode
                     )));
                 }
                 self.flashing = false;
             }
-            other => return self.refuse(detail(format!("{:?} cannot be previewed", other.tag()))),
+            other => {
+                return self.refuse(validation_error(&format!(
+                    "{:?} cannot be previewed",
+                    other.tag()
+                )))
+            }
         }
         self.standing()
     }
@@ -1296,13 +1296,7 @@ impl Preview {
         }
         let at = match self.cart.fk(&self.snap.q) {
             Ok(pose) => pose,
-            Err(e) => {
-                return self.refuse(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                ))
-            }
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
         };
         let mut state = match CartJogState::new(
             self.dt,
@@ -1316,13 +1310,7 @@ impl Preview {
             self.soft_max,
         ) {
             Ok(st) => st,
-            Err(e) => {
-                return self.refuse(make_error(
-                    ErrorCode::CommValidationError,
-                    UNATTRIBUTED,
-                    &[("detail", &e.to_string())],
-                ))
-            }
+            Err(e) => return self.refuse(validation_error(&e.to_string())),
         };
         // Housekeeping emits a setpoint every period; a cartesian jog's
         // setpoints arrive shaped, so the RT clamps and commands them
@@ -1357,7 +1345,7 @@ impl Preview {
         // under-predict where the runtime leaves the arm.
         state.release();
         let mut braking = 0usize;
-        let cap = (4.0 / period).round() as usize;
+        let cap = (PREVIEW_BRAKE_ALLOWANCE_S / period).round() as usize;
         for _ in 0..cap {
             let (target, at_rest) = match step_cart_jog(
                 &mut self.cart,

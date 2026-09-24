@@ -38,6 +38,34 @@ def test_jog_l_refuses_mismatched_axes_and_unknown_axes_with_value_error():
     asyncio.run(run())
 
 
+def test_a_keyword_no_planned_move_declares_is_a_type_error():
+    """``rel`` belongs to ``move_j`` and ``move_l`` alone, and a planned
+    move's ``**wait_kwargs`` carry only what ``wait_command`` takes: anything
+    else is refused before a byte is sent, as parol6's client refuses it,
+    rather than planned as if it had not been written."""
+
+    async def run():
+        client = _dead_client()
+        pose = [200.0, 0.0, 300.0, 180.0, 0.0, 0.0]
+        try:
+            with pytest.raises(TypeError, match="rel"):
+                await client.move_c(pose, pose, rel=True, speed=0.5)
+            with pytest.raises(TypeError, match="rel"):
+                await client.move_s([pose, pose], rel=True, speed=0.5)
+            with pytest.raises(TypeError, match="rel"):
+                await client.move_p([pose, pose], rel=True, speed=0.5)
+            with pytest.raises(TypeError, match="bogus"):
+                await client.move_l(pose, speed=0.5, bogus=1)
+            with pytest.raises(TypeError, match="bogus"):
+                await client.move_j([0.0] * 6, speed=0.5, wait=False, bogus=1)
+            with pytest.raises(TypeError, match="bogus"):
+                await client.home(bogus=1)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
 def test_the_unconfirmed_sentinel_is_a_plain_no_for_the_waits():
     """``-1`` is what the queued verbs return when no ack arrived; waiting
     on it must answer False / None, never overflow the wire's index."""
@@ -68,7 +96,9 @@ def test_a_passive_tools_status_on_the_sync_facade_is_a_query_not_a_recursion():
         client.close()
 
 
-def test_an_execution_state_request_the_runtime_stops_answering_is_a_zero():
+def test_an_execution_state_request_the_runtime_stops_answering_is_a_zero(
+    monkeypatch: pytest.MonkeyPatch,
+):
     """``set_execution_speed`` and ``pause`` answer 0 when no confirmation
     arrives — a runtime that goes away between the request and its
     readback answers the same 0 a timeout does, never an exception."""
@@ -83,8 +113,8 @@ def test_an_execution_state_request_the_runtime_stops_answering_is_a_zero():
             async def gone(**_kwargs):
                 raise ConnectionError("Controller execution speed is unavailable")
 
-            client._call = accepted  # type: ignore[method-assign]
-            client.execution_speed = gone  # type: ignore[method-assign]
+            monkeypatch.setattr(client, "_call", accepted)
+            monkeypatch.setattr(client, "execution_speed", gone)
             assert await client.set_execution_speed(0.5) == 0
             assert await client.pause() == 0
         finally:

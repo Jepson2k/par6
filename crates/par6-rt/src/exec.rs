@@ -139,11 +139,21 @@ impl ExecPlayback {
         true
     }
 
-    fn target_scale(&self) -> f64 {
-        if self.paused || self.stopping {
+    /// The operator's request: zero while paused, the selected speed
+    /// otherwise. A braking stop is not a pause and is not part of it.
+    fn requested_target(&self) -> f64 {
+        if self.paused {
             0.0
         } else {
             self.requested_scale
+        }
+    }
+
+    fn target_scale(&self) -> f64 {
+        if self.stopping {
+            0.0
+        } else {
+            self.requested_target()
         }
     }
 
@@ -161,10 +171,11 @@ impl ExecPlayback {
         self.stopping
     }
 
+    /// Runs on the tick, so it only flips state: the end of the brake is
+    /// visible to the rest of the process as `ExecStatus::stopping`.
     fn finish_stop(&mut self) {
         self.stopping = false;
-        let n = self.flush();
-        log::info!("EXEC stop braked to rest; discarded {n} samples");
+        self.flush();
     }
 
     /// Readback also advances in modes without queued motion.
@@ -512,13 +523,7 @@ impl ExecPlayback {
             completed_index: self.completed,
             settling: self.settling,
             paused: self.paused && self.applied_scale == 0.0,
-            // The operator's request, not the stop's: a braking stop is
-            // not a pause, and reads as one nowhere.
-            target_scale: if self.paused {
-                0.0
-            } else {
-                self.requested_scale
-            },
+            target_scale: self.requested_target(),
             stopping: self.stopping,
             applied_scale: self.applied_scale,
             resume_scale: self.requested_scale,

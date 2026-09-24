@@ -215,7 +215,7 @@ fn strict_settle_faults_on_stalled_progress_not_on_elapsed_time() {
     assert!(!s.error_active);
 
     // Dithering by 0.0004 rad about the same spot never clears the floor:
-    // no progress, and the timeout latches as before.
+    // no progress, and the timeout latches.
     let mut rig = Rig::with_policy(CompletionPolicy::Strict);
     enter_exec(&mut rig);
     let q0 = rig.pose[0];

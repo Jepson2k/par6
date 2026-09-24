@@ -276,7 +276,7 @@ impl LineSegment {
     }
 
     /// Unit direction of travel, the same everywhere on a line.
-    pub fn tangent(&self, _t: f64) -> DVec3 {
+    pub fn direction(&self) -> DVec3 {
         (self.p1 - self.p0).normalize_or_zero()
     }
 }
@@ -507,7 +507,7 @@ impl CartSegment {
     /// Unit direction of travel at normalized length `t`.
     pub fn tangent(&self, t: f64) -> DVec3 {
         match self {
-            Self::Line(l) => l.tangent(t),
+            Self::Line(l) => l.direction(),
             Self::Arc(a) => a.tangent(t),
         }
     }
@@ -737,9 +737,8 @@ pub fn blended_polyline(
 /// starts and to the outgoing one where it ends, so position is C1
 /// across the corner: the arm never has to come to rest to change
 /// direction. Between two lines the cubic is exactly the degree-raised
-/// quadratic through the corner point, so a chain of `move_l`s rounds
-/// the way it always has; an arc's zone follows its curvature into and
-/// out of the corner instead.
+/// quadratic through the corner point; an arc's zone follows its
+/// curvature into and out of the corner.
 pub fn blended_path(
     segments: &[CartSegment],
     radii: &[f64],
@@ -1454,7 +1453,7 @@ mod tests {
 
     /// Between two straight segments the cubic corner is the quadratic
     /// through the corner point, degree-raised: a chain of `move_l`s
-    /// rounds exactly as it did before arcs could join one.
+    /// rounds on the quadratic through the corner point.
     #[test]
     fn a_line_line_corner_is_the_quadratic_bezier_through_the_corner() {
         let a = pose(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
@@ -1476,9 +1475,6 @@ mod tests {
         let mut in_zone = 0;
         for pose in &path {
             let p = position(pose);
-            if (p - pc).length() >= r - 1e-9 && ((p - pa).length() < r || (p - pb).length() < r) {
-                continue;
-            }
             if (p - pc).length() > r {
                 continue;
             }

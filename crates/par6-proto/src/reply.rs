@@ -285,7 +285,7 @@ pub enum QueryResult {
     /// COMMAND_COMPLETION result: the COMPLETE push's content for one
     /// queue index, or `finished == false` when the runtime has no record
     /// of it finishing (still running, never accepted, or older than the
-    /// 1024 completions it keeps).
+    /// [`crate::COMPLETIONS_KEPT`] completions it keeps).
     CommandCompletion {
         /// The queue index asked about.
         index: u64,
@@ -329,9 +329,9 @@ pub enum QueryResult {
         /// RT tick period \[s\].
         tick_dt_s: f64,
         /// Every `[motion]` key in declaration order; the labels are
-        /// `MotionConfig::KEYS` in par6-config (19 entries), and an
-        /// omitted optional key (`joint_step_rad`) rides as NaN.
-        motion: [f64; 19],
+        /// `MotionConfig::KEYS` in par6-config, and an omitted optional
+        /// key (`joint_step_rad`) rides as NaN.
+        motion: [f64; crate::MOTION_KEYS],
         /// Per-joint effective EXEC limits: `[soft_min_rad,
         /// soft_max_rad, velocity_rad_s, acceleration_rad_s2]`.
         joints: Vec<[f64; 4]>,
@@ -976,6 +976,30 @@ fn r_shapes(r: &mut Reader<'_>) -> Result<Vec<crate::command::Shape>, DecodeErro
     Ok(out)
 }
 
+/// The fifth element a completion carries (COMPLETE, COMMAND_COMPLETION):
+/// nil, a settle verdict `1..=3` on success, or the failure's error.
+fn r_completion_fifth(
+    r: &mut Reader<'_>,
+    ok: bool,
+    what: &'static str,
+) -> Result<(Option<WireError>, Option<u8>), DecodeError> {
+    if r.peek_nil() {
+        r.nil()?;
+        return Ok((None, None));
+    }
+    if !ok {
+        return Ok((Some(WireError::decode(r)?), None));
+    }
+    let v = r.uint()?;
+    if !(1..=3).contains(&v) {
+        return Err(DecodeError::Validation {
+            what,
+            why: format!("settle verdict must be 1..=3, got {v}"),
+        });
+    }
+    Ok((None, Some(v as u8)))
+}
+
 fn expect_arity(what: &'static str, got: usize, expected: usize) -> Result<(), DecodeError> {
     if got != expected {
         return Err(DecodeError::Arity {
@@ -1163,21 +1187,7 @@ fn decode_result(r: &mut Reader<'_>) -> Result<QueryResult, DecodeError> {
             let index = r.uint()?;
             let finished = r.bool()?;
             let ok = r.bool()?;
-            let (mut detail, mut verdict) = (None, None);
-            if r.peek_nil() {
-                r.nil()?;
-            } else if ok {
-                let v = r.uint()?;
-                if !(1..=3).contains(&v) {
-                    return Err(DecodeError::Validation {
-                        what: "command_completion verdict",
-                        why: format!("settle verdict must be 1..=3, got {v}"),
-                    });
-                }
-                verdict = Some(v as u8);
-            } else {
-                detail = Some(WireError::decode(r)?);
-            }
+            let (detail, verdict) = r_completion_fifth(r, ok, "command_completion verdict")?;
             QueryResult::CommandCompletion {
                 index,
                 finished,
@@ -1360,23 +1370,11 @@ pub fn decode_reply(data: &[u8]) -> Result<Reply, DecodeError> {
             }
             let index = r.uint()?;
             let ok = r.bool()?;
-            let (mut detail, mut verdict) = (None, None);
-            if n == 5 {
-                if r.peek_nil() {
-                    r.nil()?;
-                } else if ok {
-                    let v = r.uint()?;
-                    if !(1..=3).contains(&v) {
-                        return Err(DecodeError::Validation {
-                            what: "COMPLETE verdict",
-                            why: format!("settle verdict must be 1..=3, got {v}"),
-                        });
-                    }
-                    verdict = Some(v as u8);
-                } else {
-                    detail = Some(WireError::decode(&mut r)?);
-                }
-            }
+            let (detail, verdict) = if n == 5 {
+                r_completion_fifth(&mut r, ok, "COMPLETE verdict")?
+            } else {
+                (None, None)
+            };
             Reply::Complete {
                 index,
                 ok,

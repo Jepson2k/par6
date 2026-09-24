@@ -548,6 +548,16 @@ class TestCartesianMotion:
         # then refuses with this very ValueError.
         with pytest.raises(ValueError, match="rel=True"):
             dry_run.move_j(pose=dry_run.pose(), rel=True, speed=1.0)
+        # ``rel`` belongs to move_j/move_l, and a move takes only the
+        # keywords its wait does: the live client refuses the rest with a
+        # TypeError, and so must the preview of the same program.
+        here = dry_run.pose()
+        with pytest.raises(TypeError, match="rel"):
+            dry_run.move_c(here, here, rel=True, speed=0.5)
+        with pytest.raises(TypeError, match="rel"):
+            dry_run.move_p([here, here], rel=True, speed=0.5)
+        with pytest.raises(TypeError, match="bogus"):
+            dry_run.move_l(here, speed=0.5, bogus=1)
 
         far = list(dry_run.angles())
         far[1] = math.degrees(_cfg.soft_limits_rad()[1, 1]) + 20.0
@@ -804,14 +814,11 @@ class TestLiveParity:
             "a jaw move holds the arm for the jaws' travel"
         )
         assert not client.tool.is_open()
-        # A move that names no current grips with the tool's configured
-        # default, which is what the runtime's wire sees.
-        assert client._program[close]["params"] == [
-            1.0,
-            0.5,
-            client.tool.default_current,
-        ]
-        assert 0 < client.tool.default_current <= client.tool.current_range[1]
+        # A move that names no current grips with half the tool's current
+        # range, as it names no speed and moves at half speed; that is
+        # what the runtime's wire sees.
+        lo, hi = client.tool.current_range
+        assert client._program[close]["params"] == [1.0, 0.5, lo + (hi - lo) // 2]
         assert _planned(client, client.tool.stop()).duration == 0.0
         assert _planned(client, client.tool.release()).duration == 0.0
         with pytest.raises(RobotError) as past_stroke:

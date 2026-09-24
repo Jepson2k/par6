@@ -13,8 +13,8 @@ use par6d::preview::Preview;
 
 mod common;
 use common::{
-    max_deg_error, park_deg, rotation_angle_deg, span_joints, span_tcp, teleport_cmd,
-    teleport_home, to_deg, to_rad, Client, Rig,
+    distance, max_deg_error, park_deg, rotation_angle_deg, span_joints, span_tcp, teleport_cmd,
+    teleport_home, to_deg, to_rad, wire_pose_at, Client, Rig,
 };
 
 /// The shipped config re-ticked to 50 Hz, shared verbatim by the daemon
@@ -1032,9 +1032,7 @@ fn off_axis(p: &[f64; 16], a: &[f64; 16], dir: [f64; 3]) -> f64 {
 
 /// A `jog_l` that drives a joint into its soft limit brakes the tool ON
 /// the axis it was jogging, as parol6's does — a solution past a limit
-/// is a pose out of reach. It used to clamp that one joint and let the
-/// others carry on, which pinned the joint and bent the tool off the
-/// axis.
+/// is a pose out of reach.
 #[test]
 fn a_jog_l_into_a_joint_limit_brakes_on_its_axis() {
     let config = test_config();
@@ -1082,9 +1080,7 @@ fn a_jog_l_into_a_joint_limit_brakes_on_its_axis() {
 }
 
 /// The dry-run preview of `servo_l` draws the straight line the runtime
-/// drives. It used to settle onto the target as a joint-interpolated
-/// move — the exact joint-space substitution the runtime fix removed —
-/// so a program checked in preview saw a bowed path the arm never takes.
+/// drives, not a joint-interpolated move onto the same pose.
 #[test]
 fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
     let config = test_config();
@@ -1096,17 +1092,9 @@ fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
     let at = preview.pose().expect("pose at start");
     let start = [at[3] * 1e3, at[7] * 1e3, at[11] * 1e3];
     let target_mm = [start[0] + 60.0, start[1] - 45.0, start[2] + 30.0];
-    let rpy = wire_rpy_deg(&at);
 
     let r = preview.submit(Command::ServoL(par6_proto::command::ServoL {
-        pose: [
-            target_mm[0],
-            target_mm[1],
-            target_mm[2],
-            rpy[0],
-            rpy[1],
-            rpy[2],
-        ],
+        pose: wire_pose_at(&at, target_mm),
         speed: Some(0.3),
         accel: Some(0.3),
     }));
@@ -1119,10 +1107,7 @@ fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
         .map(|p| off_axis(p, &at, dir))
         .fold(0.0f64, f64::max);
     let end = poses.last().expect("rows");
-    let landed = ((end[3] * 1e3 - target_mm[0]).powi(2)
-        + (end[7] * 1e3 - target_mm[1]).powi(2)
-        + (end[11] * 1e3 - target_mm[2]).powi(2))
-    .sqrt();
+    let landed = distance([end[3] * 1e3, end[7] * 1e3, end[11] * 1e3], target_mm);
     assert!(
         landed < 1.0,
         "the preview ends {landed:.2} mm from the target"
@@ -1132,15 +1117,6 @@ fn the_servo_l_preview_draws_the_line_the_runtime_drives() {
         "the servo_l preview left the line by {:.2} mm",
         worst * 1e3
     );
-}
-
-/// The wire's roll/pitch/yaw (degrees) of a pose matrix — the inverse of
-/// `par6_proto::pose_matrix`'s rotation.
-fn wire_rpy_deg(m: &[f64; 16]) -> [f64; 3] {
-    let pitch = m[2].clamp(-1.0, 1.0).asin();
-    let roll = (-m[6]).atan2(m[10]);
-    let yaw = (-m[1]).atan2(m[0]);
-    [roll.to_degrees(), pitch.to_degrees(), yaw.to_degrees()]
 }
 
 /// `LINEAR` is a profile this runtime plans with, and it is what its

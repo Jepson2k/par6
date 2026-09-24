@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, split_into_chunks, Command, Reply,
-    Status, WireError,
+    Status, WireError, COMPLETIONS_KEPT,
 };
 use tokio::net::UdpSocket;
 use tokio::sync::{oneshot, watch};
@@ -25,9 +25,6 @@ use tokio::task::JoinHandle;
 
 use crate::error::ClientError;
 use crate::sockets;
-
-/// How many completion results are kept for late `wait_command` callers.
-const COMPLETIONS_KEPT: usize = 1024;
 
 /// How often one error code may be logged for a reply nobody awaits.
 const UNCLAIMED_ERROR_PERIOD: Duration = Duration::from_secs(1);
@@ -545,9 +542,10 @@ impl Client {
     /// COMPLETE push, with the status stream as fallback (completed_index
     /// high-water, or a blocking error under the stale-error rule).
     /// `Ok(true)` on success, `Robot` when the command finished in error,
-    /// `Ok(false)` on timeout — or when STATUS showed the command finished
-    /// but its COMPLETE push never arrived, so whether it succeeded or was
-    /// cancelled is unknown (logged as a warning).
+    /// `Ok(false)` on timeout, or when STATUS showed the command finished
+    /// and neither its COMPLETE push nor the runtime's COMMAND_COMPLETION
+    /// record could be had (logged); `SessionChanged` if the runtime
+    /// restarted mid-wait, `ProtocolMismatch` if its STATUS cannot be read.
     pub async fn wait_command(&self, index: u64, timeout: Duration) -> Result<bool, ClientError> {
         let logged = self
             .inner
@@ -627,7 +625,17 @@ impl Client {
             );
             tokio::pin!(via_status);
             tokio::select! {
-                got = &mut *rx => return Ok(got.ok()),
+                got = &mut *rx => {
+                    return match got {
+                        Ok(done) => Ok(Some(done)),
+                        // The channel closes when a restart clears the
+                        // waiters, after the new session's STATUS is out.
+                        Err(_) => match self.latest_status() {
+                            Some(s) if restarted(&s) => Err(ClientError::SessionChanged { index }),
+                            _ => Ok(None),
+                        },
+                    };
+                }
                 hit = &mut via_status => hit,
             }
         };
@@ -688,8 +696,8 @@ impl Client {
     /// Settle verdict off command `index`'s COMPLETE push: 1 = object
     /// while closing, 2 = object while opening, 3 = target reached with
     /// no object. `None` for non-tool commands, unfinished ones, ones
-    /// whose COMPLETE push was lost, and completions that fell out of
-    /// the log (last 1024 are kept) — call after [`Self::wait_command`]
+    /// whose completion could not be recovered, and completions that fell
+    /// out of the log (the last [`COMPLETIONS_KEPT`]) — call after [`Self::wait_command`]
     /// returns `Ok(true)`.
     pub fn command_verdict(&self, index: u64) -> Option<u8> {
         self.inner
@@ -776,7 +784,6 @@ fn log_unclaimed(inner: &Inner, error: &WireError) {
     );
 }
 
-/// The protocol-skew warning fires once per process, not per frame.
 /// A finished command, logged and handed to whoever is waiting on it.
 fn record_completion(inner: &Inner, index: u64, done: &Completion) {
     let mut comp = inner.completions.lock().unwrap();
@@ -793,21 +800,32 @@ fn record_completion(inner: &Inner, index: u64, done: &Completion) {
     }
 }
 
+/// The protocol-skew warning fires once per process, not per frame.
 static VERSION_SKEW_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Report a daemon whose protocol version is not this client's, once.
+/// Report a daemon whose protocol version is not this client's, once, and
+/// latch it for the waits when its STATUS could not be read (`readable`
+/// false): a frame that cannot be read now will not be readable later
+/// either, and a wait that ran out its timeout instead would report the
+/// runtime silent rather than foreign. A STATUS that did decode clears the
+/// latch — the runtime this client talks to is readable after all.
 ///
-/// `None` is a datagram we could not even identify as a STATUS, which says
-/// nothing about versions and is left to the caller's debug line.
-fn warn_once_on_skew(inner: &Inner, daemon: Option<u8>) {
+/// `None` is a datagram we could not even identify as a par6 STATUS, which
+/// says nothing about versions and is left to the caller's debug line.
+fn note_skew(inner: &Inner, daemon: Option<u8>, readable: bool) {
+    if readable {
+        let mut latched = inner.skew.lock().unwrap();
+        if latched.is_some() {
+            *latched = None;
+        }
+    }
     let Some(daemon) = daemon.filter(|v| *v != par6_proto::PROTO_VERSION) else {
         return;
     };
-    // Latched for the waits: a frame that cannot be read now will not
-    // be readable later either, and a wait that ran out its timeout
-    // instead would report the runtime silent rather than foreign.
-    *inner.skew.lock().unwrap() = Some(daemon);
+    if !readable {
+        *inner.skew.lock().unwrap() = Some(daemon);
+    }
     if VERSION_SKEW_WARNED.swap(true, Ordering::Relaxed) {
         return;
     }
@@ -841,36 +859,43 @@ async fn status_rx(inner: Arc<Inner>, sock: UdpSocket) {
                 // ever reads the version — which is to say the check below
                 // could never fire in the one case it exists for, and the
                 // client went silent with a debug line as its only account.
-                warn_once_on_skew(&inner, par6_proto::peek_status_proto_version(&buf[..n]));
+                note_skew(
+                    &inner,
+                    par6_proto::peek_status_proto_version(&buf[..n]),
+                    false,
+                );
                 log::debug!("ignoring undecodable status datagram: {e}");
                 continue;
             }
         };
-        warn_once_on_skew(&inner, Some(status.proto_version));
-        {
+        note_skew(&inner, Some(status.proto_version), true);
+        let restarted = {
             let mut last = inner.last_seq.lock().unwrap();
+            let mut restarted = false;
             if let Some((session, prev)) = *last {
                 if session == status.session_id && status.seq <= prev {
                     continue;
                 }
-                if session != status.session_id {
-                    // A restarted runtime numbers its queue from the start
-                    // again: what was logged names other commands now, and
-                    // whoever waits on one learns of the restart, not of a
-                    // stranger's completion.
-                    let mut comp = inner.completions.lock().unwrap();
-                    comp.log.clear();
-                    comp.order.clear();
-                    comp.waiters.clear();
-                }
-                if session == status.session_id && status.seq > prev.saturating_add(1) {
+                restarted = session != status.session_id;
+                if !restarted && status.seq > prev.saturating_add(1) {
                     inner
                         .seq_gaps
                         .fetch_add(status.seq - prev - 1, Ordering::Relaxed);
                 }
             }
             *last = Some((status.session_id, status.seq));
-        }
+            restarted
+        };
         inner.status_tx.send_replace(Some(Arc::new(status)));
+        if restarted {
+            // A restarted runtime numbers its queue from the start again:
+            // what was logged names other commands now. The new session's
+            // STATUS is published first, so a waiter whose channel closes
+            // here finds the restart in it rather than a lost answer.
+            let mut comp = inner.completions.lock().unwrap();
+            comp.log.clear();
+            comp.order.clear();
+            comp.waiters.clear();
+        }
     }
 }

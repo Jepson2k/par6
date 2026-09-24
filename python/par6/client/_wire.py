@@ -49,6 +49,20 @@ def timing(
     return d, s
 
 
+def refuse_unknown_keywords(
+    kwargs: dict[str, Any], accepted: frozenset[str] = frozenset()
+) -> None:
+    """A planned move's ``**wait_kwargs`` exist for keywords its wait takes,
+    and ``wait_command`` takes none beyond ``timeout``: anything else —
+    ``rel`` on a move that declares none, a misspelled keyword — is a
+    TypeError, as parol6's client has it, never planned as if unwritten.
+    *accepted* names keywords the caller's signature takes through
+    ``**kwargs`` itself."""
+    unknown = sorted(k for k in kwargs if k not in accepted)
+    if unknown:
+        raise TypeError(f"unexpected keyword argument(s): {', '.join(unknown)}")
+
+
 def blend(r: float | None) -> float | None:
     return float(r) if r else None
 

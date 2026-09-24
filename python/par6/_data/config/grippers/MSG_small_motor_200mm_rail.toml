@@ -13,8 +13,6 @@ driver_type = "stepfoc"
 stroke_mm = 200.0
 kt_nm_a = 0.111
 ilim_ma = 1700.0
-# The grip current a move runs at when the caller names none.
-default_current_ma = 500.0
 voltage_limit_mv = 6000
 velocity_limit_ticks_s = 80000.0
 watchdog_timeout_ms = 5000

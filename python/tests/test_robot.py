@@ -643,7 +643,9 @@ def test_the_client_describes_the_config_the_daemon_runs(
     robot_toml = custom / "PAR6.toml"
     text = robot_toml.read_text()
     assert 'name = "isolated_in_1"' in text
-    robot_toml.write_text(text.replace('name = "isolated_in_1"', 'name = "door_switch"'))
+    robot_toml.write_text(
+        text.replace('name = "isolated_in_1"', 'name = "door_switch"')
+    )
 
     monkeypatch.setenv("PAR6_CONFIG", str(robot_toml))
     _cfg.config.cache_clear()
@@ -654,5 +656,4 @@ def test_the_client_describes_the_config_the_daemon_runs(
     finally:
         _cfg.config.cache_clear()
     monkeypatch.delenv("PAR6_CONFIG")
-    _cfg.config.cache_clear()
     assert "isolated_in_1" in _cfg.io_line_names()[0]

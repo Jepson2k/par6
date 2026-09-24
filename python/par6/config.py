@@ -11,8 +11,8 @@ turns those values into paths and waldoctl dataclasses.
 from __future__ import annotations
 
 import hashlib
-import tomllib
 import os
+import tomllib
 from functools import cache
 from importlib.resources import files as pkg_files
 from pathlib import Path
