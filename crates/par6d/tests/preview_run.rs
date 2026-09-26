@@ -443,7 +443,7 @@ fn a_run_grasps_lifts_and_drops_a_world_object() {
             params: vec![
                 ToolParam::Float(closed),
                 ToolParam::Float(0.5),
-                ToolParam::Float(500.0),
+                ToolParam::Float(0.3),
             ],
         })
     };

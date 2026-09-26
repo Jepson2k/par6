@@ -93,7 +93,7 @@ fn the_plan_records_every_command_and_a_run_of_it_lands_on_the_same_lines() {
             params: vec![
                 ToolParam::Float(1.0),
                 ToolParam::Float(0.5),
-                ToolParam::Float(500.0),
+                ToolParam::Float(0.3),
             ],
         }),
         move_j_cmd(b, 4, Some(10.0)),
