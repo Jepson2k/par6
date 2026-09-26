@@ -273,6 +273,28 @@ class TestPlannedMotion:
         assert slow.duration == pytest.approx(4.0, abs=2 * dry_run.plan().row_dt_s)
         np.testing.assert_allclose(slow.end_joints_rad, np.radians(target), atol=1e-6)
 
+    def test_an_untimed_move_runs_at_half_speed_and_a_duration_sets_the_timing(
+        self, dry_run
+    ) -> None:
+        """A planned move that names no timing runs at ``speed=0.5`` — not at
+        full speed, and not refused — and a positive ``duration`` times the
+        move even beside an explicit ``speed``."""
+        dry_run.teleport(park_deg())
+        target = np.asarray(dry_run.pose())
+        target[1] += 50.0
+        target[2] += 30.0
+
+        def line(**timing: float) -> _Block:
+            dry_run.teleport(park_deg())
+            return _planned(dry_run, dry_run.move_l(target.tolist(), **timing))
+
+        row = dry_run.plan().row_dt_s
+        half, full, untimed = line(speed=0.5), line(speed=1.0), line()
+        assert half.duration > full.duration + 2 * row, "speed must bind on this line"
+        assert untimed.duration == pytest.approx(half.duration, abs=row)
+        timed = line(duration=3.0, speed=1.0)
+        assert timed.duration == pytest.approx(3.0, abs=2 * row)
+
 
 class TestCartesianMotion:
     def test_move_l_previews_a_straight_line_and_reports_where_it_fails(
@@ -618,11 +640,12 @@ class TestCartesianMotion:
         # any datagram, with ValueError — the preview raises the same.
         with pytest.raises(ValueError, match="requires"):
             dry_run.move_j([0.0, 0.0, 0.0], speed=1.0)
-        # A planned move names its timing: neither speed nor duration is
-        # not a request for full speed, and nothing is submitted.
+        # Timing out of range is refused as the live client refuses it, and
+        # nothing is submitted.
         submitted = dry_run.program_length
-        with pytest.raises(ValueError, match="duration or speed"):
-            dry_run.move_j(dry_run.angles())
+        for timing in ({"speed": 0.0}, {"accel": 1.5}, {"duration": -1.0}):
+            with pytest.raises(ValueError, match=next(iter(timing))):
+                dry_run.move_j(dry_run.angles(), **timing)
         assert dry_run.program_length == submitted
         with pytest.raises(ValueError, match="requires"):
             dry_run.teleport([0.0, 0.0, 0.0])
@@ -814,11 +837,15 @@ class TestLiveParity:
             "a jaw move holds the arm for the jaws' travel"
         )
         assert not client.tool.is_open()
-        # A move that names no current grips with half the tool's current
-        # range, as it names no speed and moves at half speed; that is
-        # what the runtime's wire sees.
-        lo, hi = client.tool.current_range
-        assert client._program[close]["params"] == [1.0, 0.5, lo + (hi - lo) // 2]
+        # The wire carries current as a fraction of the tool's range, like
+        # speed; a move that names none grips at half the range.
+        assert client._program[close]["params"] == [1.0, 0.5, 0.5]
+        firm = client.tool.set_position(0.3, speed=0.8, current=0.25)
+        assert client._program[firm]["params"] == [0.3, 0.8, 0.25]
+        for current in (-0.1, 1.5, math.nan, math.inf):
+            with pytest.raises(RobotError, match="current") as bad_current:
+                client.tool.close(current=current)
+            assert bad_current.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert _planned(client, client.tool.stop()).duration == 0.0
         assert _planned(client, client.tool.release()).duration == 0.0
         with pytest.raises(RobotError) as past_stroke:
@@ -1225,7 +1252,7 @@ async def test_curved_and_blended_previews_match_the_runtime(tmp_path) -> None:
                 # in, so the shapes are anchored on the same place.
                 await teleport_to(client, _OPEN_POSE_DEG)
                 assert await client.wait_status(
-                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 0.02,
+                    lambda s: float(np.abs(np.asarray(s.speeds)).max()) < 1.0,
                     timeout=20.0,
                 )
                 live_start = await client.angles()

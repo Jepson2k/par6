@@ -996,7 +996,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // ---- a move before calibration is refused: the RT send gate never
     // streams to an uncalibrated gripper (the firmware's own gate drops
     // it), so admitting the move could only pretend.
-    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6003, &tool, "move", &[1.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(!ok, "an uncalibrated gripper must refuse a move");
     assert_eq!(
@@ -1015,7 +1015,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     // position with nothing between the jaws (detection: reached, no
     // object), opening runs it back.
     let before = jaw(&s);
-    let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6008, &tool, "move", &[1.0, 0.5, 0.3]));
     let (ok, detail, verdict) = c.wait_complete_full(i);
     assert!(ok, "gripper close must complete, got {detail:?}");
     assert_eq!(
@@ -1043,7 +1043,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         "a settled move leaves the jaws holding, not released"
     );
 
-    let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6004, &tool, "move", &[0.0, 0.5, 0.3]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "gripper open must complete, got {detail:?}");
     rig.wait_status("the jaw reaches the open command", |s| jaw(s) < 0.05);
@@ -1067,7 +1067,7 @@ fn tool_actions_profiles_and_unsupported_parameters() {
         ErrorCode::CommValidationError as u16
     );
     // …and out-of-range move parameters are refused the same way.
-    let i = c.ok_index(&tool_action(6007, &tool, "move", &[2.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(6007, &tool, "move", &[2.0, 0.5, 0.3]));
     assert!(!c.wait_complete(i).0, "position 2.0 must fail");
 
     // ---- teleport places the tool as well as the arm.
@@ -2093,7 +2093,7 @@ fn a_program_shape_with_physics_is_something_the_live_jaws_close_on() {
 
     // Closing meets the block: the jaws stop on it, and the settle
     // verdict says an object was found while closing.
-    let i = c.ok_index(&tool_action(7102, &tool, "move", &[1.0, 0.5, 500.0]));
+    let i = c.ok_index(&tool_action(7102, &tool, "move", &[1.0, 0.5, 0.3]));
     let (ok, detail, verdict) = c.wait_complete_full(i);
     assert!(ok, "the grip must complete, got {detail:?}");
     assert_eq!(

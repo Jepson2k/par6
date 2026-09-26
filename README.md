@@ -413,9 +413,10 @@ turns each pose into a joint waypoint, and TOPPRA times the chain. Only the shap
 differs — a line for `move_l`, the circle through the via point for `move_c`, a cubic
 spline for `move_s`, an auto-rounded polyline for `move_p`.
 
-`speed` scales the velocity ceiling, `accel` scales the acceleration ceiling, and
-`duration` acts as a **minimum** the plan is stretched to meet. The two are mutually
-exclusive.
+`speed` scales the velocity ceiling and `accel` the acceleration ceiling, both
+fractions in `(0, 1]` defaulting to 0.5. A positive `duration` takes the place of
+`speed`, acting as a **minimum** the plan is stretched to meet; `duration=0` (the
+default) leaves the timing to `speed`.
 
 `set_execution_speed(scale)` separately scales queued trajectory execution from
 0.1 through 1.0 without replanning its path. `pause()` retains the queue and

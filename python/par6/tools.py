@@ -64,9 +64,10 @@ class PassiveTool(_ClientBound, ToolSpec):
 class ElectricGripper(_ClientBound, ElectricGripperTool):
     """Electric gripper driving the runtime's ``tool_action`` verbs.
 
-    ``move`` takes ``[position 0..1, speed 0..1, current mA]``; ``calibrate``
-    runs the driver's homing/activation sequence; ``stop`` halts the jaws
-    in place; ``idle`` releases them.
+    ``move`` takes ``[position, speed, current]``, each a fraction in
+    ``[0, 1]`` (current of ``current_range``); ``calibrate`` runs the
+    driver's homing/activation sequence; ``stop`` halts the jaws in place;
+    ``idle`` releases them.
     """
 
     def __init__(self, **kwargs: Any) -> None:
@@ -74,10 +75,17 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
         kwargs.setdefault("action_r_icons", ("build", "build"))
         super().__init__(**kwargs)
 
-    async def set_position(self, position: float, **kwargs: float | int) -> int:
-        speed = float(kwargs.get("speed", 0.5))
-        current = int(kwargs.get("current", self.default_current))
-        return await self._cmd("move", [float(position), speed, current])
+    async def set_position(
+        self,
+        position: float,
+        *,
+        speed: float = 0.5,
+        current: float = 0.5,
+        **wait_kwargs: Any,
+    ) -> int:
+        return await self._cmd(
+            "move", [float(position), float(speed), float(current)], **wait_kwargs
+        )
 
     async def calibrate(self, **kwargs: object) -> int:
         return await self._cmd("calibrate")
@@ -103,17 +111,20 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
     async def action_r(self, engaged: bool) -> None:
         await self.calibrate()
 
-    async def open(self, **kwargs: float | int) -> int:
-        return await self.set_position(0.0, **kwargs)
+    async def open(
+        self, *, speed: float = 0.5, current: float = 0.5, **wait_kwargs: Any
+    ) -> int:
+        return await self.set_position(0.0, speed=speed, current=current, **wait_kwargs)
 
-    async def close(self, **kwargs: float | int) -> int:
-        return await self.set_position(1.0, **kwargs)
+    async def close(
+        self, *, speed: float = 0.5, current: float = 0.5, **wait_kwargs: Any
+    ) -> int:
+        return await self.set_position(1.0, speed=speed, current=current, **wait_kwargs)
 
     @property
     def adjust_step(self) -> int:
-        """Current step: ~10% of range, rounded to the nearest 10 mA."""
-        lo, hi = self.current_range
-        return max(10, round((hi - lo) / 10 / 10) * 10)
+        """Current step, in percent points of ``current_range``."""
+        return 10
 
     @property
     def adjust_labels(self) -> tuple[str, str]:

@@ -3065,7 +3065,7 @@ async fn a_tool_action_runs_beside_the_motion_in_flight() {
 
     // The tool action starts while it is still running — it neither
     // waits for the move nor displaces it.
-    let tool = c.ok_index(&action(902, "move", &[1.0, 0.5, 400.0])).await;
+    let tool = c.ok_index(&action(902, "move", &[1.0, 0.5, 0.3])).await;
     let deadline = tokio::time::Instant::now() + BUDGET;
     while h.planner.lock().unwrap().tools_started != vec![tool] {
         assert!(
@@ -3143,7 +3143,7 @@ async fn a_stop_halts_the_tool_but_a_streamable_leaves_it_alone() {
     };
 
     // A jog cancels planned motion but must not touch the tool.
-    let t1 = c.ok_index(&action(911, "move", &[1.0, 0.5, 400.0])).await;
+    let t1 = c.ok_index(&action(911, "move", &[1.0, 0.5, 0.3])).await;
     let deadline = tokio::time::Instant::now() + BUDGET;
     while h.planner.lock().unwrap().tools_started != vec![t1] {
         assert!(tokio::time::Instant::now() < deadline, "tool never started");

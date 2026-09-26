@@ -262,7 +262,7 @@ async def test_live_sim_session_over_protocol_v2(daemon: LiveDaemon):
             lambda s: s.angles[0] > before + 1.0, timeout=STEP_BUDGET_S
         ), "the jog must physically drive the sim"
         assert await client.wait_status(
-            lambda s: s.action_state == ActionState.IDLE and abs(s.speeds[0]) < 0.05,
+            lambda s: s.action_state == ActionState.IDLE and abs(s.speeds[0]) < 3.0,
             timeout=STEP_BUDGET_S,
         ), "the jog duration watchdog must self-terminate the motion"
         with pytest.raises(RobotError) as preempt_err:
@@ -643,11 +643,11 @@ async def test_a_stopped_arm_is_held_and_still_floats_on_request(daemon: LiveDae
 
         assert await enable(client, start_move) is None
         assert await client.wait_status(
-            lambda s: abs(s.speeds[0]) > 0.05, timeout=STEP_BUDGET_S
+            lambda s: abs(s.speeds[0]) > 3.0, timeout=STEP_BUDGET_S
         ), "the move never moved the arm"
         await client.stop()
         assert await client.wait_status(
-            lambda s: max(abs(v) for v in s.speeds) < 0.01, timeout=STEP_BUDGET_S
+            lambda s: max(abs(v) for v in s.speeds) < 0.5, timeout=STEP_BUDGET_S
         ), "the stop never brought the arm to rest"
         assert await client.is_freedrive() is False, "a stopped arm is held"
 
@@ -803,7 +803,7 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
 
         assert await enable(client, start_move) is None
         assert await client.wait_status(
-            lambda s: abs(s.speeds[0]) > 0.05, timeout=STEP_BUDGET_S
+            lambda s: abs(s.speeds[0]) > 3.0, timeout=STEP_BUDGET_S
         ), "the move never moved the arm"
         assert await client.is_robot_stopped() is False
 
@@ -844,6 +844,41 @@ async def test_estop_and_motion_predicates_answer_from_the_live_runtime(
         assert await client.wait_status(lambda s: s.enabled, timeout=STEP_BUDGET_S)
         assert await client.error() is None
         assert await client.is_estop_pressed() is False
+
+
+@pytest.mark.timeout(120)
+async def test_joint_speeds_read_in_degrees_per_second(daemon: LiveDaemon):
+    """The wire carries joint speeds in rad/s; every joint speed the client
+    reports — the STATUS buffer, ``joint_speeds()``, ``is_robot_stopped``'s
+    threshold — is deg/s. A joint jogged at a fraction of its jog ceiling
+    reads that fraction of the ceiling, in degrees."""
+    fraction = 0.1
+    expected = math.degrees(fraction * _cfg.config().limits("jog")["velocity"][0])
+
+    def cruising(s) -> bool:
+        return abs(s.speeds[0] - expected) < 0.05 * expected
+
+    async with daemon.client() as client:
+        await settle_at(client, park_deg())
+
+        async def jog_until_cruising() -> None:
+            deadline = time.monotonic() + STEP_BUDGET_S
+            while time.monotonic() < deadline:
+                await client.jog_j(0, fraction, duration=0.4)
+                if await client.wait_status(cruising, timeout=0.1):
+                    return
+            raise AssertionError(
+                f"J0 never read {expected:.1f} deg/s on the STATUS stream"
+            )
+
+        await jog_until_cruising()
+        speeds = await client.joint_speeds()
+        assert speeds is not None
+        assert speeds[0] == pytest.approx(expected, rel=0.05)
+
+        await jog_until_cruising()
+        assert await client.is_robot_stopped(threshold_speed=expected / 2) is False
+        assert await client.is_robot_stopped(threshold_speed=2 * expected) is True
 
 
 @pytest.mark.timeout(120)
@@ -963,7 +998,7 @@ async def test_jog_lookahead_stops_the_measured_arm_short_of_the_soft_limit(
         # Let the watchdog self-terminate, then jog the opposite way: the
         # block clears and the arm moves off the limit.
         assert await client.wait_status(
-            lambda s: abs(s.speeds[0]) < 0.05, timeout=STEP_BUDGET_S
+            lambda s: abs(s.speeds[0]) < 3.0, timeout=STEP_BUDGET_S
         ), "the jog watchdog never self-terminated"
         for _ in range(8):
             await client.jog_j(0, -0.3, duration=0.4)
@@ -1133,7 +1168,7 @@ async def test_jog_streams_are_gated_by_the_collision_world(daemon: LiveDaemon):
             "let the arm drive at the box"
         )
         assert await client.wait_status(
-            lambda s: abs(s.speeds[0]) < 0.05, timeout=STEP_BUDGET_S
+            lambda s: abs(s.speeds[0]) < 3.0, timeout=STEP_BUDGET_S
         ), "the blocked jog never came to rest"
         rest = (await angles_now(client))[0]
         assert rest < mid[0] - 5.0, (
@@ -1491,7 +1526,7 @@ async def test_cartesian_streams_drive_the_arm_and_are_collision_gated(
         # float once it has stopped.
         def at_rest(s) -> bool:
             z_seen.append(float(s.pose[11]))
-            resting = max(abs(v) for v in s.speeds) < 0.05
+            resting = max(abs(v) for v in s.speeds) < 3.0
             return s.mode == ControllerMode.EXEC and not s.freedrive and resting
 
         assert await client.wait_status(at_rest, timeout=STEP_BUDGET_S), (
@@ -1561,7 +1596,7 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         # gate drops it) — so the daemon refuses the move up front
         # instead of letting it silently move nothing.
         with pytest.raises(RobotError) as refused:
-            await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+            await client.tool_action(tool, "move", [1.0, 0.5, 0.3], wait=True)
         assert refused.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert "calibrat" in str(refused.value).lower()
 
@@ -1572,7 +1607,7 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         # position. The completion push carries the settle verdict, so a
         # close on air reads "target reached, no object" without racing a
         # tool-status poll.
-        idx = await client.tool_action(tool, "move", [1.0, 0.5, 400.0], wait=True)
+        idx = await client.tool_action(tool, "move", [1.0, 0.5, 0.3], wait=True)
         assert await client.command_verdict(idx) == 3, (
             "a close with nothing between the jaws must complete with "
             "verdict 3 (reached, no object)"
@@ -1594,8 +1629,8 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         # caught them, nowhere near the abandoned fully-open target. The
         # interrupted travel starts from a mid-stroke hold so the stop
         # always reads a trustable jaw byte, not the 255 edge.
-        await client.tool_action(tool, "move", [0.7, 0.5, 400.0], wait=True)
-        await client.tool_action(tool, "move", [0.0, 0.15, 400.0])
+        await client.tool_action(tool, "move", [0.7, 0.5, 0.3], wait=True)
+        await client.tool_action(tool, "move", [0.0, 0.15, 0.3])
         await client.tool_action(tool, "stop", wait=True)
         status = await client.status()
         assert status is not None and status.tool_status is not None
@@ -1608,7 +1643,7 @@ async def test_the_python_client_drives_the_gripper_and_the_digital_outputs(
         # Release, then a fresh move must still stream — the idle
         # handshake ends in watchdog polls, not a dead send slot.
         await client.tool_action(tool, "idle", wait=True)
-        await client.tool_action(tool, "move", [0.0, 0.5, 400.0], wait=True)
+        await client.tool_action(tool, "move", [0.0, 0.5, 0.3], wait=True)
         opened = await client.wait_status(
             lambda s: bool(
                 s.tool_status is not None

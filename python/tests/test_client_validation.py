@@ -5,6 +5,7 @@ own sentinels never escape as extension errors."""
 from __future__ import annotations
 
 import asyncio
+import math
 from typing import Any, cast
 
 import pytest
@@ -60,6 +61,37 @@ def test_a_keyword_no_planned_move_declares_is_a_type_error():
                 await client.move_j([0.0] * 6, speed=0.5, wait=False, bogus=1)
             with pytest.raises(TypeError, match="bogus"):
                 await client.home(bogus=1)
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+
+def test_planned_move_timing_out_of_range_is_a_value_error():
+    """``speed`` and ``accel`` are fractions in (0, 1] and ``duration`` a
+    finite time, 0 meaning "not given": every planned move refuses anything
+    else before a byte is sent, NaN and inf included."""
+
+    async def run():
+        client = _dead_client()
+        pose = [200.0, 0.0, 300.0, 180.0, 0.0, 0.0]
+        moves = (
+            lambda **t: client.move_j([0.0] * 6, **t),
+            lambda **t: client.move_l(pose, **t),
+            lambda **t: client.move_c(pose, pose, **t),
+            lambda **t: client.move_s([pose, pose], **t),
+            lambda **t: client.move_p([pose, pose], **t),
+        )
+        try:
+            for move in moves:
+                for bad in (0.0, -0.5, 1.5, math.nan, math.inf):
+                    with pytest.raises(ValueError, match="speed"):
+                        await move(speed=bad)
+                    with pytest.raises(ValueError, match="accel"):
+                        await move(accel=bad)
+                for bad in (-1.0, math.nan, math.inf):
+                    with pytest.raises(ValueError, match="duration"):
+                        await move(duration=bad)
         finally:
             await client.close()
 

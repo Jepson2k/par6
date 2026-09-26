@@ -959,14 +959,14 @@ impl Par6Planner {
         match cmd.action.as_str() {
             "move" => {
                 let [position, speed, current] = scalars(&cmd.params)
-                    .ok_or_else(|| invalid("move takes [position, speed, current_ma]".into()))?;
-                for (what, v, hi) in [
-                    ("position", position, 1.0),
-                    ("speed", speed, 1.0),
-                    ("current", current, tool.ilim_ma),
+                    .ok_or_else(|| invalid("move takes [position, speed, current]".into()))?;
+                for (what, v) in [
+                    ("position", position),
+                    ("speed", speed),
+                    ("current", current),
                 ] {
-                    if !v.is_finite() || v < 0.0 || v > hi {
-                        return Err(invalid(format!("{what} = {v} is outside [0, {hi}]")));
+                    if !v.is_finite() || !(0.0..=1.0).contains(&v) {
+                        return Err(invalid(format!("{what} = {v} is outside [0, 1]")));
                     }
                 }
                 // The RT gate never streams a move to an uncalibrated
@@ -979,7 +979,9 @@ impl Par6Planner {
                     ));
                 }
                 self.link.send(RtCommand::Gripper(gripper_move_command(
-                    position, speed, current,
+                    position,
+                    speed,
+                    current * tool.ilim_ma,
                 )));
             }
             "calibrate" => {

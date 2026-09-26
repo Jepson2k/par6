@@ -450,15 +450,15 @@ class DryRunRobotClient(RobotOwner):
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
     ) -> int:
         refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
-        d, s = timing(duration, speed)
+        d, s, a = timing(duration, speed, accel)
         if pose is not None:
             if rel:
                 raise ValueError(
@@ -472,7 +472,7 @@ class DryRunRobotClient(RobotOwner):
                     "pose": f6(pose, "pose"),
                     "duration": d,
                     "speed": s,
-                    "accel": float(accel),
+                    "accel": a,
                     "blend_radius": blend(r),
                 },
                 "move_j",
@@ -485,7 +485,7 @@ class DryRunRobotClient(RobotOwner):
                 "angles": f6(angles, "angles"),
                 "duration": d,
                 "speed": s,
-                "accel": float(accel),
+                "accel": a,
                 "blend_radius": blend(r),
                 "rel": bool(rel),
             },
@@ -497,15 +497,15 @@ class DryRunRobotClient(RobotOwner):
         pose: list[float],
         *,
         frame: str = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         rel: bool = False,
         **kwargs: Any,
     ) -> int:
         refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
-        d, s = timing(duration, speed)
+        d, s, a = timing(duration, speed, accel)
         return self._submit(
             {
                 "type": "move_l",
@@ -513,7 +513,7 @@ class DryRunRobotClient(RobotOwner):
                 "frame": wire_frame(frame),
                 "duration": d,
                 "speed": s,
-                "accel": float(accel),
+                "accel": a,
                 "blend_radius": blend(r),
                 "rel": bool(rel),
             },
@@ -526,14 +526,14 @@ class DryRunRobotClient(RobotOwner):
         end: list[float],
         *,
         frame: str = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         r: float = 0.0,
         **kwargs: Any,
     ) -> int:
         refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
-        d, s = timing(duration, speed)
+        d, s, a = timing(duration, speed, accel)
         return self._submit(
             {
                 "type": "move_c",
@@ -542,7 +542,7 @@ class DryRunRobotClient(RobotOwner):
                 "frame": wire_frame(frame),
                 "duration": d,
                 "speed": s,
-                "accel": float(accel),
+                "accel": a,
                 "blend_radius": blend(r),
                 "rel": False,
             },
@@ -554,11 +554,11 @@ class DryRunRobotClient(RobotOwner):
         kind: str,
         waypoints: list[list[float]],
         frame: str,
-        duration: float | None,
-        speed: float | None,
+        duration: float,
+        speed: float,
         accel: float,
     ) -> int:
-        d, s = timing(duration, speed)
+        d, s, a = timing(duration, speed, accel)
         return self._submit(
             {
                 "type": kind,
@@ -566,7 +566,7 @@ class DryRunRobotClient(RobotOwner):
                 "frame": wire_frame(frame),
                 "duration": d,
                 "speed": s,
-                "accel": float(accel),
+                "accel": a,
                 "rel": False,
             },
             kind,
@@ -577,9 +577,9 @@ class DryRunRobotClient(RobotOwner):
         waypoints: list[list[float]],
         *,
         frame: str = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
@@ -590,9 +590,9 @@ class DryRunRobotClient(RobotOwner):
         waypoints: list[list[float]],
         *,
         frame: str = "WRF",
-        duration: float | None = None,
-        speed: float | None = None,
-        accel: float = 1.0,
+        duration: float = 0.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         refuse_unknown_keywords(kwargs, _WAIT_KEYWORDS)
@@ -607,8 +607,8 @@ class DryRunRobotClient(RobotOwner):
         angles: list[float] | None = None,
         *,
         pose: list[float] | None = None,
-        speed: float = 1.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         """One streamed target, evaluated as if it were the last one: the
@@ -639,8 +639,8 @@ class DryRunRobotClient(RobotOwner):
         self,
         pose: list[float],
         *,
-        speed: float = 1.0,
-        accel: float = 1.0,
+        speed: float = 0.5,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         return self._system(
@@ -661,7 +661,7 @@ class DryRunRobotClient(RobotOwner):
         *,
         joints: list[int] | None = None,
         speeds: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         return self._system(
@@ -683,7 +683,7 @@ class DryRunRobotClient(RobotOwner):
         *,
         axes: list[str] | None = None,
         speeds_list: list[float] | None = None,
-        accel: float = 1.0,
+        accel: float = 0.5,
         **kwargs: Any,
     ) -> int:
         return self._system(
@@ -1171,7 +1171,7 @@ class DryRunRobotClient(RobotOwner):
     def is_estop_pressed(self) -> bool:
         return False
 
-    def is_robot_stopped(self, threshold_speed: float = 0.01) -> bool:
+    def is_robot_stopped(self, threshold_speed: float = 0.5) -> bool:
         """A preview holds still between commands: every motion it reports
         has already run to its end."""
         return True
