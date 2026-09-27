@@ -227,7 +227,8 @@ class TestPlannedMotion:
         cfg = _cfg.config()
         velocity = np.array(cfg.limits("exec")["velocity"])
         start = _cfg.homing_ready_pose_rad()
-        target = start + np.radians([25.0, -10.0, 15.0, 0.0, 20.0, 0.0])
+        # Long enough that speed, not the default half accel, bounds it.
+        target = start + np.radians([60.0, -20.0, 30.0, 0.0, 40.0, 0.0])
         # The CI tick is slower than the record's row rate, so every tick is
         # a row and the velocity check reads per-tick steps rather than a
         # stride's average, which would smear a fast tick across several.
@@ -281,8 +282,9 @@ class TestPlannedMotion:
         move even beside an explicit ``speed``."""
         dry_run.teleport(park_deg())
         target = np.asarray(dry_run.pose())
-        target[1] += 50.0
-        target[2] += 30.0
+        # Long enough that speed, not the default half accel, bounds it.
+        target[1] += 100.0
+        target[2] += 60.0
 
         def line(**timing: float) -> _Block:
             dry_run.teleport(park_deg())
@@ -456,7 +458,16 @@ class TestCartesianMotion:
         assert at_the_corner < cruising, (
             "the un-blended pair is supposed to stop at the corner"
         )
-        assert np.allclose(dry_run.angles(), np.degrees(blended.end_joints_rad))
+        # The record keeps every stride-th tick, so the motion's last
+        # ticks can fall between its final row and the end: the arm stands
+        # within one decelerating row of it.
+        last_row = np.degrees(
+            np.abs(np.diff(blended.joint_trajectory_rad[-2:], axis=0)[0])
+        )
+        stood = np.abs(
+            np.asarray(dry_run.angles()) - np.degrees(blended.end_joints_rad)
+        )
+        assert np.all(stood <= last_row + 1e-6), f"{stood} vs a last row of {last_row}"
 
         # A chain the program never closes is planned by flush(), which is
         # where the runtime's blend hold expires.
@@ -842,8 +853,14 @@ class TestLiveParity:
         assert client._program[close]["params"] == [1.0, 0.5, 0.5]
         firm = client.tool.set_position(0.3, speed=0.8, current=0.25)
         assert client._program[firm]["params"] == [0.3, 0.8, 0.25]
-        for current in (-0.1, 1.5, math.nan, math.inf):
-            with pytest.raises(RobotError, match="current") as bad_current:
+        # The wire refuses a non-finite float before any field reads it.
+        for current, reason in (
+            (-0.1, "current"),
+            (1.5, "current"),
+            (math.nan, "finite"),
+            (math.inf, "finite"),
+        ):
+            with pytest.raises(RobotError, match=reason) as bad_current:
                 client.tool.close(current=current)
             assert bad_current.value.code == ErrorCode.COMM_VALIDATION_ERROR
         assert _planned(client, client.tool.stop()).duration == 0.0

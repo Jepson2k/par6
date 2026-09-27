@@ -15,7 +15,7 @@ use par6_proto::command::{
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
-    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply, Status,
+    ActionState, CmdType, Command, ErrorCode, FlashingAssertion, Frame, QueryResult, Reply,
     WireError, UNATTRIBUTED,
 };
 use par6_rt::{
