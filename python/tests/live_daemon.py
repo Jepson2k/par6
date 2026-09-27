@@ -37,13 +37,15 @@ READY_TIMEOUT_S = 30.0
 #: The sim tick the e2e rig runs at. Every RT time constant derives from
 #: config SECONDS (``round(s/dt)``), so the runtime is rate-agnostic by
 #: contract and the wiring under test is identical to the shipped 250 Hz —
-#: but a shared CI box cannot hold a 4 ms deadline. 50 ms leaves the jitter
-#: headroom. The generated config deliberately declares no ``[timing]``
+#: but a shared CI box cannot hold a 4 ms deadline. 10 ms leaves it jitter
+#: headroom while every per-tick effect (read-back latency, the travel a
+#: check covers) stays near the scale the arm runs at. The generated config
+#: deliberately declares no ``[timing]``
 #: section, so ``par6d --sim`` applies its relaxed loop-degradation bands
 #: and host load raises the self-clearing LOOP_DEGRADED warning instead of
 #: latching LOOP_CRITICAL. ``status_rate_hz`` must integer-divide the tick
 #: rate.
-TICK_DT_S = 0.05
+TICK_DT_S = 0.01
 STATUS_RATE_HZ = 20
 
 

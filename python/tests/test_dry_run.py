@@ -42,6 +42,24 @@ def park_deg() -> list[float]:
     return np.degrees(_cfg.homing_ready_pose_rad()).tolist()
 
 
+#: The record's row period: a config ticked at it records every tick. Its
+#: STATUS rate must divide the tick rate, which the suite's 20 Hz does not.
+_ROW_DT_S = 0.02
+_ROW_STATUS_HZ = 25
+
+
+def _row_rate_tick(toml: str) -> str:
+    """Re-tick the CI config at the record's row rate."""
+    for old, new in (
+        (f"tick_dt_s = {TICK_DT_S}", f"tick_dt_s = {_ROW_DT_S}"),
+        (f"status_rate_hz = {STATUS_RATE_HZ}", f"status_rate_hz = {_ROW_STATUS_HZ}"),
+    ):
+        if old not in toml:
+            raise RuntimeError(f"PAR6.toml patch point {old!r} missing")
+        toml = toml.replace(old, new)
+    return toml
+
+
 class _Block:
     """One command's motion, read off the commanded record.
 
@@ -229,15 +247,17 @@ class TestPlannedMotion:
         start = _cfg.homing_ready_pose_rad()
         # Long enough that speed, not the default half accel, bounds it.
         target = start + np.radians([60.0, -20.0, 30.0, 0.0, 40.0, 0.0])
-        # The CI tick is slower than the record's row rate, so every tick is
-        # a row and the velocity check reads per-tick steps rather than a
-        # stride's average, which would smear a fast tick across several.
+        # Ticked at the record's row rate, so every tick is a row and the
+        # velocity check reads per-tick steps rather than a stride's
+        # average, which would smear a fast tick across several.
         client = Robot().create_dry_run_client(
             initial_joints_deg=np.degrees(start).tolist(),
-            config_path=str(sim_config(tmp_path / "config")),
+            config_path=str(
+                sim_config(tmp_path / "config", config_patch=_row_rate_tick)
+            ),
         )
         dt = client._dt
-        assert dt == pytest.approx(TICK_DT_S)
+        assert dt == pytest.approx(_ROW_DT_S)
 
         for profile in DryRunProfiles.profiles():
             client.select_profile(profile)
@@ -1040,8 +1060,8 @@ _CHAIN_R_MM = 15.0
 _CASE_SPEED = 0.05
 
 #: The RT tick and STATUS rate this capture runs at.  The rest of the suite
-#: ticks at 20 Hz to keep CI light, which samples one of these paths a dozen
-#: times — too coarse for a millimetre comparison, since the polyline
+#: broadcasts at 20 Hz to keep CI light, which samples one of these paths a
+#: dozen times — too coarse for a millimetre comparison, since the polyline
 #: through those samples cuts every corner it spans.  The packaged config
 #: documents ``status_rate_hz`` as the knob to raise for capture work, so
 #: this test raises the tick and the broadcast together and reads one frame
