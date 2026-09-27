@@ -542,3 +542,65 @@ fn a_stop_brakes_along_the_path_within_the_acceleration_limit_then_holds() {
     assert_eq!(f.vel, Some(0), "held still");
     assert_eq!(f.pos, held.pos, "held in place");
 }
+
+/// A jog that preempts a program takes the RT out of EXEC while the
+/// program's stop is still braking. The brake never reaches the flush it
+/// ends in, so the jog's own end — a hold in EXEC — must not find the
+/// cancelled program still queued and play it back.
+#[test]
+fn a_jog_cutting_a_stop_short_leaves_nothing_for_the_hold_to_play() {
+    let mut rig = Rig::new();
+    enter_exec(&mut rig);
+    let q0 = rig.pose[0];
+    let step = 0.002;
+    let mut q = rig.pose;
+    for k in 0..2000 {
+        q[0] = q0 + step * (k + 1) as f64;
+        let mut qd = [0.0; MAX_JOINTS];
+        qd[0] = step / rig.dt;
+        let s = Sample {
+            q,
+            qd,
+            tau_ff: [0.0; MAX_JOINTS],
+            inertia_velocity: [0.0; MAX_JOINTS],
+            start: None,
+            meta: SampleMeta {
+                command_index: 1,
+                checkpoint_id: 1,
+                blend_continues: false,
+                is_last: k == 1999,
+            },
+        };
+        assert!(rig.producer.try_push(&s), "ring capacity");
+    }
+    for _ in 0..40 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    rig.producer.flush_marker().mark();
+    rig.send(RtCommand::ExecStop);
+    rig.handles.heartbeat.feed();
+    rig.tick();
+    assert!(rig.snap().exec.stopping, "the stop is braking");
+
+    // The jog's mode entry, as the daemon sends it, then its end.
+    rig.send(RtCommand::SetMode(Mode::Idle));
+    rig.send(RtCommand::SetMode(Mode::Jog));
+    rig.send(RtCommand::Hold);
+    for _ in 0..10 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    let s = rig.snap();
+    assert_eq!(s.mode, Mode::Exec, "the jog ends in the EXEC hold");
+    assert_eq!(
+        s.exec.samples_remaining, 0,
+        "the cancelled program is gone, not waiting for the hold to play it"
+    );
+    let held = rig.last_joints()[0];
+    for _ in 0..30 {
+        rig.handles.heartbeat.feed();
+        rig.tick();
+    }
+    assert_eq!(rig.last_joints()[0].pos, held.pos, "the hold holds");
+}

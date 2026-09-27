@@ -171,9 +171,11 @@ impl ExecPlayback {
         self.stopping
     }
 
-    /// Runs on the tick, so it only flips state: the end of the brake is
-    /// visible to the rest of the process as `ExecStatus::stopping`.
-    fn finish_stop(&mut self) {
+    /// End the brake and discard the program it was braking out of: on the
+    /// tick the brake reaches rest, or when EXEC is left before it does.
+    /// It only flips state; the end of the brake is visible to the rest of
+    /// the process as `ExecStatus::stopping`.
+    pub(crate) fn finish_stop(&mut self) {
         self.stopping = false;
         self.flush();
     }

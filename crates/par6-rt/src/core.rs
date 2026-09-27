@@ -1839,6 +1839,10 @@ impl<B: DriverBus> RtCore<B> {
                     self.gripper_settle.disarm();
                 }
             }
+            // A stop cut short still owes its flush: the samples it was
+            // braking out of belong to a cancelled program, which the next
+            // EXEC entry — the hold a jog or stream ends in — would play.
+            Mode::Exec if self.exec.is_stopping() => self.exec.finish_stop(),
             Mode::Stream => {
                 // Only the Stream arm drains the latest-wins slot, so a
                 // setpoint published in the tick this session ended would
