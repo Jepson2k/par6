@@ -93,15 +93,16 @@ class ElectricGripper(_ClientBound, ElectricGripperTool):
     async def stop(self, **kwargs: object) -> int:
         """Halt the jaws in place, effective immediately: the physical
         stop fires when the daemon admits the command, ahead of anything
-        still settling in the queue, and the runtime re-targets the
-        reported jaw position — which the firmware already satisfies, so
-        it holds there. Falls back to :meth:`release` when no command is
+        still queued — a tool action it catches running is cancelled, and
+        what is queued behind it stays queued — and the runtime re-targets
+        the reported jaw position, which the firmware already satisfies,
+        so it holds there. Falls back to :meth:`release` when no command is
         standing or the gripper is uncalibrated (a naive stop would drive
         fully open)."""
         return await self._cmd("stop")
 
     async def release(self, **kwargs: object) -> int:
-        """Drop the grip once the action in flight settles: the runtime
+        """Drop the grip at this command's turn in the queue: the runtime
         announces ``action = 0`` and falls back to the watchdog poll —
         limp on spectral-bldc, velocity-0 hold on stepfoc. The way to
         free the jaws for manual handling; for release-*now* mid-travel,

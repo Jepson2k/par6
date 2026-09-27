@@ -294,6 +294,50 @@ fn execution_controls_reach_the_simulated_runtime() {
         .unwrap();
     assert_eq!(held.stop, StopReason::BudgetExhausted);
     assert_eq!(held.commands[1].rows, 0);
+
+    // A tool action is queued like the move, so the pause holds it too:
+    // the jaws do not close under a paused program.
+    preview.set_gripper_calibrated(true);
+    let tool = par6_config::RobotConfig::load(&config)
+        .expect("config")
+        .robot
+        .active_gripper;
+    let held_tool = preview
+        .run(
+            &[
+                Command::Pause(Pause { on: true }),
+                Command::ToolAction(ToolAction {
+                    key: 9904,
+                    tool_key: tool,
+                    action: "move".into(),
+                    params: vec![
+                        ToolParam::Float(1.0),
+                        ToolParam::Float(0.5),
+                        ToolParam::Float(0.3),
+                    ],
+                }),
+            ],
+            RunLimits { max_seconds: 0.5 },
+        )
+        .unwrap();
+    assert_eq!(
+        held_tool.stop,
+        StopReason::BudgetExhausted,
+        "{:?}",
+        held_tool.commands
+    );
+    assert_eq!(held_tool.commands[1].rows, 0);
+    let jaw: Vec<f32> = held_tool
+        .tool_closed
+        .iter()
+        .copied()
+        .filter(|j| j.is_finite())
+        .collect();
+    assert!(!jaw.is_empty(), "the run never heard from the gripper");
+    assert!(
+        jaw.iter().all(|&j| j < 0.05),
+        "a paused program closed the jaws: {jaw:?}"
+    );
 }
 
 /// The simulated run against the planner it replaces.

@@ -235,6 +235,13 @@ fn chain_timing(
 }
 
 enum InFlightKind {
+    /// A queued tool action: nothing in the ring, the jaws' own settle
+    /// decides when it is done.
+    Tool {
+        /// The settle epoch read before the command was sent (see
+        /// [`tool_settle`]).
+        epoch_at_send: u32,
+    },
     Exec {
         ring_index: u32,
         samples: Vec<RingSample>,
@@ -257,13 +264,11 @@ struct InFlight {
     kind: InFlightKind,
 }
 
-/// The tool action on the side channel. It owns no ring samples and no
-/// planner state, which is what lets it run beside a motion.
-struct ToolInFlight {
+/// The tool `stop` in flight, outside the queue.
+struct ToolStopInFlight {
     server_index: u64,
-    /// The settle epoch read before the command was sent. The RT bumps
-    /// it when it arms, so a verdict still carrying this value belongs
-    /// to the PREVIOUS action, not to ours.
+    /// The settle epoch read before the stop was sent (see
+    /// [`tool_settle`]).
     epoch_at_send: u32,
 }
 
@@ -305,7 +310,7 @@ pub(crate) struct Par6Planner {
     profile: Profile,
     tool: Option<ToolSpec>,
     inflight: Option<InFlight>,
-    tool_inflight: Option<ToolInFlight>,
+    tool_stop: Option<ToolStopInFlight>,
     enablement: Enablement,
     /// Latched near-singularity warning for the cart path in flight
     /// (vendor thresholds; STATUS `warnings` carries it).
@@ -388,7 +393,7 @@ impl Par6Planner {
             profile: Profile::default(),
             tool,
             inflight: None,
-            tool_inflight: None,
+            tool_stop: None,
             // Nothing measured yet, and the wire has no "unknown": claim
             // no freedom until the first probe runs (the next poll).
             enablement: NO_FREEDOM,
@@ -1638,6 +1643,12 @@ impl Par6Planner {
             | Command::SetTcpOffset(_)
             | Command::SetTcpTransform(_)
             | Command::WriteIo(_) => InFlightKind::Instant,
+            Command::ToolAction(p) => {
+                let snap = self.snapshots.latest();
+                InFlightKind::Tool {
+                    epoch_at_send: self.start_tool_action(&snap, p)?,
+                }
+            }
             Command::MoveJPose(p) => self.start_move_j_pose(p)?,
             Command::MoveL(p) => self.start_move_l(p)?,
             Command::MoveC(p) => self.start_move_c(p)?,
@@ -1664,12 +1675,10 @@ impl Par6Planner {
     /// corner (positive blend radius) AND the next queued command is a
     /// move of the SAME family — straight cartesian moves round corners
     /// against straight cartesian moves, joint moves against joint
-    /// moves. Anything else (an arc, a delay, a move with no radius)
-    /// ends the chain: the arm stops at that target, which is exactly
-    /// what "no blend radius" asks for. A tool action cannot end one —
-    /// it runs on the side channel and never joins the queue, so a
-    /// gripper command between two blended moves no longer breaks the
-    /// corner it had no reason to break.
+    /// moves. Anything else (an arc, a delay, a tool action, a move with
+    /// no radius) ends the chain: the arm stops at that target, which is
+    /// exactly what "no blend radius" asks for — and what a gripper
+    /// command between two moves needs, since the jaws act at the corner.
     ///
     /// A positive radius on the LAST move of a chain has nothing to
     /// round — there is no following segment — so that move stops at its
@@ -1738,6 +1747,7 @@ impl Par6Planner {
             return Some(Err(rt_error(snap)));
         }
         match &mut fl.kind {
+            InFlightKind::Tool { epoch_at_send } => tool_settle(snap, *epoch_at_send),
             InFlightKind::Exec {
                 ring_index,
                 seen_exec,
@@ -2313,7 +2323,19 @@ impl Planner for Par6Planner {
                 })
             }
             Some(Err(e)) => {
-                self.discard_planned();
+                // A tool action put nothing in the ring: a failed grip must
+                // not brake an arm that is holding still under it.
+                if matches!(
+                    self.inflight,
+                    Some(InFlight {
+                        kind: InFlightKind::Tool { .. },
+                        ..
+                    })
+                ) {
+                    self.inflight = None;
+                } else {
+                    self.discard_planned();
+                }
                 self.near_singularity = None;
                 Some(CommandOutcome {
                     index,
@@ -2324,13 +2346,26 @@ impl Planner for Par6Planner {
         }
     }
 
-    fn cancel(&mut self) {
-        // Only this planner's own state. The RT half of a cancellation —
-        // braking the program and flushing the ring — is the server's
-        // `RtCommands::discard_exec`, because it has to be
+    fn cancel(&mut self, halt_tool: bool) {
+        // Only this planner's own state — and the jaws. The RT half of a
+        // cancelled motion — braking the program and flushing the ring —
+        // is the server's `RtCommands::discard_exec`, because it has to be
         // ordered against the stream that may be replacing this motion,
         // and an answer arriving from another thread cannot be.
-        self.inflight = None;
+        let inflight = self.inflight.take();
+        if halt_tool
+            && matches!(
+                inflight,
+                Some(InFlight {
+                    kind: InFlightKind::Tool { .. },
+                    ..
+                })
+            )
+        {
+            // Halt in place rather than release: a cancellation must never
+            // drop whatever the jaws are holding.
+            self.link.send(RtCommand::GripperStop);
+        }
         self.near_singularity = None;
     }
 
@@ -2339,61 +2374,41 @@ impl Planner for Par6Planner {
         index: u64,
         cmd: &par6_proto::command::ToolAction,
     ) -> Result<(), WireError> {
+        if cmd.action != "stop" {
+            return Err(make_error(
+                ErrorCode::CommValidationError,
+                UNATTRIBUTED,
+                &[(
+                    "detail",
+                    &format!("only `stop` runs ahead of the queue, not '{}'", cmd.action),
+                )],
+            ));
+        }
         let snap = self.snapshots.latest();
         let epoch_at_send = self.start_tool_action(&snap, cmd)?;
-        self.tool_inflight = Some(ToolInFlight {
+        self.tool_stop = Some(ToolStopInFlight {
             server_index: index,
             epoch_at_send,
         });
         Ok(())
     }
 
-    /// Read the RT's settle verdict for the tool action in flight.
+    /// Read the RT's settle verdict for the tool stop in flight.
     ///
-    /// Deliberately narrow: it touches `tool_inflight` and nothing else.
-    /// The motion lane's failure path flushes the sample ring and forces
-    /// IDLE, and reaching it from here would stop an arm move because a
-    /// gripper faulted.
+    /// Deliberately narrow: it touches `tool_stop` and nothing else. The
+    /// queue's failure path flushes the sample ring and forces IDLE, and
+    /// reaching it from here would stop an arm move because a gripper
+    /// faulted.
     fn poll_tool(&mut self) -> Option<CommandOutcome> {
-        let fl = self.tool_inflight.as_ref()?;
+        let fl = self.tool_stop.as_ref()?;
         let snap = self.snapshots.latest();
-        if snap.tool.epoch == fl.epoch_at_send {
-            return None; // the RT has not armed it yet
-        }
+        let outcome = tool_settle(&snap, fl.epoch_at_send)?;
         let index = fl.server_index;
-        let (error, verdict) = match snap.tool.verdict {
-            ToolSettle::Running => return None,
-            ToolSettle::Done => (None, None),
-            ToolSettle::Settled(od) => (None, Some(od as u8)),
-            ToolSettle::Timeout(w) => (
-                Some(make_error(
-                    ErrorCode::MotnToolTimeout,
-                    UNATTRIBUTED,
-                    &[("state", w.as_str())],
-                )),
-                None,
-            ),
-            ToolSettle::Fault(bits) => (
-                Some(make_error(
-                    ErrorCode::MotnToolFault,
-                    UNATTRIBUTED,
-                    &[("fault_code", &bits.to_string())],
-                )),
-                None,
-            ),
-            // Another owner (homing, a flashing window) took the tool
-            // and released it on our behalf. Nothing is left to
-            // complete, and waiting would hang the client.
-            ToolSettle::Unarmed => (
-                Some(make_error(
-                    ErrorCode::MotnCancelled,
-                    UNATTRIBUTED,
-                    &[("scope", "the tool changed owner")],
-                )),
-                None,
-            ),
+        self.tool_stop = None;
+        let (error, verdict) = match outcome {
+            Ok(verdict) => (None, verdict),
+            Err(error) => (Some(error), None),
         };
-        self.tool_inflight = None;
         Some(CommandOutcome {
             index,
             error,
@@ -2401,12 +2416,8 @@ impl Planner for Par6Planner {
         })
     }
 
-    fn cancel_tool(&mut self, halt: bool) {
-        if self.tool_inflight.take().is_some() && halt {
-            // Halt in place rather than release: a stop must never drop
-            // whatever the jaws are holding.
-            self.link.send(RtCommand::GripperStop);
-        }
+    fn cancel_tool(&mut self) {
+        self.tool_stop = None;
     }
 
     fn warnings(&self) -> Vec<WireError> {
@@ -2682,6 +2693,43 @@ fn planning_error(e: MotionError) -> WireError {
         _ => ErrorCode::MotnSetupFailed,
     };
     make_error(code, UNATTRIBUTED, &[("detail", &e.to_string())])
+}
+
+/// The jaws' verdict on the action armed after `epoch_at_send` was
+/// read; `None` while they are still working.
+///
+/// The RT bumps the epoch when it arms, so a verdict still carrying the
+/// value read before the send belongs to the PREVIOUS action. Whether an
+/// action finished is decided against the reply stream at the tick rate
+/// (see `par6_rt::gripper_settle`), because every window in that decision
+/// counts replies and the planner polls at its own unrelated cadence.
+fn tool_settle(snap: &StateSnapshot, epoch_at_send: u32) -> Option<Result<Option<u8>, WireError>> {
+    if snap.tool.epoch == epoch_at_send {
+        return None;
+    }
+    match snap.tool.verdict {
+        ToolSettle::Running => None,
+        ToolSettle::Done => Some(Ok(None)),
+        ToolSettle::Settled(od) => Some(Ok(Some(od as u8))),
+        ToolSettle::Timeout(w) => Some(Err(make_error(
+            ErrorCode::MotnToolTimeout,
+            UNATTRIBUTED,
+            &[("state", w.as_str())],
+        ))),
+        ToolSettle::Fault(bits) => Some(Err(make_error(
+            ErrorCode::MotnToolFault,
+            UNATTRIBUTED,
+            &[("fault_code", &bits.to_string())],
+        ))),
+        // Another owner (homing, a flashing window) took the tool and
+        // released it on our behalf. Nothing is left to complete, and
+        // waiting would hang the client.
+        ToolSettle::Unarmed => Some(Err(make_error(
+            ErrorCode::MotnCancelled,
+            UNATTRIBUTED,
+            &[("scope", "the tool changed owner")],
+        ))),
+    }
 }
 
 /// The RT error latch as the failure of the command that was in flight.

@@ -612,10 +612,10 @@ class RobotClient:
         action: str,
         params: list[Any] | None = None,
         *,
-        wait: bool = True,
+        wait: bool = False,
         timeout: float = 10.0,
     ) -> int:
-        """Invoke a tool-specific action by key (blocking by default)."""
+        """Invoke a tool-specific action by key."""
         return _run(
             self._inner.tool_action(
                 tool_key, action, params, wait=wait, timeout=timeout

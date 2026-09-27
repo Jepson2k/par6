@@ -155,15 +155,12 @@ struct Executing {
     blended: Vec<usize>,
 }
 
-/// Whether a command is a tool action.
-///
-/// The planner runs tool actions on a side channel rather than in the
-/// motion queue — they drive the tool's own actuator and never write a
-/// joint slot — so a run has to dispatch them the way the server does or
-/// the planner refuses them as "not a queued command".
-fn tool_action(cmd: &Command) -> Option<&par6_proto::command::ToolAction> {
+/// The tool `stop` verb, which the server runs ahead of the queue rather
+/// than in it — it holds under neither a pause nor a zero speed — so a
+/// run dispatches it the way the server does.
+fn tool_stop(cmd: &Command) -> Option<&par6_proto::command::ToolAction> {
     match cmd {
-        Command::ToolAction(p) => Some(p),
+        Command::ToolAction(p) if p.action == "stop" => Some(p),
         _ => None,
     }
 }
@@ -435,11 +432,10 @@ impl Preview {
                     next = cmds.len();
                     break;
                 }
-                if driver.snapshot().exec.target_scale == 0.0 && tool_action(&cmds[next]).is_none()
-                {
+                if driver.snapshot().exec.target_scale == 0.0 && tool_stop(&cmds[next]).is_none() {
                     break;
                 }
-                if let Some(action) = tool_action(&cmds[next]) {
+                if let Some(action) = tool_stop(&cmds[next]) {
                     match planner.start_tool(queue_index, action) {
                         Err(error) => {
                             spans[next] = (start_row, 0, Some(error));
@@ -460,15 +456,14 @@ impl Preview {
                     next += 1;
                     continue;
                 }
-                // A tool action ends the blend lookahead: it is not the
-                // motion lane's to start, so it must not be counted
-                // among the commands this motion covers.
+                // A tool stop ends the lookahead: live it never reaches
+                // the queue the planner is offered.
                 let batch: Vec<QueuedCommand<'_>> = cmds[next..]
                     .iter()
                     .enumerate()
                     .take_while(|(k, c)| {
                         *k == 0
-                            || (tool_action(c).is_none()
+                            || (tool_stop(c).is_none()
                                 && command_class(c.tag()) == CommandClass::Queued
                                 && !matches!(
                                     c,
@@ -513,10 +508,8 @@ impl Preview {
             let (snap, bus) = driver.observe();
             rec.tick(snap, bus);
 
-            // ---- collect: the planner reports the in-flight outcome.
-            // The tool side channel drains first, exactly as the server
-            // drains it, so an action that settles on this tick is
-            // reported on this tick rather than behind a motion.
+            // ---- collect: the planner reports the in-flight outcome —
+            // the queued command's, or a tool stop's.
             for out in [planner.poll_tool(), planner.poll()].into_iter().flatten() {
                 let Some(ex) = &executing else {
                     continue;

@@ -7,19 +7,20 @@
 //! - The index allocator is monotonic and NEVER reset — not even by
 //!   `reset_state` — so a stale pre-reset status frame can never satisfy
 //!   a post-reset wait.
-//! - There are TWO execution lanes and ONE index sequence. Motion runs
-//!   from the queue; a tool action runs beside it, because the tool
-//!   drives its own actuator and never writes a joint slot, so
-//!   serialising the two bought nothing and cost the overlap that makes
-//!   a pick cycle quick. Both draw from the same allocator, so ordering
-//!   across them is still one number — which is why `completed_index`
+//! - Tool actions are queued commands: `move_l(A); close; move_l(B)` is
+//!   a pick, and it only works if the jaws close after the arm arrives
+//!   and the arm leaves after they have closed. A tool action therefore
+//!   waits, fails and is cancelled exactly like planned motion, and no
+//!   blend chain reaches across one. A cancelled tool action is halted
+//!   in place rather than released, so no cancellation drops what the
+//!   jaws are holding.
+//! - The one exception is the tool `stop` verb, which halts the jaws
+//!   AHEAD of anything still queued: it cancels the tool action running
+//!   (the queue behind it is kept) and completes once the jaws are
+//!   still. It draws its index from the same allocator, so it can finish
+//!   ahead of a lower queued index — which is why `completed_index`
 //!   advances contiguously rather than by maximum (see
-//!   `advance_completed`): a tool action finishing first must not
-//!   declare a still-running move done.
-//! - A hard stop takes both lanes; a streamable takes only the motion
-//!   lane, since cancelling planned motion is no reason to abandon a
-//!   grip. The tool is halted in place rather than released, so a
-//!   protective stop never drops what the jaws are holding.
+//!   `advance_completed`).
 //! - Gating rejections always answer with ERROR (echoed `req_id`),
 //!   including FIRE_AND_FORGET commands whose success stays unacked. A
 //!   refused fire-and-forget additionally latches as the standing error
@@ -204,19 +205,18 @@ enum PostEffect {
 /// with a default.
 const FIRST_COMMAND_INDEX: u64 = 1;
 
-/// The tool action on the side channel. It carries the same
-/// bookkeeping as a motion — index, replier, name for STATUS — but no
-/// blend set, because a tool action is never folded into a motion.
-struct ToolExecuting {
+/// A tool `stop` waiting for the jaws to come to rest.
+struct ToolStop {
     index: u64,
     addr: SocketAddr,
-    params: String,
+    /// The `start_tool` answer it is waiting on, until that arrives.
+    tag: Option<ReplyTag>,
 }
 
 struct Executing {
     index: u64,
     addr: SocketAddr,
-    name: &'static str,
+    tag: CmdType,
     params: String,
     effect: PostEffect,
     /// Commands the planner blended into this motion, in queue order
@@ -334,16 +334,15 @@ struct Core<R: RtCommands> {
     /// SET_SHAPES / reset_state clients parked on the planner's verdict,
     /// with the set they are waiting to have applied.
     pending_shapes: HashMap<ReplyTag, (u32, SocketAddr, Vec<Shape>)>,
-    /// Tool actions parked on `start_tool`'s verdict. Already acked, so
-    /// what waits on the answer is whether they execute or complete.
-    pending_tool: HashMap<ReplyTag, ToolExecuting>,
+    /// Tool stops in flight, oldest first. The planner holds one: a later
+    /// stop re-arms the same wait, so the verdict it reports answers
+    /// every stop still waiting ahead of it too.
+    tool_stops: Vec<ToolStop>,
     accepted_index: i64,
-    tool_executing: Option<ToolExecuting>,
     completed_index: i64,
-    /// Indexes that finished ahead of `completed_index`. With one
-    /// execution lane this is always empty — commands finish in queue
-    /// order — but a tool action runs beside the motion queue and can
-    /// finish while a lower motion index is still executing.
+    /// Indexes that finished ahead of `completed_index`: a tool stop
+    /// skips the queue, so it can finish while a lower queued index is
+    /// still waiting or executing.
     finished: BTreeSet<u64>,
     /// The last COMPLETE pushes, oldest first, for COMMAND_COMPLETION: a
     /// client whose push went missing asks here instead of guessing.
@@ -464,9 +463,8 @@ impl<R: RtCommands> Core<R> {
             blend_hold: None,
             planning: None,
             pending_shapes: HashMap::new(),
-            pending_tool: HashMap::new(),
+            tool_stops: Vec::new(),
             accepted_index: -1,
-            tool_executing: None,
             completed_index: -1,
             finished: BTreeSet::new(),
             completion_log: VecDeque::with_capacity(par6_proto::COMPLETIONS_KEPT),
@@ -875,9 +873,13 @@ impl<R: RtCommands> Core<R> {
         !self.motion_in_flight() && resting
     }
 
-    /// A command executing, queued behind it, or streaming.
+    /// A command executing, queued behind it, streaming, or a tool stop
+    /// still bringing the jaws to rest.
     fn motion_in_flight(&self) -> bool {
-        self.executing.is_some() || !self.pending.is_empty() || self.active_stream.is_some()
+        self.executing.is_some()
+            || !self.pending.is_empty()
+            || self.active_stream.is_some()
+            || !self.tool_stops.is_empty()
     }
 
     /// Commissioning commands rename or rewrite a drive: refused while
@@ -1021,7 +1023,9 @@ impl<R: RtCommands> Core<R> {
                         self.runtime.rt.cancel_stream();
                         self.drain_stream_backlog(superseded);
                     }
-                    self.cancel_planned("a teleport").await;
+                    // A teleport that places the jaws re-aims them itself.
+                    self.cancel_planned("a teleport", p.tool_positions.is_none())
+                        .await;
                     self.runtime
                         .rt
                         .teleport(&p.angles, p.tool_positions.as_deref());
@@ -1341,7 +1345,7 @@ impl<R: RtCommands> Core<R> {
                 // The setpoint reaches the RT before the cancellations
                 // are spoken: an escape jog must not wait behind a
                 // queue's worth of COMPLETE writes.
-                let dropped = self.drop_planned();
+                let dropped = self.drop_planned(true);
                 let outcome = self.runtime.rt.stream(&cmd);
                 if outcome.is_ok() {
                     self.active_stream = Some(tag);
@@ -1397,7 +1401,11 @@ impl<R: RtCommands> Core<R> {
             self.reply(addr, &Reply::Error { req_id, error }).await;
             return;
         }
-        if self.pending.len() >= self.cfg.queue_capacity {
+        let tool_stop = match &cmd {
+            Command::ToolAction(p) if p.action == "stop" => Some(p.clone()),
+            _ => None,
+        };
+        if tool_stop.is_none() && self.pending.len() >= self.cfg.queue_capacity {
             let error = make_error(
                 ErrorCode::CommQueueFull,
                 UNATTRIBUTED,
@@ -1421,18 +1429,7 @@ impl<R: RtCommands> Core<R> {
             params_summary(&cmd)
         );
         self.on_motion_accepted();
-        if self.active_stream.take().is_some() {
-            // A planned move cancels streaming.
-            self.runtime.rt.cancel_stream();
-        }
-        if let Command::ToolAction(p) = &cmd {
-            // A tool action drives the tool's own actuator and never
-            // writes a joint slot, so it runs beside the motion queue
-            // rather than in it — that is what lets a gripper open
-            // during an approach move. It still takes its index from
-            // the same sequence, so ordering across both lanes is one
-            // number.
-            let params = params_summary(&cmd);
+        if let Some(stop) = tool_stop {
             self.reply(
                 addr,
                 &Reply::Ok {
@@ -1441,8 +1438,12 @@ impl<R: RtCommands> Core<R> {
                 },
             )
             .await;
-            self.start_tool_action(index, addr, params, p.clone()).await;
+            self.start_tool_stop(index, addr, stop).await;
             return;
+        }
+        if self.active_stream.take().is_some() {
+            // A planned move cancels streaming.
+            self.runtime.rt.cancel_stream();
         }
         self.pending.push_back(Pending { index, cmd, addr });
         self.reply(
@@ -1456,104 +1457,82 @@ impl<R: RtCommands> Core<R> {
         self.pump().await;
     }
 
-    /// Put a tool action on the side channel, completing whatever it
-    /// supersedes first.
-    async fn start_tool_action(
+    /// A tool `stop` halts the jaws now, not at its turn in the queue: the
+    /// tool action running (or about to) is cancelled and halted, and the
+    /// stop completes once the jaws are still. The queue behind is kept.
+    async fn start_tool_stop(
         &mut self,
         index: u64,
         addr: SocketAddr,
-        params: String,
         cmd: par6_proto::command::ToolAction,
     ) {
-        // Depth one, as the reference runtime has it. The superseded
-        // action was acked and something may be waiting on it, so it is
-        // completed rather than dropped in silence.
-        //
-        // BOTH states count. An action that has been sent to the planner
-        // but not yet confirmed sits in `pending_tool`, not
-        // `tool_executing` — so a second action arriving inside that round
-        // trip used to find nothing to supersede, and both would land under
-        // different tags. `on_tool_started` then overwrote `tool_executing`
-        // with whichever answered last, and the first was never completed:
-        // its client waited out its timeout on an action the server had
-        // silently forgotten.
-        let superseded: Vec<ToolExecuting> = self
-            .pending_tool
-            .drain()
-            .map(|(_, ex)| ex)
-            .chain(self.tool_executing.take())
-            .collect();
-        for prev in superseded {
-            let error = make_error(
-                ErrorCode::MotnCancelled,
-                prev.index as i64,
-                &[("scope", "a superseding tool action")],
-            );
-            self.advance_completed(prev.index);
-            self.push_complete(prev.addr, prev.index, Some(error), None)
-                .await;
-        }
+        let dropped = self.drop_active_tool_action();
+        self.complete_cancelled("a tool stop", dropped).await;
         let tag = self.runtime.planner.next_tag();
-        self.pending_tool.insert(
-            tag,
-            ToolExecuting {
-                index,
-                addr,
-                params,
-            },
-        );
+        self.tool_stops.push(ToolStop {
+            index,
+            addr,
+            tag: Some(tag),
+        });
         self.runtime
             .planner
             .send(PlanRequest::StartTool { tag, index, cmd });
     }
 
-    /// The planner answered `start_tool`.
+    /// The planner answered `start_tool`. A refused stop never reached
+    /// the jaws, and it is not in the queue, so it fails alone.
     async fn on_tool_started(&mut self, tag: ReplyTag, result: Result<(), WireError>) {
-        let Some(ex) = self.pending_tool.remove(&tag) else {
+        let Some(at) = self.tool_stops.iter().position(|t| t.tag == Some(tag)) else {
             return;
         };
         match result {
-            Ok(()) => self.tool_executing = Some(ex),
-            // A refused verb never touched the tool and never touched
-            // motion, so unlike a failed motion it must not clear the
-            // queue standing behind it.
-            Err(mut error) => {
-                error.command_index = ex.index as i64;
-                self.standing_error = Some(error.clone());
-                self.action_state = ActionState::Error;
-                self.advance_completed(ex.index);
-                self.push_complete(ex.addr, ex.index, Some(error), None)
-                    .await;
+            Ok(()) => self.tool_stops[at].tag = None,
+            Err(error) => {
+                let stop = self.tool_stops.remove(at);
+                self.finish_tool_stop(stop, Some(error), None).await;
+                self.pump().await;
             }
         }
     }
 
-    /// Report a finished tool action.
-    ///
-    /// The two lanes are polled in one planner pass and arrive as two
-    /// events, the motion outcome first. That order does not matter here
-    /// the way it did when both were drained inline: the side channel
-    /// shares no state with the motion lane, and a tool outcome is spoken
-    /// to its own client the moment its event is routed.
+    /// The jaws came to rest (or could not). The stop the planner reports
+    /// answers every stop still waiting ahead of it as well: each later
+    /// stop re-armed the same wait.
     async fn on_tool_outcome(&mut self, out: CommandOutcome) {
-        let Some(ex) = &self.tool_executing else {
-            return; // outcome of a cancelled action
+        let Some(at) = self
+            .tool_stops
+            .iter()
+            .position(|t| t.index == out.index && t.tag.is_none())
+        else {
+            return; // stale: the stop was cancelled
         };
-        if ex.index != out.index {
-            return; // stale
+        let answered: Vec<ToolStop> = self.tool_stops.drain(..=at).collect();
+        for stop in answered {
+            self.finish_tool_stop(stop, out.error.clone(), out.verdict)
+                .await;
         }
-        let ex = self.tool_executing.take().expect("checked above");
-        if let Some(mut error) = out.error {
-            error.command_index = ex.index as i64;
-            self.standing_error = Some(error.clone());
-            self.action_state = ActionState::Error;
-            self.advance_completed(ex.index);
-            self.push_complete(ex.addr, ex.index, Some(error), None)
-                .await;
-        } else {
-            self.advance_completed(ex.index);
-            self.push_complete(ex.addr, ex.index, None, out.verdict)
-                .await;
+        self.pump().await;
+    }
+
+    async fn finish_tool_stop(
+        &mut self,
+        stop: ToolStop,
+        error: Option<WireError>,
+        verdict: Option<u8>,
+    ) {
+        self.advance_completed(stop.index);
+        match error {
+            Some(mut error) => {
+                error.command_index = stop.index as i64;
+                self.standing_error = Some(error.clone());
+                self.action_state = ActionState::Error;
+                self.push_complete(stop.addr, stop.index, Some(error), None)
+                    .await;
+            }
+            None => {
+                self.push_complete(stop.addr, stop.index, None, verdict)
+                    .await
+            }
         }
     }
 
@@ -1565,10 +1544,10 @@ impl<R: RtCommands> Core<R> {
     /// `completed_index` means "everything up to here is done", and a
     /// client's `wait_command` falls back to it when a COMPLETE
     /// datagram is lost. Taking a plain maximum keeps that promise only
-    /// while commands finish in order; with a tool action running
-    /// beside the queue, a tool index completing first would declare a
-    /// still-executing motion done. Each COMPLETE still goes out the
-    /// moment its own command finishes — only the aggregate waits.
+    /// while commands finish in order; a tool stop skips the queue, and
+    /// its index completing first would declare a still-queued command
+    /// done. Each COMPLETE still goes out the moment its own command
+    /// finishes — only the aggregate waits.
     fn advance_completed(&mut self, index: u64) {
         self.finished.insert(index);
         // Indexes are allocated from 1; -1 is the "nothing has finished"
@@ -1633,6 +1612,11 @@ impl<R: RtCommands> Core<R> {
             self.blend_hold = None;
             return;
         };
+        // The jaws belong to the stop until they are still; a tool action
+        // started now would be halted by it.
+        if matches!(head.cmd, Command::ToolAction(_)) && !self.tool_stops.is_empty() {
+            return;
+        }
         // The head waits for an enabled arm only if its gate says so:
         // configuration queued for ordering (a TCP offset) lands on a
         // disabled arm, exactly as it did when it was immediate.
@@ -1719,7 +1703,7 @@ impl<R: RtCommands> Core<R> {
         self.executing = Some(Executing {
             index: pc.index,
             addr: pc.addr,
-            name: cmd_name(pc.cmd.tag()),
+            tag: pc.cmd.tag(),
             params: params_summary(&pc.cmd),
             effect: post_effect(&pc.cmd),
             blended,
@@ -1916,16 +1900,18 @@ impl<R: RtCommands> Core<R> {
     /// pending queue is untouched. Speaks for nothing — the `cancel_*`
     /// wrappers pair the drop with its COMPLETE, and the one caller that
     /// must hand the RT a setpoint in between speaks explicitly.
+    ///
+    /// Jaws still travelling are motion too: a tool action running is
+    /// halted in place — dropping a grasped part is a worse answer to a
+    /// protective stop than holding it — and a tool stop still settling
+    /// is answered here rather than left to a verdict the stop may cut
+    /// short.
     fn drop_active_motion(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.runtime.planner.send(PlanRequest::Cancel);
+        self.runtime
+            .planner
+            .send(PlanRequest::Cancel { halt_tool: true });
         let mut dropped = self.drop_active();
-        // The tool goes with it. `stop` means halt motion, and jaws
-        // still travelling are motion — `halt()` below never reached
-        // them, so a stop used to report the action cancelled while the
-        // gripper carried on closing. The tool is halted in place, not
-        // released: dropping a grasped part is a worse answer to a
-        // protective stop than holding it.
-        dropped.extend(self.drop_tool_action(true));
+        dropped.extend(self.drop_tool_stops());
         if self.active_stream.take().is_some() {
             self.runtime.rt.cancel_stream();
         }
@@ -1933,34 +1919,50 @@ impl<R: RtCommands> Core<R> {
         dropped
     }
 
-    /// Take the tool action off the side channel so the caller can speak
-    /// its cancellation. `halt` asks the tool to stop where it is.
-    ///
-    /// An action still inside the `StartTool` round trip is parked in
-    /// `pending_tool`, and the `CancelTool` above reaches the planner
-    /// either way — so taking only `tool_executing` cancelled the parked
-    /// action on the planner while the server went on believing it was
-    /// live, and its client waited out a timeout on a COMPLETE nobody
-    /// was left to speak.
-    ///
-    /// Deliberately absent from [`Self::cancel_planned`]: a jog or servo
-    /// arriving cancels planned motion, but a gripper closing under it
-    /// is exactly the overlap the side channel exists to allow.
-    fn drop_tool_action(&mut self, halt: bool) -> Vec<(u64, SocketAddr)> {
-        self.runtime.planner.send(PlanRequest::CancelTool { halt });
-        self.pending_tool
-            .drain()
-            .map(|(_, ex)| ex)
-            .chain(self.tool_executing.take())
+    /// Abandon the tool stops still waiting for the jaws to settle.
+    fn drop_tool_stops(&mut self) -> Vec<(u64, SocketAddr)> {
+        if self.tool_stops.is_empty() {
+            return Vec::new();
+        }
+        self.runtime.planner.send(PlanRequest::CancelTool);
+        self.tool_stops
+            .drain(..)
             .map(|t| (t.index, t.addr))
             .collect()
     }
 
-    /// A streamable arrived: planned motion (active AND pending) is
-    /// dropped — the queued program must not resume from wherever a
-    /// manual jog left the arm.
-    fn drop_planned(&mut self) -> Vec<(u64, SocketAddr)> {
-        self.runtime.planner.send(PlanRequest::Cancel);
+    /// The tool action the queue is running or starting — what a tool
+    /// stop cancels. It put nothing in the sample ring, so the RT's
+    /// motion is left alone.
+    fn drop_active_tool_action(&mut self) -> Vec<(u64, SocketAddr)> {
+        let mut dropped = Vec::new();
+        if let Some(ex) = self.executing.take_if(|ex| ex.tag == CmdType::ToolAction) {
+            self.action_state = ActionState::Idle;
+            dropped.push((ex.index, ex.addr));
+            dropped.extend(ex.blended);
+        } else if let Some(index) = self.planning {
+            if let Some(p) = self
+                .pending
+                .pop_front_if(|p| p.index == index && matches!(p.cmd, Command::ToolAction(_)))
+            {
+                self.planning = None;
+                dropped.push((p.index, p.addr));
+            }
+        }
+        if !dropped.is_empty() {
+            self.runtime
+                .planner
+                .send(PlanRequest::Cancel { halt_tool: true });
+        }
+        dropped
+    }
+
+    /// Planned motion (active AND pending) is dropped — the queued program
+    /// must not resume from wherever a jog or a teleport left the arm.
+    /// `halt_tool` is false only when the caller re-aims the jaws itself:
+    /// a halt landing after that would drive them back.
+    fn drop_planned(&mut self, halt_tool: bool) -> Vec<(u64, SocketAddr)> {
+        self.runtime.planner.send(PlanRequest::Cancel { halt_tool });
         let mut dropped = self.drop_active();
         dropped.extend(self.drop_pending());
         dropped
@@ -1991,10 +1993,10 @@ impl<R: RtCommands> Core<R> {
         self.complete_cancelled(scope, dropped).await
     }
 
-    /// Cancel planned motion (active and pending) ahead of a stream,
-    /// speaking each one's COMPLETE.
-    async fn cancel_planned(&mut self, scope: &'static str) -> usize {
-        let dropped = self.drop_planned();
+    /// Cancel planned motion (active and pending), speaking each one's
+    /// COMPLETE. See [`Self::drop_planned`] for `halt_tool`.
+    async fn cancel_planned(&mut self, scope: &'static str, halt_tool: bool) -> usize {
+        let dropped = self.drop_planned(halt_tool);
         self.complete_cancelled(scope, dropped).await
     }
 
@@ -2422,21 +2424,12 @@ impl<R: RtCommands> Core<R> {
     fn action_fields(&self) -> (String, ActionState, String) {
         if let Some(ex) = &self.executing {
             (
-                ex.name.to_owned(),
+                cmd_name(ex.tag).to_owned(),
                 ActionState::Executing,
                 ex.params.clone(),
             )
         } else if let Some(name) = self.stream_shown() {
             (name.to_owned(), ActionState::Executing, String::new())
-        } else if let Some(tool) = &self.tool_executing {
-            // The side channel shows only when the motion lane is idle:
-            // an operator watching a program wants to see the move, and
-            // a jaw action running under it is the tool status's job.
-            (
-                cmd_name(CmdType::ToolAction).to_owned(),
-                ActionState::Executing,
-                tool.params.clone(),
-            )
         } else if self.effective_error().is_some() {
             // Nothing is running and an error stands: the action state is
             // the error, whether a command earned it or the RT latched it.

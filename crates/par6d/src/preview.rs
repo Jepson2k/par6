@@ -1514,14 +1514,20 @@ impl Preview {
                 rest = &rest[1..];
                 continue;
             }
-            // A tool action never enters the motion queue — it runs on
-            // the planner's own side channel — so it is offered there
-            // instead of to the batch, and it never joins a blend chain.
+            // A tool action is planned alone — no blend chain reaches
+            // across one — and the jaws' travel is drawn here, not planned.
             if let Command::ToolAction(action) = &rest[0] {
                 let action = action.clone();
-                results.push(self.preview_tool_action(&action));
+                let result = self.preview_tool_action(&action);
+                let refused = result.error.is_some() && action.action != "stop";
+                results.push(result);
                 self.next_index += 1;
                 rest = &rest[1..];
+                if refused {
+                    // A failed tool action fails the queue behind it, as a
+                    // refused move does below.
+                    break;
+                }
                 continue;
             }
             // Only offer the leading run of wire-valid commands: a later
@@ -1591,7 +1597,7 @@ impl Preview {
                 PlannedMotion::Hold(ticks) => (Vec::new(), ticks as f64 * self.dt),
                 PlannedMotion::Still => (Vec::new(), 0.0),
             };
-        self.planner.cancel();
+        self.planner.cancel(false);
         self.note_effects(head);
         let moved = !trajectory.is_empty();
         let mut result = self.advance(trajectory, duration_s);
@@ -1628,20 +1634,33 @@ impl Preview {
         result
     }
 
-    /// One tool action through the planner's tool lane — the same
-    /// admission the live daemon runs, so an unsupported verb, a missing
-    /// driver or an uncalibrated jaw move previews as the refusal the
-    /// arm would answer with. The arm holds still for as long as the
-    /// runtime waits on the jaws: a calibration's minimum wait, or a
-    /// move's travel at the firmware's constant byte rate, never less
-    /// than the grace the runtime gives a reply — with the jaws drawn on
-    /// their way.
+    /// One tool action through the planner — the same admission the live
+    /// daemon runs, a `stop` on the lane that runs ahead of the queue, so
+    /// an unsupported verb, a missing driver or an uncalibrated jaw move
+    /// previews as the refusal the arm would answer with. The arm holds
+    /// still for as long as the runtime waits on the jaws: a
+    /// calibration's minimum wait, or a move's travel at the firmware's
+    /// constant byte rate, never less than the grace the runtime gives a
+    /// reply — with the jaws drawn on their way.
     fn preview_tool_action(&mut self, action: &par6_proto::command::ToolAction) -> PreviewResult {
         self.publish();
-        if let Err(error) = self.planner.start_tool(self.next_index, action) {
+        let admitted = if action.action == "stop" {
+            self.planner
+                .start_tool(self.next_index, action)
+                .map(|()| self.planner.cancel_tool())
+        } else {
+            let cmd = Command::ToolAction(action.clone());
+            let batch = [QueuedCommand {
+                index: self.next_index,
+                cmd: &cmd,
+            }];
+            self.planner
+                .start(&batch)
+                .map(|_| self.planner.cancel(false))
+        };
+        if let Err(error) = admitted {
             return self.refuse(error);
         }
-        self.planner.cancel_tool(false);
         let from = self.tool_position;
         self.note_effects(&Command::ToolAction(action.clone()));
         let to = self.tool_position;

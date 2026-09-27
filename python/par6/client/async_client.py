@@ -1623,9 +1623,12 @@ class AsyncRobotClient(RobotOwner, _RobotClientABC):
     ) -> int:
         """Invoke a tool-specific action by key.
 
-        A gripper ``move`` carries ``[position, speed, current_mA]``; the
-        ``ElectricGripperTool`` methods take the current as a fraction of
-        ``current_range`` instead.
+        A gripper ``move`` carries ``[position, speed, current]``, each a
+        fraction in ``[0, 1]`` (current of ``current_range``). An action
+        runs in queue order with motion: it starts once everything queued
+        ahead of it has finished, and ``wait`` covers that motion too.
+        ``stop`` is the exception — it halts the jaws at once, ahead of
+        the queue.
 
         Category: I/O
 

@@ -1096,6 +1096,109 @@ fn tool_actions_profiles_and_unsupported_parameters() {
     rig.shutdown();
 }
 
+/// A tool action runs in queue order between moves.
+///
+/// `move_j(A); close; move_j(B)` is a pick. The jaws must not start
+/// closing while the arm is still travelling to the part, and the arm
+/// must not leave with it before they have closed — so the close starts
+/// when A has finished, B starts when the close has, and A does not round
+/// a corner into B across the close even though it asks to blend. A stop
+/// that lands while the jaws travel halts them where they are: the grip
+/// is kept, neither released nor carried on.
+#[test]
+fn a_tool_action_runs_in_queue_order_between_moves() {
+    let rig = Rig::boot(test_config());
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let park = park_deg();
+    teleport_home(&rig, &mut c, park);
+    let tool = fitted_tool();
+    let i = c.ok_index(&tool_action(8001, &tool, "calibrate", &[]));
+    let (ok, detail) = c.wait_complete(i);
+    assert!(ok, "gripper calibrate must complete, got {detail:?}");
+    rig.wait_status("calibration leaves the jaws open", |s| jaw(s) < 0.05);
+
+    let a = with_j0(park, 10.0);
+    rig.drain_status();
+    let ids = c.ok_indices(&[
+        Command::MoveJ(MoveJ {
+            key: 8002,
+            angles: a,
+            duration: Some(0.8),
+            speed: None,
+            accel: None,
+            blend_radius: Some(10.0),
+            rel: false,
+        }),
+        tool_action(8003, &tool, "move", &[1.0, 0.5, 0.3]),
+        move_j(8004, park, 0.8),
+    ]);
+    let (reach, close, leave) = (ids[0], ids[1], ids[2]);
+    let frames = rig.collect_through(leave, BUDGET);
+    for index in ids {
+        let (ok, detail) = c.wait_complete(index);
+        assert!(ok, "command {index} must complete, got {detail:?}");
+    }
+    let done = |s: &Status, index: u64| s.completed_index >= index as i64;
+
+    // Until A has arrived, the jaws stay open.
+    let approaching: Vec<f64> = frames.iter().filter(|s| !done(s, reach)).map(jaw).collect();
+    assert!(!approaching.is_empty(), "no frame caught the approach");
+    assert!(
+        approaching.iter().all(|&j| j < 0.05),
+        "the jaws closed before the arm reached the part: {approaching:?}"
+    );
+    // From A's arrival until the close completes, the arm holds at A.
+    let closing: Vec<&Status> = frames
+        .iter()
+        .filter(|s| done(s, reach) && !done(s, close))
+        .collect();
+    assert!(!closing.is_empty(), "no frame caught the jaws closing");
+    assert!(
+        closing.iter().all(|s| (s.angles[0] - a[0]).abs() < 1.0),
+        "the arm left A before the jaws had closed: J0 {:?}, A at {}",
+        closing.iter().map(|s| s.angles[0]).collect::<Vec<_>>(),
+        a[0]
+    );
+    let closed = frames
+        .iter()
+        .find(|s| done(s, close))
+        .expect("a frame reports the close complete");
+    assert!(
+        jaw(closed) > 0.95,
+        "the close completed with the jaws at {}",
+        jaw(closed)
+    );
+
+    // A stop while the jaws travel halts them where they are.
+    let opening = c.ok_index(&tool_action(8005, &tool, "move", &[0.0, 0.1, 0.3]));
+    rig.wait_status("the jaws start opening", |s| jaw(s) < 0.85);
+    c.ok(&Command::Stop(Stop { clear_queue: false }));
+    let (ok, detail) = c.wait_complete(opening);
+    assert!(
+        !ok && detail
+            .as_ref()
+            .is_some_and(|e| e.code == ErrorCode::MotnCancelled as u16),
+        "a stopped jaw move must report its cancellation: ok={ok} {detail:?}"
+    );
+    let caught = jaw(&rig.wait_status("a frame after the stop", |_| true));
+    let after = rig.collect_status(Duration::from_millis(600));
+    let last = after.last().expect("the broadcast carries on");
+    assert!(
+        (jaw(last) - caught).abs() < 0.1,
+        "the stop did not hold the jaws: caught at {caught}, carried on to {}",
+        jaw(last)
+    );
+    assert_eq!(
+        tool_status(last).state,
+        ToolState::Active,
+        "a stop must halt the jaws, not release the grip"
+    );
+
+    rig.shutdown();
+}
+
 /// The enablement pair is POSITIVE slot first: `[j1+, j1−, …]`.
 ///
 /// Parked past a joint's upper soft limit, the positive slot must read 0

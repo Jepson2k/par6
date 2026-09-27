@@ -166,10 +166,12 @@ pub fn blend_radius_mm(cmd: &par6_proto::Command) -> Option<f64> {
 }
 
 /// Executes queued commands: plans them, feeds the RT sample ring, and
-/// reports completion. Exactly one MOTION is in flight at a time — the
-/// server serializes the queue and calls [`Planner::start`] only after
-/// the previous outcome arrived (or was cancelled) — but one motion may
-/// cover SEVERAL queued commands when they blend into one another.
+/// reports completion. Exactly one queued command is in flight at a
+/// time — the server serializes the queue and calls [`Planner::start`]
+/// only after the previous outcome arrived (or was cancelled) — but one
+/// motion may cover SEVERAL queued commands when they blend into one
+/// another. Tool actions are queued commands too; only a tool `stop`
+/// runs outside the queue ([`Planner::start_tool`]).
 pub trait Planner: Send {
     /// Begin executing `batch[0]` (wire units). The rest of `batch` is
     /// the queue standing behind it, in order, offered for blending: an
@@ -194,19 +196,20 @@ pub trait Planner: Send {
     fn poll(&mut self) -> Option<CommandOutcome>;
 
     /// Cancel the in-flight command (if any) and discard its planned
-    /// samples. Idempotent. No outcome is expected afterwards.
-    fn cancel(&mut self);
+    /// samples. A tool action in flight is halted where it is when
+    /// `halt_tool` is set — never released, so a cancellation keeps a
+    /// grip — and otherwise left to whoever re-aims the jaws next.
+    /// Idempotent. No outcome is expected afterwards.
+    fn cancel(&mut self, halt_tool: bool);
 
-    /// Begin a tool action on the side channel.
+    /// Halt the tool where it is, ahead of the queue: the `stop` verb.
     ///
-    /// Tool commands drive the tool's own actuator and never write the
-    /// arm's joint slots, so they cannot race motion and do not belong
-    /// in the motion lane. An implementation runs at most one at a
-    /// time; the server completes a superseded one before starting the
-    /// next.
+    /// The server has already cancelled any tool action in flight. One
+    /// stop is tracked at a time; a later one re-arms the wait, and only
+    /// its outcome is expected.
     ///
     /// `Err` means nothing started — the server fails that index alone
-    /// and leaves the motion queue untouched.
+    /// and leaves the queue untouched.
     fn start_tool(
         &mut self,
         _index: u64,
@@ -215,23 +218,22 @@ pub trait Planner: Send {
         Err(par6_proto::make_error(
             par6_proto::ErrorCode::CommValidationError,
             par6_proto::UNATTRIBUTED,
-            &[("detail", "this runtime has no tool channel")],
+            &[("detail", "this runtime has no tool to stop")],
         ))
     }
 
-    /// Poll the tool side channel; `None` while it is still running.
+    /// Poll the tool stop in flight; `None` until the jaws are still.
     ///
-    /// This must not touch the motion lane. A tool fault is a fault of
-    /// the tool: flushing the sample ring here would stop an arm move
+    /// This must not touch the queue's command. A tool fault is a fault
+    /// of the tool: flushing the sample ring here would stop an arm move
     /// that has nothing to do with it.
     fn poll_tool(&mut self) -> Option<CommandOutcome> {
         None
     }
 
-    /// Abandon the tool action in flight (if any). `halt` asks the tool
-    /// to stop where it is rather than release, so a stop never drops a
-    /// grasped part. Idempotent; no outcome is expected afterwards.
-    fn cancel_tool(&mut self, _halt: bool) {}
+    /// Stop waiting on the tool stop in flight (if any). Idempotent; no
+    /// outcome is expected afterwards.
+    fn cancel_tool(&mut self) {}
 
     /// The planning context changed (profile / tool / TCP offset /
     /// completion policy). Also called once at server startup with the
