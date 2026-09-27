@@ -1310,9 +1310,11 @@ fn queue_eta_counts_speed_parameterised_moves() {
         })
     };
 
-    // One move in flight: the ETA is that move's planned duration.
-    let index = c.ok_index(&sweep(7411, 20.0, 0.10));
+    // One move in flight: the ETA is that move's planned duration. The
+    // clock starts before the send: the move runs from its acceptance,
+    // before the reply that carries its index reaches the client.
     let started = Instant::now();
+    let index = c.ok_index(&sweep(7411, 20.0, 0.10));
     let fast = priced_duration(&mut c);
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "the move must complete, got {detail:?}");
