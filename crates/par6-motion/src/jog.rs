@@ -224,11 +224,28 @@ impl JogEngine {
                 } else {
                     qm - self.limits.soft_min[j]
                 };
+                // The check runs once a tick, so the next chance to brake
+                // is a tick away: the stop that must fit is the one from
+                // where this tick's ramp leaves the joint, after the
+                // distance that tick covers. Without it a coarse tick
+                // grows the stop past the margin between two checks.
                 let speed = self.v[j].abs();
+                let a0 = (self.acc[j] * sgn).max(0.0);
+                let wanted = (v_t * sgn).max(0.0);
+                let (speed, a0) = if speed < wanted {
+                    match self.profile {
+                        JogProfile::Trapezoid => ((speed + a * self.dt).min(wanted), 0.0),
+                        JogProfile::Scurve => {
+                            let a0 = (a0 + jerk * self.dt).min(a);
+                            ((speed + a0 * self.dt).min(wanted), a0)
+                        }
+                    }
+                } else {
+                    (speed, a0)
+                };
                 let stop = match self.profile {
                     JogProfile::Trapezoid => speed * speed / (2.0 * a),
                     JogProfile::Scurve => {
-                        let a0 = (self.acc[j] * sgn).max(0.0);
                         let v_peak = speed + a0 * a0 / (2.0 * jerk);
                         speed * a0 / jerk
                             + a0 * a0 * a0 / (3.0 * jerk * jerk)
@@ -236,7 +253,7 @@ impl JogEngine {
                             + v_peak * a / (2.0 * jerk)
                     }
                 };
-                if STOP_MARGIN * stop >= remaining {
+                if STOP_MARGIN * stop + speed * self.dt >= remaining {
                     self.blocked[j] = Some(JogDirection::from_sign(sgn));
                 }
             }
