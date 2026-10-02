@@ -11,7 +11,7 @@ use std::time::Duration;
 
 use par6_proto::command::{
     EnterFlashing, JogJ, JogL, MoveJ, MoveS, SaveConfig, SetCanId, SetPayload, SetPidGains,
-    SetShapes, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
+    SetShapes, SetToolId, Shape, Simulator, Stop, Teleport, ToolAction, ToolParam, WriteIo,
 };
 use par6_proto::{
     decode_reply, decode_status, encode_chunk, encode_command, make_error, split_into_chunks,
@@ -63,6 +63,10 @@ enum RtEvent {
         new_id: u8,
     },
     SaveConfig(u8),
+    SetToolId {
+        node: u8,
+        tool_id: u8,
+    },
     RescanBus,
 }
 
@@ -214,6 +218,10 @@ impl RtCommands for TestRt {
 
     fn save_config(&mut self, node: u8) {
         self.push(RtEvent::SaveConfig(node));
+    }
+
+    fn set_tool_id(&mut self, node: u8, tool_id: u8) {
+        self.push(RtEvent::SetToolId { node, tool_id });
     }
 
     fn rescan_bus(&mut self) {
@@ -1138,16 +1146,37 @@ async fn commissioning_is_gated_on_an_idle_arm_and_the_config_and_bus_scan_repor
         err.cause
     );
     c.ok(&rename(9, 3, true)).await;
+    c.ok(&Command::SetToolId(SetToolId {
+        node: 2,
+        tool_id: 13,
+        force: false,
+    }))
+    .await;
+    let err = c
+        .expect_error(&Command::SetToolId(SetToolId {
+            node: 9,
+            tool_id: 13,
+            force: false,
+        }))
+        .await;
+    assert!(err.cause.contains("node 9"), "{}", err.cause);
     let ev = h.rt_events();
     assert_eq!(
         ev.iter()
-            .filter(|e| matches!(e, RtEvent::SetCanId { .. } | RtEvent::SaveConfig(_)))
+            .filter(|e| matches!(
+                e,
+                RtEvent::SetCanId { .. } | RtEvent::SaveConfig(_) | RtEvent::SetToolId { .. }
+            ))
             .count(),
-        3,
+        4,
         "exactly the accepted commands reach the RT: {ev:?}"
     );
     assert!(ev.contains(&RtEvent::SetCanId { node: 9, new_id: 3 }));
     assert!(ev.contains(&RtEvent::SaveConfig(2)));
+    assert!(ev.contains(&RtEvent::SetToolId {
+        node: 2,
+        tool_id: 13
+    }));
 
     // A moving arm refuses both, whatever the target.
     h.publish(|s| s.mode = Mode::Exec);

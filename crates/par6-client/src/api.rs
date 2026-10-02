@@ -366,6 +366,23 @@ impl Client {
         .await
     }
 
+    /// Commissioning: tell gripper drive `node` it is built into tool
+    /// `tool_id` and have it saved (`SET_TOOL_ID`). Same gate and `force`
+    /// rule as `set_can_id`.
+    pub async fn set_tool_id(
+        &self,
+        node: u8,
+        tool_id: u8,
+        force: bool,
+    ) -> Result<Ack, ClientError> {
+        self.system(Command::SetToolId(cmd::SetToolId {
+            node,
+            tool_id,
+            force,
+        }))
+        .await
+    }
+
     /// Commissioning: persist drive `node`'s running configuration to its
     /// NVM (`SAVE_CONFIG`). Same gate and `force` rule as `set_can_id`.
     pub async fn save_config(&self, node: u8, force: bool) -> Result<Ack, ClientError> {

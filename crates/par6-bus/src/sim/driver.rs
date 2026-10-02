@@ -5,16 +5,29 @@
 //! and carries the driver-side watchdog, per-type fault flags, the live
 //! err bit and the telemetry values the RTR polls report.
 
-use crate::spectral::codec::{unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId};
+use crate::spectral::codec::{
+    unpack_f32, unpack_i16, unpack_i24, unpack_u32, CommandId, CAPTURE_LEN, CAPTURE_STATUS_CHANNEL,
+    CAPTURE_VEL_SCALE, INJECT_TAPS, RIPPLE_SLOTS,
+};
 use crate::types::{DeviceInfo, ErrorFlags, NodeId};
 
 /// Firmware cascade frequency [Hz], from STEPFOC constants.h at 32fb5b5.
 /// The physics integrates between loop evaluations; scaling the integral
 /// without updating plant feedback adds a phase lag the drive does not have.
 const FW_LOOP_HZ: f64 = 6250.0;
+/// The raw encoder's counts per motor revolution, and the NEMA 17 steppers' pole
+/// pairs (1.8 degree step), which set the electrical phase the ripple
+/// feedforward follows.
+const ENCODER_COUNTS: f64 = 16384.0;
+const POLE_PAIRS: u32 = 50;
 pub(crate) const FW_LOOP_DT: f64 = 1.0 / FW_LOOP_HZ;
-/// STEPFOC's measured-velocity moving average, sampled each drive iteration.
+/// STEPFOC's measured-velocity moving average, sampled each drive
+/// iteration. This plant's encoder is exact, so a shorter window looks
+/// better here than it is: on the arm's base 8 samples hunted after every
+/// move where 20 hold still.
 const VELOCITY_WINDOW: usize = 20;
+/// The longest speed filter the firmware takes (cmd 41).
+const VELOCITY_WINDOW_MAX: usize = 64;
 
 /// A per-type driver fault a test can inject ([`super::SimBus::inject_fault`]).
 /// Maps 1:1 onto the cmd-26 flag bits; every injected fault also raises the
@@ -66,6 +79,14 @@ enum Mode {
     Hall { vel: f64, trigger_value: u8 },
 }
 
+impl Mode {
+    /// Position and velocity frames run the same cascade and carry its
+    /// velocity integral on from each other.
+    fn is_cascade(&self) -> bool {
+        matches!(self, Mode::Position { .. } | Mode::Velocity { .. })
+    }
+}
+
 /// What the bus must transmit back for a delivered data frame.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReplyKind {
@@ -94,13 +115,36 @@ pub(crate) struct VirtualDriver {
     integral_ma: f64,
     loop_phase: f64,
     last_drive: PlantCmd,
-    velocity_history: [f64; VELOCITY_WINDOW],
+    velocity_history: [f64; VELOCITY_WINDOW_MAX],
+    /// The speed filter's length in loops (cmd 41).
+    velocity_window: usize,
     velocity_samples: usize,
     previous_encoder: Option<f64>,
     pub measured_velocity: f64,
     armed: bool,
     ticks_since_data: u64,
     pub cur_out_ma: f64,
+    capture_wanted: u16,
+    capture_div: u16,
+    capture_tick: u16,
+    capture_pos: u16,
+    capture_vel: Vec<i16>,
+    capture_iq: Vec<i16>,
+    capture_phase: Vec<i16>,
+    /// Ripple feedforward slots (cmd 40): (harmonic, cosine mA, sine mA).
+    ripple: [(u8, i16, i16); RIPPLE_SLOTS as usize],
+    /// The injection cmd 42 armed for the next capture: amplitude \[mA\],
+    /// seed, loops per bit.
+    inject_next: (i16, u16, u8),
+    /// The injection the capture recording now runs: amplitude \[mA\] (0 =
+    /// none), LFSR state, loops per bit, loops since the last step.
+    inject: (i16, u16, u8, u8),
+    /// The rotor's electrical phase this loop, 0..16383 per cycle, as the
+    /// firmware derives it from the raw count.
+    phase: u32,
+    /// Each configuration frame as last written, echoed to a read request
+    /// the way the firmware reports the values in force.
+    written: [Option<([u8; 8], usize)>; 7],
     // -- faults --
     flags: ErrorFlags,
     // -- HALL sensor runtime (band logic evaluated by the bus) --
@@ -137,13 +181,26 @@ impl VirtualDriver {
                 vel_limit_ticks_s: vel_limit,
                 idle: true,
             },
-            velocity_history: [0.0; VELOCITY_WINDOW],
+            velocity_history: [0.0; VELOCITY_WINDOW_MAX],
+            velocity_window: VELOCITY_WINDOW,
             velocity_samples: 0,
             previous_encoder: None,
             measured_velocity: 0.0,
             armed: false,
             ticks_since_data: 0,
             cur_out_ma: 0.0,
+            capture_wanted: 0,
+            capture_div: 1,
+            capture_tick: 0,
+            capture_pos: 0,
+            capture_vel: vec![0; usize::from(CAPTURE_LEN)],
+            capture_iq: vec![0; usize::from(CAPTURE_LEN)],
+            capture_phase: vec![0; usize::from(CAPTURE_LEN)],
+            ripple: [(0, 0, 0); RIPPLE_SLOTS as usize],
+            inject_next: (0, 1, 1),
+            inject: (0, 1, 1, 0),
+            phase: 0,
+            written: [None; 7],
             flags: ErrorFlags {
                 calibrated: true,
                 activated: true,
@@ -161,16 +218,75 @@ impl VirtualDriver {
                 batch: 1,
                 sw_ver: 3,
                 serial: 1_000 + i32::from(node),
+                tool_id: 0,
             },
         }
     }
 
+    /// cmd 38: record `wanted` samples, one every `divisor` loops, from
+    /// the next loop; the firmware caps at its buffer and floors the
+    /// divisor at one.
+    pub fn capture_start(&mut self, divisor: u8, wanted: u16) {
+        self.capture_wanted = wanted.min(CAPTURE_LEN);
+        self.capture_div = u16::from(divisor.max(1));
+        self.capture_tick = 0;
+        self.capture_pos = 0;
+        // An armed injection belongs to this capture alone.
+        let (amplitude, seed, hold) = self.inject_next;
+        self.inject = (amplitude, seed, hold, 0);
+        self.inject_next.0 = 0;
+    }
+
+    /// A read request on a configuration frame: what was last written, the
+    /// firmware's answer; nothing if it was never written.
+    pub fn config_readback(&self, kind: crate::ConfigKind) -> Option<([u8; 8], usize)> {
+        self.written[kind.index()]
+    }
+
+    /// cmd 39 reply payload: pair `chunk` of `channel`, zero past what
+    /// was recorded; the status for `CAPTURE_STATUS_CHANNEL`.
+    pub fn capture_reply(&self, channel: u8, chunk: u16) -> [u8; 7] {
+        let mut p = [0u8; 7];
+        p[0] = channel;
+        let words: [i16; 3] = if channel == CAPTURE_STATUS_CHANNEL {
+            [
+                self.capture_pos as i16,
+                self.capture_wanted as i16,
+                self.capture_div as i16,
+            ]
+        } else {
+            let rows = match channel {
+                0 => &self.capture_vel,
+                1 => &self.capture_iq,
+                _ => &self.capture_phase,
+            };
+            let at = usize::from(chunk) * 2;
+            let sample = |k: usize| {
+                let i = at + k;
+                if i < usize::from(self.capture_pos) {
+                    rows[i]
+                } else {
+                    0
+                }
+            };
+            [chunk as i16, sample(0), sample(1)]
+        };
+        for (k, w) in words.iter().enumerate() {
+            p[1 + 2 * k..3 + 2 * k].copy_from_slice(&w.to_be_bytes());
+        }
+        p
+    }
     /// Handle one host→driver DATA frame. Feeds the watchdog (any valid
     /// data frame counts as command traffic; RTR polls do not), updates
     /// config/mode, and names the reply the bus owes. Wrong-DLC frames are
     /// discarded whole — no state change, no watchdog feed.
     pub fn on_data_frame(&mut self, cmd: CommandId, d: &[u8]) -> ReplyKind {
         use CommandId::*;
+        if let Some(kind) = config_kind(cmd).filter(|k| d.len() == config_dlc(*k)) {
+            let mut bytes = [0u8; 8];
+            bytes[..d.len()].copy_from_slice(d);
+            self.written[kind.index()] = Some((bytes, d.len()));
+        }
         // Firmware sets `watchdog_reset = 1` only in the data-pack cases
         // that install a Controller_mode, and only on a well-formed frame:
         // the wrong-DLC branch sets `Wrong_DL` instead and feeds nothing.
@@ -180,7 +296,34 @@ impl VirtualDriver {
                 | (CommandId::DataPackPd, 8)
                 | (CommandId::DataPackHall, 4)
         );
+        let was_cascade = self.mode.is_cascade();
         let reply = match (cmd, d.len()) {
+            (SetGripperId, 1) => {
+                self.device.tool_id = d[0];
+                ReplyKind::None
+            }
+            (VelocityWindow, 1) => {
+                // The firmware clamps, and restarts the average on a change.
+                let window = usize::from(d[0]).clamp(4, VELOCITY_WINDOW_MAX);
+                if window != self.velocity_window {
+                    self.velocity_window = window;
+                    self.velocity_samples = 0;
+                }
+                ReplyKind::None
+            }
+            (Inject, 5) => {
+                let seed = u16::from_be_bytes([d[2], d[3]]);
+                self.inject_next = (i16::from_be_bytes([d[0], d[1]]), seed.max(1), d[4].max(1));
+                ReplyKind::None
+            }
+            (Ripple, 6) if d[0] < RIPPLE_SLOTS => {
+                self.ripple[usize::from(d[0])] = (
+                    d[1],
+                    i16::from_be_bytes([d[2], d[3]]),
+                    i16::from_be_bytes([d[4], d[5]]),
+                );
+                ReplyKind::None
+            }
             (DataPack1, 8) => {
                 self.mode = Mode::Position {
                     pos: f64::from(unpack_i24([d[0], d[1], d[2]])),
@@ -298,6 +441,16 @@ impl VirtualDriver {
         if fed {
             self.ticks_since_data = 0;
         }
+        // The par6 firmware starts the velocity integral afresh when the
+        // position/velocity cascade is entered from any other mode: its
+        // charge is against the load the loop last drove, and after a
+        // current-mode release it is the wind-up of the push before it.
+        // The vendor firmware keeps the charge, and slams a joint that a
+        // current-mode push left wound up; this plant is the par6 build,
+        // which every drive is meant to run.
+        if !was_cascade && self.mode.is_cascade() {
+            self.integral_ma = 0.0;
+        }
         reply
     }
 
@@ -353,22 +506,75 @@ impl VirtualDriver {
     }
 
     fn control_iteration(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
-        let fw_steps = 1.0;
         let pos_ticks = pos_ticks.round();
+        self.phase = ((pos_ticks.rem_euclid(ENCODER_COUNTS) as u32) * POLE_PAIRS) & 16383;
         let vel_ticks_s = self
             .previous_encoder
             .map_or(vel_ticks_s, |previous| (pos_ticks - previous) * FW_LOOP_HZ)
             .trunc();
         self.previous_encoder = Some(pos_ticks);
+        let window = self.velocity_window;
         self.velocity_history.rotate_left(1);
-        self.velocity_history[VELOCITY_WINDOW - 1] = vel_ticks_s;
-        self.velocity_samples = (self.velocity_samples + 1).min(VELOCITY_WINDOW);
-        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW - self.velocity_samples..]
+        self.velocity_history[VELOCITY_WINDOW_MAX - 1] = vel_ticks_s;
+        self.velocity_samples = (self.velocity_samples + 1).min(window);
+        let vel_ticks_s = (self.velocity_history[VELOCITY_WINDOW_MAX - self.velocity_samples..]
             .iter()
             .sum::<f64>()
             / self.velocity_samples as f64)
             .trunc();
         self.measured_velocity = vel_ticks_s;
+        let driven = self.cur_out_ma;
+        let out = self.control_law(pos_ticks, vel_ticks_s);
+        self.record_capture(vel_ticks_s, driven);
+        out
+    }
+
+    /// Loop-rate capture (cmd 38), after the loop the way the firmware takes
+    /// it: this loop's filtered velocity, the current the last loop drove,
+    /// and the electrical phase, or with an injection the current this loop
+    /// just commanded.
+    fn record_capture(&mut self, vel_ticks_s: f64, driven: f64) {
+        if self.capture_pos >= self.capture_wanted {
+            return;
+        }
+        self.capture_tick += 1;
+        if self.capture_tick >= self.capture_div.max(1) {
+            self.capture_tick = 0;
+            let i = usize::from(self.capture_pos);
+            self.capture_vel[i] = (vel_ticks_s / f64::from(CAPTURE_VEL_SCALE)) as i16;
+            self.capture_iq[i] = driven as i16;
+            self.capture_phase[i] = if self.inject.0 != 0 {
+                self.cur_out_ma as i16
+            } else {
+                self.phase as i16
+            };
+            self.capture_pos += 1;
+        }
+        let (amplitude, lfsr, hold, count) = &mut self.inject;
+        if *amplitude != 0 {
+            *count += 1;
+            if *count >= *hold {
+                *count = 0;
+                *lfsr = (*lfsr >> 1) ^ (0u16.wrapping_sub(*lfsr & 1) & INJECT_TAPS);
+            }
+        }
+    }
+
+    /// The injection's current this loop \[mA\]: ±amplitude while the capture
+    /// it was armed for records.
+    fn inject_ma(&self) -> f64 {
+        let (amplitude, lfsr, ..) = self.inject;
+        if amplitude == 0 || self.capture_pos >= self.capture_wanted {
+            0.0
+        } else if lfsr & 1 == 1 {
+            f64::from(amplitude)
+        } else {
+            -f64::from(amplitude)
+        }
+    }
+
+    fn control_law(&mut self, pos_ticks: f64, vel_ticks_s: f64) -> PlantCmd {
+        let fw_steps = 1.0;
         // Without this a test could fault a joint, keep commanding it, and
         // pass — against hardware where the arm simply freewheels.
         if self.flags.error {
@@ -504,7 +710,20 @@ impl VirtualDriver {
         let err = vel_target - vel_meas;
         self.integral_ma =
             (self.integral_ma + self.kiv * err * fw_steps).clamp(-self.ilim_ma, self.ilim_ma);
-        self.kpv * err + self.integral_ma + cur_ff
+        self.kpv * err + self.integral_ma + cur_ff + self.ripple_ff() + self.inject_ma()
+    }
+
+    /// The firmware's ripple feedforward at this loop's phase \[mA\].
+    fn ripple_ff(&self) -> f64 {
+        let phase = std::f64::consts::TAU * f64::from(self.phase) / 16384.0;
+        self.ripple
+            .iter()
+            .filter(|(h, _, _)| *h != 0)
+            .map(|(h, a, b)| {
+                let x = f64::from(*h) * phase;
+                f64::from(*a) * x.cos() + f64::from(*b) * x.sin()
+            })
+            .sum()
     }
 
     pub fn set_fault(&mut self, kind: FaultKind) {
@@ -548,5 +767,29 @@ impl VirtualDriver {
     /// Current cmd-26 flag state.
     pub fn flags(&self) -> ErrorFlags {
         self.flags
+    }
+}
+
+/// The configuration frame a command writes, if it writes one.
+pub(crate) fn config_kind(cmd: CommandId) -> Option<crate::ConfigKind> {
+    use crate::ConfigKind as K;
+    Some(match cmd {
+        CommandId::Watchdog => K::Watchdog,
+        CommandId::Limits => K::Limits,
+        CommandId::VoltageLimit => K::VoltageLimit,
+        CommandId::PdGains => K::PdGains,
+        CommandId::CurrentGains => K::CurrentGains,
+        CommandId::VelocityGains => K::VelocityGains,
+        CommandId::PositionGains => K::PositionGains,
+        _ => return None,
+    })
+}
+
+fn config_dlc(kind: crate::ConfigKind) -> usize {
+    use crate::ConfigKind as K;
+    match kind {
+        K::Watchdog => 5,
+        K::VoltageLimit | K::PositionGains => 4,
+        K::Limits | K::PdGains | K::CurrentGains | K::VelocityGains => 8,
     }
 }

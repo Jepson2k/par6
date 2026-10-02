@@ -52,7 +52,7 @@ use std::collections::BTreeMap;
 use std::ffi::CStr;
 use std::ptr;
 
-use mujoco_rs::mujoco_c::{mj_id2name, mj_recompile, mjs_getError};
+use mujoco_rs::mujoco_c::{mj_recompile, mjs_getError};
 use mujoco_rs::prelude::{MjData, MjModel, MjSpec, MjtJoint, MjtObj};
 
 use super::driver::{PlantCmd, VirtualDriver, FW_LOOP_DT};
@@ -69,6 +69,18 @@ const IDLE_RATE: f64 = 40.0;
 /// limp — a wrist loaded past its holding friction back-drove a degree
 /// in that gap, and a cold position hold still sags a milliradian.
 const LANDING_CLAMP_NM: f64 = 1.0e3;
+/// Below this joint speed \[rad/s\] a joint whose net torque is inside its
+/// drivetrain friction is stuck, and stays exactly still. MuJoCo's dry
+/// friction is a soft constraint: a held joint creeps under it, the
+/// position loop keeps pushing against the creep, and at rest the motor
+/// carries the load plus most of the Coulomb loss -- 1.95 Nm of friction
+/// in J3's holding current where the arm shows 0.11 Nm, which failed the
+/// runtime's homing reference check, and a creep the base's marginal
+/// velocity loop could ring on where the arm's base sits captured. A
+/// gearbox at rest takes only the torque that balances what is left. Well
+/// under the slowest commanded motion: homing seeks run at tens of
+/// millirad per second.
+const STICK_RAD_S: f64 = 1.0e-3;
 
 /// Full jaw travel \[m\] — `jaw1_JOINT`'s slide range in the scene
 /// (0 = fully open, −`JAW_TRAVEL_M` = fully closed).
@@ -102,20 +114,24 @@ pub enum JawDrive {
 pub(crate) struct MujocoPlant {
     /// The scene and its state; the data owns the model.
     data: MjData<Box<MjModel>>,
-    /// Arm joint count (scene joints `0..n` are the arm, then the jaw
-    /// pair when the tool has one, then free world objects).
+    /// Arm joint count.
     n: usize,
-    /// qpos index of `jaw1_JOINT` (`jaw2_JOINT` follows), `None` on a
-    /// tool without jaws.
-    jaw: Option<usize>,
+    /// Where the arm, its passive structure and the jaws sit in the
+    /// generalized coordinates.
+    layout: Layout,
     /// Model timestep \[s\] (one bus tick = `round(dt/ts)` mj_steps).
     ts: f64,
     /// Cached generalized state, refreshed after every substep.
     qpos: Vec<f64>,
     qvel: Vec<f64>,
     qfrc: Vec<f64>,
-    /// Apparent joint inertias probed at boot \[kg·m²\] (idle damping).
+    /// Joint inertias at the boot pose \[kg·m²\], the mass-matrix
+    /// diagonal (idle damping).
     inertia: Vec<f64>,
+    /// This substep's dense mass matrix and acceleration, all DOFs: what
+    /// the rest of the arm's motion loads a joint with.
+    mass: Vec<f64>,
+    qacc: Vec<f64>,
     /// Reflected motor Coulomb loss per arm joint \[N·m\] — the scene's
     /// compiled `frictionloss`, the floor of the drivetrain friction.
     coulomb: Vec<f64>,
@@ -195,56 +211,64 @@ impl MujocoPlant {
             ts > 0.0 && ts < 0.1,
             "implausible model timestep {ts} — broken model?"
         );
-        let jaw = check_layout(&model, n);
-        let coulomb = model.dof_frictionloss()[..n].to_vec();
+        assert_eq!(q0.len(), n, "the boot pose needs one angle per arm joint");
+        let layout = check_layout(&model, n);
+        let coulomb: Vec<f64> = layout
+            .adr
+            .iter()
+            .map(|&a| model.dof_frictionloss()[a])
+            .collect();
 
         let mut data = MjData::new(Box::new(model));
 
         // Boot pose: scene defaults, arm at q0, jaws at the boot byte.
         let mut qpos = data.qpos().to_vec();
-        qpos[..n].copy_from_slice(q0);
-        if let Some(jaw) = jaw {
+        for (&a, &q) in layout.adr.iter().zip(q0) {
+            qpos[a] = q;
+        }
+        if let Some(jaw) = layout.jaw {
             qpos[jaw] = byte_to_m(JAW_INIT_BYTE);
             qpos[jaw + 1] = -byte_to_m(JAW_INIT_BYTE);
         }
 
-        // Apparent-inertia probe (idle damping): one-step velocity
-        // response to a unit torque against the zero-torque baseline,
-        // from the boot pose.
-        let mut probe = |tau: Option<usize>| -> Vec<f64> {
-            data.reset();
-            data.qpos_mut().copy_from_slice(&qpos);
-            let qfrc = data.qfrc_applied_mut();
-            qfrc.fill(0.0);
-            if let Some(j) = tau {
-                qfrc[j] = 1.0;
-            }
-            data.step();
-            data.qvel().to_vec()
-        };
-        let v0 = probe(None);
-        let mut inertia = vec![0.0; n];
-        for (j, m_j) in inertia.iter_mut().enumerate() {
-            let v1 = probe(Some(j));
-            let inv_m = (v1[j] - v0[j]) / ts;
-            assert!(
-                inv_m > 0.0,
-                "inertia probe returned non-positive apparent inertia for joint {j}"
-            );
-            *m_j = 1.0 / inv_m;
-        }
-
+        // Joint inertia for the idle brake: the mass-matrix diagonal at
+        // the boot pose, every other DOF held. A one-step torque probe
+        // would swing the arm's flex instead of the arm.
         data.reset();
         data.qpos_mut().copy_from_slice(&qpos);
+        data.forward();
+        let mut mass = vec![0.0; nv * nv];
+        data.full_m(&mut mass)
+            .expect("mass-matrix buffer sized to nv*nv");
+        let inertia: Vec<f64> = layout.adr.iter().map(|&a| mass[a * nv + a]).collect();
+        for (j, m) in inertia.iter().enumerate() {
+            assert!(*m > 0.0, "non-positive inertia on arm joint {j}");
+        }
+        // A spring stepped explicitly is only stable while its period
+        // clears the step: past this the flex blows up instead of
+        // ringing, and the config says nothing about the arm's inertia.
+        for &a in &layout.passive {
+            let model = data.model();
+            let jnt = model.dof_jntid()[a] as usize;
+            let k = model.jnt_stiffness()[jnt];
+            let name = model.id_to_name(MjtObj::mjOBJ_JOINT, jnt);
+            assert!(
+                k * ts * ts < mass[a * nv + a],
+                "{name:?} at {k} Nm/rad is too stiff for the {ts} s step; the limit is {} Nm/rad",
+                mass[a * nv + a] / (ts * ts)
+            );
+        }
         let mut plant = Self {
             data,
             n,
-            jaw,
+            layout,
             ts,
             qpos,
             qvel: vec![0.0; nv],
             qfrc: vec![0.0; nv],
             inertia,
+            mass,
+            qacc: vec![0.0; nv],
             coulomb,
             hold: holding_nm.to_vec(),
             friction: vec![0.0; n],
@@ -278,21 +302,33 @@ impl MujocoPlant {
     /// Place the arm at `q0` \[rad\] at rest (teleport): only the arm's
     /// generalized state moves — the jaws, the graspable objects and
     /// every contact in the scene carry on, which reloading the scene
-    /// would throw away. The boot inertia probe is kept (re-probing
-    /// needs `mj_resetData`, which would reset exactly that state).
+    /// would throw away. The boot inertia stays: the idle brake needs
+    /// its order of magnitude, not the pose.
     pub fn reseed(&mut self, q0: &[f64]) {
-        let n = self.n;
-        self.qpos[..n].copy_from_slice(q0);
-        self.qvel[..n].fill(0.0);
-        self.qfrc[..n].fill(0.0);
-        self.data.qpos_mut()[..n].copy_from_slice(q0);
-        self.data.qvel_mut()[..n].fill(0.0);
+        assert_eq!(q0.len(), self.n, "a pose needs one angle per arm joint");
+        for (j, &q) in q0.iter().enumerate() {
+            self.land(self.layout.adr[j], q);
+        }
+        // The arm's passive structure lands unstrained.
+        for k in 0..self.layout.passive.len() {
+            let a = self.layout.passive[k];
+            self.land(a, self.data.model().qpos_spring()[a]);
+        }
+    }
+
+    /// Put one-dof joint `a` at `q`, at rest.
+    fn land(&mut self, a: usize, q: f64) {
+        self.qpos[a] = q;
+        self.qvel[a] = 0.0;
+        self.qfrc[a] = 0.0;
+        self.data.qpos_mut()[a] = q;
+        self.data.qvel_mut()[a] = 0.0;
     }
 
     /// The physical angle \[rad\] of arm joint `j`, straight from the
     /// plant's state rather than back through the encoder conversion.
     pub fn joint_rad(&self, j: usize) -> f64 {
-        self.qpos[j]
+        self.qpos[self.layout.adr[j]]
     }
 
     /// Rebuild the model from `spec` in place (MuJoCo's `mj_recompile`),
@@ -300,8 +336,8 @@ impl MujocoPlant {
     /// name: the arm and jaws carry on, objects that stay keep their pose,
     /// new ones appear at their spawn pose. (MuJoCo preserves state only
     /// for the spec a model was compiled from; this spec is a fresh clone
-    /// of the base, so the carry is done here.) The boot inertia probe is
-    /// kept — an object changes no arm-joint inertia. Fails, model
+    /// of the base, so the carry is done here.) The boot inertia is
+    /// kept: an object changes no arm-joint inertia. Fails, model
     /// untouched, on a spec MuJoCo refuses.
     pub fn recompile(&mut self, spec: &mut MjSpec) -> Result<(), String> {
         let _guard = scene::load_lock();
@@ -334,17 +370,20 @@ impl MujocoPlant {
                 .into_owned();
             return Err(format!("recompile failed: {msg}"));
         }
-        let jaw = check_layout(self.data.model(), self.n);
+        let layout = check_layout(self.data.model(), self.n);
         assert_eq!(
-            jaw, self.jaw,
+            layout.jaw, self.layout.jaw,
             "a world update cannot add or remove the jaws"
         );
+        self.layout = layout;
         let nq = self.data.model().ffi().nq as usize;
         let nv = self.data.model().ffi().nv as usize;
         self.qpos.resize(nq, 0.0);
         self.qvel.resize(nv, 0.0);
         self.qfrc.resize(nv, 0.0);
         self.bias.resize(nv, 0.0);
+        self.mass.resize(nv * nv, 0.0);
+        self.qacc.resize(nv, 0.0);
         self.correction_qfrc.resize(nv, 0.0);
         let joints: Vec<(String, usize, usize, usize, usize)> = self.joints().collect();
         for (name, qadr, nq, dadr, nv) in joints {
@@ -368,19 +407,13 @@ impl MujocoPlant {
     fn joints(&self) -> impl Iterator<Item = (String, usize, usize, usize, usize)> + '_ {
         let model = self.data.model();
         (0..model.ffi().njnt as usize).map(move |j| {
-            // SAFETY: a valid model and an in-range joint id; the name is
-            // a NUL-terminated string owned by the model.
-            let name = unsafe {
-                let p = mj_id2name(model.ffi(), MjtObj::mjOBJ_JOINT as i32, j as i32);
-                if p.is_null() {
-                    String::new()
-                } else {
-                    CStr::from_ptr(p).to_string_lossy().into_owned()
-                }
-            };
+            let name = model
+                .id_to_name(MjtObj::mjOBJ_JOINT, j)
+                .unwrap_or_default()
+                .to_owned();
+            // check_layout admits only free and one-dof joints.
             let (nq, nv) = match model.jnt_type()[j] {
                 MjtJoint::mjJNT_FREE => (7, 6),
-                MjtJoint::mjJNT_BALL => (4, 3),
                 _ => (1, 1),
             };
             (
@@ -466,8 +499,10 @@ impl MujocoPlant {
         self.data.qvel_mut().fill(0.0);
         self.data.forward();
         self.correction_load();
-        (0..self.n)
-            .map(|j| self.data.qfrc_bias()[j] - self.correction_qfrc[j])
+        self.layout
+            .adr
+            .iter()
+            .map(|&a| self.data.qfrc_bias()[a] - self.correction_qfrc[a])
             .collect()
     }
 
@@ -478,8 +513,8 @@ impl MujocoPlant {
     fn correction_load(&mut self) {
         self.correction_qfrc.fill(0.0);
         let g = self.data.model().ffi().opt.gravity;
-        for (j, delta) in self.correction.iter().enumerate() {
-            let body = self.data.model().jnt_bodyid()[j] as usize;
+        for (&a, delta) in self.layout.adr.iter().zip(&self.correction) {
+            let body = self.data.model().dof_bodyid()[a] as usize;
             let r = self.data.xmat()[body];
             let p = self.data.xpos()[body];
             let h: [f64; 3] = std::array::from_fn(|k| {
@@ -500,8 +535,9 @@ impl MujocoPlant {
     /// Measured motor state of arm joint `j` (position ticks, speed
     /// ticks/s).
     pub fn motor_state(&self, j: usize, map: &JointMap) -> (f64, f64) {
-        let pos = f64::from(map.conv.motor_ticks(self.qpos[j]));
-        let vel = map.conv.motor_speed_ticks_s(self.qvel[j]);
+        let a = self.layout.adr[j];
+        let pos = f64::from(map.conv.motor_ticks(self.qpos[a]));
+        let vel = map.conv.motor_speed_ticks_s(self.qvel[a]);
         (pos, vel)
     }
 
@@ -573,30 +609,35 @@ impl MujocoPlant {
             self.jaw_cmd_byte = byte;
         }
         let h = self.ts;
+        let nv = self.qacc.len();
         let fw_steps = h / FW_LOOP_DT;
         // Once a tick: gravity moves with the pose, which a tick barely
         // changes, and the Jacobians behind it cost more than the physics
         // they would refine.
         self.correction_load();
+        // The correction is the whole applied force on every DOF the plant
+        // does not drive; the driven ones are overwritten each substep.
+        self.qfrc.copy_from_slice(&self.correction_qfrc);
         for _ in 0..substeps as u32 {
             self.bias.copy_from_slice(self.data.qfrc_bias());
             for j in 0..self.n {
                 let map = &maps[j];
+                let a = self.layout.adr[j];
                 let (pos, vel) = self.motor_state(j, map);
                 self.cmds[j] = drivers[j].loop_step(pos + map.report_offset, vel, fw_steps);
                 let cmds = &self.cmds;
-                let v = self.qvel[j];
+                let v = self.qvel[a];
                 let motor = cmds[j].current_ma / map.factor_ma_per_nm;
                 let external = -loads_ma[j] / map.factor_ma_per_nm;
                 let mut t = motor + external;
                 if cmds[j].idle {
                     t -= IDLE_RATE * self.inertia[j] * v;
                 }
-                self.qfrc[j] = t;
+                self.qfrc[a] = t + self.correction_qfrc[a];
                 // The load is what acts on the joint besides the motor:
                 // MuJoCo's bias (its sign is the force that cancels it),
                 // the gravity correction and the injected external load.
-                let load = external - self.bias[j] + self.correction_qfrc[j];
+                let load = external - self.bias[a] + self.correction_qfrc[a];
                 self.friction[j] = if clamp_arm {
                     LANDING_CLAMP_NM
                 } else {
@@ -605,8 +646,10 @@ impl MujocoPlant {
             }
             // SAFETY: only per-DOF friction values change; the model's
             // sizes and layout are untouched, so the data stays valid.
-            unsafe { self.data.model_mut() }.dof_frictionloss_mut()[..self.n]
-                .copy_from_slice(&self.friction);
+            let frictionloss = unsafe { self.data.model_mut() }.dof_frictionloss_mut();
+            for (&a, &f) in self.layout.adr.iter().zip(&self.friction) {
+                frictionloss[a] = f;
+            }
             let mut jaw_vt = 0.0;
             if let Some(JawDrive::Active {
                 target_byte,
@@ -619,35 +662,53 @@ impl MujocoPlant {
                 // byte_to_m is linear through 0, so it maps deltas too.
                 jaw_vt = byte_to_m(step) / h;
             }
-            if let Some(jaw) = self.jaw {
+            if let Some(jaw) = self.layout.jaw {
                 let x_t = byte_to_m(self.jaw_cmd_byte);
                 let f = (JAW_KP * (x_t - self.qpos[jaw]) + JAW_KD * (jaw_vt - self.qvel[jaw]))
                     .clamp(-JAW_FMAX, JAW_FMAX);
-                self.qfrc[jaw] = f;
-            }
-            for (f, c) in self.qfrc.iter_mut().zip(&self.correction_qfrc) {
-                *f += c;
+                self.qfrc[jaw] = f + self.correction_qfrc[jaw];
             }
             self.data.qfrc_applied_mut().copy_from_slice(&self.qfrc);
             self.data.step();
             self.qpos.copy_from_slice(self.data.qpos());
             self.qvel.copy_from_slice(self.data.qvel());
-            // Driver-enforced velocity limit, converted to joint space.
-            let mut clamped = false;
+            self.qacc.copy_from_slice(self.data.qacc());
+            self.data
+                .full_m(&mut self.mass)
+                .expect("mass-matrix buffer sized to nv*nv");
+            // Driver-enforced velocity limit, converted to joint space, and
+            // the stick regime of the drivetrain friction (see STICK_RAD_S):
+            // the net torque is what the joint gets besides what MuJoCo's
+            // bias cancels and what the rest of the arm's acceleration
+            // loads it with through the mass matrix (a fork swinging on a
+            // held base pulls at the base), and inside the friction limit
+            // it goes nowhere.
             for j in 0..self.n {
+                let a = self.layout.adr[j];
                 let vlim = self.cmds[j].vel_limit_ticks_s.abs()
                     * (std::f64::consts::TAU / f64::from(maps[j].encoder_max_counts))
                     / maps[j].gear_ratio;
-                if self.qvel[j].abs() > vlim {
-                    self.qvel[j] = self.qvel[j].clamp(-vlim, vlim);
-                    clamped = true;
+                let v = self.qvel[a];
+                let limited = v.clamp(-vlim, vlim);
+                let row = &self.mass[a * nv..(a + 1) * nv];
+                let coupling: f64 = row
+                    .iter()
+                    .zip(&self.qacc)
+                    .enumerate()
+                    .filter(|(k, _)| *k != a)
+                    .map(|(_, (m, acc))| m * acc)
+                    .sum();
+                let net = self.qfrc[a] - self.bias[a] - coupling;
+                let stuck =
+                    limited != 0.0 && limited.abs() < STICK_RAD_S && net.abs() <= self.friction[j];
+                let held = if stuck { 0.0 } else { limited };
+                if held != v {
+                    self.qvel[a] = held;
+                    self.data.qvel_mut()[a] = held;
                 }
             }
-            if clamped {
-                self.data.qvel_mut().copy_from_slice(&self.qvel);
-            }
         }
-        match (jaw, self.jaw) {
+        match (jaw, self.layout.jaw) {
             (Some(JawDrive::Active { .. }), Some(jaw_q)) => {
                 let measured = m_to_byte(self.qpos[jaw_q]);
                 let lag = self.jaw_cmd_byte - measured;
@@ -670,30 +731,69 @@ impl MujocoPlant {
     }
 }
 
-/// The generalized-coordinate layout the plant indexes by: `n` arm hinges
-/// first (qpos address == joint number), then the jaw slide pair when the
-/// tool has one, then only free joints. Returns the jaws' qpos index.
-/// Panics with a descriptive message on anything else — a sim
-/// construction bug, not a runtime error.
-fn check_layout(model: &MjModel, n: usize) -> Option<usize> {
+/// Where the plant's joints sit in the generalized coordinates. Every
+/// one-dof joint comes before the free world objects, so its qpos and dof
+/// addresses agree.
+struct Layout {
+    /// Address of each arm joint.
+    adr: Vec<usize>,
+    /// Addresses of every other one-dof joint that is not a jaw: the arm's
+    /// passive structure, which the plant never drives.
+    passive: Vec<usize>,
+    /// qpos index of `jaw1_JOINT` (`jaw2_JOINT` follows), `None` on a
+    /// tool without jaws.
+    jaw: Option<usize>,
+}
+
+/// The layout the plant indexes by: the arm's hinges by name
+/// ([`scene::ARM_JOINTS`]), the jaw slide pair by name, every other
+/// one-dof joint passive, and only free joints after them. Panics with a
+/// descriptive message on anything else, a sim construction bug rather
+/// than a runtime error.
+fn check_layout(model: &MjModel, n: usize) -> Layout {
     let joint_id = |name: &str| -> Option<usize> { model.name_to_id(MjtObj::mjOBJ_JOINT, name) };
-    let nq = model.ffi().nq as usize;
-    let nv = model.ffi().nv as usize;
-    let jaw = joint_id("jaw1_JOINT");
+    let address = |id: usize| model.jnt_qposadr()[id] as usize;
+    assert!(
+        n <= scene::ARM_JOINTS.len(),
+        "{n} arm joints configured, the scene names {}",
+        scene::ARM_JOINTS.len()
+    );
+    let adr: Vec<usize> = scene::ARM_JOINTS[..n]
+        .iter()
+        .map(|name| {
+            let id = joint_id(name).unwrap_or_else(|| panic!("scene has no arm joint {name}"));
+            assert!(
+                model.jnt_type()[id] == MjtJoint::mjJNT_HINGE,
+                "arm joint {name} must be a hinge"
+            );
+            address(id)
+        })
+        .collect();
+    let jaw = joint_id("jaw1_JOINT").map(address);
     if let Some(jaw) = jaw {
         assert!(
-            jaw == n && joint_id("jaw2_JOINT") == Some(n + 1),
-            "scene joint order must be {n} arm joints, then jaw1_JOINT/jaw2_JOINT, then \
-             free objects (jaw ids: {jaw}/{:?})",
-            joint_id("jaw2_JOINT")
+            joint_id("jaw2_JOINT").map(address) == Some(jaw + 1),
+            "jaw2_JOINT must follow jaw1_JOINT (jaw1 at {jaw})"
         );
     }
-    let base = n + if jaw.is_some() { 2 } else { 0 };
-    assert!(
-        nq >= base && nv >= base && nq - base == (nv - base) / 6 * 7,
-        "scene DOF layout unexpected: nq={nq} nv={nv} for {n} arm joints, {} jaws and free \
-         objects",
-        if jaw.is_some() { 2 } else { 0 }
-    );
-    jaw
+    let mut seen_free = false;
+    let mut passive = Vec::new();
+    for id in 0..model.ffi().njnt as usize {
+        match model.jnt_type()[id] {
+            MjtJoint::mjJNT_FREE => seen_free = true,
+            MjtJoint::mjJNT_HINGE | MjtJoint::mjJNT_SLIDE => {
+                assert!(
+                    !seen_free,
+                    "scene joint {id} is a one-dof joint after a free world object"
+                );
+                let a = address(id);
+                let is_jaw = jaw.is_some_and(|j| a == j || a == j + 1);
+                if !is_jaw && !adr.contains(&a) {
+                    passive.push(a);
+                }
+            }
+            other => panic!("scene joint {id} has unsupported type {other:?}"),
+        }
+    }
+    Layout { adr, passive, jaw }
 }

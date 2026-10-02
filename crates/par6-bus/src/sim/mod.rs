@@ -47,12 +47,17 @@ use crate::bus::DriverBus;
 use crate::hw::sched::{FreshnessClock, DEVICE_INFO_PERIOD_SLOTS};
 use crate::node_config::NodeConfig;
 use crate::spectral::codec::{
-    decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command, encode_limits,
-    encode_pd_gains, encode_position_gains, encode_velocity_gains, encode_voltage_limit,
-    encode_watchdog, fold_bits_msb_first, pack_can_id, pack_f32, pack_i16, pack_i24, pack_i32,
-    unfold_bits_msb_first, unpack_can_id, unpack_i16, CanFrame, CommandId, Payload,
+    decode_frame, encode_clear_error, encode_current_gains, encode_gripper_command,
+    encode_gripper_id, encode_limits, encode_pd_gains, encode_position_gains,
+    encode_velocity_gains, encode_voltage_limit, encode_watchdog, fold_bits_msb_first, pack_can_id,
+    pack_f32, pack_i16, pack_i24, pack_i32, unfold_bits_msb_first, unpack_can_id, unpack_i16,
+    CanFrame, CommandId, Payload,
+};
+use crate::spectral::codec::{
+    encode_capture, encode_capture_read, encode_inject, encode_readback_request,
 };
 use crate::spectral::convert::JointConversion;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, FirmwareGripperCommand, Freshness,
     GripperCommand, HallState, JointCommand, LinkHealth, LinkState, NodeId, PollAction, PollKind,
@@ -120,6 +125,7 @@ pub struct SimBus {
     joint_nodes: Vec<NodeId>,
     node_to_joint: [Option<usize>; MAX_NODES],
     gripper_node: NodeId,
+    captures: Vec<CaptureBuffer>,
     timing_dummy_node: NodeId,
     rx_cap: usize,
     fresh: FreshnessClock,
@@ -186,6 +192,7 @@ impl SimBus {
             joint_nodes: Vec::new(),
             node_to_joint: [None; MAX_NODES],
             gripper_node: 0,
+            captures: (0..MAX_NODES).map(|_| CaptureBuffer::new()).collect(),
             timing_dummy_node: 0,
             rx_cap: 32,
             fresh: FreshnessClock::default(),
@@ -697,6 +704,15 @@ impl SimBus {
         d.feed_watchdog_poll();
         let err = d.err_bit();
         let frame = match kind {
+            PollKind::Telemetry => {
+                let (_, _, cur) = motion.unwrap_or((0, 0, 0));
+                let mut p = [0u8; 8];
+                p[0..2].copy_from_slice(&pack_i16(d.temperature_c));
+                p[2..4].copy_from_slice(&pack_i16(d.voltage_mv));
+                p[4..6].copy_from_slice(&Self::errors_payload(d.flags()));
+                p[6..8].copy_from_slice(&pack_i16(cur));
+                CanFrame::data_frame(pack_can_id(node, CommandId::Telemetry, err), &p)
+            }
             PollKind::Temperature => CanFrame::data_frame(
                 pack_can_id(node, CommandId::Temperature, err),
                 &pack_i16(d.temperature_c),
@@ -715,12 +731,14 @@ impl SimBus {
                     batch,
                     sw_ver,
                     serial,
+                    tool_id,
                 } = d.device;
-                let mut p = [0u8; 7];
+                let mut p = [0u8; 8];
                 p[0] = hw_ver;
                 p[1] = batch;
                 p[2] = sw_ver;
                 p[3..7].copy_from_slice(&pack_i32(serial));
+                p[7] = tool_id;
                 CanFrame::data_frame(pack_can_id(node, CommandId::DeviceInfo, err), &p)
             }
             PollKind::Kt => CanFrame::data_frame(
@@ -748,8 +766,24 @@ impl SimBus {
             return;
         }
         let (node, raw_cmd, _) = unpack_can_id(frame.id);
+        if let Some(kind) = CommandId::from_raw(raw_cmd).and_then(driver::config_kind) {
+            self.count_tx();
+            let Some(j) = self.node_to_joint[usize::from(node)] else {
+                return;
+            };
+            if let Some((bytes, len)) = self.drivers[j].config_readback(kind) {
+                let err = self.drivers[j].err_bit();
+                let cmd = CommandId::from_raw(raw_cmd).expect("checked above");
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node, cmd, err),
+                    &bytes[..len],
+                ));
+            }
+            return;
+        }
         let kind = match CommandId::from_raw(raw_cmd) {
             Some(CommandId::EncoderData) => PollKind::Encoder,
+            Some(CommandId::Telemetry) => PollKind::Telemetry,
             Some(CommandId::Temperature) => PollKind::Temperature,
             Some(CommandId::Voltage) => PollKind::Voltage,
             Some(CommandId::StateOfErrors) => PollKind::Errors,
@@ -776,6 +810,23 @@ impl SimBus {
         let Some(j) = self.node_to_joint[usize::from(node)] else {
             return;
         };
+        let d = frame.payload();
+        match (cmd, d.len()) {
+            (CommandId::Capture, 3) => {
+                self.drivers[j].capture_start(d[0], u16::from_be_bytes([d[1], d[2]]));
+                return;
+            }
+            (CommandId::CaptureRead, 3) => {
+                let err = self.drivers[j].err_bit();
+                let p = self.drivers[j].capture_reply(d[0], u16::from_be_bytes([d[1], d[2]]));
+                self.enqueue(CanFrame::data_frame(
+                    pack_can_id(node, CommandId::CaptureRead, err),
+                    &p,
+                ));
+                return;
+            }
+            _ => {}
+        }
         let reply = self.drivers[j].on_data_frame(cmd, frame.payload());
         match reply {
             ReplyKind::None => {}
@@ -818,6 +869,10 @@ impl SimBus {
                     };
                     self.mj_jaw_cmd = Some(fcmd);
                     g.on_firmware_command(fcmd);
+                    None
+                }
+                (CommandId::SetGripperId, 1) => {
+                    g.driver.device.tool_id = d[0];
                     None
                 }
                 (CommandId::GripperDataPack, 0) => {
@@ -906,6 +961,10 @@ impl SimBus {
             for f in frames {
                 self.deliver_data(&f);
             }
+            let c = self.node_configs[i];
+            for f in c.extra_frames() {
+                self.deliver_data(&f);
+            }
         }
     }
 
@@ -951,6 +1010,24 @@ impl SimBus {
             Payload::Voltage { mv } => state.nodes[n].voltage_mv = Some(mv),
             Payload::IqCurrent { ma } => state.nodes[n].current_ma = Some(ma),
             Payload::Errors(flags) => state.nodes[n].error_flags = Some(flags),
+            Payload::Telemetry {
+                deg_c,
+                mv,
+                flags,
+                ma,
+            } => {
+                let s = &mut state.nodes[n];
+                s.temperature_c = Some(deg_c);
+                s.voltage_mv = Some(mv);
+                s.error_flags = Some(flags);
+                s.current_ma = Some(ma);
+                s.combined_telemetry = true;
+            }
+            // Kept by the backend, not the shared state: see `SimBus::captures`.
+            Payload::Readback(r) => state.nodes[n].readback[r.kind().index()] = Some(r),
+            Payload::Capture { .. }
+            | Payload::CaptureStatus { .. }
+            | Payload::PeriodicStatus(_) => {}
             Payload::DeviceInfo(info) => state.nodes[n].device_info = Some(info),
             Payload::Kt { nm_per_a } => state.nodes[n].kt_nm_a = Some(nm_per_a),
             Payload::Gripper(reply) => {
@@ -1008,7 +1085,19 @@ impl DriverBus for SimBus {
             // frames still count for freshness and the live fault bit.
             let (node, err_bit) = match decode_frame(&frame) {
                 Ok(d) => {
-                    Self::apply(&d, state);
+                    match d.payload {
+                        Payload::Capture {
+                            channel,
+                            chunk,
+                            samples,
+                        } => self.captures[usize::from(d.node)].store(channel, chunk, samples),
+                        Payload::CaptureStatus {
+                            recorded,
+                            wanted,
+                            divisor,
+                        } => self.captures[usize::from(d.node)].status(recorded, wanted, divisor),
+                        _ => Self::apply(&d, state),
+                    }
                     (d.node, d.err_bit)
                 }
                 Err(e) => (e.node(), e.err_bit()),
@@ -1076,8 +1165,6 @@ impl DriverBus for SimBus {
         let Some(f) = frame else {
             return Ok(());
         };
-        // NoGripper's RTR ping targets the driverless timing dummy, so it
-        // goes unanswered like on the real bus.
         self.admit_tick_tx()?;
         self.deliver_frame(&f);
         Ok(())
@@ -1099,6 +1186,18 @@ impl DriverBus for SimBus {
                     self.deliver_data(&f);
                 }
                 PollAction::ResendConfig { node } => self.apply_node_config(node, 1),
+                PollAction::ConfigRead { node, kind } => {
+                    let f = encode_readback_request(node, kind);
+                    self.deliver_frame(&f);
+                }
+                PollAction::CaptureRead {
+                    node,
+                    channel,
+                    chunk,
+                } => {
+                    let f = encode_capture_read(node, channel, chunk);
+                    self.deliver_data(&f);
+                }
                 PollAction::ConfigFrame { node, kind } => {
                     let c = self.node_configs.iter().find(|c| c.node == node).ok_or(
                         BusError::InvalidCommand {
@@ -1125,15 +1224,12 @@ impl DriverBus for SimBus {
         if self.slot_counter.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.di_remaining = self.poll_targets();
         }
-        let idx = (self.poll_cursor / 3) as usize % self.poll_targets();
+        // Every simulated drive runs the par6 firmware, so one combined
+        // poll per target is the whole cycle.
+        let idx = self.poll_cursor as usize % self.poll_targets();
         let node = self.poll_target_node(idx);
-        let kind = match self.poll_cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
         self.poll_cursor += 1;
-        self.deliver_rtr(node, kind);
+        self.deliver_rtr(node, PollKind::Telemetry);
         Ok(())
     }
 
@@ -1326,6 +1422,69 @@ impl DriverBus for SimBus {
         Ok(())
     }
 
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.deliver_frame(&encode_gripper_id(node, tool_id));
+        Ok(())
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if ripple.len() > usize::from(crate::spectral::codec::RIPPLE_SLOTS) {
+            return Err(BusError::InvalidCommand {
+                reason: "more ripple harmonics than a drive has slots",
+            });
+        }
+        let slots = crate::node_config::ripple_slots(ripple);
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.ripple = slots;
+        }
+        for (slot, (h, a, b)) in slots.iter().enumerate() {
+            self.deliver_frame(&crate::spectral::codec::encode_ripple(
+                node, slot as u8, *h, *a, *b,
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        if let Some(c) = self.node_configs.iter_mut().find(|c| c.node == node) {
+            c.velocity_window = Some(window);
+        }
+        self.deliver_frame(&crate::spectral::codec::encode_velocity_window(
+            node, window,
+        ));
+        Ok(())
+    }
+
+    fn arm_injection(
+        &mut self,
+        node: NodeId,
+        amplitude_ma: i16,
+        seed: u16,
+        hold: u8,
+    ) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.deliver_frame(&encode_inject(node, amplitude_ma, seed, hold));
+        Ok(())
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        self.captures[usize::from(node)].clear();
+        self.deliver_frame(&encode_capture(node, divisor, wanted));
+        Ok(())
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
+        self.captures.get(usize::from(node))
+    }
+
     /// The virtual driver accepts cmd 13 and has no NVM to write.
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         self.ensure_ready()?;
@@ -1427,6 +1586,10 @@ impl SimBus {
             timestep: scene::timestep_for(self.dt),
             joints: &tuning,
             tool: self.tool.as_ref(),
+            lateral: (
+                sim.arm_lateral_stiffness_nm_rad,
+                sim.arm_lateral_damping_nm_s,
+            ),
         };
         let mut spec = self
             .scene

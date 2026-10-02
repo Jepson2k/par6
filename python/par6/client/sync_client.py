@@ -497,6 +497,12 @@ class RobotClient:
         ``force`` for an id the config does not list)."""
         return _run(self._inner.set_can_id(node, new_id, force=force))
 
+    def set_tool_id(self, node: int, tool_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell gripper drive *node* it is built into tool
+        *tool_id* and have it saved (idle arm only; ``force`` for an id the
+        config does not list)."""
+        return _run(self._inner.set_tool_id(node, tool_id, force=force))
+
     def set_status_rate(self, hz: float) -> int:
         """Set the rate the runtime broadcasts STATUS at, for this session."""
         return _run(self._inner.set_status_rate(hz))

@@ -78,8 +78,13 @@ impl GripperSim {
         // consistent with the arm joints.
         let accel_max = d.velocity_limit_ticks_s * 20.0;
         let cal_ticks = (CALIBRATION_S / dt).round() as u64;
+        let mut driver =
+            VirtualDriver::new(dt, node, d.velocity_limit_ticks_s, d.ilim_ma, d.kt_nm_a);
+        // The drive says which tool it is built into, as a provisioned
+        // gripper drive does over cmd 36.
+        driver.device.tool_id = cfg.can_tool_id.unwrap_or(0);
         Self {
-            driver: VirtualDriver::new(dt, node, d.velocity_limit_ticks_s, d.ilim_ma, d.kt_nm_a),
+            driver,
             joint: JawJoint::new(
                 dt,
                 stroke_ticks / 2.0,

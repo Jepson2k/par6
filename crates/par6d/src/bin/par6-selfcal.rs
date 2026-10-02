@@ -1,23 +1,37 @@
-//! Measure a PAR6: its mechanics and its link masses.
+//! Calibrate a PAR6: everything a new arm needs measured, in one run.
 //!
-//! Four phases, in this order and for this reason:
+//! In this order, each stage building on what came before:
 //!
 //! 1. HOME: find every joint's reference against its endstop or hall.
-//! 2. MEASURE: each joint's inertia from the model and its friction from a
-//!    constant-velocity sweep. Nothing is tuned: the drive loops run at
-//!    6250 Hz, which a 250 Hz link cannot observe, so their gains stand.
-//! 3. IDENTIFY: hold twenty poses and fit this arm's own link masses, which
-//!    are 3D printed and so are not the vendor's.
-//! 4. PARK: return the shoulder and elbow to their stops, then release.
+//! 2. RIPPLE: the current that cancels each joint's cogging and commutation
+//!    ripple, from slow sweeps against the rotor's electrical angle. First,
+//!    because every verdict after it reads speed: uncompensated, J4's first
+//!    harmonic at 47 deg/s is a 25 Hz, 10 deg/s RMS swing that reads as a
+//!    hunting loop (2026-10-01).
+//! 3. GAINS: tune Kpv, Kiv and Kpp, qualify normal motion and representative
+//!    calibration poses, then keep the qualified gains for measurements.
+//! 4. STICTION: ramp each joint's current both ways from its hold until it
+//!    slides, at ready and with the arm out.
+//! 5. BELT: a current chirp on the base, for the arm's compliance.
+//! 6. MECHANICS: each joint's friction from constant-velocity sweeps, then
+//!    held poses to fit this arm's own link masses, which are 3D printed and
+//!    so are not the vendor's.
+//! 7. LIMITS, only with `--limits`: each joint's velocity, acceleration and
+//!    jerk limits.
+//! 8. PARK: return the shoulder and elbow to their stops, then release.
 //!
-//! CALIBRATION RULE: no invented heuristics. Every metric, tuning method and
-//! numerical decision rule cites a primary source beside it, and says what that
-//! source supports. A citation for a formula does not justify a threshold.
+//! `--only <stage>` (repeatable) runs homing and just those stages, for
+//! development.
+//!
+//! The gains procedure follows the StepFOC guide supplied by the user.
+//! Numeric observation thresholds and gain increments are automation choices;
+//! the guide prescribes the sequence and Kpv's 20% backoff.
 //!
 //! A number that is the same on every run is a constant here, not a flag. The
 //! justification still gets written down; it costs one comment instead of a
 //! flag, a parser, a struct field and a log line to keep in sync.
 
+use par6_bus::spectral::codec::{CAPTURE_LEN, CAPTURE_STATUS_CHANNEL, CAPTURE_VEL_SCALE};
 use par6_bus::{
     hw::SocketCanBus,
     sim::{
@@ -25,12 +39,14 @@ use par6_bus::{
         SimBus,
     },
     spectral::{torque_to_ma_factor, JointConversion},
-    BusState, ConfigKind, DriveTune, DriverBus, ErrorFlags, GripperCommand, JointCommand,
+    BusError, BusState, ConfigKind, DriveTune, DriverBus, ErrorFlags, GripperCommand, JointCommand,
     PollAction, PollKind, RuntimeBus,
 };
-use par6_config::{ConfigBundle, Gains, LimitMode, PreMove};
+use par6_config::{ConfigBundle, Gains, LimitMode, PreMove, RippleHarmonic};
 use par6_motion::{SSeptic, SEPTIC_PEAK_ACC, SEPTIC_PEAK_VEL};
 use par6_rt::homing::{Homer, HomerEvent, HomerParams};
+use par6d::ripple;
+use socketcan::{CanSocket, EmbeddedFrame, Frame as _, Socket, SocketOptions};
 use std::{
     collections::VecDeque,
     fmt::Write as _,
@@ -46,6 +62,7 @@ use std::{
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 const N: usize = 6;
+const LOOP_HZ: f64 = 6250.0;
 
 static CANCEL: AtomicBool = AtomicBool::new(false);
 extern "C" fn cancel(_: libc::c_int) {
@@ -162,29 +179,56 @@ const LIMITS_SPAN_STEP_RAD: f64 = 0.02;
 /// J6 passed the following-error rule at 16.8% and audibly rumbled (user,
 /// 2026-09-23); the joints that run quietly sit under 8%.
 const LIMITS_RIPPLE_CEILING: f64 = 0.10;
-/// Fraction of a joint's EXEC caps the gains probe moves at: fast enough
-/// for a loop that hunts to show it, slow enough that a joint at its
-/// limits is not what is being scored.
-const GAINS_PROBE_FRACTION: f64 = 0.5;
-/// Integral gain steps: halve going down, one and a half going up. Every
-/// gain that was hand-tuned on 2026-09-23 moved by a factor in that range
-/// (J1 kiv x2, J6 kiv /3); a doubling of kpv with a quadrupling of kiv in
-/// one step is what buzzed J1.
-const GAINS_STEP_DOWN: f64 = 0.5;
-const GAINS_STEP_UP: f64 = 1.5;
-/// Proportional gain steps, gentler: kpv changes the loop's crossover.
-const GAINS_KPV_STEP_DOWN: f64 = 0.75;
-const GAINS_KPV_STEP_UP: f64 = 1.25;
-/// How far a search may walk from the configured value, either way.
-const GAINS_MIN_FACTOR: f64 = 0.1;
-const GAINS_MAX_FACTOR: f64 = 3.0;
-/// Least a gains probe move lasts \[s\]: at half caps a wrist's short probe
-/// is under 0.5 s, inside the scoring guard, and scores nothing.
-const GAINS_PROBE_MIN_S: f64 = 1.5;
-/// A step must beat the best score by this fraction to count: on the
-/// simulator J3's trials differ by under 1%, which is repeat noise, and a
-/// search that follows noise walks the gains for nothing.
-const GAINS_MIN_IMPROVEMENT: f64 = 0.05;
+/// The gains step: a velocity step this fast, joint side \[rad/s\], or
+/// slower when the capture window's travel would not fit
+/// `GAINS_ROOM_SHARE` of the joint's clear span. Fast enough that the
+/// speed quantum (312 ticks/s through the drive's filter) is a small part
+/// of it on a 4:1 wrist; slow enough to be quiet.
+const GAINS_STEP_RAD_S: f64 = 20.0 * std::f64::consts::PI / 180.0;
+const GAINS_ROOM_SHARE: f64 = 0.6;
+/// Every third control loop: 1024 samples cover 0.49 s, several periods of
+/// the 12-15 Hz ring the arm's joints show, at 2083 Hz.
+const GAINS_CAPTURE_DIVISOR: u8 = 3;
+/// Status requests before a drive counts as recording no capture.
+const GAINS_STATUS_TRIES: u32 = 3;
+/// Read passes over the chunks a lossy bus did not answer.
+const GAINS_READ_PASSES: u32 = 3;
+/// The joints' drive filters speed over this many loops unless the config
+/// says otherwise (cmd 41).
+const VELOCITY_WINDOW_DRIVE: u8 = 20;
+/// The arm may not stand still longer than this between motions, anywhere in
+/// a run: every second of it is the operator's. A longer stop is reported
+/// when motion resumes, with what the run was doing, and the run's total is
+/// printed at the end.
+const IDLE_LIMIT_S: f64 = 1.0;
+/// A joint has moved when its encoder left the count it rested at by more
+/// than this; the count of noise a still joint reads is not motion.
+const IDLE_MOTION_TICKS: i64 = 2;
+/// After a trial runs away: how long the joint is held, and how much of the
+/// start of that a spinning-down joint may still read loud.
+const CALM_S: f64 = 0.5;
+const CALM_QUIET_S: f64 = 0.2;
+/// The ripple sweep's speed \[motor ticks/s\]: about two electrical cycles a
+/// second on the arm's 50-pole-pair steppers, slow enough that the velocity
+/// loop has the ripple in hand and the current it spends is what cancels it.
+const RIPPLE_SWEEP_TICKS_S: f64 = 655.0;
+/// Every twentieth loop: 1024 samples cover 3.3 s, six electrical cycles.
+const RIPPLE_CAPTURE_DIVISOR: u8 = 20;
+/// Harmonics of the electrical phase fitted and fed forward: the 1x and 2x
+/// commutation error and the 4x detent the arm's captures showed, and the
+/// 3x, 6x and 8x still left on J3, J4 and J6 once those were cancelled.
+const RIPPLE_HARMONICS: [u8; 6] = [1, 2, 3, 4, 6, 8];
+/// Each sweep's start, while the loop takes up the speed, left out of the
+/// fit \[s\].
+const RIPPLE_SETTLE_S: f64 = 0.3;
+/// The gains step's rise, left out when its speed ripple is measured \[s\].
+const RIPPLE_STEP_SKIP_S: f64 = 0.15;
+/// The feedforward stays only if it cuts the speed ripple at those
+/// harmonics, measured on the gains step, by this share.
+const RIPPLE_MIN_IMPROVEMENT: f64 = 0.2;
+/// The refinement step extrapolates from two captures; no harmonic of it
+/// may exceed the current limit over this.
+const RIPPLE_REFINE_ILIM_SHARE: f64 = 8.0;
 /// A speed error this large for `RUNAWAY_TICKS` in a row is a loop that
 /// has gone unstable, not a rough joint: J2's backlash chatter spikes to
 /// 77 deg/s for single samples, the J1 buzz sat at +-240 deg/s.
@@ -215,6 +259,22 @@ const STICTION_STILL_TIMEOUT_S: f64 = 5.0;
 const STICTION_MIN_RAMP_ILIM: f64 = 0.01;
 /// Rest between breakaways, so the last one's motion has died.
 const STICTION_REST_S: f64 = 1.0;
+/// The belt chirp: J1 in current mode at the ready pose, a sine of this
+/// torque \[Nm, joint side\] about the held current sweeping
+/// `BELT_F_LO_HZ` to `BELT_F_HI_HZ` over `BELT_SECONDS`. The rotor's
+/// answer against a rigid inertia shows the arm's compliance about the
+/// base axis, which `[sim] arm_lateral_stiffness_nm_rad` carries. Bounded
+/// by `BELT_ABORT_RAD` of travel, which stops the chirp and holds, and
+/// only run with `BELT_CLEARANCE` times that clear on both sides.
+const BELT_CHIRP_NM: f64 = 0.35;
+const BELT_F_LO_HZ: f64 = 2.0;
+const BELT_F_HI_HZ: f64 = 60.0;
+const BELT_SECONDS: f64 = 6.0;
+const BELT_ABORT_RAD: f64 = 5.0 * std::f64::consts::PI / 180.0;
+const BELT_CLEARANCE: f64 = 2.0;
+/// The ease back from a current-mode excursion takes at least this long
+/// \[s\]; the EXEC caps stretch it further when the distance needs it.
+const RETURN_S: f64 = 1.0;
 
 /// Velocity, acceleration and jerk caps for one joint's moves.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -266,20 +326,334 @@ struct Found {
     configured: Caps,
 }
 
+/// A loop-rate capture as read back, one row per sample: the drive's speed
+/// \[ticks/s\], its measured Iq \[mA\] and, when asked for, the rotor's
+/// electrical phase (0..16383 per cycle).
+#[derive(Clone, Debug)]
+struct Captured {
+    speed: Vec<f64>,
+    current: Vec<f64>,
+    phase: Vec<f64>,
+    divisor: usize,
+}
+
+#[derive(Clone, Copy)]
+struct DragSample {
+    position: f64,
+    speed: f64,
+    current: f64,
+}
+
+impl DragSample {
+    fn at(samples: &[Self], position: f64) -> Option<Self> {
+        samples.windows(2).find_map(|pair| {
+            let [a, b] = [pair[0], pair[1]];
+            if a.position == b.position
+                || position < a.position.min(b.position)
+                || position > a.position.max(b.position)
+            {
+                return None;
+            }
+            let fraction = (position - a.position) / (b.position - a.position);
+            Some(Self {
+                position,
+                speed: a.speed + fraction * (b.speed - a.speed),
+                current: a.current + fraction * (b.current - a.current),
+            })
+        })
+    }
+}
+
 /// What the gains stage settled on for one joint.
 #[derive(Clone, Copy, Debug)]
 struct Tuned {
     before: Gains,
     after: Gains,
-    /// Speed RMS off the profile on the probe move, before and after
-    /// \[rad/s\].
-    score_before: f64,
-    score_after: f64,
+    observations: usize,
+}
+
+// The StepFOC guide supplied by the user fixes the order (Kpv, Kiv, Kpp) and
+// Kpv's 20% backoff. Everything else here makes that manual procedure
+// finite, start-independent and repeatable: fixed lattices to walk, a bound
+// on observations, and the motions each verdict is read from.
+const GAIN_OBSERVATIONS: usize = 40;
+const GAIN_DIVISOR: u8 = 6;
+const GAIN_VELOCITY_RAD_S: f64 = 40.0 * std::f64::consts::PI / 180.0;
+const GAIN_SETTLE_S: f64 = 0.3;
+/// The pulse: a cosine ramp sized to the joint's EXEC acceleration within
+/// these bounds, a steady stretch, the same ramp down, then the stop the
+/// standstill verdict is read from. A velocity step instead put J3 on its
+/// current limit at the second Kpv point, which says nothing about its loop.
+const GAIN_RAMP_MIN_S: f64 = 0.1;
+const GAIN_RAMP_MAX_S: f64 = 0.5;
+const GAIN_STEADY_S: f64 = 0.35;
+/// How far into the steady stretch and into the stop the verdicts begin.
+const GAIN_RAMP_SETTLE_S: f64 = 0.1;
+const GAIN_TAIL_SETTLE_S: f64 = 0.25;
+/// The guide's 20% Kpv backoff is one step of its lattice: the result stays
+/// a lattice point, so the next run snaps straight back onto it.
+const KPV_BACKOFF_STEPS: i32 = 1;
+/// A position step may overshoot by two encoder counts or this share of the
+/// step, whichever is larger. The share is the guide's "overshoot appears":
+/// a few counts past a 1 deg step is encoder noise and stiction release
+/// (J1 read 3 counts one run and 4 the next at the same gains, 2026-10-02),
+/// and a Kpp verdict must not turn on that. Whether the chosen Kpp also
+/// holds still at the arm's inertia extremes is the posture check's call.
+const GAIN_OVERSHOOT_FRACTION: f64 = 0.05;
+/// Qualification steps a gain down its lattice at most this many times.
+const GAIN_QUALIFY_STEPS: usize = 3;
+/// Oscillation on the normal profile: the speed error crossing from beyond
+/// one side of this band to beyond the other `SWEEP_REVERSALS` times. Lag
+/// crosses it once each way; a loop hunting at tens of hertz crosses it
+/// every half cycle (J4 at 55 Hz, 2026-10-01).
+const SWEEP_BAND_RAD_S: f64 = 3.0 * MOVING_RMS_RAD_S;
+const SWEEP_REVERSALS: u32 = 6;
+/// A candidate that misbehaves on a calibration pose steps its Kpv down this
+/// many lattice points before its configured gains are retained instead.
+const POSE_BACKOFF_STEPS: u8 = 2;
+/// Passes over the calibration poses before the qualification is given up.
+const POSE_ATTEMPTS: usize = 8;
+/// How long the CAN transmit queue may stay full before the bus is given up.
+const TX_FULL_S: f64 = 1.0;
+
+#[derive(Clone, Copy, Debug)]
+enum GainAxis {
+    Kpv,
+    Kiv,
+    Kpp,
+}
+
+impl GainAxis {
+    fn value(self, g: Gains) -> f64 {
+        match self {
+            Self::Kpv => g.kpv,
+            Self::Kiv => g.kiv,
+            Self::Kpp => g.kpp,
+        }
+    }
+    fn set(self, g: &mut Gains, value: f64) {
+        let value = f64::from(value as f32);
+        match self {
+            Self::Kpv => {
+                // The integral corner (Kiv/Kpv) belongs to the Kiv search; a Kpv
+                // step keeps it so the loop's shape survives the walk. With Kiv
+                // left at the config's value, J3 hunted harder at every step
+                // down (2026-10-01).
+                let ratio = if g.kpv > 0.0 { g.kiv / g.kpv } else { 0.0 };
+                g.kpv = value;
+                g.kiv = f64::from((ratio * value) as f32);
+            }
+            Self::Kiv => g.kiv = value,
+            Self::Kpp => g.kpp = value,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Self::Kpv => "Kpv",
+            Self::Kiv => "Kiv",
+            Self::Kpp => "Kpp",
+        }
+    }
+    /// The lattice this axis is searched on: base, ratio and the highest
+    /// index. Anchored to fixed numbers, not to the configured value, so
+    /// two runs from different configs walk the same points and can agree.
+    /// Kpp stops at 20: the drive's position loop closes on a 250 Hz target
+    /// stream, and above a few hertz it amplifies that staircase.
+    fn lattice(self) -> (f64, f64, i32) {
+        match self {
+            Self::Kpv => (0.001, 1.25, 21),
+            Self::Kiv => (0.0001, 1.5, 10),
+            Self::Kpp => (2.5, 2.0, 3),
+        }
+    }
+    fn top(self) -> i32 {
+        self.lattice().2
+    }
+    /// Lattice point `index`, as the drive will hold it.
+    fn at(self, index: i32) -> f64 {
+        let (base, ratio, _) = self.lattice();
+        f64::from((base * ratio.powi(index)) as f32)
+    }
+    /// The lattice point nearest `value` by ratio, within the lattice.
+    fn snap(self, value: f64) -> i32 {
+        let (base, ratio, top) = self.lattice();
+        if !(value.is_finite() && value > 0.0) {
+            return 0;
+        }
+        ((value / base).ln() / ratio.ln())
+            .round()
+            .clamp(0.0, f64::from(top)) as i32
+    }
+}
+
+#[derive(Clone, Copy)]
+enum GainCommand {
+    /// Constant velocity \[ticks/s\] for the whole capture.
+    Velocity(f64),
+    /// Ramped to `ticks_s` over `ramp_s`, held `GAIN_STEADY_S`, ramped back
+    /// to rest, then still for the rest of the capture.
+    Pulse { ticks_s: f64, ramp_s: f64 },
+    /// A P-only position step \[ticks\], without velocity feedforward.
+    Position(i32),
+}
+
+impl GainCommand {
+    fn divisor(self) -> u8 {
+        match self {
+            Self::Velocity(_) => GAIN_DIVISOR,
+            Self::Pulse { .. } | Self::Position(_) => 12,
+        }
+    }
+}
+
+/// The pulse's velocity profile at `t` seconds, as a fraction of its speed.
+fn pulse_shape(t: f64, ramp_s: f64) -> f64 {
+    let up = |x: f64| 0.5 * (1.0 - (std::f64::consts::PI * x).cos());
+    if t < ramp_s {
+        up(t / ramp_s)
+    } else if t < ramp_s + GAIN_STEADY_S {
+        1.0
+    } else if t < 2.0 * ramp_s + GAIN_STEADY_S {
+        1.0 - up((t - ramp_s - GAIN_STEADY_S) / ramp_s)
+    } else {
+        0.0
+    }
+}
+
+/// How a candidate misbehaved on a calibration pose: on the way, or at it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoseFault {
+    /// Oscillated on a leg: the velocity loop's doing, so Kpv steps down.
+    Motion,
+    /// Would not hold still at the pose, where the measurements need two
+    /// counts of stillness: hunting, so Kpp steps down, then Kiv.
+    Hold,
+}
+
+/// What one leg of the normal profile said about trial gains.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Sweep {
+    Passed,
+    /// Oscillated, hunted at the end, or did not land: the gains' doing.
+    Failed,
+    /// Could not be judged: the budget, or a contact on the way.
+    Stopped,
+}
+
+impl Sweep {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Passed => "passed",
+            Self::Failed => "failed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// The verdict on one leg: a runaway or an oscillation fails it, as does a
+/// joint that will not hold still afterwards or did not land; a contact
+/// says nothing about the gains.
+fn sweep_verdict(m: &Measure, holding_limit: f64, tolerance: f64) -> Sweep {
+    match m.outcome {
+        Outcome::Unstable | Outcome::Timeout => Sweep::Failed,
+        Outcome::Blocked => Sweep::Stopped,
+        Outcome::Complete => {
+            if m.reversals >= SWEEP_REVERSALS
+                || m.hold_rms_rad_s > holding_limit
+                || m.settled_error_rad > tolerance
+            {
+                Sweep::Failed
+            } else {
+                Sweep::Passed
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GainObservation {
+    stable: bool,
+    ripple: f64,
+    reversals: usize,
+    overshoot: f64,
+    error: f64,
+    /// Mean velocity error without removing angle-dependent ripple.
+    mean_error: f64,
+}
+
+/// RMS about the mean measures ripple. Repeated crossings of the requested
+/// speed distinguish oscillation about the target from motion below it.
+fn gain_ripple(values: &[f64], reference: f64, per_tick: f64, limit: f64) -> (f64, usize) {
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let ripple = (values.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / values.len() as f64)
+        .sqrt()
+        * per_tick.abs();
+    let mut sign = 0;
+    let mut reversals = 0;
+    for v in values {
+        let velocity = (v - reference) * per_tick;
+        let next = if velocity > limit / 2.0 {
+            1
+        } else if velocity < -limit / 2.0 {
+            -1
+        } else {
+            0
+        };
+        if next != 0 {
+            if sign != 0 && sign != next {
+                reversals += 1;
+            }
+            sign = next;
+        }
+    }
+    (ripple, reversals)
+}
+
+/// Separate the ripple fixed to the rotor's electrical angle (the harmonics
+/// the ripple stage cancels) from free oscillation while tuning. Tracking
+/// error is still judged on the raw motion.
+fn gain_moving_residual(speed: &[f64], phase: &[f64]) -> Vec<f64> {
+    let mut residual = speed.to_vec();
+    let travel = phase
+        .windows(2)
+        .map(|p| (p[1] - p[0] + 8192.0).rem_euclid(16384.0) - 8192.0)
+        .sum::<f64>()
+        .abs();
+    // A stalled P-only trial cannot identify an angle-dependent disturbance.
+    if travel >= 2.0 * 16384.0 {
+        if let Some(fit) = ripple::fit(speed, phase, 0, &RIPPLE_HARMONICS) {
+            for (v, p) in residual.iter_mut().zip(phase) {
+                let angle = std::f64::consts::TAU * p / 16384.0;
+                for harmonic in &fit {
+                    let x = f64::from(harmonic.harmonic) * angle;
+                    *v -= harmonic.a * x.cos() + harmonic.b * x.sin();
+                }
+            }
+        }
+    }
+    residual
+}
+
+struct GainSession {
+    joint: usize,
+    span: (f64, f64),
+    /// The gains every observation restores before anything else moves.
+    original: Gains,
+}
+
+/// One coordinated approach and hold, observed on all selected joints.
+struct GainPose {
+    from_ready: bool,
+    approach: [f64; N],
+    target: [f64; N],
 }
 
 /// Waiting out one silent drive is normal; a run that spends its time doing
 /// nothing else has a bus problem no amount of waiting will fix.
 const MAX_RECOVERIES: u32 = 24;
+/// Clear-and-read-back rounds a drive gets at startup before its fault is
+/// taken as real.
+const CLEAR_ROUNDS: u32 = 3;
 /// Candidate poses drawn over each joint's whole window, from which the
 /// identification plan keeps the ones that pin the gravity parameters best.
 /// How many it keeps is `selfcal.identification_poses`.
@@ -309,39 +683,55 @@ struct Args {
     apply: bool,
     /// Also find each joint's velocity, acceleration and jerk limits, and
     /// with `--apply` write them as its EXEC limits. Off by default: it
-    /// drives every joint to the edge of what it can do.
+    /// drives every joint to the edge of what it can do, and what it finds
+    /// changes little from arm to arm.
     #[arg(long)]
     limits: bool,
-    /// Home, then run only the limits stage: skip the friction sweep and the
-    /// identification, and leave the gravity correction as configured.
-    #[arg(long)]
-    limits_only: bool,
-    /// Also tune each joint's velocity-loop gains (kiv, then kpv) on a probe
-    /// move, and with `--apply` write them. Runs before the limits stage,
-    /// which depends on them. Off by default.
-    #[arg(long)]
-    gains: bool,
-    /// Home, then run only the gains stage.
-    #[arg(long)]
-    gains_only: bool,
-    /// Also measure each joint's static friction: the current at which it
-    /// breaks away from rest, ramped up and down from the gravity balance,
-    /// at the ready pose and with the arm out. Reported, not written.
-    #[arg(long)]
-    stiction: bool,
-    /// Home, then run only the stiction stage.
-    #[arg(long)]
-    stiction_only: bool,
+    /// Development: home, then run only these stages (repeatable), in the
+    /// order a full calibration runs them. A full calibration runs every
+    /// stage but the limits.
+    #[arg(long, value_enum)]
+    only: Vec<Stage>,
+    /// Development, with `--only` ripple and/or gains: run those stages on
+    /// only these joints (1-6, repeatable).
+    #[arg(long = "joint", value_parser = clap::value_parser!(u8).range(1..=6))]
+    joints: Vec<u8>,
     /// The tool fitted on the arm now, by its config name (e.g. `Flange`).
     /// Defaults to the config's `active_tool`; the file is not changed.
     #[arg(long)]
     tool: Option<String>,
+    /// With --only gains, verify gains from this TOML without a new search.
+    /// Selected joints use the candidate gains together; startup, recovery
+    /// and parking use the primary config.
+    #[arg(long, conflicts_with = "apply")]
+    verify_gains: Option<PathBuf>,
+    /// Also verify the candidate file's ripple compensation, installed after
+    /// homing and restored to the primary config before parking.
+    #[arg(long, requires = "verify_gains")]
+    verify_ripple: bool,
+}
+
+/// The stages a calibration runs, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+enum Stage {
+    /// Ripple feedforward: cogging and commutation error, cancelled in the drive.
+    Ripple,
+    /// StepFOC velocity PI followed by position P tuning and final verification.
+    Gains,
+    /// Static friction: breakaway at the ready pose and with the arm out.
+    Stiction,
+    /// J1's current chirp: the arm's compliance about the base axis.
+    Belt,
+    /// Friction per joint and the gravity identification sweep.
+    Mechanics,
+    /// Each joint's EXEC limits (opt-in with `--limits` in a full run).
+    Limits,
 }
 
 // ---------------------------------------------------------------- events
 
-#[derive(Clone, Copy, Debug)]
-#[allow(clippy::large_enum_variant)] // Fixed-size entries: no allocation on the tick path.
+#[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)] // Tick events stay inline, without allocation.
 enum Event {
     Phase(&'static str, usize),
     Tool(u8, bool),
@@ -350,21 +740,51 @@ enum Event {
     Move(u64, usize, Outcome, f64, i32, i32, Measure),
     Contact(u64, usize, i64, f64, f64, bool, bool),
     FeedbackGap(u64, usize, f64),
+    /// The arm moved again after standing still longer than `IDLE_LIMIT_S`:
+    /// for how long \[s\], during which announced activity on which joint.
+    Idle(u64, f64, &'static str, usize),
     Drag(u64, usize, f64, f64, f64),
     Mechanics(u64, usize, f64, f64, f64),
+    FrictionQuality(u64, usize, f64, f64, f64, f64, usize),
     /// Breakaway at a labelled pose: the currents up and down \[mA\], the
     /// static friction they straddle \[Nm\], the gravity current the model
     /// predicted against the one the pair measured \[mA\], the transmission
     /// wind-up before the link moved \[motor ticks\] and the stiffness that
     /// implies \[Nm/rad, joint side\].
     Stiction(u64, usize, &'static str, f64, f64, f64, f64, f64, f64, f64),
+    /// The belt chirp's outcome: the rotor's swing and drift over it
+    /// \[deg\], and whether the travel bound stopped it.
+    Belt(u64, usize, f64, f64, bool),
     LimitsStep(u64, usize, Caps, Option<&'static str>),
     Limits(u64, usize, Found),
-    GainsStep(u64, usize, Gains, Option<f64>, &'static str),
+    GainObservation(u64, usize, Gains, &'static str, GainObservation),
+    GainPose(u64, usize, usize, [f64; N]),
+    /// One joint on a coordinated qualification move: speed RMS \[rad/s\],
+    /// peak position error \[rad\] and speed-error reversals across the
+    /// oscillation band.
+    GainPoseMotion(u64, usize, f64, f64, u32),
+    /// One leg of the normal profile under trial gains: speed-error
+    /// reversals across the oscillation band, the hold RMS after it
+    /// \[rad/s\], the lag \[ms\] and the verdict.
+    Sweep(u64, usize, Gains, u32, f64, f64, &'static str),
+    /// Why a joint keeps its configured gains.
+    GainsNote(u64, usize, &'static str),
     Gains(u64, usize, Tuned),
+    /// The ripple feedforward fitted from the sweeps: per harmonic, the
+    /// harmonic and its cosine and sine current \[mA\].
+    RippleFit(u64, usize, [(u8, i16, i16); 6]),
+    /// The at-speed refinement: speed ripple on the step with the slow-sweep
+    /// feedforward and with the refined one \[ticks/s\].
+    RippleRefine(u64, usize, f64, f64),
+    /// The speed ripple at those harmonics on the gains step, without and
+    /// with the feedforward \[ticks/s\], and whether it stayed.
+    RippleCheck(u64, usize, f64, f64, bool),
+    /// Why a joint gets no ripple feedforward.
+    RippleNote(u64, usize, &'static str),
     IdentPose(usize, usize, [f64; N]),
     IdentTorque(usize, [f64; N]),
     ArmFit(f64, f64),
+    Capture(usize, u32, f64, Gains, Captured, Option<f64>),
     Sample(
         u64,
         [JointCommand; N],
@@ -372,13 +792,14 @@ enum Event {
         [i32; N],
         [i32; N],
         [bool; N],
+        [u64; N],
     ),
 }
 
 /// `None` means the event belongs in a csv, not the console.
 fn describe(event: &Event) -> Option<String> {
     Some(match *event {
-        Event::Sample(..) => return None,
+        Event::Sample(..) | Event::Capture(..) => return None,
         Event::Phase(name, j) => format!("J{}: {name}", j + 1),
         Event::Tool(node, found) => format!(
             "TOOL node {node}: {}",
@@ -417,6 +838,10 @@ fn describe(event: &Event) -> Option<String> {
              stall_below={below:.0}ticks stopped={stopped} loaded={loaded}",
             j + 1
         ),
+        Event::Idle(tick, idle, name, j) => format!(
+            "tick={tick} IDLE {idle:.1}s: the arm stood still longer than {IDLE_LIMIT_S}s during J{} {name}",
+            j + 1
+        ),
         Event::FeedbackGap(tick, j, silent) => {
             format!(
                 "tick={tick} J{} answered again after {silent:.3}s of silence",
@@ -431,12 +856,25 @@ fn describe(event: &Event) -> Option<String> {
             "tick={tick} J{} MECHANICS J={inertia:.6}kg.m2 b={b:.6}Nm.s tc={tc:.4}Nm",
             j + 1
         ),
-        Event::Stiction(tick, j, label, up, down, s, model, measured, windup, k) => format!(
-            "tick={tick} J{} STICTION {label} up={up:.0}mA down={down:.0}mA static={s:.4}Nm \
-             gravity model={model:.0}mA measured={measured:.0}mA windup={windup:.0}ticks \
-             stiffness={k:.0}Nm/rad",
+        Event::FrictionQuality(tick, j, b, tc, b_se, tc_se, speeds) => format!(
+            "tick={tick} J{} FRICTION FIT speeds={speeds} b={b:.6} +/- {b_se:.6}Nm.s tc={tc:.6} +/- {tc_se:.6}Nm (one standard error; excludes systematic bias)",
             j + 1
         ),
+        Event::Belt(tick, j, swing, drift, aborted) => format!(
+            "tick={tick} J{} BELT chirp={BELT_CHIRP_NM:.2}Nm swing={swing:.2}deg drift={drift:+.2}deg{}",
+            j + 1,
+            if aborted { " ABORTED on travel" } else { "" }
+        ),
+        Event::Stiction(tick, j, label, up, down, s, model, measured, windup, k) => {
+            let stiffness = if k.is_finite() { format!("{k:.0}Nm/rad") } else {
+                "unresolved (windup below encoder resolution)".to_owned()
+            };
+            format!(
+                "tick={tick} J{} STICTION {label} up={up:.0}mA down={down:.0}mA static={s:.4}Nm \
+                 gravity model={model:.0}mA measured={measured:.0}mA windup={windup:.1}ticks \
+                 stiffness={stiffness}", j + 1
+            )
+        },
         Event::LimitsStep(tick, j, c, failed) => format!(
             "tick={tick} J{} LIMITS step velocity={:.4}rad/s acceleration={:.4}rad/s2 \
              jerk={:.4}rad/s3 {}",
@@ -446,25 +884,45 @@ fn describe(event: &Event) -> Option<String> {
             c.jerk,
             failed.map_or("passed".to_owned(), |why| format!("failed: {why}"))
         ),
-        Event::GainsStep(tick, j, g, score, verdict) => format!(
-            "tick={tick} J{} GAINS step kpv={:.5} kiv={:.5} {} {verdict}",
-            j + 1,
-            g.kpv,
-            g.kiv,
-            score.map_or("unstable".to_owned(), |s| format!(
-                "score={:.3}deg/s",
-                s.to_degrees()
-            ))
+        Event::GainObservation(tick, j, g, stage, o) => format!(
+            "tick={tick} J{} GAINS {stage} kpv={:.6} kiv={:.8} kpp={:.5} encoder_ripple={:.3}deg/s reversals={} overshoot={:.4}deg error={:.4} mean_error={:.4} stable={}",
+            j + 1, g.kpv, g.kiv, g.kpp, o.ripple.to_degrees(), o.reversals,
+            o.overshoot.to_degrees(), o.error, o.mean_error, o.stable
         ),
-        Event::Gains(tick, j, t) => format!(
-            "tick={tick} J{} GAINS kpv={:.5}->{:.5} kiv={:.5}->{:.5} score={:.3}->{:.3}deg/s",
+        Event::GainsNote(tick, j, note) => format!("tick={tick} J{} GAINS {note}", j + 1),
+        Event::GainPose(tick, at, total, q) => format!(
+            "tick={tick} GAINS qualify calibration pose {at}/{total} q={q:?}"
+        ),
+        Event::GainPoseMotion(tick, j, speed, position, reversals) => format!(
+            "tick={tick} J{} GAINS pose motion speed_rms={:.3}deg/s peak_position_error={:.3}deg reversals={reversals}",
+            j + 1, speed.to_degrees(), position.to_degrees()
+        ),
+        Event::Sweep(tick, j, g, reversals, hold, lag_ms, verdict) => format!(
+            "tick={tick} J{} GAINS sweep kpv={:.6} kiv={:.8} kpp={:.5} reversals={reversals} hold_rms={:.3}deg/s lag={lag_ms:.1}ms {verdict}",
+            j + 1, g.kpv, g.kiv, g.kpp, hold.to_degrees()
+        ),
+        Event::RippleFit(tick, j, h) => format!(
+            "tick={tick} J{} RIPPLE fit {}",
             j + 1,
-            t.before.kpv,
-            t.after.kpv,
-            t.before.kiv,
-            t.after.kiv,
-            t.score_before.to_degrees(),
-            t.score_after.to_degrees()
+            h.iter()
+                .map(|(n, a, b)| format!("h{n}: {a}/{b}mA"))
+                .collect::<Vec<_>>()
+                .join(" ")
+        ),
+        Event::RippleCheck(tick, j, before, after, kept) => format!(
+            "tick={tick} J{} RIPPLE speed ripple about the 20 deg/s step {before:.0}->{after:.0}ticks/s {}",
+            j + 1,
+            if kept { "kept" } else { "no better; cleared" }
+        ),
+        Event::RippleRefine(tick, j, first, refined) => format!(
+            "tick={tick} J{} RIPPLE refined at speed {first:.0}->{refined:.0}ticks/s",
+            j + 1
+        ),
+        Event::RippleNote(tick, j, note) => format!("tick={tick} J{} RIPPLE {note}", j + 1),
+        Event::Gains(tick, j, t) => format!(
+            "tick={tick} J{} GAINS StepFOC kpv={:.6}->{:.6} kiv={:.8}->{:.8} kpp={:.5}->{:.5} observations={}",
+            j + 1, t.before.kpv, t.after.kpv, t.before.kiv, t.after.kiv,
+            t.before.kpp, t.after.kpp, t.observations
         ),
         Event::Limits(tick, j, f) => format!(
             "tick={tick} J{} LIMITS velocity={:.4}rad/s{} acceleration={:.4}rad/s2 \
@@ -497,22 +955,35 @@ fn writer(rx: Receiver<Event>, directory: PathBuf) -> std::io::Result<()> {
     let mut samples = fs::File::create(directory.join("samples.csv"))?;
     writeln!(
         samples,
-        "tick,joint,command,position_ticks,speed_ticks_s,current_ma,drive_fault"
+        "tick,joint,command,position_ticks,speed_ticks_s,current_ma,drive_fault,position_rx_ns"
     )?;
     let mut line = String::new();
     while let Ok(event) = rx.recv() {
-        if let Event::Sample(tick, cmd, pos, speed, current, fault) = event {
+        if let Event::Capture(j, index, step, gains, captured, stop_after) = event {
+            if let Err(error) =
+                save_capture(&directory, j, index, step, gains, &captured, stop_after)
+            {
+                writeln!(
+                    console,
+                    "J{} capture {index} could not be saved: {error}",
+                    j + 1
+                )?;
+            }
+            continue;
+        }
+        if let Event::Sample(tick, cmd, pos, speed, current, fault, received) = event {
             line.clear();
             for j in 0..N {
                 let _ = writeln!(
                     line,
-                    "{tick},{},\"{:?}\",{},{},{},{}",
+                    "{tick},{},\"{:?}\",{},{},{},{},{}",
                     j + 1,
                     cmd[j],
                     pos[j],
                     speed[j],
                     current[j],
-                    u8::from(fault[j])
+                    u8::from(fault[j]),
+                    received[j]
                 );
             }
             samples.write_all(line.as_bytes())?;
@@ -526,6 +997,33 @@ fn writer(rx: Receiver<Event>, directory: PathBuf) -> std::io::Result<()> {
     Ok(())
 }
 
+fn save_capture(
+    directory: &Path,
+    j: usize,
+    index: u32,
+    step: f64,
+    tried: Gains,
+    captured: &Captured,
+    stop_after: Option<f64>,
+) -> std::io::Result<()> {
+    let divisor = captured.divisor;
+    let path = directory.join(format!("capture-J{}-{index}.csv", j + 1));
+    let stop = stop_after.map_or_else(|| "none".to_owned(), |s| s.to_string());
+    let mut text = format!(
+        "# step_ticks_s={step:.0} divisor={divisor} stop_after_s={stop} gains kpv={} kiv={} kpp={}\nsample,t_s,speed_ticks_s,iq_ma,phase\n",
+        tried.kpv, tried.kiv, tried.kpp
+    );
+    for (k, (v, i)) in captured.speed.iter().zip(&captured.current).enumerate() {
+        let t = (k * divisor) as f64 / LOOP_HZ;
+        let phase = captured
+            .phase
+            .get(k)
+            .map_or(String::new(), |p| format!("{p:.0}"));
+        let _ = writeln!(text, "{k},{t:.6},{v:.0},{i:.0},{phase}");
+    }
+    fs::write(path, text)
+}
+
 // ---------------------------------------------------------------- measurement
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -535,8 +1033,8 @@ enum Outcome {
     Complete,
     /// The joint stopped while loaded: a mechanical stop.
     Blocked,
-    /// The loop ran away under trial gains; the move finished under the
-    /// last sane ones.
+    /// The loop oscillated under trial gains; the move stopped under the
+    /// original gains.
     Unstable,
 }
 
@@ -550,6 +1048,9 @@ struct Measure {
     /// Largest current the move drew beyond what gravity alone needs at the
     /// measured pose \[mA\]: what accelerating the joint and its friction cost.
     peak_dynamic_ma: f64,
+    /// Times the speed error crossed from beyond one side of
+    /// `SWEEP_BAND_RAD_S` to beyond the other.
+    reversals: u32,
     settled_error_rad: f64,
     hold_rms_rad_s: f64,
     /// How far this move missed the acceptance limits, as a fraction of them.
@@ -613,32 +1114,116 @@ impl Measure {
 fn reported_fault(flags: &ErrorFlags) -> bool {
     flags.faults().next().is_some()
 }
-
 /// Encoder-difference speed estimate over a fixed window.
 #[derive(Clone, Copy, Default)]
 struct Ring {
-    samples: [(u64, i32); 8],
+    samples: [(u64, i32, u64); 8],
     len: usize,
 }
 impl Ring {
     /// Push a fresh sample; return counts/second measured back to the newest
     /// sample that is at least `window` ticks old, once there is one.
     fn push(&mut self, tick: u64, position: i32, window: u64, dt: f64) -> Option<f64> {
+        self.push_at(tick, position, window, (tick as f64 * dt * 1e9) as u64)
+    }
+
+    fn push_at(&mut self, tick: u64, position: i32, window: u64, received_ns: u64) -> Option<f64> {
         let mut speed = None;
         for k in 0..self.len {
-            let (then, was) = self.samples[k];
+            let (then, was, received_then) = self.samples[k];
             if tick.saturating_sub(then) >= window {
-                speed = Some((f64::from(position) - f64::from(was)) / ((tick - then) as f64 * dt));
+                speed = received_ns
+                    .checked_sub(received_then)
+                    .filter(|dt| *dt > 0)
+                    .map(|dt| (f64::from(position) - f64::from(was)) / (dt as f64 * 1e-9));
             }
         }
         if self.len < self.samples.len() {
-            self.samples[self.len] = (tick, position);
+            self.samples[self.len] = (tick, position, received_ns);
             self.len += 1;
         } else {
             self.samples.rotate_left(1);
-            self.samples[self.len - 1] = (tick, position);
+            self.samples[self.len - 1] = (tick, position, received_ns);
         }
         speed
+    }
+}
+
+/// The bus state exposes positions but not their receive timestamps. A
+/// passive socket supplies the timestamp of the identical motion reply;
+/// four replies per joint cover a drain crossing into the next CAN frame.
+struct EncoderClock {
+    socket: CanSocket,
+    nodes: [u8; N],
+    replies: [[(i32, i32, u64); 4]; N],
+}
+
+impl EncoderClock {
+    fn open(robot: &par6_config::RobotConfig) -> Result<Self> {
+        let socket = CanSocket::open(&robot.bus.interface)?;
+        socket.set_nonblocking(true)?;
+        socket.set_recv_timestamp(true)?;
+        let nodes = std::array::from_fn(|j| robot.joints[j].node_id);
+        let filters: [(u32, u32); N * 2] = std::array::from_fn(|k| {
+            let command = if k % 2 == 0 { 3 } else { 28 };
+            ((u32::from(nodes[k / 2]) << 7) | (command << 1), 0xc000_07fe)
+        });
+        socket.set_filters(&filters)?;
+        Ok(Self {
+            socket,
+            nodes,
+            replies: [[(0, 0, 0); 4]; N],
+        })
+    }
+
+    fn drain(&mut self) -> Result<()> {
+        use par6_bus::spectral::codec::{unpack_i24, unpack_i32};
+        for _ in 0..128 {
+            let (frame, stamp) = match self.socket.read_frame_with_timestamps() {
+                Ok(frame) => frame,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
+                Err(e) => return Err(e.into()),
+            };
+            let data = frame.data();
+            let Some(j) = self
+                .nodes
+                .iter()
+                .position(|n| u32::from(*n) == frame.raw_id() >> 7)
+            else {
+                continue;
+            };
+            if data.len() != 8 {
+                continue;
+            }
+            let ns = stamp
+                .socket
+                .ok_or("motion reply has no receive timestamp")?
+                .duration_since(std::time::SystemTime::UNIX_EPOCH)?
+                .as_nanos() as u64;
+            self.replies[j].rotate_left(1);
+            self.replies[j][3] = if (frame.raw_id() >> 1) & 0x3f == 28 {
+                (
+                    unpack_i32([data[0], data[1], data[2], data[3]]),
+                    unpack_i32([data[4], data[5], data[6], data[7]]),
+                    ns,
+                )
+            } else {
+                (
+                    unpack_i24([data[0], data[1], data[2]]),
+                    unpack_i24([data[3], data[4], data[5]]),
+                    ns,
+                )
+            };
+        }
+        Err("encoder timestamp socket backlog exceeded its drain bound".into())
+    }
+
+    fn received(&self, j: usize, position: i32, speed: i32) -> u64 {
+        self.replies[j]
+            .iter()
+            .rev()
+            .find(|r| (r.0, r.1) == (position, speed))
+            .map_or(0, |r| r.2)
     }
 }
 
@@ -654,21 +1239,64 @@ struct Arm {
     gains: [Gains; N],
     hold: [i32; N],
     homed: [bool; N],
-    found_at: [i32; N],
+    /// Where each joint was when the run first held it; `None` before then.
+    found_at: [Option<i32>; N],
     generation: [u64; N],
     seen: [u64; N],
+    encoder_clock: Option<EncoderClock>,
+    position_rx_ns: [u64; N],
     /// A contact this joint is at. Samples within `ENDSTOP_EXCLUSION_RAD` of
     /// it are not scored.
     endstop_guard: [Option<i32>; N],
+    /// Each joint's friction, joint side (viscous \[Nm·s/rad\], Coulomb
+    /// \[Nm\]): this run's once the mechanics stage measured it, the config's
+    /// until then. The gains stage feeds it forward.
+    friction: [(f64, f64); N],
+    /// Positive point estimates can still be dominated by fit uncertainty.
+    friction_fit_uncertain: [bool; N],
     /// While the gains stage trials a joint: the last gains that tracked,
     /// restored within a tick if the trial runs away.
     sane_gains: [Option<Gains>; N],
+    /// Observations spent on each joint, every part of the gains work included.
+    gain_used: [usize; N],
+    gain_watch: bool,
+    gain_joint: Option<usize>,
+    held_runaway: [u32; N],
+    /// Fresh-feedback guard shared by synchronized moves, sweeps and holds.
+    tracking_runaway: [u32; N],
+    /// The joint that guard last fired on, so the posture qualification can
+    /// tell a candidate's fault from a bus fault.
+    runaway_joint: Option<usize>,
+    /// Consecutive ticks the CAN transmit queue refused the frames.
+    tx_full: u64,
+    /// What the run last announced, named in the idle report.
+    activity: std::cell::Cell<(&'static str, usize)>,
+    /// The idle rule's state: the count each joint rested at when the arm
+    /// last stopped, the tick it stopped, and the tally of stops longer than
+    /// `IDLE_LIMIT_S`: how many, their total \[s\], and the longest \[s\]
+    /// with what the run was doing.
+    rest: [Option<i32>; N],
+    rest_since: u64,
+    idle_stops: u32,
+    idle_total_s: f64,
+    idle_longest: (f64, &'static str, usize),
+    /// The pose homing leaves the arm in, once planned.
+    ready: Option<[f64; N]>,
+    /// Every coordinated pose reached since the arm was last at ready, in
+    /// order: the legs between them were collision-checked before they were
+    /// driven, so driven backwards they are the one known-clear way home.
+    visited: Vec<[f64; N]>,
     recoveries: u32,
     /// Homing drives unreferenced joints toward the stop at the configured
     /// homing current, not the operating one.
     homing: bool,
     /// Shutdown: watch only this joint, and tolerate silence.
     only: Option<usize>,
+    /// The core the tick runs on, real-time; `None` in the simulator.
+    control_cpu: Option<i64>,
+    /// Where the gains stage leaves each capture as a CSV.
+    run_directory: Option<PathBuf>,
+    captures_written: u32,
     blind: bool,
     stopping: bool,
     tick: u64,
@@ -709,6 +1337,12 @@ impl Arm {
             bus.send_clear_error(j.node_id, 3)?;
         }
         let robot = &bundle.robot;
+        let friction = std::array::from_fn(|j| {
+            (
+                robot.sim.viscous_nm_s.get(j).copied().unwrap_or(0.0),
+                robot.sim.coulomb_nm.get(j).copied().unwrap_or(0.0),
+            )
+        });
         Ok(Self {
             conv: std::array::from_fn(|j| JointConversion::from_config(&robot.joints[j])),
             gains: std::array::from_fn(|j| robot.joints[j].gains),
@@ -720,14 +1354,36 @@ impl Arm {
             events: Some(events),
             hold: [0; N],
             homed: [false; N],
-            found_at: [0; N],
+            found_at: [None; N],
             generation: [0; N],
             seen: [0; N],
+            encoder_clock: None,
+            position_rx_ns: [0; N],
             endstop_guard: [None; N],
+            friction,
+            friction_fit_uncertain: [false; N],
             sane_gains: [None; N],
+            gain_used: [0; N],
+            gain_watch: false,
+            gain_joint: None,
+            held_runaway: [0; N],
+            tracking_runaway: [0; N],
+            runaway_joint: None,
+            activity: std::cell::Cell::new(("startup", 0)),
+            rest: [None; N],
+            rest_since: 0,
+            idle_stops: 0,
+            idle_total_s: 0.0,
+            idle_longest: (0.0, "startup", 0),
+            tx_full: 0,
+            ready: None,
+            visited: Vec::new(),
             recoveries: 0,
             homing: false,
             only: None,
+            control_cpu: None,
+            run_directory: None,
+            captures_written: 0,
             blind: false,
             stopping: false,
             tick: 0,
@@ -740,6 +1396,9 @@ impl Arm {
     /// full disk used to error every `emit`, which failed every park and
     /// then released a loaded arm anyway.
     fn emit(&self, event: Event) {
+        if let Event::Phase(name, j) = &event {
+            self.activity.set((name, *j));
+        }
         if let Some(tx) = &self.events {
             let _ = tx.try_send(event);
         }
@@ -827,16 +1486,96 @@ impl Arm {
         self.tick += 1;
         self.bus.begin_tick(self.tick);
         self.bus.drain_rx(&mut self.state)?;
-        for j in 0..N {
+        if let Some(clock) = &mut self.encoder_clock {
+            clock.drain()?;
+            for j in 0..N {
+                let node = &self.state.nodes[usize::from(self.bundle.robot.joints[j].node_id)];
+                self.position_rx_ns[j] = match (node.position_ticks, node.speed_ticks_s) {
+                    (Some(p), Some(v)) => clock.received(j, p, v),
+                    _ => 0,
+                };
+            }
+        }
+        for (j, command) in commands.iter().enumerate() {
             let node = &self.state.nodes[self.node(j)];
+            let guarded = check
+                && !self.blind
+                && !self.stopping
+                && !self.homing
+                && self.homed[j]
+                // Gain trials have their own guard and bounded backoff path.
+                && !(self.gain_joint == Some(j) && self.sane_gains[j].is_some())
+                && command.vel.is_some();
+            if !guarded {
+                self.tracking_runaway[j] = 0;
+            }
             if node.position_generation != self.generation[j] {
                 self.generation[j] = node.position_generation;
                 self.seen[j] = self.tick;
+                if guarded {
+                    let position = node
+                        .position_ticks
+                        .ok_or("missing motion position feedback")?;
+                    let speed = f64::from(
+                        node.speed_ticks_s
+                            .ok_or("missing motion velocity feedback")?,
+                    );
+                    let correction = command.pos.map_or(0.0, |target| {
+                        (f64::from(target) - f64::from(position)) * self.gains[j].kpp
+                    });
+                    let limit = self.bundle.robot.joints[j].velocity_limit_ticks_s;
+                    let expected =
+                        (f64::from(command.vel.unwrap_or(0)) + correction).clamp(-limit, limit);
+                    let error = (speed - expected) * self.per_tick(j);
+                    self.tracking_runaway[j] = if error.abs() > RUNAWAY_RAD_S {
+                        self.tracking_runaway[j] + 1
+                    } else {
+                        0
+                    };
+                    if self.tracking_runaway[j] >= RUNAWAY_TICKS {
+                        // A synchronized move keeps `hold` at its start until
+                        // arrival. Recovery must catch here, not return there.
+                        for joint in 0..N {
+                            self.adopt(joint)?;
+                        }
+                        self.runaway_joint = Some(j);
+                        self.emit(Event::GainsNote(self.tick, j, "motion or hold runaway; restoring configured gains and aborting calibration"));
+                        let restored = self.gain_restore(j, self.bundle.robot.joints[j].gains);
+                        return Err(format!("J{} motion/hold speed error {:.1}deg/s exceeded the runaway guard; gain restore: {}", j + 1, error.to_degrees(), if restored.is_ok() { "completed" } else { "failed" }).into());
+                    }
+                }
             }
         }
-        self.bus.poll_step()?;
-        self.bus.send_joint_commands(&commands)?;
-        self.bus.send_gripper(&GripperCommand::NoGripper)?;
+        self.watch_idle();
+        // A transmit queue that fills is a bus that stopped carrying frames
+        // for a moment -- on 2026-10-01 for long enough to end a run and fail
+        // its parking. The drives hold their last target meanwhile, so the
+        // tick is skipped and the next one tries again, up to `TX_FULL_S`.
+        let sent = self
+            .bus
+            .poll_step()
+            .and_then(|()| self.bus.send_joint_commands(&commands))
+            .and_then(|()| self.bus.send_gripper(&GripperCommand::NoGripper));
+        match sent {
+            Ok(()) => self.tx_full = 0,
+            Err(BusError::TxQueueFull) => {
+                self.tx_full += 1;
+                if self.tx_full == 1 {
+                    self.emit(Event::Phase(
+                        "transmit queue full; holding until it drains",
+                        0,
+                    ));
+                }
+                if self.tx_full > self.ticks(TX_FULL_S) {
+                    return Err(format!(
+                        "the CAN transmit queue stayed full for {TX_FULL_S} s; the bus is not \
+                         carrying frames"
+                    )
+                    .into());
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
         self.emit(Event::Sample(
             self.tick,
             commands,
@@ -851,8 +1590,39 @@ impl Arm {
             // not answer": on 2026-09-19 only the second was recorded and the
             // two could not be told apart afterwards.
             std::array::from_fn(|j| self.state.nodes[self.node(j)].live_error_bit),
+            self.position_rx_ns,
         ));
         Ok(())
+    }
+
+    /// The idle rule: note where the arm came to rest, and when any joint
+    /// leaves that rest report a stop longer than `IDLE_LIMIT_S` with what
+    /// the run was doing at the time.
+    fn watch_idle(&mut self) {
+        let positions: [Option<i32>; N] =
+            std::array::from_fn(|j| self.state.nodes[self.node(j)].position_ticks);
+        let moved = (0..N).any(|j| match (positions[j], self.rest[j]) {
+            (Some(position), Some(rest)) => {
+                (i64::from(position) - i64::from(rest)).abs() > IDLE_MOTION_TICKS
+            }
+            _ => false,
+        });
+        if moved {
+            let idle = self.tick.saturating_sub(self.rest_since) as f64 * self.dt;
+            if idle > IDLE_LIMIT_S {
+                let (name, j) = self.activity.get();
+                self.idle_stops += 1;
+                self.idle_total_s += idle;
+                if idle > self.idle_longest.0 {
+                    self.idle_longest = (idle, name, j);
+                }
+                self.emit(Event::Idle(self.tick, idle, name, j));
+            }
+        }
+        if moved || self.rest.iter().any(Option::is_none) {
+            self.rest = positions;
+            self.rest_since = self.tick;
+        }
     }
 
     /// Hold position and wait out a drive that has stopped answering.
@@ -941,13 +1711,43 @@ impl Arm {
     /// forward and whose hold then did not stepped J4 by 78 mA at every
     /// landing, and the position loop took a second to make it up.
     fn frame(&mut self, active: Option<(usize, JointCommand)>) -> Result<()> {
+        let generation = self.generation;
         let feedforward = self.gravity_feedforward();
         let mut commands: [JointCommand; N] =
             std::array::from_fn(|j| JointCommand::position(self.hold[j], 0, feedforward[j]));
         if let Some((j, cmd)) = active {
             commands[j] = cmd;
         }
-        self.exchange(commands, true)
+        self.exchange(commands, true)?;
+        if self.gain_watch && !self.stopping {
+            for (j, previous) in generation.iter().enumerate() {
+                if active.is_some_and(|(moving, _)| moving == j) || self.gain_joint == Some(j) {
+                    self.held_runaway[j] = 0;
+                    continue;
+                }
+                if *previous == self.generation[j] {
+                    continue;
+                }
+                let speed = f64::from(
+                    self.state.nodes[self.node(j)]
+                        .speed_ticks_s
+                        .ok_or("missing held-joint velocity feedback")?,
+                ) * self.per_tick(j);
+                self.held_runaway[j] = if speed.abs() > RUNAWAY_RAD_S {
+                    self.held_runaway[j] + 1
+                } else {
+                    0
+                };
+                if self.held_runaway[j] >= RUNAWAY_TICKS {
+                    self.gain_watch = false;
+                    self.calm(j, self.bundle.robot.joints[j].gains)?;
+                    return Err(
+                        format!("J{} ran away while holding during gains tuning", j + 1).into(),
+                    );
+                }
+            }
+        }
+        Ok(())
     }
 
     /// The current that balances gravity at the measured pose, per joint
@@ -1016,6 +1816,50 @@ impl Arm {
     /// holding current up, check the bus agrees about the fitted tool, and
     /// confirm every joint holds still before anything moves.
     fn initialize(&mut self) -> Result<()> {
+        // Clear_Error is one frame into a 3-deep FIFO that nothing
+        // acknowledges, and a drive's startup watchdog fault survives a
+        // missed one: read every drive's error register back, and clear
+        // again while it still reports a fault.
+        let mut clean = [false; N];
+        for _round in 0..CLEAR_ROUNDS {
+            for (j, clean) in clean.iter_mut().enumerate() {
+                if *clean {
+                    continue;
+                }
+                let node = self.bundle.robot.joints[j].node_id;
+                self.bus.queue_poll_override(
+                    PollAction::Poll {
+                        node,
+                        kind: PollKind::Errors,
+                    },
+                    1,
+                );
+                // The poll leaves with this tick; its answer is in the
+                // next tick's drain.
+                self.exchange([JointCommand::encoder_poll(); N], false)?;
+                self.exchange([JointCommand::encoder_poll(); N], false)?;
+                let flags = self.state.nodes[self.node(j)].error_flags;
+                *clean = flags.is_some_and(|f| !reported_fault(&f));
+                if !*clean {
+                    self.emit(Event::Phase(
+                        "still faulted after the clear; clearing again",
+                        j,
+                    ));
+                    self.bus.send_clear_error(node, 1)?;
+                }
+            }
+            if clean.iter().all(|c| *c) {
+                break;
+            }
+        }
+        if let Some(j) = clean.iter().position(|c| !c) {
+            return Err(format!(
+                "J{} still reports {:?} after {CLEAR_ROUNDS} clears",
+                j + 1,
+                self.state.nodes[self.node(j)].error_flags
+            )
+            .into());
+        }
         let mut holding = false;
         for _ in 0..self.ticks(2.0) {
             if holding {
@@ -1027,7 +1871,7 @@ impl Arm {
                 for j in 0..N {
                     self.hold[j] = self.pos(j)?;
                 }
-                self.found_at = self.hold;
+                self.found_at = self.hold.map(Some);
                 holding = true;
             }
             // Encoder replies omit current; position-hold replies supply all
@@ -1120,11 +1964,15 @@ impl Arm {
     }
 
     fn check_startup_hold(&mut self) -> Result<()> {
-        let held = self.measure_hold("startup", None)?;
+        self.check_hold("startup")
+    }
+
+    fn check_hold(&mut self, why: &'static str) -> Result<()> {
+        let held = self.measure_hold(why, None)?;
         for (j, (offset, speed)) in held.iter().enumerate() {
             if *offset > self.tolerance() || *speed > self.holding_limit(j) {
                 return Err(format!(
-                    "J{} will not hold still at startup: {:.4}deg, {:.4}deg/s",
+                    "J{} will not hold still at {why}: {:.4}deg, {:.4}deg/s",
                     j + 1,
                     offset.to_degrees(),
                     speed.to_degrees()
@@ -1155,14 +2003,20 @@ impl Arm {
                 let p = self.pos(j)?;
                 let per_tick = self.per_tick(j);
                 let offset = (f64::from(p) - f64::from(self.hold[j])) * per_tick;
-                let speed = rings[j].push(self.tick, p, window, self.dt).unwrap_or(0.0) * per_tick;
+                let Some(speed) = rings[j].push(self.tick, p, window, self.dt) else {
+                    continue;
+                };
+                let speed = speed * per_tick;
                 sums[j].0 += offset * offset;
                 sums[j].1 += speed * speed;
                 sums[j].2 += 1;
             }
         }
+        if let Some(j) = sums.iter().position(|(_, _, n)| *n == 0) {
+            return Err(format!("J{} supplied no complete encoder window at {why}", j + 1).into());
+        }
         let out: [(f64, f64); N] = std::array::from_fn(|j| {
-            let n = f64::from(sums[j].2.max(1));
+            let n = f64::from(sums[j].2);
             ((sums[j].0 / n).sqrt(), (sums[j].1 / n).sqrt())
         });
         for (j, (offset, speed)) in out.iter().enumerate() {
@@ -1266,13 +2120,21 @@ impl Arm {
         let mut expected = f64::from(start);
         let mut commanded_speed = 0;
         let mut ring = Ring::default();
+        let mut reference_ring = Ring::default();
         let mut guard_contact = ContactGuard::new(self.ticks(STALL_WINDOW_S), start, expected);
-        let guard = self.ticks(DETECT_GUARD_S).max(self.ticks(ramp));
+        let gain_trial = self.sane_gains[j].is_some();
+        // Gain trials reset the integrator. The jog ramp must not exclude
+        // the entire acceleration and peak speed of a short profile.
+        let guard = self.ticks(if gain_trial {
+            DETECT_GUARD_S
+        } else {
+            DETECT_GUARD_S.max(ramp)
+        });
         let speed_window = self.ticks(SPEED_WINDOW_S);
         let mut generation = self.generation[j];
         let started = self.tick;
         let mut runaway_ticks = 0u32;
-        let mut unstable = false;
+        let mut sign = 0i8;
         for t in 0..self.ticks(duration) {
             let reference = expected;
             let reference_speed = commanded_speed;
@@ -1299,8 +2161,49 @@ impl Arm {
                     .current_ma
                     .ok_or("missing current feedback")?,
             );
-            let measured = ring.push(self.tick, p, speed_window, self.dt);
+            let measured = if gain_trial && !self.simulated {
+                let received = self.position_rx_ns[j];
+                if received == 0 {
+                    return Err(format!("J{} motion reply has no matching timestamp", j + 1).into());
+                }
+                if ring.len > 0 && received <= ring.samples[ring.len - 1].2 {
+                    return Err("motion receive timestamps did not advance".into());
+                }
+                ring.push_at(self.tick, p, speed_window, received)
+            } else {
+                ring.push(self.tick, p, speed_window, self.dt)
+            };
+            let reference_measured =
+                reference_ring.push(self.tick, reference.round() as i32, speed_window, self.dt);
+            let scored_speed = if gain_trial {
+                reference_measured.unwrap_or(f64::from(reference_speed))
+            } else {
+                f64::from(reference_speed)
+            };
             let error = (f64::from(p) - reference) * per_tick;
+            if let Some(sane) = self.sane_gains[j] {
+                let speed = f64::from(
+                    self.state.nodes[self.node(j)]
+                        .speed_ticks_s
+                        .ok_or("missing velocity feedback")?,
+                );
+                let speed_error = (speed - f64::from(reference_speed)) * per_tick;
+                runaway_ticks = if speed_error.abs() > RUNAWAY_RAD_S {
+                    runaway_ticks + 1
+                } else {
+                    0
+                };
+                if runaway_ticks >= RUNAWAY_TICKS {
+                    self.emit(Event::GainsNote(
+                        self.tick,
+                        j,
+                        "runaway speed during motion; stopping with original gains",
+                    ));
+                    self.gain_configure(j, sane)?;
+                    out.outcome = Outcome::Unstable;
+                    break;
+                }
+            }
             // Two exclusions on the scoring window. The guard drops the ramp
             // and the drive's velocity integral unwinding from the previous
             // command -- a spike there used to fail a gain that tracked. The
@@ -1316,23 +2219,20 @@ impl Arm {
                 out.samples += 1;
                 out.position_sq += error * error;
                 if let Some(v) = measured {
-                    let speed_error = (v - f64::from(reference_speed)) * per_tick;
+                    let speed_error = (v - scored_speed) * per_tick;
                     out.speed_sq += speed_error * speed_error;
-                    // A trial gain that runs away is caught here, and the
-                    // last sane gains are back on the drive before the
-                    // next frame; the move goes on to its landing under
-                    // them, scored as unstable.
-                    runaway_ticks = if speed_error.abs() > RUNAWAY_RAD_S {
-                        runaway_ticks + 1
+                    let next = if speed_error > SWEEP_BAND_RAD_S {
+                        1
+                    } else if speed_error < -SWEEP_BAND_RAD_S {
+                        -1
                     } else {
                         0
                     };
-                    if runaway_ticks >= RUNAWAY_TICKS && !unstable {
-                        if let Some(sane) = self.sane_gains[j] {
-                            unstable = true;
-                            self.gains[j] = sane;
-                            self.retune(j, limit)?;
+                    if next != 0 {
+                        if sign != 0 && sign != next {
+                            out.reversals += 1;
                         }
+                        sign = next;
                     }
                 }
                 let q = self.angles()?;
@@ -1345,9 +2245,6 @@ impl Arm {
                 && ((f64::from(p) - f64::from(target)) * per_tick).abs() <= tolerance
             {
                 out.outcome_complete(p);
-                if unstable {
-                    out.outcome = Outcome::Unstable;
-                }
                 break;
             }
             if t < guard {
@@ -1645,30 +2542,9 @@ impl Arm {
 
     // ------------------------------------------------------------ tuning
 
-    /// Joint-side inertia at `q`: the mass-matrix diagonal, plus the rotor
-    /// reflected through the reduction.
-    ///
-    /// `Kin::dyn_feedforward` is the inverse dynamics with the gravity term
-    /// subtracted back out, so zero velocity and a unit acceleration on one
-    /// joint alone leave exactly `M_jj(q)` in that slot. The rotor table is
-    /// motor-side and reflects as `G^2 jm` through the dynamics ratio -- the
-    /// vendor's J1 reduction disagrees with its kinematic one, so this uses
-    /// the same fallback `par6-bus` does.
+    /// Joint-side inertia at `q`, as [`joint_inertia`] models it.
     fn inertia(&mut self, q: [f64; N]) -> Result<[f64; N]> {
-        let zero = [0.0; N];
-        let mut out = [0.0; N];
-        for j in 0..N {
-            let mut qdd = zero;
-            qdd[j] = 1.0;
-            let mut tau = zero;
-            self.kin
-                .dyn_feedforward(&q, &zero, &qdd, &mut tau)
-                .map_err(|e| format!("J{} inertia: {e}", j + 1))?;
-            let cfg = &self.bundle.robot.joints[j];
-            let g = cfg.dynamics_gear_ratio.unwrap_or(cfg.gear_ratio);
-            out[j] = tau[j] + g * g * self.bundle.robot.sim.motor_jm_kg_m2[j];
-        }
-        Ok(out)
+        joint_inertia(&mut self.kin, &self.bundle, q)
     }
 
     /// The septic that takes joint `j` between rest and `speed_rad_s`.
@@ -1701,18 +2577,22 @@ impl Arm {
     /// needs never arrives. Held at a speed, the balance is the same equation
     /// read the other way round, and the travel per leg is known in advance
     /// rather than discovered by hitting a limit.
-    fn drag(&mut self, j: usize, ticks_s: f64) -> Result<Option<f64>> {
+    fn drag(&mut self, j: usize, ticks_s: f64) -> Result<Option<Vec<DragSample>>> {
         let per_tick = self.per_tick(j).abs();
         let profile = self.speed_ramp(j, ticks_s * per_tick);
         let ramp = self.ticks(profile.duration());
         let settle = ramp + self.ticks(DRAG_SETTLE_S);
-        let hold = settle + self.ticks(DRAG_AVERAGE_S);
+        let measured_until = settle + self.ticks(DRAG_AVERAGE_S);
+        // Centre the measured arc so the reverse leg covers the same poses.
+        let hold = measured_until + self.ticks(DRAG_SETTLE_S);
         let mut ring = Ring::default();
         let window = self.ticks(SPEED_WINDOW_S);
         let mut generation = self.generation[j];
-        let mut current = 0.0;
         let mut speed = 0.0;
         let mut n = 0.0;
+        let mut samples = Vec::with_capacity(self.ticks(DRAG_AVERAGE_S) as usize + 1);
+        let node = self.node(j);
+        let mut saturated = false;
         for t in 0..hold + ramp {
             let fraction = if t < ramp {
                 profile.sample((t + 1) as f64 * self.dt).0
@@ -1722,27 +2602,41 @@ impl Arm {
                 1.0 - profile.sample((t - hold + 1) as f64 * self.dt).0
             };
             let cmd = JointCommand::velocity((ticks_s * fraction) as i32, 0);
+            self.state.nodes[node].current_ma = None;
             self.frame(Some((j, cmd)))?;
             if self.generation[j] == generation {
                 continue;
             }
             generation = self.generation[j];
             let p = self.pos(j)?;
-            let ma = self.state.nodes[self.node(j)]
-                .current_ma
-                .ok_or("missing current feedback")?;
-            if let Some(v) = ring.push(self.tick, p, window, self.dt) {
-                if (settle..hold).contains(&t) {
-                    current += f64::from(ma);
+            let received = if self.encoder_clock.is_some() {
+                self.position_rx_ns[j]
+            } else {
+                (self.tick as f64 * self.dt * 1e9) as u64
+            };
+            if received == 0 {
+                continue;
+            }
+            if let (Some(v), Some(ma)) = (
+                ring.push_at(self.tick, p, window, received),
+                self.state.nodes[node].current_ma,
+            ) {
+                if (settle..measured_until).contains(&t) {
+                    saturated |= f64::from(ma).abs() >= self.bundle.robot.joints[j].ilim_ma;
                     speed += v;
                     n += 1.0;
+                    samples.push(DragSample {
+                        position: f64::from(p),
+                        speed: v,
+                        current: f64::from(ma),
+                    });
                 }
             }
         }
         // The ramp has already brought it to rest; hold where it stopped.
         self.adopt(j)?;
         self.settle(DRAG_RECOVER_S)?;
-        if n < 1.0 {
+        if n < 2.0 || saturated {
             return Ok(None);
         }
         let held = speed / n;
@@ -1753,23 +2647,22 @@ impl Arm {
         {
             return Ok(None);
         }
-        Ok(Some(current / n))
+        Ok(Some(samples))
     }
 
     /// Viscous and Coulomb friction for one joint \[Nm.s/rad, Nm\], joint side.
     ///
     /// Each speed is held both ways over the same arc. Gravity is
-    /// position-dependent but direction-independent, so averaging the two
-    /// currents cancels it exactly -- the same trick the gravity sweep uses on
-    /// its approach directions, and it means no gravity model enters the
-    /// friction fit at all:
+    /// position-dependent but direction-independent, so their signed
+    /// half-difference cancels the gravity shared by the two directions.
+    /// No gravity model enters the friction fit:
     ///
-    ///   forward:  +I_f/k = +b v + tc + tau_g
-    ///   reverse:  -I_r/k = -b v - tc + tau_g
-    ///   half diff: (I_f + I_r)/2k = b v + tc
+    ///   forward:  I_f/k = +b v + tc + tau_g
+    ///   reverse:  I_r/k = -b v - tc + tau_g
+    ///   half diff: (I_f - I_r)/2k = b v + tc
     ///
     /// Two parameters, ordinary least squares over the speeds that held.
-    fn friction(&mut self, j: usize) -> Result<(f64, f64)> {
+    fn friction(&mut self, j: usize) -> Result<Option<(f64, f64)>> {
         let cfg = &self.bundle.robot.joints[j];
         let factor =
             torque_to_ma_factor(cfg.gear_ratio, cfg.gear_efficiency, cfg.kt_nm_a, cfg.dir).abs();
@@ -1779,7 +2672,7 @@ impl Arm {
         // covers `v * span` holding and `v * T` across its two ramps (each
         // septic averages half its end value), and `T` grows with `v`, so the
         // speed is found by bisection on that travel.
-        let span = DRAG_SETTLE_S + DRAG_AVERAGE_S;
+        let span = 2.0 * DRAG_SETTLE_S + DRAG_AVERAGE_S;
         let travel = |v: f64| v * (span + self.speed_ramp(j, v).duration());
         let (mut lo, mut hi) = (0.0, cfg.limits.for_mode(LimitMode::Exec).velocity_rad_s);
         if travel(hi) > DRAG_TRAVEL_RAD {
@@ -1800,24 +2693,68 @@ impl Arm {
                 + (DRAG_MAX_FRACTION - DRAG_MIN_FRACTION) * step as f64
                     / (DRAG_LEVELS - 1).max(1) as f64;
             let ticks_s = fraction * fastest;
-            let Some(forward) = self.drag(j, ticks_s)? else {
+            let start = self.pos(j)?;
+            let forward = self.drag(j, ticks_s)?;
+            let reverse = if forward.is_some() {
+                self.drag(j, -ticks_s)?
+            } else {
+                None
+            };
+            // Every speed starts at the same pose, including rejected legs.
+            self.return_to(j, start)?;
+            let (Some(forward), Some(reverse)) = (forward, reverse) else {
                 continue;
             };
-            let Some(reverse) = self.drag(j, -ticks_s)? else {
-                continue;
+            let extent = |samples: &[DragSample]| {
+                samples
+                    .iter()
+                    .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), s| {
+                        (lo.min(s.position), hi.max(s.position))
+                    })
             };
-            let torque = (forward.abs() + reverse.abs()) / 2.0 / factor;
-            let speed = ticks_s * per_tick;
+            let (flo, fhi) = extent(&forward);
+            let (rlo, rhi) = extent(&reverse);
+            let (lo, hi) = (flo.max(rlo), fhi.min(rhi));
+            // Insufficient common travel does not identify direction-independent gravity.
+            if hi - lo < 0.5 * ticks_s.abs() * DRAG_AVERAGE_S {
+                self.emit(Event::Phase(
+                    "friction: insufficient shared measurement arc",
+                    j,
+                ));
+                continue;
+            }
+            let mut sum = [0.0; 3];
+            let mut matched = 0;
+            for bin in 0..16 {
+                let at = lo + (hi - lo) * (f64::from(bin) + 0.5) / 16.0;
+                if let (Some(f), Some(r)) =
+                    (DragSample::at(&forward, at), DragSample::at(&reverse, at))
+                {
+                    if f.speed > 0.0 && r.speed < 0.0 {
+                        sum[0] += f.current;
+                        sum[1] += r.current;
+                        sum[2] += (f.speed - r.speed) * 0.5;
+                        matched += 1;
+                    }
+                }
+            }
+            if matched < 8 {
+                self.emit(Event::Phase("friction: too few matching moving samples", j));
+                continue;
+            }
+            let forward = sum[0] / f64::from(matched);
+            let reverse = sum[1] / f64::from(matched);
+            let torque = (forward - reverse) / 2.0 / factor;
+            let speed = sum[2] / f64::from(matched) * per_tick;
             self.emit(Event::Drag(self.tick, j, speed, forward, reverse));
             rows.push((speed, torque));
         }
-        if rows.len() < 2 {
-            return Err(format!(
-                "J{} held {} of {DRAG_LEVELS} speeds; friction needs two",
-                j + 1,
-                rows.len()
-            )
-            .into());
+        if rows.len() < 3 {
+            self.emit(Event::Phase(
+                "friction: fewer than three valid speeds; fit unresolved",
+                j,
+            ));
+            return Ok(None);
         }
         // tau = b v + tc: the normal equations for a straight line.
         let n = rows.len() as f64;
@@ -1833,7 +2770,33 @@ impl Arm {
         }
         let b = (n * svt - sv * st) / denominator;
         let tc = (st - b * sv) / n;
-        Ok((b.max(0.0), tc.max(0.0)))
+        let variance = rows
+            .iter()
+            .map(|(v, t)| (t - b * v - tc).powi(2))
+            .sum::<f64>()
+            / (n - 2.0);
+        let b_se = (variance * n / denominator).sqrt();
+        let tc_se = (variance * svv / denominator).sqrt();
+        // This flags unresolved coefficients, not a confidence interval or
+        // a substitute for comparing independent hardware measurements.
+        self.friction_fit_uncertain[j] = b_se >= b.abs() || tc_se >= tc.abs();
+        self.emit(Event::FrictionQuality(
+            self.tick,
+            j,
+            b,
+            tc,
+            b_se,
+            tc_se,
+            rows.len(),
+        ));
+        if !b.is_finite() || !tc.is_finite() || b < 0.0 || tc < 0.0 {
+            self.emit(Event::Phase(
+                "friction: invalid fit; configured values retained",
+                j,
+            ));
+            return Ok(None);
+        }
+        Ok(Some((b, tc)))
     }
 
     /// Measure every joint's inertia and friction.
@@ -1858,9 +2821,12 @@ impl Arm {
         let mut friction = [None; N];
         for &j in &legs {
             self.emit(Event::Phase("friction", j));
-            let (b, tc) = self.friction(j)?;
+            let Some((b, tc)) = self.friction(j)? else {
+                continue;
+            };
             self.emit(Event::Mechanics(self.tick, j, inertia[j], b, tc));
             friction[j] = Some((b, tc));
+            self.friction[j] = (b, tc);
         }
         Ok(friction)
     }
@@ -1883,39 +2849,20 @@ impl Arm {
         // Still first: the previous breakaway's return was still settling
         // when J3's ramp began, and the sliding test read that as a
         // breakaway at the balance current.
+        self.wait_still(std::array::from_fn(|k| k == j))?;
         let window = self.ticks(STICTION_WINDOW_S);
-        let mut seen: VecDeque<(u64, i32)> = VecDeque::new();
-        for _ in 0..self.ticks(STICTION_STILL_TIMEOUT_S) {
-            self.frame(None)?;
-            seen.push_back((self.tick, self.pos(j)?));
-            while seen
-                .front()
-                .is_some_and(|(tick, _)| self.tick.saturating_sub(*tick) > window)
-            {
-                seen.pop_front();
-            }
-            let (lo, hi) = seen.iter().fold((i32::MAX, i32::MIN), |(lo, hi), &(_, p)| {
-                (lo.min(p), hi.max(p))
-            });
-            if seen.len() >= window as usize / 2 && hi - lo <= STICTION_STILL_TICKS {
-                break;
-            }
-        }
         let start = self.pos(j)?;
         // The ramp starts from the current the drive is holding with, not
         // the model's balance: the position loop parks a joint against its
         // own stiction with a push of its own (J3 held with 100 mA past the
         // model), and dropping that at the switch to current mode sprang the
         // joint most of a degree before any ramp had begun.
-        let node = self.node(j);
-        let balance = self.state.nodes[node]
-            .current_ma
-            .map_or(f64::from(self.gravity_feedforward()[j]), f64::from);
+        let balance = self.holding_current_ma(j);
         let ilim = self.bundle.robot.joints[j].ilim_ma;
         let rate = STICTION_RAMP_ILIM_PER_S * ilim;
         let ceiling = STICTION_MAX_ILIM * ilim;
         let mut generation = self.generation[j];
-        let mut recent: VecDeque<(u64, i64, f64)> = VecDeque::new();
+        let mut recent: VecDeque<(u64, i64, f64)> = VecDeque::with_capacity(window as usize + 2);
         let mut found = None;
         for t in 0.. {
             let ramp = sign * rate * t as f64 * self.dt;
@@ -1952,11 +2899,32 @@ impl Arm {
                 break;
             }
         }
+        self.return_to(j, start)?;
+        Ok(found)
+    }
+
+    /// The current the drive holds joint `j` with now \[mA\]: what it last
+    /// reported, or the gravity model's balance before it has reported.
+    fn holding_current_ma(&mut self, j: usize) -> f64 {
+        let node = self.node(j);
+        match self.state.nodes[node].current_ma {
+            Some(ma) => f64::from(ma),
+            None => f64::from(self.gravity_feedforward()[j]),
+        }
+    }
+
+    /// Catch joint `j` where a current-mode excursion left it, let it
+    /// rest, then ease it back to `start` on the septic under its EXEC
+    /// caps: a chirp can leave the base degrees away, which is no
+    /// distance to jump in one frame.
+    fn return_to(&mut self, j: usize, start: i32) -> Result<()> {
         self.adopt(j)?;
         self.settle(STICTION_REST_S)?;
-        self.hold[j] = start;
-        self.settle(STICTION_REST_S)?;
-        Ok(found)
+        let result = self.run_motion(j, start, RETURN_S, false)?;
+        if result.outcome != Outcome::Complete {
+            return Err(format!("J{} did not return to where it started", j + 1).into());
+        }
+        self.settle(STICTION_REST_S)
     }
 
     /// Static friction per joint at the pose the arm holds \[Nm\]. The two
@@ -1966,7 +2934,7 @@ impl Arm {
     /// reported beside the model's, which is what the ramps started from.
     fn stiction(&mut self, label: &'static str) -> Result<[Option<f64>; N]> {
         let mut out = [None; N];
-        for j in 0..N {
+        for (j, slot) in out.iter_mut().enumerate() {
             if self.only.is_some_and(|o| o != j) {
                 continue;
             }
@@ -1988,149 +2956,1404 @@ impl Arm {
             // the link moved: the transmission's wind-up, and the torque over
             // it is the transmission's stiffness, joint side.
             let windup = (up_windup.abs() + down_windup.abs()) as f64 / 2.0;
-            let stiffness = static_nm / (windup * self.per_tick(j).abs()).max(f64::MIN_POSITIVE);
+            let stiffness = if windup >= 1.0 {
+                static_nm / (windup * self.per_tick(j).abs())
+            } else {
+                f64::NAN
+            };
             self.emit(Event::Stiction(
                 self.tick, j, label, up, down, static_nm, model, measured, windup, stiffness,
             ));
-            out[j] = Some(static_nm);
+            *slot = Some(static_nm);
         }
         Ok(out)
+    }
+
+    /// Chirp joint `j`'s drive in current mode about its gravity current:
+    /// the sine of `BELT_CHIRP_NM` sweeping `BELT_F_LO_HZ` to
+    /// `BELT_F_HI_HZ` over `BELT_SECONDS`. Every tick's command and the
+    /// encoder's answer go to the run's samples, which is what the belt
+    /// fit reads; nothing is fitted here. Travel past `BELT_ABORT_RAD`
+    /// stops it, and the joint is held where it is either way, then eased
+    /// back to where it started. Refused unless `span`, the interval the
+    /// joint may sweep clear of its limits and the collision world, gives
+    /// the cutoff `BELT_CLEARANCE` on both sides: current mode has no
+    /// bounds of its own, and a stop inside the cutoff would take the
+    /// whole chirp.
+    fn belt(&mut self, j: usize, span: (f64, f64)) -> Result<bool> {
+        self.emit(Event::Phase("belt chirp", j));
+        self.settle(STICTION_REST_S)?;
+        self.wait_still(std::array::from_fn(|k| k == j))?;
+        let start = self.pos(j)?;
+        let at = self.conv[j].joint_rad(start);
+        let clear = (at - span.0).min(span.1 - at);
+        if clear < BELT_CLEARANCE * BELT_ABORT_RAD {
+            return Err(format!(
+                "belt chirp: J{} has {:.1} deg clear of its limits and the collision world, needs {:.1}",
+                j + 1,
+                clear.to_degrees(),
+                (BELT_CLEARANCE * BELT_ABORT_RAD).to_degrees()
+            )
+            .into());
+        }
+        // The base's gravity torque is zero. Its position-loop holding
+        // current includes transmission preload: carrying that into the
+        // chirp added 97 mA of DC and drove the base into its travel guard.
+        let balance = f64::from(self.gravity_feedforward()[j]);
+        let cfg = &self.bundle.robot.joints[j];
+        let ilim = cfg.ilim_ma;
+        let amplitude = BELT_CHIRP_NM
+            * torque_to_ma_factor(cfg.gear_ratio, cfg.gear_efficiency, cfg.kt_nm_a, cfg.dir).abs();
+        let per_tick = self.per_tick(j).abs();
+        let (mut lo, mut hi) = (start, start);
+        let mut aborted = false;
+        for t in 0..self.ticks(BELT_SECONDS) {
+            let s = t as f64 * self.dt;
+            let phase = std::f64::consts::TAU
+                * (BELT_F_LO_HZ * s + (BELT_F_HI_HZ - BELT_F_LO_HZ) * s * s / (2.0 * BELT_SECONDS));
+            let current = (balance + amplitude * phase.sin()).clamp(-ilim, ilim);
+            self.frame(Some((j, JointCommand::current(current.round() as i16))))?;
+            let p = self.pos(j)?;
+            lo = lo.min(p);
+            hi = hi.max(p);
+            if ((f64::from(p) - f64::from(start)) * per_tick).abs() > BELT_ABORT_RAD {
+                aborted = true;
+                break;
+            }
+        }
+        let last = self.pos(j)?;
+        self.return_to(j, start)?;
+        self.emit(Event::Belt(
+            self.tick,
+            j,
+            (f64::from(hi - lo) * per_tick).to_degrees(),
+            (f64::from(last - start) * per_tick).to_degrees(),
+            aborted,
+        ));
+        Ok(!aborted)
     }
 }
 
 impl Arm {
     // ------------------------------------------------------------ limits
 
-    /// Tune each joint's velocity loop on one probe move: the septic at
-    /// `GAINS_PROBE_FRACTION` of its EXEC caps, out and back, scored by how
-    /// far the drive's own speed strays from the profile (speed RMS off the
-    /// commanded speed, the same number the limits stage reports as ripple).
-    ///
-    /// This is a search, not a placement: a 250 Hz bus cannot see the
-    /// 6250 Hz loop it is tuning, but it can see whether a move got
-    /// smoother. Hand-tuned on 2026-09-23 this way, J6 went from 37 to
-    /// 2.6 deg/s off the profile (kiv /3) and J1 halved its 12 Hz surge (kiv
-    /// x2, kpv x1.33). kiv first, then kpv; each walks down from the
-    /// configured value while the score improves, up only when down did
-    /// not help, never past `GAINS_MIN_FACTOR`/`GAINS_MAX_FACTOR`. A trial
-    /// that runs away is caught inside the move (`RUNAWAY_RAD_S`), the last
-    /// sane gains go back on the drive within a tick, and that direction
-    /// ends.
-    fn gains(&mut self, ready: [f64; N], spans: &[(f64, f64); N]) -> Result<[Option<Tuned>; N]> {
-        let mut tuned = [None; N];
-        for (j, slot) in tuned.iter_mut().enumerate() {
-            self.pose(ready)?;
-            self.emit(Event::Phase("gains", j));
-            *slot = Some(self.joint_gains(j, ready[j], spans[j])?);
-            if let Some(t) = *slot {
-                self.emit(Event::Gains(self.tick, j, t));
-            }
-        }
-        self.pose(ready)?;
-        Ok(tuned)
-    }
-
-    fn joint_gains(&mut self, j: usize, home: f64, span: (f64, f64)) -> Result<Tuned> {
-        let caps = self
-            .exec_caps(j)
-            .scaled(GAINS_PROBE_FRACTION, &self.ceiling_caps(j));
-        let (target, _) = self.probe_short(home, span, caps);
-        let before = self.gains[j];
-        let score_before = self
-            .gains_trial(j, home, target, caps, before)?
-            .ok_or_else(|| format!("J{} runs away on its configured gains", j + 1))?;
-        let mut best = (before, score_before);
-        for field in [GainField::Kiv, GainField::Kpv] {
-            let base = field.get(&before);
-            let (down, up) = field.steps();
-            // Down first: the safe direction. Up only when down did not help.
-            let mut improved = false;
-            loop {
-                let value = field.get(&best.0) * down;
-                if value < base * GAINS_MIN_FACTOR {
-                    break;
-                }
-                let g = field.with(best.0, value);
-                match self.gains_trial(j, home, target, caps, g)? {
-                    Some(score) if score < best.1 * (1.0 - GAINS_MIN_IMPROVEMENT) => {
-                        best = (g, score);
-                        improved = true;
-                    }
-                    _ => break,
-                }
-            }
-            if improved {
+    /// Measure and cancel each joint's ripple: cogging and commutation
+    /// error, torques fixed to the rotor's electrical angle. A slow sweep
+    /// each way at `RIPPLE_SWEEP_TICKS_S`, captured with the electrical
+    /// phase, gives the current the loop spends at each angle; its
+    /// harmonics, averaged over the two directions so friction and the
+    /// loop's lag cancel, go to the drive as feedforward (cmd 40). The gains
+    /// step is captured without and with it, and the feedforward stays only
+    /// if the speed ripple at those harmonics falls by
+    /// `RIPPLE_MIN_IMPROVEMENT`. A joint left without any says why.
+    fn ripple(
+        &mut self,
+        ready: [f64; N],
+        spans: &[(f64, f64); N],
+        chosen: [bool; N],
+    ) -> Result<[Option<Vec<RippleHarmonic>>; N]> {
+        let mut found: [Option<Vec<RippleHarmonic>>; N] = Default::default();
+        for (j, slot) in found.iter_mut().enumerate() {
+            if !chosen[j] {
                 continue;
             }
-            loop {
-                let value = field.get(&best.0) * up;
-                if value > base * GAINS_MAX_FACTOR {
-                    break;
-                }
-                let g = field.with(best.0, value);
-                match self.gains_trial(j, home, target, caps, g)? {
-                    Some(score) if score < best.1 * (1.0 - GAINS_MIN_IMPROVEMENT) => {
-                        best = (g, score);
-                    }
-                    _ => break,
-                }
-            }
+            self.pose(ready)?;
+            self.emit(Event::Phase("ripple", j));
+            *slot = Some(self.joint_ripple(j, ready[j], spans[j])?);
         }
-        self.gains[j] = best.0;
-        self.retune(j, self.bundle.robot.joints[j].ilim_ma)?;
-        Ok(Tuned {
-            before,
-            after: best.0,
-            score_before,
-            score_after: best.1,
-        })
+        self.pose(ready)?;
+        Ok(found)
     }
 
-    /// One trial: the probe out and back under `gains`, the joint left at
-    /// `home`. `None` when the loop ran away, in which case the drive is
-    /// already back on the last sane gains.
-    fn gains_trial(
+    fn joint_ripple(
         &mut self,
         j: usize,
         home: f64,
-        target: f64,
-        caps: Caps,
-        gains: Gains,
-    ) -> Result<Option<f64>> {
-        let sane = self.sane_gains[j].unwrap_or(self.gains[j]);
-        self.sane_gains[j] = Some(sane);
-        self.gains[j] = gains;
-        let mut score = 0.0_f64;
-        let mut stable = true;
-        for point in [target, home] {
-            let ticks = self.conv[j].motor_ticks(point);
-            let m = self.run_motion_capped(j, ticks, GAINS_PROBE_MIN_S, false, caps)?;
-            if m.outcome != Outcome::Complete {
-                stable = false;
-            }
-            score = score.max(m.rms_speed());
+        span: (f64, f64),
+    ) -> Result<Vec<RippleHarmonic>> {
+        let node = self.bundle.robot.joints[j].node_id;
+        let ilim = self.bundle.robot.joints[j].ilim_ma;
+        let per_tick = self.per_tick(j);
+        let (up, down) = (span.1 - home, home - span.0);
+        let direction = if up >= down { 1.0 } else { -1.0 };
+        let sweep_s = f64::from(CAPTURE_LEN) * f64::from(RIPPLE_CAPTURE_DIVISOR) / LOOP_HZ;
+        let travel = RIPPLE_SWEEP_TICKS_S * sweep_s;
+        if travel * per_tick.abs() > GAINS_ROOM_SHARE * up.max(down) {
+            self.emit(Event::RippleNote(
+                self.tick,
+                j,
+                "no room for the sweep at the ready pose",
+            ));
+            return Ok(Vec::new());
         }
-        if stable {
-            self.sane_gains[j] = Some(gains);
-        } else {
-            // Whatever ran away, the drive holds the sane gains now; make
-            // the bookkeeping say the same.
-            self.gains[j] = sane;
-            self.run_motion_capped(j, self.conv[j].motor_ticks(home), self.dt, false, caps)?;
-        }
-        let verdict = if !stable {
-            "runaway; last sane gains restored"
-        } else {
-            "scored"
+        // Out along the wider side, then back from where that ended.
+        let out = direction * per_tick.signum() * RIPPLE_SWEEP_TICKS_S;
+        self.bus.set_ripple(node, &[])?;
+        let start = self.pos(j)?;
+        let Some(there) = self.capture_step(j, out, RIPPLE_CAPTURE_DIVISOR, span)? else {
+            self.emit(Event::RippleNote(
+                self.tick,
+                j,
+                "the drive records no capture (its firmware predates cmd 38)",
+            ));
+            return Ok(Vec::new());
         };
-        self.emit(Event::GainsStep(
+        let far = start + (out * sweep_s).round() as i32;
+        if self.run_motion(j, far, RETURN_S, false)?.outcome != Outcome::Complete {
+            return Err(format!("J{} did not reach the ripple sweep's far end", j + 1).into());
+        }
+        let back = self
+            .capture_step(j, -out, RIPPLE_CAPTURE_DIVISOR, span)?
+            .ok_or_else(|| format!("J{} stopped answering captures", j + 1))?;
+        if self.run_motion(j, start, RETURN_S, false)?.outcome != Outcome::Complete {
+            return Err(format!("J{} did not return from the ripple sweep", j + 1).into());
+        }
+        let skip = (RIPPLE_SETTLE_S * LOOP_HZ / f64::from(RIPPLE_CAPTURE_DIVISOR)) as usize;
+        let fits = (
+            ripple::fit(&there.current, &there.phase, skip, &RIPPLE_HARMONICS),
+            ripple::fit(&back.current, &back.phase, skip, &RIPPLE_HARMONICS),
+        );
+        let (Some(there), Some(back)) = fits else {
+            self.emit(Event::RippleNote(
+                self.tick,
+                j,
+                "the sweeps do not pin the ripple down",
+            ));
+            return Ok(Vec::new());
+        };
+        let mean = |x: f64, y: f64| ((x + y) / 2.0).round().clamp(-ilim, ilim) as i16;
+        let harmonics: Vec<RippleHarmonic> = there
+            .iter()
+            .zip(&back)
+            .map(|(x, y)| RippleHarmonic {
+                harmonic: x.harmonic,
+                a_ma: mean(x.a, y.a),
+                b_ma: mean(x.b, y.b),
+            })
+            .collect();
+        let mut logged = [(0u8, 0i16, 0i16); 6];
+        for (slot, h) in logged.iter_mut().zip(&harmonics) {
+            *slot = (h.harmonic, h.a_ma, h.b_ma);
+        }
+        self.emit(Event::RippleFit(self.tick, j, logged));
+
+        // Judged where the arm's captures showed the ripple: the gains step.
+        let window = f64::from(CAPTURE_LEN) * f64::from(GAINS_CAPTURE_DIVISOR) / LOOP_HZ;
+        let speed = GAINS_STEP_RAD_S.min(GAINS_ROOM_SHARE * up.max(down) / window);
+        let step = direction * speed / per_tick;
+        let skip = (RIPPLE_STEP_SKIP_S * LOOP_HZ / f64::from(GAINS_CAPTURE_DIVISOR)) as usize;
+        let speed_ripple = |c: &Captured| ripple::fit(&c.speed, &c.phase, skip, &RIPPLE_HARMONICS);
+        let without = self
+            .capture_step(j, step, GAINS_CAPTURE_DIVISOR, span)?
+            .ok_or_else(|| format!("J{} stopped answering captures", j + 1))?;
+        self.bus.set_ripple(node, &harmonics)?;
+        let with = self
+            .capture_step(j, step, GAINS_CAPTURE_DIVISOR, span)?
+            .ok_or_else(|| format!("J{} stopped answering captures", j + 1))?;
+        let (Some(v0), Some(v1)) = (speed_ripple(&without), speed_ripple(&with)) else {
+            self.bus.set_ripple(node, &[])?;
+            self.emit(Event::RippleNote(
+                self.tick,
+                j,
+                "the gains step does not pin the speed ripple down; cleared",
+            ));
+            return Ok(Vec::new());
+        };
+        let before = ripple::total(&v0);
+        let mut best = (ripple::total(&v1), harmonics.clone());
+
+        // At speed the ripple is not quite what the slow sweep saw. One
+        // secant step per harmonic from the two step captures: how the speed
+        // ripple moved for the feedforward sent, and the feedforward that
+        // would null it, tried on the joint like the first.
+        let refined = ripple::refine(&harmonics, &v0, &v1, ilim / RIPPLE_REFINE_ILIM_SHARE);
+        if refined != harmonics {
+            self.bus.set_ripple(node, &refined)?;
+            let again = self
+                .capture_step(j, step, GAINS_CAPTURE_DIVISOR, span)?
+                .ok_or_else(|| format!("J{} stopped answering captures", j + 1))?;
+            let after = speed_ripple(&again).map_or(f64::INFINITY, |v| ripple::total(&v));
+            self.emit(Event::RippleRefine(self.tick, j, best.0, after));
+            if after < best.0 {
+                best = (after, refined);
+            }
+        }
+        let (after, chosen) = best;
+        let kept = after < before * (1.0 - RIPPLE_MIN_IMPROVEMENT);
+        self.emit(Event::RippleCheck(self.tick, j, before, after, kept));
+        if !kept {
+            self.bus.set_ripple(node, &[])?;
+            return Ok(Vec::new());
+        }
+        self.bus.set_ripple(node, &chosen)?;
+        Ok(chosen)
+    }
+
+    // ------------------------------------------------------------ gains
+
+    /// Tune every chosen joint in turn at the ready pose and leave each
+    /// accepted candidate active, so the joints that follow are tuned with
+    /// the arm held the way the measurements will hold it.
+    fn gains(
+        &mut self,
+        ready: [f64; N],
+        spans: &[(f64, f64); N],
+        chosen: [bool; N],
+    ) -> Result<[Option<Tuned>; N]> {
+        self.gain_watch = true;
+        self.held_runaway = [0; N];
+        self.check_startup_hold()?;
+        let mut tuned = [None; N];
+        for j in 0..N {
+            if !chosen[j] {
+                continue;
+            }
+            self.pose(ready)?;
+            self.emit(Event::Phase("StepFOC gains", j));
+            let session = GainSession {
+                joint: j,
+                span: spans[j],
+                original: self.gains[j],
+            };
+            self.gain_joint = Some(j);
+            let result = self.stepfoc_gains(&session);
+            self.gain_joint = None;
+            tuned[j] = result?;
+            if let Some(result) = tuned[j] {
+                self.gain_configure(j, result.after)?;
+                self.check_startup_hold()?;
+                self.emit(Event::Gains(self.tick, j, result));
+            }
+        }
+        self.pose(ready)?;
+        self.gain_watch = false;
+        Ok(tuned)
+    }
+
+    /// Qualify `candidates` from a file on the chosen joints, without a
+    /// search: the normal profile over the checked travel, the stage's speed
+    /// each way and a position step each way, as a searched candidate is
+    /// qualified. Nothing steps down; a candidate passes or it does not.
+    fn verify_gains(
+        &mut self,
+        ready: [f64; N],
+        spans: &[(f64, f64); N],
+        chosen: [bool; N],
+        candidates: [Gains; N],
+    ) -> Result<[Option<Tuned>; N]> {
+        self.gain_watch = true;
+        self.held_runaway = [0; N];
+        self.check_startup_hold()?;
+        let mut tuned = [None; N];
+        for j in 0..N {
+            if !chosen[j] {
+                continue;
+            }
+            self.pose(ready)?;
+            self.emit(Event::Phase("verify candidate gains", j));
+            let session = GainSession {
+                joint: j,
+                span: spans[j],
+                original: self.gains[j],
+            };
+            let Some((speed, offset, _)) = self.gain_motion_plan(&session) else {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    "insufficient clear travel for gain verification; candidate not qualified",
+                ));
+                continue;
+            };
+            let candidate = candidates[j];
+            self.gain_joint = Some(j);
+            let outcome = (|| -> Result<bool> {
+                if self.gain_verify_motion(&session, candidate)? != Sweep::Passed {
+                    return Ok(false);
+                }
+                if self.gain_verify_speeds(&session, candidate, speed)? != Outcome::Complete {
+                    return Ok(false);
+                }
+                self.gain_verify_positions(&session, candidate, offset)
+            })();
+            self.gain_joint = None;
+            if outcome? {
+                let result = Tuned {
+                    before: session.original,
+                    after: candidate,
+                    observations: self.gain_used[j],
+                };
+                tuned[j] = Some(result);
+                self.gain_configure(j, candidate)?;
+                self.check_startup_hold()?;
+                self.emit(Event::Gains(self.tick, j, result));
+            }
+        }
+        self.pose(ready)?;
+        self.gain_watch = false;
+        Ok(tuned)
+    }
+
+    /// Every selected candidate active together on the coordinated moves the
+    /// measurements make. `Some(j)` names the first `judged` joint that
+    /// oscillated on a leg or would not hold at a pose, left on its
+    /// configured gains; the arm is back at ready either way, retracing the
+    /// checked legs it came by. A joint not judged is one the run has
+    /// nothing better to offer: its faults are reported, not acted on.
+    fn verify_gain_poses(
+        &mut self,
+        ready: [f64; N],
+        poses: &[GainPose],
+        judged: [bool; N],
+    ) -> Result<Option<(usize, PoseFault)>> {
+        let mut trail: Vec<[f64; N]> = vec![ready];
+        let mut fault = None;
+        'poses: for (i, pose) in poses.iter().enumerate() {
+            self.emit(Event::GainPose(self.tick, i + 1, poses.len(), pose.target));
+            let legs: [Option<[f64; N]>; 3] = [
+                pose.from_ready.then_some(ready),
+                Some(pose.approach),
+                Some(pose.target),
+            ];
+            for to in legs.into_iter().flatten() {
+                if let Some(j) = self.pose_leg(to, &mut trail, judged)? {
+                    fault = Some((j, PoseFault::Motion));
+                    break 'poses;
+                }
+            }
+            // The measurements' own stillness rule, so a joint that hunts at
+            // the pose is caught here and not at a gravity hold minutes in.
+            if let Some(j) = self.stillness(judged)? {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    "did not reach stillness at a calibration pose",
+                ));
+                fault = Some((j, PoseFault::Hold));
+                break 'poses;
+            }
+            if let Some(j) = self.hold_fault("calibration-pose qualification", judged)? {
+                fault = Some((j, PoseFault::Hold));
+                break 'poses;
+            }
+        }
+        if let Some((j, _)) = fault {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "misbehaved on a calibration pose; retracing to ready on its configured gains",
+            ));
+            let original = self.bundle.robot.joints[j].gains;
+            self.gain_configure(j, original)?;
+            for waypoint in trail.iter().rev().skip(1) {
+                self.pose(*waypoint)?;
+            }
+            return Ok(fault);
+        }
+        self.pose(ready)?;
+        Ok(self
+            .hold_fault("return from calibration-pose qualification", judged)?
+            .map(|j| (j, PoseFault::Hold)))
+    }
+
+    /// One checked leg of the posture qualification. A joint that runs away
+    /// on the way is brought back to the leg's start along the same line,
+    /// the only route from there that was checked.
+    fn pose_leg(
+        &mut self,
+        to: [f64; N],
+        trail: &mut Vec<[f64; N]>,
+        judged: [bool; N],
+    ) -> Result<Option<usize>> {
+        self.runaway_joint = None;
+        match self.pose_checked(to, true) {
+            Ok(reversals) => {
+                trail.push(to);
+                Ok(reversals.and_then(|r| (0..N).find(|&j| judged[j] && r[j] >= SWEEP_REVERSALS)))
+            }
+            Err(error) => match self.runaway_joint.take() {
+                Some(j) if judged[j] => {
+                    let back = *trail.last().ok_or("empty posture trail")?;
+                    self.pose(back)?;
+                    Ok(Some(j))
+                }
+                _ => Err(error),
+            },
+        }
+    }
+
+    /// The first joint that will not hold still now, by the same rule
+    /// `check_hold` fails on. A joint not being judged has nothing to fall
+    /// back to, so its failure to hold is the run's, not the candidate's.
+    fn hold_fault(&mut self, why: &'static str, judged: [bool; N]) -> Result<Option<usize>> {
+        let held = self.measure_hold(why, None)?;
+        let fault =
+            (0..N).find(|&j| held[j].0 > self.tolerance() || held[j].1 > self.holding_limit(j));
+        match fault {
+            Some(j) if !judged[j] => Err(format!(
+                "J{} will not hold still at {why}: {:.4}deg, {:.4}deg/s",
+                j + 1,
+                held[j].0.to_degrees(),
+                held[j].1.to_degrees()
+            )
+            .into()),
+            other => Ok(other),
+        }
+    }
+
+    /// The stage's test motion for the session's joint at the pose it holds:
+    /// the speed of its pulses and constant-velocity checks \[rad/s\], the
+    /// position step \[motor ticks\] and the pulse's ramp \[s\]. `None` when
+    /// the checked travel leaves no room for them.
+    fn gain_motion_plan(&self, session: &GainSession) -> Option<(f64, i32, f64)> {
+        let j = session.joint;
+        let home = self.conv[j].joint_rad(self.hold[j]);
+        let room = (home - session.span.0).min(session.span.1 - home);
+        let exec = self.bundle.robot.joints[j].limits.for_mode(LimitMode::Exec);
+        let capture = f64::from(CAPTURE_LEN) * f64::from(GAIN_DIVISOR) / LOOP_HZ;
+        let travel_s = capture.max(GAIN_RAMP_MAX_S + GAIN_STEADY_S) + RETURN_S / 10.0;
+        let speed = GAIN_VELOCITY_RAD_S
+            .min(exec.velocity_rad_s)
+            .min(GAINS_ROOM_SHARE * room / travel_s);
+        let ramp = (speed / exec.acceleration_rad_s2).clamp(GAIN_RAMP_MIN_S, GAIN_RAMP_MAX_S);
+        // The step is sized so that even the lattice's highest Kpp asks no
+        // more than the stage's speed of it.
+        let kpp_top = GainAxis::Kpp.at(GainAxis::Kpp.top());
+        let distance = 2.0_f64.to_radians().min(room * 0.25).min(speed / kpp_top);
+        let offset = (distance / self.per_tick(j)).round() as i32;
+        if speed <= self.holding_limit(j) || room <= self.tolerance() || offset.abs() < 4 {
+            return None;
+        }
+        Some((speed, offset, ramp))
+    }
+
+    /// StepFOC's order on one joint: Kpv, Kiv, then Kpp, each searched along
+    /// its lattice with the stage's pulse or step, confirmed over the checked
+    /// travel at the normal profile before the next axis is searched, and
+    /// the complete candidate qualified last. Kpv keeps the guide's 20%
+    /// backoff from its last stable lattice point.
+    fn stepfoc_gains(&mut self, session: &GainSession) -> Result<Option<Tuned>> {
+        let j = session.joint;
+        let Some((speed, offset, ramp)) = self.gain_motion_plan(session) else {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "insufficient clear travel for gains tuning; gains kept",
+            ));
+            return Ok(None);
+        };
+        let pulse = GainCommand::Pulse {
+            ticks_s: speed / self.per_tick(j),
+            ramp_s: ramp,
+        };
+        self.emit(Event::GainsNote(
             self.tick,
             j,
-            gains,
-            stable.then_some(score),
-            verdict,
+            "velocity gain trials observe a ramped pulse and the stop after it; each axis is confirmed on the normal profile",
         ));
-        Ok(stable.then_some(score))
+        let before = session.original;
+        let step = GainCommand::Position(offset);
+        let axes = [
+            (GainAxis::Kpv, pulse, KPV_BACKOFF_STEPS),
+            (GainAxis::Kiv, pulse, 0),
+            (GainAxis::Kpp, step, 0),
+        ];
+        let mut candidate = before;
+        let mut indices = [0; 3];
+        for (k, (axis, command, backoff)) in axes.into_iter().enumerate() {
+            let Some((found, index)) = self.gain_search(session, candidate, axis, command)? else {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    match axis {
+                        GainAxis::Kpv => "no stable Kpv on its lattice; gains kept",
+                        GainAxis::Kiv => "no stable Kiv on its lattice; gains kept",
+                        GainAxis::Kpp => "no stable Kpp on its lattice; gains kept",
+                    },
+                ));
+                return Ok(None);
+            };
+            let Some((confirmed, index)) =
+                self.gain_sweep_down(session, found, axis, (index - backoff).max(0))?
+            else {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    match axis {
+                        GainAxis::Kpv => {
+                            "Kpv failed the normal profile down to its lattice floor; gains kept"
+                        }
+                        GainAxis::Kiv => {
+                            "Kiv failed the normal profile down to its lattice floor; gains kept"
+                        }
+                        GainAxis::Kpp => {
+                            "Kpp failed the normal profile down to its lattice floor; gains kept"
+                        }
+                    },
+                ));
+                return Ok(None);
+            };
+            candidate = confirmed;
+            indices[k] = index;
+        }
+        let Some(qualified) =
+            self.gain_qualify(session, candidate, indices[0], indices[2], speed, offset)?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(Tuned {
+            before,
+            after: qualified,
+            observations: self.gain_used[j],
+        }))
+    }
+
+    /// Walk `axis` along its lattice from the point nearest the candidate's
+    /// value: up while the observation stays stable, or down from an
+    /// unstable start until one is. The last stable lattice point and its
+    /// index, or `None` when none was found before the floor or the budget.
+    fn gain_search(
+        &mut self,
+        session: &GainSession,
+        mut gains: Gains,
+        axis: GainAxis,
+        command: GainCommand,
+    ) -> Result<Option<(Gains, i32)>> {
+        let j = session.joint;
+        let mut index = axis.snap(axis.value(gains));
+        axis.set(&mut gains, axis.at(index));
+        let Some(first) = self.gain_observe(session, gains, command, axis.label())? else {
+            return Ok(None);
+        };
+        if first.stable {
+            let mut best = (gains, index);
+            while index < axis.top() {
+                index += 1;
+                let mut next = gains;
+                axis.set(&mut next, axis.at(index));
+                // A ceiling (the velocity limit, the budget) ends the walk
+                // at the last point that passed.
+                let Some(observed) = self.gain_observe(session, next, command, axis.label())?
+                else {
+                    break;
+                };
+                if !observed.stable {
+                    break;
+                }
+                best = (next, index);
+            }
+            return Ok(Some(best));
+        }
+        while index > 0 {
+            index -= 1;
+            axis.set(&mut gains, axis.at(index));
+            let Some(observed) = self.gain_observe(session, gains, command, axis.label())? else {
+                return Ok(None);
+            };
+            if observed.stable {
+                return Ok(Some((gains, index)));
+            }
+        }
+        self.emit(Event::GainsNote(
+            self.tick,
+            j,
+            "unstable down to the lattice floor",
+        ));
+        Ok(None)
+    }
+
+    /// `axis` at its lattice point `index`, over the checked travel at the
+    /// normal profile both ways; while that misbehaves the axis steps one
+    /// lattice point down. The gains that passed and their index, or `None`
+    /// at the floor or the budget.
+    fn gain_sweep_down(
+        &mut self,
+        session: &GainSession,
+        mut gains: Gains,
+        axis: GainAxis,
+        mut index: i32,
+    ) -> Result<Option<(Gains, i32)>> {
+        loop {
+            axis.set(&mut gains, axis.at(index));
+            match self.gain_verify_motion(session, gains)? {
+                Sweep::Passed => return Ok(Some((gains, index))),
+                Sweep::Stopped => return Ok(None),
+                Sweep::Failed => {
+                    if index == 0 {
+                        return Ok(None);
+                    }
+                    index -= 1;
+                    self.emit(Event::GainsNote(
+                        self.tick,
+                        session.joint,
+                        "normal motion misbehaved; one lattice step down",
+                    ));
+                }
+            }
+        }
+    }
+
+    /// The complete candidate at the stage's speed both ways and a position
+    /// step both ways. An unstable speed check steps Kpv down its lattice
+    /// and re-confirms the profile; a failed step check steps Kpp down.
+    /// What passes within the step allowance is the joint's result.
+    fn gain_qualify(
+        &mut self,
+        session: &GainSession,
+        mut gains: Gains,
+        mut kpv_index: i32,
+        mut kpp_index: i32,
+        speed: f64,
+        offset: i32,
+    ) -> Result<Option<Gains>> {
+        let j = session.joint;
+        for _ in 0..=GAIN_QUALIFY_STEPS {
+            match self.gain_verify_speeds(session, gains, speed)? {
+                Outcome::Complete => {}
+                Outcome::Unstable => {
+                    if kpv_index == 0 {
+                        self.emit(Event::GainsNote(
+                            self.tick,
+                            j,
+                            "unstable at the stage's speed down to the Kpv lattice floor; gains kept",
+                        ));
+                        return Ok(None);
+                    }
+                    kpv_index -= 1;
+                    GainAxis::Kpv.set(&mut gains, GainAxis::Kpv.at(kpv_index));
+                    self.emit(Event::GainsNote(
+                        self.tick,
+                        j,
+                        "speed check unstable; Kpv one lattice step down, normal profile re-confirmed",
+                    ));
+                    if self.gain_verify_motion(session, gains)? != Sweep::Passed {
+                        return Ok(None);
+                    }
+                    continue;
+                }
+                // Tracking too poor for the requirement, or nothing more to
+                // observe: no lower gain fixes either.
+                _ => return Ok(None),
+            }
+            if self.gain_verify_positions(session, gains, offset)? {
+                return Ok(Some(gains));
+            }
+            if kpp_index == 0 {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    "position step failed down to the Kpp lattice floor; gains kept",
+                ));
+                return Ok(None);
+            }
+            kpp_index -= 1;
+            GainAxis::Kpp.set(&mut gains, GainAxis::Kpp.at(kpp_index));
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "position check failed; Kpp one lattice step down",
+            ));
+        }
+        self.emit(Event::GainsNote(
+            self.tick,
+            j,
+            "qualification did not settle within its step allowance; gains kept",
+        ));
+        Ok(None)
+    }
+
+    /// The stage's speed each way at `gains`: stable, and tracking within
+    /// the moving requirement once the ripple the drive has not yet been
+    /// told about is set aside.
+    fn gain_verify_speeds(
+        &mut self,
+        session: &GainSession,
+        gains: Gains,
+        speed: f64,
+    ) -> Result<Outcome> {
+        let j = session.joint;
+        for fraction in [0.5, -0.5] {
+            let Some(observed) = self.gain_observe(
+                session,
+                gains,
+                GainCommand::Velocity(fraction * speed / self.per_tick(j)),
+                "verify speed",
+            )?
+            else {
+                return Ok(Outcome::Timeout);
+            };
+            if !observed.stable {
+                return Ok(Outcome::Unstable);
+            }
+            if observed.mean_error.hypot(observed.ripple) > MOVING_RMS_RAD_S {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    "velocity gains miss the speed tracking requirement; gains kept",
+                ));
+                return Ok(Outcome::Timeout);
+            }
+        }
+        Ok(Outcome::Complete)
+    }
+
+    /// A position step each way at `gains`, each settling without overshoot
+    /// or hunting.
+    fn gain_verify_positions(
+        &mut self,
+        session: &GainSession,
+        gains: Gains,
+        offset: i32,
+    ) -> Result<bool> {
+        for direction in [1, -1] {
+            let observed = self.gain_observe(
+                session,
+                gains,
+                GainCommand::Position(direction * offset),
+                "verify position and hold",
+            )?;
+            if !observed.is_some_and(|o| o.stable) {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Sweep the checked travel both ways at the normal profile under
+    /// `gains`. A quiet low-speed pulse does not establish stability at
+    /// speed: J4's loop held at 40 deg/s and hunted at 55 Hz above 150.
+    fn gain_verify_motion(&mut self, session: &GainSession, gains: Gains) -> Result<Sweep> {
+        let j = session.joint;
+        if self.gain_used[j] + 2 > GAIN_OBSERVATIONS {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "observation budget exhausted before motion verification",
+            ));
+            return Ok(Sweep::Stopped);
+        }
+        let start = self.pos(j)?;
+        let low = self.conv[j].motor_ticks(session.span.0);
+        let high = self.conv[j].motor_ticks(session.span.1);
+        self.return_to(j, low)?;
+        self.sane_gains[j] = Some(session.original);
+        let result: Result<Sweep> = (|| {
+            self.gain_configure(j, gains)?;
+            for target in [high, low] {
+                self.gain_used[j] += 1;
+                let measured = self.run_motion(j, target, self.dt, false)?;
+                let verdict = sweep_verdict(&measured, self.holding_limit(j), self.tolerance());
+                let lag_ms = if measured.peak_command_rad_s > 0.0 {
+                    1000.0 * measured.peak_error_rad / measured.peak_command_rad_s
+                } else {
+                    0.0
+                };
+                self.emit(Event::Sweep(
+                    self.tick,
+                    j,
+                    gains,
+                    measured.reversals,
+                    measured.hold_rms_rad_s,
+                    lag_ms,
+                    verdict.label(),
+                ));
+                if verdict != Sweep::Passed {
+                    return Ok(verdict);
+                }
+            }
+            Ok(Sweep::Passed)
+        })();
+        let restored = self.gain_restore(j, session.original);
+        self.sane_gains[j] = None;
+        restored?;
+        let verdict = result?;
+        self.calm(j, session.original)?;
+        self.return_to(j, start)?;
+        Ok(verdict)
+    }
+
+    /// Every observation restores the original gains before downloading or
+    /// returning. This includes failed captures and control-loop errors.
+    /// `None` when the joint could not be observed at these gains for a
+    /// reason that is not its stability: the budget, or a step the velocity
+    /// limit would clip.
+    fn gain_observe(
+        &mut self,
+        session: &GainSession,
+        gains: Gains,
+        command: GainCommand,
+        label: &'static str,
+    ) -> Result<Option<GainObservation>> {
+        let j = session.joint;
+        if self.gain_used[j] >= GAIN_OBSERVATIONS {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "observation budget exhausted",
+            ));
+            return Ok(None);
+        }
+        let start = self.pos(j)?;
+        let per_tick = self.per_tick(j);
+        let limits = self.bundle.robot.joints[j].limits.for_mode(LimitMode::Exec);
+        let initial_speed = match command {
+            GainCommand::Velocity(v) | GainCommand::Pulse { ticks_s: v, .. } => {
+                (v * per_tick).abs()
+            }
+            GainCommand::Position(offset) => (f64::from(offset) * per_tick * gains.kpp).abs(),
+        };
+        if initial_speed > limits.velocity_rad_s {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "the step would exceed the velocity limit; lattice ceiling",
+            ));
+            return Ok(None);
+        }
+        self.gain_used[j] += 1;
+        self.adopt(j)?;
+        self.sane_gains[j] = Some(session.original);
+        let result = (|| {
+            self.gain_configure(j, gains)?;
+            self.gain_record(session, command, start)
+        })();
+        let restored = self.gain_restore(j, session.original);
+        self.sane_gains[j] = None;
+        restored?;
+        let (overshoot, position_error, stopped) = result?;
+        if stopped {
+            self.calm(j, session.original)?;
+            self.return_to(j, start)?;
+            let observed = GainObservation {
+                stable: false,
+                ripple: f64::INFINITY,
+                reversals: 0,
+                overshoot,
+                error: f64::INFINITY,
+                mean_error: f64::INFINITY,
+            };
+            self.emit(Event::GainObservation(self.tick, j, gains, label, observed));
+            return Ok(Some(observed));
+        }
+        let node = self.bundle.robot.joints[j].node_id;
+        let divisor = command.divisor();
+        let phase_capture = !matches!(command, GainCommand::Position(_));
+        let channels: &[u8] = if phase_capture { &[0, 1, 2] } else { &[0, 1] };
+        if !self.fetch_capture(j, channels, divisor)? {
+            return Err(format!("J{} did not supply encoder capture", j + 1).into());
+        }
+        let record = self
+            .bus
+            .capture(node)
+            .ok_or("encoder capture disappeared")?;
+        let captured = Captured {
+            speed: record
+                .velocity
+                .iter()
+                .map(|&v| f64::from(i32::from(v) * CAPTURE_VEL_SCALE))
+                .collect(),
+            current: record.current.iter().map(|&i| f64::from(i)).collect(),
+            phase: if phase_capture {
+                record.phase.iter().map(|&p| f64::from(p)).collect()
+            } else {
+                Vec::new()
+            },
+            divisor: usize::from(divisor),
+        };
+        let step = match command {
+            GainCommand::Velocity(v) | GainCommand::Pulse { ticks_s: v, .. } => v,
+            GainCommand::Position(_) => 0.0,
+        };
+        let rate = LOOP_HZ / f64::from(divisor);
+        // Where each verdict is read: the stop after a pulse or a step, the
+        // steady stretch of a pulse, the whole of a constant-velocity run
+        // once it has settled.
+        let (tail_from, moving) = match command {
+            GainCommand::Pulse { ramp_s, .. } => (
+                2.0 * ramp_s + GAIN_STEADY_S + GAIN_TAIL_SETTLE_S,
+                Some((ramp_s + GAIN_RAMP_SETTLE_S, ramp_s + GAIN_STEADY_S)),
+            ),
+            _ => (GAIN_SETTLE_S, None),
+        };
+        self.write_capture(
+            j,
+            step,
+            gains,
+            &captured,
+            match command {
+                GainCommand::Pulse { ramp_s, .. } => Some(2.0 * ramp_s + GAIN_STEADY_S),
+                _ => None,
+            },
+        );
+        let n = captured.speed.len();
+        let skip = ((tail_from * rate) as usize).min(n.saturating_sub(8));
+        let tail = &captured.speed[skip..];
+        // Hysteresis rejects sign changes caused by one quantized near-zero
+        // sample. Four reversals require repeated motion, not step overshoot.
+        // Moving ripple is judged against the movement requirement; applying
+        // the stationary limit there rejects the normal commutation ripple.
+        let limit = match command {
+            GainCommand::Velocity(_) => MOVING_RMS_RAD_S,
+            GainCommand::Pulse { .. } | GainCommand::Position(_) => self.holding_limit(j),
+        };
+        let reference = if matches!(command, GainCommand::Velocity(_)) {
+            step
+        } else {
+            0.0
+        };
+        let residual = matches!(command, GainCommand::Velocity(_))
+            .then(|| gain_moving_residual(tail, &captured.phase[skip..]));
+        let (mut ripple, mut reversals) = gain_ripple(
+            residual.as_deref().unwrap_or(tail),
+            reference,
+            per_tick,
+            limit,
+        );
+        let mut stable = !(ripple > limit && reversals >= 4);
+        if let Some((from_s, to_s)) = moving {
+            let from = ((from_s * rate).ceil() as usize).min(n);
+            let to = ((to_s * rate).floor() as usize).min(n);
+            if to > from + 8 {
+                let residual =
+                    gain_moving_residual(&captured.speed[from..to], &captured.phase[from..to]);
+                let (moving, crossings) = gain_ripple(&residual, step, per_tick, MOVING_RMS_RAD_S);
+                let moving_stable = !(moving > MOVING_RMS_RAD_S && crossings >= 4);
+                // Report the failing window, or the larger variation if both pass.
+                if stable && (!moving_stable || moving > ripple) {
+                    ripple = moving;
+                    reversals = crossings;
+                }
+                stable &= moving_stable;
+            }
+        }
+        let ilim = self.bundle.robot.joints[j].ilim_ma;
+        if captured.current.iter().any(|i| i.abs() >= 0.95 * ilim) {
+            // Saturating the drive on the stage's own gentle motion is this
+            // gain asking too much of it: judged like an oscillation, so the
+            // lattice steps down from here instead of giving the joint up.
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "current limit reached: too aggressive at this gain",
+            ));
+            stable = false;
+        }
+        let error = match command {
+            GainCommand::Velocity(_) | GainCommand::Pulse { .. } => {
+                (tail.iter().map(|x| (x - reference).powi(2)).sum::<f64>() / tail.len() as f64)
+                    .sqrt()
+                    * per_tick.abs()
+            }
+            GainCommand::Position(_) => position_error,
+        };
+        let mean_error = match command {
+            GainCommand::Velocity(_) | GainCommand::Pulse { .. } => {
+                (tail.iter().sum::<f64>() / tail.len() as f64 - reference).abs() * per_tick.abs()
+            }
+            GainCommand::Position(_) => position_error,
+        };
+        if let GainCommand::Position(offset) = command {
+            let allowed = (2.0 * per_tick.abs())
+                .max(GAIN_OVERSHOOT_FRACTION * (f64::from(offset) * per_tick).abs());
+            stable = stable && overshoot <= allowed && position_error <= self.tolerance();
+        }
+        let observed = GainObservation {
+            stable,
+            ripple,
+            reversals,
+            overshoot,
+            error,
+            mean_error,
+        };
+        self.return_to(j, start)?;
+        self.emit(Event::GainObservation(self.tick, j, gains, label, observed));
+        Ok(Some(observed))
+    }
+
+    fn gain_record(
+        &mut self,
+        session: &GainSession,
+        command: GainCommand,
+        start: i32,
+    ) -> Result<(f64, f64, bool)> {
+        let j = session.joint;
+        let node = self.bundle.robot.joints[j].node_id;
+        let per_tick = self.per_tick(j);
+        let target = match command {
+            GainCommand::Position(offset) => {
+                start.checked_add(offset).ok_or("position step overflow")?
+            }
+            _ => start,
+        };
+        let direction = (i64::from(target) - i64::from(start)).signum() as f64;
+        let divisor = command.divisor();
+        let duration = f64::from(CAPTURE_LEN) * f64::from(divisor) / LOOP_HZ;
+        self.bus.capture_start(node, divisor, CAPTURE_LEN)?;
+        let mut overshoot: f64 = 0.0;
+        let mut runaway = 0;
+        let mut generation = self.generation[j];
+        for t in 0..self.ticks(duration) + 2 {
+            let velocity = match command {
+                GainCommand::Velocity(v) => v,
+                GainCommand::Pulse { ticks_s, ramp_s } => {
+                    ticks_s * pulse_shape(t as f64 * self.dt, ramp_s)
+                }
+                GainCommand::Position(_) => 0.0,
+            };
+            let frame = match command {
+                GainCommand::Velocity(_) | GainCommand::Pulse { .. } => {
+                    JointCommand::velocity(velocity.round() as i32, self.gravity_feedforward()[j])
+                }
+                GainCommand::Position(_) => {
+                    JointCommand::position(target, 0, self.gravity_feedforward()[j])
+                }
+            };
+            self.frame(Some((j, frame)))?;
+            let actual = self.pos(j)?;
+            overshoot =
+                overshoot.max((f64::from(actual) - f64::from(target)) * direction * per_tick.abs());
+            let angle = self.conv[j].joint_rad(actual);
+            if !(session.span.0..=session.span.1).contains(&angle) {
+                return Err(format!("J{} reached its tuning travel bound", j + 1).into());
+            }
+            if self.generation[j] == generation {
+                continue;
+            }
+            generation = self.generation[j];
+            let speed = f64::from(
+                self.state.nodes[self.node(j)]
+                    .speed_ticks_s
+                    .ok_or("missing velocity feedback")?,
+            );
+            let expected = match command {
+                GainCommand::Velocity(_) | GainCommand::Pulse { .. } => velocity,
+                GainCommand::Position(_) => {
+                    ((f64::from(target) - f64::from(actual)) * self.gains[j].kpp).clamp(
+                        -self.bundle.robot.joints[j].velocity_limit_ticks_s,
+                        self.bundle.robot.joints[j].velocity_limit_ticks_s,
+                    )
+                }
+            };
+            let velocity_error = (speed - expected) * per_tick;
+            runaway = if velocity_error.abs() > RUNAWAY_RAD_S {
+                runaway + 1
+            } else {
+                0
+            };
+            if runaway >= RUNAWAY_TICKS {
+                self.emit(Event::GainsNote(
+                    self.tick,
+                    j,
+                    "runaway speed guard; restoring original gains",
+                ));
+                return Ok((overshoot, f64::INFINITY, true));
+            }
+        }
+        let error = ((f64::from(self.pos(j)?) - f64::from(target)) * per_tick).abs();
+        Ok((overshoot, error, false))
+    }
+
+    fn gain_configure(&mut self, j: usize, gains: Gains) -> Result<()> {
+        self.gains[j] = gains;
+        self.retune(j, self.bundle.robot.joints[j].ilim_ma)?;
+        // Changing gains does not clear the velocity accumulator. Returning
+        // from current mode to position mode does; catch at the actual pose.
+        let gravity = self.gravity_feedforward()[j];
+        self.frame(Some((j, JointCommand::current(gravity))))?;
+        self.adopt(j)?;
+        self.configure(j, self.bundle.robot.joints[j].ilim_ma)
+    }
+
+    /// Finish transmitting recovery gains even when a stop was requested.
+    /// The cancellation flag stays set so calibration cannot resume afterward.
+    fn gain_restore(&mut self, j: usize, gains: Gains) -> Result<()> {
+        let stopping = std::mem::replace(&mut self.stopping, true);
+        let restored = self.gain_configure(j, gains);
+        self.stopping = stopping;
+        restored
+    }
+
+    /// The current feedforward for joint `j` moving at `ticks_s` motor
+    /// ticks/s: gravity at the measured pose, plus, with `friction`, the
+    /// current that carries the joint's friction at that speed \[mA\].
+    /// Coulomb ramps in over one of the speed filter's steps either side of
+    /// rest, below which the drive cannot tell the joint is moving; viscous
+    /// grows with the speed. Both are joint side, as the mechanics stage
+    /// measures them.
+    fn feedforward(&mut self, j: usize, ticks_s: f64, friction: bool) -> i16 {
+        let gravity = f64::from(self.gravity_feedforward()[j]);
+        let cfg = &self.bundle.robot.joints[j];
+        let ilim = cfg.ilim_ma;
+        let carried = if friction {
+            let (viscous, coulomb) = self.friction[j];
+            let quantum = LOOP_HZ / f64::from(cfg.velocity_window.unwrap_or(VELOCITY_WINDOW_DRIVE));
+            let per_tick = self.per_tick(j);
+            let rad_s = ticks_s * per_tick;
+            let nm =
+                coulomb * (rad_s / (quantum * per_tick.abs())).clamp(-1.0, 1.0) + viscous * rad_s;
+            nm * torque_to_ma_factor(cfg.gear_ratio, cfg.gear_efficiency, cfg.kt_nm_a, cfg.dir)
+        } else {
+            0.0
+        };
+        (gravity + carried).clamp(-ilim, ilim).round() as i16
+    }
+
+    /// A trial ran away: the known-good gains go back on the drive and the
+    /// joint holds where it is. If it stays loud, its loop is opened -- the
+    /// gravity current alone, with no feedback, cannot oscillate -- then
+    /// closed again from rest. A drive can sit in a large-signal limit cycle
+    /// at gains that hold and sweep cleanly from rest (J1 at ~100 Hz,
+    /// ±0.5 deg, ±1 A for as long as it was held, 2026-10-02), so settling
+    /// that way is a recovery, not a verdict on the gains, and the run goes
+    /// on. Staying loud after the loop was reopened stops the run: something
+    /// the stage relied on did not hold.
+    fn calm(&mut self, j: usize, sane: Gains) -> Result<()> {
+        let ilim = self.bundle.robot.joints[j].ilim_ma;
+        self.adopt(j)?;
+        self.gains[j] = sane;
+        // The joint may still be spinning down from the trial just withdrawn
+        // (J1's base read 117 deg/s 72 ms after one, 2026-10-01), which the
+        // tracking guard would call a second runaway and end the run on.
+        // These holds are the judge of that decay, so the guard stands down
+        // for them.
+        let guard = self.sane_gains[j].replace(sane);
+        let settled = (|| {
+            self.configure(j, ilim)?;
+            self.quiet(j)
+        })();
+        self.sane_gains[j] = guard;
+        if settled? {
+            return Ok(());
+        }
+        self.emit(Event::GainsNote(
+            self.tick,
+            j,
+            "still oscillating on its known-good gains; opening its loop",
+        ));
+        let feedforward = self.gravity_feedforward()[j];
+        for _ in 0..self.ticks(CALM_S) {
+            self.frame(Some((j, JointCommand::current(feedforward))))?;
+        }
+        self.adopt(j)?;
+        let guard = self.sane_gains[j].replace(sane);
+        let settled = self.quiet(j);
+        self.sane_gains[j] = guard;
+        if settled? {
+            self.emit(Event::GainsNote(
+                self.tick,
+                j,
+                "settled once its loop was opened and closed again; continuing",
+            ));
+            return Ok(());
+        }
+        Err(format!(
+            "J{} kept oscillating after its trial gains were withdrawn and its loop was opened",
+            j + 1
+        )
+        .into())
+    }
+
+    /// Hold joint `j` for up to `CALM_S`: whether its reported speed stayed
+    /// under `RUNAWAY_RAD_S` once the first `CALM_QUIET_S`, which a withdrawn
+    /// trial may still be spinning down through, had passed. A loud reading
+    /// after that ends the hold at once: a limit cycle does not decay on its
+    /// own, and every tick of it hammers the joint.
+    fn quiet(&mut self, j: usize) -> Result<bool> {
+        let per_tick = self.per_tick(j);
+        let (total, grace) = (self.ticks(CALM_S), self.ticks(CALM_QUIET_S));
+        for t in 0..total {
+            self.frame(None)?;
+            let reported = self.state.nodes[self.node(j)].speed_ticks_s.unwrap_or(0);
+            if (f64::from(reported) * per_tick).abs() > RUNAWAY_RAD_S && t >= grace {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Capture a ripple trial inside the collision-checked travel. Failure
+    /// withdraws compensation before any download or return motion resumes.
+    fn capture_step(
+        &mut self,
+        j: usize,
+        step: f64,
+        divisor: u8,
+        span: (f64, f64),
+    ) -> Result<Option<Captured>> {
+        let node = self.bundle.robot.joints[j].node_id;
+        let per_tick = self.per_tick(j);
+        let tried = self.gains[j];
+        let result = (|| {
+            let start = self.pos(j)?;
+            let window = f64::from(CAPTURE_LEN) * f64::from(divisor) / LOOP_HZ;
+            self.bus.capture_start(node, divisor, CAPTURE_LEN)?;
+            let mut runaway_ticks = 0u32;
+            let mut generation = self.generation[j];
+            let stepping = self.ticks(window) + 2;
+            for t in 0..stepping + self.ticks(RETURN_S / 10.0) {
+                let command = if t < stepping { step } else { 0.0 };
+                let feedforward = self.feedforward(j, command, false);
+                self.frame(Some((
+                    j,
+                    JointCommand::velocity(command.round() as i32, feedforward),
+                )))?;
+                let angle = self.conv[j].joint_rad(self.pos(j)?);
+                if !(span.0..=span.1).contains(&angle) {
+                    return Err(format!("J{} reached its ripple travel bound", j + 1).into());
+                }
+                if self.generation[j] == generation {
+                    continue;
+                }
+                generation = self.generation[j];
+                let reported = self.state.nodes[self.node(j)]
+                    .speed_ticks_s
+                    .ok_or("missing ripple velocity feedback")?;
+                let error = (f64::from(reported) - command) * per_tick;
+                runaway_ticks = if error.abs() > RUNAWAY_RAD_S {
+                    runaway_ticks + 1
+                } else {
+                    0
+                };
+                if runaway_ticks >= RUNAWAY_TICKS {
+                    return Err(format!("J{} ripple capture ran away", j + 1).into());
+                }
+            }
+            self.adopt(j)?;
+            if !self.fetch_capture(j, &[0, 1, 2], divisor)? {
+                self.return_to(j, start)?;
+                return Ok(None);
+            }
+            let capture = self
+                .bus
+                .capture(node)
+                .ok_or_else(|| format!("J{} has no capture buffer", j + 1))?;
+            let n = usize::from(capture.recorded);
+            let captured = Captured {
+                divisor: usize::from(capture.divisor),
+                current: capture.current[..n].iter().map(|&i| f64::from(i)).collect(),
+                phase: capture.phase[..n].iter().map(|&p| f64::from(p)).collect(),
+                speed: capture.velocity[..n]
+                    .iter()
+                    .map(|&v| f64::from(i32::from(v) * CAPTURE_VEL_SCALE))
+                    .collect(),
+            };
+            self.write_capture(j, step, tried, &captured, None);
+            self.return_to(j, start)?;
+            Ok(Some(captured))
+        })();
+        if result.is_err() {
+            let joint = &self.bundle.robot.joints[j];
+            let gains = joint.gains;
+            let restored_ripple = self.bus.set_ripple(node, &joint.ripple);
+            let restored_gains = self.gain_restore(j, gains);
+            restored_ripple?;
+            restored_gains?;
+        }
+        result
+    }
+
+    /// Read joint `j`'s capture back over the poll slot: its status until it
+    /// answers, then every chunk of `channels`, again for any a lossy bus
+    /// dropped. `false` when the drive answers no status.
+    fn fetch_capture(&mut self, j: usize, channels: &[u8], divisor: u8) -> Result<bool> {
+        let node = self.bundle.robot.joints[j].node_id;
+        self.emit(Event::Phase("capture download", j));
+        let mut answered = false;
+        for _ in 0..GAINS_STATUS_TRIES {
+            self.read_capture(node, CAPTURE_STATUS_CHANNEL, 0)?;
+            self.settle(self.dt)?;
+            if self.bus.capture(node).is_some_and(|c| c.wanted > 0) {
+                answered = true;
+                break;
+            }
+        }
+        if !answered {
+            return Ok(false);
+        }
+        let capture = self.bus.capture(node).ok_or("capture status disappeared")?;
+        if capture.recorded != CAPTURE_LEN
+            || capture.wanted != CAPTURE_LEN
+            || capture.divisor != u16::from(divisor)
+        {
+            return Err(format!("J{} capture has the wrong length or sample rate", j + 1).into());
+        }
+        for _ in 0..GAINS_READ_PASSES {
+            let missing: Vec<(u8, u16)> = channels
+                .iter()
+                .copied()
+                .flat_map(|channel| {
+                    let capture = self.bus.capture(node);
+                    capture
+                        .map(|c| {
+                            c.missing(channel)
+                                .map(|chunk| (channel, chunk))
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default()
+                })
+                .collect();
+            if missing.is_empty() {
+                break;
+            }
+            for (channel, chunk) in missing {
+                self.read_capture(node, channel, chunk)?;
+            }
+            self.settle(2.0 * self.dt)?;
+        }
+        let capture = self
+            .bus
+            .capture(node)
+            .ok_or_else(|| format!("J{} has no capture buffer", j + 1))?;
+        if channels
+            .iter()
+            .any(|c| capture.missing(*c).next().is_some())
+        {
+            return Err(format!(
+                "J{} capture incomplete after {GAINS_READ_PASSES} reads",
+                j + 1
+            )
+            .into());
+        }
+        Ok(true)
+    }
+
+    /// Leave a capture in the run directory as `capture-J<j>-<n>.csv`:
+    /// sample, time \[s\], speed \[ticks/s\], Iq \[mA\], electrical phase
+    /// (0..16383, when captured), with the step
+    /// \[ticks/s\] and divisor in the header. Best effort, like every other
+    /// record.
+    fn write_capture(
+        &mut self,
+        j: usize,
+        step: f64,
+        tried: Gains,
+        captured: &Captured,
+        stop_after: Option<f64>,
+    ) {
+        if self.run_directory.is_none() {
+            return;
+        }
+        self.captures_written += 1;
+        self.emit(Event::Capture(
+            j,
+            self.captures_written,
+            step,
+            tried,
+            captured.clone(),
+            stop_after,
+        ));
+    }
+
+    /// One capture read in this tick's poll slot.
+    fn read_capture(&mut self, node: u8, channel: u8, chunk: u16) -> Result<()> {
+        self.bus.queue_poll_override(
+            PollAction::CaptureRead {
+                node,
+                channel,
+                chunk,
+            },
+            1,
+        );
+        self.frame(None)
     }
 
     /// The fastest each joint moves while still meeting the tracking
@@ -2159,10 +4382,14 @@ impl Arm {
         poses: &[[f64; N]],
         ready: [f64; N],
         spans: &[(f64, f64); N],
+        chosen: [bool; N],
     ) -> Result<[Option<Found>; N]> {
         let worst = self.worst_gravity_ma(poses, ready)?;
         let mut found = [None; N];
         for (j, slot) in found.iter_mut().enumerate() {
+            if !chosen[j] {
+                continue;
+            }
             self.pose(ready)?;
             self.emit(Event::Phase("limits", j));
             *slot = self.joint_limits(j, ready[j], spans[j], worst[j])?;
@@ -2340,39 +4567,92 @@ impl Arm {
     }
 }
 
+/// Ready is covered by the bidirectional joint probes. Add the extended
+/// stiction pose and the first identification transition: a ready-only
+/// qualification missed J4's instability at the second identification pose.
+/// This is representative coverage, not certification of every arm pose.
+fn gain_pose_plan(
+    bundle: &ConfigBundle,
+    assets: &Path,
+    ready: [f64; N],
+    identification: &[[f64; N]],
+    out: Option<[f64; N]>,
+) -> Result<Vec<GainPose>> {
+    let mut poses = Vec::with_capacity(3);
+    if let Some(target) = out {
+        poses.push(GainPose {
+            from_ready: true,
+            approach: ready,
+            target,
+        });
+    }
+    let backoff = bundle.robot.selfcal.approach_rad;
+    // For each joint, the plan poses where it carries the least and the most
+    // inertia: a loop tuned at ready runs hot where its load falls away and
+    // slack where it grows, and J1 hunted at pose 9 with the arm stacked
+    // over the base, 3 cm off its axis, while the two nearest poses had
+    // passed it (2026-10-01).
+    let mut kin = arm_kin(bundle, assets)?;
+    let inertias: Vec<[f64; N]> = identification
+        .iter()
+        .map(|q| joint_inertia(&mut kin, bundle, *q))
+        .collect::<Result<_>>()?;
+    let mut heaviest: Vec<usize> = Vec::with_capacity(2 * N);
+    let columns: [Vec<f64>; N] =
+        std::array::from_fn(|j| inertias.iter().map(|row| row[j]).collect());
+    for column in &columns {
+        let extremes = [
+            (0..identification.len()).min_by(|a, b| column[*a].total_cmp(&column[*b])),
+            (0..identification.len()).max_by(|a, b| column[*a].total_cmp(&column[*b])),
+        ];
+        for i in extremes.into_iter().flatten() {
+            if !heaviest.contains(&i) {
+                heaviest.push(i);
+            }
+        }
+    }
+    heaviest.sort_unstable();
+    let mut world = collision_world(bundle, assets)?;
+    let mut at = ready;
+    if let Some(pose) = poses.first() {
+        if world.check_segment(&at, &pose.target, 40)?.is_some() {
+            return Err("the arm-out pose is not reachable from ready".into());
+        }
+        at = pose.target;
+    }
+    for i in heaviest {
+        let target = identification[i];
+        let approach: [f64; N] = std::array::from_fn(|j| target[j] - backoff);
+        // Straight from where the last pose left the arm when that is clear,
+        // else through ready; a pose clear neither way is left to the
+        // identification, whose own legs reach it.
+        let direct = world.check_segment(&at, &approach, 40)?.is_none();
+        let via_ready = !direct
+            && world.check_segment(&at, &ready, 40)?.is_none()
+            && world.check_segment(&ready, &approach, 40)?.is_none();
+        if !(direct || via_ready) || world.check_segment(&approach, &target, 40)?.is_some() {
+            println!(
+                "gains: identification pose {} is not reachable for the posture check; skipped",
+                i + 1
+            );
+            continue;
+        }
+        poses.push(GainPose {
+            from_ready: via_ready,
+            approach,
+            target,
+        });
+        at = target;
+    }
+    if world.check_segment(&at, &ready, 40)?.is_some() {
+        return Err("gain qualification cannot return safely to ready".into());
+    }
+    Ok(poses)
+}
+
 /// Every joint's probe span, planned before anything moves: loading the
 /// collision world and sweeping each span takes far longer than a control
 /// tick, and on the arm the loop would miss its deadline doing it.
-/// The two velocity-loop gains the gains stage searches, in search order.
-#[derive(Clone, Copy)]
-enum GainField {
-    Kiv,
-    Kpv,
-}
-
-impl GainField {
-    fn get(self, g: &Gains) -> f64 {
-        match self {
-            GainField::Kiv => g.kiv,
-            GainField::Kpv => g.kpv,
-        }
-    }
-    fn with(self, mut g: Gains, value: f64) -> Gains {
-        match self {
-            GainField::Kiv => g.kiv = value,
-            GainField::Kpv => g.kpv = value,
-        }
-        g
-    }
-    /// (down, up) step factors.
-    fn steps(self) -> (f64, f64) {
-        match self {
-            GainField::Kiv => (GAINS_STEP_DOWN, GAINS_STEP_UP),
-            GainField::Kpv => (GAINS_KPV_STEP_DOWN, GAINS_KPV_STEP_UP),
-        }
-    }
-}
-
 fn limit_spans(bundle: &ConfigBundle, assets: &Path, ready: [f64; N]) -> Result<[(f64, f64); N]> {
     let mut world = collision_world(bundle, assets)?;
     let mut spans = [(0.0, 0.0); N];
@@ -2423,10 +4703,17 @@ impl Arm {
     /// forward-reach poses; the straight joint-space line between the same
     /// endpoints clears it, which is what the pose planner checks.
     fn pose(&mut self, q: [f64; N]) -> Result<()> {
+        self.pose_checked(q, false).map(|_| ())
+    }
+
+    /// With `check`, count every joint's speed-error reversals across the
+    /// oscillation band on the way, for the caller to judge; `None` when
+    /// nothing was checked.
+    fn pose_checked(&mut self, q: [f64; N], check: bool) -> Result<Option<[u32; N]>> {
         let tolerance = self.tolerance();
         let current = self.angles()?;
         if (0..N).all(|j| (q[j] - current[j]).abs() <= tolerance) {
-            return Ok(());
+            return Ok(None);
         }
         if !self.homed.iter().all(|h| *h) {
             return Err("a synchronized move needs every joint referenced".into());
@@ -2458,17 +4745,83 @@ impl Arm {
         self.emit(Event::Phase("synchronized move of all joints", widest));
         let moving = self.ticks(duration);
         let total = self.ticks(duration + self.bundle.robot.motion.settle_timeout_s);
+        let mut rings: [Ring; N] = std::array::from_fn(|_| Ring::default());
+        let mut reference_rings: [Ring; N] = std::array::from_fn(|_| Ring::default());
+        let mut expected = start.map(f64::from);
+        let mut speed_sq = [0.0; N];
+        let mut peak_error = [0.0_f64; N];
+        let mut count = [0u32; N];
+        let mut reversals = [0u32; N];
+        let mut signs = [0i8; N];
+        let window = self.ticks(SPEED_WINDOW_S);
+        let guard = self.ticks(DETECT_GUARD_S);
         for t in 0..total {
+            let generation = self.generation;
+            let reference = expected;
             let (position, velocity, _) = profile.sample((t + 1) as f64 * self.dt);
+            let feedforward = self.gravity_feedforward();
             let commands: [JointCommand; N] = std::array::from_fn(|j| {
                 let distance = f64::from(target[j]) - f64::from(start[j]);
+                expected[j] = f64::from(start[j]) + distance * position;
                 JointCommand::position(
-                    (f64::from(start[j]) + distance * position).round() as i32,
+                    expected[j].round() as i32,
                     (distance * velocity) as i32,
-                    0,
+                    feedforward[j],
                 )
             });
             self.exchange(commands, true)?;
+            if check {
+                for j in 0..N {
+                    if generation[j] == self.generation[j] {
+                        continue;
+                    }
+                    let p = self.pos(j)?;
+                    let measured = if self.simulated {
+                        rings[j].push(self.tick, p, window, self.dt)
+                    } else {
+                        let received = self.position_rx_ns[j];
+                        if received == 0
+                            || (rings[j].len > 0
+                                && received <= rings[j].samples[rings[j].len - 1].2)
+                        {
+                            return Err(format!(
+                                "J{} pose feedback timestamps did not advance",
+                                j + 1
+                            )
+                            .into());
+                        }
+                        rings[j].push_at(self.tick, p, window, received)
+                    };
+                    let commanded = reference_rings[j].push(
+                        self.tick,
+                        reference[j].round() as i32,
+                        window,
+                        self.dt,
+                    );
+                    if let (Some(measured), Some(commanded)) = (measured, commanded) {
+                        if t >= guard {
+                            let speed_error = (measured - commanded) * self.per_tick(j);
+                            speed_sq[j] += speed_error.powi(2);
+                            let next = if speed_error > SWEEP_BAND_RAD_S {
+                                1
+                            } else if speed_error < -SWEEP_BAND_RAD_S {
+                                -1
+                            } else {
+                                0
+                            };
+                            if next != 0 {
+                                if signs[j] != 0 && signs[j] != next {
+                                    reversals[j] += 1;
+                                }
+                                signs[j] = next;
+                            }
+                            peak_error[j] = peak_error[j]
+                                .max(((f64::from(p) - reference[j]) * self.per_tick(j)).abs());
+                            count[j] += 1;
+                        }
+                    }
+                }
+            }
             if t + 1 >= moving
                 && (0..N).all(|j| {
                     self.pos(j).is_ok_and(|p| {
@@ -2478,7 +4831,40 @@ impl Arm {
                 })
             {
                 self.hold = target;
-                return Ok(());
+                match self.ready {
+                    Some(ready) if (0..N).all(|j| (q[j] - ready[j]).abs() <= tolerance) => {
+                        self.visited.clear();
+                    }
+                    _ => self.visited.push(q),
+                }
+                if check {
+                    for j in 0..N {
+                        if count[j] == 0 {
+                            return Err(
+                                format!("J{} supplied no scored pose feedback", j + 1).into()
+                            );
+                        }
+                        let speed = (speed_sq[j] / f64::from(count[j])).sqrt();
+                        self.emit(Event::GainPoseMotion(
+                            self.tick,
+                            j,
+                            speed,
+                            peak_error[j],
+                            reversals[j],
+                        ));
+                    }
+                    // Lag is reported, not judged: J4 carries 13 ms of it at
+                    // its configured gains where the others carry 2 to 3,
+                    // and no gain this stage may choose closes that.
+                    // Oscillation is what a candidate answers for.
+                    for j in 0..N {
+                        if !speed_sq[j].is_finite() {
+                            reversals[j] = u32::MAX;
+                        }
+                    }
+                    return Ok(Some(reversals));
+                }
+                return Ok(None);
             }
         }
         let worst = (0..N)
@@ -2498,6 +4884,58 @@ impl Arm {
         .into())
     }
 
+    /// Require a complete stillness window of fresh encoder observations.
+    /// A timeout invalidates the measurement; elapsed time is not settling.
+    fn wait_still(&mut self, chosen: [bool; N]) -> Result<()> {
+        match self.stillness(chosen)? {
+            None => Ok(()),
+            Some(joint) => Err(format!(
+                "J{} did not settle within {STICTION_STILL_TIMEOUT_S}s; measurement rejected",
+                joint + 1
+            )
+            .into()),
+        }
+    }
+
+    /// The first chosen joint that did not reach a full window of stillness
+    /// within `STICTION_STILL_TIMEOUT_S`, or `None` when all did.
+    fn stillness(&mut self, chosen: [bool; N]) -> Result<Option<usize>> {
+        let window = self.ticks(STICTION_WINDOW_S);
+        let mut seen: [VecDeque<(u64, i32)>; N] =
+            std::array::from_fn(|_| VecDeque::with_capacity(window as usize + 2));
+        let mut generation = self.generation;
+        let mut still = chosen.map(|selected| !selected);
+        for _ in 0..self.ticks(STICTION_STILL_TIMEOUT_S) {
+            self.frame(None)?;
+            for j in 0..N {
+                if !chosen[j] || generation[j] == self.generation[j] {
+                    continue;
+                }
+                generation[j] = self.generation[j];
+                seen[j].push_back((self.tick, self.pos(j)?));
+                while seen[j]
+                    .get(1)
+                    .is_some_and(|(tick, _)| self.tick - tick >= window)
+                {
+                    seen[j].pop_front();
+                }
+                let (lo, hi) = seen[j]
+                    .iter()
+                    .fold((i32::MAX, i32::MIN), |(lo, hi), &(_, p)| {
+                        (lo.min(p), hi.max(p))
+                    });
+                still[j] = seen[j]
+                    .front()
+                    .is_some_and(|(tick, _)| self.tick - tick >= window)
+                    && i64::from(hi) - i64::from(lo) <= i64::from(STICTION_STILL_TICKS);
+            }
+            if still.iter().all(|s| *s) {
+                return Ok(None);
+            }
+        }
+        Ok(still.iter().position(|s| !s))
+    }
+
     /// Every joint's holding current at the pose it is already at.
     ///
     /// Encoder-only replies do not refresh current, so each value must come
@@ -2505,11 +4943,16 @@ impl Arm {
     /// not drift while measuring: a joint that wanders is holding something
     /// other than what the pose says.
     fn holding_current(&mut self) -> Result<[f64; N]> {
+        self.wait_still([true; N])?;
         let tolerance = self.tolerance();
         let held: [f64; N] = std::array::from_fn(|k| self.conv[k].joint_rad(self.hold[k]));
         let mut sum = [0.0; N];
         let mut count = [0u32; N];
         let mut generation = self.generation;
+        let mut rings: [Ring; N] = std::array::from_fn(|_| Ring::default());
+        let mut speed_squared = [0.0; N];
+        let mut speed_count = [0u32; N];
+        let window = self.ticks(SPEED_WINDOW_S);
         for j in 0..N {
             self.state.nodes[self.node(j)].current_ma = None;
         }
@@ -2535,6 +4978,11 @@ impl Arm {
                     continue;
                 }
                 generation[j] = self.generation[j];
+                let position = self.pos(j)?;
+                if let Some(speed) = rings[j].push(self.tick, position, window, self.dt) {
+                    speed_squared[j] += (speed * self.per_tick(j)).powi(2);
+                    speed_count[j] += 1;
+                }
                 let current = f64::from(current);
                 if current.abs() >= self.bundle.robot.joints[j].ilim_ma {
                     return Err(
@@ -2548,6 +4996,16 @@ impl Arm {
         }
         if let Some(j) = (0..N).find(|j| count[*j] == 0) {
             return Err(format!("J{} reported no holding current at this pose", j + 1).into());
+        }
+        if let Some(j) = (0..N).find(|j| {
+            speed_count[*j] == 0
+                || (speed_squared[*j] / f64::from(speed_count[*j])).sqrt() > self.holding_limit(*j)
+        }) {
+            return Err(format!(
+                "J{} did not remain still during the gravity measurement",
+                j + 1
+            )
+            .into());
         }
         Ok(std::array::from_fn(|j| sum[j] / f64::from(count[j])))
     }
@@ -2613,6 +5071,16 @@ impl Arm {
         let fit =
             par6_kin::gravity::fit_arm(&mut self.kin, &samples, self.bundle.robot.selfcal.ridge)?;
         self.emit(Event::ArmFit(fit.rms_before_nm, fit.rms_nm));
+        if !fit.rms_nm.is_finite() || fit.rms_nm > fit.rms_before_nm {
+            return Err("gravity fit did not improve the measured torque residual".into());
+        }
+        let correction: Vec<f64> = fit
+            .correction
+            .iter()
+            .enumerate()
+            .map(|(i, delta)| delta + self.kin.gravity_correction().get(i).copied().unwrap_or(0.0))
+            .collect();
+        self.kin.set_gravity_correction(&correction)?;
         Ok(fit)
     }
 
@@ -2651,6 +5119,37 @@ impl Arm {
                 self.hold[j] = p;
             }
         }
+        // Back along the legs the run came by, each checked before it was
+        // driven, before anything parks joint by joint: that path is not
+        // checked, and from identification pose 9 on 2026-10-01 it drove the
+        // folded arm into an obstacle, forced the base at its current limit
+        // into a 270 deg/s swing and took the bus down with it.
+        if let Some(ready) = self.ready {
+            let away = self
+                .angles()
+                .map(|q| (0..N).any(|j| (q[j] - ready[j]).abs() > self.tolerance()))
+                .unwrap_or(false);
+            if away && self.homed.iter().all(|h| *h) && !self.visited.is_empty() {
+                self.emit(Event::Phase(
+                    "retrace the checked legs to ready before parking",
+                    0,
+                ));
+                let mut trail = self.visited.clone();
+                trail.reverse();
+                trail.push(ready);
+                for waypoint in trail {
+                    if self.pose(waypoint).is_err() {
+                        self.emit(Event::Phase("retrace failed; parking from here", 0));
+                        break;
+                    }
+                }
+                for j in 0..N {
+                    if let Ok(p) = self.pos(j) {
+                        self.hold[j] = p;
+                    }
+                }
+            }
+        }
         let mut parked = Ok(());
         // The joints parked on their endstops last: they hold the arm up.
         let rests = |j: usize| self.bundle.robot.parks_on_endstop(j);
@@ -2683,8 +5182,12 @@ impl Arm {
         if !self.homed[j] {
             // A joint the run never referenced goes back to the count the run
             // found it at, so the next run starts from the same posture: the
-            // vendor's pre-homing wrist nudge is a relative move.
-            let distance = (i64::from(self.found_at[j]) - i64::from(self.pos(j)?)).abs() as f64;
+            // vendor's pre-homing wrist nudge is a relative move. A joint the
+            // run never held was never driven: it is where it was found.
+            let Some(found) = self.found_at[j] else {
+                return Ok(());
+            };
+            let distance = (i64::from(found) - i64::from(self.pos(j)?)).abs() as f64;
             if distance <= 1.0 {
                 return Ok(());
             }
@@ -2693,7 +5196,7 @@ impl Arm {
             self.emit(Event::Phase("return to where the run found it", j));
             self.operating(j)?;
             let seconds = (SEPTIC_PEAK_VEL * distance / per_s).max(0.3);
-            let m = self.run_motion(j, self.found_at[j], seconds, false)?;
+            let m = self.run_motion(j, found, seconds, false)?;
             return if m.outcome == Outcome::Complete {
                 Ok(())
             } else {
@@ -2765,6 +5268,30 @@ fn collision_world(bundle: &ConfigBundle, assets: &Path) -> Result<par6_kin::Col
 struct IdentPlan {
     poses: Vec<[f64; N]>,
     determined: Vec<f64>,
+}
+/// Joint-side inertia at `q`: the mass-matrix diagonal, plus the rotor
+/// reflected through the reduction.
+///
+/// `Kin::dyn_feedforward` is the inverse dynamics with the gravity term
+/// subtracted back out, so zero velocity and a unit acceleration on one
+/// joint alone leave exactly `M_jj(q)` in that slot. The rotor table is
+/// motor-side and reflects as `G^2 jm` through the dynamics ratio -- the
+/// vendor's J1 reduction disagrees with its kinematic one, so this uses the
+/// same fallback `par6-bus` does.
+fn joint_inertia(kin: &mut par6_kin::Kin, bundle: &ConfigBundle, q: [f64; N]) -> Result<[f64; N]> {
+    let zero = [0.0; N];
+    let mut out = [0.0; N];
+    for j in 0..N {
+        let mut qdd = zero;
+        qdd[j] = 1.0;
+        let mut tau = zero;
+        kin.dyn_feedforward(&q, &zero, &qdd, &mut tau)
+            .map_err(|e| format!("J{} inertia: {e}", j + 1))?;
+        let cfg = &bundle.robot.joints[j];
+        let g = cfg.dynamics_gear_ratio.unwrap_or(cfg.gear_ratio);
+        out[j] = tau[j] + g * g * bundle.robot.sim.motor_jm_kg_m2[j];
+    }
+    Ok(out)
 }
 
 /// The model the run identifies against: the arm with the fitted tool,
@@ -3020,6 +5547,7 @@ fn patch_config(
     correction: Option<&[f64]>,
     friction: Option<&[Option<(f64, f64)>; N]>,
     sim: &par6_config::SimConfig,
+    ripples: Option<&[Option<Vec<RippleHarmonic>>; N]>,
     tuned: Option<&[Option<Tuned>; N]>,
     limits: Option<&[Option<Found>; N]>,
 ) -> Result<String> {
@@ -3045,8 +5573,15 @@ fn patch_config(
         patch_array(&mut text, "viscous_nm_s", &viscous)?;
         patch_array(&mut text, "coulomb_nm", &coulomb)?;
     }
+    for (j, r) in ripples.into_iter().flatten().enumerate() {
+        // What the stage found for a joint it visited replaces what the file
+        // had, and a visited joint it found nothing for loses its line.
+        if let Some(r) = r {
+            patch_joint_ripple(&mut text, j, r)?;
+        }
+    }
     for (j, t) in tuned.into_iter().flatten().enumerate() {
-        // Only what the search moved: a joint it left alone keeps its lines
+        // Only what the design moved: a joint it left alone keeps its lines
         // byte for byte, comments and all.
         if let Some(t) = t {
             let mut values = Vec::new();
@@ -3055,6 +5590,9 @@ fn patch_config(
             }
             if t.after.kiv != t.before.kiv {
                 values.push(("kiv", t.after.kiv));
+            }
+            if t.after.kpp != t.before.kpp {
+                values.push(("kpp", t.after.kpp));
             }
             if !values.is_empty() {
                 patch_joint_table(&mut text, j, "[joints.gains]", &values)?;
@@ -3116,7 +5654,12 @@ fn patch_joint_table(
             .map_or(text.len() - body, |i| i + 1);
     let mut block = text[body..end].to_owned();
     for (key, value) in values {
-        block = set_value(&block, key, &format!("{value:.5}"));
+        let value = if header == "[joints.gains]" {
+            value.to_string()
+        } else {
+            format!("{value:.5}")
+        };
+        block = set_value(&block, key, &value);
     }
     text.replace_range(body..end, &block);
     Ok(())
@@ -3169,40 +5712,103 @@ fn main() -> std::process::ExitCode {
     }
 }
 
+fn stage_status(
+    statuses: &mut [(&'static str, Option<usize>, &'static str)],
+    stage: &'static str,
+    joint: Option<usize>,
+    status: &'static str,
+) {
+    if let Some(row) = statuses
+        .iter_mut()
+        .find(|(s, j, _)| *s == stage && *j == joint)
+    {
+        row.2 = status;
+    }
+    match joint {
+        Some(j) => println!("STAGE {stage} J{}: {status}", j + 1),
+        None => println!("STAGE {stage}: {status}"),
+    }
+}
+
 fn run(args: Args) -> Result<()> {
+    let runs = |stage: Stage| args.only.is_empty() || args.only.contains(&stage);
+    if args.verify_gains.is_some() && args.only != [Stage::Gains] {
+        return Err("--verify-gains requires --only gains".into());
+    }
+    if !args.joints.is_empty()
+        && (args.only.is_empty()
+            || args
+                .only
+                .iter()
+                .any(|s| !matches!(s, Stage::Ripple | Stage::Gains)))
+    {
+        return Err("--joint applies to --only ripple and --only gains".into());
+    }
+    let chosen: [bool; N] =
+        std::array::from_fn(|j| args.joints.is_empty() || args.joints.contains(&(j as u8 + 1)));
+    let limits_stage = args.limits && args.only.is_empty() || args.only.contains(&Stage::Limits);
+    let ripple_stage = runs(Stage::Ripple);
+    let gains_stage = runs(Stage::Gains);
+    let stiction_stage = runs(Stage::Stiction);
+    let belt_stage = runs(Stage::Belt);
+    let mechanics_stage = runs(Stage::Mechanics);
     let bundle = match &args.tool {
         Some(tool) => ConfigBundle::load_fitted(&args.config, tool)?,
         None => ConfigBundle::load(&args.config)?,
     };
     bundle.robot.validate()?;
-    // The file's own friction, for joints a partial run leaves unmeasured.
+    let load_candidate = |path: &PathBuf| -> Result<par6_config::RobotConfig> {
+        let candidate = par6_config::RobotConfig::from_toml_str(&fs::read_to_string(path)?)?;
+        candidate.validate()?;
+        if candidate.joints.len() != N
+            || candidate
+                .joints
+                .iter()
+                .zip(&bundle.robot.joints)
+                .any(|(a, b)| a.node_id != b.node_id || a.name != b.name)
+        {
+            return Err("candidate gains must name the same six joints and node IDs".into());
+        }
+        Ok(candidate)
+    };
+    let candidates = args
+        .verify_gains
+        .as_ref()
+        .map(&load_candidate)
+        .transpose()?;
     let sim = bundle.robot.sim.clone();
     // Resolved the way the daemon resolves it: a lexical step up from the
     // config directory, never `config/..` through the filesystem, which
     // follows the `config` symlink into the package and lands beside it.
     let assets = par6d::kin::resolve_assets_dir(None, &args.config)?;
     let ready = planned_ready(&bundle)?;
-    // Plan the poses before anything moves: a scene that cannot be covered
-    // should say so with the arm still parked.
-    let plan = identification_poses(&bundle, &assets, ready)?;
-    let poses = plan.poses;
-    // What the fit will report is a rank, the same for any non-degenerate
-    // set; what the plan buys is coverage, so that is what it prints.
-    let coverage: Vec<String> = (1..N)
-        .map(|j| {
-            let lo = poses.iter().map(|q| q[j]).fold(f64::INFINITY, f64::min);
-            let hi = poses.iter().map(|q| q[j]).fold(f64::NEG_INFINITY, f64::max);
-            format!("J{} {:.0}..{:.0}", j + 1, lo.to_degrees(), hi.to_degrees())
-        })
-        .collect();
-    println!(
-        "identification plan: {} poses, J1 held at ready, {} deg; {:.1} of {} parameters \
+    let poses = if mechanics_stage || limits_stage || gains_stage {
+        // Plan the poses before anything moves: a scene that cannot be covered
+        // should say so with the arm still parked.
+        let plan = identification_poses(&bundle, &assets, ready)?;
+        let poses = plan.poses;
+        // What the fit will report is a rank, the same for any non-degenerate
+        // set; what the plan buys is coverage, so that is what it prints.
+        let coverage: Vec<String> = (1..N)
+            .map(|j| {
+                let lo = poses.iter().map(|q| q[j]).fold(f64::INFINITY, f64::min);
+                let hi = poses.iter().map(|q| q[j]).fold(f64::NEG_INFINITY, f64::max);
+                format!("J{} {:.0}..{:.0}", j + 1, lo.to_degrees(), hi.to_degrees())
+            })
+            .collect();
+        println!(
+            "identification plan: {} poses, J1 held at ready, {} deg; {:.1} of {} parameters \
          observable",
-        poses.len(),
-        coverage.join(", "),
-        plan.determined.iter().sum::<f64>(),
-        plan.determined.len()
-    );
+            poses.len(),
+            coverage.join(", "),
+            plan.determined.iter().sum::<f64>(),
+            plan.determined.len()
+        );
+
+        poses
+    } else {
+        Vec::new()
+    };
 
     let directory = args.output_dir.join(format!(
         "selfcal-{}",
@@ -3251,10 +5857,6 @@ fn run(args: Args) -> Result<()> {
         .filter(|(_, s)| (**s - 1.0).abs() > 1e-9)
         .map(|(j, _)| j + 1)
         .collect();
-    let limits_stage = args.limits || args.limits_only;
-    let gains_stage = args.gains || args.gains_only;
-    let stiction_stage = args.stiction || args.stiction_only;
-    let only = args.limits_only || args.gains_only || args.stiction_only;
     // The stiction stage's second pose, the arm out level, where the base's
     // bearings carry the most overturning moment: taken only if the
     // straight path there and back is clear.
@@ -3275,45 +5877,403 @@ fn run(args: Args) -> Result<()> {
     } else {
         None
     };
-    let spans = if limits_stage || gains_stage {
+    let spans = if limits_stage || gains_stage || belt_stage || ripple_stage {
         Some(limit_spans(&bundle, &assets, ready)?)
     } else {
         None
     };
+    let gain_poses = if gains_stage {
+        gain_pose_plan(&bundle, &assets, ready, &poses, out_pose)?
+    } else {
+        Vec::new()
+    };
+    if gains_stage {
+        if candidates.is_some() {
+            println!("gains: verify selected candidates together, without a gain search");
+        } else {
+            println!("gains: StepFOC Kpv -> Kiv -> Kpp on fixed lattices, at most {GAIN_OBSERVATIONS} observations per joint including verification");
+        }
+        println!(
+            "gains: {} calibration poses qualify the accepted candidates together",
+            gain_poses.len()
+        );
+        fs::write(
+            directory.join("gain-qualification-poses.csv"),
+            gain_poses
+                .iter()
+                .enumerate()
+                .map(|(i, p)| {
+                    format!(
+                        "{},from_ready={},\"{:?}\",\"{:?}\"\n",
+                        i + 1,
+                        p.from_ready,
+                        p.approach,
+                        p.target,
+                    )
+                })
+                .collect::<String>(),
+        )?;
+    }
     let mut arm = Arm::open(bundle, &assets, args.sim, tx)?;
+    if (gains_stage || mechanics_stage) && !args.sim {
+        arm.encoder_clock = Some(EncoderClock::open(&arm.bundle.robot)?);
+    }
+    arm.run_directory = Some(directory.clone());
+    arm.ready = Some(ready);
     if !args.sim {
         runtime::realtime(timing.cpu, timing.fifo_priority)?;
+        arm.control_cpu = Some(timing.cpu);
     }
 
     let mut fit = None;
     let mut friction = None;
+    let mut ripples = None;
     let mut tuned = None;
     let mut limits = None;
     let mut stiction_ready = None;
     let mut stiction_out = None;
-    let outcome = arm.initialize().and_then(|()| {
+    let mut statuses = vec![
+        ("homing", None, "not reached"),
+        ("parking", None, "not reached"),
+    ];
+    if gains_stage {
+        statuses.push(("gain poses", None, "not reached"));
+    }
+    if belt_stage {
+        statuses.push(("belt", Some(0), "not reached"));
+    }
+    if mechanics_stage {
+        statuses.push(("gravity", None, "not reached"));
+    }
+    for (j, selected) in chosen.iter().enumerate() {
+        if stiction_stage {
+            statuses.push(("stiction ready", Some(j), "not reached"));
+            if out_pose.is_some() {
+                statuses.push(("stiction arm out", Some(j), "not reached"));
+            }
+        }
+        if mechanics_stage {
+            statuses.push(("friction", Some(j), "not reached"));
+        }
+        if ripple_stage && *selected {
+            statuses.push(("ripple", Some(j), "not reached"));
+        }
+        if gains_stage && *selected {
+            statuses.push(("gains", Some(j), "not reached"));
+        }
+        if limits_stage {
+            statuses.push(("limits", Some(j), "not reached"));
+        }
+    }
+    let outcome = (|| {
+        arm.initialize()?;
         arm.home()?;
+        stage_status(&mut statuses, "homing", None, "passed");
+        if let (true, Some(spans)) = (ripple_stage, &spans) {
+            ripples = Some(arm.ripple(ready, spans, chosen)?);
+            for (j, found) in ripples.as_ref().unwrap().iter().enumerate() {
+                if chosen[j] {
+                    stage_status(
+                        &mut statuses,
+                        "ripple",
+                        Some(j),
+                        if found.as_ref().is_some_and(|r| !r.is_empty()) {
+                            "passed"
+                        } else {
+                            "passed: no compensation improved the ripple"
+                        },
+                    );
+                }
+            }
+        }
+        if let (true, Some(spans)) = (gains_stage, &spans) {
+            if let (true, Some(candidate)) = (args.verify_ripple, &candidates) {
+                for (j, selected) in chosen.iter().enumerate() {
+                    if *selected {
+                        let joint = &candidate.joints[j];
+                        arm.bus.set_ripple(joint.node_id, &joint.ripple)?;
+                    }
+                }
+            }
+            let mut found = match &candidates {
+                Some(candidate) => arm.verify_gains(
+                    ready,
+                    spans,
+                    chosen,
+                    std::array::from_fn(|j| candidate.joints[j].gains),
+                )?,
+                None => arm.gains(ready, spans, chosen)?,
+            };
+            // Every accepted candidate together on the measurement moves. A
+            // joint that misbehaves there steps its Kpv one lattice point
+            // down (Kiv with it) and the poses are taken again; past
+            // POSE_BACKOFF_STEPS it keeps its configured gains. A joint whose
+            // configured gains misbehave too is reported and judged no
+            // further: the run has nothing better to give it.
+            stage_status(&mut statuses, "gain poses", None, "running");
+            let mut reverted = [false; N];
+            let mut unjudged = [false; N];
+            let mut judged = chosen;
+            let mut stepped = [0u8; N];
+            let mut settled = false;
+            for _ in 0..POSE_ATTEMPTS {
+                match arm.verify_gain_poses(ready, &gain_poses, judged)? {
+                    None => {
+                        settled = true;
+                        break;
+                    }
+                    Some((j, kind)) => match found[j] {
+                        Some(candidate) if stepped[j] < POSE_BACKOFF_STEPS => {
+                            // Oscillation on the way is the velocity loop's;
+                            // hunting at the pose is the position loop's,
+                            // then the integral's.
+                            let mut next = candidate.after;
+                            let axis = match kind {
+                                PoseFault::Motion => GainAxis::Kpv,
+                                PoseFault::Hold if GainAxis::Kpp.snap(next.kpp) > 0 => {
+                                    GainAxis::Kpp
+                                }
+                                PoseFault::Hold => GainAxis::Kiv,
+                            };
+                            let index = axis.snap(axis.value(next));
+                            if index == 0 {
+                                found[j] = None;
+                                reverted[j] = true;
+                                println!(
+                                    "gains J{}: misbehaved on a calibration pose at the {} lattice \
+                                     floor; configured gains retained",
+                                    j + 1,
+                                    axis.label()
+                                );
+                                continue;
+                            }
+                            axis.set(&mut next, axis.at(index - 1));
+                            stepped[j] += 1;
+                            found[j] = Some(Tuned {
+                                after: next,
+                                ..candidate
+                            });
+                            arm.gain_configure(j, next)?;
+                            println!(
+                                "gains J{}: misbehaved on a calibration pose ({kind:?}); {} one \
+                                 lattice step down to {:.6}, poses taken again",
+                                j + 1,
+                                axis.label(),
+                                axis.value(next)
+                            );
+                        }
+                        Some(_) => {
+                            found[j] = None;
+                            reverted[j] = true;
+                            println!(
+                                "gains J{}: misbehaved on a calibration pose after \
+                                 {POSE_BACKOFF_STEPS} gain steps; configured gains retained",
+                                j + 1
+                            );
+                        }
+                        None => {
+                            judged[j] = false;
+                            unjudged[j] = true;
+                            println!(
+                                "gains J{}: misbehaves on a calibration pose with its configured \
+                                 gains; reported, not judged further",
+                                j + 1
+                            );
+                        }
+                    },
+                }
+            }
+            if !settled {
+                return Err(format!(
+                    "the calibration poses did not qualify in {POSE_ATTEMPTS} passes"
+                )
+                .into());
+            }
+            stage_status(&mut statuses, "gain poses", None, "passed");
+            for j in 0..N {
+                if chosen[j] {
+                    stage_status(
+                        &mut statuses,
+                        "gains",
+                        Some(j),
+                        if found[j].is_some() {
+                            "passed"
+                        } else if unjudged[j] {
+                            "retained: configured gains misbehave on the calibration poses"
+                        } else if reverted[j] {
+                            "retained: posture qualification failed"
+                        } else {
+                            "retained: no qualified candidate"
+                        },
+                    );
+                }
+            }
+            for (j, accepted) in found.iter_mut().enumerate() {
+                if let Some(accepted) = accepted {
+                    accepted.observations = arm.gain_used[j];
+                }
+            }
+            if let (true, Some(candidate)) = (args.verify_ripple, &candidates) {
+                if (0..N).all(|j| !chosen[j] || found[j].is_some()) {
+                    ripples = Some(std::array::from_fn(|j| {
+                        chosen[j].then(|| candidate.joints[j].ripple.clone())
+                    }));
+                }
+            }
+            tuned = Some(found);
+        }
         if stiction_stage {
             stiction_ready = Some(arm.stiction("ready")?);
+            for (j, found) in stiction_ready.as_ref().unwrap().iter().enumerate() {
+                stage_status(
+                    &mut statuses,
+                    "stiction ready",
+                    Some(j),
+                    if found.is_some() {
+                        "passed"
+                    } else {
+                        "unresolved"
+                    },
+                );
+            }
             if let Some(out) = out_pose {
                 arm.pose(out)?;
                 stiction_out = Some(arm.stiction("arm out")?);
+                for (j, found) in stiction_out.as_ref().unwrap().iter().enumerate() {
+                    stage_status(
+                        &mut statuses,
+                        "stiction arm out",
+                        Some(j),
+                        if found.is_some() {
+                            "passed"
+                        } else {
+                            "unresolved"
+                        },
+                    );
+                }
                 arm.pose(ready)?;
             }
         }
-        if !only {
-            friction = Some(arm.measure_mechanics()?);
-            fit = Some(arm.identify(&poses, ready)?);
+        if let (true, Some(spans)) = (belt_stage, &spans) {
+            let captured = arm.belt(0, spans[0])?;
+            stage_status(
+                &mut statuses,
+                "belt",
+                Some(0),
+                if captured {
+                    "passed"
+                } else {
+                    "incomplete: travel guard"
+                },
+            );
         }
-        if let (true, Some(spans)) = (gains_stage, &spans) {
-            tuned = Some(arm.gains(ready, spans)?);
+        if mechanics_stage {
+            let mut measured = arm.measure_mechanics()?;
+            for (j, found) in measured.iter_mut().enumerate() {
+                // A coefficient its own standard error swamps is not a
+                // measurement; the file keeps what it had.
+                if arm.friction_fit_uncertain[j] {
+                    *found = None;
+                }
+                stage_status(
+                    &mut statuses,
+                    "friction",
+                    Some(j),
+                    if found.is_some() {
+                        "passed"
+                    } else {
+                        "retained: fit unresolved"
+                    },
+                );
+            }
+            friction = Some(measured);
+            fit = Some(arm.identify(&poses, ready)?);
+            stage_status(&mut statuses, "gravity", None, "passed");
         }
         if let (true, Some(spans)) = (limits_stage, &spans) {
-            limits = Some(arm.limits(&poses, ready, spans)?);
+            if let Some(tuned) = &tuned {
+                for (j, accepted) in tuned.iter().enumerate() {
+                    if let Some(accepted) = accepted {
+                        arm.gain_configure(j, accepted.after)?;
+                    }
+                }
+                arm.check_startup_hold()?;
+            }
+            let qualified = std::array::from_fn(|j| {
+                !gains_stage || tuned.as_ref().is_some_and(|t| t[j].is_some())
+            });
+            limits = Some(arm.limits(&poses, ready, spans, qualified)?);
+            for (j, found) in limits.as_ref().unwrap().iter().enumerate() {
+                let status = if !qualified[j] {
+                    "skipped: gains not verified"
+                } else {
+                    match found {
+                        Some(f) if f.velocity_reached && f.jerk_measured => "passed",
+                        Some(_) => "incomplete: lower bound only",
+                        None => "unresolved: no passing limits",
+                    }
+                };
+                stage_status(&mut statuses, "limits", Some(j), status);
+            }
         }
         Ok(())
-    });
+    })();
+    arm.encoder_clock = None;
+    arm.position_rx_ns = [0; N];
+    if outcome.is_err() {
+        for (_, _, status) in &mut statuses {
+            if *status == "running" {
+                *status = "failed";
+            }
+        }
+        // A failed coordinated move may not have reached its saved hold.
+        for j in 0..N {
+            if let Ok(position) = arm.pos(j) {
+                arm.hold[j] = position;
+            }
+        }
+    }
+    let mut restored_gains: Result<()> = Ok(());
+    if gains_stage {
+        for j in 0..N {
+            let original = arm.bundle.robot.joints[j].gains;
+            restored_gains = restored_gains.and(arm.gain_restore(j, original));
+        }
+    }
+    let mut restored_ripple: Result<()> = Ok(());
+    if ripple_stage || args.verify_ripple {
+        for (j, selected) in chosen.iter().enumerate() {
+            if *selected {
+                let joint = &arm.bundle.robot.joints[j];
+                let restored = arm
+                    .bus
+                    .set_ripple(joint.node_id, &joint.ripple)
+                    .map_err(Into::into);
+                restored_ripple = restored_ripple.and(restored);
+            }
+        }
+        println!(
+            "ripple: original settings {} before parking",
+            if restored_ripple.is_ok() {
+                "restored"
+            } else {
+                "RESTORE FAILED"
+            }
+        );
+    }
+    let restored_gravity = arm
+        .kin
+        .set_gravity_correction(&config_correction)
+        .map_err(Into::into);
     let parked = arm.shutdown();
+    stage_status(
+        &mut statuses,
+        "parking",
+        None,
+        if parked.is_ok() { "passed" } else { "failed" },
+    );
+    let gain_used = arm.gain_used;
+    let idle = (arm.idle_stops, arm.idle_total_s, arm.idle_longest);
     let correction = fit.as_ref().map(|f| f.correction.clone());
     arm.events.take();
     drop(arm);
@@ -3327,8 +6287,56 @@ fn run(args: Args) -> Result<()> {
             "FAILED"
         }
     );
-    let result = outcome.and(parked).and(recorded.map_err(Into::into));
-    fs::write(directory.join("result.txt"), format!("{result:?}\n"))?;
+    let idle_report = format!(
+        "idle: {} stops longer than {IDLE_LIMIT_S}s totalling {:.0}s; longest {:.1}s during J{} {}",
+        idle.0,
+        idle.1,
+        idle.2 .0,
+        idle.2 .2 + 1,
+        idle.2 .1
+    );
+    println!("{idle_report}");
+    let result = outcome
+        .and(restored_gains)
+        .and(restored_ripple)
+        .and(restored_gravity)
+        .and(parked)
+        .and(recorded.map_err(Into::into));
+    // Retaining the file's value for a joint is a complete outcome: nothing
+    // is written for it, so applying the rest is sound.
+    let complete = statuses
+        .iter()
+        .all(|(_, _, status)| status.starts_with("passed") || status.starts_with("retained"));
+    let report = statuses.iter().fold(
+        String::from("stage\tjoint\tstatus\n"),
+        |mut text, (stage, joint, status)| {
+            let joint = joint.map_or_else(|| "all".to_owned(), |j| (j + 1).to_string());
+            let _ = writeln!(text, "{stage}\t{joint}\t{status}");
+            text
+        },
+    );
+    fs::write(directory.join("stages.tsv"), report)?;
+    fs::write(
+        directory.join("gain-observations.txt"),
+        format!("{gain_used:?}\n"),
+    )?;
+    fs::write(
+        directory.join("result.txt"),
+        format!(
+            "{}\n{}\n{idle_report}\n",
+            if complete && result.is_ok() {
+                "COMPLETE"
+            } else {
+                "INCOMPLETE"
+            },
+            match &result {
+                Err(error) => error.to_string(),
+                Ok(()) if !complete =>
+                    "one or more required stages remain unresolved; see stages.tsv".to_owned(),
+                Ok(()) => "all requested stages passed".to_owned(),
+            },
+        ),
+    )?;
     result?;
 
     if let Some(fit) = &fit {
@@ -3416,18 +6424,36 @@ fn run(args: Args) -> Result<()> {
             println!("stiction at {label}: {} Nm", joints.join(", "));
         }
     }
+    if let Some(ripples) = &ripples {
+        for (j, r) in ripples.iter().enumerate() {
+            let Some(r) = r else {
+                continue;
+            };
+            let harmonics: Vec<String> = r
+                .iter()
+                .map(|h| format!("h{} {}/{} mA", h.harmonic, h.a_ma, h.b_ma))
+                .collect();
+            println!(
+                "ripple J{}: {}",
+                j + 1,
+                if harmonics.is_empty() {
+                    "none".to_owned()
+                } else {
+                    harmonics.join(", ")
+                }
+            );
+        }
+    }
     if let Some(tuned) = &tuned {
         for (j, t) in tuned.iter().enumerate() {
+            if chosen[j] && t.is_none() {
+                println!("gains J{}: unchanged (no gain change accepted)", j + 1);
+            }
             if let Some(t) = t {
                 println!(
-                    "gains J{}: kpv {:.5} -> {:.5}, kiv {:.5} -> {:.5}, off the profile {:.2} -> {:.2} deg/s",
-                    j + 1,
-                    t.before.kpv,
-                    t.after.kpv,
-                    t.before.kiv,
-                    t.after.kiv,
-                    t.score_before.to_degrees(),
-                    t.score_after.to_degrees()
+                    "gains J{}: kpv {:.6} -> {:.6}, kiv {:.8} -> {:.8}, kpp {:.5} -> {:.5}; {} observations",
+                    j + 1, t.before.kpv, t.after.kpv, t.before.kiv, t.after.kiv,
+                    t.before.kpp, t.after.kpp, t.observations
                 );
             }
         }
@@ -3437,12 +6463,20 @@ fn run(args: Args) -> Result<()> {
         correction.as_deref(),
         friction.as_ref(),
         &sim,
+        ripples.as_ref(),
         tuned.as_ref(),
         limits.as_ref(),
     )?;
     // Refuse to write something that will not load.
     par6_config::RobotConfig::from_toml_str(&patched)?.validate()?;
     fs::write(directory.join("calibrated.toml"), &patched)?;
+    if !complete {
+        return Err(format!(
+            "calibration incomplete; see {}/stages.tsv; candidate saved but not applied",
+            directory.display()
+        )
+        .into());
+    }
     if args.apply && args.sim {
         return Err("--apply writes masses fitted to the simulator; refusing".into());
     }
@@ -3541,4 +6575,49 @@ mod runtime {
     pub fn sleep(deadline: Duration) {
         par6_rt::rt::sleep_until(deadline.as_nanos() as u64);
     }
+}
+
+/// Write joint `j`'s `ripple` line in its `[[joints]]` table, or remove it
+/// when there is nothing to feed forward.
+fn patch_joint_ripple(text: &mut String, j: usize, ripple: &[RippleHarmonic]) -> Result<()> {
+    let entries: Vec<String> = ripple
+        .iter()
+        .map(|h| {
+            format!(
+                "{{ harmonic = {}, a_ma = {}, b_ma = {} }}",
+                h.harmonic, h.a_ma, h.b_ma
+            )
+        })
+        .collect();
+    patch_joint_key(
+        text,
+        j,
+        "ripple",
+        (!ripple.is_empty()).then(|| format!("[{}]", entries.join(", "))),
+    )
+}
+
+/// Set joint `j`'s top-level `key` in its `[[joints]]` table to `value`, or
+/// remove the key for `None`.
+fn patch_joint_key(text: &mut String, j: usize, key: &str, value: Option<String>) -> Result<()> {
+    let name = text
+        .find(&format!("name = \"joint{}\"", j + 1))
+        .ok_or_else(|| format!("configuration has no joint{}", j + 1))?;
+    // The joint's own keys end at its first sub-table.
+    let keys_end = text[name..]
+        .find("\n[")
+        .map_or(text.len(), |i| name + i + 1);
+    if let Some(at) = text[name..keys_end].find(&format!("\n{key} = ")) {
+        let line = name + at + 1;
+        let end = text[line..].find('\n').map_or(text.len(), |i| line + i + 1);
+        text.replace_range(line..end, "");
+    }
+    let Some(value) = value else {
+        return Ok(());
+    };
+    let keys_end = text[name..]
+        .find("\n[")
+        .map_or(text.len(), |i| name + i + 1);
+    text.insert_str(keys_end, &format!("{key} = {value}  # selfcal: measured\n"));
+    Ok(())
 }

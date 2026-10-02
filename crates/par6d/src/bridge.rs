@@ -1627,6 +1627,10 @@ impl RtCommands for RtBridge {
         self.link.send(RtCommand::SaveConfig { node });
     }
 
+    fn set_tool_id(&mut self, node: u8, tool_id: u8) {
+        self.link.send(RtCommand::SetToolId { node, tool_id });
+    }
+
     fn rescan_bus(&mut self) {
         self.link.send(RtCommand::RescanBus);
     }

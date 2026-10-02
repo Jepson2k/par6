@@ -149,6 +149,15 @@ pub enum RtCommand {
         /// Target node.
         node: par6_bus::NodeId,
     },
+    /// Commissioning: tell a gripper drive which tool it is built into
+    /// (cmd 36) and have it saved (cmd 13). The server gates this on an
+    /// idle arm; a bus refusal is logged.
+    SetToolId {
+        /// Target node.
+        node: par6_bus::NodeId,
+        /// The tool's `can_tool_id`; 0 clears it.
+        tool_id: u8,
+    },
     /// Ping every node id over the next ticks and bump the published
     /// scan epoch once the answers have had time to land.
     RescanBus,

@@ -330,10 +330,28 @@ fn boot_config_load_is_paced_and_ordered_on_the_wire() {
         "boot took {elapsed:?}, less than the {want_pace:?} of batch pacing"
     );
 
+    // The telemetry probe asks every node for the combined reply (cmd 37)
+    // — `retries` times here, since nothing on a vcan answers; a drive
+    // answers the first — and the ones that stay silent are polled the
+    // vendor way from then on.
+    let retries = usize::from(robot.bus.kt_fetch.retries);
+    let probe_frames = nodes.len() * retries;
+    let probe = &seen[config_frames..config_frames + probe_frames];
+    assert_eq!(
+        probe
+            .iter()
+            .map(|s| (s.node, s.cmd, s.rtr))
+            .collect::<Vec<_>>(),
+        nodes
+            .iter()
+            .flat_map(|n| std::iter::repeat_n((*n, CommandId::Telemetry.raw(), true), retries))
+            .collect::<Vec<_>>()
+    );
+
     // The seed sweep asks every node for its accumulated encoder reading,
     // so the RT loop's boot sector selection starts from a real 14-bit
     // wrapped position instead of the first motion reply it happens upon.
-    let seed = &seen[config_frames..];
+    let seed = &seen[config_frames + probe_frames..];
     assert_eq!(
         seed.iter()
             .map(|s| (s.node, s.cmd, s.rtr))

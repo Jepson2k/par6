@@ -131,6 +131,35 @@ pub enum CommandId {
     RespondKt = 33,
     /// 34 — Voltage_Limit (DLC 4: u32 mV; old firmware ignores).
     VoltageLimit = 34,
+    /// 36 — Gripper_ID (DLC 1: u8 tool id; par6 firmware, persisted by
+    /// Save_config, reported back in Device_Info byte 7).
+    SetGripperId = 36,
+    /// 37 — Telemetry (RTR; reply DLC 8: i16 °C, i16 mV, the two
+    /// State_of_Errors bytes, i16 mA; par6 firmware).
+    Telemetry = 37,
+    /// 38 — Capture (DLC 3: u8 loop divisor, u16 samples wanted; par6
+    /// firmware). The drive records the velocity its loop acts on and Iq
+    /// at the control loop rate into a 1024-sample buffer.
+    Capture = 38,
+    /// 39 — Capture_Read (DLC 3 request: u8 channel, u16 chunk; reply
+    /// DLC 7: channel, u16 chunk, two i16 samples; par6 firmware).
+    CaptureRead = 39,
+    /// 40 — Ripple (DLC 6: u8 slot, u8 harmonic of the electrical phase, i16
+    /// cosine and i16 sine amplitude \[mA\]; par6 firmware). Feedforward the
+    /// velocity and position loops add to cancel cogging and commutation
+    /// ripple; harmonic 0 clears the slot.
+    Ripple = 40,
+    /// 41 — Velocity_Window (DLC 1: the speed filter's moving-average length in
+    /// control loops, 4..64, the vendor's 20; par6 firmware).
+    VelocityWindow = 41,
+    /// 42 — Inject (DLC 5: i16 amplitude \[mA\], u16 seed, u8 control loops
+    /// per bit; par6 firmware). Arms the next capture only: while it records,
+    /// the velocity and position loops add a pseudo-random ±amplitude to
+    /// their current setpoint and channel 2 records that setpoint instead of
+    /// the electrical phase.
+    Inject = 42,
+    /// 43 — periodic injection configuration (DLC 8), RTR status/capability.
+    PeriodicInject = 43,
     /// 60 — Respond_Gripper_data (D→H DLC 4).
     RespondGripperData = 60,
     /// 61 — Gripper_data_pack (DLC 5, or DLC 0 = empty watchdog poll).
@@ -180,6 +209,14 @@ impl CommandId {
             32 => RespondDataHall,
             33 => RespondKt,
             34 => VoltageLimit,
+            36 => SetGripperId,
+            37 => Telemetry,
+            38 => Capture,
+            39 => CaptureRead,
+            40 => Ripple,
+            41 => VelocityWindow,
+            42 => Inject,
+            43 => PeriodicInject,
             60 => RespondGripperData,
             61 => GripperDataPack,
             62 => GripperCalibrate,
@@ -273,6 +310,25 @@ pub fn fold_bits_msb_first(bits: [bool; 8]) -> u8 {
 }
 
 /// Unfold one byte into a bit list, MSB first: index 0 = bit 7.
+/// The two State_of_Errors bytes (cmd 26, and bytes 4–5 of cmd 37).
+fn unpack_error_flags(b0: u8, b1: u8) -> ErrorFlags {
+    let b0 = unfold_bits_msb_first(b0);
+    let b1 = unfold_bits_msb_first(b1);
+    ErrorFlags {
+        error: b0[0],
+        temperature: b0[1],
+        encoder: b0[2],
+        vbus: b0[3],
+        driver: b0[4],
+        velocity: b0[5],
+        current: b0[6],
+        estop: b0[7],
+        calibrated: b1[0],
+        activated: b1[1],
+        watchdog: b1[2],
+    }
+}
+
 pub fn unfold_bits_msb_first(byte: u8) -> [bool; 8] {
     core::array::from_fn(|i| (byte >> (7 - i)) & 1 == 1)
 }
@@ -446,6 +502,186 @@ pub fn encode_voltage_limit(node: NodeId, limit_mv: u32) -> CanFrame {
     )
 }
 
+/// Gripper id (cmd 36): the tool the drive is built into, 0 = not set.
+/// Held in the drive's RAM until a Save_config persists it.
+pub fn encode_gripper_id(node: NodeId, tool_id: u8) -> CanFrame {
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::SetGripperId, false),
+        &[tool_id],
+    )
+}
+
+/// What a drive runs, as a configuration command's answer to a read
+/// request: the values in the layout that command writes them (par6
+/// firmware; the vendor firmware does not answer). Floats and integers
+/// arrive exactly as written, so a read-back compares equal to what was
+/// sent when the write landed.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Readback {
+    /// cmd 15: watchdog timeout \[ms\] and action byte.
+    Watchdog {
+        /// Timeout \[ms\].
+        ms: u32,
+        /// Action on expiry.
+        action: u8,
+    },
+    /// cmd 20: velocity limit \[ticks/s\] and current limit \[mA\].
+    Limits {
+        /// Velocity limit.
+        velocity_ticks_s: f32,
+        /// Current limit.
+        current_ma: f32,
+    },
+    /// cmd 34: voltage limit \[mV\], 0 = bus voltage.
+    VoltageLimit {
+        /// The limit.
+        mv: u32,
+    },
+    /// cmd 16: impedance PD gains.
+    PdGains {
+        /// Stiffness.
+        kp: f32,
+        /// Damping.
+        kd: f32,
+    },
+    /// cmd 17: current-loop gains.
+    CurrentGains {
+        /// Proportional.
+        kpiq: f32,
+        /// Integral.
+        kiiq: f32,
+    },
+    /// cmd 18: velocity-loop gains.
+    VelocityGains {
+        /// Proportional.
+        kpv: f32,
+        /// Integral.
+        kiv: f32,
+    },
+    /// cmd 19: position-loop gain.
+    PositionGains {
+        /// Proportional.
+        kpp: f32,
+    },
+}
+
+impl Readback {
+    /// The configuration frame this answers for.
+    pub fn kind(self) -> crate::ConfigKind {
+        use crate::ConfigKind as K;
+        match self {
+            Self::Watchdog { .. } => K::Watchdog,
+            Self::Limits { .. } => K::Limits,
+            Self::VoltageLimit { .. } => K::VoltageLimit,
+            Self::PdGains { .. } => K::PdGains,
+            Self::CurrentGains { .. } => K::CurrentGains,
+            Self::VelocityGains { .. } => K::VelocityGains,
+            Self::PositionGains { .. } => K::PositionGains,
+        }
+    }
+}
+
+/// A read request (RTR) on a configuration command: the drive answers
+/// with the values it runs ([`Readback`]).
+pub fn encode_readback_request(node: NodeId, kind: crate::ConfigKind) -> CanFrame {
+    use crate::ConfigKind as K;
+    let cmd = match kind {
+        K::Watchdog => CommandId::Watchdog,
+        K::Limits => CommandId::Limits,
+        K::VoltageLimit => CommandId::VoltageLimit,
+        K::PdGains => CommandId::PdGains,
+        K::CurrentGains => CommandId::CurrentGains,
+        K::VelocityGains => CommandId::VelocityGains,
+        K::PositionGains => CommandId::PositionGains,
+    };
+    CanFrame::rtr_frame(pack_can_id(node, cmd, false))
+}
+
+/// Loop divisor 1 records every control loop (6250 Hz); a capture holds at
+/// most [`CAPTURE_LEN`] samples per channel.
+pub const CAPTURE_LEN: u16 = 1024;
+/// The velocity channel's unit: ticks/s per count.
+pub const CAPTURE_VEL_SCALE: i32 = 16;
+/// The channel byte that asks for the capture's status instead of data.
+pub const CAPTURE_STATUS_CHANNEL: u8 = 0xFF;
+
+/// Capture (cmd 38): record `wanted` samples of velocity and Iq, one every
+/// `divisor` control loops, starting on the next loop.
+pub fn encode_capture(node: NodeId, divisor: u8, wanted: u16) -> CanFrame {
+    let w = wanted.min(CAPTURE_LEN).to_be_bytes();
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::Capture, false),
+        &[divisor.max(1), w[0], w[1]],
+    )
+}
+
+/// Capture_Read (cmd 39): ask for pair `chunk` of `channel` (0 velocity,
+/// 1 Iq, 2 electrical phase, or the current setpoint when the capture
+/// was armed with an injection), or the capture's status with [`CAPTURE_STATUS_CHANNEL`].
+pub fn encode_capture_read(node: NodeId, channel: u8, chunk: u16) -> CanFrame {
+    let c = chunk.to_be_bytes();
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::CaptureRead, false),
+        &[channel, c[0], c[1]],
+    )
+}
+
+/// Ripple feedforward slots a drive has (cmd 40).
+pub const RIPPLE_SLOTS: u8 = 8;
+
+/// Ripple (cmd 40): slot `slot` adds `a cos(h phase) + b sin(h phase)` \[mA\]
+/// to the velocity and position loops' current, phase being the rotor's
+/// electrical angle; `harmonic` 0 clears the slot.
+pub fn encode_ripple(node: NodeId, slot: u8, harmonic: u8, a_ma: i16, b_ma: i16) -> CanFrame {
+    let (a, b) = (a_ma.to_be_bytes(), b_ma.to_be_bytes());
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::Ripple, false),
+        &[slot, harmonic, a[0], a[1], b[0], b[1]],
+    )
+}
+
+/// Velocity filter window (cmd 41): the moving average's length in control
+/// loops; the drive clamps it to 4..64.
+pub fn encode_velocity_window(node: NodeId, window: u8) -> CanFrame {
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::VelocityWindow, false),
+        &[window],
+    )
+}
+
+/// Inject (cmd 42): arm the next capture with a pseudo-random ±`amplitude_ma`
+/// on the loops' current setpoint, the sign the low bit of a 16-bit Galois
+/// LFSR (taps [`INJECT_TAPS`]) seeded with `seed` and stepped every `hold`
+/// control loops; see [`inject_sequence`]. Amplitude 0 disarms.
+pub fn encode_inject(node: NodeId, amplitude_ma: i16, seed: u16, hold: u8) -> CanFrame {
+    let (a, s) = (amplitude_ma.to_be_bytes(), seed.to_be_bytes());
+    CanFrame::data_frame(
+        pack_can_id(node, CommandId::Inject, false),
+        &[a[0], a[1], s[0], s[1], hold],
+    )
+}
+
+/// The injection's LFSR taps (x^16 + x^14 + x^13 + x^11 + 1, maximal).
+pub const INJECT_TAPS: u16 = 0xB400;
+
+/// The signs an injection armed with `seed` and `hold` applies over the
+/// first `loops` control loops of its capture, as the drive steps them: +1
+/// while the LFSR's low bit is set. A seed of 0 runs as 1, and so does a
+/// hold of 0.
+pub fn inject_sequence(seed: u16, hold: u8, loops: usize) -> Vec<f64> {
+    let hold = usize::from(hold.max(1));
+    let mut lfsr = seed.max(1);
+    (0..loops)
+        .map(|k| {
+            let sign = if lfsr & 1 == 1 { 1.0 } else { -1.0 };
+            if (k + 1) % hold == 0 {
+                lfsr = (lfsr >> 1) ^ ((0u16.wrapping_sub(lfsr & 1)) & INJECT_TAPS);
+            }
+            sign
+        })
+        .collect()
+}
+
 /// Impedance PD gains (cmd 16): f32 KP + f32 KD.
 pub fn encode_pd_gains(node: NodeId, kp: f32, kd: f32) -> CanFrame {
     two_f32_frame(node, CommandId::PdGains, kp, kd)
@@ -515,6 +751,7 @@ pub fn encode_reset(node: NodeId) -> CanFrame {
 /// The command an RTR telemetry poll of `kind` targets.
 pub fn poll_command(kind: PollKind) -> CommandId {
     match kind {
+        PollKind::Telemetry => CommandId::Telemetry,
         PollKind::Temperature => CommandId::Temperature,
         PollKind::Voltage => CommandId::Voltage,
         PollKind::Errors => CommandId::StateOfErrors,
@@ -531,12 +768,12 @@ pub fn encode_poll(node: NodeId, kind: PollKind) -> CanFrame {
 }
 
 /// Encode an RTR poll for any pollable command
-/// (10/23/24/25/26/27/28/33 — [`PollKind`] plus Iq data).
+/// (10/23/24/25/26/27/28/33/37 — [`PollKind`] plus Iq data).
 pub fn encode_rtr_poll(node: NodeId, cmd: CommandId) -> Result<CanFrame, EncodeError> {
     use CommandId::*;
     match cmd {
         Ping | Temperature | Voltage | DeviceInfo | StateOfErrors | IqData | EncoderData
-        | RespondKt => Ok(CanFrame::rtr_frame(pack_can_id(node, cmd, false))),
+        | RespondKt | Telemetry => Ok(CanFrame::rtr_frame(pack_can_id(node, cmd, false))),
         other => Err(EncodeError::NotPollable { cmd: other.raw() }),
     }
 }
@@ -666,6 +903,41 @@ pub enum Payload {
     },
     /// cmd 26 reply.
     Errors(ErrorFlags),
+    /// A configuration command's answer to a read request (par6 firmware).
+    Readback(Readback),
+    /// cmd 39 reply: two consecutive samples of one capture channel,
+    /// `samples[k]` = sample `2 * chunk + k`; zero past what was recorded.
+    Capture {
+        /// 0 = the velocity the loop acts on, in ticks/s / [`CAPTURE_VEL_SCALE`];
+        /// 1 = Iq \[mA\]; 2 = the rotor's electrical phase, 0..16383 per cycle.
+        channel: u8,
+        /// Which pair.
+        chunk: u16,
+        /// The pair.
+        samples: [i16; 2],
+    },
+    /// cmd 43: periodic protocol version and the last experiment state.
+    PeriodicStatus(super::periodic::Status),
+    /// cmd 39 reply to a status request: how far the capture got.
+    CaptureStatus {
+        /// Samples recorded so far.
+        recorded: u16,
+        /// Samples the capture was asked for.
+        wanted: u16,
+        /// Control loops per sample.
+        divisor: u16,
+    },
+    /// cmd 37 reply: what cmds 23, 24, 26 and 27 answer, in one frame.
+    Telemetry {
+        /// Driver temperature \[°C\].
+        deg_c: i16,
+        /// Bus voltage \[mV\].
+        mv: i16,
+        /// Per-type fault flags.
+        flags: ErrorFlags,
+        /// Iq current \[mA\].
+        ma: i16,
+    },
     /// cmd 25 reply.
     DeviceInfo(DeviceInfo),
     /// cmd 33 reply.
@@ -799,29 +1071,57 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
         }
         CommandId::StateOfErrors => {
             expect_dlc(frame, node, raw_cmd, err_bit, 2)?;
-            let b0 = unfold_bits_msb_first(d[0]);
-            let b1 = unfold_bits_msb_first(d[1]);
-            Payload::Errors(ErrorFlags {
-                error: b0[0],
-                temperature: b0[1],
-                encoder: b0[2],
-                vbus: b0[3],
-                driver: b0[4],
-                velocity: b0[5],
-                current: b0[6],
-                estop: b0[7],
-                calibrated: b1[0],
-                activated: b1[1],
-                watchdog: b1[2],
+            Payload::Errors(unpack_error_flags(d[0], d[1]))
+        }
+        CommandId::Telemetry => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::Telemetry {
+                deg_c: unpack_i16([d[0], d[1]]),
+                mv: unpack_i16([d[2], d[3]]),
+                flags: unpack_error_flags(d[4], d[5]),
+                ma: unpack_i16([d[6], d[7]]),
+            }
+        }
+        CommandId::PeriodicInject => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::PeriodicStatus(super::periodic::Status {
+                version: d[0],
+                profile: d[1],
+                divisor: d[2],
+                flags: d[3],
+                token: u16::from_be_bytes([d[4], d[5]]),
+                peak_ma: u16::from_be_bytes([d[6], d[7]]),
             })
         }
-        CommandId::DeviceInfo => {
+        CommandId::CaptureRead => {
             expect_dlc(frame, node, raw_cmd, err_bit, 7)?;
+            let word = |i: usize| u16::from_be_bytes([d[i], d[i + 1]]);
+            if d[0] == CAPTURE_STATUS_CHANNEL {
+                Payload::CaptureStatus {
+                    recorded: word(1),
+                    wanted: word(3),
+                    divisor: word(5),
+                }
+            } else {
+                Payload::Capture {
+                    channel: d[0],
+                    chunk: word(1),
+                    samples: [unpack_i16([d[3], d[4]]), unpack_i16([d[5], d[6]])],
+                }
+            }
+        }
+        CommandId::DeviceInfo => {
+            // The vendor firmware answers 7 bytes; the par6 firmware adds
+            // the tool id as an eighth.
+            if frame.dlc != 7 {
+                expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            }
             Payload::DeviceInfo(DeviceInfo {
                 hw_ver: d[0],
                 batch: d[1],
                 sw_ver: d[2],
                 serial: unpack_i32([d[3], d[4], d[5], d[6]]),
+                tool_id: if frame.dlc == 8 { d[7] } else { 0 },
             })
         }
         CommandId::RespondKt => {
@@ -857,6 +1157,55 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
                 err_bit,
             })
         }
+        // A configuration command's data frame from a drive is its answer
+        // to a read request (par6 firmware): the values it runs.
+        CommandId::Watchdog => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 5)?;
+            Payload::Readback(Readback::Watchdog {
+                ms: unpack_u32([d[0], d[1], d[2], d[3]]),
+                action: d[4],
+            })
+        }
+        CommandId::Limits => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::Readback(Readback::Limits {
+                velocity_ticks_s: unpack_f32([d[0], d[1], d[2], d[3]]),
+                current_ma: unpack_f32([d[4], d[5], d[6], d[7]]),
+            })
+        }
+        CommandId::VoltageLimit => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 4)?;
+            Payload::Readback(Readback::VoltageLimit {
+                mv: unpack_u32([d[0], d[1], d[2], d[3]]),
+            })
+        }
+        CommandId::PdGains => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::Readback(Readback::PdGains {
+                kp: unpack_f32([d[0], d[1], d[2], d[3]]),
+                kd: unpack_f32([d[4], d[5], d[6], d[7]]),
+            })
+        }
+        CommandId::CurrentGains => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::Readback(Readback::CurrentGains {
+                kpiq: unpack_f32([d[0], d[1], d[2], d[3]]),
+                kiiq: unpack_f32([d[4], d[5], d[6], d[7]]),
+            })
+        }
+        CommandId::VelocityGains => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 8)?;
+            Payload::Readback(Readback::VelocityGains {
+                kpv: unpack_f32([d[0], d[1], d[2], d[3]]),
+                kiv: unpack_f32([d[4], d[5], d[6], d[7]]),
+            })
+        }
+        CommandId::PositionGains => {
+            expect_dlc(frame, node, raw_cmd, err_bit, 4)?;
+            Payload::Readback(Readback::PositionGains {
+                kpp: unpack_f32([d[0], d[1], d[2], d[3]]),
+            })
+        }
         // Host→driver commands — receiving one is never a reply.
         CommandId::Estop
         | CommandId::ClearError
@@ -866,16 +1215,14 @@ pub fn decode_frame(frame: &CanFrame) -> Result<DecodedFrame, DecodeError> {
         | CommandId::Idle
         | CommandId::SaveConfig
         | CommandId::Reset
-        | CommandId::Watchdog
-        | CommandId::PdGains
-        | CommandId::CurrentGains
-        | CommandId::VelocityGains
-        | CommandId::PositionGains
-        | CommandId::Limits
         | CommandId::Kt
         | CommandId::HeartbeatSetup
         | CommandId::DataPackHall
-        | CommandId::VoltageLimit
+        | CommandId::SetGripperId
+        | CommandId::Capture
+        | CommandId::Ripple
+        | CommandId::VelocityWindow
+        | CommandId::Inject
         | CommandId::GripperDataPack
         | CommandId::GripperCalibrate => {
             return Err(DecodeError::NotAReply {
@@ -1131,6 +1478,7 @@ mod tests {
             CommandId::IqData,
             CommandId::EncoderData,
             CommandId::RespondKt,
+            CommandId::Telemetry,
         ] {
             let f = encode_rtr_poll(3, cmd).unwrap();
             assert!(f.rtr);
@@ -1167,5 +1515,140 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn capture_frames_round_trip() {
+        let start = encode_capture(2, 0, 2000);
+        assert_eq!(unpack_can_id(start.id), (2, 38, false));
+        assert_eq!(
+            start.payload(),
+            &[1, 0x04, 0x00],
+            "divisor floors at 1, length at CAPTURE_LEN"
+        );
+        let read = encode_capture_read(2, 1, 0x0123);
+        assert_eq!(unpack_can_id(read.id), (2, 39, false));
+        assert_eq!(read.payload(), &[1, 0x01, 0x23]);
+
+        let id = pack_can_id(2, CommandId::CaptureRead, false);
+        let chunk = CanFrame::data_frame(id, &[0, 0x00, 0x05, 0xFF, 0xF0, 0x00, 0x10]);
+        let decoded = decode_frame(&chunk).expect("a capture chunk");
+        assert_eq!(decoded.node, 2);
+        assert_eq!(
+            decoded.payload,
+            Payload::Capture {
+                channel: 0,
+                chunk: 5,
+                samples: [-16, 16]
+            }
+        );
+        let status = CanFrame::data_frame(id, &[0xFF, 0x02, 0x00, 0x04, 0x00, 0x00, 0x01]);
+        assert_eq!(
+            decode_frame(&status).expect("a status").payload,
+            Payload::CaptureStatus {
+                recorded: 512,
+                wanted: 1024,
+                divisor: 1
+            }
+        );
+        let short = CanFrame::data_frame(id, &[0, 0, 0]);
+        assert!(
+            decode_frame(&short).is_err(),
+            "a request-sized frame is not a reply"
+        );
+        assert!(
+            decode_frame(&start).is_err(),
+            "cmd 38 is host-to-drive only"
+        );
+    }
+
+    #[test]
+    fn configuration_read_back_answers_what_was_written() {
+        use crate::ConfigKind;
+        let request = encode_readback_request(3, ConfigKind::VelocityGains);
+        assert!(request.rtr);
+        assert_eq!(unpack_can_id(request.id), (3, 18, false));
+
+        // The drive answers in the layout the write used, so the answer to
+        // a landed write decodes to exactly the values sent.
+        let written = encode_velocity_gains(3, 0.014186124, 0.000835031);
+        let answer = CanFrame::data_frame(
+            pack_can_id(3, CommandId::VelocityGains, false),
+            written.payload(),
+        );
+        assert_eq!(
+            decode_frame(&answer).expect("an answer").payload,
+            Payload::Readback(Readback::VelocityGains {
+                kpv: 0.014186124,
+                kiv: 0.000835031
+            })
+        );
+        let watchdog = encode_watchdog(3, 5000, WatchdogAction::Idle);
+        let answer = CanFrame::data_frame(
+            pack_can_id(3, CommandId::Watchdog, true),
+            watchdog.payload(),
+        );
+        let decoded = decode_frame(&answer).expect("an answer");
+        assert!(decoded.err_bit, "the live fault bit rides the answer too");
+        assert_eq!(
+            decoded.payload,
+            Payload::Readback(Readback::Watchdog {
+                ms: 5000,
+                action: 0
+            })
+        );
+        assert_eq!(
+            Readback::Watchdog {
+                ms: 5000,
+                action: 0
+            }
+            .kind(),
+            ConfigKind::Watchdog
+        );
+
+        let short = CanFrame::data_frame(pack_can_id(3, CommandId::PositionGains, false), &[0, 0]);
+        assert!(
+            decode_frame(&short).is_err(),
+            "a wrong length is refused, not guessed at"
+        );
+        assert!(
+            decode_frame(&request).is_err(),
+            "the request itself is not an answer"
+        );
+    }
+
+    #[test]
+    fn ripple_frame_carries_slot_harmonic_and_amplitudes_as_the_firmware_reads_them() {
+        let f = encode_ripple(4, 2, 4, -300, 1234);
+        assert_eq!(unpack_can_id(f.id), (4, 40, false));
+        // data[0] slot, data[1] harmonic, data[2..3] and data[4..5] big-endian.
+        assert_eq!(f.payload(), &[2, 4, 0xFE, 0xD4, 0x04, 0xD2]);
+        assert!(decode_frame(&f).is_err(), "cmd 40 is host-to-drive only");
+    }
+
+    #[test]
+    fn inject_frame_and_sequence_match_what_the_drive_runs() {
+        let f = encode_inject(3, -200, 0xACE1, 4);
+        assert_eq!(unpack_can_id(f.id), (3, 42, false));
+        // data[0..1] amplitude and data[2..3] seed big-endian, data[4] hold.
+        assert_eq!(f.payload(), &[0xFF, 0x38, 0xAC, 0xE1, 4]);
+        assert!(decode_frame(&f).is_err(), "cmd 42 is host-to-drive only");
+
+        // Maximal length: the signs repeat only after 65535 bits, balanced to
+        // one, so no capture sees a short cycle or a bias.
+        let period = usize::from(u16::MAX);
+        let bits = inject_sequence(0xACE1, 1, 2 * period);
+        assert_eq!(bits[..period], bits[period..]);
+        assert_eq!(bits[..period].iter().sum::<f64>(), 1.0);
+        let shortest = (1..period).find(|p| bits[..period] == bits[*p..*p + period]);
+        assert_eq!(shortest, None);
+
+        // A hold of 3 holds each of those signs for three loops.
+        let held = inject_sequence(0xACE1, 3, 300);
+        for (k, sign) in held.iter().enumerate() {
+            assert_eq!(*sign, bits[k / 3]);
+        }
+        // The drive runs seed 0 and hold 0 as 1.
+        assert_eq!(inject_sequence(0, 0, 64), inject_sequence(1, 1, 64));
     }
 }

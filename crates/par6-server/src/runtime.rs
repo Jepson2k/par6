@@ -400,6 +400,10 @@ pub trait RtCommands: Send {
     /// (`SAVE_CONFIG`). Gated like `set_can_id`.
     fn save_config(&mut self, node: u8);
 
+    /// Commissioning: tell a gripper drive which tool it is built into
+    /// and have it saved (`SET_TOOL_ID`). Gated like `set_can_id`.
+    fn set_tool_id(&mut self, node: u8, tool_id: u8);
+
     /// Kick a bus rescan; the snapshot's `bus_scan_epoch` advances once
     /// every id has been pinged and the answers have landed.
     fn rescan_bus(&mut self);

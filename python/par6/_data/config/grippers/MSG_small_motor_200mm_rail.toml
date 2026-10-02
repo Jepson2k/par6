@@ -7,6 +7,8 @@
 
 name = "MSG_small_motor_200mm_rail"
 urdf_variant = "msg"
+# What this tool's drive reports in its device info (`par6 tool-id` writes it).
+can_tool_id = 13
 
 [driver]
 driver_type = "stepfoc"

@@ -7,6 +7,7 @@ use par6_config::{RobotConfig, ToolConfig};
 use crate::bus::DriverBus;
 use crate::hw::SocketCanBus;
 use crate::sim::SimBus;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
     PollAction,
@@ -110,6 +111,55 @@ impl DriverBus for RuntimeBus {
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
         dispatch!(self, save_config(node))
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        dispatch!(self, set_tool_id(node, tool_id))
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        dispatch!(self, set_ripple(node, ripple))
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        dispatch!(self, set_velocity_window(node, window))
+    }
+
+    fn arm_injection(
+        &mut self,
+        node: NodeId,
+        amplitude_ma: i16,
+        seed: u16,
+        hold: u8,
+    ) -> Result<(), BusError> {
+        dispatch!(self, arm_injection(node, amplitude_ma, seed, hold))
+    }
+
+    fn arm_periodic(
+        &mut self,
+        node: NodeId,
+        spec: crate::spectral::periodic::Spec,
+    ) -> Result<(), BusError> {
+        dispatch!(self, arm_periodic(node, spec))
+    }
+
+    fn read_periodic_status(&mut self, node: NodeId) -> Result<(), BusError> {
+        dispatch!(self, read_periodic_status(node))
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        dispatch!(self, capture_start(node, divisor, wanted))
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer> {
+        match self {
+            Self::SocketCan(b) => b.capture(node),
+            Self::Sim(b) => b.capture(node),
+        }
     }
 
     fn send_limits(

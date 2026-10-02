@@ -47,6 +47,22 @@ pub enum WatchdogAction {
 /// Cascade-PID and impedance-PD gains pushed to a driver at boot.
 ///
 /// Field names match the vendor XML tags (KPP/KPV/KIV/KPIQ/KIIQ/KP/KD),
+/// One harmonic of a joint's ripple feedforward: `a_ma cos(h phase) +
+/// b_ma sin(h phase)` \[mA\], phase being the rotor's electrical angle.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RippleHarmonic {
+    /// Harmonic of the electrical angle, 1 or more.
+    pub harmonic: u8,
+    /// Cosine amplitude \[mA\].
+    pub a_ma: i16,
+    /// Sine amplitude \[mA\].
+    pub b_ma: i16,
+}
+
+/// Most ripple harmonics a drive holds.
+pub const MAX_RIPPLE_HARMONICS: usize = 8;
+
 /// lowercased.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -218,6 +234,16 @@ pub struct JointConfig {
     pub sector_home_offset_rad: f64,
     /// Controller gains pushed at boot.
     pub gains: Gains,
+    /// Ripple feedforward pushed at boot (cmd 40, par6 firmware): the current
+    /// that cancels this joint's cogging and commutation ripple, as harmonics
+    /// of the rotor's electrical angle. Measured by `par6-selfcal`; empty
+    /// sends nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ripple: Vec<RippleHarmonic>,
+    /// The drive's speed filter length in control loops (cmd 41, par6
+    /// firmware), pushed at boot; omitted keeps the drive's own (20).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub velocity_window: Option<u8>,
     /// Position limits + kinodynamic ceiling + per-mode blocks.
     pub limits: JointLimits,
 }
@@ -472,6 +498,26 @@ pub struct SimConfig {
     /// through the reduction). An estimate until measured on the arm; it
     /// shapes only what the sim does with an idled or released drive.
     pub holding_friction_nm: Vec<f64>,
+    /// Lateral stiffness of the arm's forks \[Nm/rad\]: passive hinges on
+    /// the shoulder's and the elbow's driven bodies about the two axes
+    /// their joints do not turn, so a base swing bends or twists each
+    /// link whatever the pose. The base's chirp shows the arm is not rigid
+    /// about the base axis: an anti-resonance at 23 Hz and a resonance at
+    /// 32 Hz, whose ratio puts half the arm's inertia about that axis on
+    /// each side of a flex, which the mass table places between the elbow
+    /// and the forearm; with the arm out, the same swing goes through the
+    /// shoulder fork, and the chirp's response carries a faint 12–14 Hz
+    /// pair where a shoulder of the same stiffness puts its own mode at
+    /// the ready pose. The base's velocity loop crosses over at 19 Hz at
+    /// the ready pose and 9.5 Hz with the arm out, and these modes are
+    /// where the arm's base gets the phase margin a rigid arm lacks:
+    /// rigid, the simulated base rings at the current rails through every
+    /// move on the gains the arm runs quietly. Zero makes the arm rigid,
+    /// which is that plant: the simulator's base tests fail on it. The
+    /// plant refuses a stiffness its physics step cannot integrate.
+    pub arm_lateral_stiffness_nm_rad: f64,
+    /// Damping of that flex \[Nm·s/rad\].
+    pub arm_lateral_damping_nm_s: f64,
 }
 
 impl Default for SimConfig {
@@ -482,6 +528,11 @@ impl Default for SimConfig {
             viscous_nm_s: vec![0.033145, 1.513348, 0.0, 0.0, 0.033714, 0.009957],
             coulomb_nm: vec![0.2314, 0.9030, 2.2047, 0.1279, 0.0521, 0.0854],
             holding_friction_nm: vec![1.0, 8.0, 3.0, 0.5, 0.5, 0.3],
+            // From the base chirp of 2026-09-23 (par6-selfcal --belt-only,
+            // Flange): K = I_forearm · (2π·23.3 Hz)² at the elbow, ζ ≈ 0.15;
+            // the shoulder fork is given the same, unmeasured.
+            arm_lateral_stiffness_nm_rad: 612.0,
+            arm_lateral_damping_nm_s: 1.25,
         }
     }
 }
@@ -1134,6 +1185,20 @@ impl RobotConfig {
         if j.velocity_limit_ticks_s <= 0.0 {
             return Err(invalid(f("velocity_limit_ticks_s"), "must be > 0"));
         }
+        if j.velocity_window.is_some_and(|w| !(4..=64).contains(&w)) {
+            return Err(invalid(f("velocity_window"), "must be 4..=64"));
+        }
+        if j.ripple.len() > MAX_RIPPLE_HARMONICS {
+            return Err(invalid(f("ripple"), "at most 8 harmonics"));
+        }
+        for r in &j.ripple {
+            if r.harmonic == 0 {
+                return Err(invalid(f("ripple"), "harmonic must be 1 or more"));
+            }
+            if f64::from(r.a_ma).abs() > j.ilim_ma || f64::from(r.b_ma).abs() > j.ilim_ma {
+                return Err(invalid(f("ripple"), "amplitude beyond ilim_ma"));
+            }
+        }
         if j.watchdog_timeout_ms == 0 {
             return Err(invalid(f("watchdog_timeout_ms"), "must be > 0"));
         }
@@ -1382,6 +1447,17 @@ impl RobotConfig {
                 if !(v.is_finite() && *v >= 0.0) {
                     return Err(invalid(name, format!("entry {j} must be finite and >= 0")));
                 }
+            }
+        }
+        for (v, name) in [
+            (
+                sim.arm_lateral_stiffness_nm_rad,
+                "sim.arm_lateral_stiffness_nm_rad",
+            ),
+            (sim.arm_lateral_damping_nm_s, "sim.arm_lateral_damping_nm_s"),
+        ] {
+            if !(v.is_finite() && v >= 0.0) {
+                return Err(invalid(name, "must be finite and >= 0"));
             }
         }
         for (i, j) in self.joints.iter().enumerate() {

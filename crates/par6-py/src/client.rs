@@ -352,6 +352,21 @@ impl CoreClient {
         )
     }
 
+    #[pyo3(signature = (node, tool_id, force=false))]
+    fn set_tool_id<'py>(
+        &self,
+        py: Python<'py>,
+        node: u8,
+        tool_id: u8,
+        force: bool,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let client = self.rt();
+        ack_future(
+            py,
+            async move { client.set_tool_id(node, tool_id, force).await },
+        )
+    }
+
     /// Await the checkpoint `label`; False on timeout.
     fn wait_checkpoint<'py>(
         &self,

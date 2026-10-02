@@ -15,6 +15,7 @@ use par6_config::{RobotConfig, ToolConfig};
 
 use crate::bus::DriverBus;
 use crate::hw::sched::FreshnessClock;
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, Freshness, GripperCommand, GripperReply,
     HallState, JointCommand, LinkHealth, NodeId, PollAction, PollKind, MAX_NODES,
@@ -139,6 +140,13 @@ pub enum TxRecord {
         /// Target node.
         node: NodeId,
     },
+    /// Gripper_ID (cmd 36).
+    SetToolId {
+        /// Target node.
+        node: NodeId,
+        /// The tool id it was told it is built into.
+        tool_id: u8,
+    },
     /// Limits frame (cmd 20).
     Limits {
         /// Target node.
@@ -177,7 +185,6 @@ pub struct LoopbackBus {
     configured: bool,
     joint_nodes: Vec<NodeId>,
     gripper_node: NodeId,
-    timing_dummy_node: NodeId,
     rx_cap: usize,
     fresh: FreshnessClock,
     connected: u16,
@@ -202,7 +209,6 @@ impl LoopbackBus {
             configured: false,
             joint_nodes: Vec::new(),
             gripper_node: 0,
-            timing_dummy_node: 0,
             rx_cap: 32,
             fresh: FreshnessClock::default(),
             connected: 0,
@@ -402,6 +408,9 @@ impl DriverBus for LoopbackBus {
                     self.tx_log.push((tick, TxRecord::ClearError { node }));
                 }
                 PollAction::ResendConfig { node } => self.record_config_pass(node),
+                // Nothing answers on the loopback; the slot is consumed like a poll.
+                PollAction::CaptureRead { .. } => {}
+                PollAction::ConfigRead { .. } => {}
                 PollAction::ConfigFrame { node, kind } => {
                     if !self.joint_nodes.contains(&node) && node != self.gripper_node {
                         return Err(BusError::InvalidCommand {
@@ -420,16 +429,17 @@ impl DriverBus for LoopbackBus {
             }
             return Ok(());
         }
-        let idx = (self.poll_cursor / 3) as usize % self.poll_targets();
+        let idx = self.poll_cursor as usize % self.poll_targets();
         let node = self.poll_target_node(idx);
-        let kind = match self.poll_cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
         self.poll_cursor += 1;
         let tick = self.tick;
-        self.tx_log.push((tick, TxRecord::Poll { node, kind }));
+        self.tx_log.push((
+            tick,
+            TxRecord::Poll {
+                node,
+                kind: PollKind::Telemetry,
+            },
+        ));
         Ok(())
     }
 
@@ -448,7 +458,6 @@ impl DriverBus for LoopbackBus {
     ) -> Result<(), BusError> {
         self.joint_nodes = robot.joints.iter().map(|j| j.node_id).collect();
         self.gripper_node = robot.bus.gripper_node;
-        self.timing_dummy_node = robot.bus.timing_dummy_node;
         self.fresh.configure(
             u64::from(robot.ticks(robot.bus.stale_warn_s)),
             u64::from(robot.ticks(robot.bus.lost_s)),
@@ -509,6 +518,49 @@ impl DriverBus for LoopbackBus {
         self.tx_log
             .push((tick, TxRecord::SetCanId { node, new_id }));
         Ok(())
+    }
+
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.ensure_ready()?;
+        let tick = self.tick;
+        self.tx_log
+            .push((tick, TxRecord::SetToolId { node, tool_id }));
+        Ok(())
+    }
+
+    /// Nothing on the loopback applies it; the request is accepted.
+    fn set_velocity_window(&mut self, _node: NodeId, _window: u8) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// Nothing on the loopback records; the request is accepted.
+    fn arm_injection(
+        &mut self,
+        _node: NodeId,
+        _amplitude_ma: i16,
+        _seed: u16,
+        _hold: u8,
+    ) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// Nothing on the loopback applies it; the request is accepted.
+    fn set_ripple(
+        &mut self,
+        _node: NodeId,
+        _ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    /// The loopback has no drive to record anything; the request is
+    /// accepted and nothing is ever read back.
+    fn capture_start(&mut self, _node: NodeId, _divisor: u8, _wanted: u16) -> Result<(), BusError> {
+        self.ensure_ready()
+    }
+
+    fn capture(&self, _node: NodeId) -> Option<&CaptureBuffer> {
+        None
     }
 
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError> {
@@ -797,12 +849,12 @@ mod tests {
         let (mut bus, robot) = configured_bus();
         bus.tx_log.clear();
         let total = robot.joints.len() + 1; // 6 joints + gripper
-        for t in 0..(3 * total as u64) {
+        for t in 0..(total as u64) {
             bus.begin_tick(t);
             bus.poll_step().unwrap();
         }
-        // Every node got each of temp/voltage/errors exactly once per
-        // 3×total_nodes ticks.
+        // Every node got its combined telemetry poll exactly once per
+        // total_nodes ticks.
         let mut seen = std::collections::HashMap::new();
         for (_, rec) in &bus.tx_log {
             let TxRecord::Poll { node, kind } = rec else {
@@ -810,7 +862,8 @@ mod tests {
             };
             *seen.entry((*node, *kind)).or_insert(0) += 1;
         }
-        assert_eq!(seen.len(), 3 * total);
+        assert_eq!(seen.len(), total);
+        assert!(seen.keys().all(|(_, k)| *k == PollKind::Telemetry));
         assert!(seen.values().all(|&c| c == 1));
         let polled_nodes: std::collections::BTreeSet<_> = seen.keys().map(|(n, _)| *n).collect();
         assert!(polled_nodes.contains(&robot.bus.gripper_node));

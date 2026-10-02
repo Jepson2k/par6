@@ -4,6 +4,8 @@
 
 name = "MSG"
 urdf_variant = "msg"
+# What this tool's drive reports in its device info (`par6 tool-id` writes it).
+can_tool_id = 10
 
 [driver]
 driver_type = "stepfoc"

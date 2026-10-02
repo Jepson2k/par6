@@ -45,9 +45,10 @@ pub(super) enum PollStep {
     },
 }
 
-/// Round-robin telemetry schedule: each target gets temperature /
-/// voltage / errors once every `3 × targets` slots, a device-info sweep
-/// replaces the round robin for `targets` slots every
+/// Round-robin telemetry schedule: each target gets one combined
+/// telemetry poll per cycle, or temperature / voltage / errors in three
+/// slots when it runs a firmware without the combined reply; a
+/// device-info sweep replaces the round robin for `targets` slots every
 /// [`DEVICE_INFO_PERIOD_SLOTS`], and a single-slot override queue
 /// preempts everything.
 ///
@@ -56,6 +57,10 @@ pub(super) enum PollStep {
 #[derive(Debug, Default)]
 pub(super) struct PollScheduler {
     targets: usize,
+    /// Targets polled the vendor way, three kinds a cycle.
+    legacy: Vec<bool>,
+    /// One cycle of the round robin, rebuilt when a target's way changes.
+    cycle: Vec<(usize, PollKind)>,
     cursor: u64,
     slot: u64,
     device_info_remaining: usize,
@@ -63,13 +68,41 @@ pub(super) struct PollScheduler {
 }
 
 impl PollScheduler {
-    /// Re-arm for `targets` poll targets (boot configuration).
+    /// Re-arm for `targets` poll targets (boot configuration), every one
+    /// on the combined poll until [`set_legacy`](Self::set_legacy) says
+    /// otherwise.
     pub(super) fn configure(&mut self, targets: usize) {
         self.targets = targets;
+        self.legacy = vec![false; targets];
         self.cursor = 0;
         self.slot = 0;
         self.device_info_remaining = 0;
         self.override_slot = None;
+        self.rebuild_cycle();
+    }
+
+    /// Poll `target` the vendor way (three kinds a cycle) or the
+    /// combined way; a target's answer to the boot probe decides.
+    pub(super) fn set_legacy(&mut self, target: usize, legacy: bool) {
+        if target < self.targets && self.legacy[target] != legacy {
+            self.legacy[target] = legacy;
+            self.rebuild_cycle();
+        }
+    }
+
+    fn rebuild_cycle(&mut self) {
+        self.cycle.clear();
+        for (target, &legacy) in self.legacy.iter().enumerate() {
+            if legacy {
+                self.cycle.extend([
+                    (target, PollKind::Temperature),
+                    (target, PollKind::Voltage),
+                    (target, PollKind::Errors),
+                ]);
+            } else {
+                self.cycle.push((target, PollKind::Telemetry));
+            }
+        }
     }
 
     /// Queue an override; it preempts the round robin for `repeats`
@@ -104,12 +137,7 @@ impl PollScheduler {
         if self.slot.is_multiple_of(DEVICE_INFO_PERIOD_SLOTS) {
             self.device_info_remaining = self.targets;
         }
-        let target = (self.cursor / 3) as usize % self.targets;
-        let kind = match self.cursor % 3 {
-            0 => PollKind::Temperature,
-            1 => PollKind::Voltage,
-            _ => PollKind::Errors,
-        };
+        let (target, kind) = self.cycle[self.cursor as usize % self.cycle.len()];
         self.cursor += 1;
         Some(PollStep::Poll { target, kind })
     }
@@ -282,6 +310,14 @@ pub enum ConfigKind {
 impl ConfigKind {
     /// All configuration fields in the drive's boot order.
     pub const ALL: [Self; 7] = CONFIG_ORDER;
+
+    /// This kind's position in [`Self::ALL`].
+    pub fn index(self) -> usize {
+        CONFIG_ORDER
+            .iter()
+            .position(|k| *k == self)
+            .expect("every kind is in CONFIG_ORDER")
+    }
 }
 
 /// The order the boot config load sends message types in.
@@ -343,6 +379,11 @@ pub(super) fn boot_config_plan(configs: &[NodeConfig], repeats: u8, out: &mut Ve
             }
             out.push(BootStep::Pace);
         }
+        let extra: Vec<CanFrame> = configs.iter().flat_map(NodeConfig::extra_frames).collect();
+        if !extra.is_empty() {
+            out.extend(extra.into_iter().map(BootStep::Frame));
+            out.push(BootStep::Pace);
+        }
     }
 }
 
@@ -370,28 +411,53 @@ mod tests {
                 kiv: 6.0,
                 kpp: 7.0,
             },
+            ripple: [(0, 0, 0); 8],
+            velocity_window: None,
         }
     }
 
-    /// Every target must get temperature, voltage and errors exactly once
-    /// per `3 × targets` slots — that cadence is what bounds the poll to
-    /// ONE frame per tick while still refreshing the ~84 ms telemetry.
+    /// Every target gets its combined telemetry poll exactly once per
+    /// `targets` slots — one frame per tick, the whole bus refreshed in
+    /// 28 ms at the shipped rate — and a target on the vendor firmware
+    /// gets temperature, voltage and errors instead, each once, so it
+    /// is as fully served as before at three slots a cycle.
     #[test]
     fn round_robin_covers_every_target_once_per_cycle() {
         let targets = 7;
         let mut s = PollScheduler::default();
         s.configure(targets);
         let mut seen: HashMap<(usize, PollKind), u32> = HashMap::new();
-        for _ in 0..(3 * targets) {
+        for _ in 0..targets {
             match s.step().expect("configured") {
                 PollStep::Poll { target, kind } => *seen.entry((target, kind)).or_default() += 1,
                 other => panic!("unexpected {other:?}"),
             }
         }
-        assert_eq!(seen.len(), 3 * targets);
-        assert!(seen.values().all(|&c| c == 1));
+        assert_eq!(seen.len(), targets);
+        assert!(seen.keys().all(|(_, k)| *k == PollKind::Telemetry));
         let covered: BTreeSet<usize> = seen.keys().map(|(t, _)| *t).collect();
         assert_eq!(covered, (0..targets).collect::<BTreeSet<_>>());
+
+        s.set_legacy(4, true);
+        let mut seen: HashMap<(usize, PollKind), u32> = HashMap::new();
+        for _ in 0..(targets + 2) {
+            match s.step().expect("configured") {
+                PollStep::Poll { target, kind } => *seen.entry((target, kind)).or_default() += 1,
+                other => panic!("unexpected {other:?}"),
+            }
+        }
+        assert_eq!(seen.len(), targets + 2);
+        assert!(seen.values().all(|&c| c == 1));
+        for kind in [PollKind::Temperature, PollKind::Voltage, PollKind::Errors] {
+            assert!(
+                seen.contains_key(&(4, kind)),
+                "legacy target misses {kind:?}"
+            );
+        }
+        assert!(!seen.contains_key(&(4, PollKind::Telemetry)));
+        assert!((0..targets)
+            .filter(|t| *t != 4)
+            .all(|t| seen.contains_key(&(t, PollKind::Telemetry))));
     }
 
     /// The device-info sweep replaces the round robin for exactly one
@@ -425,14 +491,7 @@ mod tests {
         // The round robin picks up its own cursor, not the sweep's.
         let before = kinds[DEVICE_INFO_PERIOD_SLOTS as usize - 1];
         let after = kinds[DEVICE_INFO_PERIOD_SLOTS as usize + targets];
-        assert_eq!(
-            after,
-            match before.1 {
-                PollKind::Temperature => (before.0, PollKind::Voltage),
-                PollKind::Voltage => (before.0, PollKind::Errors),
-                _ => ((before.0 + 1) % targets, PollKind::Temperature),
-            }
-        );
+        assert_eq!(after, ((before.0 + 1) % targets, PollKind::Telemetry));
     }
 
     /// An override owns the slot for exactly `repeats` steps, a later
@@ -456,13 +515,13 @@ mod tests {
             3
         );
         assert!(matches!(steps[3], PollStep::Poll { .. }));
-        // Second target's temperature: slot 1 of the round robin (slot 0
-        // was consumed before the override).
+        // The second target's combined poll: slot 1 of the round robin
+        // (slot 0 was consumed before the override).
         assert_eq!(
             steps[3],
             PollStep::Poll {
-                target: 0,
-                kind: PollKind::Voltage
+                target: 1,
+                kind: PollKind::Telemetry
             },
             "the round robin resumes at its own cursor"
         );

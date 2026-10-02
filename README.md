@@ -636,17 +636,45 @@ vendor's tool over a bench connection.
 There are two, for two different things.
 
 **The arm: `par6-selfcal`.** Run it on a new arm, with `par6d` stopped and the
-tool off (the passive flange fitted). It homes the arm, measures each joint's
-inertia and friction, and identifies the arm's own link masses from the torque
-it holds at a set of poses. The links are 3D printed, so they do not weigh what
-the vendor CAD says. `--apply` writes the identified `gravity_correction` into
-the config, keeping a backup; `--sim` runs it against the simulator and refuses
-`--apply`. `--gains` (off by default) tunes each joint's velocity loop on one
-probe move — kiv then kpv, walking down from the configured value while the
-drive's speed strays less from the profile, up only when down did not help — and
-writes them with `--apply`; a trial that runs away is caught mid-move and the
-last sane gains are back on the drive within a tick. It is a search on what the
-bus can see, not a placement: the 6250 Hz loop itself is out of reach.
+tool off (the passive flange fitted). One run does everything, in this order:
+it homes the arm; cancels each joint's cogging and commutation ripple with a
+feedforward the drive adds against the rotor's electrical angle (fitted on a
+slow sweep, refined and judged at the 20 deg/s step, kept only when it removes
+at least a fifth of the ripple); tunes each joint's loops; qualifies the
+tuned set on the calibration poses; measures each joint's static friction (at
+the ready pose and with the arm out) and the base's compliance (a current
+chirp); and identifies each joint's friction while moving together with the
+arm's own link masses from the torque it holds at twenty poses (the links are
+3D printed, so they do not weigh what the vendor CAD says). Ripple comes before
+gains because an uncompensated first harmonic looks exactly like a loop
+oscillation at speed and would fail every speed verdict after it.
+
+The gains stage is the StepFOC manual procedure, automated: Kpv, then Kiv,
+then Kpp, each walked up a fixed lattice (Kpv 0.001·1.25ⁿ with Kiv keeping its
+ratio to it, Kiv 0.0001·1.5ⁿ, Kpp 2.5·2ⁿ to 20) from the point nearest the
+configured value while a ramped velocity pulse (a position step for Kpp) stays
+stable, then backed off one point for Kpv. Every accepted point is confirmed on
+the normal profile over the joint's checked travel, both ways, and steps down a
+point if that sweep runs away, reverses its speed error six times across
+±15 deg/s, or fails to hold or settle; lag is reported, not judged. The set is
+then held at the arm-out pose and at each joint's minimum- and maximum-inertia
+identification poses to the measurement's own stillness rule; a joint that
+shakes on the way steps Kpv down, one that will not hold still steps Kpp then
+Kiv down, and a joint that reaches the floor keeps its configured gains and is
+reported as such. The lattices are fixed so two runs land on the same points;
+a trial that runs away is caught within a tick, its joint held on the known
+good gains, and a drive that stays in a limit cycle there has its loop opened
+and closed again from rest.
+
+Nothing a joint cannot resolve stops the run: it keeps its configured value
+for that quantity and the report says why, which counts as complete for
+`--apply`. The arm may not stand still for more than a second anywhere in a
+run; every longer stop is printed as it ends, with what the run was doing,
+and totalled at the end. Shutdown retraces the checked legs back to the ready
+pose before parking joint by joint. `--apply` writes the results into the
+config, keeping a backup. Stages other than ripple and gains can use `--sim`,
+which refuses `--apply`; nothing about tuning is developed or tested in the
+simulator.
 `--limits` (off by default) also finds each joint's velocity,
 acceleration and jerk limits: it scales the joint's EXEC limits up towards its
 hardware ceiling until a move's following error, landing or hold misses its
@@ -654,10 +682,14 @@ requirement, or the current it needs plus the worst gravity the joint carries
 would exceed its current limit; with `--apply` those become the EXEC limits,
 written only where the search moved them. Speed ripple is reported beside each result and only fails a step past 10% of
 the commanded speed, because it does not grow with the limits. A jerk no probe move was
-limited by is only a lower bound, so it is reported and left as configured. It
-tunes no drive gains: those loops run inside the drives at
-6250 Hz, which the 250 Hz bus cannot observe, so the configured gains stand.
-Hardware runs need `sudo`.
+limited by is only a lower bound, so it is reported and left as configured.
+The base's chirp (2 to 60 Hz) is recorded for fitting the arm's compliance
+outside selfcal — the anti-resonance/resonance pair it showed is what
+`[sim] arm_lateral_stiffness_nm_rad` carries. `--only <stage>` (repeatable) runs
+homing and just those stages, for development, and `--joint N` narrows the
+ripple and gains stages to some joints. Hardware runs need `sudo`; the ripple and gains stages need the par6
+STEPFOC firmware. The earlier injected and periodic identification methods are
+kept only as [development notes](docs/development/2026-09-28-periodic-tuning.md).
 
 **The tool: `estimate_payload()`.** With the tool fitted and `par6d` running,
 the client call holds a few wrist poses and fits the mass and centre of mass it

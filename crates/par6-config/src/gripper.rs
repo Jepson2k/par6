@@ -135,6 +135,14 @@ pub struct ToolConfig {
     /// `CAN_gripper = 0`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub driver: Option<GripperDriverConfig>,
+    /// The id the tool's drive reports in its device info, 1..=255
+    /// (`par6 tool-id` writes it into the drive's EEPROM; 0 on the wire
+    /// is "not set"). At boot the runtime fits the tool whose id the
+    /// gripper node reports, so the arm knows what is on it without
+    /// being told. Only a CAN-driven tool has a drive to carry one, and
+    /// no two tools may share one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub can_tool_id: Option<u8>,
     /// Motor homing parameters for the gripper's own actuator; absent for
     /// passive tools. `home_offset_gripper_dependent` is meaningless here
     /// and must stay false.
@@ -173,6 +181,21 @@ impl ToolConfig {
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.name.is_empty() {
             return Err(invalid("name", "must not be empty"));
+        }
+        match self.can_tool_id {
+            Some(0) => {
+                return Err(invalid(
+                    "can_tool_id",
+                    "0 is what an unprovisioned drive reports; use 1..=255",
+                ))
+            }
+            Some(_) if self.driver.is_none() => {
+                return Err(invalid(
+                    "can_tool_id",
+                    "only a CAN-driven tool has a drive to carry an id",
+                ))
+            }
+            _ => {}
         }
         if let Some(d) = &self.driver {
             for (v, name) in [

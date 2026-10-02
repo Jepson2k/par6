@@ -19,3 +19,4 @@ selfcal-trace-*-phases.csv
 
 # par6-selfcal run directories (root-owned on hardware runs)
 calibration-runs/
+/target-head

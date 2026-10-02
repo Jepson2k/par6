@@ -326,6 +326,7 @@ pub fn query_result_dict(py: Python<'_>, r: &QueryResult) -> PyResult<PyObject> 
                 row.set_item("hw_ver", n.hw_ver)?;
                 row.set_item("sw_ver", n.sw_ver)?;
                 row.set_item("serial", n.serial)?;
+                row.set_item("tool_id", n.tool_id)?;
                 rows.append(row)?;
             }
             d.set_item("nodes", rows)?;

@@ -153,6 +153,40 @@ impl DriverBus for FailingBus {
         self.inner.save_config(node)
     }
 
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError> {
+        self.inner.set_tool_id(node, tool_id)
+    }
+
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError> {
+        self.inner.set_ripple(node, ripple)
+    }
+
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError> {
+        self.inner.set_velocity_window(node, window)
+    }
+
+    fn arm_injection(
+        &mut self,
+        node: NodeId,
+        amplitude_ma: i16,
+        seed: u16,
+        hold: u8,
+    ) -> Result<(), BusError> {
+        self.inner.arm_injection(node, amplitude_ma, seed, hold)
+    }
+
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError> {
+        self.inner.capture_start(node, divisor, wanted)
+    }
+
+    fn capture(&self, node: NodeId) -> Option<&par6_bus::CaptureBuffer> {
+        self.inner.capture(node)
+    }
+
     fn send_limits(
         &mut self,
         node: NodeId,

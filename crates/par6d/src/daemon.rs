@@ -63,6 +63,9 @@ pub enum DaemonError {
     /// Hardware mode is unavailable (missing interface or backend).
     #[error("{0}")]
     Hardware(String),
+    /// The gripper drive reports a tool the configuration does not know.
+    #[error("tool: {0}")]
+    Tool(String),
     /// The kinematics stack could not start (missing assets tree or a
     /// URDF that failed to load).
     #[error("kinematics: {0}")]
@@ -120,6 +123,55 @@ impl Daemon {
         let config_path =
             resolve_config_path(opts.config.as_deref()).map_err(DaemonError::ConfigPath)?;
         let mut loaded = ConfigBundle::load(&config_path)?;
+        // What actually caps the tick rate is the wire, not the loop: the
+        // steady-state exchange has to finish inside one tick, and on
+        // classic CAN it is the binding constraint long before compute
+        // is. Only the real bus has one — `--sim` answers in memory —
+        // and the answer is the config's, so it comes before the
+        // interface is opened.
+        let mut hw_bus = if opts.sim {
+            None
+        } else {
+            refuse_unfit_bus(&loaded)?;
+            Some(open_hardware_bus(&loaded.robot.bus)?)
+        };
+        // The gripper drive says which tool is on the arm: a provisioned
+        // drive reports its tool id in its device info, and the bundle
+        // is fitted with that tool before anything is built from it. A
+        // drive that reports nothing leaves `active_tool` in charge; one
+        // that reports a tool the configuration does not know is a
+        // refusal, since fitting a guess is how a 200 mm rail once ran
+        // on a 150 mm gravity model. Only the real bus has a drive to
+        // ask — the simulator's gripper is whatever the bundle fits.
+        if let Some(bus) = hw_bus.as_mut() {
+            let node = loaded.robot.bus.gripper_node;
+            if let Some(id) = bus.probe_tool_id(node, &loaded.robot) {
+                let configured = loaded.robot.robot.active_tool.clone();
+                match loaded.tool_by_can_id(id).map(|t| t.name.clone()) {
+                    Some(name) if name != configured => {
+                        log::info!(
+                            "gripper node {node} reports tool id {id}: fitting `{name}` in \
+                             place of the configured `{configured}`"
+                        );
+                        loaded = ConfigBundle::load_fitted(&config_path, &name)?;
+                        // A gripper drive on the bus is one more frame a tick.
+                        refuse_unfit_bus(&loaded)?;
+                    }
+                    Some(name) => {
+                        log::info!(
+                            "gripper node {node} reports tool id {id}: `{name}`, as configured"
+                        )
+                    }
+                    None => {
+                        return Err(DaemonError::Tool(format!(
+                            "gripper node {node} reports tool id {id}, which no configured \
+                             tool carries (can_tool_id); add it to that tool's config, or \
+                             provision the drive with `par6 tool-id`"
+                        )))
+                    }
+                }
+            }
+        }
         loaded.robot.timing = Some(resolve_loop_bands(opts.sim, loaded.robot.timing));
         loaded.robot.stream.command_timeout_s = resolve_stream_timeout(
             opts.sim,
@@ -153,40 +205,6 @@ impl Daemon {
                  sustain past {resolution} s or shorten the tick",
                 bands.critical_sustain_s, robot.robot.tick_dt_s,
             )));
-        }
-        // What actually caps the tick rate is the wire, not the loop: the
-        // steady-state exchange has to finish inside one tick, and on
-        // classic CAN it is the binding constraint long before compute
-        // is. Only the real bus has one — `--sim` answers in memory.
-        if !opts.sim {
-            let budget = par6_bus::budget::bus_budget(
-                robot.joints.len(),
-                bundle.active_tool().is_some_and(|g| g.driver.is_some()),
-                robot.bus.bitrate,
-                robot.robot.tick_dt_s,
-            );
-            if !budget.fits() {
-                return Err(DaemonError::BusBudget(format!(
-                    "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
-                     {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
-                     carries at most {:.0} Hz on this bus",
-                    robot.tick_rate_hz(),
-                    budget.frames_per_tick,
-                    budget.wire_time_s * 1e3,
-                    robot.bus.bitrate,
-                    budget.utilisation * 100.0,
-                    robot.robot.tick_dt_s * 1e3,
-                    budget.max_tick_rate_hz,
-                )));
-            }
-            log::info!(
-                "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
-                budget.frames_per_tick,
-                budget.wire_time_s * 1e3,
-                robot.robot.tick_dt_s * 1e3,
-                budget.utilisation * 100.0,
-                budget.max_tick_rate_hz,
-            );
         }
         log::info!(
             "loaded {} ({} joints, tick {} Hz) from {}",
@@ -251,10 +269,10 @@ impl Daemon {
         };
         let sim_bus = opts.sim.then(|| SimBus::new(sim_scene.clone()));
         let sim_world = sim_bus.as_ref().map(SimBus::mailbox);
-        let bus = if let Some(sim_bus) = sim_bus {
-            RuntimeBus::from(sim_bus)
-        } else {
-            RuntimeBus::from(open_hardware_bus(&robot.bus)?)
+        let bus = match (sim_bus, hw_bus.take()) {
+            (Some(sim_bus), _) => RuntimeBus::from(sim_bus),
+            (None, Some(hw)) => RuntimeBus::from(hw),
+            (None, None) => unreachable!("a hardware run opened its bus before the tool probe"),
         };
         let estop = estop_source(opts)?;
         let io = io_source(opts, &robot.io)?;
@@ -1125,6 +1143,41 @@ pub(crate) fn flash_marker() -> Box<dyn FlashMarker> {
 /// the race against the CAN driver still enumerating the interface
 /// (systemd's device ordering only helps once the device unit exists),
 /// and a bounded retry turns that into a delay instead of a crash-loop.
+/// Refuse a tick the configured bus cannot carry, with the ceiling it
+/// can, and log the budget it does carry.
+fn refuse_unfit_bus(bundle: &ConfigBundle) -> Result<(), DaemonError> {
+    let robot = &bundle.robot;
+    let budget = par6_bus::budget::bus_budget(
+        robot.joints.len(),
+        bundle.active_tool().is_some_and(|g| g.driver.is_some()),
+        robot.bus.bitrate,
+        robot.robot.tick_dt_s,
+    );
+    if !budget.fits() {
+        return Err(DaemonError::BusBudget(format!(
+            "a {:.0} Hz tick asks for {} frames ({:.2} ms of wire time) on a \
+             {} bit/s bus, which is {:.0}% of the {:.2} ms tick; this arm \
+             carries at most {:.0} Hz on this bus",
+            robot.tick_rate_hz(),
+            budget.frames_per_tick,
+            budget.wire_time_s * 1e3,
+            robot.bus.bitrate,
+            budget.utilisation * 100.0,
+            robot.robot.tick_dt_s * 1e3,
+            budget.max_tick_rate_hz,
+        )));
+    }
+    log::info!(
+        "bus budget: {} frames/tick, {:.2} ms of {:.2} ms ({:.0}%); ceiling {:.0} Hz",
+        budget.frames_per_tick,
+        budget.wire_time_s * 1e3,
+        robot.robot.tick_dt_s * 1e3,
+        budget.utilisation * 100.0,
+        budget.max_tick_rate_hz,
+    );
+    Ok(())
+}
+
 fn open_hardware_bus(cfg: &par6_config::BusConfig) -> Result<SocketCanBus, DaemonError> {
     log::info!("bus backend: SocketCAN on '{}'", cfg.interface);
     open_with_retry(

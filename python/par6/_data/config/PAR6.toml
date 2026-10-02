@@ -607,6 +607,12 @@ coulomb_nm = [0.2314, 0.903, 2.2047, 0.1279, 0.0521, 0.0854]  # selfcal: measure
 # never relies on a static hold, so this only shapes what the sim does
 # with a released or idled drive.
 holding_friction_nm = [1.0, 8.0, 3.0, 0.5, 0.5, 0.3]
+# The arm's lateral flex at the shoulder and elbow forks, from the base
+# chirp's 23/32 Hz anti-resonance/resonance (why it matters: see
+# SimConfig::arm_lateral_stiffness_nm_rad). The shoulder is given the
+# elbow's value, unmeasured. 0 = rigid.
+arm_lateral_stiffness_nm_rad = 612.0  # selfcal --belt-only, 2026-09-23
+arm_lateral_damping_nm_s = 1.25
 
 [stream]
 command_timeout_s = 0.04

@@ -1648,6 +1648,18 @@ impl<B: DriverBus> RtCore<B> {
                 Ok(()) => log::info!("node {node} asked to save its configuration"),
                 Err(e) => log::error!("save_config on node {node} refused: {e}"),
             },
+            RtCommand::SetToolId { node, tool_id } => {
+                match self
+                    .bus
+                    .set_tool_id(node, tool_id)
+                    .and_then(|()| self.bus.save_config(node))
+                {
+                    Ok(()) => {
+                        log::info!("node {node} told it is tool {tool_id}, and asked to save it")
+                    }
+                    Err(e) => log::error!("set_tool_id on node {node} refused: {e}"),
+                }
+            }
             RtCommand::RescanBus => {
                 if self.bus.is_silent() {
                     log::warn!("bus rescan skipped: the bus is silent (FLASHING)");

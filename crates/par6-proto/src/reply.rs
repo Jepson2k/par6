@@ -162,6 +162,8 @@ pub struct BusNode {
     pub sw_ver: u8,
     /// Serial number (0 = not reported).
     pub serial: i32,
+    /// The tool the drive says it is built into (0 = none reported).
+    pub tool_id: u8,
 }
 
 /// A typed query result — the nested `[query_tag, ...fields]` payload of a
@@ -678,7 +680,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
             w_uint(buf, u64::from(tag));
             w_array(buf, nodes.len());
             for n in nodes {
-                w_array(buf, 7);
+                w_array(buf, 8);
                 w_uint(buf, u64::from(n.node));
                 w_bool(buf, n.configured);
                 w_bool(buf, n.present);
@@ -686,6 +688,7 @@ fn encode_result(result: &QueryResult, buf: &mut Vec<u8>) {
                 w_uint(buf, u64::from(n.hw_ver));
                 w_uint(buf, u64::from(n.sw_ver));
                 w_int(buf, i64::from(n.serial));
+                w_uint(buf, u64::from(n.tool_id));
             }
         }
         Q::Shapes {
@@ -831,7 +834,7 @@ fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
     let mut out = Vec::with_capacity(n);
     for _ in 0..n {
         let arity = r.array_len()?;
-        expect_arity("bus scan node row", arity, 7)?;
+        expect_arity("bus scan node row", arity, 8)?;
         out.push(BusNode {
             node: small(r.uint()?, "bus_scan.node")?,
             configured: r.bool()?,
@@ -843,6 +846,7 @@ fn r_bus_nodes(r: &mut Reader<'_>) -> Result<Vec<BusNode>, DecodeError> {
                 what: "bus_scan.serial",
                 why: "must fit i32".into(),
             })?,
+            tool_id: small(r.uint()?, "bus_scan.tool_id")?,
         });
     }
     Ok(out)

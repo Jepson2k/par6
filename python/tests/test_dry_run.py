@@ -336,7 +336,11 @@ class TestCartesianMotion:
         assert cruising > 0.1 * blended_speeds.max(), (
             f"the blended motion crawled to {cruising:.2f} mm/s mid-path"
         )
-        assert at_the_corner < 0.01 * max(s.max() for s in sharp_speeds), (
+        # A TOPP-RA stop ends partway through its last 4 ms tick, so the
+        # final finite difference still carries up to ~1.5% of the cruise at
+        # J2's deceleration limit; the bar sits where a blended sweep (over
+        # 10%) cannot.
+        assert at_the_corner < 0.03 * max(s.max() for s in sharp_speeds), (
             "the un-blended pair is supposed to stop at the corner"
         )
         assert np.allclose(dry_run.angles(), np.degrees(blended.end_joints_rad))

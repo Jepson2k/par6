@@ -82,6 +82,8 @@ fn node_config(node: NodeId) -> NodeConfig {
             kp: 6.0,
             kd: 7.0,
         },
+        ripple: [(0, 0, 0); 8],
+        velocity_window: None,
     }
 }
 

@@ -766,6 +766,7 @@ impl<R: RtCommands> Core<R> {
                     hw_ver: info.map_or(0, |d| d.hw_ver),
                     sw_ver: info.map_or(0, |d| d.sw_ver),
                     serial: info.map_or(0, |d| d.serial),
+                    tool_id: info.map_or(0, |d| d.tool_id),
                 }
             })
             .collect();
@@ -965,6 +966,9 @@ impl<R: RtCommands> Core<R> {
             C::SaveConfig(p) => self
                 .commissioning_gate(p.node, p.force, "save_config")
                 .map(|()| self.runtime.rt.save_config(p.node)),
+            C::SetToolId(p) => self
+                .commissioning_gate(p.node, p.force, "set_tool_id")
+                .map(|()| self.runtime.rt.set_tool_id(p.node, p.tool_id)),
             C::SetStatusRate(p) => {
                 match status_rate_fault(1.0 / self.cfg.config_info.tick_dt_s, p.hz) {
                     Some(error) => Err(error),
@@ -3016,6 +3020,7 @@ pub fn cmd_name(tag: CmdType) -> &'static str {
         T::SetPidGains => "set_pid_gains",
         T::SetCanId => "set_can_id",
         T::SaveConfig => "save_config",
+        T::SetToolId => "set_tool_id",
         T::SetStatusRate => "set_status_rate",
         T::StatusRate => "status_rate",
         T::BusScan => "bus_scan",

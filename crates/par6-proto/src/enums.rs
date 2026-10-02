@@ -137,6 +137,11 @@ wire_enum! {
         /// every Nth tick, so only divisors of the tick rate can be served;
         /// anything else is refused rather than rounded to a neighbour.
         SetStatusRate = 31,
+        /// Commissioning: tell a gripper drive which tool it is built into
+        /// (cmd 36 to `node`, carrying `tool_id`) and have it saved. Same gate
+        /// and `force` rule as SET_CAN_ID. The drive reports the id in its
+        /// device info from then on, and the runtime fits that tool at boot.
+        SetToolId = 32,
 
         // -- QUERY: replied with RESPONSE, never OK --
         /// Liveness + hardware-connected probe.
@@ -448,6 +453,7 @@ pub fn command_class(cmd: CmdType) -> CommandClass {
         | C::SetPidGains
         | C::SetCanId
         | C::SaveConfig
+        | C::SetToolId
         | C::SetStatusRate => CommandClass::System,
 
         C::Ping

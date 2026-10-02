@@ -498,7 +498,7 @@ class AsyncRobotClient(_RobotClientABC):
         Each row carries ``node``, ``configured`` (the config lists it),
         ``present`` (it answered a ping this boot), ``freshness`` (0
         unknown, 1 fresh, 2 stale, 3 lost — configured nodes only) and
-        the device identity ``hw_ver``/``sw_ver``/``serial`` when the
+        the device identity ``hw_ver``/``sw_ver``/``serial``/``tool_id`` when the
         runtime has swept it.  The reply waits for the scan to settle, so
         expect a few hundred milliseconds.  Returns None if unreachable.
 
@@ -564,6 +564,24 @@ class AsyncRobotClient(_RobotClientABC):
         """
         core = await self._ensure_core()
         return await self._call(core.set_can_id(int(node), int(new_id), bool(force)))
+
+    async def set_tool_id(self, node: int, tool_id: int, *, force: bool = False) -> int:
+        """Commissioning: tell gripper drive *node* which tool it is built
+        into, and have it saved to the drive's NVM.
+
+        *tool_id* is the ``can_tool_id`` of a configured tool (0 clears it).
+        The drive reports it in its device info from then on, and the
+        runtime fits that tool at boot instead of ``active_tool``, so the
+        arm knows what is on it without being told.  Same gate and
+        ``force`` rule as :meth:`set_can_id`.
+
+        Category: Commissioning
+
+        Example:
+            rbt.set_tool_id(6, 13, force=True)
+        """
+        core = await self._ensure_core()
+        return await self._call(core.set_tool_id(int(node), int(tool_id), bool(force)))
 
     async def save_config(self, node: int, *, force: bool = False) -> int:
         """Commissioning: ask drive *node* to persist its running

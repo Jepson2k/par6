@@ -801,22 +801,16 @@ fn peak_speed_under(rig: &Rig, c: &mut Client, profile: &str, key: u64) -> f64 {
     });
     rig.drain_status();
     let index = c.ok_index(&cmd);
-    let mut peak = 0.0f64;
-    let mut moved = false;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        let Some(s) = rig.recv_status() else { continue };
-        let v = s.speeds[0].abs();
-        peak = peak.max(v);
-        if v > 0.02 {
-            moved = true;
-        } else if moved {
-            break;
-        }
-    }
+    // Read through the COMPLETE: the drive's speed is quantised (a slow
+    // ramp reads zero between quanta), so a zero sample says nothing
+    // about the move being over.
+    let peak = rig
+        .collect_through(index, Duration::from_secs(5))
+        .iter()
+        .fold(0.0f64, |m, s| m.max(s.speeds[0].abs()));
     let (ok, detail) = c.wait_complete(index);
     assert!(ok, "{profile} move must complete, got {detail:?}");
-    assert!(moved, "the {profile} probe never moved the joint");
+    assert!(peak > 0.02, "the {profile} probe never moved the joint");
     println!("PEAK {profile} {peak:.4}");
     peak
 }
@@ -2288,5 +2282,80 @@ fn select_tool_fits_a_different_tool() {
     let i = c.ok_index(&tool_action(7007, &other, "calibrate", &[]));
     let (ok, detail) = c.wait_complete(i);
     assert!(ok, "the second driven tool's jaw must work, got {detail:?}");
+    rig.shutdown();
+}
+
+/// The move the arm's base was probed with — a 60° septic from the ready
+/// pose, timed for half J1's EXEC speed — then a two-second hold, through
+/// the runtime's own executor. The arm runs it with no ring and rests at
+/// 0.26°/s RMS afterwards. On a rigid arm the base's velocity loop has no
+/// phase margin at the shipped gains and rings at the current rails
+/// through the whole move; the scene's fork compliance is what keeps the
+/// simulated base as quiet as the arm's.
+#[test]
+fn the_base_moves_quietly_through_the_runtime_at_the_config_gains() {
+    // The config tick and a status per tick: a ring at the base's
+    // crossover (19 Hz folded) has to be sampled to be seen, and the
+    // status torque is the commanded one, which never carries it.
+    const STATUS_HZ: u32 = 250;
+    // One period of the ring, over which the profile itself bends by
+    // under half a degree per second.
+    const RING_WINDOW_S: f64 = 0.052;
+    const SPAN_DEG: f64 = 60.0;
+    let cfg = par6_config::RobotConfig::load(&common::shipped_config()).expect("PAR6 config");
+    let exec_speed = cfg.joints[0]
+        .limits
+        .for_mode(par6_config::LimitMode::Exec)
+        .velocity_rad_s;
+    let dur = par6_motion::SEPTIC_PEAK_VEL * SPAN_DEG.to_radians() / (0.5 * exec_speed);
+    let rig = Rig::boot_at_status_rate(common::retimed_config("base-move", 0.004), STATUS_HZ);
+    let mut c = Client::new(rig.addr());
+    rig.wait_status("link_ok", |s| s.link_ok == 1);
+    c.ok(&Command::Reset);
+    let ready = ready_pose_deg();
+    teleport_home(&rig, &mut c, ready);
+    c.ok(&select_profile("SEPTIC"));
+    let mut target = ready;
+    target[0] += SPAN_DEG;
+    rig.drain_status();
+    let idx = c.ok_index(&move_j(4201, target, dur));
+    let moving = rig.collect_through(idx, Duration::from_secs_f64(dur + 5.0));
+    let (ok, detail) = c.wait_complete(idx);
+    assert!(ok, "the probe move must complete, got {detail:?}");
+    let rest = rig.collect_status(Duration::from_secs(2));
+    let rms = |v: &[f64]| (v.iter().map(|x| x * x).sum::<f64>() / v.len() as f64).sqrt();
+    // What the drive's speed does around its own average over the window.
+    let window = (RING_WINDOW_S * f64::from(STATUS_HZ)).round() as usize;
+    let speed: Vec<f64> = moving.iter().map(|s| s.speeds[0].to_degrees()).collect();
+    assert!(
+        speed.len() > 2 * window,
+        "the probe move reported only {} frames",
+        speed.len()
+    );
+    let ripple: Vec<f64> = speed
+        .windows(window)
+        .map(|w| w[window / 2] - w.iter().sum::<f64>() / window as f64)
+        .collect();
+    let ripple = rms(&ripple);
+    let tail: Vec<f64> = rest
+        .iter()
+        .skip(rest.len() / 4)
+        .map(|s| s.speeds[0].to_degrees())
+        .collect();
+    let rest_rms = rms(&tail);
+    eprintln!(
+        "base probe move through the runtime: {} frames, speed ripple {ripple:.2} deg/s RMS; \
+         at rest after {rest_rms:.2} deg/s RMS",
+        moving.len()
+    );
+    assert!(
+        ripple < 3.0,
+        "the simulated base rings through the probe move: {ripple:.2} deg/s RMS around its \
+         own {RING_WINDOW_S} s average (the arm: under 1 deg/s)"
+    );
+    assert!(
+        rest_rms < 1.0,
+        "the simulated base does not come to rest after the probe move: {rest_rms:.2} deg/s RMS"
+    );
     rig.shutdown();
 }

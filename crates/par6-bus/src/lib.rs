@@ -47,8 +47,8 @@ pub use hw::sched::ConfigKind;
 pub use hw::{OpenError, SocketCanBus};
 pub use loopback::{LoopbackBus, Reply, TxRecord};
 pub use types::{
-    BusError, BusState, DeviceInfo, DriveTune, ErrorFlags, Fault, FirmwareGripperCommand,
-    Freshness, GripperCommand, GripperReply, GripperState, HallState, JointCommand, LinkHealth,
-    LinkState, NodeId, NodeState, ObjectDetection, Pack, PollAction, PollKind, MAX_NODES,
-    NODE_BOOTLOADER, NODE_GRIPPER, NODE_HOST, NODE_TIMING_DUMMY,
+    BusError, BusState, CaptureBuffer, DeviceInfo, DriveTune, ErrorFlags, Fault,
+    FirmwareGripperCommand, Freshness, GripperCommand, GripperReply, GripperState, HallState,
+    JointCommand, LinkHealth, LinkState, NodeId, NodeState, ObjectDetection, Pack, PollAction,
+    PollKind, MAX_NODES, NODE_BOOTLOADER, NODE_GRIPPER, NODE_HOST, NODE_TIMING_DUMMY,
 };

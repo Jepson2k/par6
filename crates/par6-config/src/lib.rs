@@ -39,8 +39,9 @@ pub use io::{IoConfig, IoLine, MAX_IO_LINES};
 pub use robot::{
     BusConfig, ControlMode, DriverType, FreedriveConfig, Gains, JogDefaults, JogProfile,
     JointConfig, JointLimits, KtFetchConfig, KtSource, LimitMode, LimitsSection, ModeLimits,
-    MotionConfig, ProtocolConfig, ResolvedLimits, RobotConfig, RobotSection, ScanConfig,
-    SelfcalConfig, SimConfig, StreamDefaults, TimingConfig, WatchdogAction, MAX_OPEN_RETRY_S,
+    MotionConfig, ProtocolConfig, ResolvedLimits, RippleHarmonic, RobotConfig, RobotSection,
+    ScanConfig, SelfcalConfig, SimConfig, StreamDefaults, TimingConfig, WatchdogAction,
+    MAX_OPEN_RETRY_S, MAX_RIPPLE_HARMONICS,
 };
 
 use std::path::Path;
@@ -178,6 +179,13 @@ impl ConfigBundle {
             .find(|g| g.name == self.robot.robot.active_tool)
     }
 
+    /// The tool whose drive reports `tool_id` in its device info
+    /// (`ToolConfig::can_tool_id`); `None` for 0 and for an id no tool
+    /// carries.
+    pub fn tool_by_can_id(&self, tool_id: u8) -> Option<&ToolConfig> {
+        (tool_id != 0).then(|| self.tools.iter().find(|g| g.can_tool_id == Some(tool_id)))?
+    }
+
     /// Effective home offset for an arm joint under the ACTIVE gripper:
     /// the gripper's `arm_joint_home_offsets` override when the joint is
     /// flagged `home_offset_gripper_dependent` and the gripper provides
@@ -276,6 +284,21 @@ impl ConfigBundle {
                 return Err(invalid(
                     format!("installation_shapes[{i}].{leaf}"),
                     format!("shape `{}`: {why}", s.name),
+                ));
+            }
+        }
+        for (i, tool) in self.tools.iter().enumerate() {
+            let Some(id) = tool.can_tool_id else {
+                continue;
+            };
+            if let Some(other) = self.tools[..i].iter().find(|t| t.can_tool_id == Some(id)) {
+                return Err(invalid(
+                    "can_tool_id",
+                    format!(
+                        "tools `{}` and `{}` both claim id {id}; a drive reports one id \
+                         and it must name one tool",
+                        other.name, tool.name
+                    ),
                 ));
             }
         }

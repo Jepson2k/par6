@@ -4,6 +4,7 @@
 
 use par6_config::{RobotConfig, ToolConfig};
 
+use crate::types::CaptureBuffer;
 use crate::types::{
     BusError, BusState, DriveTune, Freshness, GripperCommand, JointCommand, LinkHealth, NodeId,
     PollAction,
@@ -124,6 +125,66 @@ pub trait DriverBus {
     /// Commissioning: ask `node` to persist its running configuration to
     /// NVM (cmd 13), one frame.
     fn save_config(&mut self, node: NodeId) -> Result<(), BusError>;
+
+    /// Commissioning: tell `node` which tool it is built into (cmd 36,
+    /// `ToolConfig::can_tool_id`), one frame; it reads back in the
+    /// node's device info at once and survives a power cycle after a
+    /// [`save_config`](Self::save_config).
+    fn set_tool_id(&mut self, node: NodeId, tool_id: u8) -> Result<(), BusError>;
+
+    /// Set `node`'s ripple feedforward (cmd 40): the harmonics fill its slots
+    /// in order and the rest are cleared, sent now and kept for the node's
+    /// reconnect resend. At most `RIPPLE_SLOTS` harmonics.
+    fn set_ripple(
+        &mut self,
+        node: NodeId,
+        ripple: &[par6_config::RippleHarmonic],
+    ) -> Result<(), BusError>;
+
+    /// Set `node`'s speed filter window (cmd 41), sent now and kept for the
+    /// node's reconnect resend.
+    fn set_velocity_window(&mut self, node: NodeId, window: u8) -> Result<(), BusError>;
+
+    /// Arm `node`'s next capture with an injection (cmd 42): while it
+    /// records, the drive adds a pseudo-random ±`amplitude_ma` to its loops'
+    /// current setpoint, the signs
+    /// [`inject_sequence`](crate::spectral::codec::inject_sequence) of `seed`
+    /// and `hold`, and capture channel 2 records that setpoint instead of the
+    /// electrical phase. One capture only; amplitude 0 disarms.
+    fn arm_injection(
+        &mut self,
+        node: NodeId,
+        amplitude_ma: i16,
+        seed: u16,
+        hold: u8,
+    ) -> Result<(), BusError>;
+
+    /// Arm/cancel a finite periodic experiment. Unsupported backends refuse it.
+    fn arm_periodic(
+        &mut self,
+        _node: NodeId,
+        _spec: crate::spectral::periodic::Spec,
+    ) -> Result<(), BusError> {
+        Err(BusError::InvalidCommand {
+            reason: "periodic injection requires STEPFOC hardware",
+        })
+    }
+
+    /// Query capability/state without enabling motion or injection.
+    fn read_periodic_status(&mut self, _node: NodeId) -> Result<(), BusError> {
+        Err(BusError::InvalidCommand {
+            reason: "periodic injection requires STEPFOC hardware",
+        })
+    }
+
+    /// Start a loop-rate capture on `node` (cmd 38): `wanted` samples of the
+    /// velocity its loop acts on and Iq, one every `divisor` control loops,
+    /// from the next loop. Read back with [`PollAction::CaptureRead`]
+    /// overrides into [`capture`](Self::capture).
+    fn capture_start(&mut self, node: NodeId, divisor: u8, wanted: u16) -> Result<(), BusError>;
+
+    /// What the capture reads have assembled for `node` so far.
+    fn capture(&self, node: NodeId) -> Option<&CaptureBuffer>;
 
     /// Send a Limits frame (cmd 20: velocity limit ticks/s + current
     /// limit mA), `repeats` times. Homing uses this to drop a node to its

@@ -160,6 +160,17 @@ impl ToolInertial {
     }
 }
 
+/// The arm's passive lateral hinges (see
+/// `SimConfig::arm_lateral_stiffness_nm_rad`): `(body, name, axis)`, two
+/// per fork on the body the fork's joint drives, about the two local axes
+/// that joint (local Z in the vendor MJCF) does not turn.
+const FLEX_HINGES: [(&str, &str, [f64; 3]); 4] = [
+    ("upper_arm", "par6/flex/shoulder_x", [1.0, 0.0, 0.0]),
+    ("upper_arm", "par6/flex/shoulder_y", [0.0, 1.0, 0.0]),
+    ("elbow", "par6/flex/elbow_x", [1.0, 0.0, 0.0]),
+    ("elbow", "par6/flex/elbow_y", [0.0, 1.0, 0.0]),
+];
+
 /// What a scene is built with, besides the vendor file.
 #[derive(Debug, Clone, Copy)]
 pub struct Build<'a> {
@@ -169,6 +180,9 @@ pub struct Build<'a> {
     pub joints: &'a [JointTuning],
     /// The active tool's config inertials (`None` = the variant URDF's).
     pub tool: Option<&'a ToolInertial>,
+    /// The forks' lateral flex `(stiffness [Nm/rad], damping [Nm·s/rad])`;
+    /// a zero stiffness leaves the arm rigid.
+    pub lateral: (f64, f64),
 }
 
 /// The world objects, installation layer then program layer.
@@ -582,6 +596,26 @@ impl Scene {
             // per second under the shoulder's load.
             *joint.solref_friction_mut() = [2.0 * timestep, 1.0];
             *joint.solimp_friction_mut() = [0.9999, 0.9999, 0.001, 0.5, 2.0];
+        }
+
+        let (stiffness, damping) = build.lateral;
+        if stiffness > 0.0 {
+            for (body_name, name, axis) in FLEX_HINGES {
+                // Listed after the fork's own joint, so the hinge rides on
+                // the body that joint drives.
+                spec.body_mut(body_name)
+                    .ok_or_else(|| SceneError::Missing {
+                        kind: "body",
+                        name: body_name.to_owned(),
+                    })?
+                    .add_joint()
+                    .with_name(name)
+                    .with_type(MjtJoint::mjJNT_HINGE)
+                    .with_axis(axis)
+                    .with_pos([0.0; 3])
+                    .with_stiffness([stiffness, 0.0, 0.0])
+                    .with_damping([damping, 0.0, 0.0]);
+            }
         }
 
         if self.tool == Tool::Flange {

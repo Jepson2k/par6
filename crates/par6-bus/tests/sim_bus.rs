@@ -14,7 +14,9 @@ use std::path::PathBuf;
 
 use par6_bus::sim::scene::{Scene, Tool};
 use par6_bus::sim::{FaultKind, SimBus};
-use par6_bus::spectral::codec::{pack_can_id, CanFrame, CommandId};
+use par6_bus::spectral::codec::{
+    pack_can_id, CanFrame, CommandId, CAPTURE_STATUS_CHANNEL, CAPTURE_VEL_SCALE,
+};
 use par6_bus::spectral::convert::{ticks_per_radian, JointConversion};
 use par6_bus::{
     BusState, DriverBus, FirmwareGripperCommand, Freshness, GripperCommand, JointCommand,
@@ -26,18 +28,6 @@ use par6_proto::{Layer, Physical, Shape};
 fn par6() -> RobotConfig {
     let path = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../config/PAR6.toml");
     RobotConfig::load(&path).expect("PAR6.toml")
-}
-
-/// [`par6`] with the base joint's velocity loop at the vendor's gains.
-/// The arm holds still on its tuned kpv/kiv; on the simulated joint,
-/// rigidly coupled to the whole arm's inertia, that loop is marginal at
-/// its crossover and a base driven at speed limit-cycles in place. These
-/// tests are about driver semantics, not the base's tune.
-fn par6_stable_base() -> RobotConfig {
-    let mut robot = par6();
-    robot.joints[0].gains.kpv = 0.015;
-    robot.joints[0].gains.kiv = 0.0015;
-    robot
 }
 
 fn msg_gripper() -> ToolConfig {
@@ -514,7 +504,7 @@ fn hall_joint_trigger_edge_and_latched_position() {
 
 #[test]
 fn watchdog_silence_drops_driver_to_idle() {
-    let mut robot = par6_stable_base();
+    let mut robot = par6();
     robot.joints[0].watchdog_timeout_ms = 200; // 50 ticks at 250 Hz
     let wd_ticks = u64::from(robot.ticks(f64::from(robot.joints[0].watchdog_timeout_ms) / 1000.0));
     let mut rig = Rig::boot(&robot, None, None);
@@ -834,7 +824,7 @@ fn wrong_dlc_frames_discarded_whole() {
 
 #[test]
 fn boot_wrap_sector_semantics_and_position_mode_in_wire_coords() {
-    let robot = par6_stable_base();
+    let robot = par6();
     // J0 (gear 6.4, master 3969): a pose 0.24 rad below the calibration
     // pose puts the true motor position just below zero, so the boot
     // reading wraps to the top of the 14-bit range.
@@ -974,17 +964,20 @@ fn zero_speed_position_frames_still_close_position_error() {
     );
 }
 
-/// With Rstint=0, bypassing the velocity loop or clearing a fault
-/// preserves its accumulated current; a command packet is not a reset.
+/// The par6 firmware starts the velocity integral afresh when a position
+/// or velocity frame follows any other mode — after a current-mode
+/// release the vendor's drive re-applied the wind-up of the push before
+/// it, ~850 mA into the stop on a wrist — while position and velocity
+/// frames carry the integral on from each other.
 #[test]
-fn velocity_integral_survives_mode_changes_and_fault_clear() {
+fn velocity_integral_restarts_after_another_mode_and_carries_across_the_cascade() {
     let robot = par6();
     let mut q0 = calibration_pose(&robot);
     q0[0] = robot.joints[0].limits.hard_max_rad;
     let mut rig = Rig::boot(&robot, None, Some(&q0));
     let mut cmds = rig.idle_cmds();
     let node = usize::from(robot.joints[0].node_id);
-    for mode in ["current", "pd", "idle", "fault"] {
+    for mode in ["position", "current", "pd", "idle", "fault"] {
         cmds[0] = JointCommand::velocity(8000, 0);
         for _ in 0..robot.ticks(0.4) {
             rig.step(&cmds, &GripperCommand::NoGripper);
@@ -994,10 +987,11 @@ fn velocity_integral_survives_mode_changes_and_fault_clear() {
             loaded > 1000,
             "the blocked drive must accumulate effort: {loaded} mA"
         );
+        let here = rig.state.nodes[node].position_ticks.unwrap();
         cmds[0] = match mode {
+            "position" => JointCommand::position(here, 0, 0),
             "pd" => {
-                let mut cmd =
-                    JointCommand::position(rig.state.nodes[node].position_ticks.unwrap(), 0, 0);
+                let mut cmd = JointCommand::position(here, 0, 0);
                 cmd.pack = par6_bus::Pack::Pd;
                 cmd
             }
@@ -1024,10 +1018,18 @@ fn velocity_integral_survives_mode_changes_and_fault_clear() {
             rig.step(&cmds, &GripperCommand::NoGripper);
         }
         let resumed = rig.state.nodes[node].current_ma.unwrap();
-        assert!(
-            resumed > loaded / 2,
-            "mode {mode} erased the velocity integral: {loaded} -> {resumed} mA"
-        );
+        if mode == "position" {
+            assert!(
+                resumed > loaded / 2,
+                "a position hold erased the velocity integral: {loaded} -> {resumed} mA"
+            );
+        } else {
+            assert!(
+                resumed < loaded / 4,
+                "mode {mode} carried the velocity integral into the next velocity frame: \
+                 {loaded} -> {resumed} mA"
+            );
+        }
     }
 }
 
@@ -1801,7 +1803,7 @@ fn only_motion_frames_and_answered_polls_feed_the_watchdog() {
 /// against an arm that simply freewheels.
 #[test]
 fn a_faulted_driver_stops_driving_until_the_fault_is_cleared() {
-    let robot = par6_stable_base();
+    let robot = par6();
     let mut rig = Rig::boot(&robot, None, None);
     let mut cmds = rig.idle_cmds();
 
@@ -2060,5 +2062,173 @@ fn a_saturating_feedforward_does_not_cancel_the_position_loop() {
          moved {} ticks of {}",
         now - start,
         target - start
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Combined telemetry, the drive's tool id, and the empty gripper slot
+// ---------------------------------------------------------------------------
+
+/// One cmd-37 poll lands temperature, voltage, the error flags and the
+/// current together and marks the node as answering it; the gripper
+/// drive's device info names the tool it is built into, and a
+/// `set_tool_id` renames it on the spot. With no gripper fitted the
+/// gripper slot puts nothing on the bus: a tick is the joint frames and
+/// one poll.
+#[test]
+fn one_telemetry_poll_refreshes_the_node_and_the_gripper_names_its_tool() {
+    let robot = par6();
+    let gripper = msg_gripper();
+    let gnode = robot.bus.gripper_node;
+    let mut rig = Rig::boot(&robot, Some(&gripper), None);
+    let cmds = rig.idle_cmds();
+    rig.bus.queue_poll_override(
+        PollAction::Poll {
+            node: 2,
+            kind: PollKind::Telemetry,
+        },
+        1,
+    );
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    rig.step(&cmds, &GripperCommand::FirmwarePoll);
+    let n = &rig.state.nodes[2];
+    assert!(n.combined_telemetry, "{n:?}");
+    assert_eq!(n.temperature_c, Some(34), "{n:?}");
+    assert_eq!(n.voltage_mv, Some(24_000), "{n:?}");
+    assert!(n.error_flags.is_some_and(|f| f.calibrated), "{n:?}");
+    assert!(n.current_ma.is_some(), "{n:?}");
+
+    let device_info = |rig: &mut Rig| {
+        rig.bus.queue_poll_override(
+            PollAction::Poll {
+                node: gnode,
+                kind: PollKind::DeviceInfo,
+            },
+            1,
+        );
+        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        rig.step(&cmds, &GripperCommand::FirmwarePoll);
+        rig.state.nodes[usize::from(gnode)]
+            .device_info
+            .expect("device info")
+    };
+    assert_eq!(
+        device_info(&mut rig).tool_id,
+        gripper.can_tool_id.expect("the MSG rail carries an id")
+    );
+    rig.bus.set_tool_id(gnode, 33).expect("set_tool_id");
+    assert_eq!(device_info(&mut rig).tool_id, 33);
+
+    let mut bare = Rig::boot(&robot, None, None);
+    let cmds = bare.idle_cmds();
+    bare.step(&cmds, &GripperCommand::NoGripper);
+    bare.bus.reset_tx_peak();
+    bare.step(&cmds, &GripperCommand::NoGripper);
+    assert_eq!(
+        bare.bus.peak_tx_frames_per_tick(),
+        robot.joints.len() + 2,
+        "a bare arm's tick is its joint frames, the timing-dummy ping and one poll"
+    );
+}
+
+/// The loop-rate capture (cmd 38/39) is what host-side tuning fits: the
+/// velocity the drive's loop acted on and the current it drove, sample by
+/// sample through a velocity step, read back one pair per poll slot.
+#[test]
+fn capture_records_a_velocity_step_at_the_loop_rate_and_reads_back() {
+    let robot = par6();
+    let j = 0usize;
+    let node = robot.joints[j].node_id;
+    let mut rig = Rig::boot(&robot, None, Some(&calibration_pose(&robot)));
+    let mut cmds = rig.idle_cmds();
+    cmds[j] = JointCommand::velocity(0, 0);
+    for _ in 0..50 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+
+    // 800 samples, every second loop: 256 ms, the rise and the plateau.
+    let step = 6000;
+    let (divisor, wanted) = (2u8, 800u16);
+    rig.bus
+        .capture_start(node, divisor, wanted)
+        .expect("capture_start");
+    cmds[j] = JointCommand::velocity(step, 0);
+    for _ in 0..80 {
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    }
+    cmds[j] = JointCommand::velocity(0, 0);
+
+    let read = |rig: &mut Rig, channel: u8, chunk: u16| {
+        rig.bus.queue_poll_override(
+            PollAction::CaptureRead {
+                node,
+                channel,
+                chunk,
+            },
+            1,
+        );
+        rig.step(&cmds, &GripperCommand::NoGripper);
+    };
+    read(&mut rig, CAPTURE_STATUS_CHANNEL, 0);
+    rig.step(&cmds, &GripperCommand::NoGripper);
+    let status = rig.bus.capture(node).expect("a capture buffer");
+    assert_eq!(
+        (status.recorded, status.wanted, status.divisor),
+        (wanted, wanted, u16::from(divisor)),
+        "the drive stops by itself at the length asked for"
+    );
+    let chunks = status.chunks();
+    for channel in [0u8, 1] {
+        for chunk in 0..chunks {
+            read(&mut rig, channel, chunk);
+        }
+    }
+    rig.step(&cmds, &GripperCommand::NoGripper);
+
+    let cap = rig.bus.capture(node).expect("a capture buffer");
+    let n = usize::from(wanted);
+    let velocity: Vec<i32> = cap.velocity[..n]
+        .iter()
+        .map(|&v| i32::from(v) * CAPTURE_VEL_SCALE)
+        .collect();
+    let current = &cap.current[..n];
+    assert!(
+        velocity[0].abs() < step / 10,
+        "the capture starts before the step lands: {}",
+        velocity[0]
+    );
+    // J1 rings about its setpoint at ~15 Hz on these gains (the hardware
+    // surge the capture exists to measure); over the second half the ring
+    // averages to the commanded speed.
+    let tail = &velocity[n / 2..];
+    let settled = tail.iter().sum::<i32>() / tail.len() as i32;
+    assert!(
+        (settled - step).abs() < step / 10,
+        "the response settles about the commanded speed: {settled} vs {step}"
+    );
+    let rise = velocity
+        .iter()
+        .position(|&v| v > step / 2)
+        .expect("the capture covers the rise");
+    assert!(
+        rise > 0 && rise < n / 2,
+        "the rise is inside the capture: {rise}"
+    );
+    let accelerating = current[..=rise].iter().map(|c| c.abs()).max().unwrap();
+    let cruising = current[n - 100..]
+        .iter()
+        .map(|c| i32::from(c.abs()))
+        .sum::<i32>()
+        / 100;
+    assert!(
+        i32::from(accelerating) > cruising,
+        "accelerating costs more current ({accelerating} mA) than cruising ({cruising} mA)"
+    );
+
+    rig.bus.capture_start(node, 1, 10).expect("second capture");
+    assert_eq!(
+        rig.bus.capture(node).expect("a capture buffer").recorded,
+        0,
+        "a new capture forgets the last one"
     );
 }
